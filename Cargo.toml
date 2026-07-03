@@ -1,0 +1,27 @@
+[package]
+name = "turbolay"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "turbolay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "turbolay"
+path = "src/main.rs"
+
+[dependencies]
+# opendata substrate: serde toolkit, StorageBuilder, SequenceAllocator, merge framework.
+# Path dep into the sibling opendata workspace (package `opendata-common`, lib `common`).
+common = { path = "../../2026-06/opendata/common", package = "opendata-common" }
+
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "test-util"] }
