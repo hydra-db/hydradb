@@ -28,6 +28,10 @@
 //! - [`posting`] — [`posting::PostingValue`], the posting-list value type
 //!   (RFC 0005) stored at every adjacency/index/count key: its on-wire codec
 //!   and read-side set-algebra surface. M1 deliverable 1.
+//! - [`value`] — [`value::NodeRecord`]/[`value::TypedValue`] (RFC 0004
+//!   §"Node record") and [`value::ChangeRecord`] (§"ChangeRecord schema"):
+//!   the node blob and changelog value types, each with a fail-closed codec.
+//!   M1 deliverable 2.
 //! - [`storage`] — [`storage::GraphStorage`], the per-namespace substrate
 //!   wrapper that opens SlateDB via [`common::StorageBuilder`].
 //! - [`telemetry`] — `tracing` subscriber initialization.
@@ -40,6 +44,7 @@ pub mod schema;
 pub mod serde;
 pub mod storage;
 pub mod telemetry;
+pub mod value;
 
 pub use error::{Error, Result};
 pub use serde::record_tag::RecordType;
