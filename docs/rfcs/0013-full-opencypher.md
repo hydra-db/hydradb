@@ -11,6 +11,8 @@ related:
 
 **Status:** planned stub. Fleshed out on product need; consumes the RFC 0007 predicate IR (frontend/executor extension, not a rewrite).
 
+> **Scope amendment (2026-07-03, per RFC 0007 §13 / Q23):** the Cypher **parser + AST is no longer owned by this RFC** — the full openCypher grammar is parsed by a front-loaded frontend built during M1 (RFC 0007 Amendment A1). What this RFC accepts today as `unsupported_cypher` is already *parsed* into a complete AST; the frontend just declines to *lower* it. RFC 0013's remaining scope therefore narrows to **IR growth + lowering rules + executor support** — no parser work. Constructs are recognized (not `malformed_cypher`) the day the parser lands; they become executable when this RFC adds their `PlanNode`(s) and lowering.
+
 ## Summary (to expand)
 Extend the v0 read subset to the constructs RFC 0007 rejects as `unsupported_cypher`: `WITH` pipelines, aggregations beyond `count(*)`, `DISTINCT`, subqueries, `OPTIONAL MATCH`, path variables, `shortestPath`, and map projections.
 

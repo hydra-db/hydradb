@@ -317,3 +317,35 @@ These are v0-shaped (correct, bounded, measurable) rather than the deeper CSR/WC
 - Execution is: freshness gate (RFC 0001) → index/adjacency access valid to `W = min(watermark over used indexes)`, all combined in roaring (RFC 0005) with deleted-node/edge subtraction → changelog-tail scan `Log[(W, latest]]` re-evaluating the full pattern on materialized base nodes/edges → merge `(candidates − deleted) ∪ tail matches` → fetch `Node[uid]` blobs → `ORDER BY`/`SKIP`/`LIMIT` in the executor (materialize-then-sort per Q4). Live indexes keep `W = latest`, so the tail is empty in steady state and index lag is invisible.
 - N+1 — the dominant traversal cost — is mitigated by batched multi-get neighbor reads, filter push-down before the next frontier, smaller-side-first frontier heuristics, and a once-per-query cached deleted-node bitmap. CSR/WCOJ locality wins are deferred to RFC 0009.
 - Bounds fail loudly, never silently: a var-length request over `bfs_depth_cap` errors `bfs_depth_exceeded`; a tail over `tail_max_entries` blocks then returns retryable `index_behind`. Correctness is never traded for latency in v0.
+
+## 13. Amendment A1 (2026-07-03) — Frontend build strategy: full parser now, subset gate at lowering (Q23)
+
+Recorded **after** the original draft above; **additive**. The sections §1–§12 stand unchanged except where this amendment explicitly supersedes a stage of enforcement (§2.3). Decision register: `docs/open-decisions.md` Q23.
+
+**Decision.** The Cypher **frontend** (lexer + parser + typed AST) is built to the **full openCypher grammar** as a parallel track during M1, ahead of the planner/executor — front-loaded out of RFC 0013. This does **not** widen the v0 *executable* surface (still exactly the §2 / §12 read subset). It changes only **where the subset boundary is enforced** and removes the parser from RFC 0013's scope.
+
+### 13.1 What changes
+1. **Parse scope**: full openCypher grammar → a complete typed AST. (Original draft implied parsing only the §2 subset.)
+2. **Rejection stage moves parse-time → lowering-time.** §2.3 said out-of-v0 constructs are "rejected at parse time with `unsupported_cypher`." **Superseded**: the parser now *accepts* them syntactically; **lowering** (AST → `PlanNode` IR, §3) emits `unsupported_cypher{ construct, see: "RFC 001x" }` for any construct outside the §2 subset. `malformed_cypher` remains a **parse-time** error (never-valid syntax). The taxonomy itself and the RFC 0008 HTTP-status mapping (`unsupported_cypher` → 501, `malformed_cypher` → 400) are **unchanged** — only the stage that raises `unsupported_cypher` moves.
+3. **The predicate IR (§3) is designed against the whole language's needs**, not just the subset — so RFC 0013 *grows* it (adds nodes) without reshaping it. This hardens the D7 swap seam by pressure-testing it against every construct now.
+
+### 13.2 What does NOT change
+- v0 executable surface = exactly §2 / §12. Anything the parser accepts but lowering cannot map is `unsupported_cypher` — same client contract as before.
+- Planner, read path, freshness gate, bounds, N+1 mitigations (§5–§8) are untouched. This amendment is frontend-only.
+
+### 13.3 Sub-decisions
+- **Q23a — parser implementation · RESOLVED 2026-07-03 (user decision): ADOPT `decypher`, pinned `=0.2.0-alpha.6`.** Candidates weighed were (a) `logos` + hand-rolled recursive-descent/Pratt vs (b) adopt **`decypher`** (hand-written, **error-resilient rowan** full-openCypher parser; typed AST + `miette` diagnostics). **Chosen: (b).** Audit (scratchpad + `docs/open-decisions.md` Q23a): var-length **is** supported (`ast::pattern::{Quantifier, RangeLiteral}`), license is the permissive MIT/Apache arm, diagnostics are best-in-class; the accepted risks are that it is a **bus-factor-1 alpha with an explicitly unstable AST**. Mitigations that are part of this decision:
+  - **Pin the exact version** and upgrade deliberately; re-run the lowering test suite on every bump (the AST is unstable pre-0.2.0).
+  - **Our lowering is the only coupling surface** — `decypher` AST/HIR → our `PlanNode` IR (§3). If the crate is abandoned, the permissive license lets us fork.
+  - **Two distinct rejection layers, don't conflate:** `decypher`'s own `CypherError::Unsupported` (grammar productions *it* hasn't implemented) vs **our** `unsupported_cypher` (raised in *lowering* for constructs outside the v0 §2 subset that `decypher` parsed fine). `malformed_cypher` = a `decypher` parse error, surfacing its `miette` diagnostics.
+  - **First-spike sub-question:** lower from `decypher`'s typed AST (`ast::query::Query`) or its HIR (`hir_lower`) — pick the more stable/ergonomic source.
+- **Q23b — name-resolution seam · CONFIRMED.** Lowering takes an injectable `NameResolver` (label/pred/prop name → interned `LabelId`/`PredId`/`PropId`). Tests pass a mock map; production passes M0's `SchemaCache`. Keeps the frontend storage-independent (hence parallelizable with M1) and makes the M2 wire-up a one-liner.
+- **Q23c — literals · CONFIRMED.** IR literals use RFC 0004 `TypedValue` (imported, **not** redefined in the query module). Coordinate landing `TypedValue` early with the M1 owner so this track imports rather than shims it — the one shared-type coordination point with M1.
+
+### 13.4 Consequence for RFC 0013
+RFC 0013 no longer owns a parser — the frontend is done once this track lands. RFC 0013 narrows to: **grow the IR** (new nodes, e.g. `Aggregate` / `Optional` / `Path` / `With`), the **lowering rules** for the newly-supported constructs, and **executor** support. "Swap the frontend later" becomes "add lowering + executor," never a parser rewrite.
+
+### 13.5 Why
+- The full parser is bounded and storage-independent → parallelizable with M1 **today**, and one-and-done.
+- Designing the IR + lowering against the whole language now pressure-tests the D7 seam against every construct, instead of discovering at RFC 0013 that the IR was shaped for the subset.
+- Moving the reject to lowering yields a precise, uniform `unsupported_cypher` with a per-construct RFC pointer, and keeps `malformed_cypher` strictly syntactic.
