@@ -1,0 +1,7 @@
+   Compiling slatedb-graph-kernel v0.1.0 (/mnt/c/Users/thevi/OneDrive/Desktop/dgraph/prototype/slatedb-graph-kernel)
+    Finished `release` profile [optimized] target(s) in 26.12s
+     Running `/home/vishal/.cache/dgraph-phase0-target/release/examples/phase0_path_bench`
+phase0 path benchmark: fanouts=[100000] hops=[1] max_hop=12 kernel=SuiteSparseGraphBlas hot_iters=3 write_samples=8 object_root=/tmp/phase0-path-bench-652-1783057438581/object-store cache_root=/tmp/phase0-path-bench-652-1783057438581/slatedb-cache
+fanout=100000 stage=bulk_import edges=1200000 elapsed_ms=172457
+fanout=100000 stage=sample_writes samples=8 p50_us=100995
+fanout=100000 stage=matrix_build edges=1200000 elapsed_ms=37529

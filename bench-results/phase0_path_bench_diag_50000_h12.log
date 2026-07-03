@@ -1,0 +1,11 @@
+phase0 path bench fanout=50000 hops=12 hot_iters=1
+    Finished `release` profile [optimized] target(s) in 2.20s
+     Running `/home/vishal/.cache/dgraph-phase0-target/release/examples/phase0_path_bench`
+phase0 path benchmark: fanouts=[50000] hops=[12] max_hop=12 kernel=SuiteSparseGraphBlas hot_iters=1 write_samples=1 object_root=/tmp/phase0-path-bench-649-1783006932440/object-store cache_root=/tmp/phase0-path-bench-649-1783006932440/slatedb-cache
+fanout=50000 stage=bulk_import edges=600000 elapsed_ms=41975
+fanout=50000 stage=sample_writes samples=1 p50_us=87132
+fanout=50000 stage=matrix_build edges=600000 elapsed_ms=3300
+fanout=50000 stage=supernode_cold degree_us=1256 exists_us=54800 page_us=20
+fanout=50000 hop=12 stage=cold_read elapsed_us=933387
+fanout=50000 hop=12 stage=warm_read elapsed_us=495003
+fanout=50000 hop=12 stage=hot_read p50_us=26259 qps=38.08
