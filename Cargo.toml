@@ -2,6 +2,9 @@
 name = "slatedb-graph-kernel"
 version = "0.1.0"
 edition = "2021"
+description = "A SlateDB-backed object-store graph kernel prototype"
+repository = "https://github.com/usecortex/slatedb-graph-kernel"
+readme = "README.md"
 publish = false
 
 [features]
@@ -12,7 +15,7 @@ graphblas = []
 async-trait = "0.1"
 bytes = "1"
 libcypher-parser-sys = "0.6.1-1"
-slatedb = { path = "../../external-repos/slatedb/slatedb", default-features = false, features = ["aws", "foyer"] }
+slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "a6e169dc1e143fa72a0aa916a9b23cf29b3656b4", default-features = false, features = ["aws", "foyer"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
