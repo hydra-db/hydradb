@@ -14,7 +14,10 @@ struct Lcg(u64);
 impl Lcg {
     fn next(&mut self) -> u64 {
         // Numerical Recipes constants.
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0
     }
 }
@@ -49,7 +52,10 @@ fn roaring_treemap_portable_roundtrip_is_identity_and_ascending() {
     let mut prev: Option<u64> = None;
     for uid in back.iter() {
         if let Some(p) = prev {
-            assert!(uid > p, "iteration must be strictly ascending: {p} then {uid}");
+            assert!(
+                uid > p,
+                "iteration must be strictly ascending: {p} then {uid}"
+            );
         }
         prev = Some(uid);
     }
@@ -114,7 +120,10 @@ fn roaring_serialized_size_vs_naive_baseline() {
         },
     ];
 
-    println!("\n{:<40} {:>10} {:>14} {:>14} {:>8}", "shape", "card", "roaring B", "naive 8B/uid", "ratio");
+    println!(
+        "\n{:<40} {:>10} {:>14} {:>14} {:>8}",
+        "shape", "card", "roaring B", "naive 8B/uid", "ratio"
+    );
     for shape in shapes {
         let s = (shape.build)();
         let card = s.len();
