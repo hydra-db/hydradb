@@ -1,0 +1,8 @@
+# Pinned so plain `cargo`/`rustup` (agent shells, CI, other sessions) honor the
+# toolchain natively — mise.toml declares the same version for the mise workflow,
+# but rustup/cargo don't read mise.toml. 1.96.0 is the latest stable and clears
+# the decypher dependency's MSRV floor (rust-version = "1.94"). Keep in sync with
+# mise.toml. See docs/impl (Cypher frontend wire-in).
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

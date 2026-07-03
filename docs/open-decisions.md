@@ -33,6 +33,7 @@ Answer inline (e.g. "Q1: option A, but ..."), or we walk them live.
 - 2026-07-03 — **Q-new (index declaration) = A** (explicit declaration via admin/REST API; writer backfills). FUTURE: (i) openCypher `CREATE INDEX FOR (n:Label) ON (n.prop)` / `DROP INDEX` as a frontend on the same registry (rides RFC 0011); (ii) user-driven field selection (user specifies fields to index — the admin API is that input today; later also via Cypher DDL or namespace config). Note both in RFC 0006 future section.
 - 2026-07-03 — **Confirms taken (no objection):** Q11 session-token default, Q12 own logical seq, Q13 single-writer/no-MVCC, Q18 depend on opendata/common, Q19 one DB per namespace, Q20 single S3 store for WAL+data in v0, Q21 RAG-KG / 1–10M / correctness-first, Q22 benchmark on real S3.
 - **All 22 decisions now settled.** Remaining work: draft RFC 0006, 0007, 0008; reconcile UidPack→roaring wording in 0000/0003.
+- 2026-07-03 — **Q23 = full-parser-now** (Cypher frontend parses the *full* openCypher grammar as a parallel track during M1; subset gate moves parse-time → lowering-time; parser removed from RFC 0013 scope). Sub: **Q23a = adopt + vendor `decypher`** (user decision 2026-07-03; cloned to `../decypher` as a local sibling crate we control, upstream remote retained, path-dep from turbolay; var-length confirmed; supersedes the provisional hand-roll); **Q23b = confirmed** injectable `NameResolver`; **Q23c = confirmed** import RFC 0004 `TypedValue`. Written into RFC 0007 §13, RFC 0013 scope note.
 
 ---
 
@@ -141,6 +142,17 @@ A query filters on a non-indexed property: **(A) error by default, opt-in brute-
 Support `-[:REL*min..max]->` in the v0 read subset? **(A) Yes, bounded BFS with a hop cap + uid dedup** ← *recommend* (KG queries need k-hop) vs (B) fixed-length hops only in v0, var-length later.
 - **Why A**: k-hop neighborhoods are the core RAG-KG query; without them the subset is too thin. Cap depth (config) to bound cost.
 - **Touches**: RFC 0007.
+
+### Q23 — Cypher frontend build strategy `[in RFC 0007 §13]`
+How much of Cypher does the **parser** cover, and when is it built? Prompted by picking up the frontend as a parallel track while M1 (write path) is in flight.
+- **(A) Full parser now, subset gate at lowering** ← *decided*. Build the lexer+parser+AST to the **full openCypher grammar** during M1 (front-loaded from RFC 0013). The parser accepts everything; **lowering** (AST → `PlanNode` IR) emits `unsupported_cypher` for anything outside the v0 §2 subset; `malformed_cypher` stays a parse error. v0 *executable* surface is unchanged (still the §2 read subset).
+- (B) Subset-only parser now, extend the grammar itself later — smaller parser today, but RFC 0013 reopens the parser (grammar + AST churn), and the IR is only ever shaped for the subset until then.
+- **Why A**: the full parser is bounded and storage-independent → parallelizable with M1 today and one-and-done; designing the IR/lowering against the whole language now pressure-tests the D7 swap seam against every construct; RFC 0013 becomes a lowering+executor change, never a parser rewrite; precise per-construct `unsupported_cypher` (recognized-but-deferred) vs strictly-syntactic `malformed_cypher`.
+- **Sub-decisions**:
+  - **Q23a — parser implementation `[RESOLVED 2026-07-03: adopt + vendor decypher]`**: (a) `logos` + hand-rolled RD/Pratt vs (b) adopt **`decypher`**. **Audit result:** var-length **is** supported (`ast::pattern::{Quantifier, RangeLiteral}`), permissive MIT/Apache license arm, best-in-class `miette`/rowan diagnostics; risks are a **bus-factor-1 alpha with an unstable AST**. **Decision (user): adopt `decypher` (b), vendored as a local sibling crate we control** — `git clone` into `../decypher`, retain the upstream remote to rebase fixes, path-dep it from turbolay, modify locally as needed. This supersedes "pin the published version": vendoring neutralizes the unstable-AST risk (we own the copy) and lets us patch coverage gaps. Our **lowering** (decypher AST/HIR → `PlanNode` IR) is the only coupling surface and stays the subset gate (`unsupported_cypher` for out-of-v0 constructs; `malformed_cypher` = a decypher parse error). Full findings: scratchpad `decypher` audit entry.
+  - **Q23b — name resolution `[confirmed]`**: injectable `NameResolver` (name→interned id); mock in tests, `SchemaCache` in prod. Keeps the frontend storage-free.
+  - **Q23c — literals `[confirmed]`**: IR uses RFC 0004 `TypedValue` (imported, not redefined). Coordinate landing it early with M1.
+- **Touches**: RFC 0007 (§2.3 reject stage, §3 IR), RFC 0013 (scope narrows — no parser), RFC 0008 (error taxonomy stage, unchanged mapping), M1 coordination (`TypedValue`).
 
 ---
 

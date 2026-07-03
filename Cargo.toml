@@ -58,6 +58,11 @@ bytes.workspace = true
 thiserror.workspace = true
 # Posting-list substrate (RFC 0005).
 roaring.workspace = true
+# openCypher frontend (RFC 0007 / Q23): vendored fork at ../decypher, consumed as
+# a path dep so it stays a separate crate/repo we can modify + rebase on upstream.
+# `hir` (default) is the lowering seam (decypher HIR -> PlanNode IR); `miette` for
+# rich diagnostics. MSRV 1.94 -> see rust-toolchain.toml.
+decypher = { path = "../decypher", features = ["miette"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio.workspace = true

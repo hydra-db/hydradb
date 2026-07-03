@@ -136,3 +136,9 @@ Defaults adopted 2026-07-03 (D1–D12), vetoable:
 - **D7**: openCypher read subset + JSON writes for v0; Cypher writes to 0011. *Confirm the exact grammar subset when 0007 is drafted.*
 - **D8**: reuse `opendata/common` as a dependency vs vendor selected modules vs standalone reimplementation. Default: reuse. *Confirm the coupling before M0.*
 - **D12**: RAG-KG workload / 1–10M scale / correctness-first. *Confirm the primary workload; it right-sizes supernode + traversal effort.*
+
+## Amendments (post-draft decisions)
+
+Additive record of decisions taken after the initial draft. The catalog and locked-decision tables above are left intact; these amend specific rows.
+
+- **2026-07-03 — Q23 (amends D7; narrows RFC 0013).** The openCypher **frontend** (lexer + parser + full-grammar AST) is front-loaded as a parallel track during **M1**, ahead of the planner/executor. The parser accepts the **full** openCypher grammar; the v0 subset boundary is enforced at **lowering** (AST → predicate IR), which emits `unsupported_cypher` for out-of-v0 constructs — `malformed_cypher` stays strictly syntactic. The v0 *executable* surface is unchanged (still D7's read subset). **Consequence:** RFC 0013's scope drops the parser (→ IR growth + lowering + executor only). Parser implementation (Q23a) **resolved 2026-07-03: adopt `decypher`, vendored as a local sibling crate** (`../decypher`, cloned with upstream remote retained, path-dep'd from turbolay, modifiable locally) — its var-length + full-grammar AST and `miette` diagnostics, with vendoring absorbing the alpha/unstable-AST risk. Our lowering (decypher AST/HIR → predicate IR) is the coupling surface and the subset gate. Full record: RFC 0007 §13; `docs/open-decisions.md` Q23.
