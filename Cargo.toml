@@ -1,0 +1,20 @@
+[package]
+name = "slatedb-graph-kernel"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+graphblas = []
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+libcypher-parser-sys = "0.6.1-1"
+slatedb = { path = "../../external-repos/slatedb/slatedb", default-features = false, features = ["aws", "foyer"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
