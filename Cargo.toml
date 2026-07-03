@@ -18,6 +18,8 @@ common = { path = "../../2026-06/opendata/common", package = "opendata-common" }
 
 bytes = "1"
 thiserror = "2"
+# Posting-list substrate (RFC 0005). Pinned to the opendata workspace version.
+roaring = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
