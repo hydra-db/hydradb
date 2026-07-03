@@ -1,7 +1,43 @@
+[workspace]
+resolver = "2"
+# The root `turbolay` package is a member implicitly; `vendor/common` is our
+# vendored fork of opendata-common (see below).
+members = ["vendor/common"]
+
+[workspace.package]
+edition = "2024"
+
+# Single source of truth for shared dependency versions. Both the root crate and
+# the vendored `common` fork inherit these via `<dep>.workspace = true`. The
+# versions were pinned to what the opendata workspace used at fork time so the
+# vendored crate builds byte-for-byte as upstream.
+[workspace.dependencies]
+async-trait = "0.1"
+arc-swap = "1"
+bytes = "1.0"
+foyer = "0.22"
+futures = { version = "0.3", features = ["std"] }
+metrics = "0.24"
+mixtrics = "0.2"
+proptest = "1"
+roaring = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+slatedb = { version = "0.14.0", features = ["compaction_filters"] }
+slatedb-common = "0.14.0"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ulid = "1"
+uuid = "1.14.0"
+
 [package]
 name = "turbolay"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
 
 [lib]
 name = "turbolay"
@@ -13,17 +49,19 @@ path = "src/main.rs"
 
 [dependencies]
 # opendata substrate: serde toolkit, StorageBuilder, SequenceAllocator, merge framework.
-# Path dep into the sibling opendata workspace (package `opendata-common`, lib `common`).
-common = { path = "../../2026-06/opendata/common", package = "opendata-common" }
+# VENDORED fork (M1) at vendor/common so turbolay can extend the storage layer
+# (WriteOptions.seqnum injection, RFC 0004) without touching the shared upstream
+# crate. See docs/impl/2026-07-03-m1-spike-and-seqnum-decision.md.
+common = { path = "vendor/common", package = "opendata-common" }
 
-bytes = "1"
-thiserror = "2"
-# Posting-list substrate (RFC 0005). Pinned to the opendata workspace version.
-roaring = "0.10"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+bytes.workspace = true
+thiserror.workspace = true
+# Posting-list substrate (RFC 0005).
+roaring.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-proptest = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "test-util"] }
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

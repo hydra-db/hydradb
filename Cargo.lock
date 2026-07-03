@@ -39,6 +39,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1539,15 +1548,19 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 name = "opendata-common"
 version = "0.1.17"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "bytes",
  "foyer",
  "futures",
  "metrics",
  "mixtrics",
+ "proptest",
  "serde",
+ "serde_yaml",
  "slatedb",
  "slatedb-common",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
