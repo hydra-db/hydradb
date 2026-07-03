@@ -26,6 +26,30 @@ sudo apt-get update
 sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config libcypher-parser-dev libgraphblas-dev
 ```
 
+On macOS with Homebrew:
+
+```bash
+xcode-select --install
+brew install rustup-init cmake pkg-config llvm suite-sparse
+brew install cleishm/neo4j/libcypher-parser
+rustup-init
+```
+
+Open a new shell after `rustup-init`, then make Homebrew's native libraries
+visible to `pkg-config` and the linker:
+
+```bash
+export PKG_CONFIG_PATH="$(brew --prefix libcypher-parser)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+export LIBRARY_PATH="$(brew --prefix suite-sparse)/lib:${LIBRARY_PATH:-}"
+export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix suite-sparse)/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
+
+pkg-config --exists cypher-parser
+test -f "$(brew --prefix suite-sparse)/lib/libgraphblas.dylib"
+```
+
+The default feature set needs `libcypher-parser`. The `graphblas` feature also
+needs SuiteSparse GraphBLAS, which Homebrew provides through `suite-sparse`.
+
 ## Clone And Test
 
 ```bash
