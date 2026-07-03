@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config libgraphblas-dev
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Test default feature set
+        run: cargo test --lib
+      - name: Test GraphBLAS feature set
+        run: cargo test --features graphblas --lib
+      - name: Check examples
+        run: cargo check --examples --features graphblas

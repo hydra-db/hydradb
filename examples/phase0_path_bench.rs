@@ -132,12 +132,17 @@ async fn main() -> BenchResult<()> {
             reset_dir(&cache_dir)?;
             let read_options = reader_options(&cache_dir, cache_bytes, hop);
 
+            let reader_open_started = Instant::now();
             let cold_reader = GraphShard::open_with_options(
                 shard_path.clone(),
                 Arc::clone(&object_store),
                 read_options.clone(),
             )
             .await?;
+            eprintln!(
+                "fanout={fanout} hop={hop} stage=cold_reader_open elapsed_ms={}",
+                millis(reader_open_started.elapsed())
+            );
             let cold_started = Instant::now();
             let cold = cold_reader
                 .matrix_reachable_with_kernel(
@@ -157,12 +162,17 @@ async fn main() -> BenchResult<()> {
                 micros(cold_elapsed)
             );
 
+            let reader_open_started = Instant::now();
             let warm_reader = GraphShard::open_with_options(
                 shard_path.clone(),
                 Arc::clone(&object_store),
                 read_options,
             )
             .await?;
+            eprintln!(
+                "fanout={fanout} hop={hop} stage=warm_reader_open elapsed_ms={}",
+                millis(reader_open_started.elapsed())
+            );
             let warm_started = Instant::now();
             let warm = warm_reader
                 .matrix_reachable_with_kernel(
