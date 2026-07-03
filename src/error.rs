@@ -32,6 +32,12 @@ pub enum Error {
     /// A schema invariant was violated (unknown id on read, corrupt entry).
     #[error("schema error: {0}")]
     Schema(String),
+
+    /// A well-formed value violated a data-model business rule (e.g.
+    /// `oversize_node`, RFC 0004 §"Node size cap") — distinct from
+    /// [`Error::Encoding`], which is for structurally malformed bytes.
+    #[error("value error: {0}")]
+    Value(String),
 }
 
 impl Error {
@@ -43,6 +49,12 @@ impl Error {
     /// Convenience constructor for a schema failure from any displayable value.
     pub fn schema(msg: impl std::fmt::Display) -> Self {
         Error::Schema(msg.to_string())
+    }
+
+    /// Convenience constructor for a value/business-rule failure from any
+    /// displayable value.
+    pub fn value(msg: impl std::fmt::Display) -> Self {
+        Error::Value(msg.to_string())
     }
 }
 
