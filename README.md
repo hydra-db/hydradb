@@ -13,6 +13,7 @@ is pinned in `Cargo.toml` and `Cargo.lock`.
 ## Requirements
 
 - Rust stable
+- Optional task runner: `just`
 - Linux build tools: `build-essential`, `clang`, `libclang-dev`, `cmake`, and
   `pkg-config`
 - OpenCypher parser headers and library: `libcypher-parser-dev`
@@ -24,13 +25,14 @@ On Ubuntu or WSL:
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config libcypher-parser-dev libgraphblas-dev
+cargo install just --locked
 ```
 
 On macOS with Homebrew:
 
 ```bash
 xcode-select --install
-brew install rustup-init cmake pkg-config llvm suite-sparse
+brew install rustup-init just cmake pkg-config llvm suite-sparse
 brew install cleishm/neo4j/libcypher-parser
 rustup-init
 ```
@@ -60,6 +62,12 @@ cargo test --features graphblas --lib
 cargo check --examples --features graphblas
 ```
 
+Or, with `just`:
+
+```bash
+just ci
+```
+
 The `graphblas` Cargo feature enables the crate's native FFI path:
 `src/sparse_kernel.rs` links directly with `libgraphblas` through
 `#[link(name = "graphblas")]`. There is no Rust GraphBLAS crate dependency.
@@ -85,29 +93,35 @@ cargo test --features graphblas --lib
 
 ## Useful Commands
 
+List recipes:
+
+```bash
+just
+```
+
 Run the local object-store smoke test:
 
 ```bash
-cargo run --example phase0_object_store_smoke
+just smoke
 ```
 
 Run the path/supernode benchmark with GraphBLAS:
 
 ```bash
-PHASE0_GRAPHBLAS=1 scripts/phase0_path_bench.sh
+just bench
 ```
 
 Run local multiprocess stress against the local filesystem object store:
 
 ```bash
-scripts/phase0_multiprocess_stress.sh
+just stress
 ```
 
 Run MinIO smoke or chaos checks when Docker is available:
 
 ```bash
-scripts/phase0_minio_smoke.sh
-scripts/phase0_minio_chaos.sh
+just minio-smoke
+just minio-chaos
 ```
 
 Generated benchmark files are ignored under `bench-results/`.
