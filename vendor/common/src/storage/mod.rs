@@ -147,6 +147,22 @@ pub struct WriteOptions {
     /// When `false` (the default), the operation returns as soon as the data
     /// is in memory, providing lower latency but risking data loss on crash.
     pub await_durable: bool,
+
+    /// Optional user-injected sequence number for this write.
+    ///
+    /// When `0` (the default), the storage engine auto-generates the seqnum.
+    /// When non-zero, the provided value is used as this write's seqnum instead
+    /// of the internally generated one; it **must be strictly greater than the
+    /// current maximum seqnum** or the write fails. This forwards SlateDB's
+    /// `WriteOptions.seqnum` contract (and is honored identically by
+    /// [`InMemoryStorage`](crate::storage::in_memory::InMemoryStorage)).
+    ///
+    /// turbolay (M1, RFC 0004) uses this to inject its logical sequence number
+    /// as the durable seqnum, so the logical seq and SlateDB's durable seq never
+    /// diverge — making the session token and the reader freshness gate share
+    /// one clock. Single-writer monotonic allocation guarantees the strict
+    /// increase. This field is the reason `common` is vendored into turbolay.
+    pub seqnum: u64,
 }
 
 /// Error type for storage operations

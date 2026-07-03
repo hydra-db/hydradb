@@ -14,8 +14,8 @@ categories = ["database"]
 # RFC 0004 logical-seq protocol — without mutating the shared upstream crate.
 # Deps are inherited from the turbolay workspace ([workspace.dependencies] in the
 # root Cargo.toml), pinned to the versions the opendata workspace used at fork
-# time. The `opendata-macros` dev-dep and the `varint` bench were dropped
-# (test/bench-only; not needed to build common as a library).
+# time. `opendata-macros` (the `storage_test` test macro) is vendored alongside
+# at vendor/macros; the `varint` bench was dropped (bench-only).
 # See docs/impl/2026-07-03-m1-spike-and-seqnum-decision.md.
 
 [lib]
@@ -50,3 +50,4 @@ slatedb-common = { workspace = true, features = ["test-util"] }
 serde_yaml.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+opendata-macros = { path = "../macros" }

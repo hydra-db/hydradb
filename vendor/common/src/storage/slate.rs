@@ -362,8 +362,13 @@ impl Storage for SlateDbStorage {
                 RecordOp::Delete(key) => batch.delete(key),
             }
         }
+        // `..default()` stays for the `#[cfg(dst)]` `now` field; without dst the
+        // two explicit fields cover the struct, hence the needless_update allow.
+        #[allow(clippy::needless_update)]
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
+            // Forward turbolay's injected logical seqnum (0 = auto-generate).
+            seqnum: options.seqnum,
             ..SlateDbWriteOptions::default()
         };
         let write_handle = self
@@ -385,8 +390,13 @@ impl Storage for SlateDbStorage {
         for op in records {
             batch.put_with_options(op.record.key, op.record.value, &op.options.into());
         }
+        // `..default()` stays for the `#[cfg(dst)]` `now` field; without dst the
+        // two explicit fields cover the struct, hence the needless_update allow.
+        #[allow(clippy::needless_update)]
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
+            // Forward turbolay's injected logical seqnum (0 = auto-generate).
+            seqnum: options.seqnum,
             ..SlateDbWriteOptions::default()
         };
         let write_handle = self
@@ -408,8 +418,13 @@ impl Storage for SlateDbStorage {
         for op in records {
             batch.merge_with_options(op.record.key, op.record.value, &op.options.into());
         }
+        // `..default()` stays for the `#[cfg(dst)]` `now` field; without dst the
+        // two explicit fields cover the struct, hence the needless_update allow.
+        #[allow(clippy::needless_update)]
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
+            // Forward turbolay's injected logical seqnum (0 = auto-generate).
+            seqnum: options.seqnum,
             ..SlateDbWriteOptions::default()
         };
         let write_handle = self
@@ -933,6 +948,7 @@ mod tests {
                 vec![Record::new(Bytes::from("k1"), Bytes::from("v1")).into()],
                 WriteOptions {
                     await_durable: true,
+                    seqnum: 0,
                 },
             )
             .await
@@ -989,6 +1005,7 @@ mod tests {
                 )],
                 WriteOptions {
                     await_durable: true,
+                    seqnum: 0,
                 },
             )
             .await
@@ -1061,6 +1078,7 @@ mod tests {
                 vec![Record::new(Bytes::from("k1"), Bytes::from("v1")).into()],
                 WriteOptions {
                     await_durable: true,
+                    seqnum: 0,
                 },
             )
             .await
