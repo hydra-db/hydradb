@@ -15,7 +15,11 @@ jobs:
       - name: Install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config libgraphblas-dev
+          sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config libcypher-parser-dev libgraphblas-dev
+      - name: Verify native dependencies
+        run: |
+          pkg-config --exists cypher-parser
+          ldconfig -p | grep -q libgraphblas
       - name: Check formatting
         run: cargo fmt --check
       - name: Test default feature set

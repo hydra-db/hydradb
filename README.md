@@ -15,6 +15,7 @@ is pinned in `Cargo.toml` and `Cargo.lock`.
 - Rust stable
 - Linux build tools: `build-essential`, `clang`, `libclang-dev`, `cmake`, and
   `pkg-config`
+- OpenCypher parser headers and library: `libcypher-parser-dev`
 - Optional GraphBLAS acceleration: SuiteSparse GraphBLAS development headers
   and library, normally `libgraphblas-dev` on Ubuntu/Debian
 
@@ -22,7 +23,7 @@ On Ubuntu or WSL:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config libgraphblas-dev
+sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config libcypher-parser-dev libgraphblas-dev
 ```
 
 ## Clone And Test
@@ -38,6 +39,9 @@ cargo check --examples --features graphblas
 The `graphblas` Cargo feature enables the crate's native FFI path:
 `src/sparse_kernel.rs` links directly with `libgraphblas` through
 `#[link(name = "graphblas")]`. There is no Rust GraphBLAS crate dependency.
+
+The Cypher front-end uses `libcypher-parser-sys`, which links against the native
+`cypher-parser` system library through `pkg-config`.
 
 ## SlateDB Dependency
 
