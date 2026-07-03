@@ -25,6 +25,9 @@
 //! - [`merge`] — [`merge::GraphMergeOperator`], the record-tag-routed merge
 //!   operator (RFC 0003 dispatch table). **M0 stub** — the associative roaring
 //!   / counter merges land in M1 (RFC 0004/0005).
+//! - [`posting`] — [`posting::PostingValue`], the posting-list value type
+//!   (RFC 0005) stored at every adjacency/index/count key: its on-wire codec
+//!   and read-side set-algebra surface. M1 deliverable 1.
 //! - [`storage`] — [`storage::GraphStorage`], the per-namespace substrate
 //!   wrapper that opens SlateDB via [`common::StorageBuilder`].
 //! - [`telemetry`] — `tracing` subscriber initialization.
@@ -32,6 +35,7 @@
 pub mod error;
 pub mod ids;
 pub mod merge;
+pub mod posting;
 pub mod schema;
 pub mod serde;
 pub mod storage;
