@@ -168,6 +168,36 @@ impl InMemoryStorage {
         }
         seq
     }
+
+    /// Assigns the seqnum for a write, honoring an injected `options.seqnum`.
+    ///
+    /// Mirrors SlateDB's user-injected-seqnum contract so the in-memory double
+    /// behaves like the real backend for turbolay's logical-seq protocol
+    /// (RFC 0004): when `options.seqnum == 0` the seqnum is auto-generated
+    /// ([`next_seqnum`](Self::next_seqnum)); when non-zero it must be **strictly
+    /// greater** than the highest written seqnum (else an error, matching
+    /// SlateDB's `InvalidSequenceNumber`) and becomes the new written (and, when
+    /// not deferring durability, durable) watermark. Serialized by the caller's
+    /// `data` write lock, so the load-then-store is race-free here.
+    fn assign_seqnum(&self, options: &WriteOptions) -> StorageResult<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if options.seqnum == 0 {
+            return Ok(self.next_seqnum());
+        }
+        let written = self.written_seq.load(Relaxed);
+        if options.seqnum <= written {
+            return Err(StorageError::Storage(format!(
+                "injected seqnum {} must be strictly greater than current max {written}",
+                options.seqnum
+            )));
+        }
+        self.written_seq.store(options.seqnum, Relaxed);
+        if !self.defer_durability {
+            self.durable_seq.store(options.seqnum, Relaxed);
+            let _ = self.durable_tx.send(options.seqnum);
+        }
+        Ok(options.seqnum)
+    }
 }
 
 impl Default for InMemoryStorage {
@@ -282,7 +312,7 @@ impl Storage for InMemoryStorage {
     async fn apply_with_options(
         &self,
         records: Vec<RecordOp>,
-        _options: WriteOptions,
+        options: WriteOptions,
     ) -> StorageResult<WriteResult> {
         let mut data = self
             .data
@@ -328,7 +358,7 @@ impl Storage for InMemoryStorage {
         }
 
         Ok(WriteResult {
-            seqnum: self.next_seqnum(),
+            seqnum: self.assign_seqnum(&options)?,
         })
     }
 
@@ -340,7 +370,7 @@ impl Storage for InMemoryStorage {
     async fn put_with_options(
         &self,
         records: Vec<PutRecordOp>,
-        _options: WriteOptions,
+        options: WriteOptions,
     ) -> StorageResult<WriteResult> {
         let mut data = self
             .data
@@ -360,7 +390,7 @@ impl Storage for InMemoryStorage {
         }
 
         Ok(WriteResult {
-            seqnum: self.next_seqnum(),
+            seqnum: self.assign_seqnum(&options)?,
         })
     }
 
@@ -377,7 +407,7 @@ impl Storage for InMemoryStorage {
     async fn merge_with_options(
         &self,
         records: Vec<MergeRecordOp>,
-        _options: WriteOptions,
+        options: WriteOptions,
     ) -> StorageResult<WriteResult> {
         let merge_op = self
             .merge_operator
@@ -412,7 +442,7 @@ impl Storage for InMemoryStorage {
         }
 
         Ok(WriteResult {
-            seqnum: self.next_seqnum(),
+            seqnum: self.assign_seqnum(&options)?,
         })
     }
 
@@ -1463,5 +1493,109 @@ mod tests {
 
         let scanned = storage.scan(BytesRange::unbounded()).await.unwrap();
         assert_eq!(scanned.len(), 2);
+    }
+
+    // --- WriteOptions.seqnum injection (turbolay M1 fork; RFC 0004) ---
+
+    #[tokio::test]
+    async fn injected_seqnum_zero_is_a_noop_and_auto_generates() {
+        // The vendored addition must not change default behavior: seqnum 0 (the
+        // Default) auto-generates a monotonic seqnum exactly as before.
+        let storage = InMemoryStorage::new();
+        // Hold the durable subscription across the writes: the in-memory double
+        // only retains the watermark while a receiver is alive (same as how a
+        // real reader gate subscribes before it waits).
+        let durable = storage.subscribe_durable();
+        let r1 = storage
+            .apply_with_options(
+                vec![RecordOp::Put(
+                    Record::new(Bytes::from("k"), Bytes::from("v1")).into(),
+                )],
+                WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+        let r2 = storage
+            .apply_with_options(
+                vec![RecordOp::Put(
+                    Record::new(Bytes::from("k"), Bytes::from("v2")).into(),
+                )],
+                WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.seqnum, 1);
+        assert_eq!(r2.seqnum, 2);
+        assert_eq!(*durable.borrow(), 2);
+    }
+
+    #[tokio::test]
+    async fn injected_seqnum_becomes_the_assigned_and_durable_seq() {
+        // A non-zero injected seqnum is used verbatim as the write's seqnum and
+        // advances the durable watermark (the logical==durable identity turbolay
+        // relies on for the reader freshness gate).
+        let storage = InMemoryStorage::new();
+        let durable = storage.subscribe_durable();
+        let res = storage
+            .apply_with_options(
+                vec![RecordOp::Put(
+                    Record::new(Bytes::from("k"), Bytes::from("v")).into(),
+                )],
+                WriteOptions {
+                    await_durable: true,
+                    seqnum: 42,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.seqnum, 42);
+        assert_eq!(*durable.borrow(), 42);
+
+        // A subsequent auto-generated write resumes strictly above the injected
+        // watermark (matches SlateDB: the oracle advanced to 42).
+        let next = storage
+            .apply(vec![RecordOp::Put(
+                Record::new(Bytes::from("k2"), Bytes::from("v2")).into(),
+            )])
+            .await
+            .unwrap();
+        assert_eq!(next.seqnum, 43);
+    }
+
+    #[tokio::test]
+    async fn injected_seqnum_not_strictly_greater_is_rejected() {
+        // Mirrors SlateDB's InvalidSequenceNumber: an injected seqnum <= the
+        // current max fails rather than silently reordering.
+        let storage = InMemoryStorage::new();
+        storage
+            .apply_with_options(
+                vec![RecordOp::Put(
+                    Record::new(Bytes::from("k"), Bytes::from("v")).into(),
+                )],
+                WriteOptions {
+                    await_durable: true,
+                    seqnum: 10,
+                },
+            )
+            .await
+            .unwrap();
+        // Re-injecting 10 (equal) must error; so must anything below it.
+        for bad in [10u64, 5, 1] {
+            let err = storage
+                .apply_with_options(
+                    vec![RecordOp::Put(
+                        Record::new(Bytes::from("k"), Bytes::from("v")).into(),
+                    )],
+                    WriteOptions {
+                        await_durable: true,
+                        seqnum: bad,
+                    },
+                )
+                .await;
+            assert!(
+                err.is_err(),
+                "injected seqnum {bad} <= max 10 must be rejected"
+            );
+        }
     }
 }
