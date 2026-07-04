@@ -3166,6 +3166,25 @@ impl GraphShard {
         operation: &'static str,
         materialized_log_epoch: Option<GraphEpoch>,
     ) -> Result<EdgeMutationBatchResult> {
+        let lock = self.acquire_cell_write_lock(cell_id, operation).await?;
+        let result = self
+            .write_edge_mutations_batch_txn_locked(
+                cell_id,
+                mutations,
+                operation,
+                materialized_log_epoch,
+            )
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn write_edge_mutations_batch_txn_locked(
+        &self,
+        cell_id: &str,
+        mutations: &[EdgeMutation],
+        operation: &'static str,
+        materialized_log_epoch: Option<GraphEpoch>,
+    ) -> Result<EdgeMutationBatchResult> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
         self.validate_write_fence_txn(&txn, cell_id, operation)
             .await?;
@@ -7117,6 +7136,28 @@ mod tests {
         unreachable!("transaction retry loop always returns on final attempt")
     }
 
+    async fn edge_mutation_batch_txn_retry_for_test(
+        shard: Arc<GraphShard>,
+        cell_id: &str,
+        mutations: Vec<EdgeMutation>,
+        operation: &'static str,
+    ) -> Result<EdgeMutationBatchResult> {
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match shard
+                .write_edge_mutations_batch_txn(cell_id, &mutations, operation, None)
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
     fn assert_stale_node_a(err: GraphError) {
         assert!(matches!(
             err,
@@ -8862,6 +8903,96 @@ mod tests {
             .unwrap();
         assert_eq!(retry, result);
         assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn edge_mutation_batch_transactions_retry_without_epoch_overlap() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard =
+            Arc::new(open_test_shard("graph/write-edge-mutations-batch-race", object_store).await);
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        let left = {
+            let shard = Arc::clone(&shard);
+            tokio::spawn(async move {
+                edge_mutation_batch_txn_retry_for_test(
+                    shard,
+                    cell_id,
+                    vec![
+                        mutation(7, 10, "edge-batch-race-a-1"),
+                        mutation(7, 11, "edge-batch-race-a-2"),
+                    ],
+                    "write_edge_mutations_batch",
+                )
+                .await
+            })
+        };
+        let right = {
+            let shard = Arc::clone(&shard);
+            tokio::spawn(async move {
+                edge_mutation_batch_txn_retry_for_test(
+                    shard,
+                    cell_id,
+                    vec![
+                        mutation(7, 12, "edge-batch-race-b-1"),
+                        mutation(7, 13, "edge-batch-race-b-2"),
+                    ],
+                    "write_edge_mutations_batch",
+                )
+                .await
+            })
+        };
+
+        let mut ranges = vec![left.await.unwrap().unwrap(), right.await.unwrap().unwrap()];
+        ranges.sort_by_key(|result| result.start_epoch);
+        assert_eq!(
+            ranges,
+            vec![
+                EdgeMutationBatchResult {
+                    start_epoch: 1,
+                    end_epoch: 2,
+                    inserted: 2,
+                    already_existed: 0,
+                    results: vec![
+                        CommitResult {
+                            epoch: 1,
+                            already_existed: false,
+                        },
+                        CommitResult {
+                            epoch: 2,
+                            already_existed: false,
+                        },
+                    ],
+                },
+                EdgeMutationBatchResult {
+                    start_epoch: 3,
+                    end_epoch: 4,
+                    inserted: 2,
+                    already_existed: 0,
+                    results: vec![
+                        CommitResult {
+                            epoch: 3,
+                            already_existed: false,
+                        },
+                        CommitResult {
+                            epoch: 4,
+                            already_existed: false,
+                        },
+                    ],
+                },
+            ]
+        );
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 7).await.unwrap(),
+            vec![10, 11, 12, 13]
+        );
+        assert_eq!(shard.out_degree(cell_id, edge_type, 7).await.unwrap(), 4);
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
     }
 
     #[tokio::test]
