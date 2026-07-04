@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use slatedb::bytes::Bytes;
 use slatedb::config::{
@@ -14,20 +14,23 @@ use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 mod algebra;
+#[cfg(feature = "opencypher")]
 pub mod opencypher;
 mod phase0;
 mod placement;
 mod sparse_kernel;
 
 pub use algebra::{QueryContext, QueryOutput, QueryStatement};
+#[cfg(feature = "opencypher")]
 pub use opencypher::{
     parse_cypher, parse_opencypher, CypherFrontend, DefaultCypherFrontend, LibCypherParserFrontend,
 };
 pub use phase0::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
-    BenchmarkResult, DeltaGcResult, GraphControlPlane, GraphNode, GraphRollup, LeaseRenewalHandle,
-    MatrixArtifact, MatrixTraversalResult, Phase0Cluster, PostingChunk, RoutedPhase0Cluster,
-    ShardLease, ShardPlacement, SupernodeGroup, SupernodePage, TraversalBackend,
+    BenchmarkResult, DeltaGcResult, GraphControlMetricsSnapshot, GraphControlPlane, GraphNode,
+    GraphRollup, LeaseRenewalHandle, MatrixArtifact, MatrixTraversalResult, Phase0Cluster,
+    PostingChunk, RoutedPhase0Cluster, ShardLease, ShardPlacement, SupernodeGroup, SupernodePage,
+    TraversalBackend,
 };
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
@@ -116,6 +119,16 @@ pub enum GraphError {
         read_epoch: GraphEpoch,
         min_epoch: GraphEpoch,
     },
+    #[error(
+        "{operation} snapshot epoch {read_epoch} for cell {cell_id} edge {edge_type} changed while building; current epoch is {current_epoch}"
+    )]
+    SnapshotChanged {
+        operation: &'static str,
+        cell_id: String,
+        edge_type: String,
+        read_epoch: GraphEpoch,
+        current_epoch: GraphEpoch,
+    },
     #[error("{operation} rejected by admission control: actual {actual} exceeds limit {limit}")]
     AdmissionRejected {
         operation: &'static str,
@@ -137,18 +150,35 @@ pub enum GraphError {
         dialect: &'static str,
         feature: String,
     },
+    #[error("{operation} would violate retention for cell {cell_id}: requested epoch {requested_epoch}, safe epoch {safe_epoch}")]
+    RetentionViolation {
+        operation: &'static str,
+        cell_id: String,
+        requested_epoch: GraphEpoch,
+        safe_epoch: GraphEpoch,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, GraphError>;
 
 const GRAPH_TXN_MAX_RETRIES: usize = 32;
 const GRAPH_DELTA_GC_BATCH_KEYS: usize = 512;
+const GRAPH_WRITE_LANES: usize = 64;
+pub const DEFAULT_TRUSTED_APPEND_CHUNK_EDGES: usize = 32_768;
+// Release profiling showed larger materialization transactions regress from SlateDB
+// write-batch and conflict-tracking overhead; keep async drains in the same
+// microbatch range as foreground indexed writes.
+const GRAPH_MUTATION_LOG_MATERIALIZE_TXN_EDGES: usize = 512;
+const GRAPH_STORE_FORMAT_KEY: &str = "graph/meta/format_version";
+const GRAPH_STORE_FORMAT_VERSION: u64 = 1;
+static GRAPH_READ_LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphLimits {
     pub max_bulk_import_edges: usize,
     pub max_artifact_source_epochs: GraphEpoch,
     pub max_traversal_hops: u8,
+    pub max_artifact_build_edges: u64,
 }
 
 impl Default for GraphLimits {
@@ -157,11 +187,46 @@ impl Default for GraphLimits {
             max_bulk_import_edges: 1_000_000,
             max_artifact_source_epochs: 10_000_000,
             max_traversal_hops: 16,
+            max_artifact_build_edges: 10_000_000,
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphRetentionPolicy {
+    pub min_retained_epochs: GraphEpoch,
+    pub read_lease_ttl_ms: u64,
+    pub max_read_leases_to_scan: u64,
+}
+
+impl Default for GraphRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            min_retained_epochs: 0,
+            read_lease_ttl_ms: 60_000,
+            max_read_leases_to_scan: 10_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphBackpressurePolicy {
+    pub max_concurrent_graph_writes: usize,
+    pub max_concurrent_artifact_builds: usize,
+    pub max_concurrent_gc_jobs: usize,
+}
+
+impl Default for GraphBackpressurePolicy {
+    fn default() -> Self {
+        Self {
+            max_concurrent_graph_writes: 1,
+            max_concurrent_artifact_builds: 1,
+            max_concurrent_gc_jobs: 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GraphCacheConfig {
     pub object_store_cache_dir: Option<PathBuf>,
     pub object_store_cache_bytes: Option<usize>,
@@ -175,11 +240,26 @@ impl GraphCacheConfig {
     }
 
     pub fn disk_cache(cache_dir: impl Into<PathBuf>, max_cache_size_bytes: usize) -> Self {
+        Self::disk_cache_with_preload(cache_dir, max_cache_size_bytes, true)
+    }
+
+    pub fn disk_cache_without_preload(
+        cache_dir: impl Into<PathBuf>,
+        max_cache_size_bytes: usize,
+    ) -> Self {
+        Self::disk_cache_with_preload(cache_dir, max_cache_size_bytes, false)
+    }
+
+    pub fn disk_cache_with_preload(
+        cache_dir: impl Into<PathBuf>,
+        max_cache_size_bytes: usize,
+        preload_sst_on_startup: bool,
+    ) -> Self {
         Self {
             object_store_cache_dir: Some(cache_dir.into()),
             object_store_cache_bytes: Some(max_cache_size_bytes),
             object_store_cache_puts: true,
-            preload_sst_on_startup: true,
+            preload_sst_on_startup,
         }
     }
 
@@ -199,31 +279,79 @@ impl GraphCacheConfig {
     }
 }
 
-impl Default for GraphCacheConfig {
-    fn default() -> Self {
-        Self {
-            object_store_cache_dir: None,
-            object_store_cache_bytes: None,
-            object_store_cache_puts: false,
-            preload_sst_on_startup: false,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GraphOpenOptions {
     pub limits: GraphLimits,
     pub cache: GraphCacheConfig,
+    pub durability: GraphDurabilityConfig,
     pub cache_policy: GraphCachePolicy,
+    pub retention_policy: GraphRetentionPolicy,
+    pub backpressure_policy: GraphBackpressurePolicy,
+    pub index_policy: GraphIndexPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GraphIndexPolicy {
+    #[default]
+    Full,
+    OutboundOnly,
+}
+
+impl GraphIndexPolicy {
+    pub fn write_reverse_index(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphDurabilityConfig {
+    pub wal_flush_interval_ms: Option<u64>,
+    pub await_durable_writes: bool,
+}
+
+impl Default for GraphDurabilityConfig {
+    fn default() -> Self {
+        Self {
+            wal_flush_interval_ms: Some(1),
+            await_durable_writes: true,
+        }
+    }
+}
+
+impl GraphDurabilityConfig {
+    pub fn slatedb_default() -> Self {
+        Self {
+            wal_flush_interval_ms: Some(100),
+            await_durable_writes: true,
+        }
+    }
+
+    pub fn low_latency_durable(flush_interval_ms: u64) -> Self {
+        Self {
+            wal_flush_interval_ms: Some(flush_interval_ms.max(1)),
+            await_durable_writes: true,
+        }
+    }
+
+    pub fn with_await_durable_writes(mut self, await_durable_writes: bool) -> Self {
+        self.await_durable_writes = await_durable_writes;
+        self
+    }
+
+    fn apply_to_settings(&self, settings: &mut Settings) {
+        settings.flush_interval = self.wal_flush_interval_ms.map(Duration::from_millis);
+    }
 }
 
 pub(crate) async fn open_graph_db(
     path: impl Into<Path>,
     object_store: Arc<dyn ObjectStore>,
     cache: &GraphCacheConfig,
+    durability: &GraphDurabilityConfig,
 ) -> Result<Db> {
     let mut settings = Settings::default();
     cache.apply_to_settings(&mut settings);
+    durability.apply_to_settings(&mut settings);
     Ok(Db::builder(path, object_store)
         .with_settings(settings)
         .build()
@@ -237,6 +365,7 @@ pub struct GraphCachePolicy {
     pub max_graphblas_matrices: usize,
     pub max_supernode_groups: usize,
     pub max_posting_chunks: usize,
+    pub max_materialized_supernodes: usize,
     pub max_entries_per_cell: Option<usize>,
     pub pin_matrix_min_edges: u64,
     pub pin_supernode_min_degree: u64,
@@ -252,6 +381,7 @@ impl Default for GraphCachePolicy {
             max_graphblas_matrices: 64,
             max_supernode_groups: 4_096,
             max_posting_chunks: 16_384,
+            max_materialized_supernodes: 512,
             max_entries_per_cell: Some(8_192),
             pin_matrix_min_edges: 1_000_000,
             pin_supernode_min_degree: 10_000,
@@ -282,6 +412,7 @@ pub enum GraphCacheKind {
     GraphBlas,
     SupernodeGroup,
     PostingChunk,
+    MaterializedSupernode,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -296,6 +427,8 @@ pub struct GraphCacheMetricsSnapshot {
     pub supernode_group_misses: u64,
     pub posting_chunk_hits: u64,
     pub posting_chunk_misses: u64,
+    pub materialized_supernode_hits: u64,
+    pub materialized_supernode_misses: u64,
     pub insertions: u64,
     pub evictions: u64,
     pub pinned_insertions: u64,
@@ -305,6 +438,96 @@ pub struct GraphCacheMetricsSnapshot {
     pub hydration_completed: u64,
     pub prefetch_requests: u64,
     pub prefetch_skipped: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphOperationalMetricsSnapshot {
+    pub write_attempts: u64,
+    pub write_commits: u64,
+    pub write_retries: u64,
+    pub stale_write_rejects: u64,
+    pub retention_rejects: u64,
+    pub bulk_import_batches_profiled: u64,
+    pub bulk_import_preflight_us: u64,
+    pub bulk_import_batch_build_us: u64,
+    pub bulk_import_counter_read_us: u64,
+    pub bulk_import_commit_us: u64,
+    pub artifact_builds_started: u64,
+    pub artifact_builds_completed: u64,
+    pub artifact_build_duration_us: u64,
+    pub artifact_publish_batches: u64,
+    pub artifact_records_published: u64,
+    pub artifact_publish_duration_us: u64,
+    pub gc_jobs_started: u64,
+    pub gc_jobs_completed: u64,
+    pub gc_keys_deleted: u64,
+    pub gc_duration_us: u64,
+    pub read_leases_created: u64,
+    pub verifier_runs: u64,
+    pub verifier_failures: u64,
+    pub verifier_duration_us: u64,
+    pub backpressure_waits: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct GraphOperationalMetrics {
+    write_attempts: AtomicU64,
+    write_commits: AtomicU64,
+    write_retries: AtomicU64,
+    stale_write_rejects: AtomicU64,
+    retention_rejects: AtomicU64,
+    bulk_import_batches_profiled: AtomicU64,
+    bulk_import_preflight_us: AtomicU64,
+    bulk_import_batch_build_us: AtomicU64,
+    bulk_import_counter_read_us: AtomicU64,
+    bulk_import_commit_us: AtomicU64,
+    artifact_builds_started: AtomicU64,
+    artifact_builds_completed: AtomicU64,
+    artifact_build_duration_us: AtomicU64,
+    artifact_publish_batches: AtomicU64,
+    artifact_records_published: AtomicU64,
+    artifact_publish_duration_us: AtomicU64,
+    gc_jobs_started: AtomicU64,
+    gc_jobs_completed: AtomicU64,
+    gc_keys_deleted: AtomicU64,
+    gc_duration_us: AtomicU64,
+    read_leases_created: AtomicU64,
+    verifier_runs: AtomicU64,
+    verifier_failures: AtomicU64,
+    verifier_duration_us: AtomicU64,
+    backpressure_waits: AtomicU64,
+}
+
+impl GraphOperationalMetrics {
+    fn snapshot(&self) -> GraphOperationalMetricsSnapshot {
+        GraphOperationalMetricsSnapshot {
+            write_attempts: self.write_attempts.load(Ordering::Relaxed),
+            write_commits: self.write_commits.load(Ordering::Relaxed),
+            write_retries: self.write_retries.load(Ordering::Relaxed),
+            stale_write_rejects: self.stale_write_rejects.load(Ordering::Relaxed),
+            retention_rejects: self.retention_rejects.load(Ordering::Relaxed),
+            bulk_import_batches_profiled: self.bulk_import_batches_profiled.load(Ordering::Relaxed),
+            bulk_import_preflight_us: self.bulk_import_preflight_us.load(Ordering::Relaxed),
+            bulk_import_batch_build_us: self.bulk_import_batch_build_us.load(Ordering::Relaxed),
+            bulk_import_counter_read_us: self.bulk_import_counter_read_us.load(Ordering::Relaxed),
+            bulk_import_commit_us: self.bulk_import_commit_us.load(Ordering::Relaxed),
+            artifact_builds_started: self.artifact_builds_started.load(Ordering::Relaxed),
+            artifact_builds_completed: self.artifact_builds_completed.load(Ordering::Relaxed),
+            artifact_build_duration_us: self.artifact_build_duration_us.load(Ordering::Relaxed),
+            artifact_publish_batches: self.artifact_publish_batches.load(Ordering::Relaxed),
+            artifact_records_published: self.artifact_records_published.load(Ordering::Relaxed),
+            artifact_publish_duration_us: self.artifact_publish_duration_us.load(Ordering::Relaxed),
+            gc_jobs_started: self.gc_jobs_started.load(Ordering::Relaxed),
+            gc_jobs_completed: self.gc_jobs_completed.load(Ordering::Relaxed),
+            gc_keys_deleted: self.gc_keys_deleted.load(Ordering::Relaxed),
+            gc_duration_us: self.gc_duration_us.load(Ordering::Relaxed),
+            read_leases_created: self.read_leases_created.load(Ordering::Relaxed),
+            verifier_runs: self.verifier_runs.load(Ordering::Relaxed),
+            verifier_failures: self.verifier_failures.load(Ordering::Relaxed),
+            verifier_duration_us: self.verifier_duration_us.load(Ordering::Relaxed),
+            backpressure_waits: self.backpressure_waits.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -319,6 +542,8 @@ pub(crate) struct GraphCacheMetrics {
     supernode_group_misses: AtomicU64,
     posting_chunk_hits: AtomicU64,
     posting_chunk_misses: AtomicU64,
+    materialized_supernode_hits: AtomicU64,
+    materialized_supernode_misses: AtomicU64,
     insertions: AtomicU64,
     evictions: AtomicU64,
     pinned_insertions: AtomicU64,
@@ -351,6 +576,8 @@ impl GraphCacheMetrics {
             (GraphCacheKind::SupernodeGroup, false) => &self.supernode_group_misses,
             (GraphCacheKind::PostingChunk, true) => &self.posting_chunk_hits,
             (GraphCacheKind::PostingChunk, false) => &self.posting_chunk_misses,
+            (GraphCacheKind::MaterializedSupernode, true) => &self.materialized_supernode_hits,
+            (GraphCacheKind::MaterializedSupernode, false) => &self.materialized_supernode_misses,
         }
     }
 
@@ -366,6 +593,10 @@ impl GraphCacheMetrics {
             supernode_group_misses: self.supernode_group_misses.load(Ordering::Relaxed),
             posting_chunk_hits: self.posting_chunk_hits.load(Ordering::Relaxed),
             posting_chunk_misses: self.posting_chunk_misses.load(Ordering::Relaxed),
+            materialized_supernode_hits: self.materialized_supernode_hits.load(Ordering::Relaxed),
+            materialized_supernode_misses: self
+                .materialized_supernode_misses
+                .load(Ordering::Relaxed),
             insertions: self.insertions.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             pinned_insertions: self.pinned_insertions.load(Ordering::Relaxed),
@@ -389,6 +620,42 @@ pub struct GraphRepairReport {
     pub degree_mismatches: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphExportDigest {
+    pub cell_id: String,
+    pub edge_type: String,
+    pub read_epoch: GraphEpoch,
+    pub live_edges: u64,
+    pub edge_checksum: u64,
+    pub out_degree_checksum: u64,
+    pub in_degree_checksum: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphCorrectnessReport {
+    pub cell_id: String,
+    pub edge_type: String,
+    pub read_epoch: GraphEpoch,
+    pub delta_gc_watermark: GraphEpoch,
+    pub digest: GraphExportDigest,
+    pub canonical_edges: u64,
+    pub out_index_edges: u64,
+    pub in_index_edges: u64,
+    pub degree_counters: u64,
+    pub posting_chunks_checked: u64,
+    pub matrix_edges_checked: u64,
+    pub supernode_groups_checked: u64,
+    pub traversal_roots_checked: u64,
+    pub mismatch_count: u64,
+    pub mismatch_samples: Vec<String>,
+}
+
+impl GraphCorrectnessReport {
+    pub fn is_clean(&self) -> bool {
+        self.mismatch_count == 0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EdgeMutation {
     pub cell_id: String,
@@ -408,6 +675,16 @@ pub struct EdgeRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OutEdgeSegment {
+    pub(crate) cell_id: String,
+    pub(crate) edge_type: String,
+    pub(crate) src: VertexId,
+    pub(crate) start_epoch: GraphEpoch,
+    pub(crate) end_epoch: GraphEpoch,
+    pub(crate) edges: Vec<(GraphEpoch, VertexId)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitResult {
     pub epoch: GraphEpoch,
     pub already_existed: bool,
@@ -419,12 +696,124 @@ pub struct DeleteResult {
     pub deleted: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SegmentCompactionResult {
+    pub compacted_through_epoch: GraphEpoch,
+    pub source_segments: u64,
+    pub deleted_segment_keys: u64,
+    pub deleted_tombstone_keys: u64,
+    pub input_edges: u64,
+    pub output_edges: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BulkImportResult {
     pub start_epoch: GraphEpoch,
     pub end_epoch: GraphEpoch,
     pub inserted: u64,
     pub already_existed: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BulkImportOptions {
+    pub duplicate_policy: BulkImportDuplicatePolicy,
+    pub delta_log_policy: BulkImportDeltaLogPolicy,
+}
+
+impl BulkImportOptions {
+    pub fn trusted_append() -> Self {
+        Self {
+            duplicate_policy: BulkImportDuplicatePolicy::TrustNoExisting,
+            delta_log_policy: BulkImportDeltaLogPolicy::Batch,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BulkImportDuplicatePolicy {
+    #[default]
+    CheckExisting,
+    TrustNoExisting,
+}
+
+impl BulkImportDuplicatePolicy {
+    fn check_existing(self) -> bool {
+        matches!(self, Self::CheckExisting)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BulkImportDeltaLogPolicy {
+    #[default]
+    PerEdge,
+    Batch,
+}
+
+impl BulkImportDeltaLogPolicy {
+    fn write_per_edge(self) -> bool {
+        matches!(self, Self::PerEdge)
+    }
+
+    fn write_batch(self) -> bool {
+        matches!(self, Self::Batch)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EdgeMutationBatchResult {
+    pub start_epoch: GraphEpoch,
+    pub end_epoch: GraphEpoch,
+    pub inserted: u64,
+    pub already_existed: u64,
+    pub results: Vec<CommitResult>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EdgeIngestOptions {
+    pub batch_size: usize,
+}
+
+impl Default for EdgeIngestOptions {
+    fn default() -> Self {
+        Self { batch_size: 1_024 }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EdgeIngestResult {
+    pub start_epoch: GraphEpoch,
+    pub end_epoch: GraphEpoch,
+    pub inserted: u64,
+    pub already_existed: u64,
+    pub batches: u64,
+    pub mutations: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EdgeMutationLogAppendResult {
+    pub log_epoch: GraphEpoch,
+    pub mutations: u64,
+    pub already_appended: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EdgeMutationLogMaterializeResult {
+    pub scanned_batches: u64,
+    pub materialized_batches: u64,
+    pub mutations: u64,
+    pub inserted: u64,
+    pub already_existed: u64,
+    pub last_log_epoch: GraphEpoch,
+    pub materialized_log_epoch: GraphEpoch,
+    pub current_epoch: GraphEpoch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EdgeMutationLogBatch {
+    cell_id: String,
+    batch_id: String,
+    fingerprint: u64,
+    mutations: Vec<EdgeMutation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -439,20 +828,38 @@ pub struct DeltaRecord {
     pub edge: EdgeRecord,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OutboxDeltaBatch {
+    cell_id: String,
+    edge_type: String,
+    kind: DeltaKind,
+    start_epoch: GraphEpoch,
+    end_epoch: GraphEpoch,
+    edges: Vec<(VertexId, VertexId)>,
+}
+
 pub struct GraphShard {
     db: Db,
     pub(crate) limits: GraphLimits,
     pub(crate) cache_policy: GraphCachePolicy,
+    pub(crate) retention_policy: GraphRetentionPolicy,
     pub(crate) cache_metrics: Arc<GraphCacheMetrics>,
+    pub(crate) operation_metrics: Arc<GraphOperationalMetrics>,
     hydration_gate: Arc<Semaphore>,
+    graph_write_gate: Arc<Semaphore>,
+    artifact_build_gate: Arc<Semaphore>,
+    gc_gate: Arc<Semaphore>,
+    index_policy: GraphIndexPolicy,
+    await_durable_writes: bool,
     write_authority: GraphWriteAuthority,
-    writer_gate: Mutex<()>,
+    writer_lanes: Vec<Mutex<()>>,
     matrix_artifact_cache: Mutex<BoundedGraphCache<MatrixCacheKey, phase0::MatrixArtifact>>,
     matrix_cache: Mutex<BoundedGraphCache<MatrixCacheKey, Arc<MatrixAdjacency>>>,
     graphblas_cache:
         Mutex<BoundedGraphCache<MatrixCacheKey, Arc<sparse_kernel::CompiledGraphBlasMatrix>>>,
     supernode_group_cache: Mutex<BoundedGraphCache<SupernodeCacheKey, phase0::SupernodeGroup>>,
     posting_chunk_cache: Mutex<BoundedGraphCache<PostingChunkCacheKey, phase0::PostingChunk>>,
+    materialized_supernode_cache: Mutex<BoundedGraphCache<SupernodeCacheKey, Arc<Vec<VertexId>>>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -462,6 +869,7 @@ pub struct GraphCacheEntryCounts {
     pub graphblas_matrices: usize,
     pub supernode_groups: usize,
     pub posting_chunks: usize,
+    pub materialized_supernodes: usize,
 }
 
 #[derive(Clone)]
@@ -472,6 +880,77 @@ pub(crate) enum GraphWriteAuthority {
         local_node_id: String,
         leases: Arc<RwLock<BTreeMap<String, phase0::ShardLease>>>,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphWriteFence {
+    cell_id: String,
+    owner_node_id: String,
+    lease_token: u64,
+    expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GraphReadLease {
+    cell_id: String,
+    lease_id: String,
+    read_epoch: GraphEpoch,
+    expires_at_ms: u64,
+}
+
+impl From<&phase0::ShardLease> for GraphWriteFence {
+    fn from(lease: &phase0::ShardLease) -> Self {
+        Self {
+            cell_id: lease.cell_id.clone(),
+            owner_node_id: lease.owner_node_id.clone(),
+            lease_token: lease.lease_token,
+            expires_at_ms: lease.expires_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum GraphWriteOp {
+    Put(Bytes, Bytes),
+    Delete(Bytes),
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GraphWriteBatch {
+    ops: Vec<GraphWriteOp>,
+}
+
+impl GraphWriteBatch {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn put<K, V>(&mut self, key: K, value: V)
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.ops.push(GraphWriteOp::Put(
+            Bytes::copy_from_slice(key.as_ref()),
+            Bytes::copy_from_slice(value.as_ref()),
+        ));
+    }
+
+    pub(crate) fn delete<K>(&mut self, key: K)
+    where
+        K: AsRef<[u8]>,
+    {
+        self.ops
+            .push(GraphWriteOp::Delete(Bytes::copy_from_slice(key.as_ref())));
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.ops.len()
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -836,7 +1315,11 @@ impl GraphShard {
             GraphOpenOptions {
                 limits,
                 cache: GraphCacheConfig::default(),
+                durability: GraphDurabilityConfig::default(),
                 cache_policy: GraphCachePolicy::default(),
+                retention_policy: GraphRetentionPolicy::default(),
+                backpressure_policy: GraphBackpressurePolicy::default(),
+                index_policy: GraphIndexPolicy::default(),
             },
         )
         .await
@@ -869,7 +1352,11 @@ impl GraphShard {
             GraphOpenOptions {
                 limits,
                 cache: GraphCacheConfig::default(),
+                durability: GraphDurabilityConfig::default(),
                 cache_policy: GraphCachePolicy::default(),
+                retention_policy: GraphRetentionPolicy::default(),
+                backpressure_policy: GraphBackpressurePolicy::default(),
+                index_policy: GraphIndexPolicy::default(),
             },
         )
         .await
@@ -902,25 +1389,85 @@ impl GraphShard {
         .await
     }
 
+    #[cfg(feature = "chaos-harness")]
+    pub async fn open_chaos_leased_writer_with_options(
+        path: impl Into<Path>,
+        object_store: Arc<dyn ObjectStore>,
+        options: GraphOpenOptions,
+        local_node_id: impl Into<String>,
+        lease: phase0::ShardLease,
+    ) -> Result<Self> {
+        let local_node_id = local_node_id.into();
+        validate_component("node_id", &local_node_id)?;
+        if lease.owner_node_id != local_node_id {
+            return Err(GraphError::StaleShardLease {
+                cell_id: lease.cell_id.clone(),
+                node_id: local_node_id,
+                lease_token: lease.lease_token,
+            });
+        }
+        let leases = Arc::new(RwLock::new(BTreeMap::from([(
+            lease.cell_id.clone(),
+            lease,
+        )])));
+        Self::open_leased_writer(path, object_store, options, local_node_id, leases).await
+    }
+
+    #[cfg(feature = "chaos-harness")]
+    pub async fn open_chaos_leased_writer(
+        path: impl Into<Path>,
+        object_store: Arc<dyn ObjectStore>,
+        local_node_id: impl Into<String>,
+        lease: phase0::ShardLease,
+    ) -> Result<Self> {
+        Self::open_chaos_leased_writer_with_options(
+            path,
+            object_store,
+            GraphOpenOptions::default(),
+            local_node_id,
+            lease,
+        )
+        .await
+    }
+
     async fn open_internal(
         path: impl Into<Path>,
         object_store: Arc<dyn ObjectStore>,
         options: GraphOpenOptions,
         write_authority: GraphWriteAuthority,
     ) -> Result<Self> {
-        let db = open_graph_db(path, object_store, &options.cache).await?;
+        let db = open_graph_db(path, object_store, &options.cache, &options.durability).await?;
+        ensure_store_format(&db, &write_authority).await?;
         let cache_policy = options.cache_policy;
+        let backpressure_policy = options.backpressure_policy;
         let tenant_quota = cache_policy.max_entries_per_cell;
         let cache_metrics = Arc::new(GraphCacheMetrics::default());
+        let operation_metrics = Arc::new(GraphOperationalMetrics::default());
         let hydration_gate = Arc::new(Semaphore::new(cache_policy.hydration_permits()));
+        let graph_write_gate = Arc::new(Semaphore::new(
+            backpressure_policy.max_concurrent_graph_writes.max(1),
+        ));
+        let artifact_build_gate = Arc::new(Semaphore::new(
+            backpressure_policy.max_concurrent_artifact_builds.max(1),
+        ));
+        let gc_gate = Arc::new(Semaphore::new(
+            backpressure_policy.max_concurrent_gc_jobs.max(1),
+        ));
         Ok(Self {
             db,
             limits: options.limits,
             cache_policy: cache_policy.clone(),
+            retention_policy: options.retention_policy,
             cache_metrics,
+            operation_metrics,
             hydration_gate,
+            graph_write_gate,
+            artifact_build_gate,
+            gc_gate,
+            index_policy: options.index_policy,
+            await_durable_writes: options.durability.await_durable_writes,
             write_authority,
-            writer_gate: Mutex::new(()),
+            writer_lanes: (0..GRAPH_WRITE_LANES).map(|_| Mutex::new(())).collect(),
             matrix_artifact_cache: Mutex::new(BoundedGraphCache::new(
                 cache_policy.max_matrix_artifacts,
                 tenant_quota,
@@ -941,6 +1488,10 @@ impl GraphShard {
                 cache_policy.max_posting_chunks,
                 tenant_quota,
             )),
+            materialized_supernode_cache: Mutex::new(BoundedGraphCache::new(
+                cache_policy.max_materialized_supernodes,
+                tenant_quota,
+            )),
         })
     }
 
@@ -953,6 +1504,22 @@ impl GraphShard {
         self.cache_metrics.snapshot()
     }
 
+    pub fn graph_operational_metrics(&self) -> GraphOperationalMetricsSnapshot {
+        self.operation_metrics.snapshot()
+    }
+
+    pub fn graph_index_policy(&self) -> GraphIndexPolicy {
+        self.index_policy
+    }
+
+    pub(crate) fn writes_reverse_index(&self) -> bool {
+        self.index_policy.write_reverse_index()
+    }
+
+    fn writer_lane(&self, cell_id: &str) -> &Mutex<()> {
+        &self.writer_lanes[writer_lane_index(cell_id)]
+    }
+
     pub async fn graph_cache_entry_counts(&self) -> GraphCacheEntryCounts {
         GraphCacheEntryCounts {
             matrix_artifacts: self.matrix_artifact_cache.lock().await.len(),
@@ -960,6 +1527,7 @@ impl GraphShard {
             graphblas_matrices: self.graphblas_cache.lock().await.len(),
             supernode_groups: self.supernode_group_cache.lock().await.len(),
             posting_chunks: self.posting_chunk_cache.lock().await.len(),
+            materialized_supernodes: self.materialized_supernode_cache.lock().await.len(),
         }
     }
 
@@ -991,17 +1559,77 @@ impl GraphShard {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) async fn acquire_graph_write_permit(
+        &self,
+        operation: &'static str,
+    ) -> Result<OwnedSemaphorePermit> {
+        self.operation_metrics
+            .write_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        self.acquire_operation_permit(operation, &self.graph_write_gate)
+            .await
+    }
+
+    pub(crate) async fn acquire_artifact_build_permit(
+        &self,
+        operation: &'static str,
+    ) -> Result<OwnedSemaphorePermit> {
+        self.operation_metrics
+            .artifact_builds_started
+            .fetch_add(1, Ordering::Relaxed);
+        self.acquire_operation_permit(operation, &self.artifact_build_gate)
+            .await
+    }
+
+    pub(crate) async fn acquire_gc_permit(
+        &self,
+        operation: &'static str,
+    ) -> Result<OwnedSemaphorePermit> {
+        self.operation_metrics
+            .gc_jobs_started
+            .fetch_add(1, Ordering::Relaxed);
+        self.acquire_operation_permit(operation, &self.gc_gate)
+            .await
+    }
+
+    async fn acquire_operation_permit(
+        &self,
+        operation: &'static str,
+        gate: &Arc<Semaphore>,
+    ) -> Result<OwnedSemaphorePermit> {
+        if gate.available_permits() == 0 {
+            self.operation_metrics
+                .backpressure_waits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        gate.clone()
+            .acquire_owned()
+            .await
+            .map_err(|err| GraphError::CorruptValue {
+                key: format!("backpressure/{operation}"),
+                reason: format!("operation gate closed: {err}"),
+            })
+    }
+
     pub(crate) fn ensure_write_authority(
         &self,
         cell_id: &str,
         operation: &'static str,
     ) -> Result<()> {
+        self.active_write_lease(cell_id, operation).map(|_| ())
+    }
+
+    pub(crate) fn active_write_lease(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+    ) -> Result<Option<phase0::ShardLease>> {
         match &self.write_authority {
             GraphWriteAuthority::ReadOnly => Err(GraphError::WriteRequiresLease {
                 operation,
                 cell_id: cell_id.to_string(),
             }),
-            GraphWriteAuthority::Standalone => Ok(()),
+            GraphWriteAuthority::Standalone => Ok(None),
             GraphWriteAuthority::Leased {
                 local_node_id,
                 leases,
@@ -1014,7 +1642,7 @@ impl GraphShard {
                 };
                 if lease.owner_node_id == *local_node_id && lease.expires_at_ms > graph_now_millis()
                 {
-                    Ok(())
+                    Ok(Some(lease))
                 } else {
                     Err(GraphError::StaleShardLease {
                         cell_id: cell_id.to_string(),
@@ -1026,9 +1654,349 @@ impl GraphShard {
         }
     }
 
+    pub(crate) async fn install_write_fence(
+        &self,
+        cell_id: &str,
+        lease: &phase0::ShardLease,
+    ) -> Result<()> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("node_id", &lease.owner_node_id)?;
+        if lease.cell_id != cell_id {
+            return Err(GraphError::StaleShardLease {
+                cell_id: cell_id.to_string(),
+                node_id: lease.owner_node_id.clone(),
+                lease_token: lease.lease_token,
+            });
+        }
+        let Some(active) = self.active_write_lease(cell_id, "install_write_fence")? else {
+            return Ok(());
+        };
+        if active.owner_node_id != lease.owner_node_id || active.lease_token != lease.lease_token {
+            return Err(GraphError::StaleShardLease {
+                cell_id: cell_id.to_string(),
+                node_id: lease.owner_node_id.clone(),
+                lease_token: lease.lease_token,
+            });
+        }
+
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self.install_write_fence_txn(cell_id, lease).await {
+                Err(GraphError::Slate(err))
+                    if err.kind() == ErrorKind::Transaction
+                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    async fn install_write_fence_txn(
+        &self,
+        cell_id: &str,
+        lease: &phase0::ShardLease,
+    ) -> Result<()> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let key = keys::write_fence(cell_id);
+        if let Some(value) = read_txn_remote(&txn, &key).await? {
+            let current = decode_write_fence(&key, &value)?;
+            if current.lease_token > lease.lease_token
+                || (current.lease_token == lease.lease_token
+                    && current.owner_node_id != lease.owner_node_id)
+            {
+                return Err(GraphError::StaleShardLease {
+                    cell_id: cell_id.to_string(),
+                    node_id: lease.owner_node_id.clone(),
+                    lease_token: lease.lease_token,
+                });
+            }
+        }
+        txn.put(
+            key.as_bytes(),
+            encode_write_fence(&GraphWriteFence::from(lease)),
+        )?;
+        commit_txn_strict(txn).await
+    }
+
+    async fn validate_write_fence_txn(
+        &self,
+        txn: &DbTransaction,
+        cell_id: &str,
+        operation: &'static str,
+    ) -> Result<()> {
+        let Some(lease) = self.active_write_lease(cell_id, operation)? else {
+            return Ok(());
+        };
+        let key = keys::write_fence(cell_id);
+        let Some(value) = read_txn_remote(txn, &key).await? else {
+            return Err(GraphError::WriteRequiresLease {
+                operation,
+                cell_id: cell_id.to_string(),
+            });
+        };
+        let fence = decode_write_fence(&key, &value)?;
+        if fence.cell_id == cell_id
+            && fence.owner_node_id == lease.owner_node_id
+            && fence.lease_token == lease.lease_token
+        {
+            Ok(())
+        } else {
+            Err(GraphError::StaleShardLease {
+                cell_id: cell_id.to_string(),
+                node_id: lease.owner_node_id,
+                lease_token: lease.lease_token,
+            })
+        }
+    }
+
+    async fn publish_read_lease(&self, cell_id: &str, read_epoch: GraphEpoch) -> Result<()> {
+        if self.retention_policy.read_lease_ttl_ms == 0 {
+            return Ok(());
+        }
+        let now_ms = graph_now_millis();
+        let lease_id = format!(
+            "{now_ms:020}-{:020}",
+            GRAPH_READ_LEASE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let lease = GraphReadLease {
+            cell_id: cell_id.to_string(),
+            lease_id: lease_id.clone(),
+            read_epoch,
+            expires_at_ms: now_ms.saturating_add(self.retention_policy.read_lease_ttl_ms),
+        };
+        let mut batch = WriteBatch::new();
+        batch.put(
+            keys::read_lease(cell_id, &lease_id).as_bytes(),
+            encode_read_lease(&lease),
+        );
+        let options = WriteOptions {
+            await_durable: true,
+            ..Default::default()
+        };
+        self.db.write_with_options(batch, &options).await?;
+        self.operation_metrics
+            .read_leases_created
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn min_active_read_epoch(&self, cell_id: &str) -> Result<Option<GraphEpoch>> {
+        if self.retention_policy.read_lease_ttl_ms == 0 {
+            return Ok(None);
+        }
+        let now_ms = graph_now_millis();
+        let prefix = keys::read_lease_prefix(cell_id);
+        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        let mut scanned = 0_u64;
+        let mut min_epoch = None;
+        let mut expired_batch = GraphWriteBatch::new();
+        let mut pending_deletes = 0_usize;
+        while let Some(kv) = iter.next().await? {
+            scanned = scanned.saturating_add(1);
+            if scanned > self.retention_policy.max_read_leases_to_scan {
+                self.operation_metrics
+                    .retention_rejects
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(GraphError::AdmissionRejected {
+                    operation: "read_lease_scan",
+                    actual: scanned,
+                    limit: self.retention_policy.max_read_leases_to_scan,
+                });
+            }
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let lease = decode_read_lease(&key, &kv.value)?;
+            if lease.cell_id != cell_id {
+                return Err(GraphError::CorruptValue {
+                    key,
+                    reason: "read lease cell id does not match key prefix".to_string(),
+                });
+            }
+            if lease.expires_at_ms <= now_ms {
+                expired_batch.delete(key.as_bytes());
+                pending_deletes += 1;
+                if pending_deletes >= GRAPH_DELTA_GC_BATCH_KEYS {
+                    self.flush_read_lease_gc_batch(
+                        cell_id,
+                        &mut expired_batch,
+                        &mut pending_deletes,
+                    )
+                    .await?;
+                }
+            } else {
+                min_epoch = Some(min_epoch.map_or(lease.read_epoch, |epoch: GraphEpoch| {
+                    epoch.min(lease.read_epoch)
+                }));
+            }
+        }
+        self.flush_read_lease_gc_batch(cell_id, &mut expired_batch, &mut pending_deletes)
+            .await?;
+        Ok(min_epoch)
+    }
+
+    async fn flush_read_lease_gc_batch(
+        &self,
+        cell_id: &str,
+        batch: &mut GraphWriteBatch,
+        pending_deletes: &mut usize,
+    ) -> Result<()> {
+        if *pending_deletes == 0 {
+            return Ok(());
+        }
+        let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
+        self.write_graph_batch_strict(cell_id, "prune_read_leases", batch_to_write)
+            .await?;
+        *pending_deletes = 0;
+        Ok(())
+    }
+
+    async fn delta_gc_safe_epoch(&self, cell_id: &str, edge_type: &str) -> Result<GraphEpoch> {
+        let current_epoch = self.current_epoch(cell_id).await?;
+        let retained_safe_epoch =
+            current_epoch.saturating_sub(self.retention_policy.min_retained_epochs);
+        if self.min_active_read_epoch(cell_id).await?.is_some() {
+            let watermark = self.delta_gc_watermark(cell_id, edge_type).await?;
+            Ok(retained_safe_epoch.min(watermark))
+        } else {
+            Ok(retained_safe_epoch)
+        }
+    }
+
+    async fn artifact_gc_safe_keep_epoch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+    ) -> Result<GraphEpoch> {
+        if self.min_active_read_epoch(cell_id).await?.is_some() {
+            return Ok(1);
+        }
+        if self.retention_policy.min_retained_epochs == 0 {
+            return Ok(GraphEpoch::MAX);
+        }
+        let current_epoch = self.current_epoch(cell_id).await?;
+        let oldest_retained_epoch =
+            current_epoch.saturating_sub(self.retention_policy.min_retained_epochs);
+        if oldest_retained_epoch == 0 {
+            return Ok(1);
+        }
+        Ok(self
+            .latest_matrix_artifact(cell_id, edge_type, oldest_retained_epoch)
+            .await?
+            .map_or(1, |artifact| artifact.base_epoch))
+    }
+
+    pub(crate) fn record_retention_reject(
+        &self,
+        operation: &'static str,
+        cell_id: &str,
+        requested_epoch: GraphEpoch,
+        safe_epoch: GraphEpoch,
+    ) -> GraphError {
+        self.operation_metrics
+            .retention_rejects
+            .fetch_add(1, Ordering::Relaxed);
+        GraphError::RetentionViolation {
+            operation,
+            cell_id: cell_id.to_string(),
+            requested_epoch,
+            safe_epoch,
+        }
+    }
+
+    pub(crate) fn record_artifact_build_completed(&self, duration: std::time::Duration) {
+        self.operation_metrics
+            .artifact_builds_completed
+            .fetch_add(1, Ordering::Relaxed);
+        self.operation_metrics
+            .artifact_build_duration_us
+            .fetch_add(duration_micros_u64(duration), Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_gc_completed(&self, deleted_keys: u64, duration: std::time::Duration) {
+        self.operation_metrics
+            .gc_jobs_completed
+            .fetch_add(1, Ordering::Relaxed);
+        self.operation_metrics
+            .gc_keys_deleted
+            .fetch_add(deleted_keys, Ordering::Relaxed);
+        self.operation_metrics
+            .gc_duration_us
+            .fetch_add(duration_micros_u64(duration), Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_verifier_completed(
+        &self,
+        mismatch_count: u64,
+        duration: std::time::Duration,
+    ) {
+        self.operation_metrics
+            .verifier_runs
+            .fetch_add(1, Ordering::Relaxed);
+        self.operation_metrics
+            .verifier_duration_us
+            .fetch_add(duration_micros_u64(duration), Ordering::Relaxed);
+        if mismatch_count > 0 {
+            self.operation_metrics
+                .verifier_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_graph_batch_commit(
+        &self,
+        operation: &'static str,
+        record_count: usize,
+        duration: std::time::Duration,
+    ) {
+        if matches!(
+            operation,
+            "build_posting_chunks"
+                | "build_matrix_tiles"
+                | "build_supernode_groups"
+                | "rollup_artifacts"
+        ) {
+            self.operation_metrics
+                .artifact_publish_batches
+                .fetch_add(1, Ordering::Relaxed);
+            self.operation_metrics
+                .artifact_records_published
+                .fetch_add(record_count as u64, Ordering::Relaxed);
+            self.operation_metrics
+                .artifact_publish_duration_us
+                .fetch_add(duration_micros_u64(duration), Ordering::Relaxed);
+        }
+    }
+
+    fn record_bulk_import_profile(
+        &self,
+        preflight: std::time::Duration,
+        batch_build: std::time::Duration,
+        counter_read: std::time::Duration,
+        commit: std::time::Duration,
+    ) {
+        self.operation_metrics
+            .bulk_import_batches_profiled
+            .fetch_add(1, Ordering::Relaxed);
+        self.operation_metrics
+            .bulk_import_preflight_us
+            .fetch_add(duration_micros_u64(preflight), Ordering::Relaxed);
+        self.operation_metrics
+            .bulk_import_batch_build_us
+            .fetch_add(duration_micros_u64(batch_build), Ordering::Relaxed);
+        self.operation_metrics
+            .bulk_import_counter_read_us
+            .fetch_add(duration_micros_u64(counter_read), Ordering::Relaxed);
+        self.operation_metrics
+            .bulk_import_commit_us
+            .fetch_add(duration_micros_u64(commit), Ordering::Relaxed);
+    }
+
     pub async fn snapshot(&self, cell_id: &str) -> Result<GraphSnapshot<'_>> {
         validate_component("cell_id", cell_id)?;
         let read_epoch = self.current_epoch(cell_id).await?;
+        self.publish_read_lease(cell_id, read_epoch).await?;
         Ok(GraphSnapshot {
             shard: self,
             cell_id: cell_id.to_string(),
@@ -1050,6 +2018,7 @@ impl GraphShard {
                 current_epoch,
             });
         }
+        self.publish_read_lease(cell_id, read_epoch).await?;
         Ok(GraphSnapshot {
             shard: self,
             cell_id: cell_id.to_string(),
@@ -1063,14 +2032,30 @@ impl GraphShard {
         validate_component("idempotency_key", &mutation.idempotency_key)?;
         self.ensure_write_authority(&mutation.cell_id, "write_edge")?;
 
-        let _writer = self.writer_gate.lock().await;
+        let _permit = self.acquire_graph_write_permit("write_edge").await?;
+        let _writer = self.writer_lane(&mutation.cell_id).lock().await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self.write_edge_txn(&mutation).await {
                 Err(GraphError::Slate(err))
                     if err.kind() == ErrorKind::Transaction
                         && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(result) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(result);
                 }
                 result => return result,
             }
@@ -1080,21 +2065,23 @@ impl GraphShard {
 
     async fn write_edge_txn(&self, mutation: &EdgeMutation) -> Result<CommitResult> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, &mutation.cell_id, "write_edge")
+            .await?;
         let idem_key = keys::idempotency(&mutation.cell_id, "create", &mutation.idempotency_key);
 
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
-            return decode_commit_idempotency(&idem_key, &mutation, &value);
+            return decode_commit_idempotency(&idem_key, mutation, &value);
         }
 
-        let canonical_key = keys::edge(
+        let edge_key = keys::out_edge(
             &mutation.cell_id,
             &mutation.edge_type,
             mutation.src,
             mutation.dst,
         );
 
-        if let Some(value) = read_txn_remote(&txn, &canonical_key).await? {
-            let record = decode_edge_record(&canonical_key, &value)?;
+        if let Some(value) = read_txn_remote(&txn, &edge_key).await? {
+            let record = decode_edge_record(&edge_key, &value)?;
             let result = CommitResult {
                 epoch: record.epoch,
                 already_existed: true,
@@ -1119,17 +2106,26 @@ impl GraphShard {
             epoch,
             already_existed: false,
         };
-
+        let edge_value = encode_edge_record(&record);
+        let delta_value = encode_delta_record(&DeltaRecord {
+            kind: DeltaKind::Plus,
+            edge: record.clone(),
+        });
         let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
-        let in_degree_key = keys::degree_in(&mutation.cell_id, &mutation.edge_type, mutation.dst);
         let out_degree = read_counter_txn(&txn, &out_degree_key).await? + 1;
-        let in_degree = read_counter_txn(&txn, &in_degree_key).await? + 1;
+        let in_degree = if self.writes_reverse_index() {
+            let in_degree_key =
+                keys::degree_in(&mutation.cell_id, &mutation.edge_type, mutation.dst);
+            let in_degree = read_counter_txn(&txn, &in_degree_key).await? + 1;
+            Some((in_degree_key, in_degree))
+        } else {
+            None
+        };
 
         txn.put(
             keys::last_epoch(&mutation.cell_id).as_bytes(),
             encode_u64(epoch),
         )?;
-        txn.put(canonical_key.as_bytes(), encode_edge_record(&record))?;
         txn.put(
             keys::out_edge(
                 &mutation.cell_id,
@@ -1138,20 +2134,24 @@ impl GraphShard {
                 mutation.dst,
             )
             .as_bytes(),
-            encode_edge_record(&record),
+            &edge_value,
         )?;
-        txn.put(
-            keys::in_edge(
-                &mutation.cell_id,
-                &mutation.edge_type,
-                mutation.dst,
-                mutation.src,
-            )
-            .as_bytes(),
-            encode_edge_record(&record),
-        )?;
+        if self.writes_reverse_index() {
+            txn.put(
+                keys::in_edge(
+                    &mutation.cell_id,
+                    &mutation.edge_type,
+                    mutation.dst,
+                    mutation.src,
+                )
+                .as_bytes(),
+                &edge_value,
+            )?;
+        }
         txn.put(out_degree_key.as_bytes(), encode_u64(out_degree))?;
-        txn.put(in_degree_key.as_bytes(), encode_u64(in_degree))?;
+        if let Some((in_degree_key, in_degree)) = in_degree {
+            txn.put(in_degree_key.as_bytes(), encode_u64(in_degree))?;
+        }
         txn.put(
             keys::outbox(
                 &mutation.cell_id,
@@ -1162,21 +2162,7 @@ impl GraphShard {
                 mutation.dst,
             )
             .as_bytes(),
-            encode_delta_record(&DeltaRecord {
-                kind: DeltaKind::Plus,
-                edge: record.clone(),
-            }),
-        )?;
-        txn.put(
-            keys::delta_plus(
-                &mutation.cell_id,
-                &mutation.edge_type,
-                epoch,
-                mutation.src,
-                mutation.dst,
-            )
-            .as_bytes(),
-            encode_edge_record(&record),
+            &delta_value,
         )?;
         txn.put(
             idem_key.as_bytes(),
@@ -1193,14 +2179,30 @@ impl GraphShard {
         validate_component("idempotency_key", &mutation.idempotency_key)?;
         self.ensure_write_authority(&mutation.cell_id, "delete_edge")?;
 
-        let _writer = self.writer_gate.lock().await;
+        let _permit = self.acquire_graph_write_permit("delete_edge").await?;
+        let _writer = self.writer_lane(&mutation.cell_id).lock().await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self.delete_edge_txn(&mutation).await {
                 Err(GraphError::Slate(err))
                     if err.kind() == ErrorKind::Transaction
                         && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(result) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(result);
                 }
                 result => return result,
             }
@@ -1210,10 +2212,12 @@ impl GraphShard {
 
     async fn delete_edge_txn(&self, mutation: &EdgeMutation) -> Result<DeleteResult> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, &mutation.cell_id, "delete_edge")
+            .await?;
         let idem_key = keys::idempotency(&mutation.cell_id, "delete", &mutation.idempotency_key);
 
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
-            return decode_delete_idempotency(&idem_key, &mutation, &value);
+            return decode_delete_idempotency(&idem_key, mutation, &value);
         }
 
         let canonical_key = keys::edge(
@@ -1222,12 +2226,106 @@ impl GraphShard {
             mutation.src,
             mutation.dst,
         );
+        let edge_key = keys::out_edge(
+            &mutation.cell_id,
+            &mutation.edge_type,
+            mutation.src,
+            mutation.dst,
+        );
 
-        let Some(existing) = read_txn_remote(&txn, &canonical_key).await? else {
-            let result = DeleteResult {
-                epoch: read_counter_txn(&txn, &keys::last_epoch(&mutation.cell_id)).await?,
-                deleted: false,
+        let Some(existing) = read_txn_remote(&txn, &edge_key).await? else {
+            let current_epoch =
+                read_counter_txn(&txn, &keys::last_epoch(&mutation.cell_id)).await?;
+            let segment_edge = if self.writes_reverse_index() {
+                None
+            } else {
+                self.out_segment_edge_record_at(
+                    &mutation.cell_id,
+                    &mutation.edge_type,
+                    mutation.src,
+                    mutation.dst,
+                    current_epoch,
+                )
+                .await?
             };
+            let Some(segment_edge) = segment_edge else {
+                let result = DeleteResult {
+                    epoch: current_epoch,
+                    deleted: false,
+                };
+                txn.put(
+                    idem_key.as_bytes(),
+                    encode_delete_idempotency(mutation, &result),
+                )?;
+                commit_txn_strict(txn).await?;
+                return Ok(result);
+            };
+            let tombstone_key = keys::out_segment_tombstone(
+                &mutation.cell_id,
+                &mutation.edge_type,
+                mutation.src,
+                mutation.dst,
+            );
+            if let Some(value) = read_txn_remote(&txn, &tombstone_key).await? {
+                let tombstone_epoch = decode_u64(&tombstone_key, &value)?;
+                if !segment_edge_visible(segment_edge.epoch, Some(tombstone_epoch)) {
+                    let result = DeleteResult {
+                        epoch: current_epoch,
+                        deleted: false,
+                    };
+                    txn.put(
+                        idem_key.as_bytes(),
+                        encode_delete_idempotency(mutation, &result),
+                    )?;
+                    commit_txn_strict(txn).await?;
+                    return Ok(result);
+                }
+            }
+            let epoch = current_epoch
+                .checked_add(1)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: keys::last_epoch(&mutation.cell_id),
+                    reason: "epoch overflow".to_string(),
+                })?;
+            let result = DeleteResult {
+                epoch,
+                deleted: true,
+            };
+            let record = EdgeRecord {
+                cell_id: mutation.cell_id.clone(),
+                edge_type: mutation.edge_type.clone(),
+                src: mutation.src,
+                dst: mutation.dst,
+                epoch,
+            };
+            let delta_value = encode_delta_record(&DeltaRecord {
+                kind: DeltaKind::Minus,
+                edge: record,
+            });
+            let out_degree_key =
+                keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
+            let out_degree = read_counter_txn(&txn, &out_degree_key)
+                .await?
+                .saturating_sub(1);
+
+            txn.put(
+                keys::last_epoch(&mutation.cell_id).as_bytes(),
+                encode_u64(epoch),
+            )?;
+            txn.put(tombstone_key.as_bytes(), encode_u64(epoch))?;
+            txn.put(out_degree_key.as_bytes(), encode_u64(out_degree))?;
+            txn.put(
+                keys::outbox(
+                    &mutation.cell_id,
+                    epoch,
+                    DeltaKind::Minus,
+                    &mutation.edge_type,
+                    mutation.src,
+                    mutation.dst,
+                )
+                .as_bytes(),
+                &delta_value,
+            )?;
             txn.put(
                 idem_key.as_bytes(),
                 encode_delete_idempotency(mutation, &result),
@@ -1236,7 +2334,7 @@ impl GraphShard {
             return Ok(result);
         };
 
-        decode_edge_record(&canonical_key, &existing)?;
+        decode_edge_record(&edge_key, &existing)?;
         let epoch = next_epoch_txn(&txn, &mutation.cell_id).await?;
         let record = EdgeRecord {
             cell_id: mutation.cell_id.clone(),
@@ -1249,15 +2347,25 @@ impl GraphShard {
             epoch,
             deleted: true,
         };
+        let delta_value = encode_delta_record(&DeltaRecord {
+            kind: DeltaKind::Minus,
+            edge: record.clone(),
+        });
 
         let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
-        let in_degree_key = keys::degree_in(&mutation.cell_id, &mutation.edge_type, mutation.dst);
         let out_degree = read_counter_txn(&txn, &out_degree_key)
             .await?
             .saturating_sub(1);
-        let in_degree = read_counter_txn(&txn, &in_degree_key)
-            .await?
-            .saturating_sub(1);
+        let in_degree = if self.writes_reverse_index() {
+            let in_degree_key =
+                keys::degree_in(&mutation.cell_id, &mutation.edge_type, mutation.dst);
+            let in_degree = read_counter_txn(&txn, &in_degree_key)
+                .await?
+                .saturating_sub(1);
+            Some((in_degree_key, in_degree))
+        } else {
+            None
+        };
 
         txn.put(
             keys::last_epoch(&mutation.cell_id).as_bytes(),
@@ -1283,7 +2391,9 @@ impl GraphShard {
             .as_bytes(),
         )?;
         txn.put(out_degree_key.as_bytes(), encode_u64(out_degree))?;
-        txn.put(in_degree_key.as_bytes(), encode_u64(in_degree))?;
+        if let Some((in_degree_key, in_degree)) = in_degree {
+            txn.put(in_degree_key.as_bytes(), encode_u64(in_degree))?;
+        }
         txn.put(
             keys::outbox(
                 &mutation.cell_id,
@@ -1294,21 +2404,7 @@ impl GraphShard {
                 mutation.dst,
             )
             .as_bytes(),
-            encode_delta_record(&DeltaRecord {
-                kind: DeltaKind::Minus,
-                edge: record.clone(),
-            }),
-        )?;
-        txn.put(
-            keys::delta_minus(
-                &mutation.cell_id,
-                &mutation.edge_type,
-                epoch,
-                mutation.src,
-                mutation.dst,
-            )
-            .as_bytes(),
-            encode_edge_record(&record),
+            &delta_value,
         )?;
         txn.put(
             idem_key.as_bytes(),
@@ -1326,6 +2422,170 @@ impl GraphShard {
         edges: impl IntoIterator<Item = (VertexId, VertexId)>,
         idempotency_key: &str,
     ) -> Result<BulkImportResult> {
+        self.bulk_import_edges_with_options(
+            cell_id,
+            edge_type,
+            edges,
+            idempotency_key,
+            BulkImportOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn bulk_append_edges_trusted(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        idempotency_key: &str,
+    ) -> Result<BulkImportResult> {
+        self.bulk_append_edges_trusted_bounded(
+            cell_id,
+            edge_type,
+            edges,
+            idempotency_key,
+            DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
+        )
+        .await
+    }
+
+    pub async fn bulk_append_edges_trusted_bounded(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        idempotency_key: &str,
+        max_edges_per_commit: usize,
+    ) -> Result<BulkImportResult> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        validate_component("idempotency_key", idempotency_key)?;
+        if max_edges_per_commit == 0 {
+            return Err(GraphError::CorruptValue {
+                key: "trusted_append_chunk_size".to_string(),
+                reason: "chunk size must be greater than zero".to_string(),
+            });
+        }
+        let edges: Vec<_> = edges.into_iter().collect();
+        if edges.len() > max_edges_per_commit {
+            return self
+                .bulk_import_edges_chunked_with_options(
+                    cell_id,
+                    edge_type,
+                    edges,
+                    idempotency_key,
+                    max_edges_per_commit,
+                    BulkImportOptions::trusted_append(),
+                )
+                .await;
+        }
+        self.bulk_import_edges_with_options(
+            cell_id,
+            edge_type,
+            edges,
+            idempotency_key,
+            BulkImportOptions::trusted_append(),
+        )
+        .await
+    }
+
+    pub async fn bulk_append_supernode_segment_trusted(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dsts: impl IntoIterator<Item = VertexId>,
+        idempotency_key: &str,
+    ) -> Result<BulkImportResult> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        validate_component("idempotency_key", idempotency_key)?;
+        if self.writes_reverse_index() {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "GraphWrite",
+                feature: "segment trusted append requires outbound-only index policy".to_string(),
+            });
+        }
+        self.ensure_write_authority(cell_id, "bulk_append_supernode_segment_trusted")?;
+
+        let mut dsts: Vec<_> = dsts.into_iter().collect();
+        ensure_limit(
+            "bulk_append_supernode_segment_trusted",
+            dsts.len() as u64,
+            self.limits.max_bulk_import_edges as u64,
+        )?;
+        dsts.sort_unstable();
+        dsts.dedup();
+        let edges: Vec<_> = dsts.iter().copied().map(|dst| (src, dst)).collect();
+        let fingerprint = bulk_import_fingerprint(cell_id, edge_type, &edges);
+
+        let _permit = self
+            .acquire_graph_write_permit("bulk_append_supernode_segment_trusted")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        if matches!(&self.write_authority, GraphWriteAuthority::Standalone) {
+            let result = self
+                .bulk_append_supernode_segment_trusted_write_batch(
+                    cell_id,
+                    edge_type,
+                    src,
+                    &dsts,
+                    idempotency_key,
+                    fingerprint,
+                )
+                .await?;
+            self.operation_metrics
+                .write_commits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(result);
+        }
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .bulk_append_supernode_segment_trusted_txn(
+                    cell_id,
+                    edge_type,
+                    src,
+                    &dsts,
+                    idempotency_key,
+                    fingerprint,
+                )
+                .await
+            {
+                Err(GraphError::Slate(err))
+                    if err.kind() == ErrorKind::Transaction
+                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(result) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(result);
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    pub async fn bulk_import_edges_with_options(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        idempotency_key: &str,
+        options: BulkImportOptions,
+    ) -> Result<BulkImportResult> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         validate_component("idempotency_key", idempotency_key)?;
@@ -1341,22 +2601,996 @@ impl GraphShard {
         edges.dedup();
         let fingerprint = bulk_import_fingerprint(cell_id, edge_type, &edges);
 
-        let _writer = self.writer_gate.lock().await;
+        let _permit = self.acquire_graph_write_permit("bulk_import_edges").await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        if matches!(&self.write_authority, GraphWriteAuthority::Standalone) {
+            let result = self
+                .bulk_import_edges_write_batch(
+                    cell_id,
+                    edge_type,
+                    &edges,
+                    idempotency_key,
+                    fingerprint,
+                    options,
+                )
+                .await?;
+            self.operation_metrics
+                .write_commits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(result);
+        }
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
-                .bulk_import_edges_txn(cell_id, edge_type, &edges, idempotency_key, fingerprint)
+                .bulk_import_edges_txn(
+                    cell_id,
+                    edge_type,
+                    &edges,
+                    idempotency_key,
+                    fingerprint,
+                    options,
+                )
                 .await
             {
                 Err(GraphError::Slate(err))
                     if err.kind() == ErrorKind::Transaction
                         && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(result) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(result);
                 }
                 result => return result,
             }
         }
         unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    async fn bulk_append_supernode_segment_trusted_write_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dsts: &[VertexId],
+        idempotency_key: &str,
+        fingerprint: u64,
+    ) -> Result<BulkImportResult> {
+        let preflight_started = std::time::Instant::now();
+        let idem_key = keys::idempotency(cell_id, "segment-import", idempotency_key);
+        if let Some(value) = self.read_remote(&idem_key).await? {
+            return decode_bulk_import_idempotency(&idem_key, idempotency_key, fingerprint, &value);
+        }
+        let fingerprint_key = segment_import_fingerprint_key(cell_id, edge_type, src, fingerprint);
+        if let Some(value) = self.read_remote(&fingerprint_key).await? {
+            return decode_bulk_import_fingerprint_idempotency(
+                &fingerprint_key,
+                fingerprint,
+                &value,
+            );
+        }
+
+        let current_epoch = self.current_epoch(cell_id).await?;
+        let inserted = u64::try_from(dsts.len()).map_err(|err| GraphError::CorruptValue {
+            key: "segment_import".to_string(),
+            reason: format!("too many edges in one segment import: {err}"),
+        })?;
+        let end_epoch =
+            current_epoch
+                .checked_add(inserted)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: "segment_import".to_string(),
+                    reason: "epoch overflow during segment import".to_string(),
+                })?;
+        let start_epoch = if inserted == 0 {
+            current_epoch
+        } else {
+            current_epoch + 1
+        };
+        let result = BulkImportResult {
+            start_epoch,
+            end_epoch,
+            inserted,
+            already_existed: 0,
+        };
+        let preflight_elapsed = preflight_started.elapsed();
+
+        let batch_build_started = std::time::Instant::now();
+        let mut batch = WriteBatch::new();
+        if inserted > 0 {
+            batch.put_bytes(
+                Bytes::from(keys::out_segment(
+                    cell_id,
+                    edge_type,
+                    src,
+                    end_epoch,
+                    start_epoch,
+                    idempotency_key,
+                )),
+                Bytes::from(encode_out_edge_segment(dsts)),
+            );
+            batch.put_bytes(
+                Bytes::from(keys::last_epoch(cell_id)),
+                Bytes::from(encode_u64(end_epoch)),
+            );
+            batch.put_bytes(
+                Bytes::from(keys::outbox_batch(
+                    cell_id,
+                    end_epoch,
+                    start_epoch,
+                    DeltaKind::Plus,
+                    edge_type,
+                    idempotency_key,
+                )),
+                Bytes::from(encode_outbox_delta_batch_same_src(
+                    cell_id,
+                    edge_type,
+                    DeltaKind::Plus,
+                    start_epoch,
+                    end_epoch,
+                    src,
+                    dsts,
+                )),
+            );
+        }
+        batch.put_bytes(
+            Bytes::from(keys::mutation_batch(
+                cell_id,
+                result.start_epoch,
+                idempotency_key,
+            )),
+            Bytes::from(encode_mutation_batch_log(
+                edge_type,
+                idempotency_key,
+                fingerprint,
+                &result,
+            )),
+        );
+        batch.put_bytes(
+            Bytes::from(idem_key),
+            Bytes::from(encode_bulk_import_idempotency(
+                idempotency_key,
+                fingerprint,
+                &result,
+            )),
+        );
+        batch.put_bytes(
+            Bytes::from(fingerprint_key),
+            Bytes::from(encode_bulk_import_idempotency(
+                idempotency_key,
+                fingerprint,
+                &result,
+            )),
+        );
+        let batch_build_elapsed = batch_build_started.elapsed();
+
+        let counter_read_started = std::time::Instant::now();
+        if inserted > 0 {
+            let key = keys::degree_out(cell_id, edge_type, src);
+            let base = if current_epoch == 0 {
+                0
+            } else {
+                self.read_counter(&key).await?
+            };
+            batch.put_bytes(Bytes::from(key), Bytes::from(encode_u64(base + inserted)));
+        }
+        let counter_read_elapsed = counter_read_started.elapsed();
+
+        let options = WriteOptions {
+            await_durable: self.await_durable_writes,
+            ..Default::default()
+        };
+        let commit_started = std::time::Instant::now();
+        self.db.write_with_options(batch, &options).await?;
+        let commit_elapsed = commit_started.elapsed();
+        self.record_bulk_import_profile(
+            preflight_elapsed,
+            batch_build_elapsed,
+            counter_read_elapsed,
+            commit_elapsed,
+        );
+        Ok(result)
+    }
+
+    async fn bulk_import_edges_write_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: &[(VertexId, VertexId)],
+        idempotency_key: &str,
+        fingerprint: u64,
+        options: BulkImportOptions,
+    ) -> Result<BulkImportResult> {
+        let preflight_started = std::time::Instant::now();
+        let idem_key = keys::idempotency(cell_id, "bulk-import", idempotency_key);
+        if let Some(value) = self.read_remote(&idem_key).await? {
+            return decode_bulk_import_idempotency(&idem_key, idempotency_key, fingerprint, &value);
+        }
+
+        let current_epoch = self.current_epoch(cell_id).await?;
+        let fresh_cell = current_epoch == 0;
+        let mut already_existed = 0_u64;
+        let mut inserted_edges = Vec::new();
+        for (src, dst) in edges.iter().copied() {
+            if options.duplicate_policy.check_existing()
+                && !fresh_cell
+                && self
+                    .read_remote(&keys::out_edge(cell_id, edge_type, src, dst))
+                    .await?
+                    .is_some()
+            {
+                already_existed += 1;
+                continue;
+            }
+            inserted_edges.push((src, dst));
+        }
+        let preflight_elapsed = preflight_started.elapsed();
+
+        let inserted =
+            u64::try_from(inserted_edges.len()).map_err(|err| GraphError::CorruptValue {
+                key: "bulk_import".to_string(),
+                reason: format!("too many edges in one import: {err}"),
+            })?;
+        let end_epoch =
+            current_epoch
+                .checked_add(inserted)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: "bulk_import".to_string(),
+                    reason: "epoch overflow during bulk import".to_string(),
+                })?;
+        let start_epoch = if inserted == 0 {
+            current_epoch
+        } else {
+            current_epoch + 1
+        };
+        let result = BulkImportResult {
+            start_epoch,
+            end_epoch,
+            inserted,
+            already_existed,
+        };
+
+        let mut batch = WriteBatch::new();
+        let write_reverse_index = self.writes_reverse_index();
+        let mut out_increments = std::collections::BTreeMap::<VertexId, u64>::new();
+        let mut in_increments = std::collections::BTreeMap::<VertexId, u64>::new();
+        let batch_build_started = std::time::Instant::now();
+        for (offset, (src, dst)) in inserted_edges.iter().copied().enumerate() {
+            let epoch = current_epoch + 1 + offset as u64;
+            let edge_value = Bytes::from(encode_edge_epoch(epoch));
+            batch.put_bytes(
+                Bytes::from(keys::out_edge(cell_id, edge_type, src, dst)),
+                edge_value.clone(),
+            );
+            if write_reverse_index {
+                batch.put_bytes(
+                    Bytes::from(keys::in_edge(cell_id, edge_type, dst, src)),
+                    edge_value,
+                );
+            }
+            if options.delta_log_policy.write_per_edge() {
+                batch.put_bytes(
+                    Bytes::from(keys::outbox(
+                        cell_id,
+                        epoch,
+                        DeltaKind::Plus,
+                        edge_type,
+                        src,
+                        dst,
+                    )),
+                    Bytes::from_static(b"delta2\n"),
+                );
+            }
+            *out_increments.entry(src).or_insert(0) += 1;
+            if write_reverse_index {
+                *in_increments.entry(dst).or_insert(0) += 1;
+            }
+        }
+        let batch_build_elapsed = batch_build_started.elapsed();
+
+        let counter_read_started = std::time::Instant::now();
+        for (src, increment) in out_increments {
+            let key = keys::degree_out(cell_id, edge_type, src);
+            let base = if fresh_cell {
+                0
+            } else {
+                self.read_counter(&key).await?
+            };
+            batch.put_bytes(Bytes::from(key), Bytes::from(encode_u64(base + increment)));
+        }
+        if write_reverse_index {
+            for (dst, increment) in in_increments {
+                let key = keys::degree_in(cell_id, edge_type, dst);
+                let base = if fresh_cell {
+                    0
+                } else {
+                    self.read_counter(&key).await?
+                };
+                batch.put_bytes(Bytes::from(key), Bytes::from(encode_u64(base + increment)));
+            }
+        }
+        let counter_read_elapsed = counter_read_started.elapsed();
+        if inserted > 0 {
+            batch.put_bytes(
+                Bytes::from(keys::last_epoch(cell_id)),
+                Bytes::from(encode_u64(end_epoch)),
+            );
+            if options.delta_log_policy.write_batch() {
+                batch.put_bytes(
+                    Bytes::from(keys::outbox_batch(
+                        cell_id,
+                        end_epoch,
+                        start_epoch,
+                        DeltaKind::Plus,
+                        edge_type,
+                        idempotency_key,
+                    )),
+                    Bytes::from(encode_outbox_delta_batch(
+                        cell_id,
+                        edge_type,
+                        DeltaKind::Plus,
+                        start_epoch,
+                        end_epoch,
+                        &inserted_edges,
+                    )),
+                );
+            }
+        }
+        batch.put_bytes(
+            Bytes::from(keys::mutation_batch(
+                cell_id,
+                result.start_epoch,
+                idempotency_key,
+            )),
+            Bytes::from(encode_mutation_batch_log(
+                edge_type,
+                idempotency_key,
+                fingerprint,
+                &result,
+            )),
+        );
+        batch.put_bytes(
+            Bytes::from(idem_key),
+            Bytes::from(encode_bulk_import_idempotency(
+                idempotency_key,
+                fingerprint,
+                &result,
+            )),
+        );
+
+        let options = WriteOptions {
+            await_durable: self.await_durable_writes,
+            ..Default::default()
+        };
+        let commit_started = std::time::Instant::now();
+        self.db.write_with_options(batch, &options).await?;
+        let commit_elapsed = commit_started.elapsed();
+        self.record_bulk_import_profile(
+            preflight_elapsed,
+            batch_build_elapsed,
+            counter_read_elapsed,
+            commit_elapsed,
+        );
+        Ok(result)
+    }
+
+    pub async fn write_edge_mutations_batch(
+        &self,
+        cell_id: &str,
+        mutations: impl IntoIterator<Item = EdgeMutation>,
+    ) -> Result<EdgeMutationBatchResult> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_write_authority(cell_id, "write_edge_mutations_batch")?;
+
+        let mutations: Vec<_> = mutations.into_iter().collect();
+        if mutations.is_empty() {
+            let epoch = self.current_epoch(cell_id).await?;
+            return Ok(EdgeMutationBatchResult {
+                start_epoch: epoch,
+                end_epoch: epoch,
+                inserted: 0,
+                already_existed: 0,
+                results: Vec::new(),
+            });
+        }
+        ensure_limit(
+            "write_edge_mutations_batch",
+            mutations.len() as u64,
+            self.limits.max_bulk_import_edges as u64,
+        )?;
+        for mutation in &mutations {
+            validate_component("cell_id", &mutation.cell_id)?;
+            validate_component("edge_type", &mutation.edge_type)?;
+            validate_component("idempotency_key", &mutation.idempotency_key)?;
+            if mutation.cell_id != cell_id {
+                return Err(GraphError::CorruptValue {
+                    key: format!("cell/{cell_id}/write_edge_mutations_batch"),
+                    reason: format!(
+                        "batch contains mutation for different cell {}",
+                        mutation.cell_id
+                    ),
+                });
+            }
+        }
+
+        let _permit = self
+            .acquire_graph_write_permit("write_edge_mutations_batch")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .write_edge_mutations_batch_txn(
+                    cell_id,
+                    &mutations,
+                    "write_edge_mutations_batch",
+                    None,
+                )
+                .await
+            {
+                Err(GraphError::Slate(err))
+                    if err.kind() == ErrorKind::Transaction
+                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(result) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(result);
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    pub async fn ingest_edge_mutations(
+        &self,
+        cell_id: &str,
+        mutations: impl IntoIterator<Item = EdgeMutation>,
+        options: EdgeIngestOptions,
+    ) -> Result<EdgeIngestResult> {
+        validate_component("cell_id", cell_id)?;
+        if options.batch_size == 0 {
+            return Err(GraphError::CorruptValue {
+                key: "edge_ingest_batch_size".to_string(),
+                reason: "batch size must be greater than zero".to_string(),
+            });
+        }
+        if self.limits.max_bulk_import_edges == 0 {
+            return Err(GraphError::AdmissionRejected {
+                operation: "ingest_edge_mutations",
+                actual: 1,
+                limit: 0,
+            });
+        }
+
+        let batch_size = options.batch_size.min(self.limits.max_bulk_import_edges);
+        let mut chunk = Vec::with_capacity(batch_size);
+        let mut start_epoch = None;
+        let mut end_epoch = self.current_epoch(cell_id).await?;
+        let mut inserted = 0_u64;
+        let mut already_existed = 0_u64;
+        let mut batches = 0_u64;
+        let mut mutations_seen = 0_u64;
+
+        for mutation in mutations {
+            mutations_seen = mutations_seen.saturating_add(1);
+            chunk.push(mutation);
+            if chunk.len() == batch_size {
+                let result = self
+                    .write_edge_mutations_batch(cell_id, std::mem::take(&mut chunk))
+                    .await?;
+                merge_ingest_batch(
+                    &result,
+                    &mut start_epoch,
+                    &mut end_epoch,
+                    &mut inserted,
+                    &mut already_existed,
+                    &mut batches,
+                );
+                chunk = Vec::with_capacity(batch_size);
+            }
+        }
+        if !chunk.is_empty() {
+            let result = self.write_edge_mutations_batch(cell_id, chunk).await?;
+            merge_ingest_batch(
+                &result,
+                &mut start_epoch,
+                &mut end_epoch,
+                &mut inserted,
+                &mut already_existed,
+                &mut batches,
+            );
+        }
+
+        Ok(EdgeIngestResult {
+            start_epoch: start_epoch.unwrap_or(end_epoch),
+            end_epoch,
+            inserted,
+            already_existed,
+            batches,
+            mutations: mutations_seen,
+        })
+    }
+
+    pub async fn append_edge_mutation_log(
+        &self,
+        cell_id: &str,
+        batch_id: &str,
+        mutations: impl IntoIterator<Item = EdgeMutation>,
+    ) -> Result<EdgeMutationLogAppendResult> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("batch_id", batch_id)?;
+        self.ensure_write_authority(cell_id, "append_edge_mutation_log")?;
+
+        let mutations: Vec<_> = mutations.into_iter().collect();
+        if mutations.is_empty() {
+            return Ok(EdgeMutationLogAppendResult {
+                log_epoch: self
+                    .read_counter(&keys::mutation_log_epoch(cell_id))
+                    .await?,
+                mutations: 0,
+                already_appended: false,
+            });
+        }
+        ensure_limit(
+            "append_edge_mutation_log",
+            mutations.len() as u64,
+            self.limits.max_bulk_import_edges as u64,
+        )?;
+        validate_edge_mutations_for_cell(cell_id, &mutations, "append_edge_mutation_log")?;
+        let fingerprint = edge_mutation_log_fingerprint(cell_id, batch_id, &mutations);
+
+        let _permit = self
+            .acquire_graph_write_permit("append_edge_mutation_log")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .append_edge_mutation_log_txn(cell_id, batch_id, &mutations, fingerprint)
+                .await
+            {
+                Err(GraphError::Slate(err))
+                    if err.kind() == ErrorKind::Transaction
+                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(result) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(result);
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    async fn append_edge_mutation_log_txn(
+        &self,
+        cell_id: &str,
+        batch_id: &str,
+        mutations: &[EdgeMutation],
+        fingerprint: u64,
+    ) -> Result<EdgeMutationLogAppendResult> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, "append_edge_mutation_log")
+            .await?;
+        let idem_key = keys::idempotency(cell_id, "mutation-log", batch_id);
+        if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
+            return decode_mutation_log_append_idempotency(
+                &idem_key,
+                batch_id,
+                fingerprint,
+                &value,
+            );
+        }
+
+        let current_log_epoch = read_counter_txn(&txn, &keys::mutation_log_epoch(cell_id)).await?;
+        let log_epoch =
+            current_log_epoch
+                .checked_add(1)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: keys::mutation_log_epoch(cell_id),
+                    reason: "mutation log epoch overflow".to_string(),
+                })?;
+        let result = EdgeMutationLogAppendResult {
+            log_epoch,
+            mutations: mutations.len() as u64,
+            already_appended: false,
+        };
+        let batch = EdgeMutationLogBatch {
+            cell_id: cell_id.to_string(),
+            batch_id: batch_id.to_string(),
+            fingerprint,
+            mutations: mutations.to_vec(),
+        };
+        txn.put(
+            keys::mutation_log_entry(cell_id, log_epoch, batch_id).as_bytes(),
+            encode_edge_mutation_log_batch(&batch),
+        )?;
+        txn.put(
+            keys::mutation_log_epoch(cell_id).as_bytes(),
+            encode_u64(log_epoch),
+        )?;
+        txn.put(
+            idem_key.as_bytes(),
+            encode_mutation_log_append_idempotency(batch_id, fingerprint, &result),
+        )?;
+        commit_txn_strict(txn).await?;
+        Ok(result)
+    }
+
+    pub async fn materialize_edge_mutation_log(
+        &self,
+        cell_id: &str,
+        max_batches: usize,
+    ) -> Result<EdgeMutationLogMaterializeResult> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_write_authority(cell_id, "materialize_edge_mutation_log")?;
+
+        let mut result = EdgeMutationLogMaterializeResult {
+            materialized_log_epoch: self
+                .read_counter(&keys::mutation_log_materialized_epoch(cell_id))
+                .await?,
+            current_epoch: self.current_epoch(cell_id).await?,
+            ..Default::default()
+        };
+        if max_batches == 0 {
+            result.last_log_epoch = self
+                .read_counter(&keys::mutation_log_epoch(cell_id))
+                .await?;
+            return Ok(result);
+        }
+
+        while result.materialized_batches < max_batches as u64 {
+            let start_suffix = result
+                .materialized_log_epoch
+                .checked_add(1)
+                .map(|epoch| format!("{epoch:020}/"))
+                .unwrap_or_else(|| format!("{:020}/", GraphEpoch::MAX));
+            let mut iter = self
+                .scan_remote_prefix_from(&keys::mutation_log_prefix(cell_id), &start_suffix)
+                .await?;
+            let mut pending = Vec::new();
+            let mut pending_mutations = 0_usize;
+            while result.materialized_batches < max_batches as u64 {
+                let Some(kv) = iter.next().await? else {
+                    break;
+                };
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let log_epoch = parse_mutation_log_epoch(&key)?;
+                if log_epoch <= result.materialized_log_epoch {
+                    continue;
+                }
+                let batch = decode_edge_mutation_log_batch(&key, &kv.value)?;
+                if batch.cell_id != cell_id {
+                    return Err(GraphError::CorruptValue {
+                        key,
+                        reason: format!(
+                            "mutation log batch belongs to cell {}, expected {cell_id}",
+                            batch.cell_id
+                        ),
+                    });
+                }
+                validate_edge_mutations_for_cell(
+                    cell_id,
+                    &batch.mutations,
+                    "materialize_edge_mutation_log",
+                )?;
+                let materialize_edge_limit = self
+                    .limits
+                    .max_bulk_import_edges
+                    .min(GRAPH_MUTATION_LOG_MATERIALIZE_TXN_EDGES);
+                if !pending.is_empty()
+                    && pending_mutations.saturating_add(batch.mutations.len())
+                        > materialize_edge_limit
+                {
+                    break;
+                }
+                pending_mutations = pending_mutations.saturating_add(batch.mutations.len());
+                result.scanned_batches = result.scanned_batches.saturating_add(1);
+                result.materialized_batches = result.materialized_batches.saturating_add(1);
+                result.mutations = result
+                    .mutations
+                    .saturating_add(batch.mutations.len() as u64);
+                result.materialized_log_epoch = log_epoch;
+                pending.push((log_epoch, batch.mutations));
+            }
+            if pending.is_empty() {
+                break;
+            }
+            let last_log_epoch = pending
+                .last()
+                .map(|(log_epoch, _)| *log_epoch)
+                .unwrap_or(result.materialized_log_epoch);
+            let batch_result = self
+                .materialize_edge_mutation_log_batches(cell_id, last_log_epoch, pending)
+                .await?;
+            result.inserted = result.inserted.saturating_add(batch_result.inserted);
+            result.already_existed = result
+                .already_existed
+                .saturating_add(batch_result.already_existed);
+            result.current_epoch = batch_result.end_epoch;
+        }
+        result.last_log_epoch = self
+            .read_counter(&keys::mutation_log_epoch(cell_id))
+            .await?;
+        result.current_epoch = self.current_epoch(cell_id).await?;
+        Ok(result)
+    }
+
+    async fn materialize_edge_mutation_log_batches(
+        &self,
+        cell_id: &str,
+        last_log_epoch: GraphEpoch,
+        batches: Vec<(GraphEpoch, Vec<EdgeMutation>)>,
+    ) -> Result<EdgeMutationBatchResult> {
+        let mutation_count = batches
+            .iter()
+            .map(|(_, mutations)| mutations.len())
+            .sum::<usize>();
+        ensure_limit(
+            "materialize_edge_mutation_log",
+            mutation_count as u64,
+            self.limits.max_bulk_import_edges as u64,
+        )?;
+        let mut mutations = Vec::with_capacity(mutation_count);
+        for (_, batch_mutations) in batches {
+            mutations.extend(batch_mutations);
+        }
+        let _permit = self
+            .acquire_graph_write_permit("materialize_edge_mutation_log")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .write_edge_mutations_batch_txn(
+                    cell_id,
+                    &mutations,
+                    "materialize_edge_mutation_log",
+                    Some(last_log_epoch),
+                )
+                .await
+            {
+                Err(GraphError::Slate(err))
+                    if err.kind() == ErrorKind::Transaction
+                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(result) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(result);
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    async fn write_edge_mutations_batch_txn(
+        &self,
+        cell_id: &str,
+        mutations: &[EdgeMutation],
+        operation: &'static str,
+        materialized_log_epoch: Option<GraphEpoch>,
+    ) -> Result<EdgeMutationBatchResult> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, operation)
+            .await?;
+
+        let mut idempotency_keys = BTreeSet::new();
+        for mutation in mutations {
+            if !idempotency_keys.insert(mutation.idempotency_key.clone()) {
+                return Err(GraphError::IdempotencyConflict {
+                    operation: "create",
+                    idempotency_key: mutation.idempotency_key.clone(),
+                });
+            }
+        }
+
+        let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
+        let mut next_epoch = current_epoch;
+        let mut results = Vec::with_capacity(mutations.len());
+        let mut known_edges = BTreeMap::<(String, VertexId, VertexId), GraphEpoch>::new();
+        let mut out_increments = BTreeMap::<(String, VertexId), u64>::new();
+        let mut in_increments = BTreeMap::<(String, VertexId), u64>::new();
+        let write_reverse_index = self.writes_reverse_index();
+        let mut inserted = 0_u64;
+        let mut already_existed = 0_u64;
+
+        for mutation in mutations {
+            let idem_key = keys::idempotency(cell_id, "create", &mutation.idempotency_key);
+            if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
+                let result = decode_commit_idempotency(&idem_key, mutation, &value)?;
+                if result.already_existed {
+                    already_existed = already_existed.saturating_add(1);
+                } else {
+                    inserted = inserted.saturating_add(1);
+                }
+                results.push(result);
+                continue;
+            }
+
+            let identity = (mutation.edge_type.clone(), mutation.src, mutation.dst);
+            if let Some(epoch) = known_edges.get(&identity).copied() {
+                let result = CommitResult {
+                    epoch,
+                    already_existed: true,
+                };
+                txn.put(
+                    idem_key.as_bytes(),
+                    encode_commit_idempotency(mutation, &result),
+                )?;
+                already_existed = already_existed.saturating_add(1);
+                results.push(result);
+                continue;
+            }
+
+            let edge_key = keys::out_edge(cell_id, &mutation.edge_type, mutation.src, mutation.dst);
+            if let Some(value) = read_txn_remote(&txn, &edge_key).await? {
+                let record = decode_edge_record(&edge_key, &value)?;
+                let result = CommitResult {
+                    epoch: record.epoch,
+                    already_existed: true,
+                };
+                known_edges.insert(identity, record.epoch);
+                txn.put(
+                    idem_key.as_bytes(),
+                    encode_commit_idempotency(mutation, &result),
+                )?;
+                already_existed = already_existed.saturating_add(1);
+                results.push(result);
+                continue;
+            }
+
+            next_epoch = next_epoch
+                .checked_add(1)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: operation.to_string(),
+                    reason: "epoch overflow during edge mutation batch".to_string(),
+                })?;
+            let record = EdgeRecord {
+                cell_id: cell_id.to_string(),
+                edge_type: mutation.edge_type.clone(),
+                src: mutation.src,
+                dst: mutation.dst,
+                epoch: next_epoch,
+            };
+            let result = CommitResult {
+                epoch: next_epoch,
+                already_existed: false,
+            };
+            let edge_value = encode_edge_record(&record);
+            let delta_value = encode_delta_record(&DeltaRecord {
+                kind: DeltaKind::Plus,
+                edge: record.clone(),
+            });
+            txn.put(
+                keys::out_edge(cell_id, &mutation.edge_type, mutation.src, mutation.dst).as_bytes(),
+                &edge_value,
+            )?;
+            if write_reverse_index {
+                txn.put(
+                    keys::in_edge(cell_id, &mutation.edge_type, mutation.dst, mutation.src)
+                        .as_bytes(),
+                    &edge_value,
+                )?;
+            }
+            txn.put(
+                keys::outbox(
+                    cell_id,
+                    next_epoch,
+                    DeltaKind::Plus,
+                    &mutation.edge_type,
+                    mutation.src,
+                    mutation.dst,
+                )
+                .as_bytes(),
+                &delta_value,
+            )?;
+            txn.put(
+                idem_key.as_bytes(),
+                encode_commit_idempotency(mutation, &result),
+            )?;
+            known_edges.insert(identity, next_epoch);
+            *out_increments
+                .entry((mutation.edge_type.clone(), mutation.src))
+                .or_insert(0) += 1;
+            if write_reverse_index {
+                *in_increments
+                    .entry((mutation.edge_type.clone(), mutation.dst))
+                    .or_insert(0) += 1;
+            }
+            inserted = inserted.saturating_add(1);
+            results.push(result);
+        }
+
+        for ((edge_type, src), increment) in out_increments {
+            let key = keys::degree_out(cell_id, &edge_type, src);
+            let base = read_counter_txn(&txn, &key).await?;
+            txn.put(key.as_bytes(), encode_u64(base + increment))?;
+        }
+        if write_reverse_index {
+            for ((edge_type, dst), increment) in in_increments {
+                let key = keys::degree_in(cell_id, &edge_type, dst);
+                let base = read_counter_txn(&txn, &key).await?;
+                txn.put(key.as_bytes(), encode_u64(base + increment))?;
+            }
+        }
+        if next_epoch > current_epoch {
+            txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(next_epoch))?;
+        }
+        if let Some(log_epoch) = materialized_log_epoch {
+            txn.put(
+                keys::mutation_log_materialized_epoch(cell_id).as_bytes(),
+                encode_u64(log_epoch),
+            )?;
+        }
+
+        let inserted_start_epoch = results
+            .iter()
+            .filter(|result| !result.already_existed)
+            .map(|result| result.epoch)
+            .min();
+        let inserted_end_epoch = results
+            .iter()
+            .filter(|result| !result.already_existed)
+            .map(|result| result.epoch)
+            .max();
+        commit_txn_strict(txn).await?;
+        Ok(EdgeMutationBatchResult {
+            start_epoch: inserted_start_epoch.unwrap_or(current_epoch),
+            end_epoch: inserted_end_epoch.unwrap_or(next_epoch),
+            inserted,
+            already_existed,
+            results,
+        })
     }
 
     pub async fn write_edges_batch(
@@ -1390,6 +3624,45 @@ impl GraphShard {
         idempotency_key: &str,
         chunk_size: usize,
     ) -> Result<BulkImportResult> {
+        self.bulk_import_edges_chunked_with_options(
+            cell_id,
+            edge_type,
+            edges,
+            idempotency_key,
+            chunk_size,
+            BulkImportOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn bulk_append_edges_trusted_chunked(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        idempotency_key: &str,
+        chunk_size: usize,
+    ) -> Result<BulkImportResult> {
+        self.bulk_import_edges_chunked_with_options(
+            cell_id,
+            edge_type,
+            edges,
+            idempotency_key,
+            chunk_size,
+            BulkImportOptions::trusted_append(),
+        )
+        .await
+    }
+
+    pub async fn bulk_import_edges_chunked_with_options(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        idempotency_key: &str,
+        chunk_size: usize,
+        options: BulkImportOptions,
+    ) -> Result<BulkImportResult> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         validate_component("idempotency_key", idempotency_key)?;
@@ -1414,11 +3687,12 @@ impl GraphShard {
             chunk.push(edge);
             if chunk.len() == chunk_size {
                 let result = self
-                    .bulk_import_edges(
+                    .bulk_import_edges_with_options(
                         cell_id,
                         edge_type,
                         std::mem::take(&mut chunk),
                         &format!("{idempotency_key}-chunk-{chunk_id:020}"),
+                        options,
                     )
                     .await?;
                 start_epoch.get_or_insert(result.start_epoch);
@@ -1431,11 +3705,12 @@ impl GraphShard {
         }
         if !chunk.is_empty() {
             let result = self
-                .bulk_import_edges(
+                .bulk_import_edges_with_options(
                     cell_id,
                     edge_type,
                     chunk,
                     &format!("{idempotency_key}-chunk-{chunk_id:020}"),
+                    options,
                 )
                 .await?;
             start_epoch.get_or_insert(result.start_epoch);
@@ -1452,6 +3727,114 @@ impl GraphShard {
         })
     }
 
+    async fn bulk_append_supernode_segment_trusted_txn(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dsts: &[VertexId],
+        idempotency_key: &str,
+        fingerprint: u64,
+    ) -> Result<BulkImportResult> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, "bulk_append_supernode_segment_trusted")
+            .await?;
+        let idem_key = keys::idempotency(cell_id, "segment-import", idempotency_key);
+        if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
+            return decode_bulk_import_idempotency(&idem_key, idempotency_key, fingerprint, &value);
+        }
+        let fingerprint_key = segment_import_fingerprint_key(cell_id, edge_type, src, fingerprint);
+        if let Some(value) = read_txn_remote(&txn, &fingerprint_key).await? {
+            return decode_bulk_import_fingerprint_idempotency(
+                &fingerprint_key,
+                fingerprint,
+                &value,
+            );
+        }
+
+        let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
+        let inserted = u64::try_from(dsts.len()).map_err(|err| GraphError::CorruptValue {
+            key: "segment_import".to_string(),
+            reason: format!("too many edges in one segment import: {err}"),
+        })?;
+        let end_epoch =
+            current_epoch
+                .checked_add(inserted)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: "segment_import".to_string(),
+                    reason: "epoch overflow during segment import".to_string(),
+                })?;
+        let start_epoch = if inserted == 0 {
+            current_epoch
+        } else {
+            current_epoch + 1
+        };
+        let result = BulkImportResult {
+            start_epoch,
+            end_epoch,
+            inserted,
+            already_existed: 0,
+        };
+
+        if inserted > 0 {
+            txn.put(
+                keys::out_segment(
+                    cell_id,
+                    edge_type,
+                    src,
+                    end_epoch,
+                    start_epoch,
+                    idempotency_key,
+                )
+                .as_bytes(),
+                encode_out_edge_segment(dsts),
+            )?;
+            txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(end_epoch))?;
+            let degree_key = keys::degree_out(cell_id, edge_type, src);
+            let base = if current_epoch == 0 {
+                0
+            } else {
+                read_counter_txn(&txn, &degree_key).await?
+            };
+            txn.put(degree_key.as_bytes(), encode_u64(base + inserted))?;
+            txn.put(
+                keys::outbox_batch(
+                    cell_id,
+                    end_epoch,
+                    start_epoch,
+                    DeltaKind::Plus,
+                    edge_type,
+                    idempotency_key,
+                )
+                .as_bytes(),
+                encode_outbox_delta_batch_same_src(
+                    cell_id,
+                    edge_type,
+                    DeltaKind::Plus,
+                    start_epoch,
+                    end_epoch,
+                    src,
+                    dsts,
+                ),
+            )?;
+        }
+        txn.put(
+            keys::mutation_batch(cell_id, result.start_epoch, idempotency_key).as_bytes(),
+            encode_mutation_batch_log(edge_type, idempotency_key, fingerprint, &result),
+        )?;
+        txn.put(
+            idem_key.as_bytes(),
+            encode_bulk_import_idempotency(idempotency_key, fingerprint, &result),
+        )?;
+        txn.put(
+            fingerprint_key.as_bytes(),
+            encode_bulk_import_idempotency(idempotency_key, fingerprint, &result),
+        )?;
+
+        commit_txn_strict(txn).await?;
+        Ok(result)
+    }
+
     async fn bulk_import_edges_txn(
         &self,
         cell_id: &str,
@@ -1459,8 +3842,11 @@ impl GraphShard {
         edges: &[(VertexId, VertexId)],
         idempotency_key: &str,
         fingerprint: u64,
+        options: BulkImportOptions,
     ) -> Result<BulkImportResult> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, "bulk_import_edges")
+            .await?;
         let idem_key = keys::idempotency(cell_id, "bulk-import", idempotency_key);
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
             return decode_bulk_import_idempotency(&idem_key, idempotency_key, fingerprint, &value);
@@ -1471,8 +3857,9 @@ impl GraphShard {
         let mut already_existed = 0_u64;
         let mut inserted_edges = Vec::new();
         for (src, dst) in edges.iter().copied() {
-            if !fresh_cell
-                && read_txn_remote(&txn, &keys::edge(cell_id, edge_type, src, dst))
+            if options.duplicate_policy.check_existing()
+                && !fresh_cell
+                && read_txn_remote(&txn, &keys::out_edge(cell_id, edge_type, src, dst))
                     .await?
                     .is_some()
             {
@@ -1506,9 +3893,10 @@ impl GraphShard {
             already_existed,
         };
 
+        let write_reverse_index = self.writes_reverse_index();
         let mut out_increments = std::collections::BTreeMap::<VertexId, u64>::new();
         let mut in_increments = std::collections::BTreeMap::<VertexId, u64>::new();
-        for (offset, (src, dst)) in inserted_edges.into_iter().enumerate() {
+        for (offset, (src, dst)) in inserted_edges.iter().copied().enumerate() {
             let epoch = current_epoch + 1 + offset as u64;
             let record = EdgeRecord {
                 cell_id: cell_id.to_string(),
@@ -1517,31 +3905,31 @@ impl GraphShard {
                 dst,
                 epoch,
             };
-            txn.put(
-                keys::edge(cell_id, edge_type, src, dst).as_bytes(),
-                encode_edge_record(&record),
-            )?;
+            let edge_value = encode_edge_record(&record);
+            let delta_value = encode_delta_record(&DeltaRecord {
+                kind: DeltaKind::Plus,
+                edge: record.clone(),
+            });
             txn.put(
                 keys::out_edge(cell_id, edge_type, src, dst).as_bytes(),
-                encode_edge_record(&record),
+                &edge_value,
             )?;
-            txn.put(
-                keys::in_edge(cell_id, edge_type, dst, src).as_bytes(),
-                encode_edge_record(&record),
-            )?;
-            txn.put(
-                keys::outbox(cell_id, epoch, DeltaKind::Plus, edge_type, src, dst).as_bytes(),
-                encode_delta_record(&DeltaRecord {
-                    kind: DeltaKind::Plus,
-                    edge: record.clone(),
-                }),
-            )?;
-            txn.put(
-                keys::delta_plus(cell_id, edge_type, epoch, src, dst).as_bytes(),
-                encode_edge_record(&record),
-            )?;
+            if write_reverse_index {
+                txn.put(
+                    keys::in_edge(cell_id, edge_type, dst, src).as_bytes(),
+                    &edge_value,
+                )?;
+            }
+            if options.delta_log_policy.write_per_edge() {
+                txn.put(
+                    keys::outbox(cell_id, epoch, DeltaKind::Plus, edge_type, src, dst).as_bytes(),
+                    &delta_value,
+                )?;
+            }
             *out_increments.entry(src).or_insert(0) += 1;
-            *in_increments.entry(dst).or_insert(0) += 1;
+            if write_reverse_index {
+                *in_increments.entry(dst).or_insert(0) += 1;
+            }
         }
 
         for (src, increment) in out_increments {
@@ -1553,17 +3941,40 @@ impl GraphShard {
             };
             txn.put(key.as_bytes(), encode_u64(base + increment))?;
         }
-        for (dst, increment) in in_increments {
-            let key = keys::degree_in(cell_id, edge_type, dst);
-            let base = if fresh_cell {
-                0
-            } else {
-                read_counter_txn(&txn, &key).await?
-            };
-            txn.put(key.as_bytes(), encode_u64(base + increment))?;
+        if write_reverse_index {
+            for (dst, increment) in in_increments {
+                let key = keys::degree_in(cell_id, edge_type, dst);
+                let base = if fresh_cell {
+                    0
+                } else {
+                    read_counter_txn(&txn, &key).await?
+                };
+                txn.put(key.as_bytes(), encode_u64(base + increment))?;
+            }
         }
         if inserted > 0 {
             txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(end_epoch))?;
+            if options.delta_log_policy.write_batch() {
+                txn.put(
+                    keys::outbox_batch(
+                        cell_id,
+                        end_epoch,
+                        start_epoch,
+                        DeltaKind::Plus,
+                        edge_type,
+                        idempotency_key,
+                    )
+                    .as_bytes(),
+                    encode_outbox_delta_batch(
+                        cell_id,
+                        edge_type,
+                        DeltaKind::Plus,
+                        start_epoch,
+                        end_epoch,
+                        &inserted_edges,
+                    ),
+                )?;
+            }
         }
         txn.put(
             keys::mutation_batch(cell_id, result.start_epoch, idempotency_key).as_bytes(),
@@ -1587,8 +3998,19 @@ impl GraphShard {
         context: QueryContext,
         query: &str,
     ) -> Result<QueryOutput> {
-        let statement = parse_opencypher(query)?;
-        self.execute_query_statement(context, statement).await
+        #[cfg(feature = "opencypher")]
+        {
+            let statement = parse_opencypher(query)?;
+            self.execute_query_statement(context, statement).await
+        }
+        #[cfg(not(feature = "opencypher"))]
+        {
+            let _ = (context, query);
+            Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "enable the opencypher Cargo feature to parse Cypher".to_string(),
+            })
+        }
     }
 
     pub async fn execute_query_statement(
@@ -1670,25 +4092,17 @@ impl GraphShard {
                 return_count,
             } => {
                 let read_epoch = self.current_epoch(&context.cell_id).await?;
-                let mut vertices = self
-                    .matrix_reachable(&context.cell_id, &edge_type, &[src], max_hops, read_epoch)
+                let vertices = self
+                    .reachable_vertices_in_hop_range_at(
+                        &context.cell_id,
+                        &edge_type,
+                        src,
+                        min_hops,
+                        max_hops,
+                        read_epoch,
+                    )
                     .await?
-                    .vertices;
-                if min_hops > 1 {
-                    let shorter: BTreeSet<_> = self
-                        .matrix_reachable(
-                            &context.cell_id,
-                            &edge_type,
-                            &[src],
-                            min_hops - 1,
-                            read_epoch,
-                        )
-                        .await?
-                        .vertices
-                        .into_iter()
-                        .collect();
-                    vertices.retain(|vertex| !shorter.contains(vertex));
-                }
+                    .0;
                 if return_count {
                     Ok(QueryOutput::Count(vertices.len() as u64))
                 } else {
@@ -1696,6 +4110,63 @@ impl GraphShard {
                 }
             }
         }
+    }
+
+    async fn reachable_vertices_in_hop_range_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        min_hops: u8,
+        max_hops: u8,
+        read_epoch: GraphEpoch,
+    ) -> Result<(Vec<VertexId>, u64)> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        if min_hops > max_hops {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "invalid variable-length hop range".to_string(),
+            });
+        }
+        ensure_limit(
+            "cypher_match_reachable",
+            u64::from(max_hops),
+            u64::from(self.limits.max_traversal_hops),
+        )?;
+
+        let mut adjacency = BTreeMap::<VertexId, BTreeSet<VertexId>>::new();
+        for edge in self.edges_at(cell_id, edge_type, read_epoch).await? {
+            adjacency.entry(edge.src).or_default().insert(edge.dst);
+        }
+
+        let mut result = BTreeSet::new();
+        if min_hops == 0 {
+            result.insert(src);
+        }
+        if max_hops == 0 {
+            return Ok((result.into_iter().collect(), 0));
+        }
+
+        let mut frontier = BTreeSet::from([src]);
+        let mut edge_visits = 0_u64;
+        for depth in 1..=max_hops {
+            let mut next = BTreeSet::new();
+            for vertex in &frontier {
+                if let Some(neighbors) = adjacency.get(vertex) {
+                    edge_visits = edge_visits.saturating_add(neighbors.len() as u64);
+                    next.extend(neighbors.iter().copied());
+                }
+            }
+            if depth >= min_hops {
+                result.extend(next.iter().copied());
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        Ok((result.into_iter().collect(), edge_visits))
     }
 
     pub async fn edge_exists(
@@ -1707,8 +4178,15 @@ impl GraphShard {
     ) -> Result<bool> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        let key = keys::edge(cell_id, edge_type, src, dst);
-        Ok(self.read_remote(&key).await?.is_some())
+        let key = keys::out_edge(cell_id, edge_type, src, dst);
+        if self.read_remote(&key).await?.is_some() {
+            return Ok(true);
+        }
+        let read_epoch = self.current_epoch(cell_id).await?;
+        Ok(self
+            .out_segment_edge_record_at(cell_id, edge_type, src, dst, read_epoch)
+            .await?
+            .is_some())
     }
 
     pub async fn out_neighbors(
@@ -1727,8 +4205,179 @@ impl GraphShard {
             let record = decode_edge_record(&key, &kv.value)?;
             neighbors.push(record.dst);
         }
+        let read_epoch = self.current_epoch(cell_id).await?;
+        let tombstones = self
+            .scan_out_segment_tombstones_for_src_at(cell_id, edge_type, src, read_epoch)
+            .await?;
+        neighbors.extend(
+            self.scan_out_segments_for_src_at(cell_id, edge_type, src, read_epoch)
+                .await?
+                .into_iter()
+                .filter(|edge| segment_edge_visible(edge.epoch, tombstones.get(&edge.dst).copied()))
+                .map(|edge| edge.dst),
+        );
         neighbors.sort_unstable();
+        neighbors.dedup();
         Ok(neighbors)
+    }
+
+    async fn out_segment_edge_record_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        read_epoch: GraphEpoch,
+    ) -> Result<Option<EdgeRecord>> {
+        let tombstone_epoch = self
+            .out_segment_tombstone_epoch_at(cell_id, edge_type, src, dst, read_epoch)
+            .await?;
+        let mut latest = None;
+        for edge in self
+            .scan_out_segments_for_src_at(cell_id, edge_type, src, read_epoch)
+            .await?
+        {
+            if edge.dst == dst && segment_edge_visible(edge.epoch, tombstone_epoch) {
+                latest = Some(edge);
+            }
+        }
+        Ok(latest)
+    }
+
+    async fn scan_out_segments_for_src_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<EdgeRecord>> {
+        let prefix = keys::out_segment_src_prefix(cell_id, edge_type, src);
+        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        let mut edges = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let segment = decode_out_edge_segment(&key, &kv.value)?;
+            if segment.start_epoch > read_epoch {
+                break;
+            }
+            for (epoch, dst) in segment.edges.iter().copied() {
+                if epoch > read_epoch {
+                    break;
+                }
+                edges.push(EdgeRecord {
+                    cell_id: segment.cell_id.clone(),
+                    edge_type: segment.edge_type.clone(),
+                    src: segment.src,
+                    dst,
+                    epoch,
+                });
+            }
+        }
+        Ok(edges)
+    }
+
+    async fn out_segment_tombstone_epoch_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        read_epoch: GraphEpoch,
+    ) -> Result<Option<GraphEpoch>> {
+        let key = keys::out_segment_tombstone(cell_id, edge_type, src, dst);
+        let Some(value) = self.read_remote(&key).await? else {
+            return Ok(None);
+        };
+        let epoch = decode_u64(&key, &value)?;
+        Ok((epoch <= read_epoch).then_some(epoch))
+    }
+
+    async fn scan_out_segment_tombstones_for_src_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        read_epoch: GraphEpoch,
+    ) -> Result<BTreeMap<VertexId, GraphEpoch>> {
+        let prefix = keys::out_segment_tombstone_src_prefix(cell_id, edge_type, src);
+        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        let mut tombstones = BTreeMap::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (key_cell_id, key_edge_type, key_src, dst) =
+                parse_out_edge_segment_tombstone_key(&key)?;
+            if key_cell_id != cell_id || key_edge_type != edge_type || key_src != src {
+                return Err(GraphError::CorruptValue {
+                    key,
+                    reason: "segment tombstone identity does not match scan prefix".to_string(),
+                });
+            }
+            let epoch = decode_u64(&key, &kv.value)?;
+            if epoch <= read_epoch {
+                tombstones.insert(dst, epoch);
+            }
+        }
+        Ok(tombstones)
+    }
+
+    async fn out_segment_tombstones_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        read_epoch: GraphEpoch,
+    ) -> Result<BTreeMap<(VertexId, VertexId), GraphEpoch>> {
+        let prefix = keys::out_segment_tombstone_edge_type_prefix(cell_id, edge_type);
+        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        let mut tombstones = BTreeMap::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (key_cell_id, key_edge_type, src, dst) =
+                parse_out_edge_segment_tombstone_key(&key)?;
+            if key_cell_id != cell_id || key_edge_type != edge_type {
+                return Err(GraphError::CorruptValue {
+                    key,
+                    reason: "segment tombstone identity does not match scan prefix".to_string(),
+                });
+            }
+            let epoch = decode_u64(&key, &kv.value)?;
+            if epoch <= read_epoch {
+                tombstones.insert((src, dst), epoch);
+            }
+        }
+        Ok(tombstones)
+    }
+
+    pub(crate) async fn out_segment_edge_pairs_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        read_epoch: GraphEpoch,
+    ) -> Result<BTreeSet<(VertexId, VertexId)>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let prefix = keys::out_segment_edge_type_prefix(cell_id, edge_type);
+        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        let tombstones = self
+            .out_segment_tombstones_at(cell_id, edge_type, read_epoch)
+            .await?;
+        let mut pairs = BTreeSet::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let segment = decode_out_edge_segment(&key, &kv.value)?;
+            if segment.start_epoch > read_epoch {
+                continue;
+            }
+            for (epoch, dst) in segment.edges.iter().copied() {
+                if epoch > read_epoch {
+                    break;
+                }
+                let tombstone_epoch = tombstones.get(&(segment.src, dst)).copied();
+                if segment_edge_visible(epoch, tombstone_epoch) {
+                    pairs.insert((segment.src, dst));
+                }
+            }
+        }
+        Ok(pairs)
     }
 
     pub async fn in_neighbors(
@@ -1739,6 +4388,17 @@ impl GraphShard {
     ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
+        if !self.writes_reverse_index() {
+            let read_epoch = self.current_epoch(cell_id).await?;
+            let mut neighbors: Vec<_> = self
+                .edges_at(cell_id, edge_type, read_epoch)
+                .await?
+                .into_iter()
+                .filter_map(|edge| (edge.dst == dst).then_some(edge.src))
+                .collect();
+            neighbors.sort_unstable();
+            return Ok(neighbors);
+        }
         let prefix = keys::in_prefix(cell_id, edge_type, dst);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
         let mut neighbors = Vec::new();
@@ -1774,6 +4434,10 @@ impl GraphShard {
                 records.push(record);
             }
         }
+        records.extend(
+            self.scan_outbox_delta_batches_between(cell_id, None, after_epoch, GraphEpoch::MAX)
+                .await?,
+        );
         sort_deltas(&mut records);
         Ok(records)
     }
@@ -1810,24 +4474,108 @@ impl GraphShard {
             });
         }
 
-        let mut records = Vec::new();
-        self.scan_delta_prefix(
-            &keys::delta_plus_prefix(cell_id, edge_type),
-            DeltaKind::Plus,
-            after_epoch,
-            read_epoch,
-            &mut records,
-        )
-        .await?;
-        self.scan_delta_prefix(
-            &keys::delta_minus_prefix(cell_id, edge_type),
-            DeltaKind::Minus,
-            after_epoch,
-            read_epoch,
-            &mut records,
-        )
-        .await?;
+        let mut records = self
+            .scan_outbox_deltas_between(cell_id, edge_type, after_epoch, read_epoch)
+            .await?;
+        records.extend(
+            self.scan_outbox_delta_batches_between(
+                cell_id,
+                Some(edge_type),
+                after_epoch,
+                read_epoch,
+            )
+            .await?,
+        );
 
+        let final_watermark = self.delta_gc_watermark(cell_id, edge_type).await?;
+        if after_epoch < final_watermark {
+            return Err(GraphError::SnapshotExpired {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch: after_epoch,
+                min_epoch: final_watermark,
+            });
+        }
+
+        sort_deltas(&mut records);
+        Ok(records)
+    }
+
+    async fn scan_outbox_delta_batches_between(
+        &self,
+        cell_id: &str,
+        edge_type: Option<&str>,
+        after_epoch: GraphEpoch,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<DeltaRecord>> {
+        let start_suffix = after_epoch
+            .checked_add(1)
+            .map(|epoch| format!("{epoch:020}/"))
+            .unwrap_or_else(|| format!("{:020}/", GraphEpoch::MAX));
+        let mut iter = self
+            .scan_remote_prefix_from(&keys::outbox_batch_prefix(cell_id), &start_suffix)
+            .await?;
+        let mut records = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let batch = decode_outbox_delta_batch(&key, &kv.value)?;
+            if batch.start_epoch > read_epoch {
+                break;
+            }
+            if let Some(edge_type) = edge_type {
+                if batch.edge_type != edge_type {
+                    continue;
+                }
+            }
+            for (offset, (src, dst)) in batch.edges.iter().copied().enumerate() {
+                let epoch = batch.start_epoch + offset as u64;
+                if epoch <= after_epoch {
+                    continue;
+                }
+                if epoch > read_epoch {
+                    break;
+                }
+                records.push(DeltaRecord {
+                    kind: batch.kind,
+                    edge: EdgeRecord {
+                        cell_id: batch.cell_id.clone(),
+                        edge_type: batch.edge_type.clone(),
+                        src,
+                        dst,
+                        epoch,
+                    },
+                });
+            }
+        }
+        sort_deltas(&mut records);
+        Ok(records)
+    }
+
+    async fn scan_outbox_deltas_between(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        after_epoch: GraphEpoch,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<DeltaRecord>> {
+        let start_suffix = after_epoch
+            .checked_add(1)
+            .map(|epoch| format!("{epoch:020}/"))
+            .unwrap_or_else(|| format!("{:020}/", GraphEpoch::MAX));
+        let mut iter = self
+            .scan_remote_prefix_from(&keys::outbox_prefix(cell_id), &start_suffix)
+            .await?;
+        let mut records = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let record = decode_delta_record(&key, &kv.value)?;
+            if record.edge.epoch > read_epoch {
+                break;
+            }
+            if record.edge.edge_type == edge_type && record.edge.epoch > after_epoch {
+                records.push(record);
+            }
+        }
         sort_deltas(&mut records);
         Ok(records)
     }
@@ -1913,12 +4661,22 @@ impl GraphShard {
                 degree_mismatches.push(format!("out:{src}:expected={expected}:actual={actual}"));
             }
         }
-        for (dst, expected) in in_counts {
-            let actual = self
-                .read_counter(&keys::degree_in(cell_id, edge_type, dst))
+        if self.writes_reverse_index() {
+            for (dst, expected) in in_counts {
+                let actual = self
+                    .read_counter(&keys::degree_in(cell_id, edge_type, dst))
+                    .await?;
+                if actual != expected {
+                    degree_mismatches.push(format!("in:{dst}:expected={expected}:actual={actual}"));
+                }
+            }
+        } else {
+            let mut iter = self
+                .scan_remote_prefix(&keys::degree_in_prefix(cell_id, edge_type))
                 .await?;
-            if actual != expected {
-                degree_mismatches.push(format!("in:{dst}:expected={expected}:actual={actual}"));
+            while let Some(kv) = iter.next().await? {
+                let key = String::from_utf8_lossy(&kv.key);
+                degree_mismatches.push(format!("in:{key}:unexpected-under-outbound-only"));
             }
         }
         Ok(GraphRepairReport {
@@ -1940,6 +4698,19 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         self.ensure_write_authority(cell_id, "delete_deltas_through_rollup")?;
+        let _permit = self
+            .acquire_gc_permit("delete_deltas_through_rollup")
+            .await?;
+        let started = std::time::Instant::now();
+        let safe_epoch = self.delta_gc_safe_epoch(cell_id, edge_type).await?;
+        if compact_through_epoch > safe_epoch {
+            return Err(self.record_retention_reject(
+                "delete_deltas_through_rollup",
+                cell_id,
+                compact_through_epoch,
+                safe_epoch,
+            ));
+        }
         let Some(artifact) = self
             .latest_matrix_artifact(cell_id, edge_type, compact_through_epoch)
             .await?
@@ -1959,45 +4730,86 @@ impl GraphShard {
             });
         }
 
-        let mut watermark_batch = WriteBatch::new();
+        let mut watermark_batch = GraphWriteBatch::new();
         watermark_batch.put(
             keys::delta_gc_watermark(cell_id, edge_type),
             encode_u64(compact_through_epoch),
         );
-        self.write_strict(watermark_batch).await?;
+        self.write_graph_batch_strict(cell_id, "delete_deltas_through_rollup", watermark_batch)
+            .await?;
 
         let mut result = DeltaGcResult {
             compacted_through_epoch: compact_through_epoch,
             ..DeltaGcResult::default()
         };
+        self.delete_outbox_deltas_through(cell_id, edge_type, compact_through_epoch, &mut result)
+            .await?;
+        self.delete_outbox_delta_batches_through(
+            cell_id,
+            edge_type,
+            compact_through_epoch,
+            &mut result,
+        )
+        .await?;
         self.delete_delta_prefix_through(
+            cell_id,
             &keys::delta_plus_prefix(cell_id, edge_type),
             compact_through_epoch,
             &mut result,
         )
         .await?;
         self.delete_delta_prefix_through(
+            cell_id,
             &keys::delta_minus_prefix(cell_id, edge_type),
             compact_through_epoch,
             &mut result,
         )
         .await?;
+        self.delete_owner_delta_prefix_through(
+            cell_id,
+            &keys::owner_delta_kind_prefix(cell_id, edge_type, DeltaKind::Plus),
+            compact_through_epoch,
+            &mut result,
+        )
+        .await?;
+        self.delete_owner_delta_prefix_through(
+            cell_id,
+            &keys::owner_delta_kind_prefix(cell_id, edge_type, DeltaKind::Minus),
+            compact_through_epoch,
+            &mut result,
+        )
+        .await?;
+        tracing::info!(
+            target: "slatedb_graph_kernel",
+            cell_id,
+            edge_type,
+            compact_through_epoch,
+            deleted_delta_keys = result.deleted_delta_keys,
+            retained_delta_keys = result.retained_delta_keys,
+            "deleted graph deltas through rollup"
+        );
+        self.record_gc_completed(result.deleted_delta_keys, started.elapsed());
         Ok(result)
     }
 
-    async fn delta_gc_watermark(&self, cell_id: &str, edge_type: &str) -> Result<GraphEpoch> {
+    pub(crate) async fn delta_gc_watermark(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+    ) -> Result<GraphEpoch> {
         self.read_counter(&keys::delta_gc_watermark(cell_id, edge_type))
             .await
     }
 
     async fn delete_delta_prefix_through(
         &self,
+        cell_id: &str,
         prefix: &str,
         compact_through_epoch: GraphEpoch,
         result: &mut DeltaGcResult,
     ) -> Result<()> {
         let mut iter = self.scan_remote_prefix(prefix).await?;
-        let mut batch = WriteBatch::new();
+        let mut batch = GraphWriteBatch::new();
         let mut pending_deletes = 0_usize;
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
@@ -2007,27 +4819,124 @@ impl GraphShard {
                 result.deleted_delta_keys += 1;
                 pending_deletes += 1;
                 if pending_deletes >= GRAPH_DELTA_GC_BATCH_KEYS {
-                    self.flush_delta_gc_batch(&mut batch, &mut pending_deletes)
+                    self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
                         .await?;
                 }
             } else {
                 result.retained_delta_keys += 1;
             }
         }
-        self.flush_delta_gc_batch(&mut batch, &mut pending_deletes)
+        self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
+            .await
+    }
+
+    async fn delete_outbox_deltas_through(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        compact_through_epoch: GraphEpoch,
+        result: &mut DeltaGcResult,
+    ) -> Result<()> {
+        let mut iter = self
+            .scan_remote_prefix(&keys::outbox_prefix(cell_id))
+            .await?;
+        let mut batch = GraphWriteBatch::new();
+        let mut pending_deletes = 0_usize;
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let delta = decode_delta_record(&key, &kv.value)?;
+            if delta.edge.epoch > compact_through_epoch {
+                break;
+            }
+            if delta.edge.edge_type != edge_type {
+                continue;
+            }
+            batch.delete(key.as_bytes());
+            result.deleted_delta_keys += 1;
+            pending_deletes += 1;
+            if pending_deletes >= GRAPH_DELTA_GC_BATCH_KEYS {
+                self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
+                    .await?;
+            }
+        }
+        self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
+            .await
+    }
+
+    async fn delete_outbox_delta_batches_through(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        compact_through_epoch: GraphEpoch,
+        result: &mut DeltaGcResult,
+    ) -> Result<()> {
+        let mut iter = self
+            .scan_remote_prefix(&keys::outbox_batch_prefix(cell_id))
+            .await?;
+        let mut batch = GraphWriteBatch::new();
+        let mut pending_deletes = 0_usize;
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let delta_batch = decode_outbox_delta_batch(&key, &kv.value)?;
+            if delta_batch.end_epoch > compact_through_epoch {
+                break;
+            }
+            if delta_batch.edge_type != edge_type {
+                continue;
+            }
+            batch.delete(key.as_bytes());
+            result.deleted_delta_keys += 1;
+            pending_deletes += 1;
+            if pending_deletes >= GRAPH_DELTA_GC_BATCH_KEYS {
+                self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
+                    .await?;
+            }
+        }
+        self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
+            .await
+    }
+
+    async fn delete_owner_delta_prefix_through(
+        &self,
+        cell_id: &str,
+        prefix: &str,
+        compact_through_epoch: GraphEpoch,
+        result: &mut DeltaGcResult,
+    ) -> Result<()> {
+        let mut iter = self.scan_remote_prefix(prefix).await?;
+        let mut batch = GraphWriteBatch::new();
+        let mut pending_deletes = 0_usize;
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let delta = decode_delta_record(&key, &kv.value)?;
+            if delta.edge.epoch <= compact_through_epoch {
+                batch.delete(key.as_bytes());
+                result.deleted_delta_keys += 1;
+                pending_deletes += 1;
+                if pending_deletes >= GRAPH_DELTA_GC_BATCH_KEYS {
+                    self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
+                        .await?;
+                }
+            } else {
+                result.retained_delta_keys += 1;
+            }
+        }
+        self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
             .await
     }
 
     async fn flush_delta_gc_batch(
         &self,
-        batch: &mut WriteBatch,
+        cell_id: &str,
+        batch: &mut GraphWriteBatch,
         pending_deletes: &mut usize,
     ) -> Result<()> {
         if *pending_deletes == 0 {
             return Ok(());
         }
-        let batch_to_write = std::mem::replace(batch, WriteBatch::new());
-        self.write_strict(batch_to_write).await?;
+        let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
+        self.write_graph_batch_strict(cell_id, "delete_deltas_through_rollup", batch_to_write)
+            .await?;
         *pending_deletes = 0;
         Ok(())
     }
@@ -2077,6 +4986,166 @@ impl GraphShard {
             .len() as u64)
     }
 
+    pub async fn compact_supernode_segments(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        compacted_through_epoch: GraphEpoch,
+        idempotency_key: &str,
+    ) -> Result<SegmentCompactionResult> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        validate_component("idempotency_key", idempotency_key)?;
+        self.ensure_write_authority(cell_id, "compact_supernode_segments")?;
+
+        let started = std::time::Instant::now();
+        let _permit = self.acquire_gc_permit("compact_supernode_segments").await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        let idempotency_operation = segment_compaction_idempotency_operation(edge_type, src);
+        let idem_key = keys::idempotency(cell_id, &idempotency_operation, idempotency_key);
+        if let Some(value) = self.read_remote(&idem_key).await? {
+            return decode_segment_compaction_idempotency(
+                &idem_key,
+                idempotency_key,
+                compacted_through_epoch,
+                &value,
+            );
+        }
+
+        let current_epoch = self.current_epoch(cell_id).await?;
+        if compacted_through_epoch > current_epoch {
+            return Err(GraphError::SnapshotAhead {
+                cell_id: cell_id.to_string(),
+                read_epoch: compacted_through_epoch,
+                current_epoch,
+            });
+        }
+        let Some(artifact) = self
+            .latest_matrix_artifact(cell_id, edge_type, compacted_through_epoch)
+            .await?
+        else {
+            return Err(GraphError::CorruptValue {
+                key: keys::out_segment_src_prefix(cell_id, edge_type, src),
+                reason: "cannot compact segments without a matrix rollup artifact".to_string(),
+            });
+        };
+        if artifact.base_epoch != compacted_through_epoch {
+            return Err(GraphError::CorruptValue {
+                key: keys::out_segment_src_prefix(cell_id, edge_type, src),
+                reason: format!(
+                    "latest matrix artifact is at epoch {}, expected {compacted_through_epoch}",
+                    artifact.base_epoch
+                ),
+            });
+        }
+        let current_degree = self.out_neighbors(cell_id, edge_type, src).await?.len() as u64;
+
+        let mut segment_iter = self
+            .scan_remote_prefix(&keys::out_segment_src_prefix(cell_id, edge_type, src))
+            .await?;
+        let mut source_segments = Vec::new();
+        let mut input_edges = 0_u64;
+        while let Some(kv) = segment_iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let segment = decode_out_edge_segment(&key, &kv.value)?;
+            input_edges = input_edges.saturating_add(segment.edges.len() as u64);
+            source_segments.push((key, segment));
+        }
+
+        let mut tombstone_iter = self
+            .scan_remote_prefix(&keys::out_segment_tombstone_src_prefix(
+                cell_id, edge_type, src,
+            ))
+            .await?;
+        let mut tombstones = BTreeMap::<VertexId, (GraphEpoch, String)>::new();
+        while let Some(kv) = tombstone_iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (key_cell_id, key_edge_type, key_src, dst) =
+                parse_out_edge_segment_tombstone_key(&key)?;
+            if key_cell_id != cell_id || key_edge_type != edge_type || key_src != src {
+                return Err(GraphError::CorruptValue {
+                    key,
+                    reason: "segment tombstone identity does not match scan prefix".to_string(),
+                });
+            }
+            let epoch = decode_u64(&key, &kv.value)?;
+            if epoch <= current_epoch {
+                tombstones.insert(dst, (epoch, key));
+            }
+        }
+
+        let mut live = BTreeMap::<VertexId, GraphEpoch>::new();
+        for (_, segment) in &source_segments {
+            for (epoch, dst) in &segment.edges {
+                if *epoch > current_epoch {
+                    continue;
+                }
+                let tombstone_epoch = tombstones.get(dst).map(|(epoch, _)| *epoch);
+                if segment_edge_visible(*epoch, tombstone_epoch) {
+                    live.entry(*dst)
+                        .and_modify(|existing| *existing = (*existing).max(*epoch))
+                        .or_insert(*epoch);
+                }
+            }
+        }
+        let mut compacted_edges: Vec<_> =
+            live.into_iter().map(|(dst, epoch)| (epoch, dst)).collect();
+        compacted_edges.sort_unstable();
+
+        let mut batch = GraphWriteBatch::new();
+        for (key, _) in &source_segments {
+            batch.delete(key.as_bytes());
+        }
+        let mut deleted_tombstone_keys = 0_u64;
+        for (_, (epoch, key)) in tombstones {
+            if epoch <= compacted_through_epoch {
+                batch.delete(key.as_bytes());
+                deleted_tombstone_keys = deleted_tombstone_keys.saturating_add(1);
+            }
+        }
+        if let (Some((start_epoch, _)), Some((end_epoch, _))) =
+            (compacted_edges.first(), compacted_edges.last())
+        {
+            batch.put(
+                keys::out_segment(
+                    cell_id,
+                    edge_type,
+                    src,
+                    *end_epoch,
+                    *start_epoch,
+                    &format!("compact-{idempotency_key}"),
+                ),
+                encode_out_edge_segment_records(&compacted_edges),
+            );
+        }
+        batch.put(
+            keys::degree_out(cell_id, edge_type, src),
+            encode_u64(current_degree),
+        );
+        let result = SegmentCompactionResult {
+            compacted_through_epoch,
+            source_segments: source_segments.len() as u64,
+            deleted_segment_keys: source_segments.len() as u64,
+            deleted_tombstone_keys,
+            input_edges,
+            output_edges: compacted_edges.len() as u64,
+        };
+        batch.put(
+            idem_key.as_bytes(),
+            encode_segment_compaction_idempotency(idempotency_key, &result),
+        );
+        self.write_graph_batch_strict(cell_id, "compact_supernode_segments", batch)
+            .await?;
+        self.record_gc_completed(
+            result
+                .deleted_segment_keys
+                .saturating_add(result.deleted_tombstone_keys),
+            started.elapsed(),
+        );
+        Ok(result)
+    }
+
     async fn read_counter(&self, key: &str) -> Result<u64> {
         match self.read_remote(key).await? {
             Some(value) => decode_u64(key, &value),
@@ -2116,38 +5185,118 @@ impl GraphShard {
         Ok(iter)
     }
 
-    async fn scan_delta_prefix(
-        &self,
-        prefix: &str,
-        kind: DeltaKind,
-        after_epoch: GraphEpoch,
-        read_epoch: GraphEpoch,
-        records: &mut Vec<DeltaRecord>,
-    ) -> Result<()> {
-        if after_epoch == GraphEpoch::MAX {
-            return Ok(());
-        }
-        let start_suffix = format!("{:020}", after_epoch + 1);
-        let mut iter = self.scan_remote_prefix_from(prefix, &start_suffix).await?;
-        while let Some(kv) = iter.next().await? {
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let edge = decode_edge_record(&key, &kv.value)?;
-            if edge.epoch > read_epoch {
-                break;
-            }
-            if edge.epoch > after_epoch {
-                records.push(DeltaRecord { kind, edge });
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn write_strict(&self, batch: WriteBatch) -> Result<()> {
-        let mut options = WriteOptions::default();
-        options.await_durable = true;
+    #[cfg(test)]
+    pub(crate) async fn write_strict_for_test(&self, batch: WriteBatch) -> Result<()> {
+        let options = WriteOptions {
+            await_durable: true,
+            ..Default::default()
+        };
         self.db.write_with_options(batch, &options).await?;
         Ok(())
     }
+
+    pub(crate) async fn write_graph_batch_strict(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+        batch: GraphWriteBatch,
+    ) -> Result<()> {
+        validate_component("cell_id", cell_id)?;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let record_count = batch.len();
+        let started = std::time::Instant::now();
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .write_graph_batch_txn(cell_id, operation, batch.clone())
+                .await
+            {
+                Err(GraphError::Slate(err))
+                    if err.kind() == ErrorKind::Transaction
+                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(()) => {
+                    self.record_graph_batch_commit(operation, record_count, started.elapsed());
+                    return Ok(());
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    async fn write_graph_batch_txn(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+        batch: GraphWriteBatch,
+    ) -> Result<()> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, operation)
+            .await?;
+        for op in batch.ops {
+            match op {
+                GraphWriteOp::Put(key, value) => txn.put(key.as_ref(), value.as_ref())?,
+                GraphWriteOp::Delete(key) => txn.delete(key.as_ref())?,
+            }
+        }
+        commit_txn_strict(txn).await
+    }
+}
+
+async fn ensure_store_format(db: &Db, write_authority: &GraphWriteAuthority) -> Result<()> {
+    let current = db
+        .get_with_options(GRAPH_STORE_FORMAT_KEY.as_bytes(), &remote_read_options())
+        .await?;
+    let Some(value) = current else {
+        if !matches!(write_authority, GraphWriteAuthority::ReadOnly) {
+            tracing::info!(
+                target: "slatedb_graph_kernel",
+                version = GRAPH_STORE_FORMAT_VERSION,
+                "initializing graph store format version"
+            );
+            let mut batch = WriteBatch::new();
+            batch.put(
+                GRAPH_STORE_FORMAT_KEY.as_bytes(),
+                encode_u64(GRAPH_STORE_FORMAT_VERSION),
+            );
+            let options = WriteOptions {
+                await_durable: true,
+                ..Default::default()
+            };
+            db.write_with_options(batch, &options).await?;
+        }
+        return Ok(());
+    };
+
+    let version = decode_u64(GRAPH_STORE_FORMAT_KEY, &value)?;
+    if version != GRAPH_STORE_FORMAT_VERSION {
+        tracing::error!(
+            target: "slatedb_graph_kernel",
+            version,
+            expected = GRAPH_STORE_FORMAT_VERSION,
+            "unsupported graph store format version"
+        );
+        return Err(GraphError::CorruptValue {
+            key: GRAPH_STORE_FORMAT_KEY.to_string(),
+            reason: format!(
+                "unsupported graph store format {version}; expected {GRAPH_STORE_FORMAT_VERSION}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 async fn read_txn_remote(txn: &DbTransaction, key: &str) -> Result<Option<Bytes>> {
@@ -2175,16 +5324,19 @@ async fn next_epoch_txn(txn: &DbTransaction, cell_id: &str) -> Result<GraphEpoch
 }
 
 async fn commit_txn_strict(txn: DbTransaction) -> Result<()> {
-    let mut options = WriteOptions::default();
-    options.await_durable = true;
+    let options = WriteOptions {
+        await_durable: true,
+        ..Default::default()
+    };
     txn.commit_with_options(&options).await?;
     Ok(())
 }
 
 fn remote_read_options() -> ReadOptions {
-    let mut options = ReadOptions::default();
-    options.durability_filter = DurabilityLevel::Remote;
-    options
+    ReadOptions {
+        durability_filter: DurabilityLevel::Remote,
+        ..Default::default()
+    }
 }
 
 fn remote_scan_options() -> ScanOptions {
@@ -2207,6 +5359,35 @@ fn validate_component(component: &'static str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_edge_mutations_for_cell(
+    cell_id: &str,
+    mutations: &[EdgeMutation],
+    operation: &'static str,
+) -> Result<()> {
+    let mut idempotency_keys = BTreeSet::new();
+    for mutation in mutations {
+        validate_component("cell_id", &mutation.cell_id)?;
+        validate_component("edge_type", &mutation.edge_type)?;
+        validate_component("idempotency_key", &mutation.idempotency_key)?;
+        if mutation.cell_id != cell_id {
+            return Err(GraphError::CorruptValue {
+                key: format!("cell/{cell_id}/{operation}"),
+                reason: format!(
+                    "batch contains mutation for different cell {}",
+                    mutation.cell_id
+                ),
+            });
+        }
+        if !idempotency_keys.insert(mutation.idempotency_key.clone()) {
+            return Err(GraphError::IdempotencyConflict {
+                operation: "create",
+                idempotency_key: mutation.idempotency_key.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn encode_u64(value: u64) -> Vec<u8> {
     value.to_be_bytes().to_vec()
 }
@@ -2220,31 +5401,294 @@ fn decode_u64(key: &str, value: &[u8]) -> Result<u64> {
 }
 
 fn encode_edge_record(record: &EdgeRecord) -> Vec<u8> {
-    format!(
-        "edge1\t{}\t{}\t{}\t{}\t{}\n",
-        record.epoch, record.cell_id, record.edge_type, record.src, record.dst
-    )
-    .into_bytes()
+    encode_edge_epoch(record.epoch)
+}
+
+fn encode_edge_epoch(epoch: GraphEpoch) -> Vec<u8> {
+    let mut value = Vec::with_capacity(b"edge3".len() + 8);
+    value.extend_from_slice(b"edge3");
+    value.extend_from_slice(&epoch.to_be_bytes());
+    value
 }
 
 fn decode_edge_record(key: &str, value: &[u8]) -> Result<EdgeRecord> {
+    if let Some(epoch) = value.strip_prefix(b"edge3") {
+        let mut record = parse_edge_record_key(key)?;
+        record.epoch = decode_u64(key, epoch)?;
+        return Ok(record);
+    }
     let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
         key: key.to_string(),
         reason: err.to_string(),
     })?;
     let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 6 || parts[0] != "edge1" {
-        return Err(GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: "expected edge1 record with 6 fields".to_string(),
+    if parts.len() == 2 && parts[0] == "edge2" {
+        let mut record = parse_edge_record_key(key)?;
+        record.epoch = parse_u64(key, parts[1], "epoch")?;
+        return Ok(record);
+    }
+    if parts.len() == 6 && parts[0] == "edge1" {
+        return Ok(EdgeRecord {
+            epoch: parse_u64(key, parts[1], "epoch")?,
+            cell_id: parts[2].to_string(),
+            edge_type: parts[3].to_string(),
+            src: parse_u64(key, parts[4], "src")?,
+            dst: parse_u64(key, parts[5], "dst")?,
         });
     }
-    Ok(EdgeRecord {
-        epoch: parse_u64(key, parts[1], "epoch")?,
-        cell_id: parts[2].to_string(),
-        edge_type: parts[3].to_string(),
-        src: parse_u64(key, parts[4], "src")?,
-        dst: parse_u64(key, parts[5], "dst")?,
+    Err(GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: "expected edge3, edge2, or edge1 record".to_string(),
+    })
+}
+
+fn encode_out_edge_segment(dsts: &[VertexId]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(b"out_segment1\n".len() + 8 + dsts.len() * 8);
+    value.extend_from_slice(b"out_segment1\n");
+    value.extend_from_slice(&(dsts.len() as u64).to_be_bytes());
+    for dst in dsts {
+        value.extend_from_slice(&dst.to_be_bytes());
+    }
+    value
+}
+
+fn encode_out_edge_segment_records(edges: &[(GraphEpoch, VertexId)]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(b"out_segment2\n".len() + 8 + edges.len() * 16);
+    value.extend_from_slice(b"out_segment2\n");
+    value.extend_from_slice(&(edges.len() as u64).to_be_bytes());
+    for (epoch, dst) in edges {
+        value.extend_from_slice(&epoch.to_be_bytes());
+        value.extend_from_slice(&dst.to_be_bytes());
+    }
+    value
+}
+
+fn encode_segment_compaction_idempotency(
+    idempotency_key: &str,
+    result: &SegmentCompactionResult,
+) -> Vec<u8> {
+    format!(
+        "segment_compact1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        result.compacted_through_epoch,
+        result.source_segments,
+        result.deleted_segment_keys,
+        result.deleted_tombstone_keys,
+        result.input_edges,
+        result.output_edges,
+        idempotency_key
+    )
+    .into_bytes()
+}
+
+fn decode_segment_compaction_idempotency(
+    key: &str,
+    idempotency_key: &str,
+    compacted_through_epoch: GraphEpoch,
+    value: &[u8],
+) -> Result<SegmentCompactionResult> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 8 || parts[0] != "segment_compact1" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected segment_compact1 record with 8 fields".to_string(),
+        });
+    }
+    if parts[7] != idempotency_key {
+        return Err(GraphError::IdempotencyConflict {
+            operation: "segment-compact",
+            idempotency_key: idempotency_key.to_string(),
+        });
+    }
+    let recorded_epoch = parse_u64(key, parts[1], "compacted_through_epoch")?;
+    if recorded_epoch != compacted_through_epoch {
+        return Err(GraphError::IdempotencyConflict {
+            operation: "segment-compact",
+            idempotency_key: idempotency_key.to_string(),
+        });
+    }
+    Ok(SegmentCompactionResult {
+        compacted_through_epoch: recorded_epoch,
+        source_segments: parse_u64(key, parts[2], "source_segments")?,
+        deleted_segment_keys: parse_u64(key, parts[3], "deleted_segment_keys")?,
+        deleted_tombstone_keys: parse_u64(key, parts[4], "deleted_tombstone_keys")?,
+        input_edges: parse_u64(key, parts[5], "input_edges")?,
+        output_edges: parse_u64(key, parts[6], "output_edges")?,
+    })
+}
+
+fn decode_out_edge_segment(key: &str, value: &[u8]) -> Result<OutEdgeSegment> {
+    let (cell_id, edge_type, src, end_epoch, start_epoch) = parse_out_edge_segment_key(key)?;
+    if start_epoch > end_epoch {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "out edge segment start epoch is greater than end epoch".to_string(),
+        });
+    }
+    if let Some(body) = value.strip_prefix(b"out_segment2\n") {
+        return decode_out_edge_segment_v2(
+            key,
+            body,
+            cell_id,
+            edge_type,
+            src,
+            start_epoch,
+            end_epoch,
+        );
+    }
+    let Some(body) = value.strip_prefix(b"out_segment1\n") else {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected out_segment2 or out_segment1 record".to_string(),
+        });
+    };
+    if body.len() < 8 {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("expected out segment count, got {} bytes", body.len()),
+        });
+    }
+    let expected =
+        u64::from_be_bytes(body[..8].try_into().map_err(|_| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "invalid out segment count bytes".to_string(),
+        })?);
+    let expected_from_epoch = end_epoch.saturating_sub(start_epoch).saturating_add(1);
+    if expected != expected_from_epoch {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!(
+                "out segment epoch range implies {expected_from_epoch} edges, header says {expected}"
+            ),
+        });
+    }
+    let expected_count = usize::try_from(expected).map_err(|_| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("out segment count {expected} is too large"),
+    })?;
+    let expected_bytes = expected_count
+        .checked_mul(8)
+        .ok_or_else(|| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("out segment count {expected} is too large"),
+        })?;
+    let dst_bytes = &body[8..];
+    if dst_bytes.len() != expected_bytes {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!(
+                "expected {expected_bytes} out segment dst bytes, got {}",
+                dst_bytes.len()
+            ),
+        });
+    }
+    let mut edges = Vec::with_capacity(expected_count);
+    for (offset, chunk) in dst_bytes.chunks_exact(8).enumerate() {
+        let dst = u64::from_be_bytes(chunk.try_into().map_err(|_| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "invalid out segment dst bytes".to_string(),
+        })?);
+        edges.push((start_epoch + offset as u64, dst));
+    }
+    Ok(OutEdgeSegment {
+        cell_id,
+        edge_type,
+        src,
+        start_epoch,
+        end_epoch,
+        edges,
+    })
+}
+
+fn decode_out_edge_segment_v2(
+    key: &str,
+    body: &[u8],
+    cell_id: String,
+    edge_type: String,
+    src: VertexId,
+    start_epoch: GraphEpoch,
+    end_epoch: GraphEpoch,
+) -> Result<OutEdgeSegment> {
+    if body.len() < 8 {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("expected out_segment2 count, got {} bytes", body.len()),
+        });
+    }
+    let expected =
+        u64::from_be_bytes(body[..8].try_into().map_err(|_| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "invalid out_segment2 count bytes".to_string(),
+        })?);
+    let expected_count = usize::try_from(expected).map_err(|_| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("out_segment2 count {expected} is too large"),
+    })?;
+    let expected_bytes =
+        expected_count
+            .checked_mul(16)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("out_segment2 count {expected} is too large"),
+            })?;
+    let edge_bytes = &body[8..];
+    if edge_bytes.len() != expected_bytes {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!(
+                "expected {expected_bytes} out_segment2 edge bytes, got {}",
+                edge_bytes.len()
+            ),
+        });
+    }
+    let mut edges = Vec::with_capacity(expected_count);
+    let mut previous_epoch = None;
+    for chunk in edge_bytes.chunks_exact(16) {
+        let epoch =
+            u64::from_be_bytes(
+                chunk[..8]
+                    .try_into()
+                    .map_err(|_| GraphError::CorruptValue {
+                        key: key.to_string(),
+                        reason: "invalid out_segment2 epoch bytes".to_string(),
+                    })?,
+            );
+        let dst =
+            u64::from_be_bytes(
+                chunk[8..16]
+                    .try_into()
+                    .map_err(|_| GraphError::CorruptValue {
+                        key: key.to_string(),
+                        reason: "invalid out_segment2 dst bytes".to_string(),
+                    })?,
+            );
+        if epoch < start_epoch || epoch > end_epoch {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!(
+                    "out_segment2 edge epoch {epoch} outside key range {start_epoch}..={end_epoch}"
+                ),
+            });
+        }
+        if previous_epoch.is_some_and(|previous| epoch <= previous) {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: "out_segment2 epochs must be strictly increasing".to_string(),
+            });
+        }
+        previous_epoch = Some(epoch);
+        edges.push((epoch, dst));
+    }
+    Ok(OutEdgeSegment {
+        cell_id,
+        edge_type,
+        src,
+        start_epoch,
+        end_epoch,
+        edges,
     })
 }
 
@@ -2310,6 +5754,139 @@ fn encode_mutation_batch_log(
     .into_bytes()
 }
 
+fn encode_edge_mutation_log_batch(batch: &EdgeMutationLogBatch) -> Vec<u8> {
+    let mut value = format!(
+        "edge_mutation_log1\t{}\t{}\t{}\t{}\n",
+        batch.cell_id,
+        batch.batch_id,
+        batch.fingerprint,
+        batch.mutations.len()
+    );
+    for mutation in &batch.mutations {
+        value.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            mutation.edge_type, mutation.src, mutation.dst, mutation.idempotency_key
+        ));
+    }
+    value.into_bytes()
+}
+
+fn decode_edge_mutation_log_batch(key: &str, value: &[u8]) -> Result<EdgeMutationLogBatch> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let mut lines = text.trim_end_matches('\n').lines();
+    let Some(header) = lines.next() else {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "empty edge mutation log batch".to_string(),
+        });
+    };
+    let parts: Vec<&str> = header.split('\t').collect();
+    if parts.len() != 5 || parts[0] != "edge_mutation_log1" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected edge_mutation_log1 header with 5 fields".to_string(),
+        });
+    }
+    let cell_id = parts[1].to_string();
+    let batch_id = parts[2].to_string();
+    let fingerprint = parse_u64(key, parts[3], "fingerprint")?;
+    let expected = parse_u64(key, parts[4], "mutation_count")?;
+    validate_component("cell_id", &cell_id)?;
+    validate_component("batch_id", &batch_id)?;
+
+    let mut mutations = Vec::new();
+    for line in lines {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() != 4 {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: "expected mutation row with 4 fields".to_string(),
+            });
+        }
+        let edge_type = parts[0].to_string();
+        let idempotency_key = parts[3].to_string();
+        validate_component("edge_type", &edge_type)?;
+        validate_component("idempotency_key", &idempotency_key)?;
+        mutations.push(EdgeMutation {
+            cell_id: cell_id.clone(),
+            edge_type,
+            src: parse_u64(key, parts[1], "src")?,
+            dst: parse_u64(key, parts[2], "dst")?,
+            idempotency_key,
+        });
+    }
+    if mutations.len() as u64 != expected {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!(
+                "expected {expected} mutation rows, decoded {}",
+                mutations.len()
+            ),
+        });
+    }
+    let batch = EdgeMutationLogBatch {
+        cell_id,
+        batch_id,
+        fingerprint,
+        mutations,
+    };
+    let actual = edge_mutation_log_fingerprint(&batch.cell_id, &batch.batch_id, &batch.mutations);
+    if actual != fingerprint {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!(
+                "mutation log fingerprint mismatch expected {fingerprint} got {actual}"
+            ),
+        });
+    }
+    Ok(batch)
+}
+
+fn encode_mutation_log_append_idempotency(
+    batch_id: &str,
+    fingerprint: u64,
+    result: &EdgeMutationLogAppendResult,
+) -> Vec<u8> {
+    format!(
+        "mutation_log_append1\t{}\t{}\t{}\t{}\n",
+        result.log_epoch, result.mutations, fingerprint, batch_id
+    )
+    .into_bytes()
+}
+
+fn decode_mutation_log_append_idempotency(
+    key: &str,
+    batch_id: &str,
+    fingerprint: u64,
+    value: &[u8],
+) -> Result<EdgeMutationLogAppendResult> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 5 || parts[0] != "mutation_log_append1" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected mutation_log_append1 record with 5 fields".to_string(),
+        });
+    }
+    if parts[4] != batch_id || parse_u64(key, parts[3], "fingerprint")? != fingerprint {
+        return Err(GraphError::IdempotencyConflict {
+            operation: "mutation-log",
+            idempotency_key: batch_id.to_string(),
+        });
+    }
+    Ok(EdgeMutationLogAppendResult {
+        log_epoch: parse_u64(key, parts[1], "log_epoch")?,
+        mutations: parse_u64(key, parts[2], "mutations")?,
+        already_appended: true,
+    })
+}
+
 fn decode_bulk_import_idempotency(
     key: &str,
     idempotency_key: &str,
@@ -2331,6 +5908,36 @@ fn decode_bulk_import_idempotency(
         return Err(GraphError::IdempotencyConflict {
             operation: "bulk-import",
             idempotency_key: idempotency_key.to_string(),
+        });
+    }
+    Ok(BulkImportResult {
+        start_epoch: parse_u64(key, parts[1], "start_epoch")?,
+        end_epoch: parse_u64(key, parts[2], "end_epoch")?,
+        inserted: parse_u64(key, parts[3], "inserted")?,
+        already_existed: parse_u64(key, parts[4], "already_existed")?,
+    })
+}
+
+fn decode_bulk_import_fingerprint_idempotency(
+    key: &str,
+    fingerprint: u64,
+    value: &[u8],
+) -> Result<BulkImportResult> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 7 || parts[0] != "bulk_import1" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected bulk_import1 record with 7 fields".to_string(),
+        });
+    }
+    if parse_u64(key, parts[5], "fingerprint")? != fingerprint {
+        return Err(GraphError::IdempotencyConflict {
+            operation: "bulk-import-fingerprint",
+            idempotency_key: format!("{fingerprint:020}"),
         });
     }
     Ok(BulkImportResult {
@@ -2506,11 +6113,72 @@ fn bulk_import_fingerprint(cell_id: &str, edge_type: &str, edges: &[(VertexId, V
     hash
 }
 
+fn edge_mutation_log_fingerprint(cell_id: &str, batch_id: &str, mutations: &[EdgeMutation]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    fn update(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    update(&mut hash, cell_id.as_bytes());
+    update(&mut hash, b"\0");
+    update(&mut hash, batch_id.as_bytes());
+    update(&mut hash, b"\0");
+    for mutation in mutations {
+        update(&mut hash, mutation.edge_type.as_bytes());
+        update(&mut hash, b"\0");
+        update(&mut hash, &mutation.src.to_be_bytes());
+        update(&mut hash, &mutation.dst.to_be_bytes());
+        update(&mut hash, b"\0");
+        update(&mut hash, mutation.idempotency_key.as_bytes());
+        update(&mut hash, b"\0");
+    }
+    hash
+}
+
+fn parse_mutation_log_epoch(key: &str) -> Result<GraphEpoch> {
+    let parts: Vec<&str> = key.split('/').collect();
+    if parts.len() < 5 || parts[0] != "cell" || parts[2] != "mutation_log" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected cell/{cell_id}/mutation_log/{epoch}/{batch_id}".to_string(),
+        });
+    }
+    parse_u64(key, parts[3], "mutation_log_epoch")
+}
+
 fn bulk_import_chunk_order(src: VertexId, dst: VertexId) -> u64 {
     let mut value = src ^ dst.rotate_left(32) ^ 0x9e37_79b9_7f4a_7c15;
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
+}
+
+fn segment_compaction_idempotency_operation(edge_type: &str, src: VertexId) -> String {
+    format!("segment-compact-{edge_type}-{src:020}")
+}
+
+fn segment_import_fingerprint_key(
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    fingerprint: u64,
+) -> String {
+    keys::idempotency(
+        cell_id,
+        &format!("segment-import-fp-{edge_type}-{src:020}"),
+        &format!("{fingerprint:020}"),
+    )
+}
+
+fn writer_lane_index(cell_id: &str) -> usize {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in cell_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash as usize) % GRAPH_WRITE_LANES
 }
 
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> GraphError {
@@ -2527,21 +6195,392 @@ fn graph_now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn duration_micros_u64(duration: std::time::Duration) -> u64 {
+    duration.as_micros().try_into().unwrap_or(u64::MAX)
+}
+
+fn merge_ingest_batch(
+    batch: &EdgeMutationBatchResult,
+    start_epoch: &mut Option<GraphEpoch>,
+    end_epoch: &mut GraphEpoch,
+    inserted: &mut u64,
+    already_existed: &mut u64,
+    batches: &mut u64,
+) {
+    if batch.inserted > 0 {
+        *start_epoch =
+            Some(start_epoch.map_or(batch.start_epoch, |epoch| epoch.min(batch.start_epoch)));
+    }
+    *end_epoch = (*end_epoch).max(batch.end_epoch);
+    *inserted = inserted.saturating_add(batch.inserted);
+    *already_existed = already_existed.saturating_add(batch.already_existed);
+    *batches = batches.saturating_add(1);
+}
+
 fn encode_delta_record(record: &DeltaRecord) -> Vec<u8> {
-    let kind = match record.kind {
-        DeltaKind::Plus => "+",
-        DeltaKind::Minus => "-",
+    let _ = record;
+    b"delta2\n".to_vec()
+}
+
+fn encode_outbox_delta_batch(
+    cell_id: &str,
+    edge_type: &str,
+    kind: DeltaKind,
+    start_epoch: GraphEpoch,
+    end_epoch: GraphEpoch,
+    edges: &[(VertexId, VertexId)],
+) -> Vec<u8> {
+    if let Some((src, _)) = edges.first() {
+        if edges.iter().all(|(candidate, _)| candidate == src) {
+            let dsts: Vec<_> = edges.iter().map(|(_, dst)| *dst).collect();
+            return encode_outbox_delta_batch_same_src(
+                cell_id,
+                edge_type,
+                kind,
+                start_epoch,
+                end_epoch,
+                *src,
+                &dsts,
+            );
+        }
+    }
+    let mut value = Vec::with_capacity(b"outbox_batch2\n".len() + 8 + edges.len() * 16);
+    value.extend_from_slice(b"outbox_batch2\n");
+    value.extend_from_slice(&(edges.len() as u64).to_be_bytes());
+    for (src, dst) in edges {
+        value.extend_from_slice(&src.to_be_bytes());
+        value.extend_from_slice(&dst.to_be_bytes());
+    }
+    value
+}
+
+fn encode_outbox_delta_batch_same_src(
+    cell_id: &str,
+    edge_type: &str,
+    kind: DeltaKind,
+    start_epoch: GraphEpoch,
+    end_epoch: GraphEpoch,
+    src: VertexId,
+    dsts: &[VertexId],
+) -> Vec<u8> {
+    let _ = (cell_id, edge_type, kind, start_epoch, end_epoch);
+    let mut value = Vec::with_capacity(b"outbox_batch3\n".len() + 16 + dsts.len() * 8);
+    value.extend_from_slice(b"outbox_batch3\n");
+    value.extend_from_slice(&(dsts.len() as u64).to_be_bytes());
+    value.extend_from_slice(&src.to_be_bytes());
+    for dst in dsts {
+        value.extend_from_slice(&dst.to_be_bytes());
+    }
+    value
+}
+
+fn decode_outbox_delta_batch(key: &str, value: &[u8]) -> Result<OutboxDeltaBatch> {
+    let (key_cell_id, key_end_epoch, key_start_epoch, key_kind, key_edge_type) =
+        parse_outbox_batch_key(key)?;
+    if let Some(body) = value.strip_prefix(b"outbox_batch3\n") {
+        return decode_outbox_delta_batch_v3(
+            key,
+            body,
+            key_cell_id,
+            key_edge_type,
+            key_kind,
+            key_start_epoch,
+            key_end_epoch,
+        );
+    }
+    if let Some(body) = value.strip_prefix(b"outbox_batch2\n") {
+        return decode_outbox_delta_batch_v2(
+            key,
+            body,
+            key_cell_id,
+            key_edge_type,
+            key_kind,
+            key_start_epoch,
+            key_end_epoch,
+        );
+    }
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let mut lines = text.trim_end_matches('\n').lines();
+    let Some(header) = lines.next() else {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "empty outbox delta batch".to_string(),
+        });
     };
-    format!(
-        "delta1\t{}\t{}\t{}\t{}\t{}\t{}\n",
+    let parts: Vec<&str> = header.split('\t').collect();
+    if parts.len() != 7 || parts[0] != "outbox_batch1" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected outbox_batch1 header with 7 fields".to_string(),
+        });
+    }
+    validate_component("cell_id", parts[1])?;
+    validate_component("edge_type", parts[2])?;
+    let cell_id = parts[1].to_string();
+    let edge_type = parts[2].to_string();
+    let start_epoch = parse_u64(key, parts[3], "start_epoch")?;
+    let end_epoch = parse_u64(key, parts[4], "end_epoch")?;
+    let kind = parse_delta_kind(key, parts[5])?;
+    let expected = parse_u64(key, parts[6], "edge_count")?;
+    if cell_id != key_cell_id
+        || edge_type != key_edge_type
+        || start_epoch != key_start_epoch
+        || end_epoch != key_end_epoch
+        || kind != key_kind
+    {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "outbox batch header does not match key identity".to_string(),
+        });
+    }
+    if start_epoch > end_epoch {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "outbox batch start epoch is greater than end epoch".to_string(),
+        });
+    }
+    let expected_from_epoch = end_epoch.saturating_sub(start_epoch).saturating_add(1);
+    if expected != expected_from_epoch {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!(
+                "outbox batch epoch range implies {expected_from_epoch} edges, header says {expected}"
+            ),
+        });
+    }
+    let mut edges = Vec::new();
+    for line in lines {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() != 2 {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: "expected outbox batch row with 2 fields".to_string(),
+            });
+        }
+        edges.push((
+            parse_u64(key, parts[0], "src")?,
+            parse_u64(key, parts[1], "dst")?,
+        ));
+    }
+    if edges.len() as u64 != expected {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!(
+                "expected {expected} outbox batch rows, decoded {}",
+                edges.len()
+            ),
+        });
+    }
+    Ok(OutboxDeltaBatch {
+        cell_id,
+        edge_type,
         kind,
-        record.edge.epoch,
-        record.edge.cell_id,
-        record.edge.edge_type,
-        record.edge.src,
-        record.edge.dst
-    )
-    .into_bytes()
+        start_epoch,
+        end_epoch,
+        edges,
+    })
+}
+
+fn decode_outbox_delta_batch_v2(
+    key: &str,
+    body: &[u8],
+    cell_id: String,
+    edge_type: String,
+    kind: DeltaKind,
+    start_epoch: GraphEpoch,
+    end_epoch: GraphEpoch,
+) -> Result<OutboxDeltaBatch> {
+    if start_epoch > end_epoch {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "outbox batch start epoch is greater than end epoch".to_string(),
+        });
+    }
+    if body.len() < 8 {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("expected outbox_batch2 count, got {} bytes", body.len()),
+        });
+    }
+    let expected =
+        u64::from_be_bytes(body[..8].try_into().map_err(|_| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "invalid outbox_batch2 count bytes".to_string(),
+        })?);
+    let expected_from_epoch = end_epoch.saturating_sub(start_epoch).saturating_add(1);
+    if expected != expected_from_epoch {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!(
+                "outbox batch epoch range implies {expected_from_epoch} edges, header says {expected}"
+            ),
+        });
+    }
+    let edge_bytes = &body[8..];
+    let expected_count = usize::try_from(expected).map_err(|_| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("outbox_batch2 count {expected} is too large"),
+    })?;
+    let expected_bytes =
+        expected_count
+            .checked_mul(16)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("outbox_batch2 count {expected} is too large"),
+            })?;
+    if edge_bytes.len() != expected_bytes {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!(
+                "expected {expected_bytes} outbox_batch2 edge bytes, got {}",
+                edge_bytes.len()
+            ),
+        });
+    }
+    let mut edges = Vec::with_capacity(expected_count);
+    for chunk in edge_bytes.chunks_exact(16) {
+        let src =
+            u64::from_be_bytes(
+                chunk[..8]
+                    .try_into()
+                    .map_err(|_| GraphError::CorruptValue {
+                        key: key.to_string(),
+                        reason: "invalid outbox_batch2 src bytes".to_string(),
+                    })?,
+            );
+        let dst =
+            u64::from_be_bytes(
+                chunk[8..16]
+                    .try_into()
+                    .map_err(|_| GraphError::CorruptValue {
+                        key: key.to_string(),
+                        reason: "invalid outbox_batch2 dst bytes".to_string(),
+                    })?,
+            );
+        edges.push((src, dst));
+    }
+    Ok(OutboxDeltaBatch {
+        cell_id,
+        edge_type,
+        kind,
+        start_epoch,
+        end_epoch,
+        edges,
+    })
+}
+
+fn decode_outbox_delta_batch_v3(
+    key: &str,
+    body: &[u8],
+    cell_id: String,
+    edge_type: String,
+    kind: DeltaKind,
+    start_epoch: GraphEpoch,
+    end_epoch: GraphEpoch,
+) -> Result<OutboxDeltaBatch> {
+    if start_epoch > end_epoch {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "outbox batch start epoch is greater than end epoch".to_string(),
+        });
+    }
+    if body.len() < 16 {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!(
+                "expected outbox_batch3 count and src, got {} bytes",
+                body.len()
+            ),
+        });
+    }
+    let expected =
+        u64::from_be_bytes(body[..8].try_into().map_err(|_| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "invalid outbox_batch3 count bytes".to_string(),
+        })?);
+    let src = u64::from_be_bytes(
+        body[8..16]
+            .try_into()
+            .map_err(|_| GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: "invalid outbox_batch3 src bytes".to_string(),
+            })?,
+    );
+    let expected_from_epoch = end_epoch.saturating_sub(start_epoch).saturating_add(1);
+    if expected != expected_from_epoch {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!(
+                "outbox batch epoch range implies {expected_from_epoch} edges, header says {expected}"
+            ),
+        });
+    }
+    let expected_count = usize::try_from(expected).map_err(|_| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("outbox_batch3 count {expected} is too large"),
+    })?;
+    let expected_dst_bytes =
+        expected_count
+            .checked_mul(8)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("outbox_batch3 count {expected} is too large"),
+            })?;
+    let dst_bytes = &body[16..];
+    if dst_bytes.len() != expected_dst_bytes {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!(
+                "expected {expected_dst_bytes} outbox_batch3 dst bytes, got {}",
+                dst_bytes.len()
+            ),
+        });
+    }
+    let mut edges = Vec::with_capacity(expected_count);
+    for chunk in dst_bytes.chunks_exact(8) {
+        let dst = u64::from_be_bytes(chunk.try_into().map_err(|_| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "invalid outbox_batch3 dst bytes".to_string(),
+        })?);
+        edges.push((src, dst));
+    }
+    Ok(OutboxDeltaBatch {
+        cell_id,
+        edge_type,
+        kind,
+        start_epoch,
+        end_epoch,
+        edges,
+    })
+}
+
+fn parse_outbox_batch_key(
+    key: &str,
+) -> Result<(String, GraphEpoch, GraphEpoch, DeltaKind, String)> {
+    let parts: Vec<&str> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", cell_id, "outbox_batch", end_epoch, start_epoch, kind, edge_type, batch_id] => {
+            validate_component("cell_id", cell_id)?;
+            validate_component("edge_type", edge_type)?;
+            validate_component("batch_id", batch_id)?;
+            Ok((
+                (*cell_id).to_string(),
+                parse_u64(key, end_epoch, "end_epoch")?,
+                parse_u64(key, start_epoch, "start_epoch")?,
+                parse_delta_kind(key, kind)?,
+                (*edge_type).to_string(),
+            ))
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason:
+                "expected cell/{cell_id}/outbox_batch/{end_epoch}/{start_epoch}/{kind}/{edge_type}/{batch_id}"
+                    .to_string(),
+        }),
+    }
 }
 
 fn decode_delta_record(key: &str, value: &[u8]) -> Result<DeltaRecord> {
@@ -2550,32 +6589,206 @@ fn decode_delta_record(key: &str, value: &[u8]) -> Result<DeltaRecord> {
         reason: err.to_string(),
     })?;
     let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 7 || parts[0] != "delta1" {
-        return Err(GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: "expected delta1 record with 7 fields".to_string(),
+    if parts.len() == 1 && parts[0] == "delta2" {
+        return parse_delta_record_key(key);
+    }
+    if parts.len() == 7 && parts[0] == "delta1" {
+        let kind = parse_delta_kind(key, parts[1])?;
+        return Ok(DeltaRecord {
+            kind,
+            edge: EdgeRecord {
+                epoch: parse_u64(key, parts[2], "epoch")?,
+                cell_id: parts[3].to_string(),
+                edge_type: parts[4].to_string(),
+                src: parse_u64(key, parts[5], "src")?,
+                dst: parse_u64(key, parts[6], "dst")?,
+            },
         });
     }
-    let kind = match parts[1] {
-        "+" => DeltaKind::Plus,
-        "-" => DeltaKind::Minus,
-        other => {
-            return Err(GraphError::CorruptValue {
-                key: key.to_string(),
-                reason: format!("invalid delta kind {other}"),
-            });
-        }
-    };
-    Ok(DeltaRecord {
-        kind,
-        edge: EdgeRecord {
-            epoch: parse_u64(key, parts[2], "epoch")?,
-            cell_id: parts[3].to_string(),
-            edge_type: parts[4].to_string(),
-            src: parse_u64(key, parts[5], "src")?,
-            dst: parse_u64(key, parts[6], "dst")?,
-        },
+    Err(GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: "expected delta2 or delta1 record".to_string(),
     })
+}
+
+fn parse_edge_record_key(key: &str) -> Result<EdgeRecord> {
+    let parts: Vec<&str> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", cell_id, "edge", edge_type, src, dst] => {
+            validate_component("cell_id", cell_id)?;
+            validate_component("edge_type", edge_type)?;
+            Ok(EdgeRecord {
+                cell_id: (*cell_id).to_string(),
+                edge_type: (*edge_type).to_string(),
+                src: parse_u64(key, src, "src")?,
+                dst: parse_u64(key, dst, "dst")?,
+                epoch: 0,
+            })
+        }
+        ["cell", cell_id, "e", "out", edge_type, src, dst] => {
+            validate_component("cell_id", cell_id)?;
+            validate_component("edge_type", edge_type)?;
+            Ok(EdgeRecord {
+                cell_id: (*cell_id).to_string(),
+                edge_type: (*edge_type).to_string(),
+                src: parse_u64(key, src, "src")?,
+                dst: parse_u64(key, dst, "dst")?,
+                epoch: 0,
+            })
+        }
+        ["cell", cell_id, "e", "in", edge_type, dst, src] => {
+            validate_component("cell_id", cell_id)?;
+            validate_component("edge_type", edge_type)?;
+            Ok(EdgeRecord {
+                cell_id: (*cell_id).to_string(),
+                edge_type: (*edge_type).to_string(),
+                src: parse_u64(key, src, "src")?,
+                dst: parse_u64(key, dst, "dst")?,
+                epoch: 0,
+            })
+        }
+        ["cell", cell_id, "delta", kind, edge_type, epoch, src, dst]
+            if matches!(*kind, "plus" | "minus") =>
+        {
+            validate_component("cell_id", cell_id)?;
+            validate_component("edge_type", edge_type)?;
+            Ok(EdgeRecord {
+                cell_id: (*cell_id).to_string(),
+                edge_type: (*edge_type).to_string(),
+                src: parse_u64(key, src, "src")?,
+                dst: parse_u64(key, dst, "dst")?,
+                epoch: parse_u64(key, epoch, "epoch")?,
+            })
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "cannot infer edge record identity from key".to_string(),
+        }),
+    }
+}
+
+fn parse_out_edge_segment_key(
+    key: &str,
+) -> Result<(String, String, VertexId, GraphEpoch, GraphEpoch)> {
+    let parts: Vec<&str> = key.split('/').collect();
+    match parts.as_slice() {
+        [
+            "cell",
+            cell_id,
+            "seg",
+            "out",
+            edge_type,
+            src,
+            end_epoch,
+            start_epoch,
+            segment_id,
+        ] => {
+            validate_component("cell_id", cell_id)?;
+            validate_component("edge_type", edge_type)?;
+            validate_component("segment_id", segment_id)?;
+            Ok((
+                (*cell_id).to_string(),
+                (*edge_type).to_string(),
+                parse_u64(key, src, "src")?,
+                parse_u64(key, end_epoch, "end_epoch")?,
+                parse_u64(key, start_epoch, "start_epoch")?,
+            ))
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason:
+                "expected cell/{cell_id}/seg/out/{edge_type}/{src}/{end_epoch}/{start_epoch}/{segment_id}"
+                    .to_string(),
+        }),
+    }
+}
+
+fn parse_out_edge_segment_tombstone_key(key: &str) -> Result<(String, String, VertexId, VertexId)> {
+    let parts: Vec<&str> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", cell_id, "seg", "tomb", "out", edge_type, src, dst] => {
+            validate_component("cell_id", cell_id)?;
+            validate_component("edge_type", edge_type)?;
+            Ok((
+                (*cell_id).to_string(),
+                (*edge_type).to_string(),
+                parse_u64(key, src, "src")?,
+                parse_u64(key, dst, "dst")?,
+            ))
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected cell/{cell_id}/seg/tomb/out/{edge_type}/{src}/{dst}".to_string(),
+        }),
+    }
+}
+
+fn segment_edge_visible(edge_epoch: GraphEpoch, tombstone_epoch: Option<GraphEpoch>) -> bool {
+    match tombstone_epoch {
+        Some(epoch) => edge_epoch > epoch,
+        None => true,
+    }
+}
+
+fn parse_delta_record_key(key: &str) -> Result<DeltaRecord> {
+    let parts: Vec<&str> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", cell_id, "outbox", epoch, kind, edge_type, src, dst] => {
+            validate_component("cell_id", cell_id)?;
+            validate_component("edge_type", edge_type)?;
+            Ok(DeltaRecord {
+                kind: parse_delta_kind(key, kind)?,
+                edge: EdgeRecord {
+                    cell_id: (*cell_id).to_string(),
+                    edge_type: (*edge_type).to_string(),
+                    src: parse_u64(key, src, "src")?,
+                    dst: parse_u64(key, dst, "dst")?,
+                    epoch: parse_u64(key, epoch, "epoch")?,
+                },
+            })
+        }
+        ["cell", cell_id, "delta_owner", kind, edge_type, direction, owner, epoch, neighbor] => {
+            validate_component("cell_id", cell_id)?;
+            validate_component("edge_type", edge_type)?;
+            let owner = parse_u64(key, owner, "owner")?;
+            let neighbor = parse_u64(key, neighbor, "neighbor")?;
+            let (src, dst) = match *direction {
+                "out" => (owner, neighbor),
+                "in" => (neighbor, owner),
+                other => {
+                    return Err(GraphError::CorruptValue {
+                        key: key.to_string(),
+                        reason: format!("invalid delta owner direction {other}"),
+                    });
+                }
+            };
+            Ok(DeltaRecord {
+                kind: parse_delta_kind(key, kind)?,
+                edge: EdgeRecord {
+                    cell_id: (*cell_id).to_string(),
+                    edge_type: (*edge_type).to_string(),
+                    src,
+                    dst,
+                    epoch: parse_u64(key, epoch, "epoch")?,
+                },
+            })
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "cannot infer delta record identity from key".to_string(),
+        }),
+    }
+}
+
+fn parse_delta_kind(key: &str, value: &str) -> Result<DeltaKind> {
+    match value {
+        "plus" | "+" => Ok(DeltaKind::Plus),
+        "minus" | "-" => Ok(DeltaKind::Minus),
+        other => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("invalid delta kind {other}"),
+        }),
+    }
 }
 
 fn sort_deltas(records: &mut [DeltaRecord]) {
@@ -2590,6 +6803,66 @@ fn sort_deltas(records: &mut [DeltaRecord]) {
             delta.edge.dst,
         )
     });
+}
+
+fn encode_write_fence(fence: &GraphWriteFence) -> Vec<u8> {
+    format!(
+        "write_fence1\t{}\t{}\t{}\t{}\n",
+        fence.cell_id, fence.owner_node_id, fence.lease_token, fence.expires_at_ms
+    )
+    .into_bytes()
+}
+
+fn decode_write_fence(key: &str, value: &[u8]) -> Result<GraphWriteFence> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 5 || parts[0] != "write_fence1" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected write_fence1 record with 5 fields".to_string(),
+        });
+    }
+    validate_component("cell_id", parts[1])?;
+    validate_component("node_id", parts[2])?;
+    Ok(GraphWriteFence {
+        cell_id: parts[1].to_string(),
+        owner_node_id: parts[2].to_string(),
+        lease_token: parse_u64(key, parts[3], "lease_token")?,
+        expires_at_ms: parse_u64(key, parts[4], "expires_at_ms")?,
+    })
+}
+
+fn encode_read_lease(lease: &GraphReadLease) -> Vec<u8> {
+    format!(
+        "read_lease1\t{}\t{}\t{}\t{}\n",
+        lease.cell_id, lease.lease_id, lease.read_epoch, lease.expires_at_ms
+    )
+    .into_bytes()
+}
+
+fn decode_read_lease(key: &str, value: &[u8]) -> Result<GraphReadLease> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 5 || parts[0] != "read_lease1" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected read_lease1 record with 5 fields".to_string(),
+        });
+    }
+    validate_component("cell_id", parts[1])?;
+    validate_component("read_lease_id", parts[2])?;
+    Ok(GraphReadLease {
+        cell_id: parts[1].to_string(),
+        lease_id: parts[2].to_string(),
+        read_epoch: parse_u64(key, parts[3], "read_epoch")?,
+        expires_at_ms: parse_u64(key, parts[4], "expires_at_ms")?,
+    })
 }
 
 fn parse_u64(key: &str, value: &str, field: &str) -> Result<u64> {
@@ -2616,8 +6889,28 @@ fn ensure_limit(operation: &'static str, actual: u64, limit: u64) -> Result<()> 
 mod keys {
     use super::{GraphEpoch, VertexId};
 
+    pub fn write_fence(cell_id: &str) -> String {
+        format!("cell/{cell_id}/meta/write_fence")
+    }
+
+    pub fn read_lease_prefix(cell_id: &str) -> String {
+        format!("cell/{cell_id}/read_lease/")
+    }
+
+    pub fn read_lease(cell_id: &str, lease_id: &str) -> String {
+        format!("{}{}", read_lease_prefix(cell_id), lease_id)
+    }
+
     pub fn last_epoch(cell_id: &str) -> String {
         format!("cell/{cell_id}/meta/last_epoch")
+    }
+
+    pub fn mutation_log_epoch(cell_id: &str) -> String {
+        format!("cell/{cell_id}/meta/mutation_log_epoch")
+    }
+
+    pub fn mutation_log_materialized_epoch(cell_id: &str) -> String {
+        format!("cell/{cell_id}/meta/mutation_log_materialized_epoch")
     }
 
     pub fn idempotency(cell_id: &str, operation: &str, idempotency_key: &str) -> String {
@@ -2636,8 +6929,58 @@ mod keys {
         format!("cell/{cell_id}/e/in/{edge_type}/{dst:020}/{src:020}")
     }
 
+    pub fn out_edge_type_prefix(cell_id: &str, edge_type: &str) -> String {
+        format!("cell/{cell_id}/e/out/{edge_type}/")
+    }
+
+    pub fn in_edge_type_prefix(cell_id: &str, edge_type: &str) -> String {
+        format!("cell/{cell_id}/e/in/{edge_type}/")
+    }
+
     pub fn out_prefix(cell_id: &str, edge_type: &str, src: VertexId) -> String {
         format!("cell/{cell_id}/e/out/{edge_type}/{src:020}/")
+    }
+
+    pub fn out_segment(
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        end_epoch: GraphEpoch,
+        start_epoch: GraphEpoch,
+        segment_id: &str,
+    ) -> String {
+        format!(
+            "cell/{cell_id}/seg/out/{edge_type}/{src:020}/{end_epoch:020}/{start_epoch:020}/{segment_id}"
+        )
+    }
+
+    pub fn out_segment_edge_type_prefix(cell_id: &str, edge_type: &str) -> String {
+        format!("cell/{cell_id}/seg/out/{edge_type}/")
+    }
+
+    pub fn out_segment_src_prefix(cell_id: &str, edge_type: &str, src: VertexId) -> String {
+        format!("cell/{cell_id}/seg/out/{edge_type}/{src:020}/")
+    }
+
+    pub fn out_segment_tombstone(
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+    ) -> String {
+        format!("cell/{cell_id}/seg/tomb/out/{edge_type}/{src:020}/{dst:020}")
+    }
+
+    pub fn out_segment_tombstone_edge_type_prefix(cell_id: &str, edge_type: &str) -> String {
+        format!("cell/{cell_id}/seg/tomb/out/{edge_type}/")
+    }
+
+    pub fn out_segment_tombstone_src_prefix(
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+    ) -> String {
+        format!("cell/{cell_id}/seg/tomb/out/{edge_type}/{src:020}/")
     }
 
     pub fn in_prefix(cell_id: &str, edge_type: &str, dst: VertexId) -> String {
@@ -2679,10 +7022,40 @@ mod keys {
         format!("cell/{cell_id}/outbox/")
     }
 
+    pub fn outbox_batch(
+        cell_id: &str,
+        end_epoch: GraphEpoch,
+        start_epoch: GraphEpoch,
+        kind: super::DeltaKind,
+        edge_type: &str,
+        batch_id: &str,
+    ) -> String {
+        let kind = match kind {
+            super::DeltaKind::Plus => "plus",
+            super::DeltaKind::Minus => "minus",
+        };
+        format!(
+            "cell/{cell_id}/outbox_batch/{end_epoch:020}/{start_epoch:020}/{kind}/{edge_type}/{batch_id}"
+        )
+    }
+
+    pub fn outbox_batch_prefix(cell_id: &str) -> String {
+        format!("cell/{cell_id}/outbox_batch/")
+    }
+
     pub fn mutation_batch(cell_id: &str, start_epoch: GraphEpoch, idempotency_key: &str) -> String {
         format!("cell/{cell_id}/mutation_batch/{start_epoch:020}/{idempotency_key}")
     }
 
+    pub fn mutation_log_prefix(cell_id: &str) -> String {
+        format!("cell/{cell_id}/mutation_log/")
+    }
+
+    pub fn mutation_log_entry(cell_id: &str, log_epoch: GraphEpoch, batch_id: &str) -> String {
+        format!("{}{log_epoch:020}/{batch_id}", mutation_log_prefix(cell_id))
+    }
+
+    #[cfg(test)]
     pub fn delta_plus(
         cell_id: &str,
         edge_type: &str,
@@ -2701,6 +7074,7 @@ mod keys {
         format!("cell/{cell_id}/delta/minus/{edge_type}/")
     }
 
+    #[cfg(test)]
     pub fn delta_minus(
         cell_id: &str,
         edge_type: &str,
@@ -2709,6 +7083,48 @@ mod keys {
         dst: VertexId,
     ) -> String {
         format!("cell/{cell_id}/delta/minus/{edge_type}/{epoch:020}/{src:020}/{dst:020}")
+    }
+
+    pub fn owner_delta_prefix(
+        cell_id: &str,
+        kind: super::DeltaKind,
+        edge_type: &str,
+        direction: &str,
+        owner: VertexId,
+    ) -> String {
+        let kind = match kind {
+            super::DeltaKind::Plus => "plus",
+            super::DeltaKind::Minus => "minus",
+        };
+        format!("cell/{cell_id}/delta_owner/{kind}/{edge_type}/{direction}/{owner:020}/")
+    }
+
+    pub fn owner_delta_kind_prefix(
+        cell_id: &str,
+        edge_type: &str,
+        kind: super::DeltaKind,
+    ) -> String {
+        let kind = match kind {
+            super::DeltaKind::Plus => "plus",
+            super::DeltaKind::Minus => "minus",
+        };
+        format!("cell/{cell_id}/delta_owner/{kind}/{edge_type}/")
+    }
+
+    #[cfg(test)]
+    pub fn owner_delta(
+        cell_id: &str,
+        kind: super::DeltaKind,
+        edge_type: &str,
+        direction: &str,
+        owner: VertexId,
+        epoch: GraphEpoch,
+        neighbor: VertexId,
+    ) -> String {
+        format!(
+            "{}{epoch:020}/{neighbor:020}",
+            owner_delta_prefix(cell_id, kind, edge_type, direction, owner)
+        )
     }
 
     pub fn delta_gc_watermark(cell_id: &str, edge_type: &str) -> String {
@@ -2738,6 +7154,17 @@ mod tests {
             dst,
             idempotency_key: idempotency_key.to_string(),
         }
+    }
+
+    fn assert_stale_node_a(err: GraphError) {
+        assert!(matches!(
+            err,
+            GraphError::StaleShardLease {
+                ref cell_id,
+                ref node_id,
+                lease_token: 1
+            } if cell_id == "reddit-home" && node_id == "node-a"
+        ));
     }
 
     #[tokio::test]
@@ -2971,6 +7398,102 @@ mod tests {
         assert_eq!(outbox[0].edge.dst, 2);
     }
 
+    #[test]
+    fn compact_v2_values_decode_alongside_legacy_v1_values() {
+        let edge_key = keys::out_edge("reddit-home", "USER_FOLLOWS_USER", 1, 2);
+        let v1_edge = b"edge1\t7\treddit-home\tUSER_FOLLOWS_USER\t1\t2\n";
+        let decoded_v1 = decode_edge_record(&edge_key, v1_edge).unwrap();
+        assert_eq!(decoded_v1.epoch, 7);
+        assert_eq!(decoded_v1.src, 1);
+        assert_eq!(decoded_v1.dst, 2);
+
+        let v2_edge = decode_edge_record(&edge_key, b"edge2\t8\n").unwrap();
+        assert_eq!(v2_edge.epoch, 8);
+        assert_eq!(v2_edge.edge_type, "USER_FOLLOWS_USER");
+        assert_eq!(v2_edge.src, 1);
+        assert_eq!(v2_edge.dst, 2);
+
+        let v3_edge = decode_edge_record(&edge_key, &encode_edge_epoch(9)).unwrap();
+        assert_eq!(v3_edge.epoch, 9);
+        assert_eq!(v3_edge.edge_type, "USER_FOLLOWS_USER");
+        assert_eq!(v3_edge.src, 1);
+        assert_eq!(v3_edge.dst, 2);
+
+        let outbox_key = keys::outbox("reddit-home", 9, DeltaKind::Plus, "USER_FOLLOWS_USER", 1, 2);
+        let delta_v2 = decode_delta_record(&outbox_key, b"delta2\n").unwrap();
+        assert_eq!(delta_v2.kind, DeltaKind::Plus);
+        assert_eq!(delta_v2.edge.epoch, 9);
+        assert_eq!(delta_v2.edge.src, 1);
+        assert_eq!(delta_v2.edge.dst, 2);
+
+        let outbox_batch_key = keys::outbox_batch(
+            "reddit-home",
+            11,
+            10,
+            DeltaKind::Plus,
+            "USER_FOLLOWS_USER",
+            "b1",
+        );
+        let outbox_batch_v2 = encode_outbox_delta_batch(
+            "reddit-home",
+            "USER_FOLLOWS_USER",
+            DeltaKind::Plus,
+            10,
+            11,
+            &[(1, 2), (3, 4)],
+        );
+        assert!(outbox_batch_v2.starts_with(b"outbox_batch2\n"));
+        let decoded_batch_v2 =
+            decode_outbox_delta_batch(&outbox_batch_key, &outbox_batch_v2).unwrap();
+        assert_eq!(decoded_batch_v2.edges, vec![(1, 2), (3, 4)]);
+        assert_eq!(decoded_batch_v2.start_epoch, 10);
+        assert_eq!(decoded_batch_v2.end_epoch, 11);
+
+        let outbox_batch_v3 = encode_outbox_delta_batch(
+            "reddit-home",
+            "USER_FOLLOWS_USER",
+            DeltaKind::Plus,
+            10,
+            11,
+            &[(9, 2), (9, 4)],
+        );
+        assert!(outbox_batch_v3.starts_with(b"outbox_batch3\n"));
+        assert!(outbox_batch_v3.len() < outbox_batch_v2.len());
+        let decoded_batch_v3 =
+            decode_outbox_delta_batch(&outbox_batch_key, &outbox_batch_v3).unwrap();
+        assert_eq!(decoded_batch_v3.edges, vec![(9, 2), (9, 4)]);
+        assert_eq!(decoded_batch_v3.start_epoch, 10);
+        assert_eq!(decoded_batch_v3.end_epoch, 11);
+
+        let outbox_batch_v1 =
+            b"outbox_batch1\treddit-home\tUSER_FOLLOWS_USER\t10\t11\tplus\t2\n1\t2\n3\t4\n";
+        let decoded_batch_v1 =
+            decode_outbox_delta_batch(&outbox_batch_key, outbox_batch_v1).unwrap();
+        assert_eq!(decoded_batch_v1.edges, decoded_batch_v2.edges);
+
+        let owner_key = keys::owner_delta(
+            "reddit-home",
+            DeltaKind::Minus,
+            "USER_FOLLOWS_USER",
+            "in",
+            2,
+            10,
+            1,
+        );
+        let owner_delta = decode_delta_record(&owner_key, b"delta2\n").unwrap();
+        assert_eq!(owner_delta.kind, DeltaKind::Minus);
+        assert_eq!(owner_delta.edge.epoch, 10);
+        assert_eq!(owner_delta.edge.src, 1);
+        assert_eq!(owner_delta.edge.dst, 2);
+
+        let legacy_delta = b"delta1\t+\t11\treddit-home\tUSER_FOLLOWS_USER\t3\t4\n";
+        let decoded_legacy = decode_delta_record(&outbox_key, legacy_delta).unwrap();
+        assert_eq!(decoded_legacy.kind, DeltaKind::Plus);
+        assert_eq!(decoded_legacy.edge.epoch, 11);
+        assert_eq!(decoded_legacy.edge.src, 3);
+        assert_eq!(decoded_legacy.edge.dst, 4);
+    }
+
     #[tokio::test]
     async fn duplicate_edge_with_new_request_does_not_increment_degree() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -3169,6 +7692,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trusted_bulk_append_uses_batch_delta_log_and_survives_rollup_gc() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = open_test_shard("graph/trusted-bulk-append", object_store).await;
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        let result = shard
+            .bulk_append_edges_trusted(
+                cell_id,
+                edge_type,
+                [(1, 2), (1, 3), (2, 4), (1, 2)],
+                "trusted-bulk-1",
+            )
+            .await
+            .unwrap();
+        let retry = shard
+            .bulk_append_edges_trusted(
+                cell_id,
+                edge_type,
+                [(1, 2), (1, 3), (2, 4)],
+                "trusted-bulk-1",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            BulkImportResult {
+                start_epoch: 1,
+                end_epoch: 3,
+                inserted: 3,
+                already_existed: 0,
+            }
+        );
+        assert_eq!(retry, result);
+
+        let mut per_edge_outbox = shard
+            .scan_remote_prefix(&keys::outbox_prefix(cell_id))
+            .await
+            .unwrap();
+        assert!(per_edge_outbox.next().await.unwrap().is_none());
+
+        let mut batch_outbox = shard
+            .scan_remote_prefix(&keys::outbox_batch_prefix(cell_id))
+            .await
+            .unwrap();
+        assert!(batch_outbox.next().await.unwrap().is_some());
+        assert!(batch_outbox.next().await.unwrap().is_none());
+
+        assert_eq!(
+            shard
+                .deltas_since(cell_id, edge_type, 0)
+                .await
+                .unwrap()
+                .iter()
+                .map(|delta| (delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch))
+                .collect::<Vec<_>>(),
+            vec![
+                (DeltaKind::Plus, 1, 2, 1),
+                (DeltaKind::Plus, 1, 3, 2),
+                (DeltaKind::Plus, 2, 4, 3),
+            ]
+        );
+        assert_eq!(shard.outbox_since(cell_id, 0).await.unwrap().len(), 3);
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            shard.edges_at(cell_id, edge_type, 2).await.unwrap(),
+            vec![
+                EdgeRecord {
+                    cell_id: cell_id.to_string(),
+                    edge_type: edge_type.to_string(),
+                    src: 1,
+                    dst: 2,
+                    epoch: 1,
+                },
+                EdgeRecord {
+                    cell_id: cell_id.to_string(),
+                    edge_type: edge_type.to_string(),
+                    src: 1,
+                    dst: 3,
+                    epoch: 2,
+                },
+            ]
+        );
+
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+
+        shard
+            .rollup_artifacts(cell_id, edge_type, result.end_epoch, 2, 2, 1, 2)
+            .await
+            .unwrap();
+        let gc = shard
+            .delete_deltas_through_rollup(cell_id, edge_type, result.end_epoch)
+            .await
+            .unwrap();
+        assert_eq!(gc.deleted_delta_keys, 1);
+        assert!(matches!(
+            shard.deltas_since(cell_id, edge_type, 0).await.unwrap_err(),
+            GraphError::SnapshotExpired { min_epoch: 3, .. }
+        ));
+        assert!(shard.outbox_since(cell_id, 0).await.unwrap().is_empty());
+        let mut batch_outbox = shard
+            .scan_remote_prefix(&keys::outbox_batch_prefix(cell_id))
+            .await
+            .unwrap();
+        assert!(batch_outbox.next().await.unwrap().is_none());
+
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+    }
+
+    #[tokio::test]
+    async fn outbound_only_index_policy_skips_reverse_rows_with_read_fallback() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/outbound-only-index",
+            object_store,
+            GraphOpenOptions {
+                index_policy: GraphIndexPolicy::OutboundOnly,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = shard
+            .bulk_import_edges(
+                "reddit-home",
+                "USER_SUBSCRIBED_TO_SUBREDDIT",
+                [(1, 2), (1, 3), (4, 2)],
+                "bulk-outbound-only",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.inserted, 3);
+        assert_eq!(shard.graph_index_policy(), GraphIndexPolicy::OutboundOnly);
+        assert_eq!(
+            shard
+                .out_neighbors("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 1)
+                .await
+                .unwrap(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            shard
+                .in_neighbors("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 2)
+                .await
+                .unwrap(),
+            vec![1, 4]
+        );
+        assert_eq!(
+            shard
+                .out_degree("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 1)
+                .await
+                .unwrap(),
+            2
+        );
+
+        let mut reverse_edges = shard
+            .scan_remote_prefix(&keys::in_edge_type_prefix(
+                "reddit-home",
+                "USER_SUBSCRIBED_TO_SUBREDDIT",
+            ))
+            .await
+            .unwrap();
+        assert!(reverse_edges.next().await.unwrap().is_none());
+
+        let mut reverse_degrees = shard
+            .scan_remote_prefix(&keys::degree_in_prefix(
+                "reddit-home",
+                "USER_SUBSCRIBED_TO_SUBREDDIT",
+            ))
+            .await
+            .unwrap();
+        assert!(reverse_degrees.next().await.unwrap().is_none());
+
+        let report = shard
+            .verify_current_graph("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 2, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+        assert_eq!(report.in_index_edges, 0);
+    }
+
+    #[tokio::test]
     async fn chunked_bulk_import_respects_batch_limits_and_keeps_idempotency() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let shard = GraphShard::open_standalone_writer_with_limits(
@@ -3241,6 +7960,482 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trusted_chunked_bulk_append_uses_bounded_batch_delta_logs() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_limits(
+            "graph/trusted-bulk-import-chunked",
+            object_store,
+            GraphLimits {
+                max_bulk_import_edges: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        let zero_chunk = shard
+            .bulk_append_edges_trusted_bounded(
+                cell_id,
+                edge_type,
+                [(1, 2)],
+                "trusted-zero-chunk",
+                0,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            zero_chunk,
+            GraphError::CorruptValue { ref key, .. } if key == "trusted_append_chunk_size"
+        ));
+
+        let result = shard
+            .bulk_append_edges_trusted_bounded(
+                cell_id,
+                edge_type,
+                [(1, 2), (1, 3), (1, 4), (1, 5), (1, 6)],
+                "trusted-chunked",
+                2,
+            )
+            .await
+            .unwrap();
+        let retry = shard
+            .bulk_append_edges_trusted_chunked(
+                cell_id,
+                edge_type,
+                [(1, 6), (1, 5), (1, 4), (1, 3), (1, 2)],
+                "trusted-chunked",
+                2,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            BulkImportResult {
+                start_epoch: 1,
+                end_epoch: 5,
+                inserted: 5,
+                already_existed: 0
+            }
+        );
+        assert_eq!(retry, result);
+        assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 5);
+        assert_eq!(shard.outbox_since(cell_id, 0).await.unwrap().len(), 5);
+
+        let mut per_edge_outbox = shard
+            .scan_remote_prefix(&keys::outbox_prefix(cell_id))
+            .await
+            .unwrap();
+        assert!(per_edge_outbox.next().await.unwrap().is_none());
+
+        let mut batch_outbox = shard
+            .scan_remote_prefix(&keys::outbox_batch_prefix(cell_id))
+            .await
+            .unwrap();
+        let mut batch_records = 0;
+        while batch_outbox.next().await.unwrap().is_some() {
+            batch_records += 1;
+        }
+        assert_eq!(batch_records, 3);
+    }
+
+    #[tokio::test]
+    async fn trusted_supernode_segment_append_skips_canonical_rows_and_survives_rollup_gc() {
+        let full_index_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let full_index = open_test_shard("graph/segment-full-index-reject", full_index_store).await;
+        let rejected = full_index
+            .bulk_append_supernode_segment_trusted(
+                "reddit-home",
+                "USER_SUBSCRIBED_TO_SUBREDDIT",
+                1,
+                [2],
+                "segment-reject",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejected,
+            GraphError::UnsupportedQuery {
+                dialect: "GraphWrite",
+                ..
+            }
+        ));
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/trusted-supernode-segment",
+            object_store,
+            GraphOpenOptions {
+                index_policy: GraphIndexPolicy::OutboundOnly,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        let result = shard
+            .bulk_append_supernode_segment_trusted(
+                cell_id,
+                edge_type,
+                1,
+                [4, 2, 3, 2],
+                "trusted-segment-1",
+            )
+            .await
+            .unwrap();
+        let retry = shard
+            .bulk_append_supernode_segment_trusted(
+                cell_id,
+                edge_type,
+                1,
+                [2, 3, 4],
+                "trusted-segment-1",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            BulkImportResult {
+                start_epoch: 1,
+                end_epoch: 3,
+                inserted: 3,
+                already_existed: 0
+            }
+        );
+        assert_eq!(retry, result);
+        assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 3);
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 3);
+        assert!(shard.edge_exists(cell_id, edge_type, 1, 3).await.unwrap());
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(
+            shard.in_neighbors(cell_id, edge_type, 2).await.unwrap(),
+            vec![1]
+        );
+        assert_eq!(shard.outbox_since(cell_id, 0).await.unwrap().len(), 3);
+        assert_eq!(
+            shard
+                .deltas_since(cell_id, edge_type, 0)
+                .await
+                .unwrap()
+                .iter()
+                .map(|delta| (delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch))
+                .collect::<Vec<_>>(),
+            vec![
+                (DeltaKind::Plus, 1, 2, 1),
+                (DeltaKind::Plus, 1, 3, 2),
+                (DeltaKind::Plus, 1, 4, 3),
+            ]
+        );
+
+        let mut canonical = shard
+            .scan_remote_prefix(&keys::out_edge_type_prefix(cell_id, edge_type))
+            .await
+            .unwrap();
+        assert!(canonical.next().await.unwrap().is_none());
+        let mut segments = shard
+            .scan_remote_prefix(&keys::out_segment_src_prefix(cell_id, edge_type, 1))
+            .await
+            .unwrap();
+        assert!(segments.next().await.unwrap().is_some());
+        assert!(segments.next().await.unwrap().is_none());
+
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+        assert_eq!(report.canonical_edges, 0);
+        assert_eq!(report.out_index_edges, 3);
+
+        let delete = shard
+            .delete_edge(EdgeMutation {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                src: 1,
+                dst: 3,
+                idempotency_key: "trusted-segment-delete-1".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            delete,
+            DeleteResult {
+                epoch: 4,
+                deleted: true
+            }
+        );
+        let delete_retry = shard
+            .delete_edge(EdgeMutation {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                src: 1,
+                dst: 3,
+                idempotency_key: "trusted-segment-delete-1".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(delete_retry, delete);
+        assert!(!shard.edge_exists(cell_id, edge_type, 1, 3).await.unwrap());
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 4]
+        );
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 2);
+        assert_eq!(
+            shard
+                .out_neighbors_at(cell_id, edge_type, 1, result.end_epoch)
+                .await
+                .unwrap(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(shard.outbox_since(cell_id, 0).await.unwrap().len(), 4);
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+        assert_eq!(report.canonical_edges, 0);
+        assert_eq!(report.out_index_edges, 2);
+
+        shard
+            .rollup_artifacts(cell_id, edge_type, delete.epoch, 2, 2, 1, 2)
+            .await
+            .unwrap();
+        let gc = shard
+            .delete_deltas_through_rollup(cell_id, edge_type, delete.epoch)
+            .await
+            .unwrap();
+        assert_eq!(gc.deleted_delta_keys, 2);
+        assert!(shard.outbox_since(cell_id, 0).await.unwrap().is_empty());
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 4]
+        );
+
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+    }
+
+    #[tokio::test]
+    async fn segment_compaction_merges_segments_and_gcs_tombstones_after_rollup() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/segment-compaction",
+            object_store,
+            GraphOpenOptions {
+                index_policy: GraphIndexPolicy::OutboundOnly,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        let first = shard
+            .bulk_append_supernode_segment_trusted(
+                cell_id,
+                edge_type,
+                1,
+                [2, 3],
+                "compact-segment-1",
+            )
+            .await
+            .unwrap();
+        let second = shard
+            .bulk_append_supernode_segment_trusted(
+                cell_id,
+                edge_type,
+                1,
+                [4, 5],
+                "compact-segment-2",
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.end_epoch, 2);
+        assert_eq!(second.end_epoch, 4);
+
+        let delete = shard
+            .delete_edge(EdgeMutation {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                src: 1,
+                dst: 3,
+                idempotency_key: "compact-delete-3".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(delete.epoch, 5);
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 4, 5]
+        );
+
+        shard
+            .rollup_artifacts(cell_id, edge_type, delete.epoch, 2, 2, 1, 2)
+            .await
+            .unwrap();
+
+        let mut segments = shard
+            .scan_remote_prefix(&keys::out_segment_src_prefix(cell_id, edge_type, 1))
+            .await
+            .unwrap();
+        let mut segment_count = 0;
+        while segments.next().await.unwrap().is_some() {
+            segment_count += 1;
+        }
+        assert_eq!(segment_count, 2);
+        let mut tombstones = shard
+            .scan_remote_prefix(&keys::out_segment_tombstone_src_prefix(
+                cell_id, edge_type, 1,
+            ))
+            .await
+            .unwrap();
+        assert!(tombstones.next().await.unwrap().is_some());
+        assert!(tombstones.next().await.unwrap().is_none());
+
+        let compact = shard
+            .compact_supernode_segments(cell_id, edge_type, 1, delete.epoch, "compact-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            compact,
+            SegmentCompactionResult {
+                compacted_through_epoch: 5,
+                source_segments: 2,
+                deleted_segment_keys: 2,
+                deleted_tombstone_keys: 1,
+                input_edges: 4,
+                output_edges: 3,
+            }
+        );
+        let retry = shard
+            .compact_supernode_segments(cell_id, edge_type, 1, delete.epoch, "compact-1")
+            .await
+            .unwrap();
+        assert_eq!(retry, compact);
+
+        let mut segments = shard
+            .scan_remote_prefix(&keys::out_segment_src_prefix(cell_id, edge_type, 1))
+            .await
+            .unwrap();
+        let mut compacted_values = Vec::new();
+        while let Some(kv) = segments.next().await.unwrap() {
+            compacted_values.push(kv.value.to_vec());
+        }
+        assert_eq!(compacted_values.len(), 1);
+        assert!(compacted_values[0].starts_with(b"out_segment2\n"));
+        let mut tombstones = shard
+            .scan_remote_prefix(&keys::out_segment_tombstone_src_prefix(
+                cell_id, edge_type, 1,
+            ))
+            .await
+            .unwrap();
+        assert!(tombstones.next().await.unwrap().is_none());
+
+        assert!(!shard.edge_exists(cell_id, edge_type, 1, 3).await.unwrap());
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 4, 5]
+        );
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 3);
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+
+        shard
+            .delete_deltas_through_rollup(cell_id, edge_type, delete.epoch)
+            .await
+            .unwrap();
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+    }
+
+    #[tokio::test]
+    async fn trusted_segment_append_replay_with_new_job_id_does_not_double_count_degree() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/segment-replay-fingerprint",
+            object_store,
+            GraphOpenOptions {
+                index_policy: GraphIndexPolicy::OutboundOnly,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        let first = shard
+            .bulk_append_supernode_segment_trusted(
+                cell_id,
+                edge_type,
+                1,
+                [2, 3, 4],
+                "segment-job-a",
+            )
+            .await
+            .unwrap();
+        let replay = shard
+            .bulk_append_supernode_segment_trusted(
+                cell_id,
+                edge_type,
+                1,
+                [2, 3, 4],
+                "segment-job-b",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(replay, first);
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 3);
+        let mut segments = shard
+            .scan_remote_prefix(&keys::out_segment_src_prefix(cell_id, edge_type, 1))
+            .await
+            .unwrap();
+        let mut segment_count = 0;
+        while segments.next().await.unwrap().is_some() {
+            segment_count += 1;
+        }
+        assert_eq!(segment_count, 1);
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+    }
+
+    #[test]
+    fn writer_lanes_partition_different_cells() {
+        assert_ne!(writer_lane_index("cell-a"), writer_lane_index("cell-b"));
+        assert_ne!(
+            writer_lane_index("reddit-home"),
+            writer_lane_index("other-cell")
+        );
+    }
+
+    #[tokio::test]
     async fn write_edges_batch_uses_one_batch_idempotency_and_logs_batch_boundary() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let shard = open_test_shard("graph/write-edges-batch", object_store).await;
@@ -3292,6 +8487,432 @@ mod tests {
         assert!(logs[0]
             .1
             .starts_with("mutation_batch1\tUSER_SUBSCRIBED_TO_SUBREDDIT\t1\t3\t3\t0\t"));
+    }
+
+    #[tokio::test]
+    async fn write_edge_mutations_batch_keeps_per_edge_idempotency_and_indexes() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = open_test_shard("graph/write-edge-mutations-batch", object_store).await;
+
+        let result = shard
+            .write_edge_mutations_batch(
+                "reddit-home",
+                [
+                    mutation(7, 10, "edge-batch-1"),
+                    mutation(7, 11, "edge-batch-2"),
+                    mutation(7, 10, "edge-batch-3"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.start_epoch, 1);
+        assert_eq!(result.end_epoch, 2);
+        assert_eq!(result.inserted, 2);
+        assert_eq!(result.already_existed, 1);
+        assert_eq!(
+            result.results,
+            vec![
+                CommitResult {
+                    epoch: 1,
+                    already_existed: false
+                },
+                CommitResult {
+                    epoch: 2,
+                    already_existed: false
+                },
+                CommitResult {
+                    epoch: 1,
+                    already_existed: true
+                }
+            ]
+        );
+        assert_eq!(
+            shard
+                .out_neighbors("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 7)
+                .await
+                .unwrap(),
+            vec![10, 11]
+        );
+        assert_eq!(
+            shard
+                .out_degree("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 7)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            shard
+                .deltas_since("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 0)
+                .await
+                .unwrap()
+                .iter()
+                .map(|delta| (delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch))
+                .collect::<Vec<_>>(),
+            vec![(DeltaKind::Plus, 7, 10, 1), (DeltaKind::Plus, 7, 11, 2)]
+        );
+
+        let retry = shard
+            .write_edge_mutations_batch(
+                "reddit-home",
+                [
+                    mutation(7, 10, "edge-batch-1"),
+                    mutation(7, 11, "edge-batch-2"),
+                    mutation(7, 10, "edge-batch-3"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry, result);
+        assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn write_edge_mutations_batch_rejects_idempotency_reuse_for_different_edge() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard =
+            open_test_shard("graph/write-edge-mutations-batch-conflict", object_store).await;
+
+        shard
+            .write_edge_mutations_batch(
+                "reddit-home",
+                [
+                    mutation(7, 10, "edge-batch-conflict"),
+                    mutation(7, 11, "edge-batch-ok"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let conflict = shard
+            .write_edge_mutations_batch("reddit-home", [mutation(7, 12, "edge-batch-conflict")])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            conflict,
+            GraphError::IdempotencyConflict {
+                operation: "create",
+                ref idempotency_key
+            } if idempotency_key == "edge-batch-conflict"
+        ));
+
+        let duplicate_in_batch = shard
+            .write_edge_mutations_batch(
+                "reddit-home",
+                [
+                    mutation(8, 10, "edge-batch-duplicate"),
+                    mutation(8, 11, "edge-batch-duplicate"),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            duplicate_in_batch,
+            GraphError::IdempotencyConflict {
+                operation: "create",
+                ref idempotency_key
+            } if idempotency_key == "edge-batch-duplicate"
+        ));
+    }
+
+    #[tokio::test]
+    async fn ingest_edge_mutations_chunks_and_replays_idempotently() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/ingest-edge-mutations-chunked",
+            object_store,
+            GraphOpenOptions {
+                limits: GraphLimits {
+                    max_bulk_import_edges: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mutations =
+            (0..5).map(|index| mutation(9, 100 + index, &format!("edge-ingest-chunked-{index}")));
+        let result = shard
+            .ingest_edge_mutations(
+                "reddit-home",
+                mutations,
+                EdgeIngestOptions { batch_size: 10 },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            EdgeIngestResult {
+                start_epoch: 1,
+                end_epoch: 5,
+                inserted: 5,
+                already_existed: 0,
+                batches: 3,
+                mutations: 5,
+            }
+        );
+        assert_eq!(
+            shard
+                .out_degree("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 9)
+                .await
+                .unwrap(),
+            5
+        );
+
+        let replay = shard
+            .ingest_edge_mutations(
+                "reddit-home",
+                (0..5)
+                    .map(|index| mutation(9, 100 + index, &format!("edge-ingest-chunked-{index}"))),
+                EdgeIngestOptions { batch_size: 10 },
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay, result);
+        assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 5);
+
+        let duplicate = shard
+            .ingest_edge_mutations(
+                "reddit-home",
+                [mutation(9, 100, "edge-ingest-existing-edge")],
+                EdgeIngestOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.inserted, 0);
+        assert_eq!(duplicate.already_existed, 1);
+        assert_eq!(duplicate.end_epoch, 5);
+    }
+
+    #[tokio::test]
+    async fn ingest_edge_mutations_rejects_zero_batch_size() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = open_test_shard("graph/ingest-edge-mutations-zero-batch", object_store).await;
+
+        let err = shard
+            .ingest_edge_mutations(
+                "reddit-home",
+                [mutation(9, 10, "edge-ingest-zero-batch")],
+                EdgeIngestOptions { batch_size: 0 },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GraphError::CorruptValue { ref key, .. } if key == "edge_ingest_batch_size"
+        ));
+        assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn mutation_log_append_is_durable_and_replayed_after_reopen() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "graph/mutation-log-reopen";
+        {
+            let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+            let result = writer
+                .append_edge_mutation_log(
+                    "reddit-home",
+                    "log-batch-1",
+                    [
+                        mutation(20, 30, "log-edge-1"),
+                        mutation(20, 31, "log-edge-2"),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result,
+                EdgeMutationLogAppendResult {
+                    log_epoch: 1,
+                    mutations: 2,
+                    already_appended: false
+                }
+            );
+            assert_eq!(writer.current_epoch("reddit-home").await.unwrap(), 0);
+            assert!(!writer
+                .edge_exists("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 20, 30)
+                .await
+                .unwrap());
+            writer.close().await.unwrap();
+        }
+
+        let reopened = open_test_shard(path, Arc::clone(&object_store)).await;
+        let materialized = reopened
+            .materialize_edge_mutation_log("reddit-home", 16)
+            .await
+            .unwrap();
+        assert_eq!(materialized.scanned_batches, 1);
+        assert_eq!(materialized.materialized_batches, 1);
+        assert_eq!(materialized.mutations, 2);
+        assert_eq!(materialized.inserted, 2);
+        assert_eq!(materialized.materialized_log_epoch, 1);
+        assert_eq!(materialized.current_epoch, 2);
+        assert_eq!(
+            reopened
+                .out_neighbors("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 20)
+                .await
+                .unwrap(),
+            vec![30, 31]
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_log_append_is_batch_idempotent_and_detects_conflict() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = open_test_shard("graph/mutation-log-idempotency", object_store).await;
+
+        let first = shard
+            .append_edge_mutation_log(
+                "reddit-home",
+                "log-batch-idem",
+                [
+                    mutation(30, 40, "log-idem-1"),
+                    mutation(30, 41, "log-idem-2"),
+                ],
+            )
+            .await
+            .unwrap();
+        let retry = shard
+            .append_edge_mutation_log(
+                "reddit-home",
+                "log-batch-idem",
+                [
+                    mutation(30, 40, "log-idem-1"),
+                    mutation(30, 41, "log-idem-2"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            retry,
+            EdgeMutationLogAppendResult {
+                already_appended: true,
+                ..first
+            }
+        );
+
+        let conflict = shard
+            .append_edge_mutation_log(
+                "reddit-home",
+                "log-batch-idem",
+                [mutation(30, 42, "log-idem-different")],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            conflict,
+            GraphError::IdempotencyConflict {
+                operation: "mutation-log",
+                ref idempotency_key
+            } if idempotency_key == "log-batch-idem"
+        ));
+
+        let mut iter = shard
+            .scan_remote_prefix("cell/reddit-home/mutation_log/")
+            .await
+            .unwrap();
+        let mut logs = 0;
+        while iter.next().await.unwrap().is_some() {
+            logs += 1;
+        }
+        assert_eq!(logs, 1);
+    }
+
+    #[tokio::test]
+    async fn mutation_log_materializer_replay_is_idempotent_if_watermark_is_lost() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = open_test_shard("graph/mutation-log-replay-idempotent", object_store).await;
+
+        shard
+            .append_edge_mutation_log(
+                "reddit-home",
+                "log-batch-watermark",
+                [
+                    mutation(40, 50, "log-watermark-1"),
+                    mutation(40, 51, "log-watermark-2"),
+                ],
+            )
+            .await
+            .unwrap();
+        let first = shard
+            .materialize_edge_mutation_log("reddit-home", 16)
+            .await
+            .unwrap();
+        assert_eq!(first.inserted, 2);
+        assert_eq!(first.current_epoch, 2);
+
+        let mut batch = WriteBatch::new();
+        batch.put(
+            keys::mutation_log_materialized_epoch("reddit-home"),
+            encode_u64(0),
+        );
+        shard.write_strict_for_test(batch).await.unwrap();
+
+        let replay = shard
+            .materialize_edge_mutation_log("reddit-home", 16)
+            .await
+            .unwrap();
+        assert_eq!(replay.materialized_batches, 1);
+        assert_eq!(replay.current_epoch, 2);
+        assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 2);
+        assert_eq!(
+            shard
+                .out_degree("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 40)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_log_materializer_uses_bounded_microdrains() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = open_test_shard("graph/mutation-log-bounded-drain", object_store).await;
+
+        for batch in 0..2_u64 {
+            let mutations = (0..400_u64)
+                .map(|index| {
+                    mutation(
+                        50 + batch,
+                        10_000 + (batch * 1_000) + index,
+                        &format!("log-bounded-{batch}-{index}"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            shard
+                .append_edge_mutation_log(
+                    "reddit-home",
+                    &format!("log-bounded-batch-{batch}"),
+                    mutations,
+                )
+                .await
+                .unwrap();
+        }
+
+        let first = shard
+            .materialize_edge_mutation_log("reddit-home", 2)
+            .await
+            .unwrap();
+        assert_eq!(first.scanned_batches, 2);
+        assert_eq!(first.materialized_batches, 2);
+        assert_eq!(first.mutations, 800);
+        assert_eq!(first.materialized_log_epoch, 2);
+        assert_eq!(first.last_log_epoch, 2);
+        assert_eq!(first.current_epoch, 800);
+
+        let second = shard
+            .materialize_edge_mutation_log("reddit-home", 2)
+            .await
+            .unwrap();
+        assert_eq!(second.scanned_batches, 0);
+        assert_eq!(second.materialized_batches, 0);
+        assert_eq!(second.mutations, 0);
+        assert_eq!(second.materialized_log_epoch, 2);
+        assert_eq!(second.current_epoch, 800);
+        assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 800);
     }
 
     #[test]
@@ -3609,6 +9230,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leased_writer_requires_installed_data_write_fence() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let lease = ShardLease {
+            cell_id: "reddit-home".to_string(),
+            owner_node_id: "node-a".to_string(),
+            lease_token: 1,
+            expires_at_ms: graph_now_millis() + 60_000,
+        };
+        let leases = Arc::new(RwLock::new(BTreeMap::from([(
+            lease.cell_id.clone(),
+            lease.clone(),
+        )])));
+        let shard = GraphShard::open_leased_writer(
+            "graph/leased-fence-required",
+            Arc::clone(&object_store),
+            GraphOpenOptions::default(),
+            "node-a".to_string(),
+            Arc::clone(&leases),
+        )
+        .await
+        .unwrap();
+
+        let err = shard
+            .write_edge(mutation(1, 2, "missing-data-fence"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GraphError::WriteRequiresLease {
+                operation: "write_edge",
+                ref cell_id
+            } if cell_id == "reddit-home"
+        ));
+
+        shard
+            .install_write_fence("reddit-home", &lease)
+            .await
+            .unwrap();
+        shard
+            .write_edge(mutation(1, 2, "after-data-fence"))
+            .await
+            .unwrap();
+        shard.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn newer_data_write_fence_rejects_all_stale_write_classes() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+        let lease = ShardLease {
+            cell_id: cell_id.to_string(),
+            owner_node_id: "node-a".to_string(),
+            lease_token: 1,
+            expires_at_ms: graph_now_millis() + 60_000,
+        };
+        let leases = Arc::new(RwLock::new(BTreeMap::from([(
+            lease.cell_id.clone(),
+            lease.clone(),
+        )])));
+        let shard = GraphShard::open_leased_writer(
+            "graph/stale-data-fence",
+            Arc::clone(&object_store),
+            GraphOpenOptions::default(),
+            "node-a".to_string(),
+            Arc::clone(&leases),
+        )
+        .await
+        .unwrap();
+        shard.install_write_fence(cell_id, &lease).await.unwrap();
+        shard.write_edge(mutation(1, 2, "base-1")).await.unwrap();
+        let epoch_two = shard.write_edge(mutation(1, 3, "base-2")).await.unwrap();
+        shard
+            .rollup_artifacts(cell_id, edge_type, epoch_two.epoch, 2, 2, 1, 2)
+            .await
+            .unwrap();
+        let epoch_three = shard.write_edge(mutation(1, 4, "base-3")).await.unwrap();
+        shard
+            .rollup_artifacts(cell_id, edge_type, epoch_three.epoch, 2, 2, 1, 2)
+            .await
+            .unwrap();
+
+        let newer = ShardLease {
+            cell_id: cell_id.to_string(),
+            owner_node_id: "node-b".to_string(),
+            lease_token: 2,
+            expires_at_ms: graph_now_millis() + 60_000,
+        };
+        let mut batch = WriteBatch::new();
+        batch.put(
+            keys::write_fence(cell_id),
+            encode_write_fence(&GraphWriteFence::from(&newer)),
+        );
+        shard.write_strict_for_test(batch).await.unwrap();
+
+        assert_stale_node_a(
+            shard
+                .write_edge(mutation(1, 5, "stale-edge"))
+                .await
+                .unwrap_err(),
+        );
+        assert_stale_node_a(
+            shard
+                .delete_edge(mutation(1, 2, "stale-delete"))
+                .await
+                .unwrap_err(),
+        );
+        assert_stale_node_a(
+            shard
+                .bulk_import_edges(cell_id, edge_type, [(2, 20), (2, 21)], "stale-bulk")
+                .await
+                .unwrap_err(),
+        );
+        assert_stale_node_a(
+            shard
+                .build_posting_chunks(cell_id, edge_type, epoch_three.epoch, 2)
+                .await
+                .unwrap_err(),
+        );
+        assert_stale_node_a(
+            shard
+                .build_matrix_tiles(cell_id, edge_type, epoch_three.epoch, 2)
+                .await
+                .unwrap_err(),
+        );
+        assert_stale_node_a(
+            shard
+                .build_supernode_groups(cell_id, edge_type, epoch_three.epoch, 1, 2)
+                .await
+                .unwrap_err(),
+        );
+        assert_stale_node_a(
+            shard
+                .rollup_artifacts(cell_id, edge_type, epoch_three.epoch, 2, 2, 1, 2)
+                .await
+                .unwrap_err(),
+        );
+        assert_stale_node_a(
+            shard
+                .delete_graph_artifacts_before(cell_id, edge_type, epoch_three.epoch)
+                .await
+                .unwrap_err(),
+        );
+        assert_stale_node_a(
+            shard
+                .delete_deltas_through_rollup(cell_id, edge_type, epoch_three.epoch)
+                .await
+                .unwrap_err(),
+        );
+
+        assert!(!shard.edge_exists(cell_id, edge_type, 1, 5).await.unwrap());
+        assert_eq!(
+            shard.delta_gc_watermark(cell_id, edge_type).await.unwrap(),
+            0
+        );
+        shard.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn phase0_cluster_runs_multiple_local_shards_on_one_object_store() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let cluster = Phase0Cluster::open_cells_standalone_writers(
@@ -3786,7 +9566,7 @@ mod tests {
             "node-a",
             &control,
             object_store,
-            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(2),
         )
         .await
         .unwrap();
@@ -3794,7 +9574,7 @@ mod tests {
         let handle = cluster
             .start_lease_renewer(
                 Arc::clone(&control),
-                std::time::Duration::from_millis(250),
+                std::time::Duration::from_secs(2),
                 std::time::Duration::from_millis(25),
             )
             .unwrap();
@@ -3810,6 +9590,44 @@ mod tests {
         assert!(renewed_expiry > first_expiry);
         handle.stop().await.unwrap();
         cluster.close().await.unwrap();
+        control.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_plane_metrics_count_lease_renewal_failures() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let control = GraphControlPlane::open("graph-control/renew-metrics", object_store)
+            .await
+            .unwrap();
+        control
+            .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+            .await
+            .unwrap();
+        let lease = control
+            .acquire_lease("reddit-home", "node-a", std::time::Duration::from_millis(5))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        let err = control
+            .renew_lease(&lease, std::time::Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GraphError::StaleShardLease {
+                ref cell_id,
+                ref node_id,
+                lease_token: 1
+            } if cell_id == "reddit-home" && node_id == "node-a"
+        ));
+
+        let metrics = control.graph_control_metrics();
+        assert_eq!(metrics.lease_acquire_attempts, 1);
+        assert_eq!(metrics.lease_acquire_successes, 1);
+        assert_eq!(metrics.lease_renew_attempts, 1);
+        assert_eq!(metrics.lease_renew_successes, 0);
+        assert_eq!(metrics.lease_renew_failures, 1);
+        assert_eq!(metrics.lease_renew_lost, 1);
         control.close().await.unwrap();
     }
 
@@ -3831,7 +9649,7 @@ mod tests {
             "node-a",
             Arc::clone(&control),
             object_store,
-            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(2),
             std::time::Duration::from_millis(25),
         )
         .await
@@ -3902,6 +9720,7 @@ mod tests {
                 max_bulk_import_edges: 2,
                 max_artifact_source_epochs: 2,
                 max_traversal_hops: 1,
+                ..Default::default()
             },
         )
         .await
@@ -3960,6 +9779,255 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_leases_block_delta_and_artifact_gc_until_ttl() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/read-lease-retention",
+            object_store,
+            GraphOpenOptions {
+                retention_policy: GraphRetentionPolicy {
+                    read_lease_ttl_ms: 60_000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+        shard.write_edge(mutation(1, 2, "lease-1")).await.unwrap();
+        shard.write_edge(mutation(2, 3, "lease-2")).await.unwrap();
+        let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+        shard
+            .rollup_artifacts(cell_id, edge_type, base_epoch, 2, 2, 1, 2)
+            .await
+            .unwrap();
+        let _snapshot = shard.snapshot(cell_id).await.unwrap();
+
+        let delta_err = shard
+            .delete_deltas_through_rollup(cell_id, edge_type, base_epoch)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            delta_err,
+            GraphError::RetentionViolation {
+                operation: "delete_deltas_through_rollup",
+                ref cell_id,
+                requested_epoch,
+                safe_epoch: 0,
+            } if cell_id == "reddit-home" && requested_epoch == base_epoch
+        ));
+
+        let artifact_err = shard
+            .delete_graph_artifacts_before(cell_id, edge_type, base_epoch + 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            artifact_err,
+            GraphError::RetentionViolation {
+                operation: "delete_graph_artifacts_before",
+                ref cell_id,
+                requested_epoch,
+                safe_epoch: 1,
+            } if cell_id == "reddit-home" && requested_epoch == base_epoch + 1
+        ));
+
+        let metrics = shard.graph_operational_metrics();
+        assert!(metrics.read_leases_created >= 1);
+        assert!(metrics.retention_rejects >= 2);
+        shard.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_read_leases_are_pruned_and_gc_can_continue() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/read-lease-expiry",
+            object_store,
+            GraphOpenOptions {
+                retention_policy: GraphRetentionPolicy {
+                    read_lease_ttl_ms: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+        shard.write_edge(mutation(1, 2, "expiry-1")).await.unwrap();
+        shard.write_edge(mutation(2, 3, "expiry-2")).await.unwrap();
+        let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+        shard
+            .rollup_artifacts(cell_id, edge_type, base_epoch, 2, 2, 1, 2)
+            .await
+            .unwrap();
+        let _snapshot = shard.snapshot(cell_id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let delta_gc = shard
+            .delete_deltas_through_rollup(cell_id, edge_type, base_epoch)
+            .await
+            .unwrap();
+        assert!(delta_gc.deleted_delta_keys > 0);
+        assert_eq!(
+            shard.delta_gc_watermark(cell_id, edge_type).await.unwrap(),
+            base_epoch
+        );
+        let metrics = shard.graph_operational_metrics();
+        assert!(metrics.gc_jobs_completed >= 1);
+        assert!(metrics.gc_keys_deleted >= delta_gc.deleted_delta_keys);
+        shard.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn min_retained_epochs_blocks_delta_gc() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/min-retained-epochs",
+            object_store,
+            GraphOpenOptions {
+                retention_policy: GraphRetentionPolicy {
+                    min_retained_epochs: 10,
+                    read_lease_ttl_ms: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+        shard
+            .write_edge(mutation(1, 2, "retained-1"))
+            .await
+            .unwrap();
+        shard
+            .write_edge(mutation(2, 3, "retained-2"))
+            .await
+            .unwrap();
+        let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+        shard
+            .rollup_artifacts(cell_id, edge_type, base_epoch, 2, 2, 1, 2)
+            .await
+            .unwrap();
+        let err = shard
+            .delete_deltas_through_rollup(cell_id, edge_type, base_epoch)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GraphError::RetentionViolation {
+                operation: "delete_deltas_through_rollup",
+                requested_epoch: 2,
+                safe_epoch: 0,
+                ..
+            }
+        ));
+        shard.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn artifact_build_edge_limit_rejects_loaded_builds() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/artifact-edge-limit",
+            object_store,
+            GraphOpenOptions {
+                limits: GraphLimits {
+                    max_artifact_build_edges: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        shard
+            .write_edge(mutation(1, 2, "edge-limit-1"))
+            .await
+            .unwrap();
+        shard
+            .write_edge(mutation(2, 3, "edge-limit-2"))
+            .await
+            .unwrap();
+        shard
+            .write_edge(mutation(3, 4, "edge-limit-3"))
+            .await
+            .unwrap();
+        let err = shard
+            .build_matrix_tiles("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 3, 2)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GraphError::AdmissionRejected {
+                operation: "build_matrix_tiles_edges",
+                actual: 3,
+                limit: 2
+            }
+        ));
+        shard.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operational_metrics_track_writes_artifacts_gc_and_verifier() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/operational-metrics",
+            object_store,
+            GraphOpenOptions {
+                retention_policy: GraphRetentionPolicy {
+                    read_lease_ttl_ms: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+        shard.write_edge(mutation(1, 2, "metrics-1")).await.unwrap();
+        shard.write_edge(mutation(2, 3, "metrics-2")).await.unwrap();
+        let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+        shard
+            .rollup_artifacts(cell_id, edge_type, base_epoch, 2, 2, 1, 2)
+            .await
+            .unwrap();
+        shard
+            .delete_deltas_through_rollup(cell_id, edge_type, base_epoch)
+            .await
+            .unwrap();
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(report.mismatch_count, 0);
+
+        let metrics = shard.graph_operational_metrics();
+        assert!(metrics.write_attempts >= 2);
+        assert!(metrics.write_commits >= 2);
+        assert!(metrics.artifact_builds_started >= 2);
+        assert!(metrics.artifact_builds_completed >= 2);
+        assert!(metrics.artifact_build_duration_us > 0);
+        assert!(metrics.artifact_publish_batches > 0);
+        assert!(metrics.artifact_records_published > 0);
+        assert!(metrics.artifact_publish_duration_us > 0);
+        assert!(metrics.gc_jobs_started >= 1);
+        assert!(metrics.gc_jobs_completed >= 1);
+        assert!(metrics.gc_keys_deleted > 0);
+        assert!(metrics.gc_duration_us > 0);
+        assert!(metrics.verifier_runs >= 1);
+        assert_eq!(metrics.verifier_failures, 0);
+        assert!(metrics.verifier_duration_us > 0);
+        shard.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn repair_report_validates_degrees_and_delta_counts() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let shard = open_test_shard("graph/repair-report", object_store).await;
@@ -3972,6 +10040,72 @@ mod tests {
         assert_eq!(report.live_edges, 2);
         assert_eq!(report.delta_records, 2);
         assert!(report.degree_mismatches.is_empty());
+        shard.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn current_graph_verifier_survives_rollup_and_delta_gc() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+        let shard = open_test_shard("graph/current-verifier-gc", object_store).await;
+        shard.write_edge(mutation(1, 2, "verify-1")).await.unwrap();
+        shard.write_edge(mutation(1, 3, "verify-2")).await.unwrap();
+        let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+        shard
+            .rollup_artifacts(cell_id, edge_type, base_epoch, 2, 2, 1, 2)
+            .await
+            .unwrap();
+        shard
+            .delete_deltas_through_rollup(cell_id, edge_type, base_epoch)
+            .await
+            .unwrap();
+        shard.write_edge(mutation(1, 4, "verify-3")).await.unwrap();
+        shard
+            .delete_edge(mutation(1, 2, "verify-delete-1"))
+            .await
+            .unwrap();
+
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+        assert_eq!(report.digest.live_edges, 2);
+        assert!(report.delta_gc_watermark >= base_epoch);
+        assert!(report.matrix_edges_checked >= 2);
+        assert!(report.traversal_roots_checked > 0);
+        shard.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn current_graph_verifier_detects_index_corruption() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+        let shard = open_test_shard("graph/current-verifier-corrupt", object_store).await;
+        shard
+            .write_edge(mutation(1, 2, "verify-corrupt"))
+            .await
+            .unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.delete(keys::out_edge(cell_id, edge_type, 1, 2).as_bytes());
+        shard.write_strict_for_test(batch).await.unwrap();
+
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 1, 4)
+            .await
+            .unwrap();
+        assert!(!report.is_clean());
+        assert!(
+            report
+                .mismatch_samples
+                .iter()
+                .any(|sample| sample.contains("out_index:missing")),
+            "{:?}",
+            report.mismatch_samples
+        );
         shard.close().await.unwrap();
     }
 
@@ -4073,7 +10207,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(gc.compacted_through_epoch, base_epoch);
-        assert!(gc.deleted_delta_keys >= 2);
+        assert_eq!(gc.deleted_delta_keys, 2);
         assert_eq!(
             shard
                 .out_neighbors_at(cell_id, edge_type, 1, read_epoch)
@@ -4317,6 +10451,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "opencypher")]
     #[tokio::test]
     async fn cypher_create_and_match_use_storage_kernel() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -4325,7 +10460,7 @@ mod tests {
         let write = shard
             .execute_cypher(
                 QueryContext::new("reddit-home", "cypher-req-1"),
-                "CREATE (u:User {id: 10})-[:USER_SUBSCRIBED_TO_SUBREDDIT]->(s:Subreddit {id: 20})",
+                "CREATE (u {id: 10})-[:USER_SUBSCRIBED_TO_SUBREDDIT]->(s {id: 20})",
             )
             .await
             .unwrap();
@@ -4356,12 +10491,16 @@ mod tests {
         assert_eq!(count, QueryOutput::Count(1));
     }
 
+    #[cfg(feature = "opencypher")]
     #[tokio::test]
     async fn cypher_where_and_variable_hops_use_storage_kernel() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let shard = open_test_shard("graph/cypher-where-varhop", object_store).await;
 
-        for (idx, (src, dst)) in [(1, 2), (2, 3), (3, 4), (1, 9)].into_iter().enumerate() {
+        for (idx, (src, dst)) in [(1, 2), (2, 3), (3, 4), (1, 3), (1, 9)]
+            .into_iter()
+            .enumerate()
+        {
             shard
                 .write_edge(EdgeMutation {
                     cell_id: "reddit-home".to_string(),
@@ -4391,6 +10530,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reachable, QueryOutput::Vertices(vec![3, 4]));
+
+        let exact_two_hop = shard
+            .execute_cypher(
+                QueryContext::new("reddit-home", "read-req"),
+                "MATCH (u {id: 1})-[:FOLLOWS*2..2]->(v) RETURN v.id",
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact_two_hop, QueryOutput::Vertices(vec![3, 4]));
+
+        for (idx, (src, dst)) in [(1, 2), (2, 3), (1, 3)].into_iter().enumerate() {
+            shard
+                .write_edge(EdgeMutation {
+                    cell_id: "reddit-home".to_string(),
+                    edge_type: "MASKED_BY_SHORTER_PATH".to_string(),
+                    src,
+                    dst,
+                    idempotency_key: format!("cypher-shortest-mask-{idx}"),
+                })
+                .await
+                .unwrap();
+        }
+        let shortest_mask_regression = shard
+            .execute_cypher(
+                QueryContext::new("reddit-home", "read-req"),
+                "MATCH (u {id: 1})-[:MASKED_BY_SHORTER_PATH*2..2]->(v) RETURN v.id",
+            )
+            .await
+            .unwrap();
+        assert_eq!(shortest_mask_regression, QueryOutput::Vertices(vec![3]));
     }
 
     #[tokio::test]
@@ -4826,6 +10995,28 @@ mod tests {
             .unwrap();
         assert_eq!(one_hop.vertices, vec![10, 11, 12, 13, 14, 15]);
         assert_eq!(one_hop.edge_visits, 6);
+        assert_eq!(
+            shard
+                .graph_cache_entry_counts()
+                .await
+                .materialized_supernodes,
+            1
+        );
+        assert!(shard.graph_cache_metrics().materialized_supernode_misses >= 1);
+
+        let one_hop_cached = shard
+            .matrix_reachable_with_kernel(
+                "reddit-home",
+                "USER_FOLLOWS_USER",
+                &[100],
+                1,
+                base_epoch,
+                SparseKernelBackend::SuiteSparseGraphBlas,
+            )
+            .await
+            .unwrap();
+        assert_eq!(one_hop_cached.vertices, one_hop.vertices);
+        assert!(shard.graph_cache_metrics().materialized_supernode_hits >= 1);
         assert_eq!(
             shard
                 .supernode_intersection(

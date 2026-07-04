@@ -18,19 +18,43 @@ fmt-check:
 
 # Check all default-feature targets.
 check:
-    cargo check --all-targets
+    cargo check --locked --all-targets
+
+# Check default-feature examples.
+check-examples:
+    cargo check --locked --examples
 
 # Check examples with GraphBLAS enabled.
 check-examples-graphblas:
-    cargo check --examples --features graphblas
+    cargo check --locked --examples --features graphblas
+
+# Check examples with native parser and GraphBLAS enabled.
+check-examples-native:
+    cargo check --locked --examples --features opencypher,graphblas
+
+# Check the feature-gated hard-fence chaos harness.
+check-examples-chaos:
+    cargo check --locked --examples --features chaos-harness
 
 # Run default library tests.
 test:
-    cargo test --lib
+    cargo test --locked --lib
+
+# Run library tests with OpenCypher enabled.
+test-opencypher:
+    cargo test --locked --features opencypher --lib
 
 # Run library tests with GraphBLAS enabled.
 test-graphblas:
-    cargo test --features graphblas --lib
+    cargo test --locked --features graphblas --lib
+
+# Run library tests with all native features enabled.
+test-native:
+    cargo test --locked --features opencypher,graphblas --lib
+
+# Run library tests with the feature-gated hard-fence harness enabled.
+test-chaos:
+    cargo test --locked --features chaos-harness --lib
 
 # Verify native libraries required by Rust FFI crates.
 native-check:
@@ -46,7 +70,7 @@ native-check:
     fi
 
 # Run the local CI-equivalent check set.
-ci: native-check fmt-check test test-graphblas check-examples-graphblas
+ci: native-check fmt-check check test test-opencypher test-graphblas test-native test-chaos check-examples check-examples-native check-examples-chaos
 
 # Run the local object-store smoke test.
 smoke:
@@ -58,23 +82,35 @@ smoke-graphblas:
 
 # Run the path/supernode benchmark harness.
 bench:
-    scripts/phase0_path_bench.sh
+    bash scripts/phase0_path_bench.sh
 
 # Run the path/supernode benchmark with the Rust sparse kernel.
 bench-rust:
-    PHASE0_GRAPHBLAS=0 PHASE0_MATRIX_KERNEL=rust scripts/phase0_path_bench.sh
+    PHASE0_GRAPHBLAS=0 PHASE0_MATRIX_KERNEL=rust bash scripts/phase0_path_bench.sh
 
 # Run local multiprocess stress against the local filesystem object store.
 stress:
-    scripts/phase0_multiprocess_stress.sh
+    bash scripts/phase0_multiprocess_stress.sh
+
+# Run hard write-fence takeover proof against the local filesystem object store.
+fence:
+    bash scripts/phase0_fence_takeover.sh
 
 # Run MinIO smoke test. Requires Docker.
 minio-smoke:
-    scripts/phase0_minio_smoke.sh
+    bash scripts/phase0_minio_smoke.sh
+
+# Run path/supernode benchmarks against MinIO. Requires Docker.
+minio-bench:
+    bash scripts/phase0_minio_path_bench.sh
 
 # Run MinIO chaos test. Requires Docker.
 minio-chaos:
-    scripts/phase0_minio_chaos.sh
+    bash scripts/phase0_minio_chaos.sh
+
+# Run hard write-fence takeover proof against MinIO. Requires Docker.
+minio-fence:
+    bash scripts/phase0_minio_fence_takeover.sh
 
 # Refresh the pinned SlateDB Git dependency in Cargo.lock.
 update-slatedb:
