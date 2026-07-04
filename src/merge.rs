@@ -1,139 +1,499 @@
 //! The record-tag-routed merge operator (RFC 0003 §"Merge-operator dispatch
 //! table (D11)").
 //!
-//! **M0 STUB.** In M0 no code path issues `merge` operands — every write is a
-//! `put`/`delete` read-modify-write by the single writer (RFC 0002 D2). The
-//! associative merges below land in M1 (RFC 0004/0005). This operator exists
-//! now only so the writer (and, in M1+, every `DbReader`/compactor) is opened
-//! with the *same* operator registered — SlateDB refuses to resolve a stored
-//! merge operand without one, so the registration must be in place before the
-//! first M1 merge is ever written.
+//! **M1 D3.** Every write is still issued by a single writer (RFC 0002 D2),
+//! but from M1 on some writes are expressed as SlateDB `merge` operands
+//! instead of `put`/`delete` read-modify-writes, so the writer (and, in M1+,
+//! every `DbReader`/compactor) must be opened with the *same* operator
+//! registered — SlateDB refuses to resolve a stored merge operand without one.
 //!
-//! # RFC 0003 dispatch table (what the M1 implementer fills in)
+//! # RFC 0003 dispatch table
 //!
-//! `MergeOperator` routes on the record tag ([`crate::serde::keys::record_type_of`]);
-//! a merge operand on any non-associative record type is a bug (fail-closed in
-//! M1). All operands must be associative.
+//! `MergeOperator` routes on the record tag ([`crate::serde::keys::record_type_of`]),
+//! and for `Meta` additionally on the sub-key kind
+//! ([`crate::serde::keys::meta_kind`]). A merge operand on any non-associative
+//! record type is a bug: single-writer RMW means the *only* way an operand
+//! reaches a non-associative key is a code-path that emitted the wrong op, so
+//! this is fail-closed (see "Fail-closed" below), not newest-wins.
 //!
 //! | Record type / meta-key                               | Operand kind          | Merge semantics                                             |
 //! |------------------------------------------------------|-----------------------|------------------------------------------------------------|
 //! | `Meta["deleted_nodes"]`                              | roaring `Treemap` (u64) | set **union** — tombstoned node uids, filtered at read (RFC 0004) |
 //! | `Meta["deleted_edges"/pred_id/anchor_uid]`           | roaring `Treemap`     | set **union** — per-(anchor,pred) deleted dst/src uids (RFC 0005) |
-//! | `EdgeOut` / `EdgeIn` (fast-add path)                 | roaring set union (u64) | associative **union** into the posting set (RFC 0005)      |
+//! | `EdgeOut` / `EdgeIn` / `EdgePart` (fast-add path)    | roaring set union (u64) | associative **union** into the posting set (RFC 0005)      |
 //! | `Meta["count"/pred_id]`, corpus counters             | `i64` LE              | **sum** (degree / edge-count statistics)                   |
-//! | `Index`, `Count`, `Node`, `Schema*`, `Xid`, `Log`    | —                     | **no merge** — last-write-wins via `put` only; single-writer RMW |
+//! | `Index`, `Count`, `Node`, `Schema*`, `Xid`, `Log`, and non-associative `Meta` (e.g. `latest_seq`, `seq/*`) | — | **no merge** — last-write-wins via `put` only; single-writer RMW |
 //!
-//! In M1 the roaring rows decode each operand as a `roaring::RoaringTreemap`,
-//! fold them (and the existing value) with set union, and re-serialize; the
-//! counter row decodes 8-byte little-endian `i64`s and sums them. The
-//! non-associative rows must never receive an operand — M1 returns a
-//! `MergeOperatorError` for them (fail-closed) rather than silently applying
-//! newest-wins.
+//! ## Operand encoding: bare `RoaringTreemap`, not `PostingValue`
+//!
+//! RFC 0005 §"Add / delete mechanics" spells out the operand shape directly:
+//! `batch.merge(key, roaring_singleton(neighbor))`. Merge operands for the
+//! roaring rows above (both the adjacency fast-add path and the `Meta`
+//! deleted-bitmaps) are therefore **bare `roaring::RoaringTreemap` portable
+//! bytes** — no `format`/`kind` header. Two different reasons land on the same
+//! encoding for two different value shapes:
+//!
+//! - **`EdgeOut`/`EdgeIn`/`EdgePart`**: the *stored* value at these keys is a
+//!   full [`crate::posting::PostingValue`] (format+kind header, per RFC 0005
+//!   §"Posting value format") — but the *operand* is not, because an operand
+//!   is a transient write-path payload that is never read back on its own;
+//!   only the merge operator ever looks at it, immediately folds it into the
+//!   existing `PostingValue`'s inline set, and re-serializes the result as a
+//!   proper `PostingValue::single(..)`. Wrapping the operand in its own header
+//!   would just be dead bytes on every write.
+//! - **`Meta` deleted-bitmaps**: there is no `PostingValue` at all here — the
+//!   dispatch table's own "operand kind" column says "roaring `Treemap`", full
+//!   stop. These bitmaps never split (physical purge is vacuum, RFC 0012, not
+//!   a split/manifest lifecycle), so there is no header to carry a `kind` tag
+//!   for. Existing value and operand are both bare `RoaringTreemap` bytes.
+//!
+//! `EdgePart` is included alongside `EdgeOut`/`EdgeIn`: RFC 0005 §"Add"
+//! states that once a list is split, "subsequent adds `merge` into the
+//! appropriate part key" — a split part is itself a `Single` `PostingValue`,
+//! merged exactly like an unsplit `EdgeOut`/`EdgeIn` value. Only the *creation*
+//! of the split (rewriting the manifest) and rollup are single-writer RMW
+//! (never merge) — see the M1 handoff gotcha this module's tests exercise.
+//!
+//! If an `EdgeOut`/`EdgeIn`/`EdgePart` key's *existing* value decodes as a
+//! `Split` manifest, that is itself a bug: a merge should never race a split
+//! rewrite (single-writer), so this operator fails closed on that case too
+//! rather than silently corrupting the manifest.
+//!
+//! ## Fail-closed, expressed as a panic
+//!
+//! `common::storage::MergeOperator::merge_batch` returns a bare [`Bytes`] —
+//! there is no `Result` in the trait signature, so an error return isn't
+//! possible. With a single writer (RFC 0002 D2), a merge operand landing on a
+//! non-associative key is not a runtime condition to recover from — it is a
+//! bug in the code path that emitted the wrong op, and continuing would
+//! silently corrupt data (e.g. last-write-wins clobbering a `Node` blob via
+//! `merge` instead of `put`). This module therefore treats it as an invariant
+//! violation and `panic!`s with a message identifying the key/record type, the
+//! same posture RFC 0003 already takes for reserved-bit/tag violations
+//! elsewhere in `serde::keys`.
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use common::storage::MergeOperator;
+use roaring::RoaringTreemap;
+
+use crate::RecordType;
+use crate::posting::{PostingKind, PostingValue};
+use crate::serde::keys::{self, MetaKind};
 
 /// Record-tag-routed merge operator (RFC 0003 dispatch table).
 ///
-/// **M0 STUB.** The associative merges (deleted-bitmap roaring unions, i64
-/// degree/edge counters, EdgeOut/EdgeIn fast-add set union) land in M1
-/// (RFC 0004/0005). For M0 no code path issues `merge` ops, so this operator
-/// exists only to be registered on the writer (and, in M1+, on every
-/// DbReader/compactor). It applies **newest-operand-wins** and logs a warning
-/// if it is ever actually invoked, since that would be an unexpected M0 merge.
+/// Registered on the writer and on every `DbReader`/compactor (M1 handoff
+/// gotcha) so a stored merge operand always resolves the same way regardless
+/// of which SlateDB view read it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GraphMergeOperator;
 
 impl MergeOperator for GraphMergeOperator {
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
-        // Route on the record tag purely for a helpful diagnostic; both Ok and
-        // Err are fine here (a malformed key just means "unknown record type").
-        let record_type = crate::serde::keys::record_type_of(key);
-        tracing::warn!(
-            ?record_type,
-            operand_count = operands.len(),
-            "GraphMergeOperator invoked in M0 (stub, newest-wins)"
-        );
+        // No operands: nothing to fold in. This can't violate any
+        // non-associative invariant (there is no operand to reject), so it's
+        // handled uniformly ahead of routing.
+        if operands.is_empty() {
+            return existing_value.unwrap_or_default();
+        }
 
-        // Newest-operand-wins: the last operand supersedes older operands and
-        // the existing value; with no operands, fall back to the existing
-        // value; with neither, an empty value.
-        operands
-            .last()
-            .cloned()
-            .or(existing_value)
-            .unwrap_or_default()
+        let record_type = keys::record_type_of(key).unwrap_or_else(|e| {
+            panic!(
+                "GraphMergeOperator: merge operand on an unparseable key ({} bytes): {e}",
+                key.len()
+            )
+        });
+
+        match record_type {
+            RecordType::EdgeOut | RecordType::EdgeIn | RecordType::EdgePart => {
+                merge_posting_union(record_type, existing_value, operands)
+            }
+            RecordType::Meta => {
+                let meta = keys::parse_meta_key(key)
+                    .unwrap_or_else(|e| panic!("GraphMergeOperator: malformed Meta key: {e}"));
+                match keys::meta_kind(&meta) {
+                    MetaKind::DeletedBitmap => merge_bare_roaring_union(existing_value, operands),
+                    MetaKind::Counter => merge_i64_sum(existing_value, operands),
+                    MetaKind::Scalar => panic!(
+                        "GraphMergeOperator: merge operand on non-associative Meta[{meta:?}] — \
+                         Meta scalar keys are single-writer read-modify-write only, never merge"
+                    ),
+                }
+            }
+            RecordType::Index
+            | RecordType::Count
+            | RecordType::Node
+            | RecordType::SchemaName
+            | RecordType::SchemaId
+            | RecordType::Xid
+            | RecordType::Log => panic!(
+                "GraphMergeOperator: merge operand on non-associative record type {record_type:?} \
+                 ({} operand(s)) — single-writer RMW only, this is a bug in the write path",
+                operands.len()
+            ),
+        }
     }
+}
+
+/// Decodes bare portable-format `RoaringTreemap` bytes, panicking (fail-closed)
+/// on corruption — a merge operand or stored roaring value that doesn't
+/// decode is a data-integrity bug, not a recoverable condition.
+fn decode_roaring(bytes: &[u8], context: &str) -> RoaringTreemap {
+    RoaringTreemap::deserialize_from(bytes)
+        .unwrap_or_else(|e| panic!("GraphMergeOperator: corrupt roaring bytes for {context}: {e}"))
+}
+
+/// Serializes a `RoaringTreemap` to bare portable-format bytes (no header).
+fn encode_roaring(set: &RoaringTreemap) -> Bytes {
+    let buf = BytesMut::with_capacity(set.serialized_size());
+    let mut writer = buf.writer();
+    set.serialize_into(&mut writer)
+        .expect("serializing into a BytesMut writer cannot fail");
+    writer.into_inner().freeze()
+}
+
+/// `Meta` deleted-bitmap merge: existing value and every operand are bare
+/// `RoaringTreemap` bytes; the result is their set union, re-encoded the same
+/// way.
+fn merge_bare_roaring_union(existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
+    let mut set = match existing_value {
+        Some(bytes) => decode_roaring(&bytes, "Meta deleted-bitmap existing value"),
+        None => RoaringTreemap::new(),
+    };
+    for operand in operands {
+        set |= decode_roaring(operand, "Meta deleted-bitmap operand");
+    }
+    encode_roaring(&set)
+}
+
+/// `EdgeOut`/`EdgeIn`/`EdgePart` fast-add merge: the existing value (if any) is
+/// a full [`PostingValue`] whose inline `Single` set is unioned with each
+/// operand's bare `RoaringTreemap`; the result is re-wrapped as a `Single`
+/// `PostingValue`.
+fn merge_posting_union(
+    record_type: RecordType,
+    existing_value: Option<Bytes>,
+    operands: &[Bytes],
+) -> Bytes {
+    let mut set = match existing_value {
+        Some(bytes) => {
+            let posting = PostingValue::deserialize(&bytes).unwrap_or_else(|e| {
+                panic!("GraphMergeOperator: corrupt {record_type:?} posting value: {e}")
+            });
+            match posting.kind {
+                PostingKind::Single(set) => set,
+                PostingKind::Split(_) => panic!(
+                    "GraphMergeOperator: merge operand arrived for a Split {record_type:?} \
+                     posting list — split/rollup are single-writer RMW, never merge \
+                     (RFC 0005 §Splitting supernodes); this is a bug in the write path"
+                ),
+            }
+        }
+        None => RoaringTreemap::new(),
+    };
+    for operand in operands {
+        set |= decode_roaring(operand, "posting fast-add operand");
+    }
+    PostingValue::single(set).serialize()
+}
+
+/// `Meta["count"/pred_id]` (and similar corpus counters) merge: existing value
+/// and every operand are 8-byte little-endian `i64`s, summed.
+fn merge_i64_sum(existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
+    let mut sum: i64 = match existing_value {
+        Some(bytes) => decode_i64_le(&bytes, "counter existing value"),
+        None => 0,
+    };
+    for operand in operands {
+        sum += decode_i64_le(operand, "counter operand");
+    }
+    Bytes::copy_from_slice(&sum.to_le_bytes())
+}
+
+/// Decodes an 8-byte little-endian `i64`, panicking (fail-closed) on the wrong
+/// length.
+fn decode_i64_le(bytes: &[u8], context: &str) -> i64 {
+    let arr: [u8; 8] = bytes.try_into().unwrap_or_else(|_| {
+        panic!(
+            "GraphMergeOperator: corrupt i64 counter bytes for {context}: expected 8 bytes, got {}",
+            bytes.len()
+        )
+    });
+    i64::from_le_bytes(arr)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::serde::Uid;
-    use crate::serde::keys::node_key;
+    use crate::serde::keys::{count_key, edge_key, edge_part_key, log_key, meta_key, node_key};
+    use crate::serde::{Direction, PredId};
+
+    fn roaring_of(vals: &[u64]) -> Bytes {
+        let set: RoaringTreemap = vals.iter().copied().collect();
+        encode_roaring(&set)
+    }
+
+    fn treemap_from(bytes: &Bytes) -> RoaringTreemap {
+        RoaringTreemap::deserialize_from(bytes.as_ref()).unwrap()
+    }
+
+    fn i64_bytes(v: i64) -> Bytes {
+        Bytes::copy_from_slice(&v.to_le_bytes())
+    }
+
+    fn deleted_edges_meta_key(pred: PredId, anchor: Uid) -> Bytes {
+        let mut sub = b"deleted_edges/".to_vec();
+        sub.extend_from_slice(&pred.get().to_be_bytes());
+        sub.extend_from_slice(&anchor.get().to_be_bytes());
+        meta_key(&sub)
+    }
+
+    fn count_meta_key(pred: PredId) -> Bytes {
+        let mut sub = b"count/".to_vec();
+        sub.extend_from_slice(&pred.get().to_be_bytes());
+        meta_key(&sub)
+    }
+
+    // -- Meta deleted-bitmap union ------------------------------------------
 
     #[test]
-    fn should_return_newest_operand_when_existing_value_present() {
-        // given — an existing value and two newer operands
+    fn should_union_deleted_nodes_operands_with_existing_value() {
         let op = GraphMergeOperator;
-        let key = node_key(Uid(1));
-        let existing = Some(Bytes::from_static(b"old"));
-        let operands = [Bytes::from_static(b"mid"), Bytes::from_static(b"new")];
+        let key = meta_key(b"deleted_nodes");
+        let existing = Some(roaring_of(&[1, 2, 3]));
+        let operands = [roaring_of(&[3, 4]), roaring_of(&[5])];
 
-        // when
         let merged = op.merge_batch(&key, existing, &operands);
 
-        // then — newest operand wins over both the existing value and the mid operand
-        assert_eq!(merged, Bytes::from_static(b"new"));
+        assert_eq!(
+            treemap_from(&merged),
+            [1u64, 2, 3, 4, 5].into_iter().collect::<RoaringTreemap>()
+        );
     }
 
     #[test]
-    fn should_return_newest_operand_when_no_existing_value() {
-        // given — no existing value, two operands
+    fn should_union_deleted_nodes_operands_with_no_existing_value() {
         let op = GraphMergeOperator;
-        let key = node_key(Uid(2));
-        let operands = [Bytes::from_static(b"first"), Bytes::from_static(b"second")];
+        let key = meta_key(b"deleted_nodes");
+        let operands = [roaring_of(&[10]), roaring_of(&[11, 12])];
 
-        // when
         let merged = op.merge_batch(&key, None, &operands);
 
-        // then
-        assert_eq!(merged, Bytes::from_static(b"second"));
+        assert_eq!(
+            treemap_from(&merged),
+            [10u64, 11, 12].into_iter().collect::<RoaringTreemap>()
+        );
     }
 
     #[test]
-    fn should_return_existing_when_operands_empty() {
-        // given — an existing value and no operands
+    fn should_union_deleted_edges_operands_by_pred_and_anchor() {
+        let op = GraphMergeOperator;
+        let key = deleted_edges_meta_key(PredId(7), Uid(42));
+        let existing = Some(roaring_of(&[100]));
+        let operands = [roaring_of(&[200])];
+
+        let merged = op.merge_batch(&key, existing, &operands);
+
+        assert_eq!(
+            treemap_from(&merged),
+            [100u64, 200].into_iter().collect::<RoaringTreemap>()
+        );
+    }
+
+    // -- EdgeOut/EdgeIn/EdgePart fast-add union -------------------------------
+
+    #[test]
+    fn should_union_edge_out_fast_add_operands_into_existing_posting_value() {
+        let op = GraphMergeOperator;
+        let key = edge_key(Direction::Out, Uid(1), PredId(2));
+        let existing = Some(PostingValue::single([1u64, 2, 3].into_iter().collect()).serialize());
+        let operands = [roaring_of(&[4]), roaring_of(&[5, 6])];
+
+        let merged = op.merge_batch(&key, existing, &operands);
+
+        let posting = PostingValue::deserialize(&merged).unwrap();
+        assert_eq!(
+            posting,
+            PostingValue::single([1u64, 2, 3, 4, 5, 6].into_iter().collect())
+        );
+    }
+
+    #[test]
+    fn should_union_edge_in_fast_add_operands_with_no_existing_value() {
+        let op = GraphMergeOperator;
+        let key = edge_key(Direction::In, Uid(9), PredId(3));
+        let operands = [roaring_of(&[1]), roaring_of(&[2])];
+
+        let merged = op.merge_batch(&key, None, &operands);
+
+        let posting = PostingValue::deserialize(&merged).unwrap();
+        assert_eq!(
+            posting,
+            PostingValue::single([1u64, 2].into_iter().collect())
+        );
+    }
+
+    #[test]
+    fn should_union_edge_part_fast_add_operands_like_unsplit_lists() {
+        let op = GraphMergeOperator;
+        let key = edge_part_key(Direction::Out, Uid(1), PredId(2), Uid(1000));
+        let existing =
+            Some(PostingValue::single([1000u64, 1001].into_iter().collect()).serialize());
+        let operands = [roaring_of(&[1002])];
+
+        let merged = op.merge_batch(&key, existing, &operands);
+
+        let posting = PostingValue::deserialize(&merged).unwrap();
+        assert_eq!(
+            posting,
+            PostingValue::single([1000u64, 1001, 1002].into_iter().collect())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Split")]
+    fn should_fail_closed_when_existing_edge_posting_is_a_split_manifest() {
+        let op = GraphMergeOperator;
+        let key = edge_key(Direction::Out, Uid(1), PredId(2));
+        let existing = Some(PostingValue::split(vec![]).serialize());
+        let operands = [roaring_of(&[1])];
+
+        op.merge_batch(&key, existing, &operands);
+    }
+
+    // -- Counter (i64 LE sum) --------------------------------------------------
+
+    #[test]
+    fn should_sum_counter_operands_with_existing_value() {
+        let op = GraphMergeOperator;
+        let key = count_meta_key(PredId(3));
+        let existing = Some(i64_bytes(10));
+        let operands = [i64_bytes(1), i64_bytes(-2)];
+
+        let merged = op.merge_batch(&key, existing, &operands);
+
+        assert_eq!(i64::from_le_bytes(merged.as_ref().try_into().unwrap()), 9);
+    }
+
+    #[test]
+    fn should_sum_counter_operands_with_no_existing_value() {
+        let op = GraphMergeOperator;
+        let key = count_meta_key(PredId(4));
+        let operands = [i64_bytes(2), i64_bytes(3), i64_bytes(4)];
+
+        let merged = op.merge_batch(&key, None, &operands);
+
+        assert_eq!(i64::from_le_bytes(merged.as_ref().try_into().unwrap()), 9);
+    }
+
+    // -- Empty operands ---------------------------------------------------------
+
+    #[test]
+    fn should_return_existing_value_unchanged_when_operands_empty() {
         let op = GraphMergeOperator;
         let key = node_key(Uid(3));
 
-        // when
         let merged = op.merge_batch(&key, Some(Bytes::from_static(b"keep")), &[]);
 
-        // then — existing value is preserved
         assert_eq!(merged, Bytes::from_static(b"keep"));
     }
 
     #[test]
     fn should_return_empty_when_no_existing_and_no_operands() {
-        // given — nothing to merge
         let op = GraphMergeOperator;
         let key = node_key(Uid(4));
 
-        // when / then — empty (never panics)
         assert_eq!(op.merge_batch(&key, None, &[]), Bytes::new());
     }
 
+    // -- Fail-closed: non-associative record types --------------------------
+
     #[test]
-    fn should_not_panic_on_malformed_short_key() {
-        // given — a key too short to carry a valid record-type head
+    #[should_panic(expected = "non-associative record type")]
+    fn should_fail_closed_on_node_merge_operand() {
+        let op = GraphMergeOperator;
+        let key = node_key(Uid(1));
+        op.merge_batch(
+            &key,
+            Some(Bytes::from_static(b"v")),
+            &[Bytes::from_static(b"op")],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-associative record type")]
+    fn should_fail_closed_on_index_merge_operand() {
+        let op = GraphMergeOperator;
+        let key = crate::serde::keys::index_key(PredId(1), b"tok");
+        op.merge_batch(&key, None, &[Bytes::from_static(b"op")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-associative record type")]
+    fn should_fail_closed_on_count_merge_operand() {
+        let op = GraphMergeOperator;
+        let key = count_key(PredId(1), Direction::Out, 5);
+        op.merge_batch(&key, None, &[Bytes::from_static(b"op")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-associative record type")]
+    fn should_fail_closed_on_log_merge_operand() {
+        let op = GraphMergeOperator;
+        let key = log_key(1);
+        op.merge_batch(&key, None, &[Bytes::from_static(b"op")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-associative record type")]
+    fn should_fail_closed_on_schema_name_merge_operand() {
+        let op = GraphMergeOperator;
+        let key = crate::serde::keys::schema_name_key(crate::serde::SchemaKind::Label, b"Person");
+        op.merge_batch(&key, None, &[Bytes::from_static(b"op")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-associative record type")]
+    fn should_fail_closed_on_schema_id_merge_operand() {
+        let op = GraphMergeOperator;
+        let key = crate::serde::keys::schema_id_key(crate::serde::SchemaKind::Label, 1);
+        op.merge_batch(&key, None, &[Bytes::from_static(b"op")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-associative record type")]
+    fn should_fail_closed_on_xid_merge_operand() {
+        let op = GraphMergeOperator;
+        let key = crate::serde::keys::xid_key(b"external-id");
+        op.merge_batch(&key, None, &[Bytes::from_static(b"op")]);
+    }
+
+    // -- Fail-closed: non-associative Meta sub-keys --------------------------
+
+    #[test]
+    #[should_panic(expected = "non-associative Meta")]
+    fn should_fail_closed_on_latest_seq_merge_operand() {
+        let op = GraphMergeOperator;
+        let key = meta_key(b"latest_seq");
+        op.merge_batch(&key, None, &[Bytes::from_static(b"op")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-associative Meta")]
+    fn should_fail_closed_on_seq_block_merge_operand() {
+        let op = GraphMergeOperator;
+        let key = meta_key(b"seq/uid");
+        op.merge_batch(&key, None, &[Bytes::from_static(b"op")]);
+    }
+
+    // -- Malformed key ----------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "unparseable key")]
+    fn should_fail_closed_on_malformed_short_key() {
         let op = GraphMergeOperator;
         let malformed = Bytes::from_static(b"\x00");
-
-        // when — routing on a bad key must not panic; newest-wins still applies
-        let merged = op.merge_batch(&malformed, None, &[Bytes::from_static(b"v")]);
-
-        // then
-        assert_eq!(merged, Bytes::from_static(b"v"));
+        op.merge_batch(&malformed, None, &[Bytes::from_static(b"v")]);
     }
 }
