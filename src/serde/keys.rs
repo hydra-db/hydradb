@@ -305,6 +305,43 @@ pub fn parse_meta_key(key: &[u8]) -> Result<Bytes> {
     Ok(Bytes::copy_from_slice(tail))
 }
 
+/// Which merge semantics apply to a `Meta` sub-key (RFC 0003 §"Merge-operator
+/// dispatch table"). `Meta` is the one record type whose merge behavior isn't
+/// determined by the record type alone — every sub-identifier is its own tiny
+/// namespace, so the merge operator ([`crate::merge`]) must inspect the raw
+/// identifier (the [`parse_meta_key`] output) to route correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaKind {
+    /// `deleted_nodes`, or `deleted_edges/<pred:4 BE><anchor:8 BE>` — a bare
+    /// `roaring::RoaringTreemap` (portable format), merged by set **union**
+    /// (RFC 0004 §"Delete", RFC 0005 §"Delete").
+    DeletedBitmap,
+    /// `count/<pred:4 BE>` (and other corpus counters) — an 8-byte
+    /// little-endian `i64`, merged by **sum**.
+    Counter,
+    /// Everything else: `latest_seq`, the `seq/*` allocator block reservations
+    /// (`ids::GraphAllocators`), and any future scalar. Single-writer
+    /// read-modify-write only — must never receive a merge operand.
+    Scalar,
+}
+
+const META_DELETED_NODES: &[u8] = b"deleted_nodes";
+const META_DELETED_EDGES_PREFIX: &[u8] = b"deleted_edges/";
+const META_COUNT_PREFIX: &[u8] = b"count/";
+
+/// Classifies a `Meta` key's raw sub-identifier by merge semantics. Pure
+/// prefix/exact-match dispatch, no I/O — takes the bytes [`parse_meta_key`]
+/// returns (i.e. the key tail, not the whole key).
+pub fn meta_kind(meta: &[u8]) -> MetaKind {
+    if meta == META_DELETED_NODES || meta.starts_with(META_DELETED_EDGES_PREFIX) {
+        MetaKind::DeletedBitmap
+    } else if meta.starts_with(META_COUNT_PREFIX) {
+        MetaKind::Counter
+    } else {
+        MetaKind::Scalar
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SchemaName (0x1): [kind:1][name: terminated_bytes]
 // ---------------------------------------------------------------------------
@@ -536,6 +573,41 @@ mod tests {
         assert!(!r5.contains(&k6));
         // and predicates are ordered
         assert!(k5 < k6);
+    }
+
+    #[test]
+    fn should_classify_deleted_bitmap_meta_kinds() {
+        assert_eq!(meta_kind(b"deleted_nodes"), MetaKind::DeletedBitmap);
+
+        let mut sub = b"deleted_edges/".to_vec();
+        sub.extend_from_slice(&7u32.to_be_bytes());
+        sub.extend_from_slice(&42u64.to_be_bytes());
+        assert_eq!(meta_kind(&sub), MetaKind::DeletedBitmap);
+    }
+
+    #[test]
+    fn should_classify_counter_meta_kind() {
+        let mut sub = b"count/".to_vec();
+        sub.extend_from_slice(&3u32.to_be_bytes());
+        assert_eq!(meta_kind(&sub), MetaKind::Counter);
+    }
+
+    #[test]
+    fn should_classify_scalar_meta_kinds() {
+        assert_eq!(meta_kind(b"latest_seq"), MetaKind::Scalar);
+        assert_eq!(meta_kind(b"seq/uid"), MetaKind::Scalar);
+        assert_eq!(meta_kind(b"seq/pred"), MetaKind::Scalar);
+        // unknown/unrecognized sub-keys fail closed as Scalar too.
+        assert_eq!(meta_kind(b"something_else"), MetaKind::Scalar);
+        assert_eq!(meta_kind(b""), MetaKind::Scalar);
+    }
+
+    #[test]
+    fn should_not_confuse_deleted_nodes_prefix_with_unrelated_names() {
+        // "deleted_nodes_extra" is not the exact `deleted_nodes` key and
+        // doesn't match the `deleted_edges/` prefix either — must be Scalar,
+        // not silently classified as a bitmap.
+        assert_eq!(meta_kind(b"deleted_nodes_extra"), MetaKind::Scalar);
     }
 
     #[test]
