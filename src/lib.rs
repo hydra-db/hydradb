@@ -70,6 +70,11 @@ pub enum GraphError {
         operation: &'static str,
         cell_id: String,
     },
+    #[error("{operation} requires await_durable_writes=true: {reason}")]
+    UnsafeDurabilityConfig {
+        operation: &'static str,
+        reason: String,
+    },
     #[error("invalid {component} key component: {value}")]
     InvalidKeyComponent {
         component: &'static str,
@@ -1472,6 +1477,15 @@ impl GraphShard {
         options: GraphOpenOptions,
         write_authority: GraphWriteAuthority,
     ) -> Result<Self> {
+        if !options.durability.await_durable_writes
+            && !matches!(&write_authority, GraphWriteAuthority::ReadOnly)
+        {
+            return Err(GraphError::UnsafeDurabilityConfig {
+                operation: "open_write_authoritative_shard",
+                reason: "graph writers allocate epochs from remote-visible metadata; relaxed durability can release cross-process fences before last_epoch, degree counters, and idempotency keys are visible".to_string(),
+            });
+        }
+
         let store_path = path.into();
         let db = open_graph_db(
             store_path.clone(),
@@ -7130,6 +7144,42 @@ mod tests {
                 operation: "write_edge",
                 cell_id
             } if cell_id == "reddit-home"
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_authoritative_open_rejects_relaxed_durability() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let options = GraphOpenOptions {
+            durability: GraphDurabilityConfig::default().with_await_durable_writes(false),
+            ..Default::default()
+        };
+
+        let reader = GraphShard::open_with_options(
+            "graph/relaxed-durability-reader",
+            Arc::clone(&object_store),
+            options.clone(),
+        )
+        .await
+        .unwrap();
+        reader.close().await.unwrap();
+
+        let err = match GraphShard::open_standalone_writer_with_options(
+            "graph/relaxed-durability-writer",
+            object_store,
+            options,
+        )
+        .await
+        {
+            Ok(_) => panic!("write-authoritative shard accepted relaxed durability"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            GraphError::UnsafeDurabilityConfig {
+                operation: "open_write_authoritative_shard",
+                ref reason
+            } if reason.contains("remote-visible metadata")
         ));
     }
 
