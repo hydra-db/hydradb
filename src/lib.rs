@@ -28,6 +28,9 @@
 //! - [`posting`] — [`posting::PostingValue`], the posting-list value type
 //!   (RFC 0005) stored at every adjacency/index/count key: its on-wire codec
 //!   and read-side set-algebra surface. M1 deliverable 1.
+//! - [`posting_ops`] — add/delete/split/rollup/neighbors: the operations that
+//!   turn adjacency keys into live, updatable posting lists (RFC 0005
+//!   §"Add/delete mechanics", §"Splitting supernodes"). M1 deliverable 4.
 //! - [`value`] — [`value::NodeRecord`]/[`value::TypedValue`] (RFC 0004
 //!   §"Node record") and [`value::ChangeRecord`] (§"ChangeRecord schema"):
 //!   the node blob and changelog value types, each with a fail-closed codec.
@@ -40,6 +43,7 @@ pub mod error;
 pub mod ids;
 pub mod merge;
 pub mod posting;
+pub mod posting_ops;
 pub mod schema;
 pub mod serde;
 pub mod storage;
