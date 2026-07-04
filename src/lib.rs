@@ -1718,7 +1718,7 @@ impl GraphShard {
             key.as_bytes(),
             encode_write_fence(&GraphWriteFence::from(lease)),
         )?;
-        commit_txn_strict(txn).await
+        commit_txn_strict(txn, self.await_durable_writes).await
     }
 
     async fn validate_write_fence_txn(
@@ -2090,7 +2090,7 @@ impl GraphShard {
                 idem_key.as_bytes(),
                 encode_commit_idempotency(mutation, &result),
             )?;
-            commit_txn_strict(txn).await?;
+            commit_txn_strict(txn, self.await_durable_writes).await?;
             return Ok(result);
         }
 
@@ -2169,7 +2169,7 @@ impl GraphShard {
             encode_commit_idempotency(mutation, &result),
         )?;
 
-        commit_txn_strict(txn).await?;
+        commit_txn_strict(txn, self.await_durable_writes).await?;
         Ok(result)
     }
 
@@ -2257,7 +2257,7 @@ impl GraphShard {
                     idem_key.as_bytes(),
                     encode_delete_idempotency(mutation, &result),
                 )?;
-                commit_txn_strict(txn).await?;
+                commit_txn_strict(txn, self.await_durable_writes).await?;
                 return Ok(result);
             };
             let tombstone_key = keys::out_segment_tombstone(
@@ -2277,7 +2277,7 @@ impl GraphShard {
                         idem_key.as_bytes(),
                         encode_delete_idempotency(mutation, &result),
                     )?;
-                    commit_txn_strict(txn).await?;
+                    commit_txn_strict(txn, self.await_durable_writes).await?;
                     return Ok(result);
                 }
             }
@@ -2330,7 +2330,7 @@ impl GraphShard {
                 idem_key.as_bytes(),
                 encode_delete_idempotency(mutation, &result),
             )?;
-            commit_txn_strict(txn).await?;
+            commit_txn_strict(txn, self.await_durable_writes).await?;
             return Ok(result);
         };
 
@@ -2411,7 +2411,7 @@ impl GraphShard {
             encode_delete_idempotency(mutation, &result),
         )?;
 
-        commit_txn_strict(txn).await?;
+        commit_txn_strict(txn, self.await_durable_writes).await?;
         Ok(result)
     }
 
@@ -2587,22 +2587,6 @@ impl GraphShard {
 
         let _permit = self.acquire_graph_write_permit("bulk_import_edges").await?;
         let _writer = self.writer_lane(cell_id).lock().await;
-        if matches!(&self.write_authority, GraphWriteAuthority::Standalone) {
-            let result = self
-                .bulk_import_edges_write_batch(
-                    cell_id,
-                    edge_type,
-                    &edges,
-                    idempotency_key,
-                    fingerprint,
-                    options,
-                )
-                .await?;
-            self.operation_metrics
-                .write_commits
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(result);
-        }
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
                 .bulk_import_edges_txn(
@@ -2640,188 +2624,6 @@ impl GraphShard {
             }
         }
         unreachable!("transaction retry loop always returns on final attempt")
-    }
-
-    async fn bulk_import_edges_write_batch(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        edges: &[(VertexId, VertexId)],
-        idempotency_key: &str,
-        fingerprint: u64,
-        options: BulkImportOptions,
-    ) -> Result<BulkImportResult> {
-        let preflight_started = std::time::Instant::now();
-        let idem_key = keys::idempotency(cell_id, "bulk-import", idempotency_key);
-        if let Some(value) = self.read_remote(&idem_key).await? {
-            return decode_bulk_import_idempotency(&idem_key, idempotency_key, fingerprint, &value);
-        }
-
-        let current_epoch = self.current_epoch(cell_id).await?;
-        let fresh_cell = current_epoch == 0;
-        let mut already_existed = 0_u64;
-        let mut inserted_edges = Vec::new();
-        for (src, dst) in edges.iter().copied() {
-            if options.duplicate_policy.check_existing()
-                && !fresh_cell
-                && self
-                    .read_remote(&keys::out_edge(cell_id, edge_type, src, dst))
-                    .await?
-                    .is_some()
-            {
-                already_existed += 1;
-                continue;
-            }
-            inserted_edges.push((src, dst));
-        }
-        let preflight_elapsed = preflight_started.elapsed();
-
-        let inserted =
-            u64::try_from(inserted_edges.len()).map_err(|err| GraphError::CorruptValue {
-                key: "bulk_import".to_string(),
-                reason: format!("too many edges in one import: {err}"),
-            })?;
-        let end_epoch =
-            current_epoch
-                .checked_add(inserted)
-                .ok_or_else(|| GraphError::CorruptValue {
-                    key: "bulk_import".to_string(),
-                    reason: "epoch overflow during bulk import".to_string(),
-                })?;
-        let start_epoch = if inserted == 0 {
-            current_epoch
-        } else {
-            current_epoch + 1
-        };
-        let result = BulkImportResult {
-            start_epoch,
-            end_epoch,
-            inserted,
-            already_existed,
-        };
-
-        let mut batch = WriteBatch::new();
-        let write_reverse_index = self.writes_reverse_index();
-        let mut out_increments = std::collections::BTreeMap::<VertexId, u64>::new();
-        let mut in_increments = std::collections::BTreeMap::<VertexId, u64>::new();
-        let batch_build_started = std::time::Instant::now();
-        for (offset, (src, dst)) in inserted_edges.iter().copied().enumerate() {
-            let epoch = current_epoch + 1 + offset as u64;
-            let edge_value = Bytes::from(encode_edge_epoch(epoch));
-            batch.put_bytes(
-                Bytes::from(keys::out_edge(cell_id, edge_type, src, dst)),
-                edge_value.clone(),
-            );
-            if write_reverse_index {
-                batch.put_bytes(
-                    Bytes::from(keys::in_edge(cell_id, edge_type, dst, src)),
-                    edge_value,
-                );
-            }
-            if options.delta_log_policy.write_per_edge() {
-                batch.put_bytes(
-                    Bytes::from(keys::outbox(
-                        cell_id,
-                        epoch,
-                        DeltaKind::Plus,
-                        edge_type,
-                        src,
-                        dst,
-                    )),
-                    Bytes::from_static(b"delta2\n"),
-                );
-            }
-            *out_increments.entry(src).or_insert(0) += 1;
-            if write_reverse_index {
-                *in_increments.entry(dst).or_insert(0) += 1;
-            }
-        }
-        let batch_build_elapsed = batch_build_started.elapsed();
-
-        let counter_read_started = std::time::Instant::now();
-        for (src, increment) in out_increments {
-            let key = keys::degree_out(cell_id, edge_type, src);
-            let base = if fresh_cell {
-                0
-            } else {
-                self.read_counter(&key).await?
-            };
-            batch.put_bytes(Bytes::from(key), Bytes::from(encode_u64(base + increment)));
-        }
-        if write_reverse_index {
-            for (dst, increment) in in_increments {
-                let key = keys::degree_in(cell_id, edge_type, dst);
-                let base = if fresh_cell {
-                    0
-                } else {
-                    self.read_counter(&key).await?
-                };
-                batch.put_bytes(Bytes::from(key), Bytes::from(encode_u64(base + increment)));
-            }
-        }
-        let counter_read_elapsed = counter_read_started.elapsed();
-        if inserted > 0 {
-            batch.put_bytes(
-                Bytes::from(keys::last_epoch(cell_id)),
-                Bytes::from(encode_u64(end_epoch)),
-            );
-            if options.delta_log_policy.write_batch() {
-                batch.put_bytes(
-                    Bytes::from(keys::outbox_batch(
-                        cell_id,
-                        end_epoch,
-                        start_epoch,
-                        DeltaKind::Plus,
-                        edge_type,
-                        idempotency_key,
-                    )),
-                    Bytes::from(encode_outbox_delta_batch(
-                        cell_id,
-                        edge_type,
-                        DeltaKind::Plus,
-                        start_epoch,
-                        end_epoch,
-                        &inserted_edges,
-                    )),
-                );
-            }
-        }
-        batch.put_bytes(
-            Bytes::from(keys::mutation_batch(
-                cell_id,
-                result.start_epoch,
-                idempotency_key,
-            )),
-            Bytes::from(encode_mutation_batch_log(
-                edge_type,
-                idempotency_key,
-                fingerprint,
-                &result,
-            )),
-        );
-        batch.put_bytes(
-            Bytes::from(idem_key),
-            Bytes::from(encode_bulk_import_idempotency(
-                idempotency_key,
-                fingerprint,
-                &result,
-            )),
-        );
-
-        let options = WriteOptions {
-            await_durable: self.await_durable_writes,
-            ..Default::default()
-        };
-        let commit_started = std::time::Instant::now();
-        self.db.write_with_options(batch, &options).await?;
-        let commit_elapsed = commit_started.elapsed();
-        self.record_bulk_import_profile(
-            preflight_elapsed,
-            batch_build_elapsed,
-            counter_read_elapsed,
-            commit_elapsed,
-        );
-        Ok(result)
     }
 
     pub async fn write_edge_mutations_batch(
@@ -3089,7 +2891,7 @@ impl GraphShard {
             idem_key.as_bytes(),
             encode_mutation_log_append_idempotency(batch_id, fingerprint, &result),
         )?;
-        commit_txn_strict(txn).await?;
+        commit_txn_strict(txn, self.await_durable_writes).await?;
         Ok(result)
     }
 
@@ -3422,7 +3224,7 @@ impl GraphShard {
             .filter(|result| !result.already_existed)
             .map(|result| result.epoch)
             .max();
-        commit_txn_strict(txn).await?;
+        commit_txn_strict(txn, self.await_durable_writes).await?;
         Ok(EdgeMutationBatchResult {
             start_epoch: inserted_start_epoch.unwrap_or(current_epoch),
             end_epoch: inserted_end_epoch.unwrap_or(next_epoch),
@@ -3683,7 +3485,7 @@ impl GraphShard {
             encode_bulk_import_idempotency(idempotency_key, fingerprint, &result),
         )?;
 
-        commit_txn_strict(txn).await?;
+        commit_txn_strict(txn, self.await_durable_writes).await?;
         Ok(result)
     }
 
@@ -3696,6 +3498,7 @@ impl GraphShard {
         fingerprint: u64,
         options: BulkImportOptions,
     ) -> Result<BulkImportResult> {
+        let preflight_started = std::time::Instant::now();
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
         self.validate_write_fence_txn(&txn, cell_id, "bulk_import_edges")
             .await?;
@@ -3720,6 +3523,7 @@ impl GraphShard {
             }
             inserted_edges.push((src, dst));
         }
+        let preflight_elapsed = preflight_started.elapsed();
 
         let inserted =
             u64::try_from(inserted_edges.len()).map_err(|err| GraphError::CorruptValue {
@@ -3748,6 +3552,7 @@ impl GraphShard {
         let write_reverse_index = self.writes_reverse_index();
         let mut out_increments = std::collections::BTreeMap::<VertexId, u64>::new();
         let mut in_increments = std::collections::BTreeMap::<VertexId, u64>::new();
+        let batch_build_started = std::time::Instant::now();
         for (offset, (src, dst)) in inserted_edges.iter().copied().enumerate() {
             let epoch = current_epoch + 1 + offset as u64;
             let record = EdgeRecord {
@@ -3783,7 +3588,9 @@ impl GraphShard {
                 *in_increments.entry(dst).or_insert(0) += 1;
             }
         }
+        let batch_build_elapsed = batch_build_started.elapsed();
 
+        let counter_read_started = std::time::Instant::now();
         for (src, increment) in out_increments {
             let key = keys::degree_out(cell_id, edge_type, src);
             let base = if fresh_cell {
@@ -3804,6 +3611,7 @@ impl GraphShard {
                 txn.put(key.as_bytes(), encode_u64(base + increment))?;
             }
         }
+        let counter_read_elapsed = counter_read_started.elapsed();
         if inserted > 0 {
             txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(end_epoch))?;
             if options.delta_log_policy.write_batch() {
@@ -3837,7 +3645,15 @@ impl GraphShard {
             encode_bulk_import_idempotency(idempotency_key, fingerprint, &result),
         )?;
 
-        commit_txn_strict(txn).await?;
+        let commit_started = std::time::Instant::now();
+        commit_txn_strict(txn, self.await_durable_writes).await?;
+        let commit_elapsed = commit_started.elapsed();
+        self.record_bulk_import_profile(
+            preflight_elapsed,
+            batch_build_elapsed,
+            counter_read_elapsed,
+            commit_elapsed,
+        );
         Ok(result)
     }
 
@@ -5113,7 +4929,7 @@ impl GraphShard {
                 GraphWriteOp::Delete(key) => txn.delete(key.as_ref())?,
             }
         }
-        commit_txn_strict(txn).await
+        commit_txn_strict(txn, self.await_durable_writes).await
     }
 }
 
@@ -5249,9 +5065,9 @@ async fn next_epoch_txn(txn: &DbTransaction, cell_id: &str) -> Result<GraphEpoch
         })
 }
 
-async fn commit_txn_strict(txn: DbTransaction) -> Result<()> {
+async fn commit_txn_strict(txn: DbTransaction, await_durable: bool) -> Result<()> {
     let options = WriteOptions {
-        await_durable: true,
+        await_durable,
         ..Default::default()
     };
     txn.commit_with_options(&options).await?;
@@ -7116,6 +6932,39 @@ mod tests {
         unreachable!("transaction retry loop always returns on final attempt")
     }
 
+    async fn bulk_import_txn_retry_for_test(
+        shard: Arc<GraphShard>,
+        cell_id: &str,
+        edge_type: &str,
+        edges: Vec<(VertexId, VertexId)>,
+        idempotency_key: &str,
+        options: BulkImportOptions,
+    ) -> Result<BulkImportResult> {
+        let fingerprint = bulk_import_fingerprint(cell_id, edge_type, &edges);
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match shard
+                .bulk_import_edges_txn(
+                    cell_id,
+                    edge_type,
+                    &edges,
+                    idempotency_key,
+                    fingerprint,
+                    options,
+                )
+                .await
+            {
+                Err(GraphError::Slate(err))
+                    if err.kind() == ErrorKind::Transaction
+                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
     fn assert_stale_node_a(err: GraphError) {
         assert!(matches!(
             err,
@@ -7509,6 +7358,74 @@ mod tests {
                 .unwrap(),
             16
         );
+    }
+
+    #[tokio::test]
+    async fn bulk_import_transactions_retry_without_epoch_overlap() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard =
+            Arc::new(open_test_shard("graph/bulk-import-transaction-race", object_store).await);
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        let left = {
+            let shard = Arc::clone(&shard);
+            tokio::spawn(async move {
+                bulk_import_txn_retry_for_test(
+                    shard,
+                    cell_id,
+                    edge_type,
+                    vec![(1, 2), (1, 3)],
+                    "bulk-race-a",
+                    BulkImportOptions::default(),
+                )
+                .await
+            })
+        };
+        let right = {
+            let shard = Arc::clone(&shard);
+            tokio::spawn(async move {
+                bulk_import_txn_retry_for_test(
+                    shard,
+                    cell_id,
+                    edge_type,
+                    vec![(1, 4), (1, 5)],
+                    "bulk-race-b",
+                    BulkImportOptions::default(),
+                )
+                .await
+            })
+        };
+
+        let mut ranges = vec![left.await.unwrap().unwrap(), right.await.unwrap().unwrap()];
+        ranges.sort_by_key(|result| result.start_epoch);
+        assert_eq!(
+            ranges,
+            vec![
+                BulkImportResult {
+                    start_epoch: 1,
+                    end_epoch: 2,
+                    inserted: 2,
+                    already_existed: 0,
+                },
+                BulkImportResult {
+                    start_epoch: 3,
+                    end_epoch: 4,
+                    inserted: 2,
+                    already_existed: 0,
+                },
+            ]
+        );
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 3, 4, 5]
+        );
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 4);
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
     }
 
     #[tokio::test]
