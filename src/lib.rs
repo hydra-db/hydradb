@@ -8,7 +8,7 @@ use slatedb::bytes::Bytes;
 use slatedb::config::{
     DurabilityLevel, PreloadLevel, ReadOptions, ScanOptions, Settings, WriteOptions,
 };
-use slatedb::object_store::{path::Path, ObjectStore};
+use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode};
 use slatedb::{Db, DbTransaction, ErrorKind, IsolationLevel, WriteBatch};
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -65,6 +65,11 @@ pub enum GraphError {
     Slate(#[from] slatedb::Error),
     #[error("object store error: {0}")]
     ObjectStore(#[from] slatedb::object_store::Error),
+    #[error("cell write conflict for {operation} on {cell_id}")]
+    CellWriteConflict {
+        operation: &'static str,
+        cell_id: String,
+    },
     #[error("invalid {component} key component: {value}")]
     InvalidKeyComponent {
         component: &'static str,
@@ -164,6 +169,8 @@ pub type Result<T> = std::result::Result<T, GraphError>;
 const GRAPH_TXN_MAX_RETRIES: usize = 32;
 const GRAPH_DELTA_GC_BATCH_KEYS: usize = 512;
 const GRAPH_WRITE_LANES: usize = 64;
+const GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS: usize = 256;
+const GRAPH_CELL_WRITE_LOCK_BACKOFF_MS: u64 = 2;
 pub const DEFAULT_TRUSTED_APPEND_CHUNK_EDGES: usize = 32_768;
 // Release profiling showed larger materialization transactions regress from SlateDB
 // write-batch and conflict-tracking overhead; keep async drains in the same
@@ -840,6 +847,8 @@ struct OutboxDeltaBatch {
 
 pub struct GraphShard {
     db: Db,
+    object_store: Arc<dyn ObjectStore>,
+    store_path: Path,
     pub(crate) limits: GraphLimits,
     pub(crate) cache_policy: GraphCachePolicy,
     pub(crate) retention_policy: GraphRetentionPolicy,
@@ -913,6 +922,33 @@ impl From<&phase0::ShardLease> for GraphWriteFence {
 pub(crate) enum GraphWriteOp {
     Put(Bytes, Bytes),
     Delete(Bytes),
+}
+
+struct CellWriteLock {
+    object_store: Arc<dyn ObjectStore>,
+    path: Path,
+}
+
+impl CellWriteLock {
+    async fn release(self) -> Result<()> {
+        match self.object_store.delete(&self.path).await {
+            Ok(()) | Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+async fn release_cell_write_lock<T>(lock: CellWriteLock, result: Result<T>) -> Result<T> {
+    match (result, lock.release().await) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), _) => Err(err),
+    }
+}
+
+fn is_retryable_write_conflict(err: &GraphError) -> bool {
+    matches!(err, GraphError::Slate(err) if err.kind() == ErrorKind::Transaction)
+        || matches!(err, GraphError::CellWriteConflict { .. })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1436,7 +1472,14 @@ impl GraphShard {
         options: GraphOpenOptions,
         write_authority: GraphWriteAuthority,
     ) -> Result<Self> {
-        let db = open_graph_db(path, object_store, &options.cache, &options.durability).await?;
+        let store_path = path.into();
+        let db = open_graph_db(
+            store_path.clone(),
+            Arc::clone(&object_store),
+            &options.cache,
+            &options.durability,
+        )
+        .await?;
         ensure_store_format(&db, &write_authority).await?;
         let cache_policy = options.cache_policy;
         let backpressure_policy = options.backpressure_policy;
@@ -1455,6 +1498,8 @@ impl GraphShard {
         ));
         Ok(Self {
             db,
+            object_store,
+            store_path,
             limits: options.limits,
             cache_policy: cache_policy.clone(),
             retention_policy: options.retention_policy,
@@ -1518,6 +1563,60 @@ impl GraphShard {
 
     fn writer_lane(&self, cell_id: &str) -> &Mutex<()> {
         &self.writer_lanes[writer_lane_index(cell_id)]
+    }
+
+    fn cell_write_lock_path(&self, cell_id: &str) -> Path {
+        let db_path = if self.store_path.as_ref().is_empty() {
+            "__root__"
+        } else {
+            self.store_path.as_ref()
+        };
+        Path::from_iter(["__slatedb_graph_kernel", "write_locks", db_path, cell_id])
+    }
+
+    async fn acquire_cell_write_lock(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+    ) -> Result<CellWriteLock> {
+        let path = self.cell_write_lock_path(cell_id);
+        let payload = Bytes::from(format!(
+            "graph-cell-write-lock-v1\ncell={cell_id}\noperation={operation}\ncreated_ms={}\n",
+            graph_now_millis()
+        ));
+
+        for attempt in 0..GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS {
+            match self
+                .object_store
+                .put_opts(&path, payload.clone().into(), PutMode::Create.into())
+                .await
+            {
+                Ok(_) => {
+                    return Ok(CellWriteLock {
+                        object_store: Arc::clone(&self.object_store),
+                        path,
+                    });
+                }
+                Err(slatedb::object_store::Error::AlreadyExists { .. })
+                    if attempt + 1 < GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS =>
+                {
+                    tokio::time::sleep(Duration::from_millis(GRAPH_CELL_WRITE_LOCK_BACKOFF_MS))
+                        .await;
+                }
+                Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+                    return Err(GraphError::CellWriteConflict {
+                        operation,
+                        cell_id: cell_id.to_string(),
+                    });
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Err(GraphError::CellWriteConflict {
+            operation,
+            cell_id: cell_id.to_string(),
+        })
     }
 
     pub async fn graph_cache_entry_counts(&self) -> GraphCacheEntryCounts {
@@ -1682,9 +1781,8 @@ impl GraphShard {
         let _writer = self.writer_lane(cell_id).lock().await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self.install_write_fence_txn(cell_id, lease).await {
-                Err(GraphError::Slate(err))
-                    if err.kind() == ErrorKind::Transaction
-                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
                     tokio::task::yield_now().await;
                 }
@@ -2036,9 +2134,8 @@ impl GraphShard {
         let _writer = self.writer_lane(&mutation.cell_id).lock().await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self.write_edge_txn(&mutation).await {
-                Err(GraphError::Slate(err))
-                    if err.kind() == ErrorKind::Transaction
-                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
                     self.operation_metrics
                         .write_retries
@@ -2183,9 +2280,8 @@ impl GraphShard {
         let _writer = self.writer_lane(&mutation.cell_id).lock().await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self.delete_edge_txn(&mutation).await {
-                Err(GraphError::Slate(err))
-                    if err.kind() == ErrorKind::Transaction
-                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
                     self.operation_metrics
                         .write_retries
@@ -2535,9 +2631,8 @@ impl GraphShard {
                 )
                 .await
             {
-                Err(GraphError::Slate(err))
-                    if err.kind() == ErrorKind::Transaction
-                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
                     self.operation_metrics
                         .write_retries
@@ -2599,9 +2694,8 @@ impl GraphShard {
                 )
                 .await
             {
-                Err(GraphError::Slate(err))
-                    if err.kind() == ErrorKind::Transaction
-                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
                     self.operation_metrics
                         .write_retries
@@ -2679,9 +2773,8 @@ impl GraphShard {
                 )
                 .await
             {
-                Err(GraphError::Slate(err))
-                    if err.kind() == ErrorKind::Transaction
-                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
                     self.operation_metrics
                         .write_retries
@@ -2813,9 +2906,8 @@ impl GraphShard {
                 .append_edge_mutation_log_txn(cell_id, batch_id, &mutations, fingerprint)
                 .await
             {
-                Err(GraphError::Slate(err))
-                    if err.kind() == ErrorKind::Transaction
-                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
                     self.operation_metrics
                         .write_retries
@@ -3027,9 +3119,8 @@ impl GraphShard {
                 )
                 .await
             {
-                Err(GraphError::Slate(err))
-                    if err.kind() == ErrorKind::Transaction
-                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
                     self.operation_metrics
                         .write_retries
@@ -3377,6 +3468,31 @@ impl GraphShard {
         idempotency_key: &str,
         fingerprint: u64,
     ) -> Result<BulkImportResult> {
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "bulk_append_supernode_segment_trusted")
+            .await?;
+        let result = self
+            .bulk_append_supernode_segment_trusted_txn_locked(
+                cell_id,
+                edge_type,
+                src,
+                dsts,
+                idempotency_key,
+                fingerprint,
+            )
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn bulk_append_supernode_segment_trusted_txn_locked(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dsts: &[VertexId],
+        idempotency_key: &str,
+        fingerprint: u64,
+    ) -> Result<BulkImportResult> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
         self.validate_write_fence_txn(&txn, cell_id, "bulk_append_supernode_segment_trusted")
             .await?;
@@ -3490,6 +3606,31 @@ impl GraphShard {
     }
 
     async fn bulk_import_edges_txn(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: &[(VertexId, VertexId)],
+        idempotency_key: &str,
+        fingerprint: u64,
+        options: BulkImportOptions,
+    ) -> Result<BulkImportResult> {
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "bulk_import_edges")
+            .await?;
+        let result = self
+            .bulk_import_edges_txn_locked(
+                cell_id,
+                edge_type,
+                edges,
+                idempotency_key,
+                fingerprint,
+                options,
+            )
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn bulk_import_edges_txn_locked(
         &self,
         cell_id: &str,
         edge_type: &str,
@@ -4889,9 +5030,8 @@ impl GraphShard {
                 .write_graph_batch_txn(cell_id, operation, batch.clone())
                 .await
             {
-                Err(GraphError::Slate(err))
-                    if err.kind() == ErrorKind::Transaction
-                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
                     self.operation_metrics
                         .write_retries
@@ -6920,9 +7060,8 @@ mod tests {
                 )
                 .await
             {
-                Err(GraphError::Slate(err))
-                    if err.kind() == ErrorKind::Transaction
-                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
                     tokio::task::yield_now().await;
                 }
@@ -6953,9 +7092,8 @@ mod tests {
                 )
                 .await
             {
-                Err(GraphError::Slate(err))
-                    if err.kind() == ErrorKind::Transaction
-                        && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
                 {
                     tokio::task::yield_now().await;
                 }
