@@ -739,6 +739,13 @@ impl BulkImportOptions {
             delta_log_policy: BulkImportDeltaLogPolicy::Batch,
         }
     }
+
+    pub fn checked_batch_append() -> Self {
+        Self {
+            duplicate_policy: BulkImportDuplicatePolicy::CheckExisting,
+            delta_log_policy: BulkImportDeltaLogPolicy::Batch,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2585,7 +2592,7 @@ impl GraphShard {
                     edges,
                     idempotency_key,
                     max_edges_per_commit,
-                    BulkImportOptions::trusted_append(),
+                    BulkImportOptions::checked_batch_append(),
                 )
                 .await;
         }
@@ -2594,7 +2601,7 @@ impl GraphShard {
             edge_type,
             edges,
             idempotency_key,
-            BulkImportOptions::trusted_append(),
+            BulkImportOptions::checked_batch_append(),
         )
         .await
     }
@@ -3414,7 +3421,7 @@ impl GraphShard {
             edges,
             idempotency_key,
             chunk_size,
-            BulkImportOptions::trusted_append(),
+            BulkImportOptions::checked_batch_append(),
         )
         .await
     }
@@ -8145,6 +8152,52 @@ mod tests {
             batch_records += 1;
         }
         assert_eq!(batch_records, 3);
+
+        let overlap = shard
+            .bulk_append_edges_trusted_bounded(
+                cell_id,
+                edge_type,
+                [(1, 6), (1, 7)],
+                "trusted-overlap-new-job",
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            overlap,
+            BulkImportResult {
+                start_epoch: 6,
+                end_epoch: 6,
+                inserted: 1,
+                already_existed: 1
+            }
+        );
+        assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 6);
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 6);
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 3, 4, 5, 6, 7]
+        );
+
+        let chunked_overlap = shard
+            .bulk_append_edges_trusted_chunked(
+                cell_id,
+                edge_type,
+                [(1, 7), (1, 8)],
+                "trusted-chunked-overlap-new-job",
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(chunked_overlap.inserted, 1);
+        assert_eq!(chunked_overlap.already_existed, 1);
+        assert_eq!(chunked_overlap.end_epoch, 7);
+        assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 7);
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 7);
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 3, 4, 5, 6, 7, 8]
+        );
     }
 
     #[tokio::test]
