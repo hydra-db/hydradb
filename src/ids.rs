@@ -32,6 +32,7 @@
 //! support; it is `debug_assert!`ed and would silently wrap in release. Raising
 //! the ceiling (wider interned ids) is a post-v0 change.
 
+use common::storage::RecordOp;
 use common::{Record, SequenceAllocator, Storage};
 
 use crate::Result;
@@ -145,23 +146,35 @@ impl GraphAllocators {
     }
 }
 
-/// Resolves an external id to its uid, allocating and durably persisting a new
-/// `Xid -> uid` mapping (value = uid as a `u64` **big-endian**, per RFC 0003)
-/// on first sight.
+/// Resolves an external id to its uid, returning the `RecordOp`s (if any) the
+/// caller must fold into its own atomic write batch (RFC 0004 §"xid -> uid";
+/// M1 integration point #1).
 ///
-/// Idempotent: the same `xid` always resolves to the same uid. On a cache miss
-/// the new mapping is written together with any `SeqBlock` reservation the uid
-/// allocation produced, so a single durable `put` both reserves the block and
-/// records the mapping — there is no window in which a uid is handed out
-/// without its mapping being persisted.
-pub async fn resolve_or_create_xid(
+/// This performs a read (the existing-mapping lookup) but never writes to
+/// storage itself — persisting the returned ops is the caller's
+/// responsibility, so they can be committed atomically together with the rest
+/// of the write (e.g. the node record and its changelog entry).
+///
+/// Idempotent: the same `xid` always resolves to the same uid.
+///
+/// - If `xid` already has a mapping: returns its uid and an **empty** `Vec` —
+///   there is nothing new to persist.
+/// - If `xid` is new: allocates a uid (a cheap in-memory bump that may cross a
+///   `SeqBlock` boundary) and returns the uid plus the ops to persist — the
+///   `Xid -> uid` mapping (value = uid as `u64` **big-endian**, per RFC 0003),
+///   and, if the allocation reserved a new block, that `SeqBlock` record too.
+///   The caller MUST apply these ops atomically with the rest of its write:
+///   handing out the uid without durably persisting its mapping (and any
+///   block reservation) in the same batch would let a crash resurrect the
+///   same uid for a different `xid` on restart.
+pub async fn resolve_or_create_xid_batched(
     storage: &dyn Storage,
     allocs: &mut GraphAllocators,
     xid: &[u8],
-) -> Result<Uid> {
+) -> Result<(Uid, Vec<RecordOp>)> {
     let key = xid_key(xid);
 
-    // Fast path: mapping already exists.
+    // Fast path: mapping already exists — nothing to persist.
     if let Some(record) = storage.get(key.clone()).await? {
         let bytes: [u8; 8] = record.value.as_ref().try_into().map_err(|_| {
             crate::Error::encoding(format!(
@@ -169,21 +182,40 @@ pub async fn resolve_or_create_xid(
                 record.value.len()
             ))
         })?;
-        return Ok(Uid(u64::from_be_bytes(bytes)));
+        return Ok((Uid(u64::from_be_bytes(bytes)), Vec::new()));
     }
 
-    // First sight: allocate a uid and persist the mapping (plus any block
-    // reservation) atomically.
+    // First sight: allocate a uid (in-memory only) and hand back the ops the
+    // caller must persist — the mapping, plus any block reservation.
     let (uid, block_record) = allocs.allocate_uid();
     let mapping = Record::new(key, bytes::Bytes::copy_from_slice(&uid.get().to_be_bytes()));
 
     let mut ops = Vec::with_capacity(2);
     if let Some(block_record) = block_record {
-        ops.push(block_record.into());
+        ops.push(RecordOp::Put(block_record.into()));
     }
-    ops.push(mapping.into());
-    storage.put(ops).await?;
+    ops.push(RecordOp::Put(mapping.into()));
 
+    Ok((uid, ops))
+}
+
+/// Eager variant of [`resolve_or_create_xid_batched`] that persists the
+/// resolution's ops itself, in their own atomic batch.
+///
+/// Kept for callers that resolve an xid outside of a larger write batch (e.g.
+/// the M0 smoke path in `main.rs`) and have no other ops to fold it into. The
+/// write path (M1 deliverable #5) must use
+/// [`resolve_or_create_xid_batched`] instead, so the mapping commits
+/// atomically with the rest of the write rather than in its own round-trip.
+pub async fn resolve_or_create_xid(
+    storage: &dyn Storage,
+    allocs: &mut GraphAllocators,
+    xid: &[u8],
+) -> Result<Uid> {
+    let (uid, ops) = resolve_or_create_xid_batched(storage, allocs, xid).await?;
+    if !ops.is_empty() {
+        storage.apply(ops).await?;
+    }
     Ok(uid)
 }
 
@@ -339,5 +371,132 @@ mod tests {
         // then: the stored mapping is the uid as a u64 big-endian.
         let record = storage.get(xid_key(b"carol")).await.unwrap().unwrap();
         assert_eq!(record.value.as_ref(), &uid.get().to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn batched_new_xid_returns_mapping_and_block_ops_without_writing() {
+        // given
+        let storage = InMemoryStorage::new();
+        let mut allocs = GraphAllocators::load(&storage).await.unwrap();
+
+        // when: resolving a never-seen xid.
+        let (uid, ops) = resolve_or_create_xid_batched(&storage, &mut allocs, b"dave")
+            .await
+            .unwrap();
+
+        // then: the first uid allocation always crosses a fresh block
+        // boundary, so the ops include both the block reservation and the
+        // mapping — and nothing has actually been written yet.
+        assert_eq!(ops.len(), 2, "expected block record + mapping record");
+        assert!(
+            storage.get(xid_key(b"dave")).await.unwrap().is_none(),
+            "batched resolve must not write to storage itself"
+        );
+
+        // and: applying the returned ops makes the mapping (and block
+        // reservation) durable.
+        storage.apply(ops).await.unwrap();
+        let record = storage.get(xid_key(b"dave")).await.unwrap().unwrap();
+        assert_eq!(record.value.as_ref(), &uid.get().to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn batched_uid_allocation_is_monotonic_across_new_xids() {
+        // given
+        let storage = InMemoryStorage::new();
+        let mut allocs = GraphAllocators::load(&storage).await.unwrap();
+
+        // when: resolving several distinct new xids, applying each op set as
+        // we go (mirroring how the write path would fold + commit them).
+        let mut last: Option<Uid> = None;
+        for xid in [b"x0".as_slice(), b"x1", b"x2", b"x3"] {
+            let (uid, ops) = resolve_or_create_xid_batched(&storage, &mut allocs, xid)
+                .await
+                .unwrap();
+            if !ops.is_empty() {
+                storage.apply(ops).await.unwrap();
+            }
+            // then
+            if let Some(prev) = last {
+                assert!(uid > prev, "uid {uid:?} should exceed previous {prev:?}");
+            }
+            last = Some(uid);
+        }
+    }
+
+    #[tokio::test]
+    async fn batched_existing_xid_returns_same_uid_and_zero_ops() {
+        // given: an xid already resolved (and committed) once.
+        let storage = InMemoryStorage::new();
+        let mut allocs = GraphAllocators::load(&storage).await.unwrap();
+        let (first, ops) = resolve_or_create_xid_batched(&storage, &mut allocs, b"erin")
+            .await
+            .unwrap();
+        storage.apply(ops).await.unwrap();
+
+        // when: resolving the same xid again.
+        let (second, ops) = resolve_or_create_xid_batched(&storage, &mut allocs, b"erin")
+            .await
+            .unwrap();
+
+        // then: same uid, and nothing new to persist.
+        assert_eq!(first, second);
+        assert!(ops.is_empty(), "existing xid must not yield new ops");
+    }
+
+    #[tokio::test]
+    async fn batched_ops_applied_then_read_back_resolve_the_same_uid() {
+        // given
+        let storage = InMemoryStorage::new();
+        let mut allocs = GraphAllocators::load(&storage).await.unwrap();
+
+        // when: resolve a new xid via the batched path and apply its ops as
+        // the caller's write batch would.
+        let (uid, ops) = resolve_or_create_xid_batched(&storage, &mut allocs, b"frank")
+            .await
+            .unwrap();
+        storage.apply(ops).await.unwrap();
+
+        // then: a fresh resolve (even with a fresh allocator) reads back the
+        // same uid from the committed mapping — the fast path, not a new
+        // allocation.
+        let mut reloaded = GraphAllocators::load(&storage).await.unwrap();
+        let (again, ops) = resolve_or_create_xid_batched(&storage, &mut reloaded, b"frank")
+            .await
+            .unwrap();
+        assert_eq!(uid, again);
+        assert!(ops.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batched_uid_allocation_stays_monotonic_across_restart() {
+        // given: resolve+apply a batch of new xids, then simulate a restart
+        // by dropping the allocator and reloading from the same storage.
+        let storage = InMemoryStorage::new();
+        let mut highest = Uid::NIL;
+        {
+            let mut allocs = GraphAllocators::load(&storage).await.unwrap();
+            for xid in [b"g0".as_slice(), b"g1", b"g2"] {
+                let (uid, ops) = resolve_or_create_xid_batched(&storage, &mut allocs, xid)
+                    .await
+                    .unwrap();
+                storage.apply(ops).await.unwrap();
+                highest = uid;
+            }
+        } // allocator dropped — simulates a restart.
+
+        // when: reload and resolve one more new xid.
+        let mut reloaded = GraphAllocators::load(&storage).await.unwrap();
+        let (next, ops) = resolve_or_create_xid_batched(&storage, &mut reloaded, b"g3")
+            .await
+            .unwrap();
+        storage.apply(ops).await.unwrap();
+
+        // then: the post-restart uid exceeds every pre-restart uid — no
+        // reuse, even though resolution never persisted eagerly.
+        assert!(
+            next > highest,
+            "post-restart uid {next:?} must exceed pre-restart highest {highest:?}"
+        );
     }
 }
