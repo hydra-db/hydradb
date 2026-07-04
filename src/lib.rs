@@ -3692,15 +3692,36 @@ impl GraphShard {
         let fresh_cell = current_epoch == 0;
         let mut already_existed = 0_u64;
         let mut inserted_edges = Vec::new();
+        let mut segment_neighbors_by_src = BTreeMap::<VertexId, BTreeSet<VertexId>>::new();
         for (src, dst) in edges.iter().copied() {
-            if options.duplicate_policy.check_existing()
-                && !fresh_cell
-                && read_txn_remote(&txn, &keys::out_edge(cell_id, edge_type, src, dst))
+            if options.duplicate_policy.check_existing() && !fresh_cell {
+                if read_txn_remote(&txn, &keys::out_edge(cell_id, edge_type, src, dst))
                     .await?
                     .is_some()
-            {
-                already_existed += 1;
-                continue;
+                {
+                    already_existed += 1;
+                    continue;
+                }
+                let segment_exists = match segment_neighbors_by_src.get(&src) {
+                    Some(neighbors) => neighbors.contains(&dst),
+                    None => {
+                        let neighbors = out_segment_neighbors_for_src_txn(
+                            &txn,
+                            cell_id,
+                            edge_type,
+                            src,
+                            current_epoch,
+                        )
+                        .await?;
+                        let exists = neighbors.contains(&dst);
+                        segment_neighbors_by_src.insert(src, neighbors);
+                        exists
+                    }
+                };
+                if segment_exists {
+                    already_existed += 1;
+                    continue;
+                }
             }
             inserted_edges.push((src, dst));
         }
@@ -5184,6 +5205,19 @@ async fn out_neighbors_for_src_txn(
         }
     }
 
+    neighbors
+        .extend(out_segment_neighbors_for_src_txn(txn, cell_id, edge_type, src, read_epoch).await?);
+    Ok(neighbors)
+}
+
+async fn out_segment_neighbors_for_src_txn(
+    txn: &DbTransaction,
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    read_epoch: GraphEpoch,
+) -> Result<BTreeSet<VertexId>> {
+    let mut neighbors = BTreeSet::new();
     let mut tombstones = BTreeMap::<VertexId, GraphEpoch>::new();
     {
         let prefix = keys::out_segment_tombstone_src_prefix(cell_id, edge_type, src);
@@ -5224,7 +5258,6 @@ async fn out_neighbors_for_src_txn(
             }
         }
     }
-
     Ok(neighbors)
 }
 
@@ -8645,6 +8678,61 @@ mod tests {
             vec![2, 3, 4, 5]
         );
         assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 4);
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+    }
+
+    #[tokio::test]
+    async fn bulk_import_treats_segment_edges_as_existing_without_degree_drift() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/segment-then-bulk-overlap",
+            object_store,
+            GraphOpenOptions {
+                index_policy: GraphIndexPolicy::OutboundOnly,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        let segment = shard
+            .bulk_append_supernode_segment_trusted(cell_id, edge_type, 1, [2, 3], "segment-seed")
+            .await
+            .unwrap();
+        assert_eq!(
+            segment,
+            BulkImportResult {
+                start_epoch: 1,
+                end_epoch: 2,
+                inserted: 2,
+                already_existed: 0,
+            }
+        );
+
+        let bulk = shard
+            .bulk_import_edges(cell_id, edge_type, [(1, 2), (1, 4)], "bulk-overlap-segment")
+            .await
+            .unwrap();
+        assert_eq!(
+            bulk,
+            BulkImportResult {
+                start_epoch: 3,
+                end_epoch: 3,
+                inserted: 1,
+                already_existed: 1,
+            }
+        );
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 3);
         let report = shard
             .verify_current_graph(cell_id, edge_type, 3, 8)
             .await
