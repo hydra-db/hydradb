@@ -2443,11 +2443,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures",
  "libcypher-parser-sys",
  "slatedb",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - name: Install native dependencies
         run: |
           sudo apt-get update
@@ -21,10 +21,44 @@ jobs:
           pkg-config --exists cypher-parser
           ldconfig -p | grep -q libgraphblas
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Clippy chaos harness
+        run: cargo clippy --locked --all-targets --features chaos-harness -- -D warnings
+      - name: Clippy native feature set
+        run: cargo clippy --locked --all-targets --features opencypher,graphblas -- -D warnings
       - name: Test default feature set
-        run: cargo test --lib
-      - name: Test GraphBLAS feature set
-        run: cargo test --features graphblas --lib
-      - name: Check examples
-        run: cargo check --examples --features graphblas
+        run: cargo test --locked --lib
+      - name: Test chaos harness feature set
+        run: cargo test --locked --features chaos-harness --lib
+      - name: Test OpenCypher feature set
+        run: cargo test --locked --features opencypher --lib
+      - name: Test GraphBLAS and OpenCypher feature set
+        run: cargo test --locked --features opencypher,graphblas --lib
+      - name: Check default examples
+        run: cargo check --locked --examples
+      - name: Check chaos harness example
+        run: cargo check --locked --examples --features chaos-harness
+      - name: Check native feature examples
+        run: cargo check --locked --examples --features opencypher,graphblas
+
+  macos-default:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy default feature set
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Clippy chaos harness
+        run: cargo clippy --locked --all-targets --features chaos-harness -- -D warnings
+      - name: Test default feature set
+        run: cargo test --locked --lib
+      - name: Test chaos harness feature set
+        run: cargo test --locked --features chaos-harness --lib
+      - name: Check default examples
+        run: cargo check --locked --examples
+      - name: Check chaos harness example
+        run: cargo check --locked --examples --features chaos-harness
