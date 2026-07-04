@@ -37,6 +37,9 @@
 //!   M1 deliverable 2.
 //! - [`storage`] — [`storage::GraphStorage`], the per-namespace substrate
 //!   wrapper that opens SlateDB via [`common::StorageBuilder`].
+//! - [`write`] — [`write::Writer`], the single-writer session: `UpsertNode`/
+//!   `UpsertEdge`/`DeleteNode`/`DeleteEdge` (RFC 0004 §"Write path") and
+//!   recovery on open (§"Logical sequence protocol"). M1 deliverables 5 + 6.
 //! - [`telemetry`] — `tracing` subscriber initialization.
 
 pub mod error;
@@ -49,6 +52,7 @@ pub mod serde;
 pub mod storage;
 pub mod telemetry;
 pub mod value;
+pub mod write;
 
 pub use error::{Error, Result};
 pub use serde::record_tag::RecordType;
