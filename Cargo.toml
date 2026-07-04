@@ -70,3 +70,8 @@ tokio.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+# `FailingStorage` fault-injection (M1 D6 crash-recovery test, RFC 0004
+# acceptance #1) — test-only, mirrors the `[dependencies]` `common` path dep.
+common = { path = "vendor/common", package = "opendata-common", features = [
+    "test-utils",
+] }

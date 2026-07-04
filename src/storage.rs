@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use common::storage::{PutRecordOp, RecordOp};
-use common::{Record, Storage, StorageBuilder, StorageConfig, StorageSemantics, WriteResult};
+use common::{
+    Record, Storage, StorageBuilder, StorageConfig, StorageSemantics, WriteOptions, WriteResult,
+};
 
 use crate::Result;
 use crate::serde::RecordType;
@@ -45,6 +47,28 @@ impl GraphStorage {
         Self::open(&StorageConfig::InMemory).await
     }
 
+    /// Wraps an already-constructed storage handle directly, bypassing
+    /// `open`/`in_memory` (M1 D5/D6 escape hatch).
+    ///
+    /// Used by fault-injection tests that need to intercept `apply` (e.g.
+    /// `common::storage::in_memory::FailingStorage`, gated behind the
+    /// `test-utils` feature) between a "before crash" writer and a "reopen
+    /// after crash" writer built on the same underlying, un-wrapped handle.
+    /// Also lets a test build a second `GraphStorage` over the exact same
+    /// backing store for a minimal reader (RFC 0004 acceptance #3) without
+    /// going through `common::create_storage_read` (whose `StorageConfig::InMemory`
+    /// branch constructs a brand-new, disconnected `InMemoryStorage` — see the
+    /// M1 D6 handoff note in `write.rs`).
+    ///
+    /// NOTE: does **not** register [`crate::merge::GraphMergeOperator`] itself
+    /// — the caller must ensure `inner` already has it registered (both
+    /// `open`/`in_memory` do; wrapping another `GraphStorage`'s own
+    /// [`Self::inner`] handle preserves it automatically since it's the same
+    /// underlying backend).
+    pub fn from_storage(inner: Arc<dyn Storage>) -> Self {
+        Self { inner }
+    }
+
     /// The underlying storage handle (escape hatch for the write path).
     pub fn inner(&self) -> &Arc<dyn Storage> {
         &self.inner
@@ -59,6 +83,26 @@ impl GraphStorage {
     /// Atomic mixed batch (puts/merges/deletes) — the M1 write path uses this.
     pub async fn apply(&self, ops: Vec<RecordOp>) -> Result<WriteResult> {
         Ok(self.inner.apply(ops).await?)
+    }
+
+    /// Atomic mixed batch with explicit [`WriteOptions`] — the M1 write path's
+    /// primary entrypoint (RFC 0004 §"Logical sequence protocol"): commits with
+    /// `await_durable: true` and an injected `seqnum` equal to turbolay's own
+    /// logical sequence, so the two never diverge (M1 integration point #2,
+    /// `docs/impl/2026-07-03-m1-spike-and-seqnum-decision.md`).
+    pub async fn apply_with_options(
+        &self,
+        ops: Vec<RecordOp>,
+        options: WriteOptions,
+    ) -> Result<WriteResult> {
+        Ok(self.inner.apply_with_options(ops, options).await?)
+    }
+
+    /// Subscribes to the durable sequence watermark (RFC 0001 reader freshness
+    /// gate: `durable_seq >= token`). With seqnum injection, this durable seq
+    /// *is* turbolay's logical seq.
+    pub fn subscribe_durable(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.subscribe_durable()
     }
 
     /// Convenience put of fully-formed records.

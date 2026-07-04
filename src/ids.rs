@@ -144,6 +144,14 @@ impl GraphAllocators {
     pub fn next_seq(&mut self) -> (u64, Option<Record>) {
         self.seq.allocate_one()
     }
+
+    /// Peeks the changelog sequence [`Self::next_seq`] would allocate next,
+    /// without consuming it (M1 D6 minimal accessor: lets the write path
+    /// sanity-check, at recovery time, that the resumed allocator state is
+    /// consistent with the last durably-committed `Meta["latest_seq"]`).
+    pub fn peek_next_seq(&self) -> u64 {
+        self.seq.peek_next_sequence()
+    }
 }
 
 /// Resolves an external id to its uid, returning the `RecordOp`s (if any) the
