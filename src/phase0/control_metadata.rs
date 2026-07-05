@@ -7,13 +7,19 @@ const CONTROL_IDEMPOTENCY_PREFIX: &str = "control/idem/";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphShardCatalogEntry {
-    pub graph_id: String,
+    pub graph_id: Option<String>,
     pub cell_id: String,
     pub owner_node_id: String,
     pub lease_token: u64,
-    pub schema_epoch: GraphEpoch,
-    pub graph_epoch: GraphEpoch,
+    pub schema_epoch: Option<GraphEpoch>,
+    pub graph_epoch: Option<GraphEpoch>,
     pub generation: u64,
+}
+
+impl GraphShardCatalogEntry {
+    pub fn has_graph_metadata(&self) -> bool {
+        self.graph_id.is_some() && self.schema_epoch.is_some() && self.graph_epoch.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -115,19 +121,19 @@ impl GraphControlPlane {
                 })?;
             let graph_epoch = existing
                 .as_ref()
-                .map(|entry| entry.graph_epoch)
+                .and_then(|entry| entry.graph_epoch)
                 .unwrap_or_default();
             let lease_token = existing
                 .as_ref()
                 .map(|entry| entry.lease_token)
                 .unwrap_or_default();
             let entry = GraphShardCatalogEntry {
-                graph_id: graph_id.to_string(),
+                graph_id: Some(graph_id.to_string()),
                 cell_id: cell_id.clone(),
                 owner_node_id: node_id.clone(),
                 lease_token,
-                schema_epoch,
-                graph_epoch,
+                schema_epoch: Some(schema_epoch),
+                graph_epoch: Some(graph_epoch),
                 generation,
             };
             txn.put(metadata_key.as_bytes(), encode_control_catalog(&entry))?;
@@ -660,12 +666,12 @@ pub(super) async fn bump_catalog_lease_txn(
     let key = control_catalog_key(cell_id);
     let Some(value) = read_control_txn(txn, &key).await? else {
         let entry = GraphShardCatalogEntry {
-            graph_id: "default".to_string(),
+            graph_id: None,
             cell_id: cell_id.to_string(),
             owner_node_id: owner_node_id.to_string(),
             lease_token,
-            schema_epoch: 0,
-            graph_epoch: 0,
+            schema_epoch: None,
+            graph_epoch: None,
             generation: 1,
         };
         txn.put(key.as_bytes(), encode_control_catalog(&entry))?;
@@ -698,7 +704,20 @@ fn control_idempotency_key(cell_id: &str, operation: &str, idempotency_key: &str
 }
 
 fn validate_catalog_entry(entry: &GraphShardCatalogEntry) -> Result<()> {
-    validate_component("graph_id", &entry.graph_id)?;
+    if let Some(graph_id) = &entry.graph_id {
+        validate_component("graph_id", graph_id)?;
+    }
+    let graph_fields = [
+        entry.graph_id.is_some(),
+        entry.schema_epoch.is_some(),
+        entry.graph_epoch.is_some(),
+    ];
+    if graph_fields.iter().any(|present| *present) && !graph_fields.iter().all(|present| *present) {
+        return corrupt(
+            &control_catalog_key(&entry.cell_id),
+            "catalog graph metadata must be all present or all absent",
+        );
+    }
     validate_component("cell_id", &entry.cell_id)?;
     validate_component("node_id", &entry.owner_node_id)?;
     Ok(())
@@ -779,15 +798,28 @@ fn reject_regression(
     Ok(())
 }
 
+fn parse_optional_u64(key: &str, value: &str, field: &str) -> Result<Option<u64>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    parse_u64(key, value, field).map(Some)
+}
+
 fn encode_control_catalog(entry: &GraphShardCatalogEntry) -> Vec<u8> {
     format!(
-        "catalog1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        entry.graph_id,
+        "catalog2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        entry.graph_id.as_deref().unwrap_or(""),
         entry.cell_id,
         entry.owner_node_id,
         entry.lease_token,
-        entry.schema_epoch,
-        entry.graph_epoch,
+        entry
+            .schema_epoch
+            .map(|epoch| epoch.to_string())
+            .unwrap_or_default(),
+        entry
+            .graph_epoch
+            .map(|epoch| epoch.to_string())
+            .unwrap_or_default(),
         entry.generation
     )
     .into_bytes()
@@ -796,16 +828,32 @@ fn encode_control_catalog(entry: &GraphShardCatalogEntry) -> Vec<u8> {
 fn decode_control_catalog(key: &str, value: &[u8]) -> Result<GraphShardCatalogEntry> {
     let text = text_value(key, value)?;
     let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 8 || parts[0] != "catalog1" {
-        return corrupt(key, "expected catalog1 record with 8 fields");
+    if parts.len() != 8 {
+        return corrupt(key, "expected catalog record with 8 fields");
+    }
+    if parts[0] == "catalog1" {
+        let entry = GraphShardCatalogEntry {
+            graph_id: Some(parts[1].to_string()),
+            cell_id: parts[2].to_string(),
+            owner_node_id: parts[3].to_string(),
+            lease_token: parse_u64(key, parts[4], "lease_token")?,
+            schema_epoch: Some(parse_u64(key, parts[5], "schema_epoch")?),
+            graph_epoch: Some(parse_u64(key, parts[6], "graph_epoch")?),
+            generation: parse_u64(key, parts[7], "generation")?,
+        };
+        validate_catalog_entry(&entry)?;
+        return Ok(entry);
+    }
+    if parts[0] != "catalog2" {
+        return corrupt(key, "expected catalog1 or catalog2 record");
     }
     let entry = GraphShardCatalogEntry {
-        graph_id: parts[1].to_string(),
+        graph_id: (!parts[1].is_empty()).then(|| parts[1].to_string()),
         cell_id: parts[2].to_string(),
         owner_node_id: parts[3].to_string(),
         lease_token: parse_u64(key, parts[4], "lease_token")?,
-        schema_epoch: parse_u64(key, parts[5], "schema_epoch")?,
-        graph_epoch: parse_u64(key, parts[6], "graph_epoch")?,
+        schema_epoch: parse_optional_u64(key, parts[5], "schema_epoch")?,
+        graph_epoch: parse_optional_u64(key, parts[6], "graph_epoch")?,
         generation: parse_u64(key, parts[7], "generation")?,
     };
     validate_catalog_entry(&entry)?;
