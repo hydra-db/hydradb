@@ -154,6 +154,30 @@ impl QueryPlan {
     pub fn is_write(&self) -> bool {
         matches!(self.physical, PhysicalQueryPlan::WriteEdge { .. })
     }
+
+    pub fn validate_for_execution(&self) -> Result<()> {
+        validate_component("cell_id", &self.cell_id)?;
+        validate_logical_plan(&self.logical)?;
+
+        let expected_physical = physical_plan(&self.logical);
+        if self.physical != expected_physical {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "GraphQuery",
+                feature: "physical query plan does not match logical query plan".to_string(),
+            });
+        }
+
+        if self.is_write() {
+            validate_component("idempotency_key", &self.idempotency_key)?;
+            if self.read_epoch.is_some() {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "GraphQuery",
+                    feature: "snapshot epochs are only valid for read queries".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -162,26 +186,19 @@ pub struct QueryPlanner;
 impl QueryPlanner {
     pub fn plan(context: &QueryContext, statement: &QueryStatement) -> Result<QueryPlan> {
         validate_component("cell_id", &context.cell_id)?;
-        if statement.is_write() {
-            validate_component("idempotency_key", &context.idempotency_key)?;
-            if context.read_epoch.is_some() {
-                return Err(GraphError::UnsupportedQuery {
-                    dialect: "GraphQuery",
-                    feature: "snapshot epochs are only valid for read queries".to_string(),
-                });
-            }
-        }
 
         let logical = logical_plan(statement)?;
         validate_logical_plan(&logical)?;
         let physical = physical_plan(&logical);
-        Ok(QueryPlan {
+        let plan = QueryPlan {
             cell_id: context.cell_id.clone(),
             idempotency_key: context.idempotency_key.clone(),
             read_epoch: context.read_epoch,
             logical,
             physical,
-        })
+        };
+        plan.validate_for_execution()?;
+        Ok(plan)
     }
 }
 
