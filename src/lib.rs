@@ -41,10 +41,15 @@
 //!   `UpsertEdge`/`DeleteNode`/`DeleteEdge` (RFC 0004 §"Write path") and
 //!   recovery on open (§"Logical sequence protocol"). M1 deliverables 5 + 6.
 //! - [`telemetry`] — `tracing` subscriber initialization.
+//! - [`obs`] — RFC 0017 Phase 0 observability spine: the instrumented
+//!   [`obs::InstrumentedObjectStore`], the write fan-out's phase-timer/
+//!   `turbolay_latest_seq` registry, and the invariant-counter taxonomy.
+//!   M1 Wave 4 Workstream C.
 
 pub mod error;
 pub mod ids;
 pub mod merge;
+pub mod obs;
 pub mod posting;
 pub mod posting_ops;
 pub mod schema;

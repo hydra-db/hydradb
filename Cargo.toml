@@ -66,6 +66,19 @@ decypher = { path = "../decypher", features = ["miette"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio.workspace = true
+# RFC 0017 Phase 0 (observability spine): the `metrics` facade (no-op unless a
+# recorder is installed — safe for library code to call unconditionally) and
+# `async-trait` to implement `common::object_store::ObjectStore` for
+# `obs::InstrumentedObjectStore`.
+metrics.workspace = true
+async-trait.workspace = true
+# `object_store`'s own required `ObjectStore` methods return its private
+# `BoxStream` alias (`Pin<Box<dyn Stream<Item = T> + Send>>`, not re-exported
+# by the `object_store` crate) — implementing the trait means naming that
+# return type ourselves via the equivalent `futures::stream::BoxStream` (same
+# underlying type; `common` already depends on `futures` at this exact
+# version). Needed for `InstrumentedObjectStore`'s `list`/`delete_stream`.
+futures.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
