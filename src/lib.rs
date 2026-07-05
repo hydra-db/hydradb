@@ -2199,17 +2199,19 @@ impl GraphShard {
             return decode_commit_idempotency(&idem_key, mutation, &value);
         }
 
-        let edge_key = keys::out_edge(
+        let current_epoch = read_counter_txn(&txn, &keys::last_epoch(&mutation.cell_id)).await?;
+        if let Some(existing_epoch) = edge_epoch_at_txn(
+            &txn,
             &mutation.cell_id,
             &mutation.edge_type,
             mutation.src,
             mutation.dst,
-        );
-
-        if let Some(value) = read_txn_remote(&txn, &edge_key).await? {
-            let record = decode_edge_record(&edge_key, &value)?;
+            current_epoch,
+        )
+        .await?
+        {
             let result = CommitResult {
-                epoch: record.epoch,
+                epoch: existing_epoch,
                 already_existed: true,
             };
             txn.put(
@@ -2220,7 +2222,12 @@ impl GraphShard {
             return Ok(result);
         }
 
-        let epoch = next_epoch_txn(&txn, &mutation.cell_id).await?;
+        let epoch = current_epoch
+            .checked_add(1)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: keys::last_epoch(&mutation.cell_id),
+                reason: "epoch overflow".to_string(),
+            })?;
         let record = EdgeRecord {
             cell_id: mutation.cell_id.clone(),
             edge_type: mutation.edge_type.clone(),
@@ -5258,6 +5265,29 @@ async fn out_neighbors_for_src_txn(
     neighbors
         .extend(out_segment_neighbors_for_src_txn(txn, cell_id, edge_type, src, read_epoch).await?);
     Ok(neighbors)
+}
+
+async fn edge_epoch_at_txn(
+    txn: &DbTransaction,
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+    read_epoch: GraphEpoch,
+) -> Result<Option<GraphEpoch>> {
+    let edge_key = keys::out_edge(cell_id, edge_type, src, dst);
+    if let Some(value) = read_txn_remote(txn, &edge_key).await? {
+        let record = decode_edge_record(&edge_key, &value)?;
+        if record.epoch <= read_epoch {
+            return Ok(Some(record.epoch));
+        }
+    }
+    Ok(
+        out_segment_edges_for_src_txn(txn, cell_id, edge_type, src, read_epoch)
+            .await?
+            .get(&dst)
+            .copied(),
+    )
 }
 
 async fn out_segment_neighbors_for_src_txn(
@@ -8945,6 +8975,133 @@ mod tests {
         assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 3);
         let report = shard
             .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+    }
+
+    #[tokio::test]
+    async fn write_edge_treats_segment_edges_as_existing_without_degree_drift() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/segment-then-single-write-overlap",
+            object_store,
+            GraphOpenOptions {
+                index_policy: GraphIndexPolicy::OutboundOnly,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        let segment = shard
+            .bulk_append_supernode_segment_trusted(cell_id, edge_type, 1, [2, 3], "segment-seed")
+            .await
+            .unwrap();
+        assert_eq!(
+            segment,
+            BulkImportResult {
+                start_epoch: 1,
+                end_epoch: 2,
+                inserted: 2,
+                already_existed: 0,
+            }
+        );
+
+        let duplicate = shard
+            .write_edge(mutation(1, 2, "single-overlap-segment"))
+            .await
+            .unwrap();
+        assert_eq!(
+            duplicate,
+            CommitResult {
+                epoch: 1,
+                already_existed: true,
+            }
+        );
+        assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 2);
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 3]
+        );
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 2);
+
+        let fresh = shard
+            .write_edge(mutation(1, 4, "single-new-after-segment"))
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh,
+            CommitResult {
+                epoch: 3,
+                already_existed: false,
+            }
+        );
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 3);
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+    }
+
+    #[tokio::test]
+    async fn write_edge_reinserts_deleted_segment_edge_without_stale_duplicate_check() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/segment-delete-then-single-write",
+            object_store,
+            GraphOpenOptions {
+                index_policy: GraphIndexPolicy::OutboundOnly,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        shard
+            .bulk_append_supernode_segment_trusted(cell_id, edge_type, 1, [2], "segment-seed")
+            .await
+            .unwrap();
+        let deleted = shard
+            .delete_edge(mutation(1, 2, "delete-segment-before-reinsert"))
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted,
+            DeleteResult {
+                epoch: 2,
+                deleted: true,
+            }
+        );
+
+        let reinserted = shard
+            .write_edge(mutation(1, 2, "reinsert-after-segment-delete"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reinserted,
+            CommitResult {
+                epoch: 3,
+                already_existed: false,
+            }
+        );
+        assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 3);
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2]
+        );
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 1);
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 2, 8)
             .await
             .unwrap();
         assert!(report.is_clean(), "{:?}", report.mismatch_samples);
