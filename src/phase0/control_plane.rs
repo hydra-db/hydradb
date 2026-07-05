@@ -195,6 +195,7 @@ impl GraphControlPlane {
         };
         txn.put(token_key.as_bytes(), encode_u64_be(token))?;
         txn.put(lease_key.as_bytes(), encode_shard_lease(&lease))?;
+        control_metadata::bump_catalog_lease_txn(&txn, cell_id, node_id, token).await?;
         commit_control_txn(txn).await?;
         tracing::info!(
             target: "slatedb_graph_kernel",
@@ -416,6 +417,7 @@ impl GraphControlPlane {
         )?;
         txn.put(token_key.as_bytes(), encode_u64_be(token))?;
         txn.put(lease_key.as_bytes(), encode_shard_lease(&lease))?;
+        control_metadata::bump_catalog_lease_txn(&txn, cell_id, new_node_id, token).await?;
         commit_control_txn(txn).await?;
         tracing::warn!(
             target: "slatedb_graph_kernel",
