@@ -27,11 +27,11 @@ pub use opencypher::{
 };
 pub use phase0::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
-    BenchmarkResult, DeltaGcResult, GraphControlIdempotencyRecord, GraphControlMetricsSnapshot,
-    GraphControlPlane, GraphControlRepairReport, GraphControlWatermark, GraphNode, GraphRollup,
-    GraphShardCatalogEntry, LeaseRenewalHandle, MatrixArtifact, MatrixTraversalResult,
-    Phase0Cluster, PostingChunk, RoutedPhase0Cluster, ShardLease, ShardPlacement, SupernodeGroup,
-    SupernodePage, TraversalBackend,
+    BenchmarkResult, DeltaGcResult, GraphControlEdgeWatermark, GraphControlIdempotencyRecord,
+    GraphControlMetricsSnapshot, GraphControlPlane, GraphControlRepairReport,
+    GraphControlWatermark, GraphNode, GraphRollup, GraphShardCatalogEntry, LeaseRenewalHandle,
+    MatrixArtifact, MatrixTraversalResult, Phase0Cluster, PostingChunk, RoutedPhase0Cluster,
+    ShardLease, ShardPlacement, SupernodeGroup, SupernodePage, TraversalBackend,
 };
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,

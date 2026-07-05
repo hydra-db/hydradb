@@ -296,8 +296,8 @@ mod traversal;
 mod verify;
 
 pub use control_metadata::{
-    GraphControlIdempotencyRecord, GraphControlRepairReport, GraphControlWatermark,
-    GraphShardCatalogEntry,
+    GraphControlEdgeWatermark, GraphControlIdempotencyRecord, GraphControlRepairReport,
+    GraphControlWatermark, GraphShardCatalogEntry,
 };
 
 pub fn local_object_store(path: impl AsRef<std::path::Path>) -> Result<Arc<dyn ObjectStore>> {

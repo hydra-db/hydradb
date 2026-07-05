@@ -3790,6 +3790,52 @@ async fn control_plane_catalog_tracks_lease_token_generation() {
 }
 
 #[tokio::test]
+async fn control_plane_legacy_placement_creates_catalog_on_lease() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/catalog-legacy", object_store)
+        .await
+        .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    assert!(control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+
+    let lease = control
+        .acquire_lease("reddit-home", "node-a", std::time::Duration::from_millis(5))
+        .await
+        .unwrap();
+    let catalog = control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog.graph_id, "default");
+    assert_eq!(catalog.owner_node_id, "node-a");
+    assert_eq!(catalog.lease_token, lease.lease_token);
+    assert_eq!(catalog.generation, 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    let lease = control
+        .failover_expired_cell("reddit-home", "node-b", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let catalog = control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog.owner_node_id, "node-b");
+    assert_eq!(catalog.lease_token, lease.lease_token);
+    assert_eq!(catalog.generation, 2);
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn control_plane_watermarks_are_monotonic_and_generation_checked() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = GraphControlPlane::open("graph-control/watermark-cas", object_store)
@@ -3977,6 +4023,16 @@ async fn control_plane_repair_rebuilds_watermark_from_verified_graph_state() {
     assert_eq!(report.watermark.safe_read_epoch, base_epoch);
     assert_eq!(report.watermark.outbox_epoch, base_epoch);
     assert_eq!(report.watermark.artifact_epoch, base_epoch);
+    assert_eq!(report.watermark.edge_type, edge_type);
+    assert!(control.current_watermark(cell_id).await.unwrap().is_none());
+    assert_eq!(
+        control
+            .current_edge_watermark(cell_id, edge_type)
+            .await
+            .unwrap()
+            .unwrap(),
+        report.watermark
+    );
 
     let replay = control
         .repair_cell_control_state(&shard, cell_id, edge_type)
@@ -4084,6 +4140,66 @@ async fn control_plane_empty_compute_node_replacement_reads_object_store_state()
 }
 
 #[tokio::test]
+async fn control_plane_repair_does_not_advance_cell_watermark_for_other_edge_types() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control =
+        GraphControlPlane::open("graph-control/repair-edge-scope", Arc::clone(&object_store))
+            .await
+            .unwrap();
+    let shard = open_test_shard("graph/control-repair-edge-scope", object_store).await;
+    let cell_id = "reddit-home";
+    let repaired_edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+    let dirty_edge_type = "USER_BLOCKED_USER";
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: cell_id.to_string(),
+            edge_type: repaired_edge_type.to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "repair-scope-clean".to_string(),
+        })
+        .await
+        .unwrap();
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: cell_id.to_string(),
+            edge_type: dirty_edge_type.to_string(),
+            src: 7,
+            dst: 8,
+            idempotency_key: "repair-scope-dirty".to_string(),
+        })
+        .await
+        .unwrap();
+    let read_epoch = shard.current_epoch(cell_id).await.unwrap();
+
+    let mut batch = WriteBatch::new();
+    batch.delete(keys::out_edge(cell_id, dirty_edge_type, 7, 8).as_bytes());
+    shard.write_strict_for_test(batch).await.unwrap();
+
+    let report = control
+        .repair_cell_control_state(&shard, cell_id, repaired_edge_type)
+        .await
+        .unwrap();
+    assert_eq!(report.read_epoch, read_epoch);
+    assert_eq!(report.watermark.edge_type, repaired_edge_type);
+    assert_eq!(report.watermark.safe_read_epoch, read_epoch);
+    assert!(control.current_watermark(cell_id).await.unwrap().is_none());
+    assert!(control
+        .current_edge_watermark(cell_id, dirty_edge_type)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!shard
+        .verify_current_graph(cell_id, dirty_edge_type, 1, 4)
+        .await
+        .unwrap()
+        .is_clean());
+
+    shard.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn control_plane_repair_refuses_to_advance_on_corrupt_graph_state() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control =
@@ -4110,7 +4226,7 @@ async fn control_plane_repair_refuses_to_advance_on_corrupt_graph_state() {
         GraphError::CorruptValue {
             ref key,
             ref reason
-        } if key == "control/watermark/reddit-home"
+        } if key == "control/watermark_edge/reddit-home/USER_SUBSCRIBED_TO_SUBREDDIT"
             && reason.contains("cannot repair control state")
     ));
     assert!(control.current_watermark(cell_id).await.unwrap().is_none());
