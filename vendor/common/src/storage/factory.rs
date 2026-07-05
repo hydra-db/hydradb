@@ -15,7 +15,13 @@ pub use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 pub use slatedb::db_cache::{CachedEntry, CachedKey, SplitCache};
-use slatedb::object_store::{self, ObjectStore};
+// `pub use` (not a private `use`) so downstream crates (turbolay's
+// `InstrumentedObjectStore`, RFC 0017 §3.1) can implement `ObjectStore` at the
+// exact version SlateDB itself uses, without adding their own direct
+// `object_store`/`slatedb` dependency — see `lib.rs`'s
+// `pub use storage::factory::object_store;` for the top-level
+// `common::object_store` path this enables.
+pub use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
 use slatedb::{DbReader, FilterPolicy, PrefixExtractor, SstReader};
 use tracing::info;
@@ -75,10 +81,28 @@ impl StorageBuilder {
     /// policies. For InMemory configs it stores a sentinel so that `build()`
     /// returns an `InMemoryStorage`.
     pub async fn new(config: &StorageConfig) -> StorageResult<Self> {
+        Self::new_with_object_store(config, None).await
+    }
+
+    /// Identical to [`Self::new`], except the `SlateDb` branch uses a
+    /// caller-supplied object store instead of building one from
+    /// `slate_config.object_store` — the injection seam a downstream crate
+    /// needs to wrap the store (e.g. turbolay's `InstrumentedObjectStore`,
+    /// RFC 0017 §3.1) before SlateDB ever sees it, without duplicating any of
+    /// `new`'s settings/cache/`SstReader` wiring. `object_store: None` is
+    /// byte-identical to [`Self::new`]; every existing caller of `new` is
+    /// unaffected.
+    pub async fn new_with_object_store(
+        config: &StorageConfig,
+        object_store: Option<Arc<dyn ObjectStore>>,
+    ) -> StorageResult<Self> {
         let inner = match config {
             StorageConfig::InMemory => StorageBuilderInner::InMemory,
             StorageConfig::SlateDb(slate_config) => {
-                let object_store = create_object_store(&slate_config.object_store)?;
+                let object_store = match object_store {
+                    Some(object_store) => object_store,
+                    None => create_object_store(&slate_config.object_store)?,
+                };
                 let settings = load_slatedb_settings(slate_config)?;
                 info!(
                     "create slatedb storage with config: {:?}, settings: {:?}",
@@ -911,6 +935,45 @@ mod tests {
         assert!(result.is_none());
         // And the single-cache builder returns None for an absent config.
         assert!(build_cache(&None, "data").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn should_build_with_a_caller_provided_object_store_override() {
+        // given - a SlateDb config whose own `object_store` points nowhere
+        // useful (never touched, since we override) and a real, independent
+        // in-memory object store handed in directly.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = slatedb_config_with_local_dir(tmp.path());
+        let provided: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+
+        // when
+        let storage = StorageBuilder::new_with_object_store(&config, Some(provided))
+            .await
+            .unwrap()
+            .build()
+            .await;
+
+        // then - the override was accepted and building succeeded.
+        assert!(
+            storage.is_ok(),
+            "expected the caller-supplied object store to be used"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_match_new_when_no_object_store_override_is_given() {
+        // `new_with_object_store(config, None)` must be byte-identical to
+        // `new(config)` — the seam must not change existing callers' behavior.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = slatedb_config_with_local_dir(tmp.path());
+
+        let storage = StorageBuilder::new_with_object_store(&config, None)
+            .await
+            .unwrap()
+            .build()
+            .await;
+
+        assert!(storage.is_ok());
     }
 
     #[tokio::test]

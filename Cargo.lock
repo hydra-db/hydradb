@@ -2945,8 +2945,11 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 name = "turbolay"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "decypher",
+ "futures",
+ "metrics",
  "opendata-common",
  "proptest",
  "roaring",

@@ -9,6 +9,16 @@
 //! Library code emits spans/events via the `tracing` macros and stays
 //! subscriber-agnostic; only the binary (or a test harness) installs a
 //! subscriber via [`init`] / [`try_init`].
+//!
+//! # Metrics are a separate, exporter-agnostic facade (RFC 0017 Phase 0)
+//!
+//! [`crate::obs`]'s recording sites (the instrumented object store, the
+//! write-path phase timers, `turbolay_latest_seq`, the invariant counters)
+//! call the `metrics` facade directly and need nothing installed here — the
+//! facade is a no-op until a recorder is installed, which is deliberately
+//! *not* this module's job. A Prometheus (or other) exporter is an HTTP-plane
+//! concern that lands with the service (M3, RFC 0017 §3.8/§8 Phase 2), kept
+//! separate so every recording site stays exporter-agnostic in the meantime.
 
 use tracing_subscriber::EnvFilter;
 

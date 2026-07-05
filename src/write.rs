@@ -75,6 +75,7 @@
 //! the in-memory accelerators from durable storage," not a repair pass.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::storage::RecordOp;
@@ -82,6 +83,7 @@ use common::{Record, StorageConfig, WriteOptions};
 use roaring::RoaringTreemap;
 
 use crate::ids::{GraphAllocators, resolve_or_create_xid_batched};
+use crate::obs;
 use crate::posting_ops;
 use crate::schema::{Directives, SchemaCache, SchemaEntry, ValType};
 use crate::serde::keys::{
@@ -94,6 +96,68 @@ use crate::value::{
     decode_edge_props, encode_edge_props,
 };
 use crate::{Error, Result};
+
+/// Per-write-request phase-duration accumulator (RFC 0017 §3.2, principle #4
+/// — "one stats struct per operation, emitted once at completion"). Each
+/// public [`Writer`] method times its own phases with [`Instant`] and stashes
+/// them here; [`Writer::commit`] fills in `batch_commit`/`latest_seq` and
+/// [`WriteStats::emit`] renders every present phase into
+/// `turbolay_write_phase_duration_seconds{phase}` **after** the durable
+/// commit succeeds — never mid-fan-out, never on a batch that didn't land.
+/// Phases that don't apply to a given op (e.g. `encode_node` for a delete)
+/// are simply absent, not faked as zero — `index_fanout` is the one
+/// deliberate exception (see its doc in [`obs::write`]).
+#[derive(Default)]
+struct WriteStats {
+    encode_node: Option<Duration>,
+    encode_out: Option<Duration>,
+    encode_in: Option<Duration>,
+    index_fanout: Option<Duration>,
+    batch_commit: Option<Duration>,
+    latest_seq: Option<Duration>,
+}
+
+impl WriteStats {
+    fn emit(&self, seq: Seq) {
+        let phase = obs::write::record_phase;
+        if let Some(d) = self.encode_node {
+            phase(obs::write::PHASE_ENCODE_NODE, d);
+        }
+        if let Some(d) = self.encode_out {
+            phase(obs::write::PHASE_ENCODE_OUT, d);
+        }
+        if let Some(d) = self.encode_in {
+            phase(obs::write::PHASE_ENCODE_IN, d);
+        }
+        if let Some(d) = self.index_fanout {
+            phase(obs::write::PHASE_INDEX_FANOUT, d);
+        }
+        if let Some(d) = self.batch_commit {
+            phase(obs::write::PHASE_BATCH_COMMIT, d);
+        }
+        if let Some(d) = self.latest_seq {
+            phase(obs::write::PHASE_LATEST_SEQ, d);
+        }
+        obs::write::set_latest_seq(seq);
+    }
+}
+
+/// Records one write request's terminal outcome
+/// (`turbolay_write_requests_total{op,outcome}`) — the `oversize_node`
+/// outcome maps from [`Error::Value`], every other `Err` is `outcome=error`.
+/// Called once per public op method, at its one terminal `Result<Seq>` (a
+/// pre-commit rejection or the `commit` call itself); errors surfaced by
+/// helpers further upstream (xid resolution, schema interning, posting adds)
+/// via `?` are not separately attributed here — see [`obs::write`]'s module
+/// doc for the scope of this (optional, RFC 0017 §3.2) counter.
+fn record_write_outcome(op: &'static str, result: &Result<Seq>) {
+    let outcome = match result {
+        Ok(_) => obs::write::OUTCOME_OK,
+        Err(Error::Value(_)) => obs::write::OUTCOME_OVERSIZE_NODE,
+        Err(_) => obs::write::OUTCOME_ERROR,
+    };
+    obs::write::record_request(op, outcome);
+}
 
 /// The `Meta` key holding the highest durably-committed logical seq (RFC 0004
 /// §"Logical sequence protocol").
@@ -281,7 +345,17 @@ impl Writer {
 
         // Cap check happens here, before any ops are queued for commit — an
         // oversize node aborts the whole op with nothing written.
-        let encoded = V0NodeCodec::encode(&merged)?;
+        let encode_start = Instant::now();
+        let encoded = V0NodeCodec::encode(&merged);
+        let encode_node_elapsed = encode_start.elapsed();
+        let encoded = match encoded {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let result: Result<Seq> = Err(e);
+                record_write_outcome(obs::write::OP_UPSERT_NODE, &result);
+                return result;
+            }
+        };
         ops.push(RecordOp::Put(Record::new(node_key(uid), encoded).into()));
 
         let change = ChangeRecord {
@@ -293,7 +367,13 @@ impl Writer {
             value: None,
             label_delta: Some(label_delta),
         };
-        self.commit(ops, change).await
+        let stats = WriteStats {
+            encode_node: Some(encode_node_elapsed),
+            ..WriteStats::default()
+        };
+        let result = self.commit(ops, change, stats).await;
+        record_write_outcome(obs::write::OP_UPSERT_NODE, &result);
+        result
     }
 
     // -----------------------------------------------------------------
@@ -356,12 +436,18 @@ impl Writer {
         let dst_uid = self.resolve_and_stub_node(dst_xid, &mut ops).await?;
         let pred_id = PredId(self.intern(SchemaKind::Predicate, pred, &mut ops));
 
-        ops.extend(
-            posting_ops::add(&self.storage, Direction::Out, src_uid, pred_id, dst_uid).await?,
-        );
-        ops.extend(
-            posting_ops::add(&self.storage, Direction::In, dst_uid, pred_id, src_uid).await?,
-        );
+        let encode_out_start = Instant::now();
+        let out_ops =
+            posting_ops::add(&self.storage, Direction::Out, src_uid, pred_id, dst_uid).await?;
+        let encode_out_elapsed = encode_out_start.elapsed();
+        ops.extend(out_ops);
+
+        let encode_in_start = Instant::now();
+        let in_ops =
+            posting_ops::add(&self.storage, Direction::In, dst_uid, pred_id, src_uid).await?;
+        let encode_in_elapsed = encode_in_start.elapsed();
+        ops.extend(in_ops);
+
         ops.push(bump_degree(pred_id, Direction::Out, src_uid, 1));
         ops.push(bump_degree(pred_id, Direction::In, dst_uid, 1));
 
@@ -389,7 +475,14 @@ impl Writer {
             value: None,
             label_delta: None,
         };
-        let seq = self.commit(ops, change).await?;
+        let stats = WriteStats {
+            encode_out: Some(encode_out_elapsed),
+            encode_in: Some(encode_in_elapsed),
+            ..WriteStats::default()
+        };
+        let result = self.commit(ops, change, stats).await;
+        record_write_outcome(obs::write::OP_UPSERT_EDGE, &result);
+        let seq = result?;
 
         // Post-commit, best-effort, non-atomic (see module doc). A failure
         // here does not un-commit the logical write above, and is safe to
@@ -417,7 +510,9 @@ impl Writer {
     /// allocating a new seq or touching storage.
     pub async fn delete_node(&mut self, xid: &[u8]) -> Result<Seq> {
         let Some(uid) = self.lookup_uid(xid).await? else {
-            return Ok(self.latest_seq);
+            let result = Ok(self.latest_seq);
+            record_write_outcome(obs::write::OP_DELETE, &result);
+            return result;
         };
 
         let ops = vec![posting_ops::delete_node_op(uid)];
@@ -430,7 +525,9 @@ impl Writer {
             value: None,
             label_delta: None,
         };
-        self.commit(ops, change).await
+        let result = self.commit(ops, change, WriteStats::default()).await;
+        record_write_outcome(obs::write::OP_DELETE, &result);
+        result
     }
 
     // -----------------------------------------------------------------
@@ -451,10 +548,14 @@ impl Writer {
             self.lookup_uid(src_xid).await?,
             self.lookup_uid(dst_xid).await?,
         ) else {
-            return Ok(self.latest_seq);
+            let result = Ok(self.latest_seq);
+            record_write_outcome(obs::write::OP_DELETE, &result);
+            return result;
         };
         let Some(pred_raw) = self.schema_id(SchemaKind::Predicate, pred) else {
-            return Ok(self.latest_seq);
+            let result = Ok(self.latest_seq);
+            record_write_outcome(obs::write::OP_DELETE, &result);
+            return result;
         };
         let pred_id = PredId(pred_raw);
 
@@ -474,7 +575,9 @@ impl Writer {
             value: None,
             label_delta: None,
         };
-        self.commit(ops, change).await
+        let result = self.commit(ops, change, WriteStats::default()).await;
+        record_write_outcome(obs::write::OP_DELETE, &result);
+        result
     }
 
     // -----------------------------------------------------------------
@@ -566,7 +669,25 @@ impl Writer {
     /// `seqnum: seq` injected (RFC 0004 §"Logical sequence protocol"; M1
     /// integration point #2) — this is the single atomic `WriteBatch` every
     /// public op method funnels through.
-    async fn commit(&mut self, mut ops: Vec<RecordOp>, mut change: ChangeRecord) -> Result<Seq> {
+    ///
+    /// Also the single emission point for `stats` (RFC 0017 §3.2, principle
+    /// #4): times `index_fanout` (a genuinely-near-zero span — M1 has no
+    /// index framework yet, RFC 0006 is M2), `batch_commit` (the durable
+    /// `apply_with_options` call), and `latest_seq` (encoding+queuing the
+    /// `Meta["latest_seq"]` `RecordOp`, bundled into the very same batch —
+    /// not a separate round trip), then renders every phase this call and its
+    /// caller accumulated, and sets the `turbolay_latest_seq` gauge, **after**
+    /// the commit durably succeeds. On failure, `stats` is dropped unemitted
+    /// — this M1 Phase 0 scope emits only on the success path (RFC 0017's
+    /// fuller "emit once, on success or error" principle is a candidate M2
+    /// refinement once there's a per-request stats/debug surface to render
+    /// a partial struct into).
+    async fn commit(
+        &mut self,
+        mut ops: Vec<RecordOp>,
+        mut change: ChangeRecord,
+        mut stats: WriteStats,
+    ) -> Result<Seq> {
         let (raw_seq, seq_block) = self.allocs.next_seq();
         // Seed the logical seq space at 1 (not 0): SlateDB/`common`'s injected
         // seqnum contract requires strictly-greater-than-current-max, and a
@@ -581,10 +702,20 @@ impl Writer {
         ops.push(RecordOp::Put(
             Record::new(log_key(seq), change.encode()).into(),
         ));
+
+        // `index_fanout`: no index framework exists in M1 (RFC 0006 is M2) —
+        // timed anyway, at whatever this genuinely-empty span measures, so
+        // the phase taxonomy is stable before real index fan-out work lands.
+        let index_fanout_start = Instant::now();
+        stats.index_fanout = Some(index_fanout_start.elapsed());
+
+        let latest_seq_start = Instant::now();
         ops.push(RecordOp::Put(
             Record::new(meta_key(META_LATEST_SEQ), encode_u64_le(seq)).into(),
         ));
+        stats.latest_seq = Some(latest_seq_start.elapsed());
 
+        let commit_start = Instant::now();
         self.storage
             .apply_with_options(
                 ops,
@@ -594,7 +725,10 @@ impl Writer {
                 },
             )
             .await?;
+        stats.batch_commit = Some(commit_start.elapsed());
+
         self.latest_seq = seq;
+        stats.emit(seq);
         Ok(seq)
     }
 }

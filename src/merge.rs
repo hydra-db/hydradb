@@ -136,10 +136,17 @@ impl MergeOperator for GraphMergeOperator {
                 match keys::meta_kind(&meta) {
                     MetaKind::DeletedBitmap => merge_bare_roaring_union(existing_value, operands),
                     MetaKind::Counter => merge_i64_sum(existing_value, operands),
-                    MetaKind::Scalar => panic!(
-                        "GraphMergeOperator: merge operand on non-associative Meta[{meta:?}] — \
-                         Meta scalar keys are single-writer read-modify-write only, never merge"
-                    ),
+                    MetaKind::Scalar => {
+                        // RFC 0017 §3.7 `merge_rejected`: the merge operator
+                        // fired its reject arm (RFC 0003 dispatch table, D11)
+                        // — a genuine M1 observation site.
+                        crate::obs::invariants::record(crate::obs::invariants::MERGE_REJECTED);
+                        panic!(
+                            "GraphMergeOperator: merge operand on non-associative Meta[{meta:?}] \
+                             — Meta scalar keys are single-writer read-modify-write only, never \
+                             merge"
+                        )
+                    }
                 }
             }
             RecordType::Index
@@ -149,11 +156,17 @@ impl MergeOperator for GraphMergeOperator {
             | RecordType::SchemaName
             | RecordType::SchemaId
             | RecordType::Xid
-            | RecordType::Log => panic!(
-                "GraphMergeOperator: merge operand on non-associative record type {record_type:?} \
-                 ({} operand(s)) — single-writer RMW only, this is a bug in the write path",
-                operands.len()
-            ),
+            | RecordType::Log => {
+                // RFC 0017 §3.7 `merge_rejected` (see the `MetaKind::Scalar`
+                // arm above for the same reasoning).
+                crate::obs::invariants::record(crate::obs::invariants::MERGE_REJECTED);
+                panic!(
+                    "GraphMergeOperator: merge operand on non-associative record type \
+                     {record_type:?} ({} operand(s)) — single-writer RMW only, this is a bug in \
+                     the write path",
+                    operands.len()
+                )
+            }
         }
     }
 }
@@ -208,11 +221,16 @@ fn merge_posting_union(
         });
         match posting.kind {
             PostingKind::Single(set) => set,
-            PostingKind::Split(_) => panic!(
-                "GraphMergeOperator: {context} for a Split {record_type:?} posting list — \
-                 split/rollup are single-writer RMW, never merge (RFC 0005 §Splitting \
-                 supernodes); this is a bug in the write path"
-            ),
+            PostingKind::Split(_) => {
+                // RFC 0017 §3.7 `merge_rejected`: a merge landed on a Split
+                // manifest — never associative, always a write-path bug.
+                crate::obs::invariants::record(crate::obs::invariants::MERGE_REJECTED);
+                panic!(
+                    "GraphMergeOperator: {context} for a Split {record_type:?} posting list — \
+                     split/rollup are single-writer RMW, never merge (RFC 0005 §Splitting \
+                     supernodes); this is a bug in the write path"
+                )
+            }
         }
     };
 

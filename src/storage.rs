@@ -10,12 +10,14 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use common::object_store::ObjectStore;
 use common::storage::{PutRecordOp, RecordOp};
 use common::{
     Record, Storage, StorageBuilder, StorageConfig, StorageSemantics, WriteOptions, WriteResult,
 };
 
 use crate::Result;
+use crate::obs::InstrumentedObjectStore;
 use crate::serde::RecordType;
 
 /// Per-namespace substrate wrapper: one SlateDB database (via `common`) with
@@ -30,9 +32,26 @@ impl GraphStorage {
     /// [`crate::merge::GraphMergeOperator`]. NOTE: in M1+, every
     /// `DbReader`/compactor must be built with the SAME merge operator or reads
     /// of merge operands fail.
+    ///
+    /// On the `SlateDb` path, the real object store is built and wrapped in
+    /// [`crate::obs::InstrumentedObjectStore`] (RFC 0017 §3.1, Decision 3)
+    /// *before* SlateDB ever sees it, via
+    /// `common::StorageBuilder::new_with_object_store`'s injection seam — so
+    /// every request SlateDB itself issues against the store is counted,
+    /// timed, and byte-metered, with no SlateDB fork. The `InMemory` path is
+    /// unchanged: there is no object store to wrap.
     pub async fn open(config: &StorageConfig) -> Result<Self> {
-        let inner = StorageBuilder::new(config)
-            .await?
+        let builder = match config {
+            StorageConfig::InMemory => StorageBuilder::new(config).await?,
+            StorageConfig::SlateDb(slate_config) => {
+                let real_store = common::create_object_store(&slate_config.object_store)?;
+                let wrapped: Arc<dyn ObjectStore> =
+                    Arc::new(InstrumentedObjectStore::new(real_store));
+                StorageBuilder::new_with_object_store(config, Some(wrapped)).await?
+            }
+        };
+
+        let inner = builder
             .with_semantics(
                 StorageSemantics::new()
                     .with_merge_operator(Arc::new(crate::merge::GraphMergeOperator)),
