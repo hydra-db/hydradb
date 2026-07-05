@@ -5,6 +5,14 @@ impl GraphShard {
         self.execute_opencypher(context, query).await
     }
 
+    pub async fn execute_cypher_rows(
+        &self,
+        context: QueryContext,
+        query: &str,
+    ) -> Result<QueryResultSet> {
+        self.execute_opencypher_rows(context, query).await
+    }
+
     pub async fn execute_opencypher(
         &self,
         context: QueryContext,
@@ -14,6 +22,35 @@ impl GraphShard {
         {
             let plan = self.plan_opencypher(context, query)?;
             self.execute_query_plan(plan).await
+        }
+        #[cfg(not(feature = "opencypher"))]
+        {
+            let _ = (context, query);
+            Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "enable the opencypher Cargo feature to parse Cypher".to_string(),
+            })
+        }
+    }
+
+    pub async fn execute_opencypher_rows(
+        &self,
+        context: QueryContext,
+        query: &str,
+    ) -> Result<QueryResultSet> {
+        #[cfg(feature = "opencypher")]
+        {
+            let parsed = parse_opencypher_with_window(query)?;
+            if parsed.statement.is_write() {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "row execution requires a RETURN query".to_string(),
+                });
+            }
+            let columns = parsed.columns.clone();
+            let plan = self.plan_parsed_opencypher(context, parsed)?;
+            let output = self.execute_query_plan(plan).await?;
+            query_output_to_result_set(columns, output)
         }
         #[cfg(not(feature = "opencypher"))]
         {
@@ -45,18 +82,16 @@ impl GraphShard {
     #[cfg(feature = "opencypher")]
     pub fn plan_opencypher(&self, context: QueryContext, query: &str) -> Result<QueryPlan> {
         let parsed = parse_opencypher_with_window(query)?;
-        let context = if parsed.window.is_default() {
-            context
-        } else {
-            if !context.result_window.is_default() && context.result_window != parsed.window {
-                return Err(GraphError::UnsupportedQuery {
-                    dialect: "OpenCypher",
-                    feature: "query SKIP/LIMIT conflicts with QueryContext result window"
-                        .to_string(),
-                });
-            }
-            context.with_result_window(parsed.window.skip, parsed.window.limit)
-        };
+        self.plan_parsed_opencypher(context, parsed)
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn plan_parsed_opencypher(
+        &self,
+        context: QueryContext,
+        parsed: ParsedQuery,
+    ) -> Result<QueryPlan> {
+        let context = merge_opencypher_window(context, parsed.window)?;
         self.plan_query_statement(context, parsed.statement)
     }
 
@@ -846,6 +881,69 @@ impl GraphShard {
             live_edges: edges.len() as u64,
             delta_records: deltas.len() as u64,
             degree_mismatches,
+        })
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn merge_opencypher_window(context: QueryContext, window: QueryWindow) -> Result<QueryContext> {
+    if window.is_default() {
+        return Ok(context);
+    }
+    if !context.result_window.is_default() && context.result_window != window {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: "query SKIP/LIMIT conflicts with QueryContext result window".to_string(),
+        });
+    }
+    Ok(context.with_result_window(window.skip, window.limit))
+}
+
+#[cfg(feature = "opencypher")]
+fn query_output_to_result_set(
+    columns: Vec<QueryColumn>,
+    output: QueryOutput,
+) -> Result<QueryResultSet> {
+    match output {
+        QueryOutput::Vertices(vertices) => {
+            ensure_single_result_column(&columns, "vertex-returning query")?;
+            Ok(QueryResultSet::new(
+                columns,
+                vertices
+                    .into_iter()
+                    .map(|vertex| QueryRow::new(vec![QueryValue::VertexId(vertex)]))
+                    .collect(),
+            ))
+        }
+        QueryOutput::Count(count) => {
+            ensure_single_result_column(&columns, "count query")?;
+            Ok(QueryResultSet::new(
+                columns,
+                vec![QueryRow::new(vec![QueryValue::Count(count)])],
+            ))
+        }
+        QueryOutput::Bool(value) => {
+            ensure_single_result_column(&columns, "boolean query")?;
+            Ok(QueryResultSet::new(
+                columns,
+                vec![QueryRow::new(vec![QueryValue::Bool(value)])],
+            ))
+        }
+        QueryOutput::Write(_) => Err(GraphError::UnsupportedQuery {
+            dialect: "GraphQuery",
+            feature: "write query outputs do not have row result sets".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn ensure_single_result_column(columns: &[QueryColumn], feature: &'static str) -> Result<()> {
+    if columns.len() == 1 {
+        Ok(())
+    } else {
+        Err(GraphError::UnsupportedQuery {
+            dialect: "GraphQuery",
+            feature: format!("{feature} requires exactly one result column"),
         })
     }
 }

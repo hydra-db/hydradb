@@ -582,6 +582,16 @@ impl RoutedPhase0Cluster {
     }
 
     #[cfg(feature = "opencypher")]
+    pub async fn execute_cypher_rows(
+        &self,
+        context: crate::QueryContext,
+        query: &str,
+    ) -> Result<crate::QueryResultSet> {
+        let shard = self.shard(&context.cell_id)?;
+        shard.execute_cypher_rows(context, query).await
+    }
+
+    #[cfg(feature = "opencypher")]
     pub fn explain_cypher(
         &self,
         context: crate::QueryContext,
