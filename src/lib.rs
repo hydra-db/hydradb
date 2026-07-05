@@ -20,7 +20,10 @@ mod phase0;
 mod placement;
 mod sparse_kernel;
 
-pub use algebra::{QueryContext, QueryOutput, QueryStatement};
+pub use algebra::{
+    LogicalQueryPlan, PhysicalQueryPlan, QueryContext, QueryOutput, QueryPlan, QueryPlanner,
+    QueryStatement,
+};
 #[cfg(feature = "opencypher")]
 pub use opencypher::{
     parse_cypher, parse_opencypher, CypherFrontend, DefaultCypherFrontend, LibCypherParserFrontend,

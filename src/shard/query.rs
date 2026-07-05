@@ -30,83 +30,113 @@ impl GraphShard {
         context: QueryContext,
         statement: QueryStatement,
     ) -> Result<QueryOutput> {
-        validate_component("cell_id", &context.cell_id)?;
-        match statement {
-            QueryStatement::CreateEdge {
+        let plan = self.plan_query_statement(context, statement)?;
+        self.execute_query_plan(plan).await
+    }
+
+    pub fn plan_query_statement(
+        &self,
+        context: QueryContext,
+        statement: QueryStatement,
+    ) -> Result<QueryPlan> {
+        QueryPlanner::plan(&context, &statement)
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub fn plan_opencypher(&self, context: QueryContext, query: &str) -> Result<QueryPlan> {
+        let statement = parse_opencypher(query)?;
+        self.plan_query_statement(context, statement)
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub fn explain_cypher(&self, context: QueryContext, query: &str) -> Result<QueryPlan> {
+        self.plan_opencypher(context, query)
+    }
+
+    pub async fn execute_query_plan(&self, plan: QueryPlan) -> Result<QueryOutput> {
+        match plan.physical {
+            PhysicalQueryPlan::WriteEdge {
                 edge_type,
                 src,
                 dst,
             } => {
-                validate_component("idempotency_key", &context.idempotency_key)?;
                 let result = self
                     .write_edge(EdgeMutation {
-                        cell_id: context.cell_id,
+                        cell_id: plan.cell_id,
                         edge_type,
                         src,
                         dst,
-                        idempotency_key: context.idempotency_key,
+                        idempotency_key: plan.idempotency_key,
                     })
                     .await?;
                 Ok(QueryOutput::Write(result))
             }
-            QueryStatement::MatchOut {
-                edge_type,
-                src,
-                return_count,
-            } => {
-                if return_count {
-                    let count = self.out_degree(&context.cell_id, &edge_type, src).await?;
-                    Ok(QueryOutput::Count(count))
+            PhysicalQueryPlan::OutDegreeCounter { edge_type, src } => {
+                let count = if let Some(read_epoch) = plan.read_epoch {
+                    self.out_degree_at(&plan.cell_id, &edge_type, src, read_epoch)
+                        .await?
                 } else {
-                    let vertices = self
-                        .out_neighbors(&context.cell_id, &edge_type, src)
-                        .await?;
-                    Ok(QueryOutput::Vertices(vertices))
-                }
+                    self.out_degree(&plan.cell_id, &edge_type, src).await?
+                };
+                Ok(QueryOutput::Count(count))
             }
-            QueryStatement::MatchOutFiltered {
+            PhysicalQueryPlan::OutNeighbors { edge_type, src } => {
+                let vertices = if let Some(read_epoch) = plan.read_epoch {
+                    self.out_neighbors_at(&plan.cell_id, &edge_type, src, read_epoch)
+                        .await?
+                } else {
+                    self.out_neighbors(&plan.cell_id, &edge_type, src).await?
+                };
+                Ok(QueryOutput::Vertices(vertices))
+            }
+            PhysicalQueryPlan::EdgeExistsToCount {
                 edge_type,
                 src,
                 dst,
-                return_count,
             } => {
                 let exists = self
-                    .edge_exists(&context.cell_id, &edge_type, src, dst)
+                    .query_edge_exists(&plan.cell_id, &edge_type, src, dst, plan.read_epoch)
                     .await?;
-                if return_count {
-                    Ok(QueryOutput::Count(u64::from(exists)))
-                } else if exists {
+                Ok(QueryOutput::Count(u64::from(exists)))
+            }
+            PhysicalQueryPlan::EdgeExistsToVertices {
+                edge_type,
+                src,
+                dst,
+            } => {
+                let exists = self
+                    .query_edge_exists(&plan.cell_id, &edge_type, src, dst, plan.read_epoch)
+                    .await?;
+                if exists {
                     Ok(QueryOutput::Vertices(vec![dst]))
                 } else {
                     Ok(QueryOutput::Vertices(Vec::new()))
                 }
             }
-            QueryStatement::MatchEdge {
+            PhysicalQueryPlan::EdgeExistsToBool {
                 edge_type,
                 src,
                 dst,
-                return_count,
             } => {
                 let exists = self
-                    .edge_exists(&context.cell_id, &edge_type, src, dst)
+                    .query_edge_exists(&plan.cell_id, &edge_type, src, dst, plan.read_epoch)
                     .await?;
-                if return_count {
-                    Ok(QueryOutput::Count(u64::from(exists)))
-                } else {
-                    Ok(QueryOutput::Bool(exists))
-                }
+                Ok(QueryOutput::Bool(exists))
             }
-            QueryStatement::MatchReachable {
+            PhysicalQueryPlan::ReachableVertices {
                 edge_type,
                 src,
                 min_hops,
                 max_hops,
                 return_count,
             } => {
-                let read_epoch = self.current_epoch(&context.cell_id).await?;
+                let read_epoch = match plan.read_epoch {
+                    Some(read_epoch) => read_epoch,
+                    None => self.current_epoch(&plan.cell_id).await?,
+                };
                 let vertices = self
                     .reachable_vertices_in_hop_range_at(
-                        &context.cell_id,
+                        &plan.cell_id,
                         &edge_type,
                         src,
                         min_hops,
@@ -121,6 +151,22 @@ impl GraphShard {
                     Ok(QueryOutput::Vertices(vertices))
                 }
             }
+        }
+    }
+
+    async fn query_edge_exists(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        read_epoch: Option<GraphEpoch>,
+    ) -> Result<bool> {
+        if let Some(read_epoch) = read_epoch {
+            self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch)
+                .await
+        } else {
+            self.edge_exists(cell_id, edge_type, src, dst).await
         }
     }
 
