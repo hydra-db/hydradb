@@ -630,12 +630,15 @@ impl GraphControlPlane {
             generation: 0,
         };
         let watermark = self.advance_edge_watermark(requested, None).await?;
-        let repaired_watermark = before.as_ref().is_none_or(|before| {
-            watermark.durable_epoch > before.durable_epoch
-                || watermark.safe_read_epoch > before.safe_read_epoch
-                || watermark.outbox_epoch > before.outbox_epoch
-                || watermark.artifact_epoch > before.artifact_epoch
-        });
+        let repaired_watermark = match before.as_ref() {
+            Some(before) => {
+                watermark.durable_epoch > before.durable_epoch
+                    || watermark.safe_read_epoch > before.safe_read_epoch
+                    || watermark.outbox_epoch > before.outbox_epoch
+                    || watermark.artifact_epoch > before.artifact_epoch
+            }
+            None => true,
+        };
         if repaired_watermark {
             self.metrics.repair_actions.fetch_add(1, Ordering::Relaxed);
         }
