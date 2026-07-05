@@ -8,7 +8,7 @@ use slatedb::bytes::Bytes;
 use slatedb::config::{
     DurabilityLevel, PreloadLevel, ReadOptions, ScanOptions, Settings, WriteOptions,
 };
-use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode};
+use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
 use slatedb::{Db, DbTransaction, ErrorKind, IsolationLevel, WriteBatch};
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -176,6 +176,7 @@ const GRAPH_DELTA_GC_BATCH_KEYS: usize = 512;
 const GRAPH_WRITE_LANES: usize = 64;
 const GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS: usize = 256;
 const GRAPH_CELL_WRITE_LOCK_BACKOFF_MS: u64 = 2;
+const GRAPH_CELL_WRITE_LOCK_TTL_MS: u64 = 5 * 60 * 1000;
 pub const DEFAULT_TRUSTED_APPEND_CHUNK_EDGES: usize = 32_768;
 // Release profiling showed larger materialization transactions regress from SlateDB
 // write-batch and conflict-tracking overhead; keep async drains in the same
@@ -184,6 +185,7 @@ const GRAPH_MUTATION_LOG_MATERIALIZE_TXN_EDGES: usize = 512;
 const GRAPH_STORE_FORMAT_KEY: &str = "graph/meta/format_version";
 const GRAPH_STORE_FORMAT_VERSION: u64 = 1;
 static GRAPH_READ_LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
+static GRAPH_CELL_WRITE_LOCK_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphLimits {
@@ -939,14 +941,166 @@ pub(crate) enum GraphWriteOp {
 struct CellWriteLock {
     object_store: Arc<dyn ObjectStore>,
     path: Path,
+    owner_token: String,
 }
 
 impl CellWriteLock {
     async fn release(self) -> Result<()> {
-        match self.object_store.delete(&self.path).await {
-            Ok(()) | Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
+        let current = match self.object_store.get(&self.path).await {
+            Ok(current) => current,
+            Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        let version = UpdateVersion {
+            e_tag: current.meta.e_tag.clone(),
+            version: current.meta.version.clone(),
+        };
+        let value = current.bytes().await?;
+        let record = decode_cell_write_lock_record(self.path.as_ref(), &value)?;
+        if record.owner_token != self.owner_token {
+            return Ok(());
+        }
+        let payload = encode_cell_write_lock_record(
+            &record.cell_id,
+            &record.operation,
+            &self.owner_token,
+            record.created_ms,
+            0,
+            CellWriteLockState::Released,
+        );
+        match self
+            .object_store
+            .put_opts(&self.path, payload.into(), PutMode::Update(version).into())
+            .await
+        {
+            Ok(_) | Err(slatedb::object_store::Error::Precondition { .. }) => Ok(()),
+            Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
+            Err(slatedb::object_store::Error::NotImplemented { .. })
+            | Err(slatedb::object_store::Error::NotSupported { .. }) => {
+                match self.object_store.delete(&self.path).await {
+                    Ok(()) | Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
+                    Err(err) => Err(err.into()),
+                }
+            }
             Err(err) => Err(err.into()),
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CellWriteLockState {
+    Active,
+    Released,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CellWriteLockRecord {
+    cell_id: String,
+    operation: String,
+    owner_token: String,
+    created_ms: u64,
+    expires_at_ms: u64,
+    state: CellWriteLockState,
+}
+
+impl CellWriteLockRecord {
+    fn is_expired(&self, now_ms: u64) -> bool {
+        self.state == CellWriteLockState::Released || self.expires_at_ms <= now_ms
+    }
+}
+
+fn encode_cell_write_lock_record(
+    cell_id: &str,
+    operation: &str,
+    owner_token: &str,
+    created_ms: u64,
+    expires_at_ms: u64,
+    state: CellWriteLockState,
+) -> Bytes {
+    let state = match state {
+        CellWriteLockState::Active => "active",
+        CellWriteLockState::Released => "released",
+    };
+    Bytes::from(format!(
+        "graph-cell-write-lock-v2\ncell={cell_id}\noperation={operation}\nowner_token={owner_token}\ncreated_ms={created_ms}\nexpires_at_ms={expires_at_ms}\nstate={state}\n"
+    ))
+}
+
+fn decode_cell_write_lock_record(key: &str, value: &[u8]) -> Result<CellWriteLockRecord> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let mut lines = text.trim_end_matches('\n').lines();
+    let Some(header) = lines.next() else {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "empty cell write lock record".to_string(),
+        });
+    };
+    let mut fields = BTreeMap::new();
+    for line in lines {
+        let Some((name, value)) = line.split_once('=') else {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("invalid cell write lock field {line}"),
+            });
+        };
+        fields.insert(name, value);
+    }
+    let field = |name: &'static str| -> Result<&str> {
+        fields
+            .get(name)
+            .copied()
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("missing cell write lock field {name}"),
+            })
+    };
+    let cell_id = field("cell")?;
+    validate_component("cell_id", cell_id)?;
+    let operation = field("operation")?;
+    validate_component("operation", operation)?;
+
+    match header {
+        "graph-cell-write-lock-v1" => {
+            let created_ms = parse_u64(key, field("created_ms")?, "created_ms")?;
+            Ok(CellWriteLockRecord {
+                cell_id: cell_id.to_string(),
+                operation: operation.to_string(),
+                owner_token: String::new(),
+                created_ms,
+                expires_at_ms: created_ms.saturating_add(GRAPH_CELL_WRITE_LOCK_TTL_MS),
+                state: CellWriteLockState::Active,
+            })
+        }
+        "graph-cell-write-lock-v2" => {
+            let owner_token = field("owner_token")?;
+            let created_ms = parse_u64(key, field("created_ms")?, "created_ms")?;
+            let expires_at_ms = parse_u64(key, field("expires_at_ms")?, "expires_at_ms")?;
+            let state = match field("state")? {
+                "active" => CellWriteLockState::Active,
+                "released" => CellWriteLockState::Released,
+                other => {
+                    return Err(GraphError::CorruptValue {
+                        key: key.to_string(),
+                        reason: format!("invalid cell write lock state {other}"),
+                    });
+                }
+            };
+            Ok(CellWriteLockRecord {
+                cell_id: cell_id.to_string(),
+                operation: operation.to_string(),
+                owner_token: owner_token.to_string(),
+                created_ms,
+                expires_at_ms,
+                state,
+            })
+        }
+        other => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("unsupported cell write lock record {other}"),
+        }),
     }
 }
 
@@ -1601,12 +1755,18 @@ impl GraphShard {
         operation: &'static str,
     ) -> Result<CellWriteLock> {
         let path = self.cell_write_lock_path(cell_id);
-        let payload = Bytes::from(format!(
-            "graph-cell-write-lock-v1\ncell={cell_id}\noperation={operation}\ncreated_ms={}\n",
-            graph_now_millis()
-        ));
+        let owner_token = new_cell_write_lock_owner_token();
 
         for attempt in 0..GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS {
+            let now_ms = graph_now_millis();
+            let payload = encode_cell_write_lock_record(
+                cell_id,
+                operation,
+                &owner_token,
+                now_ms,
+                now_ms.saturating_add(GRAPH_CELL_WRITE_LOCK_TTL_MS),
+                CellWriteLockState::Active,
+            );
             match self
                 .object_store
                 .put_opts(&path, payload.clone().into(), PutMode::Create.into())
@@ -1616,15 +1776,21 @@ impl GraphShard {
                     return Ok(CellWriteLock {
                         object_store: Arc::clone(&self.object_store),
                         path,
+                        owner_token,
                     });
                 }
-                Err(slatedb::object_store::Error::AlreadyExists { .. })
-                    if attempt + 1 < GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS =>
-                {
-                    tokio::time::sleep(Duration::from_millis(GRAPH_CELL_WRITE_LOCK_BACKOFF_MS))
-                        .await;
-                }
                 Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+                    if let Some(lock) = self
+                        .try_reclaim_cell_write_lock(&path, cell_id, operation, &owner_token)
+                        .await?
+                    {
+                        return Ok(lock);
+                    }
+                    if attempt + 1 < GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(GRAPH_CELL_WRITE_LOCK_BACKOFF_MS))
+                            .await;
+                        continue;
+                    }
                     return Err(GraphError::CellWriteConflict {
                         operation,
                         cell_id: cell_id.to_string(),
@@ -1638,6 +1804,63 @@ impl GraphShard {
             operation,
             cell_id: cell_id.to_string(),
         })
+    }
+
+    async fn try_reclaim_cell_write_lock(
+        &self,
+        path: &Path,
+        cell_id: &str,
+        operation: &'static str,
+        owner_token: &str,
+    ) -> Result<Option<CellWriteLock>> {
+        let current = match self.object_store.get(path).await {
+            Ok(current) => current,
+            Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let version = UpdateVersion {
+            e_tag: current.meta.e_tag.clone(),
+            version: current.meta.version.clone(),
+        };
+        let value = current.bytes().await?;
+        let record = decode_cell_write_lock_record(path.as_ref(), &value)?;
+        if record.cell_id != cell_id {
+            return Err(GraphError::CorruptValue {
+                key: path.to_string(),
+                reason: format!(
+                    "cell write lock belongs to cell {}, expected {cell_id}",
+                    record.cell_id
+                ),
+            });
+        }
+        let now_ms = graph_now_millis();
+        if !record.is_expired(now_ms) {
+            return Ok(None);
+        }
+        let payload = encode_cell_write_lock_record(
+            cell_id,
+            operation,
+            owner_token,
+            now_ms,
+            now_ms.saturating_add(GRAPH_CELL_WRITE_LOCK_TTL_MS),
+            CellWriteLockState::Active,
+        );
+        match self
+            .object_store
+            .put_opts(path, payload.into(), PutMode::Update(version).into())
+            .await
+        {
+            Ok(_) => Ok(Some(CellWriteLock {
+                object_store: Arc::clone(&self.object_store),
+                path: path.clone(),
+                owner_token: owner_token.to_string(),
+            })),
+            Err(slatedb::object_store::Error::Precondition { .. })
+            | Err(slatedb::object_store::Error::NotFound { .. })
+            | Err(slatedb::object_store::Error::NotImplemented { .. })
+            | Err(slatedb::object_store::Error::NotSupported { .. }) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub async fn graph_cache_entry_counts(&self) -> GraphCacheEntryCounts {
@@ -6289,6 +6512,11 @@ fn graph_now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn new_cell_write_lock_owner_token() -> String {
+    let counter = GRAPH_CELL_WRITE_LOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{}-{counter}", graph_now_millis(), std::process::id())
+}
+
 fn duration_micros_u64(duration: std::time::Duration) -> u64 {
     duration.as_micros().try_into().unwrap_or(u64::MAX)
 }
@@ -8895,6 +9123,103 @@ mod tests {
             } if cell_id == "reddit-home"
         ));
         lock.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_legacy_cell_write_lock_can_be_reclaimed() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = open_test_shard(
+            "graph/stale-legacy-cell-write-lock",
+            Arc::clone(&object_store),
+        )
+        .await;
+        let cell_id = "reddit-home";
+        let path = shard.cell_write_lock_path(cell_id);
+        let stale_created_ms = graph_now_millis()
+            .saturating_sub(GRAPH_CELL_WRITE_LOCK_TTL_MS)
+            .saturating_sub(1);
+        let stale_payload = Bytes::from(format!(
+            "graph-cell-write-lock-v1\ncell={cell_id}\noperation=crashed-writer\ncreated_ms={stale_created_ms}\n"
+        ));
+        object_store
+            .put_opts(&path, stale_payload.into(), PutMode::Create.into())
+            .await
+            .unwrap();
+
+        let lock = shard
+            .acquire_cell_write_lock(cell_id, "new-writer")
+            .await
+            .unwrap();
+        let current = object_store.get(&path).await.unwrap();
+        let current_value = current.bytes().await.unwrap();
+        let current_record = decode_cell_write_lock_record(path.as_ref(), &current_value).unwrap();
+        assert_eq!(current_record.cell_id, cell_id);
+        assert_eq!(current_record.operation, "new-writer");
+        assert_eq!(current_record.owner_token, lock.owner_token);
+        assert_eq!(current_record.state, CellWriteLockState::Active);
+        assert!(current_record.expires_at_ms > graph_now_millis());
+
+        let released_token = lock.owner_token.clone();
+        lock.release().await.unwrap();
+        let released = object_store.get(&path).await.unwrap();
+        let released_value = released.bytes().await.unwrap();
+        let released_record =
+            decode_cell_write_lock_record(path.as_ref(), &released_value).unwrap();
+        assert_eq!(released_record.owner_token, released_token);
+        assert_eq!(released_record.state, CellWriteLockState::Released);
+        assert_eq!(released_record.expires_at_ms, 0);
+
+        let next = shard
+            .acquire_cell_write_lock(cell_id, "next-writer")
+            .await
+            .unwrap();
+        assert_ne!(next.owner_token, released_token);
+        next.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_owner_release_does_not_remove_reclaimed_cell_write_lock() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = open_test_shard(
+            "graph/stale-owner-release-cell-write-lock",
+            Arc::clone(&object_store),
+        )
+        .await;
+        let cell_id = "reddit-home";
+        let path = shard.cell_write_lock_path(cell_id);
+        let stale_owner = shard
+            .acquire_cell_write_lock(cell_id, "slow-writer")
+            .await
+            .unwrap();
+        let stale_created_ms = graph_now_millis()
+            .saturating_sub(GRAPH_CELL_WRITE_LOCK_TTL_MS)
+            .saturating_sub(1);
+        let stale_payload = encode_cell_write_lock_record(
+            cell_id,
+            "slow-writer",
+            &stale_owner.owner_token,
+            stale_created_ms,
+            stale_created_ms,
+            CellWriteLockState::Active,
+        );
+        object_store
+            .put_opts(&path, stale_payload.into(), PutMode::Overwrite.into())
+            .await
+            .unwrap();
+
+        let reclaimed = shard
+            .acquire_cell_write_lock(cell_id, "new-writer")
+            .await
+            .unwrap();
+        assert_ne!(reclaimed.owner_token, stale_owner.owner_token);
+        stale_owner.release().await.unwrap();
+
+        let current = object_store.get(&path).await.unwrap();
+        let current_value = current.bytes().await.unwrap();
+        let current_record = decode_cell_write_lock_record(path.as_ref(), &current_value).unwrap();
+        assert_eq!(current_record.owner_token, reclaimed.owner_token);
+        assert_eq!(current_record.state, CellWriteLockState::Active);
+        reclaimed.release().await.unwrap();
     }
 
     #[tokio::test]
