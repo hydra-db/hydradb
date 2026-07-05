@@ -5616,6 +5616,130 @@ async fn cypher_rows_return_columns_and_typed_values() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_row_engine_supports_bindings_where_order_and_windows() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-engine", object_store).await;
+
+    for (idx, (src, dst)) in [(1, 10), (1, 11), (1, 12), (1, 13), (2, 12), (2, 14)]
+        .into_iter()
+        .enumerate()
+    {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-row-engine-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let filtered = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-engine-filtered"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) \
+             WHERE v.id >= 10 AND v.id <> 12 \
+             RETURN u.id AS src, v.id AS dst ORDER BY dst DESC SKIP 1 LIMIT 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        filtered,
+        QueryResultSet::new(
+            vec![QueryColumn::new("src"), QueryColumn::new("dst")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::VertexId(11)]),
+                QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::VertexId(10)]),
+            ],
+        )
+    );
+
+    let scanned = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-engine-scan"),
+            "MATCH (u)-[:FOLLOWS]->(v {id: 12}) \
+             RETURN u.id AS src, v.id AS dst ORDER BY src",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        scanned,
+        QueryResultSet::new(
+            vec![QueryColumn::new("src"), QueryColumn::new("dst")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::VertexId(12)]),
+                QueryRow::new(vec![QueryValue::VertexId(2), QueryValue::VertexId(12)]),
+            ],
+        )
+    );
+
+    let disjunction = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-engine-or"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) \
+             WHERE v.id = 10 OR v.id = 13 RETURN v.id ORDER BY v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        disjunction,
+        QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(10)]),
+                QueryRow::new(vec![QueryValue::VertexId(13)]),
+            ],
+        )
+    );
+
+    let count_window = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-engine-count-window"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN count(*) AS total SKIP 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        count_window,
+        QueryResultSet::new(vec![QueryColumn::new("total")], Vec::new())
+    );
+
+    for (idx, (src, dst)) in [(1, 2), (2, 3), (2, 4)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "CHAIN".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-row-engine-chain-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+    let variable_hop_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-engine-varhop"),
+            "MATCH (u {id: 1})-[:CHAIN*2..2]->(v) \
+             RETURN u.id AS src, v.id AS dst ORDER BY v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        variable_hop_rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("src"), QueryColumn::new("dst")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::VertexId(3)]),
+                QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::VertexId(4)]),
+            ],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_where_and_variable_hops_use_storage_kernel() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-where-varhop", object_store).await;
