@@ -50,6 +50,47 @@ pub enum QueryOutput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryColumn {
+    pub name: String,
+}
+
+impl QueryColumn {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryValue {
+    VertexId(VertexId),
+    Count(u64),
+    Bool(bool),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryRow {
+    pub values: Vec<QueryValue>,
+}
+
+impl QueryRow {
+    pub fn new(values: Vec<QueryValue>) -> Self {
+        Self { values }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryResultSet {
+    pub columns: Vec<QueryColumn>,
+    pub rows: Vec<QueryRow>,
+}
+
+impl QueryResultSet {
+    pub fn new(columns: Vec<QueryColumn>, rows: Vec<QueryRow>) -> Self {
+        Self { columns, rows }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryStatement {
     CreateEdge {
         edge_type: String,
