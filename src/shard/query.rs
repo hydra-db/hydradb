@@ -390,14 +390,70 @@ impl GraphShard {
                 .await;
         }
 
-        let mut rows = Vec::new();
-        let mut metadata_cache = BTreeMap::new();
         let candidate_sources = self
             .candidate_vertex_ids(cell_id, &edge.src, read_epoch, budget)
             .await?;
+        let candidate_destinations = self
+            .candidate_vertex_ids(cell_id, &edge.dst, read_epoch, budget)
+            .await?;
+        let reverse_index_matches_snapshot =
+            self.writes_reverse_index() && read_epoch == self.current_epoch(cell_id).await?;
+
+        match (candidate_sources, candidate_destinations) {
+            (Some(sources), Some(destinations))
+                if reverse_index_matches_snapshot && destinations.len() < sources.len() =>
+            {
+                self.match_edge_row_pattern_from_destinations(
+                    cell_id,
+                    edge,
+                    destinations,
+                    read_epoch,
+                    budget,
+                )
+                .await
+            }
+            (Some(sources), _) => {
+                self.match_edge_row_pattern_from_sources(cell_id, edge, sources, read_epoch, budget)
+                    .await
+            }
+            (None, Some(destinations)) if reverse_index_matches_snapshot => {
+                self.match_edge_row_pattern_from_destinations(
+                    cell_id,
+                    edge,
+                    destinations,
+                    read_epoch,
+                    budget,
+                )
+                .await
+            }
+            (None, _) => {
+                self.match_edge_row_pattern_full_scan(cell_id, edge, read_epoch, budget)
+                    .await
+            }
+        }
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_edge_row_pattern_from_sources(
+        &self,
+        cell_id: &str,
+        edge: &RowEdgePattern,
+        sources: Vec<VertexId>,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<BindingRow>> {
+        self.ensure_query_index_candidates("cypher_edge_source_candidates", sources.len())?;
+        let mut rows = Vec::new();
+        let mut metadata_cache = BTreeMap::new();
         let mut scanned_edges = 0_u64;
-        if let Some(sources) = candidate_sources {
-            self.ensure_query_index_candidates("cypher_edge_source_candidates", sources.len())?;
+        {
+            let mut state = EdgeRowMatchState {
+                cell_id,
+                read_epoch,
+                rows: &mut rows,
+                metadata_cache: &mut metadata_cache,
+                budget,
+            };
             for src in sources {
                 budget.check("cypher_edge_sources")?;
                 let neighbors = self
@@ -406,77 +462,112 @@ impl GraphShard {
                 scanned_edges = scanned_edges.saturating_add(neighbors.len() as u64);
                 self.ensure_query_scan_edges("cypher_edge_neighbor_scan", scanned_edges)?;
                 for dst in neighbors {
-                    budget.check("cypher_edge_rows")?;
-                    if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst) {
-                        continue;
-                    }
-                    if let Some(mut row) = BindingRow::from_edge(edge, src, dst) {
-                        self.hydrate_binding_metadata(
-                            cell_id,
-                            read_epoch,
-                            &mut row,
-                            &mut metadata_cache,
-                            budget,
-                        )
+                    self.push_matching_edge_row(edge, src, dst, &mut state)
                         .await?;
-                        if row_matches_edge_pattern(&row, edge)? {
-                            self.push_binding_row(&mut rows, row, "cypher_edge_rows")?;
-                        }
-                    }
-                }
-            }
-            return Ok(rows);
-        }
-
-        if let Some(src) = edge.src.id {
-            let neighbors = self
-                .out_neighbors_at(cell_id, &edge.edge_type, src, read_epoch)
-                .await?;
-            self.ensure_query_scan_edges("cypher_edge_neighbor_scan", neighbors.len() as u64)?;
-            for dst in neighbors {
-                budget.check("cypher_edge_rows")?;
-                if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst) {
-                    continue;
-                }
-                if let Some(mut row) = BindingRow::from_edge(edge, src, dst) {
-                    self.hydrate_binding_metadata(
-                        cell_id,
-                        read_epoch,
-                        &mut row,
-                        &mut metadata_cache,
-                        budget,
-                    )
-                    .await?;
-                    if row_matches_edge_pattern(&row, edge)? {
-                        self.push_binding_row(&mut rows, row, "cypher_edge_rows")?;
-                    }
-                }
-            }
-            return Ok(rows);
-        }
-
-        let records = self.edges_at(cell_id, &edge.edge_type, read_epoch).await?;
-        self.ensure_query_scan_edges("cypher_edge_full_scan", records.len() as u64)?;
-        for record in records {
-            budget.check("cypher_edge_full_scan")?;
-            if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != record.dst) {
-                continue;
-            }
-            if let Some(mut row) = BindingRow::from_edge(edge, record.src, record.dst) {
-                self.hydrate_binding_metadata(
-                    cell_id,
-                    read_epoch,
-                    &mut row,
-                    &mut metadata_cache,
-                    budget,
-                )
-                .await?;
-                if row_matches_edge_pattern(&row, edge)? {
-                    self.push_binding_row(&mut rows, row, "cypher_edge_rows")?;
                 }
             }
         }
         Ok(rows)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_edge_row_pattern_from_destinations(
+        &self,
+        cell_id: &str,
+        edge: &RowEdgePattern,
+        destinations: Vec<VertexId>,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<BindingRow>> {
+        self.ensure_query_index_candidates(
+            "cypher_edge_destination_candidates",
+            destinations.len(),
+        )?;
+        let mut rows = Vec::new();
+        let mut metadata_cache = BTreeMap::new();
+        let mut scanned_edges = 0_u64;
+        {
+            let mut state = EdgeRowMatchState {
+                cell_id,
+                read_epoch,
+                rows: &mut rows,
+                metadata_cache: &mut metadata_cache,
+                budget,
+            };
+            for dst in destinations {
+                budget.check("cypher_edge_destinations")?;
+                let neighbors = self
+                    .in_neighbors_at(cell_id, &edge.edge_type, dst, read_epoch)
+                    .await?;
+                scanned_edges = scanned_edges.saturating_add(neighbors.len() as u64);
+                self.ensure_query_scan_edges("cypher_edge_reverse_neighbor_scan", scanned_edges)?;
+                for src in neighbors {
+                    self.push_matching_edge_row(edge, src, dst, &mut state)
+                        .await?;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_edge_row_pattern_full_scan(
+        &self,
+        cell_id: &str,
+        edge: &RowEdgePattern,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<BindingRow>> {
+        let mut rows = Vec::new();
+        let mut metadata_cache = BTreeMap::new();
+        let records = self.edges_at(cell_id, &edge.edge_type, read_epoch).await?;
+        self.ensure_query_scan_edges("cypher_edge_full_scan", records.len() as u64)?;
+        {
+            let mut state = EdgeRowMatchState {
+                cell_id,
+                read_epoch,
+                rows: &mut rows,
+                metadata_cache: &mut metadata_cache,
+                budget,
+            };
+            for record in records {
+                budget.check("cypher_edge_full_scan")?;
+                self.push_matching_edge_row(edge, record.src, record.dst, &mut state)
+                    .await?;
+            }
+        }
+        Ok(rows)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn push_matching_edge_row(
+        &self,
+        edge: &RowEdgePattern,
+        src: VertexId,
+        dst: VertexId,
+        state: &mut EdgeRowMatchState<'_>,
+    ) -> Result<()> {
+        state.budget.check("cypher_edge_rows")?;
+        if matches!(edge.src.id, Some(fixed_src) if fixed_src != src)
+            || matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst)
+        {
+            return Ok(());
+        }
+        let Some(mut row) = BindingRow::from_edge(edge, src, dst) else {
+            return Ok(());
+        };
+        self.hydrate_binding_metadata(
+            state.cell_id,
+            state.read_epoch,
+            &mut row,
+            state.metadata_cache,
+            state.budget,
+        )
+        .await?;
+        if row_matches_edge_pattern(&row, edge)? {
+            self.push_binding_row(state.rows, row, "cypher_edge_rows")?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "opencypher")]
@@ -1194,10 +1285,22 @@ impl GraphShard {
         edge_type: &str,
         dst: VertexId,
     ) -> Result<Vec<VertexId>> {
+        let read_epoch = self.current_epoch(cell_id).await?;
+        self.in_neighbors_at(cell_id, edge_type, dst, read_epoch)
+            .await
+    }
+
+    pub async fn in_neighbors_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        dst: VertexId,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        if !self.writes_reverse_index() {
-            let read_epoch = self.current_epoch(cell_id).await?;
+        let current_epoch = self.current_epoch(cell_id).await?;
+        if !self.writes_reverse_index() || read_epoch != current_epoch {
             let mut neighbors: Vec<_> = self
                 .edges_at(cell_id, edge_type, read_epoch)
                 .await?
@@ -1205,6 +1308,7 @@ impl GraphShard {
                 .filter_map(|edge| (edge.dst == dst).then_some(edge.src))
                 .collect();
             neighbors.sort_unstable();
+            neighbors.dedup();
             return Ok(neighbors);
         }
         let prefix = keys::in_prefix(cell_id, edge_type, dst);
@@ -1216,6 +1320,7 @@ impl GraphShard {
             neighbors.push(record.src);
         }
         neighbors.sort_unstable();
+        neighbors.dedup();
         Ok(neighbors)
     }
 
@@ -1526,6 +1631,15 @@ impl QueryBudget {
         }
         Ok(())
     }
+}
+
+#[cfg(feature = "opencypher")]
+struct EdgeRowMatchState<'a> {
+    cell_id: &'a str,
+    read_epoch: GraphEpoch,
+    rows: &'a mut Vec<BindingRow>,
+    metadata_cache: &'a mut BTreeMap<VertexId, VertexMetadata>,
+    budget: &'a QueryBudget,
 }
 
 #[cfg(feature = "opencypher")]
