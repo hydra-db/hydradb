@@ -1,9 +1,11 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures::future::join_all;
 use slatedb::bytes::Bytes;
 use slatedb::config::{DurabilityLevel, ReadOptions, ScanOptions, WriteOptions};
 use slatedb::object_store::{local::LocalFileSystem, ObjectStore};
@@ -17,11 +19,15 @@ use crate::sparse_kernel::{
     CompiledGraphBlasMatrix, GraphBlasCsc, SparseKernelBackend,
 };
 use crate::{
-    decode_edge_record, decode_u64, ensure_limit, open_graph_db, parse_u64, validate_component,
-    DeltaKind, DeltaRecord, EdgeRecord, GraphCacheConfig, GraphCacheKind, GraphEpoch, GraphError,
-    GraphOpenOptions, GraphShard, MatrixAdjacency, MatrixCacheKey, PostingChunkCacheKey, Result,
-    SupernodeCacheKey, VertexId,
+    decode_delta_record, decode_edge_record, decode_u64, ensure_limit, open_graph_db, parse_u64,
+    sort_deltas, validate_component, DeltaKind, DeltaRecord, EdgeRecord, GraphCacheConfig,
+    GraphCacheKind, GraphCorrectnessReport, GraphDurabilityConfig, GraphEpoch, GraphError,
+    GraphExportDigest, GraphOpenOptions, GraphShard, GraphWriteBatch, MatrixAdjacency,
+    MatrixCacheKey, PostingChunkCacheKey, Result, SupernodeCacheKey, VertexId,
 };
+
+const GRAPH_PREALLOC_LIMIT: usize = 1_000_000;
+const GRAPH_CHUNK_PREALLOC_LIMIT: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ArtifactDirection {
@@ -111,6 +117,46 @@ pub struct Phase0Cluster {
 
 pub struct GraphControlPlane {
     db: Db,
+    metrics: Arc<GraphControlMetrics>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphControlMetricsSnapshot {
+    pub lease_acquire_attempts: u64,
+    pub lease_acquire_successes: u64,
+    pub lease_acquire_failures: u64,
+    pub lease_renew_attempts: u64,
+    pub lease_renew_successes: u64,
+    pub lease_renew_failures: u64,
+    pub lease_renew_lost: u64,
+    pub lease_renew_retries: u64,
+}
+
+#[derive(Default)]
+struct GraphControlMetrics {
+    lease_acquire_attempts: AtomicU64,
+    lease_acquire_successes: AtomicU64,
+    lease_acquire_failures: AtomicU64,
+    lease_renew_attempts: AtomicU64,
+    lease_renew_successes: AtomicU64,
+    lease_renew_failures: AtomicU64,
+    lease_renew_lost: AtomicU64,
+    lease_renew_retries: AtomicU64,
+}
+
+impl GraphControlMetrics {
+    fn snapshot(&self) -> GraphControlMetricsSnapshot {
+        GraphControlMetricsSnapshot {
+            lease_acquire_attempts: self.lease_acquire_attempts.load(Ordering::Relaxed),
+            lease_acquire_successes: self.lease_acquire_successes.load(Ordering::Relaxed),
+            lease_acquire_failures: self.lease_acquire_failures.load(Ordering::Relaxed),
+            lease_renew_attempts: self.lease_renew_attempts.load(Ordering::Relaxed),
+            lease_renew_successes: self.lease_renew_successes.load(Ordering::Relaxed),
+            lease_renew_failures: self.lease_renew_failures.load(Ordering::Relaxed),
+            lease_renew_lost: self.lease_renew_lost.load(Ordering::Relaxed),
+            lease_renew_retries: self.lease_renew_retries.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -184,6 +230,21 @@ struct SupernodeDeltaOverlay {
     minus: BTreeSet<VertexId>,
 }
 
+impl SupernodeDeltaOverlay {
+    fn is_empty(&self) -> bool {
+        self.plus.is_empty() && self.minus.is_empty()
+    }
+}
+
+struct TraversalVerifyRequest<'a> {
+    cell_id: &'a str,
+    edge_type: &'a str,
+    read_epoch: GraphEpoch,
+    max_hops: u8,
+    root_limit: usize,
+    edges: &'a [EdgeRecord],
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GraphBlasCscManifest {
     cell_id: String,
@@ -222,7 +283,16 @@ impl GraphShard {
             self.limits.max_artifact_source_epochs,
         )?;
 
+        let _permit = self
+            .acquire_artifact_build_permit("build_posting_chunks")
+            .await?;
+        let started = Instant::now();
         let edges = self.edges_at(cell_id, edge_type, base_epoch).await?;
+        ensure_limit(
+            "build_posting_chunks_edges",
+            edges.len() as u64,
+            self.limits.max_artifact_build_edges,
+        )?;
         let mut by_out: BTreeMap<VertexId, Vec<VertexId>> = BTreeMap::new();
         let mut by_in: BTreeMap<VertexId, Vec<VertexId>> = BTreeMap::new();
         for edge in edges {
@@ -250,11 +320,13 @@ impl GraphShard {
             &mut chunks,
         );
 
-        let mut batch = WriteBatch::new();
+        let mut batch = GraphWriteBatch::new();
         let mut pending_writes = 0_usize;
         for chunk in &chunks {
             put_artifact_record(
                 self,
+                cell_id,
+                "build_posting_chunks",
                 &mut batch,
                 &mut pending_writes,
                 posting_key(chunk),
@@ -262,7 +334,14 @@ impl GraphShard {
             )
             .await?;
         }
-        flush_artifact_put_batch(self, &mut batch, &mut pending_writes).await?;
+        flush_artifact_put_batch(
+            self,
+            cell_id,
+            "build_posting_chunks",
+            &mut batch,
+            &mut pending_writes,
+        )
+        .await?;
         if !chunks.is_empty() {
             let mut cache = self.posting_chunk_cache.lock().await;
             for chunk in &chunks {
@@ -275,6 +354,7 @@ impl GraphShard {
                 );
             }
         }
+        self.record_artifact_build_completed(started.elapsed());
         Ok(chunks)
     }
 
@@ -296,6 +376,13 @@ impl GraphShard {
             chunks.push(decode_posting_chunk(&key, &kv.value)?);
         }
         chunks.sort_by_key(|chunk| chunk.chunk_id);
+        if let Some(group) = self
+            .supernode_group(cell_id, edge_type, direction, owner, base_epoch)
+            .await?
+            .filter(|group| group.base_epoch == base_epoch)
+        {
+            chunks.retain(|chunk| chunk.chunk_id < group.chunk_count);
+        }
         Ok(chunks)
     }
 
@@ -321,7 +408,16 @@ impl GraphShard {
             self.limits.max_artifact_source_epochs,
         )?;
 
+        let _permit = self
+            .acquire_artifact_build_permit("build_matrix_tiles")
+            .await?;
+        let started = Instant::now();
         let edges = self.edges_at(cell_id, edge_type, base_epoch).await?;
+        ensure_limit(
+            "build_matrix_tiles_edges",
+            edges.len() as u64,
+            self.limits.max_artifact_build_edges,
+        )?;
         let out_tiles = matrix_tiles_from_edges(
             cell_id,
             edge_type,
@@ -350,11 +446,13 @@ impl GraphShard {
             edge_count: edges.len() as u64,
         };
 
-        let mut data_batch = WriteBatch::new();
+        let mut data_batch = GraphWriteBatch::new();
         let mut pending_writes = 0_usize;
         for tile in out_tiles.iter().chain(transpose_tiles.iter()) {
             put_artifact_record(
                 self,
+                cell_id,
+                "build_matrix_tiles",
                 &mut data_batch,
                 &mut pending_writes,
                 matrix_tile_key(tile),
@@ -372,9 +470,16 @@ impl GraphShard {
             &graphblas_csc,
         )
         .await?;
-        flush_artifact_put_batch(self, &mut data_batch, &mut pending_writes).await?;
+        flush_artifact_put_batch(
+            self,
+            cell_id,
+            "build_matrix_tiles",
+            &mut data_batch,
+            &mut pending_writes,
+        )
+        .await?;
 
-        let mut manifest_batch = WriteBatch::new();
+        let mut manifest_batch = GraphWriteBatch::new();
         manifest_batch.put(
             matrix_manifest_key(cell_id, edge_type, base_epoch),
             encode_matrix_artifact(&artifact),
@@ -383,7 +488,8 @@ impl GraphShard {
             graphblas_csc_key(cell_id, edge_type, base_epoch),
             encode_graphblas_csc_manifest(&graphblas_manifest),
         );
-        self.write_strict(manifest_batch).await?;
+        self.write_graph_batch_strict(cell_id, "build_matrix_tiles", manifest_batch)
+            .await?;
         let cache_key = MatrixCacheKey::new(cell_id, edge_type, base_epoch);
         let pinned = self.cache_policy.pin_matrix_artifact(&artifact);
         let tenant = cell_id.to_string();
@@ -436,6 +542,7 @@ impl GraphShard {
                 &self.cache_metrics,
             );
         }
+        self.record_artifact_build_completed(started.elapsed());
         Ok(artifact)
     }
 
@@ -657,11 +764,18 @@ impl GraphShard {
             u64::from(hops),
             u64::from(self.limits.max_traversal_hops),
         )?;
-        let deltas = self
-            .deltas_between(cell_id, edge_type, 0, read_epoch)
-            .await?;
-        let mut adjacency = BTreeMap::new();
-        let applied = apply_delta_overlay(&mut adjacency, deltas, 0, read_epoch);
+        let watermark = self.delta_gc_watermark(cell_id, edge_type).await?;
+        let (adjacency, applied) = if watermark == 0 {
+            let deltas = self
+                .deltas_between(cell_id, edge_type, 0, read_epoch)
+                .await?;
+            let mut adjacency = BTreeMap::new();
+            let applied = apply_delta_overlay(&mut adjacency, deltas, 0, read_epoch);
+            (adjacency, applied)
+        } else {
+            let edges = self.edges_at(cell_id, edge_type, read_epoch).await?;
+            (adjacency_from_edges(&edges), 0)
+        };
         let traversal = expand_sparse(&adjacency, starts, hops, SparseKernelBackend::RustSparse)?;
         Ok(MatrixTraversalResult {
             backend: TraversalBackend::PostingExpansion,
@@ -741,56 +855,67 @@ impl GraphShard {
             self.limits.max_artifact_source_epochs,
         )?;
 
-        if base_epoch == self.current_epoch(cell_id).await? {
-            return self
-                .build_current_supernode_groups(
+        let _permit = self
+            .acquire_artifact_build_permit("build_supernode_groups")
+            .await?;
+        let started = Instant::now();
+        let groups = if base_epoch == self.current_epoch(cell_id).await? {
+            self.build_current_supernode_groups(
+                cell_id,
+                edge_type,
+                base_epoch,
+                degree_threshold,
+                chunk_size,
+                directions,
+            )
+            .await?
+        } else {
+            let edges = self.edges_at(cell_id, edge_type, base_epoch).await?;
+            ensure_limit(
+                "build_supernode_groups_edges",
+                edges.len() as u64,
+                self.limits.max_artifact_build_edges,
+            )?;
+            let mut by_out: BTreeMap<VertexId, Vec<VertexId>> = BTreeMap::new();
+            let mut by_in: BTreeMap<VertexId, Vec<VertexId>> = BTreeMap::new();
+            for edge in edges {
+                by_out.entry(edge.src).or_default().push(edge.dst);
+                by_in.entry(edge.dst).or_default().push(edge.src);
+            }
+
+            let mut chunks = Vec::new();
+            let mut groups = Vec::new();
+            if directions.contains(&ArtifactDirection::Out) {
+                append_supernode_chunks(
                     cell_id,
                     edge_type,
                     base_epoch,
+                    ArtifactDirection::Out,
                     degree_threshold,
                     chunk_size,
-                    directions,
-                )
-                .await;
-        }
-
-        let edges = self.edges_at(cell_id, edge_type, base_epoch).await?;
-        let mut by_out: BTreeMap<VertexId, Vec<VertexId>> = BTreeMap::new();
-        let mut by_in: BTreeMap<VertexId, Vec<VertexId>> = BTreeMap::new();
-        for edge in edges {
-            by_out.entry(edge.src).or_default().push(edge.dst);
-            by_in.entry(edge.dst).or_default().push(edge.src);
-        }
-
-        let mut chunks = Vec::new();
-        let mut groups = Vec::new();
-        if directions.contains(&ArtifactDirection::Out) {
-            append_supernode_chunks(
-                cell_id,
-                edge_type,
-                base_epoch,
-                ArtifactDirection::Out,
-                degree_threshold,
-                chunk_size,
-                by_out,
-                &mut chunks,
-                &mut groups,
-            );
-        }
-        if directions.contains(&ArtifactDirection::In) {
-            append_supernode_chunks(
-                cell_id,
-                edge_type,
-                base_epoch,
-                ArtifactDirection::In,
-                degree_threshold,
-                chunk_size,
-                by_in,
-                &mut chunks,
-                &mut groups,
-            );
-        }
-        self.persist_supernode_artifacts(&chunks, &groups).await?;
+                    by_out,
+                    &mut chunks,
+                    &mut groups,
+                );
+            }
+            if directions.contains(&ArtifactDirection::In) {
+                append_supernode_chunks(
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    ArtifactDirection::In,
+                    degree_threshold,
+                    chunk_size,
+                    by_in,
+                    &mut chunks,
+                    &mut groups,
+                );
+            }
+            self.persist_supernode_artifacts(cell_id, &chunks, &groups)
+                .await?;
+            groups
+        };
+        self.record_artifact_build_completed(started.elapsed());
         Ok(groups)
     }
 
@@ -803,6 +928,16 @@ impl GraphShard {
         chunk_size: usize,
         directions: &[ArtifactDirection],
     ) -> Result<Vec<SupernodeGroup>> {
+        let starting_epoch = self.current_epoch(cell_id).await?;
+        if starting_epoch != base_epoch {
+            return Err(GraphError::SnapshotChanged {
+                operation: "build_supernode_groups",
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch: base_epoch,
+                current_epoch: starting_epoch,
+            });
+        }
         let mut chunks = Vec::new();
         let mut groups = Vec::new();
         for direction in directions {
@@ -818,10 +953,22 @@ impl GraphShard {
             )
             .await?;
         }
-        self.persist_supernode_artifacts(&chunks, &groups).await?;
+        let ending_epoch = self.current_epoch(cell_id).await?;
+        if ending_epoch != base_epoch {
+            return Err(GraphError::SnapshotChanged {
+                operation: "build_supernode_groups",
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch: base_epoch,
+                current_epoch: ending_epoch,
+            });
+        }
+        self.persist_supernode_artifacts(cell_id, &chunks, &groups)
+            .await?;
         Ok(groups)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn append_current_supernode_groups(
         &self,
         cell_id: &str,
@@ -933,6 +1080,7 @@ impl GraphShard {
         Ok(owners)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn rollup_artifacts(
         &self,
         cell_id: &str,
@@ -971,12 +1119,23 @@ impl GraphShard {
             matrix_edge_count: matrix.edge_count,
             supernode_groups: supernode_groups.len() as u64,
         };
-        let mut batch = WriteBatch::new();
+        let mut batch = GraphWriteBatch::new();
         batch.put(
             rollup_key(cell_id, edge_type, base_epoch),
             encode_graph_rollup(&rollup),
         );
-        self.write_strict(batch).await?;
+        self.write_graph_batch_strict(cell_id, "rollup_artifacts", batch)
+            .await?;
+        tracing::info!(
+            target: "slatedb_graph_kernel",
+            cell_id,
+            edge_type,
+            base_epoch,
+            posting_chunks = rollup.posting_chunks,
+            matrix_edge_count = rollup.matrix_edge_count,
+            supernode_groups = rollup.supernode_groups,
+            "published graph rollup"
+        );
         Ok(rollup)
     }
 
@@ -1014,8 +1173,21 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         self.ensure_write_authority(cell_id, "delete_graph_artifacts_before")?;
+        let _permit = self
+            .acquire_gc_permit("delete_graph_artifacts_before")
+            .await?;
+        let started = Instant::now();
+        let safe_keep_epoch = self.artifact_gc_safe_keep_epoch(cell_id, edge_type).await?;
+        if keep_epoch > safe_keep_epoch {
+            return Err(self.record_retention_reject(
+                "delete_graph_artifacts_before",
+                cell_id,
+                keep_epoch,
+                safe_keep_epoch,
+            ));
+        }
         let mut result = ArtifactGcResult::default();
-        let mut batch = WriteBatch::new();
+        let mut batch = GraphWriteBatch::new();
         let mut pending_deletes = 0_usize;
 
         for prefix in graph_artifact_gc_prefixes(cell_id, edge_type) {
@@ -1031,7 +1203,14 @@ impl GraphShard {
                     result.deleted_keys += 1;
                     pending_deletes += 1;
                     if pending_deletes >= GRAPH_ARTIFACT_GC_BATCH_KEYS {
-                        flush_artifact_gc_batch(self, &mut batch, &mut pending_deletes).await?;
+                        flush_artifact_gc_batch(
+                            self,
+                            cell_id,
+                            "delete_graph_artifacts_before",
+                            &mut batch,
+                            &mut pending_deletes,
+                        )
+                        .await?;
                     }
                 } else {
                     result.retained_keys += 1;
@@ -1039,7 +1218,14 @@ impl GraphShard {
             }
         }
 
-        flush_artifact_gc_batch(self, &mut batch, &mut pending_deletes).await?;
+        flush_artifact_gc_batch(
+            self,
+            cell_id,
+            "delete_graph_artifacts_before",
+            &mut batch,
+            &mut pending_deletes,
+        )
+        .await?;
         self.matrix_artifact_cache.lock().await.retain(|key, _| {
             key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch >= keep_epoch
         });
@@ -1055,6 +1241,22 @@ impl GraphShard {
         self.posting_chunk_cache.lock().await.retain(|key, _| {
             key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch >= keep_epoch
         });
+        self.materialized_supernode_cache
+            .lock()
+            .await
+            .retain(|key, _| {
+                key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch >= keep_epoch
+            });
+        tracing::info!(
+            target: "slatedb_graph_kernel",
+            cell_id,
+            edge_type,
+            keep_epoch,
+            deleted_keys = result.deleted_keys,
+            retained_keys = result.retained_keys,
+            "deleted old graph artifacts"
+        );
+        self.record_gc_completed(result.deleted_keys, started.elapsed());
         Ok(result)
     }
 
@@ -1068,7 +1270,7 @@ impl GraphShard {
         chunks: &[PostingChunk],
     ) -> Result<Vec<SupernodeGroup>> {
         let mut groups = Vec::new();
-        let mut batch = WriteBatch::new();
+        let mut batch = GraphWriteBatch::new();
         let mut pending_writes = 0_usize;
         for direction in [ArtifactDirection::Out, ArtifactDirection::In] {
             let mut owners: BTreeMap<VertexId, Vec<&PostingChunk>> = BTreeMap::new();
@@ -1096,6 +1298,8 @@ impl GraphShard {
                 };
                 put_artifact_record(
                     self,
+                    cell_id,
+                    "persist_supernode_groups_from_chunks",
                     &mut batch,
                     &mut pending_writes,
                     supernode_group_key(&group),
@@ -1105,7 +1309,14 @@ impl GraphShard {
                 groups.push(group);
             }
         }
-        flush_artifact_put_batch(self, &mut batch, &mut pending_writes).await?;
+        flush_artifact_put_batch(
+            self,
+            cell_id,
+            "persist_supernode_groups_from_chunks",
+            &mut batch,
+            &mut pending_writes,
+        )
+        .await?;
         if !groups.is_empty() {
             let mut cache = self.supernode_group_cache.lock().await;
             for group in &groups {
@@ -1129,14 +1340,17 @@ impl GraphShard {
 
     async fn persist_supernode_artifacts(
         &self,
+        cell_id: &str,
         chunks: &[PostingChunk],
         groups: &[SupernodeGroup],
     ) -> Result<()> {
-        let mut batch = WriteBatch::new();
+        let mut batch = GraphWriteBatch::new();
         let mut pending_writes = 0_usize;
         for chunk in chunks {
             put_artifact_record(
                 self,
+                cell_id,
+                "persist_supernode_artifacts",
                 &mut batch,
                 &mut pending_writes,
                 posting_key(chunk),
@@ -1147,6 +1361,8 @@ impl GraphShard {
         for group in groups {
             put_artifact_record(
                 self,
+                cell_id,
+                "persist_supernode_artifacts",
                 &mut batch,
                 &mut pending_writes,
                 supernode_group_key(group),
@@ -1154,7 +1370,14 @@ impl GraphShard {
             )
             .await?;
         }
-        flush_artifact_put_batch(self, &mut batch, &mut pending_writes).await?;
+        flush_artifact_put_batch(
+            self,
+            cell_id,
+            "persist_supernode_artifacts",
+            &mut batch,
+            &mut pending_writes,
+        )
+        .await?;
         if !chunks.is_empty() {
             let mut cache = self.posting_chunk_cache.lock().await;
             for chunk in chunks {
@@ -1288,6 +1511,84 @@ impl GraphShard {
             }));
         }
 
+        if let [start] = starts {
+            let started = Instant::now();
+            let Some(group) = self
+                .supernode_group(
+                    cell_id,
+                    edge_type,
+                    ArtifactDirection::Out,
+                    *start,
+                    read_epoch,
+                )
+                .await?
+            else {
+                phase0_matrix_profile(
+                    profile,
+                    "supernode_one_hop_group_miss",
+                    started.elapsed(),
+                    *start,
+                );
+                return Ok(None);
+            };
+            phase0_matrix_profile(
+                profile,
+                "supernode_one_hop_group_hit",
+                started.elapsed(),
+                group.chunk_count,
+            );
+
+            let started = Instant::now();
+            let overlay = match self.supernode_delta_overlay(&group, read_epoch).await {
+                Ok(overlay) => overlay,
+                Err(GraphError::SnapshotExpired { .. }) => return Ok(None),
+                Err(err) => return Err(err),
+            };
+            let delta_records_applied =
+                (overlay.plus.len() as u64).saturating_add(overlay.minus.len() as u64);
+            phase0_matrix_profile(
+                profile,
+                "supernode_one_hop_overlay",
+                started.elapsed(),
+                delta_records_applied,
+            );
+
+            let started = Instant::now();
+            let (vertices, edge_visits) = if overlay.is_empty() {
+                let vertices = self.materialized_supernode_vertices(&group).await?;
+                (vertices.as_ref().clone(), group.degree)
+            } else {
+                let degree = self.supernode_degree_with_overlay(&group, &overlay).await?;
+                let limit = usize::try_from(degree).unwrap_or(usize::MAX);
+                (
+                    self.merged_supernode_vertices(&group, &overlay, 0, limit)
+                        .await?,
+                    degree,
+                )
+            };
+            phase0_matrix_profile(
+                profile,
+                "supernode_one_hop_materialize",
+                started.elapsed(),
+                vertices.len() as u64,
+            );
+            phase0_matrix_profile(
+                profile,
+                "supernode_one_hop_total",
+                total_started.elapsed(),
+                vertices.len() as u64,
+            );
+            return Ok(Some(MatrixTraversalResult {
+                backend: TraversalBackend::MatrixOverlay,
+                vertices,
+                hops: 1,
+                base_epoch: group.base_epoch,
+                edge_visits,
+                delta_records_applied,
+                sparse_kernel,
+            }));
+        }
+
         let mut result = BTreeSet::new();
         let mut base_epoch = read_epoch;
         let mut edge_visits = 0_u64;
@@ -1320,7 +1621,11 @@ impl GraphShard {
             );
             base_epoch = base_epoch.min(group.base_epoch);
             let started = Instant::now();
-            let overlay = self.supernode_delta_overlay(&group, read_epoch).await?;
+            let overlay = match self.supernode_delta_overlay(&group, read_epoch).await {
+                Ok(overlay) => overlay,
+                Err(GraphError::SnapshotExpired { .. }) => return Ok(None),
+                Err(err) => return Err(err),
+            };
             phase0_matrix_profile(
                 profile,
                 "supernode_one_hop_overlay",
@@ -1523,16 +1828,38 @@ impl GraphShard {
         if read_epoch <= group.base_epoch {
             return Ok(SupernodeDeltaOverlay::default());
         }
+        let watermark = self
+            .delta_gc_watermark(&group.cell_id, &group.edge_type)
+            .await?;
+        if group.base_epoch < watermark {
+            return Err(GraphError::SnapshotExpired {
+                cell_id: group.cell_id.clone(),
+                edge_type: group.edge_type.clone(),
+                read_epoch: group.base_epoch,
+                min_epoch: watermark,
+            });
+        }
+        let mut records = self
+            .owner_delta_records_between(group, DeltaKind::Plus, read_epoch)
+            .await?;
+        records.extend(
+            self.owner_delta_records_between(group, DeltaKind::Minus, read_epoch)
+                .await?,
+        );
+        if records.is_empty() {
+            records = self
+                .deltas_between(
+                    &group.cell_id,
+                    &group.edge_type,
+                    group.base_epoch,
+                    read_epoch,
+                )
+                .await?;
+        }
+        sort_deltas(&mut records);
+
         let mut overlay = SupernodeDeltaOverlay::default();
-        for delta in self
-            .deltas_between(
-                &group.cell_id,
-                &group.edge_type,
-                group.base_epoch,
-                read_epoch,
-            )
-            .await?
-        {
+        for delta in records {
             let (owner, neighbor) = match group.direction {
                 ArtifactDirection::Out => (delta.edge.src, delta.edge.dst),
                 ArtifactDirection::In => (delta.edge.dst, delta.edge.src),
@@ -1552,6 +1879,39 @@ impl GraphShard {
             }
         }
         Ok(overlay)
+    }
+
+    async fn owner_delta_records_between(
+        &self,
+        group: &SupernodeGroup,
+        kind: DeltaKind,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<DeltaRecord>> {
+        if group.base_epoch == GraphEpoch::MAX {
+            return Ok(Vec::new());
+        }
+        let prefix = crate::keys::owner_delta_prefix(
+            &group.cell_id,
+            kind,
+            &group.edge_type,
+            direction_str(group.direction),
+            group.vertex_id,
+        );
+        let start_suffix = format!("{:020}", group.base_epoch + 1);
+        let mut iter = self.scan_remote_prefix_from(&prefix, &start_suffix).await?;
+        let mut records = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let record = decode_delta_record(&key, &kv.value)?;
+            if record.edge.epoch > read_epoch {
+                break;
+            }
+            if record.edge.epoch > group.base_epoch {
+                records.push(record);
+            }
+        }
+        sort_deltas(&mut records);
+        Ok(records)
     }
 
     async fn supernode_degree_with_overlay(
@@ -1639,6 +1999,18 @@ impl GraphShard {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        if overlay.is_empty()
+            && skip == 0
+            && usize::try_from(group.degree)
+                .map(|degree| limit >= degree)
+                .unwrap_or(true)
+        {
+            return Ok(self
+                .materialized_supernode_vertices(group)
+                .await?
+                .as_ref()
+                .clone());
+        }
 
         let plus: Vec<_> = overlay.plus.iter().copied().collect();
         let mut plus_idx = 0_usize;
@@ -1647,7 +2019,7 @@ impl GraphShard {
         let mut chunk_idx = 0_usize;
         let mut pending_base = None;
         let mut skipped = 0_u64;
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(limit.min(GRAPH_PREALLOC_LIMIT));
 
         loop {
             while pending_base.is_none()
@@ -1696,6 +2068,97 @@ impl GraphShard {
         }
 
         Ok(output)
+    }
+
+    async fn materialized_supernode_vertices(
+        &self,
+        group: &SupernodeGroup,
+    ) -> Result<Arc<Vec<VertexId>>> {
+        let cache_key = SupernodeCacheKey::new(
+            &group.cell_id,
+            &group.edge_type,
+            group.direction,
+            group.vertex_id,
+            group.base_epoch,
+        );
+        if let Some(cached) = self
+            .materialized_supernode_cache
+            .lock()
+            .await
+            .get(&cache_key)
+        {
+            self.cache_metrics
+                .record_hit(GraphCacheKind::MaterializedSupernode);
+            return Ok(cached);
+        }
+
+        self.cache_metrics
+            .record_miss(GraphCacheKind::MaterializedSupernode);
+        let started = Instant::now();
+        let chunks = self
+            .supernode_chunks_range(group, 0, group.chunk_count)
+            .await?;
+        let capacity: usize = chunks.iter().map(|chunk| chunk.vertices.len()).sum();
+        let mut vertices = Vec::with_capacity(capacity.min(GRAPH_PREALLOC_LIMIT));
+        for chunk in chunks {
+            vertices.extend(chunk.vertices);
+        }
+        let vertices = Arc::new(vertices);
+        phase0_matrix_profile(
+            phase0_matrix_profile_enabled(),
+            "supernode_materialized_load",
+            started.elapsed(),
+            vertices.len() as u64,
+        );
+        let mut cache = self.materialized_supernode_cache.lock().await;
+        Ok(cache
+            .insert(
+                cache_key,
+                Arc::clone(&vertices),
+                group.cell_id.clone(),
+                self.cache_policy.pin_supernode_group(group),
+                &self.cache_metrics,
+            )
+            .unwrap_or(vertices))
+    }
+
+    async fn supernode_chunks_range(
+        &self,
+        group: &SupernodeGroup,
+        start_chunk_id: u64,
+        chunk_count: u64,
+    ) -> Result<Vec<PostingChunk>> {
+        let end_chunk_id =
+            start_chunk_id
+                .checked_add(chunk_count)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: supernode_group_key(group),
+                    reason: "supernode chunk range overflow".to_string(),
+                })?;
+        let reads = (start_chunk_id..end_chunk_id).map(|chunk_id| async move {
+            self.posting_chunk(group, chunk_id)
+                .await?
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: posting_chunk_key(
+                        &group.cell_id,
+                        &group.edge_type,
+                        group.direction,
+                        group.vertex_id,
+                        group.base_epoch,
+                        chunk_id,
+                    ),
+                    reason: "missing supernode posting chunk".to_string(),
+                })
+        });
+        let mut chunks = Vec::with_capacity(
+            usize::try_from(chunk_count)
+                .unwrap_or(0)
+                .min(GRAPH_CHUNK_PREALLOC_LIMIT),
+        );
+        for chunk in join_all(reads).await {
+            chunks.push(chunk?);
+        }
+        Ok(chunks)
     }
 
     async fn posting_chunk(
@@ -1748,15 +2211,17 @@ impl GraphShard {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
-        for chunk_id in 0..chunk_count {
+        self.cache_metrics
+            .prefetch_requests
+            .fetch_add(chunk_count, std::sync::atomic::Ordering::Relaxed);
+        if self
+            .supernode_chunks_range(group, 0, chunk_count)
+            .await
+            .is_err()
+        {
             self.cache_metrics
-                .prefetch_requests
+                .prefetch_skipped
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if self.posting_chunk(group, chunk_id).await.is_err() {
-                self.cache_metrics
-                    .prefetch_skipped
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
         }
     }
 
@@ -1778,10 +2243,15 @@ impl GraphShard {
         let _permit = self
             .acquire_hydration_permit("cached_matrix_adjacency")
             .await?;
-        let adjacency = Arc::new(
-            self.load_matrix_adjacency(cell_id, edge_type, base_epoch)
-                .await?,
-        );
+        let artifact = self
+            .latest_matrix_artifact(cell_id, edge_type, base_epoch)
+            .await?
+            .filter(|artifact| artifact.base_epoch == base_epoch)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: matrix_manifest_key(cell_id, edge_type, base_epoch),
+                reason: "missing matrix artifact manifest".to_string(),
+            })?;
+        let adjacency = Arc::new(self.load_matrix_adjacency(&artifact).await?);
         self.record_hydration_complete();
         let mut cache = self.matrix_cache.lock().await;
         Ok(cache
@@ -1945,23 +2415,457 @@ impl GraphShard {
         Ok(values)
     }
 
-    async fn load_matrix_adjacency(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        base_epoch: GraphEpoch,
-    ) -> Result<MatrixAdjacency> {
+    async fn load_matrix_adjacency(&self, artifact: &MatrixArtifact) -> Result<MatrixAdjacency> {
         let mut adjacency: MatrixAdjacency = BTreeMap::new();
-        let prefix = matrix_tile_prefix(cell_id, edge_type, base_epoch, ArtifactDirection::Out);
+        let prefix = matrix_tile_prefix(
+            &artifact.cell_id,
+            &artifact.edge_type,
+            artifact.base_epoch,
+            ArtifactDirection::Out,
+        );
         let mut iter = self.scan_remote_prefix(&prefix).await?;
+        let mut tile_count = 0_u64;
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let tile = decode_matrix_tile(&key, &kv.value)?;
+            if tile.cell_id != artifact.cell_id
+                || tile.edge_type != artifact.edge_type
+                || tile.base_epoch != artifact.base_epoch
+                || tile.tile_size != artifact.tile_size
+                || tile.direction != ArtifactDirection::Out
+            {
+                return corrupt(&key, "matrix tile identity does not match manifest");
+            }
+            tile_count = tile_count.saturating_add(1);
             for (src, dsts) in tile.rows {
                 adjacency.entry(src).or_default().extend(dsts);
             }
         }
+        if tile_count != artifact.out_tiles {
+            return corrupt(
+                &matrix_manifest_key(&artifact.cell_id, &artifact.edge_type, artifact.base_epoch),
+                format!(
+                    "matrix tile count {tile_count} does not match manifest {}",
+                    artifact.out_tiles
+                ),
+            );
+        }
+        let edge_count = adjacency_edge_count(&adjacency);
+        if edge_count != artifact.edge_count {
+            return corrupt(
+                &matrix_manifest_key(&artifact.cell_id, &artifact.edge_type, artifact.base_epoch),
+                format!(
+                    "matrix edge count {edge_count} does not match manifest {}",
+                    artifact.edge_count
+                ),
+            );
+        }
         Ok(adjacency)
+    }
+
+    pub async fn export_live_graph_digest(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        read_epoch: GraphEpoch,
+    ) -> Result<GraphExportDigest> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let edges = self.edges_at(cell_id, edge_type, read_epoch).await?;
+        Ok(graph_export_digest(cell_id, edge_type, read_epoch, &edges))
+    }
+
+    pub async fn verify_current_graph(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        max_hops: u8,
+        traversal_root_limit: usize,
+    ) -> Result<GraphCorrectnessReport> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let started = Instant::now();
+        let read_epoch = self.current_epoch(cell_id).await?;
+        let edges = self.edges_at(cell_id, edge_type, read_epoch).await?;
+        let expected_edges = edge_set(&edges);
+        let (expected_out, expected_in) = degree_maps(&edges);
+        let mut report = GraphCorrectnessReport {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            read_epoch,
+            delta_gc_watermark: self.delta_gc_watermark(cell_id, edge_type).await?,
+            digest: graph_export_digest(cell_id, edge_type, read_epoch, &edges),
+            ..GraphCorrectnessReport::default()
+        };
+
+        let canonical = self
+            .scan_edge_index_pairs(
+                &crate::keys::out_edge_type_prefix(cell_id, edge_type),
+                cell_id,
+                edge_type,
+                read_epoch,
+                "canonical",
+                &mut report,
+            )
+            .await?;
+        report.canonical_edges = canonical.len() as u64;
+
+        let mut out_index = canonical.clone();
+        out_index.extend(
+            self.out_segment_edge_pairs_at(cell_id, edge_type, read_epoch)
+                .await?,
+        );
+        report.out_index_edges = out_index.len() as u64;
+        compare_edge_sets("out_index", &expected_edges, &out_index, &mut report);
+
+        let in_index = self
+            .scan_edge_index_pairs(
+                &crate::keys::in_edge_type_prefix(cell_id, edge_type),
+                cell_id,
+                edge_type,
+                read_epoch,
+                "in_index",
+                &mut report,
+            )
+            .await?;
+        report.in_index_edges = in_index.len() as u64;
+        if self.writes_reverse_index() {
+            compare_edge_sets("in_index", &expected_edges, &in_index, &mut report);
+        } else if !in_index.is_empty() {
+            record_mismatch(
+                &mut report,
+                format!(
+                    "in_index:unexpected-under-outbound-only count={}",
+                    in_index.len()
+                ),
+            );
+        }
+
+        let actual_out = self
+            .scan_degree_counters(&crate::keys::degree_out_prefix(cell_id, edge_type))
+            .await?;
+        let actual_in = self
+            .scan_degree_counters(&crate::keys::degree_in_prefix(cell_id, edge_type))
+            .await?;
+        report.degree_counters = actual_out.len().saturating_add(actual_in.len()) as u64;
+        compare_degree_maps("out_degree", &expected_out, &actual_out, &mut report);
+        if self.writes_reverse_index() {
+            compare_degree_maps("in_degree", &expected_in, &actual_in, &mut report);
+        } else if !actual_in.is_empty() {
+            record_mismatch(
+                &mut report,
+                format!(
+                    "in_degree:unexpected-under-outbound-only count={}",
+                    actual_in.len()
+                ),
+            );
+        }
+
+        self.verify_rollup_and_artifacts(cell_id, edge_type, read_epoch, &mut report)
+            .await?;
+        self.verify_traversals(
+            TraversalVerifyRequest {
+                cell_id,
+                edge_type,
+                read_epoch,
+                max_hops,
+                root_limit: traversal_root_limit,
+                edges: &edges,
+            },
+            &mut report,
+        )
+        .await?;
+        self.record_verifier_completed(report.mismatch_count, started.elapsed());
+        Ok(report)
+    }
+
+    async fn scan_edge_index_pairs(
+        &self,
+        prefix: &str,
+        cell_id: &str,
+        edge_type: &str,
+        read_epoch: GraphEpoch,
+        index_name: &'static str,
+        report: &mut GraphCorrectnessReport,
+    ) -> Result<BTreeSet<(VertexId, VertexId)>> {
+        let mut iter = self.scan_remote_prefix(prefix).await?;
+        let mut pairs = BTreeSet::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let edge = decode_edge_record(&key, &kv.value)?;
+            if edge.cell_id != cell_id || edge.edge_type != edge_type {
+                record_mismatch(
+                    report,
+                    format!(
+                        "{index_name}:record-identity key={key} got={}/{}",
+                        edge.cell_id, edge.edge_type
+                    ),
+                );
+            }
+            if edge.epoch > read_epoch {
+                record_mismatch(
+                    report,
+                    format!(
+                        "{index_name}:future-edge key={key} edge_epoch={} read_epoch={read_epoch}",
+                        edge.epoch
+                    ),
+                );
+            }
+            pairs.insert((edge.src, edge.dst));
+        }
+        Ok(pairs)
+    }
+
+    async fn scan_degree_counters(&self, prefix: &str) -> Result<BTreeMap<VertexId, u64>> {
+        let mut iter = self.scan_remote_prefix(prefix).await?;
+        let mut counters = BTreeMap::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let vertex = parse_last_key_component(&key, "degree_vertex")?;
+            let degree = decode_u64(&key, &kv.value)?;
+            counters.insert(vertex, degree);
+        }
+        Ok(counters)
+    }
+
+    async fn verify_rollup_and_artifacts(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        read_epoch: GraphEpoch,
+        report: &mut GraphCorrectnessReport,
+    ) -> Result<()> {
+        if let Some(artifact) = self
+            .latest_matrix_artifact(cell_id, edge_type, read_epoch)
+            .await?
+        {
+            let adjacency = self
+                .cached_matrix_adjacency(cell_id, edge_type, artifact.base_epoch)
+                .await?;
+            report.matrix_edges_checked = adjacency_edge_count(adjacency.as_ref());
+            if report.matrix_edges_checked != artifact.edge_count {
+                record_mismatch(
+                    report,
+                    format!(
+                        "matrix:manifest-edge-count base_epoch={} expected={} actual={}",
+                        artifact.base_epoch, artifact.edge_count, report.matrix_edges_checked
+                    ),
+                );
+            }
+            if let Some(csc) = self
+                .graphblas_csc(cell_id, edge_type, artifact.base_epoch)
+                .await?
+            {
+                if csc.indices.len() as u64 != artifact.edge_count {
+                    record_mismatch(
+                        report,
+                        format!(
+                            "graphblas_csc:edge-count base_epoch={} expected={} actual={}",
+                            artifact.base_epoch,
+                            artifact.edge_count,
+                            csc.indices.len()
+                        ),
+                    );
+                }
+            }
+        }
+
+        let mut posting_count = 0_u64;
+        let mut posting_iter = self
+            .scan_remote_prefix(&format!("cell/{cell_id}/artifact/posting/{edge_type}/"))
+            .await?;
+        while let Some(kv) = posting_iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let chunk = decode_posting_chunk(&key, &kv.value)?;
+            if chunk.cell_id != cell_id || chunk.edge_type != edge_type {
+                record_mismatch(
+                    report,
+                    format!(
+                        "posting:identity key={key} got={}/{}",
+                        chunk.cell_id, chunk.edge_type
+                    ),
+                );
+            }
+            if !chunk
+                .vertices
+                .windows(2)
+                .all(|window| window[0] < window[1])
+            {
+                record_mismatch(report, format!("posting:unsorted key={key}"));
+            }
+            posting_count = posting_count.saturating_add(1);
+        }
+        report.posting_chunks_checked = posting_count;
+
+        let mut group_count = 0_u64;
+        let mut group_iter = self
+            .scan_remote_prefix(&format!("cell/{cell_id}/artifact/supernode/{edge_type}/"))
+            .await?;
+        while let Some(kv) = group_iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let group = decode_supernode_group(&key, &kv.value)?;
+            group_count = group_count.saturating_add(1);
+            self.verify_supernode_group_chunks(&group, report).await?;
+        }
+        report.supernode_groups_checked = group_count;
+
+        if let Some(rollup) = self.latest_rollup(cell_id, edge_type, read_epoch).await? {
+            if let Some(artifact) = self
+                .latest_matrix_artifact(cell_id, edge_type, rollup.base_epoch)
+                .await?
+                .filter(|artifact| artifact.base_epoch == rollup.base_epoch)
+            {
+                if artifact.edge_count != rollup.matrix_edge_count {
+                    record_mismatch(
+                        report,
+                        format!(
+                            "rollup:matrix-edge-count base_epoch={} expected={} actual={}",
+                            rollup.base_epoch, rollup.matrix_edge_count, artifact.edge_count
+                        ),
+                    );
+                }
+            } else {
+                record_mismatch(
+                    report,
+                    format!("rollup:missing-matrix base_epoch={}", rollup.base_epoch),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn verify_supernode_group_chunks(
+        &self,
+        group: &SupernodeGroup,
+        report: &mut GraphCorrectnessReport,
+    ) -> Result<()> {
+        let mut degree = 0_u64;
+        for chunk_id in 0..group.chunk_count {
+            let Some(chunk) = self.posting_chunk(group, chunk_id).await? else {
+                record_mismatch(
+                    report,
+                    format!(
+                        "supernode:missing-chunk vertex={} direction={} base_epoch={} chunk={chunk_id}",
+                        group.vertex_id,
+                        direction_str(group.direction),
+                        group.base_epoch
+                    ),
+                );
+                continue;
+            };
+            degree = degree.saturating_add(chunk.vertices.len() as u64);
+            if !chunk
+                .vertices
+                .windows(2)
+                .all(|window| window[0] < window[1])
+            {
+                record_mismatch(
+                    report,
+                    format!(
+                        "supernode:unsorted-chunk vertex={} direction={} base_epoch={} chunk={chunk_id}",
+                        group.vertex_id,
+                        direction_str(group.direction),
+                        group.base_epoch
+                    ),
+                );
+            }
+            if let Some(bound) = group
+                .chunk_bounds
+                .iter()
+                .find(|bound| bound.chunk_id == chunk_id)
+            {
+                if chunk.vertices.first().copied() != Some(bound.first)
+                    || chunk.vertices.last().copied() != Some(bound.last)
+                {
+                    record_mismatch(
+                        report,
+                        format!(
+                            "supernode:chunk-bound vertex={} direction={} base_epoch={} chunk={chunk_id}",
+                            group.vertex_id,
+                            direction_str(group.direction),
+                            group.base_epoch
+                        ),
+                    );
+                }
+            }
+        }
+        if degree != group.degree {
+            record_mismatch(
+                report,
+                format!(
+                    "supernode:degree vertex={} direction={} base_epoch={} expected={} actual={degree}",
+                    group.vertex_id,
+                    direction_str(group.direction),
+                    group.base_epoch,
+                    group.degree
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    async fn verify_traversals(
+        &self,
+        request: TraversalVerifyRequest<'_>,
+        report: &mut GraphCorrectnessReport,
+    ) -> Result<()> {
+        if request.max_hops == 0 || request.root_limit == 0 {
+            return Ok(());
+        }
+        let adjacency = adjacency_from_edges(request.edges);
+        let roots = adjacency
+            .keys()
+            .copied()
+            .take(request.root_limit)
+            .collect::<Vec<_>>();
+        for root in roots {
+            for hops in 1..=request.max_hops {
+                let expected = naive_reachable(&adjacency, root, hops);
+                let posting = self
+                    .posting_reachable(
+                        request.cell_id,
+                        request.edge_type,
+                        &[root],
+                        hops,
+                        request.read_epoch,
+                    )
+                    .await?
+                    .vertices;
+                let matrix = self
+                    .matrix_reachable_with_kernel(
+                        request.cell_id,
+                        request.edge_type,
+                        &[root],
+                        hops,
+                        request.read_epoch,
+                        default_matrix_kernel(),
+                    )
+                    .await?
+                    .vertices;
+                if posting != expected {
+                    record_mismatch(
+                        report,
+                        format!(
+                            "traversal:posting root={root} hops={hops} expected={} actual={}",
+                            expected.len(),
+                            posting.len()
+                        ),
+                    );
+                }
+                if matrix != expected {
+                    record_mismatch(
+                        report,
+                        format!(
+                            "traversal:matrix root={root} hops={hops} expected={} actual={}",
+                            expected.len(),
+                            matrix.len()
+                        ),
+                    );
+                }
+                report.traversal_roots_checked = report.traversal_roots_checked.saturating_add(1);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1979,8 +2883,19 @@ impl GraphControlPlane {
         cache: GraphCacheConfig,
     ) -> Result<Self> {
         Ok(Self {
-            db: open_graph_db(path, object_store, &cache).await?,
+            db: open_graph_db(
+                path,
+                object_store,
+                &cache,
+                &GraphDurabilityConfig::default(),
+            )
+            .await?,
+            metrics: Arc::new(GraphControlMetrics::default()),
         })
+    }
+
+    pub fn graph_control_metrics(&self) -> GraphControlMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -2051,7 +2966,18 @@ impl GraphControlPlane {
     ) -> Result<ShardLease> {
         validate_component("cell_id", cell_id)?;
         validate_component("node_id", node_id)?;
-        let ttl_ms = lease_ttl_ms(ttl)?;
+        self.metrics
+            .lease_acquire_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let ttl_ms = match lease_ttl_ms(ttl) {
+            Ok(ttl_ms) => ttl_ms,
+            Err(err) => {
+                self.metrics
+                    .lease_acquire_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(err);
+            }
+        };
         for attempt in 0..GRAPH_CONTROL_TXN_MAX_RETRIES {
             match self
                 .acquire_lease_txn(cell_id, node_id, ttl_ms, now_ms)
@@ -2063,7 +2989,18 @@ impl GraphControlPlane {
                 {
                     tokio::task::yield_now().await;
                 }
-                result => return result,
+                Ok(lease) => {
+                    self.metrics
+                        .lease_acquire_successes
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(lease);
+                }
+                Err(err) => {
+                    self.metrics
+                        .lease_acquire_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
             }
         }
         unreachable!("control transaction retry loop always returns on final attempt")
@@ -2128,6 +3065,14 @@ impl GraphControlPlane {
         txn.put(token_key.as_bytes(), encode_u64_be(token))?;
         txn.put(lease_key.as_bytes(), encode_shard_lease(&lease))?;
         commit_control_txn(txn).await?;
+        tracing::info!(
+            target: "slatedb_graph_kernel",
+            cell_id,
+            node_id,
+            lease_token = lease.lease_token,
+            expires_at_ms = lease.expires_at_ms,
+            "acquired shard lease"
+        );
         Ok(lease)
     }
 
@@ -2137,16 +3082,50 @@ impl GraphControlPlane {
         ttl: Duration,
         now_ms: u64,
     ) -> Result<ShardLease> {
-        let ttl_ms = lease_ttl_ms(ttl)?;
+        self.metrics
+            .lease_renew_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let ttl_ms = match lease_ttl_ms(ttl) {
+            Ok(ttl_ms) => ttl_ms,
+            Err(err) => {
+                self.metrics
+                    .lease_renew_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(err);
+            }
+        };
         for attempt in 0..GRAPH_CONTROL_TXN_MAX_RETRIES {
             match self.renew_lease_txn(lease, ttl_ms, now_ms).await {
                 Err(GraphError::Slate(err))
                     if err.kind() == ErrorKind::Transaction
                         && attempt + 1 < GRAPH_CONTROL_TXN_MAX_RETRIES =>
                 {
+                    self.metrics
+                        .lease_renew_retries
+                        .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
-                result => return result,
+                Ok(renewed) => {
+                    self.metrics
+                        .lease_renew_successes
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(renewed);
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.metrics
+                        .lease_renew_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .lease_renew_lost
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Err(err) => {
+                    self.metrics
+                        .lease_renew_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
             }
         }
         unreachable!("control transaction retry loop always returns on final attempt")
@@ -2190,6 +3169,14 @@ impl GraphControlPlane {
         };
         txn.put(lease_key.as_bytes(), encode_shard_lease(&renewed))?;
         commit_control_txn(txn).await?;
+        tracing::debug!(
+            target: "slatedb_graph_kernel",
+            cell_id = %renewed.cell_id,
+            node_id = %renewed.owner_node_id,
+            lease_token = renewed.lease_token,
+            expires_at_ms = renewed.expires_at_ms,
+            "renewed shard lease"
+        );
         Ok(renewed)
     }
 
@@ -2248,6 +3235,19 @@ impl GraphControlPlane {
         now_ms: u64,
     ) -> Result<ShardLease> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let placement_key = control_placement_key(cell_id);
+        let Some(existing_placement) = read_control_txn(&txn, &placement_key).await? else {
+            return Err(GraphError::UnknownShard {
+                cell_id: cell_id.to_string(),
+            });
+        };
+        let (placed_cell_id, _) = decode_control_placement(&placement_key, &existing_placement)?;
+        if placed_cell_id != cell_id {
+            return Err(GraphError::UnknownShard {
+                cell_id: cell_id.to_string(),
+            });
+        }
+
         let lease_key = control_lease_key(cell_id);
         if let Some(value) = read_control_txn(&txn, &lease_key).await? {
             let current = decode_shard_lease(&lease_key, &value)?;
@@ -2280,18 +3280,28 @@ impl GraphControlPlane {
                 })?,
         };
         txn.put(
-            control_placement_key(cell_id).as_bytes(),
+            placement_key.as_bytes(),
             encode_control_placement(cell_id, new_node_id),
         )?;
         txn.put(token_key.as_bytes(), encode_u64_be(token))?;
         txn.put(lease_key.as_bytes(), encode_shard_lease(&lease))?;
         commit_control_txn(txn).await?;
+        tracing::warn!(
+            target: "slatedb_graph_kernel",
+            cell_id,
+            new_node_id,
+            lease_token = lease.lease_token,
+            expires_at_ms = lease.expires_at_ms,
+            "failed over expired shard lease"
+        );
         Ok(lease)
     }
 
     async fn write_strict(&self, batch: WriteBatch) -> Result<()> {
-        let mut options = WriteOptions::default();
-        options.await_durable = true;
+        let options = WriteOptions {
+            await_durable: true,
+            ..Default::default()
+        };
         self.db.write_with_options(batch, &options).await?;
         Ok(())
     }
@@ -2605,6 +3615,16 @@ impl RoutedPhase0Cluster {
                 Arc::clone(&leases),
             )
             .await?;
+            let lease = leases
+                .read()
+                .map_err(lock_error)?
+                .get(&cell_id)
+                .cloned()
+                .ok_or_else(|| GraphError::WriteRequiresLease {
+                    operation: "install_write_fence",
+                    cell_id: cell_id.clone(),
+                })?;
+            shard.install_write_fence(&cell_id, &lease).await?;
             shards.insert(cell_id, shard);
         }
 
@@ -2687,11 +3707,42 @@ impl RoutedPhase0Cluster {
                             .cloned()
                             .collect();
                         for lease in current {
-                            let renewed = control.renew_lease(&lease, lease_ttl).await?;
-                            leases
-                                .write()
-                                .map_err(lock_error)?
-                                .insert(renewed.cell_id.clone(), renewed);
+                            match control.renew_lease(&lease, lease_ttl).await {
+                                Ok(renewed) => {
+                                    leases
+                                        .write()
+                                        .map_err(lock_error)?
+                                        .insert(renewed.cell_id.clone(), renewed);
+                                }
+                                Err(GraphError::StaleShardLease { cell_id, .. }) => {
+                                    tracing::warn!(
+                                        target: "slatedb_graph_kernel",
+                                        cell_id,
+                                        "lease renewal lost shard lease"
+                                    );
+                                    leases.write().map_err(lock_error)?.remove(&cell_id);
+                                }
+                                Err(GraphError::Slate(err))
+                                    if err.kind() == ErrorKind::Transaction =>
+                                {
+                                    tracing::warn!(
+                                        target: "slatedb_graph_kernel",
+                                        cell_id = %lease.cell_id,
+                                        error = %err,
+                                        "lease renewal transaction conflict"
+                                    );
+                                    tokio::task::yield_now().await;
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        target: "slatedb_graph_kernel",
+                                        cell_id = %lease.cell_id,
+                                        error = %err,
+                                        "lease renewal failed"
+                                    );
+                                    tokio::task::yield_now().await;
+                                }
+                            }
                         }
                     }
                 }
@@ -2746,6 +3797,19 @@ impl RoutedPhase0Cluster {
         shard.delete_edge(mutation).await
     }
 
+    pub async fn ingest_edge_mutations(
+        &self,
+        cell_id: &str,
+        mutations: impl IntoIterator<Item = crate::EdgeMutation>,
+        options: crate::EdgeIngestOptions,
+    ) -> Result<crate::EdgeIngestResult> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard
+            .ingest_edge_mutations(cell_id, mutations, options)
+            .await
+    }
+
     pub async fn bulk_import_edges(
         &self,
         cell_id: &str,
@@ -2798,9 +3862,7 @@ impl RoutedPhase0Cluster {
 }
 
 pub fn local_object_store(path: impl AsRef<std::path::Path>) -> Result<Arc<dyn ObjectStore>> {
-    Ok(Arc::new(LocalFileSystem::new_with_prefix(
-        path.as_ref().to_path_buf(),
-    )?) as Arc<dyn ObjectStore>)
+    Ok(Arc::new(LocalFileSystem::new_with_prefix(path.as_ref())?) as Arc<dyn ObjectStore>)
 }
 
 pub fn object_store_from_env(env_file: Option<String>) -> Result<Arc<dyn ObjectStore>> {
@@ -2876,16 +3938,19 @@ async fn read_control_counter_txn(txn: &DbTransaction, key: &str) -> Result<u64>
 }
 
 async fn commit_control_txn(txn: DbTransaction) -> Result<()> {
-    let mut options = WriteOptions::default();
-    options.await_durable = true;
+    let options = WriteOptions {
+        await_durable: true,
+        ..Default::default()
+    };
     txn.commit_with_options(&options).await?;
     Ok(())
 }
 
 fn control_read_options() -> ReadOptions {
-    let mut options = ReadOptions::default();
-    options.durability_filter = DurabilityLevel::Remote;
-    options
+    ReadOptions {
+        durability_filter: DurabilityLevel::Remote,
+        ..Default::default()
+    }
 }
 
 fn control_scan_options() -> ScanOptions {
@@ -2953,6 +4018,7 @@ fn append_posting_chunks(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_current_supernode_chunk(
     cell_id: &str,
     edge_type: &str,
@@ -2982,6 +4048,7 @@ fn append_current_supernode_chunk(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_supernode_chunks(
     cell_id: &str,
     edge_type: &str,
@@ -3123,6 +4190,141 @@ fn adjacency_from_edges(edges: &[EdgeRecord]) -> MatrixAdjacency {
 
 fn adjacency_edge_count(adjacency: &MatrixAdjacency) -> u64 {
     adjacency.values().map(|dsts| dsts.len() as u64).sum()
+}
+
+const GRAPH_VERIFY_MISMATCH_SAMPLES: usize = 64;
+
+fn graph_export_digest(
+    cell_id: &str,
+    edge_type: &str,
+    read_epoch: GraphEpoch,
+    edges: &[EdgeRecord],
+) -> GraphExportDigest {
+    let (out_degrees, in_degrees) = degree_maps(edges);
+    GraphExportDigest {
+        cell_id: cell_id.to_string(),
+        edge_type: edge_type.to_string(),
+        read_epoch,
+        live_edges: edges.len() as u64,
+        edge_checksum: edge_checksum(edges),
+        out_degree_checksum: degree_checksum(&out_degrees),
+        in_degree_checksum: degree_checksum(&in_degrees),
+    }
+}
+
+fn edge_checksum(edges: &[EdgeRecord]) -> u64 {
+    let mut hash = 0xcbf29ce484222325;
+    let mut sorted = edges.to_vec();
+    sorted.sort_by_key(|edge| (edge.src, edge.dst, edge.epoch));
+    for edge in sorted {
+        checksum_u64(&mut hash, edge.src);
+        checksum_u64(&mut hash, edge.dst);
+        checksum_u64(&mut hash, edge.epoch);
+    }
+    hash
+}
+
+fn degree_checksum(degrees: &BTreeMap<VertexId, u64>) -> u64 {
+    let mut hash = 0xcbf29ce484222325;
+    for (vertex, degree) in degrees {
+        checksum_u64(&mut hash, *vertex);
+        checksum_u64(&mut hash, *degree);
+    }
+    hash
+}
+
+fn edge_set(edges: &[EdgeRecord]) -> BTreeSet<(VertexId, VertexId)> {
+    edges.iter().map(|edge| (edge.src, edge.dst)).collect()
+}
+
+fn degree_maps(edges: &[EdgeRecord]) -> (BTreeMap<VertexId, u64>, BTreeMap<VertexId, u64>) {
+    let mut out = BTreeMap::<VertexId, u64>::new();
+    let mut input = BTreeMap::<VertexId, u64>::new();
+    for edge in edges {
+        *out.entry(edge.src).or_default() += 1;
+        *input.entry(edge.dst).or_default() += 1;
+    }
+    (out, input)
+}
+
+fn compare_edge_sets(
+    label: &'static str,
+    expected: &BTreeSet<(VertexId, VertexId)>,
+    actual: &BTreeSet<(VertexId, VertexId)>,
+    report: &mut GraphCorrectnessReport,
+) {
+    for (src, dst) in expected
+        .difference(actual)
+        .take(GRAPH_VERIFY_MISMATCH_SAMPLES)
+    {
+        record_mismatch(report, format!("{label}:missing src={src} dst={dst}"));
+    }
+    for (src, dst) in actual
+        .difference(expected)
+        .take(GRAPH_VERIFY_MISMATCH_SAMPLES)
+    {
+        record_mismatch(report, format!("{label}:extra src={src} dst={dst}"));
+    }
+    let missing = expected.difference(actual).count();
+    let extra = actual.difference(expected).count();
+    let sampled = missing
+        .min(GRAPH_VERIFY_MISMATCH_SAMPLES)
+        .saturating_add(extra.min(GRAPH_VERIFY_MISMATCH_SAMPLES));
+    let unsampled = missing.saturating_add(extra).saturating_sub(sampled);
+    report.mismatch_count = report.mismatch_count.saturating_add(unsampled as u64);
+}
+
+fn compare_degree_maps(
+    label: &'static str,
+    expected: &BTreeMap<VertexId, u64>,
+    actual: &BTreeMap<VertexId, u64>,
+    report: &mut GraphCorrectnessReport,
+) {
+    for (vertex, expected_degree) in expected {
+        let actual_degree = actual.get(vertex).copied().unwrap_or_default();
+        if actual_degree != *expected_degree {
+            record_mismatch(
+                report,
+                format!(
+                    "{label}:mismatch vertex={vertex} expected={expected_degree} actual={actual_degree}"
+                ),
+            );
+        }
+    }
+    for (vertex, actual_degree) in actual {
+        if *actual_degree > 0 && !expected.contains_key(vertex) {
+            record_mismatch(
+                report,
+                format!("{label}:extra vertex={vertex} actual={actual_degree}"),
+            );
+        }
+    }
+}
+
+fn record_mismatch(report: &mut GraphCorrectnessReport, message: String) {
+    report.mismatch_count = report.mismatch_count.saturating_add(1);
+    if report.mismatch_samples.len() < GRAPH_VERIFY_MISMATCH_SAMPLES {
+        report.mismatch_samples.push(message);
+    }
+}
+
+fn naive_reachable(adjacency: &MatrixAdjacency, root: VertexId, hops: u8) -> Vec<VertexId> {
+    let mut frontier = BTreeSet::from([root]);
+    let mut reachable = BTreeSet::new();
+    for _ in 0..hops {
+        let mut next = BTreeSet::new();
+        for vertex in &frontier {
+            if let Some(neighbors) = adjacency.get(vertex) {
+                next.extend(neighbors.iter().copied());
+            }
+        }
+        reachable.extend(next.iter().copied());
+        frontier = next;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+    reachable.into_iter().collect()
 }
 
 fn apply_delta_overlay(
@@ -3369,7 +4571,9 @@ const GRAPH_ARTIFACT_GC_BATCH_KEYS: usize = 512;
 
 async fn put_artifact_record(
     shard: &GraphShard,
-    batch: &mut WriteBatch,
+    cell_id: &str,
+    operation: &'static str,
+    batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
     key: String,
     value: Vec<u8>,
@@ -3377,35 +4581,43 @@ async fn put_artifact_record(
     batch.put(key, value);
     *pending_writes += 1;
     if *pending_writes >= GRAPH_ARTIFACT_WRITE_BATCH_KEYS {
-        flush_artifact_put_batch(shard, batch, pending_writes).await?;
+        flush_artifact_put_batch(shard, cell_id, operation, batch, pending_writes).await?;
     }
     Ok(())
 }
 
 async fn flush_artifact_put_batch(
     shard: &GraphShard,
-    batch: &mut WriteBatch,
+    cell_id: &str,
+    operation: &'static str,
+    batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
 ) -> Result<()> {
     if *pending_writes == 0 {
         return Ok(());
     }
-    let batch_to_write = std::mem::replace(batch, WriteBatch::new());
-    shard.write_strict(batch_to_write).await?;
+    let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
+    shard
+        .write_graph_batch_strict(cell_id, operation, batch_to_write)
+        .await?;
     *pending_writes = 0;
     Ok(())
 }
 
 async fn flush_artifact_gc_batch(
     shard: &GraphShard,
-    batch: &mut WriteBatch,
+    cell_id: &str,
+    operation: &'static str,
+    batch: &mut GraphWriteBatch,
     pending_deletes: &mut usize,
 ) -> Result<()> {
     if *pending_deletes == 0 {
         return Ok(());
     }
-    let batch_to_write = std::mem::replace(batch, WriteBatch::new());
-    shard.write_strict(batch_to_write).await?;
+    let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
+    shard
+        .write_graph_batch_strict(cell_id, operation, batch_to_write)
+        .await?;
     *pending_deletes = 0;
     Ok(())
 }
@@ -3477,7 +4689,7 @@ const GRAPHBLAS_CSC_CHUNK_U64S: usize = 64 * 1024;
 
 async fn append_graphblas_csc_chunks(
     shard: &GraphShard,
-    batch: &mut WriteBatch,
+    batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
     cell_id: &str,
     edge_type: &str,
@@ -3532,9 +4744,10 @@ async fn append_graphblas_csc_chunks(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn append_graphblas_csc_field_chunks(
     shard: &GraphShard,
-    batch: &mut WriteBatch,
+    batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
     cell_id: &str,
     edge_type: &str,
@@ -3546,6 +4759,8 @@ async fn append_graphblas_csc_field_chunks(
     for (chunk_id, chunk) in values.chunks(GRAPHBLAS_CSC_CHUNK_U64S).enumerate() {
         put_artifact_record(
             shard,
+            cell_id,
+            "build_matrix_tiles",
             batch,
             pending_writes,
             graphblas_csc_chunk_key(cell_id, edge_type, base_epoch, field, chunk_id as u64),
@@ -3835,23 +5050,46 @@ fn decode_supernode_group(key: &str, value: &[u8]) -> Result<SupernodeGroup> {
         if parts.len() != 8 {
             return corrupt(key, "expected supernode1 record with 8 fields");
         }
-        return Ok(SupernodeGroup {
-            cell_id: parts[1].to_string(),
-            edge_type: parts[2].to_string(),
-            direction: parse_direction(parts[3])?,
-            vertex_id: parse_u64(key, parts[4], "vertex_id")?,
-            base_epoch: parse_u64(key, parts[5], "base_epoch")?,
-            degree: parse_u64(key, parts[6], "degree")?,
-            chunk_count: parse_u64(key, parts[7], "chunk_count")?,
-            page_size: 0,
-            chunk_bounds: Vec::new(),
-        });
+        return validate_supernode_group(
+            key,
+            SupernodeGroup {
+                cell_id: parts[1].to_string(),
+                edge_type: parts[2].to_string(),
+                direction: parse_direction(parts[3])?,
+                vertex_id: parse_u64(key, parts[4], "vertex_id")?,
+                base_epoch: parse_u64(key, parts[5], "base_epoch")?,
+                degree: parse_u64(key, parts[6], "degree")?,
+                chunk_count: parse_u64(key, parts[7], "chunk_count")?,
+                page_size: 0,
+                chunk_bounds: Vec::new(),
+            },
+        );
     }
     if parts[0] == "supernode2" {
         if parts.len() != 9 {
             return corrupt(key, "expected supernode2 record with 9 fields");
         }
-        return Ok(SupernodeGroup {
+        return validate_supernode_group(
+            key,
+            SupernodeGroup {
+                cell_id: parts[1].to_string(),
+                edge_type: parts[2].to_string(),
+                direction: parse_direction(parts[3])?,
+                vertex_id: parse_u64(key, parts[4], "vertex_id")?,
+                base_epoch: parse_u64(key, parts[5], "base_epoch")?,
+                degree: parse_u64(key, parts[6], "degree")?,
+                chunk_count: parse_u64(key, parts[7], "chunk_count")?,
+                page_size: parse_u64(key, parts[8], "page_size")?,
+                chunk_bounds: Vec::new(),
+            },
+        );
+    }
+    if parts.len() != 10 || parts[0] != "supernode3" {
+        return corrupt(key, "expected supernode3 record with 10 fields");
+    }
+    validate_supernode_group(
+        key,
+        SupernodeGroup {
             cell_id: parts[1].to_string(),
             edge_type: parts[2].to_string(),
             direction: parse_direction(parts[3])?,
@@ -3860,23 +5098,46 @@ fn decode_supernode_group(key: &str, value: &[u8]) -> Result<SupernodeGroup> {
             degree: parse_u64(key, parts[6], "degree")?,
             chunk_count: parse_u64(key, parts[7], "chunk_count")?,
             page_size: parse_u64(key, parts[8], "page_size")?,
-            chunk_bounds: Vec::new(),
-        });
+            chunk_bounds: decode_supernode_chunk_bounds(key, parts[9])?,
+        },
+    )
+}
+
+fn validate_supernode_group(key: &str, group: SupernodeGroup) -> Result<SupernodeGroup> {
+    if group.degree > 0 && group.chunk_count == 0 {
+        return corrupt(key, "supernode degree requires at least one chunk");
     }
-    if parts.len() != 10 || parts[0] != "supernode3" {
-        return corrupt(key, "expected supernode3 record with 10 fields");
+    if group.page_size > 0 {
+        let capacity = group
+            .chunk_count
+            .checked_mul(group.page_size)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: "supernode chunk capacity overflow".to_string(),
+            })?;
+        if group.degree > capacity {
+            return corrupt(key, "supernode degree exceeds chunk capacity");
+        }
     }
-    Ok(SupernodeGroup {
-        cell_id: parts[1].to_string(),
-        edge_type: parts[2].to_string(),
-        direction: parse_direction(parts[3])?,
-        vertex_id: parse_u64(key, parts[4], "vertex_id")?,
-        base_epoch: parse_u64(key, parts[5], "base_epoch")?,
-        degree: parse_u64(key, parts[6], "degree")?,
-        chunk_count: parse_u64(key, parts[7], "chunk_count")?,
-        page_size: parse_u64(key, parts[8], "page_size")?,
-        chunk_bounds: decode_supernode_chunk_bounds(key, parts[9])?,
-    })
+    if group.chunk_bounds.len() as u64 > group.chunk_count {
+        return corrupt(key, "supernode chunk bounds exceed chunk count");
+    }
+    let mut previous = None;
+    for bound in &group.chunk_bounds {
+        if bound.chunk_id >= group.chunk_count {
+            return corrupt(key, "supernode chunk bound id exceeds chunk count");
+        }
+        if bound.first > bound.last {
+            return corrupt(key, "supernode chunk bound range is inverted");
+        }
+        if let Some((prev_first, prev_last, prev_id)) = previous {
+            if (bound.first, bound.last, bound.chunk_id) <= (prev_first, prev_last, prev_id) {
+                return corrupt(key, "supernode chunk bounds must be sorted and unique");
+            }
+        }
+        previous = Some((bound.first, bound.last, bound.chunk_id));
+    }
+    Ok(group)
 }
 
 fn encode_supernode_chunk_bounds(bounds: &[SupernodeChunkBound]) -> String {

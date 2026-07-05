@@ -557,7 +557,7 @@ mod graphblas {
     }
 
     fn graphblas_replica_count() -> usize {
-        const DEFAULT_MAX_REPLICAS: usize = 1;
+        const DEFAULT_MAX_REPLICAS: usize = 4;
         const HARD_MAX_REPLICAS: usize = 64;
         if let Ok(value) = std::env::var("PHASE0_GRAPHBLAS_REPLICAS") {
             if let Ok(parsed) = value.parse::<usize>() {

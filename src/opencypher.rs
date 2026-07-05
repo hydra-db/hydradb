@@ -154,6 +154,9 @@ fn lower_create(create: *const AstNode) -> Result<QueryStatement> {
 
         let pattern = checked_node(sys::cypher_ast_create_get_pattern(create))?;
         let edge = lower_single_edge_pattern(pattern)?;
+        if edge.hop_range.is_some() {
+            return unsupported("CREATE does not support variable-length relationships in Phase 0");
+        }
         Ok(QueryStatement::CreateEdge {
             edge_type: edge.edge_type,
             src: edge
@@ -195,6 +198,7 @@ fn lower_match_return(
         } else {
             Some(lower_where_node_id(predicate, edge.dst_binding.as_deref())?)
         };
+        let fixed_dst = resolve_node_id_constraint(edge.dst, where_dst)?;
         let src = edge
             .src
             .ok_or_else(|| unsupported_value("MATCH requires source id"))?;
@@ -203,7 +207,7 @@ fn lower_match_return(
 
         if is_count_star(expression)? {
             if let Some((min_hops, max_hops)) = edge.hop_range {
-                if edge.dst.is_some() || where_dst.is_some() {
+                if fixed_dst.is_some() {
                     return unsupported(
                         "variable-length MATCH with fixed destination is not executable in Phase 0",
                     );
@@ -216,16 +220,8 @@ fn lower_match_return(
                     return_count: true,
                 });
             }
-            if let Some(dst) = where_dst {
+            if let Some(dst) = fixed_dst {
                 return Ok(QueryStatement::MatchOutFiltered {
-                    edge_type: edge.edge_type,
-                    src,
-                    dst,
-                    return_count: true,
-                });
-            }
-            if let Some(dst) = edge.dst {
-                return Ok(QueryStatement::MatchEdge {
                     edge_type: edge.edge_type,
                     src,
                     dst,
@@ -240,7 +236,7 @@ fn lower_match_return(
         }
 
         if let Some((min_hops, max_hops)) = edge.hop_range {
-            if edge.dst.is_some() || where_dst.is_some() {
+            if fixed_dst.is_some() {
                 return unsupported(
                     "variable-length MATCH with fixed destination is not executable in Phase 0",
                 );
@@ -257,7 +253,7 @@ fn lower_match_return(
             });
         }
 
-        if let Some(dst) = edge.dst.or(where_dst) {
+        if let Some(dst) = fixed_dst {
             if !projects_node_id(expression, edge.dst_binding.as_deref())? {
                 return unsupported(
                     "exact edge MATCH currently supports RETURN <dst>.id or count(*)",
@@ -353,12 +349,11 @@ fn lower_hop_range(range: *const AstNode) -> Result<(u8, u8)> {
         } else {
             integer_u8(start, "minimum hop count")?
         };
-        let max_hops = if end.is_null() {
-            cypher_max_var_hops()
-        } else {
-            integer_u8(end, "maximum hop count")?
-        };
-        if max_hops == 0 || min_hops > max_hops {
+        if end.is_null() {
+            return unsupported("unbounded variable-length MATCH requires an explicit max hop");
+        }
+        let max_hops = integer_u8(end, "maximum hop count")?;
+        if min_hops > max_hops {
             return unsupported("invalid variable-length hop range");
         }
         Ok((min_hops, max_hops))
@@ -409,9 +404,25 @@ fn lower_node_id_equality(
     unsupported("WHERE supports only <dst>.id = <integer> in Phase 0")
 }
 
+fn resolve_node_id_constraint(
+    pattern_id: Option<VertexId>,
+    where_id: Option<VertexId>,
+) -> Result<Option<VertexId>> {
+    match (pattern_id, where_id) {
+        (Some(left), Some(right)) if left != right => {
+            unsupported("conflicting node id constraints are not executable in Phase 0")
+        }
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
 fn lower_node_pattern(node: *const AstNode) -> Result<NodePattern> {
     unsafe {
         ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "node pattern")?;
+        if sys::cypher_ast_node_pattern_nlabels(node) != 0 {
+            return unsupported("node labels are not executable in Phase 0");
+        }
         let binding = node_identifier(node)?;
         let properties = sys::cypher_ast_node_pattern_get_properties(node);
         let id = if properties.is_null() {
@@ -457,14 +468,6 @@ fn integer_vertex_id(node: *const AstNode) -> Result<VertexId> {
 fn integer_u8(node: *const AstNode, field: &str) -> Result<u8> {
     let value = integer_vertex_id(node)?;
     u8::try_from(value).map_err(|_| unsupported_value(format!("{field} exceeds 255")))
-}
-
-fn cypher_max_var_hops() -> u8 {
-    std::env::var("PHASE0_CYPHER_MAX_VAR_HOPS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(32)
 }
 
 fn is_count_star(expression: *const AstNode) -> Result<bool> {
@@ -618,10 +621,8 @@ mod tests {
     #[test]
     fn lowers_create_edge_through_libcypher_parser() {
         assert_eq!(
-            parse_opencypher(
-                "CREATE (u:User {id: 1})-[:USER_SUBSCRIBED_TO_SUBREDDIT]->(s:Subreddit {id: 2})"
-            )
-            .unwrap(),
+            parse_opencypher("CREATE (u {id: 1})-[:USER_SUBSCRIBED_TO_SUBREDDIT]->(s {id: 2})")
+                .unwrap(),
             QueryStatement::CreateEdge {
                 edge_type: "USER_SUBSCRIBED_TO_SUBREDDIT".to_string(),
                 src: 1,
@@ -650,7 +651,7 @@ mod tests {
                 "MATCH (u {id: 1})-[:USER_SUBSCRIBED_TO_SUBREDDIT]->(s {id: 2}) RETURN count(*)"
             )
             .unwrap(),
-            QueryStatement::MatchEdge {
+            QueryStatement::MatchOutFiltered {
                 edge_type: "USER_SUBSCRIBED_TO_SUBREDDIT".to_string(),
                 src: 1,
                 dst: 2,
@@ -679,6 +680,32 @@ mod tests {
         assert!(matches!(
             parse_opencypher("MATCH (u {id: 1})-[:FOLLOWS]-> RETURN u.id"),
             Err(GraphError::QueryParse { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_labels_instead_of_silently_dropping_them() {
+        assert!(matches!(
+            parse_opencypher("MATCH (u {id: 1})-[:FOLLOWS]->(v:User) RETURN v.id"),
+            Err(GraphError::UnsupportedQuery { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_unbounded_variable_length_paths() {
+        assert!(matches!(
+            parse_opencypher("MATCH (u {id: 1})-[:FOLLOWS*]->(v) RETURN v.id"),
+            Err(GraphError::UnsupportedQuery { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_conflicting_pattern_and_where_ids() {
+        assert!(matches!(
+            parse_opencypher(
+                "MATCH (u {id: 1})-[:FOLLOWS]->(v {id: 2}) WHERE v.id = 3 RETURN v.id"
+            ),
+            Err(GraphError::UnsupportedQuery { .. })
         ));
     }
 
