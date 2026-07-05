@@ -4945,6 +4945,31 @@ impl GraphShard {
         let started = std::time::Instant::now();
         let _permit = self.acquire_gc_permit("compact_supernode_segments").await?;
         let _writer = self.writer_lane(cell_id).lock().await;
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "compact_supernode_segments")
+            .await?;
+        let result = self
+            .compact_supernode_segments_locked(
+                cell_id,
+                edge_type,
+                src,
+                compacted_through_epoch,
+                idempotency_key,
+                started,
+            )
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn compact_supernode_segments_locked(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        compacted_through_epoch: GraphEpoch,
+        idempotency_key: &str,
+        started: std::time::Instant,
+    ) -> Result<SegmentCompactionResult> {
         let idempotency_operation = segment_compaction_idempotency_operation(edge_type, src);
         let idem_key = keys::idempotency(cell_id, &idempotency_operation, idempotency_key);
         if let Some(value) = self.read_remote(&idem_key).await? {
@@ -8836,6 +8861,40 @@ mod tests {
             .await
             .unwrap();
         assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+    }
+
+    #[tokio::test]
+    async fn segment_compaction_respects_cell_write_lock_before_scanning() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/segment-compaction-cell-lock",
+            object_store,
+            GraphOpenOptions {
+                index_policy: GraphIndexPolicy::OutboundOnly,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        let lock = shard
+            .acquire_cell_write_lock(cell_id, "held-by-test-writer")
+            .await
+            .unwrap();
+        let err = shard
+            .compact_supernode_segments(cell_id, edge_type, 1, 0, "compact-lock-held")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GraphError::CellWriteConflict {
+                operation: "compact_supernode_segments",
+                ref cell_id
+            } if cell_id == "reddit-home"
+        ));
+        lock.release().await.unwrap();
     }
 
     #[tokio::test]
