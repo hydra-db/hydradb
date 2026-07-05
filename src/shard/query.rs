@@ -99,6 +99,8 @@ impl GraphShard {
         query: ParsedRowQuery,
     ) -> Result<QueryResultSet> {
         validate_component("cell_id", &context.cell_id)?;
+        let budget = QueryBudget::new(context.max_runtime_ms.or(self.limits.max_query_runtime_ms));
+        budget.check("cypher_rows")?;
         let read_epoch = match context.read_epoch {
             Some(read_epoch) => {
                 let current_epoch = self.current_epoch(&context.cell_id).await?;
@@ -115,11 +117,12 @@ impl GraphShard {
         };
 
         let mut bindings = self
-            .match_row_pattern(&context.cell_id, &query.pattern, read_epoch)
+            .match_row_pattern(&context.cell_id, &query.pattern, read_epoch, &budget)
             .await?;
         if let Some(predicate) = &query.predicate {
             let mut filtered = Vec::with_capacity(bindings.len());
             for row in bindings {
+                budget.check("cypher_where")?;
                 if row_predicate_matches(&row, predicate)? {
                     filtered.push(row);
                 }
@@ -135,11 +138,13 @@ impl GraphShard {
                 vec![ProjectedQueryRow { row, sort_keys }],
                 &query.order_by,
                 context.result_window,
+                &budget,
             );
         }
 
         let mut projected = Vec::with_capacity(bindings.len());
         for binding in &bindings {
+            budget.check("cypher_project")?;
             let row = project_binding_row(binding, &query.projections)?;
             let sort_keys = sort_keys_for_row(binding, &row, &query.columns, &query.order_by)?;
             projected.push(ProjectedQueryRow { row, sort_keys });
@@ -149,11 +154,14 @@ impl GraphShard {
             projected,
             &query.order_by,
             context.result_window,
+            &budget,
         )
     }
 
     pub async fn execute_query_plan(&self, plan: QueryPlan) -> Result<QueryOutput> {
         self.validate_executable_query_plan(&plan).await?;
+        let budget = QueryBudget::new(plan.max_runtime_ms.or(self.limits.max_query_runtime_ms));
+        budget.check("query_plan")?;
         match plan.physical {
             PhysicalQueryPlan::WriteEdge {
                 edge_type,
@@ -216,6 +224,7 @@ impl GraphShard {
                         plan.result_window,
                     )
                     .await?;
+                budget.check("query_out_neighbors")?;
                 Ok(QueryOutput::Vertices(vertices))
             }
             PhysicalQueryPlan::EdgeExistsToCount {
@@ -276,6 +285,7 @@ impl GraphShard {
                     )
                     .await?
                     .0;
+                budget.check("query_reachable")?;
                 if return_count {
                     Ok(QueryOutput::Count(vertices.len() as u64))
                 } else {
@@ -310,11 +320,19 @@ impl GraphShard {
         cell_id: &str,
         pattern: &RowPattern,
         read_epoch: GraphEpoch,
+        budget: &QueryBudget,
     ) -> Result<Vec<BindingRow>> {
         validate_component("cell_id", cell_id)?;
+        budget.check("cypher_match")?;
         match pattern {
-            RowPattern::Node(node) => self.match_node_row_pattern(cell_id, node, read_epoch).await,
-            RowPattern::Edge(edge) => self.match_edge_row_pattern(cell_id, edge, read_epoch).await,
+            RowPattern::Node(node) => {
+                self.match_node_row_pattern(cell_id, node, read_epoch, budget)
+                    .await
+            }
+            RowPattern::Edge(edge) => {
+                self.match_edge_row_pattern(cell_id, edge, read_epoch, budget)
+                    .await
+            }
         }
     }
 
@@ -324,8 +342,12 @@ impl GraphShard {
         cell_id: &str,
         node: &RowNodePattern,
         read_epoch: GraphEpoch,
+        budget: &QueryBudget,
     ) -> Result<Vec<BindingRow>> {
-        let Some(vertices) = self.candidate_vertex_ids(cell_id, node, read_epoch).await? else {
+        let Some(vertices) = self
+            .candidate_vertex_ids(cell_id, node, read_epoch, budget)
+            .await?
+        else {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "OpenCypher",
                 feature: "node-only MATCH requires an id, label, or property predicate".to_string(),
@@ -335,9 +357,16 @@ impl GraphShard {
         let mut rows = Vec::with_capacity(vertices.len());
         let mut metadata_cache = BTreeMap::new();
         for vertex_id in vertices {
+            budget.check("cypher_node_rows")?;
             if let Some(mut row) = BindingRow::from_node(node, vertex_id) {
-                self.hydrate_binding_metadata(cell_id, read_epoch, &mut row, &mut metadata_cache)
-                    .await?;
+                self.hydrate_binding_metadata(
+                    cell_id,
+                    read_epoch,
+                    &mut row,
+                    &mut metadata_cache,
+                    budget,
+                )
+                .await?;
                 if row_matches_node(&row, node)? {
                     self.push_binding_row(&mut rows, row, "cypher_node_rows")?;
                 }
@@ -352,29 +381,32 @@ impl GraphShard {
         cell_id: &str,
         edge: &RowEdgePattern,
         read_epoch: GraphEpoch,
+        budget: &QueryBudget,
     ) -> Result<Vec<BindingRow>> {
         validate_component("edge_type", &edge.edge_type)?;
         if let Some((min_hops, max_hops)) = edge.hop_range {
             return self
-                .match_reachable_row_pattern(cell_id, edge, min_hops, max_hops, read_epoch)
+                .match_reachable_row_pattern(cell_id, edge, min_hops, max_hops, read_epoch, budget)
                 .await;
         }
 
         let mut rows = Vec::new();
         let mut metadata_cache = BTreeMap::new();
         let candidate_sources = self
-            .candidate_vertex_ids(cell_id, &edge.src, read_epoch)
+            .candidate_vertex_ids(cell_id, &edge.src, read_epoch, budget)
             .await?;
         let mut scanned_edges = 0_u64;
         if let Some(sources) = candidate_sources {
             self.ensure_query_index_candidates("cypher_edge_source_candidates", sources.len())?;
             for src in sources {
+                budget.check("cypher_edge_sources")?;
                 let neighbors = self
                     .out_neighbors_at(cell_id, &edge.edge_type, src, read_epoch)
                     .await?;
                 scanned_edges = scanned_edges.saturating_add(neighbors.len() as u64);
                 self.ensure_query_scan_edges("cypher_edge_neighbor_scan", scanned_edges)?;
                 for dst in neighbors {
+                    budget.check("cypher_edge_rows")?;
                     if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst) {
                         continue;
                     }
@@ -384,6 +416,7 @@ impl GraphShard {
                             read_epoch,
                             &mut row,
                             &mut metadata_cache,
+                            budget,
                         )
                         .await?;
                         if row_matches_edge_pattern(&row, edge)? {
@@ -401,6 +434,7 @@ impl GraphShard {
                 .await?;
             self.ensure_query_scan_edges("cypher_edge_neighbor_scan", neighbors.len() as u64)?;
             for dst in neighbors {
+                budget.check("cypher_edge_rows")?;
                 if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst) {
                     continue;
                 }
@@ -410,6 +444,7 @@ impl GraphShard {
                         read_epoch,
                         &mut row,
                         &mut metadata_cache,
+                        budget,
                     )
                     .await?;
                     if row_matches_edge_pattern(&row, edge)? {
@@ -423,12 +458,19 @@ impl GraphShard {
         let records = self.edges_at(cell_id, &edge.edge_type, read_epoch).await?;
         self.ensure_query_scan_edges("cypher_edge_full_scan", records.len() as u64)?;
         for record in records {
+            budget.check("cypher_edge_full_scan")?;
             if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != record.dst) {
                 continue;
             }
             if let Some(mut row) = BindingRow::from_edge(edge, record.src, record.dst) {
-                self.hydrate_binding_metadata(cell_id, read_epoch, &mut row, &mut metadata_cache)
-                    .await?;
+                self.hydrate_binding_metadata(
+                    cell_id,
+                    read_epoch,
+                    &mut row,
+                    &mut metadata_cache,
+                    budget,
+                )
+                .await?;
                 if row_matches_edge_pattern(&row, edge)? {
                     self.push_binding_row(&mut rows, row, "cypher_edge_rows")?;
                 }
@@ -445,6 +487,7 @@ impl GraphShard {
         min_hops: u8,
         max_hops: u8,
         read_epoch: GraphEpoch,
+        budget: &QueryBudget,
     ) -> Result<Vec<BindingRow>> {
         let Some(src) = edge.src.id else {
             return Err(GraphError::UnsupportedQuery {
@@ -462,17 +505,25 @@ impl GraphShard {
                 read_epoch,
             )
             .await?;
+        budget.check("cypher_reachable")?;
         self.ensure_query_scan_edges("cypher_reachable_edge_visits", edge_visits)?;
         self.ensure_query_intermediate_rows("cypher_reachable_rows", vertices.len())?;
         let mut rows = Vec::with_capacity(vertices.len());
         let mut metadata_cache = BTreeMap::new();
         for dst in vertices {
+            budget.check("cypher_reachable_rows")?;
             if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst) {
                 continue;
             }
             if let Some(mut row) = BindingRow::from_edge(edge, src, dst) {
-                self.hydrate_binding_metadata(cell_id, read_epoch, &mut row, &mut metadata_cache)
-                    .await?;
+                self.hydrate_binding_metadata(
+                    cell_id,
+                    read_epoch,
+                    &mut row,
+                    &mut metadata_cache,
+                    budget,
+                )
+                .await?;
                 if row_matches_edge_pattern(&row, edge)? {
                     self.push_binding_row(&mut rows, row, "cypher_reachable_rows")?;
                 }
@@ -487,7 +538,9 @@ impl GraphShard {
         cell_id: &str,
         pattern: &RowNodePattern,
         read_epoch: GraphEpoch,
+        budget: &QueryBudget,
     ) -> Result<Option<Vec<VertexId>>> {
+        budget.check("cypher_candidate_vertices")?;
         if let Some(id) = pattern.id {
             return Ok(Some(vec![id]));
         }
@@ -497,13 +550,13 @@ impl GraphShard {
             .find(|(property, _)| property.as_str() != "id")
         {
             return Ok(Some(
-                self.scan_vertex_property_index_at(cell_id, property, value, read_epoch)
+                self.scan_vertex_property_index_at(cell_id, property, value, read_epoch, budget)
                     .await?,
             ));
         }
         if let Some(label) = pattern.labels.iter().next() {
             return Ok(Some(
-                self.scan_vertex_label_index_at(cell_id, label, read_epoch)
+                self.scan_vertex_label_index_at(cell_id, label, read_epoch, budget)
                     .await?,
             ));
         }
@@ -550,6 +603,7 @@ impl GraphShard {
         cell_id: &str,
         label: &str,
         read_epoch: GraphEpoch,
+        budget: &QueryBudget,
     ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("label", label)?;
@@ -559,6 +613,7 @@ impl GraphShard {
         let mut latest = BTreeMap::<VertexId, bool>::new();
         let mut saw_delta = false;
         while let Some(kv) = iter.next().await? {
+            budget.check("cypher_vertex_label_index")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let (epoch, vertex_id) = parse_vertex_label_delta_key(&key)?;
             saw_delta = true;
@@ -577,7 +632,8 @@ impl GraphShard {
                 .filter_map(|(vertex_id, present)| present.then_some(vertex_id))
                 .collect());
         }
-        self.scan_vertex_label_index_current(cell_id, label).await
+        self.scan_vertex_label_index_current(cell_id, label, budget)
+            .await
     }
 
     #[cfg(feature = "opencypher")]
@@ -585,12 +641,14 @@ impl GraphShard {
         &self,
         cell_id: &str,
         label: &str,
+        budget: &QueryBudget,
     ) -> Result<Vec<VertexId>> {
         let mut iter = self
             .scan_remote_prefix(&keys::vertex_label_prefix(cell_id, label))
             .await?;
         let mut vertices = Vec::new();
         while let Some(kv) = iter.next().await? {
+            budget.check("cypher_vertex_label_index")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             vertices.push(decode_u64(&key, &kv.value)?);
             self.ensure_query_index_candidates(
@@ -608,6 +666,7 @@ impl GraphShard {
         property: &str,
         value: &VertexPropertyValue,
         read_epoch: GraphEpoch,
+        budget: &QueryBudget,
     ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("property", property)?;
@@ -620,6 +679,7 @@ impl GraphShard {
         let mut latest = BTreeMap::<VertexId, bool>::new();
         let mut saw_delta = false;
         while let Some(kv) = iter.next().await? {
+            budget.check("cypher_vertex_property_index")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let (epoch, vertex_id) = parse_vertex_property_index_delta_key(&key)?;
             saw_delta = true;
@@ -638,7 +698,7 @@ impl GraphShard {
                 .filter_map(|(vertex_id, present)| present.then_some(vertex_id))
                 .collect());
         }
-        self.scan_vertex_property_index_current(cell_id, property, &encoded)
+        self.scan_vertex_property_index_current(cell_id, property, &encoded, budget)
             .await
     }
 
@@ -648,6 +708,7 @@ impl GraphShard {
         cell_id: &str,
         property: &str,
         encoded: &str,
+        budget: &QueryBudget,
     ) -> Result<Vec<VertexId>> {
         let mut iter = self
             .scan_remote_prefix(&keys::vertex_property_index_prefix(
@@ -656,6 +717,7 @@ impl GraphShard {
             .await?;
         let mut vertices = Vec::new();
         while let Some(kv) = iter.next().await? {
+            budget.check("cypher_vertex_property_index")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             vertices.push(decode_u64(&key, &kv.value)?);
             self.ensure_query_index_candidates(
@@ -673,6 +735,7 @@ impl GraphShard {
         read_epoch: GraphEpoch,
         row: &mut BindingRow,
         cache: &mut BTreeMap<VertexId, VertexMetadata>,
+        budget: &QueryBudget,
     ) -> Result<()> {
         let bindings: Vec<_> = row
             .values
@@ -680,6 +743,7 @@ impl GraphShard {
             .map(|(name, id)| (name.clone(), *id))
             .collect();
         for (binding, vertex_id) in bindings {
+            budget.check("cypher_metadata_hydration")?;
             let metadata = match cache.get(&vertex_id) {
                 Some(metadata) => metadata.clone(),
                 None => {
@@ -702,10 +766,13 @@ impl GraphShard {
         mut projected: Vec<ProjectedQueryRow>,
         order_by: &[RowSort],
         window: QueryWindow,
+        budget: &QueryBudget,
     ) -> Result<QueryResultSet> {
+        budget.check("cypher_finish_rows")?;
         if !order_by.is_empty() {
             projected.sort_by(|left, right| compare_projected_rows(left, right, order_by));
         }
+        budget.check("cypher_sort_rows")?;
 
         let skip = usize::try_from(window.skip).map_err(|_| GraphError::AdmissionRejected {
             operation: "query_result_skip",
@@ -1428,6 +1495,36 @@ impl GraphShard {
             delta_records: deltas.len() as u64,
             degree_mismatches,
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct QueryBudget {
+    started_at: std::time::Instant,
+    max_runtime_ms: Option<u64>,
+}
+
+impl QueryBudget {
+    fn new(max_runtime_ms: Option<u64>) -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+            max_runtime_ms,
+        }
+    }
+
+    fn check(&self, operation: &'static str) -> Result<()> {
+        let Some(limit_ms) = self.max_runtime_ms else {
+            return Ok(());
+        };
+        let elapsed_ms = self.started_at.elapsed().as_millis();
+        if elapsed_ms >= u128::from(limit_ms) {
+            return Err(GraphError::QueryTimeout {
+                operation,
+                elapsed_ms: elapsed_ms.min(u128::from(u64::MAX)) as u64,
+                limit_ms,
+            });
+        }
+        Ok(())
     }
 }
 

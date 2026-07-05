@@ -183,6 +183,12 @@ pub enum GraphError {
     },
     #[error("missing {dialect} query parameter ${name}")]
     MissingQueryParameter { dialect: &'static str, name: String },
+    #[error("{operation} exceeded query timeout after {elapsed_ms} ms; limit is {limit_ms} ms")]
+    QueryTimeout {
+        operation: &'static str,
+        elapsed_ms: u64,
+        limit_ms: u64,
+    },
     #[error("{dialect} query is not supported yet: {feature}")]
     UnsupportedQuery {
         dialect: &'static str,
@@ -225,6 +231,7 @@ pub struct GraphLimits {
     pub max_query_intermediate_rows: usize,
     pub max_query_index_candidates: usize,
     pub max_query_scan_edges: u64,
+    pub max_query_runtime_ms: Option<u64>,
 }
 
 impl Default for GraphLimits {
@@ -238,6 +245,7 @@ impl Default for GraphLimits {
             max_query_intermediate_rows: 250_000,
             max_query_index_candidates: 250_000,
             max_query_scan_edges: 1_000_000,
+            max_query_runtime_ms: Some(30_000),
         }
     }
 }

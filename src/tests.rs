@@ -5207,6 +5207,37 @@ async fn query_plan_rejects_future_snapshot_epoch() {
 }
 
 #[tokio::test]
+async fn query_timeout_rejects_expired_public_plans() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/query-timeout-public-plan", object_store).await;
+    shard
+        .write_edge(mutation(1, 2, "query-timeout-seed"))
+        .await
+        .unwrap();
+
+    let err = shard
+        .execute_query_statement(
+            QueryContext::new("reddit-home", "query-timeout-read").with_timeout_ms(0),
+            QueryStatement::MatchOut {
+                edge_type: "USER_SUBSCRIBED_TO_SUBREDDIT".to_string(),
+                src: 1,
+                return_count: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::QueryTimeout {
+            operation: "query_plan",
+            limit_ms: 0,
+            ..
+        }
+    ));
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn execute_query_plan_revalidates_public_plans() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/query-plan-public-validation", object_store).await;
@@ -5216,6 +5247,7 @@ async fn execute_query_plan_revalidates_public_plans() {
         idempotency_key: "query-public-write".to_string(),
         read_epoch: Some(0),
         result_window: QueryWindow::default(),
+        max_runtime_ms: None,
         logical: LogicalQueryPlan::CreateEdge {
             edge_type: "FOLLOWS".to_string(),
             src: 1,
@@ -5237,6 +5269,7 @@ async fn execute_query_plan_revalidates_public_plans() {
         idempotency_key: "query-public-mismatch".to_string(),
         read_epoch: None,
         result_window: QueryWindow::default(),
+        max_runtime_ms: None,
         logical: LogicalQueryPlan::MatchOut {
             edge_type: "FOLLOWS".to_string(),
             src: 1,
@@ -5257,6 +5290,7 @@ async fn execute_query_plan_revalidates_public_plans() {
         idempotency_key: "query-public-invalid-edge-type".to_string(),
         read_epoch: None,
         result_window: QueryWindow::default(),
+        max_runtime_ms: None,
         logical: LogicalQueryPlan::MatchOut {
             edge_type: "BAD/TYPE".to_string(),
             src: 1,
@@ -5276,6 +5310,39 @@ async fn execute_query_plan_revalidates_public_plans() {
     ));
 
     shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_row_timeout_rejects_expired_queries() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-timeout", object_store).await;
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 10,
+            idempotency_key: "cypher-row-timeout-seed".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let err = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-timeout-read").with_timeout_ms(0),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::QueryTimeout {
+            operation: "cypher_rows",
+            limit_ms: 0,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
