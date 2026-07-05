@@ -3,7 +3,7 @@ use std::ptr::null_mut;
 
 use libcypher_parser_sys as sys;
 
-use crate::{GraphError, QueryStatement, Result, VertexId};
+use crate::{GraphError, QueryStatement, QueryWindow, Result, VertexId};
 
 type AstNode = sys::cypher_astnode_t;
 
@@ -31,12 +31,27 @@ struct NodePattern {
     id: Option<VertexId>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedQuery {
+    pub statement: QueryStatement,
+    pub window: QueryWindow,
+}
+
 pub fn parse_cypher(query: &str) -> Result<QueryStatement> {
     LibCypherParserFrontend.parse(query)
 }
 
 pub fn parse_opencypher(query: &str) -> Result<QueryStatement> {
     parse_cypher(query)
+}
+
+pub fn parse_cypher_with_window(query: &str) -> Result<ParsedQuery> {
+    let parsed = ParsedCypher::parse(query)?;
+    parsed.lower_with_window()
+}
+
+pub fn parse_opencypher_with_window(query: &str) -> Result<ParsedQuery> {
+    parse_cypher_with_window(query)
 }
 
 impl CypherFrontend for LibCypherParserFrontend {
@@ -74,6 +89,16 @@ impl ParsedCypher {
     }
 
     fn lower(&self) -> Result<QueryStatement> {
+        let lowered = self.lower_with_window()?;
+        if !lowered.window.is_default() {
+            return unsupported(
+                "statement-only Cypher parsing cannot drop SKIP/LIMIT; use parse_cypher_with_window",
+            );
+        }
+        Ok(lowered.statement)
+    }
+
+    fn lower_with_window(&self) -> Result<ParsedQuery> {
         unsafe {
             let directives = sys::cypher_parse_result_ndirectives(self.result);
             if directives != 1 {
@@ -88,13 +113,16 @@ impl ParsedCypher {
         }
     }
 
-    fn lower_query(&self, query: *const AstNode) -> Result<QueryStatement> {
+    fn lower_query(&self, query: *const AstNode) -> Result<ParsedQuery> {
         unsafe {
             let clause_count = sys::cypher_ast_query_nclauses(query);
             if clause_count == 1 {
                 let clause = checked_node(sys::cypher_ast_query_get_clause(query, 0))?;
                 if is_instance(clause, sys::CYPHER_AST_CREATE) {
-                    return lower_create(clause);
+                    return Ok(ParsedQuery {
+                        statement: lower_create(clause)?,
+                        window: QueryWindow::default(),
+                    });
                 }
             }
 
@@ -172,7 +200,7 @@ fn lower_create(create: *const AstNode) -> Result<QueryStatement> {
 fn lower_match_return(
     match_clause: *const AstNode,
     return_clause: *const AstNode,
-) -> Result<QueryStatement> {
+) -> Result<ParsedQuery> {
     unsafe {
         if sys::cypher_ast_match_is_optional(match_clause) {
             return unsupported("OPTIONAL MATCH is not executable in Phase 0");
@@ -183,12 +211,11 @@ fn lower_match_return(
         if sys::cypher_ast_return_is_distinct(return_clause)
             || sys::cypher_ast_return_has_include_existing(return_clause)
             || !sys::cypher_ast_return_get_order_by(return_clause).is_null()
-            || !sys::cypher_ast_return_get_skip(return_clause).is_null()
-            || !sys::cypher_ast_return_get_limit(return_clause).is_null()
             || sys::cypher_ast_return_nprojections(return_clause) != 1
         {
             return unsupported("MATCH edge currently supports a single RETURN projection only");
         }
+        let window = lower_return_window(return_clause)?;
 
         let pattern = checked_node(sys::cypher_ast_match_get_pattern(match_clause))?;
         let edge = lower_single_edge_pattern(pattern)?;
@@ -212,26 +239,35 @@ fn lower_match_return(
                         "variable-length MATCH with fixed destination is not executable in Phase 0",
                     );
                 }
-                return Ok(QueryStatement::MatchReachable {
-                    edge_type: edge.edge_type,
-                    src,
-                    min_hops,
-                    max_hops,
-                    return_count: true,
+                return Ok(ParsedQuery {
+                    statement: QueryStatement::MatchReachable {
+                        edge_type: edge.edge_type,
+                        src,
+                        min_hops,
+                        max_hops,
+                        return_count: true,
+                    },
+                    window,
                 });
             }
             if let Some(dst) = fixed_dst {
-                return Ok(QueryStatement::MatchOutFiltered {
-                    edge_type: edge.edge_type,
-                    src,
-                    dst,
-                    return_count: true,
+                return Ok(ParsedQuery {
+                    statement: QueryStatement::MatchOutFiltered {
+                        edge_type: edge.edge_type,
+                        src,
+                        dst,
+                        return_count: true,
+                    },
+                    window,
                 });
             }
-            return Ok(QueryStatement::MatchOut {
-                edge_type: edge.edge_type,
-                src,
-                return_count: true,
+            return Ok(ParsedQuery {
+                statement: QueryStatement::MatchOut {
+                    edge_type: edge.edge_type,
+                    src,
+                    return_count: true,
+                },
+                window,
             });
         }
 
@@ -244,12 +280,15 @@ fn lower_match_return(
             if !projects_node_id(expression, edge.dst_binding.as_deref())? {
                 return unsupported("variable-length MATCH currently requires RETURN <dst>.id");
             }
-            return Ok(QueryStatement::MatchReachable {
-                edge_type: edge.edge_type,
-                src,
-                min_hops,
-                max_hops,
-                return_count: false,
+            return Ok(ParsedQuery {
+                statement: QueryStatement::MatchReachable {
+                    edge_type: edge.edge_type,
+                    src,
+                    min_hops,
+                    max_hops,
+                    return_count: false,
+                },
+                window,
             });
         }
 
@@ -259,22 +298,48 @@ fn lower_match_return(
                     "exact edge MATCH currently supports RETURN <dst>.id or count(*)",
                 );
             }
-            return Ok(QueryStatement::MatchOutFiltered {
-                edge_type: edge.edge_type,
-                src,
-                dst,
-                return_count: false,
+            return Ok(ParsedQuery {
+                statement: QueryStatement::MatchOutFiltered {
+                    edge_type: edge.edge_type,
+                    src,
+                    dst,
+                    return_count: false,
+                },
+                window,
             });
         }
         if !projects_node_id(expression, edge.dst_binding.as_deref())? {
             return unsupported("open-ended MATCH currently requires RETURN <dst>.id");
         }
 
-        Ok(QueryStatement::MatchOut {
-            edge_type: edge.edge_type,
-            src,
-            return_count: false,
+        Ok(ParsedQuery {
+            statement: QueryStatement::MatchOut {
+                edge_type: edge.edge_type,
+                src,
+                return_count: false,
+            },
+            window,
         })
+    }
+}
+
+fn lower_return_window(return_clause: *const AstNode) -> Result<QueryWindow> {
+    unsafe {
+        let skip_node = sys::cypher_ast_return_get_skip(return_clause);
+        let skip = if skip_node.is_null() {
+            0
+        } else {
+            window_u64_expression(checked_node(skip_node)?, "SKIP")?
+        };
+
+        let limit_node = sys::cypher_ast_return_get_limit(return_clause);
+        let limit = if limit_node.is_null() {
+            None
+        } else {
+            Some(window_usize_expression(checked_node(limit_node)?, "LIMIT")?)
+        };
+
+        Ok(QueryWindow { skip, limit })
     }
 }
 
@@ -462,6 +527,74 @@ fn integer_vertex_id(node: *const AstNode) -> Result<VertexId> {
         value
             .parse::<VertexId>()
             .map_err(|err| parse_error(format!("invalid node id integer literal {value}: {err}")))
+    }
+}
+
+fn window_u64_expression(node: *const AstNode, field: &str) -> Result<u64> {
+    let value = constant_integer_expression(node, field)?;
+    u64::try_from(value).map_err(|_| unsupported_value(format!("{field} cannot be negative")))
+}
+
+fn window_usize_expression(node: *const AstNode, field: &str) -> Result<usize> {
+    let value = window_u64_expression(node, field)?;
+    usize::try_from(value).map_err(|_| unsupported_value(format!("{field} exceeds platform usize")))
+}
+
+fn constant_integer_expression(node: *const AstNode, field: &str) -> Result<i128> {
+    unsafe {
+        if is_instance(node, sys::CYPHER_AST_INTEGER) {
+            let value = c_string(sys::cypher_ast_integer_get_valuestr(node));
+            return value.parse::<i128>().map_err(|err| {
+                parse_error(format!("invalid {field} integer literal {value}: {err}"))
+            });
+        }
+
+        if is_instance(node, sys::CYPHER_AST_UNARY_OPERATOR) {
+            let op = sys::cypher_ast_unary_operator_get_operator(node);
+            let arg = checked_node(sys::cypher_ast_unary_operator_get_argument(node))?;
+            let value = constant_integer_expression(arg, field)?;
+            if op == sys::CYPHER_OP_UNARY_PLUS {
+                return Ok(value);
+            }
+            if op == sys::CYPHER_OP_UNARY_MINUS {
+                return value.checked_neg().ok_or_else(|| {
+                    unsupported_value(format!("{field} constant expression overflowed"))
+                });
+            }
+            return unsupported(format!("{field} supports only constant integer arithmetic"));
+        }
+
+        if is_instance(node, sys::CYPHER_AST_BINARY_OPERATOR) {
+            let op = sys::cypher_ast_binary_operator_get_operator(node);
+            let left = checked_node(sys::cypher_ast_binary_operator_get_argument1(node))?;
+            let right = checked_node(sys::cypher_ast_binary_operator_get_argument2(node))?;
+            let left = constant_integer_expression(left, field)?;
+            let right = constant_integer_expression(right, field)?;
+            let value = if op == sys::CYPHER_OP_PLUS {
+                left.checked_add(right)
+            } else if op == sys::CYPHER_OP_MINUS {
+                left.checked_sub(right)
+            } else if op == sys::CYPHER_OP_MULT {
+                left.checked_mul(right)
+            } else if op == sys::CYPHER_OP_DIV {
+                if right == 0 {
+                    return unsupported(format!("{field} division by zero"));
+                }
+                left.checked_div(right)
+            } else if op == sys::CYPHER_OP_MOD {
+                if right == 0 {
+                    return unsupported(format!("{field} modulo by zero"));
+                }
+                left.checked_rem(right)
+            } else {
+                return unsupported(format!("{field} supports only constant integer arithmetic"));
+            };
+            return value.ok_or_else(|| {
+                unsupported_value(format!("{field} constant expression overflowed"))
+            });
+        }
+
+        unsupported(format!("{field} supports only constant integer arithmetic"))
     }
 }
 
@@ -735,5 +868,61 @@ mod tests {
                 return_count: false,
             }
         );
+    }
+
+    #[test]
+    fn preserves_return_skip_and_limit_for_planning() {
+        let parsed = parse_opencypher_with_window(
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 2 LIMIT 3",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.statement,
+            QueryStatement::MatchOut {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                return_count: false,
+            }
+        );
+        assert_eq!(
+            parsed.window,
+            QueryWindow {
+                skip: 2,
+                limit: Some(3)
+            }
+        );
+    }
+
+    #[test]
+    fn folds_constant_return_skip_and_limit_expressions() {
+        let parsed = parse_opencypher_with_window(
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 1 + 1 LIMIT 6 / 2",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.window,
+            QueryWindow {
+                skip: 2,
+                limit: Some(3)
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_negative_return_window_expressions() {
+        assert!(matches!(
+            parse_opencypher_with_window(
+                "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 1 - 2 LIMIT 3"
+            ),
+            Err(GraphError::UnsupportedQuery { .. })
+        ));
+    }
+
+    #[test]
+    fn statement_only_parser_rejects_windowed_returns() {
+        assert!(matches!(
+            parse_opencypher("MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id LIMIT 1"),
+            Err(GraphError::UnsupportedQuery { .. })
+        ));
     }
 }
