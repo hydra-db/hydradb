@@ -1,9 +1,13 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::ptr::null_mut;
 
 use libcypher_parser_sys as sys;
 
-use crate::{GraphError, QueryColumn, QueryStatement, QueryWindow, Result, VertexId};
+use crate::{
+    validate_component, GraphError, QueryColumn, QueryStatement, QueryWindow, Result, VertexId,
+    VertexPropertyValue,
+};
 
 type AstNode = sys::cypher_astnode_t;
 
@@ -23,6 +27,20 @@ struct EdgePattern {
     src_binding: Option<String>,
     dst: Option<VertexId>,
     dst_binding: Option<String>,
+    hop_range: Option<(u8, u8)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RowEdgePattern {
+    edge_type: String,
+    src: Option<VertexId>,
+    src_binding: Option<String>,
+    src_labels: BTreeSet<String>,
+    src_properties: BTreeMap<String, VertexPropertyValue>,
+    dst: Option<VertexId>,
+    dst_binding: Option<String>,
+    dst_labels: BTreeSet<String>,
+    dst_properties: BTreeMap<String, VertexPropertyValue>,
     hop_range: Option<(u8, u8)>,
 }
 
@@ -61,11 +79,14 @@ pub struct RowPattern {
 pub struct RowNodePattern {
     pub binding: Option<String>,
     pub id: Option<VertexId>,
+    pub labels: BTreeSet<String>,
+    pub properties: BTreeMap<String, VertexPropertyValue>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowProjection {
     NodeId { binding: String },
+    Property { binding: String, property: String },
     CountAll,
 }
 
@@ -78,6 +99,7 @@ pub struct RowSort {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowSortExpression {
     NodeId { binding: String },
+    Property { binding: String, property: String },
     Column { name: String },
     CountAll,
 }
@@ -97,7 +119,8 @@ pub enum RowPredicate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowExpression {
     NodeId { binding: String },
-    Integer(VertexId),
+    Property { binding: String, property: String },
+    Literal(VertexPropertyValue),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -472,7 +495,7 @@ fn lower_match_return_rows(
         }
 
         let pattern = checked_node(sys::cypher_ast_match_get_pattern(match_clause))?;
-        let edge = lower_single_edge_pattern(pattern)?;
+        let edge = lower_row_single_edge_pattern(pattern)?;
         let predicate = sys::cypher_ast_match_get_predicate(match_clause);
         let predicate = if predicate.is_null() {
             None
@@ -501,14 +524,22 @@ fn lower_match_return_rows(
                 continue;
             }
 
-            let binding = node_id_expression_binding(expression)?.ok_or_else(|| {
-                unsupported_value("RETURN currently supports <binding>.id or count(*)")
-            })?;
+            if let Some(binding) = node_id_expression_binding(expression)? {
+                columns.push(QueryColumn::new(projection_column_name(
+                    projection,
+                    format!("{binding}.id"),
+                )?));
+                projections.push(RowProjection::NodeId { binding });
+                continue;
+            }
+            let Some((binding, property)) = property_expression_binding(expression)? else {
+                return unsupported("RETURN currently supports <binding>.<property> or count(*)");
+            };
             columns.push(QueryColumn::new(projection_column_name(
                 projection,
-                format!("{binding}.id"),
+                format!("{binding}.{property}"),
             )?));
-            projections.push(RowProjection::NodeId { binding });
+            projections.push(RowProjection::Property { binding, property });
         }
         if has_count && projection_count != 1 {
             return unsupported("count(*) cannot be mixed with row projections in Phase 2");
@@ -522,10 +553,14 @@ fn lower_match_return_rows(
                 src: RowNodePattern {
                     binding: edge.src_binding,
                     id: edge.src,
+                    labels: edge.src_labels,
+                    properties: edge.src_properties,
                 },
                 dst: RowNodePattern {
                     binding: edge.dst_binding,
                     id: edge.dst,
+                    labels: edge.dst_labels,
+                    properties: edge.dst_properties,
                 },
                 hop_range: edge.hop_range,
             },
@@ -586,6 +621,9 @@ fn lower_sort_expression(expression: *const AstNode) -> Result<RowSortExpression
     }
     if let Some(binding) = node_id_expression_binding(expression)? {
         return Ok(RowSortExpression::NodeId { binding });
+    }
+    if let Some((binding, property)) = property_expression_binding(expression)? {
+        return Ok(RowSortExpression::Property { binding, property });
     }
     unsafe {
         if is_instance(expression, sys::CYPHER_AST_IDENTIFIER) {
@@ -657,7 +695,7 @@ fn lower_row_predicate(predicate: *const AstNode) -> Result<RowPredicate> {
             }
         }
     }
-    unsupported("WHERE currently supports boolean combinations of id comparisons")
+    unsupported("WHERE currently supports boolean combinations of property comparisons")
 }
 
 fn row_comparison_op(op: *const sys::cypher_operator_t) -> Result<RowComparisonOp> {
@@ -684,7 +722,10 @@ fn lower_row_expression(expression: *const AstNode) -> Result<RowExpression> {
     if let Some(binding) = node_id_expression_binding(expression)? {
         return Ok(RowExpression::NodeId { binding });
     }
-    Ok(RowExpression::Integer(integer_vertex_id(expression)?))
+    if let Some((binding, property)) = property_expression_binding(expression)? {
+        return Ok(RowExpression::Property { binding, property });
+    }
+    Ok(RowExpression::Literal(scalar_property_value(expression)?))
 }
 
 fn lower_single_edge_pattern(pattern: *const AstNode) -> Result<EdgePattern> {
@@ -745,6 +786,76 @@ fn lower_single_edge_pattern(pattern: *const AstNode) -> Result<EdgePattern> {
             }),
             sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => {
                 unsupported("undirected relationships are not executable in Phase 0")
+            }
+        }
+    }
+}
+
+fn lower_row_single_edge_pattern(pattern: *const AstNode) -> Result<RowEdgePattern> {
+    unsafe {
+        ensure_instance(pattern, sys::CYPHER_AST_PATTERN, "pattern")?;
+        if sys::cypher_ast_pattern_npaths(pattern) != 1 {
+            return unsupported("only one path pattern is executable in Phase 2");
+        }
+
+        let path = checked_node(sys::cypher_ast_pattern_get_path(pattern, 0))?;
+        ensure_instance(path, sys::CYPHER_AST_PATTERN_PATH, "pattern path")?;
+        if sys::cypher_ast_pattern_path_nelements(path) != 3 {
+            return unsupported("only one-hop edge patterns are executable in Phase 2");
+        }
+
+        let left = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
+        let rel = checked_node(sys::cypher_ast_pattern_path_get_element(path, 1))?;
+        let right = checked_node(sys::cypher_ast_pattern_path_get_element(path, 2))?;
+        ensure_instance(left, sys::CYPHER_AST_NODE_PATTERN, "left node pattern")?;
+        ensure_instance(rel, sys::CYPHER_AST_REL_PATTERN, "relationship pattern")?;
+        ensure_instance(right, sys::CYPHER_AST_NODE_PATTERN, "right node pattern")?;
+
+        let varlength = sys::cypher_ast_rel_pattern_get_varlength(rel);
+        let hop_range = if varlength.is_null() {
+            None
+        } else {
+            Some(lower_hop_range(varlength)?)
+        };
+        if !sys::cypher_ast_rel_pattern_get_properties(rel).is_null() {
+            return unsupported("relationship properties are not executable in Phase 2");
+        }
+        if sys::cypher_ast_rel_pattern_nreltypes(rel) != 1 {
+            return unsupported("relationship pattern must have exactly one type in Phase 2");
+        }
+
+        let edge_type_node = checked_node(sys::cypher_ast_rel_pattern_get_reltype(rel, 0))?;
+        let edge_type = reltype_name(edge_type_node)?;
+        let left_node = lower_row_node_pattern(left)?;
+        let right_node = lower_row_node_pattern(right)?;
+
+        match sys::cypher_ast_rel_pattern_get_direction(rel) {
+            sys::cypher_rel_direction::CYPHER_REL_OUTBOUND => Ok(RowEdgePattern {
+                edge_type,
+                src: left_node.id,
+                src_binding: left_node.binding,
+                src_labels: left_node.labels,
+                src_properties: left_node.properties,
+                dst: right_node.id,
+                dst_binding: right_node.binding,
+                dst_labels: right_node.labels,
+                dst_properties: right_node.properties,
+                hop_range,
+            }),
+            sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(RowEdgePattern {
+                edge_type,
+                src: right_node.id,
+                src_binding: right_node.binding,
+                src_labels: right_node.labels,
+                src_properties: right_node.properties,
+                dst: left_node.id,
+                dst_binding: left_node.binding,
+                dst_labels: left_node.labels,
+                dst_properties: left_node.properties,
+                hop_range,
+            }),
+            sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => {
+                unsupported("undirected relationships are not executable in Phase 2")
             }
         }
     }
@@ -845,6 +956,61 @@ fn lower_node_pattern(node: *const AstNode) -> Result<NodePattern> {
     }
 }
 
+fn lower_row_node_pattern(node: *const AstNode) -> Result<RowNodePattern> {
+    unsafe {
+        ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "node pattern")?;
+        let binding = node_identifier(node)?;
+        let mut labels = BTreeSet::new();
+        for idx in 0..sys::cypher_ast_node_pattern_nlabels(node) {
+            let label = checked_node(sys::cypher_ast_node_pattern_get_label(node, idx))?;
+            let label = label_name(label)?;
+            validate_component("label", &label)?;
+            labels.insert(label);
+        }
+        let properties = sys::cypher_ast_node_pattern_get_properties(node);
+        let properties = if properties.is_null() {
+            BTreeMap::new()
+        } else {
+            row_node_properties(properties)?
+        };
+        let id = match properties.get("id") {
+            Some(VertexPropertyValue::Integer(id)) => Some(*id),
+            Some(_) => return unsupported("node id property must be an integer"),
+            None => None,
+        };
+        if binding.is_none()
+            && (!labels.is_empty() || properties.keys().any(|property| property != "id"))
+        {
+            return unsupported("node labels and non-id properties require a named node");
+        }
+        Ok(RowNodePattern {
+            binding,
+            id,
+            labels,
+            properties,
+        })
+    }
+}
+
+fn row_node_properties(
+    properties: *const AstNode,
+) -> Result<BTreeMap<String, VertexPropertyValue>> {
+    unsafe {
+        ensure_instance(properties, sys::CYPHER_AST_MAP, "node property map")?;
+        let mut result = BTreeMap::new();
+        for idx in 0..sys::cypher_ast_map_nentries(properties) {
+            let key = checked_node(sys::cypher_ast_map_get_key(properties, idx))?;
+            let key = prop_name(key)?;
+            validate_component("property", &key)?;
+            let value = checked_node(sys::cypher_ast_map_get_value(properties, idx))?;
+            if result.insert(key, scalar_property_value(value)?).is_some() {
+                return unsupported("duplicate node property in pattern");
+            }
+        }
+        Ok(result)
+    }
+}
+
 fn node_id_property(properties: *const AstNode) -> Result<VertexId> {
     unsafe {
         ensure_instance(properties, sys::CYPHER_AST_MAP, "node property map")?;
@@ -861,6 +1027,26 @@ fn node_id_property(properties: *const AstNode) -> Result<VertexId> {
         let value = checked_node(sys::cypher_ast_map_get_value(properties, 0))?;
         integer_vertex_id(value)
     }
+}
+
+fn scalar_property_value(node: *const AstNode) -> Result<VertexPropertyValue> {
+    unsafe {
+        if is_instance(node, sys::CYPHER_AST_INTEGER) {
+            return Ok(VertexPropertyValue::Integer(integer_vertex_id(node)?));
+        }
+        if is_instance(node, sys::CYPHER_AST_STRING) {
+            return Ok(VertexPropertyValue::String(c_string(
+                sys::cypher_ast_string_get_value(node),
+            )));
+        }
+        if is_instance(node, sys::CYPHER_AST_TRUE) {
+            return Ok(VertexPropertyValue::Bool(true));
+        }
+        if is_instance(node, sys::CYPHER_AST_FALSE) {
+            return Ok(VertexPropertyValue::Bool(false));
+        }
+    }
+    unsupported("property values currently support integer, boolean, and string literals")
 }
 
 fn integer_vertex_id(node: *const AstNode) -> Result<VertexId> {
@@ -972,21 +1158,26 @@ fn projects_node_id(expression: *const AstNode, binding: Option<&str>) -> Result
 }
 
 fn node_id_expression_binding(expression: *const AstNode) -> Result<Option<String>> {
+    match property_expression_binding(expression)? {
+        Some((binding, property)) if property.eq_ignore_ascii_case("id") => Ok(Some(binding)),
+        _ => Ok(None),
+    }
+}
+
+fn property_expression_binding(expression: *const AstNode) -> Result<Option<(String, String)>> {
     unsafe {
         if !is_instance(expression, sys::CYPHER_AST_PROPERTY_OPERATOR) {
             return Ok(None);
         }
 
         let prop = checked_node(sys::cypher_ast_property_operator_get_prop_name(expression))?;
-        if !prop_name(prop)?.eq_ignore_ascii_case("id") {
-            return Ok(None);
-        }
+        let property = prop_name(prop)?;
 
         let base = checked_node(sys::cypher_ast_property_operator_get_expression(expression))?;
         if !is_instance(base, sys::CYPHER_AST_IDENTIFIER) {
             return Ok(None);
         }
-        Ok(Some(identifier_name(base)?))
+        Ok(Some((identifier_name(base)?, property)))
     }
 }
 
@@ -1032,6 +1223,13 @@ fn prop_name(node: *const AstNode) -> Result<String> {
     unsafe {
         ensure_instance(node, sys::CYPHER_AST_PROP_NAME, "property name")?;
         Ok(c_string(sys::cypher_ast_prop_name_get_value(node)))
+    }
+}
+
+fn label_name(node: *const AstNode) -> Result<String> {
+    unsafe {
+        ensure_instance(node, sys::CYPHER_AST_LABEL, "label")?;
+        Ok(c_string(sys::cypher_ast_label_get_name(node)))
     }
 }
 
@@ -1340,6 +1538,50 @@ mod tests {
                 skip: 1,
                 limit: Some(2),
             }
+        );
+    }
+
+    #[test]
+    fn lowers_row_query_with_labels_properties_and_property_projection() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (u:User {active: true})-[:FOLLOWS]->(v:User {age: 42}) \
+             RETURN u.name AS src, v.age AS age ORDER BY v.age DESC",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.pattern.src.labels,
+            BTreeSet::from(["User".to_string()])
+        );
+        assert_eq!(
+            parsed.pattern.src.properties.get("active"),
+            Some(&VertexPropertyValue::Bool(true))
+        );
+        assert_eq!(
+            parsed.pattern.dst.properties.get("age"),
+            Some(&VertexPropertyValue::Integer(42))
+        );
+        assert_eq!(
+            parsed.projections,
+            vec![
+                RowProjection::Property {
+                    binding: "u".to_string(),
+                    property: "name".to_string(),
+                },
+                RowProjection::Property {
+                    binding: "v".to_string(),
+                    property: "age".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            parsed.order_by,
+            vec![RowSort {
+                expression: RowSortExpression::Property {
+                    binding: "v".to_string(),
+                    property: "age".to_string(),
+                },
+                ascending: false,
+            }]
         );
     }
 

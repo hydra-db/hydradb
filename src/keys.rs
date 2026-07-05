@@ -162,6 +162,33 @@ pub fn mutation_log_entry(cell_id: &str, log_epoch: GraphEpoch, batch_id: &str) 
     format!("{}{log_epoch:020}/{batch_id}", mutation_log_prefix(cell_id))
 }
 
+pub fn vertex(cell_id: &str, vertex_id: VertexId) -> String {
+    format!("cell/{cell_id}/vertex/{vertex_id:020}")
+}
+
+pub fn vertex_label(cell_id: &str, label: &str, vertex_id: VertexId) -> String {
+    format!("cell/{cell_id}/vlabel/{label}/{vertex_id:020}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn vertex_label_prefix(cell_id: &str, label: &str) -> String {
+    format!("cell/{cell_id}/vlabel/{label}/")
+}
+
+pub fn vertex_property_index(
+    cell_id: &str,
+    property: &str,
+    encoded_value: &str,
+    vertex_id: VertexId,
+) -> String {
+    format!("cell/{cell_id}/vprop_idx/{property}/{encoded_value}/{vertex_id:020}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn vertex_property_index_prefix(cell_id: &str, property: &str, encoded_value: &str) -> String {
+    format!("cell/{cell_id}/vprop_idx/{property}/{encoded_value}/")
+}
+
 #[cfg(test)]
 pub fn delta_plus(
     cell_id: &str,

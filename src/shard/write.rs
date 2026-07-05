@@ -1,6 +1,92 @@
 use super::*;
 
 impl GraphShard {
+    pub async fn set_vertex_metadata(
+        &self,
+        cell_id: &str,
+        vertex_id: VertexId,
+        metadata: VertexMetadata,
+    ) -> Result<()> {
+        validate_component("cell_id", cell_id)?;
+        validate_vertex_metadata(&metadata)?;
+        self.ensure_write_authority(cell_id, "set_vertex_metadata")?;
+        let _permit = self
+            .acquire_graph_write_permit("set_vertex_metadata")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .set_vertex_metadata_txn(cell_id, vertex_id, metadata.clone())
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(()) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    async fn set_vertex_metadata_txn(
+        &self,
+        cell_id: &str,
+        vertex_id: VertexId,
+        metadata: VertexMetadata,
+    ) -> Result<()> {
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "set_vertex_metadata")
+            .await?;
+        let result = self
+            .set_vertex_metadata_txn_locked(cell_id, vertex_id, metadata)
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn set_vertex_metadata_txn_locked(
+        &self,
+        cell_id: &str,
+        vertex_id: VertexId,
+        metadata: VertexMetadata,
+    ) -> Result<()> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, "set_vertex_metadata")
+            .await?;
+        let vertex_key = keys::vertex(cell_id, vertex_id);
+        let previous = match read_txn_remote(&txn, &vertex_key).await? {
+            Some(value) => decode_vertex_metadata(&vertex_key, &value)?,
+            None => VertexMetadata::default(),
+        };
+        delete_vertex_metadata_indexes_txn(&txn, cell_id, vertex_id, &previous)?;
+        if metadata.labels.is_empty() && metadata.properties.is_empty() {
+            txn.delete(vertex_key.as_bytes())?;
+        } else {
+            txn.put(
+                vertex_key.as_bytes(),
+                encode_vertex_metadata(&metadata).as_slice(),
+            )?;
+            put_vertex_metadata_indexes_txn(&txn, cell_id, vertex_id, &metadata)?;
+        }
+        commit_txn_strict(txn, self.await_durable_writes).await
+    }
+
     pub async fn write_edge(&self, mutation: EdgeMutation) -> Result<CommitResult> {
         validate_component("cell_id", &mutation.cell_id)?;
         validate_component("edge_type", &mutation.edge_type)?;
@@ -1787,4 +1873,64 @@ impl GraphShard {
         );
         Ok(result)
     }
+}
+
+fn validate_vertex_metadata(metadata: &VertexMetadata) -> Result<()> {
+    for label in &metadata.labels {
+        validate_component("label", label)?;
+    }
+    for property in metadata.properties.keys() {
+        validate_component("property", property)?;
+    }
+    Ok(())
+}
+
+fn put_vertex_metadata_indexes_txn(
+    txn: &DbTransaction,
+    cell_id: &str,
+    vertex_id: VertexId,
+    metadata: &VertexMetadata,
+) -> Result<()> {
+    for label in &metadata.labels {
+        txn.put(
+            keys::vertex_label(cell_id, label, vertex_id).as_bytes(),
+            encode_u64(vertex_id).as_slice(),
+        )?;
+    }
+    for (property, value) in &metadata.properties {
+        txn.put(
+            keys::vertex_property_index(
+                cell_id,
+                property,
+                &encode_vertex_property_value_key(value),
+                vertex_id,
+            )
+            .as_bytes(),
+            encode_u64(vertex_id).as_slice(),
+        )?;
+    }
+    Ok(())
+}
+
+fn delete_vertex_metadata_indexes_txn(
+    txn: &DbTransaction,
+    cell_id: &str,
+    vertex_id: VertexId,
+    metadata: &VertexMetadata,
+) -> Result<()> {
+    for label in &metadata.labels {
+        txn.delete(keys::vertex_label(cell_id, label, vertex_id).as_bytes())?;
+    }
+    for (property, value) in &metadata.properties {
+        txn.delete(
+            keys::vertex_property_index(
+                cell_id,
+                property,
+                &encode_vertex_property_value_key(value),
+                vertex_id,
+            )
+            .as_bytes(),
+        )?;
+    }
+    Ok(())
 }

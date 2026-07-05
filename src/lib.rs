@@ -714,6 +714,31 @@ pub struct EdgeRecord {
     pub epoch: GraphEpoch,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum VertexPropertyValue {
+    Integer(u64),
+    Bool(bool),
+    String(String),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VertexMetadata {
+    pub labels: BTreeSet<String>,
+    pub properties: BTreeMap<String, VertexPropertyValue>,
+}
+
+impl VertexMetadata {
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.labels.insert(label.into());
+        self
+    }
+
+    pub fn with_property(mut self, name: impl Into<String>, value: VertexPropertyValue) -> Self {
+        self.properties.insert(name.into(), value);
+        self
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OutEdgeSegment {
     pub(crate) cell_id: String,

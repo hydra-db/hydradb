@@ -5740,6 +5740,191 @@ async fn cypher_row_engine_supports_bindings_where_order_and_windows() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_rows_filter_project_and_sort_vertex_metadata() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-metadata", object_store).await;
+
+    for (idx, (src, dst)) in [(1, 10), (1, 11), (2, 12), (3, 13)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-row-metadata-edge-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(true))
+                .with_property("name", VertexPropertyValue::String("alice".to_string())),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            2,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(true))
+                .with_property("name", VertexPropertyValue::String("bob".to_string())),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            3,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(false))
+                .with_property("name", VertexPropertyValue::String("carol".to_string())),
+        )
+        .await
+        .unwrap();
+    for (vertex, name, age) in [
+        (10, "dan", 20),
+        (11, "erin", 17),
+        (12, "frank", 42),
+        (13, "zoe", 60),
+    ] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex,
+                VertexMetadata::default()
+                    .with_label("User")
+                    .with_property("name", VertexPropertyValue::String(name.to_string()))
+                    .with_property("age", VertexPropertyValue::Integer(age)),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-metadata-read"),
+            "MATCH (u:User {active: true})-[:FOLLOWS]->(v:User) \
+             WHERE v.age >= 18 AND v.name <> 'zoe' \
+             RETURN u.name AS src, v.name AS dst, v.age AS age ORDER BY age DESC",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![
+                QueryColumn::new("src"),
+                QueryColumn::new("dst"),
+                QueryColumn::new("age")
+            ],
+            vec![
+                QueryRow::new(vec![
+                    QueryValue::Property(VertexPropertyValue::String("bob".to_string())),
+                    QueryValue::Property(VertexPropertyValue::String("frank".to_string())),
+                    QueryValue::Property(VertexPropertyValue::Integer(42)),
+                ]),
+                QueryRow::new(vec![
+                    QueryValue::Property(VertexPropertyValue::String("alice".to_string())),
+                    QueryValue::Property(VertexPropertyValue::String("dan".to_string())),
+                    QueryValue::Property(VertexPropertyValue::Integer(20)),
+                ]),
+            ],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn vertex_metadata_indexes_are_replaced_on_update() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/vertex-metadata-index-update", object_store).await;
+
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 10,
+            idempotency_key: "metadata-index-edge".to_string(),
+        })
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("name", VertexPropertyValue::String("old".to_string())),
+        )
+        .await
+        .unwrap();
+
+    let old = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "metadata-index-old"),
+            "MATCH (u:User {name: 'old'})-[:FOLLOWS]->(v) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        old,
+        QueryResultSet::new(
+            vec![QueryColumn::new("u.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+        )
+    );
+
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("name", VertexPropertyValue::String("new".to_string())),
+        )
+        .await
+        .unwrap();
+
+    let stale = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "metadata-index-stale"),
+            "MATCH (u:User {name: 'old'})-[:FOLLOWS]->(v) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stale,
+        QueryResultSet::new(vec![QueryColumn::new("u.id")], Vec::new())
+    );
+
+    let updated = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "metadata-index-new"),
+            "MATCH (u:User {name: 'new'})-[:FOLLOWS]->(v) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        updated,
+        QueryResultSet::new(
+            vec![QueryColumn::new("u.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_where_and_variable_hops_use_storage_kernel() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-where-varhop", object_store).await;
