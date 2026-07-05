@@ -6,7 +6,7 @@ use libcypher_parser_sys as sys;
 
 use crate::{
     validate_component, GraphError, QueryColumn, QueryStatement, QueryWindow, Result, VertexId,
-    VertexPropertyValue,
+    VertexMetadata, VertexPropertyValue,
 };
 
 type AstNode = sys::cypher_astnode_t;
@@ -306,18 +306,37 @@ fn lower_create(create: *const AstNode) -> Result<QueryStatement> {
         }
 
         let pattern = checked_node(sys::cypher_ast_create_get_pattern(create))?;
-        let edge = lower_single_edge_pattern(pattern)?;
+        let edge = lower_create_edge_pattern(pattern)?;
         if edge.hop_range.is_some() {
-            return unsupported("CREATE does not support variable-length relationships in Phase 0");
+            return unsupported("CREATE does not support variable-length relationships in Phase 2");
         }
-        Ok(QueryStatement::CreateEdge {
+        let src = edge
+            .src
+            .id
+            .ok_or_else(|| unsupported_value("CREATE requires source id"))?;
+        let dst = edge
+            .dst
+            .id
+            .ok_or_else(|| unsupported_value("CREATE requires destination id"))?;
+        let src_metadata = vertex_metadata_from_node_pattern(&edge.src);
+        let dst_metadata = vertex_metadata_from_node_pattern(&edge.dst);
+        if src_metadata.labels.is_empty()
+            && src_metadata.properties.is_empty()
+            && dst_metadata.labels.is_empty()
+            && dst_metadata.properties.is_empty()
+        {
+            return Ok(QueryStatement::CreateEdge {
+                edge_type: edge.edge_type,
+                src,
+                dst,
+            });
+        }
+        Ok(QueryStatement::CreateEdgeWithMetadata {
             edge_type: edge.edge_type,
-            src: edge
-                .src
-                .ok_or_else(|| unsupported_value("CREATE requires source id"))?,
-            dst: edge
-                .dst
-                .ok_or_else(|| unsupported_value("CREATE requires destination id"))?,
+            src,
+            dst,
+            src_metadata,
+            dst_metadata,
         })
     }
 }
@@ -768,6 +787,66 @@ fn lower_single_edge_pattern(pattern: *const AstNode) -> Result<EdgePattern> {
     }
 }
 
+fn lower_create_edge_pattern(pattern: *const AstNode) -> Result<RowEdgePattern> {
+    unsafe {
+        ensure_instance(pattern, sys::CYPHER_AST_PATTERN, "pattern")?;
+        if sys::cypher_ast_pattern_npaths(pattern) != 1 {
+            return unsupported("only one path pattern is executable in Phase 2 CREATE");
+        }
+
+        let path = checked_node(sys::cypher_ast_pattern_get_path(pattern, 0))?;
+        ensure_instance(path, sys::CYPHER_AST_PATTERN_PATH, "pattern path")?;
+        if sys::cypher_ast_pattern_path_nelements(path) != 3 {
+            return unsupported("only one-hop edge patterns are executable in Phase 2 CREATE");
+        }
+
+        let left = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
+        let rel = checked_node(sys::cypher_ast_pattern_path_get_element(path, 1))?;
+        let right = checked_node(sys::cypher_ast_pattern_path_get_element(path, 2))?;
+        ensure_instance(left, sys::CYPHER_AST_NODE_PATTERN, "left node pattern")?;
+        ensure_instance(rel, sys::CYPHER_AST_REL_PATTERN, "relationship pattern")?;
+        ensure_instance(right, sys::CYPHER_AST_NODE_PATTERN, "right node pattern")?;
+
+        let varlength = sys::cypher_ast_rel_pattern_get_varlength(rel);
+        let hop_range = if varlength.is_null() {
+            None
+        } else {
+            Some(lower_hop_range(varlength)?)
+        };
+        if !sys::cypher_ast_rel_pattern_get_properties(rel).is_null() {
+            return unsupported("relationship properties are not executable in Phase 2 CREATE");
+        }
+        if sys::cypher_ast_rel_pattern_nreltypes(rel) != 1 {
+            return unsupported(
+                "relationship pattern must have exactly one type in Phase 2 CREATE",
+            );
+        }
+
+        let edge_type_node = checked_node(sys::cypher_ast_rel_pattern_get_reltype(rel, 0))?;
+        let edge_type = reltype_name(edge_type_node)?;
+        let left_node = lower_create_node_pattern(left)?;
+        let right_node = lower_create_node_pattern(right)?;
+
+        match sys::cypher_ast_rel_pattern_get_direction(rel) {
+            sys::cypher_rel_direction::CYPHER_REL_OUTBOUND => Ok(RowEdgePattern {
+                edge_type,
+                src: left_node,
+                dst: right_node,
+                hop_range,
+            }),
+            sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(RowEdgePattern {
+                edge_type,
+                src: right_node,
+                dst: left_node,
+                hop_range,
+            }),
+            sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => {
+                unsupported("undirected relationships are not executable in Phase 2 CREATE")
+            }
+        }
+    }
+}
+
 fn lower_row_pattern(pattern: *const AstNode) -> Result<RowPattern> {
     unsafe {
         ensure_instance(pattern, sys::CYPHER_AST_PATTERN, "pattern")?;
@@ -786,6 +865,37 @@ fn lower_row_pattern(pattern: *const AstNode) -> Result<RowPattern> {
             3 => lower_row_single_edge_path(path).map(RowPattern::Edge),
             _ => unsupported("only node and one-hop edge patterns are executable in Phase 2"),
         }
+    }
+}
+
+fn lower_create_node_pattern(node: *const AstNode) -> Result<RowNodePattern> {
+    unsafe {
+        ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "node pattern")?;
+        let binding = node_identifier(node)?;
+        let mut labels = BTreeSet::new();
+        for idx in 0..sys::cypher_ast_node_pattern_nlabels(node) {
+            let label = checked_node(sys::cypher_ast_node_pattern_get_label(node, idx))?;
+            let label = label_name(label)?;
+            validate_component("label", &label)?;
+            labels.insert(label);
+        }
+        let properties = sys::cypher_ast_node_pattern_get_properties(node);
+        let properties = if properties.is_null() {
+            BTreeMap::new()
+        } else {
+            row_node_properties(properties)?
+        };
+        let id = match properties.get("id") {
+            Some(VertexPropertyValue::Integer(id)) => Some(*id),
+            Some(_) => return unsupported("node id property must be an integer"),
+            None => None,
+        };
+        Ok(RowNodePattern {
+            binding,
+            id,
+            labels,
+            properties,
+        })
     }
 }
 
@@ -833,6 +943,18 @@ fn lower_row_single_edge_path(path: *const AstNode) -> Result<RowEdgePattern> {
                 unsupported("undirected relationships are not executable in Phase 2")
             }
         }
+    }
+}
+
+fn vertex_metadata_from_node_pattern(node: &RowNodePattern) -> VertexMetadata {
+    VertexMetadata {
+        labels: node.labels.clone(),
+        properties: node
+            .properties
+            .iter()
+            .filter(|(property, _)| property.as_str() != "id")
+            .map(|(property, value)| (property.clone(), value.clone()))
+            .collect(),
     }
 }
 

@@ -5042,6 +5042,33 @@ async fn query_planner_selects_physical_operators() {
     );
     assert!(write_plan.is_write());
 
+    let metadata_plan = QueryPlanner::plan(
+        &QueryContext::new("reddit-home", "query-plan-write-metadata"),
+        &QueryStatement::CreateEdgeWithMetadata {
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            src_metadata: VertexMetadata::default().with_label("User"),
+            dst_metadata: VertexMetadata::default()
+                .with_label("User")
+                .with_property("name", VertexPropertyValue::String("alice".to_string())),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        metadata_plan.physical,
+        PhysicalQueryPlan::WriteEdgeWithMetadata {
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            src_metadata: VertexMetadata::default().with_label("User"),
+            dst_metadata: VertexMetadata::default()
+                .with_label("User")
+                .with_property("name", VertexPropertyValue::String("alice".to_string())),
+        }
+    );
+    assert!(metadata_plan.is_write());
+
     assert!(matches!(
         QueryPlanner::plan(
             &QueryContext::new("reddit-home", "query-plan-write-snapshot").at_epoch(1),
@@ -5468,6 +5495,129 @@ async fn cypher_create_and_match_use_storage_kernel() {
         .await
         .unwrap();
     assert_eq!(count, QueryOutput::Count(1));
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_create_labels_properties_are_atomic_and_idempotent() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-create-metadata", object_store).await;
+
+    let plan = shard
+        .explain_cypher(
+            QueryContext::new("reddit-home", "cypher-create-metadata-plan"),
+            "CREATE (u:User {id: 10, name: 'alice', active: true})-[:FOLLOWS]->\
+             (v:User {id: 20, name: 'bob', age: 42})",
+        )
+        .unwrap();
+    assert_eq!(
+        plan.physical,
+        PhysicalQueryPlan::WriteEdgeWithMetadata {
+            edge_type: "FOLLOWS".to_string(),
+            src: 10,
+            dst: 20,
+            src_metadata: VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(true))
+                .with_property("name", VertexPropertyValue::String("alice".to_string())),
+            dst_metadata: VertexMetadata::default()
+                .with_label("User")
+                .with_property("age", VertexPropertyValue::Integer(42))
+                .with_property("name", VertexPropertyValue::String("bob".to_string())),
+        }
+    );
+
+    let query = "CREATE (u:User {id: 10, name: 'alice', active: true})-[:FOLLOWS]->\
+                 (v:User {id: 20, name: 'bob', age: 42})";
+    let write = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-create-metadata"),
+            query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        write,
+        QueryOutput::Write(CommitResult {
+            epoch: 1,
+            already_existed: false
+        })
+    );
+
+    let rows_at_commit = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-create-metadata-read").at_epoch(1),
+            "MATCH (u:User {active: true})-[:FOLLOWS]->(v:User) \
+             RETURN u.name AS src, v.name AS dst, v.age AS age",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_at_commit,
+        QueryResultSet::new(
+            vec![
+                QueryColumn::new("src"),
+                QueryColumn::new("dst"),
+                QueryColumn::new("age")
+            ],
+            vec![QueryRow::new(vec![
+                QueryValue::Property(VertexPropertyValue::String("alice".to_string())),
+                QueryValue::Property(VertexPropertyValue::String("bob".to_string())),
+                QueryValue::Property(VertexPropertyValue::Integer(42)),
+            ])],
+        )
+    );
+
+    let replay = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-create-metadata"),
+            query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, write);
+    assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 1);
+    assert_eq!(
+        shard
+            .out_degree("reddit-home", "FOLLOWS", 10)
+            .await
+            .unwrap(),
+        1
+    );
+
+    let metadata_merge = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-create-metadata-merge"),
+            "CREATE (u:Moderator {id: 10})-[:FOLLOWS]->\
+             (v:User {id: 20, active: true})",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata_merge,
+        QueryOutput::Write(CommitResult {
+            epoch: 2,
+            already_existed: true
+        })
+    );
+    let merged_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-create-metadata-merged-read"),
+            "MATCH (u:Moderator {name: 'alice'})-[:FOLLOWS]->(v:User {active: true}) \
+             RETURN u.name AS src, v.name AS dst",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        merged_rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("src"), QueryColumn::new("dst")],
+            vec![QueryRow::new(vec![
+                QueryValue::Property(VertexPropertyValue::String("alice".to_string())),
+                QueryValue::Property(VertexPropertyValue::String("bob".to_string())),
+            ])],
+        )
+    );
 }
 
 #[cfg(feature = "opencypher")]
