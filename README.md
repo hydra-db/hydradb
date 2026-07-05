@@ -49,8 +49,12 @@ pkg-config --exists cypher-parser
 test -f "$(brew --prefix suite-sparse)/lib/libgraphblas.dylib"
 ```
 
-The default feature set needs `libcypher-parser`. The `graphblas` feature also
-needs SuiteSparse GraphBLAS, which Homebrew provides through `suite-sparse`.
+The default feature set builds the storage kernel without native parser or
+GraphBLAS dependencies. The `opencypher` feature needs `libcypher-parser`. The
+`graphblas` feature needs SuiteSparse GraphBLAS, which Homebrew provides through
+`suite-sparse`. The `chaos-harness` feature exposes only the hard-fence test
+worker used by local/MinIO takeover scripts; it is not part of the normal
+application API.
 
 ## Clone And Test
 
@@ -58,8 +62,9 @@ needs SuiteSparse GraphBLAS, which Homebrew provides through `suite-sparse`.
 git clone https://github.com/usecortex/slatedb-graph-kernel.git
 cd slatedb-graph-kernel
 cargo test --lib
-cargo test --features graphblas --lib
-cargo check --examples --features graphblas
+cargo test --features opencypher --lib
+cargo test --features opencypher,graphblas --lib
+cargo check --examples --features opencypher,graphblas
 ```
 
 Or, with `just`:
@@ -72,8 +77,13 @@ The `graphblas` Cargo feature enables the crate's native FFI path:
 `src/sparse_kernel.rs` links directly with `libgraphblas` through
 `#[link(name = "graphblas")]`. There is no Rust GraphBLAS crate dependency.
 
-The Cypher front-end uses `libcypher-parser-sys`, which links against the native
-`cypher-parser` system library through `pkg-config`.
+The Cypher front-end is behind the `opencypher` Cargo feature. It uses
+`libcypher-parser-sys`, which links against the native `cypher-parser` system
+library through `pkg-config`.
+
+The default feature set is checked on Ubuntu and macOS in CI. The native
+OpenCypher and GraphBLAS feature set is checked on Ubuntu where the system
+packages are installed by the workflow.
 
 ## SlateDB Dependency
 
@@ -90,6 +100,20 @@ cargo update -p slatedb
 cargo test --lib
 cargo test --features graphblas --lib
 ```
+
+## Store Format
+
+Graph shards write a durable `graph/meta/format_version` record when opened by a
+writer. Missing format metadata is treated as a legacy Phase 0 store and is
+accepted so existing prototype data can still be read. Newer or otherwise
+unsupported format versions fail closed during `GraphShard::open`.
+
+## Observability
+
+The crate emits structured `tracing` events for store-format initialization,
+rollup publication, delta/artifact GC, lease acquisition, lease renewal issues,
+and failover. Applications should install their own tracing subscriber and
+export those events with their normal metrics/log pipeline.
 
 ## Useful Commands
 
@@ -111,10 +135,23 @@ Run the path/supernode benchmark with GraphBLAS:
 just bench
 ```
 
+Run the same path/supernode benchmark against a Docker MinIO object store:
+
+```bash
+just minio-bench
+```
+
 Run local multiprocess stress against the local filesystem object store:
 
 ```bash
 just stress
+```
+
+Run the hard write-fence takeover proof against the local filesystem object
+store:
+
+```bash
+just fence
 ```
 
 Run MinIO smoke or chaos checks when Docker is available:
@@ -122,9 +159,12 @@ Run MinIO smoke or chaos checks when Docker is available:
 ```bash
 just minio-smoke
 just minio-chaos
+just minio-fence
 ```
 
-Generated benchmark files are ignored under `bench-results/`.
+Generated benchmark files are ignored under `bench-results/`. The MinIO path
+benchmark writes `bench-results/phase0_path_bench_minio.csv` and a matching log
+by default.
 
 ## Current Scope
 
