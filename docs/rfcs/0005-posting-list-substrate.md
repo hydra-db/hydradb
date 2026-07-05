@@ -46,7 +46,9 @@ PostingValue {
 
 - The **`format` tag** is the CSR-ready seam: a 1-byte write-only cost today that lets a later RFC introduce UidPack/CSR values without a dual-read migration on the whole keyspace.
 - The **`PartRef` min/max/card** is the CSR-ready skip metadata (roaring gives min/max/cardinality in O(1)): a future ranged/leapfrog reader can skip whole parts by uid range without decoding them. Written from day one, exploited only in RFC 0009.
-- **Edge facets** (properties on an edge) are *not* in the set — the set is pure membership. A faceted edge stores its properties in a companion record `EdgeProp[dir][anchor_uid][pred_id][neighbor_uid] → facets` (RFC 0004). This mirrors Dgraph's pack-vs-postings split (plain edges cost membership only; faceted edges pay for a companion record).
+- **Edge facets** (properties on an edge) are *not* in the set — the set is pure membership. A faceted edge stores its properties in a companion record `EdgeProp[src_uid][pred_id][dst_uid] → facets` (RFC 0004). This mirrors Dgraph's pack-vs-postings split (plain edges cost membership only; faceted edges pay for a companion record).
+
+  **Amendment (Workstream A, M1 Wave 4):** this RFC originally specified a per-projection, two-copy key, `EdgeProp[dir][anchor_uid][pred_id][neighbor_uid]` (one copy keyed from each of `EdgeOut`/`EdgeIn`). The implementation instead keys the companion **once**, by full edge identity, `EdgeProp[src_uid][pred_id][dst_uid]` — a single copy, not two. This is a deliberate divergence: a single copy avoids the double-write/update anomaly a two-copy scheme invites (the two copies drifting out of sync if a future write path ever updates one without the other), at the cost of directionality — facets are still O(1) point lookups from either projection (an in-edge read flips to the canonical `(src, pred, dst)` key), but an **in-direction prefix scan** over a destination's incoming facets (e.g. "every faceted edge pointing at `dst`, regardless of source") is not supported by this key shape; only the out-direction `(src, pred)` prefix scan is (see [`edge_prop_range`](../../src/serde/keys.rs)).
 
 ## Splitting supernodes (512 KiB)
 

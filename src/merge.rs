@@ -22,7 +22,7 @@
 //! | `Meta["deleted_edges"/pred_id/anchor_uid]`           | roaring `Treemap`     | set **union** — per-(anchor,pred) deleted dst/src uids (RFC 0005) |
 //! | `EdgeOut` / `EdgeIn` / `EdgePart` (fast-add path)    | roaring set union (u64) | associative **union** into the posting set (RFC 0005)      |
 //! | `Meta["count"/pred_id]`, corpus counters             | `i64` LE              | **sum** (degree / edge-count statistics)                   |
-//! | `Index`, `Count`, `Node`, `Schema*`, `Xid`, `Log`, and non-associative `Meta` (e.g. `latest_seq`, `seq/*`) | — | **no merge** — last-write-wins via `put` only; single-writer RMW |
+//! | `Index`, `Count`, `Node`, `EdgeProp`, `Schema*`, `Xid`, `Log`, and non-associative `Meta` (e.g. `latest_seq`, `seq/*`) | — | **no merge** — last-write-wins via `put` only; single-writer RMW |
 //!
 //! ## Operand encoding: bare `RoaringTreemap`, not `PostingValue`
 //!
@@ -123,6 +123,7 @@ impl MergeOperator for GraphMergeOperator {
             RecordType::Index
             | RecordType::Count
             | RecordType::Node
+            | RecordType::EdgeProp
             | RecordType::SchemaName
             | RecordType::SchemaId
             | RecordType::Xid
@@ -466,6 +467,14 @@ mod tests {
     fn should_fail_closed_on_xid_merge_operand() {
         let op = GraphMergeOperator;
         let key = crate::serde::keys::xid_key(b"external-id");
+        op.merge_batch(&key, None, &[Bytes::from_static(b"op")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-associative record type")]
+    fn should_fail_closed_on_edge_prop_merge_operand() {
+        let op = GraphMergeOperator;
+        let key = crate::serde::keys::edge_prop_key(Uid(1), PredId(2), Uid(3));
         op.merge_batch(&key, None, &[Bytes::from_static(b"op")]);
     }
 

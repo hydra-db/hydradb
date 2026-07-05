@@ -343,6 +343,44 @@ pub fn meta_kind(meta: &[u8]) -> MetaKind {
 }
 
 // ---------------------------------------------------------------------------
+// EdgeProp (0xC): [src: u64 BE][pred: u32 BE][dst: u64 BE]
+// ---------------------------------------------------------------------------
+
+/// Builds an [`RecordType::EdgeProp`] key — a valued/faceted edge's companion
+/// property record, **one copy per edge**, keyed by full edge identity
+/// `(src, pred, dst)` (RFC 0005 §"Edge facets", as amended: a single copy,
+/// not a per-projection/two-copy scheme).
+pub fn edge_prop_key(src: Uid, pred: PredId, dst: Uid) -> Bytes {
+    let mut buf = head(RecordType::EdgeProp);
+    buf.put_u64(src.get());
+    buf.put_u32(pred.get());
+    buf.put_u64(dst.get());
+    buf.freeze()
+}
+
+/// Parses an [`RecordType::EdgeProp`] key.
+pub fn parse_edge_prop_key(key: &[u8]) -> Result<(Uid, PredId, Uid)> {
+    let mut tail = split_head(key, RecordType::EdgeProp)?;
+    let src = take_u64_be(&mut tail, "edge-prop src")?;
+    let pred = take_u32_be(&mut tail, "edge-prop pred")?;
+    let dst = take_u64_be(&mut tail, "edge-prop dst")?;
+    expect_end(tail, "edge-prop key")?;
+    Ok((Uid(src), PredId(pred), Uid(dst)))
+}
+
+/// A range covering every `EdgeProp` companion under one `(src, pred)` — the
+/// out-projection facet scan. Facets are otherwise point lookups from either
+/// projection (flip to `(src, pred, dst)`); an in-direction *prefix* scan
+/// over facets is not supported by the single-copy design (RFC 0005
+/// §"Edge facets", as amended).
+pub fn edge_prop_range(src: Uid, pred: PredId) -> BytesRange {
+    let mut buf = head(RecordType::EdgeProp);
+    buf.put_u64(src.get());
+    buf.put_u32(pred.get());
+    BytesRange::prefix(buf.freeze())
+}
+
+// ---------------------------------------------------------------------------
 // SchemaName (0x1): [kind:1][name: terminated_bytes]
 // ---------------------------------------------------------------------------
 
@@ -456,6 +494,43 @@ mod tests {
             parse_edge_part_key(&key).unwrap(),
             (Direction::In, Uid(9), PredId(3), Uid(1000))
         );
+    }
+
+    #[test]
+    fn should_roundtrip_edge_prop_key() {
+        // given / when / then — boundary src/pred/dst values
+        for (src, pred, dst) in [
+            (0u64, 0u32, 0u64),
+            (1, 1, 1),
+            (u32::MAX as u64, u32::MAX, u32::MAX as u64),
+            (u32::MAX as u64 + 1, u32::MAX, u64::MAX),
+            (u64::MAX, u32::MAX, u64::MAX),
+        ] {
+            let key = edge_prop_key(Uid(src), PredId(pred), Uid(dst));
+            assert_eq!(
+                parse_edge_prop_key(&key).unwrap(),
+                (Uid(src), PredId(pred), Uid(dst))
+            );
+        }
+    }
+
+    #[test]
+    fn should_scope_edge_prop_range_to_one_src_pred_pair() {
+        // given — two companions sharing (src, pred) and one under a
+        // different pred
+        let k1 = edge_prop_key(Uid(5), PredId(2), Uid(10));
+        let k2 = edge_prop_key(Uid(5), PredId(2), Uid(20));
+        let other_pred = edge_prop_key(Uid(5), PredId(3), Uid(10));
+        let other_src = edge_prop_key(Uid(6), PredId(2), Uid(10));
+
+        // when
+        let range = edge_prop_range(Uid(5), PredId(2));
+
+        // then
+        assert!(range.contains(&k1));
+        assert!(range.contains(&k2));
+        assert!(!range.contains(&other_pred));
+        assert!(!range.contains(&other_src));
     }
 
     #[test]
