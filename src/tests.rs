@@ -5559,6 +5559,21 @@ async fn cypher_rows_return_columns_and_typed_values() {
         )
     );
 
+    let aliased_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-alias-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id AS vertex_id LIMIT 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        aliased_rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("vertex_id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(10)])],
+        )
+    );
+
     let count = shard
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "cypher-row-count"),
@@ -5570,6 +5585,21 @@ async fn cypher_rows_return_columns_and_typed_values() {
         count,
         QueryResultSet::new(
             vec![QueryColumn::new("count(*)")],
+            vec![QueryRow::new(vec![QueryValue::Count(4)])],
+        )
+    );
+
+    let aliased_count = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-count-alias"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN count(*) AS total",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        aliased_count,
+        QueryResultSet::new(
+            vec![QueryColumn::new("total")],
             vec![QueryRow::new(vec![QueryValue::Count(4)])],
         )
     );
