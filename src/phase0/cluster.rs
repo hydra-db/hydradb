@@ -546,6 +546,51 @@ impl RoutedPhase0Cluster {
             .await
     }
 
+    pub async fn execute_query_statement(
+        &self,
+        context: crate::QueryContext,
+        statement: crate::QueryStatement,
+    ) -> Result<crate::QueryOutput> {
+        let shard = self.shard(&context.cell_id)?;
+        let plan = shard.plan_query_statement(context, statement)?;
+        if plan.is_write() {
+            self.ensure_active_write_lease(&plan.cell_id)?;
+        }
+        shard.execute_query_plan(plan).await
+    }
+
+    pub async fn execute_query_plan(&self, plan: crate::QueryPlan) -> Result<crate::QueryOutput> {
+        let shard = self.shard(&plan.cell_id)?;
+        if plan.is_write() {
+            self.ensure_active_write_lease(&plan.cell_id)?;
+        }
+        shard.execute_query_plan(plan).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn execute_cypher(
+        &self,
+        context: crate::QueryContext,
+        query: &str,
+    ) -> Result<crate::QueryOutput> {
+        let shard = self.shard(&context.cell_id)?;
+        let plan = shard.plan_opencypher(context, query)?;
+        if plan.is_write() {
+            self.ensure_active_write_lease(&plan.cell_id)?;
+        }
+        shard.execute_query_plan(plan).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub fn explain_cypher(
+        &self,
+        context: crate::QueryContext,
+        query: &str,
+    ) -> Result<crate::QueryPlan> {
+        let shard = self.shard(&context.cell_id)?;
+        shard.explain_cypher(context, query)
+    }
+
     pub async fn close(&self) -> Result<()> {
         for shard in self.shards.values() {
             shard.close().await?;
