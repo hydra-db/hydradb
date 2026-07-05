@@ -235,7 +235,9 @@ fn lower_match_return(
         let expression = checked_node(sys::cypher_ast_projection_get_expression(projection))?;
 
         if is_count_star(expression)? {
-            let columns = vec![QueryColumn::new("count(*)")];
+            let columns = vec![QueryColumn::new(projection_column_name(
+                projection, "count(*)",
+            )?)];
             if let Some((min_hops, max_hops)) = edge.hop_range {
                 if fixed_dst.is_some() {
                     return unsupported(
@@ -286,8 +288,9 @@ fn lower_match_return(
             if !projects_node_id(expression, edge.dst_binding.as_deref())? {
                 return unsupported("variable-length MATCH currently requires RETURN <dst>.id");
             }
-            let columns = vec![QueryColumn::new(node_id_column_name(
-                edge.dst_binding.as_deref(),
+            let columns = vec![QueryColumn::new(projection_column_name(
+                projection,
+                node_id_column_name(edge.dst_binding.as_deref())?,
             )?)];
             return Ok(ParsedQuery {
                 statement: QueryStatement::MatchReachable {
@@ -308,8 +311,9 @@ fn lower_match_return(
                     "exact edge MATCH currently supports RETURN <dst>.id or count(*)",
                 );
             }
-            let columns = vec![QueryColumn::new(node_id_column_name(
-                edge.dst_binding.as_deref(),
+            let columns = vec![QueryColumn::new(projection_column_name(
+                projection,
+                node_id_column_name(edge.dst_binding.as_deref())?,
             )?)];
             return Ok(ParsedQuery {
                 statement: QueryStatement::MatchOutFiltered {
@@ -325,8 +329,9 @@ fn lower_match_return(
         if !projects_node_id(expression, edge.dst_binding.as_deref())? {
             return unsupported("open-ended MATCH currently requires RETURN <dst>.id");
         }
-        let columns = vec![QueryColumn::new(node_id_column_name(
-            edge.dst_binding.as_deref(),
+        let columns = vec![QueryColumn::new(projection_column_name(
+            projection,
+            node_id_column_name(edge.dst_binding.as_deref())?,
         )?)];
 
         Ok(ParsedQuery {
@@ -665,6 +670,20 @@ fn node_id_column_name(binding: Option<&str>) -> Result<String> {
         .ok_or_else(|| unsupported_value("RETURN <dst>.id requires a named destination node"))
 }
 
+fn projection_column_name(
+    projection: *const AstNode,
+    fallback: impl Into<String>,
+) -> Result<String> {
+    unsafe {
+        let alias = sys::cypher_ast_projection_get_alias(projection);
+        if alias.is_null() {
+            Ok(fallback.into())
+        } else {
+            identifier_name(alias)
+        }
+    }
+}
+
 fn node_identifier(node: *const AstNode) -> Result<Option<String>> {
     unsafe {
         let ident = sys::cypher_ast_node_pattern_get_identifier(node);
@@ -940,6 +959,21 @@ mod tests {
             parse_opencypher_with_window("MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN count(*)")
                 .unwrap();
         assert_eq!(parsed.columns, vec![QueryColumn::new("count(*)")]);
+    }
+
+    #[test]
+    fn preserves_aliased_projection_columns_for_planning() {
+        let vertex = parse_opencypher_with_window(
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id AS vertex_id",
+        )
+        .unwrap();
+        assert_eq!(vertex.columns, vec![QueryColumn::new("vertex_id")]);
+
+        let count = parse_opencypher_with_window(
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN count(*) AS total",
+        )
+        .unwrap();
+        assert_eq!(count.columns, vec![QueryColumn::new("total")]);
     }
 
     #[test]
