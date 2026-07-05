@@ -2,6 +2,7 @@ use super::*;
 
 const CONTROL_CATALOG_PREFIX: &str = "control/catalog/";
 const CONTROL_WATERMARK_PREFIX: &str = "control/watermark/";
+const CONTROL_EDGE_WATERMARK_PREFIX: &str = "control/watermark_edge/";
 const CONTROL_IDEMPOTENCY_PREFIX: &str = "control/idem/";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +19,17 @@ pub struct GraphShardCatalogEntry {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GraphControlWatermark {
     pub cell_id: String,
+    pub durable_epoch: GraphEpoch,
+    pub safe_read_epoch: GraphEpoch,
+    pub outbox_epoch: GraphEpoch,
+    pub artifact_epoch: GraphEpoch,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphControlEdgeWatermark {
+    pub cell_id: String,
+    pub edge_type: String,
     pub durable_epoch: GraphEpoch,
     pub safe_read_epoch: GraphEpoch,
     pub outbox_epoch: GraphEpoch,
@@ -42,7 +54,7 @@ pub struct GraphControlRepairReport {
     pub live_edges: u64,
     pub delta_records: u64,
     pub mismatch_count: u64,
-    pub watermark: GraphControlWatermark,
+    pub watermark: GraphControlEdgeWatermark,
     pub repaired_watermark: bool,
 }
 
@@ -338,6 +350,136 @@ impl GraphControlPlane {
         Ok((requested.clone(), true))
     }
 
+    pub async fn current_edge_watermark(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+    ) -> Result<Option<GraphControlEdgeWatermark>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let key = control_edge_watermark_key(cell_id, edge_type);
+        self.db
+            .get_with_options(key.as_bytes(), &control_read_options())
+            .await?
+            .map(|value| decode_control_edge_watermark(&key, &value))
+            .transpose()
+    }
+
+    pub async fn advance_edge_watermark(
+        &self,
+        mut requested: GraphControlEdgeWatermark,
+        expected_generation: Option<u64>,
+    ) -> Result<GraphControlEdgeWatermark> {
+        validate_edge_watermark(&requested)?;
+        for attempt in 0..GRAPH_CONTROL_TXN_MAX_RETRIES {
+            match self
+                .advance_edge_watermark_txn(&mut requested, expected_generation)
+                .await
+            {
+                Err(GraphError::Slate(err))
+                    if err.kind() == ErrorKind::Transaction
+                        && attempt + 1 < GRAPH_CONTROL_TXN_MAX_RETRIES =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Ok((watermark, advanced)) => {
+                    if advanced {
+                        self.metrics
+                            .watermark_advances
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(watermark);
+                }
+                Err(err @ GraphError::ControlMetadataConflict { .. }) => {
+                    self.metrics
+                        .metadata_cas_conflicts
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Err(err @ GraphError::ControlWatermarkRegression { .. }) => {
+                    self.metrics
+                        .watermark_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                result => return result.map(|(watermark, _)| watermark),
+            }
+        }
+        unreachable!("control transaction retry loop always returns on final attempt")
+    }
+
+    async fn advance_edge_watermark_txn(
+        &self,
+        requested: &mut GraphControlEdgeWatermark,
+        expected_generation: Option<u64>,
+    ) -> Result<(GraphControlEdgeWatermark, bool)> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let key = control_edge_watermark_key(&requested.cell_id, &requested.edge_type);
+        let current = read_control_txn(&txn, &key)
+            .await?
+            .map(|value| decode_control_edge_watermark(&key, &value))
+            .transpose()?;
+        let actual_generation = current.as_ref().map(|watermark| watermark.generation);
+        if expected_generation.is_some() && actual_generation != expected_generation {
+            return Err(GraphError::ControlMetadataConflict {
+                key,
+                expected_generation,
+                actual_generation,
+            });
+        }
+
+        if let Some(current) = current {
+            reject_regression(
+                &requested.cell_id,
+                "durable_epoch",
+                requested.durable_epoch,
+                current.durable_epoch,
+            )?;
+            reject_regression(
+                &requested.cell_id,
+                "safe_read_epoch",
+                requested.safe_read_epoch,
+                current.safe_read_epoch,
+            )?;
+            reject_regression(
+                &requested.cell_id,
+                "outbox_epoch",
+                requested.outbox_epoch,
+                current.outbox_epoch,
+            )?;
+            reject_regression(
+                &requested.cell_id,
+                "artifact_epoch",
+                requested.artifact_epoch,
+                current.artifact_epoch,
+            )?;
+            let advanced = requested.durable_epoch > current.durable_epoch
+                || requested.safe_read_epoch > current.safe_read_epoch
+                || requested.outbox_epoch > current.outbox_epoch
+                || requested.artifact_epoch > current.artifact_epoch;
+            if !advanced {
+                return Ok((current, false));
+            }
+            requested.generation =
+                current
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| GraphError::CorruptValue {
+                        key: control_edge_watermark_key(&requested.cell_id, &requested.edge_type),
+                        reason: "edge watermark generation overflow".to_string(),
+                    })?;
+        } else {
+            requested.generation = 1;
+        }
+
+        txn.put(
+            control_edge_watermark_key(&requested.cell_id, &requested.edge_type).as_bytes(),
+            encode_control_edge_watermark(requested),
+        )?;
+        commit_control_txn(txn).await?;
+        Ok((requested.clone(), true))
+    }
+
     pub async fn control_idempotency_result(
         &self,
         cell_id: &str,
@@ -430,7 +572,7 @@ impl GraphControlPlane {
             .await?;
         if !correctness.is_clean() {
             return Err(GraphError::CorruptValue {
-                key: control_watermark_key(cell_id),
+                key: control_edge_watermark_key(cell_id, edge_type),
                 reason: format!(
                     "cannot repair control state while graph verifier reports {} mismatches",
                     correctness.mismatch_count
@@ -461,7 +603,7 @@ impl GraphControlPlane {
             .unwrap_or_default();
         let artifact_epoch = matrix_epoch.max(rollup_epoch);
 
-        let before = self.current_watermark(cell_id).await?;
+        let before = self.current_edge_watermark(cell_id, edge_type).await?;
         let outbox_epoch = before
             .as_ref()
             .map(|watermark| watermark.outbox_epoch)
@@ -472,15 +614,16 @@ impl GraphControlPlane {
             .map(|watermark| watermark.artifact_epoch)
             .unwrap_or_default()
             .max(artifact_epoch);
-        let requested = GraphControlWatermark {
+        let requested = GraphControlEdgeWatermark {
             cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
             durable_epoch: correctness.read_epoch,
             safe_read_epoch: correctness.read_epoch,
             outbox_epoch,
             artifact_epoch,
             generation: 0,
         };
-        let watermark = self.advance_watermark(requested, None).await?;
+        let watermark = self.advance_edge_watermark(requested, None).await?;
         let repaired_watermark = before.as_ref().is_none_or(|before| {
             watermark.durable_epoch > before.durable_epoch
                 || watermark.safe_read_epoch > before.safe_read_epoch
@@ -516,6 +659,16 @@ pub(super) async fn bump_catalog_lease_txn(
 ) -> Result<()> {
     let key = control_catalog_key(cell_id);
     let Some(value) = read_control_txn(txn, &key).await? else {
+        let entry = GraphShardCatalogEntry {
+            graph_id: "default".to_string(),
+            cell_id: cell_id.to_string(),
+            owner_node_id: owner_node_id.to_string(),
+            lease_token,
+            schema_epoch: 0,
+            graph_epoch: 0,
+            generation: 1,
+        };
+        txn.put(key.as_bytes(), encode_control_catalog(&entry))?;
         return Ok(());
     };
     let mut entry = decode_control_catalog(&key, &value)?;
@@ -534,6 +687,10 @@ pub(super) async fn bump_catalog_lease_txn(
 
 fn control_watermark_key(cell_id: &str) -> String {
     format!("{CONTROL_WATERMARK_PREFIX}{cell_id}")
+}
+
+fn control_edge_watermark_key(cell_id: &str, edge_type: &str) -> String {
+    format!("{CONTROL_EDGE_WATERMARK_PREFIX}{cell_id}/{edge_type}")
 }
 
 fn control_idempotency_key(cell_id: &str, operation: &str, idempotency_key: &str) -> String {
@@ -564,6 +721,30 @@ fn validate_watermark(watermark: &GraphControlWatermark) -> Result<()> {
     if watermark.artifact_epoch > watermark.durable_epoch {
         return corrupt(
             &control_watermark_key(&watermark.cell_id),
+            "artifact_epoch cannot exceed durable_epoch",
+        );
+    }
+    Ok(())
+}
+
+fn validate_edge_watermark(watermark: &GraphControlEdgeWatermark) -> Result<()> {
+    validate_component("cell_id", &watermark.cell_id)?;
+    validate_component("edge_type", &watermark.edge_type)?;
+    if watermark.safe_read_epoch > watermark.durable_epoch {
+        return corrupt(
+            &control_edge_watermark_key(&watermark.cell_id, &watermark.edge_type),
+            "safe_read_epoch cannot exceed durable_epoch",
+        );
+    }
+    if watermark.outbox_epoch > watermark.durable_epoch {
+        return corrupt(
+            &control_edge_watermark_key(&watermark.cell_id, &watermark.edge_type),
+            "outbox_epoch cannot exceed durable_epoch",
+        );
+    }
+    if watermark.artifact_epoch > watermark.durable_epoch {
+        return corrupt(
+            &control_edge_watermark_key(&watermark.cell_id, &watermark.edge_type),
             "artifact_epoch cannot exceed durable_epoch",
         );
     }
@@ -662,6 +843,39 @@ fn decode_control_watermark(key: &str, value: &[u8]) -> Result<GraphControlWater
     Ok(watermark)
 }
 
+fn encode_control_edge_watermark(watermark: &GraphControlEdgeWatermark) -> Vec<u8> {
+    format!(
+        "edge_watermark1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        watermark.cell_id,
+        watermark.edge_type,
+        watermark.durable_epoch,
+        watermark.safe_read_epoch,
+        watermark.outbox_epoch,
+        watermark.artifact_epoch,
+        watermark.generation
+    )
+    .into_bytes()
+}
+
+fn decode_control_edge_watermark(key: &str, value: &[u8]) -> Result<GraphControlEdgeWatermark> {
+    let text = text_value(key, value)?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 8 || parts[0] != "edge_watermark1" {
+        return corrupt(key, "expected edge_watermark1 record with 8 fields");
+    }
+    let watermark = GraphControlEdgeWatermark {
+        cell_id: parts[1].to_string(),
+        edge_type: parts[2].to_string(),
+        durable_epoch: parse_u64(key, parts[3], "durable_epoch")?,
+        safe_read_epoch: parse_u64(key, parts[4], "safe_read_epoch")?,
+        outbox_epoch: parse_u64(key, parts[5], "outbox_epoch")?,
+        artifact_epoch: parse_u64(key, parts[6], "artifact_epoch")?,
+        generation: parse_u64(key, parts[7], "generation")?,
+    };
+    validate_edge_watermark(&watermark)?;
+    Ok(watermark)
+}
+
 fn encode_control_idempotency(record: &GraphControlIdempotencyRecord) -> Vec<u8> {
     format!(
         "control_idem1\t{}\t{}\t{}\t{}\t{}\n",
@@ -701,12 +915,13 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(key: &str, value: &str) -> Result<Vec<u8>> {
-    if !value.len().is_multiple_of(2) {
+    let bytes = value.as_bytes();
+    let chunks = bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
         return corrupt(key, "hex payload has odd length");
     }
     let mut out = Vec::with_capacity(value.len() / 2);
-    let bytes = value.as_bytes();
-    for pair in bytes.chunks_exact(2) {
+    for pair in chunks {
         let hi = hex_value(key, pair[0])?;
         let lo = hex_value(key, pair[1])?;
         out.push((hi << 4) | lo);
