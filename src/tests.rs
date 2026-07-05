@@ -6170,6 +6170,158 @@ async fn cypher_row_engine_rejects_large_full_edge_scans() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_edge_match_uses_destination_id_reverse_index_without_full_scan() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-dst-id-index",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for (idx, (src, dst)) in [(1, 10), (2, 20), (3, 30)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-dst-id-index-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-dst-id-index-read"),
+            "MATCH (u)-[:FOLLOWS]->(v {id: 20}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("u.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(2)])],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_edge_match_uses_destination_metadata_index_with_reverse_expansion() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-dst-metadata-index",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for (idx, (src, dst)) in [(1, 10), (2, 20), (3, 30)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-dst-metadata-index-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            20,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(true)),
+        )
+        .await
+        .unwrap();
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-dst-metadata-index-read"),
+            "MATCH (u)-[:FOLLOWS]->(v:User {active: true}) RETURN u.id, v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("u.id"), QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![
+                QueryValue::VertexId(2),
+                QueryValue::VertexId(20),
+            ])],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn destination_reverse_expansion_preserves_historical_snapshot_reads() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer("graph/cypher-dst-snapshot", object_store)
+        .await
+        .unwrap();
+
+    let write = shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 20,
+            idempotency_key: "cypher-dst-snapshot-write".to_string(),
+        })
+        .await
+        .unwrap();
+    shard
+        .delete_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 20,
+            idempotency_key: "cypher-dst-snapshot-delete".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-dst-snapshot-read").at_epoch(write.epoch),
+            "MATCH (u)-[:FOLLOWS]->(v {id: 20}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("u.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_rows_filter_project_and_sort_vertex_metadata() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-row-metadata", object_store).await;
