@@ -172,6 +172,11 @@ pub enum StorageError {
     Storage(String),
     /// Internal errors
     Internal(String),
+    /// This writer has been fenced by a newer writer on the same path
+    /// (SlateDB single-writer-per-path). The old writer's `Db` instance is no
+    /// longer usable and must be replaced with a fresh open (RFC 0004 §"Write
+    /// path", zombie-writer fencing).
+    Fenced(String),
 }
 
 impl std::error::Error for StorageError {}
@@ -181,6 +186,7 @@ impl std::fmt::Display for StorageError {
         match self {
             StorageError::Storage(msg) => write!(f, "Storage error: {}", msg),
             StorageError::Internal(msg) => write!(f, "Internal error: {}", msg),
+            StorageError::Fenced(msg) => write!(f, "Fenced error: {}", msg),
         }
     }
 }

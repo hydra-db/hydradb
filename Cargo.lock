@@ -2950,6 +2950,7 @@ dependencies = [
  "opendata-common",
  "proptest",
  "roaring",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
