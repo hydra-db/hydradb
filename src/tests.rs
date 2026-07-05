@@ -5890,6 +5890,148 @@ async fn cypher_row_engine_supports_bindings_where_order_and_windows() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_row_engine_rejects_excess_intermediate_rows() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-row-intermediate-limit",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_intermediate_rows: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for (idx, dst) in [10, 11].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst,
+                idempotency_key: format!("cypher-row-intermediate-limit-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let err = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-intermediate-limit-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::AdmissionRejected {
+            operation: "cypher_edge_rows",
+            actual: 2,
+            limit: 1
+        }
+    ));
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_row_engine_rejects_large_index_candidate_scans() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-row-index-limit",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_index_candidates: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for vertex_id in [1, 2] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex_id,
+                VertexMetadata::default().with_label("User"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let err = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-index-limit-read"),
+            "MATCH (u:User) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::AdmissionRejected {
+            operation: "cypher_vertex_label_index_candidates",
+            actual: 2,
+            limit: 1
+        }
+    ));
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_row_engine_rejects_large_full_edge_scans() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-row-full-scan-limit",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for (idx, (src, dst)) in [(1, 10), (2, 20)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-row-full-scan-limit-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let err = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-full-scan-limit-read"),
+            "MATCH (u)-[:FOLLOWS]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::AdmissionRejected {
+            operation: "cypher_edge_full_scan",
+            actual: 2,
+            limit: 1
+        }
+    ));
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_rows_filter_project_and_sort_vertex_metadata() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-row-metadata", object_store).await;

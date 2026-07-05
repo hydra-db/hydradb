@@ -331,6 +331,7 @@ impl GraphShard {
                 feature: "node-only MATCH requires an id, label, or property predicate".to_string(),
             });
         };
+        self.ensure_query_index_candidates("cypher_node_candidates", vertices.len())?;
         let mut rows = Vec::with_capacity(vertices.len());
         let mut metadata_cache = BTreeMap::new();
         for vertex_id in vertices {
@@ -338,7 +339,7 @@ impl GraphShard {
                 self.hydrate_binding_metadata(cell_id, read_epoch, &mut row, &mut metadata_cache)
                     .await?;
                 if row_matches_node(&row, node)? {
-                    rows.push(row);
+                    self.push_binding_row(&mut rows, row, "cypher_node_rows")?;
                 }
             }
         }
@@ -364,12 +365,16 @@ impl GraphShard {
         let candidate_sources = self
             .candidate_vertex_ids(cell_id, &edge.src, read_epoch)
             .await?;
+        let mut scanned_edges = 0_u64;
         if let Some(sources) = candidate_sources {
+            self.ensure_query_index_candidates("cypher_edge_source_candidates", sources.len())?;
             for src in sources {
-                for dst in self
+                let neighbors = self
                     .out_neighbors_at(cell_id, &edge.edge_type, src, read_epoch)
-                    .await?
-                {
+                    .await?;
+                scanned_edges = scanned_edges.saturating_add(neighbors.len() as u64);
+                self.ensure_query_scan_edges("cypher_edge_neighbor_scan", scanned_edges)?;
+                for dst in neighbors {
                     if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst) {
                         continue;
                     }
@@ -382,7 +387,7 @@ impl GraphShard {
                         )
                         .await?;
                         if row_matches_edge_pattern(&row, edge)? {
-                            rows.push(row);
+                            self.push_binding_row(&mut rows, row, "cypher_edge_rows")?;
                         }
                     }
                 }
@@ -391,10 +396,11 @@ impl GraphShard {
         }
 
         if let Some(src) = edge.src.id {
-            for dst in self
+            let neighbors = self
                 .out_neighbors_at(cell_id, &edge.edge_type, src, read_epoch)
-                .await?
-            {
+                .await?;
+            self.ensure_query_scan_edges("cypher_edge_neighbor_scan", neighbors.len() as u64)?;
+            for dst in neighbors {
                 if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst) {
                     continue;
                 }
@@ -407,14 +413,16 @@ impl GraphShard {
                     )
                     .await?;
                     if row_matches_edge_pattern(&row, edge)? {
-                        rows.push(row);
+                        self.push_binding_row(&mut rows, row, "cypher_edge_rows")?;
                     }
                 }
             }
             return Ok(rows);
         }
 
-        for record in self.edges_at(cell_id, &edge.edge_type, read_epoch).await? {
+        let records = self.edges_at(cell_id, &edge.edge_type, read_epoch).await?;
+        self.ensure_query_scan_edges("cypher_edge_full_scan", records.len() as u64)?;
+        for record in records {
             if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != record.dst) {
                 continue;
             }
@@ -422,7 +430,7 @@ impl GraphShard {
                 self.hydrate_binding_metadata(cell_id, read_epoch, &mut row, &mut metadata_cache)
                     .await?;
                 if row_matches_edge_pattern(&row, edge)? {
-                    rows.push(row);
+                    self.push_binding_row(&mut rows, row, "cypher_edge_rows")?;
                 }
             }
         }
@@ -444,7 +452,7 @@ impl GraphShard {
                 feature: "variable-length MATCH requires a fixed source id".to_string(),
             });
         };
-        let vertices = self
+        let (vertices, edge_visits) = self
             .reachable_vertices_in_hop_range_at(
                 cell_id,
                 &edge.edge_type,
@@ -453,8 +461,9 @@ impl GraphShard {
                 max_hops,
                 read_epoch,
             )
-            .await?
-            .0;
+            .await?;
+        self.ensure_query_scan_edges("cypher_reachable_edge_visits", edge_visits)?;
+        self.ensure_query_intermediate_rows("cypher_reachable_rows", vertices.len())?;
         let mut rows = Vec::with_capacity(vertices.len());
         let mut metadata_cache = BTreeMap::new();
         for dst in vertices {
@@ -465,7 +474,7 @@ impl GraphShard {
                 self.hydrate_binding_metadata(cell_id, read_epoch, &mut row, &mut metadata_cache)
                     .await?;
                 if row_matches_edge_pattern(&row, edge)? {
-                    rows.push(row);
+                    self.push_binding_row(&mut rows, row, "cypher_reachable_rows")?;
                 }
             }
         }
@@ -557,6 +566,10 @@ impl GraphShard {
                 break;
             }
             latest.insert(vertex_id, decode_vertex_index_delta(&key, &kv.value)?);
+            self.ensure_query_index_candidates(
+                "cypher_vertex_label_index_candidates",
+                latest.len(),
+            )?;
         }
         if saw_delta {
             return Ok(latest
@@ -580,6 +593,10 @@ impl GraphShard {
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             vertices.push(decode_u64(&key, &kv.value)?);
+            self.ensure_query_index_candidates(
+                "cypher_vertex_label_index_candidates",
+                vertices.len(),
+            )?;
         }
         Ok(vertices)
     }
@@ -610,6 +627,10 @@ impl GraphShard {
                 break;
             }
             latest.insert(vertex_id, decode_vertex_index_delta(&key, &kv.value)?);
+            self.ensure_query_index_candidates(
+                "cypher_vertex_property_index_candidates",
+                latest.len(),
+            )?;
         }
         if saw_delta {
             return Ok(latest
@@ -637,6 +658,10 @@ impl GraphShard {
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             vertices.push(decode_u64(&key, &kv.value)?);
+            self.ensure_query_index_candidates(
+                "cypher_vertex_property_index_candidates",
+                vertices.len(),
+            )?;
         }
         Ok(vertices)
     }
@@ -763,6 +788,51 @@ impl GraphShard {
         Ok(vertices)
     }
 
+    fn ensure_query_intermediate_rows(&self, operation: &'static str, rows: usize) -> Result<()> {
+        ensure_limit(
+            operation,
+            rows as u64,
+            self.limits.max_query_intermediate_rows as u64,
+        )
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn ensure_query_index_candidates(
+        &self,
+        operation: &'static str,
+        candidates: usize,
+    ) -> Result<()> {
+        ensure_limit(
+            operation,
+            candidates as u64,
+            self.limits.max_query_index_candidates as u64,
+        )
+    }
+
+    fn ensure_query_scan_edges(&self, operation: &'static str, edges: u64) -> Result<()> {
+        ensure_limit(operation, edges, self.limits.max_query_scan_edges)
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn push_binding_row(
+        &self,
+        rows: &mut Vec<BindingRow>,
+        row: BindingRow,
+        operation: &'static str,
+    ) -> Result<()> {
+        let next_len = rows
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| GraphError::AdmissionRejected {
+                operation,
+                actual: u64::MAX,
+                limit: self.limits.max_query_intermediate_rows as u64,
+            })?;
+        self.ensure_query_intermediate_rows(operation, next_len)?;
+        rows.push(row);
+        Ok(())
+    }
+
     async fn query_edge_exists(
         &self,
         cell_id: &str,
@@ -803,7 +873,9 @@ impl GraphShard {
         )?;
 
         let mut adjacency = BTreeMap::<VertexId, BTreeSet<VertexId>>::new();
-        for edge in self.edges_at(cell_id, edge_type, read_epoch).await? {
+        let edges = self.edges_at(cell_id, edge_type, read_epoch).await?;
+        self.ensure_query_scan_edges("cypher_reachable_full_scan", edges.len() as u64)?;
+        for edge in edges {
             adjacency.entry(edge.src).or_default().insert(edge.dst);
         }
 
@@ -822,11 +894,13 @@ impl GraphShard {
             for vertex in &frontier {
                 if let Some(neighbors) = adjacency.get(vertex) {
                     edge_visits = edge_visits.saturating_add(neighbors.len() as u64);
+                    self.ensure_query_scan_edges("cypher_reachable_edge_visits", edge_visits)?;
                     next.extend(neighbors.iter().copied());
                 }
             }
             if depth >= min_hops {
                 result.extend(next.iter().copied());
+                self.ensure_query_intermediate_rows("cypher_reachable_rows", result.len())?;
             }
             if next.is_empty() {
                 break;
