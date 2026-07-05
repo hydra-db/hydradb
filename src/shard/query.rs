@@ -40,17 +40,9 @@ impl GraphShard {
     ) -> Result<QueryResultSet> {
         #[cfg(feature = "opencypher")]
         {
-            let parsed = parse_opencypher_with_window(query)?;
-            if parsed.statement.is_write() {
-                return Err(GraphError::UnsupportedQuery {
-                    dialect: "OpenCypher",
-                    feature: "row execution requires a RETURN query".to_string(),
-                });
-            }
-            let columns = parsed.columns.clone();
-            let plan = self.plan_parsed_opencypher(context, parsed)?;
-            let output = self.execute_query_plan(plan).await?;
-            query_output_to_result_set(columns, output)
+            let parsed = parse_opencypher_row_query(query)?;
+            let context = merge_opencypher_window(context, parsed.window)?;
+            self.execute_parsed_opencypher_rows(context, parsed).await
         }
         #[cfg(not(feature = "opencypher"))]
         {
@@ -98,6 +90,66 @@ impl GraphShard {
     #[cfg(feature = "opencypher")]
     pub fn explain_cypher(&self, context: QueryContext, query: &str) -> Result<QueryPlan> {
         self.plan_opencypher(context, query)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn execute_parsed_opencypher_rows(
+        &self,
+        context: QueryContext,
+        query: ParsedRowQuery,
+    ) -> Result<QueryResultSet> {
+        validate_component("cell_id", &context.cell_id)?;
+        let read_epoch = match context.read_epoch {
+            Some(read_epoch) => {
+                let current_epoch = self.current_epoch(&context.cell_id).await?;
+                if read_epoch > current_epoch {
+                    return Err(GraphError::SnapshotAhead {
+                        cell_id: context.cell_id.clone(),
+                        read_epoch,
+                        current_epoch,
+                    });
+                }
+                read_epoch
+            }
+            None => self.current_epoch(&context.cell_id).await?,
+        };
+
+        let mut bindings = self
+            .match_row_pattern(&context.cell_id, &query.pattern, read_epoch)
+            .await?;
+        if let Some(predicate) = &query.predicate {
+            let mut filtered = Vec::with_capacity(bindings.len());
+            for row in bindings {
+                if row_predicate_matches(&row, predicate)? {
+                    filtered.push(row);
+                }
+            }
+            bindings = filtered;
+        }
+
+        if query.projections == [RowProjection::CountAll] {
+            let row = QueryRow::new(vec![QueryValue::Count(bindings.len() as u64)]);
+            let sort_keys = sort_keys_for_projected_only(&row, &query.columns, &query.order_by)?;
+            return self.finish_projected_rows(
+                query.columns,
+                vec![ProjectedQueryRow { row, sort_keys }],
+                &query.order_by,
+                context.result_window,
+            );
+        }
+
+        let mut projected = Vec::with_capacity(bindings.len());
+        for binding in &bindings {
+            let row = project_binding_row(binding, &query.projections)?;
+            let sort_keys = sort_keys_for_row(binding, &row, &query.columns, &query.order_by)?;
+            projected.push(ProjectedQueryRow { row, sort_keys });
+        }
+        self.finish_projected_rows(
+            query.columns,
+            projected,
+            &query.order_by,
+            context.result_window,
+        )
     }
 
     pub async fn execute_query_plan(&self, plan: QueryPlan) -> Result<QueryOutput> {
@@ -228,6 +280,121 @@ impl GraphShard {
             }
         }
         Ok(())
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_row_pattern(
+        &self,
+        cell_id: &str,
+        pattern: &RowPattern,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<BindingRow>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", &pattern.edge_type)?;
+        if let Some((min_hops, max_hops)) = pattern.hop_range {
+            return self
+                .match_reachable_row_pattern(cell_id, pattern, min_hops, max_hops, read_epoch)
+                .await;
+        }
+
+        let mut rows = Vec::new();
+        if let Some(src) = pattern.src.id {
+            for dst in self
+                .out_neighbors_at(cell_id, &pattern.edge_type, src, read_epoch)
+                .await?
+            {
+                if matches!(pattern.dst.id, Some(fixed_dst) if fixed_dst != dst) {
+                    continue;
+                }
+                if let Some(row) = BindingRow::from_edge(pattern, src, dst) {
+                    rows.push(row);
+                }
+            }
+            return Ok(rows);
+        }
+
+        for edge in self
+            .edges_at(cell_id, &pattern.edge_type, read_epoch)
+            .await?
+        {
+            if matches!(pattern.dst.id, Some(fixed_dst) if fixed_dst != edge.dst) {
+                continue;
+            }
+            if let Some(row) = BindingRow::from_edge(pattern, edge.src, edge.dst) {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_reachable_row_pattern(
+        &self,
+        cell_id: &str,
+        pattern: &RowPattern,
+        min_hops: u8,
+        max_hops: u8,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<BindingRow>> {
+        let Some(src) = pattern.src.id else {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "variable-length MATCH requires a fixed source id".to_string(),
+            });
+        };
+        let vertices = self
+            .reachable_vertices_in_hop_range_at(
+                cell_id,
+                &pattern.edge_type,
+                src,
+                min_hops,
+                max_hops,
+                read_epoch,
+            )
+            .await?
+            .0;
+        let mut rows = Vec::with_capacity(vertices.len());
+        for dst in vertices {
+            if matches!(pattern.dst.id, Some(fixed_dst) if fixed_dst != dst) {
+                continue;
+            }
+            if let Some(row) = BindingRow::from_edge(pattern, src, dst) {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn finish_projected_rows(
+        &self,
+        columns: Vec<QueryColumn>,
+        mut projected: Vec<ProjectedQueryRow>,
+        order_by: &[RowSort],
+        window: QueryWindow,
+    ) -> Result<QueryResultSet> {
+        if !order_by.is_empty() {
+            projected.sort_by(|left, right| compare_projected_rows(left, right, order_by));
+        }
+
+        let skip = usize::try_from(window.skip).map_err(|_| GraphError::AdmissionRejected {
+            operation: "query_result_skip",
+            actual: window.skip,
+            limit: usize::MAX as u64,
+        })?;
+        let max = self.limits.max_query_result_vertices;
+        let mut rows: Vec<_> = projected
+            .into_iter()
+            .skip(skip)
+            .map(|projected| projected.row)
+            .collect();
+        if let Some(limit) = window.limit {
+            ensure_limit("query_result_limit", limit as u64, max as u64)?;
+            rows.truncate(limit);
+        } else {
+            ensure_limit("query_result_rows", rows.len() as u64, max as u64)?;
+        }
+        Ok(QueryResultSet::new(columns, rows))
     }
 
     async fn out_neighbors_window_at(
@@ -900,50 +1067,217 @@ fn merge_opencypher_window(context: QueryContext, window: QueryWindow) -> Result
 }
 
 #[cfg(feature = "opencypher")]
-fn query_output_to_result_set(
-    columns: Vec<QueryColumn>,
-    output: QueryOutput,
-) -> Result<QueryResultSet> {
-    match output {
-        QueryOutput::Vertices(vertices) => {
-            ensure_single_result_column(&columns, "vertex-returning query")?;
-            Ok(QueryResultSet::new(
-                columns,
-                vertices
-                    .into_iter()
-                    .map(|vertex| QueryRow::new(vec![QueryValue::VertexId(vertex)]))
-                    .collect(),
-            ))
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct BindingRow {
+    values: BTreeMap<String, VertexId>,
+}
+
+#[cfg(feature = "opencypher")]
+impl BindingRow {
+    fn from_edge(pattern: &RowPattern, src: VertexId, dst: VertexId) -> Option<Self> {
+        let mut row = Self::default();
+        if !row.bind(pattern.src.binding.as_deref(), src) {
+            return None;
         }
-        QueryOutput::Count(count) => {
-            ensure_single_result_column(&columns, "count query")?;
-            Ok(QueryResultSet::new(
-                columns,
-                vec![QueryRow::new(vec![QueryValue::Count(count)])],
-            ))
+        if !row.bind(pattern.dst.binding.as_deref(), dst) {
+            return None;
         }
-        QueryOutput::Bool(value) => {
-            ensure_single_result_column(&columns, "boolean query")?;
-            Ok(QueryResultSet::new(
-                columns,
-                vec![QueryRow::new(vec![QueryValue::Bool(value)])],
-            ))
+        Some(row)
+    }
+
+    fn bind(&mut self, binding: Option<&str>, value: VertexId) -> bool {
+        let Some(binding) = binding else {
+            return true;
+        };
+        match self.values.get(binding) {
+            Some(existing) => *existing == value,
+            None => {
+                self.values.insert(binding.to_string(), value);
+                true
+            }
         }
-        QueryOutput::Write(_) => Err(GraphError::UnsupportedQuery {
-            dialect: "GraphQuery",
-            feature: "write query outputs do not have row result sets".to_string(),
-        }),
+    }
+
+    fn get(&self, binding: &str) -> Result<VertexId> {
+        self.values
+            .get(binding)
+            .copied()
+            .ok_or_else(|| GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: format!("unbound variable {binding}"),
+            })
     }
 }
 
 #[cfg(feature = "opencypher")]
-fn ensure_single_result_column(columns: &[QueryColumn], feature: &'static str) -> Result<()> {
-    if columns.len() == 1 {
-        Ok(())
-    } else {
-        Err(GraphError::UnsupportedQuery {
-            dialect: "GraphQuery",
-            feature: format!("{feature} requires exactly one result column"),
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectedQueryRow {
+    row: QueryRow,
+    sort_keys: Vec<QueryValue>,
+}
+
+#[cfg(feature = "opencypher")]
+fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<bool> {
+    Ok(match predicate {
+        RowPredicate::Compare { left, op, right } => compare_row_values(
+            eval_row_expression(row, left)?,
+            *op,
+            eval_row_expression(row, right)?,
+        ),
+        RowPredicate::And(left, right) => {
+            row_predicate_matches(row, left)? && row_predicate_matches(row, right)?
+        }
+        RowPredicate::Or(left, right) => {
+            row_predicate_matches(row, left)? || row_predicate_matches(row, right)?
+        }
+        RowPredicate::Not(inner) => !row_predicate_matches(row, inner)?,
+    })
+}
+
+#[cfg(feature = "opencypher")]
+fn eval_row_expression(row: &BindingRow, expression: &RowExpression) -> Result<VertexId> {
+    match expression {
+        RowExpression::NodeId { binding } => row.get(binding),
+        RowExpression::Integer(value) => Ok(*value),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_row_values(left: VertexId, op: RowComparisonOp, right: VertexId) -> bool {
+    match op {
+        RowComparisonOp::Eq => left == right,
+        RowComparisonOp::Ne => left != right,
+        RowComparisonOp::Lt => left < right,
+        RowComparisonOp::Gt => left > right,
+        RowComparisonOp::Lte => left <= right,
+        RowComparisonOp::Gte => left >= right,
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn project_binding_row(row: &BindingRow, projections: &[RowProjection]) -> Result<QueryRow> {
+    let mut values = Vec::with_capacity(projections.len());
+    for projection in projections {
+        match projection {
+            RowProjection::NodeId { binding } => {
+                values.push(QueryValue::VertexId(row.get(binding)?));
+            }
+            RowProjection::CountAll => {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "count(*) projection must be planned as an aggregate".to_string(),
+                });
+            }
+        }
+    }
+    Ok(QueryRow::new(values))
+}
+
+#[cfg(feature = "opencypher")]
+fn sort_keys_for_row(
+    binding_row: &BindingRow,
+    row: &QueryRow,
+    columns: &[QueryColumn],
+    order_by: &[RowSort],
+) -> Result<Vec<QueryValue>> {
+    let mut keys = Vec::with_capacity(order_by.len());
+    for sort in order_by {
+        keys.push(match &sort.expression {
+            RowSortExpression::NodeId { binding } => {
+                QueryValue::VertexId(binding_row.get(binding)?)
+            }
+            RowSortExpression::Column { name } => projected_column_value(row, columns, name)?,
+            RowSortExpression::CountAll => {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "count(*) ORDER BY is only valid for aggregate rows".to_string(),
+                });
+            }
+        });
+    }
+    Ok(keys)
+}
+
+#[cfg(feature = "opencypher")]
+fn sort_keys_for_projected_only(
+    row: &QueryRow,
+    columns: &[QueryColumn],
+    order_by: &[RowSort],
+) -> Result<Vec<QueryValue>> {
+    let mut keys = Vec::with_capacity(order_by.len());
+    for sort in order_by {
+        keys.push(match &sort.expression {
+            RowSortExpression::Column { name } => projected_column_value(row, columns, name)?,
+            RowSortExpression::CountAll => {
+                let Some(value) = row.values.first() else {
+                    return Err(GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: "count(*) ORDER BY requires an aggregate row".to_string(),
+                    });
+                };
+                value.clone()
+            }
+            RowSortExpression::NodeId { .. } => {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "aggregate ORDER BY cannot reference row variables".to_string(),
+                });
+            }
+        });
+    }
+    Ok(keys)
+}
+
+#[cfg(feature = "opencypher")]
+fn projected_column_value(
+    row: &QueryRow,
+    columns: &[QueryColumn],
+    name: &str,
+) -> Result<QueryValue> {
+    let Some(index) = columns.iter().position(|column| column.name == name) else {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: format!("ORDER BY references unknown projection {name}"),
+        });
+    };
+    row.values
+        .get(index)
+        .cloned()
+        .ok_or_else(|| GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: format!("ORDER BY projection {name} has no row value"),
         })
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_projected_rows(
+    left: &ProjectedQueryRow,
+    right: &ProjectedQueryRow,
+    order_by: &[RowSort],
+) -> std::cmp::Ordering {
+    for (idx, sort) in order_by.iter().enumerate() {
+        let ordering = compare_query_values(&left.sort_keys[idx], &right.sort_keys[idx]);
+        let ordering = if sort.ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_query_values(left: &QueryValue, right: &QueryValue) -> std::cmp::Ordering {
+    match (left, right) {
+        (QueryValue::VertexId(left), QueryValue::VertexId(right))
+        | (QueryValue::VertexId(left), QueryValue::Count(right))
+        | (QueryValue::Count(left), QueryValue::VertexId(right))
+        | (QueryValue::Count(left), QueryValue::Count(right)) => left.cmp(right),
+        (QueryValue::Bool(left), QueryValue::Bool(right)) => left.cmp(right),
+        (QueryValue::Bool(_), _) => std::cmp::Ordering::Less,
+        (_, QueryValue::Bool(_)) => std::cmp::Ordering::Greater,
     }
 }

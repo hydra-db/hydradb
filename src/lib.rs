@@ -26,8 +26,10 @@ pub use algebra::{
 };
 #[cfg(feature = "opencypher")]
 pub use opencypher::{
-    parse_cypher, parse_cypher_with_window, parse_opencypher, parse_opencypher_with_window,
-    CypherFrontend, DefaultCypherFrontend, LibCypherParserFrontend, ParsedQuery,
+    parse_cypher, parse_cypher_with_window, parse_opencypher, parse_opencypher_row_query,
+    parse_opencypher_with_window, CypherFrontend, DefaultCypherFrontend, LibCypherParserFrontend,
+    ParsedQuery, ParsedRowQuery, RowComparisonOp, RowExpression, RowNodePattern, RowPattern,
+    RowPredicate, RowProjection, RowSort, RowSortExpression,
 };
 pub use phase0::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
