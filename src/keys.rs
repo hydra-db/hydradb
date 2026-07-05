@@ -1,0 +1,235 @@
+use super::{GraphEpoch, VertexId};
+
+pub fn write_fence(cell_id: &str) -> String {
+    format!("cell/{cell_id}/meta/write_fence")
+}
+
+pub fn read_lease_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/read_lease/")
+}
+
+pub fn read_lease(cell_id: &str, lease_id: &str) -> String {
+    format!("{}{}", read_lease_prefix(cell_id), lease_id)
+}
+
+pub fn last_epoch(cell_id: &str) -> String {
+    format!("cell/{cell_id}/meta/last_epoch")
+}
+
+pub fn mutation_log_epoch(cell_id: &str) -> String {
+    format!("cell/{cell_id}/meta/mutation_log_epoch")
+}
+
+pub fn mutation_log_materialized_epoch(cell_id: &str) -> String {
+    format!("cell/{cell_id}/meta/mutation_log_materialized_epoch")
+}
+
+pub fn idempotency(cell_id: &str, operation: &str, idempotency_key: &str) -> String {
+    format!("cell/{cell_id}/idem/{operation}/{idempotency_key}")
+}
+
+pub fn edge(cell_id: &str, edge_type: &str, src: VertexId, dst: VertexId) -> String {
+    format!("cell/{cell_id}/edge/{edge_type}/{src:020}/{dst:020}")
+}
+
+pub fn out_edge(cell_id: &str, edge_type: &str, src: VertexId, dst: VertexId) -> String {
+    format!("cell/{cell_id}/e/out/{edge_type}/{src:020}/{dst:020}")
+}
+
+pub fn in_edge(cell_id: &str, edge_type: &str, dst: VertexId, src: VertexId) -> String {
+    format!("cell/{cell_id}/e/in/{edge_type}/{dst:020}/{src:020}")
+}
+
+pub fn out_edge_type_prefix(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/e/out/{edge_type}/")
+}
+
+pub fn in_edge_type_prefix(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/e/in/{edge_type}/")
+}
+
+pub fn out_prefix(cell_id: &str, edge_type: &str, src: VertexId) -> String {
+    format!("cell/{cell_id}/e/out/{edge_type}/{src:020}/")
+}
+
+pub fn out_segment(
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    end_epoch: GraphEpoch,
+    start_epoch: GraphEpoch,
+    segment_id: &str,
+) -> String {
+    format!(
+            "cell/{cell_id}/seg/out/{edge_type}/{src:020}/{end_epoch:020}/{start_epoch:020}/{segment_id}"
+        )
+}
+
+pub fn out_segment_edge_type_prefix(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/seg/out/{edge_type}/")
+}
+
+pub fn out_segment_src_prefix(cell_id: &str, edge_type: &str, src: VertexId) -> String {
+    format!("cell/{cell_id}/seg/out/{edge_type}/{src:020}/")
+}
+
+pub fn out_segment_tombstone(
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+) -> String {
+    format!("cell/{cell_id}/seg/tomb/out/{edge_type}/{src:020}/{dst:020}")
+}
+
+pub fn out_segment_tombstone_edge_type_prefix(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/seg/tomb/out/{edge_type}/")
+}
+
+pub fn out_segment_tombstone_src_prefix(cell_id: &str, edge_type: &str, src: VertexId) -> String {
+    format!("cell/{cell_id}/seg/tomb/out/{edge_type}/{src:020}/")
+}
+
+pub fn in_prefix(cell_id: &str, edge_type: &str, dst: VertexId) -> String {
+    format!("cell/{cell_id}/e/in/{edge_type}/{dst:020}/")
+}
+
+pub fn degree_out_prefix(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/cnt/out/{edge_type}/")
+}
+
+pub fn degree_in_prefix(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/cnt/in/{edge_type}/")
+}
+
+pub fn degree_out(cell_id: &str, edge_type: &str, src: VertexId) -> String {
+    format!("cell/{cell_id}/cnt/out/{edge_type}/{src:020}")
+}
+
+pub fn degree_in(cell_id: &str, edge_type: &str, dst: VertexId) -> String {
+    format!("cell/{cell_id}/cnt/in/{edge_type}/{dst:020}")
+}
+
+pub fn outbox(
+    cell_id: &str,
+    epoch: GraphEpoch,
+    kind: super::DeltaKind,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+) -> String {
+    let kind = match kind {
+        super::DeltaKind::Plus => "plus",
+        super::DeltaKind::Minus => "minus",
+    };
+    format!("cell/{cell_id}/outbox/{epoch:020}/{kind}/{edge_type}/{src:020}/{dst:020}")
+}
+
+pub fn outbox_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/outbox/")
+}
+
+pub fn outbox_batch(
+    cell_id: &str,
+    end_epoch: GraphEpoch,
+    start_epoch: GraphEpoch,
+    kind: super::DeltaKind,
+    edge_type: &str,
+    batch_id: &str,
+) -> String {
+    let kind = match kind {
+        super::DeltaKind::Plus => "plus",
+        super::DeltaKind::Minus => "minus",
+    };
+    format!(
+            "cell/{cell_id}/outbox_batch/{end_epoch:020}/{start_epoch:020}/{kind}/{edge_type}/{batch_id}"
+        )
+}
+
+pub fn outbox_batch_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/outbox_batch/")
+}
+
+pub fn mutation_batch(cell_id: &str, start_epoch: GraphEpoch, idempotency_key: &str) -> String {
+    format!("cell/{cell_id}/mutation_batch/{start_epoch:020}/{idempotency_key}")
+}
+
+pub fn mutation_log_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/mutation_log/")
+}
+
+pub fn mutation_log_entry(cell_id: &str, log_epoch: GraphEpoch, batch_id: &str) -> String {
+    format!("{}{log_epoch:020}/{batch_id}", mutation_log_prefix(cell_id))
+}
+
+#[cfg(test)]
+pub fn delta_plus(
+    cell_id: &str,
+    edge_type: &str,
+    epoch: GraphEpoch,
+    src: VertexId,
+    dst: VertexId,
+) -> String {
+    format!("cell/{cell_id}/delta/plus/{edge_type}/{epoch:020}/{src:020}/{dst:020}")
+}
+
+pub fn delta_plus_prefix(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/delta/plus/{edge_type}/")
+}
+
+pub fn delta_minus_prefix(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/delta/minus/{edge_type}/")
+}
+
+#[cfg(test)]
+pub fn delta_minus(
+    cell_id: &str,
+    edge_type: &str,
+    epoch: GraphEpoch,
+    src: VertexId,
+    dst: VertexId,
+) -> String {
+    format!("cell/{cell_id}/delta/minus/{edge_type}/{epoch:020}/{src:020}/{dst:020}")
+}
+
+pub fn owner_delta_prefix(
+    cell_id: &str,
+    kind: super::DeltaKind,
+    edge_type: &str,
+    direction: &str,
+    owner: VertexId,
+) -> String {
+    let kind = match kind {
+        super::DeltaKind::Plus => "plus",
+        super::DeltaKind::Minus => "minus",
+    };
+    format!("cell/{cell_id}/delta_owner/{kind}/{edge_type}/{direction}/{owner:020}/")
+}
+
+pub fn owner_delta_kind_prefix(cell_id: &str, edge_type: &str, kind: super::DeltaKind) -> String {
+    let kind = match kind {
+        super::DeltaKind::Plus => "plus",
+        super::DeltaKind::Minus => "minus",
+    };
+    format!("cell/{cell_id}/delta_owner/{kind}/{edge_type}/")
+}
+
+#[cfg(test)]
+pub fn owner_delta(
+    cell_id: &str,
+    kind: super::DeltaKind,
+    edge_type: &str,
+    direction: &str,
+    owner: VertexId,
+    epoch: GraphEpoch,
+    neighbor: VertexId,
+) -> String {
+    format!(
+        "{}{epoch:020}/{neighbor:020}",
+        owner_delta_prefix(cell_id, kind, edge_type, direction, owner)
+    )
+}
+
+pub fn delta_gc_watermark(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/meta/delta_gc/{edge_type}")
+}
