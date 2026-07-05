@@ -3721,15 +3721,15 @@ async fn control_plane_catalog_uses_generation_cas() {
     );
 
     let mut update = entries[0].clone();
-    update.graph_epoch = 10;
+    update.graph_epoch = Some(10);
     let published = control
         .compare_and_publish_shard_metadata(update.clone(), Some(1))
         .await
         .unwrap();
     assert_eq!(published.generation, 2);
-    assert_eq!(published.graph_epoch, 10);
+    assert_eq!(published.graph_epoch, Some(10));
 
-    update.graph_epoch = 11;
+    update.graph_epoch = Some(11);
     let err = control
         .compare_and_publish_shard_metadata(update, Some(1))
         .await
@@ -3814,7 +3814,10 @@ async fn control_plane_legacy_placement_creates_catalog_on_lease() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(catalog.graph_id, "default");
+    assert_eq!(catalog.graph_id, None);
+    assert_eq!(catalog.schema_epoch, None);
+    assert_eq!(catalog.graph_epoch, None);
+    assert!(!catalog.has_graph_metadata());
     assert_eq!(catalog.owner_node_id, "node-a");
     assert_eq!(catalog.lease_token, lease.lease_token);
     assert_eq!(catalog.generation, 1);
@@ -3832,6 +3835,30 @@ async fn control_plane_legacy_placement_creates_catalog_on_lease() {
     assert_eq!(catalog.owner_node_id, "node-b");
     assert_eq!(catalog.lease_token, lease.lease_token);
     assert_eq!(catalog.generation, 2);
+    assert_eq!(catalog.graph_id, None);
+    assert_eq!(catalog.schema_epoch, None);
+    assert_eq!(catalog.graph_epoch, None);
+
+    control
+        .publish_placement_with_catalog(
+            &ShardPlacement::fixed([("reddit-home", "node-b")]).unwrap(),
+            "reddit",
+            9,
+        )
+        .await
+        .unwrap();
+    let catalog = control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog.graph_id.as_deref(), Some("reddit"));
+    assert_eq!(catalog.schema_epoch, Some(9));
+    assert_eq!(catalog.graph_epoch, Some(0));
+    assert!(catalog.has_graph_metadata());
+    assert_eq!(catalog.owner_node_id, "node-b");
+    assert_eq!(catalog.lease_token, lease.lease_token);
+    assert_eq!(catalog.generation, 3);
     control.close().await.unwrap();
 }
 
