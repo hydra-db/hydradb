@@ -5002,6 +5002,343 @@ fn locality_cell_extractor_covers_phase0_keyspace() {
     );
 }
 
+#[tokio::test]
+async fn query_planner_selects_physical_operators() {
+    let context = QueryContext::new("reddit-home", "query-plan-read");
+    let count_plan = QueryPlanner::plan(
+        &context,
+        &QueryStatement::MatchOut {
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            return_count: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        count_plan.physical,
+        PhysicalQueryPlan::OutDegreeCounter {
+            edge_type: "FOLLOWS".to_string(),
+            src: 1
+        }
+    );
+    assert!(!count_plan.is_write());
+
+    let write_plan = QueryPlanner::plan(
+        &QueryContext::new("reddit-home", "query-plan-write"),
+        &QueryStatement::CreateEdge {
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        write_plan.physical,
+        PhysicalQueryPlan::WriteEdge {
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2
+        }
+    );
+    assert!(write_plan.is_write());
+
+    assert!(matches!(
+        QueryPlanner::plan(
+            &QueryContext::new("reddit-home", "query-plan-write-snapshot").at_epoch(1),
+            &QueryStatement::CreateEdge {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+            },
+        ),
+        Err(GraphError::UnsupportedQuery { .. })
+    ));
+}
+
+#[tokio::test]
+async fn query_plan_snapshot_reads_pin_epoch() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/query-plan-snapshot", object_store).await;
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "query-snapshot-1".to_string(),
+        })
+        .await
+        .unwrap();
+    let read_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    let plan = shard
+        .plan_query_statement(
+            QueryContext::new("reddit-home", "query-snapshot-read").at_epoch(read_epoch),
+            QueryStatement::MatchOut {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                return_count: false,
+            },
+        )
+        .unwrap();
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 3,
+            idempotency_key: "query-snapshot-2".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        shard.execute_query_plan(plan).await.unwrap(),
+        QueryOutput::Vertices(vec![2])
+    );
+    assert_eq!(
+        shard
+            .execute_query_statement(
+                QueryContext::new("reddit-home", "query-snapshot-count").at_epoch(read_epoch),
+                QueryStatement::MatchOut {
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 1,
+                    return_count: true,
+                },
+            )
+            .await
+            .unwrap(),
+        QueryOutput::Count(1)
+    );
+    assert_eq!(
+        shard
+            .execute_query_statement(
+                QueryContext::new("reddit-home", "query-snapshot-exists").at_epoch(read_epoch),
+                QueryStatement::MatchEdge {
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 1,
+                    dst: 3,
+                    return_count: false,
+                },
+            )
+            .await
+            .unwrap(),
+        QueryOutput::Bool(false)
+    );
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn query_plan_rejects_future_snapshot_epoch() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/query-plan-future-snapshot", object_store).await;
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "query-future-seed".to_string(),
+        })
+        .await
+        .unwrap();
+    let current_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    let err = shard
+        .execute_query_statement(
+            QueryContext::new("reddit-home", "query-future-read").at_epoch(current_epoch + 1),
+            QueryStatement::MatchOut {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                return_count: true,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::SnapshotAhead {
+            ref cell_id,
+            read_epoch,
+            current_epoch: observed_current,
+        } if cell_id == "reddit-home"
+            && read_epoch == current_epoch + 1
+            && observed_current == current_epoch
+    ));
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn execute_query_plan_revalidates_public_plans() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/query-plan-public-validation", object_store).await;
+
+    let write_with_snapshot = QueryPlan {
+        cell_id: "reddit-home".to_string(),
+        idempotency_key: "query-public-write".to_string(),
+        read_epoch: Some(0),
+        logical: LogicalQueryPlan::CreateEdge {
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+        },
+        physical: PhysicalQueryPlan::WriteEdge {
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+        },
+    };
+    assert!(matches!(
+        shard.execute_query_plan(write_with_snapshot).await,
+        Err(GraphError::UnsupportedQuery { .. })
+    ));
+
+    let mismatched_plan = QueryPlan {
+        cell_id: "reddit-home".to_string(),
+        idempotency_key: "query-public-mismatch".to_string(),
+        read_epoch: None,
+        logical: LogicalQueryPlan::MatchOut {
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            return_count: true,
+        },
+        physical: PhysicalQueryPlan::OutNeighbors {
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+        },
+    };
+    assert!(matches!(
+        shard.execute_query_plan(mismatched_plan).await,
+        Err(GraphError::UnsupportedQuery { .. })
+    ));
+
+    let invalid_edge_type_plan = QueryPlan {
+        cell_id: "reddit-home".to_string(),
+        idempotency_key: "query-public-invalid-edge-type".to_string(),
+        read_epoch: None,
+        logical: LogicalQueryPlan::MatchOut {
+            edge_type: "BAD/TYPE".to_string(),
+            src: 1,
+            return_count: false,
+        },
+        physical: PhysicalQueryPlan::OutNeighbors {
+            edge_type: "BAD/TYPE".to_string(),
+            src: 1,
+        },
+    };
+    assert!(matches!(
+        shard.execute_query_plan(invalid_edge_type_plan).await,
+        Err(GraphError::InvalidKeyComponent {
+            component: "edge_type",
+            ..
+        })
+    ));
+
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn routed_cluster_executes_read_plans_without_write_lease_and_rejects_writes() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/query-routed", Arc::clone(&object_store))
+        .await
+        .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let mut cluster = RoutedPhase0Cluster::open_owned_with_control(
+        "phase2-query-routed",
+        "node-a",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    cluster
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "query-routed-seed".to_string(),
+        })
+        .await
+        .unwrap();
+
+    cluster
+        .renew_leases(&control, std::time::Duration::from_millis(25))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        cluster
+            .execute_query_statement(
+                QueryContext::new("reddit-home", "query-routed-read"),
+                QueryStatement::MatchOut {
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 1,
+                    return_count: false,
+                },
+            )
+            .await
+            .unwrap(),
+        QueryOutput::Vertices(vec![2])
+    );
+
+    let err = cluster
+        .execute_query_statement(
+            QueryContext::new("reddit-home", "query-routed-write"),
+            QueryStatement::CreateEdge {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 3,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::StaleShardLease {
+            ref cell_id,
+            ref node_id,
+            ..
+        } if cell_id == "reddit-home" && node_id == "node-a"
+    ));
+    cluster.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_explain_uses_phase2_query_planner() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-explain-plan", object_store).await;
+    let plan = shard
+        .explain_cypher(
+            QueryContext::new("reddit-home", "cypher-explain").at_epoch(7),
+            "MATCH (u {id: 10})-[:FOLLOWS]->(v) RETURN count(*)",
+        )
+        .unwrap();
+    assert_eq!(plan.read_epoch, Some(7));
+    assert_eq!(
+        plan.logical,
+        LogicalQueryPlan::MatchOut {
+            edge_type: "FOLLOWS".to_string(),
+            src: 10,
+            return_count: true,
+        }
+    );
+    assert_eq!(
+        plan.physical,
+        PhysicalQueryPlan::OutDegreeCounter {
+            edge_type: "FOLLOWS".to_string(),
+            src: 10,
+        }
+    );
+    assert!(!plan.is_write());
+    shard.close().await.unwrap();
+}
+
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn cypher_create_and_match_use_storage_kernel() {
