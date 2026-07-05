@@ -171,6 +171,28 @@ impl GraphShard {
                     .await?;
                 Ok(QueryOutput::Write(result))
             }
+            PhysicalQueryPlan::WriteEdgeWithMetadata {
+                edge_type,
+                src,
+                dst,
+                src_metadata,
+                dst_metadata,
+            } => {
+                let result = self
+                    .write_edge_with_vertex_metadata(
+                        EdgeMutation {
+                            cell_id: plan.cell_id,
+                            edge_type,
+                            src,
+                            dst,
+                            idempotency_key: plan.idempotency_key,
+                        },
+                        src_metadata,
+                        dst_metadata,
+                    )
+                    .await?;
+                Ok(QueryOutput::Write(result))
+            }
             PhysicalQueryPlan::OutDegreeCounter { edge_type, src } => {
                 let count = if let Some(read_epoch) = plan.read_epoch {
                     self.out_degree_at(&plan.cell_id, &edge_type, src, read_epoch)

@@ -79,23 +79,7 @@ impl GraphShard {
         }
         let epoch = next_epoch_txn(&txn, cell_id).await?;
         txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(epoch))?;
-        txn.put(
-            keys::vertex_delta(cell_id, vertex_id, epoch).as_bytes(),
-            encode_vertex_metadata(&metadata).as_slice(),
-        )?;
-        delete_vertex_metadata_indexes_txn(&txn, cell_id, vertex_id, &previous)?;
-        if metadata.labels.is_empty() && metadata.properties.is_empty() {
-            txn.delete(vertex_key.as_bytes())?;
-        } else {
-            txn.put(
-                vertex_key.as_bytes(),
-                encode_vertex_metadata(&metadata).as_slice(),
-            )?;
-            put_vertex_metadata_indexes_txn(&txn, cell_id, vertex_id, &metadata)?;
-        }
-        put_vertex_metadata_index_deltas_txn(
-            &txn, cell_id, vertex_id, &previous, &metadata, epoch,
-        )?;
+        apply_vertex_metadata_update_txn(&txn, cell_id, vertex_id, &previous, &metadata, epoch)?;
         commit_txn_strict(txn, self.await_durable_writes).await
     }
 
@@ -144,8 +128,88 @@ impl GraphShard {
     }
 
     async fn write_edge_txn_locked(&self, mutation: &EdgeMutation) -> Result<CommitResult> {
+        self.write_edge_txn_locked_with_metadata(mutation, &[], "write_edge")
+            .await
+    }
+
+    pub async fn write_edge_with_vertex_metadata(
+        &self,
+        mutation: EdgeMutation,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+    ) -> Result<CommitResult> {
+        validate_component("cell_id", &mutation.cell_id)?;
+        validate_component("edge_type", &mutation.edge_type)?;
+        validate_component("idempotency_key", &mutation.idempotency_key)?;
+        validate_vertex_metadata(&src_metadata)?;
+        validate_vertex_metadata(&dst_metadata)?;
+        self.ensure_write_authority(&mutation.cell_id, "write_edge_with_vertex_metadata")?;
+
+        let metadata_updates = coalesce_vertex_metadata_updates([
+            (mutation.src, src_metadata),
+            (mutation.dst, dst_metadata),
+        ])?;
+        let _permit = self
+            .acquire_graph_write_permit("write_edge_with_vertex_metadata")
+            .await?;
+        let _writer = self.writer_lane(&mutation.cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .write_edge_with_vertex_metadata_txn(&mutation, &metadata_updates)
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(result) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(result);
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    async fn write_edge_with_vertex_metadata_txn(
+        &self,
+        mutation: &EdgeMutation,
+        metadata_updates: &[(VertexId, VertexMetadata)],
+    ) -> Result<CommitResult> {
+        let lock = self
+            .acquire_cell_write_lock(&mutation.cell_id, "write_edge_with_vertex_metadata")
+            .await?;
+        let result = self
+            .write_edge_txn_locked_with_metadata(
+                mutation,
+                metadata_updates,
+                "write_edge_with_vertex_metadata",
+            )
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn write_edge_txn_locked_with_metadata(
+        &self,
+        mutation: &EdgeMutation,
+        metadata_updates: &[(VertexId, VertexMetadata)],
+        operation: &'static str,
+    ) -> Result<CommitResult> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
-        self.validate_write_fence_txn(&txn, &mutation.cell_id, "write_edge")
+        self.validate_write_fence_txn(&txn, &mutation.cell_id, operation)
             .await?;
         let idem_key = keys::idempotency(&mutation.cell_id, "create", &mutation.idempotency_key);
 
@@ -154,7 +218,7 @@ impl GraphShard {
         }
 
         let current_epoch = read_counter_txn(&txn, &keys::last_epoch(&mutation.cell_id)).await?;
-        if let Some(existing_epoch) = edge_epoch_at_txn(
+        let existing_edge_epoch = edge_epoch_at_txn(
             &txn,
             &mutation.cell_id,
             &mutation.edge_type,
@@ -162,18 +226,34 @@ impl GraphShard {
             mutation.dst,
             current_epoch,
         )
-        .await?
-        {
-            let result = CommitResult {
-                epoch: existing_epoch,
-                already_existed: true,
+        .await?;
+
+        let mut changed_metadata = Vec::new();
+        for (vertex_id, requested) in metadata_updates {
+            let vertex_key = keys::vertex(&mutation.cell_id, *vertex_id);
+            let previous = match read_txn_remote(&txn, &vertex_key).await? {
+                Some(value) => decode_vertex_metadata(&vertex_key, &value)?,
+                None => VertexMetadata::default(),
             };
-            txn.put(
-                idem_key.as_bytes(),
-                encode_commit_idempotency(mutation, &result),
-            )?;
-            commit_txn_strict(txn, self.await_durable_writes).await?;
-            return Ok(result);
+            let next = merge_vertex_metadata(&previous, requested);
+            if previous != next {
+                changed_metadata.push((*vertex_id, previous, next));
+            }
+        }
+
+        if let Some(existing_epoch) = existing_edge_epoch {
+            if changed_metadata.is_empty() {
+                let result = CommitResult {
+                    epoch: existing_epoch,
+                    already_existed: true,
+                };
+                txn.put(
+                    idem_key.as_bytes(),
+                    encode_commit_idempotency(mutation, &result),
+                )?;
+                commit_txn_strict(txn, self.await_durable_writes).await?;
+                return Ok(result);
+            }
         }
 
         let epoch = current_epoch
@@ -182,16 +262,39 @@ impl GraphShard {
                 key: keys::last_epoch(&mutation.cell_id),
                 reason: "epoch overflow".to_string(),
             })?;
+        let result = CommitResult {
+            epoch,
+            already_existed: existing_edge_epoch.is_some(),
+        };
+        txn.put(
+            keys::last_epoch(&mutation.cell_id).as_bytes(),
+            encode_u64(epoch),
+        )?;
+        for (vertex_id, previous, next) in &changed_metadata {
+            apply_vertex_metadata_update_txn(
+                &txn,
+                &mutation.cell_id,
+                *vertex_id,
+                previous,
+                next,
+                epoch,
+            )?;
+        }
+        if existing_edge_epoch.is_some() {
+            txn.put(
+                idem_key.as_bytes(),
+                encode_commit_idempotency(mutation, &result),
+            )?;
+            commit_txn_strict(txn, self.await_durable_writes).await?;
+            return Ok(result);
+        }
+
         let record = EdgeRecord {
             cell_id: mutation.cell_id.clone(),
             edge_type: mutation.edge_type.clone(),
             src: mutation.src,
             dst: mutation.dst,
             epoch,
-        };
-        let result = CommitResult {
-            epoch,
-            already_existed: false,
         };
         let edge_value = encode_edge_record(&record);
         let delta_value = encode_delta_record(&DeltaRecord {
@@ -209,10 +312,6 @@ impl GraphShard {
             None
         };
 
-        txn.put(
-            keys::last_epoch(&mutation.cell_id).as_bytes(),
-            encode_u64(epoch),
-        )?;
         txn.put(
             keys::out_edge(
                 &mutation.cell_id,
@@ -1895,6 +1994,72 @@ fn validate_vertex_metadata(metadata: &VertexMetadata) -> Result<()> {
         validate_component("property", property)?;
     }
     Ok(())
+}
+
+fn coalesce_vertex_metadata_updates(
+    updates: impl IntoIterator<Item = (VertexId, VertexMetadata)>,
+) -> Result<Vec<(VertexId, VertexMetadata)>> {
+    let mut by_vertex = BTreeMap::<VertexId, VertexMetadata>::new();
+    for (vertex_id, metadata) in updates {
+        validate_vertex_metadata(&metadata)?;
+        let entry = by_vertex.entry(vertex_id).or_default();
+        entry.labels.extend(metadata.labels);
+        for (property, value) in metadata.properties {
+            match entry.properties.get(&property) {
+                Some(existing) if existing != &value => {
+                    return Err(GraphError::UnsupportedQuery {
+                        dialect: "GraphQuery",
+                        feature: format!(
+                            "conflicting metadata values for vertex {vertex_id} property {property}"
+                        ),
+                    });
+                }
+                _ => {
+                    entry.properties.insert(property, value);
+                }
+            }
+        }
+    }
+    Ok(by_vertex.into_iter().collect())
+}
+
+fn merge_vertex_metadata(previous: &VertexMetadata, requested: &VertexMetadata) -> VertexMetadata {
+    let mut next = previous.clone();
+    next.labels.extend(requested.labels.iter().cloned());
+    next.properties.extend(
+        requested
+            .properties
+            .iter()
+            .map(|(property, value)| (property.clone(), value.clone())),
+    );
+    next
+}
+
+fn apply_vertex_metadata_update_txn(
+    txn: &DbTransaction,
+    cell_id: &str,
+    vertex_id: VertexId,
+    previous: &VertexMetadata,
+    next: &VertexMetadata,
+    epoch: GraphEpoch,
+) -> Result<()> {
+    validate_vertex_metadata(next)?;
+    let vertex_key = keys::vertex(cell_id, vertex_id);
+    txn.put(
+        keys::vertex_delta(cell_id, vertex_id, epoch).as_bytes(),
+        encode_vertex_metadata(next).as_slice(),
+    )?;
+    delete_vertex_metadata_indexes_txn(txn, cell_id, vertex_id, previous)?;
+    if next.labels.is_empty() && next.properties.is_empty() {
+        txn.delete(vertex_key.as_bytes())?;
+    } else {
+        txn.put(
+            vertex_key.as_bytes(),
+            encode_vertex_metadata(next).as_slice(),
+        )?;
+        put_vertex_metadata_indexes_txn(txn, cell_id, vertex_id, next)?;
+    }
+    put_vertex_metadata_index_deltas_txn(txn, cell_id, vertex_id, previous, next, epoch)
 }
 
 fn put_vertex_metadata_indexes_txn(
