@@ -5,6 +5,7 @@ pub struct QueryContext {
     pub cell_id: String,
     pub idempotency_key: String,
     pub read_epoch: Option<GraphEpoch>,
+    pub result_window: QueryWindow,
 }
 
 impl QueryContext {
@@ -13,12 +14,30 @@ impl QueryContext {
             cell_id: cell_id.into(),
             idempotency_key: idempotency_key.into(),
             read_epoch: None,
+            result_window: QueryWindow::default(),
         }
     }
 
     pub fn at_epoch(mut self, read_epoch: GraphEpoch) -> Self {
         self.read_epoch = Some(read_epoch);
         self
+    }
+
+    pub fn with_result_window(mut self, skip: u64, limit: Option<usize>) -> Self {
+        self.result_window = QueryWindow { skip, limit };
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QueryWindow {
+    pub skip: u64,
+    pub limit: Option<usize>,
+}
+
+impl QueryWindow {
+    pub fn is_default(self) -> bool {
+        self.skip == 0 && self.limit.is_none()
     }
 }
 
@@ -74,6 +93,7 @@ pub struct QueryPlan {
     pub cell_id: String,
     pub idempotency_key: String,
     pub read_epoch: Option<GraphEpoch>,
+    pub result_window: QueryWindow,
     pub logical: LogicalQueryPlan,
     pub physical: PhysicalQueryPlan,
 }
@@ -155,6 +175,18 @@ impl QueryPlan {
         matches!(self.physical, PhysicalQueryPlan::WriteEdge { .. })
     }
 
+    pub fn returns_vertices(&self) -> bool {
+        matches!(
+            self.physical,
+            PhysicalQueryPlan::OutNeighbors { .. }
+                | PhysicalQueryPlan::EdgeExistsToVertices { .. }
+                | PhysicalQueryPlan::ReachableVertices {
+                    return_count: false,
+                    ..
+                }
+        )
+    }
+
     pub fn validate_for_execution(&self) -> Result<()> {
         validate_component("cell_id", &self.cell_id)?;
         validate_logical_plan(&self.logical)?;
@@ -176,6 +208,13 @@ impl QueryPlan {
                 });
             }
         }
+        if !self.result_window.is_default() && !self.returns_vertices() {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "GraphQuery",
+                feature: "result windows are only valid for vertex-returning read queries"
+                    .to_string(),
+            });
+        }
         Ok(())
     }
 }
@@ -194,6 +233,7 @@ impl QueryPlanner {
             cell_id: context.cell_id.clone(),
             idempotency_key: context.idempotency_key.clone(),
             read_epoch: context.read_epoch,
+            result_window: context.result_window,
             logical,
             physical,
         };

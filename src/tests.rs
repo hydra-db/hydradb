@@ -5053,6 +5053,19 @@ async fn query_planner_selects_physical_operators() {
         ),
         Err(GraphError::UnsupportedQuery { .. })
     ));
+
+    assert!(matches!(
+        QueryPlanner::plan(
+            &QueryContext::new("reddit-home", "query-plan-count-window")
+                .with_result_window(0, Some(1)),
+            &QueryStatement::MatchOut {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                return_count: true,
+            },
+        ),
+        Err(GraphError::UnsupportedQuery { .. })
+    ));
 }
 
 #[tokio::test]
@@ -5175,6 +5188,7 @@ async fn execute_query_plan_revalidates_public_plans() {
         cell_id: "reddit-home".to_string(),
         idempotency_key: "query-public-write".to_string(),
         read_epoch: Some(0),
+        result_window: QueryWindow::default(),
         logical: LogicalQueryPlan::CreateEdge {
             edge_type: "FOLLOWS".to_string(),
             src: 1,
@@ -5195,6 +5209,7 @@ async fn execute_query_plan_revalidates_public_plans() {
         cell_id: "reddit-home".to_string(),
         idempotency_key: "query-public-mismatch".to_string(),
         read_epoch: None,
+        result_window: QueryWindow::default(),
         logical: LogicalQueryPlan::MatchOut {
             edge_type: "FOLLOWS".to_string(),
             src: 1,
@@ -5214,6 +5229,7 @@ async fn execute_query_plan_revalidates_public_plans() {
         cell_id: "reddit-home".to_string(),
         idempotency_key: "query-public-invalid-edge-type".to_string(),
         read_epoch: None,
+        result_window: QueryWindow::default(),
         logical: LogicalQueryPlan::MatchOut {
             edge_type: "BAD/TYPE".to_string(),
             src: 1,
@@ -5232,6 +5248,81 @@ async fn execute_query_plan_revalidates_public_plans() {
         })
     ));
 
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn query_windows_bound_neighbor_results() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_limits(
+        "graph/query-window",
+        object_store,
+        GraphLimits {
+            max_query_result_vertices: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for (idx, dst) in [10, 11, 12].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst,
+                idempotency_key: format!("query-window-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let bounded = shard
+        .execute_query_statement(
+            QueryContext::new("reddit-home", "query-window-read").with_result_window(1, Some(1)),
+            QueryStatement::MatchOut {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                return_count: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(bounded, QueryOutput::Vertices(vec![11]));
+
+    let zero_limit = shard
+        .execute_query_statement(
+            QueryContext::new("reddit-home", "query-window-zero").with_result_window(0, Some(0)),
+            QueryStatement::MatchOut {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                return_count: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(zero_limit, QueryOutput::Vertices(Vec::new()));
+
+    let too_many = shard
+        .execute_query_statement(
+            QueryContext::new("reddit-home", "query-window-unbounded"),
+            QueryStatement::MatchOut {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                return_count: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        too_many,
+        GraphError::AdmissionRejected {
+            operation: "query_result_vertices",
+            actual: 3,
+            limit: 2,
+        }
+    ));
     shard.close().await.unwrap();
 }
 
@@ -5377,6 +5468,58 @@ async fn cypher_create_and_match_use_storage_kernel() {
         .await
         .unwrap();
     assert_eq!(count, QueryOutput::Count(1));
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_limit_skip_uses_query_window() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-limit-skip", object_store).await;
+
+    for (idx, dst) in [10, 11, 12, 13].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst,
+                idempotency_key: format!("cypher-limit-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let plan = shard
+        .explain_cypher(
+            QueryContext::new("reddit-home", "cypher-window-plan"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 1 LIMIT 2",
+        )
+        .unwrap();
+    assert_eq!(
+        plan.result_window,
+        QueryWindow {
+            skip: 1,
+            limit: Some(2),
+        }
+    );
+
+    let windowed = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-window-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 1 LIMIT 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(windowed, QueryOutput::Vertices(vec![11, 12]));
+
+    let count_window = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-window-count"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN count(*) LIMIT 1",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(count_window, GraphError::UnsupportedQuery { .. }));
 }
 
 #[cfg(feature = "opencypher")]
@@ -5933,6 +6076,22 @@ async fn supernode_groups_count_exists_intersect_and_page_without_full_scan() {
         .unwrap();
     assert_eq!(page.vertices, vec![10, 11]);
     assert!(page.has_next);
+    assert_eq!(
+        shard
+            .execute_query_statement(
+                QueryContext::new("reddit-home", "supernode-query-window-base")
+                    .at_epoch(base_epoch)
+                    .with_result_window(2, Some(2)),
+                QueryStatement::MatchOut {
+                    edge_type: "USER_FOLLOWS_USER".to_string(),
+                    src: 100,
+                    return_count: false,
+                },
+            )
+            .await
+            .unwrap(),
+        QueryOutput::Vertices(vec![12, 13])
+    );
 
     shard
         .write_edge(EdgeMutation {
@@ -5999,6 +6158,22 @@ async fn supernode_groups_count_exists_intersect_and_page_without_full_scan() {
         .unwrap();
     assert_eq!(current_page_0.vertices, vec![10, 12]);
     assert!(current_page_0.has_next);
+    assert_eq!(
+        shard
+            .execute_query_statement(
+                QueryContext::new("reddit-home", "supernode-query-window-overlay")
+                    .at_epoch(read_epoch)
+                    .with_result_window(1, Some(3)),
+                QueryStatement::MatchOut {
+                    edge_type: "USER_FOLLOWS_USER".to_string(),
+                    src: 100,
+                    return_count: false,
+                },
+            )
+            .await
+            .unwrap(),
+        QueryOutput::Vertices(vec![12, 13, 14])
+    );
 
     let current_page_2 = shard
         .supernode_page(
