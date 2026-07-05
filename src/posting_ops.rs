@@ -5,11 +5,14 @@
 //! merge operator's fast-add union (M1 D3, [`crate::merge`]) into the actual
 //! read/write operations a write path (M1 D5) drives:
 //!
-//! - [`add`] — size-adaptive fast add. Emits a `RecordOp::Merge` with a bare
-//!   singleton `RoaringTreemap` operand, on the base `EdgeOut`/`EdgeIn` key or,
-//!   if the list is already split, on the one `EdgePart` key whose `[min,max]`
-//!   covers the new neighbor. Matches [`crate::merge::GraphMergeOperator`]'s
-//!   operand contract exactly — see that module's rustdoc.
+//! - [`add`] — size-adaptive fast add. Emits a `RecordOp::Merge` with a
+//!   singleton `PostingValue::single` operand (format+kind header, matching
+//!   the stored value's own wire format — see `crate::merge`'s module doc for
+//!   why a bare `RoaringTreemap` operand doesn't work here), on the base
+//!   `EdgeOut`/`EdgeIn` key or, if the list is already split, on the one
+//!   `EdgePart` key whose `[min,max]` covers the new neighbor. Matches
+//!   [`crate::merge::GraphMergeOperator`]'s operand contract exactly — see
+//!   that module's rustdoc.
 //! - [`maybe_split`] / [`maybe_split_with_threshold`] — explicit, periodic RMW
 //!   the writer calls after adds: reads the merge-resolved posting, and if its
 //!   `serialized_len()` has crossed the threshold, bin-splits it by median
@@ -133,11 +136,16 @@ fn find_target_part(parts: &[PartRef], uid: u64) -> &PartRef {
 ///
 /// Reads the base key's manifest to route (a `Single` posting's whole value,
 /// or a `Split` posting's small parts manifest — never a whole part's
-/// members), then returns a single `RecordOp::Merge` with a bare singleton
-/// `RoaringTreemap` operand on whichever key (`EdgeOut`/`EdgeIn` or the target
-/// `EdgePart`) the merge operator ([`crate::merge::GraphMergeOperator`])
-/// resolves. Does not write to storage — the caller folds this into its
-/// atomic write batch.
+/// members), then returns a single `RecordOp::Merge` with a singleton
+/// operand on whichever key (`EdgeOut`/`EdgeIn` or the target `EdgePart`) the
+/// merge operator ([`crate::merge::GraphMergeOperator`]) resolves. Does not
+/// write to storage — the caller folds this into its atomic write batch.
+///
+/// The operand is a full [`PostingValue::single`] encoding (format+kind
+/// header), **not** a bare `RoaringTreemap` — see `crate::merge`'s module doc
+/// ("Operand encoding") for why: SlateDB's real merge-resolution algorithm may
+/// re-feed a `merge_batch` call's own no-existing-value output back in as
+/// another operand, so the operand format and that output format must match.
 pub async fn add(
     storage: &GraphStorage,
     dir: Direction,
@@ -162,7 +170,7 @@ pub async fn add(
         }
     };
 
-    let operand = encode_roaring(&singleton(neighbor.get()));
+    let operand = PostingValue::single(singleton(neighbor.get())).serialize();
     Ok(vec![RecordOp::Merge(MergeRecordOp::new(Record::new(
         target_key, operand,
     )))])

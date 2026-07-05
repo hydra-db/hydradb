@@ -24,28 +24,50 @@
 //! | `Meta["count"/pred_id]`, corpus counters             | `i64` LE              | **sum** (degree / edge-count statistics)                   |
 //! | `Index`, `Count`, `Node`, `EdgeProp`, `Schema*`, `Xid`, `Log`, and non-associative `Meta` (e.g. `latest_seq`, `seq/*`) | — | **no merge** — last-write-wins via `put` only; single-writer RMW |
 //!
-//! ## Operand encoding: bare `RoaringTreemap`, not `PostingValue`
+//! ## Operand encoding: bare `RoaringTreemap` for `Meta` bitmaps, full
+//! `PostingValue` for the adjacency fast-add path
 //!
-//! RFC 0005 §"Add / delete mechanics" spells out the operand shape directly:
-//! `batch.merge(key, roaring_singleton(neighbor))`. Merge operands for the
-//! roaring rows above (both the adjacency fast-add path and the `Meta`
-//! deleted-bitmaps) are therefore **bare `roaring::RoaringTreemap` portable
-//! bytes** — no `format`/`kind` header. Two different reasons land on the same
-//! encoding for two different value shapes:
+//! RFC 0005 §"Add / delete mechanics" describes the operand as a bare
+//! `roaring_singleton(neighbor)`, but the *wire* encoding actually used for
+//! the adjacency fast-add path (`EdgeOut`/`EdgeIn`/`EdgePart`) is the full
+//! [`crate::posting::PostingValue`] format (format+kind header, per RFC 0005
+//! §"Posting value format") — **not** bare `RoaringTreemap` bytes, unlike the
+//! `Meta` deleted-bitmap rows. This asymmetry is required by (and was
+//! discovered via) SlateDB's real merge-resolution algorithm
+//! (`slatedb::merge_operator::MergeOperatorIterator`), which the M1 in-memory
+//! backend's own much simpler merge dispatch never exercises:
 //!
-//! - **`EdgeOut`/`EdgeIn`/`EdgePart`**: the *stored* value at these keys is a
-//!   full [`crate::posting::PostingValue`] (format+kind header, per RFC 0005
-//!   §"Posting value format") — but the *operand* is not, because an operand
-//!   is a transient write-path payload that is never read back on its own;
-//!   only the merge operator ever looks at it, immediately folds it into the
-//!   existing `PostingValue`'s inline set, and re-serializes the result as a
-//!   proper `PostingValue::single(..)`. Wrapping the operand in its own header
-//!   would just be dead bytes on every write.
-//! - **`Meta` deleted-bitmaps**: there is no `PostingValue` at all here — the
-//!   dispatch table's own "operand kind" column says "roaring `Treemap`", full
-//!   stop. These bitmaps never split (physical purge is vacuum, RFC 0012, not
-//!   a split/manifest lifecycle), so there is no header to carry a `kind` tag
-//!   for. Existing value and operand are both bare `RoaringTreemap` bytes.
+//! - **Real SlateDB batches operand resolution and may re-feed its own
+//!   intermediate output back in as another operand.** When resolving a run
+//!   of merge entries for one key, SlateDB folds operands in batches of up to
+//!   100 via `merge_batch(key, None, batch_of_raw_operands)`, collects each
+//!   batch's result into a `results` list, and then — **even for a single
+//!   batch** — makes one more `merge_batch(key, base_value, &results)` call to
+//!   combine those intermediate results with the real base value (`None` if
+//!   the key has no stored value yet). That means `merge_batch`'s own output
+//!   when `existing_value` is `None` must be usable **as an operand** in a
+//!   later call to the very same function — SlateDB's `MergeOperator` trait
+//!   has no separate "partial merge" vs "full merge" method to distinguish
+//!   the two cases, so the operand format and the "no-existing-value" output
+//!   format must be identical.
+//! - **The `Meta` deleted-bitmap union already satisfies this** — operand,
+//!   existing value, and output are all bare `RoaringTreemap` bytes, so
+//!   feeding a prior no-existing-value result back in as an operand decodes
+//!   fine.
+//! - **The adjacency fast-add path did not**, originally: operands were bare
+//!   `RoaringTreemap` bytes but `merge_batch`'s output (and the *stored*,
+//!   real-existing-value format) was a full `PostingValue::single(..)`. The
+//!   very first write to a fresh adjacency key hit exactly the
+//!   re-feed-as-operand case above, and `PostingValue`'s 2-byte
+//!   `format`/`kind` header got mis-decoded as `RoaringTreemap` cookie bytes —
+//!   a panic (`tests/slatedb_acceptance.rs`'s durable-gate test caught this;
+//!   `InMemoryStorage`'s dispatch never re-feeds an intermediate result as an
+//!   operand, so the M1-era in-memory-only test suite never saw it). The fix:
+//!   adjacency fast-add operands are now `PostingValue::single(singleton)`
+//!   bytes too (see [`crate::posting_ops::add`]), so decoding an operand and
+//!   decoding a stored/existing value are the *same* code path, and this
+//!   function's own no-existing-value output is trivially re-decodable as an
+//!   operand.
 //!
 //! `EdgePart` is included alongside `EdgeOut`/`EdgeIn`: RFC 0005 §"Add"
 //! states that once a list is split, "subsequent adds `merge` into the
@@ -54,10 +76,10 @@
 //! of the split (rewriting the manifest) and rollup are single-writer RMW
 //! (never merge) — see the M1 handoff gotcha this module's tests exercise.
 //!
-//! If an `EdgeOut`/`EdgeIn`/`EdgePart` key's *existing* value decodes as a
-//! `Split` manifest, that is itself a bug: a merge should never race a split
-//! rewrite (single-writer), so this operator fails closed on that case too
-//! rather than silently corrupting the manifest.
+//! If an `EdgeOut`/`EdgeIn`/`EdgePart` key's *existing* value (or an operand)
+//! decodes as a `Split` manifest, that is itself a bug: a merge should never
+//! race a split rewrite (single-writer), so this operator fails closed on
+//! that case too rather than silently corrupting the manifest.
 //!
 //! ## Fail-closed, expressed as a panic
 //!
@@ -167,33 +189,39 @@ fn merge_bare_roaring_union(existing_value: Option<Bytes>, operands: &[Bytes]) -
     encode_roaring(&set)
 }
 
-/// `EdgeOut`/`EdgeIn`/`EdgePart` fast-add merge: the existing value (if any) is
-/// a full [`PostingValue`] whose inline `Single` set is unioned with each
-/// operand's bare `RoaringTreemap`; the result is re-wrapped as a `Single`
-/// `PostingValue`.
+/// `EdgeOut`/`EdgeIn`/`EdgePart` fast-add merge: the existing value (if any)
+/// and every operand are each a full [`PostingValue`] (`Single` kind only —
+/// see the module doc's "Operand encoding" section for why operands can't be
+/// bare `RoaringTreemap` bytes here, unlike the `Meta` deleted-bitmap union).
+/// Every inline set is unioned together; the result is re-wrapped as a
+/// `Single` `PostingValue`, so this function's own no-existing-value output
+/// is itself a valid operand for a later call — required by SlateDB's real
+/// merge-resolution algorithm, which may re-feed such an output back in.
 fn merge_posting_union(
     record_type: RecordType,
     existing_value: Option<Bytes>,
     operands: &[Bytes],
 ) -> Bytes {
-    let mut set = match existing_value {
-        Some(bytes) => {
-            let posting = PostingValue::deserialize(&bytes).unwrap_or_else(|e| {
-                panic!("GraphMergeOperator: corrupt {record_type:?} posting value: {e}")
-            });
-            match posting.kind {
-                PostingKind::Single(set) => set,
-                PostingKind::Split(_) => panic!(
-                    "GraphMergeOperator: merge operand arrived for a Split {record_type:?} \
-                     posting list — split/rollup are single-writer RMW, never merge \
-                     (RFC 0005 §Splitting supernodes); this is a bug in the write path"
-                ),
-            }
+    let decode_single = |bytes: &[u8], context: &str| -> RoaringTreemap {
+        let posting = PostingValue::deserialize(bytes).unwrap_or_else(|e| {
+            panic!("GraphMergeOperator: corrupt {record_type:?} {context}: {e}")
+        });
+        match posting.kind {
+            PostingKind::Single(set) => set,
+            PostingKind::Split(_) => panic!(
+                "GraphMergeOperator: {context} for a Split {record_type:?} posting list — \
+                 split/rollup are single-writer RMW, never merge (RFC 0005 §Splitting \
+                 supernodes); this is a bug in the write path"
+            ),
         }
+    };
+
+    let mut set = match existing_value {
+        Some(bytes) => decode_single(&bytes, "posting value"),
         None => RoaringTreemap::new(),
     };
     for operand in operands {
-        set |= decode_roaring(operand, "posting fast-add operand");
+        set |= decode_single(operand, "posting fast-add operand");
     }
     PostingValue::single(set).serialize()
 }
@@ -233,6 +261,16 @@ mod tests {
     fn roaring_of(vals: &[u64]) -> Bytes {
         let set: RoaringTreemap = vals.iter().copied().collect();
         encode_roaring(&set)
+    }
+
+    /// A fast-add operand for the `EdgeOut`/`EdgeIn`/`EdgePart` path: a full
+    /// `PostingValue::single` encoding, matching what [`crate::posting_ops::add`]
+    /// actually emits (see the module doc's "Operand encoding" section) —
+    /// deliberately *not* `roaring_of`'s bare `RoaringTreemap` bytes, which is
+    /// only the right operand shape for the `Meta` deleted-bitmap union.
+    fn posting_op_of(vals: &[u64]) -> Bytes {
+        let set: RoaringTreemap = vals.iter().copied().collect();
+        PostingValue::single(set).serialize()
     }
 
     fn treemap_from(bytes: &Bytes) -> RoaringTreemap {
@@ -309,7 +347,7 @@ mod tests {
         let op = GraphMergeOperator;
         let key = edge_key(Direction::Out, Uid(1), PredId(2));
         let existing = Some(PostingValue::single([1u64, 2, 3].into_iter().collect()).serialize());
-        let operands = [roaring_of(&[4]), roaring_of(&[5, 6])];
+        let operands = [posting_op_of(&[4]), posting_op_of(&[5, 6])];
 
         let merged = op.merge_batch(&key, existing, &operands);
 
@@ -324,7 +362,7 @@ mod tests {
     fn should_union_edge_in_fast_add_operands_with_no_existing_value() {
         let op = GraphMergeOperator;
         let key = edge_key(Direction::In, Uid(9), PredId(3));
-        let operands = [roaring_of(&[1]), roaring_of(&[2])];
+        let operands = [posting_op_of(&[1]), posting_op_of(&[2])];
 
         let merged = op.merge_batch(&key, None, &operands);
 
@@ -341,7 +379,7 @@ mod tests {
         let key = edge_part_key(Direction::Out, Uid(1), PredId(2), Uid(1000));
         let existing =
             Some(PostingValue::single([1000u64, 1001].into_iter().collect()).serialize());
-        let operands = [roaring_of(&[1002])];
+        let operands = [posting_op_of(&[1002])];
 
         let merged = op.merge_batch(&key, existing, &operands);
 
@@ -358,7 +396,7 @@ mod tests {
         let op = GraphMergeOperator;
         let key = edge_key(Direction::Out, Uid(1), PredId(2));
         let existing = Some(PostingValue::split(vec![]).serialize());
-        let operands = [roaring_of(&[1])];
+        let operands = [posting_op_of(&[1])];
 
         op.merge_batch(&key, existing, &operands);
     }
