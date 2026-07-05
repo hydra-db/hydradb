@@ -12,6 +12,7 @@ pub struct QueryContext {
     pub read_epoch: Option<GraphEpoch>,
     pub result_window: QueryWindow,
     pub parameters: BTreeMap<String, VertexPropertyValue>,
+    pub max_runtime_ms: Option<u64>,
 }
 
 impl QueryContext {
@@ -22,6 +23,7 @@ impl QueryContext {
             read_epoch: None,
             result_window: QueryWindow::default(),
             parameters: BTreeMap::new(),
+            max_runtime_ms: None,
         }
     }
 
@@ -45,6 +47,11 @@ impl QueryContext {
         parameters: impl IntoIterator<Item = (String, VertexPropertyValue)>,
     ) -> Self {
         self.parameters.extend(parameters);
+        self
+    }
+
+    pub fn with_timeout_ms(mut self, max_runtime_ms: u64) -> Self {
+        self.max_runtime_ms = Some(max_runtime_ms);
         self
     }
 }
@@ -166,6 +173,7 @@ pub struct QueryPlan {
     pub idempotency_key: String,
     pub read_epoch: Option<GraphEpoch>,
     pub result_window: QueryWindow,
+    pub max_runtime_ms: Option<u64>,
     pub logical: LogicalQueryPlan,
     pub physical: PhysicalQueryPlan,
 }
@@ -323,6 +331,7 @@ impl QueryPlanner {
             idempotency_key: context.idempotency_key.clone(),
             read_epoch: context.read_epoch,
             result_window: context.result_window,
+            max_runtime_ms: context.max_runtime_ms,
             logical,
             physical,
         };
