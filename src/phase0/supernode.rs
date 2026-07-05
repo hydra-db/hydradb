@@ -943,6 +943,33 @@ impl GraphShard {
         }))
     }
 
+    pub async fn out_supernode_window(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        vertex_id: VertexId,
+        read_epoch: GraphEpoch,
+        window: crate::QueryWindow,
+        fetch_limit: usize,
+    ) -> Result<Option<Vec<VertexId>>> {
+        let Some(group) = self
+            .supernode_group(
+                cell_id,
+                edge_type,
+                ArtifactDirection::Out,
+                vertex_id,
+                read_epoch,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let overlay = self.supernode_delta_overlay(&group, read_epoch).await?;
+        self.merged_supernode_vertices(&group, &overlay, window.skip, fetch_limit)
+            .await
+            .map(Some)
+    }
+
     pub async fn supernode_edge_exists(
         &self,
         cell_id: &str,

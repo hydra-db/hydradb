@@ -22,11 +22,12 @@ mod sparse_kernel;
 
 pub use algebra::{
     LogicalQueryPlan, PhysicalQueryPlan, QueryContext, QueryOutput, QueryPlan, QueryPlanner,
-    QueryStatement,
+    QueryStatement, QueryWindow,
 };
 #[cfg(feature = "opencypher")]
 pub use opencypher::{
-    parse_cypher, parse_opencypher, CypherFrontend, DefaultCypherFrontend, LibCypherParserFrontend,
+    parse_cypher, parse_cypher_with_window, parse_opencypher, parse_opencypher_with_window,
+    CypherFrontend, DefaultCypherFrontend, LibCypherParserFrontend, ParsedQuery,
 };
 pub use phase0::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
@@ -214,6 +215,7 @@ pub struct GraphLimits {
     pub max_artifact_source_epochs: GraphEpoch,
     pub max_traversal_hops: u8,
     pub max_artifact_build_edges: u64,
+    pub max_query_result_vertices: usize,
 }
 
 impl Default for GraphLimits {
@@ -223,6 +225,7 @@ impl Default for GraphLimits {
             max_artifact_source_epochs: 10_000_000,
             max_traversal_hops: 16,
             max_artifact_build_edges: 10_000_000,
+            max_query_result_vertices: 100_000,
         }
     }
 }

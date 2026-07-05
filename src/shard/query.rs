@@ -12,8 +12,8 @@ impl GraphShard {
     ) -> Result<QueryOutput> {
         #[cfg(feature = "opencypher")]
         {
-            let statement = parse_opencypher(query)?;
-            self.execute_query_statement(context, statement).await
+            let plan = self.plan_opencypher(context, query)?;
+            self.execute_query_plan(plan).await
         }
         #[cfg(not(feature = "opencypher"))]
         {
@@ -44,8 +44,20 @@ impl GraphShard {
 
     #[cfg(feature = "opencypher")]
     pub fn plan_opencypher(&self, context: QueryContext, query: &str) -> Result<QueryPlan> {
-        let statement = parse_opencypher(query)?;
-        self.plan_query_statement(context, statement)
+        let parsed = parse_opencypher_with_window(query)?;
+        let context = if parsed.window.is_default() {
+            context
+        } else {
+            if !context.result_window.is_default() && context.result_window != parsed.window {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "query SKIP/LIMIT conflicts with QueryContext result window"
+                        .to_string(),
+                });
+            }
+            context.with_result_window(parsed.window.skip, parsed.window.limit)
+        };
+        self.plan_query_statement(context, parsed.statement)
     }
 
     #[cfg(feature = "opencypher")]
@@ -82,12 +94,19 @@ impl GraphShard {
                 Ok(QueryOutput::Count(count))
             }
             PhysicalQueryPlan::OutNeighbors { edge_type, src } => {
-                let vertices = if let Some(read_epoch) = plan.read_epoch {
-                    self.out_neighbors_at(&plan.cell_id, &edge_type, src, read_epoch)
-                        .await?
-                } else {
-                    self.out_neighbors(&plan.cell_id, &edge_type, src).await?
+                let read_epoch = match plan.read_epoch {
+                    Some(read_epoch) => read_epoch,
+                    None => self.current_epoch(&plan.cell_id).await?,
                 };
+                let vertices = self
+                    .out_neighbors_window_at(
+                        &plan.cell_id,
+                        &edge_type,
+                        src,
+                        read_epoch,
+                        plan.result_window,
+                    )
+                    .await?;
                 Ok(QueryOutput::Vertices(vertices))
             }
             PhysicalQueryPlan::EdgeExistsToCount {
@@ -109,7 +128,9 @@ impl GraphShard {
                     .query_edge_exists(&plan.cell_id, &edge_type, src, dst, plan.read_epoch)
                     .await?;
                 if exists {
-                    Ok(QueryOutput::Vertices(vec![dst]))
+                    Ok(QueryOutput::Vertices(
+                        self.apply_query_window(vec![dst], plan.result_window)?,
+                    ))
                 } else {
                     Ok(QueryOutput::Vertices(Vec::new()))
                 }
@@ -149,7 +170,9 @@ impl GraphShard {
                 if return_count {
                     Ok(QueryOutput::Count(vertices.len() as u64))
                 } else {
-                    Ok(QueryOutput::Vertices(vertices))
+                    Ok(QueryOutput::Vertices(
+                        self.apply_query_window(vertices, plan.result_window)?,
+                    ))
                 }
             }
         }
@@ -170,6 +193,67 @@ impl GraphShard {
             }
         }
         Ok(())
+    }
+
+    async fn out_neighbors_window_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        read_epoch: GraphEpoch,
+        window: QueryWindow,
+    ) -> Result<Vec<VertexId>> {
+        let fetch_limit = self.query_window_fetch_limit(window)?;
+        if let Some(vertices) = self
+            .out_supernode_window(cell_id, edge_type, src, read_epoch, window, fetch_limit)
+            .await?
+        {
+            return self.apply_query_window_fetch_result(vertices, window);
+        }
+
+        let vertices = self
+            .out_neighbors_at(cell_id, edge_type, src, read_epoch)
+            .await?;
+        self.apply_query_window(vertices, window)
+    }
+
+    fn query_window_fetch_limit(&self, window: QueryWindow) -> Result<usize> {
+        let max = self.limits.max_query_result_vertices;
+        if let Some(limit) = window.limit {
+            ensure_limit("query_result_limit", limit as u64, max as u64)?;
+            Ok(limit)
+        } else {
+            Ok(max.saturating_add(1))
+        }
+    }
+
+    fn apply_query_window(
+        &self,
+        vertices: Vec<VertexId>,
+        window: QueryWindow,
+    ) -> Result<Vec<VertexId>> {
+        let skip = usize::try_from(window.skip).map_err(|_| GraphError::AdmissionRejected {
+            operation: "query_result_skip",
+            actual: window.skip,
+            limit: usize::MAX as u64,
+        })?;
+        let windowed: Vec<_> = vertices.into_iter().skip(skip).collect();
+        self.apply_query_window_fetch_result(windowed, window)
+    }
+
+    fn apply_query_window_fetch_result(
+        &self,
+        mut vertices: Vec<VertexId>,
+        window: QueryWindow,
+    ) -> Result<Vec<VertexId>> {
+        let max = self.limits.max_query_result_vertices;
+        if let Some(limit) = window.limit {
+            ensure_limit("query_result_limit", limit as u64, max as u64)?;
+            vertices.truncate(limit);
+        } else {
+            ensure_limit("query_result_vertices", vertices.len() as u64, max as u64)?;
+        }
+        Ok(vertices)
     }
 
     async fn query_edge_exists(
