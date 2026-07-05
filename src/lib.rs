@@ -2983,6 +2983,22 @@ impl GraphShard {
         mutations: &[EdgeMutation],
         fingerprint: u64,
     ) -> Result<EdgeMutationLogAppendResult> {
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "append_edge_mutation_log")
+            .await?;
+        let result = self
+            .append_edge_mutation_log_txn_locked(cell_id, batch_id, mutations, fingerprint)
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn append_edge_mutation_log_txn_locked(
+        &self,
+        cell_id: &str,
+        batch_id: &str,
+        mutations: &[EdgeMutation],
+        fingerprint: u64,
+    ) -> Result<EdgeMutationLogAppendResult> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
         self.validate_write_fence_txn(&txn, cell_id, "append_edge_mutation_log")
             .await?;
@@ -7296,6 +7312,29 @@ mod tests {
         unreachable!("transaction retry loop always returns on final attempt")
     }
 
+    async fn append_edge_mutation_log_txn_retry_for_test(
+        shard: Arc<GraphShard>,
+        cell_id: &str,
+        batch_id: &str,
+        mutations: Vec<EdgeMutation>,
+    ) -> Result<EdgeMutationLogAppendResult> {
+        let fingerprint = edge_mutation_log_fingerprint(cell_id, batch_id, &mutations);
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match shard
+                .append_edge_mutation_log_txn(cell_id, batch_id, &mutations, fingerprint)
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
     async fn write_edge_txn_retry_for_test(
         shard: Arc<GraphShard>,
         mutation: EdgeMutation,
@@ -9816,6 +9855,82 @@ mod tests {
             logs += 1;
         }
         assert_eq!(logs, 1);
+    }
+
+    #[tokio::test]
+    async fn mutation_log_appends_retry_without_log_epoch_overlap() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard =
+            Arc::new(open_test_shard("graph/mutation-log-transaction-race", object_store).await);
+        let cell_id = "reddit-home";
+
+        let left = {
+            let shard = Arc::clone(&shard);
+            tokio::spawn(async move {
+                append_edge_mutation_log_txn_retry_for_test(
+                    shard,
+                    cell_id,
+                    "log-race-a",
+                    vec![mutation(60, 70, "log-race-edge-a")],
+                )
+                .await
+            })
+        };
+        let right = {
+            let shard = Arc::clone(&shard);
+            tokio::spawn(async move {
+                append_edge_mutation_log_txn_retry_for_test(
+                    shard,
+                    cell_id,
+                    "log-race-b",
+                    vec![mutation(61, 71, "log-race-edge-b")],
+                )
+                .await
+            })
+        };
+
+        let mut results = vec![left.await.unwrap().unwrap(), right.await.unwrap().unwrap()];
+        results.sort_by_key(|result| result.log_epoch);
+        assert_eq!(
+            results,
+            vec![
+                EdgeMutationLogAppendResult {
+                    log_epoch: 1,
+                    mutations: 1,
+                    already_appended: false,
+                },
+                EdgeMutationLogAppendResult {
+                    log_epoch: 2,
+                    mutations: 1,
+                    already_appended: false,
+                },
+            ]
+        );
+        assert_eq!(
+            shard
+                .read_counter(&keys::mutation_log_epoch(cell_id))
+                .await
+                .unwrap(),
+            2
+        );
+
+        let materialized = shard
+            .materialize_edge_mutation_log(cell_id, 16)
+            .await
+            .unwrap();
+        assert_eq!(materialized.scanned_batches, 2);
+        assert_eq!(materialized.materialized_batches, 2);
+        assert_eq!(materialized.mutations, 2);
+        assert_eq!(materialized.materialized_log_epoch, 2);
+        assert_eq!(materialized.current_epoch, 2);
+        assert!(shard
+            .edge_exists(cell_id, "USER_SUBSCRIBED_TO_SUBREDDIT", 60, 70)
+            .await
+            .unwrap());
+        assert!(shard
+            .edge_exists(cell_id, "USER_SUBSCRIBED_TO_SUBREDDIT", 61, 71)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
