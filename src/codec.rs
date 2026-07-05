@@ -265,6 +265,169 @@ pub(crate) fn decode_u64(key: &str, value: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(bytes))
 }
 
+pub(crate) fn encode_vertex_metadata(metadata: &VertexMetadata) -> Vec<u8> {
+    let mut value = String::from("vertex-metadata-v1\n");
+    for label in &metadata.labels {
+        value.push_str("label\t");
+        value.push_str(label);
+        value.push('\n');
+    }
+    for (name, property) in &metadata.properties {
+        value.push_str("property\t");
+        value.push_str(name);
+        value.push('\t');
+        value.push_str(&encode_vertex_property_value_record(property));
+        value.push('\n');
+    }
+    value.into_bytes()
+}
+
+pub(crate) fn decode_vertex_metadata(key: &str, value: &[u8]) -> Result<VertexMetadata> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let mut lines = text.lines();
+    match lines.next() {
+        Some("vertex-metadata-v1") => {}
+        Some(other) => {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("unsupported vertex metadata version {other}"),
+            });
+        }
+        None => {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: "empty vertex metadata".to_string(),
+            });
+        }
+    }
+
+    let mut metadata = VertexMetadata::default();
+    for line in lines {
+        let parts: Vec<_> = line.split('\t').collect();
+        match parts.as_slice() {
+            ["label", label] => {
+                validate_component("label", label)?;
+                metadata.labels.insert((*label).to_string());
+            }
+            ["property", name, encoded] => {
+                validate_component("property", name)?;
+                metadata.properties.insert(
+                    (*name).to_string(),
+                    decode_vertex_property_value_record(key, encoded)?,
+                );
+            }
+            _ => {
+                return Err(GraphError::CorruptValue {
+                    key: key.to_string(),
+                    reason: format!("invalid vertex metadata line {line}"),
+                });
+            }
+        }
+    }
+    Ok(metadata)
+}
+
+pub(crate) fn encode_vertex_property_value_key(value: &VertexPropertyValue) -> String {
+    match value {
+        VertexPropertyValue::Integer(value) => format!("i{value:020}"),
+        VertexPropertyValue::Bool(false) => "b0".to_string(),
+        VertexPropertyValue::Bool(true) => "b1".to_string(),
+        VertexPropertyValue::String(value) => format!("s{}", hex_encode(value.as_bytes())),
+    }
+}
+
+fn encode_vertex_property_value_record(value: &VertexPropertyValue) -> String {
+    match value {
+        VertexPropertyValue::Integer(value) => format!("i:{value}"),
+        VertexPropertyValue::Bool(false) => "b:false".to_string(),
+        VertexPropertyValue::Bool(true) => "b:true".to_string(),
+        VertexPropertyValue::String(value) => format!("s:{}", hex_encode(value.as_bytes())),
+    }
+}
+
+fn decode_vertex_property_value_record(key: &str, value: &str) -> Result<VertexPropertyValue> {
+    let Some((kind, payload)) = value.split_once(':') else {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("invalid vertex property value {value}"),
+        });
+    };
+    match kind {
+        "i" => payload
+            .parse::<u64>()
+            .map(VertexPropertyValue::Integer)
+            .map_err(|err| GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("invalid integer vertex property {payload}: {err}"),
+            }),
+        "b" => match payload {
+            "true" => Ok(VertexPropertyValue::Bool(true)),
+            "false" => Ok(VertexPropertyValue::Bool(false)),
+            other => Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("invalid boolean vertex property {other}"),
+            }),
+        },
+        "s" => {
+            let bytes = hex_decode(key, payload)?;
+            String::from_utf8(bytes)
+                .map(VertexPropertyValue::String)
+                .map_err(|err| GraphError::CorruptValue {
+                    key: key.to_string(),
+                    reason: err.to_string(),
+                })
+        }
+        other => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("unsupported vertex property kind {other}"),
+        }),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(key: &str, text: &str) -> Result<Vec<u8>> {
+    if (text.len() & 1) != 0 {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "odd-length hex string".to_string(),
+        });
+    }
+    let mut bytes = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks_exact(2) {
+        let high = hex_value(pair[0]).ok_or_else(|| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("invalid hex digit {}", pair[0] as char),
+        })?;
+        let low = hex_value(pair[1]).ok_or_else(|| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("invalid hex digit {}", pair[1] as char),
+        })?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub(crate) fn encode_edge_record(record: &EdgeRecord) -> Vec<u8> {
     encode_edge_epoch(record.epoch)
 }

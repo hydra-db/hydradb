@@ -1,4 +1,6 @@
-use crate::{validate_component, CommitResult, GraphEpoch, GraphError, Result, VertexId};
+use crate::{
+    validate_component, CommitResult, GraphEpoch, GraphError, Result, VertexId, VertexPropertyValue,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryContext {
@@ -65,6 +67,7 @@ pub enum QueryValue {
     VertexId(VertexId),
     Count(u64),
     Bool(bool),
+    Property(VertexPropertyValue),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

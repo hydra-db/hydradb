@@ -298,6 +298,31 @@ impl GraphShard {
         }
 
         let mut rows = Vec::new();
+        let mut metadata_cache = BTreeMap::new();
+        let candidate_sources = self
+            .candidate_vertex_ids(cell_id, &pattern.src, read_epoch)
+            .await?;
+        if let Some(sources) = candidate_sources {
+            for src in sources {
+                for dst in self
+                    .out_neighbors_at(cell_id, &pattern.edge_type, src, read_epoch)
+                    .await?
+                {
+                    if matches!(pattern.dst.id, Some(fixed_dst) if fixed_dst != dst) {
+                        continue;
+                    }
+                    if let Some(mut row) = BindingRow::from_edge(pattern, src, dst) {
+                        self.hydrate_binding_metadata(cell_id, &mut row, &mut metadata_cache)
+                            .await?;
+                        if row_matches_pattern(&row, pattern)? {
+                            rows.push(row);
+                        }
+                    }
+                }
+            }
+            return Ok(rows);
+        }
+
         if let Some(src) = pattern.src.id {
             for dst in self
                 .out_neighbors_at(cell_id, &pattern.edge_type, src, read_epoch)
@@ -306,8 +331,12 @@ impl GraphShard {
                 if matches!(pattern.dst.id, Some(fixed_dst) if fixed_dst != dst) {
                     continue;
                 }
-                if let Some(row) = BindingRow::from_edge(pattern, src, dst) {
-                    rows.push(row);
+                if let Some(mut row) = BindingRow::from_edge(pattern, src, dst) {
+                    self.hydrate_binding_metadata(cell_id, &mut row, &mut metadata_cache)
+                        .await?;
+                    if row_matches_pattern(&row, pattern)? {
+                        rows.push(row);
+                    }
                 }
             }
             return Ok(rows);
@@ -320,8 +349,12 @@ impl GraphShard {
             if matches!(pattern.dst.id, Some(fixed_dst) if fixed_dst != edge.dst) {
                 continue;
             }
-            if let Some(row) = BindingRow::from_edge(pattern, edge.src, edge.dst) {
-                rows.push(row);
+            if let Some(mut row) = BindingRow::from_edge(pattern, edge.src, edge.dst) {
+                self.hydrate_binding_metadata(cell_id, &mut row, &mut metadata_cache)
+                    .await?;
+                if row_matches_pattern(&row, pattern)? {
+                    rows.push(row);
+                }
             }
         }
         Ok(rows)
@@ -354,15 +387,120 @@ impl GraphShard {
             .await?
             .0;
         let mut rows = Vec::with_capacity(vertices.len());
+        let mut metadata_cache = BTreeMap::new();
         for dst in vertices {
             if matches!(pattern.dst.id, Some(fixed_dst) if fixed_dst != dst) {
                 continue;
             }
-            if let Some(row) = BindingRow::from_edge(pattern, src, dst) {
-                rows.push(row);
+            if let Some(mut row) = BindingRow::from_edge(pattern, src, dst) {
+                self.hydrate_binding_metadata(cell_id, &mut row, &mut metadata_cache)
+                    .await?;
+                if row_matches_pattern(&row, pattern)? {
+                    rows.push(row);
+                }
             }
         }
         Ok(rows)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn candidate_vertex_ids(
+        &self,
+        cell_id: &str,
+        pattern: &RowNodePattern,
+        _read_epoch: GraphEpoch,
+    ) -> Result<Option<Vec<VertexId>>> {
+        if let Some(id) = pattern.id {
+            return Ok(Some(vec![id]));
+        }
+        if let Some((property, value)) = pattern
+            .properties
+            .iter()
+            .find(|(property, _)| property.as_str() != "id")
+        {
+            return Ok(Some(
+                self.scan_vertex_property_index(cell_id, property, value)
+                    .await?,
+            ));
+        }
+        if let Some(label) = pattern.labels.iter().next() {
+            return Ok(Some(self.scan_vertex_label_index(cell_id, label).await?));
+        }
+        Ok(None)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn vertex_metadata(&self, cell_id: &str, vertex_id: VertexId) -> Result<VertexMetadata> {
+        validate_component("cell_id", cell_id)?;
+        let key = keys::vertex(cell_id, vertex_id);
+        match self.read_remote(&key).await? {
+            Some(value) => decode_vertex_metadata(&key, &value),
+            None => Ok(VertexMetadata::default()),
+        }
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn scan_vertex_label_index(&self, cell_id: &str, label: &str) -> Result<Vec<VertexId>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("label", label)?;
+        let mut iter = self
+            .scan_remote_prefix(&keys::vertex_label_prefix(cell_id, label))
+            .await?;
+        let mut vertices = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            vertices.push(decode_u64(&key, &kv.value)?);
+        }
+        Ok(vertices)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn scan_vertex_property_index(
+        &self,
+        cell_id: &str,
+        property: &str,
+        value: &VertexPropertyValue,
+    ) -> Result<Vec<VertexId>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("property", property)?;
+        let encoded = encode_vertex_property_value_key(value);
+        let mut iter = self
+            .scan_remote_prefix(&keys::vertex_property_index_prefix(
+                cell_id, property, &encoded,
+            ))
+            .await?;
+        let mut vertices = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            vertices.push(decode_u64(&key, &kv.value)?);
+        }
+        Ok(vertices)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn hydrate_binding_metadata(
+        &self,
+        cell_id: &str,
+        row: &mut BindingRow,
+        cache: &mut BTreeMap<VertexId, VertexMetadata>,
+    ) -> Result<()> {
+        let bindings: Vec<_> = row
+            .values
+            .iter()
+            .map(|(name, id)| (name.clone(), *id))
+            .collect();
+        for (binding, vertex_id) in bindings {
+            let metadata = match cache.get(&vertex_id) {
+                Some(metadata) => metadata.clone(),
+                None => {
+                    let metadata = self.vertex_metadata(cell_id, vertex_id).await?;
+                    cache.insert(vertex_id, metadata.clone());
+                    metadata
+                }
+            };
+            row.metadata.insert(binding, metadata);
+        }
+        Ok(())
     }
 
     #[cfg(feature = "opencypher")]
@@ -1070,6 +1208,7 @@ fn merge_opencypher_window(context: QueryContext, window: QueryWindow) -> Result
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct BindingRow {
     values: BTreeMap<String, VertexId>,
+    metadata: BTreeMap<String, VertexMetadata>,
 }
 
 #[cfg(feature = "opencypher")]
@@ -1117,13 +1256,62 @@ struct ProjectedQueryRow {
 }
 
 #[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RowScalarValue {
+    Value(VertexPropertyValue),
+    Missing,
+}
+
+#[cfg(feature = "opencypher")]
+fn row_matches_pattern(row: &BindingRow, pattern: &RowPattern) -> Result<bool> {
+    Ok(row_matches_node(row, &pattern.src)? && row_matches_node(row, &pattern.dst)?)
+}
+
+#[cfg(feature = "opencypher")]
+fn row_matches_node(row: &BindingRow, node: &RowNodePattern) -> Result<bool> {
+    let Some(binding) = &node.binding else {
+        return Ok(true);
+    };
+    if matches!(node.id, Some(id) if row.get(binding)? != id) {
+        return Ok(false);
+    }
+    if !node_has_metadata_constraints(node) {
+        return Ok(true);
+    }
+    let Some(metadata) = row.metadata.get(binding) else {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: format!("metadata for bound variable {binding} was not hydrated"),
+        });
+    };
+    Ok(vertex_metadata_matches(metadata, node))
+}
+
+#[cfg(feature = "opencypher")]
+fn node_has_metadata_constraints(node: &RowNodePattern) -> bool {
+    !node.labels.is_empty() || node.properties.keys().any(|property| property != "id")
+}
+
+#[cfg(feature = "opencypher")]
+fn vertex_metadata_matches(metadata: &VertexMetadata, node: &RowNodePattern) -> bool {
+    node.labels
+        .iter()
+        .all(|label| metadata.labels.contains(label))
+        && node
+            .properties
+            .iter()
+            .filter(|(property, _)| property.as_str() != "id")
+            .all(|(property, value)| metadata.properties.get(property) == Some(value))
+}
+
+#[cfg(feature = "opencypher")]
 fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<bool> {
     Ok(match predicate {
         RowPredicate::Compare { left, op, right } => compare_row_values(
             eval_row_expression(row, left)?,
             *op,
             eval_row_expression(row, right)?,
-        ),
+        )?,
         RowPredicate::And(left, right) => {
             row_predicate_matches(row, left)? && row_predicate_matches(row, right)?
         }
@@ -1135,23 +1323,90 @@ fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<b
 }
 
 #[cfg(feature = "opencypher")]
-fn eval_row_expression(row: &BindingRow, expression: &RowExpression) -> Result<VertexId> {
+fn eval_row_expression(row: &BindingRow, expression: &RowExpression) -> Result<RowScalarValue> {
     match expression {
-        RowExpression::NodeId { binding } => row.get(binding),
-        RowExpression::Integer(value) => Ok(*value),
+        RowExpression::NodeId { binding } => Ok(RowScalarValue::Value(
+            VertexPropertyValue::Integer(row.get(binding)?),
+        )),
+        RowExpression::Property { binding, property } => {
+            Ok(match binding_property(row, binding, property)? {
+                Some(value) => RowScalarValue::Value(value),
+                None => RowScalarValue::Missing,
+            })
+        }
+        RowExpression::Literal(value) => Ok(RowScalarValue::Value(value.clone())),
     }
 }
 
 #[cfg(feature = "opencypher")]
-fn compare_row_values(left: VertexId, op: RowComparisonOp, right: VertexId) -> bool {
-    match op {
+fn compare_row_values(
+    left: RowScalarValue,
+    op: RowComparisonOp,
+    right: RowScalarValue,
+) -> Result<bool> {
+    let (RowScalarValue::Value(left), RowScalarValue::Value(right)) = (left, right) else {
+        return Ok(false);
+    };
+    compare_vertex_property_values(&left, op, &right)
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_vertex_property_values(
+    left: &VertexPropertyValue,
+    op: RowComparisonOp,
+    right: &VertexPropertyValue,
+) -> Result<bool> {
+    Ok(match op {
         RowComparisonOp::Eq => left == right,
         RowComparisonOp::Ne => left != right,
-        RowComparisonOp::Lt => left < right,
-        RowComparisonOp::Gt => left > right,
-        RowComparisonOp::Lte => left <= right,
-        RowComparisonOp::Gte => left >= right,
+        RowComparisonOp::Lt | RowComparisonOp::Gt | RowComparisonOp::Lte | RowComparisonOp::Gte => {
+            match (left, right) {
+                (VertexPropertyValue::Integer(left), VertexPropertyValue::Integer(right)) => {
+                    compare_ordering(left.cmp(right), op)
+                }
+                (VertexPropertyValue::String(left), VertexPropertyValue::String(right)) => {
+                    compare_ordering(left.cmp(right), op)
+                }
+                _ => {
+                    return Err(GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: "ordered comparisons require matching integer or string values"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+    })
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_ordering(ordering: std::cmp::Ordering, op: RowComparisonOp) -> bool {
+    match op {
+        RowComparisonOp::Eq => ordering == std::cmp::Ordering::Equal,
+        RowComparisonOp::Ne => ordering != std::cmp::Ordering::Equal,
+        RowComparisonOp::Lt => ordering == std::cmp::Ordering::Less,
+        RowComparisonOp::Gt => ordering == std::cmp::Ordering::Greater,
+        RowComparisonOp::Lte => ordering != std::cmp::Ordering::Greater,
+        RowComparisonOp::Gte => ordering != std::cmp::Ordering::Less,
     }
+}
+
+#[cfg(feature = "opencypher")]
+fn binding_property(
+    row: &BindingRow,
+    binding: &str,
+    property: &str,
+) -> Result<Option<VertexPropertyValue>> {
+    if property == "id" {
+        return Ok(Some(VertexPropertyValue::Integer(row.get(binding)?)));
+    }
+    let Some(metadata) = row.metadata.get(binding) else {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: format!("metadata for bound variable {binding} was not hydrated"),
+        });
+    };
+    Ok(metadata.properties.get(property).cloned())
 }
 
 #[cfg(feature = "opencypher")]
@@ -1161,6 +1416,15 @@ fn project_binding_row(row: &BindingRow, projections: &[RowProjection]) -> Resul
         match projection {
             RowProjection::NodeId { binding } => {
                 values.push(QueryValue::VertexId(row.get(binding)?));
+            }
+            RowProjection::Property { binding, property } => {
+                let value = binding_property(row, binding, property)?.ok_or_else(|| {
+                    GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: format!("property {binding}.{property} is missing"),
+                    }
+                })?;
+                values.push(QueryValue::Property(value));
             }
             RowProjection::CountAll => {
                 return Err(GraphError::UnsupportedQuery {
@@ -1185,6 +1449,15 @@ fn sort_keys_for_row(
         keys.push(match &sort.expression {
             RowSortExpression::NodeId { binding } => {
                 QueryValue::VertexId(binding_row.get(binding)?)
+            }
+            RowSortExpression::Property { binding, property } => {
+                let value = binding_property(binding_row, binding, property)?.ok_or_else(|| {
+                    GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: format!("ORDER BY property {binding}.{property} is missing"),
+                    }
+                })?;
+                QueryValue::Property(value)
             }
             RowSortExpression::Column { name } => projected_column_value(row, columns, name)?,
             RowSortExpression::CountAll => {
@@ -1221,6 +1494,12 @@ fn sort_keys_for_projected_only(
                 return Err(GraphError::UnsupportedQuery {
                     dialect: "OpenCypher",
                     feature: "aggregate ORDER BY cannot reference row variables".to_string(),
+                });
+            }
+            RowSortExpression::Property { .. } => {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "aggregate ORDER BY cannot reference row properties".to_string(),
                 });
             }
         });
@@ -1276,8 +1555,43 @@ fn compare_query_values(left: &QueryValue, right: &QueryValue) -> std::cmp::Orde
         | (QueryValue::VertexId(left), QueryValue::Count(right))
         | (QueryValue::Count(left), QueryValue::VertexId(right))
         | (QueryValue::Count(left), QueryValue::Count(right)) => left.cmp(right),
+        (QueryValue::Property(left), QueryValue::Property(right)) => {
+            compare_vertex_property_order(left, right)
+        }
         (QueryValue::Bool(left), QueryValue::Bool(right)) => left.cmp(right),
-        (QueryValue::Bool(_), _) => std::cmp::Ordering::Less,
-        (_, QueryValue::Bool(_)) => std::cmp::Ordering::Greater,
+        _ => query_value_rank(left).cmp(&query_value_rank(right)),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_vertex_property_order(
+    left: &VertexPropertyValue,
+    right: &VertexPropertyValue,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (VertexPropertyValue::Integer(left), VertexPropertyValue::Integer(right)) => {
+            left.cmp(right)
+        }
+        (VertexPropertyValue::Bool(left), VertexPropertyValue::Bool(right)) => left.cmp(right),
+        (VertexPropertyValue::String(left), VertexPropertyValue::String(right)) => left.cmp(right),
+        _ => vertex_property_rank(left).cmp(&vertex_property_rank(right)),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn query_value_rank(value: &QueryValue) -> u8 {
+    match value {
+        QueryValue::Bool(_) => 0,
+        QueryValue::VertexId(_) | QueryValue::Count(_) => 1,
+        QueryValue::Property(value) => 2 + vertex_property_rank(value),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn vertex_property_rank(value: &VertexPropertyValue) -> u8 {
+    match value {
+        VertexPropertyValue::Bool(_) => 0,
+        VertexPropertyValue::Integer(_) => 1,
+        VertexPropertyValue::String(_) => 2,
     }
 }
