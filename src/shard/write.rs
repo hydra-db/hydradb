@@ -74,6 +74,15 @@ impl GraphShard {
             Some(value) => decode_vertex_metadata(&vertex_key, &value)?,
             None => VertexMetadata::default(),
         };
+        if previous == metadata {
+            return Ok(());
+        }
+        let epoch = next_epoch_txn(&txn, cell_id).await?;
+        txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(epoch))?;
+        txn.put(
+            keys::vertex_delta(cell_id, vertex_id, epoch).as_bytes(),
+            encode_vertex_metadata(&metadata).as_slice(),
+        )?;
         delete_vertex_metadata_indexes_txn(&txn, cell_id, vertex_id, &previous)?;
         if metadata.labels.is_empty() && metadata.properties.is_empty() {
             txn.delete(vertex_key.as_bytes())?;
@@ -84,6 +93,9 @@ impl GraphShard {
             )?;
             put_vertex_metadata_indexes_txn(&txn, cell_id, vertex_id, &metadata)?;
         }
+        put_vertex_metadata_index_deltas_txn(
+            &txn, cell_id, vertex_id, &previous, &metadata, epoch,
+        )?;
         commit_txn_strict(txn, self.await_durable_writes).await
     }
 
@@ -1931,6 +1943,59 @@ fn delete_vertex_metadata_indexes_txn(
             )
             .as_bytes(),
         )?;
+    }
+    Ok(())
+}
+
+fn put_vertex_metadata_index_deltas_txn(
+    txn: &DbTransaction,
+    cell_id: &str,
+    vertex_id: VertexId,
+    previous: &VertexMetadata,
+    next: &VertexMetadata,
+    epoch: GraphEpoch,
+) -> Result<()> {
+    for label in previous.labels.difference(&next.labels) {
+        txn.put(
+            keys::vertex_label_delta(cell_id, label, epoch, vertex_id).as_bytes(),
+            encode_vertex_index_delta(false).as_slice(),
+        )?;
+    }
+    for label in next.labels.difference(&previous.labels) {
+        txn.put(
+            keys::vertex_label_delta(cell_id, label, epoch, vertex_id).as_bytes(),
+            encode_vertex_index_delta(true).as_slice(),
+        )?;
+    }
+    for (property, value) in &previous.properties {
+        if next.properties.get(property) != Some(value) {
+            txn.put(
+                keys::vertex_property_index_delta(
+                    cell_id,
+                    property,
+                    &encode_vertex_property_value_key(value),
+                    epoch,
+                    vertex_id,
+                )
+                .as_bytes(),
+                encode_vertex_index_delta(false).as_slice(),
+            )?;
+        }
+    }
+    for (property, value) in &next.properties {
+        if previous.properties.get(property) != Some(value) {
+            txn.put(
+                keys::vertex_property_index_delta(
+                    cell_id,
+                    property,
+                    &encode_vertex_property_value_key(value),
+                    epoch,
+                    vertex_id,
+                )
+                .as_bytes(),
+                encode_vertex_index_delta(true).as_slice(),
+            )?;
+        }
     }
     Ok(())
 }

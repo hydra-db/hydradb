@@ -290,31 +290,76 @@ impl GraphShard {
         read_epoch: GraphEpoch,
     ) -> Result<Vec<BindingRow>> {
         validate_component("cell_id", cell_id)?;
-        validate_component("edge_type", &pattern.edge_type)?;
-        if let Some((min_hops, max_hops)) = pattern.hop_range {
+        match pattern {
+            RowPattern::Node(node) => self.match_node_row_pattern(cell_id, node, read_epoch).await,
+            RowPattern::Edge(edge) => self.match_edge_row_pattern(cell_id, edge, read_epoch).await,
+        }
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_node_row_pattern(
+        &self,
+        cell_id: &str,
+        node: &RowNodePattern,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<BindingRow>> {
+        let Some(vertices) = self.candidate_vertex_ids(cell_id, node, read_epoch).await? else {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "node-only MATCH requires an id, label, or property predicate".to_string(),
+            });
+        };
+        let mut rows = Vec::with_capacity(vertices.len());
+        let mut metadata_cache = BTreeMap::new();
+        for vertex_id in vertices {
+            if let Some(mut row) = BindingRow::from_node(node, vertex_id) {
+                self.hydrate_binding_metadata(cell_id, read_epoch, &mut row, &mut metadata_cache)
+                    .await?;
+                if row_matches_node(&row, node)? {
+                    rows.push(row);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_edge_row_pattern(
+        &self,
+        cell_id: &str,
+        edge: &RowEdgePattern,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<BindingRow>> {
+        validate_component("edge_type", &edge.edge_type)?;
+        if let Some((min_hops, max_hops)) = edge.hop_range {
             return self
-                .match_reachable_row_pattern(cell_id, pattern, min_hops, max_hops, read_epoch)
+                .match_reachable_row_pattern(cell_id, edge, min_hops, max_hops, read_epoch)
                 .await;
         }
 
         let mut rows = Vec::new();
         let mut metadata_cache = BTreeMap::new();
         let candidate_sources = self
-            .candidate_vertex_ids(cell_id, &pattern.src, read_epoch)
+            .candidate_vertex_ids(cell_id, &edge.src, read_epoch)
             .await?;
         if let Some(sources) = candidate_sources {
             for src in sources {
                 for dst in self
-                    .out_neighbors_at(cell_id, &pattern.edge_type, src, read_epoch)
+                    .out_neighbors_at(cell_id, &edge.edge_type, src, read_epoch)
                     .await?
                 {
-                    if matches!(pattern.dst.id, Some(fixed_dst) if fixed_dst != dst) {
+                    if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst) {
                         continue;
                     }
-                    if let Some(mut row) = BindingRow::from_edge(pattern, src, dst) {
-                        self.hydrate_binding_metadata(cell_id, &mut row, &mut metadata_cache)
-                            .await?;
-                        if row_matches_pattern(&row, pattern)? {
+                    if let Some(mut row) = BindingRow::from_edge(edge, src, dst) {
+                        self.hydrate_binding_metadata(
+                            cell_id,
+                            read_epoch,
+                            &mut row,
+                            &mut metadata_cache,
+                        )
+                        .await?;
+                        if row_matches_edge_pattern(&row, edge)? {
                             rows.push(row);
                         }
                     }
@@ -323,18 +368,23 @@ impl GraphShard {
             return Ok(rows);
         }
 
-        if let Some(src) = pattern.src.id {
+        if let Some(src) = edge.src.id {
             for dst in self
-                .out_neighbors_at(cell_id, &pattern.edge_type, src, read_epoch)
+                .out_neighbors_at(cell_id, &edge.edge_type, src, read_epoch)
                 .await?
             {
-                if matches!(pattern.dst.id, Some(fixed_dst) if fixed_dst != dst) {
+                if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst) {
                     continue;
                 }
-                if let Some(mut row) = BindingRow::from_edge(pattern, src, dst) {
-                    self.hydrate_binding_metadata(cell_id, &mut row, &mut metadata_cache)
-                        .await?;
-                    if row_matches_pattern(&row, pattern)? {
+                if let Some(mut row) = BindingRow::from_edge(edge, src, dst) {
+                    self.hydrate_binding_metadata(
+                        cell_id,
+                        read_epoch,
+                        &mut row,
+                        &mut metadata_cache,
+                    )
+                    .await?;
+                    if row_matches_edge_pattern(&row, edge)? {
                         rows.push(row);
                     }
                 }
@@ -342,17 +392,14 @@ impl GraphShard {
             return Ok(rows);
         }
 
-        for edge in self
-            .edges_at(cell_id, &pattern.edge_type, read_epoch)
-            .await?
-        {
-            if matches!(pattern.dst.id, Some(fixed_dst) if fixed_dst != edge.dst) {
+        for record in self.edges_at(cell_id, &edge.edge_type, read_epoch).await? {
+            if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != record.dst) {
                 continue;
             }
-            if let Some(mut row) = BindingRow::from_edge(pattern, edge.src, edge.dst) {
-                self.hydrate_binding_metadata(cell_id, &mut row, &mut metadata_cache)
+            if let Some(mut row) = BindingRow::from_edge(edge, record.src, record.dst) {
+                self.hydrate_binding_metadata(cell_id, read_epoch, &mut row, &mut metadata_cache)
                     .await?;
-                if row_matches_pattern(&row, pattern)? {
+                if row_matches_edge_pattern(&row, edge)? {
                     rows.push(row);
                 }
             }
@@ -364,12 +411,12 @@ impl GraphShard {
     async fn match_reachable_row_pattern(
         &self,
         cell_id: &str,
-        pattern: &RowPattern,
+        edge: &RowEdgePattern,
         min_hops: u8,
         max_hops: u8,
         read_epoch: GraphEpoch,
     ) -> Result<Vec<BindingRow>> {
-        let Some(src) = pattern.src.id else {
+        let Some(src) = edge.src.id else {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "OpenCypher",
                 feature: "variable-length MATCH requires a fixed source id".to_string(),
@@ -378,7 +425,7 @@ impl GraphShard {
         let vertices = self
             .reachable_vertices_in_hop_range_at(
                 cell_id,
-                &pattern.edge_type,
+                &edge.edge_type,
                 src,
                 min_hops,
                 max_hops,
@@ -389,13 +436,13 @@ impl GraphShard {
         let mut rows = Vec::with_capacity(vertices.len());
         let mut metadata_cache = BTreeMap::new();
         for dst in vertices {
-            if matches!(pattern.dst.id, Some(fixed_dst) if fixed_dst != dst) {
+            if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst) {
                 continue;
             }
-            if let Some(mut row) = BindingRow::from_edge(pattern, src, dst) {
-                self.hydrate_binding_metadata(cell_id, &mut row, &mut metadata_cache)
+            if let Some(mut row) = BindingRow::from_edge(edge, src, dst) {
+                self.hydrate_binding_metadata(cell_id, read_epoch, &mut row, &mut metadata_cache)
                     .await?;
-                if row_matches_pattern(&row, pattern)? {
+                if row_matches_edge_pattern(&row, edge)? {
                     rows.push(row);
                 }
             }
@@ -408,7 +455,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         pattern: &RowNodePattern,
-        _read_epoch: GraphEpoch,
+        read_epoch: GraphEpoch,
     ) -> Result<Option<Vec<VertexId>>> {
         if let Some(id) = pattern.id {
             return Ok(Some(vec![id]));
@@ -419,19 +466,46 @@ impl GraphShard {
             .find(|(property, _)| property.as_str() != "id")
         {
             return Ok(Some(
-                self.scan_vertex_property_index(cell_id, property, value)
+                self.scan_vertex_property_index_at(cell_id, property, value, read_epoch)
                     .await?,
             ));
         }
         if let Some(label) = pattern.labels.iter().next() {
-            return Ok(Some(self.scan_vertex_label_index(cell_id, label).await?));
+            return Ok(Some(
+                self.scan_vertex_label_index_at(cell_id, label, read_epoch)
+                    .await?,
+            ));
         }
         Ok(None)
     }
 
     #[cfg(feature = "opencypher")]
-    async fn vertex_metadata(&self, cell_id: &str, vertex_id: VertexId) -> Result<VertexMetadata> {
+    async fn vertex_metadata_at(
+        &self,
+        cell_id: &str,
+        vertex_id: VertexId,
+        read_epoch: GraphEpoch,
+    ) -> Result<VertexMetadata> {
         validate_component("cell_id", cell_id)?;
+        let prefix = keys::vertex_delta_prefix(cell_id, vertex_id);
+        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        let mut latest = None;
+        let mut saw_delta = false;
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let epoch = parse_vertex_delta_key(&key)?;
+            saw_delta = true;
+            if epoch > read_epoch {
+                break;
+            }
+            latest = Some(decode_vertex_metadata(&key, &kv.value)?);
+        }
+        if let Some(metadata) = latest {
+            return Ok(metadata);
+        }
+        if saw_delta {
+            return Ok(VertexMetadata::default());
+        }
         let key = keys::vertex(cell_id, vertex_id);
         match self.read_remote(&key).await? {
             Some(value) => decode_vertex_metadata(&key, &value),
@@ -440,9 +514,43 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    async fn scan_vertex_label_index(&self, cell_id: &str, label: &str) -> Result<Vec<VertexId>> {
+    async fn scan_vertex_label_index_at(
+        &self,
+        cell_id: &str,
+        label: &str,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("label", label)?;
+        let mut iter = self
+            .scan_remote_prefix(&keys::vertex_label_delta_prefix(cell_id, label))
+            .await?;
+        let mut latest = BTreeMap::<VertexId, bool>::new();
+        let mut saw_delta = false;
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (epoch, vertex_id) = parse_vertex_label_delta_key(&key)?;
+            saw_delta = true;
+            if epoch > read_epoch {
+                break;
+            }
+            latest.insert(vertex_id, decode_vertex_index_delta(&key, &kv.value)?);
+        }
+        if saw_delta {
+            return Ok(latest
+                .into_iter()
+                .filter_map(|(vertex_id, present)| present.then_some(vertex_id))
+                .collect());
+        }
+        self.scan_vertex_label_index_current(cell_id, label).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn scan_vertex_label_index_current(
+        &self,
+        cell_id: &str,
+        label: &str,
+    ) -> Result<Vec<VertexId>> {
         let mut iter = self
             .scan_remote_prefix(&keys::vertex_label_prefix(cell_id, label))
             .await?;
@@ -455,18 +563,52 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    async fn scan_vertex_property_index(
+    async fn scan_vertex_property_index_at(
         &self,
         cell_id: &str,
         property: &str,
         value: &VertexPropertyValue,
+        read_epoch: GraphEpoch,
     ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("property", property)?;
         let encoded = encode_vertex_property_value_key(value);
         let mut iter = self
-            .scan_remote_prefix(&keys::vertex_property_index_prefix(
+            .scan_remote_prefix(&keys::vertex_property_index_delta_prefix(
                 cell_id, property, &encoded,
+            ))
+            .await?;
+        let mut latest = BTreeMap::<VertexId, bool>::new();
+        let mut saw_delta = false;
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (epoch, vertex_id) = parse_vertex_property_index_delta_key(&key)?;
+            saw_delta = true;
+            if epoch > read_epoch {
+                break;
+            }
+            latest.insert(vertex_id, decode_vertex_index_delta(&key, &kv.value)?);
+        }
+        if saw_delta {
+            return Ok(latest
+                .into_iter()
+                .filter_map(|(vertex_id, present)| present.then_some(vertex_id))
+                .collect());
+        }
+        self.scan_vertex_property_index_current(cell_id, property, &encoded)
+            .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn scan_vertex_property_index_current(
+        &self,
+        cell_id: &str,
+        property: &str,
+        encoded: &str,
+    ) -> Result<Vec<VertexId>> {
+        let mut iter = self
+            .scan_remote_prefix(&keys::vertex_property_index_prefix(
+                cell_id, property, encoded,
             ))
             .await?;
         let mut vertices = Vec::new();
@@ -481,6 +623,7 @@ impl GraphShard {
     async fn hydrate_binding_metadata(
         &self,
         cell_id: &str,
+        read_epoch: GraphEpoch,
         row: &mut BindingRow,
         cache: &mut BTreeMap<VertexId, VertexMetadata>,
     ) -> Result<()> {
@@ -493,7 +636,9 @@ impl GraphShard {
             let metadata = match cache.get(&vertex_id) {
                 Some(metadata) => metadata.clone(),
                 None => {
-                    let metadata = self.vertex_metadata(cell_id, vertex_id).await?;
+                    let metadata = self
+                        .vertex_metadata_at(cell_id, vertex_id, read_epoch)
+                        .await?;
                     cache.insert(vertex_id, metadata.clone());
                     metadata
                 }
@@ -1205,6 +1350,50 @@ fn merge_opencypher_window(context: QueryContext, window: QueryWindow) -> Result
 }
 
 #[cfg(feature = "opencypher")]
+fn parse_vertex_delta_key(key: &str) -> Result<GraphEpoch> {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", _cell_id, "vertex_delta", _vertex_id, epoch] => {
+            parse_u64(key, epoch, "vertex_metadata_epoch")
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected vertex metadata delta key".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn parse_vertex_label_delta_key(key: &str) -> Result<(GraphEpoch, VertexId)> {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", _cell_id, "vlabel_delta", _label, epoch, vertex_id] => Ok((
+            parse_u64(key, epoch, "vertex_label_epoch")?,
+            parse_u64(key, vertex_id, "vertex_id")?,
+        )),
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected vertex label delta key".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn parse_vertex_property_index_delta_key(key: &str) -> Result<(GraphEpoch, VertexId)> {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", _cell_id, "vprop_delta", _property, _value, epoch, vertex_id] => Ok((
+            parse_u64(key, epoch, "vertex_property_epoch")?,
+            parse_u64(key, vertex_id, "vertex_id")?,
+        )),
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected vertex property delta key".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct BindingRow {
     values: BTreeMap<String, VertexId>,
@@ -1213,7 +1402,15 @@ struct BindingRow {
 
 #[cfg(feature = "opencypher")]
 impl BindingRow {
-    fn from_edge(pattern: &RowPattern, src: VertexId, dst: VertexId) -> Option<Self> {
+    fn from_node(pattern: &RowNodePattern, vertex_id: VertexId) -> Option<Self> {
+        let mut row = Self::default();
+        if !row.bind(pattern.binding.as_deref(), vertex_id) {
+            return None;
+        }
+        Some(row)
+    }
+
+    fn from_edge(pattern: &RowEdgePattern, src: VertexId, dst: VertexId) -> Option<Self> {
         let mut row = Self::default();
         if !row.bind(pattern.src.binding.as_deref(), src) {
             return None;
@@ -1263,7 +1460,7 @@ enum RowScalarValue {
 }
 
 #[cfg(feature = "opencypher")]
-fn row_matches_pattern(row: &BindingRow, pattern: &RowPattern) -> Result<bool> {
+fn row_matches_edge_pattern(row: &BindingRow, pattern: &RowEdgePattern) -> Result<bool> {
     Ok(row_matches_node(row, &pattern.src)? && row_matches_node(row, &pattern.dst)?)
 }
 

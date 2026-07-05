@@ -339,6 +339,22 @@ pub(crate) fn encode_vertex_property_value_key(value: &VertexPropertyValue) -> S
     }
 }
 
+pub(crate) fn encode_vertex_index_delta(present: bool) -> Vec<u8> {
+    vec![u8::from(present)]
+}
+
+#[cfg(feature = "opencypher")]
+pub(crate) fn decode_vertex_index_delta(key: &str, value: &[u8]) -> Result<bool> {
+    match value {
+        [0] => Ok(false),
+        [1] => Ok(true),
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected one-byte vertex index delta".to_string(),
+        }),
+    }
+}
+
 fn encode_vertex_property_value_record(value: &VertexPropertyValue) -> String {
     match value {
         VertexPropertyValue::Integer(value) => format!("i:{value}"),
