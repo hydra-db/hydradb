@@ -16,10 +16,28 @@ use slatedb::IterationOrder;
 use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
 use slatedb::manifest::VersionedManifest;
 use slatedb::{
-    Db, DbIterator, DbReader, DbSnapshot, FilterContext, MergeOperator as SlateDbMergeOperator,
-    MergeOperatorError, SstReader, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
+    CloseReason, Db, DbIterator, DbReader, DbSnapshot, ErrorKind, FilterContext,
+    MergeOperator as SlateDbMergeOperator, MergeOperatorError, SstReader, WriteBatch,
+    config::WriteOptions as SlateDbWriteOptions,
 };
 use tokio::sync::watch;
+
+/// Maps a `slatedb::Error` from the write path (`apply_with_options` /
+/// `put_with_options` / `merge_with_options`) to a [`StorageError`].
+///
+/// Detects SlateDB's single-writer-per-path fencing (`ErrorKind::Closed(
+/// CloseReason::Fenced)`, RFC 0004 zombie-writer fencing) and surfaces it as
+/// the typed [`StorageError::Fenced`] instead of flattening it to a generic
+/// `StorageError::Storage` string — callers need to distinguish "this writer
+/// has been superseded and must reopen" from an ordinary transient failure.
+/// Every other error kind flattens to `StorageError::from_storage` as before.
+fn map_write_error(e: slatedb::Error) -> StorageError {
+    if e.kind() == ErrorKind::Closed(CloseReason::Fenced) {
+        StorageError::Fenced(e.to_string())
+    } else {
+        StorageError::from_storage(e)
+    }
+}
 
 /// Adapter that wraps our `MergeOperator` trait to implement SlateDB's `MergeOperator` trait.
 ///
@@ -375,7 +393,7 @@ impl Storage for SlateDbStorage {
             .db
             .write_with_options(batch, &slate_options)
             .await
-            .map_err(StorageError::from_storage)?;
+            .map_err(map_write_error)?;
         Ok(WriteResult {
             seqnum: write_handle.seqnum(),
         })
@@ -403,7 +421,7 @@ impl Storage for SlateDbStorage {
             .db
             .write_with_options(batch, &slate_options)
             .await
-            .map_err(StorageError::from_storage)?;
+            .map_err(map_write_error)?;
         Ok(WriteResult {
             seqnum: write_handle.seqnum(),
         })
@@ -438,7 +456,7 @@ impl Storage for SlateDbStorage {
                         "Merge operator not configured for this database".to_string(),
                     )
                 } else {
-                    StorageError::from_storage(e)
+                    map_write_error(e)
                 }
             })?;
         Ok(WriteResult {
@@ -1092,5 +1110,81 @@ mod tests {
         );
 
         storage.close().await.unwrap();
+    }
+
+    /// RFC 0004 zombie-writer fencing, exercised directly at the `common`
+    /// layer (not just via `map_write_error`'s logic in isolation): two
+    /// `SlateDbStorage`s opened against the *same* path + shared in-memory
+    /// `object_store` (mirroring `should_coexist_writer_and_reader_without_fencing_error`
+    /// above, but with a second **writer** instead of a `DbReader` — SlateDB's
+    /// single-writer-per-path fencing only fires against another writer, never
+    /// a `DbReader`). Opening `storage2` bumps the writer epoch and fences
+    /// `storage1`; `storage1`'s next durable write must surface as the typed
+    /// `StorageError::Fenced` this module's `map_write_error` produces, not a
+    /// generic `StorageError::Storage` string.
+    #[tokio::test]
+    async fn should_map_a_fenced_writer_error_to_storage_error_fenced() {
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/fenced_db";
+
+        let db1 = DbBuilder::new(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        let storage1 = SlateDbStorage::new(Arc::new(db1));
+
+        // Baseline write succeeds — storage1 is the only writer so far.
+        storage1
+            .put_with_options(
+                vec![Record::new(Bytes::from("key1"), Bytes::from("value1")).into()],
+                WriteOptions {
+                    await_durable: true,
+                    seqnum: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        // A second writer over the same path fences storage1 (bumped epoch +
+        // WAL barrier write, per slatedb's `WriterFencer`).
+        let db2 = DbBuilder::new(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        let storage2 = SlateDbStorage::new(Arc::new(db2));
+
+        // storage1's next durable write must fail, typed as Fenced.
+        let result = storage1
+            .put_with_options(
+                vec![Record::new(Bytes::from("key2"), Bytes::from("value2")).into()],
+                WriteOptions {
+                    await_durable: true,
+                    seqnum: 0,
+                },
+            )
+            .await;
+        match result {
+            Err(StorageError::Fenced(msg)) => {
+                assert!(
+                    !msg.is_empty(),
+                    "Fenced error should carry the underlying slatedb message"
+                );
+            }
+            other => panic!("expected StorageError::Fenced, got: {other:?}"),
+        }
+
+        // storage2 (the new epoch's writer) continues to work normally.
+        storage2
+            .put_with_options(
+                vec![Record::new(Bytes::from("key3"), Bytes::from("value3")).into()],
+                WriteOptions {
+                    await_durable: true,
+                    seqnum: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        storage2.close().await.unwrap();
     }
 }

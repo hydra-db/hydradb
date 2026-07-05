@@ -75,3 +75,9 @@ tokio = { workspace = true, features = ["test-util"] }
 common = { path = "vendor/common", package = "opendata-common", features = [
     "test-utils",
 ] }
+# SlateDB-on-local-disk acceptance tier (`tests/slatedb_acceptance.rs`, M1 Wave
+# 4 Workstream B): a real tempdir backs `StorageConfig::SlateDb` so durable
+# gate / zombie-writer fencing / crash-recovery can be exercised against real
+# SlateDB, not just the in-memory backend (RFC 0017 D12 is about S3/LocalStack
+# benchmarking, not this — SlateDB correctness over a local object store).
+tempfile.workspace = true
