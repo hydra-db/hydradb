@@ -5925,6 +5925,186 @@ async fn vertex_metadata_indexes_are_replaced_on_update() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_vertex_metadata_reads_are_snapshot_consistent() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-metadata-snapshot", object_store).await;
+
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 10,
+            idempotency_key: "metadata-snapshot-edge".to_string(),
+        })
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(true))
+                .with_property("name", VertexPropertyValue::String("alice".to_string())),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            10,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("name", VertexPropertyValue::String("erin".to_string()))
+                .with_property("age", VertexPropertyValue::Integer(17)),
+        )
+        .await
+        .unwrap();
+    let pinned_epoch = shard.current_epoch("reddit-home").await.unwrap();
+
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(false))
+                .with_property("name", VertexPropertyValue::String("alice".to_string())),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            10,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("name", VertexPropertyValue::String("erin".to_string()))
+                .with_property("age", VertexPropertyValue::Integer(18)),
+        )
+        .await
+        .unwrap();
+
+    let old_snapshot = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "metadata-snapshot-old").at_epoch(pinned_epoch),
+            "MATCH (u:User {active: true})-[:FOLLOWS]->(v:User) \
+             WHERE v.age >= 18 RETURN v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        old_snapshot,
+        QueryResultSet::new(vec![QueryColumn::new("v.id")], Vec::new())
+    );
+
+    let old_property = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "metadata-snapshot-old-property")
+                .at_epoch(pinned_epoch),
+            "MATCH (u:User {active: true})-[:FOLLOWS]->(v:User) \
+             WHERE v.age = 17 RETURN u.name AS src, v.age AS age",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        old_property,
+        QueryResultSet::new(
+            vec![QueryColumn::new("src"), QueryColumn::new("age")],
+            vec![QueryRow::new(vec![
+                QueryValue::Property(VertexPropertyValue::String("alice".to_string())),
+                QueryValue::Property(VertexPropertyValue::Integer(17)),
+            ])],
+        )
+    );
+
+    let latest = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "metadata-snapshot-latest"),
+            "MATCH (u:User {active: false})-[:FOLLOWS]->(v:User) \
+             WHERE v.age >= 18 RETURN v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        latest,
+        QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(10)])],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_node_only_rows_use_vertex_metadata_indexes() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-node-only-metadata", object_store).await;
+
+    for (vertex, active, name) in [(1, true, "alice"), (2, true, "bob"), (3, false, "carol")] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex,
+                VertexMetadata::default()
+                    .with_label("User")
+                    .with_property("active", VertexPropertyValue::Bool(active))
+                    .with_property("name", VertexPropertyValue::String(name.to_string())),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "node-only-active-users"),
+            "MATCH (u:User {active: true}) RETURN u.name AS name ORDER BY u.name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("name")],
+            vec![
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                    "alice".to_string()
+                ))]),
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                    "bob".to_string()
+                ))]),
+            ],
+        )
+    );
+
+    let count = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "node-only-count"),
+            "MATCH (u:User {active: true}) RETURN count(*) AS total",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        count,
+        QueryResultSet::new(
+            vec![QueryColumn::new("total")],
+            vec![QueryRow::new(vec![QueryValue::Count(2)])],
+        )
+    );
+
+    let unbounded = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "node-only-unbounded"),
+            "MATCH (u) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(unbounded, GraphError::UnsupportedQuery { .. }));
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_where_and_variable_hops_use_storage_kernel() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-where-varhop", object_store).await;

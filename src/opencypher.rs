@@ -31,20 +31,6 @@ struct EdgePattern {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RowEdgePattern {
-    edge_type: String,
-    src: Option<VertexId>,
-    src_binding: Option<String>,
-    src_labels: BTreeSet<String>,
-    src_properties: BTreeMap<String, VertexPropertyValue>,
-    dst: Option<VertexId>,
-    dst_binding: Option<String>,
-    dst_labels: BTreeSet<String>,
-    dst_properties: BTreeMap<String, VertexPropertyValue>,
-    hop_range: Option<(u8, u8)>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct NodePattern {
     binding: Option<String>,
     id: Option<VertexId>,
@@ -68,7 +54,13 @@ pub struct ParsedRowQuery {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RowPattern {
+pub enum RowPattern {
+    Node(RowNodePattern),
+    Edge(RowEdgePattern),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RowEdgePattern {
     pub edge_type: String,
     pub src: RowNodePattern,
     pub dst: RowNodePattern,
@@ -495,7 +487,7 @@ fn lower_match_return_rows(
         }
 
         let pattern = checked_node(sys::cypher_ast_match_get_pattern(match_clause))?;
-        let edge = lower_row_single_edge_pattern(pattern)?;
+        let pattern = lower_row_pattern(pattern)?;
         let predicate = sys::cypher_ast_match_get_predicate(match_clause);
         let predicate = if predicate.is_null() {
             None
@@ -548,22 +540,7 @@ fn lower_match_return_rows(
         let order_by = lower_return_order_by(return_clause)?;
         let window = lower_return_window(return_clause)?;
         Ok(ParsedRowQuery {
-            pattern: RowPattern {
-                edge_type: edge.edge_type,
-                src: RowNodePattern {
-                    binding: edge.src_binding,
-                    id: edge.src,
-                    labels: edge.src_labels,
-                    properties: edge.src_properties,
-                },
-                dst: RowNodePattern {
-                    binding: edge.dst_binding,
-                    id: edge.dst,
-                    labels: edge.dst_labels,
-                    properties: edge.dst_properties,
-                },
-                hop_range: edge.hop_range,
-            },
+            pattern,
             predicate,
             projections,
             order_by,
@@ -791,7 +768,7 @@ fn lower_single_edge_pattern(pattern: *const AstNode) -> Result<EdgePattern> {
     }
 }
 
-fn lower_row_single_edge_pattern(pattern: *const AstNode) -> Result<RowEdgePattern> {
+fn lower_row_pattern(pattern: *const AstNode) -> Result<RowPattern> {
     unsafe {
         ensure_instance(pattern, sys::CYPHER_AST_PATTERN, "pattern")?;
         if sys::cypher_ast_pattern_npaths(pattern) != 1 {
@@ -800,10 +777,20 @@ fn lower_row_single_edge_pattern(pattern: *const AstNode) -> Result<RowEdgePatte
 
         let path = checked_node(sys::cypher_ast_pattern_get_path(pattern, 0))?;
         ensure_instance(path, sys::CYPHER_AST_PATTERN_PATH, "pattern path")?;
-        if sys::cypher_ast_pattern_path_nelements(path) != 3 {
-            return unsupported("only one-hop edge patterns are executable in Phase 2");
+        match sys::cypher_ast_pattern_path_nelements(path) {
+            1 => {
+                let node = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
+                ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "node pattern")?;
+                Ok(RowPattern::Node(lower_row_node_pattern(node)?))
+            }
+            3 => lower_row_single_edge_path(path).map(RowPattern::Edge),
+            _ => unsupported("only node and one-hop edge patterns are executable in Phase 2"),
         }
+    }
+}
 
+fn lower_row_single_edge_path(path: *const AstNode) -> Result<RowEdgePattern> {
+    unsafe {
         let left = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
         let rel = checked_node(sys::cypher_ast_pattern_path_get_element(path, 1))?;
         let right = checked_node(sys::cypher_ast_pattern_path_get_element(path, 2))?;
@@ -832,26 +819,14 @@ fn lower_row_single_edge_pattern(pattern: *const AstNode) -> Result<RowEdgePatte
         match sys::cypher_ast_rel_pattern_get_direction(rel) {
             sys::cypher_rel_direction::CYPHER_REL_OUTBOUND => Ok(RowEdgePattern {
                 edge_type,
-                src: left_node.id,
-                src_binding: left_node.binding,
-                src_labels: left_node.labels,
-                src_properties: left_node.properties,
-                dst: right_node.id,
-                dst_binding: right_node.binding,
-                dst_labels: right_node.labels,
-                dst_properties: right_node.properties,
+                src: left_node,
+                dst: right_node,
                 hop_range,
             }),
             sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(RowEdgePattern {
                 edge_type,
-                src: right_node.id,
-                src_binding: right_node.binding,
-                src_labels: right_node.labels,
-                src_properties: right_node.properties,
-                dst: left_node.id,
-                dst_binding: left_node.binding,
-                dst_labels: left_node.labels,
-                dst_properties: left_node.properties,
+                src: right_node,
+                dst: left_node,
                 hop_range,
             }),
             sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => {
@@ -1548,16 +1523,16 @@ mod tests {
              RETURN u.name AS src, v.age AS age ORDER BY v.age DESC",
         )
         .unwrap();
+        let RowPattern::Edge(pattern) = &parsed.pattern else {
+            panic!("expected edge row pattern");
+        };
+        assert_eq!(pattern.src.labels, BTreeSet::from(["User".to_string()]));
         assert_eq!(
-            parsed.pattern.src.labels,
-            BTreeSet::from(["User".to_string()])
-        );
-        assert_eq!(
-            parsed.pattern.src.properties.get("active"),
+            pattern.src.properties.get("active"),
             Some(&VertexPropertyValue::Bool(true))
         );
         assert_eq!(
-            parsed.pattern.dst.properties.get("age"),
+            pattern.dst.properties.get("age"),
             Some(&VertexPropertyValue::Integer(42))
         );
         assert_eq!(
@@ -1581,6 +1556,30 @@ mod tests {
                     property: "age".to_string(),
                 },
                 ascending: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn lowers_node_only_row_query() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (u:User {active: true}) RETURN u.name AS name ORDER BY u.name",
+        )
+        .unwrap();
+        let RowPattern::Node(node) = &parsed.pattern else {
+            panic!("expected node row pattern");
+        };
+        assert_eq!(node.binding.as_deref(), Some("u"));
+        assert_eq!(node.labels, BTreeSet::from(["User".to_string()]));
+        assert_eq!(
+            node.properties.get("active"),
+            Some(&VertexPropertyValue::Bool(true))
+        );
+        assert_eq!(
+            parsed.projections,
+            vec![RowProjection::Property {
+                binding: "u".to_string(),
+                property: "name".to_string(),
             }]
         );
     }

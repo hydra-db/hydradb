@@ -166,6 +166,15 @@ pub fn vertex(cell_id: &str, vertex_id: VertexId) -> String {
     format!("cell/{cell_id}/vertex/{vertex_id:020}")
 }
 
+pub fn vertex_delta(cell_id: &str, vertex_id: VertexId, epoch: GraphEpoch) -> String {
+    format!("cell/{cell_id}/vertex_delta/{vertex_id:020}/{epoch:020}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn vertex_delta_prefix(cell_id: &str, vertex_id: VertexId) -> String {
+    format!("cell/{cell_id}/vertex_delta/{vertex_id:020}/")
+}
+
 pub fn vertex_label(cell_id: &str, label: &str, vertex_id: VertexId) -> String {
     format!("cell/{cell_id}/vlabel/{label}/{vertex_id:020}")
 }
@@ -173,6 +182,20 @@ pub fn vertex_label(cell_id: &str, label: &str, vertex_id: VertexId) -> String {
 #[cfg(feature = "opencypher")]
 pub fn vertex_label_prefix(cell_id: &str, label: &str) -> String {
     format!("cell/{cell_id}/vlabel/{label}/")
+}
+
+pub fn vertex_label_delta(
+    cell_id: &str,
+    label: &str,
+    epoch: GraphEpoch,
+    vertex_id: VertexId,
+) -> String {
+    format!("cell/{cell_id}/vlabel_delta/{label}/{epoch:020}/{vertex_id:020}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn vertex_label_delta_prefix(cell_id: &str, label: &str) -> String {
+    format!("cell/{cell_id}/vlabel_delta/{label}/")
 }
 
 pub fn vertex_property_index(
@@ -187,6 +210,25 @@ pub fn vertex_property_index(
 #[cfg(feature = "opencypher")]
 pub fn vertex_property_index_prefix(cell_id: &str, property: &str, encoded_value: &str) -> String {
     format!("cell/{cell_id}/vprop_idx/{property}/{encoded_value}/")
+}
+
+pub fn vertex_property_index_delta(
+    cell_id: &str,
+    property: &str,
+    encoded_value: &str,
+    epoch: GraphEpoch,
+    vertex_id: VertexId,
+) -> String {
+    format!("cell/{cell_id}/vprop_delta/{property}/{encoded_value}/{epoch:020}/{vertex_id:020}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn vertex_property_index_delta_prefix(
+    cell_id: &str,
+    property: &str,
+    encoded_value: &str,
+) -> String {
+    format!("cell/{cell_id}/vprop_delta/{property}/{encoded_value}/")
 }
 
 #[cfg(test)]
