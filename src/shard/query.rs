@@ -54,6 +54,7 @@ impl GraphShard {
     }
 
     pub async fn execute_query_plan(&self, plan: QueryPlan) -> Result<QueryOutput> {
+        self.validate_executable_query_plan(&plan).await?;
         match plan.physical {
             PhysicalQueryPlan::WriteEdge {
                 edge_type,
@@ -152,6 +153,23 @@ impl GraphShard {
                 }
             }
         }
+    }
+
+    async fn validate_executable_query_plan(&self, plan: &QueryPlan) -> Result<()> {
+        plan.validate_for_execution()?;
+        if !plan.is_write() {
+            if let Some(read_epoch) = plan.read_epoch {
+                let current_epoch = self.current_epoch(&plan.cell_id).await?;
+                if read_epoch > current_epoch {
+                    return Err(GraphError::SnapshotAhead {
+                        cell_id: plan.cell_id.clone(),
+                        read_epoch,
+                        current_epoch,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn query_edge_exists(
