@@ -2182,6 +2182,14 @@ impl GraphShard {
     }
 
     async fn write_edge_txn(&self, mutation: &EdgeMutation) -> Result<CommitResult> {
+        let lock = self
+            .acquire_cell_write_lock(&mutation.cell_id, "write_edge")
+            .await?;
+        let result = self.write_edge_txn_locked(mutation).await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn write_edge_txn_locked(&self, mutation: &EdgeMutation) -> Result<CommitResult> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
         self.validate_write_fence_txn(&txn, &mutation.cell_id, "write_edge")
             .await?;
@@ -2328,6 +2336,14 @@ impl GraphShard {
     }
 
     async fn delete_edge_txn(&self, mutation: &EdgeMutation) -> Result<DeleteResult> {
+        let lock = self
+            .acquire_cell_write_lock(&mutation.cell_id, "delete_edge")
+            .await?;
+        let result = self.delete_edge_txn_locked(mutation).await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn delete_edge_txn_locked(&self, mutation: &EdgeMutation) -> Result<DeleteResult> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
         self.validate_write_fence_txn(&txn, &mutation.cell_id, "delete_edge")
             .await?;
@@ -7250,6 +7266,40 @@ mod tests {
         unreachable!("transaction retry loop always returns on final attempt")
     }
 
+    async fn write_edge_txn_retry_for_test(
+        shard: Arc<GraphShard>,
+        mutation: EdgeMutation,
+    ) -> Result<CommitResult> {
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match shard.write_edge_txn(&mutation).await {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    async fn delete_edge_txn_retry_for_test(
+        shard: Arc<GraphShard>,
+        mutation: EdgeMutation,
+    ) -> Result<DeleteResult> {
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match shard.delete_edge_txn(&mutation).await {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
     fn assert_stale_node_a(err: GraphError) {
         assert!(matches!(
             err,
@@ -7679,6 +7729,114 @@ mod tests {
                 .unwrap(),
             16
         );
+    }
+
+    #[tokio::test]
+    async fn write_edge_transactions_retry_without_epoch_overlap() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard =
+            Arc::new(open_test_shard("graph/write-edge-transaction-race", object_store).await);
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        let left = {
+            let shard = Arc::clone(&shard);
+            tokio::spawn(async move {
+                write_edge_txn_retry_for_test(shard, mutation(1, 2, "single-race-a")).await
+            })
+        };
+        let right = {
+            let shard = Arc::clone(&shard);
+            tokio::spawn(async move {
+                write_edge_txn_retry_for_test(shard, mutation(1, 3, "single-race-b")).await
+            })
+        };
+
+        let mut results = vec![left.await.unwrap().unwrap(), right.await.unwrap().unwrap()];
+        results.sort_by_key(|result| result.epoch);
+        assert_eq!(
+            results,
+            vec![
+                CommitResult {
+                    epoch: 1,
+                    already_existed: false,
+                },
+                CommitResult {
+                    epoch: 2,
+                    already_existed: false,
+                },
+            ]
+        );
+        assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 2);
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 2);
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 3]
+        );
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 2, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+    }
+
+    #[tokio::test]
+    async fn delete_edge_transactions_retry_without_epoch_overlap() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard =
+            Arc::new(open_test_shard("graph/delete-edge-transaction-race", object_store).await);
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        shard
+            .write_edge(mutation(1, 2, "delete-race-base-a"))
+            .await
+            .unwrap();
+        shard
+            .write_edge(mutation(1, 3, "delete-race-base-b"))
+            .await
+            .unwrap();
+
+        let left = {
+            let shard = Arc::clone(&shard);
+            tokio::spawn(async move {
+                delete_edge_txn_retry_for_test(shard, mutation(1, 2, "delete-race-a")).await
+            })
+        };
+        let right = {
+            let shard = Arc::clone(&shard);
+            tokio::spawn(async move {
+                delete_edge_txn_retry_for_test(shard, mutation(1, 3, "delete-race-b")).await
+            })
+        };
+
+        let mut results = vec![left.await.unwrap().unwrap(), right.await.unwrap().unwrap()];
+        results.sort_by_key(|result| result.epoch);
+        assert_eq!(
+            results,
+            vec![
+                DeleteResult {
+                    epoch: 3,
+                    deleted: true,
+                },
+                DeleteResult {
+                    epoch: 4,
+                    deleted: true,
+                },
+            ]
+        );
+        assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 4);
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 0);
+        assert!(shard
+            .out_neighbors(cell_id, edge_type, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 2, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
     }
 
     #[tokio::test]
