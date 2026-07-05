@@ -3698,6 +3698,570 @@ async fn control_plane_can_fail_over_after_lease_expiry() {
 }
 
 #[tokio::test]
+async fn control_plane_catalog_uses_generation_cas() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/catalog-cas", object_store)
+        .await
+        .unwrap();
+    let placement = ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap();
+    let entries = control
+        .publish_placement_with_catalog(&placement, "reddit", 7)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].generation, 1);
+    assert_eq!(
+        control
+            .load_placement()
+            .await
+            .unwrap()
+            .owner("reddit-home")
+            .unwrap(),
+        "node-a"
+    );
+
+    let mut update = entries[0].clone();
+    update.graph_epoch = Some(10);
+    let published = control
+        .compare_and_publish_shard_metadata(update.clone(), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(published.generation, 2);
+    assert_eq!(published.graph_epoch, Some(10));
+
+    update.graph_epoch = Some(11);
+    let err = control
+        .compare_and_publish_shard_metadata(update, Some(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::ControlMetadataConflict {
+            ref key,
+            expected_generation: Some(1),
+            actual_generation: Some(2),
+        } if key == "control/catalog/reddit-home"
+    ));
+    let metrics = control.graph_control_metrics();
+    assert_eq!(metrics.metadata_cas_attempts, 2);
+    assert!(metrics.metadata_cas_successes >= 2);
+    assert_eq!(metrics.metadata_cas_conflicts, 1);
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn control_plane_catalog_tracks_lease_token_generation() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/catalog-lease", object_store)
+        .await
+        .unwrap();
+    let placement = ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap();
+    control
+        .publish_placement_with_catalog(&placement, "reddit", 1)
+        .await
+        .unwrap();
+    let lease_a = control
+        .acquire_lease("reddit-home", "node-a", std::time::Duration::from_millis(5))
+        .await
+        .unwrap();
+    let catalog_a = control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog_a.owner_node_id, "node-a");
+    assert_eq!(catalog_a.lease_token, lease_a.lease_token);
+    assert_eq!(catalog_a.generation, 2);
+
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    let lease_b = control
+        .failover_expired_cell("reddit-home", "node-b", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let catalog_b = control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog_b.owner_node_id, "node-b");
+    assert_eq!(catalog_b.lease_token, lease_b.lease_token);
+    assert_eq!(catalog_b.generation, 3);
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn control_plane_legacy_placement_creates_catalog_on_lease() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/catalog-legacy", object_store)
+        .await
+        .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    assert!(control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+
+    let lease = control
+        .acquire_lease("reddit-home", "node-a", std::time::Duration::from_millis(5))
+        .await
+        .unwrap();
+    let catalog = control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog.graph_id, None);
+    assert_eq!(catalog.schema_epoch, None);
+    assert_eq!(catalog.graph_epoch, None);
+    assert!(!catalog.has_graph_metadata());
+    assert_eq!(catalog.owner_node_id, "node-a");
+    assert_eq!(catalog.lease_token, lease.lease_token);
+    assert_eq!(catalog.generation, 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    let lease = control
+        .failover_expired_cell("reddit-home", "node-b", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let catalog = control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog.owner_node_id, "node-b");
+    assert_eq!(catalog.lease_token, lease.lease_token);
+    assert_eq!(catalog.generation, 2);
+    assert_eq!(catalog.graph_id, None);
+    assert_eq!(catalog.schema_epoch, None);
+    assert_eq!(catalog.graph_epoch, None);
+
+    control
+        .publish_placement_with_catalog(
+            &ShardPlacement::fixed([("reddit-home", "node-b")]).unwrap(),
+            "reddit",
+            9,
+        )
+        .await
+        .unwrap();
+    let catalog = control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog.graph_id.as_deref(), Some("reddit"));
+    assert_eq!(catalog.schema_epoch, Some(9));
+    assert_eq!(catalog.graph_epoch, Some(0));
+    assert!(catalog.has_graph_metadata());
+    assert_eq!(catalog.owner_node_id, "node-b");
+    assert_eq!(catalog.lease_token, lease.lease_token);
+    assert_eq!(catalog.generation, 3);
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn control_plane_watermarks_are_monotonic_and_generation_checked() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/watermark-cas", object_store)
+        .await
+        .unwrap();
+
+    let first = control
+        .advance_watermark(
+            GraphControlWatermark {
+                cell_id: "reddit-home".to_string(),
+                durable_epoch: 5,
+                safe_read_epoch: 4,
+                outbox_epoch: 3,
+                artifact_epoch: 2,
+                generation: 0,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.generation, 1);
+
+    let same = control
+        .advance_watermark(
+            GraphControlWatermark {
+                generation: 99,
+                ..first.clone()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(same, first);
+
+    let stale = control
+        .advance_watermark(
+            GraphControlWatermark {
+                cell_id: "reddit-home".to_string(),
+                durable_epoch: 6,
+                safe_read_epoch: 5,
+                outbox_epoch: 4,
+                artifact_epoch: 2,
+                generation: 0,
+            },
+            Some(0),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        GraphError::ControlMetadataConflict {
+            ref key,
+            expected_generation: Some(0),
+            actual_generation: Some(1)
+        } if key == "control/watermark/reddit-home"
+    ));
+
+    let regression = control
+        .advance_watermark(
+            GraphControlWatermark {
+                cell_id: "reddit-home".to_string(),
+                durable_epoch: 6,
+                safe_read_epoch: 3,
+                outbox_epoch: 4,
+                artifact_epoch: 2,
+                generation: 0,
+            },
+            Some(1),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        regression,
+        GraphError::ControlWatermarkRegression {
+            ref cell_id,
+            field: "safe_read_epoch",
+            requested_epoch: 3,
+            current_epoch: 4
+        } if cell_id == "reddit-home"
+    ));
+
+    let advanced = control
+        .advance_watermark(
+            GraphControlWatermark {
+                cell_id: "reddit-home".to_string(),
+                durable_epoch: 6,
+                safe_read_epoch: 5,
+                outbox_epoch: 4,
+                artifact_epoch: 2,
+                generation: 0,
+            },
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(advanced.generation, 2);
+    assert_eq!(
+        control
+            .current_watermark("reddit-home")
+            .await
+            .unwrap()
+            .unwrap(),
+        advanced
+    );
+    let metrics = control.graph_control_metrics();
+    assert_eq!(metrics.watermark_advances, 2);
+    assert_eq!(metrics.watermark_rejects, 1);
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn control_plane_idempotency_replays_and_rejects_conflicts() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/idempotency", object_store)
+        .await
+        .unwrap();
+    let first = control
+        .commit_control_idempotency("reddit-home", "repair", "req-1", b"ok")
+        .await
+        .unwrap();
+    assert_eq!(first.result, b"ok");
+    let replay = control
+        .commit_control_idempotency("reddit-home", "repair", "req-1", b"ok")
+        .await
+        .unwrap();
+    assert_eq!(replay, first);
+    let conflict = control
+        .commit_control_idempotency("reddit-home", "repair", "req-1", b"different")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        conflict,
+        GraphError::IdempotencyConflict {
+            operation: "control",
+            ref idempotency_key
+        } if idempotency_key == "req-1"
+    ));
+    assert_eq!(
+        control
+            .control_idempotency_result("reddit-home", "repair", "req-1")
+            .await
+            .unwrap()
+            .unwrap(),
+        first
+    );
+    let metrics = control.graph_control_metrics();
+    assert_eq!(metrics.control_idempotency_commits, 1);
+    assert_eq!(metrics.control_idempotency_replays, 1);
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn control_plane_repair_rebuilds_watermark_from_verified_graph_state() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/repair", Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let shard = open_test_shard("graph/control-repair", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+    shard
+        .write_edge(mutation(1, 2, "repair-cp-1"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(mutation(1, 3, "repair-cp-2"))
+        .await
+        .unwrap();
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    shard
+        .rollup_artifacts(cell_id, edge_type, base_epoch, 2, 2, 1, 2)
+        .await
+        .unwrap();
+
+    let report = control
+        .repair_cell_control_state(&shard, cell_id, edge_type)
+        .await
+        .unwrap();
+    assert_eq!(report.read_epoch, base_epoch);
+    assert_eq!(report.live_edges, 2);
+    assert_eq!(report.delta_records, 2);
+    assert_eq!(report.mismatch_count, 0);
+    assert!(report.repaired_watermark);
+    assert_eq!(report.watermark.durable_epoch, base_epoch);
+    assert_eq!(report.watermark.safe_read_epoch, base_epoch);
+    assert_eq!(report.watermark.outbox_epoch, base_epoch);
+    assert_eq!(report.watermark.artifact_epoch, base_epoch);
+    assert_eq!(report.watermark.edge_type, edge_type);
+    assert!(control.current_watermark(cell_id).await.unwrap().is_none());
+    assert_eq!(
+        control
+            .current_edge_watermark(cell_id, edge_type)
+            .await
+            .unwrap()
+            .unwrap(),
+        report.watermark
+    );
+
+    let replay = control
+        .repair_cell_control_state(&shard, cell_id, edge_type)
+        .await
+        .unwrap();
+    assert!(!replay.repaired_watermark);
+    assert_eq!(replay.watermark, report.watermark);
+
+    shard
+        .delete_deltas_through_rollup(cell_id, edge_type, base_epoch)
+        .await
+        .unwrap();
+    let after_delta_gc = control
+        .repair_cell_control_state(&shard, cell_id, edge_type)
+        .await
+        .unwrap();
+    assert!(!after_delta_gc.repaired_watermark);
+    assert_eq!(after_delta_gc.watermark, report.watermark);
+
+    let metrics = control.graph_control_metrics();
+    assert_eq!(metrics.repair_runs, 3);
+    assert_eq!(metrics.repair_actions, 1);
+    shard.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn control_plane_empty_compute_node_replacement_reads_object_store_state() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control_path = "graph-control/empty-compute-replacement";
+    let control = GraphControlPlane::open(control_path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let placement = ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap();
+    control
+        .publish_placement_with_catalog(&placement, "reddit", 1)
+        .await
+        .unwrap();
+    let cluster_a = RoutedPhase0Cluster::open_owned_with_control(
+        "phase1-empty-compute",
+        "node-a",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_millis(100),
+    )
+    .await
+    .unwrap();
+    cluster_a
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "USER_SUBSCRIBED_TO_SUBREDDIT".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "empty-compute-a".to_string(),
+        })
+        .await
+        .unwrap();
+    cluster_a.close().await.unwrap();
+    control.close().await.unwrap();
+
+    let control = GraphControlPlane::open(control_path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(125)).await;
+    control
+        .failover_expired_cell("reddit-home", "node-b", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let cluster_b = RoutedPhase0Cluster::open_owned_with_control(
+        "phase1-empty-compute",
+        "node-b",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let shard_b = cluster_b.shard("reddit-home").unwrap();
+    assert_eq!(
+        shard_b
+            .out_neighbors("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 1)
+            .await
+            .unwrap(),
+        vec![2]
+    );
+    cluster_b
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "USER_SUBSCRIBED_TO_SUBREDDIT".to_string(),
+            src: 1,
+            dst: 3,
+            idempotency_key: "empty-compute-b".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        shard_b
+            .out_neighbors("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 1)
+            .await
+            .unwrap(),
+        vec![2, 3]
+    );
+    cluster_b.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn control_plane_repair_does_not_advance_cell_watermark_for_other_edge_types() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control =
+        GraphControlPlane::open("graph-control/repair-edge-scope", Arc::clone(&object_store))
+            .await
+            .unwrap();
+    let shard = open_test_shard("graph/control-repair-edge-scope", object_store).await;
+    let cell_id = "reddit-home";
+    let repaired_edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+    let dirty_edge_type = "USER_BLOCKED_USER";
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: cell_id.to_string(),
+            edge_type: repaired_edge_type.to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "repair-scope-clean".to_string(),
+        })
+        .await
+        .unwrap();
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: cell_id.to_string(),
+            edge_type: dirty_edge_type.to_string(),
+            src: 7,
+            dst: 8,
+            idempotency_key: "repair-scope-dirty".to_string(),
+        })
+        .await
+        .unwrap();
+    let read_epoch = shard.current_epoch(cell_id).await.unwrap();
+
+    let mut batch = WriteBatch::new();
+    batch.delete(keys::out_edge(cell_id, dirty_edge_type, 7, 8).as_bytes());
+    shard.write_strict_for_test(batch).await.unwrap();
+
+    let report = control
+        .repair_cell_control_state(&shard, cell_id, repaired_edge_type)
+        .await
+        .unwrap();
+    assert_eq!(report.read_epoch, read_epoch);
+    assert_eq!(report.watermark.edge_type, repaired_edge_type);
+    assert_eq!(report.watermark.safe_read_epoch, read_epoch);
+    assert!(control.current_watermark(cell_id).await.unwrap().is_none());
+    assert!(control
+        .current_edge_watermark(cell_id, dirty_edge_type)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!shard
+        .verify_current_graph(cell_id, dirty_edge_type, 1, 4)
+        .await
+        .unwrap()
+        .is_clean());
+
+    shard.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn control_plane_repair_refuses_to_advance_on_corrupt_graph_state() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control =
+        GraphControlPlane::open("graph-control/repair-corrupt", Arc::clone(&object_store))
+            .await
+            .unwrap();
+    let shard = open_test_shard("graph/control-repair-corrupt", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+    shard
+        .write_edge(mutation(1, 2, "repair-cp-corrupt"))
+        .await
+        .unwrap();
+    let mut batch = WriteBatch::new();
+    batch.delete(keys::out_edge(cell_id, edge_type, 1, 2).as_bytes());
+    shard.write_strict_for_test(batch).await.unwrap();
+
+    let err = control
+        .repair_cell_control_state(&shard, cell_id, edge_type)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::CorruptValue {
+            ref key,
+            ref reason
+        } if key == "control/watermark_edge/reddit-home/USER_SUBSCRIBED_TO_SUBREDDIT"
+            && reason.contains("cannot repair control state")
+    ));
+    assert!(control.current_watermark(cell_id).await.unwrap().is_none());
+    shard.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn graph_limits_reject_unbounded_bulk_artifact_and_traversal_work() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_limits(

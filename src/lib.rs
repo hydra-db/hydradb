@@ -27,10 +27,11 @@ pub use opencypher::{
 };
 pub use phase0::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
-    BenchmarkResult, DeltaGcResult, GraphControlMetricsSnapshot, GraphControlPlane, GraphNode,
-    GraphRollup, LeaseRenewalHandle, MatrixArtifact, MatrixTraversalResult, Phase0Cluster,
-    PostingChunk, RoutedPhase0Cluster, ShardLease, ShardPlacement, SupernodeGroup, SupernodePage,
-    TraversalBackend,
+    BenchmarkResult, DeltaGcResult, GraphControlEdgeWatermark, GraphControlIdempotencyRecord,
+    GraphControlMetricsSnapshot, GraphControlPlane, GraphControlRepairReport,
+    GraphControlWatermark, GraphNode, GraphRollup, GraphShardCatalogEntry, LeaseRenewalHandle,
+    MatrixArtifact, MatrixTraversalResult, Phase0Cluster, PostingChunk, RoutedPhase0Cluster,
+    ShardLease, ShardPlacement, SupernodeGroup, SupernodePage, TraversalBackend,
 };
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
@@ -86,6 +87,23 @@ pub enum GraphError {
     IdempotencyConflict {
         operation: &'static str,
         idempotency_key: String,
+    },
+    #[error(
+        "control metadata conflict at {key}: expected generation {expected_generation:?}, actual generation {actual_generation:?}"
+    )]
+    ControlMetadataConflict {
+        key: String,
+        expected_generation: Option<u64>,
+        actual_generation: Option<u64>,
+    },
+    #[error(
+        "control watermark regression for {field} on cell {cell_id}: requested {requested_epoch}, current {current_epoch}"
+    )]
+    ControlWatermarkRegression {
+        cell_id: String,
+        field: &'static str,
+        requested_epoch: GraphEpoch,
+        current_epoch: GraphEpoch,
     },
     #[error(
         "snapshot epoch {read_epoch} is ahead of current epoch {current_epoch} for cell {cell_id}"
