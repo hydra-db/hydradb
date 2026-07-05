@@ -5492,7 +5492,7 @@ async fn cypher_limit_skip_uses_query_window() {
     let plan = shard
         .explain_cypher(
             QueryContext::new("reddit-home", "cypher-window-plan"),
-            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 1 LIMIT 2",
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 2 - 1 LIMIT 1 + 1",
         )
         .unwrap();
     assert_eq!(
@@ -5506,7 +5506,7 @@ async fn cypher_limit_skip_uses_query_window() {
     let windowed = shard
         .execute_cypher(
             QueryContext::new("reddit-home", "cypher-window-read"),
-            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 1 LIMIT 2",
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 2 - 1 LIMIT 1 + 1",
         )
         .await
         .unwrap();

@@ -329,18 +329,14 @@ fn lower_return_window(return_clause: *const AstNode) -> Result<QueryWindow> {
         let skip = if skip_node.is_null() {
             0
         } else {
-            integer_vertex_id(checked_node(skip_node)?)?
+            window_u64_expression(checked_node(skip_node)?, "SKIP")?
         };
 
         let limit_node = sys::cypher_ast_return_get_limit(return_clause);
         let limit = if limit_node.is_null() {
             None
         } else {
-            let limit = integer_vertex_id(checked_node(limit_node)?)?;
-            Some(
-                usize::try_from(limit)
-                    .map_err(|_| unsupported_value("LIMIT exceeds platform usize"))?,
-            )
+            Some(window_usize_expression(checked_node(limit_node)?, "LIMIT")?)
         };
 
         Ok(QueryWindow { skip, limit })
@@ -531,6 +527,74 @@ fn integer_vertex_id(node: *const AstNode) -> Result<VertexId> {
         value
             .parse::<VertexId>()
             .map_err(|err| parse_error(format!("invalid node id integer literal {value}: {err}")))
+    }
+}
+
+fn window_u64_expression(node: *const AstNode, field: &str) -> Result<u64> {
+    let value = constant_integer_expression(node, field)?;
+    u64::try_from(value).map_err(|_| unsupported_value(format!("{field} cannot be negative")))
+}
+
+fn window_usize_expression(node: *const AstNode, field: &str) -> Result<usize> {
+    let value = window_u64_expression(node, field)?;
+    usize::try_from(value).map_err(|_| unsupported_value(format!("{field} exceeds platform usize")))
+}
+
+fn constant_integer_expression(node: *const AstNode, field: &str) -> Result<i128> {
+    unsafe {
+        if is_instance(node, sys::CYPHER_AST_INTEGER) {
+            let value = c_string(sys::cypher_ast_integer_get_valuestr(node));
+            return value.parse::<i128>().map_err(|err| {
+                parse_error(format!("invalid {field} integer literal {value}: {err}"))
+            });
+        }
+
+        if is_instance(node, sys::CYPHER_AST_UNARY_OPERATOR) {
+            let op = sys::cypher_ast_unary_operator_get_operator(node);
+            let arg = checked_node(sys::cypher_ast_unary_operator_get_argument(node))?;
+            let value = constant_integer_expression(arg, field)?;
+            if op == sys::CYPHER_OP_UNARY_PLUS {
+                return Ok(value);
+            }
+            if op == sys::CYPHER_OP_UNARY_MINUS {
+                return value.checked_neg().ok_or_else(|| {
+                    unsupported_value(format!("{field} constant expression overflowed"))
+                });
+            }
+            return unsupported(format!("{field} supports only constant integer arithmetic"));
+        }
+
+        if is_instance(node, sys::CYPHER_AST_BINARY_OPERATOR) {
+            let op = sys::cypher_ast_binary_operator_get_operator(node);
+            let left = checked_node(sys::cypher_ast_binary_operator_get_argument1(node))?;
+            let right = checked_node(sys::cypher_ast_binary_operator_get_argument2(node))?;
+            let left = constant_integer_expression(left, field)?;
+            let right = constant_integer_expression(right, field)?;
+            let value = if op == sys::CYPHER_OP_PLUS {
+                left.checked_add(right)
+            } else if op == sys::CYPHER_OP_MINUS {
+                left.checked_sub(right)
+            } else if op == sys::CYPHER_OP_MULT {
+                left.checked_mul(right)
+            } else if op == sys::CYPHER_OP_DIV {
+                if right == 0 {
+                    return unsupported(format!("{field} division by zero"));
+                }
+                left.checked_div(right)
+            } else if op == sys::CYPHER_OP_MOD {
+                if right == 0 {
+                    return unsupported(format!("{field} modulo by zero"));
+                }
+                left.checked_rem(right)
+            } else {
+                return unsupported(format!("{field} supports only constant integer arithmetic"));
+            };
+            return value.ok_or_else(|| {
+                unsupported_value(format!("{field} constant expression overflowed"))
+            });
+        }
+
+        unsupported(format!("{field} supports only constant integer arithmetic"))
     }
 }
 
@@ -827,6 +891,31 @@ mod tests {
                 limit: Some(3)
             }
         );
+    }
+
+    #[test]
+    fn folds_constant_return_skip_and_limit_expressions() {
+        let parsed = parse_opencypher_with_window(
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 1 + 1 LIMIT 6 / 2",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.window,
+            QueryWindow {
+                skip: 2,
+                limit: Some(3)
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_negative_return_window_expressions() {
+        assert!(matches!(
+            parse_opencypher_with_window(
+                "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 1 - 2 LIMIT 3"
+            ),
+            Err(GraphError::UnsupportedQuery { .. })
+        ));
     }
 
     #[test]

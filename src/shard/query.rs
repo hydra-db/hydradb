@@ -232,7 +232,11 @@ impl GraphShard {
         vertices: Vec<VertexId>,
         window: QueryWindow,
     ) -> Result<Vec<VertexId>> {
-        let skip = usize::try_from(window.skip).unwrap_or(usize::MAX);
+        let skip = usize::try_from(window.skip).map_err(|_| GraphError::AdmissionRejected {
+            operation: "query_result_skip",
+            actual: window.skip,
+            limit: usize::MAX as u64,
+        })?;
         let windowed: Vec<_> = vertices.into_iter().skip(skip).collect();
         self.apply_query_window_fetch_result(windowed, window)
     }
