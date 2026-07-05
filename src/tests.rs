@@ -5524,6 +5524,98 @@ async fn cypher_limit_skip_uses_query_window() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_rows_return_columns_and_typed_values() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-rows", object_store).await;
+
+    for (idx, dst) in [10, 11, 12, 13].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst,
+                idempotency_key: format!("cypher-row-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 1 LIMIT 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(11)]),
+                QueryRow::new(vec![QueryValue::VertexId(12)]),
+            ],
+        )
+    );
+
+    let aliased_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-alias-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id AS vertex_id LIMIT 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        aliased_rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("vertex_id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(10)])],
+        )
+    );
+
+    let count = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-count"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN count(*)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        count,
+        QueryResultSet::new(
+            vec![QueryColumn::new("count(*)")],
+            vec![QueryRow::new(vec![QueryValue::Count(4)])],
+        )
+    );
+
+    let aliased_count = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-count-alias"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN count(*) AS total",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        aliased_count,
+        QueryResultSet::new(
+            vec![QueryColumn::new("total")],
+            vec![QueryRow::new(vec![QueryValue::Count(4)])],
+        )
+    );
+
+    let write = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-write"),
+            "CREATE (u {id: 1})-[:FOLLOWS]->(v {id: 99})",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(write, GraphError::UnsupportedQuery { .. }));
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_where_and_variable_hops_use_storage_kernel() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-where-varhop", object_store).await;
