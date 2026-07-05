@@ -40,7 +40,7 @@ impl GraphShard {
     ) -> Result<QueryResultSet> {
         #[cfg(feature = "opencypher")]
         {
-            let parsed = parse_opencypher_row_query(query)?;
+            let parsed = parse_opencypher_row_query_with_parameters(query, &context.parameters)?;
             let context = merge_opencypher_window(context, parsed.window)?;
             self.execute_parsed_opencypher_rows(context, parsed).await
         }
@@ -73,7 +73,7 @@ impl GraphShard {
 
     #[cfg(feature = "opencypher")]
     pub fn plan_opencypher(&self, context: QueryContext, query: &str) -> Result<QueryPlan> {
-        let parsed = parse_opencypher_with_window(query)?;
+        let parsed = parse_opencypher_with_parameters(query, &context.parameters)?;
         self.plan_parsed_opencypher(context, parsed)
     }
 
