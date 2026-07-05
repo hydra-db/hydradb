@@ -12,6 +12,13 @@
 //!    `src/write.rs`'s own `should_read_a_committed_write_through_a_separate_reader_handle`
 //!    test).
 //!
+//! A fourth test covers RFC 0005 acceptance #6 (Workstream A): the valued-edge
+//! `EdgeProp` companion (`upsert_edge_with_props`) is a plain `Put`, so it
+//! rides the same durable WAL/manifest path — this drives it end-to-end on
+//! real SlateDB *and* across a drop-without-close reopen, closing the coverage
+//! gap the in-memory `src/write.rs` unit tests leave (they can't prove on-disk
+//! durability of the companion).
+//!
 //! `common::create_object_store`'s `ObjectStoreConfig::InMemory` branch builds
 //! a fresh, disconnected `object_store::memory::InMemory` on every call, so
 //! two `StorageConfig::InMemory` opens never share state — that backend is
@@ -31,6 +38,7 @@
 //! Every SlateDB `.await` in this file is wrapped in [`with_timeout`] so a
 //! regression that causes a hang fails the test suite instead of hanging CI.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 
@@ -40,7 +48,9 @@ use common::storage::config::{LocalObjectStoreConfig, SlateDbStorageConfig};
 use common::{ObjectStoreConfig, Record, StorageConfig, StorageError, WriteOptions};
 use tempfile::TempDir;
 use turbolay::serde::keys::log_key;
+use turbolay::value::TypedValue;
 use turbolay::write::Writer;
+use turbolay::{Direction, PredId, PropId, SchemaKind};
 
 /// Every SlateDB op in this file is awaited through here: a hang becomes a
 /// panic (test failure) after 10s instead of wedging the test binary.
@@ -307,5 +317,87 @@ async fn should_recover_committed_state_after_drop_without_close() {
     assert!(
         carol_uid.get() > alice_uid.get() && carol_uid.get() > bob_uid.get(),
         "post-crash uid must exceed every pre-crash uid (no reuse)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RFC 0005 acceptance #6: valued/faceted-edge companion, end-to-end + durable
+// ---------------------------------------------------------------------------
+
+/// RFC 0005 acceptance #6 (Workstream A), on real SlateDB. The in-memory
+/// `src/write.rs` unit tests already prove the `EdgeProp` companion's *logic*
+/// (write/read/delete/preserve-on-re-upsert), but they run on a backend with
+/// no on-disk WAL/manifest, so they can't prove the companion `Put` actually
+/// *persists*. This drives `upsert_edge_with_props` against real SlateDB and,
+/// crucially, across a drop-**without**-`close()` reopen (the same faithful
+/// crash simulation as `should_recover_committed_state_after_drop_without_close`):
+/// the companion must survive like every other durable record. It also
+/// re-covers, on the real backend, the adjacency fast-add merge for a *valued*
+/// edge — the exact path the `6c32e2c` operand-format fix made correct there.
+#[tokio::test(flavor = "multi_thread")]
+async fn should_persist_and_recover_valued_edge_props_on_real_slatedb() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = slatedb_config(&dir, "ns-edge-props");
+
+    let (src_uid, dst_uid, pred_id, since_prop, weight_prop) = {
+        let mut writer = with_timeout(Writer::open(&config)).await.unwrap();
+
+        let mut props = BTreeMap::new();
+        props.insert("since".to_string(), TypedValue::Int(2020));
+        props.insert("weight".to_string(), TypedValue::Float(0.5));
+        let token =
+            with_timeout(writer.upsert_edge_with_props(b"user:a", "knows", b"user:b", props))
+                .await
+                .unwrap();
+        assert_eq!(token, 1, "first commit on a fresh writer is logical seq 1");
+
+        let src = with_timeout(writer.lookup_uid(b"user:a"))
+            .await
+            .unwrap()
+            .unwrap();
+        let dst = with_timeout(writer.lookup_uid(b"user:b"))
+            .await
+            .unwrap()
+            .unwrap();
+        let pred = PredId(writer.schema_id(SchemaKind::Predicate, "knows").unwrap());
+        let since = PropId(writer.schema_id(SchemaKind::PropertyKey, "since").unwrap());
+        let weight = PropId(writer.schema_id(SchemaKind::PropertyKey, "weight").unwrap());
+
+        // Readable immediately on the same real-SlateDB writer (committed in
+        // the one atomic batch with the adjacency/degree/changelog fan-out).
+        let got = with_timeout(writer.edge_props(src, pred, dst))
+            .await
+            .unwrap()
+            .expect("companion must be readable right after the commit");
+        assert_eq!(got.get(&since), Some(&TypedValue::Int(2020)));
+        assert_eq!(got.get(&weight), Some(&TypedValue::Float(0.5)));
+
+        (src, dst, pred, since, weight)
+        // `writer` dropped here WITHOUT `close()` — crash simulation.
+    };
+
+    // Reopen: the `EdgeProp` companion `Put` must have survived the crash,
+    // recovered from the durable WAL/manifest like any other record.
+    let writer2 = with_timeout(Writer::open(&config)).await.unwrap();
+    let recovered = with_timeout(writer2.edge_props(src_uid, pred_id, dst_uid))
+        .await
+        .unwrap()
+        .expect("EdgeProp companion must survive drop-without-close and reopen");
+    assert_eq!(recovered.get(&since_prop), Some(&TypedValue::Int(2020)));
+    assert_eq!(recovered.get(&weight_prop), Some(&TypedValue::Float(0.5)));
+    assert_eq!(
+        recovered.len(),
+        2,
+        "exactly the two props written survive — no more, no fewer"
+    );
+
+    // And the valued edge's adjacency projection is intact on the real backend
+    // too (the fast-add merge path `6c32e2c` fixed), reachable after recovery.
+    let out = with_timeout(writer2.neighbors(src_uid, pred_id, Direction::Out))
+        .await
+        .unwrap();
+    assert!(
+        out.contains(dst_uid.get()),
+        "the valued edge's Out adjacency must survive and read back on real SlateDB"
     );
 }
