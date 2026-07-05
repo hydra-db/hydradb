@@ -130,6 +130,15 @@ pub struct GraphControlMetricsSnapshot {
     pub lease_renew_failures: u64,
     pub lease_renew_lost: u64,
     pub lease_renew_retries: u64,
+    pub metadata_cas_attempts: u64,
+    pub metadata_cas_successes: u64,
+    pub metadata_cas_conflicts: u64,
+    pub watermark_advances: u64,
+    pub watermark_rejects: u64,
+    pub control_idempotency_commits: u64,
+    pub control_idempotency_replays: u64,
+    pub repair_runs: u64,
+    pub repair_actions: u64,
 }
 
 #[derive(Default)]
@@ -142,6 +151,15 @@ struct GraphControlMetrics {
     lease_renew_failures: AtomicU64,
     lease_renew_lost: AtomicU64,
     lease_renew_retries: AtomicU64,
+    metadata_cas_attempts: AtomicU64,
+    metadata_cas_successes: AtomicU64,
+    metadata_cas_conflicts: AtomicU64,
+    watermark_advances: AtomicU64,
+    watermark_rejects: AtomicU64,
+    control_idempotency_commits: AtomicU64,
+    control_idempotency_replays: AtomicU64,
+    repair_runs: AtomicU64,
+    repair_actions: AtomicU64,
 }
 
 impl GraphControlMetrics {
@@ -155,6 +173,15 @@ impl GraphControlMetrics {
             lease_renew_failures: self.lease_renew_failures.load(Ordering::Relaxed),
             lease_renew_lost: self.lease_renew_lost.load(Ordering::Relaxed),
             lease_renew_retries: self.lease_renew_retries.load(Ordering::Relaxed),
+            metadata_cas_attempts: self.metadata_cas_attempts.load(Ordering::Relaxed),
+            metadata_cas_successes: self.metadata_cas_successes.load(Ordering::Relaxed),
+            metadata_cas_conflicts: self.metadata_cas_conflicts.load(Ordering::Relaxed),
+            watermark_advances: self.watermark_advances.load(Ordering::Relaxed),
+            watermark_rejects: self.watermark_rejects.load(Ordering::Relaxed),
+            control_idempotency_commits: self.control_idempotency_commits.load(Ordering::Relaxed),
+            control_idempotency_replays: self.control_idempotency_replays.load(Ordering::Relaxed),
+            repair_runs: self.repair_runs.load(Ordering::Relaxed),
+            repair_actions: self.repair_actions.load(Ordering::Relaxed),
         }
     }
 }
@@ -262,10 +289,16 @@ struct GraphBlasCscManifest {
 
 mod artifact_build;
 mod cluster;
+mod control_metadata;
 mod control_plane;
 mod supernode;
 mod traversal;
 mod verify;
+
+pub use control_metadata::{
+    GraphControlEdgeWatermark, GraphControlIdempotencyRecord, GraphControlRepairReport,
+    GraphControlWatermark, GraphShardCatalogEntry,
+};
 
 pub fn local_object_store(path: impl AsRef<std::path::Path>) -> Result<Arc<dyn ObjectStore>> {
     Ok(Arc::new(LocalFileSystem::new_with_prefix(path.as_ref())?) as Arc<dyn ObjectStore>)
