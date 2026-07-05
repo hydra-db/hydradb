@@ -28,6 +28,7 @@ use crate::{Error, Result};
 /// | `0x9` | [`Xid`](RecordType::Xid) | `[xid: terminated]` | `uid: u64` BE |
 /// | `0xA` | [`Log`](RecordType::Log) | `[seq: u64 BE]` | `ChangeRecord` |
 /// | `0xB` | [`Meta`](RecordType::Meta) | `[meta_key: bytes]` | scalar / bitmap / counter |
+/// | `0xC` | [`EdgeProp`](RecordType::EdgeProp) | `[src: u64 BE][pred: u32 BE][dst: u64 BE]` | `EdgeProps` (bincode-free LE map) |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum RecordType {
@@ -53,6 +54,9 @@ pub enum RecordType {
     Log = 0xA,
     /// Namespace metadata: `latest_seq`, seq-block reservations, counters, bitmaps.
     Meta = 0xB,
+    /// A valued/faceted edge's companion property record — one copy per edge,
+    /// keyed by full edge identity (RFC 0005 §"Edge facets", as amended).
+    EdgeProp = 0xC,
 }
 
 impl RecordType {
@@ -83,6 +87,7 @@ impl RecordType {
             0x9 => RecordType::Xid,
             0xA => RecordType::Log,
             0xB => RecordType::Meta,
+            0xC => RecordType::EdgeProp,
             other => {
                 return Err(Error::encoding(format!(
                     "unknown record type nibble: 0x{other:x}"
@@ -122,6 +127,7 @@ mod tests {
         RecordType::Xid,
         RecordType::Log,
         RecordType::Meta,
+        RecordType::EdgeProp,
     ];
 
     #[test]
@@ -138,8 +144,8 @@ mod tests {
 
     #[test]
     fn should_reject_unknown_nibble() {
-        // given — 0xC..=0xF are unassigned
-        for nibble in 0xC..=0xF {
+        // given — 0xD..=0xF are unassigned (0xC is now EdgeProp)
+        for nibble in 0xD..=0xF {
             assert!(RecordType::from_nibble(nibble).is_err());
         }
     }

@@ -27,6 +27,9 @@
 //!   records; `SchemaCache` itself never writes).
 //! - [`crate::value::{V0NodeCodec, ChangeRecord, NodeRecord}`] — node encoding
 //!   (with its 1 MiB cap) and the changelog value.
+//! - [`crate::value::{encode_edge_props, decode_edge_props}`] — the
+//!   `EdgeProp` companion codec ([`Self::upsert_edge_with_props`],
+//!   [`Self::edge_props`]; Workstream A, RFC 0005 §"Edge facets").
 //!
 //! # Degree counter (D5's "optionally maintain a degree/count Meta counter")
 //!
@@ -81,11 +84,14 @@ use roaring::RoaringTreemap;
 use crate::ids::{GraphAllocators, resolve_or_create_xid_batched};
 use crate::posting_ops;
 use crate::schema::{Directives, SchemaCache, SchemaEntry, ValType};
-use crate::serde::keys::{log_key, meta_key, node_key, schema_id_key, schema_name_key, xid_key};
+use crate::serde::keys::{
+    edge_prop_key, log_key, meta_key, node_key, schema_id_key, schema_name_key, xid_key,
+};
 use crate::serde::{Direction, LabelId, PredId, PropId, SchemaKind, Uid};
 use crate::storage::GraphStorage;
 use crate::value::{
-    ChangeOp, ChangeRecord, LabelDelta, NodeCodec, NodeRecord, TypedValue, V0NodeCodec,
+    ChangeOp, ChangeRecord, EdgeProps, LabelDelta, NodeCodec, NodeRecord, TypedValue, V0NodeCodec,
+    decode_edge_props, encode_edge_props,
 };
 use crate::{Error, Result};
 
@@ -182,6 +188,25 @@ impl Writer {
         match self.storage.get(node_key(uid)).await? {
             None => Ok(None),
             Some(bytes) => Ok(Some(V0NodeCodec::decode(&bytes)?)),
+        }
+    }
+
+    /// Reads back an edge's `EdgeProp` companion record (RFC 0005 §"Edge
+    /// facets", as amended: a single copy keyed by full edge identity) — read
+    /// escape hatch for tests/callers, mirroring [`Self::get_node`]. `None`
+    /// means the edge has no companion: either it was never upserted with
+    /// props ([`Self::upsert_edge`] / an empty-map [`Self::upsert_edge_with_props`]
+    /// call), or it was deleted ([`Self::delete_edge`] blind-deletes the
+    /// companion). Like `get_node`, this is a **raw point-get** — it does not
+    /// consult `Meta["deleted_edges"]`/`Meta["deleted_nodes"]` tombstones, so
+    /// a companion for a since-tombstoned edge (deleted via the adjacency
+    /// bitmap rather than `delete_edge`, which can't happen through this
+    /// module's own API but could via a future path) would still read back
+    /// here until vacuum (RFC 0012) physically reaps it.
+    pub async fn edge_props(&self, src: Uid, pred: PredId, dst: Uid) -> Result<Option<EdgeProps>> {
+        match self.storage.get(edge_prop_key(src, pred, dst)).await? {
+            None => Ok(None),
+            Some(bytes) => Ok(Some(decode_edge_props(&bytes)?)),
         }
     }
 
@@ -283,7 +308,48 @@ impl Writer {
     /// one seq. After the commit, runs [`posting_ops::maybe_split`] on both
     /// touched adjacency keys as a best-effort, non-atomic follow-up (see the
     /// module-level note).
+    ///
+    /// A thin, back-compat wrapper over [`Self::upsert_edge_inner`] with an
+    /// empty props map — it **never** touches the edge's `EdgeProp` companion
+    /// (RFC 0005 §"Edge facets"), so re-`upsert_edge`-ing an already-valued
+    /// edge preserves whatever props [`Self::upsert_edge_with_props`]
+    /// previously wrote for it.
     pub async fn upsert_edge(&mut self, src_xid: &[u8], pred: &str, dst_xid: &[u8]) -> Result<Seq> {
+        self.upsert_edge_inner(src_xid, pred, dst_xid, BTreeMap::new())
+            .await
+    }
+
+    /// `UpsertEdge(src_xid, pred, dst_xid, props)` — [`Self::upsert_edge`]'s
+    /// valued/faceted-edge counterpart (Workstream A, RFC 0005 §"Edge
+    /// facets"). Identical fan-out to `upsert_edge`, plus: each prop name is
+    /// interned to a [`PropId`] (exactly like [`Self::upsert_node`] interns
+    /// node props) and, **if `props` is non-empty**, the edge's single
+    /// `EdgeProp[src][pred][dst]` companion record is put in the same atomic
+    /// batch as the adjacency/degree/changelog writes. If `props` is empty,
+    /// no companion is written — behaves exactly like plain `upsert_edge`.
+    /// Emits the same `ChangeOp::UpsertEdge` changelog record as
+    /// `upsert_edge` (no new `ChangeOp`, no `ChangeRecord` format change: the
+    /// companion is a storage-layer detail, not a change-stream event).
+    pub async fn upsert_edge_with_props(
+        &mut self,
+        src_xid: &[u8],
+        pred: &str,
+        dst_xid: &[u8],
+        props: BTreeMap<String, TypedValue>,
+    ) -> Result<Seq> {
+        self.upsert_edge_inner(src_xid, pred, dst_xid, props).await
+    }
+
+    /// Shared `UpsertEdge` fan-out for [`Self::upsert_edge`] and
+    /// [`Self::upsert_edge_with_props`] — an empty `props` map is exactly the
+    /// plain-edge case (no `EdgeProp` companion is written either way).
+    async fn upsert_edge_inner(
+        &mut self,
+        src_xid: &[u8],
+        pred: &str,
+        dst_xid: &[u8],
+        props: BTreeMap<String, TypedValue>,
+    ) -> Result<Seq> {
         let mut ops = Vec::new();
 
         let src_uid = self.resolve_and_stub_node(src_xid, &mut ops).await?;
@@ -298,6 +364,21 @@ impl Writer {
         );
         ops.push(bump_degree(pred_id, Direction::Out, src_uid, 1));
         ops.push(bump_degree(pred_id, Direction::In, dst_uid, 1));
+
+        if !props.is_empty() {
+            let mut edge_props: EdgeProps = BTreeMap::new();
+            for (name, value) in props {
+                let prop_id = PropId(self.intern(SchemaKind::PropertyKey, &name, &mut ops));
+                edge_props.insert(prop_id, value);
+            }
+            ops.push(RecordOp::Put(
+                Record::new(
+                    edge_prop_key(src_uid, pred_id, dst_uid),
+                    encode_edge_props(&edge_props),
+                )
+                .into(),
+            ));
+        }
 
         let change = ChangeRecord {
             seq: 0,
@@ -358,9 +439,13 @@ impl Writer {
 
     /// `DeleteEdge(src_xid, pred, dst_xid)` (RFC 0004 §"Write path"):
     /// tombstones the edge in both directions (`Meta["deleted_edges"/pred/src]`
-    /// and the symmetric `.../dst]`) and decrements both degree counters.
-    /// No-op (current `latest_seq`, nothing written) if either endpoint's xid
-    /// is unmapped or `pred` was never interned — there is no edge to delete.
+    /// and the symmetric `.../dst]`), decrements both degree counters, and
+    /// blind-deletes the edge's `EdgeProp[src][pred][dst]` companion (RFC 0005
+    /// §"Edge facets") if one exists — a `Delete` on a Put-only key that was
+    /// never written is a safe no-op, so this doesn't need its own presence
+    /// check. No-op (current `latest_seq`, nothing written) if either
+    /// endpoint's xid is unmapped or `pred` was never interned — there is no
+    /// edge to delete.
     pub async fn delete_edge(&mut self, src_xid: &[u8], pred: &str, dst_xid: &[u8]) -> Result<Seq> {
         let (Some(src_uid), Some(dst_uid)) = (
             self.lookup_uid(src_xid).await?,
@@ -378,6 +463,7 @@ impl Writer {
             posting_ops::delete_edge_op(pred_id, dst_uid, src_uid),
             bump_degree(pred_id, Direction::Out, src_uid, -1),
             bump_degree(pred_id, Direction::In, dst_uid, -1),
+            RecordOp::Delete(edge_prop_key(src_uid, pred_id, dst_uid)),
         ];
         let change = ChangeRecord {
             seq: 0,
@@ -770,6 +856,150 @@ mod tests {
         assert_eq!(change.seq, token);
         assert_eq!(change.op, ChangeOp::UpsertEdge);
         assert_eq!(writer.latest_seq(), token);
+    }
+
+    // -- Workstream A: EdgeProp companion (valued/faceted edges) ---------
+
+    #[tokio::test]
+    async fn should_write_and_read_back_valued_edge_props() {
+        let mut writer = Writer::in_memory().await.unwrap();
+
+        writer
+            .upsert_edge_with_props(
+                b"user:a",
+                "knows",
+                b"user:b",
+                props(&[("since", TypedValue::Int(2020))]),
+            )
+            .await
+            .unwrap();
+
+        let src = writer.lookup_uid(b"user:a").await.unwrap().unwrap();
+        let dst = writer.lookup_uid(b"user:b").await.unwrap().unwrap();
+        let pred = PredId(writer.schema_id(SchemaKind::Predicate, "knows").unwrap());
+
+        let got = writer.edge_props(src, pred, dst).await.unwrap().unwrap();
+        let prop_id = PropId(writer.schema_id(SchemaKind::PropertyKey, "since").unwrap());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got.get(&prop_id), Some(&TypedValue::Int(2020)));
+    }
+
+    #[tokio::test]
+    async fn should_commit_edge_props_at_the_same_seq_as_the_edge() {
+        let mut writer = Writer::in_memory().await.unwrap();
+
+        let token = writer
+            .upsert_edge_with_props(
+                b"user:a",
+                "knows",
+                b"user:b",
+                props(&[("since", TypedValue::Int(2020))]),
+            )
+            .await
+            .unwrap();
+
+        let src = writer.lookup_uid(b"user:a").await.unwrap().unwrap();
+        let dst = writer.lookup_uid(b"user:b").await.unwrap().unwrap();
+        let pred = PredId(writer.schema_id(SchemaKind::Predicate, "knows").unwrap());
+
+        // The companion is already readable right after the token is
+        // returned — it was committed in the same atomic batch.
+        assert!(writer.edge_props(src, pred, dst).await.unwrap().is_some());
+
+        let log = writer.storage().get(log_key(token)).await.unwrap().unwrap();
+        let change = ChangeRecord::decode(&log).unwrap();
+        assert_eq!(change.seq, token);
+        assert_eq!(
+            change.op,
+            ChangeOp::UpsertEdge,
+            "no new ChangeOp for a valued edge — the companion is a storage \
+             detail, not a change-stream event"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_remove_companion_on_delete_edge() {
+        let mut writer = Writer::in_memory().await.unwrap();
+        writer
+            .upsert_edge_with_props(
+                b"user:a",
+                "knows",
+                b"user:b",
+                props(&[("since", TypedValue::Int(2020))]),
+            )
+            .await
+            .unwrap();
+
+        let src = writer.lookup_uid(b"user:a").await.unwrap().unwrap();
+        let dst = writer.lookup_uid(b"user:b").await.unwrap().unwrap();
+        let pred = PredId(writer.schema_id(SchemaKind::Predicate, "knows").unwrap());
+        assert!(writer.edge_props(src, pred, dst).await.unwrap().is_some());
+
+        writer
+            .delete_edge(b"user:a", "knows", b"user:b")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            writer.edge_props(src, pred, dst).await.unwrap(),
+            None,
+            "delete_edge must blind-delete the EdgeProp companion too"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_preserve_props_on_plain_re_upsert_of_a_valued_edge() {
+        let mut writer = Writer::in_memory().await.unwrap();
+        writer
+            .upsert_edge_with_props(
+                b"user:a",
+                "knows",
+                b"user:b",
+                props(&[("since", TypedValue::Int(2020))]),
+            )
+            .await
+            .unwrap();
+
+        // A plain upsert_edge of the same (src, pred, dst) must never touch
+        // the companion.
+        writer
+            .upsert_edge(b"user:a", "knows", b"user:b")
+            .await
+            .unwrap();
+
+        let src = writer.lookup_uid(b"user:a").await.unwrap().unwrap();
+        let dst = writer.lookup_uid(b"user:b").await.unwrap().unwrap();
+        let pred = PredId(writer.schema_id(SchemaKind::Predicate, "knows").unwrap());
+        let got = writer.edge_props(src, pred, dst).await.unwrap().unwrap();
+        assert_eq!(got.len(), 1, "prior props must survive a plain re-upsert");
+    }
+
+    #[tokio::test]
+    async fn should_write_no_companion_for_empty_props_map() {
+        let mut writer = Writer::in_memory().await.unwrap();
+        writer
+            .upsert_edge_with_props(b"user:a", "knows", b"user:b", BTreeMap::new())
+            .await
+            .unwrap();
+
+        let src = writer.lookup_uid(b"user:a").await.unwrap().unwrap();
+        let dst = writer.lookup_uid(b"user:b").await.unwrap().unwrap();
+        let pred = PredId(writer.schema_id(SchemaKind::Predicate, "knows").unwrap());
+        assert_eq!(writer.edge_props(src, pred, dst).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn should_write_no_companion_for_plain_upsert_edge() {
+        let mut writer = Writer::in_memory().await.unwrap();
+        writer
+            .upsert_edge(b"user:a", "knows", b"user:b")
+            .await
+            .unwrap();
+
+        let src = writer.lookup_uid(b"user:a").await.unwrap().unwrap();
+        let dst = writer.lookup_uid(b"user:b").await.unwrap().unwrap();
+        let pred = PredId(writer.schema_id(SchemaKind::Predicate, "knows").unwrap());
+        assert_eq!(writer.edge_props(src, pred, dst).await.unwrap(), None);
     }
 
     // -- RFC 0004 acceptance #4: delete correctness ----------------------

@@ -203,6 +203,53 @@ impl NodeCodec for V0NodeCodec {
 }
 
 // ---------------------------------------------------------------------------
+// EdgeProps (companion record for valued/faceted edges — RFC 0005
+// §"Edge facets", as amended: one copy per edge, not per-projection)
+// ---------------------------------------------------------------------------
+
+/// The value at every [`crate::serde::keys::edge_prop_key`] — an edge's
+/// properties, keyed by `prop_id` the same way [`NodeRecord::props`] is. A
+/// `BTreeMap` gives a canonical encode order; this lives in `value.rs` (not
+/// `serde::keys`) because it reuses [`TypedValue::write_to`]/`read_from`,
+/// which are module-private.
+pub type EdgeProps = BTreeMap<PropId, TypedValue>;
+
+/// Encodes `props` exactly the way [`V0NodeCodec::encode_with_cap`] encodes a
+/// node's `props` field: an [`encode_array_count`]-prefixed sequence of
+/// `(prop_id: u32 LE, value: TypedValue)` pairs. No node-size cap applies
+/// here — the companion record is its own, separate key.
+pub fn encode_edge_props(props: &EdgeProps) -> Bytes {
+    let mut buf = BytesMut::new();
+    encode_array_count(props.len(), &mut buf);
+    for (prop_id, value) in props {
+        buf.put_u32_le(prop_id.get());
+        value.write_to(&mut buf);
+    }
+    buf.freeze()
+}
+
+/// Decodes [`encode_edge_props`]'s output — the exact inverse. Fail-closed:
+/// truncation, an unknown `TypedValue` tag, or trailing bytes are all `Err`,
+/// never a panic (mirrors [`V0NodeCodec::decode`]'s trailing-bytes check).
+pub fn decode_edge_props(bytes: &[u8]) -> Result<EdgeProps> {
+    let mut cur = bytes;
+    let count = decode_array_count(&mut cur).map_err(Error::from)?;
+    let mut props = BTreeMap::new();
+    for _ in 0..count {
+        let prop_id = PropId(take_u32_le(&mut cur, "edge-prop prop id")?);
+        let value = TypedValue::read_from(&mut cur)?;
+        props.insert(prop_id, value);
+    }
+    if !cur.is_empty() {
+        return Err(Error::encoding(format!(
+            "trailing bytes after edge props: {} extra",
+            cur.len()
+        )));
+    }
+    Ok(props)
+}
+
+// ---------------------------------------------------------------------------
 // ChangeRecord
 // ---------------------------------------------------------------------------
 
@@ -531,6 +578,39 @@ mod tests {
         let mut extended = bytes.to_vec();
         extended.push(0xAB);
         assert!(V0NodeCodec::decode(&extended).is_err());
+    }
+
+    #[test]
+    fn should_roundtrip_edge_props_empty_and_populated() {
+        let empty: EdgeProps = BTreeMap::new();
+        assert_eq!(
+            decode_edge_props(&encode_edge_props(&empty)).unwrap(),
+            empty
+        );
+
+        let mut props: EdgeProps = BTreeMap::new();
+        props.insert(PropId(1), TypedValue::String("blue".to_string()));
+        props.insert(PropId(2), TypedValue::Int(42));
+        props.insert(PropId(3), TypedValue::Null);
+        assert_eq!(
+            decode_edge_props(&encode_edge_props(&props)).unwrap(),
+            props
+        );
+    }
+
+    #[test]
+    fn should_reject_truncated_and_trailing_edge_props_bytes() {
+        let mut props: EdgeProps = BTreeMap::new();
+        props.insert(PropId(1), TypedValue::Bool(true));
+        props.insert(PropId(9), TypedValue::Float(1.5));
+        let bytes = encode_edge_props(&props);
+
+        for cut in 0..bytes.len() {
+            assert!(decode_edge_props(&bytes[..cut]).is_err());
+        }
+        let mut extended = bytes.to_vec();
+        extended.push(0xAB);
+        assert!(decode_edge_props(&extended).is_err());
     }
 
     #[test]

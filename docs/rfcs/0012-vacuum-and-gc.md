@@ -18,6 +18,7 @@ Physically reclaim what tombstone-and-filter (RFC 0004) and deleted-edge bitmaps
 ## Will contain
 - Vacuum loop (single-writer RMW): fold `deleted_nodes` / `deleted_edges` bitmaps into the sets and clear them; re-merge posting parts on shrink.
 - Purge a deleted node's `Node` record, `Xid` mapping, index tokens, and incident `EdgeOut`/`EdgeIn` entries.
+- Vacuum must also reap `EdgeProp` companion records for tombstoned edges/nodes (RFC 0005 §"Edge facets"): `delete_edge` blind-deletes its own companion synchronously, but a node delete's tombstone-and-filter does *not* cascade to its incident edges' companions, so those stay live-but-unreachable (the owning edge no longer resolves through any live projection) until vacuum physically purges them.
 - Snapshot-retention horizon (min manifest version any live reader is pinned to) so vacuum never resurrects a row a reader can still see; interaction with SlateDB compaction/GC + checkpoints.
 - Cardinality-based trigger; guardrails against tombstone storms.
 
