@@ -5622,6 +5622,77 @@ async fn cypher_create_labels_properties_are_atomic_and_idempotent() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_parameters_bind_create_match_where_and_window() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-parameters", object_store).await;
+
+    let create_context = QueryContext::new("reddit-home", "cypher-params-create")
+        .with_parameter("src", VertexPropertyValue::Integer(10))
+        .with_parameter("dst", VertexPropertyValue::Integer(20))
+        .with_parameter("src_name", VertexPropertyValue::String("alice".to_string()))
+        .with_parameter("dst_name", VertexPropertyValue::String("bob".to_string()))
+        .with_parameter("active", VertexPropertyValue::Bool(true))
+        .with_parameter("age", VertexPropertyValue::Integer(42));
+    let write = shard
+        .execute_cypher(
+            create_context,
+            "CREATE (u:User {id: $src, name: $src_name, active: $active})-[:FOLLOWS]->\
+             (v:User {id: $dst, name: $dst_name, age: $age})",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        write,
+        QueryOutput::Write(CommitResult {
+            epoch: 1,
+            already_existed: false
+        })
+    );
+
+    let read_context = QueryContext::new("reddit-home", "cypher-params-read")
+        .with_parameter("active", VertexPropertyValue::Bool(true))
+        .with_parameter("age", VertexPropertyValue::Integer(42))
+        .with_parameter("name", VertexPropertyValue::String("bob".to_string()))
+        .with_parameter("skip", VertexPropertyValue::Integer(0))
+        .with_parameter("limit", VertexPropertyValue::Integer(1));
+    let rows = shard
+        .execute_cypher_rows(
+            read_context,
+            "MATCH (u:User {active: $active})-[:FOLLOWS]->(v:User {age: $age}) \
+             WHERE v.name = $name \
+             RETURN u.name AS src, v.name AS dst SKIP $skip LIMIT $limit",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("src"), QueryColumn::new("dst")],
+            vec![QueryRow::new(vec![
+                QueryValue::Property(VertexPropertyValue::String("alice".to_string())),
+                QueryValue::Property(VertexPropertyValue::String("bob".to_string())),
+            ])],
+        )
+    );
+
+    let missing = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-params-missing"),
+            "MATCH (u {id: $missing})-[:FOLLOWS]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        missing,
+        GraphError::MissingQueryParameter {
+            dialect: "OpenCypher",
+            ref name
+        } if name == "missing"
+    ));
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_limit_skip_uses_query_window() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-limit-skip", object_store).await;

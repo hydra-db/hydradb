@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::{
     validate_component, CommitResult, GraphEpoch, GraphError, Result, VertexId, VertexMetadata,
     VertexPropertyValue,
@@ -9,6 +11,7 @@ pub struct QueryContext {
     pub idempotency_key: String,
     pub read_epoch: Option<GraphEpoch>,
     pub result_window: QueryWindow,
+    pub parameters: BTreeMap<String, VertexPropertyValue>,
 }
 
 impl QueryContext {
@@ -18,6 +21,7 @@ impl QueryContext {
             idempotency_key: idempotency_key.into(),
             read_epoch: None,
             result_window: QueryWindow::default(),
+            parameters: BTreeMap::new(),
         }
     }
 
@@ -28,6 +32,19 @@ impl QueryContext {
 
     pub fn with_result_window(mut self, skip: u64, limit: Option<usize>) -> Self {
         self.result_window = QueryWindow { skip, limit };
+        self
+    }
+
+    pub fn with_parameter(mut self, name: impl Into<String>, value: VertexPropertyValue) -> Self {
+        self.parameters.insert(name.into(), value);
+        self
+    }
+
+    pub fn with_parameters(
+        mut self,
+        parameters: impl IntoIterator<Item = (String, VertexPropertyValue)>,
+    ) -> Self {
+        self.parameters.extend(parameters);
         self
     }
 }

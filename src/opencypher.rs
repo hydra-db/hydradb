@@ -134,17 +134,38 @@ pub fn parse_opencypher(query: &str) -> Result<QueryStatement> {
 }
 
 pub fn parse_cypher_with_window(query: &str) -> Result<ParsedQuery> {
+    parse_cypher_with_parameters(query, &BTreeMap::new())
+}
+
+pub fn parse_cypher_with_parameters(
+    query: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<ParsedQuery> {
     let parsed = ParsedCypher::parse(query)?;
-    parsed.lower_with_window()
+    parsed.lower_with_window(parameters)
 }
 
 pub fn parse_opencypher_with_window(query: &str) -> Result<ParsedQuery> {
     parse_cypher_with_window(query)
 }
 
+pub fn parse_opencypher_with_parameters(
+    query: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<ParsedQuery> {
+    parse_cypher_with_parameters(query, parameters)
+}
+
 pub fn parse_opencypher_row_query(query: &str) -> Result<ParsedRowQuery> {
+    parse_opencypher_row_query_with_parameters(query, &BTreeMap::new())
+}
+
+pub fn parse_opencypher_row_query_with_parameters(
+    query: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<ParsedRowQuery> {
     let parsed = ParsedCypher::parse(query)?;
-    parsed.lower_row_query()
+    parsed.lower_row_query(parameters)
 }
 
 impl CypherFrontend for LibCypherParserFrontend {
@@ -182,7 +203,7 @@ impl ParsedCypher {
     }
 
     fn lower(&self) -> Result<QueryStatement> {
-        let lowered = self.lower_with_window()?;
+        let lowered = self.lower_with_window(&BTreeMap::new())?;
         if !lowered.window.is_default() {
             return unsupported(
                 "statement-only Cypher parsing cannot drop SKIP/LIMIT; use parse_cypher_with_window",
@@ -191,7 +212,10 @@ impl ParsedCypher {
         Ok(lowered.statement)
     }
 
-    fn lower_with_window(&self) -> Result<ParsedQuery> {
+    fn lower_with_window(
+        &self,
+        parameters: &BTreeMap<String, VertexPropertyValue>,
+    ) -> Result<ParsedQuery> {
         unsafe {
             let directives = sys::cypher_parse_result_ndirectives(self.result);
             if directives != 1 {
@@ -202,18 +226,22 @@ impl ParsedCypher {
             ensure_instance(statement, sys::CYPHER_AST_STATEMENT, "statement")?;
             let body = checked_node(sys::cypher_ast_statement_get_body(statement))?;
             ensure_instance(body, sys::CYPHER_AST_QUERY, "query")?;
-            self.lower_query(body)
+            self.lower_query(body, parameters)
         }
     }
 
-    fn lower_query(&self, query: *const AstNode) -> Result<ParsedQuery> {
+    fn lower_query(
+        &self,
+        query: *const AstNode,
+        parameters: &BTreeMap<String, VertexPropertyValue>,
+    ) -> Result<ParsedQuery> {
         unsafe {
             let clause_count = sys::cypher_ast_query_nclauses(query);
             if clause_count == 1 {
                 let clause = checked_node(sys::cypher_ast_query_get_clause(query, 0))?;
                 if is_instance(clause, sys::CYPHER_AST_CREATE) {
                     return Ok(ParsedQuery {
-                        statement: lower_create(clause)?,
+                        statement: lower_create(clause, parameters)?,
                         window: QueryWindow::default(),
                         columns: Vec::new(),
                     });
@@ -226,7 +254,7 @@ impl ParsedCypher {
                 if is_instance(match_clause, sys::CYPHER_AST_MATCH)
                     && is_instance(return_clause, sys::CYPHER_AST_RETURN)
                 {
-                    return lower_match_return(match_clause, return_clause);
+                    return lower_match_return(match_clause, return_clause, parameters);
                 }
             }
 
@@ -234,7 +262,10 @@ impl ParsedCypher {
         }
     }
 
-    fn lower_row_query(&self) -> Result<ParsedRowQuery> {
+    fn lower_row_query(
+        &self,
+        parameters: &BTreeMap<String, VertexPropertyValue>,
+    ) -> Result<ParsedRowQuery> {
         unsafe {
             let directives = sys::cypher_parse_result_ndirectives(self.result);
             if directives != 1 {
@@ -245,11 +276,15 @@ impl ParsedCypher {
             ensure_instance(statement, sys::CYPHER_AST_STATEMENT, "statement")?;
             let body = checked_node(sys::cypher_ast_statement_get_body(statement))?;
             ensure_instance(body, sys::CYPHER_AST_QUERY, "query")?;
-            self.lower_row_query_body(body)
+            self.lower_row_query_body(body, parameters)
         }
     }
 
-    fn lower_row_query_body(&self, query: *const AstNode) -> Result<ParsedRowQuery> {
+    fn lower_row_query_body(
+        &self,
+        query: *const AstNode,
+        parameters: &BTreeMap<String, VertexPropertyValue>,
+    ) -> Result<ParsedRowQuery> {
         unsafe {
             if sys::cypher_ast_query_nclauses(query) != 2 {
                 return unsupported("row execution supports MATCH ... RETURN queries");
@@ -261,7 +296,7 @@ impl ParsedCypher {
             {
                 return unsupported("row execution supports MATCH ... RETURN queries");
             }
-            lower_match_return_rows(match_clause, return_clause)
+            lower_match_return_rows(match_clause, return_clause, parameters)
         }
     }
 
@@ -299,14 +334,17 @@ impl Drop for ParsedCypher {
     }
 }
 
-fn lower_create(create: *const AstNode) -> Result<QueryStatement> {
+fn lower_create(
+    create: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<QueryStatement> {
     unsafe {
         if sys::cypher_ast_create_is_unique(create) {
             return unsupported("CREATE UNIQUE is not executable in Phase 0");
         }
 
         let pattern = checked_node(sys::cypher_ast_create_get_pattern(create))?;
-        let edge = lower_create_edge_pattern(pattern)?;
+        let edge = lower_create_edge_pattern(pattern, parameters)?;
         if edge.hop_range.is_some() {
             return unsupported("CREATE does not support variable-length relationships in Phase 2");
         }
@@ -344,6 +382,7 @@ fn lower_create(create: *const AstNode) -> Result<QueryStatement> {
 fn lower_match_return(
     match_clause: *const AstNode,
     return_clause: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<ParsedQuery> {
     unsafe {
         if sys::cypher_ast_match_is_optional(match_clause) {
@@ -359,15 +398,19 @@ fn lower_match_return(
         {
             return unsupported("MATCH edge currently supports a single RETURN projection only");
         }
-        let window = lower_return_window(return_clause)?;
+        let window = lower_return_window(return_clause, parameters)?;
 
         let pattern = checked_node(sys::cypher_ast_match_get_pattern(match_clause))?;
-        let edge = lower_single_edge_pattern(pattern)?;
+        let edge = lower_single_edge_pattern(pattern, parameters)?;
         let predicate = sys::cypher_ast_match_get_predicate(match_clause);
         let where_dst = if predicate.is_null() {
             None
         } else {
-            Some(lower_where_node_id(predicate, edge.dst_binding.as_deref())?)
+            Some(lower_where_node_id_with_parameters(
+                predicate,
+                edge.dst_binding.as_deref(),
+                parameters,
+            )?)
         };
         let fixed_dst = resolve_node_id_constraint(edge.dst, where_dst)?;
         let src = edge
@@ -491,6 +534,7 @@ fn lower_match_return(
 fn lower_match_return_rows(
     match_clause: *const AstNode,
     return_clause: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<ParsedRowQuery> {
     unsafe {
         if sys::cypher_ast_match_is_optional(match_clause) {
@@ -506,12 +550,12 @@ fn lower_match_return_rows(
         }
 
         let pattern = checked_node(sys::cypher_ast_match_get_pattern(match_clause))?;
-        let pattern = lower_row_pattern(pattern)?;
+        let pattern = lower_row_pattern(pattern, parameters)?;
         let predicate = sys::cypher_ast_match_get_predicate(match_clause);
         let predicate = if predicate.is_null() {
             None
         } else {
-            Some(lower_row_predicate(predicate)?)
+            Some(lower_row_predicate(predicate, parameters)?)
         };
 
         let projection_count = sys::cypher_ast_return_nprojections(return_clause);
@@ -557,7 +601,7 @@ fn lower_match_return_rows(
         }
 
         let order_by = lower_return_order_by(return_clause)?;
-        let window = lower_return_window(return_clause)?;
+        let window = lower_return_window(return_clause, parameters)?;
         Ok(ParsedRowQuery {
             pattern,
             predicate,
@@ -569,20 +613,27 @@ fn lower_match_return_rows(
     }
 }
 
-fn lower_return_window(return_clause: *const AstNode) -> Result<QueryWindow> {
+fn lower_return_window(
+    return_clause: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<QueryWindow> {
     unsafe {
         let skip_node = sys::cypher_ast_return_get_skip(return_clause);
         let skip = if skip_node.is_null() {
             0
         } else {
-            window_u64_expression(checked_node(skip_node)?, "SKIP")?
+            window_u64_expression(checked_node(skip_node)?, "SKIP", parameters)?
         };
 
         let limit_node = sys::cypher_ast_return_get_limit(return_clause);
         let limit = if limit_node.is_null() {
             None
         } else {
-            Some(window_usize_expression(checked_node(limit_node)?, "LIMIT")?)
+            Some(window_usize_expression(
+                checked_node(limit_node)?,
+                "LIMIT",
+                parameters,
+            )?)
         };
 
         Ok(QueryWindow { skip, limit })
@@ -631,7 +682,10 @@ fn lower_sort_expression(expression: *const AstNode) -> Result<RowSortExpression
     unsupported("ORDER BY currently supports projected aliases, <binding>.id, or count(*)")
 }
 
-fn lower_row_predicate(predicate: *const AstNode) -> Result<RowPredicate> {
+fn lower_row_predicate(
+    predicate: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<RowPredicate> {
     unsafe {
         if is_instance(predicate, sys::CYPHER_AST_COMPARISON) {
             let length = sys::cypher_ast_comparison_get_length(predicate);
@@ -646,9 +700,9 @@ fn lower_row_predicate(predicate: *const AstNode) -> Result<RowPredicate> {
                 let op =
                     row_comparison_op(sys::cypher_ast_comparison_get_operator(predicate, idx))?;
                 let next = RowPredicate::Compare {
-                    left: lower_row_expression(left)?,
+                    left: lower_row_expression(left, parameters)?,
                     op,
-                    right: lower_row_expression(right)?,
+                    right: lower_row_expression(right, parameters)?,
                 };
                 combined = Some(match combined {
                     Some(prev) => RowPredicate::And(Box::new(prev), Box::new(next)),
@@ -664,21 +718,21 @@ fn lower_row_predicate(predicate: *const AstNode) -> Result<RowPredicate> {
             let right = checked_node(sys::cypher_ast_binary_operator_get_argument2(predicate))?;
             if op == sys::CYPHER_OP_AND {
                 return Ok(RowPredicate::And(
-                    Box::new(lower_row_predicate(left)?),
-                    Box::new(lower_row_predicate(right)?),
+                    Box::new(lower_row_predicate(left, parameters)?),
+                    Box::new(lower_row_predicate(right, parameters)?),
                 ));
             }
             if op == sys::CYPHER_OP_OR {
                 return Ok(RowPredicate::Or(
-                    Box::new(lower_row_predicate(left)?),
-                    Box::new(lower_row_predicate(right)?),
+                    Box::new(lower_row_predicate(left, parameters)?),
+                    Box::new(lower_row_predicate(right, parameters)?),
                 ));
             }
             if let Ok(op) = row_comparison_op(op) {
                 return Ok(RowPredicate::Compare {
-                    left: lower_row_expression(left)?,
+                    left: lower_row_expression(left, parameters)?,
                     op,
-                    right: lower_row_expression(right)?,
+                    right: lower_row_expression(right, parameters)?,
                 });
             }
         }
@@ -687,7 +741,9 @@ fn lower_row_predicate(predicate: *const AstNode) -> Result<RowPredicate> {
             let op = sys::cypher_ast_unary_operator_get_operator(predicate);
             if op == sys::CYPHER_OP_NOT {
                 let arg = checked_node(sys::cypher_ast_unary_operator_get_argument(predicate))?;
-                return Ok(RowPredicate::Not(Box::new(lower_row_predicate(arg)?)));
+                return Ok(RowPredicate::Not(Box::new(lower_row_predicate(
+                    arg, parameters,
+                )?)));
             }
         }
     }
@@ -714,17 +770,25 @@ fn row_comparison_op(op: *const sys::cypher_operator_t) -> Result<RowComparisonO
     }
 }
 
-fn lower_row_expression(expression: *const AstNode) -> Result<RowExpression> {
+fn lower_row_expression(
+    expression: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<RowExpression> {
     if let Some(binding) = node_id_expression_binding(expression)? {
         return Ok(RowExpression::NodeId { binding });
     }
     if let Some((binding, property)) = property_expression_binding(expression)? {
         return Ok(RowExpression::Property { binding, property });
     }
-    Ok(RowExpression::Literal(scalar_property_value(expression)?))
+    Ok(RowExpression::Literal(scalar_property_value(
+        expression, parameters,
+    )?))
 }
 
-fn lower_single_edge_pattern(pattern: *const AstNode) -> Result<EdgePattern> {
+fn lower_single_edge_pattern(
+    pattern: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<EdgePattern> {
     unsafe {
         ensure_instance(pattern, sys::CYPHER_AST_PATTERN, "pattern")?;
         if sys::cypher_ast_pattern_npaths(pattern) != 1 {
@@ -760,8 +824,8 @@ fn lower_single_edge_pattern(pattern: *const AstNode) -> Result<EdgePattern> {
         let edge_type_node = checked_node(sys::cypher_ast_rel_pattern_get_reltype(rel, 0))?;
         let edge_type = reltype_name(edge_type_node)?;
 
-        let left_node = lower_node_pattern(left)?;
-        let right_node = lower_node_pattern(right)?;
+        let left_node = lower_node_pattern(left, parameters)?;
+        let right_node = lower_node_pattern(right, parameters)?;
 
         match sys::cypher_ast_rel_pattern_get_direction(rel) {
             sys::cypher_rel_direction::CYPHER_REL_OUTBOUND => Ok(EdgePattern {
@@ -787,7 +851,10 @@ fn lower_single_edge_pattern(pattern: *const AstNode) -> Result<EdgePattern> {
     }
 }
 
-fn lower_create_edge_pattern(pattern: *const AstNode) -> Result<RowEdgePattern> {
+fn lower_create_edge_pattern(
+    pattern: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<RowEdgePattern> {
     unsafe {
         ensure_instance(pattern, sys::CYPHER_AST_PATTERN, "pattern")?;
         if sys::cypher_ast_pattern_npaths(pattern) != 1 {
@@ -824,8 +891,8 @@ fn lower_create_edge_pattern(pattern: *const AstNode) -> Result<RowEdgePattern> 
 
         let edge_type_node = checked_node(sys::cypher_ast_rel_pattern_get_reltype(rel, 0))?;
         let edge_type = reltype_name(edge_type_node)?;
-        let left_node = lower_create_node_pattern(left)?;
-        let right_node = lower_create_node_pattern(right)?;
+        let left_node = lower_create_node_pattern(left, parameters)?;
+        let right_node = lower_create_node_pattern(right, parameters)?;
 
         match sys::cypher_ast_rel_pattern_get_direction(rel) {
             sys::cypher_rel_direction::CYPHER_REL_OUTBOUND => Ok(RowEdgePattern {
@@ -847,7 +914,10 @@ fn lower_create_edge_pattern(pattern: *const AstNode) -> Result<RowEdgePattern> 
     }
 }
 
-fn lower_row_pattern(pattern: *const AstNode) -> Result<RowPattern> {
+fn lower_row_pattern(
+    pattern: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<RowPattern> {
     unsafe {
         ensure_instance(pattern, sys::CYPHER_AST_PATTERN, "pattern")?;
         if sys::cypher_ast_pattern_npaths(pattern) != 1 {
@@ -860,15 +930,18 @@ fn lower_row_pattern(pattern: *const AstNode) -> Result<RowPattern> {
             1 => {
                 let node = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
                 ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "node pattern")?;
-                Ok(RowPattern::Node(lower_row_node_pattern(node)?))
+                Ok(RowPattern::Node(lower_row_node_pattern(node, parameters)?))
             }
-            3 => lower_row_single_edge_path(path).map(RowPattern::Edge),
+            3 => lower_row_single_edge_path(path, parameters).map(RowPattern::Edge),
             _ => unsupported("only node and one-hop edge patterns are executable in Phase 2"),
         }
     }
 }
 
-fn lower_create_node_pattern(node: *const AstNode) -> Result<RowNodePattern> {
+fn lower_create_node_pattern(
+    node: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<RowNodePattern> {
     unsafe {
         ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "node pattern")?;
         let binding = node_identifier(node)?;
@@ -883,7 +956,7 @@ fn lower_create_node_pattern(node: *const AstNode) -> Result<RowNodePattern> {
         let properties = if properties.is_null() {
             BTreeMap::new()
         } else {
-            row_node_properties(properties)?
+            row_node_properties(properties, parameters)?
         };
         let id = match properties.get("id") {
             Some(VertexPropertyValue::Integer(id)) => Some(*id),
@@ -899,7 +972,10 @@ fn lower_create_node_pattern(node: *const AstNode) -> Result<RowNodePattern> {
     }
 }
 
-fn lower_row_single_edge_path(path: *const AstNode) -> Result<RowEdgePattern> {
+fn lower_row_single_edge_path(
+    path: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<RowEdgePattern> {
     unsafe {
         let left = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
         let rel = checked_node(sys::cypher_ast_pattern_path_get_element(path, 1))?;
@@ -923,8 +999,8 @@ fn lower_row_single_edge_path(path: *const AstNode) -> Result<RowEdgePattern> {
 
         let edge_type_node = checked_node(sys::cypher_ast_rel_pattern_get_reltype(rel, 0))?;
         let edge_type = reltype_name(edge_type_node)?;
-        let left_node = lower_row_node_pattern(left)?;
-        let right_node = lower_row_node_pattern(right)?;
+        let left_node = lower_row_node_pattern(left, parameters)?;
+        let right_node = lower_row_node_pattern(right, parameters)?;
 
         match sys::cypher_ast_rel_pattern_get_direction(rel) {
             sys::cypher_rel_direction::CYPHER_REL_OUTBOUND => Ok(RowEdgePattern {
@@ -979,7 +1055,11 @@ fn lower_hop_range(range: *const AstNode) -> Result<(u8, u8)> {
     }
 }
 
-fn lower_where_node_id(predicate: *const AstNode, binding: Option<&str>) -> Result<VertexId> {
+fn lower_where_node_id_with_parameters(
+    predicate: *const AstNode,
+    binding: Option<&str>,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<VertexId> {
     let Some(binding) = binding else {
         return unsupported("WHERE id filter requires a named destination binding");
     };
@@ -994,7 +1074,7 @@ fn lower_where_node_id(predicate: *const AstNode, binding: Option<&str>) -> Resu
             }
             let left = checked_node(sys::cypher_ast_comparison_get_argument(predicate, 0))?;
             let right = checked_node(sys::cypher_ast_comparison_get_argument(predicate, 1))?;
-            return lower_node_id_equality(left, right, binding);
+            return lower_node_id_equality(left, right, binding, parameters);
         }
         if is_instance(predicate, sys::CYPHER_AST_BINARY_OPERATOR) {
             let op = sys::cypher_ast_binary_operator_get_operator(predicate);
@@ -1003,7 +1083,7 @@ fn lower_where_node_id(predicate: *const AstNode, binding: Option<&str>) -> Resu
             }
             let left = checked_node(sys::cypher_ast_binary_operator_get_argument1(predicate))?;
             let right = checked_node(sys::cypher_ast_binary_operator_get_argument2(predicate))?;
-            return lower_node_id_equality(left, right, binding);
+            return lower_node_id_equality(left, right, binding, parameters);
         }
     }
     unsupported("WHERE supports only <dst>.id = <integer> in Phase 0")
@@ -1013,12 +1093,13 @@ fn lower_node_id_equality(
     left: *const AstNode,
     right: *const AstNode,
     binding: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<VertexId> {
     if projects_node_id(left, Some(binding))? {
-        return integer_vertex_id(right);
+        return integer_vertex_id(right, parameters);
     }
     if projects_node_id(right, Some(binding))? {
-        return integer_vertex_id(left);
+        return integer_vertex_id(left, parameters);
     }
     unsupported("WHERE supports only <dst>.id = <integer> in Phase 0")
 }
@@ -1036,7 +1117,10 @@ fn resolve_node_id_constraint(
     }
 }
 
-fn lower_node_pattern(node: *const AstNode) -> Result<NodePattern> {
+fn lower_node_pattern(
+    node: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<NodePattern> {
     unsafe {
         ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "node pattern")?;
         if sys::cypher_ast_node_pattern_nlabels(node) != 0 {
@@ -1047,13 +1131,16 @@ fn lower_node_pattern(node: *const AstNode) -> Result<NodePattern> {
         let id = if properties.is_null() {
             None
         } else {
-            Some(node_id_property(properties)?)
+            Some(node_id_property(properties, parameters)?)
         };
         Ok(NodePattern { binding, id })
     }
 }
 
-fn lower_row_node_pattern(node: *const AstNode) -> Result<RowNodePattern> {
+fn lower_row_node_pattern(
+    node: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<RowNodePattern> {
     unsafe {
         ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "node pattern")?;
         let binding = node_identifier(node)?;
@@ -1068,7 +1155,7 @@ fn lower_row_node_pattern(node: *const AstNode) -> Result<RowNodePattern> {
         let properties = if properties.is_null() {
             BTreeMap::new()
         } else {
-            row_node_properties(properties)?
+            row_node_properties(properties, parameters)?
         };
         let id = match properties.get("id") {
             Some(VertexPropertyValue::Integer(id)) => Some(*id),
@@ -1091,6 +1178,7 @@ fn lower_row_node_pattern(node: *const AstNode) -> Result<RowNodePattern> {
 
 fn row_node_properties(
     properties: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<BTreeMap<String, VertexPropertyValue>> {
     unsafe {
         ensure_instance(properties, sys::CYPHER_AST_MAP, "node property map")?;
@@ -1100,7 +1188,10 @@ fn row_node_properties(
             let key = prop_name(key)?;
             validate_component("property", &key)?;
             let value = checked_node(sys::cypher_ast_map_get_value(properties, idx))?;
-            if result.insert(key, scalar_property_value(value)?).is_some() {
+            if result
+                .insert(key, scalar_property_value(value, parameters)?)
+                .is_some()
+            {
                 return unsupported("duplicate node property in pattern");
             }
         }
@@ -1108,7 +1199,10 @@ fn row_node_properties(
     }
 }
 
-fn node_id_property(properties: *const AstNode) -> Result<VertexId> {
+fn node_id_property(
+    properties: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<VertexId> {
     unsafe {
         ensure_instance(properties, sys::CYPHER_AST_MAP, "node property map")?;
         if sys::cypher_ast_map_nentries(properties) != 1 {
@@ -1122,14 +1216,22 @@ fn node_id_property(properties: *const AstNode) -> Result<VertexId> {
         }
 
         let value = checked_node(sys::cypher_ast_map_get_value(properties, 0))?;
-        integer_vertex_id(value)
+        integer_vertex_id(value, parameters)
     }
 }
 
-fn scalar_property_value(node: *const AstNode) -> Result<VertexPropertyValue> {
+fn scalar_property_value(
+    node: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<VertexPropertyValue> {
     unsafe {
+        if is_instance(node, sys::CYPHER_AST_PARAMETER) {
+            return parameter_value(node, parameters).cloned();
+        }
         if is_instance(node, sys::CYPHER_AST_INTEGER) {
-            return Ok(VertexPropertyValue::Integer(integer_vertex_id(node)?));
+            return Ok(VertexPropertyValue::Integer(integer_vertex_id(
+                node, parameters,
+            )?));
         }
         if is_instance(node, sys::CYPHER_AST_STRING) {
             return Ok(VertexPropertyValue::String(c_string(
@@ -1146,8 +1248,18 @@ fn scalar_property_value(node: *const AstNode) -> Result<VertexPropertyValue> {
     unsupported("property values currently support integer, boolean, and string literals")
 }
 
-fn integer_vertex_id(node: *const AstNode) -> Result<VertexId> {
+fn integer_vertex_id(
+    node: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<VertexId> {
     unsafe {
+        if is_instance(node, sys::CYPHER_AST_PARAMETER) {
+            let name = parameter_name(node)?;
+            return match parameter_value_by_name(&name, parameters)? {
+                VertexPropertyValue::Integer(value) => Ok(*value),
+                _ => unsupported(format!("parameter ${name} must be an integer")),
+            };
+        }
         ensure_instance(node, sys::CYPHER_AST_INTEGER, "integer literal")?;
         let value = c_string(sys::cypher_ast_integer_get_valuestr(node));
         if value.starts_with('-') {
@@ -1159,18 +1271,37 @@ fn integer_vertex_id(node: *const AstNode) -> Result<VertexId> {
     }
 }
 
-fn window_u64_expression(node: *const AstNode, field: &str) -> Result<u64> {
-    let value = constant_integer_expression(node, field)?;
+fn window_u64_expression(
+    node: *const AstNode,
+    field: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<u64> {
+    let value = constant_integer_expression(node, field, parameters)?;
     u64::try_from(value).map_err(|_| unsupported_value(format!("{field} cannot be negative")))
 }
 
-fn window_usize_expression(node: *const AstNode, field: &str) -> Result<usize> {
-    let value = window_u64_expression(node, field)?;
+fn window_usize_expression(
+    node: *const AstNode,
+    field: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<usize> {
+    let value = window_u64_expression(node, field, parameters)?;
     usize::try_from(value).map_err(|_| unsupported_value(format!("{field} exceeds platform usize")))
 }
 
-fn constant_integer_expression(node: *const AstNode, field: &str) -> Result<i128> {
+fn constant_integer_expression(
+    node: *const AstNode,
+    field: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<i128> {
     unsafe {
+        if is_instance(node, sys::CYPHER_AST_PARAMETER) {
+            let name = parameter_name(node)?;
+            return match parameter_value_by_name(&name, parameters)? {
+                VertexPropertyValue::Integer(value) => Ok(i128::from(*value)),
+                _ => unsupported(format!("{field} parameter ${name} must be an integer")),
+            };
+        }
         if is_instance(node, sys::CYPHER_AST_INTEGER) {
             let value = c_string(sys::cypher_ast_integer_get_valuestr(node));
             return value.parse::<i128>().map_err(|err| {
@@ -1181,7 +1312,7 @@ fn constant_integer_expression(node: *const AstNode, field: &str) -> Result<i128
         if is_instance(node, sys::CYPHER_AST_UNARY_OPERATOR) {
             let op = sys::cypher_ast_unary_operator_get_operator(node);
             let arg = checked_node(sys::cypher_ast_unary_operator_get_argument(node))?;
-            let value = constant_integer_expression(arg, field)?;
+            let value = constant_integer_expression(arg, field, parameters)?;
             if op == sys::CYPHER_OP_UNARY_PLUS {
                 return Ok(value);
             }
@@ -1197,8 +1328,8 @@ fn constant_integer_expression(node: *const AstNode, field: &str) -> Result<i128
             let op = sys::cypher_ast_binary_operator_get_operator(node);
             let left = checked_node(sys::cypher_ast_binary_operator_get_argument1(node))?;
             let right = checked_node(sys::cypher_ast_binary_operator_get_argument2(node))?;
-            let left = constant_integer_expression(left, field)?;
-            let right = constant_integer_expression(right, field)?;
+            let left = constant_integer_expression(left, field, parameters)?;
+            let right = constant_integer_expression(right, field, parameters)?;
             let value = if op == sys::CYPHER_OP_PLUS {
                 left.checked_add(right)
             } else if op == sys::CYPHER_OP_MINUS {
@@ -1228,7 +1359,7 @@ fn constant_integer_expression(node: *const AstNode, field: &str) -> Result<i128
 }
 
 fn integer_u8(node: *const AstNode, field: &str) -> Result<u8> {
-    let value = integer_vertex_id(node)?;
+    let value = integer_vertex_id(node, &BTreeMap::new())?;
     u8::try_from(value).map_err(|_| unsupported_value(format!("{field} exceeds 255")))
 }
 
@@ -1342,6 +1473,35 @@ fn function_name(node: *const AstNode) -> Result<String> {
         ensure_instance(node, sys::CYPHER_AST_FUNCTION_NAME, "function name")?;
         Ok(c_string(sys::cypher_ast_function_name_get_value(node)))
     }
+}
+
+fn parameter_name(node: *const AstNode) -> Result<String> {
+    unsafe {
+        ensure_instance(node, sys::CYPHER_AST_PARAMETER, "parameter")?;
+        let name = c_string(sys::cypher_ast_parameter_get_name(node));
+        Ok(name.trim_start_matches('$').to_string())
+    }
+}
+
+fn parameter_value(
+    node: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<&VertexPropertyValue> {
+    let name = parameter_name(node)?;
+    parameter_value_by_name(&name, parameters)
+}
+
+fn parameter_value_by_name<'a>(
+    name: &str,
+    parameters: &'a BTreeMap<String, VertexPropertyValue>,
+) -> Result<&'a VertexPropertyValue> {
+    parameters
+        .get(name)
+        .or_else(|| parameters.get(&format!("${name}")))
+        .ok_or_else(|| GraphError::MissingQueryParameter {
+            dialect: "OpenCypher",
+            name: name.to_string(),
+        })
 }
 
 fn checked_node(node: *const AstNode) -> Result<*const AstNode> {
@@ -1704,6 +1864,92 @@ mod tests {
                 property: "name".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn lowers_parameterized_statement_queries() {
+        let parameters = BTreeMap::from([
+            ("src".to_string(), VertexPropertyValue::Integer(1)),
+            ("dst".to_string(), VertexPropertyValue::Integer(2)),
+            ("skip".to_string(), VertexPropertyValue::Integer(3)),
+            ("limit".to_string(), VertexPropertyValue::Integer(4)),
+        ]);
+        let parsed = parse_opencypher_with_parameters(
+            "MATCH (u {id: $src})-[:FOLLOWS]->(v {id: $dst}) \
+             RETURN v.id SKIP $skip LIMIT $limit",
+            &parameters,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.statement,
+            QueryStatement::MatchOutFiltered {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                return_count: false,
+            }
+        );
+        assert_eq!(
+            parsed.window,
+            QueryWindow {
+                skip: 3,
+                limit: Some(4),
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_parameterized_create_metadata() {
+        let parameters = BTreeMap::from([
+            ("src".to_string(), VertexPropertyValue::Integer(1)),
+            ("dst".to_string(), VertexPropertyValue::Integer(2)),
+            (
+                "name".to_string(),
+                VertexPropertyValue::String("alice".to_string()),
+            ),
+            ("active".to_string(), VertexPropertyValue::Bool(true)),
+        ]);
+        let parsed = parse_opencypher_with_parameters(
+            "CREATE (u:User {id: $src, name: $name, active: $active})-[:FOLLOWS]->\
+             (v {id: $dst})",
+            &parameters,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.statement,
+            QueryStatement::CreateEdgeWithMetadata {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                src_metadata: VertexMetadata::default()
+                    .with_label("User")
+                    .with_property("active", VertexPropertyValue::Bool(true))
+                    .with_property("name", VertexPropertyValue::String("alice".to_string())),
+                dst_metadata: VertexMetadata::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_missing_or_mistyped_parameters() {
+        assert!(matches!(
+            parse_opencypher_with_parameters(
+                "MATCH (u {id: $src})-[:FOLLOWS]->(v) RETURN v.id",
+                &BTreeMap::new(),
+            ),
+            Err(GraphError::MissingQueryParameter { ref name, .. }) if name == "src"
+        ));
+        let parameters = BTreeMap::from([(
+            "src".to_string(),
+            VertexPropertyValue::String("bad".to_string()),
+        )]);
+        assert!(matches!(
+            parse_opencypher_with_parameters(
+                "MATCH (u {id: $src})-[:FOLLOWS]->(v) RETURN v.id",
+                &parameters,
+            ),
+            Err(GraphError::UnsupportedQuery { .. })
+        ));
     }
 
     #[test]
