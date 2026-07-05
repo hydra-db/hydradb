@@ -3210,6 +3210,8 @@ impl GraphShard {
         let mut next_epoch = current_epoch;
         let mut results = Vec::with_capacity(mutations.len());
         let mut known_edges = BTreeMap::<(String, VertexId, VertexId), GraphEpoch>::new();
+        let mut segment_edges_by_type_src =
+            BTreeMap::<(String, VertexId), BTreeMap<VertexId, GraphEpoch>>::new();
         let mut out_increments = BTreeMap::<(String, VertexId), u64>::new();
         let mut in_increments = BTreeMap::<(String, VertexId), u64>::new();
         let write_reverse_index = self.writes_reverse_index();
@@ -3252,6 +3254,38 @@ impl GraphShard {
                     already_existed: true,
                 };
                 known_edges.insert(identity, record.epoch);
+                txn.put(
+                    idem_key.as_bytes(),
+                    encode_commit_idempotency(mutation, &result),
+                )?;
+                already_existed = already_existed.saturating_add(1);
+                results.push(result);
+                continue;
+            }
+
+            let segment_cache_key = (mutation.edge_type.clone(), mutation.src);
+            let segment_epoch = match segment_edges_by_type_src.get(&segment_cache_key) {
+                Some(edges) => edges.get(&mutation.dst).copied(),
+                None => {
+                    let edges = out_segment_edges_for_src_txn(
+                        &txn,
+                        cell_id,
+                        &mutation.edge_type,
+                        mutation.src,
+                        current_epoch,
+                    )
+                    .await?;
+                    let epoch = edges.get(&mutation.dst).copied();
+                    segment_edges_by_type_src.insert(segment_cache_key, edges);
+                    epoch
+                }
+            };
+            if let Some(epoch) = segment_epoch {
+                let result = CommitResult {
+                    epoch,
+                    already_existed: true,
+                };
+                known_edges.insert(identity, epoch);
                 txn.put(
                     idem_key.as_bytes(),
                     encode_commit_idempotency(mutation, &result),
@@ -5217,7 +5251,22 @@ async fn out_segment_neighbors_for_src_txn(
     src: VertexId,
     read_epoch: GraphEpoch,
 ) -> Result<BTreeSet<VertexId>> {
-    let mut neighbors = BTreeSet::new();
+    Ok(
+        out_segment_edges_for_src_txn(txn, cell_id, edge_type, src, read_epoch)
+            .await?
+            .into_keys()
+            .collect(),
+    )
+}
+
+async fn out_segment_edges_for_src_txn(
+    txn: &DbTransaction,
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    read_epoch: GraphEpoch,
+) -> Result<BTreeMap<VertexId, GraphEpoch>> {
+    let mut edges = BTreeMap::<VertexId, GraphEpoch>::new();
     let mut tombstones = BTreeMap::<VertexId, GraphEpoch>::new();
     {
         let prefix = keys::out_segment_tombstone_src_prefix(cell_id, edge_type, src);
@@ -5253,12 +5302,15 @@ async fn out_segment_neighbors_for_src_txn(
                     break;
                 }
                 if segment_edge_visible(epoch, tombstones.get(&dst).copied()) {
-                    neighbors.insert(dst);
+                    edges
+                        .entry(dst)
+                        .and_modify(|current| *current = (*current).max(epoch))
+                        .or_insert(epoch);
                 }
             }
         }
     }
-    Ok(neighbors)
+    Ok(edges)
 }
 
 async fn read_counter_txn(txn: &DbTransaction, key: &str) -> Result<u64> {
@@ -9253,6 +9305,67 @@ mod tests {
         assert_eq!(duplicate.inserted, 0);
         assert_eq!(duplicate.already_existed, 1);
         assert_eq!(duplicate.end_epoch, 5);
+    }
+
+    #[tokio::test]
+    async fn ingest_edge_mutations_treats_segment_edges_as_existing_without_degree_drift() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_options(
+            "graph/segment-then-ingest-overlap",
+            object_store,
+            GraphOpenOptions {
+                index_policy: GraphIndexPolicy::OutboundOnly,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+        shard
+            .bulk_append_supernode_segment_trusted(
+                cell_id,
+                edge_type,
+                1,
+                [2, 3],
+                "segment-ingest-seed",
+            )
+            .await
+            .unwrap();
+
+        let ingest = shard
+            .ingest_edge_mutations(
+                cell_id,
+                [
+                    mutation(1, 2, "ingest-overlap-segment"),
+                    mutation(1, 4, "ingest-new-after-segment"),
+                ],
+                EdgeIngestOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ingest,
+            EdgeIngestResult {
+                start_epoch: 3,
+                end_epoch: 3,
+                inserted: 1,
+                already_existed: 1,
+                batches: 1,
+                mutations: 2,
+            }
+        );
+        assert_eq!(
+            shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 3);
+        let report = shard
+            .verify_current_graph(cell_id, edge_type, 3, 8)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{:?}", report.mismatch_samples);
     }
 
     #[tokio::test]
