@@ -16,18 +16,30 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 mod algebra;
 #[cfg(feature = "opencypher")]
 pub mod opencypher;
+#[cfg(feature = "opencypher")]
+mod opencypher_corpus;
 mod phase0;
 mod placement;
 mod sparse_kernel;
 
 pub use algebra::{
-    LogicalQueryPlan, PhysicalQueryPlan, QueryColumn, QueryContext, QueryOutput, QueryPlan,
-    QueryPlanner, QueryResultSet, QueryRow, QueryStatement, QueryValue, QueryWindow,
+    LogicalQueryPlan, PhysicalQueryPlan, QueryColumn, QueryContext, QueryCursorToken, QueryFloat,
+    QueryMutationResult, QueryOutput, QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet,
+    QueryRow, QueryStatement, QueryValue, QueryWindow,
 };
 #[cfg(feature = "opencypher")]
 pub use opencypher::{
-    parse_cypher, parse_cypher_with_window, parse_opencypher, parse_opencypher_with_window,
-    CypherFrontend, DefaultCypherFrontend, LibCypherParserFrontend, ParsedQuery,
+    parse_cypher, parse_cypher_with_parameters, parse_cypher_with_window, parse_opencypher,
+    parse_opencypher_mutation_query_with_parameters, parse_opencypher_row_query,
+    parse_opencypher_row_query_with_parameters, parse_opencypher_with_parameters,
+    parse_opencypher_with_window, CypherFrontend, DefaultCypherFrontend, LibCypherParserFrontend,
+    ParsedMutationQuery, ParsedQuery, ParsedRowQuery, RowAggregateFunction, RowComparisonOp,
+    RowEdgePattern, RowExpression, RowMatchGroup, RowMutationAction, RowNodePattern, RowPattern,
+    RowPredicate, RowProjection, RowSort, RowSortExpression,
+};
+#[cfg(feature = "opencypher")]
+pub use opencypher_corpus::{
+    parse_opencypher_tck_corpus, CypherTckCase, CypherTckCompatibilityReport, CypherTckCorpus,
 };
 pub use phase0::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
@@ -36,6 +48,17 @@ pub use phase0::{
     GraphControlWatermark, GraphNode, GraphRollup, GraphShardCatalogEntry, LeaseRenewalHandle,
     MatrixArtifact, MatrixTraversalResult, Phase0Cluster, PostingChunk, RoutedPhase0Cluster,
     ShardLease, ShardPlacement, SupernodeGroup, SupernodePage, TraversalBackend,
+};
+#[cfg(feature = "opencypher")]
+pub use phase0::{
+    DistributedQueryCoordinator, DistributedQueryJoin, DistributedQueryLeg, DistributedQueryMerge,
+    DistributedQueryPageRequest, DistributedQueryPlan, DistributedQueryPlanResult, QueryCellClient,
+};
+#[cfg(feature = "query-transport")]
+pub use phase0::{
+    QueryServiceDirectory, QueryServiceEndpoint, QueryTransportAuthPolicy,
+    QueryTransportClientConfig, QueryTransportMetricsSnapshot, QueryTransportServerConfig,
+    TcpQueryCellClient, TcpQueryRowStream, TcpQueryServer,
 };
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
@@ -177,6 +200,14 @@ pub enum GraphError {
         dialect: &'static str,
         reason: String,
     },
+    #[error("missing {dialect} query parameter ${name}")]
+    MissingQueryParameter { dialect: &'static str, name: String },
+    #[error("{operation} exceeded query timeout after {elapsed_ms} ms; limit is {limit_ms} ms")]
+    QueryTimeout {
+        operation: &'static str,
+        elapsed_ms: u64,
+        limit_ms: u64,
+    },
     #[error("{dialect} query is not supported yet: {feature}")]
     UnsupportedQuery {
         dialect: &'static str,
@@ -216,6 +247,10 @@ pub struct GraphLimits {
     pub max_traversal_hops: u8,
     pub max_artifact_build_edges: u64,
     pub max_query_result_vertices: usize,
+    pub max_query_intermediate_rows: usize,
+    pub max_query_index_candidates: usize,
+    pub max_query_scan_edges: u64,
+    pub max_query_runtime_ms: Option<u64>,
 }
 
 impl Default for GraphLimits {
@@ -226,6 +261,10 @@ impl Default for GraphLimits {
             max_traversal_hops: 16,
             max_artifact_build_edges: 10_000_000,
             max_query_result_vertices: 100_000,
+            max_query_intermediate_rows: 250_000,
+            max_query_index_candidates: 250_000,
+            max_query_scan_edges: 1_000_000,
+            max_query_runtime_ms: Some(30_000),
         }
     }
 }
@@ -504,6 +543,11 @@ pub struct GraphOperationalMetricsSnapshot {
     pub verifier_runs: u64,
     pub verifier_failures: u64,
     pub verifier_duration_us: u64,
+    pub query_rows_started: u64,
+    pub query_rows_completed: u64,
+    pub query_rows_failed: u64,
+    pub query_rows_returned: u64,
+    pub query_rows_duration_us: u64,
     pub backpressure_waits: u64,
 }
 
@@ -533,6 +577,11 @@ pub(crate) struct GraphOperationalMetrics {
     verifier_runs: AtomicU64,
     verifier_failures: AtomicU64,
     verifier_duration_us: AtomicU64,
+    query_rows_started: AtomicU64,
+    query_rows_completed: AtomicU64,
+    query_rows_failed: AtomicU64,
+    query_rows_returned: AtomicU64,
+    query_rows_duration_us: AtomicU64,
     backpressure_waits: AtomicU64,
 }
 
@@ -563,6 +612,11 @@ impl GraphOperationalMetrics {
             verifier_runs: self.verifier_runs.load(Ordering::Relaxed),
             verifier_failures: self.verifier_failures.load(Ordering::Relaxed),
             verifier_duration_us: self.verifier_duration_us.load(Ordering::Relaxed),
+            query_rows_started: self.query_rows_started.load(Ordering::Relaxed),
+            query_rows_completed: self.query_rows_completed.load(Ordering::Relaxed),
+            query_rows_failed: self.query_rows_failed.load(Ordering::Relaxed),
+            query_rows_returned: self.query_rows_returned.load(Ordering::Relaxed),
+            query_rows_duration_us: self.query_rows_duration_us.load(Ordering::Relaxed),
             backpressure_waits: self.backpressure_waits.load(Ordering::Relaxed),
         }
     }
@@ -710,6 +764,47 @@ pub struct EdgeRecord {
     pub src: VertexId,
     pub dst: VertexId,
     pub epoch: GraphEpoch,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum VertexPropertyValue {
+    Integer(u64),
+    Bool(bool),
+    String(String),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VertexMetadata {
+    pub labels: BTreeSet<String>,
+    pub properties: BTreeMap<String, VertexPropertyValue>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EdgeMetadata {
+    pub properties: BTreeMap<String, VertexPropertyValue>,
+}
+
+impl EdgeMetadata {
+    pub fn with_property(mut self, name: impl Into<String>, value: VertexPropertyValue) -> Self {
+        self.properties.insert(name.into(), value);
+        self
+    }
+}
+
+impl VertexMetadata {
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.labels.insert(label.into());
+        self
+    }
+
+    pub fn with_property(mut self, name: impl Into<String>, value: VertexPropertyValue) -> Self {
+        self.properties.insert(name.into(), value);
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

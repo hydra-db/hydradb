@@ -1,11 +1,22 @@
-use crate::{validate_component, CommitResult, GraphEpoch, GraphError, Result, VertexId};
+use std::collections::BTreeMap;
 
+use crate::{
+    validate_component, CommitResult, EdgeMetadata, GraphEpoch, GraphError, Result, VertexId,
+    VertexMetadata, VertexPropertyValue,
+};
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryContext {
     pub cell_id: String,
     pub idempotency_key: String,
     pub read_epoch: Option<GraphEpoch>,
     pub result_window: QueryWindow,
+    pub parameters: BTreeMap<String, VertexPropertyValue>,
+    pub max_runtime_ms: Option<u64>,
 }
 
 impl QueryContext {
@@ -15,6 +26,8 @@ impl QueryContext {
             idempotency_key: idempotency_key.into(),
             read_epoch: None,
             result_window: QueryWindow::default(),
+            parameters: BTreeMap::new(),
+            max_runtime_ms: None,
         }
     }
 
@@ -27,8 +40,30 @@ impl QueryContext {
         self.result_window = QueryWindow { skip, limit };
         self
     }
+
+    pub fn with_parameter(mut self, name: impl Into<String>, value: VertexPropertyValue) -> Self {
+        self.parameters.insert(name.into(), value);
+        self
+    }
+
+    pub fn with_parameters(
+        mut self,
+        parameters: impl IntoIterator<Item = (String, VertexPropertyValue)>,
+    ) -> Self {
+        self.parameters.extend(parameters);
+        self
+    }
+
+    pub fn with_timeout_ms(mut self, max_runtime_ms: u64) -> Self {
+        self.max_runtime_ms = Some(max_runtime_ms);
+        self
+    }
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueryWindow {
     pub skip: u64,
@@ -44,11 +79,16 @@ impl QueryWindow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryOutput {
     Write(CommitResult),
+    Mutation(QueryMutationResult),
     Vertices(Vec<VertexId>),
     Count(u64),
     Bool(bool),
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryColumn {
     pub name: String,
@@ -60,13 +100,52 @@ impl QueryColumn {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueryFloat(pub f64);
+
+impl PartialEq for QueryFloat {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for QueryFloat {}
+
+impl PartialOrd for QueryFloat {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueryFloat {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum QueryValue {
+    Null,
     VertexId(VertexId),
     Count(u64),
     Bool(bool),
+    Float(QueryFloat),
+    Property(VertexPropertyValue),
+    List(Vec<QueryValue>),
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryRow {
     pub values: Vec<QueryValue>,
@@ -78,6 +157,10 @@ impl QueryRow {
     }
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryResultSet {
     pub columns: Vec<QueryColumn>,
@@ -90,12 +173,77 @@ impl QueryResultSet {
     }
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QueryCursorToken {
+    pub offset: u64,
+}
+
+impl QueryCursorToken {
+    pub fn new(offset: u64) -> Self {
+        Self { offset }
+    }
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryResultPage {
+    pub columns: Vec<QueryColumn>,
+    pub rows: Vec<QueryRow>,
+    pub next_cursor: Option<QueryCursorToken>,
+}
+
+impl QueryResultPage {
+    pub fn new(
+        columns: Vec<QueryColumn>,
+        rows: Vec<QueryRow>,
+        next_cursor: Option<QueryCursorToken>,
+    ) -> Self {
+        Self {
+            columns,
+            rows,
+            next_cursor,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueryMutationResult {
+    pub matched_rows: u64,
+    pub created_edges: u64,
+    pub deleted_edges: u64,
+    pub updated_vertices: u64,
+    pub updated_relationships: u64,
+    pub noops: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryStatement {
     CreateEdge {
         edge_type: String,
         src: VertexId,
         dst: VertexId,
+    },
+    CreateEdgeWithMetadata {
+        edge_type: String,
+        src: VertexId,
+        dst: VertexId,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+    },
+    CreateEdgeWithFullMetadata {
+        edge_type: String,
+        src: VertexId,
+        dst: VertexId,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+        edge_metadata: EdgeMetadata,
     },
     MatchOut {
         edge_type: String,
@@ -125,7 +273,12 @@ pub enum QueryStatement {
 
 impl QueryStatement {
     pub fn is_write(&self) -> bool {
-        matches!(self, QueryStatement::CreateEdge { .. })
+        matches!(
+            self,
+            QueryStatement::CreateEdge { .. }
+                | QueryStatement::CreateEdgeWithMetadata { .. }
+                | QueryStatement::CreateEdgeWithFullMetadata { .. }
+        )
     }
 }
 
@@ -135,6 +288,7 @@ pub struct QueryPlan {
     pub idempotency_key: String,
     pub read_epoch: Option<GraphEpoch>,
     pub result_window: QueryWindow,
+    pub max_runtime_ms: Option<u64>,
     pub logical: LogicalQueryPlan,
     pub physical: PhysicalQueryPlan,
 }
@@ -145,6 +299,21 @@ pub enum LogicalQueryPlan {
         edge_type: String,
         src: VertexId,
         dst: VertexId,
+    },
+    CreateEdgeWithMetadata {
+        edge_type: String,
+        src: VertexId,
+        dst: VertexId,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+    },
+    CreateEdgeWithFullMetadata {
+        edge_type: String,
+        src: VertexId,
+        dst: VertexId,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+        edge_metadata: EdgeMetadata,
     },
     MatchOut {
         edge_type: String,
@@ -178,6 +347,21 @@ pub enum PhysicalQueryPlan {
         edge_type: String,
         src: VertexId,
         dst: VertexId,
+    },
+    WriteEdgeWithMetadata {
+        edge_type: String,
+        src: VertexId,
+        dst: VertexId,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+    },
+    WriteEdgeWithFullMetadata {
+        edge_type: String,
+        src: VertexId,
+        dst: VertexId,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+        edge_metadata: EdgeMetadata,
     },
     OutDegreeCounter {
         edge_type: String,
@@ -213,7 +397,12 @@ pub enum PhysicalQueryPlan {
 
 impl QueryPlan {
     pub fn is_write(&self) -> bool {
-        matches!(self.physical, PhysicalQueryPlan::WriteEdge { .. })
+        matches!(
+            self.physical,
+            PhysicalQueryPlan::WriteEdge { .. }
+                | PhysicalQueryPlan::WriteEdgeWithMetadata { .. }
+                | PhysicalQueryPlan::WriteEdgeWithFullMetadata { .. }
+        )
     }
 
     pub fn returns_vertices(&self) -> bool {
@@ -275,6 +464,7 @@ impl QueryPlanner {
             idempotency_key: context.idempotency_key.clone(),
             read_epoch: context.read_epoch,
             result_window: context.result_window,
+            max_runtime_ms: context.max_runtime_ms,
             logical,
             physical,
         };
@@ -293,6 +483,34 @@ fn logical_plan(statement: &QueryStatement) -> Result<LogicalQueryPlan> {
             edge_type: edge_type.clone(),
             src: *src,
             dst: *dst,
+        },
+        QueryStatement::CreateEdgeWithMetadata {
+            edge_type,
+            src,
+            dst,
+            src_metadata,
+            dst_metadata,
+        } => LogicalQueryPlan::CreateEdgeWithMetadata {
+            edge_type: edge_type.clone(),
+            src: *src,
+            dst: *dst,
+            src_metadata: src_metadata.clone(),
+            dst_metadata: dst_metadata.clone(),
+        },
+        QueryStatement::CreateEdgeWithFullMetadata {
+            edge_type,
+            src,
+            dst,
+            src_metadata,
+            dst_metadata,
+            edge_metadata,
+        } => LogicalQueryPlan::CreateEdgeWithFullMetadata {
+            edge_type: edge_type.clone(),
+            src: *src,
+            dst: *dst,
+            src_metadata: src_metadata.clone(),
+            dst_metadata: dst_metadata.clone(),
+            edge_metadata: edge_metadata.clone(),
         },
         QueryStatement::MatchOut {
             edge_type,
@@ -344,12 +562,31 @@ fn logical_plan(statement: &QueryStatement) -> Result<LogicalQueryPlan> {
 fn validate_logical_plan(plan: &LogicalQueryPlan) -> Result<()> {
     match plan {
         LogicalQueryPlan::CreateEdge { edge_type, .. }
+        | LogicalQueryPlan::CreateEdgeWithMetadata { edge_type, .. }
+        | LogicalQueryPlan::CreateEdgeWithFullMetadata { edge_type, .. }
         | LogicalQueryPlan::MatchOut { edge_type, .. }
         | LogicalQueryPlan::MatchOutFiltered { edge_type, .. }
         | LogicalQueryPlan::MatchEdge { edge_type, .. }
         | LogicalQueryPlan::MatchReachable { edge_type, .. } => {
             validate_component("edge_type", edge_type)?;
         }
+    }
+    if let LogicalQueryPlan::CreateEdgeWithMetadata {
+        src_metadata,
+        dst_metadata,
+        ..
+    }
+    | LogicalQueryPlan::CreateEdgeWithFullMetadata {
+        src_metadata,
+        dst_metadata,
+        ..
+    } = plan
+    {
+        validate_query_vertex_metadata(src_metadata)?;
+        validate_query_vertex_metadata(dst_metadata)?;
+    }
+    if let LogicalQueryPlan::CreateEdgeWithFullMetadata { edge_metadata, .. } = plan {
+        validate_query_edge_metadata(edge_metadata)?;
     }
     Ok(())
 }
@@ -364,6 +601,34 @@ fn physical_plan(logical: &LogicalQueryPlan) -> PhysicalQueryPlan {
             edge_type: edge_type.clone(),
             src: *src,
             dst: *dst,
+        },
+        LogicalQueryPlan::CreateEdgeWithMetadata {
+            edge_type,
+            src,
+            dst,
+            src_metadata,
+            dst_metadata,
+        } => PhysicalQueryPlan::WriteEdgeWithMetadata {
+            edge_type: edge_type.clone(),
+            src: *src,
+            dst: *dst,
+            src_metadata: src_metadata.clone(),
+            dst_metadata: dst_metadata.clone(),
+        },
+        LogicalQueryPlan::CreateEdgeWithFullMetadata {
+            edge_type,
+            src,
+            dst,
+            src_metadata,
+            dst_metadata,
+            edge_metadata,
+        } => PhysicalQueryPlan::WriteEdgeWithFullMetadata {
+            edge_type: edge_type.clone(),
+            src: *src,
+            dst: *dst,
+            src_metadata: src_metadata.clone(),
+            dst_metadata: dst_metadata.clone(),
+            edge_metadata: edge_metadata.clone(),
         },
         LogicalQueryPlan::MatchOut {
             edge_type,
@@ -431,4 +696,21 @@ fn physical_plan(logical: &LogicalQueryPlan) -> PhysicalQueryPlan {
             return_count: *return_count,
         },
     }
+}
+
+fn validate_query_vertex_metadata(metadata: &VertexMetadata) -> Result<()> {
+    for label in &metadata.labels {
+        validate_component("label", label)?;
+    }
+    for property in metadata.properties.keys() {
+        validate_component("property", property)?;
+    }
+    Ok(())
+}
+
+fn validate_query_edge_metadata(metadata: &EdgeMetadata) -> Result<()> {
+    for property in metadata.properties.keys() {
+        validate_component("property", property)?;
+    }
+    Ok(())
 }
