@@ -381,8 +381,25 @@ struct QueryTransportServerRuntime {
 #[cfg(feature = "query-transport")]
 #[derive(Default)]
 struct QueryTransportLifecycle {
-    active_queries: BTreeSet<String>,
-    cancellations: BTreeSet<String>,
+    next_token: QueryLifecycleToken,
+    queries: BTreeMap<String, QueryLifecycleEntry>,
+}
+
+#[cfg(feature = "query-transport")]
+type QueryLifecycleToken = u64;
+
+#[cfg(feature = "query-transport")]
+struct QueryLifecycleEntry {
+    token: QueryLifecycleToken,
+    state: QueryLifecycleState,
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum QueryLifecycleState {
+    Queued,
+    Running,
+    Cancelled,
 }
 
 #[cfg(feature = "query-transport")]
@@ -472,10 +489,18 @@ impl TcpQueryServer {
         let query_id = query_id.into();
         validate_component("query_id", &query_id)?;
         let mut lifecycle = self.lifecycle.lock().await;
-        if !lifecycle.active_queries.contains(&query_id) {
+        let Some(entry) = lifecycle.queries.get(&query_id) else {
             return Err(inactive_query_cancel_error(&query_id));
+        };
+        let queued = entry.state == QueryLifecycleState::Queued;
+        if queued {
+            lifecycle.queries.remove(&query_id);
+            self.metrics
+                .cancelled_rejections
+                .fetch_add(1, Ordering::Relaxed);
+        } else if let Some(entry) = lifecycle.queries.get_mut(&query_id) {
+            entry.state = QueryLifecycleState::Cancelled;
         }
-        lifecycle.cancellations.insert(query_id);
         self.metrics.cancellations.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -1313,10 +1338,11 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    begin_query_lifecycle(runtime, query_id).await?;
+    let lifecycle_token = begin_query_lifecycle(runtime, query_id).await?;
     let result = async {
         let _permit = acquire_query_transport_permit(runtime).await?;
-        ensure_query_not_cancelled(runtime, query_id).await?;
+        activate_query_lifecycle(runtime, query_id, lifecycle_token).await?;
+        ensure_query_not_cancelled(runtime, query_id, lifecycle_token).await?;
         runtime
             .metrics
             .requests_started
@@ -1344,9 +1370,9 @@ where
         result
     }
     .await;
-    let result = match finish_query_lifecycle(runtime, query_id).await {
+    let result = match finish_query_lifecycle(runtime, query_id, lifecycle_token).await {
         QueryLifecycleFinish::Cancelled => Err(cancelled_query_error()),
-        QueryLifecycleFinish::NotCancelled => result,
+        QueryLifecycleFinish::NotCancelled | QueryLifecycleFinish::NotOwned => result,
     };
     match &result {
         Ok(_) => runtime
@@ -1365,14 +1391,43 @@ where
 async fn begin_query_lifecycle(
     runtime: &QueryTransportServerRuntime,
     query_id: &str,
-) -> Result<()> {
+) -> Result<QueryLifecycleToken> {
     let mut lifecycle = runtime.lifecycle.lock().await;
-    if !lifecycle.active_queries.insert(query_id.to_string()) {
+    if lifecycle.queries.contains_key(query_id) {
         return Err(GraphError::UnsupportedQuery {
             dialect: "QueryTransport",
             feature: format!("query id {query_id} is already active"),
         });
     }
+    let token = lifecycle.next_token;
+    lifecycle.next_token = lifecycle.next_token.wrapping_add(1);
+    lifecycle.queries.insert(
+        query_id.to_string(),
+        QueryLifecycleEntry {
+            token,
+            state: QueryLifecycleState::Queued,
+        },
+    );
+    Ok(token)
+}
+
+#[cfg(feature = "query-transport")]
+async fn activate_query_lifecycle(
+    runtime: &QueryTransportServerRuntime,
+    query_id: &str,
+    token: QueryLifecycleToken,
+) -> Result<()> {
+    let mut lifecycle = runtime.lifecycle.lock().await;
+    let Some(entry) = lifecycle.queries.get_mut(query_id) else {
+        return Err(cancelled_query_error());
+    };
+    if entry.token != token {
+        return Err(cancelled_query_error());
+    }
+    if entry.state == QueryLifecycleState::Cancelled {
+        return Err(cancelled_query_error());
+    }
+    entry.state = QueryLifecycleState::Running;
     Ok(())
 }
 
@@ -1380,17 +1435,28 @@ async fn begin_query_lifecycle(
 async fn finish_query_lifecycle(
     runtime: &QueryTransportServerRuntime,
     query_id: &str,
+    token: QueryLifecycleToken,
 ) -> QueryLifecycleFinish {
     let mut lifecycle = runtime.lifecycle.lock().await;
-    lifecycle.active_queries.remove(query_id);
-    if lifecycle.cancellations.remove(query_id) {
-        runtime
-            .metrics
-            .cancelled_rejections
-            .fetch_add(1, Ordering::Relaxed);
-        QueryLifecycleFinish::Cancelled
-    } else {
-        QueryLifecycleFinish::NotCancelled
+    let Some(entry) = lifecycle.queries.get(query_id) else {
+        return QueryLifecycleFinish::NotOwned;
+    };
+    if entry.token != token {
+        return QueryLifecycleFinish::NotOwned;
+    }
+    let state = entry.state;
+    lifecycle.queries.remove(query_id);
+    match state {
+        QueryLifecycleState::Cancelled => {
+            runtime
+                .metrics
+                .cancelled_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            QueryLifecycleFinish::Cancelled
+        }
+        QueryLifecycleState::Queued | QueryLifecycleState::Running => {
+            QueryLifecycleFinish::NotCancelled
+        }
     }
 }
 
@@ -1398,16 +1464,26 @@ async fn finish_query_lifecycle(
 enum QueryLifecycleFinish {
     Cancelled,
     NotCancelled,
+    NotOwned,
 }
 
 #[cfg(feature = "query-transport")]
 async fn cancel_active_query(runtime: &QueryTransportServerRuntime, query_id: &str) -> Result<()> {
     validate_component("query_id", query_id)?;
     let mut lifecycle = runtime.lifecycle.lock().await;
-    if !lifecycle.active_queries.contains(query_id) {
+    let Some(entry) = lifecycle.queries.get(query_id) else {
         return Err(inactive_query_cancel_error(query_id));
+    };
+    let queued = entry.state == QueryLifecycleState::Queued;
+    if queued {
+        lifecycle.queries.remove(query_id);
+        runtime
+            .metrics
+            .cancelled_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    } else if let Some(entry) = lifecycle.queries.get_mut(query_id) {
+        entry.state = QueryLifecycleState::Cancelled;
     }
-    lifecycle.cancellations.insert(query_id.to_string());
     runtime
         .metrics
         .cancellations
@@ -1441,14 +1517,13 @@ async fn acquire_query_transport_permit(
 async fn ensure_query_not_cancelled(
     runtime: &QueryTransportServerRuntime,
     query_id: &str,
+    token: QueryLifecycleToken,
 ) -> Result<()> {
-    if runtime
-        .lifecycle
-        .lock()
-        .await
-        .cancellations
-        .contains(query_id)
-    {
+    let lifecycle = runtime.lifecycle.lock().await;
+    let Some(entry) = lifecycle.queries.get(query_id) else {
+        return Err(cancelled_query_error());
+    };
+    if entry.token != token || entry.state == QueryLifecycleState::Cancelled {
         return Err(cancelled_query_error());
     }
     Ok(())

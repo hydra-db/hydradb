@@ -6157,6 +6157,44 @@ async fn tcp_query_transport_applies_server_backpressure_under_load() {
     assert!(server.metrics().backpressure_waits >= 1);
 
     let client = TcpQueryCellClient::new(server.local_addr()).with_bearer_token("secret");
+    let blocker_client = client.clone();
+    let blocker = tokio::spawn(async move {
+        blocker_client
+            .execute_cypher_rows(
+                QueryContext::new("reddit-home", "query-transport-queue-blocker"),
+                "MATCH (u {id: 1}) RETURN u.id",
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let queued_client = client.clone();
+    let queued = tokio::spawn(async move {
+        queued_client
+            .execute_cypher_rows(
+                QueryContext::new("reddit-home", "query-transport-cancel-queued"),
+                "MATCH (u {id: 1}) RETURN u.id",
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    client
+        .cancel_query("query-transport-cancel-queued")
+        .await
+        .unwrap();
+    let retry_after_queued_cancel = client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "query-transport-cancel-queued"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry_after_queued_cancel.rows.len(), 1);
+    let queued_cancelled = queued.await.unwrap().unwrap_err();
+    assert!(queued_cancelled
+        .to_string()
+        .contains("query_transport_cancelled"));
+    assert_eq!(blocker.await.unwrap().unwrap().rows.len(), 1);
+
     let active_client = client.clone();
     let active = tokio::spawn(async move {
         active_client
