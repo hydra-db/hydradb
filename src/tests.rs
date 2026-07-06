@@ -5535,6 +5535,110 @@ async fn routed_cluster_executes_read_plans_without_write_lease_and_rejects_writ
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn routed_cluster_executes_row_queries_across_local_cells() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open(
+        "graph-control/query-routed-multi-cell",
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    control
+        .publish_placement(
+            &ShardPlacement::fixed([("reddit-home", "node-a"), ("reddit-popular", "node-a")])
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cluster = RoutedPhase0Cluster::open_owned_with_control(
+        "phase2-query-routed-multi-cell",
+        "node-a",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+
+    for (cell_id, dsts) in [("reddit-home", vec![10, 11]), ("reddit-popular", vec![20])] {
+        for (idx, dst) in dsts.into_iter().enumerate() {
+            cluster
+                .write_edge(EdgeMutation {
+                    cell_id: cell_id.to_string(),
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 1,
+                    dst,
+                    idempotency_key: format!("query-routed-multi-cell-{cell_id}-{idx}"),
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    let result_sets = cluster
+        .execute_cypher_rows_many(
+            [
+                QueryContext::new("reddit-home", "query-routed-multi-cell-home"),
+                QueryContext::new("reddit-popular", "query-routed-multi-cell-popular"),
+            ],
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result_sets.get("reddit-home").unwrap(),
+        &QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(10)]),
+                QueryRow::new(vec![QueryValue::VertexId(11)]),
+            ],
+        )
+    );
+    assert_eq!(
+        result_sets.get("reddit-popular").unwrap(),
+        &QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(20)])],
+        )
+    );
+
+    let page = cluster
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "query-routed-multi-cell-page"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page,
+        QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(10)])],
+            Some(QueryCursorToken::new(1)),
+        )
+    );
+
+    let duplicate = cluster
+        .execute_cypher_rows_many(
+            [
+                QueryContext::new("reddit-home", "query-routed-duplicate-a"),
+                QueryContext::new("reddit-home", "query-routed-duplicate-b"),
+            ],
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(duplicate, GraphError::CorruptValue { .. }));
+
+    cluster.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_explain_uses_phase2_query_planner() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-explain-plan", object_store).await;
@@ -5940,6 +6044,121 @@ async fn cypher_rows_return_columns_and_typed_values() {
         .await
         .unwrap_err();
     assert!(matches!(write, GraphError::UnsupportedQuery { .. }));
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_rows_page_returns_bounded_cursor_pages() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-pages", object_store).await;
+
+    for (idx, dst) in [10, 11, 12, 13].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst,
+                idempotency_key: format!("cypher-row-page-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let first = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "cypher-row-page-first"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(10)]),
+                QueryRow::new(vec![QueryValue::VertexId(11)]),
+            ],
+            Some(QueryCursorToken::new(2)),
+        )
+    );
+
+    let second = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "cypher-row-page-second"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
+            first.next_cursor,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second,
+        QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(12)]),
+                QueryRow::new(vec![QueryValue::VertexId(13)]),
+            ],
+            None,
+        )
+    );
+
+    let limited_first = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "cypher-row-page-limited-first"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id SKIP 1 LIMIT 2",
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        limited_first,
+        QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(11)])],
+            Some(QueryCursorToken::new(1)),
+        )
+    );
+
+    let limited_second = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "cypher-row-page-limited-second"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id SKIP 1 LIMIT 2",
+            limited_first.next_cursor,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        limited_second,
+        QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(12)])],
+            None,
+        )
+    );
+
+    let zero_page = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "cypher-row-page-zero"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id",
+            None,
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        zero_page,
+        GraphError::AdmissionRejected {
+            operation: "query_page_size",
+            ..
+        }
+    ));
 }
 
 #[cfg(feature = "opencypher")]
@@ -6828,6 +7047,66 @@ async fn cypher_row_engine_records_operational_metrics() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_row_engine_property_fuzz_matches_direct_model() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-property-fuzz", object_store).await;
+    let mut expected = BTreeMap::<u64, BTreeSet<(VertexId, VertexId)>>::new();
+
+    for idx in 0_u64..48 {
+        let src = 1 + ((idx * 17 + 3) % 11);
+        let dst = 100 + idx;
+        let score = (idx * 7 + 5) % 9;
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "POSTED".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-row-property-fuzz-edge-{idx}"),
+            })
+            .await
+            .unwrap();
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                dst,
+                VertexMetadata::default()
+                    .with_label("Post")
+                    .with_property("score", VertexPropertyValue::Integer(score)),
+            )
+            .await
+            .unwrap();
+        expected.entry(score).or_default().insert((src, dst));
+    }
+
+    for score in 0_u64..9 {
+        let rows = shard
+            .execute_cypher_rows(
+                QueryContext::new("reddit-home", format!("cypher-row-property-fuzz-{score}"))
+                    .with_parameter("score", VertexPropertyValue::Integer(score)),
+                "MATCH (u)-[:POSTED]->(p:Post {score: $score}) \
+                 RETURN u.id AS user, p.id AS post ORDER BY user, post",
+            )
+            .await
+            .unwrap();
+        let actual: BTreeSet<_> = rows
+            .rows
+            .iter()
+            .map(|row| match row.values.as_slice() {
+                [QueryValue::VertexId(src), QueryValue::VertexId(dst)] => (*src, *dst),
+                values => panic!("unexpected row values: {values:?}"),
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            expected.get(&score).cloned().unwrap_or_default(),
+            "score {score}"
+        );
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_row_engine_rejects_excess_intermediate_rows() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
@@ -6966,6 +7245,68 @@ async fn cypher_row_engine_rejects_large_full_edge_scans() {
             limit: 1
         }
     ));
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_row_planner_runs_selective_match_group_before_full_scan() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-row-planner-selective-group",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for (idx, (src, dst)) in [(1, 10), (2, 20), (3, 30)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-row-planner-selective-group-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            20,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(true)),
+        )
+        .await
+        .unwrap();
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-planner-selective-group-read"),
+            "MATCH (u)-[:FOLLOWS]->(v) \
+             MATCH (v:User {active: true}) \
+             RETURN u.id AS user, v.id AS followed",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("user"), QueryColumn::new("followed")],
+            vec![QueryRow::new(vec![
+                QueryValue::VertexId(2),
+                QueryValue::VertexId(20),
+            ])],
+        )
+    );
 }
 
 #[cfg(feature = "opencypher")]

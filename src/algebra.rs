@@ -145,6 +145,38 @@ impl QueryResultSet {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QueryCursorToken {
+    pub offset: u64,
+}
+
+impl QueryCursorToken {
+    pub fn new(offset: u64) -> Self {
+        Self { offset }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryResultPage {
+    pub columns: Vec<QueryColumn>,
+    pub rows: Vec<QueryRow>,
+    pub next_cursor: Option<QueryCursorToken>,
+}
+
+impl QueryResultPage {
+    pub fn new(
+        columns: Vec<QueryColumn>,
+        rows: Vec<QueryRow>,
+        next_cursor: Option<QueryCursorToken>,
+    ) -> Self {
+        Self {
+            columns,
+            rows,
+            next_cursor,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueryMutationResult {
     pub matched_rows: u64,

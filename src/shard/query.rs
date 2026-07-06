@@ -13,6 +13,17 @@ impl GraphShard {
         self.execute_opencypher_rows(context, query).await
     }
 
+    pub async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        self.execute_opencypher_rows_page(context, query, cursor, page_size)
+            .await
+    }
+
     pub async fn execute_opencypher(
         &self,
         context: QueryContext,
@@ -55,6 +66,52 @@ impl GraphShard {
         #[cfg(not(feature = "opencypher"))]
         {
             let _ = (context, query);
+            Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "enable the opencypher Cargo feature to parse Cypher".to_string(),
+            })
+        }
+    }
+
+    pub async fn execute_opencypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        #[cfg(feature = "opencypher")]
+        {
+            let mut parsed =
+                parse_opencypher_row_query_with_parameters(query, &context.parameters)?;
+            let context = merge_opencypher_window(context, parsed.window)?;
+            let cursor_offset = cursor.map_or(0, |cursor| cursor.offset);
+            let context = self.query_page_context(context, cursor_offset, page_size)?;
+            parsed.window = QueryWindow::default();
+            let mut result_set = self.execute_parsed_opencypher_rows(context, parsed).await?;
+            let next_cursor = if result_set.rows.len() > page_size {
+                result_set.rows.truncate(page_size);
+                Some(QueryCursorToken::new(
+                    cursor_offset.checked_add(page_size as u64).ok_or_else(|| {
+                        GraphError::AdmissionRejected {
+                            operation: "query_cursor_offset",
+                            actual: u64::MAX,
+                            limit: u64::MAX - 1,
+                        }
+                    })?,
+                ))
+            } else {
+                None
+            };
+            Ok(QueryResultPage::new(
+                result_set.columns,
+                result_set.rows,
+                next_cursor,
+            ))
+        }
+        #[cfg(not(feature = "opencypher"))]
+        {
+            let _ = (context, query, cursor, page_size);
             Err(GraphError::UnsupportedQuery {
                 dialect: "OpenCypher",
                 feature: "enable the opencypher Cargo feature to parse Cypher".to_string(),
@@ -871,8 +928,9 @@ impl GraphShard {
             });
         }
 
+        let groups = optimize_row_match_groups(groups);
         let mut rows = vec![BindingRow::default()];
-        for group in groups {
+        for group in &groups {
             budget.check("cypher_match_group")?;
             if group.patterns.is_empty() {
                 return Err(GraphError::UnsupportedQuery {
@@ -936,7 +994,8 @@ impl GraphShard {
         budget: &QueryBudget,
         mut rows: Vec<BindingRow>,
     ) -> Result<Vec<BindingRow>> {
-        for pattern in patterns {
+        let patterns = optimize_row_patterns(patterns);
+        for pattern in &patterns {
             budget.check("cypher_match_pipeline")?;
             let mut next_rows = Vec::new();
             for row in rows {
@@ -1810,6 +1869,51 @@ impl GraphShard {
         Ok(vertices)
     }
 
+    #[cfg(feature = "opencypher")]
+    fn query_page_context(
+        &self,
+        context: QueryContext,
+        cursor_offset: u64,
+        page_size: usize,
+    ) -> Result<QueryContext> {
+        let max = self.limits.max_query_result_vertices;
+        if page_size == 0 {
+            return Err(GraphError::AdmissionRejected {
+                operation: "query_page_size",
+                actual: 0,
+                limit: max as u64,
+            });
+        }
+        let max_page_size = max.saturating_sub(1);
+        ensure_limit("query_page_size", page_size as u64, max_page_size as u64)?;
+
+        let base_window = context.result_window;
+        let skip =
+            base_window
+                .skip
+                .checked_add(cursor_offset)
+                .ok_or(GraphError::AdmissionRejected {
+                    operation: "query_cursor_offset",
+                    actual: u64::MAX,
+                    limit: u64::MAX - 1,
+                })?;
+        let probe_limit = match base_window.limit {
+            Some(limit) => {
+                let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+                if cursor_offset >= limit_u64 {
+                    0
+                } else {
+                    let remaining = limit_u64 - cursor_offset;
+                    usize::try_from(remaining)
+                        .unwrap_or(usize::MAX)
+                        .min(page_size.saturating_add(1))
+                }
+            }
+            None => page_size.saturating_add(1),
+        };
+        Ok(context.with_result_window(skip, Some(probe_limit)))
+    }
+
     fn ensure_query_intermediate_rows(&self, operation: &'static str, rows: usize) -> Result<()> {
         ensure_limit(
             operation,
@@ -2516,6 +2620,95 @@ struct VertexMutationApplyState<'a> {
     pending_edge_metadata: &'a mut BTreeMap<BoundRelationship, EdgeMetadata>,
     original_edge_metadata: &'a mut BTreeMap<BoundRelationship, EdgeMetadata>,
     budget: &'a QueryBudget,
+}
+
+#[cfg(feature = "opencypher")]
+fn optimize_row_match_groups(groups: &[RowMatchGroup]) -> Vec<RowMatchGroup> {
+    fn flush_required_segment(output: &mut Vec<RowMatchGroup>, segment: &mut Vec<RowMatchGroup>) {
+        segment.sort_by_key(estimate_row_match_group_cost);
+        output.append(segment);
+    }
+
+    let mut output = Vec::with_capacity(groups.len());
+    let mut required_segment = Vec::new();
+    for group in groups {
+        if !group.optional && group.predicate.is_none() {
+            let mut group = group.clone();
+            group.patterns = optimize_row_patterns(&group.patterns);
+            required_segment.push(group);
+        } else {
+            flush_required_segment(&mut output, &mut required_segment);
+            let mut group = group.clone();
+            group.patterns = optimize_row_patterns(&group.patterns);
+            output.push(group);
+        }
+    }
+    flush_required_segment(&mut output, &mut required_segment);
+    output
+}
+
+#[cfg(feature = "opencypher")]
+fn optimize_row_patterns(patterns: &[RowPattern]) -> Vec<RowPattern> {
+    let mut planned: Vec<_> = patterns.iter().cloned().enumerate().collect();
+    planned.sort_by_key(|(idx, pattern)| (estimate_row_pattern_cost(pattern), *idx));
+    planned.into_iter().map(|(_, pattern)| pattern).collect()
+}
+
+#[cfg(feature = "opencypher")]
+fn estimate_row_match_group_cost(group: &RowMatchGroup) -> u64 {
+    group
+        .patterns
+        .iter()
+        .map(estimate_row_pattern_cost)
+        .min()
+        .unwrap_or(u64::MAX)
+}
+
+#[cfg(feature = "opencypher")]
+fn estimate_row_pattern_cost(pattern: &RowPattern) -> u64 {
+    match pattern {
+        RowPattern::Node(node) => estimate_row_node_pattern_cost(node),
+        RowPattern::Edge(edge) => estimate_row_edge_pattern_cost(edge),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn estimate_row_node_pattern_cost(node: &RowNodePattern) -> u64 {
+    if node.id.is_some() {
+        1
+    } else if node
+        .properties
+        .iter()
+        .any(|(property, _)| property.as_str() != "id")
+    {
+        8
+    } else if !node.labels.is_empty() {
+        64
+    } else {
+        1_000_000
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn estimate_row_edge_pattern_cost(edge: &RowEdgePattern) -> u64 {
+    if edge.hop_range.is_some() {
+        return if edge.src.id.is_some() {
+            10_000
+        } else {
+            2_000_000
+        };
+    }
+
+    let endpoint_cost =
+        estimate_row_node_pattern_cost(&edge.src).min(estimate_row_node_pattern_cost(&edge.dst));
+    let relationship_property_cost = if edge.properties.is_empty() {
+        1_000_000
+    } else {
+        16
+    };
+    endpoint_cost
+        .min(relationship_property_cost)
+        .saturating_add(4)
 }
 
 #[cfg(feature = "opencypher")]
