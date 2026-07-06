@@ -574,6 +574,12 @@ impl RoutedPhase0Cluster {
         query: &str,
     ) -> Result<crate::QueryOutput> {
         let shard = self.shard(&context.cell_id)?;
+        if crate::parse_opencypher_mutation_query_with_parameters(query, &context.parameters)?
+            .is_some()
+        {
+            self.ensure_active_write_lease(&context.cell_id)?;
+            return shard.execute_cypher(context, query).await;
+        }
         let plan = shard.plan_opencypher(context, query)?;
         if plan.is_write() {
             self.ensure_active_write_lease(&plan.cell_id)?;
