@@ -265,6 +265,100 @@ pub(crate) fn decode_u64(key: &str, value: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(bytes))
 }
 
+#[cfg(feature = "opencypher")]
+pub(crate) fn encode_query_stats_record(record: &QueryStatsRecord) -> Vec<u8> {
+    format!(
+        "query-stats-v1\ncount\t{}\nread_epoch\t{}\nrefreshed_at_ms\t{}\ndistinct_values\t{}\ntotal_values\t{}\nmost_common_count\t{}\n",
+        record.count,
+        record.read_epoch,
+        record.refreshed_at_ms,
+        record.distinct_values,
+        record.total_values,
+        record.most_common_count,
+    )
+    .into_bytes()
+}
+
+#[cfg(feature = "opencypher")]
+pub(crate) fn decode_query_stats_record(key: &str, value: &[u8]) -> Result<QueryStatsRecord> {
+    if value.len() == 8 {
+        let count = decode_u64(key, value)?;
+        return Ok(QueryStatsRecord::point_count(count, 0, 0));
+    }
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let mut lines = text.lines();
+    match lines.next() {
+        Some("query-stats-v1") => {}
+        Some(other) => {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("unsupported query stats version {other}"),
+            });
+        }
+        None => {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: "empty query stats record".to_string(),
+            });
+        }
+    }
+
+    let mut count = None;
+    let mut read_epoch = None;
+    let mut refreshed_at_ms = None;
+    let mut distinct_values = None;
+    let mut total_values = None;
+    let mut most_common_count = None;
+    for line in lines {
+        let parts: Vec<_> = line.split('\t').collect();
+        let [field, value] = parts.as_slice() else {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("invalid query stats line {line}"),
+            });
+        };
+        let parsed = value
+            .parse::<u64>()
+            .map_err(|err| GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("invalid query stats {field} value {value}: {err}"),
+            })?;
+        match *field {
+            "count" => count = Some(parsed),
+            "read_epoch" => read_epoch = Some(parsed),
+            "refreshed_at_ms" => refreshed_at_ms = Some(parsed),
+            "distinct_values" => distinct_values = Some(parsed),
+            "total_values" => total_values = Some(parsed),
+            "most_common_count" => most_common_count = Some(parsed),
+            other => {
+                return Err(GraphError::CorruptValue {
+                    key: key.to_string(),
+                    reason: format!("unknown query stats field {other}"),
+                });
+            }
+        }
+    }
+    Ok(QueryStatsRecord {
+        count: required_query_stats_field(key, "count", count)?,
+        read_epoch: required_query_stats_field(key, "read_epoch", read_epoch)?,
+        refreshed_at_ms: required_query_stats_field(key, "refreshed_at_ms", refreshed_at_ms)?,
+        distinct_values: required_query_stats_field(key, "distinct_values", distinct_values)?,
+        total_values: required_query_stats_field(key, "total_values", total_values)?,
+        most_common_count: required_query_stats_field(key, "most_common_count", most_common_count)?,
+    })
+}
+
+#[cfg(feature = "opencypher")]
+fn required_query_stats_field(key: &str, field: &'static str, value: Option<u64>) -> Result<u64> {
+    value.ok_or_else(|| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("missing query stats field {field}"),
+    })
+}
+
 pub(crate) fn encode_vertex_metadata(metadata: &VertexMetadata) -> Vec<u8> {
     let mut value = String::from("vertex-metadata-v1\n");
     for label in &metadata.labels {

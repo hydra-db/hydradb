@@ -947,6 +947,102 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
+    pub fn start_query_stats_refresh_job(
+        self: Arc<Self>,
+        specs: Vec<QueryStatsRefreshSpec>,
+        interval: Duration,
+    ) -> Result<QueryStatsRefreshHandle> {
+        if specs.is_empty() {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "QueryStats",
+                feature: "stats refresh job requires at least one spec".to_string(),
+            });
+        }
+        if interval.is_zero() {
+            return Err(GraphError::AdmissionRejected {
+                operation: "query_stats_refresh_interval_ms",
+                actual: 0,
+                limit: u64::MAX,
+            });
+        }
+        for spec in &specs {
+            validate_component("cell_id", &spec.cell_id)?;
+            validate_query_stats_refresh_kind(&spec.kind)?;
+        }
+        let handle = tokio::spawn(async move {
+            loop {
+                for spec in &specs {
+                    if let Err(err) = self.refresh_query_stats_spec(spec).await {
+                        tracing::warn!(
+                            target: "slatedb_graph_kernel",
+                            cell_id = %spec.cell_id,
+                            error = %err,
+                            "query stats background refresh failed"
+                        );
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+        Ok(QueryStatsRefreshHandle { handle })
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn refresh_query_stats_spec(
+        &self,
+        spec: &QueryStatsRefreshSpec,
+    ) -> Result<QueryStatsRefreshResult> {
+        validate_component("cell_id", &spec.cell_id)?;
+        validate_query_stats_refresh_kind(&spec.kind)?;
+        match &spec.kind {
+            QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::EdgeType {
+                edge_type,
+            }) => Ok(QueryStatsRefreshResult::Cardinality(
+                self.refresh_edge_type_query_stats(&spec.cell_id, edge_type)
+                    .await?,
+            )),
+            QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::VertexLabel {
+                label,
+            }) => Ok(QueryStatsRefreshResult::Cardinality(
+                self.refresh_vertex_label_query_stats(&spec.cell_id, label)
+                    .await?,
+            )),
+            QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::VertexProperty {
+                property,
+                value,
+            }) => Ok(QueryStatsRefreshResult::Cardinality(
+                self.refresh_vertex_property_query_stats(&spec.cell_id, property, value)
+                    .await?,
+            )),
+            QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::EdgeProperty {
+                edge_type,
+                property,
+                value,
+            }) => Ok(QueryStatsRefreshResult::Cardinality(
+                self.refresh_edge_property_query_stats(&spec.cell_id, edge_type, property, value)
+                    .await?,
+            )),
+            QueryStatsRefreshKind::VertexPropertyHistogram { property } => {
+                Ok(QueryStatsRefreshResult::Histogram(
+                    self.refresh_vertex_property_histogram_query_stats(&spec.cell_id, property)
+                        .await?,
+                ))
+            }
+            QueryStatsRefreshKind::EdgePropertyHistogram {
+                edge_type,
+                property,
+            } => Ok(QueryStatsRefreshResult::Histogram(
+                self.refresh_edge_property_histogram_query_stats(
+                    &spec.cell_id,
+                    edge_type,
+                    property,
+                )
+                .await?,
+            )),
+        }
+    }
+
+    #[cfg(feature = "opencypher")]
     pub async fn refresh_edge_type_query_stats(
         &self,
         cell_id: &str,
@@ -960,12 +1056,13 @@ impl GraphShard {
         let count = self
             .edge_type_cardinality_from_degree_counters(cell_id, edge_type, &budget)
             .await?;
-        self.publish_query_stats_count_after_snapshot(
+        let stats = QueryStatsRecord::point_count(count, read_epoch, graph_now_millis());
+        self.publish_query_stats_record_after_snapshot(
             cell_id,
             "refresh_edge_type_query_stats",
             read_epoch,
             keys::query_stats_edge_type(cell_id, edge_type),
-            count,
+            &stats,
         )
         .await?;
         Ok(QueryCardinalityStatsRefresh {
@@ -975,6 +1072,7 @@ impl GraphShard {
                 edge_type: edge_type.to_string(),
             },
             count,
+            stats,
         })
     }
 
@@ -993,12 +1091,13 @@ impl GraphShard {
             .scan_vertex_label_index_at(cell_id, label, read_epoch, &budget)
             .await?
             .len() as u64;
-        self.publish_query_stats_count_after_snapshot(
+        let stats = QueryStatsRecord::point_count(count, read_epoch, graph_now_millis());
+        self.publish_query_stats_record_after_snapshot(
             cell_id,
             "refresh_vertex_label_query_stats",
             read_epoch,
             keys::query_stats_vertex_label(cell_id, label),
-            count,
+            &stats,
         )
         .await?;
         Ok(QueryCardinalityStatsRefresh {
@@ -1008,6 +1107,7 @@ impl GraphShard {
                 label: label.to_string(),
             },
             count,
+            stats,
         })
     }
 
@@ -1028,12 +1128,16 @@ impl GraphShard {
             .await?
             .len() as u64;
         let encoded = encode_vertex_property_value_key(value);
-        self.publish_query_stats_count_after_snapshot(
+        let histogram = self
+            .vertex_property_histogram_counts(cell_id, property, read_epoch, &budget)
+            .await?;
+        let stats = stats_record_from_bucket_count(count, read_epoch, &histogram);
+        self.publish_query_stats_record_after_snapshot(
             cell_id,
             "refresh_vertex_property_query_stats",
             read_epoch,
             keys::query_stats_vertex_property(cell_id, property, &encoded),
-            count,
+            &stats,
         )
         .await?;
         Ok(QueryCardinalityStatsRefresh {
@@ -1044,6 +1148,7 @@ impl GraphShard {
                 value: value.clone(),
             },
             count,
+            stats,
         })
     }
 
@@ -1066,12 +1171,16 @@ impl GraphShard {
             .await?
             .len() as u64;
         let encoded = encode_vertex_property_value_key(value);
-        self.publish_query_stats_count_after_snapshot(
+        let histogram = self
+            .edge_property_histogram_counts(cell_id, edge_type, property, read_epoch, &budget)
+            .await?;
+        let stats = stats_record_from_bucket_count(count, read_epoch, &histogram);
+        self.publish_query_stats_record_after_snapshot(
             cell_id,
             "refresh_edge_property_query_stats",
             read_epoch,
             keys::query_stats_edge_property(cell_id, edge_type, property, &encoded),
-            count,
+            &stats,
         )
         .await?;
         Ok(QueryCardinalityStatsRefresh {
@@ -1083,17 +1192,98 @@ impl GraphShard {
                 value: value.clone(),
             },
             count,
+            stats,
         })
     }
 
     #[cfg(feature = "opencypher")]
-    async fn publish_query_stats_count_after_snapshot(
+    pub async fn refresh_vertex_property_histogram_query_stats(
+        &self,
+        cell_id: &str,
+        property: &str,
+    ) -> Result<QueryStatsHistogramRefresh> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("property", property)?;
+        self.ensure_write_authority(cell_id, "refresh_vertex_property_histogram_query_stats")?;
+        let read_epoch = self.snapshot(cell_id).await?.read_epoch();
+        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
+        let buckets = self
+            .vertex_property_histogram_counts(cell_id, property, read_epoch, &budget)
+            .await?;
+        let stats = stats_record_from_histogram(read_epoch, &buckets);
+        self.publish_query_stats_histogram_after_snapshot(
+            QueryStatsHistogramPublish {
+                cell_id,
+                operation: "refresh_vertex_property_histogram_query_stats",
+                read_epoch,
+                histogram_key: keys::query_stats_vertex_property_histogram(cell_id, property),
+                bucket_prefix: keys::query_stats_vertex_property_prefix(cell_id, property),
+                stats: &stats,
+                buckets: &buckets,
+            },
+            |encoded| keys::query_stats_vertex_property(cell_id, property, encoded),
+        )
+        .await?;
+        Ok(QueryStatsHistogramRefresh {
+            cell_id: cell_id.to_string(),
+            read_epoch,
+            property: property.to_string(),
+            edge_type: None,
+            stats,
+            buckets,
+        })
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn refresh_edge_property_histogram_query_stats(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        property: &str,
+    ) -> Result<QueryStatsHistogramRefresh> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        validate_component("property", property)?;
+        self.ensure_write_authority(cell_id, "refresh_edge_property_histogram_query_stats")?;
+        let read_epoch = self.snapshot(cell_id).await?.read_epoch();
+        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
+        let buckets = self
+            .edge_property_histogram_counts(cell_id, edge_type, property, read_epoch, &budget)
+            .await?;
+        let stats = stats_record_from_histogram(read_epoch, &buckets);
+        self.publish_query_stats_histogram_after_snapshot(
+            QueryStatsHistogramPublish {
+                cell_id,
+                operation: "refresh_edge_property_histogram_query_stats",
+                read_epoch,
+                histogram_key: keys::query_stats_edge_property_histogram(
+                    cell_id, edge_type, property,
+                ),
+                bucket_prefix: keys::query_stats_edge_property_prefix(cell_id, edge_type, property),
+                stats: &stats,
+                buckets: &buckets,
+            },
+            |encoded| keys::query_stats_edge_property(cell_id, edge_type, property, encoded),
+        )
+        .await?;
+        Ok(QueryStatsHistogramRefresh {
+            cell_id: cell_id.to_string(),
+            read_epoch,
+            property: property.to_string(),
+            edge_type: Some(edge_type.to_string()),
+            stats,
+            buckets,
+        })
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn publish_query_stats_record_after_snapshot(
         &self,
         cell_id: &str,
         operation: &'static str,
         read_epoch: GraphEpoch,
         key: String,
-        count: u64,
+        stats: &QueryStatsRecord,
     ) -> Result<()> {
         let _permit = self.acquire_graph_write_permit(operation).await?;
         let lock = self.acquire_cell_write_lock(cell_id, operation).await?;
@@ -1108,12 +1298,98 @@ impl GraphShard {
                 });
             }
             let mut batch = GraphWriteBatch::new();
-            batch.put(key.as_bytes(), encode_u64(count));
+            batch.put(key.as_bytes(), encode_u64(stats.count));
+            batch.put(
+                keys::query_stats_record_key(&key).as_bytes(),
+                encode_query_stats_record(stats),
+            );
             self.write_graph_batch_strict(cell_id, operation, batch)
                 .await
         }
         .await;
         release_cell_write_lock(lock, result).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn publish_query_stats_histogram_after_snapshot(
+        &self,
+        publish: QueryStatsHistogramPublish<'_>,
+        bucket_key: impl Fn(&str) -> String,
+    ) -> Result<()> {
+        let stale_bucket_keys = self.stale_query_stats_bucket_keys(&publish).await?;
+        let _permit = self.acquire_graph_write_permit(publish.operation).await?;
+        let lock = self
+            .acquire_cell_write_lock(publish.cell_id, publish.operation)
+            .await?;
+        let result = async {
+            let current_epoch = self.current_epoch(publish.cell_id).await?;
+            if current_epoch != publish.read_epoch {
+                return Err(GraphError::QueryStatsSnapshotChanged {
+                    operation: publish.operation,
+                    cell_id: publish.cell_id.to_string(),
+                    read_epoch: publish.read_epoch,
+                    current_epoch,
+                });
+            }
+            let mut batch = GraphWriteBatch::new();
+            batch.put(
+                publish.histogram_key.as_bytes(),
+                encode_u64(publish.stats.count),
+            );
+            batch.put(
+                keys::query_stats_record_key(&publish.histogram_key).as_bytes(),
+                encode_query_stats_record(publish.stats),
+            );
+            for key in &stale_bucket_keys {
+                batch.delete(key.as_bytes());
+                batch.delete(keys::query_stats_record_key(key).as_bytes());
+            }
+            for (encoded, count) in publish.buckets {
+                let key = bucket_key(encoded);
+                let bucket_stats = QueryStatsRecord {
+                    count: *count,
+                    read_epoch: publish.stats.read_epoch,
+                    refreshed_at_ms: publish.stats.refreshed_at_ms,
+                    distinct_values: publish.stats.distinct_values,
+                    total_values: publish.stats.total_values,
+                    most_common_count: publish.stats.most_common_count,
+                };
+                batch.put(key.as_bytes(), encode_u64(*count));
+                batch.put(
+                    keys::query_stats_record_key(&key).as_bytes(),
+                    encode_query_stats_record(&bucket_stats),
+                );
+            }
+            self.write_graph_batch_strict(publish.cell_id, publish.operation, batch)
+                .await
+        }
+        .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn stale_query_stats_bucket_keys(
+        &self,
+        publish: &QueryStatsHistogramPublish<'_>,
+    ) -> Result<Vec<String>> {
+        let mut iter = self.scan_remote_prefix(&publish.bucket_prefix).await?;
+        let mut keys_to_delete = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let Some(encoded) = key.strip_prefix(&publish.bucket_prefix) else {
+                return Err(GraphError::CorruptValue {
+                    key,
+                    reason: "query stats bucket key does not match scan prefix".to_string(),
+                });
+            };
+            if encoded.contains('/') {
+                continue;
+            }
+            if !publish.buckets.contains_key(encoded) {
+                keys_to_delete.push(key);
+            }
+        }
+        Ok(keys_to_delete)
     }
 
     #[cfg(feature = "opencypher")]
@@ -1141,6 +1417,106 @@ impl GraphShard {
                 })?;
         }
         Ok(count)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn vertex_property_histogram_counts(
+        &self,
+        cell_id: &str,
+        property: &str,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<BTreeMap<String, u64>> {
+        budget.check("query_stats_vertex_property_histogram")?;
+        let mut iter = self
+            .scan_remote_prefix(&keys::vertex_property_index_property_prefix(
+                cell_id, property,
+            ))
+            .await?;
+        let mut buckets = BTreeMap::<String, u64>::new();
+        let mut total = 0_u64;
+        while let Some(kv) = iter.next().await? {
+            budget.check("query_stats_vertex_property_histogram")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (_cell_id, _property, encoded, vertex_id) = parse_vertex_property_index_key(&key)?;
+            let metadata = self
+                .vertex_metadata_at(cell_id, vertex_id, read_epoch, budget)
+                .await?;
+            let Some(value) = metadata.properties.get(property) else {
+                continue;
+            };
+            if encode_vertex_property_value_key(value) != encoded {
+                continue;
+            }
+            *buckets.entry(encoded).or_default() += 1;
+            total = total
+                .checked_add(1)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key,
+                    reason: "vertex-property histogram count overflow".to_string(),
+                })?;
+            self.ensure_query_index_candidates(
+                "query_stats_vertex_property_histogram_candidates",
+                total as usize,
+            )?;
+        }
+        Ok(buckets)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn edge_property_histogram_counts(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        property: &str,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<BTreeMap<String, u64>> {
+        budget.check("query_stats_edge_property_histogram")?;
+        let mut iter = self
+            .scan_remote_prefix(&keys::edge_property_index_property_prefix(
+                cell_id, edge_type, property,
+            ))
+            .await?;
+        let mut buckets = BTreeMap::<String, u64>::new();
+        let mut total = 0_u64;
+        let latest_snapshot = read_epoch == self.current_epoch(cell_id).await?;
+        while let Some(kv) = iter.next().await? {
+            budget.check("query_stats_edge_property_histogram")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (_cell_id, _edge_type, _property, encoded, src, dst) =
+                parse_edge_property_index_key(&key)?;
+            let edge_exists = if latest_snapshot {
+                self.edge_exists(cell_id, edge_type, src, dst).await?
+            } else {
+                self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch)
+                    .await?
+            };
+            if !edge_exists {
+                continue;
+            }
+            let metadata = self
+                .edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget)
+                .await?;
+            let Some(value) = metadata.properties.get(property) else {
+                continue;
+            };
+            if encode_vertex_property_value_key(value) != encoded {
+                continue;
+            }
+            *buckets.entry(encoded).or_default() += 1;
+            total = total
+                .checked_add(1)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key,
+                    reason: "edge-property histogram count overflow".to_string(),
+                })?;
+            self.ensure_query_index_candidates(
+                "query_stats_edge_property_histogram_candidates",
+                total as usize,
+            )?;
+        }
+        Ok(buckets)
     }
 
     #[cfg(feature = "opencypher")]
@@ -1257,6 +1633,28 @@ impl GraphShard {
             .await?;
         for pattern in &patterns {
             budget.check("cypher_match_pipeline")?;
+            if let Some(next_rows) = self
+                .match_expand_into_pattern_from_rows(cell_id, pattern, read_epoch, budget, &rows)
+                .await?
+            {
+                rows = next_rows;
+                self.ensure_query_intermediate_rows("cypher_expand_into_rows", rows.len())?;
+                if rows.is_empty() {
+                    break;
+                }
+                continue;
+            }
+            if let Some(next_rows) = self
+                .match_hash_join_pattern_from_rows(cell_id, pattern, read_epoch, budget, &rows)
+                .await?
+            {
+                rows = next_rows;
+                self.ensure_query_intermediate_rows("cypher_hash_join_rows", rows.len())?;
+                if rows.is_empty() {
+                    break;
+                }
+                continue;
+            }
             let mut next_rows = Vec::new();
             for row in rows {
                 let Some(bound_pattern) = constrain_row_pattern(pattern, &row)? else {
@@ -1279,6 +1677,144 @@ impl GraphShard {
             }
         }
         Ok(rows)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_expand_into_pattern_from_rows(
+        &self,
+        cell_id: &str,
+        pattern: &RowPattern,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+        rows: &[BindingRow],
+    ) -> Result<Option<Vec<BindingRow>>> {
+        let RowPattern::Edge(edge) = pattern else {
+            return Ok(None);
+        };
+        if edge.hop_range.is_some() || rows.is_empty() {
+            return Ok(None);
+        }
+
+        let current_epoch = self.current_epoch(cell_id).await?;
+        let latest_snapshot = read_epoch == current_epoch;
+        let mut next_rows = Vec::new();
+        let mut metadata_cache = BTreeMap::new();
+        let mut edge_metadata_cache = BTreeMap::new();
+        for row in rows {
+            budget.check("cypher_expand_into")?;
+            let Some(RowPattern::Edge(bound_edge)) = constrain_row_pattern(pattern, row)? else {
+                continue;
+            };
+            let (Some(src), Some(dst)) = (bound_edge.src.id, bound_edge.dst.id) else {
+                return Ok(None);
+            };
+            let exists = if latest_snapshot {
+                self.edge_exists(cell_id, &bound_edge.edge_type, src, dst)
+                    .await?
+            } else {
+                self.edge_exists_at(cell_id, &bound_edge.edge_type, src, dst, read_epoch)
+                    .await?
+            };
+            if !exists {
+                continue;
+            }
+            let Some(mut matched) = BindingRow::from_edge(&bound_edge, src, dst) else {
+                continue;
+            };
+            self.hydrate_binding_metadata(
+                cell_id,
+                read_epoch,
+                &mut matched,
+                &mut metadata_cache,
+                budget,
+            )
+            .await?;
+            self.hydrate_row_relationship_metadata(
+                cell_id,
+                read_epoch,
+                &mut matched,
+                &bound_edge,
+                &mut edge_metadata_cache,
+                budget,
+            )
+            .await?;
+            if row_matches_edge_pattern(&matched, &bound_edge)? {
+                if let Some(joined) = row.join(&matched) {
+                    self.push_binding_row(&mut next_rows, joined, "cypher_expand_into_rows")?;
+                }
+            }
+        }
+        Ok(Some(next_rows))
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_hash_join_pattern_from_rows(
+        &self,
+        cell_id: &str,
+        pattern: &RowPattern,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+        rows: &[BindingRow],
+    ) -> Result<Option<Vec<BindingRow>>> {
+        if rows.len() <= 1 {
+            return Ok(None);
+        }
+        let row_bindings = binding_rows_bound_names_union(rows);
+        let pattern_bindings = row_pattern_bound_names(pattern);
+        let join_bindings: Vec<_> = row_bindings
+            .intersection(&pattern_bindings)
+            .cloned()
+            .collect();
+
+        if join_bindings.is_empty() {
+            let matches = self
+                .match_row_pattern(cell_id, pattern, read_epoch, budget)
+                .await?;
+            let mut next_rows = Vec::new();
+            for row in rows {
+                for matched in &matches {
+                    budget.check("cypher_precomputed_cross_join")?;
+                    if let Some(joined) = row.join(matched) {
+                        self.push_binding_row(
+                            &mut next_rows,
+                            joined,
+                            "cypher_precomputed_cross_join_rows",
+                        )?;
+                    }
+                }
+            }
+            return Ok(Some(next_rows));
+        }
+
+        if !hash_joinable_pattern(pattern) {
+            return Ok(None);
+        }
+        let matches = self
+            .match_row_pattern(cell_id, pattern, read_epoch, budget)
+            .await?;
+        let mut matches_by_key = BTreeMap::<Vec<VertexId>, Vec<BindingRow>>::new();
+        for matched in matches {
+            if let Some(key) = binding_row_join_key(&matched, &join_bindings) {
+                matches_by_key.entry(key).or_default().push(matched);
+            }
+        }
+
+        let mut next_rows = Vec::new();
+        for row in rows {
+            budget.check("cypher_hash_join")?;
+            let Some(key) = binding_row_join_key(row, &join_bindings) else {
+                continue;
+            };
+            let Some(matches) = matches_by_key.get(&key) else {
+                continue;
+            };
+            for matched in matches {
+                if let Some(joined) = row.join(matched) {
+                    self.push_binding_row(&mut next_rows, joined, "cypher_hash_join_rows")?;
+                }
+            }
+        }
+        Ok(Some(next_rows))
     }
 
     #[cfg(feature = "opencypher")]
@@ -1361,7 +1897,11 @@ impl GraphShard {
             .best_row_edge_access_with_stats(cell_id, edge, read_epoch, &BTreeSet::new())
             .await?;
         match access {
-            RowQueryAccess::ExpandInto { .. } | RowQueryAccess::BoundOutExpand { .. } => {
+            RowQueryAccess::ExpandInto { .. } => {
+                self.match_edge_row_pattern_expand_into(cell_id, edge, read_epoch, budget)
+                    .await
+            }
+            RowQueryAccess::BoundOutExpand { .. } => {
                 let Some(sources) = self
                     .candidate_vertex_ids(cell_id, &edge.src, read_epoch, budget)
                     .await?
@@ -1410,6 +1950,76 @@ impl GraphShard {
                 reason: "optimizer selected node access for edge pattern".to_string(),
             }),
         }
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_edge_row_pattern_expand_into(
+        &self,
+        cell_id: &str,
+        edge: &RowEdgePattern,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<BindingRow>> {
+        let Some(sources) = self
+            .candidate_vertex_ids(cell_id, &edge.src, read_epoch, budget)
+            .await?
+        else {
+            return self
+                .match_edge_row_pattern_full_scan(cell_id, edge, read_epoch, budget)
+                .await;
+        };
+        let Some(destinations) = self
+            .candidate_vertex_ids(cell_id, &edge.dst, read_epoch, budget)
+            .await?
+        else {
+            return self
+                .match_edge_row_pattern_full_scan(cell_id, edge, read_epoch, budget)
+                .await;
+        };
+        self.ensure_query_index_candidates("cypher_edge_expand_into_sources", sources.len())?;
+        self.ensure_query_index_candidates(
+            "cypher_edge_expand_into_destinations",
+            destinations.len(),
+        )?;
+        let candidate_pairs = sources
+            .len()
+            .checked_mul(destinations.len())
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: format!("cell/{cell_id}/query/expand-into/{}", edge.edge_type),
+                reason: "expand-into candidate pair count overflow".to_string(),
+            })?;
+        self.ensure_query_index_candidates("cypher_edge_expand_into_pairs", candidate_pairs)?;
+
+        let current_epoch = self.current_epoch(cell_id).await?;
+        let latest_snapshot = read_epoch == current_epoch;
+        let mut rows = Vec::new();
+        let mut metadata_cache = BTreeMap::new();
+        let mut edge_metadata_cache = BTreeMap::new();
+        let mut state = EdgeRowMatchState {
+            cell_id,
+            read_epoch,
+            rows: &mut rows,
+            metadata_cache: &mut metadata_cache,
+            edge_metadata_cache: &mut edge_metadata_cache,
+            budget,
+        };
+        for src in sources {
+            for dst in &destinations {
+                budget.check("cypher_edge_expand_into")?;
+                let exists = if latest_snapshot {
+                    self.edge_exists(cell_id, &edge.edge_type, src, *dst)
+                        .await?
+                } else {
+                    self.edge_exists_at(cell_id, &edge.edge_type, src, *dst, read_epoch)
+                        .await?
+                };
+                if exists {
+                    self.push_matching_edge_row(edge, src, *dst, &mut state)
+                        .await?;
+                }
+            }
+        }
+        Ok(rows)
     }
 
     #[cfg(feature = "opencypher")]
@@ -3164,6 +3774,78 @@ fn check_optional_query_budget(
 }
 
 #[cfg(feature = "opencypher")]
+struct QueryStatsHistogramPublish<'a> {
+    cell_id: &'a str,
+    operation: &'static str,
+    read_epoch: GraphEpoch,
+    histogram_key: String,
+    bucket_prefix: String,
+    stats: &'a QueryStatsRecord,
+    buckets: &'a BTreeMap<String, u64>,
+}
+
+#[cfg(feature = "opencypher")]
+fn stats_record_from_bucket_count(
+    count: u64,
+    read_epoch: GraphEpoch,
+    buckets: &BTreeMap<String, u64>,
+) -> QueryStatsRecord {
+    let mut stats = stats_record_from_histogram(read_epoch, buckets);
+    stats.count = count;
+    stats
+}
+
+#[cfg(feature = "opencypher")]
+fn stats_record_from_histogram(
+    read_epoch: GraphEpoch,
+    buckets: &BTreeMap<String, u64>,
+) -> QueryStatsRecord {
+    let total = buckets.values().copied().sum::<u64>();
+    let most_common = buckets.values().copied().max().unwrap_or(0);
+    QueryStatsRecord::histogram(
+        total,
+        read_epoch,
+        graph_now_millis(),
+        buckets.len() as u64,
+        most_common,
+    )
+}
+
+#[cfg(feature = "opencypher")]
+fn validate_query_stats_refresh_kind(kind: &QueryStatsRefreshKind) -> Result<()> {
+    match kind {
+        QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::EdgeType { edge_type }) => {
+            validate_component("edge_type", edge_type)
+        }
+        QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::VertexLabel { label }) => {
+            validate_component("label", label)
+        }
+        QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::VertexProperty {
+            property,
+            ..
+        }) => validate_component("property", property),
+        QueryStatsRefreshKind::Cardinality(QueryCardinalityStatsKind::EdgeProperty {
+            edge_type,
+            property,
+            ..
+        }) => {
+            validate_component("edge_type", edge_type)?;
+            validate_component("property", property)
+        }
+        QueryStatsRefreshKind::VertexPropertyHistogram { property } => {
+            validate_component("property", property)
+        }
+        QueryStatsRefreshKind::EdgePropertyHistogram {
+            edge_type,
+            property,
+        } => {
+            validate_component("edge_type", edge_type)?;
+            validate_component("property", property)
+        }
+    }
+}
+
+#[cfg(feature = "opencypher")]
 struct EdgeRowMatchState<'a> {
     cell_id: &'a str,
     read_epoch: GraphEpoch,
@@ -3373,6 +4055,23 @@ fn parse_vertex_property_index_delta_key(key: &str) -> Result<(GraphEpoch, Verte
         _ => Err(GraphError::CorruptValue {
             key: key.to_string(),
             reason: "expected vertex property delta key".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn parse_vertex_property_index_key(key: &str) -> Result<(String, String, String, VertexId)> {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", cell_id, "vprop_idx", property, encoded, vertex_id] => Ok((
+            (*cell_id).to_string(),
+            (*property).to_string(),
+            (*encoded).to_string(),
+            parse_u64(key, vertex_id, "vertex_id")?,
+        )),
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected vertex property index key".to_string(),
         }),
     }
 }
@@ -3630,12 +4329,53 @@ fn common_binding_row_bound_names(rows: &[BindingRow]) -> BTreeSet<String> {
 }
 
 #[cfg(feature = "opencypher")]
+fn binding_rows_bound_names_union(rows: &[BindingRow]) -> BTreeSet<String> {
+    rows.iter().flat_map(binding_row_bound_names).collect()
+}
+
+#[cfg(feature = "opencypher")]
 fn binding_row_bound_names(row: &BindingRow) -> BTreeSet<String> {
     row.values
         .keys()
         .chain(row.relationships.keys())
         .cloned()
         .collect()
+}
+
+#[cfg(feature = "opencypher")]
+fn row_pattern_bound_names(pattern: &RowPattern) -> BTreeSet<String> {
+    match pattern {
+        RowPattern::Node(node) => node.binding.iter().cloned().collect(),
+        RowPattern::Edge(edge) => {
+            let mut names = BTreeSet::new();
+            if let Some(binding) = &edge.src.binding {
+                names.insert(binding.clone());
+            }
+            if let Some(binding) = &edge.dst.binding {
+                names.insert(binding.clone());
+            }
+            names
+        }
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn binding_row_join_key(row: &BindingRow, bindings: &[String]) -> Option<Vec<VertexId>> {
+    let mut key = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        key.push(*row.values.get(binding)?);
+    }
+    Some(key)
+}
+
+#[cfg(feature = "opencypher")]
+fn hash_joinable_pattern(pattern: &RowPattern) -> bool {
+    match pattern {
+        RowPattern::Node(node) => {
+            node.id.is_none() && (!node.labels.is_empty() || node_has_metadata_constraints(node))
+        }
+        RowPattern::Edge(edge) => edge.hop_range.is_none() && !edge.properties.is_empty(),
+    }
 }
 
 #[cfg(feature = "opencypher")]

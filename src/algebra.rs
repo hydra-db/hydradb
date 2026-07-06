@@ -138,6 +138,132 @@ pub struct QueryCardinalityStatsRefresh {
     pub read_epoch: GraphEpoch,
     pub kind: QueryCardinalityStatsKind,
     pub count: u64,
+    pub stats: QueryStatsRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryStatsRecord {
+    pub count: u64,
+    pub read_epoch: GraphEpoch,
+    pub refreshed_at_ms: u64,
+    pub distinct_values: u64,
+    pub total_values: u64,
+    pub most_common_count: u64,
+}
+
+impl QueryStatsRecord {
+    pub fn point_count(count: u64, read_epoch: GraphEpoch, refreshed_at_ms: u64) -> Self {
+        Self {
+            count,
+            read_epoch,
+            refreshed_at_ms,
+            distinct_values: 1,
+            total_values: count,
+            most_common_count: count,
+        }
+    }
+
+    pub fn histogram(
+        count: u64,
+        read_epoch: GraphEpoch,
+        refreshed_at_ms: u64,
+        distinct_values: u64,
+        most_common_count: u64,
+    ) -> Self {
+        Self {
+            count,
+            read_epoch,
+            refreshed_at_ms,
+            distinct_values,
+            total_values: count,
+            most_common_count,
+        }
+    }
+
+    pub fn is_stale_at(&self, current_epoch: GraphEpoch, now_ms: u64) -> bool {
+        self.read_epoch < current_epoch || self.refreshed_at_ms > now_ms
+    }
+
+    pub fn equality_estimate(&self) -> u64 {
+        if self.distinct_values == 0 {
+            return self.count.max(1);
+        }
+        self.count
+            .checked_div(self.distinct_values)
+            .unwrap_or(self.count)
+            .max(1)
+            .min(self.most_common_count.max(1))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryStatsHistogramRefresh {
+    pub cell_id: String,
+    pub read_epoch: GraphEpoch,
+    pub property: String,
+    pub edge_type: Option<String>,
+    pub stats: QueryStatsRecord,
+    pub buckets: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryStatsRefreshSpec {
+    pub cell_id: String,
+    pub kind: QueryStatsRefreshKind,
+}
+
+impl QueryStatsRefreshSpec {
+    pub fn new(cell_id: impl Into<String>, kind: impl Into<QueryStatsRefreshKind>) -> Self {
+        Self {
+            cell_id: cell_id.into(),
+            kind: kind.into(),
+        }
+    }
+
+    pub fn vertex_property_histogram(
+        cell_id: impl Into<String>,
+        property: impl Into<String>,
+    ) -> Self {
+        Self {
+            cell_id: cell_id.into(),
+            kind: QueryStatsRefreshKind::VertexPropertyHistogram {
+                property: property.into(),
+            },
+        }
+    }
+
+    pub fn edge_property_histogram(
+        cell_id: impl Into<String>,
+        edge_type: impl Into<String>,
+        property: impl Into<String>,
+    ) -> Self {
+        Self {
+            cell_id: cell_id.into(),
+            kind: QueryStatsRefreshKind::EdgePropertyHistogram {
+                edge_type: edge_type.into(),
+                property: property.into(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryStatsRefreshKind {
+    Cardinality(QueryCardinalityStatsKind),
+    VertexPropertyHistogram { property: String },
+    EdgePropertyHistogram { edge_type: String, property: String },
+}
+
+impl From<QueryCardinalityStatsKind> for QueryStatsRefreshKind {
+    fn from(value: QueryCardinalityStatsKind) -> Self {
+        Self::Cardinality(value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryStatsRefreshResult {
+    Cardinality(QueryCardinalityStatsRefresh),
+    Histogram(QueryStatsHistogramRefresh),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

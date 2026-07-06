@@ -12,6 +12,8 @@ use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, Up
 use slatedb::{Db, DbTransaction, ErrorKind, IsolationLevel, WriteBatch};
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+#[cfg(feature = "opencypher")]
+use tokio::task::JoinHandle;
 
 mod algebra;
 #[cfg(feature = "opencypher")]
@@ -26,8 +28,9 @@ pub use algebra::{
     LogicalQueryPlan, PhysicalQueryPlan, QueryCancellationToken, QueryCardinalityStatsKind,
     QueryCardinalityStatsRefresh, QueryColumn, QueryContext, QueryCursorToken, QueryFloat,
     QueryMutationResult, QueryOutput, QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet,
-    QueryRow, QueryStatement, QueryValue, QueryWindow, RowQueryAccess, RowQueryOptimizerPass,
-    RowQueryPlan, RowQueryPlanGroup, RowQueryPlanPattern,
+    QueryRow, QueryStatement, QueryStatsHistogramRefresh, QueryStatsRecord, QueryStatsRefreshKind,
+    QueryStatsRefreshResult, QueryStatsRefreshSpec, QueryValue, QueryWindow, RowQueryAccess,
+    RowQueryOptimizerPass, RowQueryPlan, RowQueryPlanGroup, RowQueryPlanPattern,
 };
 #[cfg(feature = "opencypher")]
 pub use opencypher::{
@@ -1026,6 +1029,25 @@ pub struct GraphShard {
     supernode_group_cache: Mutex<BoundedGraphCache<SupernodeCacheKey, phase0::SupernodeGroup>>,
     posting_chunk_cache: Mutex<BoundedGraphCache<PostingChunkCacheKey, phase0::PostingChunk>>,
     materialized_supernode_cache: Mutex<BoundedGraphCache<SupernodeCacheKey, Arc<Vec<VertexId>>>>,
+}
+
+#[cfg(feature = "opencypher")]
+pub struct QueryStatsRefreshHandle {
+    handle: JoinHandle<()>,
+}
+
+#[cfg(feature = "opencypher")]
+impl QueryStatsRefreshHandle {
+    pub fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
+#[cfg(feature = "opencypher")]
+impl Drop for QueryStatsRefreshHandle {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
