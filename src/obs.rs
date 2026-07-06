@@ -37,7 +37,8 @@ use async_trait::async_trait;
 use common::object_store::path::Path;
 use common::object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    Result as ObjectStoreResult,
 };
 use futures::stream::{BoxStream, Stream, StreamExt};
 
@@ -264,6 +265,18 @@ impl ObjectStore for InstrumentedObjectStore {
         InstrumentedStream::new(self.inner.list(prefix), objstore::OP_LIST).boxed()
     }
 
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        InstrumentedStream::new(
+            self.inner.list_with_offset(prefix, offset),
+            objstore::OP_LIST,
+        )
+        .boxed()
+    }
+
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
         let start = Instant::now();
         let result = self.inner.list_with_delimiter(prefix).await;
@@ -280,6 +293,17 @@ impl ObjectStore for InstrumentedObjectStore {
         // Plain delegate — see the struct doc: `copy` has no slot in RFC
         // 0017 §3.1's closed `op` enum.
         self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: RenameOptions,
+    ) -> ObjectStoreResult<()> {
+        // Plain delegate — see the struct doc: `rename` has no slot in RFC
+        // 0017 §3.1's closed `op` enum.
+        self.inner.rename_opts(from, to, options).await
     }
 }
 
@@ -463,6 +487,126 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use common::object_store::ObjectStoreExt;
+    use futures::TryStreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ForwardingProbeStore {
+        inner: common::object_store::memory::InMemory,
+        list_calls: AtomicUsize,
+        list_with_offset_calls: AtomicUsize,
+        copy_calls: AtomicUsize,
+        rename_calls: AtomicUsize,
+    }
+
+    impl Default for ForwardingProbeStore {
+        fn default() -> Self {
+            Self {
+                inner: common::object_store::memory::InMemory::new(),
+                list_calls: AtomicUsize::new(0),
+                list_with_offset_calls: AtomicUsize::new(0),
+                copy_calls: AtomicUsize::new(0),
+                rename_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl fmt::Debug for ForwardingProbeStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("ForwardingProbeStore").finish()
+        }
+    }
+
+    impl fmt::Display for ForwardingProbeStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "ForwardingProbeStore")
+        }
+    }
+
+    fn not_implemented(operation: &str) -> common::object_store::Error {
+        common::object_store::Error::NotImplemented {
+            operation: operation.to_string(),
+            implementer: "ForwardingProbeStore".to_string(),
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ForwardingProbeStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            futures::stream::once(async { Err(not_implemented("list fallback used")) }).boxed()
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.list_with_offset_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            _from: &Path,
+            _to: &Path,
+            _options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.copy_calls.fetch_add(1, Ordering::SeqCst);
+            Err(not_implemented("copy fallback used"))
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: RenameOptions,
+        ) -> ObjectStoreResult<()> {
+            self.rename_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.rename_opts(from, to, options).await
+        }
+    }
 
     // -- Delegation round-trip (no recorder needed) ----------------------
 
@@ -501,6 +645,52 @@ mod tests {
             matches!(err, common::object_store::Error::NotFound { .. }),
             "expected NotFound to pass through the wrapper unchanged, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn should_forward_offset_list_and_rename_without_trait_default_fallbacks() {
+        let inner = Arc::new(ForwardingProbeStore::default());
+        let wrapped = InstrumentedObjectStore::new(inner.clone());
+        let prefix = Path::from("obs-test/offset");
+        let first = Path::from("obs-test/offset/a");
+        let second = Path::from("obs-test/offset/b");
+        let renamed = Path::from("obs-test/offset/renamed");
+
+        wrapped
+            .put(&first, Bytes::from_static(b"a").into())
+            .await
+            .unwrap();
+        wrapped
+            .put(&second, Bytes::from_static(b"b").into())
+            .await
+            .unwrap();
+
+        let listed: Vec<_> = wrapped
+            .list_with_offset(Some(&prefix), &first)
+            .try_collect()
+            .await
+            .expect("wrapper must forward list_with_offset directly");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].location, second);
+        assert_eq!(inner.list_with_offset_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            inner.list_calls.load(Ordering::SeqCst),
+            0,
+            "wrapper must not fall back to list()+client-side filtering"
+        );
+
+        wrapped
+            .rename_opts(&second, &renamed, RenameOptions::default())
+            .await
+            .expect("wrapper must forward rename_opts directly");
+        assert_eq!(inner.rename_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            inner.copy_calls.load(Ordering::SeqCst),
+            0,
+            "wrapper must not fall back to copy_opts()+delete"
+        );
+        let got = wrapped.get(&renamed).await.unwrap().bytes().await.unwrap();
+        assert_eq!(got, Bytes::from_static(b"b"));
     }
 
     // -- Metric values, via a tiny in-test `metrics::Recorder` -----------
