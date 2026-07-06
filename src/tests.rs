@@ -6528,10 +6528,61 @@ async fn query_property_histogram_stats_refresh_persists_selectivity_records() {
     assert_eq!(filtered_edge_histogram.buckets.get(&weight_7), Some(&2));
     assert_eq!(filtered_edge_histogram.buckets.get(&weight_9), Some(&1));
 
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            3,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("tier", VertexPropertyValue::String("common".to_string())),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_edge_metadata(
+            "reddit-home",
+            "FOLLOWS",
+            3,
+            30,
+            EdgeMetadata::default().with_property("weight", VertexPropertyValue::Integer(7)),
+        )
+        .await
+        .unwrap();
+
+    let zeroed_vertex_histogram = shard
+        .refresh_vertex_property_histogram_query_stats("reddit-home", "tier")
+        .await
+        .unwrap();
+    assert_eq!(zeroed_vertex_histogram.stats.count, 3);
+    assert_eq!(zeroed_vertex_histogram.stats.distinct_values, 1);
+    assert_eq!(zeroed_vertex_histogram.buckets.get(&common), Some(&3));
+    assert_eq!(zeroed_vertex_histogram.buckets.get(&rare), None);
+    assert!(shard.read_remote(&rare_key).await.unwrap().is_none());
+    assert!(shard
+        .read_remote(&keys::query_stats_record_key(&rare_key))
+        .await
+        .unwrap()
+        .is_none());
+
+    let zeroed_edge_histogram = shard
+        .refresh_edge_property_histogram_query_stats("reddit-home", "FOLLOWS", "weight")
+        .await
+        .unwrap();
+    assert_eq!(zeroed_edge_histogram.stats.count, 3);
+    assert_eq!(zeroed_edge_histogram.stats.distinct_values, 1);
+    assert_eq!(zeroed_edge_histogram.buckets.get(&weight_7), Some(&3));
+    assert_eq!(zeroed_edge_histogram.buckets.get(&weight_9), None);
+    assert!(shard.read_remote(&weight_9_key).await.unwrap().is_none());
+    assert!(shard
+        .read_remote(&keys::query_stats_record_key(&weight_9_key))
+        .await
+        .unwrap()
+        .is_none());
+
     let plan = shard
         .explain_opencypher_rows(
             QueryContext::new("reddit-home", "query-histogram-stats-explain"),
-            "MATCH (u:User {tier: 'rare'}) RETURN u.id",
+            "MATCH (u:User {tier: 'common'}) RETURN u.id",
         )
         .await
         .unwrap();
@@ -6541,7 +6592,7 @@ async fn query_property_histogram_stats_refresh_persists_selectivity_records() {
             property: "tier".to_string(),
         }
     );
-    assert_eq!(plan.groups[0].patterns[0].estimated_cardinality, 1);
+    assert_eq!(plan.groups[0].patterns[0].estimated_cardinality, 3);
     shard.close().await.unwrap();
 }
 
@@ -6657,28 +6708,31 @@ fn query_service_discovery_parses_kubernetes_consul_and_etcd() {
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn distributed_query_plan_orders_legs_by_cost_estimate() {
-    let plan = DistributedQueryPlan::union_all(vec![
-        DistributedQueryLeg::new(
-            "large",
-            QueryContext::new("reddit-large", "distributed-cost-large"),
-            "MATCH (u:User) RETURN u.id",
-        )
-        .unwrap()
-        .with_estimated_rows(10_000),
-        DistributedQueryLeg::new(
-            "small",
-            QueryContext::new("reddit-small", "distributed-cost-small"),
-            "MATCH (u:User {id: 1}) RETURN u.id",
-        )
-        .unwrap()
-        .with_estimated_rows(1),
-        DistributedQueryLeg::new(
-            "unknown",
-            QueryContext::new("reddit-unknown", "distributed-cost-unknown"),
-            "MATCH (u) RETURN u.id",
-        )
-        .unwrap(),
-    ])
+    let plan = DistributedQueryPlan::inner_join(
+        vec![
+            DistributedQueryLeg::new(
+                "large",
+                QueryContext::new("reddit-large", "distributed-cost-large"),
+                "MATCH (u:User) RETURN u.id AS id",
+            )
+            .unwrap()
+            .with_estimated_rows(10_000),
+            DistributedQueryLeg::new(
+                "small",
+                QueryContext::new("reddit-small", "distributed-cost-small"),
+                "MATCH (u:User {id: 1}) RETURN u.id AS id",
+            )
+            .unwrap()
+            .with_estimated_rows(1),
+            DistributedQueryLeg::new(
+                "unknown",
+                QueryContext::new("reddit-unknown", "distributed-cost-unknown"),
+                "MATCH (u) RETURN u.id AS id",
+            )
+            .unwrap(),
+        ],
+        DistributedQueryJoin::inner("small", "id", "large", "id"),
+    )
     .optimized_for_costs();
     let names: Vec<_> = plan.legs.iter().map(|leg| leg.name.as_str()).collect();
     assert_eq!(names, vec!["small", "large", "unknown"]);
@@ -6737,7 +6791,8 @@ async fn distributed_union_all_preserves_declared_leg_order() {
         )
         .unwrap()
         .with_estimated_rows(1),
-    ]);
+    ])
+    .optimized_for_costs();
 
     let result = coordinator
         .execute_distributed_query_plan(plan)

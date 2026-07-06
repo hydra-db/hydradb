@@ -1217,6 +1217,7 @@ impl GraphShard {
                 operation: "refresh_vertex_property_histogram_query_stats",
                 read_epoch,
                 histogram_key: keys::query_stats_vertex_property_histogram(cell_id, property),
+                bucket_prefix: keys::query_stats_vertex_property_prefix(cell_id, property),
                 stats: &stats,
                 buckets: &buckets,
             },
@@ -1258,6 +1259,7 @@ impl GraphShard {
                 histogram_key: keys::query_stats_edge_property_histogram(
                     cell_id, edge_type, property,
                 ),
+                bucket_prefix: keys::query_stats_edge_property_prefix(cell_id, edge_type, property),
                 stats: &stats,
                 buckets: &buckets,
             },
@@ -1314,6 +1316,7 @@ impl GraphShard {
         publish: QueryStatsHistogramPublish<'_>,
         bucket_key: impl Fn(&str) -> String,
     ) -> Result<()> {
+        let stale_bucket_keys = self.stale_query_stats_bucket_keys(&publish).await?;
         let _permit = self.acquire_graph_write_permit(publish.operation).await?;
         let lock = self
             .acquire_cell_write_lock(publish.cell_id, publish.operation)
@@ -1337,6 +1340,10 @@ impl GraphShard {
                 keys::query_stats_record_key(&publish.histogram_key).as_bytes(),
                 encode_query_stats_record(publish.stats),
             );
+            for key in &stale_bucket_keys {
+                batch.delete(key.as_bytes());
+                batch.delete(keys::query_stats_record_key(key).as_bytes());
+            }
             for (encoded, count) in publish.buckets {
                 let key = bucket_key(encoded);
                 let bucket_stats = QueryStatsRecord {
@@ -1358,6 +1365,31 @@ impl GraphShard {
         }
         .await;
         release_cell_write_lock(lock, result).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn stale_query_stats_bucket_keys(
+        &self,
+        publish: &QueryStatsHistogramPublish<'_>,
+    ) -> Result<Vec<String>> {
+        let mut iter = self.scan_remote_prefix(&publish.bucket_prefix).await?;
+        let mut keys_to_delete = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let Some(encoded) = key.strip_prefix(&publish.bucket_prefix) else {
+                return Err(GraphError::CorruptValue {
+                    key,
+                    reason: "query stats bucket key does not match scan prefix".to_string(),
+                });
+            };
+            if encoded.contains('/') {
+                continue;
+            }
+            if !publish.buckets.contains_key(encoded) {
+                keys_to_delete.push(key);
+            }
+        }
+        Ok(keys_to_delete)
     }
 
     #[cfg(feature = "opencypher")]
@@ -3747,6 +3779,7 @@ struct QueryStatsHistogramPublish<'a> {
     operation: &'static str,
     read_epoch: GraphEpoch,
     histogram_key: String,
+    bucket_prefix: String,
     stats: &'a QueryStatsRecord,
     buckets: &'a BTreeMap<String, u64>,
 }

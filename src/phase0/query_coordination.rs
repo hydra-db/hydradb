@@ -1384,6 +1384,9 @@ impl DistributedQueryPlan {
     }
 
     pub fn optimized_for_costs(mut self) -> Self {
+        if !matches!(self.merge, DistributedQueryMerge::InnerJoin(_)) {
+            return self;
+        }
         self.legs.sort_by_key(|leg| {
             (
                 leg.estimated_rows.unwrap_or(u64::MAX),
