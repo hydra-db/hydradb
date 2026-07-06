@@ -5911,6 +5911,447 @@ async fn tcp_query_transport_routes_distributed_cypher_pages() {
     control.close().await.unwrap();
 }
 
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_enforces_auth_cancellation_streaming_metrics_and_discovery() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open(
+        "graph-control/query-transport-hardening",
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    let placement = ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap();
+    control.publish_placement(&placement).await.unwrap();
+
+    let cluster = Arc::new(
+        RoutedPhase0Cluster::open_owned_with_control(
+            "phase2-query-transport-hardening",
+            "node-a",
+            &control,
+            Arc::clone(&object_store),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap(),
+    );
+    for (idx, dst) in [10, 11, 12].into_iter().enumerate() {
+        cluster
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst,
+                idempotency_key: format!("query-transport-hardening-edge-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let cluster_client: Arc<dyn QueryCellClient> = cluster.clone();
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        cluster_client,
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("secret")
+            .with_max_concurrent_requests(1)
+            .with_slow_query_log_threshold(Some(std::time::Duration::ZERO)),
+    )
+    .await
+    .unwrap();
+
+    let unauthorized = TcpQueryCellClient::new(server.local_addr());
+    let unauthorized_err = unauthorized
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "query-transport-unauthorized"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(unauthorized_err.to_string().contains("unauthorized"));
+
+    let mut directory = QueryServiceDirectory::new();
+    directory
+        .insert(
+            QueryServiceEndpoint::new("node-a", server.local_addr()).with_client_config(
+                QueryTransportClientConfig::default().with_bearer_token("secret"),
+            ),
+        )
+        .unwrap();
+    let coordinator =
+        DistributedQueryCoordinator::from_service_directory(placement.clone(), &directory).unwrap();
+    let rows = coordinator
+        .execute_cypher_rows_many(
+            [QueryContext::new(
+                "reddit-home",
+                "query-transport-discovery",
+            )],
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows["reddit-home"].rows.len(), 3);
+
+    let client = TcpQueryCellClient::new(server.local_addr()).with_bearer_token("secret");
+    let mut stream = client.stream_cypher_rows(
+        QueryContext::new("reddit-home", "query-transport-stream"),
+        "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
+        2,
+    );
+    assert_eq!(
+        stream.next_row().await.unwrap(),
+        Some(QueryRow::new(vec![QueryValue::VertexId(10)]))
+    );
+    assert_eq!(
+        stream.next_row().await.unwrap(),
+        Some(QueryRow::new(vec![QueryValue::VertexId(11)]))
+    );
+    assert_eq!(
+        stream.next_row().await.unwrap(),
+        Some(QueryRow::new(vec![QueryValue::VertexId(12)]))
+    );
+    assert_eq!(stream.next_row().await.unwrap(), None);
+    assert_eq!(stream.columns().unwrap(), &[QueryColumn::new("v.id")]);
+
+    client
+        .cancel_query("query-transport-cancelled")
+        .await
+        .unwrap();
+    let cancelled = client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "query-transport-cancelled"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(cancelled.to_string().contains("query_transport_cancelled"));
+
+    let server_metrics = server.metrics();
+    assert!(server_metrics.auth_failures >= 1);
+    assert!(server_metrics.cancellations >= 1);
+    assert!(server_metrics.cancelled_rejections >= 1);
+    assert!(server_metrics.slow_queries >= 1);
+    assert!(server_metrics.bytes_received > 0);
+    assert!(server_metrics.bytes_sent > 0);
+    let client_metrics = client.metrics();
+    assert!(client_metrics.bytes_received > 0);
+    assert!(client_metrics.bytes_sent > 0);
+
+    server.stop().await.unwrap();
+    cluster.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_applies_server_backpressure_under_load() {
+    struct SlowQueryClient;
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for SlowQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(QueryResultSet::new(
+                vec![QueryColumn::new("v.id")],
+                vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+            ))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(SlowQueryClient),
+        QueryTransportServerConfig::default().with_max_concurrent_requests(1),
+    )
+    .await
+    .unwrap();
+    let mut tasks = Vec::new();
+    for idx in 0..6 {
+        let client = TcpQueryCellClient::new(server.local_addr());
+        tasks.push(tokio::spawn(async move {
+            client
+                .execute_cypher_rows(
+                    QueryContext::new("reddit-home", format!("query-transport-load-{idx}")),
+                    "MATCH (u {id: 1}) RETURN u.id",
+                )
+                .await
+                .unwrap()
+        }));
+    }
+    for task in tasks {
+        let result = task.await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+    assert!(server.metrics().backpressure_waits >= 1);
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn distributed_query_plan_joins_results_across_cells() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control =
+        GraphControlPlane::open("graph-control/query-distributed-join", object_store.clone())
+            .await
+            .unwrap();
+    let placement =
+        ShardPlacement::fixed([("reddit-users", "node-a"), ("reddit-posts", "node-b")]).unwrap();
+    control.publish_placement(&placement).await.unwrap();
+
+    let cluster_a = Arc::new(
+        RoutedPhase0Cluster::open_owned_with_control(
+            "phase2-query-distributed-join",
+            "node-a",
+            &control,
+            object_store.clone(),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap(),
+    );
+    let cluster_b = Arc::new(
+        RoutedPhase0Cluster::open_owned_with_control(
+            "phase2-query-distributed-join",
+            "node-b",
+            &control,
+            object_store,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap(),
+    );
+
+    for (vertex, name) in [(1, "alice"), (2, "bob")] {
+        cluster_a
+            .set_vertex_metadata(
+                "reddit-users",
+                vertex,
+                VertexMetadata::default()
+                    .with_label("User")
+                    .with_property("uid", VertexPropertyValue::Integer(vertex))
+                    .with_property("name", VertexPropertyValue::String(name.to_string())),
+            )
+            .await
+            .unwrap();
+    }
+    for (post, author) in [(100, 1), (101, 1), (102, 2)] {
+        cluster_b
+            .set_vertex_metadata(
+                "reddit-posts",
+                post,
+                VertexMetadata::default()
+                    .with_label("Post")
+                    .with_property("author_id", VertexPropertyValue::Integer(author)),
+            )
+            .await
+            .unwrap();
+    }
+
+    let client_a: Arc<dyn QueryCellClient> = cluster_a.clone();
+    let client_b: Arc<dyn QueryCellClient> = cluster_b.clone();
+    let coordinator = DistributedQueryCoordinator::new(placement)
+        .with_client("node-a", client_a)
+        .unwrap()
+        .with_client("node-b", client_b)
+        .unwrap();
+    let plan = DistributedQueryPlan::inner_join(
+        vec![
+            DistributedQueryLeg::new(
+                "users",
+                QueryContext::new("reddit-users", "distributed-join-users"),
+                "MATCH (u:User) RETURN u.uid AS user, u.name AS name ORDER BY user",
+            )
+            .unwrap(),
+            DistributedQueryLeg::new(
+                "posts",
+                QueryContext::new("reddit-posts", "distributed-join-posts"),
+                "MATCH (p:Post) RETURN p.author_id AS user, p.id AS post ORDER BY post",
+            )
+            .unwrap(),
+        ],
+        DistributedQueryJoin::inner("users", "user", "posts", "user"),
+    );
+    let result = coordinator
+        .execute_distributed_query_plan(plan)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.merged.columns,
+        vec![
+            QueryColumn::new("users.user"),
+            QueryColumn::new("users.name"),
+            QueryColumn::new("posts.user"),
+            QueryColumn::new("posts.post"),
+        ]
+    );
+    assert_eq!(result.merged.rows.len(), 3);
+    assert!(result.merged.rows.iter().any(|row| {
+        row.values
+            == vec![
+                QueryValue::Property(VertexPropertyValue::Integer(1)),
+                QueryValue::Property(VertexPropertyValue::String("alice".to_string())),
+                QueryValue::Property(VertexPropertyValue::Integer(1)),
+                QueryValue::VertexId(100),
+            ]
+    }));
+
+    cluster_a.close().await.unwrap();
+    cluster_b.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[test]
+fn phase2_query_transport_child_process_entry() {
+    if std::env::var("SLATEDB_GRAPH_QUERY_CHILD").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let object_root = std::env::var("SLATEDB_GRAPH_QUERY_OBJECT_ROOT").unwrap();
+        let addr: std::net::SocketAddr = std::env::var("SLATEDB_GRAPH_QUERY_ADDR")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let ready_path =
+            std::path::PathBuf::from(std::env::var("SLATEDB_GRAPH_QUERY_READY_FILE").unwrap());
+        let stop_path =
+            std::path::PathBuf::from(std::env::var("SLATEDB_GRAPH_QUERY_STOP_FILE").unwrap());
+        let token = std::env::var("SLATEDB_GRAPH_QUERY_TOKEN").unwrap();
+
+        let object_store = local_object_store(&object_root).unwrap();
+        let control =
+            GraphControlPlane::open("graph-control/query-child-process", object_store.clone())
+                .await
+                .unwrap();
+        let placement = ShardPlacement::fixed([("reddit-home", "node-child")]).unwrap();
+        control.publish_placement(&placement).await.unwrap();
+        let cluster = Arc::new(
+            RoutedPhase0Cluster::open_owned_with_control(
+                "phase2-query-child-process",
+                "node-child",
+                &control,
+                object_store,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap(),
+        );
+        for (idx, dst) in [71, 72].into_iter().enumerate() {
+            cluster
+                .write_edge(EdgeMutation {
+                    cell_id: "reddit-home".to_string(),
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 7,
+                    dst,
+                    idempotency_key: format!("query-child-process-edge-{idx}"),
+                })
+                .await
+                .unwrap();
+        }
+
+        let client: Arc<dyn QueryCellClient> = cluster.clone();
+        let server = TcpQueryServer::bind_with_config(
+            addr,
+            client,
+            QueryTransportServerConfig::default().with_required_bearer_token(token),
+        )
+        .await
+        .unwrap();
+        std::fs::write(&ready_path, b"ready").unwrap();
+        while !stop_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        server.stop().await.unwrap();
+        cluster.close().await.unwrap();
+        control.close().await.unwrap();
+    });
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_runs_against_separate_child_process_and_local_object_store() {
+    let object_root = tempfile::tempdir().unwrap();
+    let control_socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = control_socket.local_addr().unwrap();
+    drop(control_socket);
+
+    let ready_file = object_root.path().join("child.ready");
+    let stop_file = object_root.path().join("child.stop");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("tests::phase2_query_transport_child_process_entry")
+        .arg("--nocapture")
+        .env("SLATEDB_GRAPH_QUERY_CHILD", "1")
+        .env("SLATEDB_GRAPH_QUERY_OBJECT_ROOT", object_root.path())
+        .env("SLATEDB_GRAPH_QUERY_ADDR", addr.to_string())
+        .env("SLATEDB_GRAPH_QUERY_READY_FILE", &ready_file)
+        .env("SLATEDB_GRAPH_QUERY_STOP_FILE", &stop_file)
+        .env("SLATEDB_GRAPH_QUERY_TOKEN", "child-secret")
+        .spawn()
+        .unwrap();
+
+    for _ in 0..200 {
+        if ready_file.exists() {
+            break;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("query child exited before ready: {status}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(ready_file.exists(), "query child did not become ready");
+
+    let client = TcpQueryCellClient::new(addr).with_bearer_token("child-secret");
+    let rows = client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "query-child-process-read"),
+            "MATCH (u {id: 7})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(71)]),
+                QueryRow::new(vec![QueryValue::VertexId(72)]),
+            ],
+        )
+    );
+
+    std::fs::write(&stop_file, b"stop").unwrap();
+    for _ in 0..200 {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "query child failed: {status}");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    child.kill().unwrap();
+    panic!("query child did not stop");
+}
+
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn cypher_explain_uses_phase2_query_planner() {
@@ -7520,6 +7961,11 @@ Feature: Supported row-query corpus
     .unwrap();
     assert_eq!(corpus.cases.len(), 5);
     assert_eq!(corpus.skipped.len(), 1);
+    let report = corpus.compatibility_report();
+    assert_eq!(report.total_scenarios, 6);
+    assert_eq!(report.runnable_scenarios, 5);
+    assert_eq!(report.skipped_scenarios, 1);
+    assert!(report.skipped[0].contains("side-effect assertions"));
 
     for case in corpus.cases {
         let rows = shard
