@@ -357,6 +357,100 @@ pub struct QueryPlan {
     pub physical: PhysicalQueryPlan,
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RowQueryPlan {
+    pub cell_id: String,
+    pub read_epoch: GraphEpoch,
+    pub columns: Vec<QueryColumn>,
+    pub groups: Vec<RowQueryPlanGroup>,
+    pub union_all: bool,
+    pub union_arms: Vec<RowQueryPlan>,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RowQueryPlanGroup {
+    pub optional: bool,
+    pub has_predicate: bool,
+    pub estimated_cardinality: u64,
+    pub patterns: Vec<RowQueryPlanPattern>,
+    pub optimizer_passes: Vec<RowQueryOptimizerPass>,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RowQueryPlanPattern {
+    pub original_index: usize,
+    pub access: RowQueryAccess,
+    pub estimated_cardinality: u64,
+    pub bindings: Vec<String>,
+    pub optimizer_passes: Vec<RowQueryOptimizerPass>,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RowQueryAccess {
+    VertexIdSeek,
+    VertexPropertyIndex {
+        property: String,
+    },
+    VertexLabelScan {
+        label: String,
+    },
+    AllVertexScan,
+    BoundOutExpand {
+        edge_type: String,
+    },
+    BoundInExpand {
+        edge_type: String,
+    },
+    ExpandInto {
+        edge_type: String,
+    },
+    EdgePropertyIndex {
+        edge_type: String,
+        property: String,
+    },
+    FullEdgeScan {
+        edge_type: String,
+    },
+    VariableLengthExpand {
+        edge_type: String,
+        min_hops: u8,
+        max_hops: u8,
+    },
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RowQueryOptimizerPass {
+    UtilizeVertexIndex,
+    UtilizeEdgeIndex,
+    CostBasedLabelScan,
+    ConnectivityOrder,
+    JoinOrder,
+    ExpandInto,
+    ReverseExpand,
+    FullScanFallback,
+    PreserveOptionalBoundary,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LogicalQueryPlan {
     CreateEdge {
