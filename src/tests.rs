@@ -8313,16 +8313,30 @@ Feature: Supported row-query corpus
       """
     Then the side effects should be:
       | +relationships | 1 |
+
+  Scenario: skipped-result-without-table
+    When executing query:
+      """
+      CALL db.labels()
+      """
+    Then the result should be empty
 "#,
     )
     .unwrap();
     assert_eq!(corpus.cases.len(), 5);
-    assert_eq!(corpus.skipped.len(), 1);
+    assert_eq!(corpus.skipped.len(), 2);
     let report = corpus.compatibility_report();
-    assert_eq!(report.total_scenarios, 6);
+    assert_eq!(report.total_scenarios, 7);
     assert_eq!(report.runnable_scenarios, 5);
-    assert_eq!(report.skipped_scenarios, 1);
-    assert!(report.skipped[0].contains("side-effect assertions"));
+    assert_eq!(report.skipped_scenarios, 2);
+    assert!(report
+        .skipped
+        .iter()
+        .any(|reason| reason.contains("side-effect assertions")));
+    assert!(report
+        .skipped
+        .iter()
+        .any(|reason| reason.contains("result assertions without inline tables")));
 
     for case in corpus.cases {
         let rows = shard

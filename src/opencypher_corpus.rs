@@ -165,7 +165,16 @@ impl<'a> TckCorpusParser<'a> {
             }
             if line.starts_with("Then the result should be") {
                 self.idx += 1;
-                expected = Some(self.read_result_table(&name)?);
+                match self.read_result_table(&name)? {
+                    Some(table) => expected = Some(table),
+                    None => {
+                        unsupported.get_or_insert_with(|| {
+                            format!(
+                                "{name}: result assertions without inline tables are not row-query corpus cases"
+                            )
+                        });
+                    }
+                }
                 continue;
             }
             if line.starts_with("Then no side effects")
@@ -221,7 +230,7 @@ impl<'a> TckCorpusParser<'a> {
         })
     }
 
-    fn read_result_table(&mut self, scenario: &str) -> Result<QueryResultSet> {
+    fn read_result_table(&mut self, scenario: &str) -> Result<Option<QueryResultSet>> {
         self.skip_blank_lines();
         let mut rows = Vec::new();
         while self.idx < self.lines.len() {
@@ -237,10 +246,7 @@ impl<'a> TckCorpusParser<'a> {
             self.idx += 1;
         }
         if rows.is_empty() {
-            return Err(GraphError::QueryParse {
-                dialect: "OpenCypherTCK",
-                reason: format!("{scenario}: expected result table"),
-            });
+            return Ok(None);
         }
         let columns = rows
             .remove(0)
@@ -268,7 +274,7 @@ impl<'a> TckCorpusParser<'a> {
                 Ok(QueryRow::new(values))
             })
             .collect::<Result<_>>()?;
-        Ok(QueryResultSet::new(columns, query_rows))
+        Ok(Some(QueryResultSet::new(columns, query_rows)))
     }
 
     fn skip_blank_lines(&mut self) {
