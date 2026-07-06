@@ -180,6 +180,20 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
+    pub async fn explain_opencypher_rows(
+        &self,
+        context: QueryContext,
+        query: &str,
+    ) -> Result<RowQueryPlan> {
+        validate_component("cell_id", &context.cell_id)?;
+        let parsed = parse_opencypher_row_query_with_parameters(query, &context.parameters)?;
+        let context = merge_opencypher_window(context, parsed.window)?;
+        let read_epoch = self.query_read_epoch(&context).await?;
+        self.explain_row_query_plan_with_stats(&context.cell_id, read_epoch, &parsed)
+            .await
+    }
+
+    #[cfg(feature = "opencypher")]
     async fn execute_parsed_opencypher_rows(
         &self,
         context: QueryContext,
@@ -1170,7 +1184,7 @@ impl GraphShard {
         }
 
         let groups = self
-            .optimize_row_match_groups_with_stats(cell_id, groups)
+            .optimize_row_match_groups_with_stats(cell_id, groups, read_epoch)
             .await?;
         let mut rows = vec![BindingRow::default()];
         for group in &groups {
@@ -1237,8 +1251,9 @@ impl GraphShard {
         budget: &QueryBudget,
         mut rows: Vec<BindingRow>,
     ) -> Result<Vec<BindingRow>> {
+        let initial_bindings = common_binding_row_bound_names(&rows);
         let patterns = self
-            .optimize_row_patterns_with_stats(cell_id, patterns)
+            .optimize_row_patterns_with_stats(cell_id, patterns, read_epoch, &initial_bindings)
             .await?;
         for pattern in &patterns {
             budget.check("cypher_match_pipeline")?;
@@ -1342,33 +1357,31 @@ impl GraphShard {
                 .await;
         }
 
-        let candidate_sources = self
-            .candidate_vertex_ids(cell_id, &edge.src, read_epoch, budget)
+        let access = self
+            .best_row_edge_access_with_stats(cell_id, edge, read_epoch, &BTreeSet::new())
             .await?;
-        let candidate_destinations = self
-            .candidate_vertex_ids(cell_id, &edge.dst, read_epoch, budget)
-            .await?;
-        let reverse_index_matches_snapshot =
-            self.writes_reverse_index() && read_epoch == self.current_epoch(cell_id).await?;
-
-        match (candidate_sources, candidate_destinations) {
-            (Some(sources), Some(destinations))
-                if reverse_index_matches_snapshot && destinations.len() < sources.len() =>
-            {
-                self.match_edge_row_pattern_from_destinations(
-                    cell_id,
-                    edge,
-                    destinations,
-                    read_epoch,
-                    budget,
-                )
-                .await
-            }
-            (Some(sources), _) => {
+        match access {
+            RowQueryAccess::ExpandInto { .. } | RowQueryAccess::BoundOutExpand { .. } => {
+                let Some(sources) = self
+                    .candidate_vertex_ids(cell_id, &edge.src, read_epoch, budget)
+                    .await?
+                else {
+                    return self
+                        .match_edge_row_pattern_full_scan(cell_id, edge, read_epoch, budget)
+                        .await;
+                };
                 self.match_edge_row_pattern_from_sources(cell_id, edge, sources, read_epoch, budget)
                     .await
             }
-            (None, Some(destinations)) if reverse_index_matches_snapshot => {
+            RowQueryAccess::BoundInExpand { .. } => {
+                let Some(destinations) = self
+                    .candidate_vertex_ids(cell_id, &edge.dst, read_epoch, budget)
+                    .await?
+                else {
+                    return self
+                        .match_edge_row_pattern_full_scan(cell_id, edge, read_epoch, budget)
+                        .await;
+                };
                 self.match_edge_row_pattern_from_destinations(
                     cell_id,
                     edge,
@@ -1378,14 +1391,24 @@ impl GraphShard {
                 )
                 .await
             }
-            (None, None) if !edge.properties.is_empty() => {
+            RowQueryAccess::EdgePropertyIndex { .. } => {
                 self.match_edge_row_pattern_from_property_index(cell_id, edge, read_epoch, budget)
                     .await
             }
-            (None, _) => {
+            RowQueryAccess::FullEdgeScan { .. } => {
                 self.match_edge_row_pattern_full_scan(cell_id, edge, read_epoch, budget)
                     .await
             }
+            RowQueryAccess::VariableLengthExpand { .. } => {
+                unreachable!("variable-length edge patterns return before access planning")
+            }
+            RowQueryAccess::VertexIdSeek
+            | RowQueryAccess::VertexPropertyIndex { .. }
+            | RowQueryAccess::VertexLabelScan { .. }
+            | RowQueryAccess::AllVertexScan => Err(GraphError::CorruptValue {
+                key: format!("cell/{cell_id}/query/edge-access/{}", edge.edge_type),
+                reason: "optimizer selected node access for edge pattern".to_string(),
+            }),
         }
     }
 
@@ -1656,26 +1679,40 @@ impl GraphShard {
         budget: &QueryBudget,
     ) -> Result<Option<Vec<VertexId>>> {
         budget.check("cypher_candidate_vertices")?;
-        if let Some(id) = pattern.id {
-            return Ok(Some(vec![id]));
-        }
-        if let Some((property, value)) = pattern
-            .properties
-            .iter()
-            .find(|(property, _)| property.as_str() != "id")
-        {
-            return Ok(Some(
-                self.scan_vertex_property_index_at(cell_id, property, value, read_epoch, budget)
+        let access = self
+            .best_row_node_access_with_stats(cell_id, pattern, &BTreeSet::new())
+            .await?;
+        match access {
+            RowQueryAccess::VertexIdSeek => Ok(pattern.id.map(|id| vec![id])),
+            RowQueryAccess::VertexPropertyIndex { property } => {
+                let Some(value) = pattern.properties.get(&property) else {
+                    return Err(GraphError::CorruptValue {
+                        key: format!("cell/{cell_id}/query/node-access/{property}"),
+                        reason: "optimizer selected missing vertex property".to_string(),
+                    });
+                };
+                Ok(Some(
+                    self.scan_vertex_property_index_at(
+                        cell_id, &property, value, read_epoch, budget,
+                    )
                     .await?,
-            ));
-        }
-        if let Some(label) = pattern.labels.iter().next() {
-            return Ok(Some(
-                self.scan_vertex_label_index_at(cell_id, label, read_epoch, budget)
+                ))
+            }
+            RowQueryAccess::VertexLabelScan { label } => Ok(Some(
+                self.scan_vertex_label_index_at(cell_id, &label, read_epoch, budget)
                     .await?,
-            ));
+            )),
+            RowQueryAccess::AllVertexScan => Ok(None),
+            RowQueryAccess::BoundOutExpand { .. }
+            | RowQueryAccess::BoundInExpand { .. }
+            | RowQueryAccess::ExpandInto { .. }
+            | RowQueryAccess::EdgePropertyIndex { .. }
+            | RowQueryAccess::FullEdgeScan { .. }
+            | RowQueryAccess::VariableLengthExpand { .. } => Err(GraphError::CorruptValue {
+                key: format!("cell/{cell_id}/query/node-access"),
+                reason: "optimizer selected edge access for node pattern".to_string(),
+            }),
         }
-        Ok(None)
     }
 
     #[cfg(feature = "opencypher")]
@@ -3061,174 +3098,6 @@ impl GraphShard {
             degree_mismatches,
         })
     }
-
-    #[cfg(feature = "opencypher")]
-    async fn optimize_row_match_groups_with_stats(
-        &self,
-        cell_id: &str,
-        groups: &[RowMatchGroup],
-    ) -> Result<Vec<RowMatchGroup>> {
-        let mut output = Vec::with_capacity(groups.len());
-        let mut required_segment = Vec::new();
-        for group in groups {
-            if !group.optional && group.predicate.is_none() {
-                let mut group = group.clone();
-                group.patterns = self
-                    .optimize_row_patterns_with_stats(cell_id, &group.patterns)
-                    .await?;
-                let cost = self
-                    .estimate_row_match_group_cost_with_stats(cell_id, &group)
-                    .await?;
-                required_segment.push((cost, output.len() + required_segment.len(), group));
-            } else {
-                required_segment.sort_by_key(|(cost, idx, _)| (*cost, *idx));
-                output.extend(required_segment.drain(..).map(|(_, _, group)| group));
-                let mut group = group.clone();
-                group.patterns = self
-                    .optimize_row_patterns_with_stats(cell_id, &group.patterns)
-                    .await?;
-                output.push(group);
-            }
-        }
-        required_segment.sort_by_key(|(cost, idx, _)| (*cost, *idx));
-        output.extend(required_segment.into_iter().map(|(_, _, group)| group));
-        Ok(output)
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn optimize_row_patterns_with_stats(
-        &self,
-        cell_id: &str,
-        patterns: &[RowPattern],
-    ) -> Result<Vec<RowPattern>> {
-        let mut planned = Vec::with_capacity(patterns.len());
-        for (idx, pattern) in patterns.iter().cloned().enumerate() {
-            let cost = self
-                .estimate_row_pattern_cost_with_stats(cell_id, &pattern)
-                .await?;
-            planned.push((cost, idx, pattern));
-        }
-        planned.sort_by_key(|(cost, idx, _)| (*cost, *idx));
-        Ok(planned.into_iter().map(|(_, _, pattern)| pattern).collect())
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn estimate_row_match_group_cost_with_stats(
-        &self,
-        cell_id: &str,
-        group: &RowMatchGroup,
-    ) -> Result<u64> {
-        let mut best = u64::MAX;
-        for pattern in &group.patterns {
-            best = best.min(
-                self.estimate_row_pattern_cost_with_stats(cell_id, pattern)
-                    .await?,
-            );
-        }
-        Ok(best)
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn estimate_row_pattern_cost_with_stats(
-        &self,
-        cell_id: &str,
-        pattern: &RowPattern,
-    ) -> Result<u64> {
-        match pattern {
-            RowPattern::Node(node) => {
-                self.estimate_row_node_pattern_cost_with_stats(cell_id, node)
-                    .await
-            }
-            RowPattern::Edge(edge) => {
-                self.estimate_row_edge_pattern_cost_with_stats(cell_id, edge)
-                    .await
-            }
-        }
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn estimate_row_node_pattern_cost_with_stats(
-        &self,
-        cell_id: &str,
-        node: &RowNodePattern,
-    ) -> Result<u64> {
-        if node.id.is_some() {
-            return Ok(1);
-        }
-        if let Some((property, value)) = node
-            .properties
-            .iter()
-            .find(|(property, _)| property.as_str() != "id")
-        {
-            let encoded = encode_vertex_property_value_key(value);
-            if let Some(count) = self
-                .query_stats_count(&keys::query_stats_vertex_property(
-                    cell_id, property, &encoded,
-                ))
-                .await?
-            {
-                return Ok(count);
-            }
-        }
-        if let Some(label) = node.labels.iter().next() {
-            if let Some(count) = self
-                .query_stats_count(&keys::query_stats_vertex_label(cell_id, label))
-                .await?
-            {
-                return Ok(count);
-            }
-        }
-        Ok(estimate_row_node_pattern_cost(node))
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn estimate_row_edge_pattern_cost_with_stats(
-        &self,
-        cell_id: &str,
-        edge: &RowEdgePattern,
-    ) -> Result<u64> {
-        if edge.hop_range.is_some() {
-            return Ok(estimate_row_edge_pattern_cost(edge));
-        }
-
-        let endpoint_cost = self
-            .estimate_row_node_pattern_cost_with_stats(cell_id, &edge.src)
-            .await?
-            .min(
-                self.estimate_row_node_pattern_cost_with_stats(cell_id, &edge.dst)
-                    .await?,
-            );
-        let mut best = endpoint_cost;
-        if let Some(count) = self
-            .query_stats_count(&keys::query_stats_edge_type(cell_id, &edge.edge_type))
-            .await?
-        {
-            best = best.min(count);
-        }
-        if let Some((property, value)) = edge.properties.iter().next() {
-            let encoded = encode_vertex_property_value_key(value);
-            if let Some(count) = self
-                .query_stats_count(&keys::query_stats_edge_property(
-                    cell_id,
-                    &edge.edge_type,
-                    property,
-                    &encoded,
-                ))
-                .await?
-            {
-                best = best.min(count);
-            }
-        }
-        Ok(best.saturating_add(4))
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn query_stats_count(&self, key: &str) -> Result<Option<u64>> {
-        match self.read_remote(key).await? {
-            Some(value) => Ok(Some(decode_u64(key, &value)?)),
-            None => Ok(None),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -3313,45 +3182,6 @@ struct VertexMutationApplyState<'a> {
     pending_edge_metadata: &'a mut BTreeMap<BoundRelationship, EdgeMetadata>,
     original_edge_metadata: &'a mut BTreeMap<BoundRelationship, EdgeMetadata>,
     budget: &'a QueryBudget,
-}
-
-#[cfg(feature = "opencypher")]
-fn estimate_row_node_pattern_cost(node: &RowNodePattern) -> u64 {
-    if node.id.is_some() {
-        1
-    } else if node
-        .properties
-        .iter()
-        .any(|(property, _)| property.as_str() != "id")
-    {
-        8
-    } else if !node.labels.is_empty() {
-        64
-    } else {
-        1_000_000
-    }
-}
-
-#[cfg(feature = "opencypher")]
-fn estimate_row_edge_pattern_cost(edge: &RowEdgePattern) -> u64 {
-    if edge.hop_range.is_some() {
-        return if edge.src.id.is_some() {
-            10_000
-        } else {
-            2_000_000
-        };
-    }
-
-    let endpoint_cost =
-        estimate_row_node_pattern_cost(&edge.src).min(estimate_row_node_pattern_cost(&edge.dst));
-    let relationship_property_cost = if edge.properties.is_empty() {
-        1_000_000
-    } else {
-        16
-    };
-    endpoint_cost
-        .min(relationship_property_cost)
-        .saturating_add(4)
 }
 
 #[cfg(feature = "opencypher")]
@@ -3784,6 +3614,28 @@ impl BindingRow {
         }
         Some(joined)
     }
+}
+
+#[cfg(feature = "opencypher")]
+fn common_binding_row_bound_names(rows: &[BindingRow]) -> BTreeSet<String> {
+    let Some(first) = rows.first() else {
+        return BTreeSet::new();
+    };
+    let mut common = binding_row_bound_names(first);
+    for row in &rows[1..] {
+        let bound = binding_row_bound_names(row);
+        common.retain(|binding| bound.contains(binding));
+    }
+    common
+}
+
+#[cfg(feature = "opencypher")]
+fn binding_row_bound_names(row: &BindingRow) -> BTreeSet<String> {
+    row.values
+        .keys()
+        .chain(row.relationships.keys())
+        .cloned()
+        .collect()
 }
 
 #[cfg(feature = "opencypher")]
