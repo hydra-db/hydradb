@@ -12,6 +12,7 @@ default = []
 opencypher = ["dep:libcypher-parser-sys"]
 graphblas = []
 chaos-harness = []
+query-transport = ["opencypher", "dep:serde", "dep:serde_json", "tokio/io-util", "tokio/net"]
 
 [[example]]
 name = "phase0_fence_worker"
@@ -23,6 +24,8 @@ async-trait = "0.1"
 bytes = "1"
 futures = "0.3"
 libcypher-parser-sys = { version = "0.6.1-1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "a6e169dc1e143fa72a0aa916a9b23cf29b3656b4", default-features = false, features = ["aws", "foyer"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

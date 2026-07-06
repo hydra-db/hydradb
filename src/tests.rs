@@ -5767,6 +5767,150 @@ async fn distributed_query_coordinator_routes_to_remote_cell_clients() {
     control.close().await.unwrap();
 }
 
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_routes_distributed_cypher_pages() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open(
+        "graph-control/query-tcp-transport",
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    let placement =
+        ShardPlacement::fixed([("reddit-home", "node-a"), ("reddit-popular", "node-b")]).unwrap();
+    control.publish_placement(&placement).await.unwrap();
+
+    let cluster_a = Arc::new(
+        RoutedPhase0Cluster::open_owned_with_control(
+            "phase2-query-tcp-transport",
+            "node-a",
+            &control,
+            Arc::clone(&object_store),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap(),
+    );
+    let cluster_b = Arc::new(
+        RoutedPhase0Cluster::open_owned_with_control(
+            "phase2-query-tcp-transport",
+            "node-b",
+            &control,
+            Arc::clone(&object_store),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap(),
+    );
+
+    for (cluster, cell_id, dsts) in [
+        (Arc::clone(&cluster_a), "reddit-home", vec![10, 11]),
+        (Arc::clone(&cluster_b), "reddit-popular", vec![20]),
+    ] {
+        for (idx, dst) in dsts.into_iter().enumerate() {
+            cluster
+                .write_edge(EdgeMutation {
+                    cell_id: cell_id.to_string(),
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 1,
+                    dst,
+                    idempotency_key: format!("query-tcp-transport-{cell_id}-{idx}"),
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    let client_a: Arc<dyn QueryCellClient> = cluster_a.clone();
+    let client_b: Arc<dyn QueryCellClient> = cluster_b.clone();
+    let server_a = TcpQueryServer::bind("127.0.0.1:0".parse().unwrap(), client_a)
+        .await
+        .unwrap();
+    let server_b = TcpQueryServer::bind("127.0.0.1:0".parse().unwrap(), client_b)
+        .await
+        .unwrap();
+    let coordinator = DistributedQueryCoordinator::new(placement)
+        .with_client(
+            "node-a",
+            Arc::new(TcpQueryCellClient::new(server_a.local_addr())),
+        )
+        .unwrap()
+        .with_client(
+            "node-b",
+            Arc::new(TcpQueryCellClient::new(server_b.local_addr())),
+        )
+        .unwrap();
+
+    let rows = coordinator
+        .execute_cypher_rows_many(
+            [
+                QueryContext::new("reddit-home", "query-tcp-home-rows"),
+                QueryContext::new("reddit-popular", "query-tcp-popular-rows"),
+            ],
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.get("reddit-home").unwrap(),
+        &QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(10)]),
+                QueryRow::new(vec![QueryValue::VertexId(11)]),
+            ],
+        )
+    );
+    assert_eq!(
+        rows.get("reddit-popular").unwrap(),
+        &QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(20)])],
+        )
+    );
+
+    let pages = coordinator
+        .execute_cypher_rows_pages(
+            [
+                DistributedQueryPageRequest::new(
+                    QueryContext::new("reddit-home", "query-tcp-home-page"),
+                    None,
+                ),
+                DistributedQueryPageRequest::new(
+                    QueryContext::new("reddit-popular", "query-tcp-popular-page"),
+                    None,
+                ),
+            ],
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pages.get("reddit-home").unwrap(),
+        &QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(10)])],
+            Some(QueryCursorToken::new(1)),
+        )
+    );
+    assert_eq!(
+        pages.get("reddit-popular").unwrap(),
+        &QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(20)])],
+            None,
+        )
+    );
+
+    server_a.stop().await.unwrap();
+    server_b.stop().await.unwrap();
+    cluster_a.close().await.unwrap();
+    cluster_b.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn cypher_explain_uses_phase2_query_planner() {
@@ -7219,12 +7363,6 @@ async fn cypher_union_merges_row_query_arms_with_distinct_or_all_semantics() {
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn cypher_tck_style_row_corpus_covers_supported_clause_semantics() {
-    struct CorpusCase {
-        name: &'static str,
-        query: &'static str,
-        expected: QueryResultSet,
-    }
-
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-tck-style-corpus", object_store).await;
 
@@ -7310,97 +7448,84 @@ async fn cypher_tck_style_row_corpus_covers_supported_clause_semantics() {
         .await
         .unwrap();
 
-    let cases = vec![
-        CorpusCase {
-            name: "label-property-filter-order",
-            query: "MATCH (u:User {active: true}) RETURN u.name AS name ORDER BY name",
-            expected: QueryResultSet::new(
-                vec![QueryColumn::new("name")],
-                vec![
-                    QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
-                        "alice".to_string(),
-                    ))]),
-                    QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
-                        "bob".to_string(),
-                    ))]),
-                ],
-            ),
-        },
-        CorpusCase {
-            name: "optional-match-null-extension",
-            query: "MATCH (u:User) OPTIONAL MATCH (u)-[:POSTED]->(p) \
-                    RETURN u.id AS user, p.id AS post ORDER BY user, post",
-            expected: QueryResultSet::new(
-                vec![QueryColumn::new("user"), QueryColumn::new("post")],
-                vec![
-                    QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::Null]),
-                    QueryRow::new(vec![QueryValue::VertexId(2), QueryValue::VertexId(100)]),
-                    QueryRow::new(vec![QueryValue::VertexId(2), QueryValue::VertexId(101)]),
-                    QueryRow::new(vec![QueryValue::VertexId(3), QueryValue::VertexId(102)]),
-                ],
-            ),
-        },
-        CorpusCase {
-            name: "relationship-property-filter-project",
-            query: "MATCH (u)-[r:FOLLOWS {since: 2020}]->(v) \
-                    RETURN u.id AS user, v.id AS followed, r.close AS close",
-            expected: QueryResultSet::new(
-                vec![
-                    QueryColumn::new("user"),
-                    QueryColumn::new("followed"),
-                    QueryColumn::new("close"),
-                ],
-                vec![QueryRow::new(vec![
-                    QueryValue::VertexId(1),
-                    QueryValue::VertexId(2),
-                    QueryValue::Property(VertexPropertyValue::Bool(true)),
-                ])],
-            ),
-        },
-        CorpusCase {
-            name: "grouped-aggregate",
-            query: "MATCH (u)-[:POSTED]->(p:Post) \
-                    RETURN u.id AS user, count(*) AS posts, sum(p.score) AS score ORDER BY user",
-            expected: QueryResultSet::new(
-                vec![
-                    QueryColumn::new("user"),
-                    QueryColumn::new("posts"),
-                    QueryColumn::new("score"),
-                ],
-                vec![
-                    QueryRow::new(vec![
-                        QueryValue::VertexId(2),
-                        QueryValue::Count(2),
-                        QueryValue::Property(VertexPropertyValue::Integer(12)),
-                    ]),
-                    QueryRow::new(vec![
-                        QueryValue::VertexId(3),
-                        QueryValue::Count(1),
-                        QueryValue::Property(VertexPropertyValue::Integer(11)),
-                    ]),
-                ],
-            ),
-        },
-        CorpusCase {
-            name: "union-distinct",
-            query: "MATCH (u:User) RETURN u.id AS id \
-                    UNION MATCH (m:Moderator) RETURN m.id AS id",
-            expected: QueryResultSet::new(
-                vec![QueryColumn::new("id")],
-                vec![
-                    QueryRow::new(vec![QueryValue::VertexId(1)]),
-                    QueryRow::new(vec![QueryValue::VertexId(2)]),
-                    QueryRow::new(vec![QueryValue::VertexId(3)]),
-                ],
-            ),
-        },
-    ];
+    let corpus = parse_opencypher_tck_corpus(
+        r#"
+Feature: Supported row-query corpus
 
-    for case in cases {
+  Scenario: label-property-filter-order
+    When executing query:
+      """
+      MATCH (u:User {active: true}) RETURN u.name AS name ORDER BY name
+      """
+    Then the result should be, in order:
+      | name |
+      | 'alice' |
+      | 'bob' |
+
+  Scenario: optional-match-null-extension
+    When executing query:
+      """
+      MATCH (u:User) OPTIONAL MATCH (u)-[:POSTED]->(p)
+      RETURN u.id AS user, p.id AS post ORDER BY user, post
+      """
+    Then the result should be, in order:
+      | user | post |
+      | 1 | null |
+      | 2 | 100 |
+      | 2 | 101 |
+      | 3 | 102 |
+
+  Scenario: relationship-property-filter-project
+    When executing query:
+      """
+      MATCH (u)-[r:FOLLOWS {since: 2020}]->(v)
+      RETURN u.id AS user, v.id AS followed, r.close AS close
+      """
+    Then the result should be, in order:
+      | user | followed | close |
+      | 1 | 2 | true |
+
+  Scenario: grouped-aggregate
+    When executing query:
+      """
+      MATCH (u)-[:POSTED]->(p:Post)
+      RETURN u.id AS user, count(*) AS total, sum(p.score) AS score ORDER BY user
+      """
+    Then the result should be, in order:
+      | user | total | score |
+      | 2 | 2 | 12 |
+      | 3 | 1 | 11 |
+
+  Scenario: union-distinct
+    When executing query:
+      """
+      MATCH (u:User) RETURN u.id AS id
+      UNION MATCH (m:Moderator) RETURN m.id AS id
+      """
+    Then the result should be, in order:
+      | id |
+      | 1 |
+      | 2 |
+      | 3 |
+
+  Scenario: skipped-side-effect
+    When executing query:
+      """
+      CREATE (u {id: 99})-[:FOLLOWS]->(v {id: 100})
+      """
+    Then the side effects should be:
+      | +relationships | 1 |
+"#,
+    )
+    .unwrap();
+    assert_eq!(corpus.cases.len(), 5);
+    assert_eq!(corpus.skipped.len(), 1);
+
+    for case in corpus.cases {
         let rows = shard
             .execute_cypher_rows(
                 QueryContext::new("reddit-home", format!("cypher-tck-style-{}", case.name)),
-                case.query,
+                &case.query,
             )
             .await
             .unwrap();

@@ -301,6 +301,8 @@ mod verify;
 pub use query_coordination::{
     DistributedQueryCoordinator, DistributedQueryPageRequest, QueryCellClient,
 };
+#[cfg(feature = "query-transport")]
+pub use query_coordination::{TcpQueryCellClient, TcpQueryServer};
 
 pub use control_metadata::{
     GraphControlEdgeWatermark, GraphControlIdempotencyRecord, GraphControlRepairReport,

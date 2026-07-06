@@ -16,6 +16,8 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 mod algebra;
 #[cfg(feature = "opencypher")]
 pub mod opencypher;
+#[cfg(feature = "opencypher")]
+mod opencypher_corpus;
 mod phase0;
 mod placement;
 mod sparse_kernel;
@@ -35,6 +37,8 @@ pub use opencypher::{
     RowEdgePattern, RowExpression, RowMatchGroup, RowMutationAction, RowNodePattern, RowPattern,
     RowPredicate, RowProjection, RowSort, RowSortExpression,
 };
+#[cfg(feature = "opencypher")]
+pub use opencypher_corpus::{parse_opencypher_tck_corpus, CypherTckCase, CypherTckCorpus};
 pub use phase0::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
     BenchmarkResult, DeltaGcResult, GraphControlEdgeWatermark, GraphControlIdempotencyRecord,
@@ -45,6 +49,8 @@ pub use phase0::{
 };
 #[cfg(feature = "opencypher")]
 pub use phase0::{DistributedQueryCoordinator, DistributedQueryPageRequest, QueryCellClient};
+#[cfg(feature = "query-transport")]
+pub use phase0::{TcpQueryCellClient, TcpQueryServer};
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
     LocalityCellExtractor, LocalityLayoutExperiment, StorageLayout,
@@ -751,6 +757,10 @@ pub struct EdgeRecord {
     pub epoch: GraphEpoch,
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum VertexPropertyValue {
     Integer(u64),
