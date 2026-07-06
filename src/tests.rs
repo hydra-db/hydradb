@@ -6252,6 +6252,195 @@ async fn tcp_query_transport_applies_server_backpressure_under_load() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn opencypher_local_executor_honors_cancellation_token() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/query-local-cancel", object_store).await;
+    shard
+        .write_edge(mutation(1, 2, "query-local-cancel-edge"))
+        .await
+        .unwrap();
+
+    let token = QueryCancellationToken::new();
+    token.cancel();
+    let err = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "query-local-cancel").with_cancellation_token(token),
+            "MATCH (u {id: 1})-[:USER_SUBSCRIBED_TO_SUBREDDIT]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("query_cancelled"));
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn query_cardinality_stats_refresh_persists_edge_counts() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/query-cardinality-stats", object_store).await;
+    for idx in 0..3 {
+        shard
+            .write_edge(mutation(
+                1,
+                10 + idx,
+                &format!("query-cardinality-stats-edge-{idx}"),
+            ))
+            .await
+            .unwrap();
+    }
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(true)),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            10,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(true)),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            11,
+            VertexMetadata::default()
+                .with_label("Subreddit")
+                .with_property("active", VertexPropertyValue::Bool(false)),
+        )
+        .await
+        .unwrap();
+    for (idx, dst) in [10, 11].into_iter().enumerate() {
+        shard
+            .set_edge_metadata(
+                "reddit-home",
+                "USER_SUBSCRIBED_TO_SUBREDDIT",
+                1,
+                dst,
+                EdgeMetadata::default().with_property("weight", VertexPropertyValue::Integer(7)),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("edge metadata {idx} failed: {err}"));
+    }
+
+    let refresh = shard
+        .refresh_edge_type_query_stats("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT")
+        .await
+        .unwrap();
+    assert_eq!(refresh.count, 3);
+    assert_eq!(refresh.cell_id, "reddit-home");
+    let key = keys::query_stats_edge_type("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT");
+    let stored = shard.read_counter(&key).await.unwrap();
+    assert_eq!(stored, 3);
+
+    let label_refresh = shard
+        .refresh_vertex_label_query_stats("reddit-home", "User")
+        .await
+        .unwrap();
+    assert_eq!(label_refresh.count, 2);
+    let label_key = keys::query_stats_vertex_label("reddit-home", "User");
+    assert_eq!(shard.read_counter(&label_key).await.unwrap(), 2);
+
+    let active = VertexPropertyValue::Bool(true);
+    let vertex_property_refresh = shard
+        .refresh_vertex_property_query_stats("reddit-home", "active", &active)
+        .await
+        .unwrap();
+    assert_eq!(vertex_property_refresh.count, 2);
+    let active_key = encode_vertex_property_value_key(&active);
+    let vertex_property_key =
+        keys::query_stats_vertex_property("reddit-home", "active", &active_key);
+    assert_eq!(shard.read_counter(&vertex_property_key).await.unwrap(), 2);
+
+    let weight = VertexPropertyValue::Integer(7);
+    let edge_property_refresh = shard
+        .refresh_edge_property_query_stats(
+            "reddit-home",
+            "USER_SUBSCRIBED_TO_SUBREDDIT",
+            "weight",
+            &weight,
+        )
+        .await
+        .unwrap();
+    assert_eq!(edge_property_refresh.count, 2);
+    let weight_key = encode_vertex_property_value_key(&weight);
+    let edge_property_key = keys::query_stats_edge_property(
+        "reddit-home",
+        "USER_SUBSCRIBED_TO_SUBREDDIT",
+        "weight",
+        &weight_key,
+    );
+    assert_eq!(shard.read_counter(&edge_property_key).await.unwrap(), 2);
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[test]
+fn query_service_discovery_parses_kubernetes_consul_and_etcd() {
+    let k8s = serde_json::json!({
+        "items": [{
+            "ports": [{"name": "cypher", "port": 7777}],
+            "endpoints": [{
+                "hostname": "node-a",
+                "addresses": ["127.0.0.1"],
+                "conditions": {"ready": true}
+            }, {
+                "hostname": "node-b",
+                "addresses": ["127.0.0.2"],
+                "conditions": {"ready": false}
+            }]
+        }]
+    });
+    let directory = KubernetesQueryServiceDiscovery::directory_from_endpointslices_json(
+        &k8s,
+        Some("cypher"),
+        QueryTransportClientConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(directory.endpoint("node-a").unwrap().addr.port(), 7777);
+    assert!(directory.endpoint("node-b").is_none());
+
+    let consul = serde_json::json!([{
+        "Node": {"Address": "127.0.0.3"},
+        "Service": {"ID": "node-c", "Service": "graph-query", "Address": "", "Port": 8888}
+    }]);
+    let directory = ConsulQueryServiceDiscovery::directory_from_health_service_json(
+        &consul,
+        QueryTransportClientConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(directory.endpoint("node-c").unwrap().addr.port(), 8888);
+
+    use base64::Engine;
+    let record = serde_json::json!({
+        "node_id": "node-d",
+        "address": "127.0.0.4",
+        "port": 9999
+    })
+    .to_string();
+    let etcd = serde_json::json!({
+        "kvs": [{
+            "value": base64::engine::general_purpose::STANDARD.encode(record.as_bytes())
+        }]
+    });
+    let directory = EtcdQueryServiceDiscovery::directory_from_range_json(
+        &etcd,
+        QueryTransportClientConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(directory.endpoint("node-d").unwrap().addr.port(), 9999);
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn distributed_query_plan_joins_results_across_cells() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control =
@@ -8124,16 +8313,30 @@ Feature: Supported row-query corpus
       """
     Then the side effects should be:
       | +relationships | 1 |
+
+  Scenario: skipped-result-without-table
+    When executing query:
+      """
+      CALL db.labels()
+      """
+    Then the result should be empty
 "#,
     )
     .unwrap();
     assert_eq!(corpus.cases.len(), 5);
-    assert_eq!(corpus.skipped.len(), 1);
+    assert_eq!(corpus.skipped.len(), 2);
     let report = corpus.compatibility_report();
-    assert_eq!(report.total_scenarios, 6);
+    assert_eq!(report.total_scenarios, 7);
     assert_eq!(report.runnable_scenarios, 5);
-    assert_eq!(report.skipped_scenarios, 1);
-    assert!(report.skipped[0].contains("side-effect assertions"));
+    assert_eq!(report.skipped_scenarios, 2);
+    assert!(report
+        .skipped
+        .iter()
+        .any(|reason| reason.contains("side-effect assertions")));
+    assert!(report
+        .skipped
+        .iter()
+        .any(|reason| reason.contains("result assertions without inline tables")));
 
     for case in corpus.cases {
         let rows = shard

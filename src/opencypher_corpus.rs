@@ -2,6 +2,7 @@ use crate::{
     GraphError, QueryColumn, QueryFloat, QueryResultSet, QueryRow, QueryValue, Result,
     VertexPropertyValue,
 };
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CypherTckCorpus {
@@ -39,6 +40,66 @@ impl CypherTckCorpus {
 pub fn parse_opencypher_tck_corpus(input: &str) -> Result<CypherTckCorpus> {
     let mut parser = TckCorpusParser::new(input);
     parser.parse()
+}
+
+pub fn parse_opencypher_tck_corpus_dir(root: impl AsRef<Path>) -> Result<CypherTckCorpus> {
+    let root = root.as_ref();
+    let mut files = Vec::new();
+    collect_feature_files(root, &mut files)?;
+    files.sort();
+
+    let mut cases = Vec::new();
+    let mut skipped = Vec::new();
+    let mut total_scenarios = 0;
+    for file in files {
+        let input = std::fs::read_to_string(&file).map_err(|err| GraphError::CorruptValue {
+            key: file.display().to_string(),
+            reason: err.to_string(),
+        })?;
+        let corpus = parse_opencypher_tck_corpus(&input)?;
+        total_scenarios += corpus.total_scenarios;
+        let relative = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .display()
+            .to_string();
+        cases.extend(corpus.cases.into_iter().map(|mut case| {
+            case.name = format!("{relative}: {}", case.name);
+            case
+        }));
+        skipped.extend(
+            corpus
+                .skipped
+                .into_iter()
+                .map(|reason| format!("{relative}: {reason}")),
+        );
+    }
+
+    Ok(CypherTckCorpus {
+        cases,
+        skipped,
+        total_scenarios,
+    })
+}
+
+fn collect_feature_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = std::fs::read_dir(root).map_err(|err| GraphError::CorruptValue {
+        key: root.display().to_string(),
+        reason: err.to_string(),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| GraphError::CorruptValue {
+            key: root.display().to_string(),
+            reason: err.to_string(),
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_feature_files(&path, files)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("feature") {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 struct TckCorpusParser<'a> {
@@ -104,7 +165,16 @@ impl<'a> TckCorpusParser<'a> {
             }
             if line.starts_with("Then the result should be") {
                 self.idx += 1;
-                expected = Some(self.read_result_table(&name)?);
+                match self.read_result_table(&name)? {
+                    Some(table) => expected = Some(table),
+                    None => {
+                        unsupported.get_or_insert_with(|| {
+                            format!(
+                                "{name}: result assertions without inline tables are not row-query corpus cases"
+                            )
+                        });
+                    }
+                }
                 continue;
             }
             if line.starts_with("Then no side effects")
@@ -160,7 +230,7 @@ impl<'a> TckCorpusParser<'a> {
         })
     }
 
-    fn read_result_table(&mut self, scenario: &str) -> Result<QueryResultSet> {
+    fn read_result_table(&mut self, scenario: &str) -> Result<Option<QueryResultSet>> {
         self.skip_blank_lines();
         let mut rows = Vec::new();
         while self.idx < self.lines.len() {
@@ -176,10 +246,7 @@ impl<'a> TckCorpusParser<'a> {
             self.idx += 1;
         }
         if rows.is_empty() {
-            return Err(GraphError::QueryParse {
-                dialect: "OpenCypherTCK",
-                reason: format!("{scenario}: expected result table"),
-            });
+            return Ok(None);
         }
         let columns = rows
             .remove(0)
@@ -207,7 +274,7 @@ impl<'a> TckCorpusParser<'a> {
                 Ok(QueryRow::new(values))
             })
             .collect::<Result<_>>()?;
-        Ok(QueryResultSet::new(columns, query_rows))
+        Ok(Some(QueryResultSet::new(columns, query_rows)))
     }
 
     fn skip_blank_lines(&mut self) {
