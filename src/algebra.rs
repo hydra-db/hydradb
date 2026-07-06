@@ -5,6 +5,10 @@ use crate::{
     VertexMetadata, VertexPropertyValue,
 };
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryContext {
     pub cell_id: String,
@@ -56,6 +60,10 @@ impl QueryContext {
     }
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueryWindow {
     pub skip: u64,
@@ -77,6 +85,10 @@ pub enum QueryOutput {
     Bool(bool),
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryColumn {
     pub name: String,
@@ -88,6 +100,10 @@ impl QueryColumn {
     }
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct QueryFloat(pub f64);
 
@@ -111,6 +127,10 @@ impl Ord for QueryFloat {
     }
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum QueryValue {
     Null,
@@ -122,6 +142,10 @@ pub enum QueryValue {
     List(Vec<QueryValue>),
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryRow {
     pub values: Vec<QueryValue>,
@@ -133,6 +157,10 @@ impl QueryRow {
     }
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryResultSet {
     pub columns: Vec<QueryColumn>,
@@ -145,6 +173,10 @@ impl QueryResultSet {
     }
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueryCursorToken {
     pub offset: u64,
@@ -156,6 +188,10 @@ impl QueryCursorToken {
     }
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryResultPage {
     pub columns: Vec<QueryColumn>,

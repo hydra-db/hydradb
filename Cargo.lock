@@ -2445,6 +2445,8 @@ dependencies = [
  "bytes",
  "futures",
  "libcypher-parser-sys",
+ "serde",
+ "serde_json",
  "slatedb",
  "tempfile",
  "thiserror 2.0.18",
