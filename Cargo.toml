@@ -2,7 +2,7 @@
 resolver = "2"
 # The root `turbolay` package is a member implicitly; `vendor/common` is our
 # vendored fork of opendata-common (see below).
-members = ["vendor/common", "vendor/macros"]
+members = ["vendor/common", "vendor/macros", "bench"]
 
 [workspace.package]
 edition = "2024"
