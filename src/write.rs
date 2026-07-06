@@ -74,7 +74,7 @@
 //! absent — there is no partial state to repair, so recovery is purely "reload
 //! the in-memory accelerators from durable storage," not a repair pass.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -167,6 +167,29 @@ const META_LATEST_SEQ: &[u8] = b"latest_seq";
 /// injected as SlateDB's durable seqnum for the same commit (M1 integration
 /// point #2). A freshness gate is `durable_seq >= token`.
 pub type Seq = u64;
+
+/// One logical record for [`Writer::ingest_batch`] — the batched-ingest
+/// counterpart of a single [`Writer::upsert_node`] /
+/// [`Writer::upsert_edge_with_props`] call. An empty `props` map on `Edge` is
+/// exactly the plain [`Writer::upsert_edge`] case, matching that method's own
+/// convention.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IngestRecord {
+    /// `UpsertNode(xid, labels, props)` — see [`Writer::upsert_node`].
+    Node {
+        xid: Vec<u8>,
+        labels: Vec<String>,
+        props: BTreeMap<String, TypedValue>,
+    },
+    /// `UpsertEdge(src_xid, pred, dst_xid, props)` — see
+    /// [`Writer::upsert_edge_with_props`].
+    Edge {
+        src_xid: Vec<u8>,
+        pred: String,
+        dst_xid: Vec<u8>,
+        props: BTreeMap<String, TypedValue>,
+    },
+}
 
 /// The single-writer session for one graph namespace (RFC 0002 D2; M1
 /// deliverables 5 + 6).
@@ -517,6 +540,250 @@ impl Writer {
     }
 
     // -----------------------------------------------------------------
+    // Bulk ingest (batched write path)
+    // -----------------------------------------------------------------
+
+    /// Bulk-ingest path: groups up to `records.len()` logical
+    /// `UpsertNode`/`UpsertEdge` writes into **one** physical
+    /// [`GraphStorage::apply_with_options`] call, while preserving every
+    /// invariant a sequence of individual [`Self::upsert_node`] /
+    /// [`Self::upsert_edge_with_props`] calls would have produced. This is
+    /// the throughput path for large loads (RFC 0004's write path is
+    /// otherwise one durable commit per logical write, which is one network
+    /// round trip per element on a real object-store-backed SlateDB — fine
+    /// for OLTP-shaped traffic, far too slow for bulk load).
+    ///
+    /// # Invariants preserved
+    ///
+    /// - **Seq protocol** (RFC 0004 §"Logical sequence protocol"): every
+    ///   logical record in `records` still gets its own strictly-monotonic
+    ///   seq and its own `Log[seq]` [`ChangeRecord`], allocated via the exact
+    ///   same [`GraphAllocators::next_seq`] a per-record [`Self::commit`]
+    ///   uses (see [`Self::commit_batch`]) — so seqs stay strictly increasing
+    ///   across batches exactly as they are across individual per-record
+    ///   commits, and `Meta["latest_seq"]` only ever moves forward. The one
+    ///   physical commit's injected `WriteOptions.seqnum` is the batch's
+    ///   **max** seq (its last-allocated one, since `next_seq` only
+    ///   increases) — required because SlateDB rejects a non-monotonic
+    ///   injected seqnum (see `should_reject_non_monotonic_injected_seqnum`),
+    ///   so batch K's max must be < batch K+1's min, which holds for the same
+    ///   reason two individual commits' seqs never collide.
+    /// - **In-batch xid resolution**: [`resolve_or_create_xid_batched`] only
+    ///   consults durable storage, so a second reference to a brand-new xid
+    ///   later in this *same*, not-yet-committed batch would not see the
+    ///   first reference's queued-but-uncommitted mapping `Put` and would
+    ///   double-allocate a uid. [`Self::resolve_xid_cached`] is this method's
+    ///   in-batch `xid -> uid` cache: the first reference allocates and
+    ///   queues the mapping ops (and, if new, a stub node), every later
+    ///   reference in the batch reuses the cached uid. Schema-name interning
+    ///   ([`Self::intern`]) needs no equivalent batch cache — it already
+    ///   updates the in-memory [`SchemaCache`] synchronously on first use, so
+    ///   calling it repeatedly across this whole batch loop is already
+    ///   correct (a second reference to the same name in the batch is a
+    ///   cache hit, no re-intern).
+    /// - **Node-record merge coalescing**: an edge referencing a brand-new
+    ///   endpoint queues a stub `NodeRecord`; a later `Node` record for that
+    ///   same xid later in the batch must merge onto *that* stub (there's
+    ///   nothing for it in storage yet) and must not emit a second, colliding
+    ///   `Put` for the same node key. `pending_nodes` tracks the batch's
+    ///   coalesced, not-yet-committed node state per uid and is flushed to
+    ///   exactly one `Put` per touched uid at the end — mirroring how a
+    ///   sequence of individual `upsert_node`/`upsert_edge` calls would leave
+    ///   exactly one current `NodeRecord` per uid, just without the
+    ///   intermediate round trips.
+    /// - **Atomicity**: everything above — every xid/schema/posting/degree/
+    ///   node op, every per-record `Log[seq]`, and the one `latest_seq` bump
+    ///   — is folded into one `Vec<RecordOp>` committed by one
+    ///   `apply_with_options` call. A failure commits nothing from the batch,
+    ///   exactly like a single-record [`Self::commit`] (nothing is
+    ///   partially applied; the whole batch is atomic-or-nothing).
+    ///
+    /// An oversize node (RFC 0004 §"Node size cap") anywhere in the batch
+    /// aborts the **whole batch** with nothing committed — same all-or-
+    /// nothing cap-check-before-commit policy as [`Self::upsert_node`], just
+    /// scoped to the batch rather than one record.
+    ///
+    /// Post-commit, [`posting_ops::maybe_split`] runs once per distinct
+    /// `(dir, anchor, pred)` posting touched anywhere in the batch (instead
+    /// of once per edge, as [`Self::upsert_edge_inner`]'s per-record path
+    /// does) — the same best-effort, non-atomic follow-up: **a failure here
+    /// is logged and swallowed, never surfaced as an ingest failure**, since
+    /// the batch has already committed durably by the time split-checking
+    /// runs (see the module-level "Split/rollup: post-commit, not in-band"
+    /// doc).
+    ///
+    /// Returns the batch's max seq, or the writer's current `latest_seq`
+    /// unchanged if `records` is empty (no seq is consumed for an empty
+    /// batch).
+    pub async fn ingest_batch(&mut self, records: &[IngestRecord]) -> Result<Seq> {
+        if records.is_empty() {
+            return Ok(self.latest_seq);
+        }
+
+        let mut ops: Vec<RecordOp> = Vec::new();
+        let mut changes: Vec<ChangeRecord> = Vec::new();
+        let mut xid_cache: HashMap<Vec<u8>, Uid> = HashMap::new();
+        let mut pending_nodes: BTreeMap<Uid, NodeRecord> = BTreeMap::new();
+        let mut touched: BTreeSet<(Direction, Uid, PredId)> = BTreeSet::new();
+
+        for record in records {
+            match record {
+                IngestRecord::Node { xid, labels, props } => {
+                    let uid = self
+                        .resolve_xid_cached(xid, &mut xid_cache, &mut ops, &mut pending_nodes)
+                        .await?;
+
+                    let mut label_ids = Vec::with_capacity(labels.len());
+                    for name in labels {
+                        label_ids.push(LabelId(self.intern(SchemaKind::Label, name, &mut ops)));
+                    }
+                    let mut new_props = BTreeMap::new();
+                    for (name, value) in props {
+                        let prop_id = PropId(self.intern(SchemaKind::PropertyKey, name, &mut ops));
+                        new_props.insert(prop_id, value.clone());
+                    }
+
+                    // Prior state is the batch's own coalesced state if this
+                    // uid was already touched earlier in the batch (a stub
+                    // from an edge endpoint, or an earlier `Node` record for
+                    // the same xid) — there is nothing newer in storage than
+                    // that. Only fall back to a storage read if this is the
+                    // uid's first touch in the whole batch.
+                    let prior = match pending_nodes.get(&uid) {
+                        Some(node) => Some(node.clone()),
+                        None => self.get_node(uid).await?,
+                    };
+                    let xid_string = xid_utf8(xid)?;
+                    let (merged, label_delta) =
+                        merge_node_record(prior, label_ids, new_props, xid_string);
+
+                    // Cap check now, before anything commits — an oversize
+                    // node aborts the whole batch with nothing written, same
+                    // policy as the per-record path.
+                    if let Err(e) = V0NodeCodec::encode(&merged) {
+                        let result: Result<Seq> = Err(e);
+                        record_write_outcome(obs::write::OP_INGEST_BATCH, &result);
+                        return result;
+                    }
+                    pending_nodes.insert(uid, merged);
+
+                    changes.push(ChangeRecord {
+                        seq: 0, // filled in by `commit_batch`
+                        op: ChangeOp::UpsertNode,
+                        subject_uid: uid,
+                        pred_id: None,
+                        object_uid: None,
+                        value: None,
+                        label_delta: Some(label_delta),
+                    });
+                }
+                IngestRecord::Edge {
+                    src_xid,
+                    pred,
+                    dst_xid,
+                    props,
+                } => {
+                    let src_uid = self
+                        .resolve_xid_cached(src_xid, &mut xid_cache, &mut ops, &mut pending_nodes)
+                        .await?;
+                    let dst_uid = self
+                        .resolve_xid_cached(dst_xid, &mut xid_cache, &mut ops, &mut pending_nodes)
+                        .await?;
+                    let pred_id = PredId(self.intern(SchemaKind::Predicate, pred, &mut ops));
+
+                    let out_ops =
+                        posting_ops::add(&self.storage, Direction::Out, src_uid, pred_id, dst_uid)
+                            .await?;
+                    ops.extend(out_ops);
+                    let in_ops =
+                        posting_ops::add(&self.storage, Direction::In, dst_uid, pred_id, src_uid)
+                            .await?;
+                    ops.extend(in_ops);
+                    touched.insert((Direction::Out, src_uid, pred_id));
+                    touched.insert((Direction::In, dst_uid, pred_id));
+
+                    ops.push(bump_degree(pred_id, Direction::Out, src_uid, 1));
+                    ops.push(bump_degree(pred_id, Direction::In, dst_uid, 1));
+
+                    if !props.is_empty() {
+                        let mut edge_props: EdgeProps = BTreeMap::new();
+                        for (name, value) in props {
+                            let prop_id =
+                                PropId(self.intern(SchemaKind::PropertyKey, name, &mut ops));
+                            edge_props.insert(prop_id, value.clone());
+                        }
+                        ops.push(RecordOp::Put(
+                            Record::new(
+                                edge_prop_key(src_uid, pred_id, dst_uid),
+                                encode_edge_props(&edge_props),
+                            )
+                            .into(),
+                        ));
+                    }
+
+                    changes.push(ChangeRecord {
+                        seq: 0, // filled in by `commit_batch`
+                        op: ChangeOp::UpsertEdge,
+                        subject_uid: src_uid,
+                        pred_id: Some(pred_id),
+                        object_uid: Some(dst_uid),
+                        value: None,
+                        label_delta: None,
+                    });
+                }
+            }
+        }
+
+        // Flush the batch's coalesced node state: exactly one `Put` per
+        // touched uid, reflecting every `Node` record (and edge-endpoint
+        // stub) this batch queued for it. Every entry here already passed
+        // the cap check above, so this re-encode cannot fail.
+        for (uid, node) in &pending_nodes {
+            let encoded = V0NodeCodec::encode(node)
+                .expect("every pending node was already cap-checked before insertion above");
+            ops.push(RecordOp::Put(Record::new(node_key(*uid), encoded).into()));
+        }
+
+        let result = self.commit_batch(ops, changes).await;
+        record_write_outcome(obs::write::OP_INGEST_BATCH, &result);
+        let seq = result?;
+
+        // Post-commit, best-effort, non-atomic maybe_split — once per
+        // distinct (dir, anchor, pred) touched anywhere in the batch (not
+        // once per edge). Per the module doc: a failure here must NOT be
+        // surfaced as an ingest failure — the batch already committed
+        // durably, and split-checking is idempotent/stateless across calls,
+        // so the next touch of any of these postings re-evaluates it anyway.
+        let mut split_ops = Vec::new();
+        for (dir, anchor, pred) in touched {
+            match posting_ops::maybe_split(&self.storage, dir, anchor, pred).await {
+                Ok(more_ops) => split_ops.extend(more_ops),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        anchor = anchor.get(),
+                        pred = pred.get(),
+                        "maybe_split check failed after a batched ingest commit; the ingest \
+                         already committed durably, only the deferred split reorganization is \
+                         affected and will be retried on the next touch of this posting"
+                    );
+                }
+            }
+        }
+        if !split_ops.is_empty()
+            && let Err(e) = self.storage.apply(split_ops).await
+        {
+            tracing::warn!(
+                error = %e,
+                "applying batched maybe_split ops failed after a batched ingest commit; \
+                 the ingest already committed durably"
+            );
+        }
+
+        Ok(seq)
+    }
+
+    // -----------------------------------------------------------------
     // DeleteNode
     // -----------------------------------------------------------------
 
@@ -676,6 +943,119 @@ impl Writer {
 
         self.schema.insert(kind, id, entry);
         id
+    }
+
+    /// [`Self::ingest_batch`]'s in-batch counterpart of
+    /// [`Self::resolve_and_stub_node`]: resolves `xid` to a uid, but first
+    /// consults `cache` — a scratch `xid -> uid` map scoped to one
+    /// `ingest_batch` call — before falling through to
+    /// [`resolve_or_create_xid_batched`]'s durable-storage lookup.
+    ///
+    /// This is required, not just an optimization: `resolve_or_create_xid_batched`
+    /// decides "new vs. existing" purely by reading storage, so without this
+    /// cache a second reference to a brand-new xid later in the *same*,
+    /// not-yet-committed batch would not see the first reference's queued
+    /// mapping `Put` and would allocate (and durably persist) a second uid
+    /// for the same xid — silently corrupting xid stability. `cache` closes
+    /// that gap: every reference to `xid` within one `ingest_batch` call
+    /// after the first is a pure in-memory cache hit.
+    ///
+    /// If `xid` is brand new *anywhere in the batch so far* (a cache miss and
+    /// `resolve_or_create_xid_batched` returns non-empty ops), also queues a
+    /// minimal stub `NodeRecord{labels: [], props: {}, xid}` into
+    /// `pending_nodes` — the batched equivalent of
+    /// `resolve_and_stub_node`'s stub `Put`, routed through the batch's
+    /// coalesced node state instead of a bare `ops` push so that a later
+    /// `Node` record for the same xid in the same batch merges onto this
+    /// stub instead of colliding with it (see [`Self::ingest_batch`]'s doc).
+    async fn resolve_xid_cached(
+        &mut self,
+        xid: &[u8],
+        cache: &mut HashMap<Vec<u8>, Uid>,
+        ops: &mut Vec<RecordOp>,
+        pending_nodes: &mut BTreeMap<Uid, NodeRecord>,
+    ) -> Result<Uid> {
+        if let Some(uid) = cache.get(xid) {
+            return Ok(*uid);
+        }
+
+        let (uid, xid_ops) =
+            resolve_or_create_xid_batched(self.storage.inner().as_ref(), &mut self.allocs, xid)
+                .await?;
+        let is_new = !xid_ops.is_empty();
+        ops.extend(xid_ops);
+        cache.insert(xid.to_vec(), uid);
+
+        if is_new {
+            pending_nodes.insert(
+                uid,
+                NodeRecord {
+                    labels: Vec::new(),
+                    props: BTreeMap::new(),
+                    xid: xid_utf8(xid)?,
+                },
+            );
+        }
+        Ok(uid)
+    }
+
+    /// Finalizes a batch of `N` logical writes for [`Self::ingest_batch`]
+    /// (RFC 0004 §"Logical sequence protocol", batched form of
+    /// [`Self::commit`]): allocates one seq per entry in `changes`, in order,
+    /// via the exact same [`GraphAllocators::next_seq`] a per-record
+    /// `commit` uses (folding in any `SeqBlock` reservation exactly as
+    /// `commit` does), appends one `Log[seq]` per change, bumps
+    /// `Meta["latest_seq"]` **once** to the batch's max seq (the
+    /// last-allocated one — `next_seq` only ever increases, so "last" and
+    /// "max" are the same value here), and commits `ops` plus every
+    /// `Log[seq]` plus that one `latest_seq` bump in **one**
+    /// `GraphStorage::apply_with_options` call with `await_durable: true` and
+    /// `seqnum` injected as that same max seq. A failure here leaves nothing
+    /// from the batch committed — identical failure behavior to
+    /// [`Self::commit`], just for `N` logical writes instead of one.
+    async fn commit_batch(
+        &mut self,
+        mut ops: Vec<RecordOp>,
+        mut changes: Vec<ChangeRecord>,
+    ) -> Result<Seq> {
+        debug_assert!(
+            !changes.is_empty(),
+            "ingest_batch already returns early on an empty records slice"
+        );
+
+        let mut max_seq = self.latest_seq;
+        for change in changes.iter_mut() {
+            let (raw_seq, seq_block) = self.allocs.next_seq();
+            // Same +1 seed as `commit` — see that method's own comment on why
+            // the logical seq space starts at 1, not 0.
+            let seq = raw_seq + 1;
+            if let Some(record) = seq_block {
+                ops.push(RecordOp::Put(record.into()));
+            }
+            change.seq = seq;
+            ops.push(RecordOp::Put(
+                Record::new(log_key(seq), change.encode()).into(),
+            ));
+            max_seq = seq;
+        }
+
+        ops.push(RecordOp::Put(
+            Record::new(meta_key(META_LATEST_SEQ), encode_u64_le(max_seq)).into(),
+        ));
+
+        self.storage
+            .apply_with_options(
+                ops,
+                WriteOptions {
+                    await_durable: true,
+                    seqnum: max_seq,
+                },
+            )
+            .await?;
+
+        self.latest_seq = max_seq;
+        obs::write::set_latest_seq(max_seq);
+        Ok(max_seq)
     }
 
     /// Finalizes one write request: allocates the next logical seq (folding
@@ -1576,5 +1956,334 @@ mod tests {
             )
             .await;
         assert!(rejected.is_err());
+    }
+
+    // -- Batched ingest: correctness oracle (batched == per-record) -------
+    //
+    // `ingest_batch` exists purely as a throughput optimization over the
+    // per-record path — every test in this section holds it to the standard
+    // that its *observable* result must be indistinguishable from the
+    // sequential per-record calls it replaces, for the exact cases the
+    // module doc flags as the crux: an xid touched twice in one batch (both
+    // as a `Node` record and as an edge endpoint stub), an xid referenced
+    // from two different edges in the same batch (in-batch xid cache reuse),
+    // and a duplicate edge in the same batch (repeated posting/degree merges
+    // to the same key in one physical commit).
+
+    /// Three `Node` records (`alice` touched twice — must merge onto her own
+    /// in-batch stub/prior state, not collide) and four `Edge` records
+    /// (`carol` is brand new and only ever referenced via edges, referenced
+    /// from two different edges; the last edge duplicates the first).
+    fn sample_ingest_records() -> (Vec<IngestRecord>, Vec<IngestRecord>) {
+        let nodes = vec![
+            IngestRecord::Node {
+                xid: b"user:alice".to_vec(),
+                labels: vec!["Person".to_string()],
+                props: props(&[
+                    ("name", TypedValue::String("Alice".to_string())),
+                    ("age", TypedValue::Int(30)),
+                ]),
+            },
+            IngestRecord::Node {
+                xid: b"user:bob".to_vec(),
+                labels: vec!["Person".to_string()],
+                props: props(&[("name", TypedValue::String("Bob".to_string()))]),
+            },
+            // A second record for the same xid: must merge onto the first
+            // (additive labels, prop overlay), not double-allocate alice's
+            // uid or collide with her already-queued Put.
+            IngestRecord::Node {
+                xid: b"user:alice".to_vec(),
+                labels: vec!["Admin".to_string()],
+                props: props(&[("age", TypedValue::Int(31))]),
+            },
+        ];
+        let edges = vec![
+            IngestRecord::Edge {
+                src_xid: b"user:alice".to_vec(),
+                pred: "knows".to_string(),
+                dst_xid: b"user:bob".to_vec(),
+                props: props(&[("since", TypedValue::Int(2020))]),
+            },
+            // carol is brand new and only ever referenced via edges — must
+            // get a stub NodeRecord and a stable uid.
+            IngestRecord::Edge {
+                src_xid: b"user:alice".to_vec(),
+                pred: "knows".to_string(),
+                dst_xid: b"user:carol".to_vec(),
+                props: BTreeMap::new(),
+            },
+            // carol referenced again — must resolve to the same uid the
+            // batch already minted for her (in-batch xid cache), not a
+            // second uid.
+            IngestRecord::Edge {
+                src_xid: b"user:bob".to_vec(),
+                pred: "knows".to_string(),
+                dst_xid: b"user:carol".to_vec(),
+                props: BTreeMap::new(),
+            },
+            // A duplicate of the first edge (same src/pred/dst) — exercises
+            // repeated posting/degree merges targeting the same key within
+            // one physical commit.
+            IngestRecord::Edge {
+                src_xid: b"user:alice".to_vec(),
+                pred: "knows".to_string(),
+                dst_xid: b"user:bob".to_vec(),
+                props: BTreeMap::new(),
+            },
+        ];
+        (nodes, edges)
+    }
+
+    async fn apply_per_record(writer: &mut Writer, nodes: &[IngestRecord], edges: &[IngestRecord]) {
+        for n in nodes {
+            let IngestRecord::Node { xid, labels, props } = n else {
+                panic!("sample_ingest_records' nodes must all be Node variants");
+            };
+            writer
+                .upsert_node(xid, labels, props.clone())
+                .await
+                .unwrap();
+        }
+        for e in edges {
+            let IngestRecord::Edge {
+                src_xid,
+                pred,
+                dst_xid,
+                props,
+            } = e
+            else {
+                panic!("sample_ingest_records' edges must all be Edge variants");
+            };
+            writer
+                .upsert_edge_with_props(src_xid, pred, dst_xid, props.clone())
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The observable state the correctness oracle compares: every sample
+    /// node's decoded record, every sample `(anchor,pred,dir)`'s neighbor
+    /// set, every sample degree counter, and the valued edge's props.
+    #[derive(Debug, PartialEq)]
+    struct IngestSnapshot {
+        alice_node: NodeRecord,
+        bob_node: NodeRecord,
+        carol_node: NodeRecord,
+        alice_out_knows: Vec<u64>,
+        bob_out_knows: Vec<u64>,
+        carol_in_knows: Vec<u64>,
+        alice_out_degree: i64,
+        bob_in_degree: i64,
+        carol_in_degree: i64,
+        alice_knows_bob_props: Option<EdgeProps>,
+    }
+
+    async fn snapshot(writer: &Writer) -> IngestSnapshot {
+        let alice = writer.lookup_uid(b"user:alice").await.unwrap().unwrap();
+        let bob = writer.lookup_uid(b"user:bob").await.unwrap().unwrap();
+        let carol = writer.lookup_uid(b"user:carol").await.unwrap().unwrap();
+        let pred = PredId(writer.schema_id(SchemaKind::Predicate, "knows").unwrap());
+
+        let mut alice_out_knows: Vec<u64> = writer
+            .neighbors(alice, pred, Direction::Out)
+            .await
+            .unwrap()
+            .iter()
+            .collect();
+        alice_out_knows.sort_unstable();
+        let mut bob_out_knows: Vec<u64> = writer
+            .neighbors(bob, pred, Direction::Out)
+            .await
+            .unwrap()
+            .iter()
+            .collect();
+        bob_out_knows.sort_unstable();
+        let mut carol_in_knows: Vec<u64> = writer
+            .neighbors(carol, pred, Direction::In)
+            .await
+            .unwrap()
+            .iter()
+            .collect();
+        carol_in_knows.sort_unstable();
+
+        IngestSnapshot {
+            alice_node: writer.get_node(alice).await.unwrap().unwrap(),
+            bob_node: writer.get_node(bob).await.unwrap().unwrap(),
+            carol_node: writer.get_node(carol).await.unwrap().unwrap(),
+            alice_out_knows,
+            bob_out_knows,
+            carol_in_knows,
+            alice_out_degree: writer.degree(pred, Direction::Out, alice).await.unwrap(),
+            bob_in_degree: writer.degree(pred, Direction::In, bob).await.unwrap(),
+            carol_in_degree: writer.degree(pred, Direction::In, carol).await.unwrap(),
+            alice_knows_bob_props: writer.edge_props(alice, pred, bob).await.unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_produce_identical_state_via_batched_and_per_record_ingest() {
+        let (nodes, edges) = sample_ingest_records();
+
+        // Oracle: sequential per-record upsert_node/upsert_edge_with_props
+        // calls, one durable commit each — today's only write path.
+        let mut per_record = Writer::in_memory().await.unwrap();
+        apply_per_record(&mut per_record, &nodes, &edges).await;
+        let oracle = snapshot(&per_record).await;
+
+        // Candidate 1: one single `ingest_batch` call over every record
+        // (nodes then edges, same order as the oracle), one physical commit
+        // for the whole dataset.
+        let mut single_batch = Writer::in_memory().await.unwrap();
+        let mut all = nodes.clone();
+        all.extend(edges.clone());
+        single_batch.ingest_batch(&all).await.unwrap();
+        assert_eq!(
+            oracle,
+            snapshot(&single_batch).await,
+            "a single ingest_batch call must match the per-record oracle exactly"
+        );
+
+        // Candidate 2: the bench loader's actual shape — one `ingest_batch`
+        // call for the node phase, then one for the edge phase (edges
+        // reference node xids already committed by the node phase).
+        let mut split_batch = Writer::in_memory().await.unwrap();
+        split_batch.ingest_batch(&nodes).await.unwrap();
+        split_batch.ingest_batch(&edges).await.unwrap();
+        assert_eq!(
+            oracle,
+            snapshot(&split_batch).await,
+            "a node-phase-then-edge-phase ingest_batch pair must match the per-record oracle"
+        );
+    }
+
+    // -- Seq monotonicity across batches + reopen recovery ----------------
+
+    #[tokio::test]
+    async fn should_keep_seqs_strictly_monotonic_across_batches_and_recover_cleanly() {
+        let storage = GraphStorage::in_memory().await.unwrap();
+        let (nodes, edges) = sample_ingest_records();
+
+        let (seq_batch1, seq_batch2, seq_batch3) = {
+            let mut writer = Writer::from_storage(storage.clone()).await.unwrap();
+            assert_eq!(writer.latest_seq(), 0);
+
+            // Batch 1: the node phase — 3 logical records, one physical commit.
+            let seq1 = writer.ingest_batch(&nodes).await.unwrap();
+            assert_eq!(
+                seq1, 3,
+                "3 logical Node records should consume seqs 1..=3, max = 3"
+            );
+            assert_eq!(writer.latest_seq(), seq1);
+
+            // Each logical record's own Log[seq] entry exists, strictly
+            // increasing, 1..=3 — not just one Log entry for the whole batch.
+            for expected_seq in 1..=3u64 {
+                let raw = writer
+                    .storage()
+                    .get(log_key(expected_seq))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let change = ChangeRecord::decode(&raw).unwrap();
+                assert_eq!(change.seq, expected_seq);
+            }
+
+            // Batch 2: the edge phase — 4 logical records, one physical
+            // commit, seqs must continue strictly past batch 1's max.
+            let seq2 = writer.ingest_batch(&edges).await.unwrap();
+            assert_eq!(
+                seq2, 7,
+                "4 more logical Edge records should consume seqs 4..=7, max = 7"
+            );
+            assert!(seq2 > seq1, "batch 2's max seq must exceed batch 1's max");
+            for expected_seq in 4..=7u64 {
+                let raw = writer
+                    .storage()
+                    .get(log_key(expected_seq))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let change = ChangeRecord::decode(&raw).unwrap();
+                assert_eq!(change.seq, expected_seq);
+            }
+
+            // A plain per-record commit after two batches keeps the same
+            // strictly-monotonic lineage.
+            let seq3 = writer
+                .upsert_edge(b"user:carol", "knows", b"user:alice")
+                .await
+                .unwrap();
+            assert!(seq3 > seq2);
+
+            (seq1, seq2, seq3)
+        }; // writer dropped — simulates a restart.
+
+        let recovered = Writer::from_storage(storage.clone()).await.unwrap();
+        assert_eq!(
+            recovered.latest_seq(),
+            seq_batch3,
+            "reopening after a batched load must recover latest_seq exactly"
+        );
+        assert!(seq_batch1 < seq_batch2 && seq_batch2 < seq_batch3);
+
+        // And every xid/uid/node state from the batched load is intact
+        // post-recovery too (not just the seq counter).
+        assert!(recovered.lookup_uid(b"user:alice").await.unwrap().is_some());
+        assert!(recovered.lookup_uid(b"user:carol").await.unwrap().is_some());
+        let alice = recovered.lookup_uid(b"user:alice").await.unwrap().unwrap();
+        let node = recovered.get_node(alice).await.unwrap().unwrap();
+        assert_eq!(
+            node.labels.len(),
+            2,
+            "Person + Admin from the batched node phase"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_leave_no_partial_state_when_an_ingest_batch_fails_to_apply() {
+        use common::StorageError;
+
+        let raw: std::sync::Arc<dyn Storage> =
+            std::sync::Arc::new(InMemoryStorage::with_merge_operator(std::sync::Arc::new(
+                crate::merge::GraphMergeOperator,
+            )));
+        let failing = FailingStorage::wrap(raw.clone());
+
+        let mut writer = Writer::from_storage(GraphStorage::from_storage(failing.clone()))
+            .await
+            .unwrap();
+
+        let (nodes, edges) = sample_ingest_records();
+        failing.fail_apply_once(StorageError::Storage("simulated crash mid-batch".into()));
+        let result = writer.ingest_batch(&nodes).await;
+        assert!(
+            result.is_err(),
+            "the injected failure must surface as an error"
+        );
+
+        // Nothing from the failed batch is visible — no xid mapping, no
+        // node, no seq consumed.
+        assert_eq!(writer.lookup_uid(b"user:alice").await.unwrap(), None);
+        assert_eq!(writer.latest_seq(), 0);
+
+        // A fresh writer over the raw (un-wrapped) storage confirms there is
+        // truly nothing to recover — the batch committed zero of its ops.
+        let recovered = Writer::from_storage(GraphStorage::from_storage(raw.clone()))
+            .await
+            .unwrap();
+        assert_eq!(recovered.latest_seq(), 0);
+        assert_eq!(recovered.lookup_uid(b"user:alice").await.unwrap(), None);
+
+        // And a subsequent successful batch on the original writer (the
+        // transient fault has "healed") proceeds cleanly. Like the
+        // per-record `commit` precedent (`should_leave_no_partial_state_...`
+        // above), the seq allocator's in-memory cursor already advanced past
+        // the failed attempt's seqs even though nothing committed — so this
+        // is `> 0`, not necessarily `== 3` (no reuse, but a gap is fine).
+        let seq = writer.ingest_batch(&nodes).await.unwrap();
+        assert!(seq > 0, "batch must succeed and consume fresh seqs");
+        assert!(writer.lookup_uid(b"user:alice").await.unwrap().is_some());
+        let _ = edges; // reserved for symmetry with the other test's dataset
     }
 }

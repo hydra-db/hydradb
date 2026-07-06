@@ -345,6 +345,9 @@ pub mod write {
     pub const OP_UPSERT_NODE: &str = "upsert_node";
     pub const OP_UPSERT_EDGE: &str = "upsert_edge";
     pub const OP_DELETE: &str = "delete";
+    /// [`crate::write::Writer::ingest_batch`] — one label for the whole
+    /// physical batch (not one per logical record it folds in).
+    pub const OP_INGEST_BATCH: &str = "ingest_batch";
 
     /// `outcome` label values.
     pub const OUTCOME_OK: &str = "ok";
