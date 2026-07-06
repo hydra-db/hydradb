@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    validate_component, CommitResult, GraphEpoch, GraphError, Result, VertexId, VertexMetadata,
-    VertexPropertyValue,
+    validate_component, CommitResult, EdgeMetadata, GraphEpoch, GraphError, Result, VertexId,
+    VertexMetadata, VertexPropertyValue,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +151,7 @@ pub struct QueryMutationResult {
     pub created_edges: u64,
     pub deleted_edges: u64,
     pub updated_vertices: u64,
+    pub updated_relationships: u64,
     pub noops: u64,
 }
 
@@ -167,6 +168,14 @@ pub enum QueryStatement {
         dst: VertexId,
         src_metadata: VertexMetadata,
         dst_metadata: VertexMetadata,
+    },
+    CreateEdgeWithFullMetadata {
+        edge_type: String,
+        src: VertexId,
+        dst: VertexId,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+        edge_metadata: EdgeMetadata,
     },
     MatchOut {
         edge_type: String,
@@ -198,7 +207,9 @@ impl QueryStatement {
     pub fn is_write(&self) -> bool {
         matches!(
             self,
-            QueryStatement::CreateEdge { .. } | QueryStatement::CreateEdgeWithMetadata { .. }
+            QueryStatement::CreateEdge { .. }
+                | QueryStatement::CreateEdgeWithMetadata { .. }
+                | QueryStatement::CreateEdgeWithFullMetadata { .. }
         )
     }
 }
@@ -227,6 +238,14 @@ pub enum LogicalQueryPlan {
         dst: VertexId,
         src_metadata: VertexMetadata,
         dst_metadata: VertexMetadata,
+    },
+    CreateEdgeWithFullMetadata {
+        edge_type: String,
+        src: VertexId,
+        dst: VertexId,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+        edge_metadata: EdgeMetadata,
     },
     MatchOut {
         edge_type: String,
@@ -268,6 +287,14 @@ pub enum PhysicalQueryPlan {
         src_metadata: VertexMetadata,
         dst_metadata: VertexMetadata,
     },
+    WriteEdgeWithFullMetadata {
+        edge_type: String,
+        src: VertexId,
+        dst: VertexId,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+        edge_metadata: EdgeMetadata,
+    },
     OutDegreeCounter {
         edge_type: String,
         src: VertexId,
@@ -304,7 +331,9 @@ impl QueryPlan {
     pub fn is_write(&self) -> bool {
         matches!(
             self.physical,
-            PhysicalQueryPlan::WriteEdge { .. } | PhysicalQueryPlan::WriteEdgeWithMetadata { .. }
+            PhysicalQueryPlan::WriteEdge { .. }
+                | PhysicalQueryPlan::WriteEdgeWithMetadata { .. }
+                | PhysicalQueryPlan::WriteEdgeWithFullMetadata { .. }
         )
     }
 
@@ -400,6 +429,21 @@ fn logical_plan(statement: &QueryStatement) -> Result<LogicalQueryPlan> {
             src_metadata: src_metadata.clone(),
             dst_metadata: dst_metadata.clone(),
         },
+        QueryStatement::CreateEdgeWithFullMetadata {
+            edge_type,
+            src,
+            dst,
+            src_metadata,
+            dst_metadata,
+            edge_metadata,
+        } => LogicalQueryPlan::CreateEdgeWithFullMetadata {
+            edge_type: edge_type.clone(),
+            src: *src,
+            dst: *dst,
+            src_metadata: src_metadata.clone(),
+            dst_metadata: dst_metadata.clone(),
+            edge_metadata: edge_metadata.clone(),
+        },
         QueryStatement::MatchOut {
             edge_type,
             src,
@@ -451,6 +495,7 @@ fn validate_logical_plan(plan: &LogicalQueryPlan) -> Result<()> {
     match plan {
         LogicalQueryPlan::CreateEdge { edge_type, .. }
         | LogicalQueryPlan::CreateEdgeWithMetadata { edge_type, .. }
+        | LogicalQueryPlan::CreateEdgeWithFullMetadata { edge_type, .. }
         | LogicalQueryPlan::MatchOut { edge_type, .. }
         | LogicalQueryPlan::MatchOutFiltered { edge_type, .. }
         | LogicalQueryPlan::MatchEdge { edge_type, .. }
@@ -462,10 +507,18 @@ fn validate_logical_plan(plan: &LogicalQueryPlan) -> Result<()> {
         src_metadata,
         dst_metadata,
         ..
+    }
+    | LogicalQueryPlan::CreateEdgeWithFullMetadata {
+        src_metadata,
+        dst_metadata,
+        ..
     } = plan
     {
         validate_query_vertex_metadata(src_metadata)?;
         validate_query_vertex_metadata(dst_metadata)?;
+    }
+    if let LogicalQueryPlan::CreateEdgeWithFullMetadata { edge_metadata, .. } = plan {
+        validate_query_edge_metadata(edge_metadata)?;
     }
     Ok(())
 }
@@ -493,6 +546,21 @@ fn physical_plan(logical: &LogicalQueryPlan) -> PhysicalQueryPlan {
             dst: *dst,
             src_metadata: src_metadata.clone(),
             dst_metadata: dst_metadata.clone(),
+        },
+        LogicalQueryPlan::CreateEdgeWithFullMetadata {
+            edge_type,
+            src,
+            dst,
+            src_metadata,
+            dst_metadata,
+            edge_metadata,
+        } => PhysicalQueryPlan::WriteEdgeWithFullMetadata {
+            edge_type: edge_type.clone(),
+            src: *src,
+            dst: *dst,
+            src_metadata: src_metadata.clone(),
+            dst_metadata: dst_metadata.clone(),
+            edge_metadata: edge_metadata.clone(),
         },
         LogicalQueryPlan::MatchOut {
             edge_type,
@@ -566,6 +634,13 @@ fn validate_query_vertex_metadata(metadata: &VertexMetadata) -> Result<()> {
     for label in &metadata.labels {
         validate_component("label", label)?;
     }
+    for property in metadata.properties.keys() {
+        validate_component("property", property)?;
+    }
+    Ok(())
+}
+
+fn validate_query_edge_metadata(metadata: &EdgeMetadata) -> Result<()> {
     for property in metadata.properties.keys() {
         validate_component("property", property)?;
     }

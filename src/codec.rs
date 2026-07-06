@@ -330,6 +330,62 @@ pub(crate) fn decode_vertex_metadata(key: &str, value: &[u8]) -> Result<VertexMe
     Ok(metadata)
 }
 
+pub(crate) fn encode_edge_metadata(metadata: &EdgeMetadata) -> Vec<u8> {
+    let mut value = String::from("edge-metadata-v1\n");
+    for (name, property) in &metadata.properties {
+        value.push_str("property\t");
+        value.push_str(name);
+        value.push('\t');
+        value.push_str(&encode_vertex_property_value_record(property));
+        value.push('\n');
+    }
+    value.into_bytes()
+}
+
+pub(crate) fn decode_edge_metadata(key: &str, value: &[u8]) -> Result<EdgeMetadata> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let mut lines = text.lines();
+    match lines.next() {
+        Some("edge-metadata-v1") => {}
+        Some(other) => {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("unsupported edge metadata version {other}"),
+            });
+        }
+        None => {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: "empty edge metadata".to_string(),
+            });
+        }
+    }
+
+    let mut metadata = EdgeMetadata::default();
+    for line in lines {
+        let parts: Vec<_> = line.split('\t').collect();
+        match parts.as_slice() {
+            ["property", name, encoded] => {
+                validate_component("property", name)?;
+                metadata.properties.insert(
+                    (*name).to_string(),
+                    decode_vertex_property_value_record(key, encoded)?,
+                );
+            }
+            _ => {
+                return Err(GraphError::CorruptValue {
+                    key: key.to_string(),
+                    reason: format!("invalid edge metadata line {line}"),
+                });
+            }
+        }
+    }
+    Ok(metadata)
+}
+
 pub(crate) fn encode_vertex_property_value_key(value: &VertexPropertyValue) -> String {
     match value {
         VertexPropertyValue::Integer(value) => format!("i{value:020}"),

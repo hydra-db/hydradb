@@ -6413,6 +6413,376 @@ async fn cypher_executes_set_remove_delete_and_merge_mutations() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_relationship_properties_are_indexed_mutable_and_snapshot_safe() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-relationship-properties",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let create = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-rel-props-create"),
+            "CREATE (u {id: 1})-[r:FOLLOWS {since: 2020, close: true}]->(v {id: 2})",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        create,
+        QueryOutput::Write(CommitResult {
+            already_existed: false,
+            ..
+        })
+    ));
+    let created_epoch = shard.current_epoch("reddit-home").await.unwrap();
+
+    for (idx, (src, dst)) in [(3, 4), (5, 6)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-rel-props-extra-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let indexed = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-rel-props-indexed"),
+            "MATCH (u)-[r:FOLLOWS {since: 2020}]->(v) \
+             RETURN u.id AS src, v.id AS dst, r.close AS close",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        indexed,
+        QueryResultSet::new(
+            vec![
+                QueryColumn::new("src"),
+                QueryColumn::new("dst"),
+                QueryColumn::new("close")
+            ],
+            vec![QueryRow::new(vec![
+                QueryValue::VertexId(1),
+                QueryValue::VertexId(2),
+                QueryValue::Property(VertexPropertyValue::Bool(true)),
+            ])],
+        )
+    );
+
+    let update = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-rel-props-set"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) SET r.since = 2021, r.weight = 7",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        update,
+        QueryOutput::Mutation(QueryMutationResult {
+            matched_rows: 1,
+            updated_relationships: 1,
+            ..QueryMutationResult::default()
+        })
+    );
+
+    let old_index_latest = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-rel-props-old-latest"),
+            "MATCH (u)-[r:FOLLOWS {since: 2020}]->(v) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        old_index_latest,
+        QueryResultSet::new(vec![QueryColumn::new("u.id")], Vec::new())
+    );
+
+    let old_index_snapshot = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-rel-props-old-snapshot")
+                .at_epoch(created_epoch),
+            "MATCH (u)-[r:FOLLOWS {since: 2020}]->(v) RETURN r.since AS since",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        old_index_snapshot,
+        QueryResultSet::new(
+            vec![QueryColumn::new("since")],
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::Integer(2020)
+            )])],
+        )
+    );
+
+    let updated = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-rel-props-updated"),
+            "MATCH (u)-[r:FOLLOWS {since: 2021}]->(v) \
+             RETURN u.id AS src, v.id AS dst, r.since AS since, r.weight AS weight",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        updated,
+        QueryResultSet::new(
+            vec![
+                QueryColumn::new("src"),
+                QueryColumn::new("dst"),
+                QueryColumn::new("since"),
+                QueryColumn::new("weight")
+            ],
+            vec![QueryRow::new(vec![
+                QueryValue::VertexId(1),
+                QueryValue::VertexId(2),
+                QueryValue::Property(VertexPropertyValue::Integer(2021)),
+                QueryValue::Property(VertexPropertyValue::Integer(7)),
+            ])],
+        )
+    );
+
+    let remove = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-rel-props-remove"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) REMOVE r.close",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        remove,
+        QueryOutput::Mutation(QueryMutationResult {
+            matched_rows: 1,
+            updated_relationships: 1,
+            ..QueryMutationResult::default()
+        })
+    );
+
+    let removed_index = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-rel-props-removed-index"),
+            "MATCH (u)-[r:FOLLOWS {close: true}]->(v) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        removed_index,
+        QueryResultSet::new(vec![QueryColumn::new("u.id")], Vec::new())
+    );
+
+    let delete = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-rel-props-delete"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) DELETE r",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        delete,
+        QueryOutput::Mutation(QueryMutationResult {
+            matched_rows: 1,
+            deleted_edges: 1,
+            ..QueryMutationResult::default()
+        })
+    );
+
+    let deleted_index = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-rel-props-deleted-index"),
+            "MATCH (u)-[r:FOLLOWS {since: 2021}]->(v) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted_index,
+        QueryResultSet::new(vec![QueryColumn::new("u.id")], Vec::new())
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_optional_match_preserves_required_rows_with_null_bindings() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-optional-match", object_store).await;
+
+    for user in [1, 3] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                user,
+                VertexMetadata::default().with_label("User"),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "cypher-optional-follows".to_string(),
+        })
+        .await
+        .unwrap();
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "POSTED".to_string(),
+            src: 2,
+            dst: 99,
+            idempotency_key: "cypher-optional-posted".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-optional-read"),
+            "MATCH (u:User) OPTIONAL MATCH (u)-[:FOLLOWS]->(v) \
+             RETURN u.id AS user, v.id AS followed ORDER BY user",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("user"), QueryColumn::new("followed")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::VertexId(2)]),
+                QueryRow::new(vec![QueryValue::VertexId(3), QueryValue::Null]),
+            ],
+        )
+    );
+
+    let filtered_optional = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-optional-where"),
+            "MATCH (u:User) OPTIONAL MATCH (u)-[:FOLLOWS]->(v) WHERE v.id = 99 \
+             RETURN u.id AS user, v.id AS followed ORDER BY user",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        filtered_optional,
+        QueryResultSet::new(
+            vec![QueryColumn::new("user"), QueryColumn::new("followed")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::Null]),
+                QueryRow::new(vec![QueryValue::VertexId(3), QueryValue::Null]),
+            ],
+        )
+    );
+
+    let required_after_optional = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-optional-required-after"),
+            "MATCH (u:User) OPTIONAL MATCH (u)-[:FOLLOWS]->(v) \
+             MATCH (v)-[:POSTED]->(p) RETURN u.id AS user, p.id AS post",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        required_after_optional,
+        QueryResultSet::new(
+            vec![QueryColumn::new("user"), QueryColumn::new("post")],
+            vec![QueryRow::new(vec![
+                QueryValue::VertexId(1),
+                QueryValue::VertexId(99),
+            ])],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_union_merges_row_query_arms_with_distinct_or_all_semantics() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-union", object_store).await;
+
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default().with_label("User"),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            2,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_label("Moderator"),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            3,
+            VertexMetadata::default().with_label("Moderator"),
+        )
+        .await
+        .unwrap();
+
+    let distinct = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-union-distinct"),
+            "MATCH (u:User) RETURN u.id AS id \
+             UNION MATCH (m:Moderator) RETURN m.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        distinct,
+        QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(1)]),
+                QueryRow::new(vec![QueryValue::VertexId(2)]),
+                QueryRow::new(vec![QueryValue::VertexId(3)]),
+            ],
+        )
+    );
+
+    let all = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-union-all"),
+            "MATCH (u:User) RETURN u.id AS id \
+             UNION ALL MATCH (m:Moderator) RETURN m.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        all,
+        QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(1)]),
+                QueryRow::new(vec![QueryValue::VertexId(2)]),
+                QueryRow::new(vec![QueryValue::VertexId(2)]),
+                QueryRow::new(vec![QueryValue::VertexId(3)]),
+            ],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_row_engine_records_operational_metrics() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-row-query-metrics", object_store).await;
