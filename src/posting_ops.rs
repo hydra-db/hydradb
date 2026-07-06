@@ -223,8 +223,14 @@ pub async fn neighbors(
     dir: Direction,
     deleted_nodes: &RoaringTreemap,
 ) -> Result<RoaringTreemap> {
+    // Issue the base adjacency read and the deleted-edges tombstone read
+    // *concurrently* — they are independent, so this is one round of latency
+    // instead of two serial round-trips (matters most on S3; free in-memory).
     let base_key = edge_key(dir, anchor, pred);
-    let mut set = match storage.get(base_key).await? {
+    let del_key = deleted_edges_key(pred, anchor);
+    let (base_res, del_res) = futures::join!(storage.get(base_key), storage.get(del_key));
+
+    let mut set = match base_res? {
         None => RoaringTreemap::new(),
         Some(bytes) => {
             resolve_whole_set(
@@ -238,11 +244,69 @@ pub async fn neighbors(
         }
     };
 
-    if let Some(bytes) = storage.get(deleted_edges_key(pred, anchor)).await? {
+    if let Some(bytes) = del_res? {
         set -= decode_roaring(&bytes)?;
     }
     set -= deleted_nodes;
     Ok(set)
+}
+
+/// Max concurrent per-anchor [`neighbors`] reads inside a batched frontier
+/// expansion. Bounds the fan-out so a supernode frontier can't open thousands
+/// of simultaneous requests, while still overlapping the reads that dominate
+/// traversal latency (RFC 0007 §8.1, "batch neighbor reads").
+const FRONTIER_CONCURRENCY: usize = 64;
+
+/// Expand an **entire frontier** one `(pred, dir)` hop and roaring-union the
+/// results — the batched, concurrent replacement for a serial
+/// `for u in frontier { neighbors(u).await }` loop (RFC 0007 §8.1, the single
+/// biggest N+1 lever). Per-anchor [`neighbors`] calls run up to
+/// [`FRONTIER_CONCURRENCY`] at a time; the union is order-independent so the
+/// result is identical to the serial loop.
+pub async fn neighbors_batch(
+    storage: &GraphStorage,
+    frontier: impl IntoIterator<Item = Uid>,
+    pred: PredId,
+    dir: Direction,
+    deleted_nodes: &RoaringTreemap,
+) -> Result<RoaringTreemap> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+
+    let sets: Vec<RoaringTreemap> = stream::iter(frontier)
+        .map(|u| neighbors(storage, u, pred, dir, deleted_nodes))
+        .buffer_unordered(FRONTIER_CONCURRENCY)
+        .try_collect()
+        .await?;
+
+    let mut out = RoaringTreemap::new();
+    for s in sets {
+        out |= s;
+    }
+    Ok(out)
+}
+
+/// Like [`neighbors_batch`], but returns each anchor's neighbor set **paired
+/// with its anchor** instead of unioning — for callers that must preserve the
+/// src→dst binding (e.g. "messages authored by *this* person"). Concurrent,
+/// order of the returned vec is unspecified.
+pub async fn neighbors_each(
+    storage: &GraphStorage,
+    anchors: impl IntoIterator<Item = Uid>,
+    pred: PredId,
+    dir: Direction,
+    deleted_nodes: &RoaringTreemap,
+) -> Result<Vec<(Uid, RoaringTreemap)>> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+
+    stream::iter(anchors)
+        .map(|u| async move {
+            neighbors(storage, u, pred, dir, deleted_nodes)
+                .await
+                .map(|set| (u, set))
+        })
+        .buffer_unordered(FRONTIER_CONCURRENCY)
+        .try_collect()
+        .await
 }
 
 /// Materializes a posting's whole member set: the inline set if `Single`, or

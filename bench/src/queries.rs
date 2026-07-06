@@ -52,14 +52,29 @@
 //! apples-to-apples comparison. That's what `Cmd::Verify` /
 //! `bench/py/verify_diff.py` diff — see `Cmd::Verify`'s doc in `main.rs`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Context, Result};
 use roaring::RoaringTreemap;
 use serde_json::{Value, json};
-use turbolay::value::TypedValue;
+use turbolay::value::{NodeRecord, TypedValue};
 use turbolay::write::Writer;
 use turbolay::{Direction, LabelId, PredId, PropId, SchemaKind, Uid, posting_ops};
+
+/// Batch-fetch and decode the nodes for `uids` into a lookup map (present
+/// nodes only). One [`Writer::get_nodes`] fan-out instead of a serial
+/// `get_node` per uid, and the `BTreeSet` input dedups so a node reached
+/// several ways in one query is fetched+decoded **once** (the intra-query
+/// portion of the "no cache / re-decode" cost — R4/R5).
+async fn fetch_node_map(writer: &Writer, uids: &BTreeSet<u64>) -> Result<HashMap<u64, NodeRecord>> {
+    let ordered: Vec<Uid> = uids.iter().map(|u| Uid(*u)).collect();
+    let nodes = writer.get_nodes_cached(&ordered).await?;
+    Ok(ordered
+        .iter()
+        .zip(nodes)
+        .filter_map(|(u, n)| n.map(|node| (u.get(), node)))
+        .collect())
+}
 
 /// One of the LDBC SNB Complex Read queries this bench supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
@@ -327,6 +342,11 @@ async fn load_deleted_nodes(writer: &Writer) -> Result<RoaringTreemap> {
 /// Expands every uid in `frontier` by one `(pred, dir)` hop and unions the
 /// results — the frontier itself is a `RoaringTreemap`, so cross-node dedup
 /// within a single hop is automatic (see the module doc's determinism note).
+///
+/// Uses [`posting_ops::neighbors_batch`] so the frontier's per-node adjacency
+/// reads run concurrently (bounded), not one serial `await` per node — the
+/// N+1 fix (RFC 0007 §8.1). The unioned result is identical to the old serial
+/// loop; only the I/O scheduling changed.
 async fn expand_frontier(
     writer: &Writer,
     frontier: &RoaringTreemap,
@@ -334,13 +354,9 @@ async fn expand_frontier(
     dir: Direction,
     deleted_nodes: &RoaringTreemap,
 ) -> Result<RoaringTreemap> {
-    let mut out = RoaringTreemap::new();
-    for raw in frontier.iter() {
-        let ns =
-            posting_ops::neighbors(writer.storage(), Uid(raw), pred, dir, deleted_nodes).await?;
-        out |= ns;
-    }
-    Ok(out)
+    Ok(writer
+        .neighbors_batch_cached(frontier.iter().map(Uid), pred, dir, deleted_nodes)
+        .await?)
 }
 
 fn string_prop(props: &BTreeMap<PropId, TypedValue>, id: PropId) -> String {
@@ -372,26 +388,36 @@ async fn messages_by_frontier(
     deleted_nodes: &RoaringTreemap,
     mode: RowLimit,
 ) -> Result<Vec<Row>> {
-    let mut scored: Vec<(i64, String, Row)> = Vec::new();
-    for raw_person in frontier.iter() {
-        let person_uid = Uid(raw_person);
-        let Some(person_node) = writer.get_node(person_uid).await? else {
-            continue;
-        };
-        let first_name = string_prop(&person_node.props, schema.first_name);
-        let last_name = string_prop(&person_node.props, schema.last_name);
-
-        let messages = posting_ops::neighbors(
-            writer.storage(),
-            person_uid,
+    // 1. Every frontier person's authored messages, concurrently, keeping the
+    //    person→messages binding (creator name is a returned column).
+    let persons: Vec<Uid> = frontier.iter().map(Uid).collect();
+    let per_person = writer
+        .neighbors_each_cached(
+            persons.iter().copied(),
             schema.has_creator,
             Direction::In,
             deleted_nodes,
         )
         .await?;
+
+    // 2. One batched node fetch for every person + every message they created.
+    let mut want: BTreeSet<u64> = frontier.iter().collect();
+    for (_, msgs) in &per_person {
+        want.extend(msgs.iter());
+    }
+    let nodes = fetch_node_map(writer, &want).await?;
+
+    // 3. Build rows in memory — no further I/O.
+    let mut scored: Vec<(i64, String, Row)> = Vec::new();
+    for (person_uid, messages) in &per_person {
+        let Some(person_node) = nodes.get(&person_uid.get()) else {
+            continue;
+        };
+        let first_name = string_prop(&person_node.props, schema.first_name);
+        let last_name = string_prop(&person_node.props, schema.last_name);
+
         for raw_msg in messages.iter() {
-            let msg_uid = Uid(raw_msg);
-            let Some(msg_node) = writer.get_node(msg_uid).await? else {
+            let Some(msg_node) = nodes.get(&raw_msg) else {
                 continue;
             };
             // `HAS_CREATOR` is authored-by-Person for both Posts and
@@ -435,64 +461,82 @@ async fn ic07(
     deleted_nodes: &RoaringTreemap,
     mode: RowLimit,
 ) -> Result<Vec<Row>> {
-    let mut scored: Vec<(i64, String, Row)> = Vec::new();
-    for raw_author in frontier.iter() {
-        let messages = posting_ops::neighbors(
-            writer.storage(),
-            Uid(raw_author),
-            schema.has_creator,
-            Direction::In,
-            deleted_nodes,
-        )
+    // 1. Messages authored by the frontier (each message has one creator, so
+    //    the union across authors is already distinct).
+    let authors: Vec<Uid> = frontier.iter().map(Uid).collect();
+    let per_author = writer
+        .neighbors_each_cached(authors, schema.has_creator, Direction::In, deleted_nodes)
+        .await?;
+    let mut msg_set: BTreeSet<u64> = BTreeSet::new();
+    for (_, msgs) in &per_author {
+        msg_set.extend(msgs.iter());
+    }
+
+    // 2. Fetch message nodes (batched) to keep only `:Post` and read content.
+    let msg_nodes = fetch_node_map(writer, &msg_set).await?;
+    let post_msgs: Vec<Uid> = msg_set
+        .iter()
+        .filter(|m| {
+            msg_nodes
+                .get(m)
+                .is_some_and(|n| n.labels.contains(&schema.post))
+        })
+        .map(|m| Uid(*m))
+        .collect();
+
+    // 3. Likers of each post message, concurrently, keeping the message→fans
+    //    binding (message content + the per-pair LIKES edge prop).
+    let per_msg_fans = writer
+        .neighbors_each_cached(post_msgs, schema.likes, Direction::In, deleted_nodes)
         .await?;
 
-        for raw_msg in messages.iter() {
-            let msg_uid = Uid(raw_msg);
-            let Some(msg_node) = writer.get_node(msg_uid).await? else {
+    // 4. Batched fan-node fetch + batched per-(fan,message) edge-prop fetch.
+    let mut fan_set: BTreeSet<u64> = BTreeSet::new();
+    let mut edge_keys: Vec<(Uid, PredId, Uid)> = Vec::new();
+    for (msg, fans) in &per_msg_fans {
+        for raw_fan in fans.iter() {
+            fan_set.insert(raw_fan);
+            edge_keys.push((Uid(raw_fan), schema.likes, *msg));
+        }
+    }
+    let fan_nodes = fetch_node_map(writer, &fan_set).await?;
+    let edge_props = writer.edge_props_batch(&edge_keys).await?;
+
+    // 5. Build rows in memory. `ei` walks `edge_props` in the exact order
+    //    `edge_keys` was built (one slot per fan, advanced unconditionally).
+    let mut scored: Vec<(i64, String, Row)> = Vec::new();
+    let mut ei = 0usize;
+    for (msg, fans) in &per_msg_fans {
+        let content = msg_nodes
+            .get(&msg.get())
+            .map(|n| string_prop(&n.props, schema.content))
+            .unwrap_or_default();
+        for raw_fan in fans.iter() {
+            let props = &edge_props[ei];
+            ei += 1;
+            let Some(fan_node) = fan_nodes.get(&raw_fan) else {
                 continue;
             };
-            // `message:Post` in the Cypher pattern — exclude Comments authored
-            // by the frontier person (HAS_CREATOR alone doesn't distinguish).
-            if !msg_node.labels.contains(&schema.post) {
-                continue;
-            }
-            let content = string_prop(&msg_node.props, schema.content);
-
-            let fans = posting_ops::neighbors(
-                writer.storage(),
-                msg_uid,
-                schema.likes,
-                Direction::In,
-                deleted_nodes,
-            )
-            .await?;
-            for raw_fan in fans.iter() {
-                let fan_uid = Uid(raw_fan);
-                let Some(fan_node) = writer.get_node(fan_uid).await? else {
-                    continue;
-                };
-                let first_name = string_prop(&fan_node.props, schema.first_name);
-                let last_name = string_prop(&fan_node.props, schema.last_name);
-                let like_creation_date = writer
-                    .edge_props(fan_uid, schema.likes, msg_uid)
-                    .await?
-                    .and_then(|props| props.get(&schema.creation_date).cloned())
-                    .map(|v| match v {
-                        TypedValue::Int(i) => i,
-                        _ => 0,
-                    })
-                    .unwrap_or(0);
-                scored.push((
-                    like_creation_date,
-                    fan_node.xid.clone(),
-                    Row(vec![
-                        json!(first_name),
-                        json!(last_name),
-                        json!(like_creation_date),
-                        json!(content),
-                    ]),
-                ));
-            }
+            let first_name = string_prop(&fan_node.props, schema.first_name);
+            let last_name = string_prop(&fan_node.props, schema.last_name);
+            let like_creation_date = props
+                .as_ref()
+                .and_then(|p| p.get(&schema.creation_date).cloned())
+                .map(|v| match v {
+                    TypedValue::Int(i) => i,
+                    _ => 0,
+                })
+                .unwrap_or(0);
+            scored.push((
+                like_creation_date,
+                fan_node.xid.clone(),
+                Row(vec![
+                    json!(first_name),
+                    json!(last_name),
+                    json!(like_creation_date),
+                    json!(content),
+                ]),
+            ));
         }
     }
     Ok(finish_rows(scored, mode))
@@ -512,61 +556,70 @@ async fn ic08(
     deleted_nodes: &RoaringTreemap,
     mode: RowLimit,
 ) -> Result<Vec<Row>> {
-    let mut scored: Vec<(i64, String, Row)> = Vec::new();
-    for raw_author in frontier.iter() {
-        let posts = posting_ops::neighbors(
-            writer.storage(),
-            Uid(raw_author),
-            schema.has_creator,
-            Direction::In,
-            deleted_nodes,
-        )
+    // 1. Posts authored by the frontier (each has one creator → already distinct).
+    let authors: Vec<Uid> = frontier.iter().map(Uid).collect();
+    let per_author = writer
+        .neighbors_each_cached(authors, schema.has_creator, Direction::In, deleted_nodes)
+        .await?;
+    let mut post_set: BTreeSet<u64> = BTreeSet::new();
+    for (_, posts) in &per_author {
+        post_set.extend(posts.iter());
+    }
+
+    // 2. Fetch message nodes (batched); keep only `:Post` and read content.
+    let post_nodes = fetch_node_map(writer, &post_set).await?;
+    let posts: Vec<Uid> = post_set
+        .iter()
+        .filter(|p| {
+            post_nodes
+                .get(p)
+                .is_some_and(|n| n.labels.contains(&schema.post))
+        })
+        .map(|p| Uid(*p))
+        .collect();
+
+    // 3. Replies to each post, concurrently, keeping the post→replies binding
+    //    (post content is a returned column).
+    let per_post_replies = writer
+        .neighbors_each_cached(posts, schema.reply_of, Direction::In, deleted_nodes)
         .await?;
 
-        for raw_post in posts.iter() {
-            let post_uid = Uid(raw_post);
-            let Some(post_node) = writer.get_node(post_uid).await? else {
+    // 4. Batched reply-node fetch.
+    let mut reply_set: BTreeSet<u64> = BTreeSet::new();
+    for (_, replies) in &per_post_replies {
+        reply_set.extend(replies.iter());
+    }
+    let reply_nodes = fetch_node_map(writer, &reply_set).await?;
+
+    // 5. Build rows in memory.
+    let mut scored: Vec<(i64, String, Row)> = Vec::new();
+    for (post, replies) in &per_post_replies {
+        let post_content = post_nodes
+            .get(&post.get())
+            .map(|n| string_prop(&n.props, schema.content))
+            .unwrap_or_default();
+        for raw_reply in replies.iter() {
+            let Some(reply_node) = reply_nodes.get(&raw_reply) else {
                 continue;
             };
-            // `post:Post` in the Cypher pattern — exclude Comments authored by
-            // the frontier person (HAS_CREATOR alone doesn't distinguish).
-            if !post_node.labels.contains(&schema.post) {
+            // `reply:Comment` in the Cypher pattern — `REPLY_OF` can also point
+            // Comment->Comment (a reply to a reply), so exclude those here too
+            // (only direct Post replies survive the filter above, but the inner
+            // reply itself must be a Comment).
+            if !reply_node.labels.contains(&schema.comment) {
                 continue;
             }
-            let post_content = string_prop(&post_node.props, schema.content);
-
-            let replies = posting_ops::neighbors(
-                writer.storage(),
-                post_uid,
-                schema.reply_of,
-                Direction::In,
-                deleted_nodes,
-            )
-            .await?;
-            for raw_reply in replies.iter() {
-                let reply_uid = Uid(raw_reply);
-                let Some(reply_node) = writer.get_node(reply_uid).await? else {
-                    continue;
-                };
-                // `reply:Comment` in the Cypher pattern — `REPLY_OF` can also
-                // point Comment->Comment (a reply to a reply), so exclude
-                // those here too (only direct Post replies survive the outer
-                // filter above, but the inner reply itself must be a Comment).
-                if !reply_node.labels.contains(&schema.comment) {
-                    continue;
-                }
-                let reply_content = string_prop(&reply_node.props, schema.content);
-                let reply_date = int_prop(&reply_node.props, schema.creation_date);
-                scored.push((
-                    reply_date,
-                    reply_node.xid.clone(),
-                    Row(vec![
-                        json!(reply_content),
-                        json!(reply_date),
-                        json!(post_content),
-                    ]),
-                ));
-            }
+            let reply_content = string_prop(&reply_node.props, schema.content);
+            let reply_date = int_prop(&reply_node.props, schema.creation_date);
+            scored.push((
+                reply_date,
+                reply_node.xid.clone(),
+                Row(vec![
+                    json!(reply_content),
+                    json!(reply_date),
+                    json!(post_content),
+                ]),
+            ));
         }
     }
     Ok(finish_rows(scored, mode))
