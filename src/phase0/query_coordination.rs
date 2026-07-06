@@ -104,9 +104,28 @@ impl QueryTransportClientConfig {
 
 #[cfg(feature = "query-transport")]
 #[derive(Clone)]
+pub enum QueryTransportAuthPolicy {
+    RejectAll,
+    BearerToken(String),
+    InsecureAllowAll,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportAuthPolicy {
+    fn accepts(&self, auth: &QueryTransportAuth) -> bool {
+        match self {
+            Self::RejectAll => false,
+            Self::BearerToken(required) => auth.bearer_token.as_deref() == Some(required.as_str()),
+            Self::InsecureAllowAll => true,
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone)]
 pub struct QueryTransportServerConfig {
     pub max_frame_bytes: usize,
-    pub required_bearer_token: Option<String>,
+    pub auth_policy: QueryTransportAuthPolicy,
     pub max_concurrent_requests: usize,
     pub slow_query_log_threshold: Option<Duration>,
     #[cfg(feature = "query-transport-tls")]
@@ -118,7 +137,7 @@ impl Default for QueryTransportServerConfig {
     fn default() -> Self {
         Self {
             max_frame_bytes: DEFAULT_QUERY_TRANSPORT_MAX_FRAME_BYTES,
-            required_bearer_token: None,
+            auth_policy: QueryTransportAuthPolicy::RejectAll,
             max_concurrent_requests: 128,
             slow_query_log_threshold: Some(Duration::from_millis(500)),
             #[cfg(feature = "query-transport-tls")]
@@ -130,7 +149,12 @@ impl Default for QueryTransportServerConfig {
 #[cfg(feature = "query-transport")]
 impl QueryTransportServerConfig {
     pub fn with_required_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.required_bearer_token = Some(token.into());
+        self.auth_policy = QueryTransportAuthPolicy::BearerToken(token.into());
+        self
+    }
+
+    pub fn insecure_allow_unauthenticated(mut self) -> Self {
+        self.auth_policy = QueryTransportAuthPolicy::InsecureAllowAll;
         self
     }
 
@@ -344,6 +368,7 @@ pub struct TcpQueryServer {
     task: JoinHandle<Result<()>>,
     metrics: Arc<QueryTransportMetrics>,
     cancellations: Arc<Mutex<BTreeSet<String>>>,
+    active_queries: Arc<Mutex<BTreeSet<String>>>,
 }
 
 #[cfg(feature = "query-transport")]
@@ -351,6 +376,7 @@ struct QueryTransportServerRuntime {
     config: QueryTransportServerConfig,
     metrics: Arc<QueryTransportMetrics>,
     cancellations: Arc<Mutex<BTreeSet<String>>>,
+    active_queries: Arc<Mutex<BTreeSet<String>>>,
     request_gate: Arc<Semaphore>,
 }
 
@@ -387,11 +413,13 @@ impl TcpQueryServer {
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let metrics = Arc::new(QueryTransportMetrics::default());
         let cancellations = Arc::new(Mutex::new(BTreeSet::new()));
+        let active_queries = Arc::new(Mutex::new(BTreeSet::new()));
         let max_concurrent_requests = config.max_concurrent_requests.max(1);
         let runtime = Arc::new(QueryTransportServerRuntime {
             config,
             metrics: Arc::clone(&metrics),
             cancellations: Arc::clone(&cancellations),
+            active_queries: Arc::clone(&active_queries),
             request_gate: Arc::new(Semaphore::new(max_concurrent_requests)),
         });
         let task = tokio::spawn(async move {
@@ -426,6 +454,7 @@ impl TcpQueryServer {
             task,
             metrics,
             cancellations,
+            active_queries,
         })
     }
 
@@ -440,8 +469,10 @@ impl TcpQueryServer {
     pub async fn cancel_query(&self, query_id: impl Into<String>) -> Result<()> {
         let query_id = query_id.into();
         validate_component("query_id", &query_id)?;
-        self.cancellations.lock().await.insert(query_id);
-        self.metrics.cancellations.fetch_add(1, Ordering::Relaxed);
+        if self.active_queries.lock().await.contains(&query_id) {
+            self.cancellations.lock().await.insert(query_id);
+            self.metrics.cancellations.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -1253,11 +1284,13 @@ async fn execute_query_transport_request(
             }
             match validate_component("query_id", &query_id) {
                 Ok(()) => {
-                    runtime.cancellations.lock().await.insert(query_id);
-                    runtime
-                        .metrics
-                        .cancellations
-                        .fetch_add(1, Ordering::Relaxed);
+                    if runtime.active_queries.lock().await.contains(&query_id) {
+                        runtime.cancellations.lock().await.insert(query_id);
+                        runtime
+                            .metrics
+                            .cancellations
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     QueryTransportResponse::Cancelled
                 }
                 Err(err) => transport_error_response(&runtime, err),
@@ -1285,44 +1318,71 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    let _permit = acquire_query_transport_permit(runtime).await?;
-    ensure_query_not_cancelled(runtime, query_id).await?;
-    runtime
-        .metrics
-        .requests_started
-        .fetch_add(1, Ordering::Relaxed);
-    let started = std::time::Instant::now();
-    let result = execute().await;
-    let elapsed = started.elapsed();
-    runtime.metrics.remote_latency_us.fetch_add(
-        elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
-        Ordering::Relaxed,
-    );
-    let is_slow_query = match runtime.config.slow_query_log_threshold {
-        Some(threshold) => elapsed >= threshold,
-        None => false,
-    };
-    if is_slow_query {
-        runtime.metrics.slow_queries.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(
-            target: "slatedb_graph_kernel",
-            query_id,
-            elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
-            "slow query transport request"
+    begin_query_lifecycle(runtime, query_id).await?;
+    let result = async {
+        let _permit = acquire_query_transport_permit(runtime).await?;
+        ensure_query_not_cancelled(runtime, query_id).await?;
+        runtime
+            .metrics
+            .requests_started
+            .fetch_add(1, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let result = execute().await;
+        let elapsed = started.elapsed();
+        runtime.metrics.remote_latency_us.fetch_add(
+            elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
         );
+        let is_slow_query = match runtime.config.slow_query_log_threshold {
+            Some(threshold) => elapsed >= threshold,
+            None => false,
+        };
+        if is_slow_query {
+            runtime.metrics.slow_queries.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "slatedb_graph_kernel",
+                query_id,
+                elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+                "slow query transport request"
+            );
+        }
+        ensure_query_not_cancelled(runtime, query_id).await?;
+        match &result {
+            Ok(_) => runtime
+                .metrics
+                .requests_completed
+                .fetch_add(1, Ordering::Relaxed),
+            Err(_) => runtime
+                .metrics
+                .requests_failed
+                .fetch_add(1, Ordering::Relaxed),
+        };
+        result
     }
-    ensure_query_not_cancelled(runtime, query_id).await?;
-    match &result {
-        Ok(_) => runtime
-            .metrics
-            .requests_completed
-            .fetch_add(1, Ordering::Relaxed),
-        Err(_) => runtime
-            .metrics
-            .requests_failed
-            .fetch_add(1, Ordering::Relaxed),
-    };
+    .await;
+    finish_query_lifecycle(runtime, query_id).await;
     result
+}
+
+#[cfg(feature = "query-transport")]
+async fn begin_query_lifecycle(
+    runtime: &QueryTransportServerRuntime,
+    query_id: &str,
+) -> Result<()> {
+    let mut active = runtime.active_queries.lock().await;
+    if !active.insert(query_id.to_string()) {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "QueryTransport",
+            feature: format!("query id {query_id} is already active"),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "query-transport")]
+async fn finish_query_lifecycle(runtime: &QueryTransportServerRuntime, query_id: &str) {
+    runtime.active_queries.lock().await.remove(query_id);
+    runtime.cancellations.lock().await.remove(query_id);
 }
 
 #[cfg(feature = "query-transport")]
@@ -1371,21 +1431,17 @@ fn authenticate_query_transport(
     runtime: &QueryTransportServerRuntime,
     auth: &QueryTransportAuth,
 ) -> Result<()> {
-    let Some(required) = &runtime.config.required_bearer_token else {
+    if runtime.config.auth_policy.accepts(auth) {
         return Ok(());
-    };
-    if auth.bearer_token.as_deref() == Some(required.as_str()) {
-        Ok(())
-    } else {
-        runtime
-            .metrics
-            .auth_failures
-            .fetch_add(1, Ordering::Relaxed);
-        Err(GraphError::UnsupportedQuery {
-            dialect: "QueryTransport",
-            feature: "unauthorized query transport request".to_string(),
-        })
     }
+    runtime
+        .metrics
+        .auth_failures
+        .fetch_add(1, Ordering::Relaxed);
+    Err(GraphError::UnsupportedQuery {
+        dialect: "QueryTransport",
+        feature: "unauthorized query transport request".to_string(),
+    })
 }
 
 #[cfg(feature = "query-transport")]

@@ -304,9 +304,9 @@ pub use query_coordination::{
 };
 #[cfg(feature = "query-transport")]
 pub use query_coordination::{
-    QueryServiceDirectory, QueryServiceEndpoint, QueryTransportClientConfig,
-    QueryTransportMetricsSnapshot, QueryTransportServerConfig, TcpQueryCellClient,
-    TcpQueryRowStream, TcpQueryServer,
+    QueryServiceDirectory, QueryServiceEndpoint, QueryTransportAuthPolicy,
+    QueryTransportClientConfig, QueryTransportMetricsSnapshot, QueryTransportServerConfig,
+    TcpQueryCellClient, TcpQueryRowStream, TcpQueryServer,
 };
 
 pub use control_metadata::{

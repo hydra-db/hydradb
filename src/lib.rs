@@ -56,9 +56,9 @@ pub use phase0::{
 };
 #[cfg(feature = "query-transport")]
 pub use phase0::{
-    QueryServiceDirectory, QueryServiceEndpoint, QueryTransportClientConfig,
-    QueryTransportMetricsSnapshot, QueryTransportServerConfig, TcpQueryCellClient,
-    TcpQueryRowStream, TcpQueryServer,
+    QueryServiceDirectory, QueryServiceEndpoint, QueryTransportAuthPolicy,
+    QueryTransportClientConfig, QueryTransportMetricsSnapshot, QueryTransportServerConfig,
+    TcpQueryCellClient, TcpQueryRowStream, TcpQueryServer,
 };
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
