@@ -174,6 +174,17 @@ enum Cmd {
         /// `--param-count`. See `Run`'s `--anchor-index`.
         #[arg(long)]
         anchor_index: Vec<usize>,
+        /// Inject hub persons when generating a fresh dataset — **must match
+        /// the `run` sweep's `--hub-count`** or the anchors chosen by
+        /// `--anchor-index 0..N` land on regular low-degree people and the
+        /// degree axis silently collapses. Ignored when `--dataset-dir`
+        /// already has data. See `Run`'s `--hub-count`.
+        #[arg(long, default_value_t = 0)]
+        hub_count: usize,
+        /// Target total degree for each hub person. Must match `run`'s
+        /// `--hub-degree`. See `Run`'s `--hub-degree`.
+        #[arg(long, default_value_t = 0)]
+        hub_degree: usize,
     },
 }
 
@@ -312,11 +323,16 @@ async fn main() -> Result<()> {
             batch_size,
             hops,
             anchor_index,
+            hub_count,
+            hub_degree,
         } => {
-            // Hub params must match the Run sweep: reuse the dataset dir's hub
-            // generation via resolve_dataset (hub_count/degree come from the dir
-            // if it already exists, else default). We only need the CSVs here.
-            let (dataset_dir, sizes) = resolve_dataset(dataset_dir, scale, seed, 0, 0)?;
+            // A freshly-generated verify dataset must carry the SAME hubs as the
+            // run sweep — otherwise `--anchor-index 0..N` anchors on regular
+            // low-degree people, the degree axis collapses, and the accuracy
+            // dump compares the wrong graph. (Ignored when `--dataset-dir`
+            // already has CSVs; resolve_dataset reuses those.)
+            let (dataset_dir, sizes) =
+                resolve_dataset(dataset_dir, scale, seed, hub_count, hub_degree)?;
 
             let mut writer = Writer::in_memory().await?;
             loader::load_into_writer(&mut writer, &dataset_dir, batch_size).await?;
@@ -353,7 +369,9 @@ async fn main() -> Result<()> {
                     for p in &params {
                         let rows =
                             queries::execute_distinct_with_hops(&writer, &schema, *q, p, *h).await?;
-                        let effective_hops = h.unwrap_or(0);
+                        // No `--hops` → the query's natural depth (not 0), so
+                        // verify's `(query, hops)` keys line up with `run`'s.
+                        let effective_hops = h.unwrap_or_else(|| q.natural_hops());
                         dumps.push(serde_json::json!({
                             "query": q.name(),
                             "hops": effective_hops,
