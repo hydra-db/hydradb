@@ -197,9 +197,12 @@ impl QueryTransportAuthPolicy {
                 allowed_fingerprints,
                 bearer_token,
             } => {
-                let bearer_ok = bearer_token.as_ref().map_or(true, |required| {
-                    auth.bearer_token.as_deref() == Some(required.expose_secret())
-                });
+                let bearer_ok = match bearer_token {
+                    Some(required) => {
+                        auth.bearer_token.as_deref() == Some(required.expose_secret())
+                    }
+                    None => true,
+                };
                 bearer_ok
                     && _identity
                         .tls_peer_fingerprints
@@ -508,14 +511,6 @@ impl QueryServiceEndpoint {
     pub fn with_client_config(mut self, client_config: QueryTransportClientConfig) -> Self {
         self.client_config = client_config;
         self
-    }
-
-    pub fn directory_from_endpointslices_json(
-        value: &serde_json::Value,
-        port_name: Option<&str>,
-        client_config: QueryTransportClientConfig,
-    ) -> Result<QueryServiceDirectory> {
-        parse_kubernetes_endpointslices(value, port_name, client_config)
     }
 }
 

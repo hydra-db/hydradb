@@ -948,8 +948,9 @@ impl GraphShard {
             .acquire_cell_write_lock(cell_id, "refresh_edge_type_query_stats")
             .await?;
         let read_epoch = self.current_epoch(cell_id).await?;
+        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
         let count = self
-            .edges_at_with_budget(cell_id, edge_type, read_epoch, None)
+            .edges_at_with_budget(cell_id, edge_type, read_epoch, Some(&budget))
             .await?
             .len() as u64;
         let mut batch = GraphWriteBatch::new();
@@ -3214,11 +3215,10 @@ impl QueryBudget {
     }
 
     fn check(&self, operation: &'static str) -> Result<()> {
-        if self
-            .cancellation_token
-            .as_ref()
-            .map_or(false, QueryCancellationToken::is_cancelled)
-        {
+        if let Some(token) = &self.cancellation_token {
+            if !token.is_cancelled() {
+                return self.check_runtime_limit(operation);
+            }
             return Err(GraphError::QueryTimeout {
                 operation: "query_cancelled",
                 elapsed_ms: self
@@ -3229,6 +3229,10 @@ impl QueryBudget {
                 limit_ms: 0,
             });
         }
+        self.check_runtime_limit(operation)
+    }
+
+    fn check_runtime_limit(&self, operation: &'static str) -> Result<()> {
         let Some(limit_ms) = self.max_runtime_ms else {
             return Ok(());
         };
