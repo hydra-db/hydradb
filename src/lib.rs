@@ -38,7 +38,9 @@ pub use opencypher::{
     RowPredicate, RowProjection, RowSort, RowSortExpression,
 };
 #[cfg(feature = "opencypher")]
-pub use opencypher_corpus::{parse_opencypher_tck_corpus, CypherTckCase, CypherTckCorpus};
+pub use opencypher_corpus::{
+    parse_opencypher_tck_corpus, CypherTckCase, CypherTckCompatibilityReport, CypherTckCorpus,
+};
 pub use phase0::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
     BenchmarkResult, DeltaGcResult, GraphControlEdgeWatermark, GraphControlIdempotencyRecord,
@@ -48,9 +50,16 @@ pub use phase0::{
     ShardLease, ShardPlacement, SupernodeGroup, SupernodePage, TraversalBackend,
 };
 #[cfg(feature = "opencypher")]
-pub use phase0::{DistributedQueryCoordinator, DistributedQueryPageRequest, QueryCellClient};
+pub use phase0::{
+    DistributedQueryCoordinator, DistributedQueryJoin, DistributedQueryLeg, DistributedQueryMerge,
+    DistributedQueryPageRequest, DistributedQueryPlan, DistributedQueryPlanResult, QueryCellClient,
+};
 #[cfg(feature = "query-transport")]
-pub use phase0::{TcpQueryCellClient, TcpQueryServer};
+pub use phase0::{
+    QueryServiceDirectory, QueryServiceEndpoint, QueryTransportClientConfig,
+    QueryTransportMetricsSnapshot, QueryTransportServerConfig, TcpQueryCellClient,
+    TcpQueryRowStream, TcpQueryServer,
+};
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
     LocalityCellExtractor, LocalityLayoutExperiment, StorageLayout,

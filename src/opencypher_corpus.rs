@@ -7,6 +7,7 @@ use crate::{
 pub struct CypherTckCorpus {
     pub cases: Vec<CypherTckCase>,
     pub skipped: Vec<String>,
+    pub total_scenarios: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,6 +15,25 @@ pub struct CypherTckCase {
     pub name: String,
     pub query: String,
     pub expected: QueryResultSet,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CypherTckCompatibilityReport {
+    pub total_scenarios: usize,
+    pub runnable_scenarios: usize,
+    pub skipped_scenarios: usize,
+    pub skipped: Vec<String>,
+}
+
+impl CypherTckCorpus {
+    pub fn compatibility_report(&self) -> CypherTckCompatibilityReport {
+        CypherTckCompatibilityReport {
+            total_scenarios: self.total_scenarios,
+            runnable_scenarios: self.cases.len(),
+            skipped_scenarios: self.skipped.len(),
+            skipped: self.skipped.clone(),
+        }
+    }
 }
 
 pub fn parse_opencypher_tck_corpus(input: &str) -> Result<CypherTckCorpus> {
@@ -26,6 +46,7 @@ struct TckCorpusParser<'a> {
     idx: usize,
     cases: Vec<CypherTckCase>,
     skipped: Vec<String>,
+    total_scenarios: usize,
 }
 
 impl<'a> TckCorpusParser<'a> {
@@ -35,6 +56,7 @@ impl<'a> TckCorpusParser<'a> {
             idx: 0,
             cases: Vec::new(),
             skipped: Vec::new(),
+            total_scenarios: 0,
         }
     }
 
@@ -42,6 +64,7 @@ impl<'a> TckCorpusParser<'a> {
         while self.idx < self.lines.len() {
             let line = self.trimmed();
             if let Some(name) = scenario_name(line) {
+                self.total_scenarios += 1;
                 self.idx += 1;
                 self.parse_scenario(name)?;
             } else {
@@ -51,6 +74,7 @@ impl<'a> TckCorpusParser<'a> {
         Ok(CypherTckCorpus {
             cases: std::mem::take(&mut self.cases),
             skipped: std::mem::take(&mut self.skipped),
+            total_scenarios: self.total_scenarios,
         })
     }
 

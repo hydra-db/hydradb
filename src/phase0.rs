@@ -299,10 +299,15 @@ mod verify;
 
 #[cfg(feature = "opencypher")]
 pub use query_coordination::{
-    DistributedQueryCoordinator, DistributedQueryPageRequest, QueryCellClient,
+    DistributedQueryCoordinator, DistributedQueryJoin, DistributedQueryLeg, DistributedQueryMerge,
+    DistributedQueryPageRequest, DistributedQueryPlan, DistributedQueryPlanResult, QueryCellClient,
 };
 #[cfg(feature = "query-transport")]
-pub use query_coordination::{TcpQueryCellClient, TcpQueryServer};
+pub use query_coordination::{
+    QueryServiceDirectory, QueryServiceEndpoint, QueryTransportClientConfig,
+    QueryTransportMetricsSnapshot, QueryTransportServerConfig, TcpQueryCellClient,
+    TcpQueryRowStream, TcpQueryServer,
+};
 
 pub use control_metadata::{
     GraphControlEdgeWatermark, GraphControlIdempotencyRecord, GraphControlRepairReport,

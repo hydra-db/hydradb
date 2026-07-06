@@ -227,6 +227,13 @@ impl ShardPlacement {
     pub fn cells(&self) -> impl Iterator<Item = &str> {
         self.owners.keys().map(String::as_str)
     }
+
+    pub fn node_ids(&self) -> impl Iterator<Item = &str> {
+        let mut nodes = self.owners.values().map(String::as_str).collect::<Vec<_>>();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes.into_iter()
+    }
 }
 
 impl RoutedPhase0Cluster {
@@ -543,6 +550,34 @@ impl RoutedPhase0Cluster {
         self.ensure_active_write_lease(cell_id)?;
         shard
             .write_edges_batch_chunked(cell_id, edge_type, edges, idempotency_key, chunk_size)
+            .await
+    }
+
+    pub async fn set_vertex_metadata(
+        &self,
+        cell_id: &str,
+        vertex_id: crate::VertexId,
+        metadata: crate::VertexMetadata,
+    ) -> Result<()> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard
+            .set_vertex_metadata(cell_id, vertex_id, metadata)
+            .await
+    }
+
+    pub async fn set_edge_metadata(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: crate::VertexId,
+        dst: crate::VertexId,
+        metadata: crate::EdgeMetadata,
+    ) -> Result<bool> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard
+            .set_edge_metadata(cell_id, edge_type, src, dst, metadata)
             .await
     }
 
