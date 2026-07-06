@@ -1,0 +1,214 @@
+{
+  "scale": 1.0,
+  "seed": 42,
+  "backend": "s3://turbolay-tier3-1783311225",
+  "dataset_sizes": {
+    "persons": 10000,
+    "posts": 100000,
+    "comments": 50000,
+    "knows": 100000,
+    "has_creator": 150000,
+    "likes": 100000,
+    "reply_of": 30000
+  },
+  "results": [
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic02",
+      "param": "50000000000000000000000000000000",
+      "rows": 20,
+      "cold_us": 8819,
+      "warm_p50_us": 6803,
+      "warm_p95_us": 8981,
+      "warm_p99_us": 10058,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic02",
+      "param": "50000000000000000000000000000d05",
+      "rows": 20,
+      "cold_us": 5518,
+      "warm_p50_us": 5879,
+      "warm_p95_us": 6678,
+      "warm_p99_us": 6719,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic02",
+      "param": "50000000000000000000000000001a0a",
+      "rows": 20,
+      "cold_us": 5580,
+      "warm_p50_us": 6491,
+      "warm_p95_us": 10793,
+      "warm_p99_us": 10951,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic07",
+      "param": "50000000000000000000000000000000",
+      "rows": 4,
+      "cold_us": 1269,
+      "warm_p50_us": 874,
+      "warm_p95_us": 946,
+      "warm_p99_us": 1003,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic07",
+      "param": "50000000000000000000000000000d05",
+      "rows": 6,
+      "cold_us": 1169,
+      "warm_p50_us": 896,
+      "warm_p95_us": 1016,
+      "warm_p99_us": 1047,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic07",
+      "param": "50000000000000000000000000001a0a",
+      "rows": 4,
+      "cold_us": 1139,
+      "warm_p50_us": 851,
+      "warm_p95_us": 898,
+      "warm_p99_us": 908,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic08",
+      "param": "50000000000000000000000000000000",
+      "rows": 1,
+      "cold_us": 802,
+      "warm_p50_us": 790,
+      "warm_p95_us": 1175,
+      "warm_p99_us": 1305,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic08",
+      "param": "50000000000000000000000000000d05",
+      "rows": 2,
+      "cold_us": 1007,
+      "warm_p50_us": 964,
+      "warm_p95_us": 1139,
+      "warm_p99_us": 1274,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic08",
+      "param": "50000000000000000000000000001a0a",
+      "rows": 4,
+      "cold_us": 1308,
+      "warm_p50_us": 1169,
+      "warm_p95_us": 1405,
+      "warm_p99_us": 1745,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic09",
+      "param": "50000000000000000000000000000000",
+      "rows": 20,
+      "cold_us": 109227,
+      "warm_p50_us": 82760,
+      "warm_p95_us": 196961,
+      "warm_p99_us": 203076,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic09",
+      "param": "50000000000000000000000000000d05",
+      "rows": 20,
+      "cold_us": 43898,
+      "warm_p50_us": 44834,
+      "warm_p95_us": 64855,
+      "warm_p99_us": 155711,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic09",
+      "param": "50000000000000000000000000001a0a",
+      "rows": 20,
+      "cold_us": 34889,
+      "warm_p50_us": 40952,
+      "warm_p95_us": 62349,
+      "warm_p99_us": 175804,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic3h",
+      "param": "50000000000000000000000000000000",
+      "rows": 20,
+      "cold_us": 793295,
+      "warm_p50_us": 876056,
+      "warm_p95_us": 1072657,
+      "warm_p99_us": 1084789,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic3h",
+      "param": "50000000000000000000000000000d05",
+      "rows": 20,
+      "cold_us": 497308,
+      "warm_p50_us": 413721,
+      "warm_p95_us": 466071,
+      "warm_p99_us": 684860,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic3h",
+      "param": "50000000000000000000000000001a0a",
+      "rows": 20,
+      "cold_us": 482236,
+      "warm_p50_us": 430651,
+      "warm_p95_us": 481200,
+      "warm_p99_us": 488680,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic4h",
+      "param": "50000000000000000000000000000000",
+      "rows": 20,
+      "cold_us": 4856096,
+      "warm_p50_us": 4818530,
+      "warm_p95_us": 5136860,
+      "warm_p99_us": 5276053,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic4h",
+      "param": "50000000000000000000000000000d05",
+      "rows": 20,
+      "cold_us": 3134726,
+      "warm_p50_us": 3332524,
+      "warm_p95_us": 3620012,
+      "warm_p99_us": 4015889,
+      "warm_runs": 20
+    },
+    {
+      "backend": "s3://turbolay-tier3-1783311225",
+      "query": "ic4h",
+      "param": "50000000000000000000000000001a0a",
+      "rows": 20,
+      "cold_us": 3280165,
+      "warm_p50_us": 3176115,
+      "warm_p95_us": 3397005,
+      "warm_p99_us": 3625136,
+      "warm_runs": 20
+    }
+  ]
+}
