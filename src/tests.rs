@@ -6182,6 +6182,30 @@ async fn tcp_query_transport_applies_server_backpressure_under_load() {
         .await
         .unwrap();
     assert_eq!(reused.rows.len(), 1);
+
+    let finished = client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "query-transport-late-cancel"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(finished.rows.len(), 1);
+    let late_cancel = client
+        .cancel_query("query-transport-late-cancel")
+        .await
+        .unwrap_err();
+    assert!(late_cancel
+        .to_string()
+        .contains("no active query with id query-transport-late-cancel was cancelled"));
+    let reused_after_late_cancel = client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "query-transport-late-cancel"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(reused_after_late_cancel.rows.len(), 1);
     let metrics = server.metrics();
     assert!(metrics.cancellations >= 1);
     assert!(metrics.cancelled_rejections >= 1);
