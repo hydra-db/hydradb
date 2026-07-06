@@ -165,12 +165,17 @@ impl GraphShard {
             bindings = filtered;
         }
 
-        if query.projections == [RowProjection::CountAll] {
-            let row = QueryRow::new(vec![QueryValue::Count(bindings.len() as u64)]);
-            let sort_keys = sort_keys_for_projected_only(&row, &query.columns, &query.order_by)?;
+        if row_projections_have_aggregates(&query.projections) {
+            let projected = aggregate_projected_rows(
+                bindings,
+                &query.projections,
+                &query.columns,
+                &query.order_by,
+                &budget,
+            )?;
             return self.finish_projected_rows(
                 query.columns,
-                vec![ProjectedQueryRow { row, sort_keys }],
+                projected,
                 &query.order_by,
                 context.result_window,
                 &budget,
@@ -1863,6 +1868,16 @@ enum RowScalarValue {
 }
 
 #[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AggregateAccumulator {
+    CountAll(u64),
+    CountExpression(u64),
+    Sum(u128),
+    Avg { sum: u128, count: u64 },
+    Collect(Vec<QueryValue>),
+}
+
+#[cfg(feature = "opencypher")]
 fn constrain_row_pattern(pattern: &RowPattern, row: &BindingRow) -> Result<Option<RowPattern>> {
     Ok(Some(match pattern {
         RowPattern::Node(node) => {
@@ -2076,15 +2091,275 @@ fn project_binding_row(row: &BindingRow, projections: &[RowProjection]) -> Resul
                 })?;
                 values.push(QueryValue::Property(value));
             }
-            RowProjection::CountAll => {
+            RowProjection::CountAll | RowProjection::Aggregate { .. } => {
                 return Err(GraphError::UnsupportedQuery {
                     dialect: "OpenCypher",
-                    feature: "count(*) projection must be planned as an aggregate".to_string(),
+                    feature: "aggregate projection must be planned as an aggregate".to_string(),
                 });
             }
         }
     }
     Ok(QueryRow::new(values))
+}
+
+#[cfg(feature = "opencypher")]
+fn row_projections_have_aggregates(projections: &[RowProjection]) -> bool {
+    projections.iter().any(is_aggregate_projection)
+}
+
+#[cfg(feature = "opencypher")]
+fn is_aggregate_projection(projection: &RowProjection) -> bool {
+    matches!(
+        projection,
+        RowProjection::CountAll | RowProjection::Aggregate { .. }
+    )
+}
+
+#[cfg(feature = "opencypher")]
+fn aggregate_projected_rows(
+    bindings: Vec<BindingRow>,
+    projections: &[RowProjection],
+    columns: &[QueryColumn],
+    order_by: &[RowSort],
+    budget: &QueryBudget,
+) -> Result<Vec<ProjectedQueryRow>> {
+    let group_projection_indexes: Vec<_> = projections
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, projection)| (!is_aggregate_projection(projection)).then_some(idx))
+        .collect();
+    let aggregate_projection_indexes: Vec<_> = projections
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, projection)| is_aggregate_projection(projection).then_some(idx))
+        .collect();
+
+    let mut groups = BTreeMap::<Vec<QueryValue>, Vec<AggregateAccumulator>>::new();
+    if bindings.is_empty() && group_projection_indexes.is_empty() {
+        groups.insert(
+            Vec::new(),
+            aggregate_projection_indexes
+                .iter()
+                .map(|idx| new_aggregate_accumulator(&projections[*idx]))
+                .collect::<Result<_>>()?,
+        );
+    }
+
+    for binding in bindings {
+        budget.check("cypher_aggregate_group")?;
+        let mut group_key = Vec::with_capacity(group_projection_indexes.len());
+        for idx in &group_projection_indexes {
+            group_key.push(project_single_binding_value(&binding, &projections[*idx])?);
+        }
+        let states = match groups.entry(group_key) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                aggregate_projection_indexes
+                    .iter()
+                    .map(|idx| new_aggregate_accumulator(&projections[*idx]))
+                    .collect::<Result<_>>()?,
+            ),
+        };
+        for (state_idx, projection_idx) in aggregate_projection_indexes.iter().enumerate() {
+            apply_aggregate_projection(
+                &mut states[state_idx],
+                &projections[*projection_idx],
+                &binding,
+            )?;
+        }
+    }
+
+    let mut projected = Vec::with_capacity(groups.len());
+    for (group_key, states) in groups {
+        budget.check("cypher_aggregate_project")?;
+        let mut group_idx = 0;
+        let mut aggregate_idx = 0;
+        let mut values = Vec::with_capacity(projections.len());
+        for projection in projections {
+            if is_aggregate_projection(projection) {
+                values.push(finalize_aggregate(&states[aggregate_idx])?);
+                aggregate_idx += 1;
+            } else {
+                values.push(group_key[group_idx].clone());
+                group_idx += 1;
+            }
+        }
+        let row = QueryRow::new(values);
+        let sort_keys = sort_keys_for_projected_only(&row, columns, order_by)?;
+        projected.push(ProjectedQueryRow { row, sort_keys });
+    }
+    Ok(projected)
+}
+
+#[cfg(feature = "opencypher")]
+fn new_aggregate_accumulator(projection: &RowProjection) -> Result<AggregateAccumulator> {
+    Ok(match projection {
+        RowProjection::CountAll => AggregateAccumulator::CountAll(0),
+        RowProjection::Aggregate { function, .. } => match function {
+            RowAggregateFunction::Count => AggregateAccumulator::CountExpression(0),
+            RowAggregateFunction::Sum => AggregateAccumulator::Sum(0),
+            RowAggregateFunction::Avg => AggregateAccumulator::Avg { sum: 0, count: 0 },
+            RowAggregateFunction::Collect => AggregateAccumulator::Collect(Vec::new()),
+        },
+        _ => {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "non-aggregate projection cannot create aggregate state".to_string(),
+            });
+        }
+    })
+}
+
+#[cfg(feature = "opencypher")]
+fn apply_aggregate_projection(
+    state: &mut AggregateAccumulator,
+    projection: &RowProjection,
+    row: &BindingRow,
+) -> Result<()> {
+    match (state, projection) {
+        (AggregateAccumulator::CountAll(count), RowProjection::CountAll) => {
+            *count = count.saturating_add(1);
+        }
+        (
+            AggregateAccumulator::CountExpression(count),
+            RowProjection::Aggregate {
+                function: RowAggregateFunction::Count,
+                expression,
+            },
+        ) => {
+            if expression_query_value(row, expression)?.is_some() {
+                *count = count.saturating_add(1);
+            }
+        }
+        (
+            AggregateAccumulator::Sum(sum),
+            RowProjection::Aggregate {
+                function: RowAggregateFunction::Sum,
+                expression,
+            },
+        ) => {
+            if let Some(value) = aggregate_integer_value(row, expression, "sum")? {
+                *sum = sum.checked_add(u128::from(value)).ok_or_else(|| {
+                    GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: "sum aggregate overflowed".to_string(),
+                    }
+                })?;
+            }
+        }
+        (
+            AggregateAccumulator::Avg { sum, count },
+            RowProjection::Aggregate {
+                function: RowAggregateFunction::Avg,
+                expression,
+            },
+        ) => {
+            if let Some(value) = aggregate_integer_value(row, expression, "avg")? {
+                *sum = sum.checked_add(u128::from(value)).ok_or_else(|| {
+                    GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: "avg aggregate overflowed".to_string(),
+                    }
+                })?;
+                *count = count.saturating_add(1);
+            }
+        }
+        (
+            AggregateAccumulator::Collect(values),
+            RowProjection::Aggregate {
+                function: RowAggregateFunction::Collect,
+                expression,
+            },
+        ) => {
+            if let Some(value) = expression_query_value(row, expression)? {
+                values.push(value);
+            }
+        }
+        _ => {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "aggregate projection state mismatch".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "opencypher")]
+fn aggregate_integer_value(
+    row: &BindingRow,
+    expression: &RowExpression,
+    function: &str,
+) -> Result<Option<u64>> {
+    match eval_row_expression(row, expression)? {
+        RowScalarValue::Missing => Ok(None),
+        RowScalarValue::Value(VertexPropertyValue::Integer(value)) => Ok(Some(value)),
+        RowScalarValue::Value(_) => Err(GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: format!("{function} aggregate requires integer values"),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn finalize_aggregate(state: &AggregateAccumulator) -> Result<QueryValue> {
+    Ok(match state {
+        AggregateAccumulator::CountAll(count) | AggregateAccumulator::CountExpression(count) => {
+            QueryValue::Count(*count)
+        }
+        AggregateAccumulator::Sum(sum) => {
+            QueryValue::Property(VertexPropertyValue::Integer((*sum).try_into().map_err(
+                |_| GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "sum aggregate exceeds u64 result range".to_string(),
+                },
+            )?))
+        }
+        AggregateAccumulator::Avg { sum: _, count: 0 } => QueryValue::Null,
+        AggregateAccumulator::Avg { sum, count } => {
+            QueryValue::Float(QueryFloat(*sum as f64 / *count as f64))
+        }
+        AggregateAccumulator::Collect(values) => QueryValue::List(values.clone()),
+    })
+}
+
+#[cfg(feature = "opencypher")]
+fn project_single_binding_value(
+    row: &BindingRow,
+    projection: &RowProjection,
+) -> Result<QueryValue> {
+    match projection {
+        RowProjection::NodeId { binding } => Ok(QueryValue::VertexId(row.get(binding)?)),
+        RowProjection::Property { binding, property } => {
+            let value = binding_property(row, binding, property)?.ok_or_else(|| {
+                GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: format!("property {binding}.{property} is missing"),
+                }
+            })?;
+            Ok(QueryValue::Property(value))
+        }
+        RowProjection::CountAll | RowProjection::Aggregate { .. } => {
+            Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "aggregate projection cannot be used as a group key".to_string(),
+            })
+        }
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn expression_query_value(
+    row: &BindingRow,
+    expression: &RowExpression,
+) -> Result<Option<QueryValue>> {
+    Ok(match expression {
+        RowExpression::NodeId { binding } => Some(QueryValue::VertexId(row.get(binding)?)),
+        RowExpression::Property { binding, property } => {
+            binding_property(row, binding, property)?.map(QueryValue::Property)
+        }
+        RowExpression::Literal(value) => Some(QueryValue::Property(value.clone())),
+    })
 }
 
 #[cfg(feature = "opencypher")]
@@ -2132,7 +2407,11 @@ fn sort_keys_for_projected_only(
         keys.push(match &sort.expression {
             RowSortExpression::Column { name } => projected_column_value(row, columns, name)?,
             RowSortExpression::CountAll => {
-                let Some(value) = row.values.first() else {
+                let Some(value) = row
+                    .values
+                    .iter()
+                    .find(|value| matches!(value, QueryValue::Count(_)))
+                else {
                     return Err(GraphError::UnsupportedQuery {
                         dialect: "OpenCypher",
                         feature: "count(*) ORDER BY requires an aggregate row".to_string(),
@@ -2201,12 +2480,23 @@ fn compare_projected_rows(
 #[cfg(feature = "opencypher")]
 fn compare_query_values(left: &QueryValue, right: &QueryValue) -> std::cmp::Ordering {
     match (left, right) {
+        (QueryValue::Null, QueryValue::Null) => std::cmp::Ordering::Equal,
         (QueryValue::VertexId(left), QueryValue::VertexId(right))
         | (QueryValue::VertexId(left), QueryValue::Count(right))
         | (QueryValue::Count(left), QueryValue::VertexId(right))
         | (QueryValue::Count(left), QueryValue::Count(right)) => left.cmp(right),
+        (QueryValue::Float(left), QueryValue::Float(right)) => left.cmp(right),
         (QueryValue::Property(left), QueryValue::Property(right)) => {
             compare_vertex_property_order(left, right)
+        }
+        (QueryValue::List(left), QueryValue::List(right)) => {
+            for (left, right) in left.iter().zip(right.iter()) {
+                let ordering = compare_query_values(left, right);
+                if ordering != std::cmp::Ordering::Equal {
+                    return ordering;
+                }
+            }
+            left.len().cmp(&right.len())
         }
         (QueryValue::Bool(left), QueryValue::Bool(right)) => left.cmp(right),
         _ => query_value_rank(left).cmp(&query_value_rank(right)),
@@ -2231,9 +2521,12 @@ fn compare_vertex_property_order(
 #[cfg(feature = "opencypher")]
 fn query_value_rank(value: &QueryValue) -> u8 {
     match value {
-        QueryValue::Bool(_) => 0,
-        QueryValue::VertexId(_) | QueryValue::Count(_) => 1,
-        QueryValue::Property(value) => 2 + vertex_property_rank(value),
+        QueryValue::Null => 0,
+        QueryValue::Bool(_) => 1,
+        QueryValue::VertexId(_) | QueryValue::Count(_) => 2,
+        QueryValue::Float(_) => 3,
+        QueryValue::Property(value) => 4 + vertex_property_rank(value),
+        QueryValue::List(_) => 8,
     }
 }
 
