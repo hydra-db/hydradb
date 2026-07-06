@@ -6066,10 +6066,13 @@ async fn tcp_query_transport_enforces_auth_cancellation_streaming_metrics_and_di
     assert_eq!(stream.next_row().await.unwrap(), None);
     assert_eq!(stream.columns().unwrap(), &[QueryColumn::new("v.id")]);
 
-    client
+    let inactive_cancel = client
         .cancel_query("query-transport-cancelled")
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(inactive_cancel
+        .to_string()
+        .contains("no active query with id query-transport-cancelled was cancelled"));
     let reused_after_precancel = client
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "query-transport-cancelled"),
