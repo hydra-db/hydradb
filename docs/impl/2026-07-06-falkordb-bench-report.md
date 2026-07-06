@@ -1,6 +1,8 @@
 # turbolay vs FalkorDB — 3–4-hop benchmark (RFC 0017 Phase 3)
 
-**Status: IN PROGRESS.** FalkorDB baseline captured; turbolay tiers being filled in.
+**Status: COMPLETE for local tiers + MinIO S3-compatible Tier 3.** FalkorDB
+baseline and turbolay InMemory, Local FS, and MinIO-backed S3-compatible runs
+are captured.
 Raw result JSONs live in `bench/out/`; reproduce with the commands in each section.
 
 ## 1. What this measures (and what it does not)
@@ -140,14 +142,48 @@ planner batching reads) — and it quantifies the gap the roadmap's optimization
 RFCs must close. The result JSONs are `bench/out/turbolay-local-s1.0.*`
 (ic02–ic3h) and `bench/out/turbolay-local-ic4h-s1.0.json`.
 
-### Tier 3 — real S3 / S3-compatible
+### Tier 3 — S3-compatible MinIO
 
-_Needs an S3 bucket + AWS creds (or the local MinIO on :9010 as an
-S3-compatible stand-in). scale=1.0 then scale=10 — TODO / pending creds._
+Run against local MinIO (`hydra-minio-it`, endpoint `http://127.0.0.1:9010`) with
+`AWS_ENDPOINT` + `AWS_ALLOW_HTTP=true`, fresh bucket
+`turbolay-tier3-1783311225`. This validates the `--backend s3` / object-store
+path, but it is **not** a canonical AWS S3 latency claim.
+
+**Correctness (verify oracle): PASS.** Full row-content verify passed at scale
+1.0 for all 18 `(query,param)` cases after setting FalkorDB
+`GRAPH.CONFIG SET RESULTSET_SIZE -1` so unlimited `RETURN DISTINCT` results are
+not silently capped at 10k rows. Result: `bench/out/verify-tier3-minio-s1.0.json`.
+
+**Timing, scale = 1.0** (release build, batched ingest bs=1000, 20 warm runs,
+median across 3 params) — `bench/out/turbolay-s3-minio-s1.0.json`,
+`bench/out/compare-s3-minio-s1.0.txt`:
+
+| query | rows | MinIO p50 | Local FS p50 | InMemory p50 | FalkorDB p50 | vs FalkorDB |
+|-------|-----:|----------:|-------------:|-------------:|-------------:|------------:|
+| ic02 | 20  | ~6.5 ms   | ~5.2 ms  | 152 us  | 1.07 ms | ~6.1x |
+| ic07 | 4-6 | ~0.87 ms  | ~1.5 ms  | 27 us   | 941 us  | ~0.95x |
+| ic08 | 1-4 | ~0.96 ms  | ~1.2 ms  | 18 us   | 750 us  | ~1.5x |
+| ic09 | 20  | ~44.8 ms  | ~47 ms   | 2.04 ms | 2.19 ms | ~24x |
+| ic3h | 20  | ~431 ms   | ~449 ms  | 21.9 ms | 14.3 ms | ~41x |
+| ic4h | 20  | **~3.33 s** | ~4.6 s | 144 ms  | 68 ms   | **~57x** |
+
+**Reading:** MinIO shows the same bottleneck shape as Local FS, with slightly
+better deep-hop medians on this machine but the same order-of-magnitude cliff.
+That is useful because it exercises the real S3 object-store code path while
+confirming the underlying problem is still the uncached traversal strategy: each
+frontier node causes an object-store read, and deep KNOWS traversals multiply
+that cost quickly. RFC 0017 should target adjacency/node caching and batched
+frontier reads before any real-S3 number is expected to be competitive.
 
 ## 5. Ratio tables (compare.py)
 
-_`python3 bench/py/compare.py <turbolay>.json <falkordb>.json` per tier — TODO._
+Available outputs:
+
+- InMemory: `bench/out/compare-memory-s1.0.txt`
+- MinIO S3-compatible: `bench/out/compare-s3-minio-s1.0.txt`
+
+(`compare.py` still prints inherited "Kuzu"/"GATE" labels; those labels are
+cosmetic in this repo.)
 
 ## 6. Bottleneck notes & review cross-reference
 
