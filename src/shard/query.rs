@@ -941,18 +941,29 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         self.ensure_write_authority(cell_id, "refresh_edge_type_query_stats")?;
+        let read_epoch = self.snapshot(cell_id).await?.read_epoch();
+        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
+        let count = self
+            .edges_at_with_budget(cell_id, edge_type, read_epoch, Some(&budget))
+            .await?
+            .len() as u64;
+
         let _permit = self
             .acquire_graph_write_permit("refresh_edge_type_query_stats")
             .await?;
         let _lock = self
             .acquire_cell_write_lock(cell_id, "refresh_edge_type_query_stats")
             .await?;
-        let read_epoch = self.current_epoch(cell_id).await?;
-        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
-        let count = self
-            .edges_at_with_budget(cell_id, edge_type, read_epoch, Some(&budget))
-            .await?
-            .len() as u64;
+        let current_epoch = self.current_epoch(cell_id).await?;
+        if current_epoch != read_epoch {
+            return Err(GraphError::SnapshotChanged {
+                operation: "refresh_edge_type_query_stats",
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch,
+                current_epoch,
+            });
+        }
         let mut batch = GraphWriteBatch::new();
         batch.put(
             keys::query_stats_edge_type(cell_id, edge_type).as_bytes(),
