@@ -1129,7 +1129,7 @@ impl GraphShard {
             .len() as u64;
         let encoded = encode_vertex_property_value_key(value);
         let histogram = self
-            .vertex_property_histogram_counts(cell_id, property, &budget)
+            .vertex_property_histogram_counts(cell_id, property, read_epoch, &budget)
             .await?;
         let stats = stats_record_from_bucket_count(count, read_epoch, &histogram);
         self.publish_query_stats_record_after_snapshot(
@@ -1172,7 +1172,7 @@ impl GraphShard {
             .len() as u64;
         let encoded = encode_vertex_property_value_key(value);
         let histogram = self
-            .edge_property_histogram_counts(cell_id, edge_type, property, &budget)
+            .edge_property_histogram_counts(cell_id, edge_type, property, read_epoch, &budget)
             .await?;
         let stats = stats_record_from_bucket_count(count, read_epoch, &histogram);
         self.publish_query_stats_record_after_snapshot(
@@ -1208,16 +1208,18 @@ impl GraphShard {
         let read_epoch = self.snapshot(cell_id).await?.read_epoch();
         let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
         let buckets = self
-            .vertex_property_histogram_counts(cell_id, property, &budget)
+            .vertex_property_histogram_counts(cell_id, property, read_epoch, &budget)
             .await?;
         let stats = stats_record_from_histogram(read_epoch, &buckets);
         self.publish_query_stats_histogram_after_snapshot(
-            cell_id,
-            "refresh_vertex_property_histogram_query_stats",
-            read_epoch,
-            keys::query_stats_vertex_property_histogram(cell_id, property),
-            &stats,
-            &buckets,
+            QueryStatsHistogramPublish {
+                cell_id,
+                operation: "refresh_vertex_property_histogram_query_stats",
+                read_epoch,
+                histogram_key: keys::query_stats_vertex_property_histogram(cell_id, property),
+                stats: &stats,
+                buckets: &buckets,
+            },
             |encoded| keys::query_stats_vertex_property(cell_id, property, encoded),
         )
         .await?;
@@ -1245,16 +1247,20 @@ impl GraphShard {
         let read_epoch = self.snapshot(cell_id).await?.read_epoch();
         let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
         let buckets = self
-            .edge_property_histogram_counts(cell_id, edge_type, property, &budget)
+            .edge_property_histogram_counts(cell_id, edge_type, property, read_epoch, &budget)
             .await?;
         let stats = stats_record_from_histogram(read_epoch, &buckets);
         self.publish_query_stats_histogram_after_snapshot(
-            cell_id,
-            "refresh_edge_property_histogram_query_stats",
-            read_epoch,
-            keys::query_stats_edge_property_histogram(cell_id, edge_type, property),
-            &stats,
-            &buckets,
+            QueryStatsHistogramPublish {
+                cell_id,
+                operation: "refresh_edge_property_histogram_query_stats",
+                read_epoch,
+                histogram_key: keys::query_stats_edge_property_histogram(
+                    cell_id, edge_type, property,
+                ),
+                stats: &stats,
+                buckets: &buckets,
+            },
             |encoded| keys::query_stats_edge_property(cell_id, edge_type, property, encoded),
         )
         .await?;
@@ -1305,41 +1311,41 @@ impl GraphShard {
     #[cfg(feature = "opencypher")]
     async fn publish_query_stats_histogram_after_snapshot(
         &self,
-        cell_id: &str,
-        operation: &'static str,
-        read_epoch: GraphEpoch,
-        histogram_key: String,
-        stats: &QueryStatsRecord,
-        buckets: &BTreeMap<String, u64>,
+        publish: QueryStatsHistogramPublish<'_>,
         bucket_key: impl Fn(&str) -> String,
     ) -> Result<()> {
-        let _permit = self.acquire_graph_write_permit(operation).await?;
-        let lock = self.acquire_cell_write_lock(cell_id, operation).await?;
+        let _permit = self.acquire_graph_write_permit(publish.operation).await?;
+        let lock = self
+            .acquire_cell_write_lock(publish.cell_id, publish.operation)
+            .await?;
         let result = async {
-            let current_epoch = self.current_epoch(cell_id).await?;
-            if current_epoch != read_epoch {
+            let current_epoch = self.current_epoch(publish.cell_id).await?;
+            if current_epoch != publish.read_epoch {
                 return Err(GraphError::QueryStatsSnapshotChanged {
-                    operation,
-                    cell_id: cell_id.to_string(),
-                    read_epoch,
+                    operation: publish.operation,
+                    cell_id: publish.cell_id.to_string(),
+                    read_epoch: publish.read_epoch,
                     current_epoch,
                 });
             }
             let mut batch = GraphWriteBatch::new();
-            batch.put(histogram_key.as_bytes(), encode_u64(stats.count));
             batch.put(
-                keys::query_stats_record_key(&histogram_key).as_bytes(),
-                encode_query_stats_record(stats),
+                publish.histogram_key.as_bytes(),
+                encode_u64(publish.stats.count),
             );
-            for (encoded, count) in buckets {
+            batch.put(
+                keys::query_stats_record_key(&publish.histogram_key).as_bytes(),
+                encode_query_stats_record(publish.stats),
+            );
+            for (encoded, count) in publish.buckets {
                 let key = bucket_key(encoded);
                 let bucket_stats = QueryStatsRecord {
                     count: *count,
-                    read_epoch: stats.read_epoch,
-                    refreshed_at_ms: stats.refreshed_at_ms,
-                    distinct_values: stats.distinct_values,
-                    total_values: stats.total_values,
-                    most_common_count: stats.most_common_count,
+                    read_epoch: publish.stats.read_epoch,
+                    refreshed_at_ms: publish.stats.refreshed_at_ms,
+                    distinct_values: publish.stats.distinct_values,
+                    total_values: publish.stats.total_values,
+                    most_common_count: publish.stats.most_common_count,
                 };
                 batch.put(key.as_bytes(), encode_u64(*count));
                 batch.put(
@@ -1347,7 +1353,7 @@ impl GraphShard {
                     encode_query_stats_record(&bucket_stats),
                 );
             }
-            self.write_graph_batch_strict(cell_id, operation, batch)
+            self.write_graph_batch_strict(publish.cell_id, publish.operation, batch)
                 .await
         }
         .await;
@@ -1386,6 +1392,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         property: &str,
+        read_epoch: GraphEpoch,
         budget: &QueryBudget,
     ) -> Result<BTreeMap<String, u64>> {
         budget.check("query_stats_vertex_property_histogram")?;
@@ -1399,7 +1406,16 @@ impl GraphShard {
         while let Some(kv) = iter.next().await? {
             budget.check("query_stats_vertex_property_histogram")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (_cell_id, _property, encoded, _vertex_id) = parse_vertex_property_index_key(&key)?;
+            let (_cell_id, _property, encoded, vertex_id) = parse_vertex_property_index_key(&key)?;
+            let metadata = self
+                .vertex_metadata_at(cell_id, vertex_id, read_epoch, budget)
+                .await?;
+            let Some(value) = metadata.properties.get(property) else {
+                continue;
+            };
+            if encode_vertex_property_value_key(value) != encoded {
+                continue;
+            }
             *buckets.entry(encoded).or_default() += 1;
             total = total
                 .checked_add(1)
@@ -1421,6 +1437,7 @@ impl GraphShard {
         cell_id: &str,
         edge_type: &str,
         property: &str,
+        read_epoch: GraphEpoch,
         budget: &QueryBudget,
     ) -> Result<BTreeMap<String, u64>> {
         budget.check("query_stats_edge_property_histogram")?;
@@ -1431,11 +1448,30 @@ impl GraphShard {
             .await?;
         let mut buckets = BTreeMap::<String, u64>::new();
         let mut total = 0_u64;
+        let latest_snapshot = read_epoch == self.current_epoch(cell_id).await?;
         while let Some(kv) = iter.next().await? {
             budget.check("query_stats_edge_property_histogram")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (_cell_id, _edge_type, _property, encoded, _src, _dst) =
+            let (_cell_id, _edge_type, _property, encoded, src, dst) =
                 parse_edge_property_index_key(&key)?;
+            let edge_exists = if latest_snapshot {
+                self.edge_exists(cell_id, edge_type, src, dst).await?
+            } else {
+                self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch)
+                    .await?
+            };
+            if !edge_exists {
+                continue;
+            }
+            let metadata = self
+                .edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget)
+                .await?;
+            let Some(value) = metadata.properties.get(property) else {
+                continue;
+            };
+            if encode_vertex_property_value_key(value) != encoded {
+                continue;
+            }
             *buckets.entry(encoded).or_default() += 1;
             total = total
                 .checked_add(1)
@@ -3703,6 +3739,16 @@ fn check_optional_query_budget(
         budget.check(operation)?;
     }
     Ok(())
+}
+
+#[cfg(feature = "opencypher")]
+struct QueryStatsHistogramPublish<'a> {
+    cell_id: &'a str,
+    operation: &'static str,
+    read_epoch: GraphEpoch,
+    histogram_key: String,
+    stats: &'a QueryStatsRecord,
+    buckets: &'a BTreeMap<String, u64>,
 }
 
 #[cfg(feature = "opencypher")]
