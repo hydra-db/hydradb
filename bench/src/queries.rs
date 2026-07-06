@@ -103,6 +103,15 @@ impl Query {
             Query::Ic07 | Query::Ic08 => None,
         }
     }
+
+    /// The query's natural KNOWS-prefix depth when no explicit `--hops` sweep
+    /// value is given: ic02=1, ic09=2, ic3h=3, ic4h=4, and ic07/ic08=0 (their
+    /// tail applies to the anchor itself). The **single source of truth** for
+    /// the effective-hops label both the `run` timing path and the `verify`
+    /// dump emit, so their `(query, hops)` keys can never drift apart.
+    pub fn natural_hops(self) -> usize {
+        self.knows_hops().unwrap_or(0)
+    }
 }
 
 /// One output row: column values in RETURN-clause order (see each query's
