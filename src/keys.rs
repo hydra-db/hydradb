@@ -330,6 +330,11 @@ pub fn query_stats_vertex_property(cell_id: &str, property: &str, encoded_value:
 }
 
 #[cfg(feature = "opencypher")]
+pub fn query_stats_vertex_property_prefix(cell_id: &str, property: &str) -> String {
+    format!("cell/{cell_id}/qstats/vprop/{property}/")
+}
+
+#[cfg(feature = "opencypher")]
 pub fn query_stats_edge_property(
     cell_id: &str,
     edge_type: &str,
@@ -337,6 +342,11 @@ pub fn query_stats_edge_property(
     encoded_value: &str,
 ) -> String {
     format!("cell/{cell_id}/qstats/eprop/{edge_type}/{property}/{encoded_value}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn query_stats_edge_property_prefix(cell_id: &str, edge_type: &str, property: &str) -> String {
+    format!("cell/{cell_id}/qstats/eprop/{edge_type}/{property}/")
 }
 
 #[cfg(feature = "opencypher")]
