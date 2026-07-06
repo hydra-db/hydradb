@@ -21,9 +21,9 @@ mod placement;
 mod sparse_kernel;
 
 pub use algebra::{
-    LogicalQueryPlan, PhysicalQueryPlan, QueryColumn, QueryContext, QueryFloat,
-    QueryMutationResult, QueryOutput, QueryPlan, QueryPlanner, QueryResultSet, QueryRow,
-    QueryStatement, QueryValue, QueryWindow,
+    LogicalQueryPlan, PhysicalQueryPlan, QueryColumn, QueryContext, QueryCursorToken, QueryFloat,
+    QueryMutationResult, QueryOutput, QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet,
+    QueryRow, QueryStatement, QueryValue, QueryWindow,
 };
 #[cfg(feature = "opencypher")]
 pub use opencypher::{

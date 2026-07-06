@@ -598,6 +598,43 @@ impl RoutedPhase0Cluster {
     }
 
     #[cfg(feature = "opencypher")]
+    pub async fn execute_cypher_rows_page(
+        &self,
+        context: crate::QueryContext,
+        query: &str,
+        cursor: Option<crate::QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<crate::QueryResultPage> {
+        let shard = self.shard(&context.cell_id)?;
+        shard
+            .execute_cypher_rows_page(context, query, cursor, page_size)
+            .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn execute_cypher_rows_many(
+        &self,
+        contexts: impl IntoIterator<Item = crate::QueryContext>,
+        query: &str,
+    ) -> Result<BTreeMap<String, crate::QueryResultSet>> {
+        let mut result_sets = BTreeMap::new();
+        for context in contexts {
+            validate_component("cell_id", &context.cell_id)?;
+            if result_sets.contains_key(&context.cell_id) {
+                return Err(GraphError::CorruptValue {
+                    key: format!("query/cell/{}", context.cell_id),
+                    reason: "duplicate cell in routed query request".to_string(),
+                });
+            }
+            let cell_id = context.cell_id.clone();
+            let shard = self.shard(&cell_id)?;
+            let result_set = shard.execute_cypher_rows(context, query).await?;
+            result_sets.insert(cell_id, result_set);
+        }
+        Ok(result_sets)
+    }
+
+    #[cfg(feature = "opencypher")]
     pub fn explain_cypher(
         &self,
         context: crate::QueryContext,
