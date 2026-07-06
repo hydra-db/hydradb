@@ -3,6 +3,7 @@ title: "turbolay — Graph Database on S3"
 status: draft
 date: 2026-07-03T00:00:00Z
 related:
+  - goals.md
   - rfcs/0000-rfc-index.md
 ---
 
