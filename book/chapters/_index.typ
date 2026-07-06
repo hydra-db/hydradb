@@ -20,3 +20,4 @@
 #include "detail-01-posting-values.typ"
 #include "detail-02-uids-identity.typ"
 #include "detail-03-node-schema-records.typ"
+#include "detail-04-substrate-keyspace.typ"
