@@ -43,6 +43,8 @@ pub use phase0::{
     MatrixArtifact, MatrixTraversalResult, Phase0Cluster, PostingChunk, RoutedPhase0Cluster,
     ShardLease, ShardPlacement, SupernodeGroup, SupernodePage, TraversalBackend,
 };
+#[cfg(feature = "opencypher")]
+pub use phase0::{DistributedQueryCoordinator, DistributedQueryPageRequest, QueryCellClient};
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
     LocalityCellExtractor, LocalityLayoutExperiment, StorageLayout,
