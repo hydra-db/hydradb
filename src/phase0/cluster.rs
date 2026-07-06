@@ -227,6 +227,13 @@ impl ShardPlacement {
     pub fn cells(&self) -> impl Iterator<Item = &str> {
         self.owners.keys().map(String::as_str)
     }
+
+    pub fn node_ids(&self) -> impl Iterator<Item = &str> {
+        let mut nodes = self.owners.values().map(String::as_str).collect::<Vec<_>>();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes.into_iter()
+    }
 }
 
 impl RoutedPhase0Cluster {
@@ -546,6 +553,34 @@ impl RoutedPhase0Cluster {
             .await
     }
 
+    pub async fn set_vertex_metadata(
+        &self,
+        cell_id: &str,
+        vertex_id: crate::VertexId,
+        metadata: crate::VertexMetadata,
+    ) -> Result<()> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard
+            .set_vertex_metadata(cell_id, vertex_id, metadata)
+            .await
+    }
+
+    pub async fn set_edge_metadata(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: crate::VertexId,
+        dst: crate::VertexId,
+        metadata: crate::EdgeMetadata,
+    ) -> Result<bool> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard
+            .set_edge_metadata(cell_id, edge_type, src, dst, metadata)
+            .await
+    }
+
     pub async fn execute_query_statement(
         &self,
         context: crate::QueryContext,
@@ -574,6 +609,12 @@ impl RoutedPhase0Cluster {
         query: &str,
     ) -> Result<crate::QueryOutput> {
         let shard = self.shard(&context.cell_id)?;
+        if crate::parse_opencypher_mutation_query_with_parameters(query, &context.parameters)?
+            .is_some()
+        {
+            self.ensure_active_write_lease(&context.cell_id)?;
+            return shard.execute_cypher(context, query).await;
+        }
         let plan = shard.plan_opencypher(context, query)?;
         if plan.is_write() {
             self.ensure_active_write_lease(&plan.cell_id)?;
@@ -589,6 +630,43 @@ impl RoutedPhase0Cluster {
     ) -> Result<crate::QueryResultSet> {
         let shard = self.shard(&context.cell_id)?;
         shard.execute_cypher_rows(context, query).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn execute_cypher_rows_page(
+        &self,
+        context: crate::QueryContext,
+        query: &str,
+        cursor: Option<crate::QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<crate::QueryResultPage> {
+        let shard = self.shard(&context.cell_id)?;
+        shard
+            .execute_cypher_rows_page(context, query, cursor, page_size)
+            .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn execute_cypher_rows_many(
+        &self,
+        contexts: impl IntoIterator<Item = crate::QueryContext>,
+        query: &str,
+    ) -> Result<BTreeMap<String, crate::QueryResultSet>> {
+        let mut result_sets = BTreeMap::new();
+        for context in contexts {
+            validate_component("cell_id", &context.cell_id)?;
+            if result_sets.contains_key(&context.cell_id) {
+                return Err(GraphError::CorruptValue {
+                    key: format!("query/cell/{}", context.cell_id),
+                    reason: "duplicate cell in routed query request".to_string(),
+                });
+            }
+            let cell_id = context.cell_id.clone();
+            let shard = self.shard(&cell_id)?;
+            let result_set = shard.execute_cypher_rows(context, query).await?;
+            result_sets.insert(cell_id, result_set);
+        }
+        Ok(result_sets)
     }
 
     #[cfg(feature = "opencypher")]
