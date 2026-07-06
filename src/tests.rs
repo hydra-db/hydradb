@@ -6288,6 +6288,48 @@ async fn query_cardinality_stats_refresh_persists_edge_counts() {
             .await
             .unwrap();
     }
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(true)),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            10,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(true)),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            11,
+            VertexMetadata::default()
+                .with_label("Subreddit")
+                .with_property("active", VertexPropertyValue::Bool(false)),
+        )
+        .await
+        .unwrap();
+    for (idx, dst) in [10, 11].into_iter().enumerate() {
+        shard
+            .set_edge_metadata(
+                "reddit-home",
+                "USER_SUBSCRIBED_TO_SUBREDDIT",
+                1,
+                dst,
+                EdgeMetadata::default().with_property("weight", VertexPropertyValue::Integer(7)),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("edge metadata {idx} failed: {err}"));
+    }
 
     let refresh = shard
         .refresh_edge_type_query_stats("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT")
@@ -6298,6 +6340,45 @@ async fn query_cardinality_stats_refresh_persists_edge_counts() {
     let key = keys::query_stats_edge_type("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT");
     let stored = shard.read_counter(&key).await.unwrap();
     assert_eq!(stored, 3);
+
+    let label_refresh = shard
+        .refresh_vertex_label_query_stats("reddit-home", "User")
+        .await
+        .unwrap();
+    assert_eq!(label_refresh.count, 2);
+    let label_key = keys::query_stats_vertex_label("reddit-home", "User");
+    assert_eq!(shard.read_counter(&label_key).await.unwrap(), 2);
+
+    let active = VertexPropertyValue::Bool(true);
+    let vertex_property_refresh = shard
+        .refresh_vertex_property_query_stats("reddit-home", "active", &active)
+        .await
+        .unwrap();
+    assert_eq!(vertex_property_refresh.count, 2);
+    let active_key = encode_vertex_property_value_key(&active);
+    let vertex_property_key =
+        keys::query_stats_vertex_property("reddit-home", "active", &active_key);
+    assert_eq!(shard.read_counter(&vertex_property_key).await.unwrap(), 2);
+
+    let weight = VertexPropertyValue::Integer(7);
+    let edge_property_refresh = shard
+        .refresh_edge_property_query_stats(
+            "reddit-home",
+            "USER_SUBSCRIBED_TO_SUBREDDIT",
+            "weight",
+            &weight,
+        )
+        .await
+        .unwrap();
+    assert_eq!(edge_property_refresh.count, 2);
+    let weight_key = encode_vertex_property_value_key(&weight);
+    let edge_property_key = keys::query_stats_edge_property(
+        "reddit-home",
+        "USER_SUBSCRIBED_TO_SUBREDDIT",
+        "weight",
+        &weight_key,
+    );
+    assert_eq!(shard.read_counter(&edge_property_key).await.unwrap(), 2);
     shard.close().await.unwrap();
 }
 

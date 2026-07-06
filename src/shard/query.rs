@@ -947,30 +947,14 @@ impl GraphShard {
             .edges_at_with_budget(cell_id, edge_type, read_epoch, Some(&budget))
             .await?
             .len() as u64;
-
-        let _permit = self
-            .acquire_graph_write_permit("refresh_edge_type_query_stats")
-            .await?;
-        let _lock = self
-            .acquire_cell_write_lock(cell_id, "refresh_edge_type_query_stats")
-            .await?;
-        let current_epoch = self.current_epoch(cell_id).await?;
-        if current_epoch != read_epoch {
-            return Err(GraphError::SnapshotChanged {
-                operation: "refresh_edge_type_query_stats",
-                cell_id: cell_id.to_string(),
-                edge_type: edge_type.to_string(),
-                read_epoch,
-                current_epoch,
-            });
-        }
-        let mut batch = GraphWriteBatch::new();
-        batch.put(
-            keys::query_stats_edge_type(cell_id, edge_type).as_bytes(),
-            encode_u64(count),
-        );
-        self.write_graph_batch_strict(cell_id, "refresh_edge_type_query_stats", batch)
-            .await?;
+        self.publish_query_stats_count_after_snapshot(
+            cell_id,
+            "refresh_edge_type_query_stats",
+            read_epoch,
+            keys::query_stats_edge_type(cell_id, edge_type),
+            count,
+        )
+        .await?;
         Ok(QueryCardinalityStatsRefresh {
             cell_id: cell_id.to_string(),
             read_epoch,
@@ -990,25 +974,20 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("label", label)?;
         self.ensure_write_authority(cell_id, "refresh_vertex_label_query_stats")?;
-        let _permit = self
-            .acquire_graph_write_permit("refresh_vertex_label_query_stats")
-            .await?;
-        let _lock = self
-            .acquire_cell_write_lock(cell_id, "refresh_vertex_label_query_stats")
-            .await?;
-        let read_epoch = self.current_epoch(cell_id).await?;
+        let read_epoch = self.snapshot(cell_id).await?.read_epoch();
         let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
         let count = self
             .scan_vertex_label_index_at(cell_id, label, read_epoch, &budget)
             .await?
             .len() as u64;
-        let mut batch = GraphWriteBatch::new();
-        batch.put(
-            keys::query_stats_vertex_label(cell_id, label).as_bytes(),
-            encode_u64(count),
-        );
-        self.write_graph_batch_strict(cell_id, "refresh_vertex_label_query_stats", batch)
-            .await?;
+        self.publish_query_stats_count_after_snapshot(
+            cell_id,
+            "refresh_vertex_label_query_stats",
+            read_epoch,
+            keys::query_stats_vertex_label(cell_id, label),
+            count,
+        )
+        .await?;
         Ok(QueryCardinalityStatsRefresh {
             cell_id: cell_id.to_string(),
             read_epoch,
@@ -1029,26 +1008,21 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("property", property)?;
         self.ensure_write_authority(cell_id, "refresh_vertex_property_query_stats")?;
-        let _permit = self
-            .acquire_graph_write_permit("refresh_vertex_property_query_stats")
-            .await?;
-        let _lock = self
-            .acquire_cell_write_lock(cell_id, "refresh_vertex_property_query_stats")
-            .await?;
-        let read_epoch = self.current_epoch(cell_id).await?;
+        let read_epoch = self.snapshot(cell_id).await?.read_epoch();
         let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
         let count = self
             .scan_vertex_property_index_at(cell_id, property, value, read_epoch, &budget)
             .await?
             .len() as u64;
         let encoded = encode_vertex_property_value_key(value);
-        let mut batch = GraphWriteBatch::new();
-        batch.put(
-            keys::query_stats_vertex_property(cell_id, property, &encoded).as_bytes(),
-            encode_u64(count),
-        );
-        self.write_graph_batch_strict(cell_id, "refresh_vertex_property_query_stats", batch)
-            .await?;
+        self.publish_query_stats_count_after_snapshot(
+            cell_id,
+            "refresh_vertex_property_query_stats",
+            read_epoch,
+            keys::query_stats_vertex_property(cell_id, property, &encoded),
+            count,
+        )
+        .await?;
         Ok(QueryCardinalityStatsRefresh {
             cell_id: cell_id.to_string(),
             read_epoch,
@@ -1072,26 +1046,21 @@ impl GraphShard {
         validate_component("edge_type", edge_type)?;
         validate_component("property", property)?;
         self.ensure_write_authority(cell_id, "refresh_edge_property_query_stats")?;
-        let _permit = self
-            .acquire_graph_write_permit("refresh_edge_property_query_stats")
-            .await?;
-        let _lock = self
-            .acquire_cell_write_lock(cell_id, "refresh_edge_property_query_stats")
-            .await?;
-        let read_epoch = self.current_epoch(cell_id).await?;
+        let read_epoch = self.snapshot(cell_id).await?.read_epoch();
         let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
         let count = self
             .scan_edge_property_index_at(cell_id, edge_type, property, value, read_epoch, &budget)
             .await?
             .len() as u64;
         let encoded = encode_vertex_property_value_key(value);
-        let mut batch = GraphWriteBatch::new();
-        batch.put(
-            keys::query_stats_edge_property(cell_id, edge_type, property, &encoded).as_bytes(),
-            encode_u64(count),
-        );
-        self.write_graph_batch_strict(cell_id, "refresh_edge_property_query_stats", batch)
-            .await?;
+        self.publish_query_stats_count_after_snapshot(
+            cell_id,
+            "refresh_edge_property_query_stats",
+            read_epoch,
+            keys::query_stats_edge_property(cell_id, edge_type, property, &encoded),
+            count,
+        )
+        .await?;
         Ok(QueryCardinalityStatsRefresh {
             cell_id: cell_id.to_string(),
             read_epoch,
@@ -1102,6 +1071,36 @@ impl GraphShard {
             },
             count,
         })
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn publish_query_stats_count_after_snapshot(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+        read_epoch: GraphEpoch,
+        key: String,
+        count: u64,
+    ) -> Result<()> {
+        let _permit = self.acquire_graph_write_permit(operation).await?;
+        let lock = self.acquire_cell_write_lock(cell_id, operation).await?;
+        let result = async {
+            let current_epoch = self.current_epoch(cell_id).await?;
+            if current_epoch != read_epoch {
+                return Err(GraphError::QueryStatsSnapshotChanged {
+                    operation,
+                    cell_id: cell_id.to_string(),
+                    read_epoch,
+                    current_epoch,
+                });
+            }
+            let mut batch = GraphWriteBatch::new();
+            batch.put(key.as_bytes(), encode_u64(count));
+            self.write_graph_batch_strict(cell_id, operation, batch)
+                .await
+        }
+        .await;
+        release_cell_write_lock(lock, result).await
     }
 
     #[cfg(feature = "opencypher")]
