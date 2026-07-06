@@ -198,6 +198,15 @@ pub enum GraphError {
         read_epoch: GraphEpoch,
         current_epoch: GraphEpoch,
     },
+    #[error(
+        "{operation} stats snapshot epoch {read_epoch} for cell {cell_id} changed while refreshing; current epoch is {current_epoch}"
+    )]
+    QueryStatsSnapshotChanged {
+        operation: &'static str,
+        cell_id: String,
+        read_epoch: GraphEpoch,
+        current_epoch: GraphEpoch,
+    },
     #[error("{operation} rejected by admission control: actual {actual} exceeds limit {limit}")]
     AdmissionRejected {
         operation: &'static str,
