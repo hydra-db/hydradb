@@ -8909,6 +8909,67 @@ async fn cypher_edge_match_uses_edge_property_index_before_endpoint_expansion() 
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_edge_property_index_is_not_planned_for_historical_snapshots() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-edge-property-index-snapshot", object_store).await;
+
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 10,
+            idempotency_key: "cypher-edge-property-index-snapshot-edge".to_string(),
+        })
+        .await
+        .unwrap();
+    let pinned_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    shard
+        .set_edge_metadata(
+            "reddit-home",
+            "FOLLOWS",
+            1,
+            10,
+            EdgeMetadata::default().with_property("weight", VertexPropertyValue::Integer(7)),
+        )
+        .await
+        .unwrap();
+
+    let plan = shard
+        .explain_opencypher_rows(
+            QueryContext::new("reddit-home", "cypher-edge-property-index-snapshot-explain")
+                .at_epoch(pinned_epoch),
+            "MATCH ()-[e:FOLLOWS {weight: 7}]->() RETURN count(*)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.groups[0].patterns[0].access,
+        RowQueryAccess::FullEdgeScan {
+            edge_type: "FOLLOWS".to_string(),
+        }
+    );
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-edge-property-index-snapshot-read")
+                .at_epoch(pinned_epoch),
+            "MATCH ()-[e:FOLLOWS {weight: 7}]->() RETURN count(*)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("count(*)")],
+            vec![QueryRow::new(vec![QueryValue::Count(0)])],
+        )
+    );
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_edge_match_uses_destination_metadata_index_with_reverse_expansion() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
