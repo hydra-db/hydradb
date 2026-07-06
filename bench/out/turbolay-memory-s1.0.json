@@ -1,0 +1,214 @@
+{
+  "scale": 1.0,
+  "seed": 42,
+  "backend": "memory://bench",
+  "dataset_sizes": {
+    "persons": 10000,
+    "posts": 100000,
+    "comments": 50000,
+    "knows": 100000,
+    "has_creator": 150000,
+    "likes": 100000,
+    "reply_of": 30000
+  },
+  "results": [
+    {
+      "backend": "memory://bench",
+      "query": "ic02",
+      "param": "50000000000000000000000000000000",
+      "rows": 20,
+      "cold_us": 9678,
+      "warm_p50_us": 190,
+      "warm_p95_us": 263,
+      "warm_p99_us": 420,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic02",
+      "param": "50000000000000000000000000000d05",
+      "rows": 20,
+      "cold_us": 1502,
+      "warm_p50_us": 152,
+      "warm_p95_us": 283,
+      "warm_p99_us": 292,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic02",
+      "param": "50000000000000000000000000001a0a",
+      "rows": 20,
+      "cold_us": 4518,
+      "warm_p50_us": 95,
+      "warm_p95_us": 179,
+      "warm_p99_us": 239,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic07",
+      "param": "50000000000000000000000000000000",
+      "rows": 4,
+      "cold_us": 309,
+      "warm_p50_us": 27,
+      "warm_p95_us": 68,
+      "warm_p99_us": 91,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic07",
+      "param": "50000000000000000000000000000d05",
+      "rows": 6,
+      "cold_us": 425,
+      "warm_p50_us": 31,
+      "warm_p95_us": 46,
+      "warm_p99_us": 116,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic07",
+      "param": "50000000000000000000000000001a0a",
+      "rows": 4,
+      "cold_us": 995,
+      "warm_p50_us": 24,
+      "warm_p95_us": 63,
+      "warm_p99_us": 64,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic08",
+      "param": "50000000000000000000000000000000",
+      "rows": 1,
+      "cold_us": 77,
+      "warm_p50_us": 17,
+      "warm_p95_us": 19,
+      "warm_p99_us": 20,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic08",
+      "param": "50000000000000000000000000000d05",
+      "rows": 2,
+      "cold_us": 63,
+      "warm_p50_us": 18,
+      "warm_p95_us": 19,
+      "warm_p99_us": 21,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic08",
+      "param": "50000000000000000000000000001a0a",
+      "rows": 4,
+      "cold_us": 64,
+      "warm_p50_us": 23,
+      "warm_p95_us": 52,
+      "warm_p99_us": 75,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic09",
+      "param": "50000000000000000000000000000000",
+      "rows": 20,
+      "cold_us": 25169,
+      "warm_p50_us": 5218,
+      "warm_p95_us": 5544,
+      "warm_p99_us": 6145,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic09",
+      "param": "50000000000000000000000000000d05",
+      "rows": 20,
+      "cold_us": 4134,
+      "warm_p50_us": 1899,
+      "warm_p95_us": 2289,
+      "warm_p99_us": 2333,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic09",
+      "param": "50000000000000000000000000001a0a",
+      "rows": 20,
+      "cold_us": 3276,
+      "warm_p50_us": 2041,
+      "warm_p95_us": 2283,
+      "warm_p99_us": 2427,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic3h",
+      "param": "50000000000000000000000000000000",
+      "rows": 20,
+      "cold_us": 40238,
+      "warm_p50_us": 39380,
+      "warm_p95_us": 45338,
+      "warm_p99_us": 45540,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic3h",
+      "param": "50000000000000000000000000000d05",
+      "rows": 20,
+      "cold_us": 28641,
+      "warm_p50_us": 21927,
+      "warm_p95_us": 23510,
+      "warm_p99_us": 28266,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic3h",
+      "param": "50000000000000000000000000001a0a",
+      "rows": 20,
+      "cold_us": 22102,
+      "warm_p50_us": 21450,
+      "warm_p95_us": 23994,
+      "warm_p99_us": 24066,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic4h",
+      "param": "50000000000000000000000000000000",
+      "rows": 20,
+      "cold_us": 239658,
+      "warm_p50_us": 228663,
+      "warm_p95_us": 288554,
+      "warm_p99_us": 315855,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic4h",
+      "param": "50000000000000000000000000000d05",
+      "rows": 20,
+      "cold_us": 140353,
+      "warm_p50_us": 144490,
+      "warm_p95_us": 158329,
+      "warm_p99_us": 160130,
+      "warm_runs": 20
+    },
+    {
+      "backend": "memory://bench",
+      "query": "ic4h",
+      "param": "50000000000000000000000000001a0a",
+      "rows": 20,
+      "cold_us": 158653,
+      "warm_p50_us": 143974,
+      "warm_p95_us": 176138,
+      "warm_p99_us": 249984,
+      "warm_runs": 20
+    }
+  ]
+}
