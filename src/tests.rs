@@ -6028,6 +6028,167 @@ async fn cypher_row_engine_supports_bindings_where_order_and_windows() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_row_engine_executes_multi_match_join_pipeline() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-multi-match", object_store).await;
+
+    for (idx, (edge_type, src, dst)) in [
+        ("FOLLOWS", 1, 10),
+        ("FOLLOWS", 1, 11),
+        ("FOLLOWS", 2, 12),
+        ("POSTED", 10, 100),
+        ("POSTED", 11, 101),
+        ("POSTED", 12, 102),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-row-multi-match-edge-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+    for (post, score) in [(100, 5), (101, 20), (102, 30)] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                post,
+                VertexMetadata::default()
+                    .with_label("Post")
+                    .with_property("score", VertexPropertyValue::Integer(score)),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-multi-match-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) \
+             MATCH (v)-[:POSTED]->(p:Post) \
+             WHERE p.score >= 10 \
+             RETURN u.id AS user, v.id AS followed, p.id AS post ORDER BY post",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![
+                QueryColumn::new("user"),
+                QueryColumn::new("followed"),
+                QueryColumn::new("post"),
+            ],
+            vec![QueryRow::new(vec![
+                QueryValue::VertexId(1),
+                QueryValue::VertexId(11),
+                QueryValue::VertexId(101),
+            ])],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_row_engine_executes_multi_edge_path_pipeline() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-multi-edge-path", object_store).await;
+
+    for (idx, (edge_type, src, dst)) in [
+        ("FOLLOWS", 1, 10),
+        ("FOLLOWS", 1, 11),
+        ("POSTED", 10, 100),
+        ("POSTED", 11, 101),
+        ("POSTED", 99, 999),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-row-multi-edge-path-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-multi-edge-path-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v)-[:POSTED]->(p) \
+             RETURN v.id AS followed, p.id AS post ORDER BY followed",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("followed"), QueryColumn::new("post")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(10), QueryValue::VertexId(100)]),
+                QueryRow::new(vec![QueryValue::VertexId(11), QueryValue::VertexId(101)]),
+            ],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_row_engine_records_operational_metrics() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-query-metrics", object_store).await;
+
+    for (idx, dst) in [10, 11].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst,
+                idempotency_key: format!("cypher-row-query-metrics-edge-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-query-metrics-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 2);
+
+    let err = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-query-metrics-fail"),
+            "MATCH (u) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GraphError::UnsupportedQuery { .. }));
+
+    let metrics = shard.graph_operational_metrics();
+    assert_eq!(metrics.query_rows_started, 2);
+    assert_eq!(metrics.query_rows_completed, 1);
+    assert_eq!(metrics.query_rows_failed, 1);
+    assert_eq!(metrics.query_rows_returned, 2);
+    assert!(metrics.query_rows_duration_us > 0);
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_row_engine_rejects_excess_intermediate_rows() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(

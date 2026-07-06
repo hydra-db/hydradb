@@ -524,6 +524,11 @@ pub struct GraphOperationalMetricsSnapshot {
     pub verifier_runs: u64,
     pub verifier_failures: u64,
     pub verifier_duration_us: u64,
+    pub query_rows_started: u64,
+    pub query_rows_completed: u64,
+    pub query_rows_failed: u64,
+    pub query_rows_returned: u64,
+    pub query_rows_duration_us: u64,
     pub backpressure_waits: u64,
 }
 
@@ -553,6 +558,11 @@ pub(crate) struct GraphOperationalMetrics {
     verifier_runs: AtomicU64,
     verifier_failures: AtomicU64,
     verifier_duration_us: AtomicU64,
+    query_rows_started: AtomicU64,
+    query_rows_completed: AtomicU64,
+    query_rows_failed: AtomicU64,
+    query_rows_returned: AtomicU64,
+    query_rows_duration_us: AtomicU64,
     backpressure_waits: AtomicU64,
 }
 
@@ -583,6 +593,11 @@ impl GraphOperationalMetrics {
             verifier_runs: self.verifier_runs.load(Ordering::Relaxed),
             verifier_failures: self.verifier_failures.load(Ordering::Relaxed),
             verifier_duration_us: self.verifier_duration_us.load(Ordering::Relaxed),
+            query_rows_started: self.query_rows_started.load(Ordering::Relaxed),
+            query_rows_completed: self.query_rows_completed.load(Ordering::Relaxed),
+            query_rows_failed: self.query_rows_failed.load(Ordering::Relaxed),
+            query_rows_returned: self.query_rows_returned.load(Ordering::Relaxed),
+            query_rows_duration_us: self.query_rows_duration_us.load(Ordering::Relaxed),
             backpressure_waits: self.backpressure_waits.load(Ordering::Relaxed),
         }
     }

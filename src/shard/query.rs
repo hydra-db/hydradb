@@ -98,6 +98,41 @@ impl GraphShard {
         context: QueryContext,
         query: ParsedRowQuery,
     ) -> Result<QueryResultSet> {
+        self.operation_metrics
+            .query_rows_started
+            .fetch_add(1, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let result = self
+            .execute_parsed_opencypher_rows_inner(context, query)
+            .await;
+        let elapsed_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
+        self.operation_metrics
+            .query_rows_duration_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
+        match &result {
+            Ok(result_set) => {
+                self.operation_metrics
+                    .query_rows_completed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.operation_metrics
+                    .query_rows_returned
+                    .fetch_add(result_set.rows.len() as u64, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.operation_metrics
+                    .query_rows_failed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn execute_parsed_opencypher_rows_inner(
+        &self,
+        context: QueryContext,
+        query: ParsedRowQuery,
+    ) -> Result<QueryResultSet> {
         validate_component("cell_id", &context.cell_id)?;
         let budget = QueryBudget::new(context.max_runtime_ms.or(self.limits.max_query_runtime_ms));
         budget.check("cypher_rows")?;
@@ -117,7 +152,7 @@ impl GraphShard {
         };
 
         let mut bindings = self
-            .match_row_pattern(&context.cell_id, &query.pattern, read_epoch, &budget)
+            .match_row_patterns(&context.cell_id, &query.patterns, read_epoch, &budget)
             .await?;
         if let Some(predicate) = &query.predicate {
             let mut filtered = Vec::with_capacity(bindings.len());
@@ -312,6 +347,48 @@ impl GraphShard {
             }
         }
         Ok(())
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_row_patterns(
+        &self,
+        cell_id: &str,
+        patterns: &[RowPattern],
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<BindingRow>> {
+        if patterns.is_empty() {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "MATCH requires at least one executable pattern".to_string(),
+            });
+        }
+
+        let mut rows = vec![BindingRow::default()];
+        for pattern in patterns {
+            budget.check("cypher_match_pipeline")?;
+            let mut next_rows = Vec::new();
+            for row in rows {
+                let Some(bound_pattern) = constrain_row_pattern(pattern, &row)? else {
+                    continue;
+                };
+                let matches = self
+                    .match_row_pattern(cell_id, &bound_pattern, read_epoch, budget)
+                    .await?;
+                for matched in matches {
+                    budget.check("cypher_match_join")?;
+                    if let Some(joined) = row.join(&matched) {
+                        self.push_binding_row(&mut next_rows, joined, "cypher_match_join_rows")?;
+                    }
+                }
+            }
+            rows = next_rows;
+            self.ensure_query_intermediate_rows("cypher_match_pipeline_rows", rows.len())?;
+            if rows.is_empty() {
+                break;
+            }
+        }
+        Ok(rows)
     }
 
     #[cfg(feature = "opencypher")]
@@ -1750,6 +1827,25 @@ impl BindingRow {
                 feature: format!("unbound variable {binding}"),
             })
     }
+
+    fn join(&self, other: &Self) -> Option<Self> {
+        let mut joined = self.clone();
+        for (binding, value) in &other.values {
+            if !joined.bind(Some(binding), *value) {
+                return None;
+            }
+        }
+        for (binding, metadata) in &other.metadata {
+            match joined.metadata.get(binding) {
+                Some(existing) if existing != metadata => return None,
+                Some(_) => {}
+                None => {
+                    joined.metadata.insert(binding.clone(), metadata.clone());
+                }
+            }
+        }
+        Some(joined)
+    }
 }
 
 #[cfg(feature = "opencypher")]
@@ -1764,6 +1860,56 @@ struct ProjectedQueryRow {
 enum RowScalarValue {
     Value(VertexPropertyValue),
     Missing,
+}
+
+#[cfg(feature = "opencypher")]
+fn constrain_row_pattern(pattern: &RowPattern, row: &BindingRow) -> Result<Option<RowPattern>> {
+    Ok(Some(match pattern {
+        RowPattern::Node(node) => {
+            let Some(node) = constrain_row_node_pattern(node, row)? else {
+                return Ok(None);
+            };
+            RowPattern::Node(node)
+        }
+        RowPattern::Edge(edge) => {
+            let Some(src) = constrain_row_node_pattern(&edge.src, row)? else {
+                return Ok(None);
+            };
+            let Some(dst) = constrain_row_node_pattern(&edge.dst, row)? else {
+                return Ok(None);
+            };
+            RowPattern::Edge(RowEdgePattern {
+                edge_type: edge.edge_type.clone(),
+                src,
+                dst,
+                hop_range: edge.hop_range,
+            })
+        }
+    }))
+}
+
+#[cfg(feature = "opencypher")]
+fn constrain_row_node_pattern(
+    node: &RowNodePattern,
+    row: &BindingRow,
+) -> Result<Option<RowNodePattern>> {
+    let Some(binding) = &node.binding else {
+        return Ok(Some(node.clone()));
+    };
+    let Some(bound_id) = row.values.get(binding).copied() else {
+        return Ok(Some(node.clone()));
+    };
+    if matches!(node.id, Some(pattern_id) if pattern_id != bound_id) {
+        return Ok(None);
+    }
+    let mut constrained = node.clone();
+    constrained.id = Some(bound_id);
+    if let Some(metadata) = row.metadata.get(binding) {
+        if !vertex_metadata_matches(metadata, &constrained) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(constrained))
 }
 
 #[cfg(feature = "opencypher")]

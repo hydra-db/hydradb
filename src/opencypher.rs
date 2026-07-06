@@ -45,7 +45,7 @@ pub struct ParsedQuery {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedRowQuery {
-    pub pattern: RowPattern,
+    pub patterns: Vec<RowPattern>,
     pub predicate: Option<RowPredicate>,
     pub projections: Vec<RowProjection>,
     pub order_by: Vec<RowSort>,
@@ -286,17 +286,28 @@ impl ParsedCypher {
         parameters: &BTreeMap<String, VertexPropertyValue>,
     ) -> Result<ParsedRowQuery> {
         unsafe {
-            if sys::cypher_ast_query_nclauses(query) != 2 {
+            let clause_count = sys::cypher_ast_query_nclauses(query);
+            if clause_count < 2 {
                 return unsupported("row execution supports MATCH ... RETURN queries");
             }
-            let match_clause = checked_node(sys::cypher_ast_query_get_clause(query, 0))?;
-            let return_clause = checked_node(sys::cypher_ast_query_get_clause(query, 1))?;
-            if !is_instance(match_clause, sys::CYPHER_AST_MATCH)
-                || !is_instance(return_clause, sys::CYPHER_AST_RETURN)
-            {
-                return unsupported("row execution supports MATCH ... RETURN queries");
+            let return_clause =
+                checked_node(sys::cypher_ast_query_get_clause(query, clause_count - 1))?;
+            if !is_instance(return_clause, sys::CYPHER_AST_RETURN) {
+                return unsupported(
+                    "row execution supports MATCH ... RETURN queries ending in RETURN",
+                );
             }
-            lower_match_return_rows(match_clause, return_clause, parameters)
+            let mut match_clauses = Vec::with_capacity(clause_count.saturating_sub(1) as usize);
+            for idx in 0..clause_count - 1 {
+                let clause = checked_node(sys::cypher_ast_query_get_clause(query, idx))?;
+                if !is_instance(clause, sys::CYPHER_AST_MATCH) {
+                    return unsupported(
+                        "row execution currently supports one or more MATCH clauses followed by RETURN",
+                    );
+                }
+                match_clauses.push(clause);
+            }
+            lower_match_return_rows(&match_clauses, return_clause, parameters)
         }
     }
 
@@ -532,31 +543,39 @@ fn lower_match_return(
 }
 
 fn lower_match_return_rows(
-    match_clause: *const AstNode,
+    match_clauses: &[*const AstNode],
     return_clause: *const AstNode,
     parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<ParsedRowQuery> {
     unsafe {
-        if sys::cypher_ast_match_is_optional(match_clause) {
-            return unsupported("OPTIONAL MATCH is not executable in Phase 2");
+        let mut patterns = Vec::new();
+        let mut predicate = None;
+        for match_clause in match_clauses {
+            if sys::cypher_ast_match_is_optional(*match_clause) {
+                return unsupported("OPTIONAL MATCH is not executable in Phase 2");
+            }
+            if sys::cypher_ast_match_nhints(*match_clause) != 0 {
+                return unsupported("MATCH hints are not executable in Phase 2");
+            }
+
+            let pattern = checked_node(sys::cypher_ast_match_get_pattern(*match_clause))?;
+            patterns.extend(lower_row_patterns(pattern, parameters)?);
+            let match_predicate = sys::cypher_ast_match_get_predicate(*match_clause);
+            if !match_predicate.is_null() {
+                predicate = Some(and_row_predicates(
+                    predicate,
+                    lower_row_predicate(match_predicate, parameters)?,
+                ));
+            }
         }
-        if sys::cypher_ast_match_nhints(match_clause) != 0 {
-            return unsupported("MATCH hints are not executable in Phase 2");
+        if patterns.is_empty() {
+            return unsupported("MATCH requires at least one executable row pattern");
         }
         if sys::cypher_ast_return_is_distinct(return_clause)
             || sys::cypher_ast_return_has_include_existing(return_clause)
         {
             return unsupported("DISTINCT and RETURN * are not executable in Phase 2");
         }
-
-        let pattern = checked_node(sys::cypher_ast_match_get_pattern(match_clause))?;
-        let pattern = lower_row_pattern(pattern, parameters)?;
-        let predicate = sys::cypher_ast_match_get_predicate(match_clause);
-        let predicate = if predicate.is_null() {
-            None
-        } else {
-            Some(lower_row_predicate(predicate, parameters)?)
-        };
 
         let projection_count = sys::cypher_ast_return_nprojections(return_clause);
         if projection_count == 0 {
@@ -603,7 +622,7 @@ fn lower_match_return_rows(
         let order_by = lower_return_order_by(return_clause)?;
         let window = lower_return_window(return_clause, parameters)?;
         Ok(ParsedRowQuery {
-            pattern,
+            patterns,
             predicate,
             projections,
             order_by,
@@ -748,6 +767,13 @@ fn lower_row_predicate(
         }
     }
     unsupported("WHERE currently supports boolean combinations of property comparisons")
+}
+
+fn and_row_predicates(left: Option<RowPredicate>, right: RowPredicate) -> RowPredicate {
+    match left {
+        Some(left) => RowPredicate::And(Box::new(left), Box::new(right)),
+        None => right,
+    }
 }
 
 fn row_comparison_op(op: *const sys::cypher_operator_t) -> Result<RowComparisonOp> {
@@ -914,27 +940,44 @@ fn lower_create_edge_pattern(
     }
 }
 
-fn lower_row_pattern(
+fn lower_row_patterns(
     pattern: *const AstNode,
     parameters: &BTreeMap<String, VertexPropertyValue>,
-) -> Result<RowPattern> {
+) -> Result<Vec<RowPattern>> {
     unsafe {
         ensure_instance(pattern, sys::CYPHER_AST_PATTERN, "pattern")?;
-        if sys::cypher_ast_pattern_npaths(pattern) != 1 {
-            return unsupported("only one path pattern is executable in Phase 2");
+        let path_count = sys::cypher_ast_pattern_npaths(pattern);
+        if path_count == 0 {
+            return unsupported("MATCH requires at least one path pattern");
         }
 
-        let path = checked_node(sys::cypher_ast_pattern_get_path(pattern, 0))?;
-        ensure_instance(path, sys::CYPHER_AST_PATTERN_PATH, "pattern path")?;
-        match sys::cypher_ast_pattern_path_nelements(path) {
-            1 => {
-                let node = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
-                ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "node pattern")?;
-                Ok(RowPattern::Node(lower_row_node_pattern(node, parameters)?))
+        let mut patterns = Vec::new();
+        for path_idx in 0..path_count {
+            let path = checked_node(sys::cypher_ast_pattern_get_path(pattern, path_idx))?;
+            ensure_instance(path, sys::CYPHER_AST_PATTERN_PATH, "pattern path")?;
+            let element_count = sys::cypher_ast_pattern_path_nelements(path);
+            match element_count {
+                1 => {
+                    let node = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
+                    ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "node pattern")?;
+                    patterns.push(RowPattern::Node(lower_row_node_pattern(node, parameters)?));
+                }
+                count if count >= 3 && count % 2 == 1 => {
+                    let edge_count = (count - 1) / 2;
+                    for edge_idx in 0..edge_count {
+                        patterns.push(RowPattern::Edge(lower_row_edge_path_segment(
+                            path, edge_idx, parameters,
+                        )?));
+                    }
+                }
+                _ => {
+                    return unsupported(
+                        "MATCH paths must alternate node and relationship patterns in Phase 2",
+                    );
+                }
             }
-            3 => lower_row_single_edge_path(path, parameters).map(RowPattern::Edge),
-            _ => unsupported("only node and one-hop edge patterns are executable in Phase 2"),
         }
+        Ok(patterns)
     }
 }
 
@@ -972,14 +1015,18 @@ fn lower_create_node_pattern(
     }
 }
 
-fn lower_row_single_edge_path(
+fn lower_row_edge_path_segment(
     path: *const AstNode,
+    edge_idx: u32,
     parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<RowEdgePattern> {
     unsafe {
-        let left = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
-        let rel = checked_node(sys::cypher_ast_pattern_path_get_element(path, 1))?;
-        let right = checked_node(sys::cypher_ast_pattern_path_get_element(path, 2))?;
+        let left_idx = edge_idx.saturating_mul(2);
+        let rel_idx = left_idx + 1;
+        let right_idx = left_idx + 2;
+        let left = checked_node(sys::cypher_ast_pattern_path_get_element(path, left_idx))?;
+        let rel = checked_node(sys::cypher_ast_pattern_path_get_element(path, rel_idx))?;
+        let right = checked_node(sys::cypher_ast_pattern_path_get_element(path, right_idx))?;
         ensure_instance(left, sys::CYPHER_AST_NODE_PATTERN, "left node pattern")?;
         ensure_instance(rel, sys::CYPHER_AST_REL_PATTERN, "relationship pattern")?;
         ensure_instance(right, sys::CYPHER_AST_NODE_PATTERN, "right node pattern")?;
@@ -1805,7 +1852,8 @@ mod tests {
              RETURN u.name AS src, v.age AS age ORDER BY v.age DESC",
         )
         .unwrap();
-        let RowPattern::Edge(pattern) = &parsed.pattern else {
+        assert_eq!(parsed.patterns.len(), 1);
+        let RowPattern::Edge(pattern) = &parsed.patterns[0] else {
             panic!("expected edge row pattern");
         };
         assert_eq!(pattern.src.labels, BTreeSet::from(["User".to_string()]));
@@ -1848,7 +1896,8 @@ mod tests {
             "MATCH (u:User {active: true}) RETURN u.name AS name ORDER BY u.name",
         )
         .unwrap();
-        let RowPattern::Node(node) = &parsed.pattern else {
+        assert_eq!(parsed.patterns.len(), 1);
+        let RowPattern::Node(node) = &parsed.patterns[0] else {
             panic!("expected node row pattern");
         };
         assert_eq!(node.binding.as_deref(), Some("u"));
@@ -1864,6 +1913,55 @@ mod tests {
                 property: "name".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn lowers_multi_match_row_query_as_pattern_pipeline() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (u:User {id: 1})-[:FOLLOWS]->(v) \
+             MATCH (v)-[:POSTED]->(p:Post) \
+             WHERE p.score >= 10 \
+             RETURN u.id AS user, p.id AS post ORDER BY post",
+        )
+        .unwrap();
+        assert_eq!(parsed.patterns.len(), 2);
+        let RowPattern::Edge(first) = &parsed.patterns[0] else {
+            panic!("expected first edge row pattern");
+        };
+        let RowPattern::Edge(second) = &parsed.patterns[1] else {
+            panic!("expected second edge row pattern");
+        };
+        assert_eq!(first.src.binding.as_deref(), Some("u"));
+        assert_eq!(first.dst.binding.as_deref(), Some("v"));
+        assert_eq!(second.src.binding.as_deref(), Some("v"));
+        assert_eq!(second.dst.binding.as_deref(), Some("p"));
+        assert!(parsed.predicate.is_some());
+        assert_eq!(
+            parsed.columns,
+            vec![QueryColumn::new("user"), QueryColumn::new("post")]
+        );
+    }
+
+    #[test]
+    fn lowers_multi_edge_path_as_joinable_edge_patterns() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v)-[:POSTED]->(p) \
+             RETURN u.id, v.id, p.id",
+        )
+        .unwrap();
+        assert_eq!(parsed.patterns.len(), 2);
+        let RowPattern::Edge(first) = &parsed.patterns[0] else {
+            panic!("expected first edge row pattern");
+        };
+        let RowPattern::Edge(second) = &parsed.patterns[1] else {
+            panic!("expected second edge row pattern");
+        };
+        assert_eq!(first.edge_type, "FOLLOWS");
+        assert_eq!(first.src.id, Some(1));
+        assert_eq!(first.dst.binding.as_deref(), Some("v"));
+        assert_eq!(second.edge_type, "POSTED");
+        assert_eq!(second.src.binding.as_deref(), Some("v"));
+        assert_eq!(second.dst.binding.as_deref(), Some("p"));
     }
 
     #[test]
