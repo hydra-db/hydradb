@@ -613,6 +613,7 @@ impl GraphShard {
                                     relationship.src,
                                     relationship.dst,
                                     state.read_epoch,
+                                    state.budget,
                                 )
                                 .await?
                             }
@@ -646,6 +647,7 @@ impl GraphShard {
                                     relationship.src,
                                     relationship.dst,
                                     state.read_epoch,
+                                    state.budget,
                                 )
                                 .await?
                             }
@@ -682,8 +684,13 @@ impl GraphShard {
             let metadata = match row.metadata.get(binding) {
                 Some(metadata) => metadata.clone(),
                 None => {
-                    self.vertex_metadata_at(state.cell_id, vertex_id, state.read_epoch)
-                        .await?
+                    self.vertex_metadata_at(
+                        state.cell_id,
+                        vertex_id,
+                        state.read_epoch,
+                        state.budget,
+                    )
+                    .await?
                 }
             };
             state.original_metadata.insert(vertex_id, metadata.clone());
@@ -805,6 +812,7 @@ impl GraphShard {
                         src,
                         read_epoch,
                         plan.result_window,
+                        Some(&budget),
                     )
                     .await?;
                 budget.check("query_out_neighbors")?;
@@ -862,9 +870,9 @@ impl GraphShard {
                         &plan.cell_id,
                         &edge_type,
                         src,
-                        min_hops,
-                        max_hops,
+                        (min_hops, max_hops),
                         read_epoch,
+                        &budget,
                     )
                     .await?
                     .0;
@@ -1238,7 +1246,7 @@ impl GraphShard {
             for src in sources {
                 budget.check("cypher_edge_sources")?;
                 let neighbors = self
-                    .out_neighbors_at(cell_id, &edge.edge_type, src, read_epoch)
+                    .out_neighbors_at_for_query(cell_id, &edge.edge_type, src, read_epoch, budget)
                     .await?;
                 scanned_edges = scanned_edges.saturating_add(neighbors.len() as u64);
                 self.ensure_query_scan_edges("cypher_edge_neighbor_scan", scanned_edges)?;
@@ -1280,7 +1288,7 @@ impl GraphShard {
             for dst in destinations {
                 budget.check("cypher_edge_destinations")?;
                 let neighbors = self
-                    .in_neighbors_at(cell_id, &edge.edge_type, dst, read_epoch)
+                    .in_neighbors_at_for_query(cell_id, &edge.edge_type, dst, read_epoch, budget)
                     .await?;
                 scanned_edges = scanned_edges.saturating_add(neighbors.len() as u64);
                 self.ensure_query_scan_edges("cypher_edge_reverse_neighbor_scan", scanned_edges)?;
@@ -1304,7 +1312,9 @@ impl GraphShard {
         let mut rows = Vec::new();
         let mut metadata_cache = BTreeMap::new();
         let mut edge_metadata_cache = BTreeMap::new();
-        let records = self.edges_at(cell_id, &edge.edge_type, read_epoch).await?;
+        let records = self
+            .edges_at_with_budget(cell_id, &edge.edge_type, read_epoch, Some(budget))
+            .await?;
         self.ensure_query_scan_edges("cypher_edge_full_scan", records.len() as u64)?;
         {
             let mut state = EdgeRowMatchState {
@@ -1385,9 +1395,9 @@ impl GraphShard {
                 cell_id,
                 &edge.edge_type,
                 src,
-                min_hops,
-                max_hops,
+                (min_hops, max_hops),
                 read_epoch,
+                budget,
             )
             .await?;
         budget.check("cypher_reachable")?;
@@ -1464,6 +1474,7 @@ impl GraphShard {
         cell_id: &str,
         vertex_id: VertexId,
         read_epoch: GraphEpoch,
+        budget: &QueryBudget,
     ) -> Result<VertexMetadata> {
         validate_component("cell_id", cell_id)?;
         let prefix = keys::vertex_delta_prefix(cell_id, vertex_id);
@@ -1471,6 +1482,7 @@ impl GraphShard {
         let mut latest = None;
         let mut saw_delta = false;
         while let Some(kv) = iter.next().await? {
+            budget.check("cypher_vertex_metadata_delta")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let epoch = parse_vertex_delta_key(&key)?;
             saw_delta = true;
@@ -1500,6 +1512,7 @@ impl GraphShard {
         src: VertexId,
         dst: VertexId,
         read_epoch: GraphEpoch,
+        budget: &QueryBudget,
     ) -> Result<EdgeMetadata> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
@@ -1508,6 +1521,7 @@ impl GraphShard {
         let mut latest = None;
         let mut saw_delta = false;
         while let Some(kv) = iter.next().await? {
+            budget.check("cypher_edge_metadata_delta")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let epoch = parse_edge_metadata_delta_key(&key)?;
             saw_delta = true;
@@ -1754,7 +1768,7 @@ impl GraphShard {
                 Some(metadata) => metadata.clone(),
                 None => {
                     let metadata = self
-                        .vertex_metadata_at(cell_id, vertex_id, read_epoch)
+                        .vertex_metadata_at(cell_id, vertex_id, read_epoch, budget)
                         .await?;
                     cache.insert(vertex_id, metadata.clone());
                     metadata
@@ -1790,6 +1804,7 @@ impl GraphShard {
                         relationship.src,
                         relationship.dst,
                         read_epoch,
+                        budget,
                     )
                     .await?;
                 cache.insert(relationship.clone(), metadata.clone());
@@ -1842,18 +1857,28 @@ impl GraphShard {
         src: VertexId,
         read_epoch: GraphEpoch,
         window: QueryWindow,
+        budget: Option<&QueryBudget>,
     ) -> Result<Vec<VertexId>> {
+        check_optional_query_budget(budget, "query_out_neighbors_window")?;
         let fetch_limit = self.query_window_fetch_limit(window)?;
         if let Some(vertices) = self
             .out_supernode_window(cell_id, edge_type, src, read_epoch, window, fetch_limit)
             .await?
         {
+            check_optional_query_budget(budget, "query_out_supernode_window")?;
             return self.apply_query_window_fetch_result(vertices, window);
         }
 
-        let vertices = self
-            .out_neighbors_at(cell_id, edge_type, src, read_epoch)
-            .await?;
+        let vertices = match budget {
+            Some(budget) => {
+                self.out_neighbors_at_for_query(cell_id, edge_type, src, read_epoch, budget)
+                    .await?
+            }
+            None => {
+                self.out_neighbors_at(cell_id, edge_type, src, read_epoch)
+                    .await?
+            }
+        };
         self.apply_query_window(vertices, window)
     }
 
@@ -1927,6 +1952,8 @@ impl GraphShard {
         }
 
         let read_epoch = self.query_read_epoch(context).await?;
+        let budget = QueryBudget::new(context.max_runtime_ms.or(self.limits.max_query_runtime_ms));
+        budget.check("cypher_rows_page_stream")?;
         let src = edge.src.id.expect("streaming edge has fixed source");
         let mut vertices = self
             .out_neighbors_window_at(
@@ -1935,6 +1962,7 @@ impl GraphShard {
                 src,
                 read_epoch,
                 page_window,
+                Some(&budget),
             )
             .await?;
         let has_next = vertices.len() > page_size;
@@ -1942,6 +1970,7 @@ impl GraphShard {
 
         let mut rows = Vec::with_capacity(vertices.len());
         for dst in vertices {
+            budget.check("cypher_rows_page_stream_project")?;
             rows.push(QueryRow::new(streaming_neighbor_projection_values(
                 edge,
                 src,
@@ -2111,12 +2140,14 @@ impl GraphShard {
         cell_id: &str,
         edge_type: &str,
         src: VertexId,
-        min_hops: u8,
-        max_hops: u8,
+        hop_range: (u8, u8),
         read_epoch: GraphEpoch,
+        budget: &QueryBudget,
     ) -> Result<(Vec<VertexId>, u64)> {
+        budget.check("cypher_match_reachable")?;
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
+        let (min_hops, max_hops) = hop_range;
         if min_hops > max_hops {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "OpenCypher",
@@ -2130,9 +2161,12 @@ impl GraphShard {
         )?;
 
         let mut adjacency = BTreeMap::<VertexId, BTreeSet<VertexId>>::new();
-        let edges = self.edges_at(cell_id, edge_type, read_epoch).await?;
+        let edges = self
+            .edges_at_with_budget(cell_id, edge_type, read_epoch, Some(budget))
+            .await?;
         self.ensure_query_scan_edges("cypher_reachable_full_scan", edges.len() as u64)?;
         for edge in edges {
+            budget.check("cypher_reachable_adjacency_build")?;
             adjacency.entry(edge.src).or_default().insert(edge.dst);
         }
 
@@ -2147,8 +2181,10 @@ impl GraphShard {
         let mut frontier = BTreeSet::from([src]);
         let mut edge_visits = 0_u64;
         for depth in 1..=max_hops {
+            budget.check("cypher_reachable_depth")?;
             let mut next = BTreeSet::new();
             for vertex in &frontier {
+                budget.check("cypher_reachable_frontier")?;
                 if let Some(neighbors) = adjacency.get(vertex) {
                     edge_visits = edge_visits.saturating_add(neighbors.len() as u64);
                     self.ensure_query_scan_edges("cypher_reachable_edge_visits", edge_visits)?;
@@ -2205,10 +2241,10 @@ impl GraphShard {
         }
         let read_epoch = self.current_epoch(cell_id).await?;
         let tombstones = self
-            .scan_out_segment_tombstones_for_src_at(cell_id, edge_type, src, read_epoch)
+            .scan_out_segment_tombstones_for_src_at(cell_id, edge_type, src, read_epoch, None)
             .await?;
         neighbors.extend(
-            self.scan_out_segments_for_src_at(cell_id, edge_type, src, read_epoch)
+            self.scan_out_segments_for_src_at(cell_id, edge_type, src, read_epoch, None)
                 .await?
                 .into_iter()
                 .filter(|edge| segment_edge_visible(edge.epoch, tombstones.get(&edge.dst).copied()))
@@ -2216,6 +2252,30 @@ impl GraphShard {
         );
         neighbors.sort_unstable();
         neighbors.dedup();
+        Ok(neighbors)
+    }
+
+    async fn out_neighbors_at_for_query(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<VertexId>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let mut neighbors = Vec::new();
+        for edge in self
+            .edges_at_with_budget(cell_id, edge_type, read_epoch, Some(budget))
+            .await?
+        {
+            budget.check("query_out_neighbors_scan")?;
+            if edge.src == src {
+                neighbors.push(edge.dst);
+            }
+        }
+        neighbors.sort_unstable();
         Ok(neighbors)
     }
 
@@ -2232,7 +2292,7 @@ impl GraphShard {
             .await?;
         let mut latest = None;
         for edge in self
-            .scan_out_segments_for_src_at(cell_id, edge_type, src, read_epoch)
+            .scan_out_segments_for_src_at(cell_id, edge_type, src, read_epoch, None)
             .await?
         {
             if edge.dst == dst && segment_edge_visible(edge.epoch, tombstone_epoch) {
@@ -2248,17 +2308,20 @@ impl GraphShard {
         edge_type: &str,
         src: VertexId,
         read_epoch: GraphEpoch,
+        budget: Option<&QueryBudget>,
     ) -> Result<Vec<EdgeRecord>> {
         let prefix = keys::out_segment_src_prefix(cell_id, edge_type, src);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
         let mut edges = Vec::new();
         while let Some(kv) = iter.next().await? {
+            check_optional_query_budget(budget, "query_out_segment_scan")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let segment = decode_out_edge_segment(&key, &kv.value)?;
             if segment.start_epoch > read_epoch {
                 break;
             }
             for (epoch, dst) in segment.edges.iter().copied() {
+                check_optional_query_budget(budget, "query_out_segment_edge_scan")?;
                 if epoch > read_epoch {
                     break;
                 }
@@ -2296,11 +2359,13 @@ impl GraphShard {
         edge_type: &str,
         src: VertexId,
         read_epoch: GraphEpoch,
+        budget: Option<&QueryBudget>,
     ) -> Result<BTreeMap<VertexId, GraphEpoch>> {
         let prefix = keys::out_segment_tombstone_src_prefix(cell_id, edge_type, src);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
         let mut tombstones = BTreeMap::new();
         while let Some(kv) = iter.next().await? {
+            check_optional_query_budget(budget, "query_out_segment_tombstone_scan")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let (key_cell_id, key_edge_type, key_src, dst) =
                 parse_out_edge_segment_tombstone_key(&key)?;
@@ -2323,11 +2388,13 @@ impl GraphShard {
         cell_id: &str,
         edge_type: &str,
         read_epoch: GraphEpoch,
+        budget: Option<&QueryBudget>,
     ) -> Result<BTreeMap<(VertexId, VertexId), GraphEpoch>> {
         let prefix = keys::out_segment_tombstone_edge_type_prefix(cell_id, edge_type);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
         let mut tombstones = BTreeMap::new();
         while let Some(kv) = iter.next().await? {
+            check_optional_query_budget(budget, "query_out_segment_tombstone_scan")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let (key_cell_id, key_edge_type, src, dst) =
                 parse_out_edge_segment_tombstone_key(&key)?;
@@ -2356,7 +2423,7 @@ impl GraphShard {
         let prefix = keys::out_segment_edge_type_prefix(cell_id, edge_type);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
         let tombstones = self
-            .out_segment_tombstones_at(cell_id, edge_type, read_epoch)
+            .out_segment_tombstones_at(cell_id, edge_type, read_epoch, None)
             .await?;
         let mut pairs = BTreeSet::new();
         while let Some(kv) = iter.next().await? {
@@ -2423,6 +2490,47 @@ impl GraphShard {
         Ok(neighbors)
     }
 
+    #[cfg(feature = "opencypher")]
+    async fn in_neighbors_at_for_query(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        dst: VertexId,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<VertexId>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let current_epoch = self.current_epoch(cell_id).await?;
+        if !self.writes_reverse_index() || read_epoch != current_epoch {
+            let mut neighbors = Vec::new();
+            for edge in self
+                .edges_at_with_budget(cell_id, edge_type, read_epoch, Some(budget))
+                .await?
+            {
+                budget.check("query_in_neighbors_full_scan")?;
+                if edge.dst == dst {
+                    neighbors.push(edge.src);
+                }
+            }
+            neighbors.sort_unstable();
+            neighbors.dedup();
+            return Ok(neighbors);
+        }
+        let prefix = keys::in_prefix(cell_id, edge_type, dst);
+        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        let mut neighbors = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            budget.check("query_in_neighbors_reverse_scan")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let record = decode_edge_record(&key, &kv.value)?;
+            neighbors.push(record.src);
+        }
+        neighbors.sort_unstable();
+        neighbors.dedup();
+        Ok(neighbors)
+    }
+
     pub async fn out_degree(&self, cell_id: &str, edge_type: &str, src: VertexId) -> Result<u64> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
@@ -2447,8 +2555,14 @@ impl GraphShard {
             }
         }
         records.extend(
-            self.scan_outbox_delta_batches_between(cell_id, None, after_epoch, GraphEpoch::MAX)
-                .await?,
+            self.scan_outbox_delta_batches_between(
+                cell_id,
+                None,
+                after_epoch,
+                GraphEpoch::MAX,
+                None,
+            )
+            .await?,
         );
         sort_deltas(&mut records);
         Ok(records)
@@ -2471,8 +2585,21 @@ impl GraphShard {
         after_epoch: GraphEpoch,
         read_epoch: GraphEpoch,
     ) -> Result<Vec<DeltaRecord>> {
+        self.deltas_between_with_budget(cell_id, edge_type, after_epoch, read_epoch, None)
+            .await
+    }
+
+    async fn deltas_between_with_budget(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        after_epoch: GraphEpoch,
+        read_epoch: GraphEpoch,
+        budget: Option<&QueryBudget>,
+    ) -> Result<Vec<DeltaRecord>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
+        check_optional_query_budget(budget, "query_deltas_between")?;
         if after_epoch >= read_epoch {
             return Ok(Vec::new());
         }
@@ -2487,7 +2614,7 @@ impl GraphShard {
         }
 
         let mut records = self
-            .scan_outbox_deltas_between(cell_id, edge_type, after_epoch, read_epoch)
+            .scan_outbox_deltas_between(cell_id, edge_type, after_epoch, read_epoch, budget)
             .await?;
         records.extend(
             self.scan_outbox_delta_batches_between(
@@ -2495,6 +2622,7 @@ impl GraphShard {
                 Some(edge_type),
                 after_epoch,
                 read_epoch,
+                budget,
             )
             .await?,
         );
@@ -2519,6 +2647,7 @@ impl GraphShard {
         edge_type: Option<&str>,
         after_epoch: GraphEpoch,
         read_epoch: GraphEpoch,
+        budget: Option<&QueryBudget>,
     ) -> Result<Vec<DeltaRecord>> {
         let start_suffix = after_epoch
             .checked_add(1)
@@ -2529,6 +2658,7 @@ impl GraphShard {
             .await?;
         let mut records = Vec::new();
         while let Some(kv) = iter.next().await? {
+            check_optional_query_budget(budget, "query_outbox_batch_scan")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let batch = decode_outbox_delta_batch(&key, &kv.value)?;
             if batch.start_epoch > read_epoch {
@@ -2540,6 +2670,7 @@ impl GraphShard {
                 }
             }
             for (offset, (src, dst)) in batch.edges.iter().copied().enumerate() {
+                check_optional_query_budget(budget, "query_outbox_batch_edge_scan")?;
                 let epoch = batch.start_epoch + offset as u64;
                 if epoch <= after_epoch {
                     continue;
@@ -2569,6 +2700,7 @@ impl GraphShard {
         edge_type: &str,
         after_epoch: GraphEpoch,
         read_epoch: GraphEpoch,
+        budget: Option<&QueryBudget>,
     ) -> Result<Vec<DeltaRecord>> {
         let start_suffix = after_epoch
             .checked_add(1)
@@ -2579,6 +2711,7 @@ impl GraphShard {
             .await?;
         let mut records = Vec::new();
         while let Some(kv) = iter.next().await? {
+            check_optional_query_budget(budget, "query_outbox_delta_scan")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let record = decode_delta_record(&key, &kv.value)?;
             if record.edge.epoch > read_epoch {
@@ -2603,8 +2736,20 @@ impl GraphShard {
         edge_type: &str,
         read_epoch: GraphEpoch,
     ) -> Result<Vec<EdgeRecord>> {
+        self.edges_at_with_budget(cell_id, edge_type, read_epoch, None)
+            .await
+    }
+
+    async fn edges_at_with_budget(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        read_epoch: GraphEpoch,
+        budget: Option<&QueryBudget>,
+    ) -> Result<Vec<EdgeRecord>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
+        check_optional_query_budget(budget, "query_edges_at")?;
         let mut edges = std::collections::BTreeMap::new();
         let base_epoch = if let Some(artifact) = self
             .latest_matrix_artifact(cell_id, edge_type, read_epoch)
@@ -2614,7 +2759,9 @@ impl GraphShard {
                 .cached_matrix_adjacency(cell_id, edge_type, artifact.base_epoch)
                 .await?;
             for (src, dsts) in adjacency.iter() {
+                check_optional_query_budget(budget, "query_edges_at_adjacency")?;
                 for dst in dsts {
+                    check_optional_query_budget(budget, "query_edges_at_adjacency_edge")?;
                     edges.insert(
                         (*src, *dst),
                         EdgeRecord {
@@ -2632,9 +2779,10 @@ impl GraphShard {
             0
         };
         for delta in self
-            .deltas_between(cell_id, edge_type, base_epoch, read_epoch)
+            .deltas_between_with_budget(cell_id, edge_type, base_epoch, read_epoch, budget)
             .await?
         {
+            check_optional_query_budget(budget, "query_edges_at_delta_apply")?;
             let key = (delta.edge.src, delta.edge.dst);
             match delta.kind {
                 DeltaKind::Plus => {
@@ -2730,6 +2878,16 @@ impl QueryBudget {
         }
         Ok(())
     }
+}
+
+fn check_optional_query_budget(
+    budget: Option<&QueryBudget>,
+    operation: &'static str,
+) -> Result<()> {
+    if let Some(budget) = budget {
+        budget.check(operation)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "opencypher")]
@@ -4030,12 +4188,12 @@ fn compare_vertex_property_order(
 #[cfg(feature = "opencypher")]
 fn query_value_rank(value: &QueryValue) -> u8 {
     match value {
-        QueryValue::Null => 0,
         QueryValue::Bool(_) => 1,
         QueryValue::VertexId(_) | QueryValue::Count(_) => 2,
         QueryValue::Float(_) => 3,
         QueryValue::Property(value) => 4 + vertex_property_rank(value),
         QueryValue::List(_) => 8,
+        QueryValue::Null => u8::MAX,
     }
 }
 

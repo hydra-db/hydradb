@@ -5824,21 +5824,29 @@ async fn tcp_query_transport_routes_distributed_cypher_pages() {
 
     let client_a: Arc<dyn QueryCellClient> = cluster_a.clone();
     let client_b: Arc<dyn QueryCellClient> = cluster_b.clone();
-    let server_a = TcpQueryServer::bind("127.0.0.1:0".parse().unwrap(), client_a)
-        .await
-        .unwrap();
-    let server_b = TcpQueryServer::bind("127.0.0.1:0".parse().unwrap(), client_b)
-        .await
-        .unwrap();
+    let server_a = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        client_a,
+        QueryTransportServerConfig::default().with_required_bearer_token("secret-a"),
+    )
+    .await
+    .unwrap();
+    let server_b = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        client_b,
+        QueryTransportServerConfig::default().with_required_bearer_token("secret-b"),
+    )
+    .await
+    .unwrap();
     let coordinator = DistributedQueryCoordinator::new(placement)
         .with_client(
             "node-a",
-            Arc::new(TcpQueryCellClient::new(server_a.local_addr())),
+            Arc::new(TcpQueryCellClient::new(server_a.local_addr()).with_bearer_token("secret-a")),
         )
         .unwrap()
         .with_client(
             "node-b",
-            Arc::new(TcpQueryCellClient::new(server_b.local_addr())),
+            Arc::new(TcpQueryCellClient::new(server_b.local_addr()).with_bearer_token("secret-b")),
         )
         .unwrap();
 
@@ -5909,6 +5917,51 @@ async fn tcp_query_transport_routes_distributed_cypher_pages() {
     cluster_a.close().await.unwrap();
     cluster_b.close().await.unwrap();
     control.close().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_default_bind_rejects_unauthenticated_requests() {
+    struct StaticQueryClient;
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for StaticQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            Ok(QueryResultSet::new(
+                vec![QueryColumn::new("v.id")],
+                vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+            ))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    let server = TcpQueryServer::bind("127.0.0.1:0".parse().unwrap(), Arc::new(StaticQueryClient))
+        .await
+        .unwrap();
+    let err = TcpQueryCellClient::new(server.local_addr())
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "query-transport-default-deny"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("unauthorized"));
+    assert!(server.metrics().auth_failures >= 1);
+    server.stop().await.unwrap();
 }
 
 #[cfg(feature = "query-transport")]
@@ -6017,19 +6070,18 @@ async fn tcp_query_transport_enforces_auth_cancellation_streaming_metrics_and_di
         .cancel_query("query-transport-cancelled")
         .await
         .unwrap();
-    let cancelled = client
+    let reused_after_precancel = client
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "query-transport-cancelled"),
-            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id",
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
         )
         .await
-        .unwrap_err();
-    assert!(cancelled.to_string().contains("query_transport_cancelled"));
+        .unwrap();
+    assert_eq!(reused_after_precancel.rows.len(), 3);
 
     let server_metrics = server.metrics();
     assert!(server_metrics.auth_failures >= 1);
-    assert!(server_metrics.cancellations >= 1);
-    assert!(server_metrics.cancelled_rejections >= 1);
+    assert_eq!(server_metrics.cancelled_rejections, 0);
     assert!(server_metrics.slow_queries >= 1);
     assert!(server_metrics.bytes_received > 0);
     assert!(server_metrics.bytes_sent > 0);
@@ -6076,13 +6128,15 @@ async fn tcp_query_transport_applies_server_backpressure_under_load() {
     let server = TcpQueryServer::bind_with_config(
         "127.0.0.1:0".parse().unwrap(),
         Arc::new(SlowQueryClient),
-        QueryTransportServerConfig::default().with_max_concurrent_requests(1),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("secret")
+            .with_max_concurrent_requests(1),
     )
     .await
     .unwrap();
     let mut tasks = Vec::new();
     for idx in 0..6 {
-        let client = TcpQueryCellClient::new(server.local_addr());
+        let client = TcpQueryCellClient::new(server.local_addr()).with_bearer_token("secret");
         tasks.push(tokio::spawn(async move {
             client
                 .execute_cypher_rows(
@@ -6098,6 +6152,36 @@ async fn tcp_query_transport_applies_server_backpressure_under_load() {
         assert_eq!(result.rows.len(), 1);
     }
     assert!(server.metrics().backpressure_waits >= 1);
+
+    let client = TcpQueryCellClient::new(server.local_addr()).with_bearer_token("secret");
+    let active_client = client.clone();
+    let active = tokio::spawn(async move {
+        active_client
+            .execute_cypher_rows(
+                QueryContext::new("reddit-home", "query-transport-cancel-active"),
+                "MATCH (u {id: 1}) RETURN u.id",
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    client
+        .cancel_query("query-transport-cancel-active")
+        .await
+        .unwrap();
+    let cancelled = active.await.unwrap().unwrap_err();
+    assert!(cancelled.to_string().contains("query_transport_cancelled"));
+
+    let reused = client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "query-transport-cancel-active"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(reused.rows.len(), 1);
+    let metrics = server.metrics();
+    assert!(metrics.cancellations >= 1);
+    assert!(metrics.cancelled_rejections >= 1);
     server.stop().await.unwrap();
 }
 
@@ -7702,6 +7786,25 @@ async fn cypher_optional_match_preserves_required_rows_with_null_bindings() {
             vec![
                 QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::Null]),
                 QueryRow::new(vec![QueryValue::VertexId(3), QueryValue::Null]),
+            ],
+        )
+    );
+
+    let nullable_order = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-optional-null-order"),
+            "MATCH (u:User) OPTIONAL MATCH (u)-[:FOLLOWS]->(v) \
+             RETURN v.id AS followed ORDER BY followed",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        nullable_order,
+        QueryResultSet::new(
+            vec![QueryColumn::new("followed")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(2)]),
+                QueryRow::new(vec![QueryValue::Null]),
             ],
         )
     );
