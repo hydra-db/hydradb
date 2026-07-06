@@ -36,6 +36,7 @@ fn typed_mutation(
     }
 }
 
+#[cfg(feature = "opencypher")]
 fn adjacency_from_records_for_test(edges: &[EdgeRecord]) -> MatrixAdjacency {
     let mut adjacency = MatrixAdjacency::new();
     for edge in edges {
@@ -8338,6 +8339,108 @@ async fn cypher_variable_hops_use_matrix_artifact_adjacency() {
     assert!(hot_metrics.matrix_adjacency_hits > first_metrics.matrix_adjacency_hits);
 
     shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_graph_kernel_descending_order_is_global_before_window() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-varhop-desc-order", object_store).await;
+
+    for (idx, (src, dst)) in [(1, 50), (1, 10), (50, 2), (10, 99), (2, 7)]
+        .into_iter()
+        .enumerate()
+    {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "DESC_CHAIN".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-varhop-desc-order-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+    let base_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    shard
+        .build_matrix_tiles("reddit-home", "DESC_CHAIN", base_epoch, 4)
+        .await
+        .unwrap();
+
+    let query = "MATCH (u {id: 1})-[:DESC_CHAIN*1..3]->(v) \
+                 RETURN v.id ORDER BY v.id DESC LIMIT 4";
+    let plan = shard
+        .explain_opencypher_rows(
+            QueryContext::new("reddit-home", "cypher-varhop-desc-order-plan"),
+            query,
+        )
+        .await
+        .unwrap();
+    assert!(plan.groups[0].patterns[0]
+        .optimizer_passes
+        .contains(&RowQueryOptimizerPass::GraphKernel));
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-varhop-desc-order-read"),
+            query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(99)]),
+                QueryRow::new(vec![QueryValue::VertexId(50)]),
+                QueryRow::new(vec![QueryValue::VertexId(10)]),
+                QueryRow::new(vec![QueryValue::VertexId(7)]),
+            ],
+        )
+    );
+
+    let first_page = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "cypher-varhop-desc-order-page-1"),
+            query,
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first_page,
+        QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(99)]),
+                QueryRow::new(vec![QueryValue::VertexId(50)]),
+            ],
+            Some(QueryCursorToken::new(2)),
+        )
+    );
+    let second_page = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "cypher-varhop-desc-order-page-2"),
+            query,
+            first_page.next_cursor,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second_page,
+        QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(10)]),
+                QueryRow::new(vec![QueryValue::VertexId(7)]),
+            ],
+            None,
+        )
+    );
 }
 
 #[cfg(feature = "opencypher")]
