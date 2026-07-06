@@ -944,9 +944,8 @@ impl GraphShard {
         let read_epoch = self.snapshot(cell_id).await?.read_epoch();
         let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
         let count = self
-            .edges_at_with_budget(cell_id, edge_type, read_epoch, Some(&budget))
-            .await?
-            .len() as u64;
+            .edge_type_cardinality_from_degree_counters(cell_id, edge_type, &budget)
+            .await?;
         self.publish_query_stats_count_after_snapshot(
             cell_id,
             "refresh_edge_type_query_stats",
@@ -1101,6 +1100,33 @@ impl GraphShard {
         }
         .await;
         release_cell_write_lock(lock, result).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn edge_type_cardinality_from_degree_counters(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        budget: &QueryBudget,
+    ) -> Result<u64> {
+        budget.check("query_stats_edge_type_degree_scan")?;
+        let mut iter = self
+            .scan_remote_prefix(&keys::degree_out_prefix(cell_id, edge_type))
+            .await?;
+        let mut count = 0_u64;
+        while let Some(kv) = iter.next().await? {
+            budget.check("query_stats_edge_type_degree_scan")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let degree = decode_u64(&key, &kv.value)?;
+            count = count
+                .checked_add(degree)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key,
+                    reason: "edge-type cardinality overflow while summing degree counters"
+                        .to_string(),
+                })?;
+        }
+        Ok(count)
     }
 
     #[cfg(feature = "opencypher")]
