@@ -26,6 +26,16 @@ name = "opencypher_tck_report"
 path = "examples/opencypher_tck_report.rs"
 required-features = ["opencypher"]
 
+[[example]]
+name = "phase2_query_bench"
+path = "examples/phase2_query_bench.rs"
+required-features = ["opencypher"]
+
+[[example]]
+name = "phase2_query_correctness"
+path = "examples/phase2_query_correctness.rs"
+required-features = ["opencypher"]
+
 [dependencies]
 async-trait = "0.1"
 bytes = "1"

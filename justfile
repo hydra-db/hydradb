@@ -104,6 +104,22 @@ minio-smoke:
 minio-bench:
     bash scripts/phase0_minio_path_bench.sh
 
+# Run Phase 2 Cypher query benchmarks.
+query-bench:
+    bash scripts/phase2_query_bench.sh
+
+# Run Phase 2 exact query correctness benchmark.
+query-correctness:
+    bash scripts/phase2_query_correctness.sh
+
+# Run Phase 2 Cypher query benchmarks against MinIO. Requires Docker.
+minio-query-bench:
+    bash scripts/phase2_minio_query_bench.sh
+
+# Run Phase 2 exact query correctness benchmark against MinIO. Requires Docker.
+minio-query-correctness:
+    bash scripts/phase2_minio_query_correctness.sh
+
 # Run MinIO chaos test. Requires Docker.
 minio-chaos:
     bash scripts/phase0_minio_chaos.sh
