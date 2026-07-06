@@ -6144,6 +6144,113 @@ async fn cypher_row_engine_executes_multi_edge_path_pipeline() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_row_engine_executes_grouped_aggregates() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-aggregates", object_store).await;
+
+    for (idx, (edge_type, src, dst)) in [
+        ("FOLLOWS", 1, 10),
+        ("FOLLOWS", 1, 11),
+        ("FOLLOWS", 2, 12),
+        ("POSTED", 10, 100),
+        ("POSTED", 11, 101),
+        ("POSTED", 12, 102),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-row-aggregates-edge-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+    for (post, score) in [(100, 5), (101, 20), (102, 30)] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                post,
+                VertexMetadata::default()
+                    .with_label("Post")
+                    .with_property("score", VertexPropertyValue::Integer(score)),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-aggregates-read"),
+            "MATCH (u)-[:FOLLOWS]->(v)-[:POSTED]->(p:Post) \
+             RETURN u.id AS user, count(*) AS posts, sum(p.score) AS score, \
+             avg(p.score) AS avg_score, collect(p.id) AS post_ids ORDER BY user",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![
+                QueryColumn::new("user"),
+                QueryColumn::new("posts"),
+                QueryColumn::new("score"),
+                QueryColumn::new("avg_score"),
+                QueryColumn::new("post_ids"),
+            ],
+            vec![
+                QueryRow::new(vec![
+                    QueryValue::VertexId(1),
+                    QueryValue::Count(2),
+                    QueryValue::Property(VertexPropertyValue::Integer(25)),
+                    QueryValue::Float(QueryFloat(12.5)),
+                    QueryValue::List(vec![QueryValue::VertexId(100), QueryValue::VertexId(101)]),
+                ]),
+                QueryRow::new(vec![
+                    QueryValue::VertexId(2),
+                    QueryValue::Count(1),
+                    QueryValue::Property(VertexPropertyValue::Integer(30)),
+                    QueryValue::Float(QueryFloat(30.0)),
+                    QueryValue::List(vec![QueryValue::VertexId(102)]),
+                ]),
+            ],
+        )
+    );
+
+    let empty = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-aggregates-empty"),
+            "MATCH (u {id: 404})-[:FOLLOWS]->(v) \
+             RETURN count(*) AS total, sum(v.id) AS sum_ids, avg(v.id) AS avg_id, \
+             collect(v.id) AS ids",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        empty,
+        QueryResultSet::new(
+            vec![
+                QueryColumn::new("total"),
+                QueryColumn::new("sum_ids"),
+                QueryColumn::new("avg_id"),
+                QueryColumn::new("ids"),
+            ],
+            vec![QueryRow::new(vec![
+                QueryValue::Count(0),
+                QueryValue::Property(VertexPropertyValue::Integer(0)),
+                QueryValue::Null,
+                QueryValue::List(Vec::new()),
+            ])],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_row_engine_records_operational_metrics() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-row-query-metrics", object_store).await;

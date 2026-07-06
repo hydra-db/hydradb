@@ -77,9 +77,26 @@ pub struct RowNodePattern {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowProjection {
-    NodeId { binding: String },
-    Property { binding: String, property: String },
+    NodeId {
+        binding: String,
+    },
+    Property {
+        binding: String,
+        property: String,
+    },
     CountAll,
+    Aggregate {
+        function: RowAggregateFunction,
+        expression: RowExpression,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RowAggregateFunction {
+    Count,
+    Sum,
+    Avg,
+    Collect,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -584,17 +601,28 @@ fn lower_match_return_rows(
 
         let mut projections = Vec::with_capacity(projection_count as usize);
         let mut columns = Vec::with_capacity(projection_count as usize);
-        let mut has_count = false;
         for idx in 0..projection_count {
             let projection =
                 checked_node(sys::cypher_ast_return_get_projection(return_clause, idx))?;
             let expression = checked_node(sys::cypher_ast_projection_get_expression(projection))?;
             if is_count_star(expression)? {
-                has_count = true;
                 projections.push(RowProjection::CountAll);
                 columns.push(QueryColumn::new(projection_column_name(
                     projection, "count(*)",
                 )?));
+                continue;
+            }
+            if let Some((function, expression, fallback_name)) =
+                lower_row_aggregate_expression(expression, parameters)?
+            {
+                columns.push(QueryColumn::new(projection_column_name(
+                    projection,
+                    fallback_name,
+                )?));
+                projections.push(RowProjection::Aggregate {
+                    function,
+                    expression,
+                });
                 continue;
             }
 
@@ -614,9 +642,6 @@ fn lower_match_return_rows(
                 format!("{binding}.{property}"),
             )?));
             projections.push(RowProjection::Property { binding, property });
-        }
-        if has_count && projection_count != 1 {
-            return unsupported("count(*) cannot be mixed with row projections in Phase 2");
         }
 
         let order_by = lower_return_order_by(return_clause)?;
@@ -809,6 +834,73 @@ fn lower_row_expression(
     Ok(RowExpression::Literal(scalar_property_value(
         expression, parameters,
     )?))
+}
+
+fn lower_row_aggregate_expression(
+    expression: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<Option<(RowAggregateFunction, RowExpression, String)>> {
+    unsafe {
+        if !is_instance(expression, sys::CYPHER_AST_APPLY_OPERATOR) {
+            return Ok(None);
+        }
+        if sys::cypher_ast_apply_operator_get_distinct(expression) {
+            return unsupported("DISTINCT aggregate arguments are not executable in Phase 2");
+        }
+        let function_node = checked_node(sys::cypher_ast_apply_operator_get_func_name(expression))?;
+        let function_name = function_name(function_node)?;
+        let Some(function) = row_aggregate_function(&function_name) else {
+            return Ok(None);
+        };
+        let argument_count = sys::cypher_ast_apply_operator_narguments(expression);
+        if argument_count != 1 {
+            return unsupported(format!(
+                "{} aggregate expects exactly one argument",
+                aggregate_function_name(function)
+            ));
+        }
+        let argument = checked_node(sys::cypher_ast_apply_operator_get_argument(expression, 0))?;
+        let expression = lower_row_expression(argument, parameters)?;
+        let fallback_name = format!(
+            "{}({})",
+            aggregate_function_name(function),
+            row_expression_name(&expression)
+        );
+        Ok(Some((function, expression, fallback_name)))
+    }
+}
+
+fn row_aggregate_function(name: &str) -> Option<RowAggregateFunction> {
+    if name.eq_ignore_ascii_case("count") {
+        Some(RowAggregateFunction::Count)
+    } else if name.eq_ignore_ascii_case("sum") {
+        Some(RowAggregateFunction::Sum)
+    } else if name.eq_ignore_ascii_case("avg") {
+        Some(RowAggregateFunction::Avg)
+    } else if name.eq_ignore_ascii_case("collect") {
+        Some(RowAggregateFunction::Collect)
+    } else {
+        None
+    }
+}
+
+fn aggregate_function_name(function: RowAggregateFunction) -> &'static str {
+    match function {
+        RowAggregateFunction::Count => "count",
+        RowAggregateFunction::Sum => "sum",
+        RowAggregateFunction::Avg => "avg",
+        RowAggregateFunction::Collect => "collect",
+    }
+}
+
+fn row_expression_name(expression: &RowExpression) -> String {
+    match expression {
+        RowExpression::NodeId { binding } => format!("{binding}.id"),
+        RowExpression::Property { binding, property } => format!("{binding}.{property}"),
+        RowExpression::Literal(VertexPropertyValue::Integer(value)) => value.to_string(),
+        RowExpression::Literal(VertexPropertyValue::Bool(value)) => value.to_string(),
+        RowExpression::Literal(VertexPropertyValue::String(value)) => format!("'{value}'"),
+    }
 }
 
 fn lower_single_edge_pattern(
@@ -1962,6 +2054,55 @@ mod tests {
         assert_eq!(second.edge_type, "POSTED");
         assert_eq!(second.src.binding.as_deref(), Some("v"));
         assert_eq!(second.dst.binding.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn lowers_grouped_aggregate_row_query() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (u)-[:FOLLOWS]->(v)-[:POSTED]->(p:Post) \
+             RETURN u.id AS user, count(*) AS posts, sum(p.score) AS score, \
+             avg(p.score) AS avg_score, collect(p.id) AS post_ids ORDER BY posts DESC",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.columns,
+            vec![
+                QueryColumn::new("user"),
+                QueryColumn::new("posts"),
+                QueryColumn::new("score"),
+                QueryColumn::new("avg_score"),
+                QueryColumn::new("post_ids"),
+            ]
+        );
+        assert_eq!(
+            parsed.projections,
+            vec![
+                RowProjection::NodeId {
+                    binding: "u".to_string(),
+                },
+                RowProjection::CountAll,
+                RowProjection::Aggregate {
+                    function: RowAggregateFunction::Sum,
+                    expression: RowExpression::Property {
+                        binding: "p".to_string(),
+                        property: "score".to_string(),
+                    },
+                },
+                RowProjection::Aggregate {
+                    function: RowAggregateFunction::Avg,
+                    expression: RowExpression::Property {
+                        binding: "p".to_string(),
+                        property: "score".to_string(),
+                    },
+                },
+                RowProjection::Aggregate {
+                    function: RowAggregateFunction::Collect,
+                    expression: RowExpression::NodeId {
+                        binding: "p".to_string(),
+                    },
+                },
+            ]
+        );
     }
 
     #[test]

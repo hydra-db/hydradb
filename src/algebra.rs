@@ -87,12 +87,38 @@ impl QueryColumn {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueryFloat(pub f64);
+
+impl PartialEq for QueryFloat {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for QueryFloat {}
+
+impl PartialOrd for QueryFloat {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueryFloat {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum QueryValue {
+    Null,
     VertexId(VertexId),
     Count(u64),
     Bool(bool),
+    Float(QueryFloat),
     Property(VertexPropertyValue),
+    List(Vec<QueryValue>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
