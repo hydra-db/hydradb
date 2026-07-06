@@ -217,8 +217,9 @@ impl GraphShard {
         read_epoch: GraphEpoch,
         initial_bindings: &BTreeSet<String>,
     ) -> Result<Vec<OptimizedRowPattern>> {
-        let reverse_index_available =
-            self.writes_reverse_index() && read_epoch == self.current_epoch(cell_id).await?;
+        let current_epoch = self.current_epoch(cell_id).await?;
+        let latest_snapshot = read_epoch == current_epoch;
+        let reverse_index_available = self.writes_reverse_index() && latest_snapshot;
         let mut remaining: Vec<_> = patterns
             .iter()
             .cloned()
@@ -237,8 +238,8 @@ impl GraphShard {
                 let mut optimized = self
                     .plan_row_pattern_with_stats(
                         cell_id,
-                        read_epoch,
                         reverse_index_available,
+                        latest_snapshot,
                         &remaining_pattern.pattern,
                         remaining_pattern.original_index,
                         &bound,
@@ -280,8 +281,8 @@ impl GraphShard {
     async fn plan_row_pattern_with_stats(
         &self,
         cell_id: &str,
-        read_epoch: GraphEpoch,
         reverse_index_available: bool,
+        latest_snapshot: bool,
         pattern: &RowPattern,
         original_index: usize,
         bound: &BTreeSet<String>,
@@ -294,8 +295,8 @@ impl GraphShard {
             RowPattern::Edge(edge) => {
                 self.plan_row_edge_with_stats(
                     cell_id,
-                    read_epoch,
                     reverse_index_available,
+                    latest_snapshot,
                     edge,
                     original_index,
                     bound,
@@ -329,14 +330,20 @@ impl GraphShard {
     async fn plan_row_edge_with_stats(
         &self,
         cell_id: &str,
-        _read_epoch: GraphEpoch,
         reverse_index_available: bool,
+        latest_snapshot: bool,
         edge: &RowEdgePattern,
         original_index: usize,
         bound: &BTreeSet<String>,
     ) -> Result<RowQueryPlanPattern> {
         let access = self
-            .best_row_edge_access(cell_id, edge, reverse_index_available, bound)
+            .best_row_edge_access(
+                cell_id,
+                edge,
+                reverse_index_available,
+                latest_snapshot,
+                bound,
+            )
             .await?;
         Ok(RowQueryPlanPattern {
             original_index,
@@ -366,10 +373,17 @@ impl GraphShard {
         read_epoch: GraphEpoch,
         bound: &BTreeSet<String>,
     ) -> Result<RowQueryAccess> {
-        let reverse_index_available =
-            self.writes_reverse_index() && read_epoch == self.current_epoch(cell_id).await?;
+        let current_epoch = self.current_epoch(cell_id).await?;
+        let latest_snapshot = read_epoch == current_epoch;
+        let reverse_index_available = self.writes_reverse_index() && latest_snapshot;
         Ok(self
-            .best_row_edge_access(cell_id, edge, reverse_index_available, bound)
+            .best_row_edge_access(
+                cell_id,
+                edge,
+                reverse_index_available,
+                latest_snapshot,
+                bound,
+            )
             .await?
             .access)
     }
@@ -437,6 +451,7 @@ impl GraphShard {
         cell_id: &str,
         edge: &RowEdgePattern,
         reverse_index_available: bool,
+        latest_snapshot: bool,
         bound: &BTreeSet<String>,
     ) -> Result<AccessEstimate> {
         if let Some((min_hops, max_hops)) = edge.hop_range {
@@ -494,28 +509,30 @@ impl GraphShard {
                 .with_pass(RowQueryOptimizerPass::ReverseExpand),
             );
         }
-        for (property, value) in &edge.properties {
-            let encoded = encode_vertex_property_value_key(value);
-            let estimate = self
-                .query_stats_count(&keys::query_stats_edge_property(
-                    cell_id,
-                    &edge.edge_type,
-                    property,
-                    &encoded,
-                ))
-                .await?
-                .unwrap_or(16);
-            choose_best_access(
-                &mut best,
-                AccessEstimate::new(
-                    RowQueryAccess::EdgePropertyIndex {
-                        edge_type: edge.edge_type.clone(),
-                        property: property.clone(),
-                    },
-                    estimate,
-                )
-                .with_pass(RowQueryOptimizerPass::UtilizeEdgeIndex),
-            );
+        if latest_snapshot {
+            for (property, value) in &edge.properties {
+                let encoded = encode_vertex_property_value_key(value);
+                let estimate = self
+                    .query_stats_count(&keys::query_stats_edge_property(
+                        cell_id,
+                        &edge.edge_type,
+                        property,
+                        &encoded,
+                    ))
+                    .await?
+                    .unwrap_or(16);
+                choose_best_access(
+                    &mut best,
+                    AccessEstimate::new(
+                        RowQueryAccess::EdgePropertyIndex {
+                            edge_type: edge.edge_type.clone(),
+                            property: property.clone(),
+                        },
+                        estimate,
+                    )
+                    .with_pass(RowQueryOptimizerPass::UtilizeEdgeIndex),
+                );
+            }
         }
         if let Some(best) = best {
             return Ok(best);
