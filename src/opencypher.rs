@@ -54,6 +54,13 @@ pub struct ParsedRowQuery {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedMutationQuery {
+    pub patterns: Vec<RowPattern>,
+    pub predicate: Option<RowPredicate>,
+    pub actions: Vec<RowMutationAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowPattern {
     Node(RowNodePattern),
     Edge(RowEdgePattern),
@@ -61,6 +68,7 @@ pub enum RowPattern {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowEdgePattern {
+    pub binding: Option<String>,
     pub edge_type: String,
     pub src: RowNodePattern,
     pub dst: RowNodePattern,
@@ -97,6 +105,38 @@ pub enum RowAggregateFunction {
     Sum,
     Avg,
     Collect,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RowMutationAction {
+    DeleteRelationship {
+        binding: String,
+        detach: bool,
+    },
+    SetProperty {
+        binding: String,
+        property: String,
+        value: VertexPropertyValue,
+    },
+    SetLabels {
+        binding: String,
+        labels: BTreeSet<String>,
+    },
+    RemoveProperty {
+        binding: String,
+        property: String,
+    },
+    RemoveLabels {
+        binding: String,
+        labels: BTreeSet<String>,
+    },
+    MergeEdge {
+        edge_type: String,
+        src: VertexId,
+        dst: VertexId,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,6 +223,14 @@ pub fn parse_opencypher_row_query_with_parameters(
 ) -> Result<ParsedRowQuery> {
     let parsed = ParsedCypher::parse(query)?;
     parsed.lower_row_query(parameters)
+}
+
+pub fn parse_opencypher_mutation_query_with_parameters(
+    query: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<Option<ParsedMutationQuery>> {
+    let parsed = ParsedCypher::parse(query)?;
+    parsed.lower_mutation_query(parameters)
 }
 
 impl CypherFrontend for LibCypherParserFrontend {
@@ -297,6 +345,24 @@ impl ParsedCypher {
         }
     }
 
+    fn lower_mutation_query(
+        &self,
+        parameters: &BTreeMap<String, VertexPropertyValue>,
+    ) -> Result<Option<ParsedMutationQuery>> {
+        unsafe {
+            let directives = sys::cypher_parse_result_ndirectives(self.result);
+            if directives != 1 {
+                return unsupported("only a single Cypher statement is supported in Phase 2");
+            }
+
+            let statement = checked_node(sys::cypher_parse_result_get_directive(self.result, 0))?;
+            ensure_instance(statement, sys::CYPHER_AST_STATEMENT, "statement")?;
+            let body = checked_node(sys::cypher_ast_statement_get_body(statement))?;
+            ensure_instance(body, sys::CYPHER_AST_QUERY, "query")?;
+            self.lower_mutation_query_body(body, parameters)
+        }
+    }
+
     fn lower_row_query_body(
         &self,
         query: *const AstNode,
@@ -325,6 +391,97 @@ impl ParsedCypher {
                 match_clauses.push(clause);
             }
             lower_match_return_rows(&match_clauses, return_clause, parameters)
+        }
+    }
+
+    fn lower_mutation_query_body(
+        &self,
+        query: *const AstNode,
+        parameters: &BTreeMap<String, VertexPropertyValue>,
+    ) -> Result<Option<ParsedMutationQuery>> {
+        unsafe {
+            let clause_count = sys::cypher_ast_query_nclauses(query);
+            if clause_count == 0 {
+                return Ok(None);
+            }
+
+            let first_clause = checked_node(sys::cypher_ast_query_get_clause(query, 0))?;
+            if is_instance(first_clause, sys::CYPHER_AST_MERGE) {
+                if clause_count != 1 {
+                    return unsupported(
+                        "MERGE with following clauses is not executable in Phase 2",
+                    );
+                }
+                return Ok(Some(lower_simple_merge(first_clause, parameters)?));
+            }
+
+            let mut match_clauses = Vec::new();
+            let mut actions = Vec::new();
+            let mut saw_mutation = false;
+            for idx in 0..clause_count {
+                let clause = checked_node(sys::cypher_ast_query_get_clause(query, idx))?;
+                if !saw_mutation && is_instance(clause, sys::CYPHER_AST_MATCH) {
+                    match_clauses.push(clause);
+                    continue;
+                }
+                if is_instance(clause, sys::CYPHER_AST_DELETE) {
+                    saw_mutation = true;
+                    actions.extend(lower_delete_actions(clause)?);
+                    continue;
+                }
+                if is_instance(clause, sys::CYPHER_AST_SET) {
+                    saw_mutation = true;
+                    actions.extend(lower_set_actions(clause, parameters)?);
+                    continue;
+                }
+                if is_instance(clause, sys::CYPHER_AST_REMOVE) {
+                    saw_mutation = true;
+                    actions.extend(lower_remove_actions(clause)?);
+                    continue;
+                }
+                if saw_mutation {
+                    return unsupported(
+                        "mutation queries cannot continue with MATCH, RETURN, or WITH after writes",
+                    );
+                }
+                return Ok(None);
+            }
+
+            if !saw_mutation {
+                return Ok(None);
+            }
+            if match_clauses.is_empty() {
+                return unsupported("DELETE, SET, and REMOVE require a preceding MATCH");
+            }
+            if actions.is_empty() {
+                return unsupported("mutation query has no executable actions");
+            }
+
+            let mut patterns = Vec::new();
+            let mut predicate = None;
+            for match_clause in match_clauses {
+                if sys::cypher_ast_match_is_optional(match_clause) {
+                    return unsupported("OPTIONAL MATCH mutations are not executable in Phase 2");
+                }
+                if sys::cypher_ast_match_nhints(match_clause) != 0 {
+                    return unsupported("MATCH hints are not executable in Phase 2 mutations");
+                }
+                let pattern = checked_node(sys::cypher_ast_match_get_pattern(match_clause))?;
+                patterns.extend(lower_row_patterns(pattern, parameters)?);
+                let match_predicate = sys::cypher_ast_match_get_predicate(match_clause);
+                if !match_predicate.is_null() {
+                    predicate = Some(and_row_predicates(
+                        predicate,
+                        lower_row_predicate(match_predicate, parameters)?,
+                    ));
+                }
+            }
+
+            Ok(Some(ParsedMutationQuery {
+                patterns,
+                predicate,
+                actions,
+            }))
         }
     }
 
@@ -657,6 +814,170 @@ fn lower_match_return_rows(
     }
 }
 
+fn lower_simple_merge(
+    merge_clause: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<ParsedMutationQuery> {
+    unsafe {
+        if sys::cypher_ast_merge_nactions(merge_clause) != 0 {
+            return unsupported("MERGE ON CREATE/ON MATCH actions are not executable in Phase 2");
+        }
+        let path = checked_node(sys::cypher_ast_merge_get_pattern_path(merge_clause))?;
+        let edge = lower_create_edge_path(path, parameters, "MERGE")?;
+        if edge.hop_range.is_some() {
+            return unsupported("MERGE does not support variable-length relationships in Phase 2");
+        }
+        let src = edge
+            .src
+            .id
+            .ok_or_else(|| unsupported_value("MERGE requires source id"))?;
+        let dst = edge
+            .dst
+            .id
+            .ok_or_else(|| unsupported_value("MERGE requires destination id"))?;
+        Ok(ParsedMutationQuery {
+            patterns: Vec::new(),
+            predicate: None,
+            actions: vec![RowMutationAction::MergeEdge {
+                edge_type: edge.edge_type,
+                src,
+                dst,
+                src_metadata: vertex_metadata_from_node_pattern(&edge.src),
+                dst_metadata: vertex_metadata_from_node_pattern(&edge.dst),
+            }],
+        })
+    }
+}
+
+fn lower_delete_actions(delete_clause: *const AstNode) -> Result<Vec<RowMutationAction>> {
+    unsafe {
+        let detach = sys::cypher_ast_delete_has_detach(delete_clause);
+        let expression_count = sys::cypher_ast_delete_nexpressions(delete_clause);
+        if expression_count == 0 {
+            return unsupported("DELETE requires at least one expression");
+        }
+        let mut actions = Vec::with_capacity(expression_count as usize);
+        for idx in 0..expression_count {
+            let expression =
+                checked_node(sys::cypher_ast_delete_get_expression(delete_clause, idx))?;
+            if is_instance(expression, sys::CYPHER_AST_IDENTIFIER) {
+                actions.push(RowMutationAction::DeleteRelationship {
+                    binding: identifier_name(expression)?,
+                    detach,
+                });
+            } else {
+                return unsupported(
+                    "DELETE currently supports relationship variables, for example DELETE r",
+                );
+            }
+        }
+        Ok(actions)
+    }
+}
+
+fn lower_set_actions(
+    set_clause: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<Vec<RowMutationAction>> {
+    unsafe {
+        let item_count = sys::cypher_ast_set_nitems(set_clause);
+        if item_count == 0 {
+            return unsupported("SET requires at least one item");
+        }
+        let mut actions = Vec::with_capacity(item_count as usize);
+        for idx in 0..item_count {
+            let item = checked_node(sys::cypher_ast_set_get_item(set_clause, idx))?;
+            if is_instance(item, sys::CYPHER_AST_SET_PROPERTY) {
+                let property = checked_node(sys::cypher_ast_set_property_get_property(item))?;
+                let Some((binding, property)) = property_expression_binding(property)? else {
+                    return unsupported("SET property requires <node>.<property>");
+                };
+                if property.eq_ignore_ascii_case("id") {
+                    return unsupported("SET cannot update node id");
+                }
+                validate_component("property", &property)?;
+                let expression = checked_node(sys::cypher_ast_set_property_get_expression(item))?;
+                actions.push(RowMutationAction::SetProperty {
+                    binding,
+                    property,
+                    value: scalar_property_value(expression, parameters)?,
+                });
+                continue;
+            }
+            if is_instance(item, sys::CYPHER_AST_SET_LABELS) {
+                let binding = identifier_name(checked_node(
+                    sys::cypher_ast_set_labels_get_identifier(item),
+                )?)?;
+                let mut labels = BTreeSet::new();
+                for label_idx in 0..sys::cypher_ast_set_labels_nlabels(item) {
+                    let label = label_name(checked_node(sys::cypher_ast_set_labels_get_label(
+                        item, label_idx,
+                    ))?)?;
+                    validate_component("label", &label)?;
+                    labels.insert(label);
+                }
+                if labels.is_empty() {
+                    return unsupported("SET label item has no labels");
+                }
+                actions.push(RowMutationAction::SetLabels { binding, labels });
+                continue;
+            }
+            if is_instance(item, sys::CYPHER_AST_SET_ALL_PROPERTIES)
+                || is_instance(item, sys::CYPHER_AST_MERGE_PROPERTIES)
+            {
+                return unsupported("SET property-map replacement is not executable in Phase 2");
+            }
+            return unsupported(format!("unsupported SET item {}", node_type_name(item)));
+        }
+        Ok(actions)
+    }
+}
+
+fn lower_remove_actions(remove_clause: *const AstNode) -> Result<Vec<RowMutationAction>> {
+    unsafe {
+        let item_count = sys::cypher_ast_remove_nitems(remove_clause);
+        if item_count == 0 {
+            return unsupported("REMOVE requires at least one item");
+        }
+        let mut actions = Vec::with_capacity(item_count as usize);
+        for idx in 0..item_count {
+            let item = checked_node(sys::cypher_ast_remove_get_item(remove_clause, idx))?;
+            if is_instance(item, sys::CYPHER_AST_REMOVE_PROPERTY) {
+                let property = checked_node(sys::cypher_ast_remove_property_get_property(item))?;
+                let Some((binding, property)) = property_expression_binding(property)? else {
+                    return unsupported("REMOVE property requires <node>.<property>");
+                };
+                if property.eq_ignore_ascii_case("id") {
+                    return unsupported("REMOVE cannot remove node id");
+                }
+                validate_component("property", &property)?;
+                actions.push(RowMutationAction::RemoveProperty { binding, property });
+                continue;
+            }
+            if is_instance(item, sys::CYPHER_AST_REMOVE_LABELS) {
+                let binding = identifier_name(checked_node(
+                    sys::cypher_ast_remove_labels_get_identifier(item),
+                )?)?;
+                let mut labels = BTreeSet::new();
+                for label_idx in 0..sys::cypher_ast_remove_labels_nlabels(item) {
+                    let label = label_name(checked_node(
+                        sys::cypher_ast_remove_labels_get_label(item, label_idx),
+                    )?)?;
+                    validate_component("label", &label)?;
+                    labels.insert(label);
+                }
+                if labels.is_empty() {
+                    return unsupported("REMOVE label item has no labels");
+                }
+                actions.push(RowMutationAction::RemoveLabels { binding, labels });
+                continue;
+            }
+            return unsupported(format!("unsupported REMOVE item {}", node_type_name(item)));
+        }
+        Ok(actions)
+    }
+}
+
 fn lower_return_window(
     return_clause: *const AstNode,
     parameters: &BTreeMap<String, VertexPropertyValue>,
@@ -980,9 +1301,21 @@ fn lower_create_edge_pattern(
         }
 
         let path = checked_node(sys::cypher_ast_pattern_get_path(pattern, 0))?;
+        lower_create_edge_path(path, parameters, "CREATE")
+    }
+}
+
+fn lower_create_edge_path(
+    path: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+    clause: &str,
+) -> Result<RowEdgePattern> {
+    unsafe {
         ensure_instance(path, sys::CYPHER_AST_PATTERN_PATH, "pattern path")?;
         if sys::cypher_ast_pattern_path_nelements(path) != 3 {
-            return unsupported("only one-hop edge patterns are executable in Phase 2 CREATE");
+            return unsupported(format!(
+                "only one-hop edge patterns are executable in Phase 2 {clause}"
+            ));
         }
 
         let left = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
@@ -999,35 +1332,40 @@ fn lower_create_edge_pattern(
             Some(lower_hop_range(varlength)?)
         };
         if !sys::cypher_ast_rel_pattern_get_properties(rel).is_null() {
-            return unsupported("relationship properties are not executable in Phase 2 CREATE");
+            return unsupported(format!(
+                "relationship properties are not executable in Phase 2 {clause}"
+            ));
         }
         if sys::cypher_ast_rel_pattern_nreltypes(rel) != 1 {
-            return unsupported(
-                "relationship pattern must have exactly one type in Phase 2 CREATE",
-            );
+            return unsupported(format!(
+                "relationship pattern must have exactly one type in Phase 2 {clause}"
+            ));
         }
 
         let edge_type_node = checked_node(sys::cypher_ast_rel_pattern_get_reltype(rel, 0))?;
         let edge_type = reltype_name(edge_type_node)?;
+        let binding = rel_identifier(rel)?;
         let left_node = lower_create_node_pattern(left, parameters)?;
         let right_node = lower_create_node_pattern(right, parameters)?;
 
         match sys::cypher_ast_rel_pattern_get_direction(rel) {
             sys::cypher_rel_direction::CYPHER_REL_OUTBOUND => Ok(RowEdgePattern {
+                binding,
                 edge_type,
                 src: left_node,
                 dst: right_node,
                 hop_range,
             }),
             sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(RowEdgePattern {
+                binding,
                 edge_type,
                 src: right_node,
                 dst: left_node,
                 hop_range,
             }),
-            sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => {
-                unsupported("undirected relationships are not executable in Phase 2 CREATE")
-            }
+            sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => unsupported(format!(
+                "undirected relationships are not executable in Phase 2 {clause}"
+            )),
         }
     }
 }
@@ -1138,17 +1476,25 @@ fn lower_row_edge_path_segment(
 
         let edge_type_node = checked_node(sys::cypher_ast_rel_pattern_get_reltype(rel, 0))?;
         let edge_type = reltype_name(edge_type_node)?;
+        let binding = rel_identifier(rel)?;
+        if binding.is_some() && hop_range.is_some() {
+            return unsupported(
+                "variable-length relationship bindings are not executable in Phase 2",
+            );
+        }
         let left_node = lower_row_node_pattern(left, parameters)?;
         let right_node = lower_row_node_pattern(right, parameters)?;
 
         match sys::cypher_ast_rel_pattern_get_direction(rel) {
             sys::cypher_rel_direction::CYPHER_REL_OUTBOUND => Ok(RowEdgePattern {
+                binding,
                 edge_type,
                 src: left_node,
                 dst: right_node,
                 hop_range,
             }),
             sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(RowEdgePattern {
+                binding,
                 edge_type,
                 src: right_node,
                 dst: left_node,
@@ -1571,6 +1917,17 @@ fn projection_column_name(
 fn node_identifier(node: *const AstNode) -> Result<Option<String>> {
     unsafe {
         let ident = sys::cypher_ast_node_pattern_get_identifier(node);
+        if ident.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(identifier_name(ident)?))
+        }
+    }
+}
+
+fn rel_identifier(rel: *const AstNode) -> Result<Option<String>> {
+    unsafe {
+        let ident = sys::cypher_ast_rel_pattern_get_identifier(rel);
         if ident.is_null() {
             Ok(None)
         } else {
@@ -2102,6 +2459,64 @@ mod tests {
                     },
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn lowers_mutation_queries() {
+        let parsed = parse_opencypher_mutation_query_with_parameters(
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) \
+             SET u.active = true, v:Moderator REMOVE v.name DELETE r",
+            &BTreeMap::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.patterns.len(), 1);
+        let RowPattern::Edge(edge) = &parsed.patterns[0] else {
+            panic!("expected edge pattern");
+        };
+        assert_eq!(edge.binding.as_deref(), Some("r"));
+        assert_eq!(edge.edge_type, "FOLLOWS");
+        assert_eq!(edge.src.binding.as_deref(), Some("u"));
+        assert_eq!(edge.dst.binding.as_deref(), Some("v"));
+        assert_eq!(
+            parsed.actions,
+            vec![
+                RowMutationAction::SetProperty {
+                    binding: "u".to_string(),
+                    property: "active".to_string(),
+                    value: VertexPropertyValue::Bool(true),
+                },
+                RowMutationAction::SetLabels {
+                    binding: "v".to_string(),
+                    labels: BTreeSet::from(["Moderator".to_string()]),
+                },
+                RowMutationAction::RemoveProperty {
+                    binding: "v".to_string(),
+                    property: "name".to_string(),
+                },
+                RowMutationAction::DeleteRelationship {
+                    binding: "r".to_string(),
+                    detach: false,
+                },
+            ]
+        );
+
+        let merge = parse_opencypher_mutation_query_with_parameters(
+            "MERGE (u:User {id: 1})-[:FOLLOWS]->(v {id: 2})",
+            &BTreeMap::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            merge.actions,
+            vec![RowMutationAction::MergeEdge {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                src_metadata: VertexMetadata::default().with_label("User"),
+                dst_metadata: VertexMetadata::default(),
+            }]
         );
     }
 
