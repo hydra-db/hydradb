@@ -6252,6 +6252,114 @@ async fn tcp_query_transport_applies_server_backpressure_under_load() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn opencypher_local_executor_honors_cancellation_token() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/query-local-cancel", object_store).await;
+    shard
+        .write_edge(mutation(1, 2, "query-local-cancel-edge"))
+        .await
+        .unwrap();
+
+    let token = QueryCancellationToken::new();
+    token.cancel();
+    let err = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "query-local-cancel").with_cancellation_token(token),
+            "MATCH (u {id: 1})-[:USER_SUBSCRIBED_TO_SUBREDDIT]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("query_cancelled"));
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn query_cardinality_stats_refresh_persists_edge_counts() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/query-cardinality-stats", object_store).await;
+    for idx in 0..3 {
+        shard
+            .write_edge(mutation(
+                1,
+                10 + idx,
+                &format!("query-cardinality-stats-edge-{idx}"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let refresh = shard
+        .refresh_edge_type_query_stats("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT")
+        .await
+        .unwrap();
+    assert_eq!(refresh.count, 3);
+    assert_eq!(refresh.cell_id, "reddit-home");
+    let key = keys::query_stats_edge_type("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT");
+    let stored = shard.read_counter(&key).await.unwrap();
+    assert_eq!(stored, 3);
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[test]
+fn query_service_discovery_parses_kubernetes_consul_and_etcd() {
+    let k8s = serde_json::json!({
+        "items": [{
+            "ports": [{"name": "cypher", "port": 7777}],
+            "endpoints": [{
+                "hostname": "node-a",
+                "addresses": ["127.0.0.1"],
+                "conditions": {"ready": true}
+            }, {
+                "hostname": "node-b",
+                "addresses": ["127.0.0.2"],
+                "conditions": {"ready": false}
+            }]
+        }]
+    });
+    let directory = KubernetesQueryServiceDiscovery::directory_from_endpointslices_json(
+        &k8s,
+        Some("cypher"),
+        QueryTransportClientConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(directory.endpoint("node-a").unwrap().addr.port(), 7777);
+    assert!(directory.endpoint("node-b").is_none());
+
+    let consul = serde_json::json!([{
+        "Node": {"Address": "127.0.0.3"},
+        "Service": {"ID": "node-c", "Service": "graph-query", "Address": "", "Port": 8888}
+    }]);
+    let directory = ConsulQueryServiceDiscovery::directory_from_health_service_json(
+        &consul,
+        QueryTransportClientConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(directory.endpoint("node-c").unwrap().addr.port(), 8888);
+
+    use base64::Engine;
+    let record = serde_json::json!({
+        "node_id": "node-d",
+        "address": "127.0.0.4",
+        "port": 9999
+    })
+    .to_string();
+    let etcd = serde_json::json!({
+        "kvs": [{
+            "value": base64::engine::general_purpose::STANDARD.encode(record.as_bytes())
+        }]
+    });
+    let directory = EtcdQueryServiceDiscovery::directory_from_range_json(
+        &etcd,
+        QueryTransportClientConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(directory.endpoint("node-d").unwrap().addr.port(), 9999);
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn distributed_query_plan_joins_results_across_cells() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control =

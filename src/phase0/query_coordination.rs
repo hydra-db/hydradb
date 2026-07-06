@@ -6,11 +6,17 @@ use std::net::SocketAddr;
 #[cfg(feature = "query-transport")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "query-transport-tls")]
+use std::sync::RwLock;
 #[cfg(feature = "query-transport")]
 use std::time::Duration;
 
 use async_trait::async_trait;
+#[cfg(feature = "query-service-discovery")]
+use base64::Engine;
 use futures::future::join_all;
+#[cfg(feature = "query-transport-tls")]
+use sha2::{Digest, Sha256};
 #[cfg(feature = "query-transport")]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(feature = "query-transport")]
@@ -27,6 +33,8 @@ use tokio_rustls::rustls::{
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::{RoutedPhase0Cluster, ShardPlacement};
+#[cfg(feature = "query-transport")]
+use crate::QueryCancellationToken;
 use crate::{
     validate_component, GraphError, QueryContext, QueryCursorToken, QueryResultPage,
     QueryResultSet, QueryRow, QueryValue, Result,
@@ -44,12 +52,14 @@ const DEFAULT_QUERY_TRANSPORT_TIMEOUT_MS: u64 = 30_000;
 pub struct QueryTransportClientConfig {
     pub max_frame_bytes: usize,
     pub timeout: Duration,
-    pub bearer_token: Option<String>,
+    pub bearer_token: Option<QueryTransportSecret>,
     pub max_retries: usize,
     #[cfg(feature = "query-transport-tls")]
     pub tls_server_name: Option<String>,
     #[cfg(feature = "query-transport-tls")]
     pub tls_config: Option<Arc<RustlsClientConfig>>,
+    #[cfg(feature = "query-transport-tls")]
+    pub tls_config_provider: Option<Arc<dyn QueryTransportTlsClientConfigProvider>>,
 }
 
 #[cfg(feature = "query-transport")]
@@ -64,14 +74,56 @@ impl Default for QueryTransportClientConfig {
             tls_server_name: None,
             #[cfg(feature = "query-transport-tls")]
             tls_config: None,
+            #[cfg(feature = "query-transport-tls")]
+            tls_config_provider: None,
         }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Eq, PartialEq)]
+pub struct QueryTransportSecret {
+    value: Arc<str>,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportSecret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self {
+            value: Arc::from(value.into()),
+        }
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.value
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl std::fmt::Debug for QueryTransportSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QueryTransportSecret(REDACTED)")
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl From<String> for QueryTransportSecret {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl From<&str> for QueryTransportSecret {
+    fn from(value: &str) -> Self {
+        Self::new(value)
     }
 }
 
 #[cfg(feature = "query-transport")]
 impl QueryTransportClientConfig {
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.bearer_token = Some(token.into());
+        self.bearer_token = Some(QueryTransportSecret::new(token));
         self
     }
 
@@ -98,6 +150,19 @@ impl QueryTransportClientConfig {
     ) -> Self {
         self.tls_server_name = Some(server_name.into());
         self.tls_config = Some(config);
+        self.tls_config_provider = None;
+        self
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_tls_provider(
+        mut self,
+        server_name: impl Into<String>,
+        provider: Arc<dyn QueryTransportTlsClientConfigProvider>,
+    ) -> Self {
+        self.tls_server_name = Some(server_name.into());
+        self.tls_config = None;
+        self.tls_config_provider = Some(provider);
         self
     }
 }
@@ -106,18 +171,166 @@ impl QueryTransportClientConfig {
 #[derive(Clone)]
 pub enum QueryTransportAuthPolicy {
     RejectAll,
-    BearerToken(String),
+    BearerToken(QueryTransportSecret),
+    #[cfg(feature = "query-transport-tls")]
+    MtlsPeerFingerprint {
+        allowed_fingerprints: BTreeSet<String>,
+        bearer_token: Option<QueryTransportSecret>,
+    },
     InsecureAllowAll,
 }
 
 #[cfg(feature = "query-transport")]
 impl QueryTransportAuthPolicy {
-    fn accepts(&self, auth: &QueryTransportAuth) -> bool {
+    fn accepts(
+        &self,
+        auth: &QueryTransportAuth,
+        _identity: &QueryTransportConnectionIdentity,
+    ) -> bool {
         match self {
             Self::RejectAll => false,
-            Self::BearerToken(required) => auth.bearer_token.as_deref() == Some(required.as_str()),
+            Self::BearerToken(required) => {
+                auth.bearer_token.as_deref() == Some(required.expose_secret())
+            }
+            #[cfg(feature = "query-transport-tls")]
+            Self::MtlsPeerFingerprint {
+                allowed_fingerprints,
+                bearer_token,
+            } => {
+                let bearer_ok = bearer_token.as_ref().map_or(true, |required| {
+                    auth.bearer_token.as_deref() == Some(required.expose_secret())
+                });
+                bearer_ok
+                    && _identity
+                        .tls_peer_fingerprints
+                        .iter()
+                        .any(|fingerprint| allowed_fingerprints.contains(fingerprint))
+            }
             Self::InsecureAllowAll => true,
         }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueryTransportConnectionIdentity {
+    #[cfg(feature = "query-transport-tls")]
+    pub tls_peer_fingerprints: BTreeSet<String>,
+}
+
+#[cfg(feature = "query-transport-tls")]
+pub trait QueryTransportTlsServerConfigProvider: Send + Sync {
+    fn current_server_config(&self) -> Result<Arc<RustlsServerConfig>>;
+}
+
+#[cfg(feature = "query-transport-tls")]
+pub trait QueryTransportTlsClientConfigProvider: Send + Sync {
+    fn current_client_config(&self) -> Result<Arc<RustlsClientConfig>>;
+}
+
+#[cfg(feature = "query-transport-tls")]
+pub struct StaticQueryTransportTlsServerConfigProvider {
+    config: Arc<RustlsServerConfig>,
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl StaticQueryTransportTlsServerConfigProvider {
+    pub fn new(config: Arc<RustlsServerConfig>) -> Self {
+        Self { config }
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl QueryTransportTlsServerConfigProvider for StaticQueryTransportTlsServerConfigProvider {
+    fn current_server_config(&self) -> Result<Arc<RustlsServerConfig>> {
+        Ok(Arc::clone(&self.config))
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+pub struct StaticQueryTransportTlsClientConfigProvider {
+    config: Arc<RustlsClientConfig>,
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl StaticQueryTransportTlsClientConfigProvider {
+    pub fn new(config: Arc<RustlsClientConfig>) -> Self {
+        Self { config }
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl QueryTransportTlsClientConfigProvider for StaticQueryTransportTlsClientConfigProvider {
+    fn current_client_config(&self) -> Result<Arc<RustlsClientConfig>> {
+        Ok(Arc::clone(&self.config))
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+pub struct ReloadableQueryTransportTlsServerConfigProvider {
+    config: RwLock<Arc<RustlsServerConfig>>,
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl ReloadableQueryTransportTlsServerConfigProvider {
+    pub fn new(config: Arc<RustlsServerConfig>) -> Self {
+        Self {
+            config: RwLock::new(config),
+        }
+    }
+
+    pub fn rotate(&self, config: Arc<RustlsServerConfig>) -> Result<()> {
+        let mut guard = self.config.write().map_err(|_| GraphError::CorruptValue {
+            key: "query/transport/tls/server_config".to_string(),
+            reason: "TLS server config lock is poisoned".to_string(),
+        })?;
+        *guard = config;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl QueryTransportTlsServerConfigProvider for ReloadableQueryTransportTlsServerConfigProvider {
+    fn current_server_config(&self) -> Result<Arc<RustlsServerConfig>> {
+        let guard = self.config.read().map_err(|_| GraphError::CorruptValue {
+            key: "query/transport/tls/server_config".to_string(),
+            reason: "TLS server config lock is poisoned".to_string(),
+        })?;
+        Ok(Arc::clone(&guard))
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+pub struct ReloadableQueryTransportTlsClientConfigProvider {
+    config: RwLock<Arc<RustlsClientConfig>>,
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl ReloadableQueryTransportTlsClientConfigProvider {
+    pub fn new(config: Arc<RustlsClientConfig>) -> Self {
+        Self {
+            config: RwLock::new(config),
+        }
+    }
+
+    pub fn rotate(&self, config: Arc<RustlsClientConfig>) -> Result<()> {
+        let mut guard = self.config.write().map_err(|_| GraphError::CorruptValue {
+            key: "query/transport/tls/client_config".to_string(),
+            reason: "TLS client config lock is poisoned".to_string(),
+        })?;
+        *guard = config;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl QueryTransportTlsClientConfigProvider for ReloadableQueryTransportTlsClientConfigProvider {
+    fn current_client_config(&self) -> Result<Arc<RustlsClientConfig>> {
+        let guard = self.config.read().map_err(|_| GraphError::CorruptValue {
+            key: "query/transport/tls/client_config".to_string(),
+            reason: "TLS client config lock is poisoned".to_string(),
+        })?;
+        Ok(Arc::clone(&guard))
     }
 }
 
@@ -130,6 +343,8 @@ pub struct QueryTransportServerConfig {
     pub slow_query_log_threshold: Option<Duration>,
     #[cfg(feature = "query-transport-tls")]
     pub tls_config: Option<Arc<RustlsServerConfig>>,
+    #[cfg(feature = "query-transport-tls")]
+    pub tls_config_provider: Option<Arc<dyn QueryTransportTlsServerConfigProvider>>,
 }
 
 #[cfg(feature = "query-transport")]
@@ -142,6 +357,8 @@ impl Default for QueryTransportServerConfig {
             slow_query_log_threshold: Some(Duration::from_millis(500)),
             #[cfg(feature = "query-transport-tls")]
             tls_config: None,
+            #[cfg(feature = "query-transport-tls")]
+            tls_config_provider: None,
         }
     }
 }
@@ -149,7 +366,7 @@ impl Default for QueryTransportServerConfig {
 #[cfg(feature = "query-transport")]
 impl QueryTransportServerConfig {
     pub fn with_required_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_policy = QueryTransportAuthPolicy::BearerToken(token.into());
+        self.auth_policy = QueryTransportAuthPolicy::BearerToken(QueryTransportSecret::new(token));
         self
     }
 
@@ -176,6 +393,42 @@ impl QueryTransportServerConfig {
     #[cfg(feature = "query-transport-tls")]
     pub fn with_tls(mut self, config: Arc<RustlsServerConfig>) -> Self {
         self.tls_config = Some(config);
+        self.tls_config_provider = None;
+        self
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_tls_provider(
+        mut self,
+        provider: Arc<dyn QueryTransportTlsServerConfigProvider>,
+    ) -> Self {
+        self.tls_config = None;
+        self.tls_config_provider = Some(provider);
+        self
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_required_mtls_fingerprints(
+        mut self,
+        allowed_fingerprints: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.auth_policy = QueryTransportAuthPolicy::MtlsPeerFingerprint {
+            allowed_fingerprints: allowed_fingerprints.into_iter().collect(),
+            bearer_token: None,
+        };
+        self
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_required_mtls_fingerprints_and_bearer(
+        mut self,
+        allowed_fingerprints: impl IntoIterator<Item = String>,
+        token: impl Into<String>,
+    ) -> Self {
+        self.auth_policy = QueryTransportAuthPolicy::MtlsPeerFingerprint {
+            allowed_fingerprints: allowed_fingerprints.into_iter().collect(),
+            bearer_token: Some(QueryTransportSecret::new(token)),
+        };
         self
     }
 }
@@ -256,6 +509,14 @@ impl QueryServiceEndpoint {
         self.client_config = client_config;
         self
     }
+
+    pub fn directory_from_endpointslices_json(
+        value: &serde_json::Value,
+        port_name: Option<&str>,
+        client_config: QueryTransportClientConfig,
+    ) -> Result<QueryServiceDirectory> {
+        parse_kubernetes_endpointslices(value, port_name, client_config)
+    }
 }
 
 #[cfg(feature = "query-transport")]
@@ -283,6 +544,253 @@ impl QueryServiceDirectory {
 
     pub fn endpoint(&self, node_id: &str) -> Option<&QueryServiceEndpoint> {
         self.endpoints.get(node_id)
+    }
+
+    pub fn endpoints(&self) -> impl Iterator<Item = &QueryServiceEndpoint> {
+        self.endpoints.values()
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[async_trait]
+pub trait QueryServiceDiscovery: Send + Sync {
+    async fn resolve_query_services(&self) -> Result<QueryServiceDirectory>;
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone)]
+pub struct StaticQueryServiceDiscovery {
+    directory: QueryServiceDirectory,
+}
+
+#[cfg(feature = "query-transport")]
+impl StaticQueryServiceDiscovery {
+    pub fn new(directory: QueryServiceDirectory) -> Self {
+        Self { directory }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[async_trait]
+impl QueryServiceDiscovery for StaticQueryServiceDiscovery {
+    async fn resolve_query_services(&self) -> Result<QueryServiceDirectory> {
+        Ok(self.directory.clone())
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[derive(Clone)]
+pub struct KubernetesQueryServiceDiscovery {
+    api_server: String,
+    namespace: String,
+    label_selector: String,
+    port_name: Option<String>,
+    bearer_token: Option<QueryTransportSecret>,
+    client_config: QueryTransportClientConfig,
+    http: reqwest::Client,
+}
+
+#[cfg(feature = "query-service-discovery")]
+impl KubernetesQueryServiceDiscovery {
+    pub fn new(
+        api_server: impl Into<String>,
+        namespace: impl Into<String>,
+        label_selector: impl Into<String>,
+    ) -> Self {
+        Self {
+            api_server: api_server.into().trim_end_matches('/').to_string(),
+            namespace: namespace.into(),
+            label_selector: label_selector.into(),
+            port_name: None,
+            bearer_token: None,
+            client_config: QueryTransportClientConfig::default(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    pub fn with_port_name(mut self, port_name: impl Into<String>) -> Self {
+        self.port_name = Some(port_name.into());
+        self
+    }
+
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.bearer_token = Some(QueryTransportSecret::new(token));
+        self
+    }
+
+    pub fn with_client_config(mut self, client_config: QueryTransportClientConfig) -> Self {
+        self.client_config = client_config;
+        self
+    }
+
+    pub fn directory_from_endpointslices_json(
+        value: &serde_json::Value,
+        port_name: Option<&str>,
+        client_config: QueryTransportClientConfig,
+    ) -> Result<QueryServiceDirectory> {
+        parse_kubernetes_endpointslices(value, port_name, client_config)
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[async_trait]
+impl QueryServiceDiscovery for KubernetesQueryServiceDiscovery {
+    async fn resolve_query_services(&self) -> Result<QueryServiceDirectory> {
+        let url = format!(
+            "{}/apis/discovery.k8s.io/v1/namespaces/{}/endpointslices",
+            self.api_server, self.namespace
+        );
+        let mut request = self
+            .http
+            .get(url)
+            .query(&[("labelSelector", self.label_selector.as_str())]);
+        if let Some(token) = &self.bearer_token {
+            request = request.bearer_auth(token.expose_secret());
+        }
+        let value = request
+            .send()
+            .await
+            .map_err(|err| service_discovery_error("kubernetes/send", err))?
+            .error_for_status()
+            .map_err(|err| service_discovery_error("kubernetes/status", err))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|err| service_discovery_error("kubernetes/decode", err))?;
+        parse_kubernetes_endpointslices(
+            &value,
+            self.port_name.as_deref(),
+            self.client_config.clone(),
+        )
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[derive(Clone)]
+pub struct ConsulQueryServiceDiscovery {
+    base_url: String,
+    service_name: String,
+    token: Option<QueryTransportSecret>,
+    client_config: QueryTransportClientConfig,
+    http: reqwest::Client,
+}
+
+#[cfg(feature = "query-service-discovery")]
+impl ConsulQueryServiceDiscovery {
+    pub fn new(base_url: impl Into<String>, service_name: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            service_name: service_name.into(),
+            token: None,
+            client_config: QueryTransportClientConfig::default(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(QueryTransportSecret::new(token));
+        self
+    }
+
+    pub fn with_client_config(mut self, client_config: QueryTransportClientConfig) -> Self {
+        self.client_config = client_config;
+        self
+    }
+
+    pub fn directory_from_health_service_json(
+        value: &serde_json::Value,
+        client_config: QueryTransportClientConfig,
+    ) -> Result<QueryServiceDirectory> {
+        parse_consul_health_service(value, client_config)
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[async_trait]
+impl QueryServiceDiscovery for ConsulQueryServiceDiscovery {
+    async fn resolve_query_services(&self) -> Result<QueryServiceDirectory> {
+        let url = format!("{}/v1/health/service/{}", self.base_url, self.service_name);
+        let mut request = self.http.get(url).query(&[("passing", "1")]);
+        if let Some(token) = &self.token {
+            request = request.header("X-Consul-Token", token.expose_secret());
+        }
+        let value = request
+            .send()
+            .await
+            .map_err(|err| service_discovery_error("consul/send", err))?
+            .error_for_status()
+            .map_err(|err| service_discovery_error("consul/status", err))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|err| service_discovery_error("consul/decode", err))?;
+        parse_consul_health_service(&value, self.client_config.clone())
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[derive(Clone)]
+pub struct EtcdQueryServiceDiscovery {
+    endpoint: String,
+    prefix: String,
+    token: Option<QueryTransportSecret>,
+    client_config: QueryTransportClientConfig,
+    http: reqwest::Client,
+}
+
+#[cfg(feature = "query-service-discovery")]
+impl EtcdQueryServiceDiscovery {
+    pub fn new(endpoint: impl Into<String>, prefix: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into().trim_end_matches('/').to_string(),
+            prefix: prefix.into(),
+            token: None,
+            client_config: QueryTransportClientConfig::default(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(QueryTransportSecret::new(token));
+        self
+    }
+
+    pub fn with_client_config(mut self, client_config: QueryTransportClientConfig) -> Self {
+        self.client_config = client_config;
+        self
+    }
+
+    pub fn directory_from_range_json(
+        value: &serde_json::Value,
+        client_config: QueryTransportClientConfig,
+    ) -> Result<QueryServiceDirectory> {
+        parse_etcd_query_services(value, client_config)
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[async_trait]
+impl QueryServiceDiscovery for EtcdQueryServiceDiscovery {
+    async fn resolve_query_services(&self) -> Result<QueryServiceDirectory> {
+        let key = base64::engine::general_purpose::STANDARD.encode(self.prefix.as_bytes());
+        let range_end =
+            base64::engine::general_purpose::STANDARD.encode(etcd_prefix_end(&self.prefix));
+        let body = serde_json::json!({ "key": key, "range_end": range_end });
+        let mut request = self
+            .http
+            .post(format!("{}/v3/kv/range", self.endpoint))
+            .json(&body);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token.expose_secret());
+        }
+        let value = request
+            .send()
+            .await
+            .map_err(|err| service_discovery_error("etcd/send", err))?
+            .error_for_status()
+            .map_err(|err| service_discovery_error("etcd/status", err))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|err| service_discovery_error("etcd/decode", err))?;
+        parse_etcd_query_services(&value, self.client_config.clone())
     }
 }
 
@@ -336,7 +844,7 @@ impl TcpQueryCellClient {
     }
 
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.config.bearer_token = Some(token.into());
+        self.config.bearer_token = Some(QueryTransportSecret::new(token));
         self
     }
 
@@ -353,6 +861,19 @@ impl TcpQueryCellClient {
     ) -> Self {
         self.config.tls_server_name = Some(server_name.into());
         self.config.tls_config = Some(config);
+        self.config.tls_config_provider = None;
+        self
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_tls_provider(
+        mut self,
+        server_name: impl Into<String>,
+        provider: Arc<dyn QueryTransportTlsClientConfigProvider>,
+    ) -> Self {
+        self.config.tls_server_name = Some(server_name.into());
+        self.config.tls_config = None;
+        self.config.tls_config_provider = Some(provider);
         self
     }
 
@@ -392,6 +913,7 @@ type QueryLifecycleToken = u64;
 struct QueryLifecycleEntry {
     token: QueryLifecycleToken,
     state: QueryLifecycleState,
+    cancellation_token: QueryCancellationToken,
 }
 
 #[cfg(feature = "query-transport")]
@@ -499,6 +1021,7 @@ impl TcpQueryServer {
                 .cancelled_rejections
                 .fetch_add(1, Ordering::Relaxed);
         } else if let Some(entry) = lifecycle.queries.get_mut(&query_id) {
+            entry.cancellation_token.cancel();
             entry.state = QueryLifecycleState::Cancelled;
         }
         self.metrics.cancellations.fetch_add(1, Ordering::Relaxed);
@@ -623,7 +1146,11 @@ impl TcpQueryCellClient {
 
     fn auth(&self) -> QueryTransportAuth {
         QueryTransportAuth {
-            bearer_token: self.config.bearer_token.clone(),
+            bearer_token: self
+                .config
+                .bearer_token
+                .as_ref()
+                .map(|secret| secret.expose_secret().to_string()),
         }
     }
 
@@ -672,7 +1199,12 @@ impl TcpQueryCellClient {
     ) -> Result<QueryTransportResponse> {
         #[cfg(feature = "query-transport-tls")]
         {
-            if let Some(tls_config) = &self.config.tls_config {
+            let tls_config = if let Some(provider) = &self.config.tls_config_provider {
+                Some(provider.current_client_config()?)
+            } else {
+                self.config.tls_config.clone()
+            };
+            if let Some(tls_config) = tls_config {
                 let server_name = self.config.tls_server_name.clone().ok_or_else(|| {
                     transport_protocol_error("query/transport/tls", "missing TLS server name")
                 })?;
@@ -681,7 +1213,7 @@ impl TcpQueryCellClient {
                         key: "query/transport/tls/server_name".to_string(),
                         reason: err.to_string(),
                     })?;
-                let mut stream = TlsConnector::from(Arc::clone(tls_config))
+                let mut stream = TlsConnector::from(tls_config)
                     .connect(server_name, stream)
                     .await
                     .map_err(|err| transport_error("tls_connect", err))?;
@@ -911,6 +1443,15 @@ impl DistributedQueryCoordinator {
             )?;
         }
         Ok(coordinator)
+    }
+
+    #[cfg(feature = "query-transport")]
+    pub async fn from_service_discovery(
+        placement: ShardPlacement,
+        discovery: &dyn QueryServiceDiscovery,
+    ) -> Result<Self> {
+        let directory = discovery.resolve_query_services().await?;
+        Self::from_service_directory(placement, &directory)
     }
 
     pub async fn execute_cypher_rows_many(
@@ -1157,6 +1698,224 @@ fn checked_unique_cell(seen: &mut BTreeSet<String>, cell_id: &str) -> Result<Str
     Ok(cell_id.to_string())
 }
 
+#[cfg(feature = "query-service-discovery")]
+fn parse_kubernetes_endpointslices(
+    value: &serde_json::Value,
+    port_name: Option<&str>,
+    client_config: QueryTransportClientConfig,
+) -> Result<QueryServiceDirectory> {
+    let mut directory = QueryServiceDirectory::new();
+    let items = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| service_discovery_format_error("kubernetes", "items array is missing"))?;
+    for item in items {
+        let port = select_kubernetes_port(item, port_name)?;
+        let Some(endpoints) = item.get("endpoints").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for endpoint in endpoints {
+            if endpoint
+                .pointer("/conditions/ready")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                continue;
+            }
+            let Some(address) = endpoint
+                .get("addresses")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|addresses| addresses.first())
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let node_id = endpoint
+                .get("hostname")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    endpoint
+                        .pointer("/targetRef/name")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or(address);
+            directory.insert(
+                QueryServiceEndpoint::new(
+                    discovery_node_id(node_id),
+                    socket_addr_from_host_port("kubernetes", address, port)?,
+                )
+                .with_client_config(client_config.clone()),
+            )?;
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn select_kubernetes_port(item: &serde_json::Value, port_name: Option<&str>) -> Result<u16> {
+    let ports = item
+        .get("ports")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| service_discovery_format_error("kubernetes", "ports array is missing"))?;
+    let selected = match port_name {
+        Some(port_name) => ports
+            .iter()
+            .find(|port| port.get("name").and_then(serde_json::Value::as_str) == Some(port_name)),
+        None => ports.first(),
+    }
+    .ok_or_else(|| service_discovery_format_error("kubernetes", "matching port is missing"))?;
+    u16_from_json_field("kubernetes", selected, "port")
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn parse_consul_health_service(
+    value: &serde_json::Value,
+    client_config: QueryTransportClientConfig,
+) -> Result<QueryServiceDirectory> {
+    let mut directory = QueryServiceDirectory::new();
+    let services = value.as_array().ok_or_else(|| {
+        service_discovery_format_error("consul", "health service array is missing")
+    })?;
+    for item in services {
+        let service = item
+            .get("Service")
+            .ok_or_else(|| service_discovery_format_error("consul", "Service object is missing"))?;
+        let node = item.get("Node");
+        let node_id = service
+            .get("ID")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| service.get("Service").and_then(serde_json::Value::as_str))
+            .ok_or_else(|| service_discovery_format_error("consul", "Service.ID is missing"))?;
+        let address = service
+            .get("Address")
+            .and_then(serde_json::Value::as_str)
+            .filter(|address| !address.is_empty())
+            .or_else(|| {
+                node.and_then(|node| node.get("Address"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .ok_or_else(|| {
+                service_discovery_format_error("consul", "service address is missing")
+            })?;
+        let port = u16_from_json_field("consul", service, "Port")?;
+        directory.insert(
+            QueryServiceEndpoint::new(
+                discovery_node_id(node_id),
+                socket_addr_from_host_port("consul", address, port)?,
+            )
+            .with_client_config(client_config.clone()),
+        )?;
+    }
+    Ok(directory)
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[derive(serde::Deserialize)]
+struct EtcdQueryServiceRecord {
+    node_id: String,
+    address: String,
+    port: u16,
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn parse_etcd_query_services(
+    value: &serde_json::Value,
+    client_config: QueryTransportClientConfig,
+) -> Result<QueryServiceDirectory> {
+    let mut directory = QueryServiceDirectory::new();
+    let Some(kvs) = value.get("kvs").and_then(serde_json::Value::as_array) else {
+        return Ok(directory);
+    };
+    for kv in kvs {
+        let encoded = kv
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| service_discovery_format_error("etcd", "kv value is missing"))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|err| service_discovery_error("etcd/base64", err))?;
+        let record: EtcdQueryServiceRecord = serde_json::from_slice(&bytes)
+            .map_err(|err| service_discovery_error("etcd/record", err))?;
+        directory.insert(
+            QueryServiceEndpoint::new(
+                discovery_node_id(&record.node_id),
+                socket_addr_from_host_port("etcd", &record.address, record.port)?,
+            )
+            .with_client_config(client_config.clone()),
+        )?;
+    }
+    Ok(directory)
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn etcd_prefix_end(prefix: &str) -> Vec<u8> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    for idx in (0..bytes.len()).rev() {
+        if bytes[idx] != 0xff {
+            bytes[idx] = bytes[idx].saturating_add(1);
+            bytes.truncate(idx + 1);
+            return bytes;
+        }
+    }
+    vec![0]
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn socket_addr_from_host_port(provider: &'static str, host: &str, port: u16) -> Result<SocketAddr> {
+    let raw = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    raw.parse().map_err(|err| GraphError::CorruptValue {
+        key: format!("query/service_discovery/{provider}/address"),
+        reason: format!("invalid endpoint address {raw}: {err}"),
+    })
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn u16_from_json_field(
+    provider: &'static str,
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<u16> {
+    let raw = value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| service_discovery_format_error(provider, &format!("{field} is missing")))?;
+    u16::try_from(raw)
+        .map_err(|_| service_discovery_format_error(provider, &format!("{field} is out of range")))
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn discovery_node_id(raw: &str) -> String {
+    raw.bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.') {
+                byte as char
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn service_discovery_format_error(provider: &'static str, reason: &str) -> GraphError {
+    GraphError::CorruptValue {
+        key: format!("query/service_discovery/{provider}"),
+        reason: reason.to_string(),
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn service_discovery_error(provider: &'static str, err: impl std::fmt::Display) -> GraphError {
+    GraphError::CorruptValue {
+        key: format!("query/service_discovery/{provider}"),
+        reason: err.to_string(),
+    }
+}
+
 #[cfg(feature = "query-transport")]
 #[derive(serde::Deserialize, serde::Serialize)]
 struct QueryTransportAuth {
@@ -1206,18 +1965,58 @@ async fn serve_query_transport_stream(
 ) -> Result<()> {
     #[cfg(feature = "query-transport-tls")]
     {
-        if let Some(tls_config) = &runtime.config.tls_config {
-            let acceptor = TlsAcceptor::from(Arc::clone(tls_config));
+        let tls_config = if let Some(provider) = &runtime.config.tls_config_provider {
+            Some(provider.current_server_config()?)
+        } else {
+            runtime.config.tls_config.clone()
+        };
+        if let Some(tls_config) = tls_config {
+            let acceptor = TlsAcceptor::from(tls_config);
             let mut stream = acceptor
                 .accept(stream)
                 .await
                 .map_err(|err| transport_error("tls_accept", err))?;
-            return serve_query_transport_io(&mut stream, client, runtime).await;
+            let identity = query_transport_tls_identity(&stream);
+            return serve_query_transport_io(&mut stream, client, runtime, identity).await;
         }
     }
 
     let mut stream = stream;
-    serve_query_transport_io(&mut stream, client, runtime).await
+    serve_query_transport_io(
+        &mut stream,
+        client,
+        runtime,
+        QueryTransportConnectionIdentity::default(),
+    )
+    .await
+}
+
+#[cfg(feature = "query-transport-tls")]
+fn query_transport_tls_identity<S>(
+    stream: &tokio_rustls::server::TlsStream<S>,
+) -> QueryTransportConnectionIdentity {
+    let mut identity = QueryTransportConnectionIdentity::default();
+    let (_, connection) = stream.get_ref();
+    if let Some(certs) = connection.peer_certificates() {
+        for cert in certs {
+            let digest = Sha256::digest(cert.as_ref());
+            identity
+                .tls_peer_fingerprints
+                .insert(format!("sha256:{}", lowercase_hex(&digest)));
+        }
+    }
+    identity
+}
+
+#[cfg(feature = "query-transport-tls")]
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[cfg(feature = "query-transport")]
@@ -1225,6 +2024,7 @@ async fn serve_query_transport_io<S>(
     stream: &mut S,
     client: Arc<dyn QueryCellClient>,
     runtime: Arc<QueryTransportServerRuntime>,
+    identity: QueryTransportConnectionIdentity,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1233,7 +2033,9 @@ where
         read_query_transport_frame(stream, runtime.config.max_frame_bytes, &runtime.metrics)
             .await?;
     let response = match serde_json::from_slice::<QueryTransportRequest>(&frame) {
-        Ok(request) => execute_query_transport_request(client, request, Arc::clone(&runtime)).await,
+        Ok(request) => {
+            execute_query_transport_request(client, request, Arc::clone(&runtime), identity).await
+        }
         Err(err) => QueryTransportResponse::Error {
             message: format!("invalid query transport request: {err}"),
         },
@@ -1252,6 +2054,7 @@ async fn execute_query_transport_request(
     client: Arc<dyn QueryCellClient>,
     request: QueryTransportRequest,
     runtime: Arc<QueryTransportServerRuntime>,
+    identity: QueryTransportConnectionIdentity,
 ) -> QueryTransportResponse {
     match request {
         QueryTransportRequest::Rows {
@@ -1263,12 +2066,15 @@ async fn execute_query_transport_request(
             if version != QUERY_TRANSPORT_VERSION {
                 return transport_version_error(version);
             }
-            if let Err(err) = authenticate_query_transport(&runtime, &auth) {
+            if let Err(err) = authenticate_query_transport(&runtime, &auth, &identity) {
                 return transport_error_response(&runtime, err);
             }
             let query_id = context.idempotency_key.clone();
-            match execute_metered_query(&runtime, &query_id, || {
-                client.execute_cypher_rows(context, &query)
+            match execute_metered_query(&runtime, &query_id, |cancellation_token| {
+                client.execute_cypher_rows(
+                    context.with_cancellation_token(cancellation_token),
+                    &query,
+                )
             })
             .await
             {
@@ -1287,12 +2093,17 @@ async fn execute_query_transport_request(
             if version != QUERY_TRANSPORT_VERSION {
                 return transport_version_error(version);
             }
-            if let Err(err) = authenticate_query_transport(&runtime, &auth) {
+            if let Err(err) = authenticate_query_transport(&runtime, &auth, &identity) {
                 return transport_error_response(&runtime, err);
             }
             let query_id = context.idempotency_key.clone();
-            match execute_metered_query(&runtime, &query_id, || {
-                client.execute_cypher_rows_page(context, &query, cursor, page_size)
+            match execute_metered_query(&runtime, &query_id, |cancellation_token| {
+                client.execute_cypher_rows_page(
+                    context.with_cancellation_token(cancellation_token),
+                    &query,
+                    cursor,
+                    page_size,
+                )
             })
             .await
             {
@@ -1308,7 +2119,7 @@ async fn execute_query_transport_request(
             if version != QUERY_TRANSPORT_VERSION {
                 return transport_version_error(version);
             }
-            if let Err(err) = authenticate_query_transport(&runtime, &auth) {
+            if let Err(err) = authenticate_query_transport(&runtime, &auth, &identity) {
                 return transport_error_response(&runtime, err);
             }
             match cancel_active_query(&runtime, &query_id).await {
@@ -1335,10 +2146,10 @@ async fn execute_metered_query<F, Fut, T>(
     execute: F,
 ) -> Result<T>
 where
-    F: FnOnce() -> Fut,
+    F: FnOnce(QueryCancellationToken) -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    let lifecycle_token = begin_query_lifecycle(runtime, query_id).await?;
+    let (lifecycle_token, cancellation_token) = begin_query_lifecycle(runtime, query_id).await?;
     let result = async {
         let _permit = acquire_query_transport_permit(runtime).await?;
         activate_query_lifecycle(runtime, query_id, lifecycle_token).await?;
@@ -1348,7 +2159,7 @@ where
             .requests_started
             .fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
-        let result = execute().await;
+        let result = execute(cancellation_token).await;
         let elapsed = started.elapsed();
         runtime.metrics.remote_latency_us.fetch_add(
             elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
@@ -1391,7 +2202,7 @@ where
 async fn begin_query_lifecycle(
     runtime: &QueryTransportServerRuntime,
     query_id: &str,
-) -> Result<QueryLifecycleToken> {
+) -> Result<(QueryLifecycleToken, QueryCancellationToken)> {
     let mut lifecycle = runtime.lifecycle.lock().await;
     if lifecycle.queries.contains_key(query_id) {
         return Err(GraphError::UnsupportedQuery {
@@ -1401,14 +2212,16 @@ async fn begin_query_lifecycle(
     }
     let token = lifecycle.next_token;
     lifecycle.next_token = lifecycle.next_token.wrapping_add(1);
+    let cancellation_token = QueryCancellationToken::new();
     lifecycle.queries.insert(
         query_id.to_string(),
         QueryLifecycleEntry {
             token,
             state: QueryLifecycleState::Queued,
+            cancellation_token: cancellation_token.clone(),
         },
     );
-    Ok(token)
+    Ok((token, cancellation_token))
 }
 
 #[cfg(feature = "query-transport")]
@@ -1482,6 +2295,7 @@ async fn cancel_active_query(runtime: &QueryTransportServerRuntime, query_id: &s
             .cancelled_rejections
             .fetch_add(1, Ordering::Relaxed);
     } else if let Some(entry) = lifecycle.queries.get_mut(query_id) {
+        entry.cancellation_token.cancel();
         entry.state = QueryLifecycleState::Cancelled;
     }
     runtime
@@ -1550,8 +2364,9 @@ fn inactive_query_cancel_error(query_id: &str) -> GraphError {
 fn authenticate_query_transport(
     runtime: &QueryTransportServerRuntime,
     auth: &QueryTransportAuth,
+    identity: &QueryTransportConnectionIdentity,
 ) -> Result<()> {
-    if runtime.config.auth_policy.accepts(auth) {
+    if runtime.config.auth_policy.accepts(auth, identity) {
         return Ok(());
     }
     runtime
