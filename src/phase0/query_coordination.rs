@@ -367,17 +367,22 @@ pub struct TcpQueryServer {
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<Result<()>>,
     metrics: Arc<QueryTransportMetrics>,
-    cancellations: Arc<Mutex<BTreeSet<String>>>,
-    active_queries: Arc<Mutex<BTreeSet<String>>>,
+    lifecycle: Arc<Mutex<QueryTransportLifecycle>>,
 }
 
 #[cfg(feature = "query-transport")]
 struct QueryTransportServerRuntime {
     config: QueryTransportServerConfig,
     metrics: Arc<QueryTransportMetrics>,
-    cancellations: Arc<Mutex<BTreeSet<String>>>,
-    active_queries: Arc<Mutex<BTreeSet<String>>>,
+    lifecycle: Arc<Mutex<QueryTransportLifecycle>>,
     request_gate: Arc<Semaphore>,
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Default)]
+struct QueryTransportLifecycle {
+    active_queries: BTreeSet<String>,
+    cancellations: BTreeSet<String>,
 }
 
 #[cfg(feature = "query-transport")]
@@ -412,14 +417,12 @@ impl TcpQueryServer {
             .map_err(|err| transport_error("local_addr", err))?;
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let metrics = Arc::new(QueryTransportMetrics::default());
-        let cancellations = Arc::new(Mutex::new(BTreeSet::new()));
-        let active_queries = Arc::new(Mutex::new(BTreeSet::new()));
+        let lifecycle = Arc::new(Mutex::new(QueryTransportLifecycle::default()));
         let max_concurrent_requests = config.max_concurrent_requests.max(1);
         let runtime = Arc::new(QueryTransportServerRuntime {
             config,
             metrics: Arc::clone(&metrics),
-            cancellations: Arc::clone(&cancellations),
-            active_queries: Arc::clone(&active_queries),
+            lifecycle: Arc::clone(&lifecycle),
             request_gate: Arc::new(Semaphore::new(max_concurrent_requests)),
         });
         let task = tokio::spawn(async move {
@@ -453,8 +456,7 @@ impl TcpQueryServer {
             stop_tx,
             task,
             metrics,
-            cancellations,
-            active_queries,
+            lifecycle,
         })
     }
 
@@ -469,11 +471,11 @@ impl TcpQueryServer {
     pub async fn cancel_query(&self, query_id: impl Into<String>) -> Result<()> {
         let query_id = query_id.into();
         validate_component("query_id", &query_id)?;
-        let active = self.active_queries.lock().await;
-        if !active.contains(&query_id) {
+        let mut lifecycle = self.lifecycle.lock().await;
+        if !lifecycle.active_queries.contains(&query_id) {
             return Err(inactive_query_cancel_error(&query_id));
         }
-        self.cancellations.lock().await.insert(query_id);
+        lifecycle.cancellations.insert(query_id);
         self.metrics.cancellations.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -1364,8 +1366,8 @@ async fn begin_query_lifecycle(
     runtime: &QueryTransportServerRuntime,
     query_id: &str,
 ) -> Result<()> {
-    let mut active = runtime.active_queries.lock().await;
-    if !active.insert(query_id.to_string()) {
+    let mut lifecycle = runtime.lifecycle.lock().await;
+    if !lifecycle.active_queries.insert(query_id.to_string()) {
         return Err(GraphError::UnsupportedQuery {
             dialect: "QueryTransport",
             feature: format!("query id {query_id} is already active"),
@@ -1379,10 +1381,9 @@ async fn finish_query_lifecycle(
     runtime: &QueryTransportServerRuntime,
     query_id: &str,
 ) -> QueryLifecycleFinish {
-    let mut active = runtime.active_queries.lock().await;
-    let mut cancellations = runtime.cancellations.lock().await;
-    active.remove(query_id);
-    if cancellations.remove(query_id) {
+    let mut lifecycle = runtime.lifecycle.lock().await;
+    lifecycle.active_queries.remove(query_id);
+    if lifecycle.cancellations.remove(query_id) {
         runtime
             .metrics
             .cancelled_rejections
@@ -1402,15 +1403,11 @@ enum QueryLifecycleFinish {
 #[cfg(feature = "query-transport")]
 async fn cancel_active_query(runtime: &QueryTransportServerRuntime, query_id: &str) -> Result<()> {
     validate_component("query_id", query_id)?;
-    let active = runtime.active_queries.lock().await;
-    if !active.contains(query_id) {
+    let mut lifecycle = runtime.lifecycle.lock().await;
+    if !lifecycle.active_queries.contains(query_id) {
         return Err(inactive_query_cancel_error(query_id));
     }
-    runtime
-        .cancellations
-        .lock()
-        .await
-        .insert(query_id.to_string());
+    lifecycle.cancellations.insert(query_id.to_string());
     runtime
         .metrics
         .cancellations
@@ -1445,7 +1442,13 @@ async fn ensure_query_not_cancelled(
     runtime: &QueryTransportServerRuntime,
     query_id: &str,
 ) -> Result<()> {
-    if runtime.cancellations.lock().await.contains(query_id) {
+    if runtime
+        .lifecycle
+        .lock()
+        .await
+        .cancellations
+        .contains(query_id)
+    {
         return Err(cancelled_query_error());
     }
     Ok(())
