@@ -5450,11 +5450,33 @@ async fn routed_cluster_executes_read_plans_without_write_lease_and_rejects_writ
         .await
         .unwrap();
 
+    #[cfg(feature = "opencypher")]
+    {
+        let merge = cluster
+            .execute_cypher(
+                QueryContext::new("reddit-home", "query-routed-cypher-merge"),
+                "MERGE (u {id: 1})-[:FOLLOWS]->(v {id: 4})",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            merge,
+            QueryOutput::Mutation(QueryMutationResult {
+                created_edges: 1,
+                ..QueryMutationResult::default()
+            })
+        );
+    }
+
     cluster
         .renew_leases(&control, std::time::Duration::from_millis(25))
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    #[cfg(feature = "opencypher")]
+    let expected_vertices = vec![2, 4];
+    #[cfg(not(feature = "opencypher"))]
+    let expected_vertices = vec![2];
     assert_eq!(
         cluster
             .execute_query_statement(
@@ -5467,7 +5489,7 @@ async fn routed_cluster_executes_read_plans_without_write_lease_and_rejects_writ
             )
             .await
             .unwrap(),
-        QueryOutput::Vertices(vec![2])
+        QueryOutput::Vertices(expected_vertices)
     );
 
     let err = cluster
@@ -5489,6 +5511,24 @@ async fn routed_cluster_executes_read_plans_without_write_lease_and_rejects_writ
             ..
         } if cell_id == "reddit-home" && node_id == "node-a"
     ));
+    #[cfg(feature = "opencypher")]
+    {
+        let err = cluster
+            .execute_cypher(
+                QueryContext::new("reddit-home", "query-routed-cypher-delete"),
+                "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) DELETE r",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GraphError::StaleShardLease {
+                ref cell_id,
+                ref node_id,
+                ..
+            } if cell_id == "reddit-home" && node_id == "node-a"
+        ));
+    }
     cluster.close().await.unwrap();
     control.close().await.unwrap();
 }
