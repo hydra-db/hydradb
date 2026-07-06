@@ -105,6 +105,130 @@ impl MatrixCacheKey {
     }
 }
 
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ParsedRowQueryCacheKey {
+    query: String,
+}
+
+#[cfg(feature = "opencypher")]
+impl ParsedRowQueryCacheKey {
+    pub(crate) fn new(query: &str) -> Self {
+        Self {
+            query: query.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ReachabilityCacheKey {
+    cell_id: String,
+    edge_type: String,
+    src: VertexId,
+    min_hops: u8,
+    max_hops: u8,
+    read_epoch: GraphEpoch,
+    window: Option<ReachabilityCacheWindow>,
+}
+
+#[cfg(feature = "opencypher")]
+impl ReachabilityCacheKey {
+    pub(crate) fn new(
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        hop_range: (u8, u8),
+        read_epoch: GraphEpoch,
+    ) -> Self {
+        Self {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            src,
+            min_hops: hop_range.0,
+            max_hops: hop_range.1,
+            read_epoch,
+            window: None,
+        }
+    }
+
+    pub(crate) fn new_window(
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        hop_range: (u8, u8),
+        read_epoch: GraphEpoch,
+        window: QueryWindow,
+        ascending: bool,
+    ) -> Self {
+        Self {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            src,
+            min_hops: hop_range.0,
+            max_hops: hop_range.1,
+            read_epoch,
+            window: Some(ReachabilityCacheWindow {
+                skip: window.skip,
+                limit: window.limit,
+                ascending,
+            }),
+        }
+    }
+
+    pub(crate) fn cell_id(&self) -> &str {
+        &self.cell_id
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ReachabilityCacheWindow {
+    skip: u64,
+    limit: Option<usize>,
+    ascending: bool,
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReachabilityCacheValue {
+    vertices: Option<Arc<Vec<VertexId>>>,
+    count: u64,
+    edge_visits: u64,
+}
+
+#[cfg(feature = "opencypher")]
+impl ReachabilityCacheValue {
+    pub(crate) fn from_vertices(vertices: Vec<VertexId>, edge_visits: u64) -> Self {
+        let count = vertices.len() as u64;
+        Self {
+            vertices: Some(Arc::new(vertices)),
+            count,
+            edge_visits,
+        }
+    }
+
+    pub(crate) fn count_only(count: u64, edge_visits: u64) -> Self {
+        Self {
+            vertices: None,
+            count,
+            edge_visits,
+        }
+    }
+
+    pub(crate) fn vertices(&self) -> Option<Arc<Vec<VertexId>>> {
+        self.vertices.clone()
+    }
+
+    pub(crate) fn count(&self) -> u64 {
+        self.count
+    }
+
+    pub(crate) fn edge_visits(&self) -> u64 {
+        self.edge_visits
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum GraphError {
     #[error("slatedb error: {0}")]
@@ -467,6 +591,10 @@ pub struct GraphCachePolicy {
     pub max_matrix_artifacts: usize,
     pub max_matrix_adjacencies: usize,
     pub max_graphblas_matrices: usize,
+    #[cfg(feature = "opencypher")]
+    pub max_parsed_row_queries: usize,
+    #[cfg(feature = "opencypher")]
+    pub max_reachability_results: usize,
     pub max_supernode_groups: usize,
     pub max_posting_chunks: usize,
     pub max_materialized_supernodes: usize,
@@ -483,6 +611,10 @@ impl Default for GraphCachePolicy {
             max_matrix_artifacts: 1_024,
             max_matrix_adjacencies: 128,
             max_graphblas_matrices: 64,
+            #[cfg(feature = "opencypher")]
+            max_parsed_row_queries: 4_096,
+            #[cfg(feature = "opencypher")]
+            max_reachability_results: 512,
             max_supernode_groups: 4_096,
             max_posting_chunks: 16_384,
             max_materialized_supernodes: 512,
@@ -514,6 +646,8 @@ pub enum GraphCacheKind {
     MatrixArtifact,
     MatrixAdjacency,
     GraphBlas,
+    ParsedRowQuery,
+    ReachabilityResult,
     SupernodeGroup,
     PostingChunk,
     MaterializedSupernode,
@@ -527,6 +661,10 @@ pub struct GraphCacheMetricsSnapshot {
     pub matrix_adjacency_misses: u64,
     pub graphblas_hits: u64,
     pub graphblas_misses: u64,
+    pub parsed_row_query_hits: u64,
+    pub parsed_row_query_misses: u64,
+    pub reachability_result_hits: u64,
+    pub reachability_result_misses: u64,
     pub supernode_group_hits: u64,
     pub supernode_group_misses: u64,
     pub posting_chunk_hits: u64,
@@ -657,6 +795,10 @@ pub(crate) struct GraphCacheMetrics {
     matrix_adjacency_misses: AtomicU64,
     graphblas_hits: AtomicU64,
     graphblas_misses: AtomicU64,
+    parsed_row_query_hits: AtomicU64,
+    parsed_row_query_misses: AtomicU64,
+    reachability_result_hits: AtomicU64,
+    reachability_result_misses: AtomicU64,
     supernode_group_hits: AtomicU64,
     supernode_group_misses: AtomicU64,
     posting_chunk_hits: AtomicU64,
@@ -691,6 +833,10 @@ impl GraphCacheMetrics {
             (GraphCacheKind::MatrixAdjacency, false) => &self.matrix_adjacency_misses,
             (GraphCacheKind::GraphBlas, true) => &self.graphblas_hits,
             (GraphCacheKind::GraphBlas, false) => &self.graphblas_misses,
+            (GraphCacheKind::ParsedRowQuery, true) => &self.parsed_row_query_hits,
+            (GraphCacheKind::ParsedRowQuery, false) => &self.parsed_row_query_misses,
+            (GraphCacheKind::ReachabilityResult, true) => &self.reachability_result_hits,
+            (GraphCacheKind::ReachabilityResult, false) => &self.reachability_result_misses,
             (GraphCacheKind::SupernodeGroup, true) => &self.supernode_group_hits,
             (GraphCacheKind::SupernodeGroup, false) => &self.supernode_group_misses,
             (GraphCacheKind::PostingChunk, true) => &self.posting_chunk_hits,
@@ -708,6 +854,10 @@ impl GraphCacheMetrics {
             matrix_adjacency_misses: self.matrix_adjacency_misses.load(Ordering::Relaxed),
             graphblas_hits: self.graphblas_hits.load(Ordering::Relaxed),
             graphblas_misses: self.graphblas_misses.load(Ordering::Relaxed),
+            parsed_row_query_hits: self.parsed_row_query_hits.load(Ordering::Relaxed),
+            parsed_row_query_misses: self.parsed_row_query_misses.load(Ordering::Relaxed),
+            reachability_result_hits: self.reachability_result_hits.load(Ordering::Relaxed),
+            reachability_result_misses: self.reachability_result_misses.load(Ordering::Relaxed),
             supernode_group_hits: self.supernode_group_hits.load(Ordering::Relaxed),
             supernode_group_misses: self.supernode_group_misses.load(Ordering::Relaxed),
             posting_chunk_hits: self.posting_chunk_hits.load(Ordering::Relaxed),
@@ -1026,6 +1176,10 @@ pub struct GraphShard {
     matrix_cache: Mutex<BoundedGraphCache<MatrixCacheKey, Arc<MatrixAdjacency>>>,
     graphblas_cache:
         Mutex<BoundedGraphCache<MatrixCacheKey, Arc<sparse_kernel::CompiledGraphBlasMatrix>>>,
+    #[cfg(feature = "opencypher")]
+    parsed_row_query_cache: Mutex<BoundedGraphCache<ParsedRowQueryCacheKey, ParsedRowQuery>>,
+    #[cfg(feature = "opencypher")]
+    reachability_cache: Mutex<BoundedGraphCache<ReachabilityCacheKey, ReachabilityCacheValue>>,
     supernode_group_cache: Mutex<BoundedGraphCache<SupernodeCacheKey, phase0::SupernodeGroup>>,
     posting_chunk_cache: Mutex<BoundedGraphCache<PostingChunkCacheKey, phase0::PostingChunk>>,
     materialized_supernode_cache: Mutex<BoundedGraphCache<SupernodeCacheKey, Arc<Vec<VertexId>>>>,
@@ -1055,6 +1209,10 @@ pub struct GraphCacheEntryCounts {
     pub matrix_artifacts: usize,
     pub matrix_adjacencies: usize,
     pub graphblas_matrices: usize,
+    #[cfg(feature = "opencypher")]
+    pub parsed_row_queries: usize,
+    #[cfg(feature = "opencypher")]
+    pub reachability_results: usize,
     pub supernode_groups: usize,
     pub posting_chunks: usize,
     pub materialized_supernodes: usize,
