@@ -20,6 +20,30 @@ fn mutation(src: VertexId, dst: VertexId, idempotency_key: &str) -> EdgeMutation
     }
 }
 
+fn typed_mutation(
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+    idempotency_key: &str,
+) -> EdgeMutation {
+    EdgeMutation {
+        cell_id: cell_id.to_string(),
+        edge_type: edge_type.to_string(),
+        src,
+        dst,
+        idempotency_key: idempotency_key.to_string(),
+    }
+}
+
+fn adjacency_from_records_for_test(edges: &[EdgeRecord]) -> MatrixAdjacency {
+    let mut adjacency = MatrixAdjacency::new();
+    for edge in edges {
+        adjacency.entry(edge.src).or_default().insert(edge.dst);
+    }
+    adjacency
+}
+
 #[cfg(feature = "opencypher")]
 async fn read_query_stats_record_for_test(shard: &GraphShard, key: &str) -> QueryStatsRecord {
     let record_key = keys::query_stats_record_key(key);
@@ -339,6 +363,245 @@ async fn graph_cache_policy_bounds_entries_and_reports_hits_misses() {
     assert!(metrics.matrix_adjacency_hits >= 1);
     assert!(metrics.hydration_started >= 2);
     assert!(metrics.hydration_completed >= 2);
+    reader.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn graph_layer_caches_match_reopened_object_store_truth() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/cache-accuracy-reopen";
+    let cell_id = "reddit-home";
+    let edge_type = "CACHE_EDGE";
+    let edges = [
+        (1, 2),
+        (1, 3),
+        (2, 4),
+        (3, 5),
+        (4, 6),
+        (5, 7),
+        (100, 200),
+        (100, 201),
+        (100, 202),
+        (100, 203),
+        (100, 204),
+        (100, 205),
+        (100, 206),
+        (100, 207),
+    ];
+    let options = GraphOpenOptions {
+        cache_policy: GraphCachePolicy {
+            prefetch_supernode_chunks: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let base_epoch = {
+        let writer = GraphShard::open_standalone_writer_with_options(
+            path,
+            Arc::clone(&object_store),
+            options.clone(),
+        )
+        .await
+        .unwrap();
+        for (idx, (src, dst)) in edges.into_iter().enumerate() {
+            writer
+                .write_edge(typed_mutation(
+                    cell_id,
+                    edge_type,
+                    src,
+                    dst,
+                    &format!("cache-accuracy-edge-{idx}"),
+                ))
+                .await
+                .unwrap();
+        }
+        let base_epoch = writer.current_epoch(cell_id).await.unwrap();
+        writer
+            .build_matrix_tiles(cell_id, edge_type, base_epoch, 4)
+            .await
+            .unwrap();
+        writer
+            .build_supernode_groups_for_directions(
+                cell_id,
+                edge_type,
+                base_epoch,
+                4,
+                3,
+                &[ArtifactDirection::Out],
+            )
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        base_epoch
+    };
+
+    let reader = GraphShard::open_with_options(path, Arc::clone(&object_store), options)
+        .await
+        .unwrap();
+    assert_eq!(
+        reader.graph_cache_entry_counts().await,
+        GraphCacheEntryCounts::default()
+    );
+
+    let raw_edges = reader
+        .edges_at(cell_id, edge_type, base_epoch)
+        .await
+        .unwrap();
+    let expected_adjacency = adjacency_from_records_for_test(&raw_edges);
+    assert_eq!(
+        expected_adjacency
+            .get(&100)
+            .map(|neighbors| neighbors.iter().copied().collect::<Vec<_>>()),
+        Some((200..208).collect::<Vec<_>>())
+    );
+
+    let posting_truth = reader
+        .posting_reachable(cell_id, edge_type, &[1], 3, base_epoch)
+        .await
+        .unwrap();
+    let matrix_rust = reader
+        .matrix_reachable_with_kernel(
+            cell_id,
+            edge_type,
+            &[1],
+            3,
+            base_epoch,
+            SparseKernelBackend::RustSparse,
+        )
+        .await
+        .unwrap();
+    assert_eq!(matrix_rust.vertices, posting_truth.vertices);
+    assert_eq!(matrix_rust.delta_records_applied, 0);
+
+    let matrix_key = MatrixCacheKey::new(cell_id, edge_type, base_epoch);
+    let cached_adjacency = reader
+        .matrix_cache
+        .lock()
+        .await
+        .get(&matrix_key)
+        .expect("matrix adjacency should be cached after RustSparse traversal");
+    assert_eq!(cached_adjacency.as_ref(), &expected_adjacency);
+    let cached_artifact = reader
+        .matrix_artifact_cache
+        .lock()
+        .await
+        .get(&matrix_key)
+        .expect("matrix artifact manifest should be cached after traversal");
+    assert_eq!(cached_artifact.base_epoch, base_epoch);
+    assert_eq!(cached_artifact.edge_count, raw_edges.len() as u64);
+
+    #[cfg(feature = "graphblas")]
+    {
+        let graphblas = reader
+            .matrix_reachable_with_kernel(
+                cell_id,
+                edge_type,
+                &[1],
+                3,
+                base_epoch,
+                SparseKernelBackend::SuiteSparseGraphBlas,
+            )
+            .await
+            .unwrap();
+        assert_eq!(graphblas.vertices, posting_truth.vertices);
+        assert!(reader
+            .graphblas_cache
+            .lock()
+            .await
+            .get(&matrix_key)
+            .is_some());
+    }
+
+    let rows = reader
+        .execute_cypher_rows(
+            QueryContext::new(cell_id, "cache-accuracy-varhop").at_epoch(base_epoch),
+            "MATCH (u {id: 1})-[:CACHE_EDGE*1..3]->(v) RETURN v.id ORDER BY v.id",
+        )
+        .await
+        .unwrap();
+    let row_vertices = rows
+        .rows
+        .iter()
+        .map(|row| match row.values.as_slice() {
+            [QueryValue::VertexId(vertex)] => *vertex,
+            values => panic!("unexpected row values: {values:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(row_vertices, posting_truth.vertices);
+    let reachability_key = ReachabilityCacheKey::new(cell_id, edge_type, 1, (1, 3), base_epoch);
+    let cached_reachability = reader
+        .reachability_cache
+        .lock()
+        .await
+        .get(&reachability_key)
+        .expect("variable-hop query should cache reachability output");
+    assert_eq!(
+        cached_reachability
+            .vertices()
+            .expect("reachability cache should store vertices")
+            .as_ref(),
+        &posting_truth.vertices
+    );
+    assert_eq!(
+        cached_reachability.count(),
+        posting_truth.vertices.len() as u64
+    );
+
+    let page = reader
+        .supernode_page(
+            cell_id,
+            edge_type,
+            ArtifactDirection::Out,
+            100,
+            base_epoch,
+            0,
+        )
+        .await
+        .unwrap()
+        .expect("supernode page should exist");
+    assert_eq!(page.vertices, vec![200, 201, 202]);
+    assert!(page.has_next);
+
+    let supernode_truth = reader
+        .matrix_reachable_with_kernel(
+            cell_id,
+            edge_type,
+            &[100],
+            1,
+            base_epoch,
+            SparseKernelBackend::RustSparse,
+        )
+        .await
+        .unwrap();
+    assert_eq!(supernode_truth.vertices, (200..208).collect::<Vec<_>>());
+
+    let supernode_key =
+        SupernodeCacheKey::new(cell_id, edge_type, ArtifactDirection::Out, 100, base_epoch);
+    let cached_group = reader
+        .supernode_group_cache
+        .lock()
+        .await
+        .get(&supernode_key)
+        .expect("supernode group should be cached");
+    assert_eq!(cached_group.degree, 8);
+    assert_eq!(cached_group.chunk_count, 3);
+    let cached_chunk = reader
+        .posting_chunk_cache
+        .lock()
+        .await
+        .get(&PostingChunkCacheKey::new(&cached_group, 0))
+        .expect("first posting chunk should be cached");
+    assert_eq!(cached_chunk.vertices, vec![200, 201, 202]);
+    let materialized = reader
+        .materialized_supernode_cache
+        .lock()
+        .await
+        .get(&supernode_key)
+        .expect("full one-hop supernode read should cache materialized vertices");
+    assert_eq!(materialized.as_ref(), &(200..208).collect::<Vec<_>>());
+
     reader.close().await.unwrap();
 }
 
@@ -2686,6 +2949,153 @@ async fn mutation_log_append_is_durable_and_replayed_after_reopen() {
             .unwrap(),
         vec![30, 31]
     );
+}
+
+#[tokio::test]
+async fn graph_mutation_log_and_outbox_payloads_match_replayed_graph() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/mutation-log-payload-accuracy";
+    let cell_id = "reddit-home";
+    let edge_type = "WAL_EDGE";
+    let first_batch = vec![
+        typed_mutation(cell_id, edge_type, 1, 10, "wal-payload-1"),
+        typed_mutation(cell_id, edge_type, 1, 11, "wal-payload-2"),
+    ];
+    let second_batch = vec![
+        typed_mutation(cell_id, edge_type, 2, 20, "wal-payload-3"),
+        typed_mutation(cell_id, edge_type, 2, 21, "wal-payload-4"),
+    ];
+
+    {
+        let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+        assert_eq!(
+            writer
+                .append_edge_mutation_log(cell_id, "wal-batch-1", first_batch.clone())
+                .await
+                .unwrap(),
+            EdgeMutationLogAppendResult {
+                log_epoch: 1,
+                mutations: 2,
+                already_appended: false,
+            }
+        );
+        assert_eq!(
+            writer
+                .append_edge_mutation_log(cell_id, "wal-batch-2", second_batch.clone())
+                .await
+                .unwrap(),
+            EdgeMutationLogAppendResult {
+                log_epoch: 2,
+                mutations: 2,
+                already_appended: false,
+            }
+        );
+
+        let mut iter = writer
+            .scan_remote_prefix(&keys::mutation_log_prefix(cell_id))
+            .await
+            .unwrap();
+        let mut decoded = Vec::new();
+        while let Some(kv) = iter.next().await.unwrap() {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            decoded.push((
+                parse_mutation_log_epoch(&key).unwrap(),
+                decode_edge_mutation_log_batch(&key, &kv.value).unwrap(),
+            ));
+        }
+        decoded.sort_by_key(|(log_epoch, _)| *log_epoch);
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].0, 1);
+        assert_eq!(decoded[0].1.cell_id, cell_id);
+        assert_eq!(decoded[0].1.batch_id, "wal-batch-1");
+        assert_eq!(
+            decoded[0].1.fingerprint,
+            edge_mutation_log_fingerprint(cell_id, "wal-batch-1", &first_batch)
+        );
+        assert_eq!(decoded[0].1.mutations, first_batch);
+        assert_eq!(decoded[1].0, 2);
+        assert_eq!(decoded[1].1.cell_id, cell_id);
+        assert_eq!(decoded[1].1.batch_id, "wal-batch-2");
+        assert_eq!(
+            decoded[1].1.fingerprint,
+            edge_mutation_log_fingerprint(cell_id, "wal-batch-2", &second_batch)
+        );
+        assert_eq!(decoded[1].1.mutations, second_batch);
+        assert_eq!(
+            writer
+                .read_counter(&keys::mutation_log_epoch(cell_id))
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(writer.current_epoch(cell_id).await.unwrap(), 0);
+        assert!(writer.outbox_since(cell_id, 0).await.unwrap().is_empty());
+        writer.close().await.unwrap();
+    }
+
+    let reopened = open_test_shard(path, Arc::clone(&object_store)).await;
+    let replay = reopened
+        .materialize_edge_mutation_log(cell_id, 16)
+        .await
+        .unwrap();
+    assert_eq!(
+        replay,
+        EdgeMutationLogMaterializeResult {
+            scanned_batches: 2,
+            materialized_batches: 2,
+            mutations: 4,
+            inserted: 4,
+            already_existed: 0,
+            last_log_epoch: 2,
+            materialized_log_epoch: 2,
+            current_epoch: 4,
+        }
+    );
+
+    let expected_pairs = [(1, 10), (1, 11), (2, 20), (2, 21)];
+    let outbox = reopened.outbox_since(cell_id, 0).await.unwrap();
+    assert_eq!(outbox.len(), expected_pairs.len());
+    for (idx, record) in outbox.iter().enumerate() {
+        assert_eq!(record.kind, DeltaKind::Plus);
+        assert_eq!(record.edge.cell_id, cell_id);
+        assert_eq!(record.edge.edge_type, edge_type);
+        assert_eq!(record.edge.epoch, (idx + 1) as u64);
+        assert_eq!((record.edge.src, record.edge.dst), expected_pairs[idx]);
+    }
+    assert_eq!(
+        reopened
+            .read_counter(&keys::mutation_log_materialized_epoch(cell_id))
+            .await
+            .unwrap(),
+        2
+    );
+
+    let live_edges = reopened.edges_at(cell_id, edge_type, 4).await.unwrap();
+    assert_eq!(
+        live_edges
+            .iter()
+            .map(|edge| (edge.epoch, edge.src, edge.dst))
+            .collect::<Vec<_>>(),
+        vec![(1, 1, 10), (2, 1, 11), (3, 2, 20), (4, 2, 21)]
+    );
+    assert_eq!(
+        reopened.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+        vec![10, 11]
+    );
+    assert_eq!(
+        reopened.out_neighbors(cell_id, edge_type, 2).await.unwrap(),
+        vec![20, 21]
+    );
+    assert_eq!(reopened.out_degree(cell_id, edge_type, 1).await.unwrap(), 2);
+    assert_eq!(reopened.out_degree(cell_id, edge_type, 2).await.unwrap(), 2);
+
+    let replay_again = reopened
+        .materialize_edge_mutation_log(cell_id, 16)
+        .await
+        .unwrap();
+    assert_eq!(replay_again.scanned_batches, 0);
+    assert_eq!(replay_again.materialized_batches, 0);
+    assert_eq!(replay_again.current_epoch, 4);
 }
 
 #[tokio::test]
@@ -7795,6 +8205,139 @@ async fn cypher_row_engine_supports_bindings_where_order_and_windows() {
             ],
         )
     );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_variable_hops_use_matrix_artifact_adjacency() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-varhop-matrix-artifact", object_store).await;
+
+    for (idx, (src, dst)) in [(1, 2), (2, 1), (2, 3)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "CHAIN".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-varhop-matrix-artifact-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+    let base_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    shard
+        .build_matrix_tiles("reddit-home", "CHAIN", base_epoch, 4)
+        .await
+        .unwrap();
+    let plan = shard
+        .explain_opencypher_rows(
+            QueryContext::new("reddit-home", "cypher-varhop-matrix-artifact-plan"),
+            "MATCH (u {id: 1})-[:CHAIN*2..2]->(v) RETURN v.id ORDER BY v.id",
+        )
+        .await
+        .unwrap();
+    assert!(plan.groups[0].patterns[0]
+        .optimizer_passes
+        .contains(&RowQueryOptimizerPass::GraphKernel));
+
+    let before_metrics = shard.graph_cache_metrics();
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-varhop-matrix-artifact-read"),
+            "MATCH (u {id: 1})-[:CHAIN*2..2]->(v) RETURN v.id ORDER BY v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(1)]),
+                QueryRow::new(vec![QueryValue::VertexId(3)]),
+            ],
+        )
+    );
+    let parsed_metrics = shard.graph_cache_metrics();
+    assert!(parsed_metrics.parsed_row_query_misses >= 1);
+    assert!(parsed_metrics.parsed_row_query_hits >= 1);
+    assert!(parsed_metrics.reachability_result_misses >= 1);
+
+    let first_page = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "cypher-varhop-matrix-artifact-page-1"),
+            "MATCH (u {id: 1})-[:CHAIN*2..2]->(v) RETURN v.id ORDER BY v.id",
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first_page,
+        QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+            Some(QueryCursorToken::new(1)),
+        )
+    );
+    let second_page = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "cypher-varhop-matrix-artifact-page-2"),
+            "MATCH (u {id: 1})-[:CHAIN*2..2]->(v) RETURN v.id ORDER BY v.id",
+            first_page.next_cursor,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second_page,
+        QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(3)])],
+            None,
+        )
+    );
+
+    let count_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-varhop-matrix-artifact-count"),
+            "MATCH (u {id: 1})-[:CHAIN*2..2]->(v) RETURN count(*) AS total",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        count_rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("total")],
+            vec![QueryRow::new(vec![QueryValue::Count(2)])],
+        )
+    );
+    let first_metrics = shard.graph_cache_metrics();
+    assert!(first_metrics.reachability_result_hits > parsed_metrics.reachability_result_hits);
+    #[cfg(feature = "graphblas")]
+    assert!(first_metrics.graphblas_hits > before_metrics.graphblas_hits);
+    #[cfg(not(feature = "graphblas"))]
+    assert!(
+        first_metrics.matrix_adjacency_hits > before_metrics.matrix_adjacency_hits
+            || first_metrics.matrix_adjacency_misses > before_metrics.matrix_adjacency_misses
+    );
+
+    shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-varhop-matrix-artifact-hot"),
+            "MATCH (u {id: 1})-[:CHAIN*1..2]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap();
+    let hot_metrics = shard.graph_cache_metrics();
+    #[cfg(feature = "graphblas")]
+    assert!(hot_metrics.graphblas_hits > first_metrics.graphblas_hits);
+    #[cfg(not(feature = "graphblas"))]
+    assert!(hot_metrics.matrix_adjacency_hits > first_metrics.matrix_adjacency_hits);
+
+    shard.close().await.unwrap();
 }
 
 #[cfg(feature = "opencypher")]

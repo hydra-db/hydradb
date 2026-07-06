@@ -572,6 +572,7 @@ pub enum RowQueryOptimizerPass {
     ConnectivityOrder,
     JoinOrder,
     ExpandInto,
+    GraphKernel,
     ReverseExpand,
     FullScanFallback,
     PreserveOptionalBoundary,

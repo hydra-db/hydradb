@@ -473,7 +473,8 @@ impl GraphShard {
                     max_hops,
                 },
                 if anchored { 10_000 } else { 2_000_000 },
-            ));
+            )
+            .with_pass(RowQueryOptimizerPass::GraphKernel));
         }
 
         let source = self.best_row_node_access(cell_id, &edge.src, bound).await?;
