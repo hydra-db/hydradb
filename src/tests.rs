@@ -6092,6 +6092,18 @@ async fn cypher_row_engine_executes_multi_match_join_pipeline() {
             ])],
         )
     );
+
+    let with_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-multi-match-with-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) WITH u, v \
+             MATCH (v)-[:POSTED]->(p:Post) \
+             WHERE p.score >= 10 \
+             RETURN u.id AS user, v.id AS followed, p.id AS post ORDER BY post",
+        )
+        .await
+        .unwrap();
+    assert_eq!(with_rows, rows);
 }
 
 #[cfg(feature = "opencypher")]

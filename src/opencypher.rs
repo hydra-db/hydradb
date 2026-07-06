@@ -381,14 +381,21 @@ impl ParsedCypher {
                 );
             }
             let mut match_clauses = Vec::with_capacity(clause_count.saturating_sub(1) as usize);
+            let mut scoped_bindings = BTreeSet::new();
             for idx in 0..clause_count - 1 {
                 let clause = checked_node(sys::cypher_ast_query_get_clause(query, idx))?;
-                if !is_instance(clause, sys::CYPHER_AST_MATCH) {
-                    return unsupported(
-                        "row execution currently supports one or more MATCH clauses followed by RETURN",
-                    );
+                if is_instance(clause, sys::CYPHER_AST_MATCH) {
+                    collect_match_clause_bindings(clause, parameters, &mut scoped_bindings)?;
+                    match_clauses.push(clause);
+                    continue;
                 }
-                match_clauses.push(clause);
+                if is_instance(clause, sys::CYPHER_AST_WITH) {
+                    lower_passthrough_with(clause, &scoped_bindings)?;
+                    continue;
+                }
+                return unsupported(
+                    "row execution currently supports MATCH/WITH clauses followed by RETURN",
+                );
             }
             lower_match_return_rows(&match_clauses, return_clause, parameters)
         }
@@ -811,6 +818,89 @@ fn lower_match_return_rows(
             window,
             columns,
         })
+    }
+}
+
+fn collect_match_clause_bindings(
+    match_clause: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+    bindings: &mut BTreeSet<String>,
+) -> Result<()> {
+    unsafe {
+        let pattern = checked_node(sys::cypher_ast_match_get_pattern(match_clause))?;
+        for pattern in lower_row_patterns(pattern, parameters)? {
+            collect_row_pattern_bindings(&pattern, bindings);
+        }
+        Ok(())
+    }
+}
+
+fn collect_row_pattern_bindings(pattern: &RowPattern, bindings: &mut BTreeSet<String>) {
+    match pattern {
+        RowPattern::Node(node) => collect_row_node_bindings(node, bindings),
+        RowPattern::Edge(edge) => {
+            if let Some(binding) = &edge.binding {
+                bindings.insert(binding.clone());
+            }
+            collect_row_node_bindings(&edge.src, bindings);
+            collect_row_node_bindings(&edge.dst, bindings);
+        }
+    }
+}
+
+fn collect_row_node_bindings(node: &RowNodePattern, bindings: &mut BTreeSet<String>) {
+    if let Some(binding) = &node.binding {
+        bindings.insert(binding.clone());
+    }
+}
+
+fn lower_passthrough_with(
+    with_clause: *const AstNode,
+    scoped_bindings: &BTreeSet<String>,
+) -> Result<()> {
+    unsafe {
+        if scoped_bindings.is_empty() {
+            return unsupported("WITH requires preceding bindings in Phase 2");
+        }
+        if sys::cypher_ast_with_is_distinct(with_clause)
+            || sys::cypher_ast_with_has_include_existing(with_clause)
+            || !sys::cypher_ast_with_get_order_by(with_clause).is_null()
+            || !sys::cypher_ast_with_get_skip(with_clause).is_null()
+            || !sys::cypher_ast_with_get_limit(with_clause).is_null()
+            || !sys::cypher_ast_with_get_predicate(with_clause).is_null()
+        {
+            return unsupported(
+                "WITH currently supports only pass-through identifiers without DISTINCT, WHERE, ORDER BY, SKIP, or LIMIT",
+            );
+        }
+
+        let projection_count = sys::cypher_ast_with_nprojections(with_clause);
+        if projection_count as usize != scoped_bindings.len() {
+            return unsupported("WITH must pass through every in-scope binding in Phase 2");
+        }
+        let mut projected = BTreeSet::new();
+        for idx in 0..projection_count {
+            let projection = checked_node(sys::cypher_ast_with_get_projection(with_clause, idx))?;
+            let expression = checked_node(sys::cypher_ast_projection_get_expression(projection))?;
+            if !is_instance(expression, sys::CYPHER_AST_IDENTIFIER) {
+                return unsupported("WITH pass-through supports only bare identifiers");
+            }
+            let binding = identifier_name(expression)?;
+            let alias = sys::cypher_ast_projection_get_alias(projection);
+            if !alias.is_null() && identifier_name(alias)? != binding {
+                return unsupported("WITH aliases are not executable in Phase 2");
+            }
+            if !scoped_bindings.contains(&binding) {
+                return unsupported(format!("WITH references out-of-scope binding {binding}"));
+            }
+            projected.insert(binding);
+        }
+        if &projected != scoped_bindings {
+            return unsupported(
+                "WITH must pass through each in-scope binding exactly once in Phase 2",
+            );
+        }
+        Ok(())
     }
 }
 
@@ -2389,6 +2479,28 @@ mod tests {
             parsed.columns,
             vec![QueryColumn::new("user"), QueryColumn::new("post")]
         );
+    }
+
+    #[test]
+    fn lowers_passthrough_with_row_query() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v) WITH u, r, v \
+             MATCH (v)-[:POSTED]->(p) RETURN p.id AS post",
+        )
+        .unwrap();
+        assert_eq!(parsed.patterns.len(), 2);
+        let RowPattern::Edge(first) = &parsed.patterns[0] else {
+            panic!("expected first edge row pattern");
+        };
+        assert_eq!(first.binding.as_deref(), Some("r"));
+        assert_eq!(parsed.columns, vec![QueryColumn::new("post")]);
+
+        let err = parse_opencypher_row_query(
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v) WITH v \
+             MATCH (v)-[:POSTED]->(p) RETURN p.id",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GraphError::UnsupportedQuery { .. }));
     }
 
     #[test]
