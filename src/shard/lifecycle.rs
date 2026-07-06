@@ -199,6 +199,16 @@ impl GraphShard {
                 cache_policy.max_graphblas_matrices,
                 tenant_quota,
             )),
+            #[cfg(feature = "opencypher")]
+            parsed_row_query_cache: Mutex::new(BoundedGraphCache::new(
+                cache_policy.max_parsed_row_queries,
+                tenant_quota,
+            )),
+            #[cfg(feature = "opencypher")]
+            reachability_cache: Mutex::new(BoundedGraphCache::new(
+                cache_policy.max_reachability_results,
+                tenant_quota,
+            )),
             supernode_group_cache: Mutex::new(BoundedGraphCache::new(
                 cache_policy.max_supernode_groups,
                 tenant_quota,
@@ -367,6 +377,10 @@ impl GraphShard {
             matrix_artifacts: self.matrix_artifact_cache.lock().await.len(),
             matrix_adjacencies: self.matrix_cache.lock().await.len(),
             graphblas_matrices: self.graphblas_cache.lock().await.len(),
+            #[cfg(feature = "opencypher")]
+            parsed_row_queries: self.parsed_row_query_cache.lock().await.len(),
+            #[cfg(feature = "opencypher")]
+            reachability_results: self.reachability_cache.lock().await.len(),
             supernode_groups: self.supernode_group_cache.lock().await.len(),
             posting_chunks: self.posting_chunk_cache.lock().await.len(),
             materialized_supernodes: self.materialized_supernode_cache.lock().await.len(),

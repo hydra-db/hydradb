@@ -24,6 +24,14 @@ pub(crate) struct SparseTraversal {
     pub backend: SparseKernelBackend,
 }
 
+#[cfg(feature = "graphblas")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SparseTraversalCount {
+    pub vertices: u64,
+    pub edge_visits: u64,
+    pub backend: SparseKernelBackend,
+}
+
 pub(crate) fn default_matrix_kernel() -> SparseKernelBackend {
     if cfg!(feature = "graphblas") {
         SparseKernelBackend::SuiteSparseGraphBlas
@@ -41,6 +49,23 @@ pub(crate) fn expand(
     match backend {
         SparseKernelBackend::RustSparse => Ok(expand_rust(adjacency, starts, hops)),
         SparseKernelBackend::SuiteSparseGraphBlas => expand_graphblas(adjacency, starts, hops),
+    }
+}
+
+pub(crate) fn expand_range(
+    adjacency: &Adjacency,
+    starts: &[VertexId],
+    min_hops: u8,
+    max_hops: u8,
+    backend: SparseKernelBackend,
+) -> Result<SparseTraversal> {
+    match backend {
+        SparseKernelBackend::RustSparse => {
+            Ok(expand_range_rust(adjacency, starts, min_hops, max_hops))
+        }
+        SparseKernelBackend::SuiteSparseGraphBlas => {
+            expand_range_graphblas(adjacency, starts, min_hops, max_hops)
+        }
     }
 }
 
@@ -112,6 +137,48 @@ pub(crate) fn expand_compiled_graphblas(
     expand_graphblas_compiled(compiled, adjacency, starts, hops)
 }
 
+#[cfg(feature = "graphblas")]
+pub(crate) fn expand_range_compiled_graphblas(
+    compiled: &CompiledGraphBlasMatrix,
+    adjacency: &Adjacency,
+    starts: &[VertexId],
+    min_hops: u8,
+    max_hops: u8,
+) -> Result<SparseTraversal> {
+    expand_range_graphblas_compiled(compiled, adjacency, starts, min_hops, max_hops)
+}
+
+#[cfg(feature = "graphblas")]
+pub(crate) fn expand_range_count_compiled_graphblas(
+    compiled: &CompiledGraphBlasMatrix,
+    adjacency: &Adjacency,
+    starts: &[VertexId],
+    min_hops: u8,
+    max_hops: u8,
+) -> Result<SparseTraversalCount> {
+    expand_range_count_graphblas_compiled(compiled, adjacency, starts, min_hops, max_hops)
+}
+
+#[cfg(feature = "graphblas")]
+pub(crate) fn expand_range_window_compiled_graphblas(
+    compiled: &CompiledGraphBlasMatrix,
+    adjacency: &Adjacency,
+    starts: &[VertexId],
+    min_hops: u8,
+    max_hops: u8,
+    window: SparseTraversalWindow,
+) -> Result<SparseTraversal> {
+    expand_range_window_graphblas_compiled(compiled, adjacency, starts, min_hops, max_hops, window)
+}
+
+#[cfg(feature = "graphblas")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SparseTraversalWindow {
+    pub skip: u64,
+    pub limit: Option<usize>,
+    pub ascending: bool,
+}
+
 fn expand_rust(adjacency: &Adjacency, starts: &[VertexId], hops: u8) -> SparseTraversal {
     let start_set: BTreeSet<_> = starts.iter().copied().collect();
     let mut frontier = start_set.clone();
@@ -144,6 +211,48 @@ fn expand_rust(adjacency: &Adjacency, starts: &[VertexId], hops: u8) -> SparseTr
     }
 }
 
+fn expand_range_rust(
+    adjacency: &Adjacency,
+    starts: &[VertexId],
+    min_hops: u8,
+    max_hops: u8,
+) -> SparseTraversal {
+    let mut frontier: BTreeSet<_> = starts.iter().copied().collect();
+    let mut reachable = BTreeSet::new();
+    let mut edge_visits = 0_u64;
+    if min_hops == 0 {
+        reachable.extend(frontier.iter().copied());
+    }
+    if max_hops == 0 || frontier.is_empty() {
+        return SparseTraversal {
+            vertices: reachable.into_iter().collect(),
+            edge_visits,
+            backend: SparseKernelBackend::RustSparse,
+        };
+    }
+    for depth in 1..=max_hops {
+        let mut next = BTreeSet::new();
+        for src in &frontier {
+            if let Some(neighbors) = adjacency.get(src) {
+                edge_visits = edge_visits.saturating_add(neighbors.len() as u64);
+                next.extend(neighbors.iter().copied());
+            }
+        }
+        if depth >= min_hops {
+            reachable.extend(next.iter().copied());
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    SparseTraversal {
+        vertices: reachable.into_iter().collect(),
+        edge_visits,
+        backend: SparseKernelBackend::RustSparse,
+    }
+}
+
 fn graphblas_vertices_from_adjacency(adjacency: &Adjacency) -> Result<Vec<VertexId>> {
     let mut vertices = BTreeSet::new();
     for (src, dsts) in adjacency {
@@ -169,6 +278,19 @@ fn expand_graphblas(
     _adjacency: &Adjacency,
     _starts: &[VertexId],
     _hops: u8,
+) -> Result<SparseTraversal> {
+    Err(crate::GraphError::SparseKernel {
+        backend: "SuiteSparseGraphBlas",
+        reason: "crate was built without the graphblas feature".to_string(),
+    })
+}
+
+#[cfg(not(feature = "graphblas"))]
+fn expand_range_graphblas(
+    _adjacency: &Adjacency,
+    _starts: &[VertexId],
+    _min_hops: u8,
+    _max_hops: u8,
 ) -> Result<SparseTraversal> {
     Err(crate::GraphError::SparseKernel {
         backend: "SuiteSparseGraphBlas",
@@ -215,6 +337,16 @@ fn expand_graphblas(
 }
 
 #[cfg(feature = "graphblas")]
+fn expand_range_graphblas(
+    adjacency: &Adjacency,
+    starts: &[VertexId],
+    min_hops: u8,
+    max_hops: u8,
+) -> Result<SparseTraversal> {
+    graphblas::expand_range(adjacency, starts, min_hops, max_hops)
+}
+
+#[cfg(feature = "graphblas")]
 fn compile_graphblas(adjacency: &Adjacency) -> Result<CompiledGraphBlasMatrix> {
     graphblas::CompiledGraphBlasMatrix::new(adjacency)
 }
@@ -235,6 +367,40 @@ fn expand_graphblas_compiled(
 }
 
 #[cfg(feature = "graphblas")]
+fn expand_range_graphblas_compiled(
+    compiled: &CompiledGraphBlasMatrix,
+    adjacency: &Adjacency,
+    starts: &[VertexId],
+    min_hops: u8,
+    max_hops: u8,
+) -> Result<SparseTraversal> {
+    compiled.expand_range(adjacency, starts, min_hops, max_hops)
+}
+
+#[cfg(feature = "graphblas")]
+fn expand_range_count_graphblas_compiled(
+    compiled: &CompiledGraphBlasMatrix,
+    adjacency: &Adjacency,
+    starts: &[VertexId],
+    min_hops: u8,
+    max_hops: u8,
+) -> Result<SparseTraversalCount> {
+    compiled.expand_range_count(adjacency, starts, min_hops, max_hops)
+}
+
+#[cfg(feature = "graphblas")]
+fn expand_range_window_graphblas_compiled(
+    compiled: &CompiledGraphBlasMatrix,
+    adjacency: &Adjacency,
+    starts: &[VertexId],
+    min_hops: u8,
+    max_hops: u8,
+    window: SparseTraversalWindow,
+) -> Result<SparseTraversal> {
+    compiled.expand_range_window(adjacency, starts, min_hops, max_hops, window)
+}
+
+#[cfg(feature = "graphblas")]
 mod graphblas {
     use std::collections::BTreeMap;
     use std::ffi::c_void;
@@ -244,7 +410,8 @@ mod graphblas {
     use std::sync::{Mutex, OnceLock};
 
     use super::{
-        graphblas_csc_from_adjacency, Adjacency, GraphBlasCsc, SparseKernelBackend, SparseTraversal,
+        graphblas_csc_from_adjacency, Adjacency, GraphBlasCsc, SparseKernelBackend,
+        SparseTraversal, SparseTraversalCount, SparseTraversalWindow,
     };
     use crate::{GraphError, Result, VertexId};
 
@@ -433,6 +600,58 @@ mod graphblas {
                 })?;
             expand_with_compiled(adjacency, starts, hops, &inner)
         }
+
+        pub(crate) fn expand_range(
+            &self,
+            adjacency: &Adjacency,
+            starts: &[VertexId],
+            min_hops: u8,
+            max_hops: u8,
+        ) -> Result<SparseTraversal> {
+            let idx = self.next_replica.fetch_add(1, Ordering::Relaxed) % self.replicas.len();
+            let inner = self.replicas[idx]
+                .lock()
+                .map_err(|_| GraphError::SparseKernel {
+                    backend: "SuiteSparseGraphBlas",
+                    reason: "compiled matrix cache lock was poisoned".to_string(),
+                })?;
+            expand_range_with_compiled(adjacency, starts, min_hops, max_hops, &inner)
+        }
+
+        pub(crate) fn expand_range_count(
+            &self,
+            adjacency: &Adjacency,
+            starts: &[VertexId],
+            min_hops: u8,
+            max_hops: u8,
+        ) -> Result<SparseTraversalCount> {
+            let idx = self.next_replica.fetch_add(1, Ordering::Relaxed) % self.replicas.len();
+            let inner = self.replicas[idx]
+                .lock()
+                .map_err(|_| GraphError::SparseKernel {
+                    backend: "SuiteSparseGraphBlas",
+                    reason: "compiled matrix cache lock was poisoned".to_string(),
+                })?;
+            expand_range_count_with_compiled(adjacency, starts, min_hops, max_hops, &inner)
+        }
+
+        pub(crate) fn expand_range_window(
+            &self,
+            adjacency: &Adjacency,
+            starts: &[VertexId],
+            min_hops: u8,
+            max_hops: u8,
+            window: SparseTraversalWindow,
+        ) -> Result<SparseTraversal> {
+            let idx = self.next_replica.fetch_add(1, Ordering::Relaxed) % self.replicas.len();
+            let inner = self.replicas[idx]
+                .lock()
+                .map_err(|_| GraphError::SparseKernel {
+                    backend: "SuiteSparseGraphBlas",
+                    reason: "compiled matrix cache lock was poisoned".to_string(),
+                })?;
+            expand_range_window_with_compiled(adjacency, starts, min_hops, max_hops, window, &inner)
+        }
     }
 
     pub(super) fn expand(
@@ -445,6 +664,19 @@ mod graphblas {
         let csc = graphblas_csc_from_adjacency(adjacency)?;
         let compiled = build_compiled_inner(&csc)?;
         expand_with_compiled(adjacency, starts, hops, &compiled)
+    }
+
+    pub(super) fn expand_range(
+        adjacency: &Adjacency,
+        starts: &[VertexId],
+        min_hops: u8,
+        max_hops: u8,
+    ) -> Result<SparseTraversal> {
+        init()?;
+
+        let csc = graphblas_csc_from_adjacency(adjacency)?;
+        let compiled = build_compiled_inner(&csc)?;
+        expand_range_with_compiled(adjacency, starts, min_hops, max_hops, &compiled)
     }
 
     fn build_compiled_inner(csc: &GraphBlasCsc) -> Result<CompiledGraphBlasMatrixInner> {
@@ -529,6 +761,165 @@ mod graphblas {
             edge_visits,
             backend: SparseKernelBackend::SuiteSparseGraphBlas,
         })
+    }
+
+    fn expand_range_with_compiled(
+        _adjacency: &Adjacency,
+        starts: &[VertexId],
+        min_hops: u8,
+        max_hops: u8,
+        compiled: &CompiledGraphBlasMatrixInner,
+    ) -> Result<SparseTraversal> {
+        let range = range_result_vector(starts, min_hops, max_hops, compiled)?;
+        let Some(result) = range.result.as_ref() else {
+            return Ok(empty_traversal());
+        };
+        let ordinals = extract_ordinals(result)?;
+        let mut vertices = Vec::with_capacity(ordinals.len());
+        for ordinal in ordinals {
+            vertices.push(compiled.ordinal_map.vertex(ordinal)?);
+        }
+        vertices.sort_unstable();
+        Ok(SparseTraversal {
+            vertices,
+            edge_visits: range.edge_visits,
+            backend: SparseKernelBackend::SuiteSparseGraphBlas,
+        })
+    }
+
+    fn expand_range_count_with_compiled(
+        _adjacency: &Adjacency,
+        starts: &[VertexId],
+        min_hops: u8,
+        max_hops: u8,
+        compiled: &CompiledGraphBlasMatrixInner,
+    ) -> Result<SparseTraversalCount> {
+        let range = range_result_vector(starts, min_hops, max_hops, compiled)?;
+        let Some(result) = range.result.as_ref() else {
+            return Ok(SparseTraversalCount {
+                vertices: 0,
+                edge_visits: range.edge_visits,
+                backend: SparseKernelBackend::SuiteSparseGraphBlas,
+            });
+        };
+        Ok(SparseTraversalCount {
+            vertices: vector_nvals(result)?,
+            edge_visits: range.edge_visits,
+            backend: SparseKernelBackend::SuiteSparseGraphBlas,
+        })
+    }
+
+    fn expand_range_window_with_compiled(
+        _adjacency: &Adjacency,
+        starts: &[VertexId],
+        min_hops: u8,
+        max_hops: u8,
+        window: SparseTraversalWindow,
+        compiled: &CompiledGraphBlasMatrixInner,
+    ) -> Result<SparseTraversal> {
+        let range = range_result_vector(starts, min_hops, max_hops, compiled)?;
+        let Some(result) = range.result.as_ref() else {
+            return Ok(empty_traversal());
+        };
+        let mut ordinals = extract_ordinals(result)?;
+        ordinals.sort_unstable();
+        if !window.ascending {
+            ordinals.reverse();
+        }
+        let skip = usize::try_from(window.skip).map_err(|_| GraphError::SparseKernel {
+            backend: "SuiteSparseGraphBlas",
+            reason: format!("window skip {} does not fit in usize", window.skip),
+        })?;
+        let iter = ordinals.into_iter().skip(skip);
+        let selected: Vec<_> = match window.limit {
+            Some(limit) => iter.take(limit).collect(),
+            None => iter.collect(),
+        };
+        let mut vertices = Vec::with_capacity(selected.len());
+        for ordinal in selected {
+            vertices.push(compiled.ordinal_map.vertex(ordinal)?);
+        }
+        Ok(SparseTraversal {
+            vertices,
+            edge_visits: range.edge_visits,
+            backend: SparseKernelBackend::SuiteSparseGraphBlas,
+        })
+    }
+
+    struct RangeVector {
+        result: Option<Vector>,
+        edge_visits: u64,
+    }
+
+    fn range_result_vector(
+        starts: &[VertexId],
+        min_hops: u8,
+        max_hops: u8,
+        compiled: &CompiledGraphBlasMatrixInner,
+    ) -> Result<RangeVector> {
+        let Some(matrix) = compiled.matrix.as_ref() else {
+            return Ok(empty_range_vector());
+        };
+        let Some(degree_vector) = compiled.degree_vector.as_ref() else {
+            return Ok(empty_range_vector());
+        };
+        if min_hops > max_hops || compiled.ordinal_map.is_empty() || starts.is_empty() {
+            return Ok(empty_range_vector());
+        }
+
+        let mut start_ordinals = Vec::with_capacity(starts.len());
+        let mut seen_start = vec![false; compiled.ordinal_map.len() as usize];
+        for start in starts {
+            if let Some(ordinal) = compiled.ordinal_map.try_ordinal(*start) {
+                let idx = ordinal as usize;
+                if !seen_start[idx] {
+                    seen_start[idx] = true;
+                    start_ordinals.push(ordinal);
+                }
+            }
+        }
+        if start_ordinals.is_empty() {
+            return Ok(empty_range_vector());
+        }
+
+        let dimension = compiled.ordinal_map.len();
+        let mut frontier = vector_from_ordinals(dimension, &start_ordinals)?;
+        let mut result = if min_hops == 0 {
+            vector_from_ordinals(dimension, &start_ordinals)?
+        } else {
+            vector_from_ordinals(dimension, &[])?
+        };
+        let mut degree_scratch = uint64_vector(dimension)?;
+        let mut edge_visits = 0_u64;
+
+        for depth in 1..=max_hops {
+            edge_visits = edge_visits.saturating_add(frontier_edge_visits_graphblas(
+                degree_vector,
+                &frontier,
+                &mut degree_scratch,
+            )?);
+            let next = multiply(matrix, &frontier, dimension)?;
+            let next_count = vector_nvals(&next)?;
+            if depth >= min_hops {
+                union_into(&mut result, &next)?;
+            }
+            if next_count == 0 {
+                break;
+            }
+            frontier = next;
+        }
+
+        Ok(RangeVector {
+            result: Some(result),
+            edge_visits,
+        })
+    }
+
+    fn empty_range_vector() -> RangeVector {
+        RangeVector {
+            result: None,
+            edge_visits: 0,
+        }
     }
 
     fn empty_traversal() -> SparseTraversal {
@@ -710,6 +1101,29 @@ mod graphblas {
                     matrix.0,
                     input.0,
                     GrB_DESC_SC,
+                ),
+                "GrB_mxv",
+            )?;
+        }
+        Ok(Vector(raw))
+    }
+
+    fn multiply(matrix: &Matrix, input: &Vector, dimension: GrBIndex) -> Result<Vector> {
+        let mut raw = null_mut();
+        unsafe {
+            check(
+                GrB_Vector_new(&mut raw, GrB_BOOL, dimension),
+                "GrB_Vector_new",
+            )?;
+            check(
+                GrB_mxv(
+                    raw,
+                    null_mut(),
+                    null_mut(),
+                    GrB_LOR_LAND_SEMIRING_BOOL,
+                    matrix.0,
+                    input.0,
+                    null_mut(),
                 ),
                 "GrB_mxv",
             )?;

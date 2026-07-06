@@ -792,7 +792,7 @@ fn naive_reachable(adjacency: &MatrixAdjacency, root: VertexId, hops: u8) -> Vec
     reachable.into_iter().collect()
 }
 
-fn apply_delta_overlay(
+pub(crate) fn apply_delta_overlay(
     adjacency: &mut BTreeMap<VertexId, BTreeSet<VertexId>>,
     deltas: Vec<DeltaRecord>,
     base_epoch: GraphEpoch,
