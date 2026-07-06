@@ -23,7 +23,8 @@ mod placement;
 mod sparse_kernel;
 
 pub use algebra::{
-    LogicalQueryPlan, PhysicalQueryPlan, QueryColumn, QueryContext, QueryCursorToken, QueryFloat,
+    LogicalQueryPlan, PhysicalQueryPlan, QueryCancellationToken, QueryCardinalityStatsKind,
+    QueryCardinalityStatsRefresh, QueryColumn, QueryContext, QueryCursorToken, QueryFloat,
     QueryMutationResult, QueryOutput, QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet,
     QueryRow, QueryStatement, QueryValue, QueryWindow,
 };
@@ -39,7 +40,8 @@ pub use opencypher::{
 };
 #[cfg(feature = "opencypher")]
 pub use opencypher_corpus::{
-    parse_opencypher_tck_corpus, CypherTckCase, CypherTckCompatibilityReport, CypherTckCorpus,
+    parse_opencypher_tck_corpus, parse_opencypher_tck_corpus_dir, CypherTckCase,
+    CypherTckCompatibilityReport, CypherTckCorpus,
 };
 pub use phase0::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
@@ -49,6 +51,10 @@ pub use phase0::{
     MatrixArtifact, MatrixTraversalResult, Phase0Cluster, PostingChunk, RoutedPhase0Cluster,
     ShardLease, ShardPlacement, SupernodeGroup, SupernodePage, TraversalBackend,
 };
+#[cfg(feature = "query-service-discovery")]
+pub use phase0::{
+    ConsulQueryServiceDiscovery, EtcdQueryServiceDiscovery, KubernetesQueryServiceDiscovery,
+};
 #[cfg(feature = "opencypher")]
 pub use phase0::{
     DistributedQueryCoordinator, DistributedQueryJoin, DistributedQueryLeg, DistributedQueryMerge,
@@ -56,9 +62,17 @@ pub use phase0::{
 };
 #[cfg(feature = "query-transport")]
 pub use phase0::{
-    QueryServiceDirectory, QueryServiceEndpoint, QueryTransportAuthPolicy,
-    QueryTransportClientConfig, QueryTransportMetricsSnapshot, QueryTransportServerConfig,
+    QueryServiceDirectory, QueryServiceDiscovery, QueryServiceEndpoint, QueryTransportAuthPolicy,
+    QueryTransportClientConfig, QueryTransportConnectionIdentity, QueryTransportMetricsSnapshot,
+    QueryTransportSecret, QueryTransportServerConfig, StaticQueryServiceDiscovery,
     TcpQueryCellClient, TcpQueryRowStream, TcpQueryServer,
+};
+#[cfg(feature = "query-transport-tls")]
+pub use phase0::{
+    QueryTransportTlsClientConfigProvider, QueryTransportTlsServerConfigProvider,
+    ReloadableQueryTransportTlsClientConfigProvider,
+    ReloadableQueryTransportTlsServerConfigProvider, StaticQueryTransportTlsClientConfigProvider,
+    StaticQueryTransportTlsServerConfigProvider,
 };
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
@@ -181,6 +195,15 @@ pub enum GraphError {
         operation: &'static str,
         cell_id: String,
         edge_type: String,
+        read_epoch: GraphEpoch,
+        current_epoch: GraphEpoch,
+    },
+    #[error(
+        "{operation} stats snapshot epoch {read_epoch} for cell {cell_id} changed while refreshing; current epoch is {current_epoch}"
+    )]
+    QueryStatsSnapshotChanged {
+        operation: &'static str,
+        cell_id: String,
         read_epoch: GraphEpoch,
         current_epoch: GraphEpoch,
     },

@@ -300,6 +300,31 @@ pub fn edge_property_index_delta_prefix(
     format!("cell/{cell_id}/eprop_delta/{edge_type}/{property}/{encoded_value}/")
 }
 
+#[cfg(feature = "opencypher")]
+pub fn query_stats_edge_type(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/qstats/edge_type/{edge_type}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn query_stats_vertex_label(cell_id: &str, label: &str) -> String {
+    format!("cell/{cell_id}/qstats/vlabel/{label}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn query_stats_vertex_property(cell_id: &str, property: &str, encoded_value: &str) -> String {
+    format!("cell/{cell_id}/qstats/vprop/{property}/{encoded_value}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn query_stats_edge_property(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+    encoded_value: &str,
+) -> String {
+    format!("cell/{cell_id}/qstats/eprop/{edge_type}/{property}/{encoded_value}")
+}
+
 #[cfg(test)]
 pub fn delta_plus(
     cell_id: &str,
