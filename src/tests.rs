@@ -8661,6 +8661,127 @@ async fn cypher_row_planner_runs_selective_match_group_before_full_scan() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_row_explain_shows_connectivity_aware_reverse_expansion() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-explain-optimizer", object_store).await;
+
+    let plan = shard
+        .explain_opencypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-explain-optimizer"),
+            "MATCH (u)-[:FOLLOWS]->(v)-[:POSTED]->(p:Post {score: 20}) \
+             RETURN p.id",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(plan.groups.len(), 1);
+    let patterns = &plan.groups[0].patterns;
+    assert_eq!(patterns.len(), 2);
+    assert_eq!(patterns[0].original_index, 1);
+    assert_eq!(
+        patterns[0].access,
+        RowQueryAccess::BoundInExpand {
+            edge_type: "POSTED".to_string(),
+        }
+    );
+    assert!(patterns[0]
+        .optimizer_passes
+        .contains(&RowQueryOptimizerPass::ReverseExpand));
+    assert_eq!(patterns[1].original_index, 0);
+    assert_eq!(
+        patterns[1].access,
+        RowQueryAccess::BoundInExpand {
+            edge_type: "FOLLOWS".to_string(),
+        }
+    );
+    assert!(patterns[1]
+        .optimizer_passes
+        .contains(&RowQueryOptimizerPass::ConnectivityOrder));
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_row_explain_uses_persisted_stats_for_index_choice() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-explain-stats", object_store).await;
+
+    for vertex in 1..=5 {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex,
+                VertexMetadata::default()
+                    .with_label("User")
+                    .with_property("active", VertexPropertyValue::Bool(true)),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            99,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(false))
+                .with_property("name", VertexPropertyValue::String("neo".to_string())),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            100,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(false)),
+        )
+        .await
+        .unwrap();
+    shard
+        .refresh_vertex_label_query_stats("reddit-home", "User")
+        .await
+        .unwrap();
+    shard
+        .refresh_vertex_property_query_stats(
+            "reddit-home",
+            "active",
+            &VertexPropertyValue::Bool(false),
+        )
+        .await
+        .unwrap();
+    shard
+        .refresh_vertex_property_query_stats(
+            "reddit-home",
+            "name",
+            &VertexPropertyValue::String("neo".to_string()),
+        )
+        .await
+        .unwrap();
+
+    let plan = shard
+        .explain_opencypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-explain-stats"),
+            "MATCH (u:User {active: false, name: 'neo'}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(plan.groups.len(), 1);
+    assert_eq!(plan.groups[0].patterns.len(), 1);
+    assert_eq!(
+        plan.groups[0].patterns[0].access,
+        RowQueryAccess::VertexPropertyIndex {
+            property: "name".to_string(),
+        }
+    );
+    assert_eq!(plan.groups[0].patterns[0].estimated_cardinality, 1);
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_edge_match_uses_destination_id_reverse_index_without_full_scan() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
@@ -8702,6 +8823,86 @@ async fn cypher_edge_match_uses_destination_id_reverse_index_without_full_scan()
         QueryResultSet::new(
             vec![QueryColumn::new("u.id")],
             vec![QueryRow::new(vec![QueryValue::VertexId(2)])],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_edge_match_uses_edge_property_index_before_endpoint_expansion() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-edge-property-index-plan",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for (idx, (src, dst)) in [(1, 10), (2, 20), (3, 30)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-edge-property-index-plan-{idx}"),
+            })
+            .await
+            .unwrap();
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                src,
+                VertexMetadata::default().with_label("User"),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .set_edge_metadata(
+            "reddit-home",
+            "FOLLOWS",
+            2,
+            20,
+            EdgeMetadata::default().with_property("weight", VertexPropertyValue::Integer(7)),
+        )
+        .await
+        .unwrap();
+
+    let plan = shard
+        .explain_opencypher_rows(
+            QueryContext::new("reddit-home", "cypher-edge-property-index-plan-explain"),
+            "MATCH (u:User)-[e:FOLLOWS {weight: 7}]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.groups[0].patterns[0].access,
+        RowQueryAccess::EdgePropertyIndex {
+            edge_type: "FOLLOWS".to_string(),
+            property: "weight".to_string(),
+        }
+    );
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-edge-property-index-plan-read"),
+            "MATCH (u:User)-[e:FOLLOWS {weight: 7}]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(20)])],
         )
     );
 }

@@ -26,7 +26,8 @@ pub use algebra::{
     LogicalQueryPlan, PhysicalQueryPlan, QueryCancellationToken, QueryCardinalityStatsKind,
     QueryCardinalityStatsRefresh, QueryColumn, QueryContext, QueryCursorToken, QueryFloat,
     QueryMutationResult, QueryOutput, QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet,
-    QueryRow, QueryStatement, QueryValue, QueryWindow,
+    QueryRow, QueryStatement, QueryValue, QueryWindow, RowQueryAccess, RowQueryOptimizerPass,
+    RowQueryPlan, RowQueryPlanGroup, RowQueryPlanPattern,
 };
 #[cfg(feature = "opencypher")]
 pub use opencypher::{
