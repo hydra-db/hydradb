@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::{
     validate_component, CommitResult, EdgeMetadata, GraphEpoch, GraphError, Result, VertexId,
@@ -17,6 +19,8 @@ pub struct QueryContext {
     pub result_window: QueryWindow,
     pub parameters: BTreeMap<String, VertexPropertyValue>,
     pub max_runtime_ms: Option<u64>,
+    #[cfg_attr(feature = "query-transport", serde(skip, default))]
+    pub cancellation_token: Option<QueryCancellationToken>,
 }
 
 impl QueryContext {
@@ -28,6 +32,7 @@ impl QueryContext {
             result_window: QueryWindow::default(),
             parameters: BTreeMap::new(),
             max_runtime_ms: None,
+            cancellation_token: None,
         }
     }
 
@@ -58,7 +63,39 @@ impl QueryContext {
         self.max_runtime_ms = Some(max_runtime_ms);
         self
     }
+
+    pub fn with_cancellation_token(mut self, token: QueryCancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
 }
+
+#[derive(Clone, Debug, Default)]
+pub struct QueryCancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl QueryCancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+impl PartialEq for QueryCancellationToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_cancelled() == other.is_cancelled()
+    }
+}
+
+impl Eq for QueryCancellationToken {}
 
 #[cfg_attr(
     feature = "query-transport",
@@ -74,6 +111,33 @@ impl QueryWindow {
     pub fn is_default(self) -> bool {
         self.skip == 0 && self.limit.is_none()
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryCardinalityStatsKind {
+    EdgeType {
+        edge_type: String,
+    },
+    VertexLabel {
+        label: String,
+    },
+    VertexProperty {
+        property: String,
+        value: VertexPropertyValue,
+    },
+    EdgeProperty {
+        edge_type: String,
+        property: String,
+        value: VertexPropertyValue,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryCardinalityStatsRefresh {
+    pub cell_id: String,
+    pub read_epoch: GraphEpoch,
+    pub kind: QueryCardinalityStatsKind,
+    pub count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

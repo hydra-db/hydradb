@@ -221,7 +221,10 @@ impl GraphShard {
         query: ParsedRowQuery,
     ) -> Result<QueryResultSet> {
         validate_component("cell_id", &context.cell_id)?;
-        let budget = QueryBudget::new(context.max_runtime_ms.or(self.limits.max_query_runtime_ms));
+        let budget = QueryBudget::new(
+            context.max_runtime_ms.or(self.limits.max_query_runtime_ms),
+            context.cancellation_token.clone(),
+        );
         budget.check("cypher_rows")?;
         let read_epoch = self.query_read_epoch(&context).await?;
 
@@ -376,7 +379,10 @@ impl GraphShard {
                 feature: "mutation queries cannot run at a historical read epoch".to_string(),
             });
         }
-        let budget = QueryBudget::new(context.max_runtime_ms.or(self.limits.max_query_runtime_ms));
+        let budget = QueryBudget::new(
+            context.max_runtime_ms.or(self.limits.max_query_runtime_ms),
+            context.cancellation_token.clone(),
+        );
         budget.check("cypher_mutation")?;
 
         if query.patterns.is_empty() {
@@ -726,7 +732,10 @@ impl GraphShard {
 
     pub async fn execute_query_plan(&self, plan: QueryPlan) -> Result<QueryOutput> {
         self.validate_executable_query_plan(&plan).await?;
-        let budget = QueryBudget::new(plan.max_runtime_ms.or(self.limits.max_query_runtime_ms));
+        let budget = QueryBudget::new(
+            plan.max_runtime_ms.or(self.limits.max_query_runtime_ms),
+            None,
+        );
         budget.check("query_plan")?;
         match plan.physical {
             PhysicalQueryPlan::WriteEdge {
@@ -924,6 +933,166 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
+    pub async fn refresh_edge_type_query_stats(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+    ) -> Result<QueryCardinalityStatsRefresh> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        self.ensure_write_authority(cell_id, "refresh_edge_type_query_stats")?;
+        let _permit = self
+            .acquire_graph_write_permit("refresh_edge_type_query_stats")
+            .await?;
+        let _lock = self
+            .acquire_cell_write_lock(cell_id, "refresh_edge_type_query_stats")
+            .await?;
+        let read_epoch = self.current_epoch(cell_id).await?;
+        let count = self
+            .edges_at_with_budget(cell_id, edge_type, read_epoch, None)
+            .await?
+            .len() as u64;
+        let mut batch = GraphWriteBatch::new();
+        batch.put(
+            keys::query_stats_edge_type(cell_id, edge_type).as_bytes(),
+            encode_u64(count),
+        );
+        self.write_graph_batch_strict(cell_id, "refresh_edge_type_query_stats", batch)
+            .await?;
+        Ok(QueryCardinalityStatsRefresh {
+            cell_id: cell_id.to_string(),
+            read_epoch,
+            kind: QueryCardinalityStatsKind::EdgeType {
+                edge_type: edge_type.to_string(),
+            },
+            count,
+        })
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn refresh_vertex_label_query_stats(
+        &self,
+        cell_id: &str,
+        label: &str,
+    ) -> Result<QueryCardinalityStatsRefresh> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("label", label)?;
+        self.ensure_write_authority(cell_id, "refresh_vertex_label_query_stats")?;
+        let _permit = self
+            .acquire_graph_write_permit("refresh_vertex_label_query_stats")
+            .await?;
+        let _lock = self
+            .acquire_cell_write_lock(cell_id, "refresh_vertex_label_query_stats")
+            .await?;
+        let read_epoch = self.current_epoch(cell_id).await?;
+        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
+        let count = self
+            .scan_vertex_label_index_at(cell_id, label, read_epoch, &budget)
+            .await?
+            .len() as u64;
+        let mut batch = GraphWriteBatch::new();
+        batch.put(
+            keys::query_stats_vertex_label(cell_id, label).as_bytes(),
+            encode_u64(count),
+        );
+        self.write_graph_batch_strict(cell_id, "refresh_vertex_label_query_stats", batch)
+            .await?;
+        Ok(QueryCardinalityStatsRefresh {
+            cell_id: cell_id.to_string(),
+            read_epoch,
+            kind: QueryCardinalityStatsKind::VertexLabel {
+                label: label.to_string(),
+            },
+            count,
+        })
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn refresh_vertex_property_query_stats(
+        &self,
+        cell_id: &str,
+        property: &str,
+        value: &VertexPropertyValue,
+    ) -> Result<QueryCardinalityStatsRefresh> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("property", property)?;
+        self.ensure_write_authority(cell_id, "refresh_vertex_property_query_stats")?;
+        let _permit = self
+            .acquire_graph_write_permit("refresh_vertex_property_query_stats")
+            .await?;
+        let _lock = self
+            .acquire_cell_write_lock(cell_id, "refresh_vertex_property_query_stats")
+            .await?;
+        let read_epoch = self.current_epoch(cell_id).await?;
+        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
+        let count = self
+            .scan_vertex_property_index_at(cell_id, property, value, read_epoch, &budget)
+            .await?
+            .len() as u64;
+        let encoded = encode_vertex_property_value_key(value);
+        let mut batch = GraphWriteBatch::new();
+        batch.put(
+            keys::query_stats_vertex_property(cell_id, property, &encoded).as_bytes(),
+            encode_u64(count),
+        );
+        self.write_graph_batch_strict(cell_id, "refresh_vertex_property_query_stats", batch)
+            .await?;
+        Ok(QueryCardinalityStatsRefresh {
+            cell_id: cell_id.to_string(),
+            read_epoch,
+            kind: QueryCardinalityStatsKind::VertexProperty {
+                property: property.to_string(),
+                value: value.clone(),
+            },
+            count,
+        })
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn refresh_edge_property_query_stats(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        property: &str,
+        value: &VertexPropertyValue,
+    ) -> Result<QueryCardinalityStatsRefresh> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        validate_component("property", property)?;
+        self.ensure_write_authority(cell_id, "refresh_edge_property_query_stats")?;
+        let _permit = self
+            .acquire_graph_write_permit("refresh_edge_property_query_stats")
+            .await?;
+        let _lock = self
+            .acquire_cell_write_lock(cell_id, "refresh_edge_property_query_stats")
+            .await?;
+        let read_epoch = self.current_epoch(cell_id).await?;
+        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
+        let count = self
+            .scan_edge_property_index_at(cell_id, edge_type, property, value, read_epoch, &budget)
+            .await?
+            .len() as u64;
+        let encoded = encode_vertex_property_value_key(value);
+        let mut batch = GraphWriteBatch::new();
+        batch.put(
+            keys::query_stats_edge_property(cell_id, edge_type, property, &encoded).as_bytes(),
+            encode_u64(count),
+        );
+        self.write_graph_batch_strict(cell_id, "refresh_edge_property_query_stats", batch)
+            .await?;
+        Ok(QueryCardinalityStatsRefresh {
+            cell_id: cell_id.to_string(),
+            read_epoch,
+            kind: QueryCardinalityStatsKind::EdgeProperty {
+                edge_type: edge_type.to_string(),
+                property: property.to_string(),
+                value: value.clone(),
+            },
+            count,
+        })
+    }
+
+    #[cfg(feature = "opencypher")]
     async fn match_row_patterns(
         &self,
         cell_id: &str,
@@ -963,7 +1132,9 @@ impl GraphShard {
             });
         }
 
-        let groups = optimize_row_match_groups(groups);
+        let groups = self
+            .optimize_row_match_groups_with_stats(cell_id, groups)
+            .await?;
         let mut rows = vec![BindingRow::default()];
         for group in &groups {
             budget.check("cypher_match_group")?;
@@ -1029,7 +1200,9 @@ impl GraphShard {
         budget: &QueryBudget,
         mut rows: Vec<BindingRow>,
     ) -> Result<Vec<BindingRow>> {
-        let patterns = optimize_row_patterns(patterns);
+        let patterns = self
+            .optimize_row_patterns_with_stats(cell_id, patterns)
+            .await?;
         for pattern in &patterns {
             budget.check("cypher_match_pipeline")?;
             let mut next_rows = Vec::new();
@@ -1952,7 +2125,10 @@ impl GraphShard {
         }
 
         let read_epoch = self.query_read_epoch(context).await?;
-        let budget = QueryBudget::new(context.max_runtime_ms.or(self.limits.max_query_runtime_ms));
+        let budget = QueryBudget::new(
+            context.max_runtime_ms.or(self.limits.max_query_runtime_ms),
+            context.cancellation_token.clone(),
+        );
         budget.check("cypher_rows_page_stream")?;
         let src = edge.src.id.expect("streaming edge has fixed source");
         let mut vertices = self
@@ -2848,23 +3024,211 @@ impl GraphShard {
             degree_mismatches,
         })
     }
+
+    #[cfg(feature = "opencypher")]
+    async fn optimize_row_match_groups_with_stats(
+        &self,
+        cell_id: &str,
+        groups: &[RowMatchGroup],
+    ) -> Result<Vec<RowMatchGroup>> {
+        let mut output = Vec::with_capacity(groups.len());
+        let mut required_segment = Vec::new();
+        for group in groups {
+            if !group.optional && group.predicate.is_none() {
+                let mut group = group.clone();
+                group.patterns = self
+                    .optimize_row_patterns_with_stats(cell_id, &group.patterns)
+                    .await?;
+                let cost = self
+                    .estimate_row_match_group_cost_with_stats(cell_id, &group)
+                    .await?;
+                required_segment.push((cost, output.len() + required_segment.len(), group));
+            } else {
+                required_segment.sort_by_key(|(cost, idx, _)| (*cost, *idx));
+                output.extend(required_segment.drain(..).map(|(_, _, group)| group));
+                let mut group = group.clone();
+                group.patterns = self
+                    .optimize_row_patterns_with_stats(cell_id, &group.patterns)
+                    .await?;
+                output.push(group);
+            }
+        }
+        required_segment.sort_by_key(|(cost, idx, _)| (*cost, *idx));
+        output.extend(required_segment.into_iter().map(|(_, _, group)| group));
+        Ok(output)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn optimize_row_patterns_with_stats(
+        &self,
+        cell_id: &str,
+        patterns: &[RowPattern],
+    ) -> Result<Vec<RowPattern>> {
+        let mut planned = Vec::with_capacity(patterns.len());
+        for (idx, pattern) in patterns.iter().cloned().enumerate() {
+            let cost = self
+                .estimate_row_pattern_cost_with_stats(cell_id, &pattern)
+                .await?;
+            planned.push((cost, idx, pattern));
+        }
+        planned.sort_by_key(|(cost, idx, _)| (*cost, *idx));
+        Ok(planned.into_iter().map(|(_, _, pattern)| pattern).collect())
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn estimate_row_match_group_cost_with_stats(
+        &self,
+        cell_id: &str,
+        group: &RowMatchGroup,
+    ) -> Result<u64> {
+        let mut best = u64::MAX;
+        for pattern in &group.patterns {
+            best = best.min(
+                self.estimate_row_pattern_cost_with_stats(cell_id, pattern)
+                    .await?,
+            );
+        }
+        Ok(best)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn estimate_row_pattern_cost_with_stats(
+        &self,
+        cell_id: &str,
+        pattern: &RowPattern,
+    ) -> Result<u64> {
+        match pattern {
+            RowPattern::Node(node) => {
+                self.estimate_row_node_pattern_cost_with_stats(cell_id, node)
+                    .await
+            }
+            RowPattern::Edge(edge) => {
+                self.estimate_row_edge_pattern_cost_with_stats(cell_id, edge)
+                    .await
+            }
+        }
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn estimate_row_node_pattern_cost_with_stats(
+        &self,
+        cell_id: &str,
+        node: &RowNodePattern,
+    ) -> Result<u64> {
+        if node.id.is_some() {
+            return Ok(1);
+        }
+        if let Some((property, value)) = node
+            .properties
+            .iter()
+            .find(|(property, _)| property.as_str() != "id")
+        {
+            let encoded = encode_vertex_property_value_key(value);
+            if let Some(count) = self
+                .query_stats_count(&keys::query_stats_vertex_property(
+                    cell_id, property, &encoded,
+                ))
+                .await?
+            {
+                return Ok(count);
+            }
+        }
+        if let Some(label) = node.labels.iter().next() {
+            if let Some(count) = self
+                .query_stats_count(&keys::query_stats_vertex_label(cell_id, label))
+                .await?
+            {
+                return Ok(count);
+            }
+        }
+        Ok(estimate_row_node_pattern_cost(node))
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn estimate_row_edge_pattern_cost_with_stats(
+        &self,
+        cell_id: &str,
+        edge: &RowEdgePattern,
+    ) -> Result<u64> {
+        if edge.hop_range.is_some() {
+            return Ok(estimate_row_edge_pattern_cost(edge));
+        }
+
+        let endpoint_cost = self
+            .estimate_row_node_pattern_cost_with_stats(cell_id, &edge.src)
+            .await?
+            .min(
+                self.estimate_row_node_pattern_cost_with_stats(cell_id, &edge.dst)
+                    .await?,
+            );
+        let mut best = endpoint_cost;
+        if let Some(count) = self
+            .query_stats_count(&keys::query_stats_edge_type(cell_id, &edge.edge_type))
+            .await?
+        {
+            best = best.min(count);
+        }
+        if let Some((property, value)) = edge.properties.iter().next() {
+            let encoded = encode_vertex_property_value_key(value);
+            if let Some(count) = self
+                .query_stats_count(&keys::query_stats_edge_property(
+                    cell_id,
+                    &edge.edge_type,
+                    property,
+                    &encoded,
+                ))
+                .await?
+            {
+                best = best.min(count);
+            }
+        }
+        Ok(best.saturating_add(4))
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn query_stats_count(&self, key: &str) -> Result<Option<u64>> {
+        match self.read_remote(key).await? {
+            Some(value) => Ok(Some(decode_u64(key, &value)?)),
+            None => Ok(None),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct QueryBudget {
     started_at: std::time::Instant,
     max_runtime_ms: Option<u64>,
+    cancellation_token: Option<QueryCancellationToken>,
 }
 
 impl QueryBudget {
-    fn new(max_runtime_ms: Option<u64>) -> Self {
+    fn new(
+        max_runtime_ms: Option<u64>,
+        cancellation_token: Option<QueryCancellationToken>,
+    ) -> Self {
         Self {
             started_at: std::time::Instant::now(),
             max_runtime_ms,
+            cancellation_token,
         }
     }
 
     fn check(&self, operation: &'static str) -> Result<()> {
+        if self
+            .cancellation_token
+            .as_ref()
+            .map_or(false, QueryCancellationToken::is_cancelled)
+        {
+            return Err(GraphError::QueryTimeout {
+                operation: "query_cancelled",
+                elapsed_ms: self
+                    .started_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+                limit_ms: 0,
+            });
+        }
         let Some(limit_ms) = self.max_runtime_ms else {
             return Ok(());
         };
@@ -2909,56 +3273,6 @@ struct VertexMutationApplyState<'a> {
     pending_edge_metadata: &'a mut BTreeMap<BoundRelationship, EdgeMetadata>,
     original_edge_metadata: &'a mut BTreeMap<BoundRelationship, EdgeMetadata>,
     budget: &'a QueryBudget,
-}
-
-#[cfg(feature = "opencypher")]
-fn optimize_row_match_groups(groups: &[RowMatchGroup]) -> Vec<RowMatchGroup> {
-    fn flush_required_segment(output: &mut Vec<RowMatchGroup>, segment: &mut Vec<RowMatchGroup>) {
-        segment.sort_by_key(estimate_row_match_group_cost);
-        output.append(segment);
-    }
-
-    let mut output = Vec::with_capacity(groups.len());
-    let mut required_segment = Vec::new();
-    for group in groups {
-        if !group.optional && group.predicate.is_none() {
-            let mut group = group.clone();
-            group.patterns = optimize_row_patterns(&group.patterns);
-            required_segment.push(group);
-        } else {
-            flush_required_segment(&mut output, &mut required_segment);
-            let mut group = group.clone();
-            group.patterns = optimize_row_patterns(&group.patterns);
-            output.push(group);
-        }
-    }
-    flush_required_segment(&mut output, &mut required_segment);
-    output
-}
-
-#[cfg(feature = "opencypher")]
-fn optimize_row_patterns(patterns: &[RowPattern]) -> Vec<RowPattern> {
-    let mut planned: Vec<_> = patterns.iter().cloned().enumerate().collect();
-    planned.sort_by_key(|(idx, pattern)| (estimate_row_pattern_cost(pattern), *idx));
-    planned.into_iter().map(|(_, pattern)| pattern).collect()
-}
-
-#[cfg(feature = "opencypher")]
-fn estimate_row_match_group_cost(group: &RowMatchGroup) -> u64 {
-    group
-        .patterns
-        .iter()
-        .map(estimate_row_pattern_cost)
-        .min()
-        .unwrap_or(u64::MAX)
-}
-
-#[cfg(feature = "opencypher")]
-fn estimate_row_pattern_cost(pattern: &RowPattern) -> u64 {
-    match pattern {
-        RowPattern::Node(node) => estimate_row_node_pattern_cost(node),
-        RowPattern::Edge(edge) => estimate_row_edge_pattern_cost(edge),
-    }
 }
 
 #[cfg(feature = "opencypher")]

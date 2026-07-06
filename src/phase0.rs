@@ -297,6 +297,10 @@ mod supernode;
 mod traversal;
 mod verify;
 
+#[cfg(feature = "query-service-discovery")]
+pub use query_coordination::{
+    ConsulQueryServiceDiscovery, EtcdQueryServiceDiscovery, KubernetesQueryServiceDiscovery,
+};
 #[cfg(feature = "opencypher")]
 pub use query_coordination::{
     DistributedQueryCoordinator, DistributedQueryJoin, DistributedQueryLeg, DistributedQueryMerge,
@@ -304,9 +308,17 @@ pub use query_coordination::{
 };
 #[cfg(feature = "query-transport")]
 pub use query_coordination::{
-    QueryServiceDirectory, QueryServiceEndpoint, QueryTransportAuthPolicy,
-    QueryTransportClientConfig, QueryTransportMetricsSnapshot, QueryTransportServerConfig,
+    QueryServiceDirectory, QueryServiceDiscovery, QueryServiceEndpoint, QueryTransportAuthPolicy,
+    QueryTransportClientConfig, QueryTransportConnectionIdentity, QueryTransportMetricsSnapshot,
+    QueryTransportSecret, QueryTransportServerConfig, StaticQueryServiceDiscovery,
     TcpQueryCellClient, TcpQueryRowStream, TcpQueryServer,
+};
+#[cfg(feature = "query-transport-tls")]
+pub use query_coordination::{
+    QueryTransportTlsClientConfigProvider, QueryTransportTlsServerConfigProvider,
+    ReloadableQueryTransportTlsClientConfigProvider,
+    ReloadableQueryTransportTlsServerConfigProvider, StaticQueryTransportTlsClientConfigProvider,
+    StaticQueryTransportTlsServerConfigProvider,
 };
 
 pub use control_metadata::{
