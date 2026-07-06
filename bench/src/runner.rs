@@ -96,14 +96,9 @@ pub async fn run_query(
     times.sort_unstable();
 
     // Effective hop depth actually run (for the JSON matrix): the override if
-    // present, else the query's natural depth.
-    let effective_hops = hops.unwrap_or_else(|| match query {
-        Query::Ic02 => 1,
-        Query::Ic09 => 2,
-        Query::Ic3h => 3,
-        Query::Ic4h => 4,
-        Query::Ic07 | Query::Ic08 => 0,
-    });
+    // present, else the query's natural depth (shared source of truth so `run`
+    // and `verify` label cells identically).
+    let effective_hops = hops.unwrap_or_else(|| query.natural_hops());
 
     Ok(QueryResult {
         backend: backend.to_string(),

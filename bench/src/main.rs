@@ -353,7 +353,9 @@ async fn main() -> Result<()> {
                     for p in &params {
                         let rows =
                             queries::execute_distinct_with_hops(&writer, &schema, *q, p, *h).await?;
-                        let effective_hops = h.unwrap_or(0);
+                        // No `--hops` → the query's natural depth (not 0), so
+                        // verify's `(query, hops)` keys line up with `run`'s.
+                        let effective_hops = h.unwrap_or_else(|| q.natural_hops());
                         dumps.push(serde_json::json!({
                             "query": q.name(),
                             "hops": effective_hops,
