@@ -71,6 +71,7 @@ impl QueryWindow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryOutput {
     Write(CommitResult),
+    Mutation(QueryMutationResult),
     Vertices(Vec<VertexId>),
     Count(u64),
     Bool(bool),
@@ -142,6 +143,15 @@ impl QueryResultSet {
     pub fn new(columns: Vec<QueryColumn>, rows: Vec<QueryRow>) -> Self {
         Self { columns, rows }
     }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueryMutationResult {
+    pub matched_rows: u64,
+    pub created_edges: u64,
+    pub deleted_edges: u64,
+    pub updated_vertices: u64,
+    pub noops: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

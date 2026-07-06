@@ -20,6 +20,14 @@ impl GraphShard {
     ) -> Result<QueryOutput> {
         #[cfg(feature = "opencypher")]
         {
+            if let Some(parsed) =
+                parse_opencypher_mutation_query_with_parameters(query, &context.parameters)?
+            {
+                let result = self
+                    .execute_parsed_opencypher_mutation(context, parsed)
+                    .await?;
+                return Ok(QueryOutput::Mutation(result));
+            }
             let plan = self.plan_opencypher(context, query)?;
             self.execute_query_plan(plan).await
         }
@@ -196,6 +204,246 @@ impl GraphShard {
             context.result_window,
             &budget,
         )
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn execute_parsed_opencypher_mutation(
+        &self,
+        context: QueryContext,
+        query: ParsedMutationQuery,
+    ) -> Result<QueryMutationResult> {
+        validate_component("cell_id", &context.cell_id)?;
+        if context.read_epoch.is_some() {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "mutation queries cannot run at a historical read epoch".to_string(),
+            });
+        }
+        let budget = QueryBudget::new(context.max_runtime_ms.or(self.limits.max_query_runtime_ms));
+        budget.check("cypher_mutation")?;
+
+        if query.patterns.is_empty() {
+            return self
+                .execute_patternless_mutation(&context, &query.actions, &budget)
+                .await;
+        }
+
+        let read_epoch = self.current_epoch(&context.cell_id).await?;
+        let mut bindings = self
+            .match_row_patterns(&context.cell_id, &query.patterns, read_epoch, &budget)
+            .await?;
+        if let Some(predicate) = &query.predicate {
+            let mut filtered = Vec::with_capacity(bindings.len());
+            for row in bindings {
+                budget.check("cypher_mutation_where")?;
+                if row_predicate_matches(&row, predicate)? {
+                    filtered.push(row);
+                }
+            }
+            bindings = filtered;
+        }
+
+        let mut result = QueryMutationResult {
+            matched_rows: bindings.len() as u64,
+            ..QueryMutationResult::default()
+        };
+        let mut pending_metadata = BTreeMap::<VertexId, VertexMetadata>::new();
+        let mut original_metadata = BTreeMap::<VertexId, VertexMetadata>::new();
+
+        for action in &query.actions {
+            budget.check("cypher_mutation_action")?;
+            match action {
+                RowMutationAction::DeleteRelationship { binding, detach: _ } => {
+                    let mut relationships = BTreeSet::new();
+                    for row in &bindings {
+                        let Some(relationship) = row.relationships.get(binding) else {
+                            return Err(GraphError::UnsupportedQuery {
+                                dialect: "OpenCypher",
+                                feature: format!(
+                                    "DELETE references unbound relationship {binding}"
+                                ),
+                            });
+                        };
+                        relationships.insert(relationship.clone());
+                    }
+                    for relationship in relationships {
+                        budget.check("cypher_delete_relationship")?;
+                        let edge_type = relationship.edge_type.clone();
+                        let delete = self
+                            .delete_edge(EdgeMutation {
+                                cell_id: context.cell_id.clone(),
+                                edge_type: edge_type.clone(),
+                                src: relationship.src,
+                                dst: relationship.dst,
+                                idempotency_key: format!(
+                                    "{}.delete.{}.{}.{}",
+                                    context.idempotency_key,
+                                    edge_type,
+                                    relationship.src,
+                                    relationship.dst
+                                ),
+                            })
+                            .await?;
+                        if delete.deleted {
+                            result.deleted_edges = result.deleted_edges.saturating_add(1);
+                        } else {
+                            result.noops = result.noops.saturating_add(1);
+                        }
+                    }
+                }
+                RowMutationAction::SetProperty { .. }
+                | RowMutationAction::SetLabels { .. }
+                | RowMutationAction::RemoveProperty { .. }
+                | RowMutationAction::RemoveLabels { .. } => {
+                    let mut state = VertexMutationApplyState {
+                        cell_id: &context.cell_id,
+                        read_epoch,
+                        pending_metadata: &mut pending_metadata,
+                        original_metadata: &mut original_metadata,
+                        budget: &budget,
+                    };
+                    for row in &bindings {
+                        self.apply_vertex_mutation_action(row, action, &mut state)
+                            .await?;
+                    }
+                }
+                RowMutationAction::MergeEdge { .. } => {
+                    return Err(GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: "MERGE is executable only as a standalone clause".to_string(),
+                    });
+                }
+            }
+        }
+
+        for (vertex_id, metadata) in pending_metadata {
+            budget.check("cypher_set_vertex_metadata")?;
+            if original_metadata.get(&vertex_id) == Some(&metadata) {
+                result.noops = result.noops.saturating_add(1);
+                continue;
+            }
+            self.set_vertex_metadata(&context.cell_id, vertex_id, metadata)
+                .await?;
+            result.updated_vertices = result.updated_vertices.saturating_add(1);
+        }
+
+        Ok(result)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn execute_patternless_mutation(
+        &self,
+        context: &QueryContext,
+        actions: &[RowMutationAction],
+        budget: &QueryBudget,
+    ) -> Result<QueryMutationResult> {
+        let mut result = QueryMutationResult::default();
+        for action in actions {
+            budget.check("cypher_patternless_mutation")?;
+            let RowMutationAction::MergeEdge {
+                edge_type,
+                src,
+                dst,
+                src_metadata,
+                dst_metadata,
+            } = action
+            else {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "patternless mutation supports only standalone MERGE".to_string(),
+                });
+            };
+            let mutation = EdgeMutation {
+                cell_id: context.cell_id.clone(),
+                edge_type: edge_type.clone(),
+                src: *src,
+                dst: *dst,
+                idempotency_key: format!(
+                    "{}.merge.{}.{}.{}",
+                    context.idempotency_key, edge_type, src, dst
+                ),
+            };
+            let commit = if src_metadata.labels.is_empty()
+                && src_metadata.properties.is_empty()
+                && dst_metadata.labels.is_empty()
+                && dst_metadata.properties.is_empty()
+            {
+                self.write_edge(mutation).await?
+            } else {
+                self.write_edge_with_vertex_metadata(
+                    mutation,
+                    src_metadata.clone(),
+                    dst_metadata.clone(),
+                )
+                .await?
+            };
+            if commit.already_existed {
+                result.noops = result.noops.saturating_add(1);
+            } else {
+                result.created_edges = result.created_edges.saturating_add(1);
+            }
+        }
+        Ok(result)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn apply_vertex_mutation_action(
+        &self,
+        row: &BindingRow,
+        action: &RowMutationAction,
+        state: &mut VertexMutationApplyState<'_>,
+    ) -> Result<()> {
+        let binding = match action {
+            RowMutationAction::SetProperty { binding, .. }
+            | RowMutationAction::SetLabels { binding, .. }
+            | RowMutationAction::RemoveProperty { binding, .. }
+            | RowMutationAction::RemoveLabels { binding, .. } => binding,
+            _ => {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "non-vertex mutation action cannot update metadata".to_string(),
+                });
+            }
+        };
+        let vertex_id = row.get(binding)?;
+        if state.pending_metadata.get(&vertex_id).is_none() {
+            state.budget.check("cypher_load_mutation_metadata")?;
+            let metadata = match row.metadata.get(binding) {
+                Some(metadata) => metadata.clone(),
+                None => {
+                    self.vertex_metadata_at(state.cell_id, vertex_id, state.read_epoch)
+                        .await?
+                }
+            };
+            state.original_metadata.insert(vertex_id, metadata.clone());
+            state.pending_metadata.insert(vertex_id, metadata);
+        }
+        let metadata = state.pending_metadata.get_mut(&vertex_id).ok_or_else(|| {
+            GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: format!("metadata for {binding} was not loaded"),
+            }
+        })?;
+        match action {
+            RowMutationAction::SetProperty {
+                property, value, ..
+            } => {
+                metadata.properties.insert(property.clone(), value.clone());
+            }
+            RowMutationAction::SetLabels { labels, .. } => {
+                metadata.labels.extend(labels.iter().cloned());
+            }
+            RowMutationAction::RemoveProperty { property, .. } => {
+                metadata.properties.remove(property);
+            }
+            RowMutationAction::RemoveLabels { labels, .. } => {
+                for label in labels {
+                    metadata.labels.remove(label);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub async fn execute_query_plan(&self, plan: QueryPlan) -> Result<QueryOutput> {
@@ -1725,6 +1973,15 @@ struct EdgeRowMatchState<'a> {
 }
 
 #[cfg(feature = "opencypher")]
+struct VertexMutationApplyState<'a> {
+    cell_id: &'a str,
+    read_epoch: GraphEpoch,
+    pending_metadata: &'a mut BTreeMap<VertexId, VertexMetadata>,
+    original_metadata: &'a mut BTreeMap<VertexId, VertexMetadata>,
+    budget: &'a QueryBudget,
+}
+
+#[cfg(feature = "opencypher")]
 fn merge_opencypher_window(context: QueryContext, window: QueryWindow) -> Result<QueryContext> {
     if window.is_default() {
         return Ok(context);
@@ -1786,7 +2043,16 @@ fn parse_vertex_property_index_delta_key(key: &str) -> Result<(GraphEpoch, Verte
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct BindingRow {
     values: BTreeMap<String, VertexId>,
+    relationships: BTreeMap<String, BoundRelationship>,
     metadata: BTreeMap<String, VertexMetadata>,
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BoundRelationship {
+    edge_type: String,
+    src: VertexId,
+    dst: VertexId,
 }
 
 #[cfg(feature = "opencypher")]
@@ -1807,6 +2073,16 @@ impl BindingRow {
         if !row.bind(pattern.dst.binding.as_deref(), dst) {
             return None;
         }
+        if !row.bind_relationship(
+            pattern.binding.as_deref(),
+            BoundRelationship {
+                edge_type: pattern.edge_type.clone(),
+                src,
+                dst,
+            },
+        ) {
+            return None;
+        }
         Some(row)
     }
 
@@ -1818,6 +2094,19 @@ impl BindingRow {
             Some(existing) => *existing == value,
             None => {
                 self.values.insert(binding.to_string(), value);
+                true
+            }
+        }
+    }
+
+    fn bind_relationship(&mut self, binding: Option<&str>, value: BoundRelationship) -> bool {
+        let Some(binding) = binding else {
+            return true;
+        };
+        match self.relationships.get(binding) {
+            Some(existing) => *existing == value,
+            None => {
+                self.relationships.insert(binding.to_string(), value);
                 true
             }
         }
@@ -1846,6 +2135,17 @@ impl BindingRow {
                 Some(_) => {}
                 None => {
                     joined.metadata.insert(binding.clone(), metadata.clone());
+                }
+            }
+        }
+        for (binding, relationship) in &other.relationships {
+            match joined.relationships.get(binding) {
+                Some(existing) if existing != relationship => return None,
+                Some(_) => {}
+                None => {
+                    joined
+                        .relationships
+                        .insert(binding.clone(), relationship.clone());
                 }
             }
         }
@@ -1894,6 +2194,7 @@ fn constrain_row_pattern(pattern: &RowPattern, row: &BindingRow) -> Result<Optio
                 return Ok(None);
             };
             RowPattern::Edge(RowEdgePattern {
+                binding: edge.binding.clone(),
                 edge_type: edge.edge_type.clone(),
                 src,
                 dst,

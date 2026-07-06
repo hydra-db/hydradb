@@ -6251,6 +6251,116 @@ async fn cypher_row_engine_executes_grouped_aggregates() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_executes_set_remove_delete_and_merge_mutations() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-mutations", object_store).await;
+
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-mutation-merge"),
+            "MERGE (u:User {id: 1, name: 'alice'})-[:FOLLOWS]->\
+             (v:User {id: 2, name: 'bob'})",
+        )
+        .await
+        .unwrap();
+    assert!(shard
+        .edge_exists("reddit-home", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+
+    let set = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-mutation-set"),
+            "MATCH (u {id: 1}) SET u.active = true, u:Moderator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        set,
+        QueryOutput::Mutation(QueryMutationResult {
+            matched_rows: 1,
+            updated_vertices: 1,
+            ..QueryMutationResult::default()
+        })
+    );
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-mutation-read-set"),
+            "MATCH (u:Moderator {active: true}) RETURN u.name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("u.name")],
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::String("alice".to_string())
+            )])]
+        )
+    );
+
+    let remove = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-mutation-remove"),
+            "MATCH (u {id: 1}) REMOVE u.active, u:Moderator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        remove,
+        QueryOutput::Mutation(QueryMutationResult {
+            matched_rows: 1,
+            updated_vertices: 1,
+            ..QueryMutationResult::default()
+        })
+    );
+
+    let removed_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-mutation-read-remove"),
+            "MATCH (u:Moderator {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert!(removed_rows.rows.is_empty());
+
+    let delete = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-mutation-delete"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) DELETE r",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        delete,
+        QueryOutput::Mutation(QueryMutationResult {
+            matched_rows: 1,
+            deleted_edges: 1,
+            ..QueryMutationResult::default()
+        })
+    );
+    assert!(!shard
+        .edge_exists("reddit-home", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+
+    let replay = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-mutation-delete"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) DELETE r",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        replay,
+        QueryOutput::Mutation(QueryMutationResult::default())
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_row_engine_records_operational_metrics() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-row-query-metrics", object_store).await;

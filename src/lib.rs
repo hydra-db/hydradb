@@ -21,17 +21,19 @@ mod placement;
 mod sparse_kernel;
 
 pub use algebra::{
-    LogicalQueryPlan, PhysicalQueryPlan, QueryColumn, QueryContext, QueryFloat, QueryOutput,
-    QueryPlan, QueryPlanner, QueryResultSet, QueryRow, QueryStatement, QueryValue, QueryWindow,
+    LogicalQueryPlan, PhysicalQueryPlan, QueryColumn, QueryContext, QueryFloat,
+    QueryMutationResult, QueryOutput, QueryPlan, QueryPlanner, QueryResultSet, QueryRow,
+    QueryStatement, QueryValue, QueryWindow,
 };
 #[cfg(feature = "opencypher")]
 pub use opencypher::{
     parse_cypher, parse_cypher_with_parameters, parse_cypher_with_window, parse_opencypher,
-    parse_opencypher_row_query, parse_opencypher_row_query_with_parameters,
-    parse_opencypher_with_parameters, parse_opencypher_with_window, CypherFrontend,
-    DefaultCypherFrontend, LibCypherParserFrontend, ParsedQuery, ParsedRowQuery,
-    RowAggregateFunction, RowComparisonOp, RowEdgePattern, RowExpression, RowNodePattern,
-    RowPattern, RowPredicate, RowProjection, RowSort, RowSortExpression,
+    parse_opencypher_mutation_query_with_parameters, parse_opencypher_row_query,
+    parse_opencypher_row_query_with_parameters, parse_opencypher_with_parameters,
+    parse_opencypher_with_window, CypherFrontend, DefaultCypherFrontend, LibCypherParserFrontend,
+    ParsedMutationQuery, ParsedQuery, ParsedRowQuery, RowAggregateFunction, RowComparisonOp,
+    RowEdgePattern, RowExpression, RowMutationAction, RowNodePattern, RowPattern, RowPredicate,
+    RowProjection, RowSort, RowSortExpression,
 };
 pub use phase0::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
