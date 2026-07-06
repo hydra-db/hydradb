@@ -408,9 +408,14 @@ impl GraphShard {
         {
             let encoded = encode_vertex_property_value_key(value);
             let estimate = self
-                .query_stats_count(&keys::query_stats_vertex_property(
-                    cell_id, property, &encoded,
-                ))
+                .query_stats_estimate(
+                    cell_id,
+                    &keys::query_stats_vertex_property(cell_id, property, &encoded),
+                    Some(&keys::query_stats_vertex_property_histogram(
+                        cell_id, property,
+                    )),
+                    8,
+                )
                 .await?
                 .unwrap_or(8);
             choose_best_access(
@@ -426,7 +431,12 @@ impl GraphShard {
         }
         for label in &node.labels {
             let estimate = self
-                .query_stats_count(&keys::query_stats_vertex_label(cell_id, label))
+                .query_stats_estimate(
+                    cell_id,
+                    &keys::query_stats_vertex_label(cell_id, label),
+                    None,
+                    64,
+                )
                 .await?
                 .unwrap_or(64);
             choose_best_access(
@@ -513,12 +523,21 @@ impl GraphShard {
             for (property, value) in &edge.properties {
                 let encoded = encode_vertex_property_value_key(value);
                 let estimate = self
-                    .query_stats_count(&keys::query_stats_edge_property(
+                    .query_stats_estimate(
                         cell_id,
-                        &edge.edge_type,
-                        property,
-                        &encoded,
-                    ))
+                        &keys::query_stats_edge_property(
+                            cell_id,
+                            &edge.edge_type,
+                            property,
+                            &encoded,
+                        ),
+                        Some(&keys::query_stats_edge_property_histogram(
+                            cell_id,
+                            &edge.edge_type,
+                            property,
+                        )),
+                        16,
+                    )
                     .await?
                     .unwrap_or(16);
                 choose_best_access(
@@ -539,7 +558,12 @@ impl GraphShard {
         }
 
         let estimate = self
-            .query_stats_count(&keys::query_stats_edge_type(cell_id, &edge.edge_type))
+            .query_stats_estimate(
+                cell_id,
+                &keys::query_stats_edge_type(cell_id, &edge.edge_type),
+                None,
+                1_000_000,
+            )
             .await?
             .unwrap_or(1_000_000);
         Ok(AccessEstimate::new(
@@ -551,12 +575,60 @@ impl GraphShard {
         .with_pass(RowQueryOptimizerPass::FullScanFallback))
     }
 
-    pub(crate) async fn query_stats_count(&self, key: &str) -> Result<Option<u64>> {
+    pub(crate) async fn query_stats_estimate(
+        &self,
+        cell_id: &str,
+        key: &str,
+        histogram_key: Option<&str>,
+        fallback: u64,
+    ) -> Result<Option<u64>> {
+        let current_epoch = self.current_epoch(cell_id).await?;
+        if let Some(record) = self.query_stats_record(key).await? {
+            return Ok(Some(stats_record_cost_estimate(
+                &record,
+                current_epoch,
+                fallback,
+            )));
+        }
+        if let Some(histogram_key) = histogram_key {
+            if let Some(record) = self.query_stats_record(histogram_key).await? {
+                let estimate = record.equality_estimate();
+                return Ok(Some(stats_record_cost_estimate(
+                    &QueryStatsRecord {
+                        count: estimate,
+                        ..record
+                    },
+                    current_epoch,
+                    fallback,
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) async fn query_stats_record(&self, key: &str) -> Result<Option<QueryStatsRecord>> {
+        let record_key = keys::query_stats_record_key(key);
+        if let Some(value) = self.read_remote(&record_key).await? {
+            return decode_query_stats_record(&record_key, &value).map(Some);
+        }
         match self.read_remote(key).await? {
-            Some(value) => Ok(Some(decode_u64(key, &value)?)),
+            Some(value) => decode_query_stats_record(key, &value).map(Some),
             None => Ok(None),
         }
     }
+}
+
+#[cfg(feature = "opencypher")]
+fn stats_record_cost_estimate(
+    record: &QueryStatsRecord,
+    current_epoch: GraphEpoch,
+    fallback: u64,
+) -> u64 {
+    let base = record.count.max(1);
+    if record.is_stale_at(current_epoch, graph_now_millis()) {
+        return base.saturating_mul(4).max(fallback);
+    }
+    base
 }
 
 #[cfg(feature = "opencypher")]

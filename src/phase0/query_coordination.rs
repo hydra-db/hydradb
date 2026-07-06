@@ -1307,6 +1307,7 @@ pub struct DistributedQueryLeg {
     pub name: String,
     pub context: QueryContext,
     pub query: String,
+    pub estimated_rows: Option<u64>,
 }
 
 impl DistributedQueryLeg {
@@ -1321,7 +1322,13 @@ impl DistributedQueryLeg {
             name,
             context,
             query: query.into(),
+            estimated_rows: None,
         })
+    }
+
+    pub fn with_estimated_rows(mut self, estimated_rows: u64) -> Self {
+        self.estimated_rows = Some(estimated_rows);
+        self
     }
 }
 
@@ -1374,6 +1381,20 @@ impl DistributedQueryPlan {
             legs,
             merge: DistributedQueryMerge::InnerJoin(join),
         }
+    }
+
+    pub fn optimized_for_costs(mut self) -> Self {
+        if !matches!(self.merge, DistributedQueryMerge::InnerJoin(_)) {
+            return self;
+        }
+        self.legs.sort_by_key(|leg| {
+            (
+                leg.estimated_rows.unwrap_or(u64::MAX),
+                leg.context.cell_id.clone(),
+                leg.name.clone(),
+            )
+        });
+        self
     }
 }
 
@@ -1511,12 +1532,22 @@ impl DistributedQueryCoordinator {
         &self,
         plan: DistributedQueryPlan,
     ) -> Result<DistributedQueryPlanResult> {
+        let plan = if matches!(&plan.merge, DistributedQueryMerge::InnerJoin(_)) {
+            plan.optimized_for_costs()
+        } else {
+            plan
+        };
         if plan.legs.is_empty() {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "DistributedQuery",
                 feature: "distributed query plan requires at least one leg".to_string(),
             });
         }
+        let leg_order = plan
+            .legs
+            .iter()
+            .map(|leg| leg.name.clone())
+            .collect::<Vec<_>>();
         let mut seen_leg_names = BTreeSet::new();
         let mut jobs = Vec::new();
         for leg in plan.legs {
@@ -1541,7 +1572,9 @@ impl DistributedQueryCoordinator {
             leg_results.insert(leg_name, result?);
         }
         let merged = match plan.merge {
-            DistributedQueryMerge::UnionAll => merge_distributed_union_all(&leg_results)?,
+            DistributedQueryMerge::UnionAll => {
+                merge_distributed_union_all(&leg_results, &leg_order)?
+            }
             DistributedQueryMerge::InnerJoin(join) => {
                 merge_distributed_inner_join(&leg_results, &join)?
             }
@@ -1566,17 +1599,23 @@ impl DistributedQueryCoordinator {
 
 fn merge_distributed_union_all(
     leg_results: &BTreeMap<String, QueryResultSet>,
+    leg_order: &[String],
 ) -> Result<QueryResultSet> {
-    let mut iter = leg_results.iter();
-    let Some((_, first)) = iter.next() else {
+    let Some(first_leg) = leg_order.first() else {
         return Err(GraphError::UnsupportedQuery {
             dialect: "DistributedQuery",
             feature: "cannot merge an empty distributed result".to_string(),
         });
     };
+    let first = leg_results
+        .get(first_leg)
+        .ok_or_else(|| missing_distributed_leg(first_leg))?;
     let columns = first.columns.clone();
     let mut rows = first.rows.clone();
-    for (leg_name, result) in iter {
+    for leg_name in leg_order.iter().skip(1) {
+        let result = leg_results
+            .get(leg_name)
+            .ok_or_else(|| missing_distributed_leg(leg_name))?;
         if result.columns != columns {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "DistributedQuery",
@@ -1613,30 +1652,59 @@ fn merge_distributed_inner_join(
             .map(|column| crate::QueryColumn::new(format!("{}.{}", join.right_leg, column.name))),
     );
 
-    let mut right_by_key = BTreeMap::<QueryValue, Vec<&QueryRow>>::new();
-    for row in &right.rows {
-        let Some(key) = row.values.get(right_idx).cloned() else {
-            return Err(GraphError::CorruptValue {
-                key: format!("query/leg/{}", join.right_leg),
-                reason: "right row is missing join column".to_string(),
-            });
-        };
-        right_by_key.entry(key).or_default().push(row);
-    }
-
     let mut rows = Vec::new();
-    for left_row in &left.rows {
-        let Some(key) = left_row.values.get(left_idx) else {
-            return Err(GraphError::CorruptValue {
-                key: format!("query/leg/{}", join.left_leg),
-                reason: "left row is missing join column".to_string(),
-            });
-        };
-        if let Some(right_rows) = right_by_key.get(key) {
-            for right_row in right_rows {
-                let mut values = left_row.values.clone();
-                values.extend(right_row.values.clone());
-                rows.push(QueryRow::new(values));
+    if right.rows.len() <= left.rows.len() {
+        let mut right_by_key = BTreeMap::<QueryValue, Vec<&QueryRow>>::new();
+        for row in &right.rows {
+            let Some(key) = row.values.get(right_idx).cloned() else {
+                return Err(GraphError::CorruptValue {
+                    key: format!("query/leg/{}", join.right_leg),
+                    reason: "right row is missing join column".to_string(),
+                });
+            };
+            right_by_key.entry(key).or_default().push(row);
+        }
+
+        for left_row in &left.rows {
+            let Some(key) = left_row.values.get(left_idx) else {
+                return Err(GraphError::CorruptValue {
+                    key: format!("query/leg/{}", join.left_leg),
+                    reason: "left row is missing join column".to_string(),
+                });
+            };
+            if let Some(right_rows) = right_by_key.get(key) {
+                for right_row in right_rows {
+                    let mut values = left_row.values.clone();
+                    values.extend(right_row.values.clone());
+                    rows.push(QueryRow::new(values));
+                }
+            }
+        }
+    } else {
+        let mut left_by_key = BTreeMap::<QueryValue, Vec<&QueryRow>>::new();
+        for row in &left.rows {
+            let Some(key) = row.values.get(left_idx).cloned() else {
+                return Err(GraphError::CorruptValue {
+                    key: format!("query/leg/{}", join.left_leg),
+                    reason: "left row is missing join column".to_string(),
+                });
+            };
+            left_by_key.entry(key).or_default().push(row);
+        }
+
+        for right_row in &right.rows {
+            let Some(key) = right_row.values.get(right_idx) else {
+                return Err(GraphError::CorruptValue {
+                    key: format!("query/leg/{}", join.right_leg),
+                    reason: "right row is missing join column".to_string(),
+                });
+            };
+            if let Some(left_rows) = left_by_key.get(key) {
+                for left_row in left_rows {
+                    let mut values = left_row.values.clone();
+                    values.extend(right_row.values.clone());
+                    rows.push(QueryRow::new(values));
+                }
             }
         }
     }

@@ -236,6 +236,11 @@ pub fn vertex_property_index_prefix(cell_id: &str, property: &str, encoded_value
     format!("cell/{cell_id}/vprop_idx/{property}/{encoded_value}/")
 }
 
+#[cfg(feature = "opencypher")]
+pub fn vertex_property_index_property_prefix(cell_id: &str, property: &str) -> String {
+    format!("cell/{cell_id}/vprop_idx/{property}/")
+}
+
 pub fn vertex_property_index_delta(
     cell_id: &str,
     property: &str,
@@ -274,6 +279,15 @@ pub fn edge_property_index_prefix(
     encoded_value: &str,
 ) -> String {
     format!("cell/{cell_id}/eprop_idx/{edge_type}/{property}/{encoded_value}/")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn edge_property_index_property_prefix(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+) -> String {
+    format!("cell/{cell_id}/eprop_idx/{edge_type}/{property}/")
 }
 
 pub fn edge_property_index_delta(
@@ -316,6 +330,11 @@ pub fn query_stats_vertex_property(cell_id: &str, property: &str, encoded_value:
 }
 
 #[cfg(feature = "opencypher")]
+pub fn query_stats_vertex_property_prefix(cell_id: &str, property: &str) -> String {
+    format!("cell/{cell_id}/qstats/vprop/{property}/")
+}
+
+#[cfg(feature = "opencypher")]
 pub fn query_stats_edge_property(
     cell_id: &str,
     edge_type: &str,
@@ -323,6 +342,30 @@ pub fn query_stats_edge_property(
     encoded_value: &str,
 ) -> String {
     format!("cell/{cell_id}/qstats/eprop/{edge_type}/{property}/{encoded_value}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn query_stats_edge_property_prefix(cell_id: &str, edge_type: &str, property: &str) -> String {
+    format!("cell/{cell_id}/qstats/eprop/{edge_type}/{property}/")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn query_stats_vertex_property_histogram(cell_id: &str, property: &str) -> String {
+    format!("cell/{cell_id}/qstats/vprop_hist/{property}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn query_stats_edge_property_histogram(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+) -> String {
+    format!("cell/{cell_id}/qstats/eprop_hist/{edge_type}/{property}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn query_stats_record_key(count_key: &str) -> String {
+    format!("{count_key}/record")
 }
 
 #[cfg(test)]

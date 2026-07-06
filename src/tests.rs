@@ -20,6 +20,18 @@ fn mutation(src: VertexId, dst: VertexId, idempotency_key: &str) -> EdgeMutation
     }
 }
 
+#[cfg(feature = "opencypher")]
+async fn read_query_stats_record_for_test(shard: &GraphShard, key: &str) -> QueryStatsRecord {
+    let record_key = keys::query_stats_record_key(key);
+    let value = shard
+        .read_remote(&record_key)
+        .await
+        .unwrap_or_else(|err| panic!("read stats record {record_key} failed: {err}"))
+        .unwrap_or_else(|| panic!("missing stats record {record_key}"));
+    decode_query_stats_record(&record_key, &value)
+        .unwrap_or_else(|err| panic!("decode stats record {record_key} failed: {err}"))
+}
+
 async fn segment_append_txn_retry_for_test(
     shard: Arc<GraphShard>,
     cell_id: &str,
@@ -6336,18 +6348,26 @@ async fn query_cardinality_stats_refresh_persists_edge_counts() {
         .await
         .unwrap();
     assert_eq!(refresh.count, 3);
+    assert_eq!(refresh.stats.count, 3);
+    assert_eq!(refresh.stats.read_epoch, refresh.read_epoch);
+    assert!(refresh.stats.refreshed_at_ms > 0);
     assert_eq!(refresh.cell_id, "reddit-home");
     let key = keys::query_stats_edge_type("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT");
     let stored = shard.read_counter(&key).await.unwrap();
     assert_eq!(stored, 3);
+    let record = read_query_stats_record_for_test(&shard, &key).await;
+    assert_eq!(record, refresh.stats);
 
     let label_refresh = shard
         .refresh_vertex_label_query_stats("reddit-home", "User")
         .await
         .unwrap();
     assert_eq!(label_refresh.count, 2);
+    assert_eq!(label_refresh.stats.count, 2);
     let label_key = keys::query_stats_vertex_label("reddit-home", "User");
     assert_eq!(shard.read_counter(&label_key).await.unwrap(), 2);
+    let label_record = read_query_stats_record_for_test(&shard, &label_key).await;
+    assert_eq!(label_record, label_refresh.stats);
 
     let active = VertexPropertyValue::Bool(true);
     let vertex_property_refresh = shard
@@ -6355,10 +6375,17 @@ async fn query_cardinality_stats_refresh_persists_edge_counts() {
         .await
         .unwrap();
     assert_eq!(vertex_property_refresh.count, 2);
+    assert_eq!(vertex_property_refresh.stats.count, 2);
+    assert_eq!(vertex_property_refresh.stats.distinct_values, 2);
+    assert_eq!(vertex_property_refresh.stats.total_values, 3);
+    assert_eq!(vertex_property_refresh.stats.most_common_count, 2);
     let active_key = encode_vertex_property_value_key(&active);
     let vertex_property_key =
         keys::query_stats_vertex_property("reddit-home", "active", &active_key);
     assert_eq!(shard.read_counter(&vertex_property_key).await.unwrap(), 2);
+    let vertex_property_record =
+        read_query_stats_record_for_test(&shard, &vertex_property_key).await;
+    assert_eq!(vertex_property_record, vertex_property_refresh.stats);
 
     let weight = VertexPropertyValue::Integer(7);
     let edge_property_refresh = shard
@@ -6371,6 +6398,10 @@ async fn query_cardinality_stats_refresh_persists_edge_counts() {
         .await
         .unwrap();
     assert_eq!(edge_property_refresh.count, 2);
+    assert_eq!(edge_property_refresh.stats.count, 2);
+    assert_eq!(edge_property_refresh.stats.distinct_values, 1);
+    assert_eq!(edge_property_refresh.stats.total_values, 2);
+    assert_eq!(edge_property_refresh.stats.most_common_count, 2);
     let weight_key = encode_vertex_property_value_key(&weight);
     let edge_property_key = keys::query_stats_edge_property(
         "reddit-home",
@@ -6379,6 +6410,241 @@ async fn query_cardinality_stats_refresh_persists_edge_counts() {
         &weight_key,
     );
     assert_eq!(shard.read_counter(&edge_property_key).await.unwrap(), 2);
+    let edge_property_record = read_query_stats_record_for_test(&shard, &edge_property_key).await;
+    assert_eq!(edge_property_record, edge_property_refresh.stats);
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn query_property_histogram_stats_refresh_persists_selectivity_records() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/query-histogram-stats", object_store).await;
+
+    for (vertex, tier) in [(1, "common"), (2, "common"), (3, "rare")] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex,
+                VertexMetadata::default()
+                    .with_label("User")
+                    .with_property("tier", VertexPropertyValue::String(tier.to_string())),
+            )
+            .await
+            .unwrap();
+    }
+    for (idx, (src, dst, weight)) in [(1, 10, 7), (2, 20, 7), (3, 30, 9)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("query-histogram-stats-edge-{idx}"),
+            })
+            .await
+            .unwrap();
+        shard
+            .set_edge_metadata(
+                "reddit-home",
+                "FOLLOWS",
+                src,
+                dst,
+                EdgeMetadata::default()
+                    .with_property("weight", VertexPropertyValue::Integer(weight)),
+            )
+            .await
+            .unwrap();
+    }
+
+    let vertex_histogram = shard
+        .refresh_vertex_property_histogram_query_stats("reddit-home", "tier")
+        .await
+        .unwrap();
+    assert_eq!(vertex_histogram.stats.count, 3);
+    assert_eq!(vertex_histogram.stats.distinct_values, 2);
+    assert_eq!(vertex_histogram.stats.most_common_count, 2);
+    let common =
+        encode_vertex_property_value_key(&VertexPropertyValue::String("common".to_string()));
+    let rare = encode_vertex_property_value_key(&VertexPropertyValue::String("rare".to_string()));
+    assert_eq!(vertex_histogram.buckets.get(&common), Some(&2));
+    assert_eq!(vertex_histogram.buckets.get(&rare), Some(&1));
+    let vertex_histogram_key = keys::query_stats_vertex_property_histogram("reddit-home", "tier");
+    let vertex_histogram_record =
+        read_query_stats_record_for_test(&shard, &vertex_histogram_key).await;
+    assert_eq!(vertex_histogram_record, vertex_histogram.stats);
+    let rare_key = keys::query_stats_vertex_property("reddit-home", "tier", &rare);
+    let rare_record = read_query_stats_record_for_test(&shard, &rare_key).await;
+    assert_eq!(rare_record.count, 1);
+    assert_eq!(rare_record.distinct_values, 2);
+
+    let edge_histogram = shard
+        .refresh_edge_property_histogram_query_stats("reddit-home", "FOLLOWS", "weight")
+        .await
+        .unwrap();
+    assert_eq!(edge_histogram.stats.count, 3);
+    assert_eq!(edge_histogram.stats.distinct_values, 2);
+    assert_eq!(edge_histogram.stats.most_common_count, 2);
+    let weight_7 = encode_vertex_property_value_key(&VertexPropertyValue::Integer(7));
+    let weight_9 = encode_vertex_property_value_key(&VertexPropertyValue::Integer(9));
+    assert_eq!(edge_histogram.buckets.get(&weight_7), Some(&2));
+    assert_eq!(edge_histogram.buckets.get(&weight_9), Some(&1));
+    let edge_histogram_key =
+        keys::query_stats_edge_property_histogram("reddit-home", "FOLLOWS", "weight");
+    let edge_histogram_record = read_query_stats_record_for_test(&shard, &edge_histogram_key).await;
+    assert_eq!(edge_histogram_record, edge_histogram.stats);
+    let weight_9_key =
+        keys::query_stats_edge_property("reddit-home", "FOLLOWS", "weight", &weight_9);
+    let weight_9_record = read_query_stats_record_for_test(&shard, &weight_9_key).await;
+    assert_eq!(weight_9_record.count, 1);
+    assert_eq!(weight_9_record.distinct_values, 2);
+
+    let mut stale_batch = WriteBatch::new();
+    stale_batch.put(
+        keys::vertex_property_index("reddit-home", "tier", &common, 3),
+        encode_u64(3),
+    );
+    stale_batch.put(
+        keys::edge_property_index("reddit-home", "FOLLOWS", "weight", &weight_9, 1, 10),
+        encode_u64(10),
+    );
+    shard.write_strict_for_test(stale_batch).await.unwrap();
+
+    let filtered_vertex_histogram = shard
+        .refresh_vertex_property_histogram_query_stats("reddit-home", "tier")
+        .await
+        .unwrap();
+    assert_eq!(filtered_vertex_histogram.stats.count, 3);
+    assert_eq!(filtered_vertex_histogram.stats.distinct_values, 2);
+    assert_eq!(filtered_vertex_histogram.buckets.get(&common), Some(&2));
+    assert_eq!(filtered_vertex_histogram.buckets.get(&rare), Some(&1));
+
+    let filtered_edge_histogram = shard
+        .refresh_edge_property_histogram_query_stats("reddit-home", "FOLLOWS", "weight")
+        .await
+        .unwrap();
+    assert_eq!(filtered_edge_histogram.stats.count, 3);
+    assert_eq!(filtered_edge_histogram.stats.distinct_values, 2);
+    assert_eq!(filtered_edge_histogram.buckets.get(&weight_7), Some(&2));
+    assert_eq!(filtered_edge_histogram.buckets.get(&weight_9), Some(&1));
+
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            3,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("tier", VertexPropertyValue::String("common".to_string())),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_edge_metadata(
+            "reddit-home",
+            "FOLLOWS",
+            3,
+            30,
+            EdgeMetadata::default().with_property("weight", VertexPropertyValue::Integer(7)),
+        )
+        .await
+        .unwrap();
+
+    let zeroed_vertex_histogram = shard
+        .refresh_vertex_property_histogram_query_stats("reddit-home", "tier")
+        .await
+        .unwrap();
+    assert_eq!(zeroed_vertex_histogram.stats.count, 3);
+    assert_eq!(zeroed_vertex_histogram.stats.distinct_values, 1);
+    assert_eq!(zeroed_vertex_histogram.buckets.get(&common), Some(&3));
+    assert_eq!(zeroed_vertex_histogram.buckets.get(&rare), None);
+    assert!(shard.read_remote(&rare_key).await.unwrap().is_none());
+    assert!(shard
+        .read_remote(&keys::query_stats_record_key(&rare_key))
+        .await
+        .unwrap()
+        .is_none());
+
+    let zeroed_edge_histogram = shard
+        .refresh_edge_property_histogram_query_stats("reddit-home", "FOLLOWS", "weight")
+        .await
+        .unwrap();
+    assert_eq!(zeroed_edge_histogram.stats.count, 3);
+    assert_eq!(zeroed_edge_histogram.stats.distinct_values, 1);
+    assert_eq!(zeroed_edge_histogram.buckets.get(&weight_7), Some(&3));
+    assert_eq!(zeroed_edge_histogram.buckets.get(&weight_9), None);
+    assert!(shard.read_remote(&weight_9_key).await.unwrap().is_none());
+    assert!(shard
+        .read_remote(&keys::query_stats_record_key(&weight_9_key))
+        .await
+        .unwrap()
+        .is_none());
+
+    let plan = shard
+        .explain_opencypher_rows(
+            QueryContext::new("reddit-home", "query-histogram-stats-explain"),
+            "MATCH (u:User {tier: 'common'}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.groups[0].patterns[0].access,
+        RowQueryAccess::VertexPropertyIndex {
+            property: "tier".to_string(),
+        }
+    );
+    assert_eq!(plan.groups[0].patterns[0].estimated_cardinality, 3);
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn query_stats_background_refresh_job_publishes_records() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard =
+        Arc::new(open_test_shard("graph/query-stats-background-refresh", object_store).await);
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("tier", VertexPropertyValue::String("rare".to_string())),
+        )
+        .await
+        .unwrap();
+    let key = keys::query_stats_vertex_label("reddit-home", "User");
+    let histogram_key = keys::query_stats_vertex_property_histogram("reddit-home", "tier");
+    let handle = Arc::clone(&shard)
+        .start_query_stats_refresh_job(
+            vec![
+                QueryStatsRefreshSpec::new(
+                    "reddit-home",
+                    QueryCardinalityStatsKind::VertexLabel {
+                        label: "User".to_string(),
+                    },
+                ),
+                QueryStatsRefreshSpec::vertex_property_histogram("reddit-home", "tier"),
+            ],
+            std::time::Duration::from_millis(10),
+        )
+        .unwrap();
+    for _ in 0..100 {
+        if shard.read_counter(&key).await.unwrap() == 1
+            && shard.read_counter(&histogram_key).await.unwrap() == 1
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    handle.abort();
+    assert_eq!(shard.read_counter(&key).await.unwrap(), 1);
+    let record = read_query_stats_record_for_test(&shard, &key).await;
+    assert_eq!(record.count, 1);
+    assert!(record.refreshed_at_ms > 0);
+    assert_eq!(shard.read_counter(&histogram_key).await.unwrap(), 1);
+    let histogram_record = read_query_stats_record_for_test(&shard, &histogram_key).await;
+    assert_eq!(histogram_record.count, 1);
+    assert_eq!(histogram_record.distinct_values, 1);
     shard.close().await.unwrap();
 }
 
@@ -6437,6 +6703,111 @@ fn query_service_discovery_parses_kubernetes_consul_and_etcd() {
     )
     .unwrap();
     assert_eq!(directory.endpoint("node-d").unwrap().addr.port(), 9999);
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn distributed_query_plan_orders_legs_by_cost_estimate() {
+    let plan = DistributedQueryPlan::inner_join(
+        vec![
+            DistributedQueryLeg::new(
+                "large",
+                QueryContext::new("reddit-large", "distributed-cost-large"),
+                "MATCH (u:User) RETURN u.id AS id",
+            )
+            .unwrap()
+            .with_estimated_rows(10_000),
+            DistributedQueryLeg::new(
+                "small",
+                QueryContext::new("reddit-small", "distributed-cost-small"),
+                "MATCH (u:User {id: 1}) RETURN u.id AS id",
+            )
+            .unwrap()
+            .with_estimated_rows(1),
+            DistributedQueryLeg::new(
+                "unknown",
+                QueryContext::new("reddit-unknown", "distributed-cost-unknown"),
+                "MATCH (u) RETURN u.id AS id",
+            )
+            .unwrap(),
+        ],
+        DistributedQueryJoin::inner("small", "id", "large", "id"),
+    )
+    .optimized_for_costs();
+    let names: Vec<_> = plan.legs.iter().map(|leg| leg.name.as_str()).collect();
+    assert_eq!(names, vec!["small", "large", "unknown"]);
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn distributed_union_all_preserves_declared_leg_order() {
+    struct StaticRowsClient {
+        value: VertexId,
+    }
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for StaticRowsClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            Ok(QueryResultSet::new(
+                vec![QueryColumn::new("id")],
+                vec![QueryRow::new(vec![QueryValue::VertexId(self.value)])],
+            ))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    let placement = ShardPlacement::fixed([("cell-z", "node-z"), ("cell-a", "node-a")]).unwrap();
+    let coordinator = DistributedQueryCoordinator::new(placement)
+        .with_client("node-z", Arc::new(StaticRowsClient { value: 2 }))
+        .unwrap()
+        .with_client("node-a", Arc::new(StaticRowsClient { value: 1 }))
+        .unwrap();
+    let plan = DistributedQueryPlan::union_all(vec![
+        DistributedQueryLeg::new(
+            "z_first",
+            QueryContext::new("cell-z", "distributed-union-z"),
+            "MATCH (u) RETURN u.id AS id",
+        )
+        .unwrap()
+        .with_estimated_rows(10_000),
+        DistributedQueryLeg::new(
+            "a_second",
+            QueryContext::new("cell-a", "distributed-union-a"),
+            "MATCH (u) RETURN u.id AS id",
+        )
+        .unwrap()
+        .with_estimated_rows(1),
+    ])
+    .optimized_for_costs();
+
+    let result = coordinator
+        .execute_distributed_query_plan(plan)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.merged,
+        QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(2)]),
+                QueryRow::new(vec![QueryValue::VertexId(1)]),
+            ],
+        )
+    );
 }
 
 #[cfg(feature = "opencypher")]
@@ -6514,13 +6885,15 @@ async fn distributed_query_plan_joins_results_across_cells() {
                 QueryContext::new("reddit-users", "distributed-join-users"),
                 "MATCH (u:User) RETURN u.uid AS user, u.name AS name ORDER BY user",
             )
-            .unwrap(),
+            .unwrap()
+            .with_estimated_rows(2),
             DistributedQueryLeg::new(
                 "posts",
                 QueryContext::new("reddit-posts", "distributed-join-posts"),
                 "MATCH (p:Post) RETURN p.author_id AS user, p.id AS post ORDER BY post",
             )
-            .unwrap(),
+            .unwrap()
+            .with_estimated_rows(3),
         ],
         DistributedQueryJoin::inner("users", "user", "posts", "user"),
     );
@@ -8777,6 +9150,125 @@ async fn cypher_row_explain_uses_persisted_stats_for_index_choice() {
         }
     );
     assert_eq!(plan.groups[0].patterns[0].estimated_cardinality, 1);
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_expand_into_checks_bound_edge_without_neighbor_scan() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-expand-into-physical",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for (idx, dst) in [10, 11].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst,
+                idempotency_key: format!("cypher-expand-into-physical-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-expand-into-physical-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v {id: 10}) RETURN v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(10)])],
+        )
+    );
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_hash_join_uses_edge_property_index_without_per_row_neighbor_scans() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-hash-join-physical",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for (idx, (src, dst, weight)) in [(1, 10, 7), (2, 20, 9), (3, 30, 7)].into_iter().enumerate() {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                src,
+                VertexMetadata::default().with_label("User"),
+            )
+            .await
+            .unwrap();
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-hash-join-physical-edge-{idx}"),
+            })
+            .await
+            .unwrap();
+        shard
+            .set_edge_metadata(
+                "reddit-home",
+                "FOLLOWS",
+                src,
+                dst,
+                EdgeMetadata::default()
+                    .with_property("weight", VertexPropertyValue::Integer(weight)),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-hash-join-physical-read"),
+            "MATCH (u:User) MATCH (u)-[e:FOLLOWS {weight: 7}]->(v) \
+             RETURN v.id ORDER BY v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(10)]),
+                QueryRow::new(vec![QueryValue::VertexId(30)]),
+            ],
+        )
+    );
     shard.close().await.unwrap();
 }
 
