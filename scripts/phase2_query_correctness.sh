@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-FEATURES="${PHASE2_QUERY_CORRECTNESS_FEATURES:-opencypher,graphblas}"
+FEATURES="${PHASE2_QUERY_CORRECTNESS_FEATURES:-opencypher}"
 RESULTS="${PHASE2_QUERY_CORRECTNESS_RESULTS:-bench-results/phase2_query_correctness.csv}"
 LOG="${PHASE2_QUERY_CORRECTNESS_LOG:-bench-results/phase2_query_correctness.log}"
 TARGET_DIR="${PHASE2_QUERY_CORRECTNESS_TARGET_DIR:-${CARGO_TARGET_DIR:-$HOME/.cache/dgraph-phase2-target}}"

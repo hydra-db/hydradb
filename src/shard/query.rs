@@ -509,9 +509,7 @@ impl GraphShard {
         if let Some(dst) = request.edge.dst.id {
             vertices.retain(|vertex| *vertex == dst);
         }
-        if !request.ascending {
-            vertices.reverse();
-        }
+        graph_kernel_order_vertices(&mut vertices, request.ascending);
         self.ensure_query_intermediate_rows("cypher_graph_kernel_rows", vertices.len())?;
 
         let rows = match request.projection {
@@ -3045,9 +3043,7 @@ impl GraphShard {
         if let Some(dst) = request.edge.dst.id {
             vertices.retain(|vertex| *vertex == dst);
         }
-        if !request.ascending {
-            vertices.reverse();
-        }
+        graph_kernel_order_vertices(&mut vertices, request.ascending);
 
         let rows = match request.projection {
             GraphKernelProjection::NodeId => {
@@ -3489,9 +3485,7 @@ impl GraphShard {
         if let Some((mut vertices, edge_visits)) =
             self.cached_reachability_vertices(&cache_key).await
         {
-            if !request.ascending {
-                vertices.reverse();
-            }
+            graph_kernel_order_vertices(&mut vertices, request.ascending);
             return Ok((
                 self.apply_query_window(vertices, request.window)?,
                 edge_visits,
@@ -3530,9 +3524,7 @@ impl GraphShard {
                 request.budget,
             )
             .await?;
-        if !request.ascending {
-            vertices.reverse();
-        }
+        graph_kernel_order_vertices(&mut vertices, request.ascending);
         Ok((
             self.apply_query_window(vertices, request.window)?,
             edge_visits,
@@ -4593,6 +4585,15 @@ fn graph_kernel_node_id_rows(
         rows.push(QueryRow::new(vec![QueryValue::VertexId(vertex)]));
     }
     Ok(rows)
+}
+
+#[cfg(feature = "opencypher")]
+fn graph_kernel_order_vertices(vertices: &mut Vec<VertexId>, ascending: bool) {
+    vertices.sort_unstable();
+    vertices.dedup();
+    if !ascending {
+        vertices.reverse();
+    }
 }
 
 #[cfg(feature = "opencypher")]
