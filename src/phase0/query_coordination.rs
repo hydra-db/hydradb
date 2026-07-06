@@ -1529,13 +1529,22 @@ impl DistributedQueryCoordinator {
         &self,
         plan: DistributedQueryPlan,
     ) -> Result<DistributedQueryPlanResult> {
-        let plan = plan.optimized_for_costs();
+        let plan = if matches!(&plan.merge, DistributedQueryMerge::InnerJoin(_)) {
+            plan.optimized_for_costs()
+        } else {
+            plan
+        };
         if plan.legs.is_empty() {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "DistributedQuery",
                 feature: "distributed query plan requires at least one leg".to_string(),
             });
         }
+        let leg_order = plan
+            .legs
+            .iter()
+            .map(|leg| leg.name.clone())
+            .collect::<Vec<_>>();
         let mut seen_leg_names = BTreeSet::new();
         let mut jobs = Vec::new();
         for leg in plan.legs {
@@ -1560,7 +1569,9 @@ impl DistributedQueryCoordinator {
             leg_results.insert(leg_name, result?);
         }
         let merged = match plan.merge {
-            DistributedQueryMerge::UnionAll => merge_distributed_union_all(&leg_results)?,
+            DistributedQueryMerge::UnionAll => {
+                merge_distributed_union_all(&leg_results, &leg_order)?
+            }
             DistributedQueryMerge::InnerJoin(join) => {
                 merge_distributed_inner_join(&leg_results, &join)?
             }
@@ -1585,17 +1596,23 @@ impl DistributedQueryCoordinator {
 
 fn merge_distributed_union_all(
     leg_results: &BTreeMap<String, QueryResultSet>,
+    leg_order: &[String],
 ) -> Result<QueryResultSet> {
-    let mut iter = leg_results.iter();
-    let Some((_, first)) = iter.next() else {
+    let Some(first_leg) = leg_order.first() else {
         return Err(GraphError::UnsupportedQuery {
             dialect: "DistributedQuery",
             feature: "cannot merge an empty distributed result".to_string(),
         });
     };
+    let first = leg_results
+        .get(first_leg)
+        .ok_or_else(|| missing_distributed_leg(first_leg))?;
     let columns = first.columns.clone();
     let mut rows = first.rows.clone();
-    for (leg_name, result) in iter {
+    for leg_name in leg_order.iter().skip(1) {
+        let result = leg_results
+            .get(leg_name)
+            .ok_or_else(|| missing_distributed_leg(leg_name))?;
         if result.columns != columns {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "DistributedQuery",

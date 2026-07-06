@@ -6499,6 +6499,35 @@ async fn query_property_histogram_stats_refresh_persists_selectivity_records() {
     assert_eq!(weight_9_record.count, 1);
     assert_eq!(weight_9_record.distinct_values, 2);
 
+    let mut stale_batch = WriteBatch::new();
+    stale_batch.put(
+        keys::vertex_property_index("reddit-home", "tier", &common, 3),
+        encode_u64(3),
+    );
+    stale_batch.put(
+        keys::edge_property_index("reddit-home", "FOLLOWS", "weight", &weight_9, 1, 10),
+        encode_u64(10),
+    );
+    shard.write_strict_for_test(stale_batch).await.unwrap();
+
+    let filtered_vertex_histogram = shard
+        .refresh_vertex_property_histogram_query_stats("reddit-home", "tier")
+        .await
+        .unwrap();
+    assert_eq!(filtered_vertex_histogram.stats.count, 3);
+    assert_eq!(filtered_vertex_histogram.stats.distinct_values, 2);
+    assert_eq!(filtered_vertex_histogram.buckets.get(&common), Some(&2));
+    assert_eq!(filtered_vertex_histogram.buckets.get(&rare), Some(&1));
+
+    let filtered_edge_histogram = shard
+        .refresh_edge_property_histogram_query_stats("reddit-home", "FOLLOWS", "weight")
+        .await
+        .unwrap();
+    assert_eq!(filtered_edge_histogram.stats.count, 3);
+    assert_eq!(filtered_edge_histogram.stats.distinct_values, 2);
+    assert_eq!(filtered_edge_histogram.buckets.get(&weight_7), Some(&2));
+    assert_eq!(filtered_edge_histogram.buckets.get(&weight_9), Some(&1));
+
     let plan = shard
         .explain_opencypher_rows(
             QueryContext::new("reddit-home", "query-histogram-stats-explain"),
@@ -6653,6 +6682,77 @@ async fn distributed_query_plan_orders_legs_by_cost_estimate() {
     .optimized_for_costs();
     let names: Vec<_> = plan.legs.iter().map(|leg| leg.name.as_str()).collect();
     assert_eq!(names, vec!["small", "large", "unknown"]);
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn distributed_union_all_preserves_declared_leg_order() {
+    struct StaticRowsClient {
+        value: VertexId,
+    }
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for StaticRowsClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            Ok(QueryResultSet::new(
+                vec![QueryColumn::new("id")],
+                vec![QueryRow::new(vec![QueryValue::VertexId(self.value)])],
+            ))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    let placement = ShardPlacement::fixed([("cell-z", "node-z"), ("cell-a", "node-a")]).unwrap();
+    let coordinator = DistributedQueryCoordinator::new(placement)
+        .with_client("node-z", Arc::new(StaticRowsClient { value: 2 }))
+        .unwrap()
+        .with_client("node-a", Arc::new(StaticRowsClient { value: 1 }))
+        .unwrap();
+    let plan = DistributedQueryPlan::union_all(vec![
+        DistributedQueryLeg::new(
+            "z_first",
+            QueryContext::new("cell-z", "distributed-union-z"),
+            "MATCH (u) RETURN u.id AS id",
+        )
+        .unwrap()
+        .with_estimated_rows(10_000),
+        DistributedQueryLeg::new(
+            "a_second",
+            QueryContext::new("cell-a", "distributed-union-a"),
+            "MATCH (u) RETURN u.id AS id",
+        )
+        .unwrap()
+        .with_estimated_rows(1),
+    ]);
+
+    let result = coordinator
+        .execute_distributed_query_plan(plan)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.merged,
+        QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(2)]),
+                QueryRow::new(vec![QueryValue::VertexId(1)]),
+            ],
+        )
+    );
 }
 
 #[cfg(feature = "opencypher")]
