@@ -469,10 +469,12 @@ impl TcpQueryServer {
     pub async fn cancel_query(&self, query_id: impl Into<String>) -> Result<()> {
         let query_id = query_id.into();
         validate_component("query_id", &query_id)?;
-        if self.active_queries.lock().await.contains(&query_id) {
-            self.cancellations.lock().await.insert(query_id);
-            self.metrics.cancellations.fetch_add(1, Ordering::Relaxed);
+        let active = self.active_queries.lock().await;
+        if !active.contains(&query_id) {
+            return Err(inactive_query_cancel_error(&query_id));
         }
+        self.cancellations.lock().await.insert(query_id);
+        self.metrics.cancellations.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1282,17 +1284,8 @@ async fn execute_query_transport_request(
             if let Err(err) = authenticate_query_transport(&runtime, &auth) {
                 return transport_error_response(&runtime, err);
             }
-            match validate_component("query_id", &query_id) {
-                Ok(()) => {
-                    if runtime.active_queries.lock().await.contains(&query_id) {
-                        runtime.cancellations.lock().await.insert(query_id);
-                        runtime
-                            .metrics
-                            .cancellations
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    QueryTransportResponse::Cancelled
-                }
+            match cancel_active_query(&runtime, &query_id).await {
+                Ok(()) => QueryTransportResponse::Cancelled,
                 Err(err) => transport_error_response(&runtime, err),
             }
         }
@@ -1346,21 +1339,23 @@ where
                 "slow query transport request"
             );
         }
-        ensure_query_not_cancelled(runtime, query_id).await?;
-        match &result {
-            Ok(_) => runtime
-                .metrics
-                .requests_completed
-                .fetch_add(1, Ordering::Relaxed),
-            Err(_) => runtime
-                .metrics
-                .requests_failed
-                .fetch_add(1, Ordering::Relaxed),
-        };
         result
     }
     .await;
-    finish_query_lifecycle(runtime, query_id).await;
+    let result = match finish_query_lifecycle(runtime, query_id).await {
+        QueryLifecycleFinish::Cancelled => Err(cancelled_query_error()),
+        QueryLifecycleFinish::NotCancelled => result,
+    };
+    match &result {
+        Ok(_) => runtime
+            .metrics
+            .requests_completed
+            .fetch_add(1, Ordering::Relaxed),
+        Err(_) => runtime
+            .metrics
+            .requests_failed
+            .fetch_add(1, Ordering::Relaxed),
+    };
     result
 }
 
@@ -1380,9 +1375,47 @@ async fn begin_query_lifecycle(
 }
 
 #[cfg(feature = "query-transport")]
-async fn finish_query_lifecycle(runtime: &QueryTransportServerRuntime, query_id: &str) {
-    runtime.active_queries.lock().await.remove(query_id);
-    runtime.cancellations.lock().await.remove(query_id);
+async fn finish_query_lifecycle(
+    runtime: &QueryTransportServerRuntime,
+    query_id: &str,
+) -> QueryLifecycleFinish {
+    let mut active = runtime.active_queries.lock().await;
+    let mut cancellations = runtime.cancellations.lock().await;
+    active.remove(query_id);
+    if cancellations.remove(query_id) {
+        runtime
+            .metrics
+            .cancelled_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        QueryLifecycleFinish::Cancelled
+    } else {
+        QueryLifecycleFinish::NotCancelled
+    }
+}
+
+#[cfg(feature = "query-transport")]
+enum QueryLifecycleFinish {
+    Cancelled,
+    NotCancelled,
+}
+
+#[cfg(feature = "query-transport")]
+async fn cancel_active_query(runtime: &QueryTransportServerRuntime, query_id: &str) -> Result<()> {
+    validate_component("query_id", query_id)?;
+    let active = runtime.active_queries.lock().await;
+    if !active.contains(query_id) {
+        return Err(inactive_query_cancel_error(query_id));
+    }
+    runtime
+        .cancellations
+        .lock()
+        .await
+        .insert(query_id.to_string());
+    runtime
+        .metrics
+        .cancellations
+        .fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 #[cfg(feature = "query-transport")]
@@ -1413,17 +1446,26 @@ async fn ensure_query_not_cancelled(
     query_id: &str,
 ) -> Result<()> {
     if runtime.cancellations.lock().await.contains(query_id) {
-        runtime
-            .metrics
-            .cancelled_rejections
-            .fetch_add(1, Ordering::Relaxed);
-        return Err(GraphError::QueryTimeout {
-            operation: "query_transport_cancelled",
-            elapsed_ms: 0,
-            limit_ms: 0,
-        });
+        return Err(cancelled_query_error());
     }
     Ok(())
+}
+
+#[cfg(feature = "query-transport")]
+fn cancelled_query_error() -> GraphError {
+    GraphError::QueryTimeout {
+        operation: "query_transport_cancelled",
+        elapsed_ms: 0,
+        limit_ms: 0,
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn inactive_query_cancel_error(query_id: &str) -> GraphError {
+    GraphError::UnsupportedQuery {
+        dialect: "QueryTransport",
+        feature: format!("no active query with id {query_id} was cancelled"),
+    }
 }
 
 #[cfg(feature = "query-transport")]
