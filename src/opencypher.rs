@@ -5,8 +5,8 @@ use std::ptr::null_mut;
 use libcypher_parser_sys as sys;
 
 use crate::{
-    validate_component, GraphError, QueryColumn, QueryStatement, QueryWindow, Result, VertexId,
-    VertexMetadata, VertexPropertyValue,
+    validate_component, EdgeMetadata, GraphError, QueryColumn, QueryStatement, QueryWindow, Result,
+    VertexId, VertexMetadata, VertexPropertyValue,
 };
 
 type AstNode = sys::cypher_astnode_t;
@@ -46,6 +46,9 @@ pub struct ParsedQuery {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedRowQuery {
     pub patterns: Vec<RowPattern>,
+    pub pattern_groups: Vec<RowMatchGroup>,
+    pub union_arms: Vec<ParsedRowQuery>,
+    pub union_all: bool,
     pub predicate: Option<RowPredicate>,
     pub projections: Vec<RowProjection>,
     pub order_by: Vec<RowSort>,
@@ -67,11 +70,19 @@ pub enum RowPattern {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RowMatchGroup {
+    pub patterns: Vec<RowPattern>,
+    pub predicate: Option<RowPredicate>,
+    pub optional: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowEdgePattern {
     pub binding: Option<String>,
     pub edge_type: String,
     pub src: RowNodePattern,
     pub dst: RowNodePattern,
+    pub properties: BTreeMap<String, VertexPropertyValue>,
     pub hop_range: Option<(u8, u8)>,
 }
 
@@ -136,6 +147,7 @@ pub enum RowMutationAction {
         dst: VertexId,
         src_metadata: VertexMetadata,
         dst_metadata: VertexMetadata,
+        edge_metadata: EdgeMetadata,
     },
 }
 
@@ -370,34 +382,23 @@ impl ParsedCypher {
     ) -> Result<ParsedRowQuery> {
         unsafe {
             let clause_count = sys::cypher_ast_query_nclauses(query);
-            if clause_count < 2 {
+            if clause_count == 0 {
                 return unsupported("row execution supports MATCH ... RETURN queries");
             }
-            let return_clause =
-                checked_node(sys::cypher_ast_query_get_clause(query, clause_count - 1))?;
-            if !is_instance(return_clause, sys::CYPHER_AST_RETURN) {
-                return unsupported(
-                    "row execution supports MATCH ... RETURN queries ending in RETURN",
-                );
-            }
-            let mut match_clauses = Vec::with_capacity(clause_count.saturating_sub(1) as usize);
-            let mut scoped_bindings = BTreeSet::new();
-            for idx in 0..clause_count - 1 {
+            let mut clauses = Vec::with_capacity(clause_count as usize);
+            let mut has_union = false;
+            for idx in 0..clause_count {
                 let clause = checked_node(sys::cypher_ast_query_get_clause(query, idx))?;
-                if is_instance(clause, sys::CYPHER_AST_MATCH) {
-                    collect_match_clause_bindings(clause, parameters, &mut scoped_bindings)?;
-                    match_clauses.push(clause);
-                    continue;
+                if is_instance(clause, sys::CYPHER_AST_UNION) {
+                    has_union = true;
                 }
-                if is_instance(clause, sys::CYPHER_AST_WITH) {
-                    lower_passthrough_with(clause, &scoped_bindings)?;
-                    continue;
-                }
-                return unsupported(
-                    "row execution currently supports MATCH/WITH clauses followed by RETURN",
-                );
+                clauses.push(clause);
             }
-            lower_match_return_rows(&match_clauses, return_clause, parameters)
+            if has_union {
+                lower_row_union_query_clauses(&clauses, parameters)
+            } else {
+                lower_row_query_clauses(&clauses, parameters)
+            }
         }
     }
 
@@ -526,6 +527,89 @@ impl Drop for ParsedCypher {
     }
 }
 
+fn lower_row_query_clauses(
+    clauses: &[*const AstNode],
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<ParsedRowQuery> {
+    unsafe {
+        if clauses.len() < 2 {
+            return unsupported("row execution supports MATCH ... RETURN queries");
+        }
+        let return_clause = checked_node(*clauses.last().expect("checked non-empty clauses"))?;
+        if !is_instance(return_clause, sys::CYPHER_AST_RETURN) {
+            return unsupported("row execution supports MATCH ... RETURN queries ending in RETURN");
+        }
+        let mut match_clauses = Vec::with_capacity(clauses.len().saturating_sub(1));
+        let mut scoped_bindings = BTreeSet::new();
+        for clause in &clauses[..clauses.len() - 1] {
+            if is_instance(*clause, sys::CYPHER_AST_MATCH) {
+                collect_match_clause_bindings(*clause, parameters, &mut scoped_bindings)?;
+                match_clauses.push(*clause);
+                continue;
+            }
+            if is_instance(*clause, sys::CYPHER_AST_WITH) {
+                lower_passthrough_with(*clause, &scoped_bindings)?;
+                continue;
+            }
+            return unsupported(
+                "row execution currently supports MATCH/WITH clauses followed by RETURN",
+            );
+        }
+        lower_match_return_rows(&match_clauses, return_clause, parameters)
+    }
+}
+
+fn lower_row_union_query_clauses(
+    clauses: &[*const AstNode],
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<ParsedRowQuery> {
+    let mut arms = Vec::new();
+    let mut start = 0usize;
+    let mut union_all = None;
+    for (idx, clause) in clauses.iter().enumerate() {
+        if !unsafe { is_instance(*clause, sys::CYPHER_AST_UNION) } {
+            continue;
+        }
+        if idx == start {
+            return unsupported("UNION requires a query before it");
+        }
+        let all = unsafe { sys::cypher_ast_union_has_all(*clause) };
+        if let Some(previous) = union_all {
+            if previous != all {
+                return unsupported("mixing UNION and UNION ALL is not executable in Phase 2");
+            }
+        } else {
+            union_all = Some(all);
+        }
+        arms.push(lower_row_query_clauses(&clauses[start..idx], parameters)?);
+        start = idx + 1;
+    }
+    if start >= clauses.len() {
+        return unsupported("UNION requires a query after it");
+    }
+    arms.push(lower_row_query_clauses(&clauses[start..], parameters)?);
+    if arms.len() < 2 {
+        return unsupported("UNION requires at least two query arms");
+    }
+
+    let columns = arms[0].columns.clone();
+    for arm in &arms {
+        if arm.columns != columns {
+            return unsupported("UNION arms must project the same column names");
+        }
+        if !arm.order_by.is_empty() || !arm.window.is_default() {
+            return unsupported(
+                "UNION arms with ORDER BY, SKIP, or LIMIT are not executable in Phase 2",
+            );
+        }
+    }
+
+    let mut first = arms.remove(0);
+    first.union_all = union_all.unwrap_or(false);
+    first.union_arms = arms;
+    Ok(first)
+}
+
 fn lower_create(
     create: *const AstNode,
     parameters: &BTreeMap<String, VertexPropertyValue>,
@@ -550,15 +634,27 @@ fn lower_create(
             .ok_or_else(|| unsupported_value("CREATE requires destination id"))?;
         let src_metadata = vertex_metadata_from_node_pattern(&edge.src);
         let dst_metadata = vertex_metadata_from_node_pattern(&edge.dst);
+        let edge_metadata = edge_metadata_from_edge_pattern(&edge);
         if src_metadata.labels.is_empty()
             && src_metadata.properties.is_empty()
             && dst_metadata.labels.is_empty()
             && dst_metadata.properties.is_empty()
+            && edge_metadata.properties.is_empty()
         {
             return Ok(QueryStatement::CreateEdge {
                 edge_type: edge.edge_type,
                 src,
                 dst,
+            });
+        }
+        if !edge_metadata.properties.is_empty() {
+            return Ok(QueryStatement::CreateEdgeWithFullMetadata {
+                edge_type: edge.edge_type,
+                src,
+                dst,
+                src_metadata,
+                dst_metadata,
+                edge_metadata,
             });
         }
         Ok(QueryStatement::CreateEdgeWithMetadata {
@@ -730,24 +826,31 @@ fn lower_match_return_rows(
 ) -> Result<ParsedRowQuery> {
     unsafe {
         let mut patterns = Vec::new();
+        let mut pattern_groups = Vec::new();
         let mut predicate = None;
         for match_clause in match_clauses {
-            if sys::cypher_ast_match_is_optional(*match_clause) {
-                return unsupported("OPTIONAL MATCH is not executable in Phase 2");
-            }
+            let optional = sys::cypher_ast_match_is_optional(*match_clause);
             if sys::cypher_ast_match_nhints(*match_clause) != 0 {
                 return unsupported("MATCH hints are not executable in Phase 2");
             }
 
             let pattern = checked_node(sys::cypher_ast_match_get_pattern(*match_clause))?;
-            patterns.extend(lower_row_patterns(pattern, parameters)?);
+            let group_patterns = lower_row_patterns(pattern, parameters)?;
+            patterns.extend(group_patterns.iter().cloned());
             let match_predicate = sys::cypher_ast_match_get_predicate(*match_clause);
-            if !match_predicate.is_null() {
-                predicate = Some(and_row_predicates(
-                    predicate,
-                    lower_row_predicate(match_predicate, parameters)?,
-                ));
+            let group_predicate = if match_predicate.is_null() {
+                None
+            } else {
+                Some(lower_row_predicate(match_predicate, parameters)?)
+            };
+            if let Some(group_predicate) = &group_predicate {
+                predicate = Some(and_row_predicates(predicate, group_predicate.clone()));
             }
+            pattern_groups.push(RowMatchGroup {
+                patterns: group_patterns,
+                predicate: group_predicate,
+                optional,
+            });
         }
         if patterns.is_empty() {
             return unsupported("MATCH requires at least one executable row pattern");
@@ -812,6 +915,9 @@ fn lower_match_return_rows(
         let window = lower_return_window(return_clause, parameters)?;
         Ok(ParsedRowQuery {
             patterns,
+            pattern_groups,
+            union_arms: Vec::new(),
+            union_all: false,
             predicate,
             projections,
             order_by,
@@ -925,6 +1031,7 @@ fn lower_simple_merge(
             .dst
             .id
             .ok_or_else(|| unsupported_value("MERGE requires destination id"))?;
+        let edge_metadata = edge_metadata_from_edge_pattern(&edge);
         Ok(ParsedMutationQuery {
             patterns: Vec::new(),
             predicate: None,
@@ -934,6 +1041,7 @@ fn lower_simple_merge(
                 dst,
                 src_metadata: vertex_metadata_from_node_pattern(&edge.src),
                 dst_metadata: vertex_metadata_from_node_pattern(&edge.dst),
+                edge_metadata,
             }],
         })
     }
@@ -1421,11 +1529,7 @@ fn lower_create_edge_path(
         } else {
             Some(lower_hop_range(varlength)?)
         };
-        if !sys::cypher_ast_rel_pattern_get_properties(rel).is_null() {
-            return unsupported(format!(
-                "relationship properties are not executable in Phase 2 {clause}"
-            ));
-        }
+        let properties = relationship_properties(rel, parameters)?;
         if sys::cypher_ast_rel_pattern_nreltypes(rel) != 1 {
             return unsupported(format!(
                 "relationship pattern must have exactly one type in Phase 2 {clause}"
@@ -1444,6 +1548,7 @@ fn lower_create_edge_path(
                 edge_type,
                 src: left_node,
                 dst: right_node,
+                properties,
                 hop_range,
             }),
             sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(RowEdgePattern {
@@ -1451,6 +1556,7 @@ fn lower_create_edge_path(
                 edge_type,
                 src: right_node,
                 dst: left_node,
+                properties,
                 hop_range,
             }),
             sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => unsupported(format!(
@@ -1557,9 +1663,7 @@ fn lower_row_edge_path_segment(
         } else {
             Some(lower_hop_range(varlength)?)
         };
-        if !sys::cypher_ast_rel_pattern_get_properties(rel).is_null() {
-            return unsupported("relationship properties are not executable in Phase 2");
-        }
+        let properties = relationship_properties(rel, parameters)?;
         if sys::cypher_ast_rel_pattern_nreltypes(rel) != 1 {
             return unsupported("relationship pattern must have exactly one type in Phase 2");
         }
@@ -1581,6 +1685,7 @@ fn lower_row_edge_path_segment(
                 edge_type,
                 src: left_node,
                 dst: right_node,
+                properties,
                 hop_range,
             }),
             sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(RowEdgePattern {
@@ -1588,6 +1693,7 @@ fn lower_row_edge_path_segment(
                 edge_type,
                 src: right_node,
                 dst: left_node,
+                properties,
                 hop_range,
             }),
             sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => {
@@ -1606,6 +1712,26 @@ fn vertex_metadata_from_node_pattern(node: &RowNodePattern) -> VertexMetadata {
             .filter(|(property, _)| property.as_str() != "id")
             .map(|(property, value)| (property.clone(), value.clone()))
             .collect(),
+    }
+}
+
+fn edge_metadata_from_edge_pattern(edge: &RowEdgePattern) -> EdgeMetadata {
+    EdgeMetadata {
+        properties: edge.properties.clone(),
+    }
+}
+
+fn relationship_properties(
+    rel: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<BTreeMap<String, VertexPropertyValue>> {
+    unsafe {
+        let properties = sys::cypher_ast_rel_pattern_get_properties(rel);
+        if properties.is_null() {
+            Ok(BTreeMap::new())
+        } else {
+            property_map(properties, parameters, "relationship property map")
+        }
     }
 }
 
@@ -1755,8 +1881,16 @@ fn row_node_properties(
     properties: *const AstNode,
     parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<BTreeMap<String, VertexPropertyValue>> {
+    property_map(properties, parameters, "node property map")
+}
+
+fn property_map(
+    properties: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+    expected: &str,
+) -> Result<BTreeMap<String, VertexPropertyValue>> {
     unsafe {
-        ensure_instance(properties, sys::CYPHER_AST_MAP, "node property map")?;
+        ensure_instance(properties, sys::CYPHER_AST_MAP, expected)?;
         let mut result = BTreeMap::new();
         for idx in 0..sys::cypher_ast_map_nentries(properties) {
             let key = checked_node(sys::cypher_ast_map_get_key(properties, idx))?;
@@ -1767,7 +1901,7 @@ fn row_node_properties(
                 .insert(key, scalar_property_value(value, parameters)?)
                 .is_some()
             {
-                return unsupported("duplicate node property in pattern");
+                return unsupported("duplicate property in map");
             }
         }
         Ok(result)
@@ -2175,6 +2309,29 @@ mod tests {
     }
 
     #[test]
+    fn lowers_create_edge_with_relationship_properties() {
+        assert_eq!(
+            parse_opencypher(
+                "CREATE (u:User {id: 1, name: 'alice'})-[r:FOLLOWS {since: 2020, close: true}]->\
+                 (v {id: 2})"
+            )
+            .unwrap(),
+            QueryStatement::CreateEdgeWithFullMetadata {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                src_metadata: VertexMetadata::default()
+                    .with_label("User")
+                    .with_property("name", VertexPropertyValue::String("alice".to_string())),
+                dst_metadata: VertexMetadata::default(),
+                edge_metadata: EdgeMetadata::default()
+                    .with_property("close", VertexPropertyValue::Bool(true))
+                    .with_property("since", VertexPropertyValue::Integer(2020)),
+            }
+        );
+    }
+
+    #[test]
     fn lowers_match_out_neighbors_through_libcypher_parser() {
         assert_eq!(
             parse_opencypher("MATCH (u {id: 1})-[:USER_SUBSCRIBED_TO_SUBREDDIT]->(s) RETURN s.id")
@@ -2430,6 +2587,54 @@ mod tests {
     }
 
     #[test]
+    fn lowers_row_query_with_relationship_properties_and_projection() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (u {id: 1})-[r:FOLLOWS {since: 2020, close: true}]->(v) \
+             RETURN r.since AS since, v.id AS dst ORDER BY r.since DESC",
+        )
+        .unwrap();
+        assert_eq!(parsed.patterns.len(), 1);
+        let RowPattern::Edge(pattern) = &parsed.patterns[0] else {
+            panic!("expected edge row pattern");
+        };
+        assert_eq!(pattern.binding.as_deref(), Some("r"));
+        assert_eq!(
+            pattern.properties.get("since"),
+            Some(&VertexPropertyValue::Integer(2020))
+        );
+        assert_eq!(
+            pattern.properties.get("close"),
+            Some(&VertexPropertyValue::Bool(true))
+        );
+        assert_eq!(
+            parsed.projections,
+            vec![
+                RowProjection::Property {
+                    binding: "r".to_string(),
+                    property: "since".to_string(),
+                },
+                RowProjection::NodeId {
+                    binding: "v".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            parsed.order_by,
+            vec![RowSort {
+                expression: RowSortExpression::Property {
+                    binding: "r".to_string(),
+                    property: "since".to_string(),
+                },
+                ascending: false,
+            }]
+        );
+        assert_eq!(
+            parsed.columns,
+            vec![QueryColumn::new("since"), QueryColumn::new("dst")]
+        );
+    }
+
+    #[test]
     fn lowers_node_only_row_query() {
         let parsed = parse_opencypher_row_query(
             "MATCH (u:User {active: true}) RETURN u.name AS name ORDER BY u.name",
@@ -2501,6 +2706,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, GraphError::UnsupportedQuery { .. }));
+    }
+
+    #[test]
+    fn lowers_optional_match_as_left_join_group() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (u:User) OPTIONAL MATCH (u)-[:FOLLOWS]->(v) WHERE v.id <> 99 \
+             RETURN u.id AS user, v.id AS followed ORDER BY user",
+        )
+        .unwrap();
+        assert_eq!(parsed.pattern_groups.len(), 2);
+        assert!(!parsed.pattern_groups[0].optional);
+        assert!(parsed.pattern_groups[1].optional);
+        assert!(parsed.pattern_groups[1].predicate.is_some());
+        assert_eq!(
+            parsed.columns,
+            vec![QueryColumn::new("user"), QueryColumn::new("followed")]
+        );
+    }
+
+    #[test]
+    fn lowers_union_row_query_arms() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (u:User) RETURN u.id AS id \
+             UNION ALL MATCH (m:Moderator) RETURN m.id AS id",
+        )
+        .unwrap();
+        assert!(parsed.union_all);
+        assert_eq!(parsed.union_arms.len(), 1);
+        assert_eq!(parsed.columns, vec![QueryColumn::new("id")]);
+        assert_eq!(parsed.union_arms[0].columns, vec![QueryColumn::new("id")]);
+
+        let mismatch = parse_opencypher_row_query(
+            "MATCH (u:User) RETURN u.id AS id \
+             UNION MATCH (m:Moderator) RETURN m.id AS other",
+        )
+        .unwrap_err();
+        assert!(matches!(mismatch, GraphError::UnsupportedQuery { .. }));
     }
 
     #[test]
@@ -2628,6 +2870,7 @@ mod tests {
                 dst: 2,
                 src_metadata: VertexMetadata::default().with_label("User"),
                 dst_metadata: VertexMetadata::default(),
+                edge_metadata: EdgeMetadata::default(),
             }]
         );
     }

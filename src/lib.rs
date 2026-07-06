@@ -32,8 +32,8 @@ pub use opencypher::{
     parse_opencypher_row_query_with_parameters, parse_opencypher_with_parameters,
     parse_opencypher_with_window, CypherFrontend, DefaultCypherFrontend, LibCypherParserFrontend,
     ParsedMutationQuery, ParsedQuery, ParsedRowQuery, RowAggregateFunction, RowComparisonOp,
-    RowEdgePattern, RowExpression, RowMutationAction, RowNodePattern, RowPattern, RowPredicate,
-    RowProjection, RowSort, RowSortExpression,
+    RowEdgePattern, RowExpression, RowMatchGroup, RowMutationAction, RowNodePattern, RowPattern,
+    RowPredicate, RowProjection, RowSort, RowSortExpression,
 };
 pub use phase0::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
@@ -760,6 +760,18 @@ pub enum VertexPropertyValue {
 pub struct VertexMetadata {
     pub labels: BTreeSet<String>,
     pub properties: BTreeMap<String, VertexPropertyValue>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EdgeMetadata {
+    pub properties: BTreeMap<String, VertexPropertyValue>,
+}
+
+impl EdgeMetadata {
+    pub fn with_property(mut self, name: impl Into<String>, value: VertexPropertyValue) -> Self {
+        self.properties.insert(name.into(), value);
+        self
+    }
 }
 
 impl VertexMetadata {

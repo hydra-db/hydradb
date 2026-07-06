@@ -159,19 +159,116 @@ impl GraphShard {
             None => self.current_epoch(&context.cell_id).await?,
         };
 
-        let mut bindings = self
-            .match_row_patterns(&context.cell_id, &query.patterns, read_epoch, &budget)
-            .await?;
-        if let Some(predicate) = &query.predicate {
-            let mut filtered = Vec::with_capacity(bindings.len());
-            for row in bindings {
-                budget.check("cypher_where")?;
-                if row_predicate_matches(&row, predicate)? {
-                    filtered.push(row);
-                }
-            }
-            bindings = filtered;
+        if !query.union_arms.is_empty() {
+            return self
+                .execute_union_opencypher_rows(
+                    &context.cell_id,
+                    read_epoch,
+                    query,
+                    context.result_window,
+                    &budget,
+                )
+                .await;
         }
+        self.execute_single_opencypher_rows(
+            &context.cell_id,
+            read_epoch,
+            query,
+            context.result_window,
+            &budget,
+        )
+        .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn execute_union_opencypher_rows(
+        &self,
+        cell_id: &str,
+        read_epoch: GraphEpoch,
+        mut query: ParsedRowQuery,
+        window: QueryWindow,
+        budget: &QueryBudget,
+    ) -> Result<QueryResultSet> {
+        budget.check("cypher_union")?;
+        let union_all = query.union_all;
+        let mut arms = std::mem::take(&mut query.union_arms);
+        query.union_all = false;
+        let columns = query.columns.clone();
+
+        let mut rows = self
+            .execute_single_opencypher_rows(
+                cell_id,
+                read_epoch,
+                query,
+                QueryWindow::default(),
+                budget,
+            )
+            .await?
+            .rows;
+        for arm in arms.drain(..) {
+            budget.check("cypher_union_arm")?;
+            if arm.columns != columns {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "UNION arms must project the same column names".to_string(),
+                });
+            }
+            rows.extend(
+                self.execute_single_opencypher_rows(
+                    cell_id,
+                    read_epoch,
+                    arm,
+                    QueryWindow::default(),
+                    budget,
+                )
+                .await?
+                .rows,
+            );
+        }
+
+        if !union_all {
+            let mut seen = BTreeSet::new();
+            rows.retain(|row| seen.insert(row.values.clone()));
+        }
+
+        let projected = rows
+            .into_iter()
+            .map(|row| ProjectedQueryRow {
+                row,
+                sort_keys: Vec::new(),
+            })
+            .collect();
+        self.finish_projected_rows(columns, projected, &[], window, budget)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn execute_single_opencypher_rows(
+        &self,
+        cell_id: &str,
+        read_epoch: GraphEpoch,
+        query: ParsedRowQuery,
+        window: QueryWindow,
+        budget: &QueryBudget,
+    ) -> Result<QueryResultSet> {
+        let bindings = if query.pattern_groups.is_empty() {
+            let mut bindings = self
+                .match_row_patterns(cell_id, &query.patterns, read_epoch, budget)
+                .await?;
+            if let Some(predicate) = &query.predicate {
+                let mut filtered = Vec::with_capacity(bindings.len());
+                for row in bindings {
+                    budget.check("cypher_where")?;
+                    if row_predicate_matches(&row, predicate)? {
+                        filtered.push(row);
+                    }
+                }
+                bindings = filtered;
+            }
+            bindings
+        } else {
+            self.match_row_pattern_groups(cell_id, &query.pattern_groups, read_epoch, budget)
+                .await?
+        };
 
         if row_projections_have_aggregates(&query.projections) {
             let projected = aggregate_projected_rows(
@@ -179,14 +276,14 @@ impl GraphShard {
                 &query.projections,
                 &query.columns,
                 &query.order_by,
-                &budget,
+                budget,
             )?;
             return self.finish_projected_rows(
                 query.columns,
                 projected,
                 &query.order_by,
-                context.result_window,
-                &budget,
+                window,
+                budget,
             );
         }
 
@@ -197,13 +294,7 @@ impl GraphShard {
             let sort_keys = sort_keys_for_row(binding, &row, &query.columns, &query.order_by)?;
             projected.push(ProjectedQueryRow { row, sort_keys });
         }
-        self.finish_projected_rows(
-            query.columns,
-            projected,
-            &query.order_by,
-            context.result_window,
-            &budget,
-        )
+        self.finish_projected_rows(query.columns, projected, &query.order_by, window, budget)
     }
 
     #[cfg(feature = "opencypher")]
@@ -249,6 +340,8 @@ impl GraphShard {
         };
         let mut pending_metadata = BTreeMap::<VertexId, VertexMetadata>::new();
         let mut original_metadata = BTreeMap::<VertexId, VertexMetadata>::new();
+        let mut pending_edge_metadata = BTreeMap::<BoundRelationship, EdgeMetadata>::new();
+        let mut original_edge_metadata = BTreeMap::<BoundRelationship, EdgeMetadata>::new();
 
         for action in &query.actions {
             budget.check("cypher_mutation_action")?;
@@ -300,6 +393,8 @@ impl GraphShard {
                         read_epoch,
                         pending_metadata: &mut pending_metadata,
                         original_metadata: &mut original_metadata,
+                        pending_edge_metadata: &mut pending_edge_metadata,
+                        original_edge_metadata: &mut original_edge_metadata,
                         budget: &budget,
                     };
                     for row in &bindings {
@@ -326,6 +421,27 @@ impl GraphShard {
                 .await?;
             result.updated_vertices = result.updated_vertices.saturating_add(1);
         }
+        for (relationship, metadata) in pending_edge_metadata {
+            budget.check("cypher_set_relationship_metadata")?;
+            if original_edge_metadata.get(&relationship) == Some(&metadata) {
+                result.noops = result.noops.saturating_add(1);
+                continue;
+            }
+            if self
+                .set_edge_metadata(
+                    &context.cell_id,
+                    &relationship.edge_type,
+                    relationship.src,
+                    relationship.dst,
+                    metadata,
+                )
+                .await?
+            {
+                result.updated_relationships = result.updated_relationships.saturating_add(1);
+            } else {
+                result.noops = result.noops.saturating_add(1);
+            }
+        }
 
         Ok(result)
     }
@@ -346,6 +462,7 @@ impl GraphShard {
                 dst,
                 src_metadata,
                 dst_metadata,
+                edge_metadata,
             } = action
             else {
                 return Err(GraphError::UnsupportedQuery {
@@ -367,13 +484,22 @@ impl GraphShard {
                 && src_metadata.properties.is_empty()
                 && dst_metadata.labels.is_empty()
                 && dst_metadata.properties.is_empty()
+                && edge_metadata.properties.is_empty()
             {
                 self.write_edge(mutation).await?
-            } else {
+            } else if edge_metadata.properties.is_empty() {
                 self.write_edge_with_vertex_metadata(
                     mutation,
                     src_metadata.clone(),
                     dst_metadata.clone(),
+                )
+                .await?
+            } else {
+                self.write_edge_with_full_metadata(
+                    mutation,
+                    src_metadata.clone(),
+                    dst_metadata.clone(),
+                    edge_metadata.clone(),
                 )
                 .await?
             };
@@ -405,6 +531,85 @@ impl GraphShard {
                 });
             }
         };
+        if let Some(relationship) = row.relationships.get(binding) {
+            match action {
+                RowMutationAction::SetProperty {
+                    property, value, ..
+                } => {
+                    if state.pending_edge_metadata.get(relationship).is_none() {
+                        state.budget.check("cypher_load_relationship_metadata")?;
+                        let metadata = match row.relationship_metadata.get(relationship) {
+                            Some(metadata) => metadata.clone(),
+                            None => {
+                                self.edge_metadata_at(
+                                    state.cell_id,
+                                    &relationship.edge_type,
+                                    relationship.src,
+                                    relationship.dst,
+                                    state.read_epoch,
+                                )
+                                .await?
+                            }
+                        };
+                        state
+                            .original_edge_metadata
+                            .insert(relationship.clone(), metadata.clone());
+                        state
+                            .pending_edge_metadata
+                            .insert(relationship.clone(), metadata);
+                    }
+                    let metadata = state
+                        .pending_edge_metadata
+                        .get_mut(relationship)
+                        .ok_or_else(|| GraphError::UnsupportedQuery {
+                            dialect: "OpenCypher",
+                            feature: format!("metadata for relationship {binding} was not loaded"),
+                        })?;
+                    metadata.properties.insert(property.clone(), value.clone());
+                    return Ok(());
+                }
+                RowMutationAction::RemoveProperty { property, .. } => {
+                    if state.pending_edge_metadata.get(relationship).is_none() {
+                        state.budget.check("cypher_load_relationship_metadata")?;
+                        let metadata = match row.relationship_metadata.get(relationship) {
+                            Some(metadata) => metadata.clone(),
+                            None => {
+                                self.edge_metadata_at(
+                                    state.cell_id,
+                                    &relationship.edge_type,
+                                    relationship.src,
+                                    relationship.dst,
+                                    state.read_epoch,
+                                )
+                                .await?
+                            }
+                        };
+                        state
+                            .original_edge_metadata
+                            .insert(relationship.clone(), metadata.clone());
+                        state
+                            .pending_edge_metadata
+                            .insert(relationship.clone(), metadata);
+                    }
+                    let metadata = state
+                        .pending_edge_metadata
+                        .get_mut(relationship)
+                        .ok_or_else(|| GraphError::UnsupportedQuery {
+                            dialect: "OpenCypher",
+                            feature: format!("metadata for relationship {binding} was not loaded"),
+                        })?;
+                    metadata.properties.remove(property);
+                    return Ok(());
+                }
+                RowMutationAction::SetLabels { .. } | RowMutationAction::RemoveLabels { .. } => {
+                    return Err(GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: "relationship labels are not executable in Phase 2".to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
         let vertex_id = row.get(binding)?;
         if state.pending_metadata.get(&vertex_id).is_none() {
             state.budget.check("cypher_load_mutation_metadata")?;
@@ -485,6 +690,30 @@ impl GraphShard {
                         },
                         src_metadata,
                         dst_metadata,
+                    )
+                    .await?;
+                Ok(QueryOutput::Write(result))
+            }
+            PhysicalQueryPlan::WriteEdgeWithFullMetadata {
+                edge_type,
+                src,
+                dst,
+                src_metadata,
+                dst_metadata,
+                edge_metadata,
+            } => {
+                let result = self
+                    .write_edge_with_full_metadata(
+                        EdgeMutation {
+                            cell_id: plan.cell_id,
+                            edge_type,
+                            src,
+                            dst,
+                            idempotency_key: plan.idempotency_key,
+                        },
+                        src_metadata,
+                        dst_metadata,
+                        edge_metadata,
                     )
                     .await?;
                 Ok(QueryOutput::Write(result))
@@ -617,7 +846,96 @@ impl GraphShard {
             });
         }
 
+        self.match_row_patterns_from_rows(
+            cell_id,
+            patterns,
+            read_epoch,
+            budget,
+            vec![BindingRow::default()],
+        )
+        .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_row_pattern_groups(
+        &self,
+        cell_id: &str,
+        groups: &[RowMatchGroup],
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<BindingRow>> {
+        if groups.is_empty() {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "MATCH requires at least one executable pattern".to_string(),
+            });
+        }
+
         let mut rows = vec![BindingRow::default()];
+        for group in groups {
+            budget.check("cypher_match_group")?;
+            if group.patterns.is_empty() {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "MATCH requires at least one executable pattern".to_string(),
+                });
+            }
+
+            let mut group_rows = Vec::new();
+            for row in rows {
+                let mut matches = self
+                    .match_row_patterns_from_rows(
+                        cell_id,
+                        &group.patterns,
+                        read_epoch,
+                        budget,
+                        vec![row.clone()],
+                    )
+                    .await?;
+                if let Some(predicate) = &group.predicate {
+                    let mut filtered = Vec::with_capacity(matches.len());
+                    for matched in matches {
+                        budget.check("cypher_group_where")?;
+                        if row_predicate_matches(&matched, predicate)? {
+                            filtered.push(matched);
+                        }
+                    }
+                    matches = filtered;
+                }
+
+                if matches.is_empty() && group.optional {
+                    let mut optional_row = row;
+                    optional_row.mark_optional_group_nulls(group);
+                    self.push_binding_row(
+                        &mut group_rows,
+                        optional_row,
+                        "cypher_optional_match_rows",
+                    )?;
+                } else {
+                    for matched in matches {
+                        self.push_binding_row(&mut group_rows, matched, "cypher_match_group_rows")?;
+                    }
+                }
+            }
+
+            rows = group_rows;
+            self.ensure_query_intermediate_rows("cypher_match_group_pipeline_rows", rows.len())?;
+            if rows.is_empty() {
+                break;
+            }
+        }
+        Ok(rows)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_row_patterns_from_rows(
+        &self,
+        cell_id: &str,
+        patterns: &[RowPattern],
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+        mut rows: Vec<BindingRow>,
+    ) -> Result<Vec<BindingRow>> {
         for pattern in patterns {
             budget.check("cypher_match_pipeline")?;
             let mut next_rows = Vec::new();
@@ -756,11 +1074,56 @@ impl GraphShard {
                 )
                 .await
             }
+            (None, None) if !edge.properties.is_empty() => {
+                self.match_edge_row_pattern_from_property_index(cell_id, edge, read_epoch, budget)
+                    .await
+            }
             (None, _) => {
                 self.match_edge_row_pattern_full_scan(cell_id, edge, read_epoch, budget)
                     .await
             }
         }
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn match_edge_row_pattern_from_property_index(
+        &self,
+        cell_id: &str,
+        edge: &RowEdgePattern,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<BindingRow>> {
+        let Some((property, value)) = edge.properties.iter().next() else {
+            return Ok(Vec::new());
+        };
+        let pairs = self
+            .scan_edge_property_index_at(
+                cell_id,
+                &edge.edge_type,
+                property,
+                value,
+                read_epoch,
+                budget,
+            )
+            .await?;
+        self.ensure_query_index_candidates("cypher_edge_property_candidates", pairs.len())?;
+        let mut rows = Vec::new();
+        let mut metadata_cache = BTreeMap::new();
+        let mut edge_metadata_cache = BTreeMap::new();
+        let mut state = EdgeRowMatchState {
+            cell_id,
+            read_epoch,
+            rows: &mut rows,
+            metadata_cache: &mut metadata_cache,
+            edge_metadata_cache: &mut edge_metadata_cache,
+            budget,
+        };
+        for (src, dst) in pairs {
+            budget.check("cypher_edge_property_rows")?;
+            self.push_matching_edge_row(edge, src, dst, &mut state)
+                .await?;
+        }
+        Ok(rows)
     }
 
     #[cfg(feature = "opencypher")]
@@ -775,6 +1138,7 @@ impl GraphShard {
         self.ensure_query_index_candidates("cypher_edge_source_candidates", sources.len())?;
         let mut rows = Vec::new();
         let mut metadata_cache = BTreeMap::new();
+        let mut edge_metadata_cache = BTreeMap::new();
         let mut scanned_edges = 0_u64;
         {
             let mut state = EdgeRowMatchState {
@@ -782,6 +1146,7 @@ impl GraphShard {
                 read_epoch,
                 rows: &mut rows,
                 metadata_cache: &mut metadata_cache,
+                edge_metadata_cache: &mut edge_metadata_cache,
                 budget,
             };
             for src in sources {
@@ -815,6 +1180,7 @@ impl GraphShard {
         )?;
         let mut rows = Vec::new();
         let mut metadata_cache = BTreeMap::new();
+        let mut edge_metadata_cache = BTreeMap::new();
         let mut scanned_edges = 0_u64;
         {
             let mut state = EdgeRowMatchState {
@@ -822,6 +1188,7 @@ impl GraphShard {
                 read_epoch,
                 rows: &mut rows,
                 metadata_cache: &mut metadata_cache,
+                edge_metadata_cache: &mut edge_metadata_cache,
                 budget,
             };
             for dst in destinations {
@@ -850,6 +1217,7 @@ impl GraphShard {
     ) -> Result<Vec<BindingRow>> {
         let mut rows = Vec::new();
         let mut metadata_cache = BTreeMap::new();
+        let mut edge_metadata_cache = BTreeMap::new();
         let records = self.edges_at(cell_id, &edge.edge_type, read_epoch).await?;
         self.ensure_query_scan_edges("cypher_edge_full_scan", records.len() as u64)?;
         {
@@ -858,6 +1226,7 @@ impl GraphShard {
                 read_epoch,
                 rows: &mut rows,
                 metadata_cache: &mut metadata_cache,
+                edge_metadata_cache: &mut edge_metadata_cache,
                 budget,
             };
             for record in records {
@@ -891,6 +1260,15 @@ impl GraphShard {
             state.read_epoch,
             &mut row,
             state.metadata_cache,
+            state.budget,
+        )
+        .await?;
+        self.hydrate_row_relationship_metadata(
+            state.cell_id,
+            state.read_epoch,
+            &mut row,
+            edge,
+            state.edge_metadata_cache,
             state.budget,
         )
         .await?;
@@ -931,6 +1309,7 @@ impl GraphShard {
         self.ensure_query_intermediate_rows("cypher_reachable_rows", vertices.len())?;
         let mut rows = Vec::with_capacity(vertices.len());
         let mut metadata_cache = BTreeMap::new();
+        let mut edge_metadata_cache = BTreeMap::new();
         for dst in vertices {
             budget.check("cypher_reachable_rows")?;
             if matches!(edge.dst.id, Some(fixed_dst) if fixed_dst != dst) {
@@ -942,6 +1321,15 @@ impl GraphShard {
                     read_epoch,
                     &mut row,
                     &mut metadata_cache,
+                    budget,
+                )
+                .await?;
+                self.hydrate_row_relationship_metadata(
+                    cell_id,
+                    read_epoch,
+                    &mut row,
+                    edge,
+                    &mut edge_metadata_cache,
                     budget,
                 )
                 .await?;
@@ -1016,6 +1404,117 @@ impl GraphShard {
             Some(value) => decode_vertex_metadata(&key, &value),
             None => Ok(VertexMetadata::default()),
         }
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn edge_metadata_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        read_epoch: GraphEpoch,
+    ) -> Result<EdgeMetadata> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let prefix = keys::edge_metadata_delta_prefix(cell_id, edge_type, src, dst);
+        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        let mut latest = None;
+        let mut saw_delta = false;
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let epoch = parse_edge_metadata_delta_key(&key)?;
+            saw_delta = true;
+            if epoch > read_epoch {
+                break;
+            }
+            latest = Some(decode_edge_metadata(&key, &kv.value)?);
+        }
+        if let Some(metadata) = latest {
+            return Ok(metadata);
+        }
+        if saw_delta {
+            return Ok(EdgeMetadata::default());
+        }
+        let key = keys::edge_metadata(cell_id, edge_type, src, dst);
+        match self.read_remote(&key).await? {
+            Some(value) => decode_edge_metadata(&key, &value),
+            None => Ok(EdgeMetadata::default()),
+        }
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn scan_edge_property_index_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        property: &str,
+        value: &VertexPropertyValue,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<(VertexId, VertexId)>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        validate_component("property", property)?;
+        let encoded = encode_vertex_property_value_key(value);
+        let mut iter = self
+            .scan_remote_prefix(&keys::edge_property_index_delta_prefix(
+                cell_id, edge_type, property, &encoded,
+            ))
+            .await?;
+        let mut latest = BTreeMap::<(VertexId, VertexId), bool>::new();
+        let mut saw_delta = false;
+        while let Some(kv) = iter.next().await? {
+            budget.check("cypher_edge_property_index")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (epoch, src, dst) = parse_edge_property_index_delta_key(&key)?;
+            saw_delta = true;
+            if epoch > read_epoch {
+                break;
+            }
+            latest.insert((src, dst), decode_vertex_index_delta(&key, &kv.value)?);
+            self.ensure_query_index_candidates(
+                "cypher_edge_property_index_candidates",
+                latest.len(),
+            )?;
+        }
+        if saw_delta {
+            return Ok(latest
+                .into_iter()
+                .filter_map(|(edge, present)| present.then_some(edge))
+                .collect());
+        }
+        self.scan_edge_property_index_current(cell_id, edge_type, property, &encoded, budget)
+            .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn scan_edge_property_index_current(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        property: &str,
+        encoded: &str,
+        budget: &QueryBudget,
+    ) -> Result<Vec<(VertexId, VertexId)>> {
+        let mut iter = self
+            .scan_remote_prefix(&keys::edge_property_index_prefix(
+                cell_id, edge_type, property, encoded,
+            ))
+            .await?;
+        let mut edges = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            budget.check("cypher_edge_property_index")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (_cell_id, _edge_type, _property, _encoded, src, dst) =
+                parse_edge_property_index_key(&key)?;
+            edges.push((src, dst));
+            self.ensure_query_index_candidates(
+                "cypher_edge_property_index_candidates",
+                edges.len(),
+            )?;
+        }
+        Ok(edges)
     }
 
     #[cfg(feature = "opencypher")]
@@ -1177,6 +1676,41 @@ impl GraphShard {
             };
             row.metadata.insert(binding, metadata);
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn hydrate_row_relationship_metadata(
+        &self,
+        cell_id: &str,
+        read_epoch: GraphEpoch,
+        row: &mut BindingRow,
+        pattern: &RowEdgePattern,
+        cache: &mut BTreeMap<BoundRelationship, EdgeMetadata>,
+        budget: &QueryBudget,
+    ) -> Result<()> {
+        if pattern.binding.is_none() && pattern.properties.is_empty() {
+            return Ok(());
+        }
+        let relationship = relationship_identity_for_pattern(row, pattern)?;
+        budget.check("cypher_relationship_metadata_hydration")?;
+        let metadata = match cache.get(&relationship) {
+            Some(metadata) => metadata.clone(),
+            None => {
+                let metadata = self
+                    .edge_metadata_at(
+                        cell_id,
+                        &relationship.edge_type,
+                        relationship.src,
+                        relationship.dst,
+                        read_epoch,
+                    )
+                    .await?;
+                cache.insert(relationship.clone(), metadata.clone());
+                metadata
+            }
+        };
+        row.relationship_metadata.insert(relationship, metadata);
         Ok(())
     }
 
@@ -1969,6 +2503,7 @@ struct EdgeRowMatchState<'a> {
     read_epoch: GraphEpoch,
     rows: &'a mut Vec<BindingRow>,
     metadata_cache: &'a mut BTreeMap<VertexId, VertexMetadata>,
+    edge_metadata_cache: &'a mut BTreeMap<BoundRelationship, EdgeMetadata>,
     budget: &'a QueryBudget,
 }
 
@@ -1978,6 +2513,8 @@ struct VertexMutationApplyState<'a> {
     read_epoch: GraphEpoch,
     pending_metadata: &'a mut BTreeMap<VertexId, VertexMetadata>,
     original_metadata: &'a mut BTreeMap<VertexId, VertexMetadata>,
+    pending_edge_metadata: &'a mut BTreeMap<BoundRelationship, EdgeMetadata>,
+    original_edge_metadata: &'a mut BTreeMap<BoundRelationship, EdgeMetadata>,
     budget: &'a QueryBudget,
 }
 
@@ -2005,6 +2542,20 @@ fn parse_vertex_delta_key(key: &str) -> Result<GraphEpoch> {
         _ => Err(GraphError::CorruptValue {
             key: key.to_string(),
             reason: "expected vertex metadata delta key".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn parse_edge_metadata_delta_key(key: &str) -> Result<GraphEpoch> {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", _cell_id, "emeta_delta", _edge_type, _src, _dst, epoch] => {
+            parse_u64(key, epoch, "edge_metadata_epoch")
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected edge metadata delta key".to_string(),
         }),
     }
 }
@@ -2040,10 +2591,52 @@ fn parse_vertex_property_index_delta_key(key: &str) -> Result<(GraphEpoch, Verte
 }
 
 #[cfg(feature = "opencypher")]
+fn parse_edge_property_index_key(
+    key: &str,
+) -> Result<(String, String, String, String, VertexId, VertexId)> {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", cell_id, "eprop_idx", edge_type, property, encoded, src, dst] => Ok((
+            (*cell_id).to_string(),
+            (*edge_type).to_string(),
+            (*property).to_string(),
+            (*encoded).to_string(),
+            parse_u64(key, src, "src")?,
+            parse_u64(key, dst, "dst")?,
+        )),
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected edge property index key".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn parse_edge_property_index_delta_key(key: &str) -> Result<(GraphEpoch, VertexId, VertexId)> {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", _cell_id, "eprop_delta", _edge_type, _property, _encoded, epoch, src, dst] => {
+            Ok((
+                parse_u64(key, epoch, "edge_property_epoch")?,
+                parse_u64(key, src, "src")?,
+                parse_u64(key, dst, "dst")?,
+            ))
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected edge property index delta key".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct BindingRow {
     values: BTreeMap<String, VertexId>,
+    null_values: BTreeSet<String>,
     relationships: BTreeMap<String, BoundRelationship>,
+    null_relationships: BTreeSet<String>,
+    relationship_metadata: BTreeMap<BoundRelationship, EdgeMetadata>,
     metadata: BTreeMap<String, VertexMetadata>,
 }
 
@@ -2067,22 +2660,22 @@ impl BindingRow {
 
     fn from_edge(pattern: &RowEdgePattern, src: VertexId, dst: VertexId) -> Option<Self> {
         let mut row = Self::default();
+        let relationship = BoundRelationship {
+            edge_type: pattern.edge_type.clone(),
+            src,
+            dst,
+        };
         if !row.bind(pattern.src.binding.as_deref(), src) {
             return None;
         }
         if !row.bind(pattern.dst.binding.as_deref(), dst) {
             return None;
         }
-        if !row.bind_relationship(
-            pattern.binding.as_deref(),
-            BoundRelationship {
-                edge_type: pattern.edge_type.clone(),
-                src,
-                dst,
-            },
-        ) {
+        if !row.bind_relationship(pattern.binding.as_deref(), relationship.clone()) {
             return None;
         }
+        row.relationship_metadata
+            .insert(relationship, EdgeMetadata::default());
         Some(row)
     }
 
@@ -2090,6 +2683,9 @@ impl BindingRow {
         let Some(binding) = binding else {
             return true;
         };
+        if self.null_values.contains(binding) {
+            return false;
+        }
         match self.values.get(binding) {
             Some(existing) => *existing == value,
             None => {
@@ -2103,6 +2699,9 @@ impl BindingRow {
         let Some(binding) = binding else {
             return true;
         };
+        if self.null_relationships.contains(binding) {
+            return false;
+        }
         match self.relationships.get(binding) {
             Some(existing) => *existing == value,
             None => {
@@ -2113,6 +2712,12 @@ impl BindingRow {
     }
 
     fn get(&self, binding: &str) -> Result<VertexId> {
+        if self.null_values.contains(binding) {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: format!("variable {binding} is null"),
+            });
+        }
         self.values
             .get(binding)
             .copied()
@@ -2122,12 +2727,61 @@ impl BindingRow {
             })
     }
 
+    fn get_optional(&self, binding: &str) -> Result<Option<VertexId>> {
+        if self.null_values.contains(binding) {
+            return Ok(None);
+        }
+        self.values
+            .get(binding)
+            .copied()
+            .map(Some)
+            .ok_or_else(|| GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: format!("unbound variable {binding}"),
+            })
+    }
+
+    fn mark_optional_group_nulls(&mut self, group: &RowMatchGroup) {
+        for pattern in &group.patterns {
+            self.mark_optional_pattern_nulls(pattern);
+        }
+    }
+
+    fn mark_optional_pattern_nulls(&mut self, pattern: &RowPattern) {
+        match pattern {
+            RowPattern::Node(node) => self.mark_optional_node_nulls(node),
+            RowPattern::Edge(edge) => {
+                if let Some(binding) = &edge.binding {
+                    if !self.relationships.contains_key(binding) {
+                        self.null_relationships.insert(binding.clone());
+                    }
+                }
+                self.mark_optional_node_nulls(&edge.src);
+                self.mark_optional_node_nulls(&edge.dst);
+            }
+        }
+    }
+
+    fn mark_optional_node_nulls(&mut self, node: &RowNodePattern) {
+        if let Some(binding) = &node.binding {
+            if !self.values.contains_key(binding) {
+                self.null_values.insert(binding.clone());
+            }
+        }
+    }
+
     fn join(&self, other: &Self) -> Option<Self> {
         let mut joined = self.clone();
         for (binding, value) in &other.values {
             if !joined.bind(Some(binding), *value) {
                 return None;
             }
+        }
+        for binding in &other.null_values {
+            if joined.values.contains_key(binding) {
+                return None;
+            }
+            joined.null_values.insert(binding.clone());
         }
         for (binding, metadata) in &other.metadata {
             match joined.metadata.get(binding) {
@@ -2146,6 +2800,28 @@ impl BindingRow {
                     joined
                         .relationships
                         .insert(binding.clone(), relationship.clone());
+                }
+            }
+        }
+        for binding in &other.null_relationships {
+            if joined.relationships.contains_key(binding) {
+                return None;
+            }
+            joined.null_relationships.insert(binding.clone());
+        }
+        for (relationship, metadata) in &other.relationship_metadata {
+            match joined.relationship_metadata.get(relationship) {
+                Some(existing) if existing.properties.is_empty() => {
+                    joined
+                        .relationship_metadata
+                        .insert(relationship.clone(), metadata.clone());
+                }
+                Some(existing) if metadata.properties.is_empty() || existing == metadata => {}
+                Some(_) => return None,
+                None => {
+                    joined
+                        .relationship_metadata
+                        .insert(relationship.clone(), metadata.clone());
                 }
             }
         }
@@ -2187,6 +2863,11 @@ fn constrain_row_pattern(pattern: &RowPattern, row: &BindingRow) -> Result<Optio
             RowPattern::Node(node)
         }
         RowPattern::Edge(edge) => {
+            if let Some(binding) = &edge.binding {
+                if row.null_relationships.contains(binding) {
+                    return Ok(None);
+                }
+            }
             let Some(src) = constrain_row_node_pattern(&edge.src, row)? else {
                 return Ok(None);
             };
@@ -2198,6 +2879,7 @@ fn constrain_row_pattern(pattern: &RowPattern, row: &BindingRow) -> Result<Optio
                 edge_type: edge.edge_type.clone(),
                 src,
                 dst,
+                properties: edge.properties.clone(),
                 hop_range: edge.hop_range,
             })
         }
@@ -2212,6 +2894,9 @@ fn constrain_row_node_pattern(
     let Some(binding) = &node.binding else {
         return Ok(Some(node.clone()));
     };
+    if row.null_values.contains(binding) {
+        return Ok(None);
+    }
     let Some(bound_id) = row.values.get(binding).copied() else {
         return Ok(Some(node.clone()));
     };
@@ -2230,7 +2915,65 @@ fn constrain_row_node_pattern(
 
 #[cfg(feature = "opencypher")]
 fn row_matches_edge_pattern(row: &BindingRow, pattern: &RowEdgePattern) -> Result<bool> {
-    Ok(row_matches_node(row, &pattern.src)? && row_matches_node(row, &pattern.dst)?)
+    if !(row_matches_node(row, &pattern.src)? && row_matches_node(row, &pattern.dst)?) {
+        return Ok(false);
+    }
+    if pattern.properties.is_empty() {
+        return Ok(true);
+    }
+    let relationship = relationship_identity_for_pattern(row, pattern)?;
+    let Some(metadata) = row.relationship_metadata.get(&relationship) else {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: "relationship metadata was not hydrated".to_string(),
+        });
+    };
+    Ok(pattern
+        .properties
+        .iter()
+        .all(|(property, value)| metadata.properties.get(property) == Some(value)))
+}
+
+#[cfg(feature = "opencypher")]
+fn relationship_identity_for_pattern(
+    row: &BindingRow,
+    pattern: &RowEdgePattern,
+) -> Result<BoundRelationship> {
+    if let Some(binding) = &pattern.binding {
+        return row.relationships.get(binding).cloned().ok_or_else(|| {
+            GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: format!("unbound relationship {binding}"),
+            }
+        });
+    }
+    if let (Some(src_binding), Some(dst_binding)) = (
+        pattern.src.binding.as_deref(),
+        pattern.dst.binding.as_deref(),
+    ) {
+        return Ok(BoundRelationship {
+            edge_type: pattern.edge_type.clone(),
+            src: row.get(src_binding)?,
+            dst: row.get(dst_binding)?,
+        });
+    }
+    let mut matches = row
+        .relationship_metadata
+        .keys()
+        .filter(|relationship| relationship.edge_type == pattern.edge_type);
+    let Some(relationship) = matches.next().cloned() else {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: "relationship pattern has no bound identity".to_string(),
+        });
+    };
+    if matches.next().is_some() {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: "anonymous relationship property pattern is ambiguous".to_string(),
+        });
+    }
+    Ok(relationship)
 }
 
 #[cfg(feature = "opencypher")]
@@ -2238,6 +2981,9 @@ fn row_matches_node(row: &BindingRow, node: &RowNodePattern) -> Result<bool> {
     let Some(binding) = &node.binding else {
         return Ok(true);
     };
+    if row.null_values.contains(binding) {
+        return Ok(false);
+    }
     if matches!(node.id, Some(id) if row.get(binding)? != id) {
         return Ok(false);
     }
@@ -2291,9 +3037,10 @@ fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<b
 #[cfg(feature = "opencypher")]
 fn eval_row_expression(row: &BindingRow, expression: &RowExpression) -> Result<RowScalarValue> {
     match expression {
-        RowExpression::NodeId { binding } => Ok(RowScalarValue::Value(
-            VertexPropertyValue::Integer(row.get(binding)?),
-        )),
+        RowExpression::NodeId { binding } => match row.get_optional(binding)? {
+            Some(value) => Ok(RowScalarValue::Value(VertexPropertyValue::Integer(value))),
+            None => Ok(RowScalarValue::Missing),
+        },
         RowExpression::Property { binding, property } => {
             Ok(match binding_property(row, binding, property)? {
                 Some(value) => RowScalarValue::Value(value),
@@ -2363,8 +3110,26 @@ fn binding_property(
     binding: &str,
     property: &str,
 ) -> Result<Option<VertexPropertyValue>> {
-    if property == "id" {
+    if row.null_values.contains(binding) || row.null_relationships.contains(binding) {
+        return Ok(None);
+    }
+    if row.values.contains_key(binding) && property == "id" {
         return Ok(Some(VertexPropertyValue::Integer(row.get(binding)?)));
+    }
+    if let Some(relationship) = row.relationships.get(binding) {
+        if property == "id" {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "relationship id properties are not executable in Phase 2".to_string(),
+            });
+        }
+        let Some(metadata) = row.relationship_metadata.get(relationship) else {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: format!("metadata for relationship {binding} was not hydrated"),
+            });
+        };
+        return Ok(metadata.properties.get(property).cloned());
     }
     let Some(metadata) = row.metadata.get(binding) else {
         return Err(GraphError::UnsupportedQuery {
@@ -2381,16 +3146,16 @@ fn project_binding_row(row: &BindingRow, projections: &[RowProjection]) -> Resul
     for projection in projections {
         match projection {
             RowProjection::NodeId { binding } => {
-                values.push(QueryValue::VertexId(row.get(binding)?));
+                values.push(match row.get_optional(binding)? {
+                    Some(value) => QueryValue::VertexId(value),
+                    None => QueryValue::Null,
+                });
             }
             RowProjection::Property { binding, property } => {
-                let value = binding_property(row, binding, property)?.ok_or_else(|| {
-                    GraphError::UnsupportedQuery {
-                        dialect: "OpenCypher",
-                        feature: format!("property {binding}.{property} is missing"),
-                    }
-                })?;
-                values.push(QueryValue::Property(value));
+                values.push(match binding_property(row, binding, property)? {
+                    Some(value) => QueryValue::Property(value),
+                    None => QueryValue::Null,
+                });
             }
             RowProjection::CountAll | RowProjection::Aggregate { .. } => {
                 return Err(GraphError::UnsupportedQuery {
@@ -2630,15 +3395,15 @@ fn project_single_binding_value(
     projection: &RowProjection,
 ) -> Result<QueryValue> {
     match projection {
-        RowProjection::NodeId { binding } => Ok(QueryValue::VertexId(row.get(binding)?)),
+        RowProjection::NodeId { binding } => Ok(match row.get_optional(binding)? {
+            Some(value) => QueryValue::VertexId(value),
+            None => QueryValue::Null,
+        }),
         RowProjection::Property { binding, property } => {
-            let value = binding_property(row, binding, property)?.ok_or_else(|| {
-                GraphError::UnsupportedQuery {
-                    dialect: "OpenCypher",
-                    feature: format!("property {binding}.{property} is missing"),
-                }
-            })?;
-            Ok(QueryValue::Property(value))
+            Ok(match binding_property(row, binding, property)? {
+                Some(value) => QueryValue::Property(value),
+                None => QueryValue::Null,
+            })
         }
         RowProjection::CountAll | RowProjection::Aggregate { .. } => {
             Err(GraphError::UnsupportedQuery {
@@ -2655,7 +3420,7 @@ fn expression_query_value(
     expression: &RowExpression,
 ) -> Result<Option<QueryValue>> {
     Ok(match expression {
-        RowExpression::NodeId { binding } => Some(QueryValue::VertexId(row.get(binding)?)),
+        RowExpression::NodeId { binding } => row.get_optional(binding)?.map(QueryValue::VertexId),
         RowExpression::Property { binding, property } => {
             binding_property(row, binding, property)?.map(QueryValue::Property)
         }
@@ -2673,17 +3438,15 @@ fn sort_keys_for_row(
     let mut keys = Vec::with_capacity(order_by.len());
     for sort in order_by {
         keys.push(match &sort.expression {
-            RowSortExpression::NodeId { binding } => {
-                QueryValue::VertexId(binding_row.get(binding)?)
-            }
+            RowSortExpression::NodeId { binding } => match binding_row.get_optional(binding)? {
+                Some(value) => QueryValue::VertexId(value),
+                None => QueryValue::Null,
+            },
             RowSortExpression::Property { binding, property } => {
-                let value = binding_property(binding_row, binding, property)?.ok_or_else(|| {
-                    GraphError::UnsupportedQuery {
-                        dialect: "OpenCypher",
-                        feature: format!("ORDER BY property {binding}.{property} is missing"),
-                    }
-                })?;
-                QueryValue::Property(value)
+                match binding_property(binding_row, binding, property)? {
+                    Some(value) => QueryValue::Property(value),
+                    None => QueryValue::Null,
+                }
             }
             RowSortExpression::Column { name } => projected_column_value(row, columns, name)?,
             RowSortExpression::CountAll => {

@@ -94,6 +94,30 @@ pub fn in_prefix(cell_id: &str, edge_type: &str, dst: VertexId) -> String {
     format!("cell/{cell_id}/e/in/{edge_type}/{dst:020}/")
 }
 
+pub fn edge_metadata(cell_id: &str, edge_type: &str, src: VertexId, dst: VertexId) -> String {
+    format!("cell/{cell_id}/emeta/{edge_type}/{src:020}/{dst:020}")
+}
+
+pub fn edge_metadata_delta(
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+    epoch: GraphEpoch,
+) -> String {
+    format!("cell/{cell_id}/emeta_delta/{edge_type}/{src:020}/{dst:020}/{epoch:020}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn edge_metadata_delta_prefix(
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+) -> String {
+    format!("cell/{cell_id}/emeta_delta/{edge_type}/{src:020}/{dst:020}/")
+}
+
 pub fn degree_out_prefix(cell_id: &str, edge_type: &str) -> String {
     format!("cell/{cell_id}/cnt/out/{edge_type}/")
 }
@@ -229,6 +253,51 @@ pub fn vertex_property_index_delta_prefix(
     encoded_value: &str,
 ) -> String {
     format!("cell/{cell_id}/vprop_delta/{property}/{encoded_value}/")
+}
+
+pub fn edge_property_index(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+    encoded_value: &str,
+    src: VertexId,
+    dst: VertexId,
+) -> String {
+    format!("cell/{cell_id}/eprop_idx/{edge_type}/{property}/{encoded_value}/{src:020}/{dst:020}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn edge_property_index_prefix(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+    encoded_value: &str,
+) -> String {
+    format!("cell/{cell_id}/eprop_idx/{edge_type}/{property}/{encoded_value}/")
+}
+
+pub fn edge_property_index_delta(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+    encoded_value: &str,
+    epoch: GraphEpoch,
+    src: VertexId,
+    dst: VertexId,
+) -> String {
+    format!(
+        "cell/{cell_id}/eprop_delta/{edge_type}/{property}/{encoded_value}/{epoch:020}/{src:020}/{dst:020}"
+    )
+}
+
+#[cfg(feature = "opencypher")]
+pub fn edge_property_index_delta_prefix(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+    encoded_value: &str,
+) -> String {
+    format!("cell/{cell_id}/eprop_delta/{edge_type}/{property}/{encoded_value}/")
 }
 
 #[cfg(test)]
