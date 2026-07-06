@@ -82,10 +82,32 @@ impl GraphShard {
     ) -> Result<QueryResultPage> {
         #[cfg(feature = "opencypher")]
         {
-            let mut parsed =
-                parse_opencypher_row_query_with_parameters(query, &context.parameters)?;
+            let parsed = parse_opencypher_row_query_with_parameters(query, &context.parameters)?;
             let context = merge_opencypher_window(context, parsed.window)?;
             let cursor_offset = cursor.map_or(0, |cursor| cursor.offset);
+
+            let started = std::time::Instant::now();
+            match self
+                .try_execute_streaming_opencypher_rows_page(
+                    &context,
+                    &parsed,
+                    cursor_offset,
+                    page_size,
+                )
+                .await
+            {
+                Ok(Some(page)) => {
+                    self.record_streaming_query_rows_success(page.rows.len(), started);
+                    return Ok(page);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    self.record_streaming_query_rows_failure(started);
+                    return Err(err);
+                }
+            }
+
+            let mut parsed = parsed;
             let context = self.query_page_context(context, cursor_offset, page_size)?;
             parsed.window = QueryWindow::default();
             let mut result_set = self.execute_parsed_opencypher_rows(context, parsed).await?;
@@ -201,20 +223,7 @@ impl GraphShard {
         validate_component("cell_id", &context.cell_id)?;
         let budget = QueryBudget::new(context.max_runtime_ms.or(self.limits.max_query_runtime_ms));
         budget.check("cypher_rows")?;
-        let read_epoch = match context.read_epoch {
-            Some(read_epoch) => {
-                let current_epoch = self.current_epoch(&context.cell_id).await?;
-                if read_epoch > current_epoch {
-                    return Err(GraphError::SnapshotAhead {
-                        cell_id: context.cell_id.clone(),
-                        read_epoch,
-                        current_epoch,
-                    });
-                }
-                read_epoch
-            }
-            None => self.current_epoch(&context.cell_id).await?,
-        };
+        let read_epoch = self.query_read_epoch(&context).await?;
 
         if !query.union_arms.is_empty() {
             return self
@@ -886,6 +895,24 @@ impl GraphShard {
             }
         }
         Ok(())
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn query_read_epoch(&self, context: &QueryContext) -> Result<GraphEpoch> {
+        match context.read_epoch {
+            Some(read_epoch) => {
+                let current_epoch = self.current_epoch(&context.cell_id).await?;
+                if read_epoch > current_epoch {
+                    return Err(GraphError::SnapshotAhead {
+                        cell_id: context.cell_id.clone(),
+                        read_epoch,
+                        current_epoch,
+                    });
+                }
+                Ok(read_epoch)
+            }
+            None => self.current_epoch(&context.cell_id).await,
+        }
     }
 
     #[cfg(feature = "opencypher")]
@@ -1870,6 +1897,110 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
+    async fn try_execute_streaming_opencypher_rows_page(
+        &self,
+        context: &QueryContext,
+        query: &ParsedRowQuery,
+        cursor_offset: u64,
+        page_size: usize,
+    ) -> Result<Option<QueryResultPage>> {
+        let Some(edge) = streaming_neighbor_page_edge(query) else {
+            return Ok(None);
+        };
+        if !streaming_neighbor_order_supported(
+            edge,
+            &query.projections,
+            &query.columns,
+            &query.order_by,
+        ) {
+            return Ok(None);
+        }
+
+        let page_context = self.query_page_context(context.clone(), cursor_offset, page_size)?;
+        let page_window = page_context.result_window;
+        if page_window.limit == Some(0) {
+            return Ok(Some(QueryResultPage::new(
+                query.columns.clone(),
+                Vec::new(),
+                None,
+            )));
+        }
+
+        let read_epoch = self.query_read_epoch(context).await?;
+        let src = edge.src.id.expect("streaming edge has fixed source");
+        let mut vertices = self
+            .out_neighbors_window_at(
+                &context.cell_id,
+                &edge.edge_type,
+                src,
+                read_epoch,
+                page_window,
+            )
+            .await?;
+        let has_next = vertices.len() > page_size;
+        vertices.truncate(page_size);
+
+        let mut rows = Vec::with_capacity(vertices.len());
+        for dst in vertices {
+            rows.push(QueryRow::new(streaming_neighbor_projection_values(
+                edge,
+                src,
+                dst,
+                &query.projections,
+            )?));
+        }
+        let next_cursor = if has_next {
+            Some(QueryCursorToken::new(
+                cursor_offset
+                    .checked_add(u64::try_from(page_size).unwrap_or(u64::MAX))
+                    .ok_or(GraphError::AdmissionRejected {
+                        operation: "query_cursor_offset",
+                        actual: u64::MAX,
+                        limit: u64::MAX - 1,
+                    })?,
+            ))
+        } else {
+            None
+        };
+        Ok(Some(QueryResultPage::new(
+            query.columns.clone(),
+            rows,
+            next_cursor,
+        )))
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn record_streaming_query_rows_success(&self, row_count: usize, started: std::time::Instant) {
+        self.operation_metrics
+            .query_rows_started
+            .fetch_add(1, Ordering::Relaxed);
+        self.operation_metrics
+            .query_rows_completed
+            .fetch_add(1, Ordering::Relaxed);
+        self.operation_metrics
+            .query_rows_returned
+            .fetch_add(row_count as u64, Ordering::Relaxed);
+        let elapsed_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
+        self.operation_metrics
+            .query_rows_duration_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn record_streaming_query_rows_failure(&self, started: std::time::Instant) {
+        self.operation_metrics
+            .query_rows_started
+            .fetch_add(1, Ordering::Relaxed);
+        self.operation_metrics
+            .query_rows_failed
+            .fetch_add(1, Ordering::Relaxed);
+        let elapsed_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
+        self.operation_metrics
+            .query_rows_duration_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "opencypher")]
     fn query_page_context(
         &self,
         context: QueryContext,
@@ -2709,6 +2840,127 @@ fn estimate_row_edge_pattern_cost(edge: &RowEdgePattern) -> u64 {
     endpoint_cost
         .min(relationship_property_cost)
         .saturating_add(4)
+}
+
+#[cfg(feature = "opencypher")]
+fn streaming_neighbor_page_edge(query: &ParsedRowQuery) -> Option<&RowEdgePattern> {
+    if !query.union_arms.is_empty()
+        || query.predicate.is_some()
+        || row_projections_have_aggregates(&query.projections)
+        || query.pattern_groups.len() != 1
+    {
+        return None;
+    }
+    let group = query.pattern_groups.first()?;
+    if group.optional || group.predicate.is_some() || group.patterns.len() != 1 {
+        return None;
+    }
+    let RowPattern::Edge(edge) = group.patterns.first()? else {
+        return None;
+    };
+    if edge.hop_range.is_some()
+        || !edge.properties.is_empty()
+        || edge.src.id.is_none()
+        || edge.dst.id.is_some()
+        || !edge.src.labels.is_empty()
+        || !row_node_has_only_id_property(&edge.src)
+        || !edge.dst.labels.is_empty()
+        || !edge.dst.properties.is_empty()
+    {
+        return None;
+    }
+    if !query
+        .projections
+        .iter()
+        .all(|projection| streaming_neighbor_projection_supported(edge, projection))
+    {
+        return None;
+    }
+    Some(edge)
+}
+
+#[cfg(feature = "opencypher")]
+fn row_node_has_only_id_property(node: &RowNodePattern) -> bool {
+    node.properties.keys().all(|property| property == "id")
+}
+
+#[cfg(feature = "opencypher")]
+fn streaming_neighbor_projection_supported(
+    edge: &RowEdgePattern,
+    projection: &RowProjection,
+) -> bool {
+    let RowProjection::NodeId { binding } = projection else {
+        return false;
+    };
+    edge.src.binding.as_deref() == Some(binding.as_str())
+        || edge.dst.binding.as_deref() == Some(binding.as_str())
+}
+
+#[cfg(feature = "opencypher")]
+fn streaming_neighbor_order_supported(
+    edge: &RowEdgePattern,
+    projections: &[RowProjection],
+    columns: &[QueryColumn],
+    order_by: &[RowSort],
+) -> bool {
+    if order_by.is_empty() {
+        return true;
+    }
+    let [sort] = order_by else {
+        return false;
+    };
+    if !sort.ascending {
+        return false;
+    }
+    match &sort.expression {
+        RowSortExpression::NodeId { binding } => {
+            edge.dst.binding.as_deref() == Some(binding.as_str())
+        }
+        RowSortExpression::Column { name } => match columns
+            .iter()
+            .position(|column| column.name == *name)
+            .and_then(|idx| projections.get(idx))
+        {
+            Some(projection) => {
+                matches!(
+                    projection,
+                    RowProjection::NodeId { binding }
+                        if edge.dst.binding.as_deref() == Some(binding.as_str())
+                )
+            }
+            None => false,
+        },
+        RowSortExpression::Property { .. } | RowSortExpression::CountAll => false,
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn streaming_neighbor_projection_values(
+    edge: &RowEdgePattern,
+    src: VertexId,
+    dst: VertexId,
+    projections: &[RowProjection],
+) -> Result<Vec<QueryValue>> {
+    let mut values = Vec::with_capacity(projections.len());
+    for projection in projections {
+        let RowProjection::NodeId { binding } = projection else {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "streaming neighbor page supports only node-id projections".to_string(),
+            });
+        };
+        if edge.src.binding.as_deref() == Some(binding.as_str()) {
+            values.push(QueryValue::VertexId(src));
+        } else if edge.dst.binding.as_deref() == Some(binding.as_str()) {
+            values.push(QueryValue::VertexId(dst));
+        } else {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: format!("streaming neighbor page cannot project unbound {binding}"),
+            });
+        }
+    }
+    Ok(values)
 }
 
 #[cfg(feature = "opencypher")]

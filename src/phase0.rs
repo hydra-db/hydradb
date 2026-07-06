@@ -291,9 +291,16 @@ mod artifact_build;
 mod cluster;
 mod control_metadata;
 mod control_plane;
+#[cfg(feature = "opencypher")]
+mod query_coordination;
 mod supernode;
 mod traversal;
 mod verify;
+
+#[cfg(feature = "opencypher")]
+pub use query_coordination::{
+    DistributedQueryCoordinator, DistributedQueryPageRequest, QueryCellClient,
+};
 
 pub use control_metadata::{
     GraphControlEdgeWatermark, GraphControlIdempotencyRecord, GraphControlRepairReport,

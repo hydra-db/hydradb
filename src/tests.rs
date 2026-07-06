@@ -5639,6 +5639,136 @@ async fn routed_cluster_executes_row_queries_across_local_cells() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn distributed_query_coordinator_routes_to_remote_cell_clients() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open(
+        "graph-control/query-distributed-coordinator",
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    let placement =
+        ShardPlacement::fixed([("reddit-home", "node-a"), ("reddit-popular", "node-b")]).unwrap();
+    control.publish_placement(&placement).await.unwrap();
+
+    let cluster_a = Arc::new(
+        RoutedPhase0Cluster::open_owned_with_control(
+            "phase2-query-distributed-coordinator",
+            "node-a",
+            &control,
+            Arc::clone(&object_store),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap(),
+    );
+    let cluster_b = Arc::new(
+        RoutedPhase0Cluster::open_owned_with_control(
+            "phase2-query-distributed-coordinator",
+            "node-b",
+            &control,
+            Arc::clone(&object_store),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap(),
+    );
+
+    cluster_a
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 10,
+            idempotency_key: "query-distributed-home".to_string(),
+        })
+        .await
+        .unwrap();
+    cluster_b
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-popular".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 20,
+            idempotency_key: "query-distributed-popular".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let client_a: Arc<dyn QueryCellClient> = cluster_a.clone();
+    let client_b: Arc<dyn QueryCellClient> = cluster_b.clone();
+    let coordinator = DistributedQueryCoordinator::new(placement)
+        .with_client("node-a", client_a)
+        .unwrap()
+        .with_client("node-b", client_b)
+        .unwrap();
+
+    let rows = coordinator
+        .execute_cypher_rows_many(
+            [
+                QueryContext::new("reddit-home", "query-distributed-home-read"),
+                QueryContext::new("reddit-popular", "query-distributed-popular-read"),
+            ],
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.get("reddit-home").unwrap(),
+        &QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(10)])],
+        )
+    );
+    assert_eq!(
+        rows.get("reddit-popular").unwrap(),
+        &QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(20)])],
+        )
+    );
+
+    let pages = coordinator
+        .execute_cypher_rows_pages(
+            [
+                DistributedQueryPageRequest::new(
+                    QueryContext::new("reddit-home", "query-distributed-home-page"),
+                    None,
+                ),
+                DistributedQueryPageRequest::new(
+                    QueryContext::new("reddit-popular", "query-distributed-popular-page"),
+                    None,
+                ),
+            ],
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pages.get("reddit-home").unwrap(),
+        &QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(10)])],
+            None,
+        )
+    );
+    assert_eq!(
+        pages.get("reddit-popular").unwrap(),
+        &QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(20)])],
+            None,
+        )
+    );
+
+    cluster_a.close().await.unwrap();
+    cluster_b.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_explain_uses_phase2_query_planner() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-explain-plan", object_store).await;
@@ -6159,6 +6289,92 @@ async fn cypher_rows_page_returns_bounded_cursor_pages() {
             ..
         }
     ));
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_rows_page_streams_bound_neighbor_windows_without_row_materialization() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-row-page-streaming",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_intermediate_rows: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for dst in 10..16 {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "USER_FOLLOWS_USER".to_string(),
+                src: 100,
+                dst,
+                idempotency_key: format!("cypher-row-page-streaming-{dst}"),
+            })
+            .await
+            .unwrap();
+    }
+    let base_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    shard
+        .build_supernode_groups("reddit-home", "USER_FOLLOWS_USER", base_epoch, 4, 2)
+        .await
+        .unwrap();
+
+    let first = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "cypher-row-page-streaming-first"),
+            "MATCH (u {id: 100})-[:USER_FOLLOWS_USER]->(v) \
+             RETURN v.id ORDER BY v.id",
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(10)]),
+                QueryRow::new(vec![QueryValue::VertexId(11)]),
+            ],
+            Some(QueryCursorToken::new(2)),
+        )
+    );
+
+    let second = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "cypher-row-page-streaming-second"),
+            "MATCH (u {id: 100})-[:USER_FOLLOWS_USER]->(v) \
+             RETURN v.id ORDER BY v.id",
+            first.next_cursor,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second,
+        QueryResultPage::new(
+            vec![QueryColumn::new("v.id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(12)]),
+                QueryRow::new(vec![QueryValue::VertexId(13)]),
+            ],
+            Some(QueryCursorToken::new(4)),
+        )
+    );
+
+    let metrics = shard.graph_operational_metrics();
+    assert_eq!(metrics.query_rows_started, 2);
+    assert_eq!(metrics.query_rows_completed, 2);
+    assert_eq!(metrics.query_rows_returned, 4);
 }
 
 #[cfg(feature = "opencypher")]
@@ -6998,6 +7214,198 @@ async fn cypher_union_merges_row_query_arms_with_distinct_or_all_semantics() {
             ],
         )
     );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_tck_style_row_corpus_covers_supported_clause_semantics() {
+    struct CorpusCase {
+        name: &'static str,
+        query: &'static str,
+        expected: QueryResultSet,
+    }
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-tck-style-corpus", object_store).await;
+
+    for (vertex, active, name) in [(1, true, "alice"), (2, true, "bob"), (3, false, "carol")] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex,
+                VertexMetadata::default()
+                    .with_label("User")
+                    .with_property("active", VertexPropertyValue::Bool(active))
+                    .with_property("name", VertexPropertyValue::String(name.to_string())),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            2,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_label("Moderator")
+                .with_property("active", VertexPropertyValue::Bool(true))
+                .with_property("name", VertexPropertyValue::String("bob".to_string())),
+        )
+        .await
+        .unwrap();
+    for (idx, (edge_type, src, dst)) in [
+        ("FOLLOWS", 1, 2),
+        ("FOLLOWS", 1, 3),
+        ("FOLLOWS", 2, 3),
+        ("POSTED", 2, 100),
+        ("POSTED", 2, 101),
+        ("POSTED", 3, 102),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-tck-style-corpus-edge-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+    for (post, score) in [(100, 5), (101, 7), (102, 11)] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                post,
+                VertexMetadata::default()
+                    .with_label("Post")
+                    .with_property("score", VertexPropertyValue::Integer(score)),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .set_edge_metadata(
+            "reddit-home",
+            "FOLLOWS",
+            1,
+            2,
+            EdgeMetadata::default()
+                .with_property("since", VertexPropertyValue::Integer(2020))
+                .with_property("close", VertexPropertyValue::Bool(true)),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_edge_metadata(
+            "reddit-home",
+            "FOLLOWS",
+            1,
+            3,
+            EdgeMetadata::default().with_property("since", VertexPropertyValue::Integer(2021)),
+        )
+        .await
+        .unwrap();
+
+    let cases = vec![
+        CorpusCase {
+            name: "label-property-filter-order",
+            query: "MATCH (u:User {active: true}) RETURN u.name AS name ORDER BY name",
+            expected: QueryResultSet::new(
+                vec![QueryColumn::new("name")],
+                vec![
+                    QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                        "alice".to_string(),
+                    ))]),
+                    QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                        "bob".to_string(),
+                    ))]),
+                ],
+            ),
+        },
+        CorpusCase {
+            name: "optional-match-null-extension",
+            query: "MATCH (u:User) OPTIONAL MATCH (u)-[:POSTED]->(p) \
+                    RETURN u.id AS user, p.id AS post ORDER BY user, post",
+            expected: QueryResultSet::new(
+                vec![QueryColumn::new("user"), QueryColumn::new("post")],
+                vec![
+                    QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::Null]),
+                    QueryRow::new(vec![QueryValue::VertexId(2), QueryValue::VertexId(100)]),
+                    QueryRow::new(vec![QueryValue::VertexId(2), QueryValue::VertexId(101)]),
+                    QueryRow::new(vec![QueryValue::VertexId(3), QueryValue::VertexId(102)]),
+                ],
+            ),
+        },
+        CorpusCase {
+            name: "relationship-property-filter-project",
+            query: "MATCH (u)-[r:FOLLOWS {since: 2020}]->(v) \
+                    RETURN u.id AS user, v.id AS followed, r.close AS close",
+            expected: QueryResultSet::new(
+                vec![
+                    QueryColumn::new("user"),
+                    QueryColumn::new("followed"),
+                    QueryColumn::new("close"),
+                ],
+                vec![QueryRow::new(vec![
+                    QueryValue::VertexId(1),
+                    QueryValue::VertexId(2),
+                    QueryValue::Property(VertexPropertyValue::Bool(true)),
+                ])],
+            ),
+        },
+        CorpusCase {
+            name: "grouped-aggregate",
+            query: "MATCH (u)-[:POSTED]->(p:Post) \
+                    RETURN u.id AS user, count(*) AS posts, sum(p.score) AS score ORDER BY user",
+            expected: QueryResultSet::new(
+                vec![
+                    QueryColumn::new("user"),
+                    QueryColumn::new("posts"),
+                    QueryColumn::new("score"),
+                ],
+                vec![
+                    QueryRow::new(vec![
+                        QueryValue::VertexId(2),
+                        QueryValue::Count(2),
+                        QueryValue::Property(VertexPropertyValue::Integer(12)),
+                    ]),
+                    QueryRow::new(vec![
+                        QueryValue::VertexId(3),
+                        QueryValue::Count(1),
+                        QueryValue::Property(VertexPropertyValue::Integer(11)),
+                    ]),
+                ],
+            ),
+        },
+        CorpusCase {
+            name: "union-distinct",
+            query: "MATCH (u:User) RETURN u.id AS id \
+                    UNION MATCH (m:Moderator) RETURN m.id AS id",
+            expected: QueryResultSet::new(
+                vec![QueryColumn::new("id")],
+                vec![
+                    QueryRow::new(vec![QueryValue::VertexId(1)]),
+                    QueryRow::new(vec![QueryValue::VertexId(2)]),
+                    QueryRow::new(vec![QueryValue::VertexId(3)]),
+                ],
+            ),
+        },
+    ];
+
+    for case in cases {
+        let rows = shard
+            .execute_cypher_rows(
+                QueryContext::new("reddit-home", format!("cypher-tck-style-{}", case.name)),
+                case.query,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows, case.expected, "{}", case.name);
+    }
 }
 
 #[cfg(feature = "opencypher")]
