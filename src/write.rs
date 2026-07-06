@@ -485,16 +485,32 @@ impl Writer {
         let seq = result?;
 
         // Post-commit, best-effort, non-atomic (see module doc). A failure
-        // here does not un-commit the logical write above, and is safe to
-        // retry/ignore — the next touch of either key re-evaluates split from
-        // scratch.
-        let mut split_ops =
-            posting_ops::maybe_split(&self.storage, Direction::Out, src_uid, pred_id).await?;
-        split_ops.extend(
-            posting_ops::maybe_split(&self.storage, Direction::In, dst_uid, pred_id).await?,
-        );
-        if !split_ops.is_empty() {
-            self.storage.apply(split_ops).await?;
+        // here must not turn an already-committed logical write into a reported
+        // failure; the next touch of either key re-evaluates split from scratch.
+        let mut split_ops = Vec::new();
+        for (dir, anchor) in [(Direction::Out, src_uid), (Direction::In, dst_uid)] {
+            match posting_ops::maybe_split(&self.storage, dir, anchor, pred_id).await {
+                Ok(more_ops) => split_ops.extend(more_ops),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        anchor = anchor.get(),
+                        pred = pred_id.get(),
+                        "maybe_split check failed after an edge commit; the edge already \
+                         committed durably, only the deferred split reorganization is affected \
+                         and will be retried on the next touch of this posting"
+                    );
+                }
+            }
+        }
+        if !split_ops.is_empty()
+            && let Err(e) = self.storage.apply(split_ops).await
+        {
+            tracing::warn!(
+                error = %e,
+                "applying maybe_split ops failed after an edge commit; the edge already \
+                 committed durably"
+            );
         }
 
         Ok(seq)
@@ -860,17 +876,101 @@ fn decode_i64_le(bytes: &[u8], what: &str) -> Result<i64> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    use common::Storage;
-    use common::WriteResult;
+    use common::storage::StorageSnapshot;
     use common::storage::in_memory::FailingStorage;
     use common::storage::in_memory::InMemoryStorage;
+    use common::{
+        BytesRange, CheckpointInfo, MergeRecordOp, PutRecordOp, Storage, StorageError,
+        StorageIterator, StorageRead, StorageResult, WriteResult,
+    };
 
     fn props(pairs: &[(&str, TypedValue)]) -> BTreeMap<String, TypedValue> {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect()
+    }
+
+    struct FailFirstGetAfterApplyStorage {
+        inner: Arc<dyn Storage>,
+        fail_next_get: AtomicBool,
+    }
+
+    impl FailFirstGetAfterApplyStorage {
+        fn wrap(inner: Arc<dyn Storage>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                fail_next_get: AtomicBool::new(false),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageRead for FailFirstGetAfterApplyStorage {
+        async fn get(&self, key: Bytes) -> StorageResult<Option<Record>> {
+            if self.fail_next_get.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::Storage(
+                    "simulated post-commit split read failure".into(),
+                ));
+            }
+            self.inner.get(key).await
+        }
+
+        async fn scan_iter(
+            &self,
+            range: BytesRange,
+        ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+            self.inner.scan_iter(range).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for FailFirstGetAfterApplyStorage {
+        async fn apply_with_options(
+            &self,
+            ops: Vec<RecordOp>,
+            options: WriteOptions,
+        ) -> StorageResult<WriteResult> {
+            let result = self.inner.apply_with_options(ops, options).await;
+            if result.is_ok() {
+                self.fail_next_get.store(true, Ordering::SeqCst);
+            }
+            result
+        }
+
+        async fn put_with_options(
+            &self,
+            records: Vec<PutRecordOp>,
+            options: WriteOptions,
+        ) -> StorageResult<WriteResult> {
+            self.inner.put_with_options(records, options).await
+        }
+
+        async fn merge_with_options(
+            &self,
+            records: Vec<MergeRecordOp>,
+            options: WriteOptions,
+        ) -> StorageResult<WriteResult> {
+            self.inner.merge_with_options(records, options).await
+        }
+
+        async fn snapshot(&self) -> StorageResult<Arc<dyn StorageSnapshot>> {
+            self.inner.snapshot().await
+        }
+
+        async fn flush(&self) -> StorageResult<()> {
+            self.inner.flush().await
+        }
+
+        fn subscribe_durable(&self) -> tokio::sync::watch::Receiver<u64> {
+            self.inner.subscribe_durable()
+        }
+
+        async fn create_checkpoint(&self) -> StorageResult<CheckpointInfo> {
+            self.inner.create_checkpoint().await
+        }
     }
 
     // -- Basic upsert/read round trip -----------------------------------
@@ -990,6 +1090,37 @@ mod tests {
         assert_eq!(change.seq, token);
         assert_eq!(change.op, ChangeOp::UpsertEdge);
         assert_eq!(writer.latest_seq(), token);
+    }
+
+    #[tokio::test]
+    async fn should_return_committed_seq_when_post_commit_split_read_fails() {
+        let raw: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            crate::merge::GraphMergeOperator,
+        )));
+        let flaky = FailFirstGetAfterApplyStorage::wrap(raw);
+        let mut writer = Writer::from_storage(GraphStorage::from_storage(flaky))
+            .await
+            .unwrap();
+
+        let seq = writer
+            .upsert_edge(b"user:a", "knows", b"user:b")
+            .await
+            .expect("post-commit split read failure must not fail the committed edge write");
+
+        assert_eq!(seq, 1);
+        assert_eq!(writer.latest_seq(), 1);
+
+        let src = writer.lookup_uid(b"user:a").await.unwrap().unwrap();
+        let dst = writer.lookup_uid(b"user:b").await.unwrap().unwrap();
+        let pred = PredId(writer.schema_id(SchemaKind::Predicate, "knows").unwrap());
+        let out = writer.neighbors(src, pred, Direction::Out).await.unwrap();
+
+        assert!(
+            out.contains(dst.get()),
+            "the edge must be visible even though post-commit split maintenance failed"
+        );
+        assert_eq!(writer.degree(pred, Direction::Out, src).await.unwrap(), 1);
+        assert_eq!(writer.degree(pred, Direction::In, dst).await.unwrap(), 1);
     }
 
     // -- Workstream A: EdgeProp companion (valued/faceted edges) ---------
