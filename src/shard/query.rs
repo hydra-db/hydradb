@@ -578,7 +578,14 @@ impl GraphShard {
         for action in &query.actions {
             budget.check("cypher_mutation_action")?;
             match action {
-                RowMutationAction::DeleteRelationship { binding, detach: _ } => {
+                RowMutationAction::DeleteRelationship { binding, detach } => {
+                    if *detach {
+                        return Err(GraphError::UnsupportedQuery {
+                            dialect: "OpenCypher",
+                            feature: "DETACH DELETE requires node deletion support, which is not implemented yet"
+                                .to_string(),
+                        });
+                    }
                     let mut relationships = BTreeSet::new();
                     for row in &bindings {
                         let Some(relationship) = row.relationships.get(binding) else {
@@ -838,7 +845,8 @@ impl GraphShard {
                 RowMutationAction::SetLabels { .. } | RowMutationAction::RemoveLabels { .. } => {
                     return Err(GraphError::UnsupportedQuery {
                         dialect: "OpenCypher",
-                        feature: "relationship labels are not executable in Phase 2".to_string(),
+                        feature: "relationship labels are not executable in Query engine"
+                            .to_string(),
                     });
                 }
                 _ => {}
@@ -3697,7 +3705,7 @@ impl GraphShard {
                 .await?
         };
         let applied =
-            crate::phase0::apply_delta_overlay(&mut adjacency, deltas, base_epoch, read_epoch);
+            crate::engine::apply_delta_overlay(&mut adjacency, deltas, base_epoch, read_epoch);
         Ok((adjacency, applied))
     }
 
@@ -5521,7 +5529,8 @@ fn binding_property(
         if property == "id" {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "OpenCypher",
-                feature: "relationship id properties are not executable in Phase 2".to_string(),
+                feature: "relationship id properties are not executable in Query engine"
+                    .to_string(),
             });
         }
         let Some(metadata) = row.relationship_metadata.get(relationship) else {
