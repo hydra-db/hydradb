@@ -33,7 +33,7 @@ pub use core::model::{
     CommitResult, DeleteResult, DeltaKind, DeltaRecord, EdgeIngestOptions, EdgeIngestResult,
     EdgeMetadata, EdgeMutation, EdgeMutationBatchResult, EdgeMutationLogAppendResult,
     EdgeMutationLogMaterializeResult, EdgeRecord, GraphCorrectnessReport, GraphExportDigest,
-    GraphRepairReport, SegmentCompactionResult, VertexMetadata, VertexPropertyValue,
+    GraphRepairReport, QueryFloat, SegmentCompactionResult, VertexMetadata, VertexPropertyValue,
 };
 pub(crate) use core::model::{EdgeMutationLogBatch, OutEdgeSegment, OutboxDeltaBatch};
 pub use core::snapshot::GraphSnapshot;
@@ -61,9 +61,9 @@ pub use placement::{
 };
 pub use query::algebra::{
     LogicalQueryPlan, PhysicalQueryPlan, QueryCancellationToken, QueryCardinalityStatsKind,
-    QueryCardinalityStatsRefresh, QueryColumn, QueryContext, QueryCursorToken, QueryFloat,
-    QueryMutationResult, QueryOutput, QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet,
-    QueryRow, QueryStatement, QueryStatsHistogramRefresh, QueryStatsRecord, QueryStatsRefreshKind,
+    QueryCardinalityStatsRefresh, QueryColumn, QueryContext, QueryCursorToken, QueryMutationResult,
+    QueryOutput, QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet, QueryRow,
+    QueryStatement, QueryStatsHistogramRefresh, QueryStatsRecord, QueryStatsRefreshKind,
     QueryStatsRefreshResult, QueryStatsRefreshSpec, QueryValue, QueryWindow, RowQueryAccess,
     RowQueryOptimizerPass, RowQueryPlan, RowQueryPlanGroup, RowQueryPlanPattern,
 };

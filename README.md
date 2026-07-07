@@ -226,6 +226,9 @@ Currently supported query shapes include:
 - `UNION` and `UNION ALL`, preserving `UNION ALL` leg order.
 - Bounded variable-length relationships such as `[:FOLLOWS*1..20]`.
 - Node labels, node properties, relationship properties, and `id` constraints.
+- Property values support unsigned integers, floats, booleans, and strings.
+  JSON import helpers preserve non-negative JSON integers as integers and
+  floating JSON numbers as native floats.
 - `WHERE` boolean combinations over property/id comparisons with `=`, `<>`,
   `<`, `>`, `<=`, and `>=`.
 - `ORDER BY`, `SKIP`, `LIMIT`, aliases, and parameter values.
