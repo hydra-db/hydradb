@@ -7170,6 +7170,274 @@ async fn query_property_histogram_stats_refresh_persists_selectivity_records() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_float_properties_roundtrip_index_compare_and_order() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-float-properties", object_store).await;
+
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-float-create"),
+            "CREATE (a:Event {id: 1, timestamp: 1783112914.47055})-[:NEXT]->\
+             (b:Event {id: 2, timestamp: 1783112915.25})",
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            3,
+            VertexMetadata::default()
+                .with_label("Event")
+                .with_property("timestamp", VertexPropertyValue::Float(QueryFloat(100.5))),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_edge_metadata(
+            "reddit-home",
+            "NEXT",
+            1,
+            2,
+            EdgeMetadata::default()
+                .with_property("confidence", VertexPropertyValue::Float(QueryFloat(0.75))),
+        )
+        .await
+        .unwrap();
+    for (vertex_id, score) in [
+        (10, VertexPropertyValue::Integer(42)),
+        (11, VertexPropertyValue::Float(QueryFloat(42.0))),
+        (12, VertexPropertyValue::Integer(999)),
+        (13, VertexPropertyValue::Float(QueryFloat(1.0))),
+    ] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex_id,
+                VertexMetadata::default()
+                    .with_label("Score")
+                    .with_property("score", score),
+            )
+            .await
+            .unwrap();
+    }
+    for (vertex_id, score) in [
+        (20, VertexPropertyValue::Float(QueryFloat(0.0))),
+        (21, VertexPropertyValue::Float(QueryFloat(-0.0))),
+        (22, VertexPropertyValue::Integer(0)),
+    ] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex_id,
+                VertexMetadata::default()
+                    .with_label("ZeroScore")
+                    .with_property("score", score),
+            )
+            .await
+            .unwrap();
+    }
+
+    let exact = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-float-exact"),
+            "MATCH (e:Event {timestamp: 1783112914.47055}) RETURN e.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact, QueryOutput::Vertices(vec![1]));
+
+    let range_order = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-float-range"),
+            "MATCH (e:Event) WHERE e.timestamp > 1783112914.47055 \
+             RETURN e.id AS event, e.timestamp AS ts ORDER BY ts",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        range_order,
+        QueryResultSet::new(
+            vec![QueryColumn::new("event"), QueryColumn::new("ts")],
+            vec![QueryRow::new(vec![
+                QueryValue::VertexId(2),
+                QueryValue::Property(VertexPropertyValue::Float(QueryFloat(1783112915.25))),
+            ])],
+        )
+    );
+
+    let edge_property = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-float-edge-property"),
+            "MATCH (a)-[r:NEXT {confidence: 0.75}]->(b) RETURN b.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(edge_property, QueryOutput::Vertices(vec![2]));
+
+    let integer_literal_exact = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-mixed-numeric-integer-exact"),
+            "MATCH (s:Score {score: 42}) RETURN s.id AS score_id ORDER BY score_id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        integer_literal_exact,
+        QueryResultSet::new(
+            vec![QueryColumn::new("score_id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(10)]),
+                QueryRow::new(vec![QueryValue::VertexId(11)]),
+            ],
+        )
+    );
+
+    let float_literal_exact = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-mixed-numeric-float-exact"),
+            "MATCH (s:Score {score: 42.0}) RETURN s.id AS score_id ORDER BY score_id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(float_literal_exact, integer_literal_exact);
+
+    let float_range = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-mixed-numeric-float-range"),
+            "MATCH (s:Score) WHERE s.score > 3.0 RETURN s.id AS score_id ORDER BY score_id",
+        )
+        .await
+        .unwrap();
+    let integer_range = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-mixed-numeric-integer-range"),
+            "MATCH (s:Score) WHERE s.score > 3 RETURN s.id AS score_id ORDER BY score_id",
+        )
+        .await
+        .unwrap();
+    let expected_range = QueryResultSet::new(
+        vec![QueryColumn::new("score_id")],
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(10)]),
+            QueryRow::new(vec![QueryValue::VertexId(11)]),
+            QueryRow::new(vec![QueryValue::VertexId(12)]),
+        ],
+    );
+    assert_eq!(float_range, expected_range);
+    assert_eq!(integer_range, expected_range);
+
+    let expected_zero_exact = QueryResultSet::new(
+        vec![QueryColumn::new("zero_id")],
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(20)]),
+            QueryRow::new(vec![QueryValue::VertexId(21)]),
+            QueryRow::new(vec![QueryValue::VertexId(22)]),
+        ],
+    );
+    for (request_id, query, context) in [
+        (
+            "cypher-mixed-numeric-integer-zero-exact",
+            "MATCH (z:ZeroScore {score: 0}) RETURN z.id AS zero_id ORDER BY zero_id",
+            QueryContext::new("reddit-home", "cypher-mixed-numeric-integer-zero-exact"),
+        ),
+        (
+            "cypher-mixed-numeric-positive-zero-exact",
+            "MATCH (z:ZeroScore {score: 0.0}) RETURN z.id AS zero_id ORDER BY zero_id",
+            QueryContext::new("reddit-home", "cypher-mixed-numeric-positive-zero-exact"),
+        ),
+        (
+            "cypher-mixed-numeric-negative-zero-exact",
+            "MATCH (z:ZeroScore {score: -0.0}) RETURN z.id AS zero_id ORDER BY zero_id",
+            QueryContext::new("reddit-home", "cypher-mixed-numeric-negative-zero-exact"),
+        ),
+        (
+            "cypher-mixed-numeric-negative-zero-parameter-exact",
+            "MATCH (z:ZeroScore {score: $score}) RETURN z.id AS zero_id ORDER BY zero_id",
+            QueryContext::new(
+                "reddit-home",
+                "cypher-mixed-numeric-negative-zero-parameter-exact",
+            )
+            .with_parameter("score", VertexPropertyValue::Float(QueryFloat(-0.0))),
+        ),
+    ] {
+        let exact_zero = shard.execute_cypher_rows(context, query).await.unwrap();
+        assert_eq!(exact_zero, expected_zero_exact, "{request_id}");
+    }
+
+    let numeric_order = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-mixed-numeric-order"),
+            "MATCH (s:Score) RETURN s.id AS score_id, s.score AS score ORDER BY score, score_id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        numeric_order,
+        QueryResultSet::new(
+            vec![QueryColumn::new("score_id"), QueryColumn::new("score")],
+            vec![
+                QueryRow::new(vec![
+                    QueryValue::VertexId(13),
+                    QueryValue::Property(VertexPropertyValue::Float(QueryFloat(1.0))),
+                ]),
+                QueryRow::new(vec![
+                    QueryValue::VertexId(10),
+                    QueryValue::Property(VertexPropertyValue::Integer(42)),
+                ]),
+                QueryRow::new(vec![
+                    QueryValue::VertexId(11),
+                    QueryValue::Property(VertexPropertyValue::Float(QueryFloat(42.0))),
+                ]),
+                QueryRow::new(vec![
+                    QueryValue::VertexId(12),
+                    QueryValue::Property(VertexPropertyValue::Integer(999)),
+                ]),
+            ],
+        )
+    );
+
+    let low_key = encode_vertex_property_value_key(&VertexPropertyValue::Float(QueryFloat(1.5)));
+    let high_key = encode_vertex_property_value_key(&VertexPropertyValue::Float(QueryFloat(2.5)));
+    assert!(low_key < high_key);
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "json-properties")]
+#[test]
+fn json_property_values_preserve_integer_and_float_number_shapes() {
+    assert_eq!(
+        VertexPropertyValue::from_json_value(&serde_json::json!(42)),
+        VertexPropertyValue::Integer(42)
+    );
+    assert_eq!(
+        VertexPropertyValue::from_json_value(&serde_json::json!(42.0)),
+        VertexPropertyValue::Integer(42)
+    );
+    assert_eq!(
+        VertexPropertyValue::from_json_value(&serde_json::json!(42.5)),
+        VertexPropertyValue::Float(QueryFloat(42.5))
+    );
+    assert_eq!(
+        VertexPropertyValue::from_json_value(&serde_json::json!(1783112914.47055)),
+        VertexPropertyValue::Float(QueryFloat(1783112914.47055))
+    );
+    assert_eq!(
+        VertexPropertyValue::from_json_value(&serde_json::json!(true)),
+        VertexPropertyValue::Bool(true)
+    );
+    assert_eq!(
+        VertexPropertyValue::from_json_value(&serde_json::json!("source")),
+        VertexPropertyValue::String("source".to_string())
+    );
+    assert_eq!(
+        VertexPropertyValue::from_json_value(&serde_json::json!({"raw": ["value"]})),
+        VertexPropertyValue::String("{\"raw\":[\"value\"]}".to_string())
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn query_stats_background_refresh_job_publishes_records() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard =

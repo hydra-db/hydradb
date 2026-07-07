@@ -69,11 +69,85 @@ pub struct EdgeRecord {
     feature = "query-transport",
     derive(serde::Deserialize, serde::Serialize)
 )]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueryFloat(pub f64);
+
+impl PartialEq for QueryFloat {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for QueryFloat {}
+
+impl PartialOrd for QueryFloat {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueryFloat {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum VertexPropertyValue {
     Integer(u64),
     Bool(bool),
+    Float(QueryFloat),
     String(String),
+}
+
+impl VertexPropertyValue {
+    #[cfg_attr(
+        not(any(feature = "json-properties", feature = "opencypher")),
+        allow(dead_code)
+    )]
+    pub(crate) fn exact_u64_from_f64(value: f64) -> Option<u64> {
+        const U64_EXCLUSIVE_UPPER: f64 = 18446744073709551616.0;
+        if !value.is_finite()
+            || !(0.0..U64_EXCLUSIVE_UPPER).contains(&value)
+            || value.fract() != 0.0
+        {
+            return None;
+        }
+        let integer = value as u64;
+        ((integer as f64) == value).then_some(integer)
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn exact_f64_from_u64(value: u64) -> Option<f64> {
+        let float = value as f64;
+        (Self::exact_u64_from_f64(float) == Some(value)).then_some(float)
+    }
+
+    #[cfg(feature = "json-properties")]
+    pub fn from_json_value(value: &serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Bool(value) => Self::Bool(*value),
+            serde_json::Value::Number(value) => {
+                if let Some(value) = value.as_u64() {
+                    Self::Integer(value)
+                } else if let Some(value) = value.as_f64() {
+                    Self::exact_u64_from_f64(value)
+                        .map(Self::Integer)
+                        .unwrap_or(Self::Float(QueryFloat(value)))
+                } else {
+                    Self::String(value.to_string())
+                }
+            }
+            serde_json::Value::String(value) => Self::String(value.clone()),
+            serde_json::Value::Null
+            | serde_json::Value::Array(_)
+            | serde_json::Value::Object(_) => Self::String(value.to_string()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
