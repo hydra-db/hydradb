@@ -4714,16 +4714,17 @@ async fn matrix_snapshot_abort_cleanup_removes_unpublished_chunks() {
         .await
         .unwrap();
 
-    let deleted = engine::cleanup_unpublished_matrix_artifact_epoch(
+    let cleanup = engine::cleanup_unpublished_matrix_artifact_epoch(
         &shard,
         cell_id,
         edge_type,
         base_epoch,
         "test_cleanup_unpublished_matrix_artifacts",
     )
-    .await
-    .unwrap();
-    assert_eq!(deleted, keys.len() as u64);
+    .await;
+    assert_eq!(cleanup.deleted_keys, keys.len() as u64);
+    assert_eq!(cleanup.cleanup_errors, 0);
+    assert!(!cleanup.skipped_published_manifest);
     for key in keys {
         assert!(
             shard.read_remote(&key).await.unwrap().is_none(),
@@ -4764,16 +4765,17 @@ async fn matrix_snapshot_abort_cleanup_preserves_published_manifest_epoch() {
         .await
         .unwrap();
 
-    let deleted = engine::cleanup_unpublished_matrix_artifact_epoch(
+    let cleanup = engine::cleanup_unpublished_matrix_artifact_epoch(
         &shard,
         cell_id,
         edge_type,
         base_epoch,
         "test_cleanup_published_matrix_artifacts",
     )
-    .await
-    .unwrap();
-    assert_eq!(deleted, 0);
+    .await;
+    assert_eq!(cleanup.deleted_keys, 0);
+    assert_eq!(cleanup.cleanup_errors, 0);
+    assert!(cleanup.skipped_published_manifest);
     assert!(shard.read_remote(&manifest_key).await.unwrap().is_some());
     assert!(shard.read_remote(&chunk_key).await.unwrap().is_some());
 }
