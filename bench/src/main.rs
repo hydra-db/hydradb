@@ -174,6 +174,17 @@ enum Cmd {
         /// `--param-count`. See `Run`'s `--anchor-index`.
         #[arg(long)]
         anchor_index: Vec<usize>,
+        /// Inject hub persons when generating a fresh dataset — **must match
+        /// the `run` sweep's `--hub-count`** or the anchors chosen by
+        /// `--anchor-index 0..N` land on regular low-degree people and the
+        /// degree axis silently collapses. Ignored when `--dataset-dir`
+        /// already has data. See `Run`'s `--hub-count`.
+        #[arg(long, default_value_t = 0)]
+        hub_count: usize,
+        /// Target total degree for each hub person. Must match `run`'s
+        /// `--hub-degree`. See `Run`'s `--hub-degree`.
+        #[arg(long, default_value_t = 0)]
+        hub_degree: usize,
     },
 }
 
@@ -312,11 +323,36 @@ async fn main() -> Result<()> {
             batch_size,
             hops,
             anchor_index,
+            hub_count,
+            hub_degree,
         } => {
-            // Hub params must match the Run sweep: reuse the dataset dir's hub
-            // generation via resolve_dataset (hub_count/degree come from the dir
-            // if it already exists, else default). We only need the CSVs here.
-            let (dataset_dir, sizes) = resolve_dataset(dataset_dir, scale, seed, 0, 0)?;
+            // A freshly-generated verify dataset must carry the SAME hubs as the
+            // run sweep — otherwise `--anchor-index 0..N` anchors on regular
+            // low-degree people, the degree axis collapses, and the accuracy
+            // dump compares the wrong graph.
+            //
+            // Fail closed on the dangerous combo: if we're about to GENERATE a
+            // fresh dataset (no existing CSVs to reuse) and the caller pinned
+            // specific `--anchor-index` anchors but did not request hubs
+            // (`--hub-count`/`--hub-degree` both > 0), the anchors can't be the
+            // hub persons the run sweep used — refuse rather than silently
+            // verify the wrong graph. When `--dataset-dir` already has CSVs,
+            // resolve_dataset reuses them (hubs baked in) and this doesn't fire.
+            let will_generate = match &dataset_dir {
+                Some(dir) => !dir.join("persons.csv").exists(),
+                None => true,
+            };
+            if will_generate && !anchor_index.is_empty() && (hub_count == 0 || hub_degree == 0) {
+                anyhow::bail!(
+                    "verify would generate a fresh HUBLESS dataset while --anchor-index pins \
+                     specific persons as anchors — those indices would be regular low-degree \
+                     people, so the degree axis collapses and the accuracy dump compares the \
+                     wrong graph. Pass --hub-count and --hub-degree matching the run sweep, or \
+                     point --dataset-dir at the run's already-generated (hub) dataset."
+                );
+            }
+            let (dataset_dir, sizes) =
+                resolve_dataset(dataset_dir, scale, seed, hub_count, hub_degree)?;
 
             let mut writer = Writer::in_memory().await?;
             loader::load_into_writer(&mut writer, &dataset_dir, batch_size).await?;
