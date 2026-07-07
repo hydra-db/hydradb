@@ -838,7 +838,8 @@ impl GraphShard {
                 RowMutationAction::SetLabels { .. } | RowMutationAction::RemoveLabels { .. } => {
                     return Err(GraphError::UnsupportedQuery {
                         dialect: "OpenCypher",
-                        feature: "relationship labels are not executable in Phase 2".to_string(),
+                        feature: "relationship labels are not executable in Query engine"
+                            .to_string(),
                     });
                 }
                 _ => {}
@@ -3697,7 +3698,7 @@ impl GraphShard {
                 .await?
         };
         let applied =
-            crate::phase0::apply_delta_overlay(&mut adjacency, deltas, base_epoch, read_epoch);
+            crate::engine::apply_delta_overlay(&mut adjacency, deltas, base_epoch, read_epoch);
         Ok((adjacency, applied))
     }
 
@@ -5521,7 +5522,8 @@ fn binding_property(
         if property == "id" {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "OpenCypher",
-                feature: "relationship id properties are not executable in Phase 2".to_string(),
+                feature: "relationship id properties are not executable in Query engine"
+                    .to_string(),
             });
         }
         let Some(metadata) = row.relationship_metadata.get(relationship) else {

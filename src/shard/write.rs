@@ -1880,6 +1880,7 @@ impl GraphShard {
             inserted = inserted.saturating_add(result.inserted);
             already_existed = already_existed.saturating_add(result.already_existed);
         }
+        crate::engine::trim_process_memory_after_hydration();
 
         Ok(BulkImportResult {
             start_epoch: start_epoch.unwrap_or(end_epoch),
