@@ -76,7 +76,7 @@ impl GraphShard {
         object_store: Arc<dyn ObjectStore>,
         options: GraphOpenOptions,
         local_node_id: String,
-        leases: Arc<RwLock<BTreeMap<String, phase0::ShardLease>>>,
+        leases: Arc<RwLock<BTreeMap<String, engine::ShardLease>>>,
     ) -> Result<Self> {
         Self::open_internal(
             path,
@@ -96,7 +96,7 @@ impl GraphShard {
         object_store: Arc<dyn ObjectStore>,
         options: GraphOpenOptions,
         local_node_id: impl Into<String>,
-        lease: phase0::ShardLease,
+        lease: engine::ShardLease,
     ) -> Result<Self> {
         let local_node_id = local_node_id.into();
         validate_component("node_id", &local_node_id)?;
@@ -119,7 +119,7 @@ impl GraphShard {
         path: impl Into<Path>,
         object_store: Arc<dyn ObjectStore>,
         local_node_id: impl Into<String>,
-        lease: phase0::ShardLease,
+        lease: engine::ShardLease,
     ) -> Result<Self> {
         Self::open_chaos_leased_writer_with_options(
             path,
@@ -479,7 +479,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         operation: &'static str,
-    ) -> Result<Option<phase0::ShardLease>> {
+    ) -> Result<Option<engine::ShardLease>> {
         match &self.write_authority {
             GraphWriteAuthority::ReadOnly => Err(GraphError::WriteRequiresLease {
                 operation,
@@ -513,7 +513,7 @@ impl GraphShard {
     pub(crate) async fn install_write_fence(
         &self,
         cell_id: &str,
-        lease: &phase0::ShardLease,
+        lease: &engine::ShardLease,
     ) -> Result<()> {
         validate_component("cell_id", cell_id)?;
         validate_component("node_id", &lease.owner_node_id)?;
@@ -552,7 +552,7 @@ impl GraphShard {
     async fn install_write_fence_txn(
         &self,
         cell_id: &str,
-        lease: &phase0::ShardLease,
+        lease: &engine::ShardLease,
     ) -> Result<()> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
         let key = keys::write_fence(cell_id);

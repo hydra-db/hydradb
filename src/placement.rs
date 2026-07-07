@@ -15,7 +15,7 @@ pub struct LocalityLayoutExperiment {
     pub segmentable_keys: usize,
     pub cells: BTreeMap<String, usize>,
     pub unsegmentable_keys: Vec<String>,
-    pub recommended_phase0_layout: StorageLayout,
+    pub recommended_layout: StorageLayout,
 }
 
 impl LocalityLayoutExperiment {
@@ -74,7 +74,7 @@ pub fn compare_locality_layouts(
         segmentable_keys,
         cells,
         unsegmentable_keys,
-        recommended_phase0_layout: StorageLayout::OneDbPerLocalityCell,
+        recommended_layout: StorageLayout::OneDbPerLocalityCell,
     }
 }
 
