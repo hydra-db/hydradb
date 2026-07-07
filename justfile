@@ -74,59 +74,63 @@ ci: native-check fmt-check check test test-opencypher test-graphblas test-native
 
 # Run the local object-store smoke test.
 smoke:
-    cargo run --example phase0_object_store_smoke
+    cargo run --example object_store_smoke
 
 # Run the local object-store smoke test with GraphBLAS enabled.
 smoke-graphblas:
-    PHASE0_MATRIX_KERNEL=graphblas cargo run --features graphblas --example phase0_object_store_smoke
+    GRAPH_MATRIX_KERNEL=graphblas cargo run --features graphblas --example object_store_smoke
 
 # Run the path/supernode benchmark harness.
 bench:
-    bash scripts/phase0_path_bench.sh
+    bash scripts/path_bench.sh
 
 # Run the path/supernode benchmark with the Rust sparse kernel.
 bench-rust:
-    PHASE0_GRAPHBLAS=0 PHASE0_MATRIX_KERNEL=rust bash scripts/phase0_path_bench.sh
+    GRAPH_BENCH_GRAPHBLAS=0 GRAPH_MATRIX_KERNEL=rust bash scripts/path_bench.sh
 
 # Run local multiprocess stress against the local filesystem object store.
 stress:
-    bash scripts/phase0_multiprocess_stress.sh
+    bash scripts/multiprocess_stress.sh
 
 # Run hard write-fence takeover proof against the local filesystem object store.
 fence:
-    bash scripts/phase0_fence_takeover.sh
+    bash scripts/fence_takeover.sh
 
 # Run MinIO smoke test. Requires Docker.
 minio-smoke:
-    bash scripts/phase0_minio_smoke.sh
+    bash scripts/minio_smoke.sh
 
 # Run path/supernode benchmarks against MinIO. Requires Docker.
 minio-bench:
-    bash scripts/phase0_minio_path_bench.sh
+    bash scripts/minio_path_bench.sh
 
-# Run Phase 2 Cypher query benchmarks.
+# Run Query engine Cypher query benchmarks.
 query-bench:
-    bash scripts/phase2_query_bench.sh
+    bash scripts/query_bench.sh
 
-# Run Phase 2 exact query correctness benchmark.
+# Run low-memory query/build/concurrency profiling.
+query-memory-profile:
+    bash scripts/query_memory_profile.sh
+
+# Run Query engine exact query correctness benchmark.
 query-correctness:
-    bash scripts/phase2_query_correctness.sh
+    bash scripts/query_correctness.sh
 
-# Run Phase 2 Cypher query benchmarks against MinIO. Requires Docker.
+# Run Query engine Cypher query benchmarks against MinIO. Requires Docker.
 minio-query-bench:
-    bash scripts/phase2_minio_query_bench.sh
+    bash scripts/minio_query_bench.sh
 
-# Run Phase 2 exact query correctness benchmark against MinIO. Requires Docker.
+# Run Query engine exact query correctness benchmark against MinIO. Requires Docker.
 minio-query-correctness:
-    bash scripts/phase2_minio_query_correctness.sh
+    bash scripts/minio_query_correctness.sh
 
 # Run MinIO chaos test. Requires Docker.
 minio-chaos:
-    bash scripts/phase0_minio_chaos.sh
+    bash scripts/minio_chaos.sh
 
 # Run hard write-fence takeover proof against MinIO. Requires Docker.
 minio-fence:
-    bash scripts/phase0_minio_fence_takeover.sh
+    bash scripts/minio_fence_takeover.sh
 
 # Refresh the pinned SlateDB Git dependency in Cargo.lock.
 update-slatedb:

@@ -17,8 +17,8 @@ query-transport-tls = ["query-transport", "dep:tokio-rustls", "dep:sha2"]
 query-service-discovery = ["query-transport", "dep:base64", "dep:reqwest"]
 
 [[example]]
-name = "phase0_fence_worker"
-path = "examples/phase0_fence_worker.rs"
+name = "fence_worker"
+path = "examples/fence_worker.rs"
 required-features = ["chaos-harness"]
 
 [[example]]
@@ -27,13 +27,13 @@ path = "examples/opencypher_tck_report.rs"
 required-features = ["opencypher"]
 
 [[example]]
-name = "phase2_query_bench"
-path = "examples/phase2_query_bench.rs"
+name = "query_bench"
+path = "examples/query_bench.rs"
 required-features = ["opencypher"]
 
 [[example]]
-name = "phase2_query_correctness"
-path = "examples/phase2_query_correctness.rs"
+name = "query_correctness"
+path = "examples/query_correctness.rs"
 required-features = ["opencypher"]
 
 [dependencies]

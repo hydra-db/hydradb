@@ -3805,10 +3805,10 @@ async fn newer_data_write_fence_rejects_all_stale_write_classes() {
 }
 
 #[tokio::test]
-async fn phase0_cluster_runs_multiple_local_shards_on_one_object_store() {
+async fn graph_cluster_runs_multiple_local_shards_on_one_object_store() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let cluster = Phase0Cluster::open_cells_standalone_writers(
-        "phase0-cluster",
+    let cluster = GraphCluster::open_cells_standalone_writers(
+        "graph-cluster",
         ["cell-a".to_string(), "cell-b".to_string()],
         object_store,
     )
@@ -3858,7 +3858,7 @@ async fn routed_cluster_rejects_writes_for_non_owned_cells() {
     let placement =
         ShardPlacement::fixed([("reddit-home", "node-a"), ("reddit-search", "node-b")]).unwrap();
     let cluster =
-        RoutedPhase0Cluster::open_owned("phase0-routed-cluster", "node-a", placement, object_store)
+        RoutedGraphCluster::open_owned("graph-routed-cluster", "node-a", placement, object_store)
             .await
             .unwrap();
     assert_eq!(cluster.local_cells(), vec!["reddit-home"]);
@@ -3914,8 +3914,8 @@ async fn control_plane_persists_placement_and_enforces_active_leases() {
         ShardPlacement::fixed([("reddit-home", "node-a"), ("reddit-search", "node-b")]).unwrap();
     control.publish_placement(&placement).await.unwrap();
 
-    let mut cluster = RoutedPhase0Cluster::open_owned_with_control(
-        "phase0-control-cluster",
+    let mut cluster = RoutedGraphCluster::open_owned_with_control(
+        "graph-control-cluster",
         "node-a",
         &control,
         Arc::clone(&object_store),
@@ -3971,8 +3971,8 @@ async fn lease_renewer_extends_owned_shard_leases_in_background() {
     );
     let placement = ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap();
     control.publish_placement(&placement).await.unwrap();
-    let cluster = RoutedPhase0Cluster::open_owned_with_control(
-        "phase0-renewer-cluster",
+    let cluster = RoutedGraphCluster::open_owned_with_control(
+        "graph-renewer-cluster",
         "node-a",
         &control,
         object_store,
@@ -4055,7 +4055,7 @@ async fn graph_node_starts_lease_renewal_automatically() {
         .unwrap();
 
     let node = GraphNode::open(
-        "phase0-graph-node",
+        "graph-node",
         "node-a",
         Arc::clone(&control),
         object_store,
@@ -4521,7 +4521,7 @@ async fn control_plane_empty_compute_node_replacement_reads_object_store_state()
         .publish_placement_with_catalog(&placement, "reddit", 1)
         .await
         .unwrap();
-    let cluster_a = RoutedPhase0Cluster::open_owned_with_control(
+    let cluster_a = RoutedGraphCluster::open_owned_with_control(
         "phase1-empty-compute",
         "node-a",
         &control,
@@ -4551,7 +4551,7 @@ async fn control_plane_empty_compute_node_replacement_reads_object_store_state()
         .failover_expired_cell("reddit-home", "node-b", std::time::Duration::from_secs(60))
         .await
         .unwrap();
-    let cluster_b = RoutedPhase0Cluster::open_owned_with_control(
+    let cluster_b = RoutedGraphCluster::open_owned_with_control(
         "phase1-empty-compute",
         "node-b",
         &control,
@@ -4682,6 +4682,102 @@ async fn control_plane_repair_refuses_to_advance_on_corrupt_graph_state() {
     assert!(control.current_watermark(cell_id).await.unwrap().is_none());
     shard.close().await.unwrap();
     control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn matrix_snapshot_abort_cleanup_removes_unpublished_chunks() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/matrix-snapshot-abort-cleanup", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "ABORT_CLEANUP_EDGE";
+
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 1, 2, "cleanup-seed"))
+        .await
+        .unwrap();
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    let epoch = format!("{base_epoch:020}");
+    let keys = vec![
+        format!("cell/{cell_id}/artifact/matrix/{edge_type}/{epoch}/out/00000000000000000000/00000000000000000000"),
+        format!("cell/{cell_id}/artifact/matrix/{edge_type}/{epoch}/in/00000000000000000000/00000000000000000000"),
+        format!("cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/{epoch}/vertices/00000000000000000000"),
+        format!("cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/{epoch}/pointers/00000000000000000000"),
+        format!("cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/{epoch}/indices/00000000000000000000"),
+    ];
+
+    let mut batch = GraphWriteBatch::new();
+    for key in &keys {
+        batch.put(key.as_bytes(), b"unpublished");
+    }
+    shard
+        .write_graph_batch_strict(cell_id, "test_seed_unpublished_matrix_artifacts", batch)
+        .await
+        .unwrap();
+
+    let cleanup = engine::cleanup_unpublished_matrix_artifact_epoch(
+        &shard,
+        cell_id,
+        edge_type,
+        base_epoch,
+        "test_cleanup_unpublished_matrix_artifacts",
+    )
+    .await;
+    assert_eq!(cleanup.deleted_keys, keys.len() as u64);
+    assert_eq!(cleanup.cleanup_errors, 0);
+    assert!(!cleanup.skipped_published_manifest);
+    for key in keys {
+        assert!(
+            shard.read_remote(&key).await.unwrap().is_none(),
+            "expected unpublished artifact key to be deleted: {key}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn matrix_snapshot_abort_cleanup_preserves_published_manifest_epoch() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/matrix-snapshot-abort-published-guard", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "PUBLISHED_GUARD_EDGE";
+
+    shard
+        .write_edge(typed_mutation(
+            cell_id,
+            edge_type,
+            1,
+            2,
+            "published-guard-seed",
+        ))
+        .await
+        .unwrap();
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    let epoch = format!("{base_epoch:020}");
+    let manifest_key = format!("cell/{cell_id}/artifact/matrix_manifest/{edge_type}/{epoch}");
+    let chunk_key = format!(
+        "cell/{cell_id}/artifact/matrix/{edge_type}/{epoch}/out/00000000000000000000/00000000000000000000"
+    );
+
+    let mut batch = GraphWriteBatch::new();
+    batch.put(manifest_key.as_bytes(), b"published");
+    batch.put(chunk_key.as_bytes(), b"published-chunk");
+    shard
+        .write_graph_batch_strict(cell_id, "test_seed_published_matrix_artifacts", batch)
+        .await
+        .unwrap();
+
+    let cleanup = engine::cleanup_unpublished_matrix_artifact_epoch(
+        &shard,
+        cell_id,
+        edge_type,
+        base_epoch,
+        "test_cleanup_published_matrix_artifacts",
+    )
+    .await;
+    assert_eq!(cleanup.deleted_keys, 0);
+    assert_eq!(cleanup.cleanup_errors, 0);
+    assert!(cleanup.skipped_published_manifest);
+    assert!(shard.read_remote(&manifest_key).await.unwrap().is_some());
+    assert!(shard.read_remote(&chunk_key).await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -5269,20 +5365,17 @@ async fn concurrent_rollup_artifact_builds_publish_one_coherent_epoch() {
 }
 
 #[tokio::test]
-async fn phase0_cluster_reopens_many_shards_from_local_object_store() {
+async fn graph_cluster_reopens_many_shards_from_local_object_store() {
     let tempdir = tempfile::tempdir().unwrap();
     let cells = ["cell-a", "cell-b", "cell-c", "cell-d"];
     let edge_type = "FOLLOWS";
 
     {
         let object_store = local_object_store(tempdir.path()).unwrap();
-        let cluster = Phase0Cluster::open_cells_standalone_writers(
-            "phase0-local-cluster",
-            cells,
-            object_store,
-        )
-        .await
-        .unwrap();
+        let cluster =
+            GraphCluster::open_cells_standalone_writers("graph-local-cluster", cells, object_store)
+                .await
+                .unwrap();
         for (idx, cell_id) in cells.iter().enumerate() {
             let shard = cluster.shard(cell_id).unwrap();
             let src = 10 + idx as u64;
@@ -5328,7 +5421,7 @@ async fn phase0_cluster_reopens_many_shards_from_local_object_store() {
     }
 
     let object_store = local_object_store(tempdir.path()).unwrap();
-    let reopened = Phase0Cluster::open_cells("phase0-local-cluster", cells, object_store)
+    let reopened = GraphCluster::open_cells("graph-local-cluster", cells, object_store)
         .await
         .unwrap();
     assert_eq!(reopened.shard_count(), cells.len());
@@ -5357,7 +5450,7 @@ async fn phase0_cluster_reopens_many_shards_from_local_object_store() {
 }
 
 #[tokio::test]
-async fn env_object_store_loader_supports_phase0_harness() {
+async fn env_object_store_loader_supports_graph_harness() {
     let tempdir = tempfile::tempdir().unwrap();
     let env_path = tempdir.path().join("memory.env");
     std::fs::write(&env_path, "CLOUD_PROVIDER=memory\n").unwrap();
@@ -5373,7 +5466,7 @@ async fn env_object_store_loader_supports_phase0_harness() {
 }
 
 #[test]
-fn locality_cell_extractor_covers_phase0_keyspace() {
+fn locality_cell_extractor_covers_graph_keyspace() {
     let keys = vec![
             keys::last_epoch("reddit-home"),
             keys::idempotency("reddit-home", "create", "req-1"),
@@ -5398,7 +5491,7 @@ fn locality_cell_extractor_covers_phase0_keyspace() {
     assert_eq!(experiment.cells["reddit-home"], 14);
     assert_eq!(experiment.cells["subreddit-programming"], 1);
     assert_eq!(
-        experiment.recommended_phase0_layout,
+        experiment.recommended_layout,
         StorageLayout::OneDbPerLocalityCell
     );
 
@@ -5853,8 +5946,8 @@ async fn routed_cluster_executes_read_plans_without_write_lease_and_rejects_writ
         .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
         .await
         .unwrap();
-    let mut cluster = RoutedPhase0Cluster::open_owned_with_control(
-        "phase2-query-routed",
+    let mut cluster = RoutedGraphCluster::open_owned_with_control(
+        "query-routed",
         "node-a",
         &control,
         Arc::clone(&object_store),
@@ -5973,8 +6066,8 @@ async fn routed_cluster_executes_row_queries_across_local_cells() {
         )
         .await
         .unwrap();
-    let cluster = RoutedPhase0Cluster::open_owned_with_control(
-        "phase2-query-routed-multi-cell",
+    let cluster = RoutedGraphCluster::open_owned_with_control(
+        "query-routed-multi-cell",
         "node-a",
         &control,
         Arc::clone(&object_store),
@@ -6075,8 +6168,8 @@ async fn distributed_query_coordinator_routes_to_remote_cell_clients() {
     control.publish_placement(&placement).await.unwrap();
 
     let cluster_a = Arc::new(
-        RoutedPhase0Cluster::open_owned_with_control(
-            "phase2-query-distributed-coordinator",
+        RoutedGraphCluster::open_owned_with_control(
+            "query-distributed-coordinator",
             "node-a",
             &control,
             Arc::clone(&object_store),
@@ -6086,8 +6179,8 @@ async fn distributed_query_coordinator_routes_to_remote_cell_clients() {
         .unwrap(),
     );
     let cluster_b = Arc::new(
-        RoutedPhase0Cluster::open_owned_with_control(
-            "phase2-query-distributed-coordinator",
+        RoutedGraphCluster::open_owned_with_control(
+            "query-distributed-coordinator",
             "node-b",
             &control,
             Arc::clone(&object_store),
@@ -6205,8 +6298,8 @@ async fn tcp_query_transport_routes_distributed_cypher_pages() {
     control.publish_placement(&placement).await.unwrap();
 
     let cluster_a = Arc::new(
-        RoutedPhase0Cluster::open_owned_with_control(
-            "phase2-query-tcp-transport",
+        RoutedGraphCluster::open_owned_with_control(
+            "query-tcp-transport",
             "node-a",
             &control,
             Arc::clone(&object_store),
@@ -6216,8 +6309,8 @@ async fn tcp_query_transport_routes_distributed_cypher_pages() {
         .unwrap(),
     );
     let cluster_b = Arc::new(
-        RoutedPhase0Cluster::open_owned_with_control(
-            "phase2-query-tcp-transport",
+        RoutedGraphCluster::open_owned_with_control(
+            "query-tcp-transport",
             "node-b",
             &control,
             Arc::clone(&object_store),
@@ -6401,8 +6494,8 @@ async fn tcp_query_transport_enforces_auth_cancellation_streaming_metrics_and_di
     control.publish_placement(&placement).await.unwrap();
 
     let cluster = Arc::new(
-        RoutedPhase0Cluster::open_owned_with_control(
-            "phase2-query-transport-hardening",
+        RoutedGraphCluster::open_owned_with_control(
+            "query-transport-hardening",
             "node-a",
             &control,
             Arc::clone(&object_store),
@@ -7234,8 +7327,8 @@ async fn distributed_query_plan_joins_results_across_cells() {
     control.publish_placement(&placement).await.unwrap();
 
     let cluster_a = Arc::new(
-        RoutedPhase0Cluster::open_owned_with_control(
-            "phase2-query-distributed-join",
+        RoutedGraphCluster::open_owned_with_control(
+            "query-distributed-join",
             "node-a",
             &control,
             object_store.clone(),
@@ -7245,8 +7338,8 @@ async fn distributed_query_plan_joins_results_across_cells() {
         .unwrap(),
     );
     let cluster_b = Arc::new(
-        RoutedPhase0Cluster::open_owned_with_control(
-            "phase2-query-distributed-join",
+        RoutedGraphCluster::open_owned_with_control(
+            "query-distributed-join",
             "node-b",
             &control,
             object_store,
@@ -7339,7 +7432,7 @@ async fn distributed_query_plan_joins_results_across_cells() {
 
 #[cfg(feature = "query-transport")]
 #[test]
-fn phase2_query_transport_child_process_entry() {
+fn query_transport_child_process_entry() {
     if std::env::var("SLATEDB_GRAPH_QUERY_CHILD").ok().as_deref() != Some("1") {
         return;
     }
@@ -7368,8 +7461,8 @@ fn phase2_query_transport_child_process_entry() {
         let placement = ShardPlacement::fixed([("reddit-home", "node-child")]).unwrap();
         control.publish_placement(&placement).await.unwrap();
         let cluster = Arc::new(
-            RoutedPhase0Cluster::open_owned_with_control(
-                "phase2-query-child-process",
+            RoutedGraphCluster::open_owned_with_control(
+                "query-child-process",
                 "node-child",
                 &control,
                 object_store,
@@ -7421,7 +7514,7 @@ async fn tcp_query_transport_runs_against_separate_child_process_and_local_objec
     let stop_file = object_root.path().join("child.stop");
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("tests::phase2_query_transport_child_process_entry")
+        .arg("tests::query_transport_child_process_entry")
         .arg("--nocapture")
         .env("SLATEDB_GRAPH_QUERY_CHILD", "1")
         .env("SLATEDB_GRAPH_QUERY_OBJECT_ROOT", object_root.path())
@@ -7476,7 +7569,7 @@ async fn tcp_query_transport_runs_against_separate_child_process_and_local_objec
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
-async fn cypher_explain_uses_phase2_query_planner() {
+async fn cypher_explain_uses_query_planner() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-explain-plan", object_store).await;
     let plan = shard
@@ -8786,6 +8879,40 @@ async fn cypher_executes_set_remove_delete_and_merge_mutations() {
         replay,
         QueryOutput::Mutation(QueryMutationResult::default())
     );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_rejects_detach_delete_until_node_deletion_is_supported() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-detach-delete-rejects", object_store).await;
+
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-detach-delete-seed"),
+            "MERGE (u:User {id: 1})-[:FOLLOWS]->(v:User {id: 2})",
+        )
+        .await
+        .unwrap();
+
+    let err = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-detach-delete"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) DETACH DELETE r",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature
+        } if feature.contains("DETACH DELETE")
+    ));
+    assert!(shard
+        .edge_exists("reddit-home", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
 }
 
 #[cfg(feature = "opencypher")]
