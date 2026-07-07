@@ -270,6 +270,7 @@ pub enum QueryStatsRefreshResult {
 pub enum QueryOutput {
     Write(CommitResult),
     Mutation(QueryMutationResult),
+    Rows(QueryResultSet),
     Vertices(Vec<VertexId>),
     Count(u64),
     Bool(bool),
