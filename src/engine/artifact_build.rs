@@ -314,86 +314,108 @@ impl GraphShard {
             self.limits.max_artifact_build_edges,
         )?;
 
-        let mut data_batch = GraphWriteBatch::new();
-        let mut pending_writes = 0_usize;
-        let out_tiles = append_matrix_tiles_from_rows(
-            self,
-            &mut data_batch,
-            &mut pending_writes,
-            cell_id,
-            edge_type,
-            base_epoch,
-            tile_size,
-            ArtifactDirection::Out,
-            &rows.rows,
-        )
-        .await?;
-        let reversed = rows.reversed();
-        let transpose_tiles = append_matrix_tiles_from_rows(
-            self,
-            &mut data_batch,
-            &mut pending_writes,
-            cell_id,
-            edge_type,
-            base_epoch,
-            tile_size,
-            ArtifactDirection::In,
-            &reversed.rows,
-        )
-        .await?;
-        drop(reversed);
+        let artifact = match async {
+            let mut data_batch = GraphWriteBatch::new();
+            let mut pending_writes = 0_usize;
+            let out_tiles = append_matrix_tiles_from_rows(
+                self,
+                &mut data_batch,
+                &mut pending_writes,
+                cell_id,
+                edge_type,
+                base_epoch,
+                tile_size,
+                ArtifactDirection::Out,
+                &rows.rows,
+            )
+            .await?;
+            let reversed = rows.reversed();
+            let transpose_tiles = append_matrix_tiles_from_rows(
+                self,
+                &mut data_batch,
+                &mut pending_writes,
+                cell_id,
+                edge_type,
+                base_epoch,
+                tile_size,
+                ArtifactDirection::In,
+                &reversed.rows,
+            )
+            .await?;
+            drop(reversed);
 
-        let graphblas_manifest = append_graphblas_csc_chunks_from_rows(
-            self,
-            &mut data_batch,
-            &mut pending_writes,
-            cell_id,
-            edge_type,
-            base_epoch,
-            &rows,
-        )
-        .await?;
-        flush_artifact_put_batch(
-            self,
-            cell_id,
-            "build_matrix_tiles",
-            &mut data_batch,
-            &mut pending_writes,
-        )
-        .await?;
+            let graphblas_manifest = append_graphblas_csc_chunks_from_rows(
+                self,
+                &mut data_batch,
+                &mut pending_writes,
+                cell_id,
+                edge_type,
+                base_epoch,
+                &rows,
+            )
+            .await?;
+            flush_artifact_put_batch(
+                self,
+                cell_id,
+                "build_matrix_tiles",
+                &mut data_batch,
+                &mut pending_writes,
+            )
+            .await?;
 
-        let ending_epoch = self.current_epoch(cell_id).await?;
-        if ending_epoch != base_epoch {
-            return Err(GraphError::SnapshotChanged {
-                operation: "build_matrix_tiles",
+            let ending_epoch = self.current_epoch(cell_id).await?;
+            if ending_epoch != base_epoch {
+                return Err(GraphError::SnapshotChanged {
+                    operation: "build_matrix_tiles",
+                    cell_id: cell_id.to_string(),
+                    edge_type: edge_type.to_string(),
+                    read_epoch: base_epoch,
+                    current_epoch: ending_epoch,
+                });
+            }
+
+            let artifact = MatrixArtifact {
                 cell_id: cell_id.to_string(),
                 edge_type: edge_type.to_string(),
-                read_epoch: base_epoch,
-                current_epoch: ending_epoch,
-            });
+                base_epoch,
+                tile_size,
+                out_tiles,
+                transpose_tiles,
+                edge_count: rows.live_edges,
+            };
+
+            let mut manifest_batch = GraphWriteBatch::new();
+            manifest_batch.put(
+                matrix_manifest_key(cell_id, edge_type, base_epoch),
+                encode_matrix_artifact(&artifact),
+            );
+            manifest_batch.put(
+                graphblas_csc_key(cell_id, edge_type, base_epoch),
+                encode_graphblas_csc_manifest(&graphblas_manifest),
+            );
+            self.write_graph_batch_strict(cell_id, "build_matrix_tiles", manifest_batch)
+                .await?;
+
+            Ok(artifact)
         }
-
-        let artifact = MatrixArtifact {
-            cell_id: cell_id.to_string(),
-            edge_type: edge_type.to_string(),
-            base_epoch,
-            tile_size,
-            out_tiles,
-            transpose_tiles,
-            edge_count: rows.live_edges,
+        .await
+        {
+            Ok(artifact) => artifact,
+            Err(err) => {
+                let manifest_key = matrix_manifest_key(cell_id, edge_type, base_epoch);
+                if self.read_remote(&manifest_key).await?.is_none() {
+                    delete_matrix_artifact_epoch(
+                        self,
+                        cell_id,
+                        edge_type,
+                        base_epoch,
+                        "build_matrix_tiles_abort",
+                    )
+                    .await?;
+                }
+                return Err(err);
+            }
         };
-
-        let mut manifest_batch = GraphWriteBatch::new();
-        manifest_batch.put(
-            matrix_manifest_key(cell_id, edge_type, base_epoch),
-            encode_matrix_artifact(&artifact),
-        );
-        manifest_batch.put(
-            graphblas_csc_key(cell_id, edge_type, base_epoch),
-            encode_graphblas_csc_manifest(&graphblas_manifest),
-        );
-        self.write_graph_batch_strict(cell_id, "build_matrix_tiles", manifest_batch)
-            .await?;
 
         let cache_key = MatrixCacheKey::new(cell_id, edge_type, base_epoch);
         let pinned = self.cache_policy.pin_matrix_artifact(&artifact);
