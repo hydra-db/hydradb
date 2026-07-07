@@ -1,26 +1,66 @@
 # SlateDB Graph Kernel
 
-This repository contains the Phase 0 graph kernel prototype for a stateless,
-object-store-backed graph database. SlateDB is the durable KV/object-store layer;
-this crate adds graph layout, write routing, edge mutation batching, artifact
-builders, supernode indexes, sparse traversal kernels, and the early Cypher
-front-end.
+`slatedb-graph-kernel` is a Rust graph storage and query kernel built on top of
+SlateDB. The object store is the durable source of truth, while local SSD/NVMe
+and memory are cache layers controlled through SlateDB settings and graph-layer
+cache policy.
 
-The crate is intentionally kept outside the SlateDB source tree so it can track
-upstream SlateDB without carrying a long-lived fork. The tested SlateDB revision
-is pinned in `Cargo.toml` and `Cargo.lock`.
+The crate is intentionally kept outside the SlateDB repository. SlateDB stays an
+upstream dependency pinned in `Cargo.toml`/`Cargo.lock`, and this crate owns the
+graph model, write fencing, artifact layout, traversal kernels, query planner,
+and operational harnesses.
+
+## What Is Implemented
+
+- Durable edge writes, deletes, bulk import, trusted segment append, mutation
+  logs, idempotency records, and degree/index maintenance.
+- Per-cell hard write fencing with object-store lock records, lease generation
+  checks, and SlateDB transactional retries.
+- Routed multi-cell clusters, graph nodes with lease renewal, placement metadata,
+  control-plane watermarks, failover helpers, and repair paths.
+- Snapshot reads, read leases, retention checks, rollup, delta GC, artifact GC,
+  and full graph export/verifier digests.
+- Posting chunks, matrix tiles, supernode chunk indexes, paginated supernode
+  scans, supernode membership checks, and intersection helpers.
+- Sparse traversal through the Rust kernel by default, with optional SuiteSparse
+  GraphBLAS FFI for compiled CSC traversal.
+- OpenCypher row query execution behind the `opencypher` feature, including
+  parsing through `libcypher-parser`, row result sets, pages/cursors,
+  cancellation, limits, stats, and optimizer passes.
+- Optional TCP query transport with required auth by default, optional TLS/mTLS,
+  static directory discovery, and Kubernetes/Consul/etcd discovery helpers.
+- Local filesystem, MinIO, and S3-compatible object-store workflows through
+  SlateDB/object-store configuration.
+
+## Repository Layout
+
+```text
+src/core/        configuration, error types, public model types, cache policy
+src/shard/       GraphShard lifecycle, writes, reads, query execution, maintenance
+src/engine/      artifacts, supernodes, rollup/GC, cluster/control-plane helpers
+src/query/       OpenCypher lowering, algebra, optimizer, transport, TCK parser
+src/sparse_kernel.rs
+                 Rust sparse traversal and optional SuiteSparse GraphBLAS FFI
+examples/        smoke, stress, correctness, benchmark, and profiling binaries
+scripts/         local, MinIO, query, write, stress, and chaos harnesses
+```
 
 ## Requirements
 
-- Rust stable
-- Optional task runner: `just`
-- Linux build tools: `build-essential`, `clang`, `libclang-dev`, `cmake`, and
-  `pkg-config`
-- OpenCypher parser headers and library: `libcypher-parser-dev`
-- Optional GraphBLAS acceleration: SuiteSparse GraphBLAS development headers
-  and library, normally `libgraphblas-dev` on Ubuntu/Debian
+Base build:
 
-On Ubuntu or WSL:
+- Rust stable
+- `pkg-config`, `cmake`, `clang`, and normal C/C++ build tools
+- Optional: `just` for recipe shortcuts
+
+Native query/traversal features:
+
+- `opencypher`: native `libcypher-parser`
+- `graphblas`: SuiteSparse GraphBLAS development headers and library
+- `query-transport-tls`: Rustls dependencies are pulled by Cargo; you provide
+  certificates/configuration in the embedding service
+
+Ubuntu or WSL:
 
 ```bash
 sudo apt-get update
@@ -28,7 +68,7 @@ sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config libc
 cargo install just --locked
 ```
 
-On macOS with Homebrew:
+macOS with Homebrew:
 
 ```bash
 xcode-select --install
@@ -37,8 +77,8 @@ brew install cleishm/neo4j/libcypher-parser
 rustup-init
 ```
 
-Open a new shell after `rustup-init`, then make Homebrew's native libraries
-visible to `pkg-config` and the linker:
+Then open a new shell and make the native libraries visible when using native
+features:
 
 ```bash
 export PKG_CONFIG_PATH="$(brew --prefix libcypher-parser)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
@@ -49,127 +89,249 @@ pkg-config --exists cypher-parser
 test -f "$(brew --prefix suite-sparse)/lib/libgraphblas.dylib"
 ```
 
-The default feature set builds the storage kernel without native parser or
-GraphBLAS dependencies. The `opencypher` feature needs `libcypher-parser`. The
-`graphblas` feature needs SuiteSparse GraphBLAS, which Homebrew provides through
-`suite-sparse`. The `chaos-harness` feature exposes only the hard-fence test
-worker used by local/MinIO takeover scripts; it is not part of the normal
-application API.
-
-## Clone And Test
+## Build And Test
 
 ```bash
 git clone https://github.com/usecortex/slatedb-graph-kernel.git
 cd slatedb-graph-kernel
-cargo test --lib
-cargo test --features opencypher --lib
-cargo test --features opencypher,graphblas --lib
-cargo check --examples --features opencypher,graphblas
+
+cargo test --locked --lib
+cargo test --locked --features opencypher --lib
+cargo test --locked --features graphblas --lib
+cargo test --locked --features opencypher,graphblas --lib
+cargo check --locked --examples --features opencypher,graphblas
 ```
 
-Or, with `just`:
-
-```bash
-just ci
-```
-
-The `graphblas` Cargo feature enables the crate's native FFI path:
-`src/sparse_kernel.rs` links directly with `libgraphblas` through
-`#[link(name = "graphblas")]`. There is no Rust GraphBLAS crate dependency.
-
-The Cypher front-end is behind the `opencypher` Cargo feature. It uses
-`libcypher-parser-sys`, which links against the native `cypher-parser` system
-library through `pkg-config`.
-
-The default feature set is checked on Ubuntu and macOS in CI. The native
-OpenCypher and GraphBLAS feature set is checked on Ubuntu where the system
-packages are installed by the workflow.
-
-## SlateDB Dependency
-
-SlateDB is fetched from GitHub:
-
-```toml
-slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "a6e169dc1e143fa72a0aa916a9b23cf29b3656b4", default-features = false, features = ["aws", "foyer"] }
-```
-
-To move to a newer upstream SlateDB, update the `rev` in `Cargo.toml`, then run:
-
-```bash
-cargo update -p slatedb
-cargo test --lib
-cargo test --features graphblas --lib
-```
-
-## Store Format
-
-Graph shards write a durable `graph/meta/format_version` record when opened by a
-writer. Missing format metadata is treated as a legacy Phase 0 store and is
-accepted so existing prototype data can still be read. Newer or otherwise
-unsupported format versions fail closed during `GraphShard::open`.
-
-## Observability
-
-The crate emits structured `tracing` events for store-format initialization,
-rollup publication, delta/artifact GC, lease acquisition, lease renewal issues,
-and failover. Applications should install their own tracing subscriber and
-export those events with their normal metrics/log pipeline.
-
-## Useful Commands
-
-List recipes:
+With `just`:
 
 ```bash
 just
+just ci
 ```
 
-Run the local object-store smoke test:
+CI runs default and native feature checks on Ubuntu. macOS CI validates the
+default and chaos-harness feature sets, so native `opencypher,graphblas` support
+on macOS should be checked locally when those libraries are installed.
+
+## Feature Flags
+
+| Feature | Purpose |
+|---|---|
+| default | Storage kernel, graph APIs, Rust sparse traversal, no native parser/GraphBLAS |
+| `opencypher` | Enables OpenCypher parsing and row query execution through `libcypher-parser-sys` |
+| `graphblas` | Enables direct FFI to `libgraphblas` from `src/sparse_kernel.rs` |
+| `chaos-harness` | Builds the hard-fence worker used by stress/failover scripts |
+| `query-transport` | Enables TCP query client/server types and serde row frames |
+| `query-transport-tls` | Adds TLS/mTLS config provider support for TCP query transport |
+| `query-service-discovery` | Adds Kubernetes EndpointSlice, Consul, and etcd discovery helpers |
+
+The GraphBLAS path does not depend on a Rust GraphBLAS crate. It links directly
+to the system library with `#[link(name = "graphblas")]`.
+
+## Object Store And Cache Model
+
+The object store is the durable graph store. For local development use
+`local_object_store(path)`. For MinIO/S3-compatible storage use
+`object_store_from_env(...)`, which delegates to SlateDB's object-store loader.
+The MinIO scripts generate env files containing values such as:
+
+```text
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_DEFAULT_REGION=us-east-1
+AWS_ENDPOINT=http://127.0.0.1:19000
+AWS_BUCKET=...
+AWS_ALLOW_HTTP=true
+AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false
+```
+
+Caching is two-layer:
+
+- SlateDB object-store cache: configured through `GraphCacheConfig`, including
+  disk cache directory, cache size, cache-on-put, and SST preload.
+- Graph-layer memory cache: configured through `GraphCachePolicy`, including
+  matrix artifacts, matrix adjacencies, compiled GraphBLAS matrices, parsed
+  row queries, reachability results, supernode groups, posting chunks, and
+  hydration concurrency.
+
+## Write And Read APIs
+
+The main embedding type is `GraphShard`. It can be opened as a read shard, a
+standalone writer, or through a routed `GraphNode`/`RoutedGraphCluster`.
+
+Common write paths:
+
+- `write_edge`, `write_edge_with_vertex_metadata`, `write_edge_with_full_metadata`
+- `delete_edge`
+- `write_edge_mutations_batch`
+- `ingest_edge_mutations`
+- `append_edge_mutation_log`
+- `bulk_import_edges`, `bulk_import_edges_chunked`
+- `bulk_append_edges_trusted_chunked`
+- `bulk_append_supernode_segment_trusted`
+
+Common read/artifact paths:
+
+- `edge_exists`, `out_neighbors`, `out_degree`
+- `snapshot`, `snapshot_at`
+- `build_posting_chunks`, `build_matrix_tiles`, `build_supernode_groups`
+- `matrix_reachable`, `matrix_reachable_with_kernel`, `posting_reachable`
+- `supernode_page`, `supernode_degree`, `supernode_edge_exists`,
+  `supernode_intersection`
+- `rollup_artifacts`, `delete_deltas_through_rollup`,
+  `delete_graph_artifacts_before`
+- `export_live_graph_digest`, `verify_current_graph`
+
+Minimal local example:
+
+```rust
+use slatedb_graph_kernel::{local_object_store, EdgeMutation, GraphShard, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let store = local_object_store("target/local-graph-store")?;
+    let shard = GraphShard::open_standalone_writer("demo-db", store).await?;
+
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "follow-1-2".to_string(),
+        })
+        .await?;
+
+    let epoch = shard.current_epoch("reddit-home").await?;
+    let neighbors = shard
+        .out_neighbors_at("reddit-home", "FOLLOWS", 1, epoch)
+        .await?;
+
+    assert_eq!(neighbors, vec![2]);
+    shard.close().await
+}
+```
+
+## Query Engine
+
+OpenCypher support is enabled with `--features opencypher`. The row engine
+returns `QueryResultSet` or `QueryResultPage` and is available on `GraphShard`,
+`RoutedGraphCluster`, and the optional TCP transport.
+
+Currently supported query shapes include:
+
+- `MATCH ... RETURN` over node patterns and directed typed relationships.
+- Multi-edge path patterns in one `MATCH`.
+- `OPTIONAL MATCH`.
+- `UNION` and `UNION ALL`, preserving `UNION ALL` leg order.
+- Bounded variable-length relationships such as `[:FOLLOWS*1..20]`.
+- Node labels, node properties, relationship properties, and `id` constraints.
+- `WHERE` boolean combinations over property/id comparisons with `=`, `<>`,
+  `<`, `>`, `<=`, and `>=`.
+- `ORDER BY`, `SKIP`, `LIMIT`, aliases, and parameter values.
+- Aggregates: `count(*)`, `count(expr)`, `sum(expr)`, `avg(expr)`,
+  and `collect(expr)`.
+- Mutations: `CREATE` edge patterns, `MERGE` edge patterns, `DELETE r`,
+  `SET`/`REMOVE` labels and properties.
+
+Known query limits:
+
+- `DETACH DELETE` is rejected because node deletion is not implemented.
+- Unbounded variable-length paths are rejected; provide an explicit max hop.
+- Undirected relationships are rejected.
+- `RETURN *` and `DISTINCT` are rejected.
+- `WITH` is pass-through only; it must keep every in-scope binding unchanged.
+- Native row execution is materialized for many plans; page APIs and the graph
+  kernel fast path avoid materializing the hottest bounded reachability cases.
+
+Example:
+
+```rust
+use slatedb_graph_kernel::{QueryContext, QueryValue};
+
+let rows = shard
+    .execute_cypher_rows(
+        QueryContext::new("reddit-home", "query-1").with_timeout_ms(30_000),
+        "MATCH (u {id: 1})-[:FOLLOWS*1..5]->(v) \
+         RETURN v.id AS id ORDER BY id LIMIT 10",
+    )
+    .await?;
+
+for row in rows.rows {
+    if let [QueryValue::VertexId(id)] = row.values.as_slice() {
+        println!("{id}");
+    }
+}
+```
+
+## Optimizer And Stats
+
+The row query optimizer uses both structural heuristics and persisted stats.
+It can select vertex label/property indexes, edge property indexes, full scans,
+bound expands, reverse expands, expand-into, graph-kernel reachability, and hash
+join shortcuts.
+
+Stats APIs include:
+
+- `refresh_edge_type_query_stats`
+- `refresh_vertex_label_query_stats`
+- `refresh_vertex_property_query_stats`
+- `refresh_edge_property_query_stats`
+- `refresh_vertex_property_histogram_query_stats`
+- `refresh_edge_property_histogram_query_stats`
+- `start_query_stats_refresh_job`
+
+Stats refresh scans run outside write locks and publish with snapshot
+revalidation.
+
+## Useful Commands
 
 ```bash
-just smoke
+just smoke                    # local object-store smoke
+just smoke-graphblas          # local smoke with GraphBLAS traversal
+just stress                   # local multiprocess stress and recovery checks
+just fence                    # local stale-writer/fence takeover proof
+just bench                    # path/supernode benchmark
+just bench-rust               # same benchmark with Rust sparse traversal
+just query-bench              # OpenCypher hot/warm/cold query benchmark
+just query-correctness        # exact query correctness checks
+just query-memory-profile     # low-memory query/build/concurrency profile
+just minio-smoke              # Docker MinIO smoke
+just minio-chaos              # Docker MinIO chaos
+just minio-fence              # MinIO fence takeover proof
+just minio-bench              # MinIO path/supernode benchmark
+just minio-query-bench        # MinIO query benchmark
+just minio-query-correctness  # MinIO query correctness checks
 ```
 
-Run the path/supernode benchmark with GraphBLAS:
+Benchmark and correctness outputs are written under `bench-results/`.
+
+To enable GraphBLAS for query benchmarks on machines with native GraphBLAS:
 
 ```bash
-just bench
+GRAPH_QUERY_BENCH_FEATURES=opencypher,graphblas \
+GRAPH_QUERY_BENCH_MAX_GRAPHBLAS_MATRICES=1 \
+just query-bench
 ```
 
-Run the same path/supernode benchmark against a Docker MinIO object store:
+## Production Boundary
 
-```bash
-just minio-bench
-```
+This crate is a kernel/library, not a complete hosted database service. It now
+contains the major storage, query, routing, fencing, artifact, stress, and
+verification pieces needed for an object-store graph database, but production
+use still requires an embedding service and operational validation around it:
 
-Run local multiprocess stress against the local filesystem object store:
+- real deployment controller for placement, failover, lease renewal, and rollout
+  policy;
+- production metrics export, dashboards, alerts, tenant quotas, and backpressure
+  policy choices;
+- long-running multi-process and real S3 soak tests under throttling, latency,
+  timeout, and restart faults;
+- complete compatibility policy for the OpenCypher subset, including larger TCK
+  reports and documented skip reasons;
+- security integration for the TCP transport, including real certificate
+  rotation and secret management.
 
-```bash
-just stress
-```
-
-Run the hard write-fence takeover proof against the local filesystem object
-store:
-
-```bash
-just fence
-```
-
-Run MinIO smoke or chaos checks when Docker is available:
-
-```bash
-just minio-smoke
-just minio-chaos
-just minio-fence
-```
-
-Generated benchmark files are ignored under `bench-results/`. The MinIO path
-benchmark writes `bench-results/phase0_path_bench_minio.csv` and a matching log
-by default.
-
-## Current Scope
-
-This is still a Phase 0 kernel. It is meant for correctness, layout, traversal,
-supernode, and object-store experiments, not as a finished database server. The
-main production boundary is the graph layer above SlateDB: routing, leases,
-rollups, artifact publication, and query execution policy must continue to be
-validated under real multi-node and S3 failure modes.
+The safest way to evaluate a new environment is: run default tests, native
+feature tests, local smoke, MinIO smoke, query correctness, stress, and then a
+long soak using the same object store and cache settings intended for deployment.
