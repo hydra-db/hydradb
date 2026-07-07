@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::{
-    validate_component, CommitResult, EdgeMetadata, GraphEpoch, GraphError, Result, VertexId,
-    VertexMetadata, VertexPropertyValue,
+    validate_component, CommitResult, EdgeMetadata, GraphEpoch, GraphError, QueryFloat, Result,
+    VertexId, VertexMetadata, VertexPropertyValue,
 };
 
 #[cfg_attr(
@@ -288,33 +288,6 @@ pub struct QueryColumn {
 impl QueryColumn {
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
-    }
-}
-
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Deserialize, serde::Serialize)
-)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct QueryFloat(pub f64);
-
-impl PartialEq for QueryFloat {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.to_bits() == other.0.to_bits()
-    }
-}
-
-impl Eq for QueryFloat {}
-
-impl PartialOrd for QueryFloat {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for QueryFloat {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.total_cmp(&other.0)
     }
 }
 

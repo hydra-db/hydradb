@@ -2581,36 +2581,49 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         validate_component("property", property)?;
-        let encoded = encode_vertex_property_value_key(value);
-        let mut iter = self
-            .scan_remote_prefix(&keys::edge_property_index_delta_prefix(
-                cell_id, edge_type, property, &encoded,
-            ))
-            .await?;
-        let mut latest = BTreeMap::<(VertexId, VertexId), bool>::new();
-        let mut saw_delta = false;
-        while let Some(kv) = iter.next().await? {
-            budget.check("cypher_edge_property_index")?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (epoch, src, dst) = parse_edge_property_index_delta_key(&key)?;
-            saw_delta = true;
-            if epoch > read_epoch {
-                break;
+        let mut edges = BTreeSet::<(VertexId, VertexId)>::new();
+        for encoded in equivalent_property_index_keys(value) {
+            let mut iter = self
+                .scan_remote_prefix(&keys::edge_property_index_delta_prefix(
+                    cell_id, edge_type, property, &encoded,
+                ))
+                .await?;
+            let mut latest = BTreeMap::<(VertexId, VertexId), bool>::new();
+            let mut saw_delta = false;
+            while let Some(kv) = iter.next().await? {
+                budget.check("cypher_edge_property_index")?;
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let (epoch, src, dst) = parse_edge_property_index_delta_key(&key)?;
+                saw_delta = true;
+                if epoch > read_epoch {
+                    break;
+                }
+                latest.insert((src, dst), decode_vertex_index_delta(&key, &kv.value)?);
+                self.ensure_query_index_candidates(
+                    "cypher_edge_property_index_candidates",
+                    latest.len(),
+                )?;
             }
-            latest.insert((src, dst), decode_vertex_index_delta(&key, &kv.value)?);
-            self.ensure_query_index_candidates(
-                "cypher_edge_property_index_candidates",
-                latest.len(),
-            )?;
+            let encoded_edges = if saw_delta {
+                latest
+                    .into_iter()
+                    .filter_map(|(edge, present)| present.then_some(edge))
+                    .collect()
+            } else {
+                self.scan_edge_property_index_current(
+                    cell_id, edge_type, property, &encoded, budget,
+                )
+                .await?
+            };
+            for edge in encoded_edges {
+                edges.insert(edge);
+                self.ensure_query_index_candidates(
+                    "cypher_edge_property_index_candidates",
+                    edges.len(),
+                )?;
+            }
         }
-        if saw_delta {
-            return Ok(latest
-                .into_iter()
-                .filter_map(|(edge, present)| present.then_some(edge))
-                .collect());
-        }
-        self.scan_edge_property_index_current(cell_id, edge_type, property, &encoded, budget)
-            .await
+        Ok(edges.into_iter().collect())
     }
 
     #[cfg(feature = "opencypher")]
@@ -2715,36 +2728,47 @@ impl GraphShard {
     ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("property", property)?;
-        let encoded = encode_vertex_property_value_key(value);
-        let mut iter = self
-            .scan_remote_prefix(&keys::vertex_property_index_delta_prefix(
-                cell_id, property, &encoded,
-            ))
-            .await?;
-        let mut latest = BTreeMap::<VertexId, bool>::new();
-        let mut saw_delta = false;
-        while let Some(kv) = iter.next().await? {
-            budget.check("cypher_vertex_property_index")?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (epoch, vertex_id) = parse_vertex_property_index_delta_key(&key)?;
-            saw_delta = true;
-            if epoch > read_epoch {
-                break;
+        let mut vertices = BTreeSet::<VertexId>::new();
+        for encoded in equivalent_property_index_keys(value) {
+            let mut iter = self
+                .scan_remote_prefix(&keys::vertex_property_index_delta_prefix(
+                    cell_id, property, &encoded,
+                ))
+                .await?;
+            let mut latest = BTreeMap::<VertexId, bool>::new();
+            let mut saw_delta = false;
+            while let Some(kv) = iter.next().await? {
+                budget.check("cypher_vertex_property_index")?;
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let (epoch, vertex_id) = parse_vertex_property_index_delta_key(&key)?;
+                saw_delta = true;
+                if epoch > read_epoch {
+                    break;
+                }
+                latest.insert(vertex_id, decode_vertex_index_delta(&key, &kv.value)?);
+                self.ensure_query_index_candidates(
+                    "cypher_vertex_property_index_candidates",
+                    latest.len(),
+                )?;
             }
-            latest.insert(vertex_id, decode_vertex_index_delta(&key, &kv.value)?);
-            self.ensure_query_index_candidates(
-                "cypher_vertex_property_index_candidates",
-                latest.len(),
-            )?;
+            let encoded_vertices = if saw_delta {
+                latest
+                    .into_iter()
+                    .filter_map(|(vertex_id, present)| present.then_some(vertex_id))
+                    .collect()
+            } else {
+                self.scan_vertex_property_index_current(cell_id, property, &encoded, budget)
+                    .await?
+            };
+            for vertex_id in encoded_vertices {
+                vertices.insert(vertex_id);
+                self.ensure_query_index_candidates(
+                    "cypher_vertex_property_index_candidates",
+                    vertices.len(),
+                )?;
+            }
         }
-        if saw_delta {
-            return Ok(latest
-                .into_iter()
-                .filter_map(|(vertex_id, present)| present.then_some(vertex_id))
-                .collect());
-        }
-        self.scan_vertex_property_index_current(cell_id, property, &encoded, budget)
-            .await
+        Ok(vertices.into_iter().collect())
     }
 
     #[cfg(feature = "opencypher")]
@@ -5390,10 +5414,12 @@ fn row_matches_edge_pattern(row: &BindingRow, pattern: &RowEdgePattern) -> Resul
             feature: "relationship metadata was not hydrated".to_string(),
         });
     };
-    Ok(pattern
-        .properties
-        .iter()
-        .all(|(property, value)| metadata.properties.get(property) == Some(value)))
+    Ok(pattern.properties.iter().all(|(property, value)| {
+        metadata
+            .properties
+            .get(property)
+            .is_some_and(|existing| vertex_property_values_equal(existing, value))
+    }))
 }
 
 #[cfg(feature = "opencypher")]
@@ -5475,7 +5501,12 @@ fn vertex_metadata_matches(metadata: &VertexMetadata, node: &RowNodePattern) -> 
             .properties
             .iter()
             .filter(|(property, _)| property.as_str() != "id")
-            .all(|(property, value)| metadata.properties.get(property) == Some(value))
+            .all(|(property, value)| {
+                metadata
+                    .properties
+                    .get(property)
+                    .is_some_and(|existing| vertex_property_values_equal(existing, value))
+            })
 }
 
 #[cfg(feature = "opencypher")]
@@ -5532,26 +5563,36 @@ fn compare_vertex_property_values(
     right: &VertexPropertyValue,
 ) -> Result<bool> {
     Ok(match op {
-        RowComparisonOp::Eq => left == right,
-        RowComparisonOp::Ne => left != right,
+        RowComparisonOp::Eq => numeric_property_order(left, right)
+            .map(|ordering| compare_ordering(ordering, op))
+            .unwrap_or(left == right),
+        RowComparisonOp::Ne => numeric_property_order(left, right)
+            .map(|ordering| compare_ordering(ordering, op))
+            .unwrap_or(left != right),
         RowComparisonOp::Lt | RowComparisonOp::Gt | RowComparisonOp::Lte | RowComparisonOp::Gte => {
-            match (left, right) {
-                (VertexPropertyValue::Integer(left), VertexPropertyValue::Integer(right)) => {
-                    compare_ordering(left.cmp(right), op)
-                }
-                (VertexPropertyValue::String(left), VertexPropertyValue::String(right)) => {
-                    compare_ordering(left.cmp(right), op)
-                }
-                _ => {
-                    return Err(GraphError::UnsupportedQuery {
-                        dialect: "OpenCypher",
-                        feature: "ordered comparisons require matching integer or string values"
-                            .to_string(),
-                    });
-                }
+            match numeric_property_order(left, right) {
+                Some(ordering) => compare_ordering(ordering, op),
+                None => match (left, right) {
+                    (VertexPropertyValue::String(left), VertexPropertyValue::String(right)) => {
+                        compare_ordering(left.cmp(right), op)
+                    }
+                    _ => {
+                        return Err(GraphError::UnsupportedQuery {
+                            dialect: "OpenCypher",
+                            feature:
+                                "ordered comparisons require numeric or matching string values"
+                                    .to_string(),
+                        });
+                    }
+                },
             }
         }
     })
+}
+
+#[cfg(feature = "opencypher")]
+fn vertex_property_values_equal(left: &VertexPropertyValue, right: &VertexPropertyValue) -> bool {
+    compare_vertex_property_values(left, RowComparisonOp::Eq, right).unwrap_or(false)
 }
 
 #[cfg(feature = "opencypher")]
@@ -6035,10 +6076,10 @@ fn compare_vertex_property_order(
     left: &VertexPropertyValue,
     right: &VertexPropertyValue,
 ) -> std::cmp::Ordering {
+    if let Some(ordering) = numeric_property_order(left, right) {
+        return ordering;
+    }
     match (left, right) {
-        (VertexPropertyValue::Integer(left), VertexPropertyValue::Integer(right)) => {
-            left.cmp(right)
-        }
         (VertexPropertyValue::Bool(left), VertexPropertyValue::Bool(right)) => left.cmp(right),
         (VertexPropertyValue::String(left), VertexPropertyValue::String(right)) => left.cmp(right),
         _ => vertex_property_rank(left).cmp(&vertex_property_rank(right)),
@@ -6061,7 +6102,95 @@ fn query_value_rank(value: &QueryValue) -> u8 {
 fn vertex_property_rank(value: &VertexPropertyValue) -> u8 {
     match value {
         VertexPropertyValue::Bool(_) => 0,
-        VertexPropertyValue::Integer(_) => 1,
+        VertexPropertyValue::Integer(_) | VertexPropertyValue::Float(_) => 1,
         VertexPropertyValue::String(_) => 2,
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn equivalent_property_index_keys(value: &VertexPropertyValue) -> Vec<String> {
+    let mut keys = BTreeSet::new();
+    keys.insert(encode_vertex_property_value_key(value));
+    match value {
+        VertexPropertyValue::Integer(value) => {
+            if let Some(float) = VertexPropertyValue::exact_f64_from_u64(*value) {
+                insert_float_property_index_key(&mut keys, float);
+                if *value == 0 {
+                    insert_float_property_index_key(&mut keys, -0.0);
+                }
+            }
+        }
+        VertexPropertyValue::Float(value) => {
+            if value.0 == 0.0 {
+                insert_float_property_index_key(&mut keys, 0.0);
+                insert_float_property_index_key(&mut keys, -0.0);
+            }
+            if let Some(integer) = VertexPropertyValue::exact_u64_from_f64(value.0) {
+                keys.insert(encode_vertex_property_value_key(
+                    &VertexPropertyValue::Integer(integer),
+                ));
+            }
+        }
+        VertexPropertyValue::Bool(_) | VertexPropertyValue::String(_) => {}
+    }
+    keys.into_iter().collect()
+}
+
+#[cfg(feature = "opencypher")]
+fn insert_float_property_index_key(keys: &mut BTreeSet<String>, value: f64) {
+    keys.insert(encode_vertex_property_value_key(
+        &VertexPropertyValue::Float(QueryFloat(value)),
+    ));
+}
+
+#[cfg(feature = "opencypher")]
+fn numeric_property_order(
+    left: &VertexPropertyValue,
+    right: &VertexPropertyValue,
+) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (VertexPropertyValue::Integer(left), VertexPropertyValue::Integer(right)) => {
+            Some(left.cmp(right))
+        }
+        (VertexPropertyValue::Float(left), VertexPropertyValue::Float(right)) => {
+            Some(compare_f64_numeric(left.0, right.0))
+        }
+        (VertexPropertyValue::Integer(left), VertexPropertyValue::Float(right)) => {
+            Some(compare_u64_f64(*left, right.0))
+        }
+        (VertexPropertyValue::Float(left), VertexPropertyValue::Integer(right)) => {
+            Some(compare_u64_f64(*right, left.0).reverse())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_f64_numeric(left: f64, right: f64) -> std::cmp::Ordering {
+    if left == right {
+        std::cmp::Ordering::Equal
+    } else {
+        left.total_cmp(&right)
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_u64_f64(left: u64, right: f64) -> std::cmp::Ordering {
+    const U64_EXCLUSIVE_UPPER: f64 = 18446744073709551616.0;
+    if right.is_nan() {
+        return (left as f64).total_cmp(&right);
+    }
+    if right < 0.0 {
+        return std::cmp::Ordering::Greater;
+    }
+    if right >= U64_EXCLUSIVE_UPPER {
+        return std::cmp::Ordering::Less;
+    }
+    let floor = right.floor();
+    let floor_integer = floor as u64;
+    match left.cmp(&floor_integer) {
+        std::cmp::Ordering::Equal if floor == right => std::cmp::Ordering::Equal,
+        std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
+        ordering => ordering,
     }
 }
