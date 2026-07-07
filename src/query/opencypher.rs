@@ -5,8 +5,8 @@ use std::ptr::null_mut;
 use libcypher_parser_sys as sys;
 
 use crate::{
-    validate_component, EdgeMetadata, GraphError, QueryColumn, QueryStatement, QueryWindow, Result,
-    VertexId, VertexMetadata, VertexPropertyValue,
+    validate_component, EdgeMetadata, GraphError, QueryColumn, QueryFloat, QueryStatement,
+    QueryWindow, Result, VertexId, VertexMetadata, VertexPropertyValue,
 };
 
 type AstNode = sys::cypher_astnode_t;
@@ -1443,6 +1443,7 @@ fn row_expression_name(expression: &RowExpression) -> String {
         RowExpression::Property { binding, property } => format!("{binding}.{property}"),
         RowExpression::Literal(VertexPropertyValue::Integer(value)) => value.to_string(),
         RowExpression::Literal(VertexPropertyValue::Bool(value)) => value.to_string(),
+        RowExpression::Literal(VertexPropertyValue::Float(value)) => value.0.to_string(),
         RowExpression::Literal(VertexPropertyValue::String(value)) => format!("'{value}'"),
     }
 }
@@ -1989,6 +1990,13 @@ fn scalar_property_value(
                 node, parameters,
             )?));
         }
+        if is_instance(node, sys::CYPHER_AST_FLOAT) {
+            let value = c_string(sys::cypher_ast_float_get_valuestr(node));
+            return value
+                .parse::<f64>()
+                .map(|value| VertexPropertyValue::Float(QueryFloat(value)))
+                .map_err(|err| parse_error(format!("invalid float literal {value}: {err}")));
+        }
         if is_instance(node, sys::CYPHER_AST_STRING) {
             return Ok(VertexPropertyValue::String(c_string(
                 sys::cypher_ast_string_get_value(node),
@@ -2000,8 +2008,37 @@ fn scalar_property_value(
         if is_instance(node, sys::CYPHER_AST_FALSE) {
             return Ok(VertexPropertyValue::Bool(false));
         }
+        if is_instance(node, sys::CYPHER_AST_UNARY_OPERATOR) {
+            let op = sys::cypher_ast_unary_operator_get_operator(node);
+            let arg = checked_node(sys::cypher_ast_unary_operator_get_argument(node))?;
+            let value = scalar_property_value(arg, parameters)?;
+            if op == sys::CYPHER_OP_UNARY_PLUS {
+                return match value {
+                    VertexPropertyValue::Integer(_) | VertexPropertyValue::Float(_) => Ok(value),
+                    VertexPropertyValue::Bool(_) | VertexPropertyValue::String(_) => {
+                        unsupported("unary plus requires a numeric property value")
+                    }
+                };
+            }
+            if op == sys::CYPHER_OP_UNARY_MINUS {
+                return match value {
+                    VertexPropertyValue::Float(value) => {
+                        Ok(VertexPropertyValue::Float(QueryFloat(-value.0)))
+                    }
+                    VertexPropertyValue::Integer(0) => {
+                        Ok(VertexPropertyValue::Float(QueryFloat(-0.0)))
+                    }
+                    VertexPropertyValue::Integer(_)
+                    | VertexPropertyValue::Bool(_)
+                    | VertexPropertyValue::String(_) => {
+                        unsupported("unary minus requires a float property value")
+                    }
+                };
+            }
+            return unsupported("property value unary operator must be plus or minus");
+        }
     }
-    unsupported("property values currently support integer, boolean, and string literals")
+    unsupported("property values currently support integer, float, boolean, and string literals")
 }
 
 fn integer_vertex_id(

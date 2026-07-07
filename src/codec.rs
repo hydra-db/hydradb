@@ -485,6 +485,7 @@ pub(crate) fn encode_vertex_property_value_key(value: &VertexPropertyValue) -> S
         VertexPropertyValue::Integer(value) => format!("i{value:020}"),
         VertexPropertyValue::Bool(false) => "b0".to_string(),
         VertexPropertyValue::Bool(true) => "b1".to_string(),
+        VertexPropertyValue::Float(value) => format!("n{:016x}", sortable_float_bits(value.0)),
         VertexPropertyValue::String(value) => format!("s{}", hex_encode(value.as_bytes())),
     }
 }
@@ -510,6 +511,7 @@ fn encode_vertex_property_value_record(value: &VertexPropertyValue) -> String {
         VertexPropertyValue::Integer(value) => format!("i:{value}"),
         VertexPropertyValue::Bool(false) => "b:false".to_string(),
         VertexPropertyValue::Bool(true) => "b:true".to_string(),
+        VertexPropertyValue::Float(value) => format!("f:{:016x}", value.0.to_bits()),
         VertexPropertyValue::String(value) => format!("s:{}", hex_encode(value.as_bytes())),
     }
 }
@@ -537,6 +539,12 @@ fn decode_vertex_property_value_record(key: &str, value: &str) -> Result<VertexP
                 reason: format!("invalid boolean vertex property {other}"),
             }),
         },
+        "f" => u64::from_str_radix(payload, 16)
+            .map(|bits| VertexPropertyValue::Float(QueryFloat(f64::from_bits(bits))))
+            .map_err(|err| GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("invalid float vertex property {payload}: {err}"),
+            }),
         "s" => {
             let bytes = hex_decode(key, payload)?;
             String::from_utf8(bytes)
@@ -550,6 +558,15 @@ fn decode_vertex_property_value_record(key: &str, value: &str) -> Result<VertexP
             key: key.to_string(),
             reason: format!("unsupported vertex property kind {other}"),
         }),
+    }
+}
+
+fn sortable_float_bits(value: f64) -> u64 {
+    let bits = value.to_bits();
+    if bits & (1 << 63) == 0 {
+        bits ^ (1 << 63)
+    } else {
+        !bits
     }
 }
 
