@@ -2137,6 +2137,163 @@ mod tests {
         assert!(rejected.is_err());
     }
 
+    // -- Bug #1: a post-commit split must not break the next write --------
+    //
+    // `upsert_edge_inner`/`ingest_batch` run `maybe_split` AFTER the durable
+    // injected-seqnum commit and apply its ops with a **bare**
+    // `storage.apply(split_ops)` — i.e. `WriteOptions::seqnum == 0`, which the
+    // backend treats as *auto-generate* and which advances `written_seq`
+    // out-of-band (`in_memory.rs::next_seqnum`). The writer's `latest_seq`
+    // never learns about that bump, so its NEXT injected seqnum is no longer
+    // strictly greater than `written_seq` and the commit is rejected. This is
+    // latent only because no existing test drives a real 512 KiB split through
+    // the writer (the split tests apply through a test helper); here we seed
+    // one so the post-commit split actually fires.
+    #[tokio::test]
+    async fn post_commit_split_must_not_break_the_next_write() {
+        let raw: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            crate::merge::GraphMergeOperator,
+        )));
+        let gs = GraphStorage::from_storage(raw.clone());
+
+        // Phase 1: a normal writer creates node "a", predicate "knows", and one
+        // edge — establishing the uid/pred the oversized posting will live at.
+        let mut w1 = Writer::from_storage(GraphStorage::from_storage(raw.clone()))
+            .await
+            .unwrap();
+        let s1 = w1.upsert_edge(b"a", "knows", b"b").await.unwrap();
+        assert_eq!(s1, 1);
+        let src = w1.lookup_uid(b"a").await.unwrap().unwrap();
+        let pred = PredId(w1.schema_id(SchemaKind::Predicate, "knows").unwrap());
+        drop(w1);
+
+        // Build an Out-adjacency posting that exceeds the 512 KiB split
+        // threshold. One uid per treemap bucket (`k << 32`) maximizes
+        // bytes-per-uid, so a few tens of thousands of uids suffice — no need
+        // for the millions a dense, run-compressible set would require.
+        let mut big = RoaringTreemap::new();
+        let mut k: u64 = 1;
+        while 2 + big.serialized_size() <= posting_ops::SPLIT_THRESHOLD {
+            for _ in 0..4096 {
+                big.insert(k << 32);
+                k += 1;
+            }
+        }
+        let oversized = crate::posting::PostingValue::single(big).serialize();
+
+        // Seed it at (Out, src, knows) with an injected seqnum just above the
+        // phase-1 commit. Recovery below resumes the logical-seq allocator well
+        // past this (the abandoned seq block), so it does not collide.
+        gs.apply_with_options(
+            vec![RecordOp::Put(PutRecordOp::new(Record::new(
+                crate::serde::keys::edge_key(Direction::Out, src, pred),
+                oversized,
+            )))],
+            WriteOptions {
+                await_durable: true,
+                seqnum: 2,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Phase 2: recover a fresh writer (its logical-seq allocator resumes
+        // past the abandoned block, safely above the seeded seqnum).
+        let mut w2 = Writer::from_storage(GraphStorage::from_storage(raw.clone()))
+            .await
+            .unwrap();
+
+        // This edge commits, then its post-commit `maybe_split` fires on the
+        // oversized (Out, src) posting and bare-applies the split ops.
+        let s_c = w2.upsert_edge(b"a", "knows", b"c").await.unwrap();
+
+        // Precondition: the split really happened (else the test is vacuous).
+        let base = gs
+            .get(crate::serde::keys::edge_key(Direction::Out, src, pred))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::posting::PostingValue::deserialize(base.as_ref())
+                .unwrap()
+                .is_split(),
+            "precondition: the post-commit split must have fired",
+        );
+
+        // THE BUG: the next write is rejected because the bare split apply
+        // auto-generated a backend seqnum (one past the c-edge commit), so
+        // w2's next injected seqnum is no longer strictly greater than the
+        // backend max and the commit is refused.
+        let next = w2.upsert_edge(b"a", "knows", b"d").await;
+        assert!(
+            next.is_ok(),
+            "a write after a post-commit split must still succeed; got {next:?}",
+        );
+        assert!(
+            next.unwrap() > s_c,
+            "the follow-up write must advance the logical seq past the split",
+        );
+    }
+
+    // -- Bug #2: a failed commit must not poison the schema cache ----------
+    //
+    // `intern` mutates the in-memory `SchemaCache` (and advances the id
+    // allocator) BEFORE the batch commits, and only queues the durable
+    // `SchemaId` `Put` on a cache MISS. If the enclosing commit then fails,
+    // the cache keeps `name -> id` but nothing durable backs it; a later
+    // SUCCESSFUL write for the same name hits the cache, emits no schema op,
+    // and commits a node referencing an id whose `SchemaId` record was never
+    // persisted — leaving it unresolvable after recovery.
+    #[tokio::test]
+    async fn failed_commit_must_not_poison_the_schema_cache() {
+        let raw: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            crate::merge::GraphMergeOperator,
+        )));
+        let failing = FailingStorage::wrap(raw.clone());
+        let mut w = Writer::from_storage(GraphStorage::from_storage(failing.clone()))
+            .await
+            .unwrap();
+
+        // First upsert interns the new prop "blob" (mutating the cache), then
+        // its commit is forced to fail — nothing durable is written.
+        failing.fail_apply_once(StorageError::Storage("simulated crash".into()));
+        let failed = w
+            .upsert_node(b"doc:huge", &[], props(&[("blob", TypedValue::Int(1))]))
+            .await;
+        assert!(
+            failed.is_err(),
+            "the injected failure must surface as an error"
+        );
+
+        // Second upsert of the SAME prop name succeeds — but on the poisoned
+        // cache it emits no `SchemaId` op, committing a node that references
+        // the interned prop id with no durable name record behind it.
+        w.upsert_node(b"doc:small", &[], props(&[("blob", TypedValue::Int(5))]))
+            .await
+            .unwrap();
+        let uid = w.lookup_uid(b"doc:small").await.unwrap().unwrap();
+        let node = w.get_node(uid).await.unwrap().unwrap();
+        assert!(
+            !node.props.is_empty(),
+            "the second upsert must have committed the 'blob' property",
+        );
+
+        // Recover over the raw (healed) storage: `SchemaCache` is rebuilt from
+        // durable `SchemaId` records only. "blob" is referenced by a committed
+        // node, so its name MUST be resolvable — today it is not (None).
+        let recovered = Writer::from_storage(GraphStorage::from_storage(raw.clone()))
+            .await
+            .unwrap();
+        assert!(
+            recovered
+                .schema_id(SchemaKind::PropertyKey, "blob")
+                .is_some(),
+            "prop 'blob' is referenced by a committed node but has no durable \
+             SchemaId record after recovery — the schema cache was poisoned by \
+             the earlier failed commit",
+        );
+    }
+
     // -- Batched ingest: correctness oracle (batched == per-record) -------
     //
     // `ingest_batch` exists purely as a throughput optimization over the
