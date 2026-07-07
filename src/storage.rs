@@ -20,6 +20,12 @@ use crate::Result;
 use crate::obs::InstrumentedObjectStore;
 use crate::serde::RecordType;
 
+/// Max in-flight point reads per [`GraphStorage::multi_get`] fan-out. Bounds
+/// concurrency so a huge frontier can't open thousands of simultaneous S3
+/// requests; large enough to hide per-request latency. Tunable — a real
+/// multi-get in the vendored `common` could replace this later (RFC 0007 §8.1).
+const MULTI_GET_CONCURRENCY: usize = 64;
+
 /// Per-namespace substrate wrapper: one SlateDB database (via `common`) with
 /// the graph merge operator registered. The single writer holds one of these.
 #[derive(Clone)]
@@ -97,6 +103,30 @@ impl GraphStorage {
     pub async fn get(&self, key: Bytes) -> Result<Option<Bytes>> {
         let record = self.inner.get(key).await?;
         Ok(record.map(|r| r.value))
+    }
+
+    /// Batched point read: resolves many keys with bounded concurrency,
+    /// **preserving input order** (result `i` is the value for `keys[i]`).
+    ///
+    /// The read path's dominant cost is one point-read per frontier node,
+    /// issued serially (RFC 0007 §8 N+1). SlateDB exposes no native multi-get,
+    /// so this is a bounded fan-out over [`Self::get`] via `buffered`: up to
+    /// [`MULTI_GET_CONCURRENCY`] in flight at once, converting `N` sequential
+    /// awaits into `⌈N / k⌉` overlapped rounds (parallel decode across the
+    /// runtime's workers in-memory; overlapped round-trips on S3). Order is
+    /// preserved so callers can zip results back to their keys/uids.
+    pub async fn multi_get(&self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        stream::iter(keys)
+            .map(|key| {
+                let inner = self.inner.clone();
+                async move { inner.get(key).await.map(|rec| rec.map(|r| r.value)) }
+            })
+            .buffered(MULTI_GET_CONCURRENCY)
+            .map_err(|e| e.into())
+            .try_collect()
+            .await
     }
 
     /// Atomic mixed batch (puts/merges/deletes) — the M1 write path uses this.
