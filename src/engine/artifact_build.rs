@@ -244,14 +244,10 @@ impl GraphShard {
         {
             Ok(()) => {}
             Err(err) => {
-                cleanup_unpublished_matrix_artifact_epoch(
-                    self,
-                    cell_id,
-                    edge_type,
-                    base_epoch,
-                    "build_matrix_tiles_abort",
+                self.cleanup_unpublished_matrix_artifacts_after_abort(
+                    cell_id, edge_type, base_epoch, &err,
                 )
-                .await?;
+                .await;
                 return Err(err);
             }
         }
@@ -419,14 +415,10 @@ impl GraphShard {
         {
             Ok(artifact) => artifact,
             Err(err) => {
-                cleanup_unpublished_matrix_artifact_epoch(
-                    self,
-                    cell_id,
-                    edge_type,
-                    base_epoch,
-                    "build_matrix_tiles_abort",
+                self.cleanup_unpublished_matrix_artifacts_after_abort(
+                    cell_id, edge_type, base_epoch, &err,
                 )
-                .await?;
+                .await;
                 return Err(err);
             }
         };
@@ -501,6 +493,35 @@ impl GraphShard {
 
         self.record_artifact_build_completed(started.elapsed());
         Ok(artifact)
+    }
+
+    async fn cleanup_unpublished_matrix_artifacts_after_abort(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+        build_error: &GraphError,
+    ) {
+        let cleanup = cleanup_unpublished_matrix_artifact_epoch(
+            self,
+            cell_id,
+            edge_type,
+            base_epoch,
+            "build_matrix_tiles_abort",
+        )
+        .await;
+        if cleanup.cleanup_errors > 0 {
+            tracing::warn!(
+                target: "slatedb_graph_kernel",
+                cell_id,
+                edge_type,
+                base_epoch,
+                deleted_keys = cleanup.deleted_keys,
+                cleanup_errors = cleanup.cleanup_errors,
+                build_error = %build_error,
+                "matrix artifact abort cleanup was incomplete"
+            );
+        }
     }
 
     async fn current_matrix_rows(
