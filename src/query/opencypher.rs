@@ -296,7 +296,9 @@ impl ParsedCypher {
         unsafe {
             let directives = sys::cypher_parse_result_ndirectives(self.result);
             if directives != 1 {
-                return unsupported("only a single Cypher statement is supported in Phase 0");
+                return unsupported(
+                    "only a single Cypher statement is supported in the legacy scalar Cypher planner",
+                );
             }
 
             let statement = checked_node(sys::cypher_parse_result_get_directive(self.result, 0))?;
@@ -335,7 +337,9 @@ impl ParsedCypher {
                 }
             }
 
-            unsupported("only CREATE and MATCH edge patterns are supported in Phase 0")
+            unsupported(
+                "only CREATE and simple MATCH edge patterns are supported in the legacy scalar Cypher planner",
+            )
         }
     }
 
@@ -618,7 +622,9 @@ fn lower_create(
 ) -> Result<QueryStatement> {
     unsafe {
         if sys::cypher_ast_create_is_unique(create) {
-            return unsupported("CREATE UNIQUE is not executable in Phase 0");
+            return unsupported(
+                "CREATE UNIQUE is not executable in the legacy scalar Cypher planner",
+            );
         }
 
         let pattern = checked_node(sys::cypher_ast_create_get_pattern(create))?;
@@ -678,10 +684,14 @@ fn lower_match_return(
 ) -> Result<ParsedQuery> {
     unsafe {
         if sys::cypher_ast_match_is_optional(match_clause) {
-            return unsupported("OPTIONAL MATCH is not executable in Phase 0");
+            return unsupported(
+                "OPTIONAL MATCH is not executable in the legacy scalar Cypher planner",
+            );
         }
         if sys::cypher_ast_match_nhints(match_clause) != 0 {
-            return unsupported("MATCH hints are not executable in Phase 0");
+            return unsupported(
+                "MATCH hints are not executable in the legacy scalar Cypher planner",
+            );
         }
         if sys::cypher_ast_return_is_distinct(return_clause)
             || sys::cypher_ast_return_has_include_existing(return_clause)
@@ -718,7 +728,7 @@ fn lower_match_return(
             if let Some((min_hops, max_hops)) = edge.hop_range {
                 if fixed_dst.is_some() {
                     return unsupported(
-                        "variable-length MATCH with fixed destination is not executable in Phase 0",
+                        "variable-length MATCH with fixed destination is not executable in the legacy scalar Cypher planner",
                     );
                 }
                 return Ok(ParsedQuery {
@@ -759,7 +769,7 @@ fn lower_match_return(
         if let Some((min_hops, max_hops)) = edge.hop_range {
             if fixed_dst.is_some() {
                 return unsupported(
-                    "variable-length MATCH with fixed destination is not executable in Phase 0",
+                    "variable-length MATCH with fixed destination is not executable in the legacy scalar Cypher planner",
                 );
             }
             if !projects_node_id(expression, edge.dst_binding.as_deref())? {
@@ -1444,13 +1454,17 @@ fn lower_single_edge_pattern(
     unsafe {
         ensure_instance(pattern, sys::CYPHER_AST_PATTERN, "pattern")?;
         if sys::cypher_ast_pattern_npaths(pattern) != 1 {
-            return unsupported("only one path pattern is executable in Phase 0");
+            return unsupported(
+                "only one path pattern is executable in the legacy scalar Cypher planner",
+            );
         }
 
         let path = checked_node(sys::cypher_ast_pattern_get_path(pattern, 0))?;
         ensure_instance(path, sys::CYPHER_AST_PATTERN_PATH, "pattern path")?;
         if sys::cypher_ast_pattern_path_nelements(path) != 3 {
-            return unsupported("only one-hop edge patterns are executable in Phase 0");
+            return unsupported(
+                "only one-hop edge patterns are executable in the legacy scalar Cypher planner",
+            );
         }
 
         let left = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
@@ -1467,10 +1481,14 @@ fn lower_single_edge_pattern(
             Some(lower_hop_range(varlength)?)
         };
         if !sys::cypher_ast_rel_pattern_get_properties(rel).is_null() {
-            return unsupported("relationship properties are not executable in Phase 0");
+            return unsupported(
+                "relationship properties are not executable in the legacy scalar Cypher planner",
+            );
         }
         if sys::cypher_ast_rel_pattern_nreltypes(rel) != 1 {
-            return unsupported("relationship pattern must have exactly one type in Phase 0");
+            return unsupported(
+                "relationship pattern must have exactly one type in the legacy scalar Cypher planner",
+            );
         }
 
         let edge_type_node = checked_node(sys::cypher_ast_rel_pattern_get_reltype(rel, 0))?;
@@ -1497,7 +1515,7 @@ fn lower_single_edge_pattern(
                 hop_range,
             }),
             sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => {
-                unsupported("undirected relationships are not executable in Phase 0")
+                unsupported("undirected relationships are not executable in the query engine")
             }
         }
     }
@@ -1782,11 +1800,15 @@ fn lower_where_node_id_with_parameters(
     unsafe {
         if is_instance(predicate, sys::CYPHER_AST_COMPARISON) {
             if sys::cypher_ast_comparison_get_length(predicate) != 1 {
-                return unsupported("WHERE supports only one equality comparison in Phase 0");
+                return unsupported(
+                    "WHERE supports only one equality comparison in the legacy scalar Cypher planner",
+                );
             }
             let op = sys::cypher_ast_comparison_get_operator(predicate, 0);
             if op != sys::CYPHER_OP_EQUAL {
-                return unsupported("WHERE supports only equality on node id in Phase 0");
+                return unsupported(
+                    "WHERE supports only equality on node id in the legacy scalar Cypher planner",
+                );
             }
             let left = checked_node(sys::cypher_ast_comparison_get_argument(predicate, 0))?;
             let right = checked_node(sys::cypher_ast_comparison_get_argument(predicate, 1))?;
@@ -1795,14 +1817,16 @@ fn lower_where_node_id_with_parameters(
         if is_instance(predicate, sys::CYPHER_AST_BINARY_OPERATOR) {
             let op = sys::cypher_ast_binary_operator_get_operator(predicate);
             if op != sys::CYPHER_OP_EQUAL {
-                return unsupported("WHERE supports only equality on node id in Phase 0");
+                return unsupported(
+                    "WHERE supports only equality on node id in the legacy scalar Cypher planner",
+                );
             }
             let left = checked_node(sys::cypher_ast_binary_operator_get_argument1(predicate))?;
             let right = checked_node(sys::cypher_ast_binary_operator_get_argument2(predicate))?;
             return lower_node_id_equality(left, right, binding, parameters);
         }
     }
-    unsupported("WHERE supports only <dst>.id = <integer> in Phase 0")
+    unsupported("WHERE supports only <dst>.id = <integer> in the legacy scalar Cypher planner")
 }
 
 fn lower_node_id_equality(
@@ -1817,7 +1841,7 @@ fn lower_node_id_equality(
     if projects_node_id(right, Some(binding))? {
         return integer_vertex_id(left, parameters);
     }
-    unsupported("WHERE supports only <dst>.id = <integer> in Phase 0")
+    unsupported("WHERE supports only <dst>.id = <integer> in the legacy scalar Cypher planner")
 }
 
 fn resolve_node_id_constraint(
@@ -1826,7 +1850,9 @@ fn resolve_node_id_constraint(
 ) -> Result<Option<VertexId>> {
     match (pattern_id, where_id) {
         (Some(left), Some(right)) if left != right => {
-            unsupported("conflicting node id constraints are not executable in Phase 0")
+            unsupported(
+                "conflicting node id constraints are not executable in the legacy scalar Cypher planner",
+            )
         }
         (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
         (None, None) => Ok(None),
@@ -1840,7 +1866,9 @@ fn lower_node_pattern(
     unsafe {
         ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "node pattern")?;
         if sys::cypher_ast_node_pattern_nlabels(node) != 0 {
-            return unsupported("node labels are not executable in Phase 0");
+            return unsupported(
+                "node labels are not executable in the legacy scalar Cypher planner",
+            );
         }
         let binding = node_identifier(node)?;
         let properties = sys::cypher_ast_node_pattern_get_properties(node);
@@ -1930,13 +1958,17 @@ fn node_id_property(
     unsafe {
         ensure_instance(properties, sys::CYPHER_AST_MAP, "node property map")?;
         if sys::cypher_ast_map_nentries(properties) != 1 {
-            return unsupported("node property map must contain only id in Phase 0");
+            return unsupported(
+                "node property map must contain only id in the legacy scalar Cypher planner",
+            );
         }
 
         let key = checked_node(sys::cypher_ast_map_get_key(properties, 0))?;
         let key_name = prop_name(key)?;
         if !key_name.eq_ignore_ascii_case("id") {
-            return unsupported("node property map must contain id in Phase 0");
+            return unsupported(
+                "node property map must contain id in the legacy scalar Cypher planner",
+            );
         }
 
         let value = checked_node(sys::cypher_ast_map_get_value(properties, 0))?;
@@ -2093,7 +2125,7 @@ fn is_count_star(expression: *const AstNode) -> Result<bool> {
             return Ok(false);
         }
         if sys::cypher_ast_apply_all_operator_get_distinct(expression) {
-            return unsupported("count(DISTINCT *) is not executable in Phase 0");
+            return unsupported("count(DISTINCT *) is not executable in the query engine");
         }
 
         let function = checked_node(sys::cypher_ast_apply_all_operator_get_func_name(expression))?;
