@@ -4698,8 +4698,6 @@ async fn matrix_snapshot_abort_cleanup_removes_unpublished_chunks() {
     let base_epoch = shard.current_epoch(cell_id).await.unwrap();
     let epoch = format!("{base_epoch:020}");
     let keys = vec![
-        format!("cell/{cell_id}/artifact/matrix_manifest/{edge_type}/{epoch}"),
-        format!("cell/{cell_id}/artifact/graphblas_csc/{edge_type}/{epoch}"),
         format!("cell/{cell_id}/artifact/matrix/{edge_type}/{epoch}/out/00000000000000000000/00000000000000000000"),
         format!("cell/{cell_id}/artifact/matrix/{edge_type}/{epoch}/in/00000000000000000000/00000000000000000000"),
         format!("cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/{epoch}/vertices/00000000000000000000"),
@@ -4716,7 +4714,7 @@ async fn matrix_snapshot_abort_cleanup_removes_unpublished_chunks() {
         .await
         .unwrap();
 
-    let deleted = engine::delete_matrix_artifact_epoch(
+    let deleted = engine::cleanup_unpublished_matrix_artifact_epoch(
         &shard,
         cell_id,
         edge_type,
@@ -4732,6 +4730,52 @@ async fn matrix_snapshot_abort_cleanup_removes_unpublished_chunks() {
             "expected unpublished artifact key to be deleted: {key}"
         );
     }
+}
+
+#[tokio::test]
+async fn matrix_snapshot_abort_cleanup_preserves_published_manifest_epoch() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/matrix-snapshot-abort-published-guard", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "PUBLISHED_GUARD_EDGE";
+
+    shard
+        .write_edge(typed_mutation(
+            cell_id,
+            edge_type,
+            1,
+            2,
+            "published-guard-seed",
+        ))
+        .await
+        .unwrap();
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    let epoch = format!("{base_epoch:020}");
+    let manifest_key = format!("cell/{cell_id}/artifact/matrix_manifest/{edge_type}/{epoch}");
+    let chunk_key = format!(
+        "cell/{cell_id}/artifact/matrix/{edge_type}/{epoch}/out/00000000000000000000/00000000000000000000"
+    );
+
+    let mut batch = GraphWriteBatch::new();
+    batch.put(manifest_key.as_bytes(), b"published");
+    batch.put(chunk_key.as_bytes(), b"published-chunk");
+    shard
+        .write_graph_batch_strict(cell_id, "test_seed_published_matrix_artifacts", batch)
+        .await
+        .unwrap();
+
+    let deleted = engine::cleanup_unpublished_matrix_artifact_epoch(
+        &shard,
+        cell_id,
+        edge_type,
+        base_epoch,
+        "test_cleanup_published_matrix_artifacts",
+    )
+    .await
+    .unwrap();
+    assert_eq!(deleted, 0);
+    assert!(shard.read_remote(&manifest_key).await.unwrap().is_some());
+    assert!(shard.read_remote(&chunk_key).await.unwrap().is_some());
 }
 
 #[tokio::test]

@@ -1353,6 +1353,20 @@ pub(crate) async fn delete_matrix_artifact_epoch(
     Ok(deleted_keys)
 }
 
+pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
+    shard: &GraphShard,
+    cell_id: &str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+    operation: &'static str,
+) -> Result<u64> {
+    let manifest_key = matrix_manifest_key(cell_id, edge_type, base_epoch);
+    if shard.read_remote(&manifest_key).await?.is_some() {
+        return Ok(0);
+    }
+    delete_matrix_artifact_epoch(shard, cell_id, edge_type, base_epoch, operation).await
+}
+
 async fn flush_artifact_gc_batch(
     shard: &GraphShard,
     cell_id: &str,

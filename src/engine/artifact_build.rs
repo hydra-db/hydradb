@@ -194,50 +194,67 @@ impl GraphShard {
             edge_count: edges.len() as u64,
         };
 
-        let mut data_batch = GraphWriteBatch::new();
-        let mut pending_writes = 0_usize;
-        for tile in out_tiles.iter().chain(transpose_tiles.iter()) {
-            put_artifact_record(
+        match async {
+            let mut data_batch = GraphWriteBatch::new();
+            let mut pending_writes = 0_usize;
+            for tile in out_tiles.iter().chain(transpose_tiles.iter()) {
+                put_artifact_record(
+                    self,
+                    cell_id,
+                    "build_matrix_tiles",
+                    &mut data_batch,
+                    &mut pending_writes,
+                    matrix_tile_key(tile),
+                    encode_matrix_tile(tile),
+                )
+                .await?;
+            }
+            let graphblas_manifest = append_graphblas_csc_chunks(
+                self,
+                &mut data_batch,
+                &mut pending_writes,
+                cell_id,
+                edge_type,
+                base_epoch,
+                &graphblas_csc,
+            )
+            .await?;
+            flush_artifact_put_batch(
                 self,
                 cell_id,
                 "build_matrix_tiles",
                 &mut data_batch,
                 &mut pending_writes,
-                matrix_tile_key(tile),
-                encode_matrix_tile(tile),
             )
             .await?;
-        }
-        let graphblas_manifest = append_graphblas_csc_chunks(
-            self,
-            &mut data_batch,
-            &mut pending_writes,
-            cell_id,
-            edge_type,
-            base_epoch,
-            &graphblas_csc,
-        )
-        .await?;
-        flush_artifact_put_batch(
-            self,
-            cell_id,
-            "build_matrix_tiles",
-            &mut data_batch,
-            &mut pending_writes,
-        )
-        .await?;
 
-        let mut manifest_batch = GraphWriteBatch::new();
-        manifest_batch.put(
-            matrix_manifest_key(cell_id, edge_type, base_epoch),
-            encode_matrix_artifact(&artifact),
-        );
-        manifest_batch.put(
-            graphblas_csc_key(cell_id, edge_type, base_epoch),
-            encode_graphblas_csc_manifest(&graphblas_manifest),
-        );
-        self.write_graph_batch_strict(cell_id, "build_matrix_tiles", manifest_batch)
-            .await?;
+            let mut manifest_batch = GraphWriteBatch::new();
+            manifest_batch.put(
+                matrix_manifest_key(cell_id, edge_type, base_epoch),
+                encode_matrix_artifact(&artifact),
+            );
+            manifest_batch.put(
+                graphblas_csc_key(cell_id, edge_type, base_epoch),
+                encode_graphblas_csc_manifest(&graphblas_manifest),
+            );
+            self.write_graph_batch_strict(cell_id, "build_matrix_tiles", manifest_batch)
+                .await
+        }
+        .await
+        {
+            Ok(()) => {}
+            Err(err) => {
+                cleanup_unpublished_matrix_artifact_epoch(
+                    self,
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    "build_matrix_tiles_abort",
+                )
+                .await?;
+                return Err(err);
+            }
+        }
         let cache_key = MatrixCacheKey::new(cell_id, edge_type, base_epoch);
         let pinned = self.cache_policy.pin_matrix_artifact(&artifact);
         let tenant = cell_id.to_string();
@@ -402,17 +419,14 @@ impl GraphShard {
         {
             Ok(artifact) => artifact,
             Err(err) => {
-                let manifest_key = matrix_manifest_key(cell_id, edge_type, base_epoch);
-                if self.read_remote(&manifest_key).await?.is_none() {
-                    delete_matrix_artifact_epoch(
-                        self,
-                        cell_id,
-                        edge_type,
-                        base_epoch,
-                        "build_matrix_tiles_abort",
-                    )
-                    .await?;
-                }
+                cleanup_unpublished_matrix_artifact_epoch(
+                    self,
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    "build_matrix_tiles_abort",
+                )
+                .await?;
                 return Err(err);
             }
         };
