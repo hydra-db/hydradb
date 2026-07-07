@@ -75,6 +75,7 @@
 //! the in-memory accelerators from durable storage," not a repair pass.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -203,6 +204,35 @@ pub struct Writer {
     allocs: GraphAllocators,
     schema: SchemaCache,
     latest_seq: Seq,
+    /// Read-side decode cache (the `*_cached` read methods). Holds decoded
+    /// node blobs and fully-resolved (deleted-subtracted) adjacency sets so a
+    /// value touched across hops / repeated queries is decoded **once**, not
+    /// re-parsed from KV on every access — matching an in-RAM engine's model
+    /// and the RFC 0007 §8 / RFC 0017 read-path target.
+    ///
+    /// Correctness: **cleared on every durable write** ([`Self::commit`] /
+    /// [`Self::commit_batch`]), so it never serves state older than the
+    /// writer's last commit. It caches *membership/decoded results*, which are
+    /// invariant under the post-commit `maybe_split` reorganization (a split
+    /// preserves the member set), so split — the one write that bypasses
+    /// commit — needs no invalidation. Interior-mutable behind `Mutex` (never
+    /// held across an `.await`) so the concurrent `*_batch`/`*_each` fan-outs
+    /// can share it through `&self`.
+    node_cache: Mutex<HashMap<u64, Option<NodeRecord>>>,
+    neigh_cache: Mutex<HashMap<(u8, u64, u32), RoaringTreemap>>,
+}
+
+/// Max concurrent per-anchor cached-neighbor reads in a batched expansion —
+/// mirrors [`posting_ops`]'s own frontier concurrency.
+const FRONTIER_CONCURRENCY: usize = 64;
+
+/// Neighbor-cache key: `(dir_tag, anchor_uid, pred_id)`.
+fn nbr_cache_key(dir: Direction, anchor: Uid, pred: PredId) -> (u8, u64, u32) {
+    let dtag = match dir {
+        Direction::Out => 0u8,
+        Direction::In => 1u8,
+    };
+    (dtag, anchor.get(), pred.get())
 }
 
 impl Writer {
@@ -237,7 +267,19 @@ impl Writer {
             allocs,
             schema,
             latest_seq,
+            node_cache: Mutex::new(HashMap::new()),
+            neigh_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Drop the whole read-side decode cache — called after every durable
+    /// write so cached reads never predate the writer's latest commit.
+    /// Conservative (clears everything, not just touched keys); the read cache
+    /// re-warms on the next query, and writes are rare relative to reads in
+    /// the query workloads this serves.
+    fn invalidate_read_cache(&self) {
+        self.node_cache.lock().unwrap().clear();
+        self.neigh_cache.lock().unwrap().clear();
     }
 
     /// The storage handle this writer drives (read escape hatch for tests /
@@ -278,6 +320,21 @@ impl Writer {
         }
     }
 
+    /// Batched [`Self::get_node`]: fetch many node blobs with bounded
+    /// concurrency ([`GraphStorage::multi_get`]) and decode them, **preserving
+    /// input order** (result `i` is the node for `uids[i]`, `None` if absent).
+    /// Turns the read path's per-result-node serial `get_node` loop into one
+    /// batched fan-out (RFC 0007 §8 N+1 — the materialize phase's lever).
+    pub async fn get_nodes(&self, uids: &[Uid]) -> Result<Vec<Option<NodeRecord>>> {
+        let keys: Vec<Bytes> = uids.iter().map(|u| node_key(*u)).collect();
+        self.storage
+            .multi_get(keys)
+            .await?
+            .into_iter()
+            .map(|opt| opt.map(|bytes| V0NodeCodec::decode(&bytes)).transpose())
+            .collect()
+    }
+
     /// Reads back an edge's `EdgeProp` companion record (RFC 0005 §"Edge
     /// facets", as amended: a single copy keyed by full edge identity) — read
     /// escape hatch for tests/callers, mirroring [`Self::get_node`]. `None`
@@ -295,6 +352,126 @@ impl Writer {
             None => Ok(None),
             Some(bytes) => Ok(Some(decode_edge_props(&bytes)?)),
         }
+    }
+
+    /// Batched [`Self::edge_props`]: fetch many edge companions with bounded
+    /// concurrency, **preserving input order** (result `i` is for `edges[i]`).
+    /// Used by valued-edge queries (e.g. IC07's per-`(fan, message)`
+    /// `likeCreationDate`) to replace a serial per-pair `edge_props` loop.
+    pub async fn edge_props_batch(
+        &self,
+        edges: &[(Uid, PredId, Uid)],
+    ) -> Result<Vec<Option<EdgeProps>>> {
+        let keys: Vec<Bytes> = edges
+            .iter()
+            .map(|(src, pred, dst)| edge_prop_key(*src, *pred, *dst))
+            .collect();
+        self.storage
+            .multi_get(keys)
+            .await?
+            .into_iter()
+            .map(|opt| opt.map(|bytes| decode_edge_props(&bytes)).transpose())
+            .collect()
+    }
+
+    // -----------------------------------------------------------------
+    // Cached read path (decode-once; see the `node_cache`/`neigh_cache` doc).
+    // These are what the query/traversal path uses; the uncached siblings
+    // above stay for the write path and tests.
+    // -----------------------------------------------------------------
+
+    /// Cache-aware batched node fetch: returns cached decoded nodes, batches a
+    /// single [`Self::get_nodes`] fan-out for the misses, populates the cache,
+    /// and preserves input order. A node touched by an earlier hop/query is a
+    /// pure in-memory clone — no re-decode, no storage read.
+    pub async fn get_nodes_cached(&self, uids: &[Uid]) -> Result<Vec<Option<NodeRecord>>> {
+        let mut resolved: Vec<Option<Option<NodeRecord>>> = vec![None; uids.len()];
+        let mut miss_uids: Vec<Uid> = Vec::new();
+        let mut miss_pos: Vec<usize> = Vec::new();
+        {
+            let cache = self.node_cache.lock().unwrap();
+            for (i, u) in uids.iter().enumerate() {
+                match cache.get(&u.get()) {
+                    Some(hit) => resolved[i] = Some(hit.clone()),
+                    None => {
+                        miss_uids.push(*u);
+                        miss_pos.push(i);
+                    }
+                }
+            }
+        }
+        if !miss_uids.is_empty() {
+            let fetched = self.get_nodes(&miss_uids).await?;
+            let mut cache = self.node_cache.lock().unwrap();
+            for (j, node) in fetched.into_iter().enumerate() {
+                cache.insert(miss_uids[j].get(), node.clone());
+                resolved[miss_pos[j]] = Some(node);
+            }
+        }
+        Ok(resolved.into_iter().map(|x| x.expect("every slot resolved")).collect())
+    }
+
+    /// Cache-aware [`posting_ops::neighbors`]: returns the fully-resolved
+    /// (deleted-subtracted) neighbor set from cache, or computes it once and
+    /// caches it. On a hit this issues **zero** storage reads (the base
+    /// adjacency read, the split-part reads, and the deleted-edges read are
+    /// all skipped).
+    pub async fn neighbors_cached(
+        &self,
+        anchor: Uid,
+        pred: PredId,
+        dir: Direction,
+        deleted_nodes: &RoaringTreemap,
+    ) -> Result<RoaringTreemap> {
+        let key = nbr_cache_key(dir, anchor, pred);
+        if let Some(hit) = self.neigh_cache.lock().unwrap().get(&key) {
+            return Ok(hit.clone());
+        }
+        let set = posting_ops::neighbors(&self.storage, anchor, pred, dir, deleted_nodes).await?;
+        self.neigh_cache.lock().unwrap().insert(key, set.clone());
+        Ok(set)
+    }
+
+    /// Cache-aware, concurrent frontier expansion + union (the batched hop).
+    pub async fn neighbors_batch_cached(
+        &self,
+        frontier: impl IntoIterator<Item = Uid>,
+        pred: PredId,
+        dir: Direction,
+        deleted_nodes: &RoaringTreemap,
+    ) -> Result<RoaringTreemap> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+        let sets: Vec<RoaringTreemap> = stream::iter(frontier)
+            .map(|u| self.neighbors_cached(u, pred, dir, deleted_nodes))
+            .buffer_unordered(FRONTIER_CONCURRENCY)
+            .try_collect()
+            .await?;
+        let mut out = RoaringTreemap::new();
+        for s in sets {
+            out |= s;
+        }
+        Ok(out)
+    }
+
+    /// Cache-aware, concurrent per-anchor neighbor fetch preserving the
+    /// anchor→set binding (for materialization that needs the src→dst pairing).
+    pub async fn neighbors_each_cached(
+        &self,
+        anchors: impl IntoIterator<Item = Uid>,
+        pred: PredId,
+        dir: Direction,
+        deleted_nodes: &RoaringTreemap,
+    ) -> Result<Vec<(Uid, RoaringTreemap)>> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+        stream::iter(anchors)
+            .map(|u| async move {
+                self.neighbors_cached(u, pred, dir, deleted_nodes)
+                    .await
+                    .map(|set| (u, set))
+            })
+            .buffer_unordered(FRONTIER_CONCURRENCY)
+            .try_collect()
+            .await
     }
 
     /// Reads the current `(pred, dir, anchor)` degree counter (0 if never
@@ -1054,6 +1231,7 @@ impl Writer {
             .await?;
 
         self.latest_seq = max_seq;
+        self.invalidate_read_cache();
         obs::write::set_latest_seq(max_seq);
         Ok(max_seq)
     }
@@ -1124,6 +1302,7 @@ impl Writer {
         stats.batch_commit = Some(commit_start.elapsed());
 
         self.latest_seq = seq;
+        self.invalidate_read_cache();
         stats.emit(seq);
         Ok(seq)
     }

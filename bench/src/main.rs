@@ -128,6 +128,21 @@ enum Cmd {
         /// (per-record would be one network round trip per element).
         #[arg(long, default_value_t = 1000)]
         batch_size: usize,
+        /// KNOWS-prefix hop depth(s) to sweep. Repeatable
+        /// (`--hops 1 --hops 2 ...`). Each selected query is run once per hop
+        /// value: every query walks `hops` outgoing KNOWS hops from the anchor
+        /// to build a person frontier, then applies its tail (messages /
+        /// likers / replies). Omit = each query's natural depth
+        /// (ic02=1/ic09=2/ic07=0/ic08=0).
+        #[arg(long)]
+        hops: Vec<usize>,
+        /// Anchor on these Person *indices* (0-based, as emitted by the
+        /// generator's `person_id`). Repeatable. Overrides `--param-count`
+        /// and `--top-degree`. Use with the hub indices (`0..hub_count`) so
+        /// the supernode-degree sweep actually anchors on the high-degree
+        /// hubs.
+        #[arg(long)]
+        anchor_index: Vec<usize>,
     },
     /// Load the dataset into an in-memory `Writer` and dump every selected
     /// query's DISTINCT, un-truncated row set as JSON (`{query, param, rows:
@@ -151,6 +166,14 @@ enum Cmd {
         /// See `Run`'s `--batch-size`.
         #[arg(long, default_value_t = 1000)]
         batch_size: usize,
+        /// KNOWS-prefix hop depth(s) to dump. Repeatable. Omit = each query's
+        /// natural depth. See `Run`'s `--hops`.
+        #[arg(long)]
+        hops: Vec<usize>,
+        /// Anchor on these Person indices. Repeatable. Overrides
+        /// `--param-count`. See `Run`'s `--anchor-index`.
+        #[arg(long)]
+        anchor_index: Vec<usize>,
     },
 }
 
@@ -195,6 +218,8 @@ async fn main() -> Result<()> {
             hub_count,
             hub_degree,
             batch_size,
+            hops,
+            anchor_index,
         } => {
             let (dataset_dir, sizes) =
                 resolve_dataset(dataset_dir, scale, seed, hub_count, hub_degree)?;
@@ -205,7 +230,11 @@ async fn main() -> Result<()> {
             loader::load_into_writer(&mut writer, &dataset_dir, batch_size).await?;
             let schema = Schema::resolve(&writer)?;
 
-            let params: Vec<String> = if let Some(top_n) = top_degree {
+            let params: Vec<String> = if !anchor_index.is_empty() {
+                // Explicit anchor indices win — the supernode sweep anchors on
+                // the hub persons (0..hub_count) so degree bites the traversal.
+                anchor_index.iter().map(|i| make_person_id_hex(*i)).collect()
+            } else if let Some(top_n) = top_degree {
                 let deg_list = dataset::person_degrees_from_csvs(&dataset_dir)
                     .context("compute person degrees for --top-degree")?;
                 deg_list.into_iter().take(top_n).map(|(id, _)| id).collect()
@@ -228,21 +257,39 @@ async fn main() -> Result<()> {
                 only
             };
 
+            // Hop-sweep axis: each `Some(h)` runs every query at that KNOWS
+            // prefix depth; empty = one pass at each query's natural depth.
+            let hop_values: Vec<Option<usize>> = if hops.is_empty() {
+                vec![None]
+            } else {
+                hops.iter().map(|h| Some(*h)).collect()
+            };
+
             let mut results: Vec<QueryResult> = Vec::new();
             for q in &queries {
-                for p in &params {
-                    let r =
-                        runner::run_query(&writer, &schema, &backend_label_str, *q, p, warm_runs)
-                            .await?;
-                    eprintln!(
-                        " {} param={} rows={} cold={}us warm_p50={}us",
-                        r.query,
-                        &r.param[..8.min(r.param.len())],
-                        r.rows,
-                        r.cold_us,
-                        r.warm_p50_us
-                    );
-                    results.push(r);
+                for h in &hop_values {
+                    for p in &params {
+                        let r = runner::run_query(
+                            &writer,
+                            &schema,
+                            &backend_label_str,
+                            *q,
+                            p,
+                            warm_runs,
+                            *h,
+                        )
+                        .await?;
+                        eprintln!(
+                            " {} hops={} param={} rows={} cold={}us warm_p50={}us",
+                            r.query,
+                            r.hops,
+                            &r.param[..8.min(r.param.len())],
+                            r.rows,
+                            r.cold_us,
+                            r.warm_p50_us
+                        );
+                        results.push(r);
+                    }
                 }
             }
 
@@ -250,6 +297,7 @@ async fn main() -> Result<()> {
                 scale,
                 seed,
                 backend: backend_label_str,
+                hub_degree,
                 dataset_sizes: SizesReport::from(&sizes),
                 results,
             };
@@ -262,16 +310,25 @@ async fn main() -> Result<()> {
             param_count,
             only,
             batch_size,
+            hops,
+            anchor_index,
         } => {
+            // Hub params must match the Run sweep: reuse the dataset dir's hub
+            // generation via resolve_dataset (hub_count/degree come from the dir
+            // if it already exists, else default). We only need the CSVs here.
             let (dataset_dir, sizes) = resolve_dataset(dataset_dir, scale, seed, 0, 0)?;
 
             let mut writer = Writer::in_memory().await?;
             loader::load_into_writer(&mut writer, &dataset_dir, batch_size).await?;
             let schema = Schema::resolve(&writer)?;
 
-            let params: Vec<String> = (0..param_count)
-                .map(|i| make_person_id_hex(i * (sizes.persons / param_count.max(1)).max(1)))
-                .collect();
+            let params: Vec<String> = if !anchor_index.is_empty() {
+                anchor_index.iter().map(|i| make_person_id_hex(*i)).collect()
+            } else {
+                (0..param_count)
+                    .map(|i| make_person_id_hex(i * (sizes.persons / param_count.max(1)).max(1)))
+                    .collect()
+            };
             let queries: Vec<Query> = if only.is_empty() {
                 vec![
                     Query::Ic02,
@@ -284,16 +341,28 @@ async fn main() -> Result<()> {
             } else {
                 only
             };
+            let hop_values: Vec<Option<usize>> = if hops.is_empty() {
+                vec![None]
+            } else {
+                hops.iter().map(|h| Some(*h)).collect()
+            };
 
             let mut dumps = Vec::new();
             for q in &queries {
-                for p in &params {
-                    let rows = queries::execute_distinct(&writer, &schema, *q, p).await?;
-                    dumps.push(serde_json::json!({
-                        "query": q.name(),
-                        "param": p,
-                        "rows": rows,
-                    }));
+                for h in &hop_values {
+                    for p in &params {
+                        let rows =
+                            queries::execute_distinct_with_hops(&writer, &schema, *q, p, *h).await?;
+                        // No `--hops` → the query's natural depth (not 0), so
+                        // verify's `(query, hops)` keys line up with `run`'s.
+                        let effective_hops = h.unwrap_or_else(|| q.natural_hops());
+                        dumps.push(serde_json::json!({
+                            "query": q.name(),
+                            "hops": effective_hops,
+                            "param": p,
+                            "rows": rows,
+                        }));
+                    }
                 }
             }
             println!("{}", serde_json::to_string_pretty(&dumps)?);

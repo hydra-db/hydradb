@@ -17,6 +17,8 @@ use crate::queries::{self, Query, Schema};
 pub struct QueryResult {
     pub backend: String,
     pub query: &'static str,
+    /// KNOWS-prefix hop depth this row was run at (the bench hop-sweep axis).
+    pub hops: usize,
     pub param: String,
     pub rows: usize,
     pub cold_us: u64,
@@ -33,6 +35,10 @@ pub struct BenchOutput {
     /// `memory://bench`, `local://<path>`, or `s3://<bucket>` — see
     /// `main.rs`'s `backend_label`.
     pub backend: String,
+    /// Target hub degree the dataset was generated with (0 = no hubs). The
+    /// supernode-degree axis of the bench sweep; captured here so each output
+    /// file self-describes which degree tier it belongs to.
+    pub hub_degree: usize,
     pub dataset_sizes: SizesReport,
     pub results: Vec<QueryResult>,
 }
@@ -75,22 +81,29 @@ pub async fn run_query(
     query: Query,
     param: &str,
     warm_runs: usize,
+    hops: Option<usize>,
 ) -> Result<QueryResult> {
     let cold_start = Instant::now();
-    let cold_rows = queries::execute(writer, schema, query, param).await?;
+    let cold_rows = queries::execute_with_hops(writer, schema, query, param, hops).await?;
     let cold_us = cold_start.elapsed().as_micros() as u64;
 
     let mut times: Vec<u64> = Vec::with_capacity(warm_runs);
     for _ in 0..warm_runs {
         let start = Instant::now();
-        let _ = queries::execute(writer, schema, query, param).await?;
+        let _ = queries::execute_with_hops(writer, schema, query, param, hops).await?;
         times.push(start.elapsed().as_micros() as u64);
     }
     times.sort_unstable();
 
+    // Effective hop depth actually run (for the JSON matrix): the override if
+    // present, else the query's natural depth (shared source of truth so `run`
+    // and `verify` label cells identically).
+    let effective_hops = hops.unwrap_or_else(|| query.natural_hops());
+
     Ok(QueryResult {
         backend: backend.to_string(),
         query: query.name(),
+        hops: effective_hops,
         param: param.to_string(),
         rows: cold_rows.len(),
         cold_us,

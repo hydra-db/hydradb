@@ -52,14 +52,29 @@
 //! apples-to-apples comparison. That's what `Cmd::Verify` /
 //! `bench/py/verify_diff.py` diff — see `Cmd::Verify`'s doc in `main.rs`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Context, Result};
 use roaring::RoaringTreemap;
 use serde_json::{Value, json};
-use turbolay::value::TypedValue;
+use turbolay::value::{NodeRecord, TypedValue};
 use turbolay::write::Writer;
 use turbolay::{Direction, LabelId, PredId, PropId, SchemaKind, Uid, posting_ops};
+
+/// Batch-fetch and decode the nodes for `uids` into a lookup map (present
+/// nodes only). One [`Writer::get_nodes`] fan-out instead of a serial
+/// `get_node` per uid, and the `BTreeSet` input dedups so a node reached
+/// several ways in one query is fetched+decoded **once** (the intra-query
+/// portion of the "no cache / re-decode" cost — R4/R5).
+async fn fetch_node_map(writer: &Writer, uids: &BTreeSet<u64>) -> Result<HashMap<u64, NodeRecord>> {
+    let ordered: Vec<Uid> = uids.iter().map(|u| Uid(*u)).collect();
+    let nodes = writer.get_nodes_cached(&ordered).await?;
+    Ok(ordered
+        .iter()
+        .zip(nodes)
+        .filter_map(|(u, n)| n.map(|node| (u.get(), node)))
+        .collect())
+}
 
 /// One of the LDBC SNB Complex Read queries this bench supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
@@ -102,6 +117,15 @@ impl Query {
             Query::Ic4h => Some(4),
             Query::Ic07 | Query::Ic08 => None,
         }
+    }
+
+    /// The query's natural KNOWS-prefix depth when no explicit `--hops` sweep
+    /// value is given: ic02=1, ic09=2, ic3h=3, ic4h=4, and ic07/ic08=0 (their
+    /// tail applies to the anchor itself). The **single source of truth** for
+    /// the effective-hops label both the `run` timing path and the `verify`
+    /// dump emit, so their `(query, hops)` keys can never drift apart.
+    pub fn natural_hops(self) -> usize {
+        self.knows_hops().unwrap_or(0)
     }
 }
 
@@ -207,7 +231,27 @@ pub async fn execute(
     query: Query,
     person_id_hex: &str,
 ) -> Result<Vec<Row>> {
-    execute_mode(writer, schema, query, person_id_hex, RowLimit::Top20).await
+    execute_mode(writer, schema, query, person_id_hex, RowLimit::Top20, None).await
+}
+
+/// Like [`execute`], but with an explicit KNOWS-prefix hop count that
+/// overrides the query's natural hop depth — the bench hop-sweep entrypoint.
+///
+/// Every query is generalized to "walk `hops` outgoing `KNOWS` hops from the
+/// anchor to build a person frontier, then apply the query's tail to that
+/// frontier": messages-authored (ic02/ic09), likers-of-messages (ic07), or
+/// replies-to-posts (ic08). `hops = 0` recovers each query's original
+/// anchor-only behavior; `hops = 1` is the anchor's direct friends, etc.
+/// `None` falls back to the query's natural hop (`Query::knows_hops`, i.e.
+/// ic02=1/ic09=2/ic3h=3/ic4h=4, ic07/ic08=0).
+pub async fn execute_with_hops(
+    writer: &Writer,
+    schema: &Schema,
+    query: Query,
+    person_id_hex: &str,
+    hops: Option<usize>,
+) -> Result<Vec<Row>> {
+    execute_mode(writer, schema, query, person_id_hex, RowLimit::Top20, hops).await
 }
 
 /// Like [`execute`], but returns every DISTINCT row (deduped by the full
@@ -222,7 +266,20 @@ pub async fn execute_distinct(
     query: Query,
     person_id_hex: &str,
 ) -> Result<Vec<Row>> {
-    execute_mode(writer, schema, query, person_id_hex, RowLimit::Distinct).await
+    execute_mode(writer, schema, query, person_id_hex, RowLimit::Distinct, None).await
+}
+
+/// Hop-aware [`execute_distinct`] — the correctness oracle for the hop sweep.
+/// Same DISTINCT/no-LIMIT semantics, but with an explicit KNOWS-prefix depth
+/// so `verify` can dump the full row set at each swept hop.
+pub async fn execute_distinct_with_hops(
+    writer: &Writer,
+    schema: &Schema,
+    query: Query,
+    person_id_hex: &str,
+    hops: Option<usize>,
+) -> Result<Vec<Row>> {
+    execute_mode(writer, schema, query, person_id_hex, RowLimit::Distinct, hops).await
 }
 
 async fn execute_mode(
@@ -231,6 +288,7 @@ async fn execute_mode(
     query: Query,
     person_id_hex: &str,
     mode: RowLimit,
+    hops_override: Option<usize>,
 ) -> Result<Vec<Row>> {
     // Loaded once per query call (not per frontier node) — the deleted-nodes
     // bitmap is a single `Meta` key, and `posting_ops::neighbors` wants it
@@ -241,16 +299,40 @@ async fn execute_mode(
         return Ok(Vec::new());
     };
 
-    if let Some(hops) = query.knows_hops() {
-        return knows_chain_then_messages(writer, schema, anchor, &deleted_nodes, hops, mode).await;
-    }
+    // Effective KNOWS-prefix depth: an explicit sweep override wins; otherwise
+    // the query's natural hop (ic02=1/ic09=2/ic3h=3/ic4h=4, ic07/ic08=0).
+    let hops = hops_override.unwrap_or_else(|| query.knows_hops().unwrap_or(0));
+
+    // Walk `hops` outgoing KNOWS expansions to build the person frontier every
+    // query's tail then operates over (hops=0 → just the anchor itself).
+    let frontier = knows_frontier(writer, schema, anchor, &deleted_nodes, hops).await?;
+
     match query {
-        Query::Ic07 => ic07(writer, schema, anchor, &deleted_nodes, mode).await,
-        Query::Ic08 => ic08(writer, schema, anchor, &deleted_nodes, mode).await,
         Query::Ic02 | Query::Ic09 | Query::Ic3h | Query::Ic4h => {
-            unreachable!("knows_hops() covers every KNOWS-chain query; handled above")
+            messages_by_frontier(writer, schema, &frontier, &deleted_nodes, mode).await
         }
+        Query::Ic07 => ic07(writer, schema, &frontier, &deleted_nodes, mode).await,
+        Query::Ic08 => ic08(writer, schema, &frontier, &deleted_nodes, mode).await,
     }
+}
+
+/// Walks `hops` outgoing `KNOWS` expansions from `anchor`, returning the
+/// resulting person frontier (deduped as a `RoaringTreemap`). `hops = 0`
+/// returns the singleton `{anchor}`.
+async fn knows_frontier(
+    writer: &Writer,
+    schema: &Schema,
+    anchor: Uid,
+    deleted_nodes: &RoaringTreemap,
+    hops: usize,
+) -> Result<RoaringTreemap> {
+    let mut frontier = RoaringTreemap::new();
+    frontier.insert(anchor.get());
+    for _ in 0..hops {
+        frontier =
+            expand_frontier(writer, &frontier, schema.knows, Direction::Out, deleted_nodes).await?;
+    }
+    Ok(frontier)
 }
 
 async fn load_deleted_nodes(writer: &Writer) -> Result<RoaringTreemap> {
@@ -269,6 +351,11 @@ async fn load_deleted_nodes(writer: &Writer) -> Result<RoaringTreemap> {
 /// Expands every uid in `frontier` by one `(pred, dir)` hop and unions the
 /// results — the frontier itself is a `RoaringTreemap`, so cross-node dedup
 /// within a single hop is automatic (see the module doc's determinism note).
+///
+/// Uses [`posting_ops::neighbors_batch`] so the frontier's per-node adjacency
+/// reads run concurrently (bounded), not one serial `await` per node — the
+/// N+1 fix (RFC 0007 §8.1). The unioned result is identical to the old serial
+/// loop; only the I/O scheduling changed.
 async fn expand_frontier(
     writer: &Writer,
     frontier: &RoaringTreemap,
@@ -276,13 +363,9 @@ async fn expand_frontier(
     dir: Direction,
     deleted_nodes: &RoaringTreemap,
 ) -> Result<RoaringTreemap> {
-    let mut out = RoaringTreemap::new();
-    for raw in frontier.iter() {
-        let ns =
-            posting_ops::neighbors(writer.storage(), Uid(raw), pred, dir, deleted_nodes).await?;
-        out |= ns;
-    }
-    Ok(out)
+    Ok(writer
+        .neighbors_batch_cached(frontier.iter().map(Uid), pred, dir, deleted_nodes)
+        .await?)
 }
 
 fn string_prop(props: &BTreeMap<PropId, TypedValue>, id: PropId) -> String {
@@ -299,56 +382,51 @@ fn int_prop(props: &BTreeMap<PropId, TypedValue>, id: PropId) -> i64 {
     }
 }
 
-/// IC02 (`hops=1`) / IC09 (`hops=2`) / IC3H (`hops=3`) / IC4H (`hops=4`): a
-/// fixed `hops`-long outgoing `KNOWS` chain from `anchor`, then every message
-/// whose `HAS_CREATOR` points at a node in the final frontier. `HAS_CREATOR`
-/// is stored `(Post)-[HAS_CREATOR]->(Person)`, so "messages created by X" is
-/// X's *incoming* `HAS_CREATOR` neighbors (`Direction::In` from X).
+/// IC02/IC09/IC3H/IC4H tail: every message whose `HAS_CREATOR` points at a
+/// node in `frontier` (the person set the KNOWS-prefix walk produced).
+/// `HAS_CREATOR` is stored `(Post)-[HAS_CREATOR]->(Person)`, so "messages
+/// created by X" is X's *incoming* `HAS_CREATOR` neighbors (`Direction::In`).
 ///
 /// Returns `[creator.firstName, creator.lastName, message.content,
 /// message.creationDate]` rows, sorted by `creationDate` DESC then message
 /// xid ASC (tie-break), capped at LDBC's `LIMIT 20`.
-async fn knows_chain_then_messages(
+async fn messages_by_frontier(
     writer: &Writer,
     schema: &Schema,
-    anchor: Uid,
+    frontier: &RoaringTreemap,
     deleted_nodes: &RoaringTreemap,
-    hops: usize,
     mode: RowLimit,
 ) -> Result<Vec<Row>> {
-    let mut frontier = RoaringTreemap::new();
-    frontier.insert(anchor.get());
-    for _ in 0..hops {
-        frontier = expand_frontier(
-            writer,
-            &frontier,
-            schema.knows,
-            Direction::Out,
-            deleted_nodes,
-        )
-        .await?;
-    }
-
-    let mut scored: Vec<(i64, String, Row)> = Vec::new();
-    for raw_person in frontier.iter() {
-        let person_uid = Uid(raw_person);
-        let Some(person_node) = writer.get_node(person_uid).await? else {
-            continue;
-        };
-        let first_name = string_prop(&person_node.props, schema.first_name);
-        let last_name = string_prop(&person_node.props, schema.last_name);
-
-        let messages = posting_ops::neighbors(
-            writer.storage(),
-            person_uid,
+    // 1. Every frontier person's authored messages, concurrently, keeping the
+    //    person→messages binding (creator name is a returned column).
+    let persons: Vec<Uid> = frontier.iter().map(Uid).collect();
+    let per_person = writer
+        .neighbors_each_cached(
+            persons.iter().copied(),
             schema.has_creator,
             Direction::In,
             deleted_nodes,
         )
         .await?;
+
+    // 2. One batched node fetch for every person + every message they created.
+    let mut want: BTreeSet<u64> = frontier.iter().collect();
+    for (_, msgs) in &per_person {
+        want.extend(msgs.iter());
+    }
+    let nodes = fetch_node_map(writer, &want).await?;
+
+    // 3. Build rows in memory — no further I/O.
+    let mut scored: Vec<(i64, String, Row)> = Vec::new();
+    for (person_uid, messages) in &per_person {
+        let Some(person_node) = nodes.get(&person_uid.get()) else {
+            continue;
+        };
+        let first_name = string_prop(&person_node.props, schema.first_name);
+        let last_name = string_prop(&person_node.props, schema.last_name);
+
         for raw_msg in messages.iter() {
-            let msg_uid = Uid(raw_msg);
-            let Some(msg_node) = writer.get_node(msg_uid).await? else {
+            let Some(msg_node) = nodes.get(&raw_msg) else {
                 continue;
             };
             // `HAS_CREATOR` is authored-by-Person for both Posts and
@@ -375,62 +453,84 @@ async fn knows_chain_then_messages(
     Ok(finish_rows(scored, mode))
 }
 
-/// IC07: messages `anchor` created (`anchor`'s incoming `HAS_CREATOR`
-/// neighbors), then every Person who `LIKES` one of those messages (`LIKES`
-/// is stored `(Person)-[LIKES]->(Post|Comment)`, so "likers of message M" is
-/// M's *incoming* `LIKES` neighbors). Returns `[fan.firstName,
-/// fan.lastName, likeCreationDate, message.content]` rows —
-/// `likeCreationDate` is the `LIKES` edge's own `creationDate` prop
-/// (`Writer::edge_props` per `(fan, message)` pair), not a node property.
-/// Sorted by `likeCreationDate` DESC then fan xid ASC, capped at 20.
+/// IC07: for every author in `frontier` (the KNOWS-prefix person set —
+/// `{anchor}` at hops=0, matching the original IC07), the messages that
+/// author created (their incoming `HAS_CREATOR` neighbors), then every Person
+/// who `LIKES` one of those messages (`LIKES` is stored
+/// `(Person)-[LIKES]->(Post|Comment)`, so "likers of message M" is M's
+/// *incoming* `LIKES` neighbors). Returns `[fan.firstName, fan.lastName,
+/// likeCreationDate, message.content]` rows — `likeCreationDate` is the
+/// `LIKES` edge's own `creationDate` prop (`Writer::edge_props` per `(fan,
+/// message)` pair), not a node property. Sorted by `likeCreationDate` DESC
+/// then fan xid ASC, capped at 20.
 async fn ic07(
     writer: &Writer,
     schema: &Schema,
-    anchor: Uid,
+    frontier: &RoaringTreemap,
     deleted_nodes: &RoaringTreemap,
     mode: RowLimit,
 ) -> Result<Vec<Row>> {
-    let messages = posting_ops::neighbors(
-        writer.storage(),
-        anchor,
-        schema.has_creator,
-        Direction::In,
-        deleted_nodes,
-    )
-    .await?;
-
-    let mut scored: Vec<(i64, String, Row)> = Vec::new();
-    for raw_msg in messages.iter() {
-        let msg_uid = Uid(raw_msg);
-        let Some(msg_node) = writer.get_node(msg_uid).await? else {
-            continue;
-        };
-        // `message:Post` in the Cypher pattern — exclude Comments authored
-        // by `anchor` (HAS_CREATOR alone doesn't distinguish).
-        if !msg_node.labels.contains(&schema.post) {
-            continue;
-        }
-        let content = string_prop(&msg_node.props, schema.content);
-
-        let fans = posting_ops::neighbors(
-            writer.storage(),
-            msg_uid,
-            schema.likes,
-            Direction::In,
-            deleted_nodes,
-        )
+    // 1. Messages authored by the frontier (each message has one creator, so
+    //    the union across authors is already distinct).
+    let authors: Vec<Uid> = frontier.iter().map(Uid).collect();
+    let per_author = writer
+        .neighbors_each_cached(authors, schema.has_creator, Direction::In, deleted_nodes)
         .await?;
+    let mut msg_set: BTreeSet<u64> = BTreeSet::new();
+    for (_, msgs) in &per_author {
+        msg_set.extend(msgs.iter());
+    }
+
+    // 2. Fetch message nodes (batched) to keep only `:Post` and read content.
+    let msg_nodes = fetch_node_map(writer, &msg_set).await?;
+    let post_msgs: Vec<Uid> = msg_set
+        .iter()
+        .filter(|m| {
+            msg_nodes
+                .get(m)
+                .is_some_and(|n| n.labels.contains(&schema.post))
+        })
+        .map(|m| Uid(*m))
+        .collect();
+
+    // 3. Likers of each post message, concurrently, keeping the message→fans
+    //    binding (message content + the per-pair LIKES edge prop).
+    let per_msg_fans = writer
+        .neighbors_each_cached(post_msgs, schema.likes, Direction::In, deleted_nodes)
+        .await?;
+
+    // 4. Batched fan-node fetch + batched per-(fan,message) edge-prop fetch.
+    let mut fan_set: BTreeSet<u64> = BTreeSet::new();
+    let mut edge_keys: Vec<(Uid, PredId, Uid)> = Vec::new();
+    for (msg, fans) in &per_msg_fans {
         for raw_fan in fans.iter() {
-            let fan_uid = Uid(raw_fan);
-            let Some(fan_node) = writer.get_node(fan_uid).await? else {
+            fan_set.insert(raw_fan);
+            edge_keys.push((Uid(raw_fan), schema.likes, *msg));
+        }
+    }
+    let fan_nodes = fetch_node_map(writer, &fan_set).await?;
+    let edge_props = writer.edge_props_batch(&edge_keys).await?;
+
+    // 5. Build rows in memory. `ei` walks `edge_props` in the exact order
+    //    `edge_keys` was built (one slot per fan, advanced unconditionally).
+    let mut scored: Vec<(i64, String, Row)> = Vec::new();
+    let mut ei = 0usize;
+    for (msg, fans) in &per_msg_fans {
+        let content = msg_nodes
+            .get(&msg.get())
+            .map(|n| string_prop(&n.props, schema.content))
+            .unwrap_or_default();
+        for raw_fan in fans.iter() {
+            let props = &edge_props[ei];
+            ei += 1;
+            let Some(fan_node) = fan_nodes.get(&raw_fan) else {
                 continue;
             };
             let first_name = string_prop(&fan_node.props, schema.first_name);
             let last_name = string_prop(&fan_node.props, schema.last_name);
-            let like_creation_date = writer
-                .edge_props(fan_uid, schema.likes, msg_uid)
-                .await?
-                .and_then(|props| props.get(&schema.creation_date).cloned())
+            let like_creation_date = props
+                .as_ref()
+                .and_then(|p| p.get(&schema.creation_date).cloned())
                 .map(|v| match v {
                     TypedValue::Int(i) => i,
                     _ => 0,
@@ -451,57 +551,70 @@ async fn ic07(
     Ok(finish_rows(scored, mode))
 }
 
-/// IC08: Posts `anchor` created, then every Comment `REPLY_OF` one of those
-/// posts (`REPLY_OF` is stored `(Comment)-[REPLY_OF]->(Post|Comment)`, so
-/// "replies to post P" is P's *incoming* `REPLY_OF` neighbors). Returns
-/// `[reply.content, reply.creationDate, post.content]` rows, sorted by
-/// `replyDate` DESC then reply xid ASC, capped at 20.
+/// IC08: for every author in `frontier` (the KNOWS-prefix person set —
+/// `{anchor}` at hops=0, matching the original IC08), the Posts that author
+/// created, then every Comment `REPLY_OF` one of those posts (`REPLY_OF` is
+/// stored `(Comment)-[REPLY_OF]->(Post|Comment)`, so "replies to post P" is
+/// P's *incoming* `REPLY_OF` neighbors). Returns `[reply.content,
+/// reply.creationDate, post.content]` rows, sorted by `replyDate` DESC then
+/// reply xid ASC, capped at 20.
 async fn ic08(
     writer: &Writer,
     schema: &Schema,
-    anchor: Uid,
+    frontier: &RoaringTreemap,
     deleted_nodes: &RoaringTreemap,
     mode: RowLimit,
 ) -> Result<Vec<Row>> {
-    let posts = posting_ops::neighbors(
-        writer.storage(),
-        anchor,
-        schema.has_creator,
-        Direction::In,
-        deleted_nodes,
-    )
-    .await?;
-
-    let mut scored: Vec<(i64, String, Row)> = Vec::new();
-    for raw_post in posts.iter() {
-        let post_uid = Uid(raw_post);
-        let Some(post_node) = writer.get_node(post_uid).await? else {
-            continue;
-        };
-        // `post:Post` in the Cypher pattern — exclude Comments authored by
-        // `anchor` (HAS_CREATOR alone doesn't distinguish).
-        if !post_node.labels.contains(&schema.post) {
-            continue;
-        }
-        let post_content = string_prop(&post_node.props, schema.content);
-
-        let replies = posting_ops::neighbors(
-            writer.storage(),
-            post_uid,
-            schema.reply_of,
-            Direction::In,
-            deleted_nodes,
-        )
+    // 1. Posts authored by the frontier (each has one creator → already distinct).
+    let authors: Vec<Uid> = frontier.iter().map(Uid).collect();
+    let per_author = writer
+        .neighbors_each_cached(authors, schema.has_creator, Direction::In, deleted_nodes)
         .await?;
+    let mut post_set: BTreeSet<u64> = BTreeSet::new();
+    for (_, posts) in &per_author {
+        post_set.extend(posts.iter());
+    }
+
+    // 2. Fetch message nodes (batched); keep only `:Post` and read content.
+    let post_nodes = fetch_node_map(writer, &post_set).await?;
+    let posts: Vec<Uid> = post_set
+        .iter()
+        .filter(|p| {
+            post_nodes
+                .get(p)
+                .is_some_and(|n| n.labels.contains(&schema.post))
+        })
+        .map(|p| Uid(*p))
+        .collect();
+
+    // 3. Replies to each post, concurrently, keeping the post→replies binding
+    //    (post content is a returned column).
+    let per_post_replies = writer
+        .neighbors_each_cached(posts, schema.reply_of, Direction::In, deleted_nodes)
+        .await?;
+
+    // 4. Batched reply-node fetch.
+    let mut reply_set: BTreeSet<u64> = BTreeSet::new();
+    for (_, replies) in &per_post_replies {
+        reply_set.extend(replies.iter());
+    }
+    let reply_nodes = fetch_node_map(writer, &reply_set).await?;
+
+    // 5. Build rows in memory.
+    let mut scored: Vec<(i64, String, Row)> = Vec::new();
+    for (post, replies) in &per_post_replies {
+        let post_content = post_nodes
+            .get(&post.get())
+            .map(|n| string_prop(&n.props, schema.content))
+            .unwrap_or_default();
         for raw_reply in replies.iter() {
-            let reply_uid = Uid(raw_reply);
-            let Some(reply_node) = writer.get_node(reply_uid).await? else {
+            let Some(reply_node) = reply_nodes.get(&raw_reply) else {
                 continue;
             };
-            // `reply:Comment` in the Cypher pattern — `REPLY_OF` can also
-            // point Comment->Comment (a reply to a reply), so exclude those
-            // here too (only direct Post replies survive the outer filter
-            // above, but the inner reply itself must still be a Comment).
+            // `reply:Comment` in the Cypher pattern — `REPLY_OF` can also point
+            // Comment->Comment (a reply to a reply), so exclude those here too
+            // (only direct Post replies survive the filter above, but the inner
+            // reply itself must be a Comment).
             if !reply_node.labels.contains(&schema.comment) {
                 continue;
             }
