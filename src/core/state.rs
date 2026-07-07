@@ -18,7 +18,10 @@ use crate::{
     PostingChunkCacheKey, Result, SupernodeCacheKey, VertexId, GRAPH_CELL_WRITE_LOCK_TTL_MS,
 };
 #[cfg(feature = "opencypher")]
-use crate::{ParsedRowQueryCacheKey, ReachabilityCacheKey, ReachabilityCacheValue};
+use crate::{
+    ParsedRowQueryCacheKey, ReachabilityCacheKey, ReachabilityCacheValue,
+    RelationshipPropertyRowsCacheKey, RelationshipRowsCacheKey, RelationshipRowsCacheValue,
+};
 
 pub struct GraphShard {
     pub(crate) db: Db,
@@ -48,6 +51,12 @@ pub struct GraphShard {
     #[cfg(feature = "opencypher")]
     pub(crate) reachability_cache:
         Mutex<BoundedGraphCache<ReachabilityCacheKey, ReachabilityCacheValue>>,
+    #[cfg(feature = "opencypher")]
+    pub(crate) relationship_rows_cache:
+        Mutex<BoundedGraphCache<RelationshipRowsCacheKey, RelationshipRowsCacheValue>>,
+    #[cfg(feature = "opencypher")]
+    pub(crate) relationship_property_rows_cache:
+        Mutex<BoundedGraphCache<RelationshipPropertyRowsCacheKey, RelationshipRowsCacheValue>>,
     pub(crate) supernode_group_cache:
         Mutex<BoundedGraphCache<SupernodeCacheKey, engine::SupernodeGroup>>,
     pub(crate) posting_chunk_cache:
@@ -84,6 +93,10 @@ pub struct GraphCacheEntryCounts {
     pub parsed_row_queries: usize,
     #[cfg(feature = "opencypher")]
     pub reachability_results: usize,
+    #[cfg(feature = "opencypher")]
+    pub relationship_row_sets: usize,
+    #[cfg(feature = "opencypher")]
+    pub relationship_property_row_sets: usize,
     pub supernode_groups: usize,
     pub posting_chunks: usize,
     pub materialized_supernodes: usize,

@@ -18,6 +18,11 @@ mod query;
 mod sparse_kernel;
 
 pub(crate) use core::cache::{BoundedGraphCache, PostingChunkCacheKey, SupernodeCacheKey};
+#[cfg(feature = "opencypher")]
+pub(crate) use core::cache::{
+    RelationshipPropertyRowsCacheKey, RelationshipRowsCacheEntry, RelationshipRowsCacheKey,
+    RelationshipRowsCacheValue,
+};
 pub(crate) use core::config::open_graph_db;
 pub use core::config::{
     GraphBackpressurePolicy, GraphCacheConfig, GraphDurabilityConfig, GraphIndexPolicy,
@@ -33,7 +38,9 @@ pub use core::model::{
     CommitResult, DeleteResult, DeltaKind, DeltaRecord, EdgeIngestOptions, EdgeIngestResult,
     EdgeMetadata, EdgeMutation, EdgeMutationBatchResult, EdgeMutationLogAppendResult,
     EdgeMutationLogMaterializeResult, EdgeRecord, GraphCorrectnessReport, GraphExportDigest,
-    GraphRepairReport, QueryFloat, SegmentCompactionResult, VertexMetadata, VertexPropertyValue,
+    GraphRepairReport, QueryFloat, RelationshipCreateResult, RelationshipId,
+    RelationshipImportResult, RelationshipMutation, RelationshipRecord, SegmentCompactionResult,
+    VertexMetadata, VertexPropertyValue,
 };
 pub(crate) use core::model::{EdgeMutationLogBatch, OutEdgeSegment, OutboxDeltaBatch};
 pub use core::snapshot::GraphSnapshot;

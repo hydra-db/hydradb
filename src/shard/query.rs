@@ -409,6 +409,18 @@ impl GraphShard {
         {
             return Ok(result);
         }
+        if let Some(result) = self
+            .try_execute_relationship_count_query(cell_id, read_epoch, &query, window, budget)
+            .await?
+        {
+            return Ok(result);
+        }
+        if let Some(result) = self
+            .try_execute_relationship_rows_query(cell_id, read_epoch, &query, window, budget)
+            .await?
+        {
+            return Ok(result);
+        }
 
         let bindings = if query.pattern_groups.is_empty() {
             let mut bindings = self
@@ -541,6 +553,96 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
+    async fn try_execute_relationship_rows_query(
+        &self,
+        cell_id: &str,
+        read_epoch: GraphEpoch,
+        query: &ParsedRowQuery,
+        window: QueryWindow,
+        budget: &QueryBudget,
+    ) -> Result<Option<QueryResultSet>> {
+        let Some(edge) = relationship_rows_query_edge(query) else {
+            return Ok(None);
+        };
+        if !relationship_rows_projection_supported(edge, &query.projections)
+            || !relationship_rows_order_supported(
+                edge,
+                &query.projections,
+                &query.columns,
+                &query.order_by,
+            )
+        {
+            return Ok(None);
+        }
+        let (Some(src), Some(dst)) = (edge.src.id, edge.dst.id) else {
+            return Ok(None);
+        };
+        let relationships = if let Some((property, value)) = edge.properties.iter().next() {
+            self.relationships_for_edge_property_at(RelationshipPropertyLookup {
+                cell_id,
+                edge_type: &edge.edge_type,
+                src,
+                dst,
+                property,
+                value,
+                read_epoch,
+                budget,
+            })
+            .await?
+        } else {
+            self.relationships_for_edge_at(cell_id, &edge.edge_type, src, dst, read_epoch, budget)
+                .await?
+        };
+        let mut projected = Vec::with_capacity(relationships.len());
+        for (relationship, metadata) in relationships {
+            budget.check("cypher_relationship_rows_fast_path")?;
+            if !relationship_metadata_matches(&metadata, edge) {
+                continue;
+            }
+            let row = project_relationship_row(edge, &relationship, &metadata, &query.projections)?;
+            let sort_keys =
+                sort_keys_for_relationship_row(edge, &relationship, &metadata, &row, query)?;
+            projected.push(ProjectedQueryRow { row, sort_keys });
+            self.ensure_query_intermediate_rows(
+                "cypher_relationship_rows_fast_path",
+                projected.len(),
+            )?;
+        }
+        Ok(Some(self.finish_projected_rows(
+            query.columns.clone(),
+            projected,
+            &query.order_by,
+            window,
+            budget,
+        )?))
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn try_execute_relationship_count_query(
+        &self,
+        cell_id: &str,
+        read_epoch: GraphEpoch,
+        query: &ParsedRowQuery,
+        window: QueryWindow,
+        budget: &QueryBudget,
+    ) -> Result<Option<QueryResultSet>> {
+        let Some(edge) = relationship_count_query_edge(query) else {
+            return Ok(None);
+        };
+        let (Some(src), Some(dst)) = (edge.src.id, edge.dst.id) else {
+            return Ok(None);
+        };
+        let count = self
+            .relationship_count_for_edge_at(cell_id, &edge.edge_type, src, dst, read_epoch, budget)
+            .await?;
+        let rows = vec![QueryRow::new(vec![QueryValue::Count(count)])];
+        Ok(Some(QueryResultSet::new(
+            query.columns.clone(),
+            self.apply_query_row_window(rows, window)?,
+        )))
+    }
+
+    #[cfg(feature = "opencypher")]
     async fn execute_parsed_opencypher_mutation(
         &self,
         context: QueryContext,
@@ -615,21 +717,27 @@ impl GraphShard {
                     for relationship in relationships {
                         budget.check("cypher_delete_relationship")?;
                         let edge_type = relationship.edge_type.clone();
-                        let delete = self
-                            .delete_edge(EdgeMutation {
-                                cell_id: context.cell_id.clone(),
-                                edge_type: edge_type.clone(),
-                                src: relationship.src,
-                                dst: relationship.dst,
-                                idempotency_key: format!(
-                                    "{}.delete.{}.{}.{}",
-                                    context.idempotency_key,
-                                    edge_type,
-                                    relationship.src,
-                                    relationship.dst
-                                ),
-                            })
-                            .await?;
+                        let mutation = EdgeMutation {
+                            cell_id: context.cell_id.clone(),
+                            edge_type: edge_type.clone(),
+                            src: relationship.src,
+                            dst: relationship.dst,
+                            idempotency_key: format!(
+                                "{}.delete.{}.{}.{}.{}",
+                                context.idempotency_key,
+                                edge_type,
+                                relationship.src,
+                                relationship.dst,
+                                relationship
+                                    .relationship_id
+                                    .map_or_else(|| "edge".to_string(), |id| id.to_string())
+                            ),
+                        };
+                        let delete = if let Some(relationship_id) = relationship.relationship_id {
+                            self.delete_relationship(mutation, relationship_id).await?
+                        } else {
+                            self.delete_edge(mutation).await?
+                        };
                         if delete.deleted {
                             result.deleted_edges = result.deleted_edges.saturating_add(1);
                         } else {
@@ -680,8 +788,18 @@ impl GraphShard {
                 result.noops = result.noops.saturating_add(1);
                 continue;
             }
-            if self
-                .set_edge_metadata(
+            let changed = if let Some(relationship_id) = relationship.relationship_id {
+                self.set_relationship_metadata(
+                    &context.cell_id,
+                    &relationship.edge_type,
+                    relationship.src,
+                    relationship.dst,
+                    relationship_id,
+                    metadata,
+                )
+                .await?
+            } else {
+                self.set_edge_metadata(
                     &context.cell_id,
                     &relationship.edge_type,
                     relationship.src,
@@ -689,7 +807,8 @@ impl GraphShard {
                     metadata,
                 )
                 .await?
-            {
+            };
+            if changed {
                 result.updated_relationships = result.updated_relationships.saturating_add(1);
             } else {
                 result.noops = result.noops.saturating_add(1);
@@ -926,15 +1045,21 @@ impl GraphShard {
                 dst,
             } => {
                 let result = self
-                    .write_edge(EdgeMutation {
-                        cell_id: plan.cell_id,
-                        edge_type,
-                        src,
-                        dst,
-                        idempotency_key: plan.idempotency_key,
-                    })
+                    .create_relationship(
+                        EdgeMutation {
+                            cell_id: plan.cell_id,
+                            edge_type,
+                            src,
+                            dst,
+                            idempotency_key: plan.idempotency_key,
+                        },
+                        EdgeMetadata::default(),
+                    )
                     .await?;
-                Ok(QueryOutput::Write(result))
+                Ok(QueryOutput::Write(CommitResult {
+                    epoch: result.epoch,
+                    already_existed: result.already_created,
+                }))
             }
             PhysicalQueryPlan::WriteEdgeWithMetadata {
                 edge_type,
@@ -944,7 +1069,7 @@ impl GraphShard {
                 dst_metadata,
             } => {
                 let result = self
-                    .write_edge_with_vertex_metadata(
+                    .create_relationship_with_vertex_metadata(
                         EdgeMutation {
                             cell_id: plan.cell_id,
                             edge_type,
@@ -956,7 +1081,10 @@ impl GraphShard {
                         dst_metadata,
                     )
                     .await?;
-                Ok(QueryOutput::Write(result))
+                Ok(QueryOutput::Write(CommitResult {
+                    epoch: result.epoch,
+                    already_existed: result.already_created,
+                }))
             }
             PhysicalQueryPlan::WriteEdgeWithFullMetadata {
                 edge_type,
@@ -967,7 +1095,7 @@ impl GraphShard {
                 edge_metadata,
             } => {
                 let result = self
-                    .write_edge_with_full_metadata(
+                    .create_relationship_with_full_metadata(
                         EdgeMutation {
                             cell_id: plan.cell_id,
                             edge_type,
@@ -980,7 +1108,10 @@ impl GraphShard {
                         edge_metadata,
                     )
                     .await?;
-                Ok(QueryOutput::Write(result))
+                Ok(QueryOutput::Write(CommitResult {
+                    epoch: result.epoch,
+                    already_existed: result.already_created,
+                }))
             }
             PhysicalQueryPlan::OutDegreeCounter { edge_type, src } => {
                 let count = if let Some(read_epoch) = plan.read_epoch {
@@ -1886,29 +2017,57 @@ impl GraphShard {
             if !exists {
                 continue;
             }
-            let Some(mut matched) = BindingRow::from_edge(&bound_edge, src, dst) else {
-                continue;
+            let relationships = if let Some((property, value)) = bound_edge.properties.iter().next()
+            {
+                self.relationships_for_edge_property_at(RelationshipPropertyLookup {
+                    cell_id,
+                    edge_type: &bound_edge.edge_type,
+                    src,
+                    dst,
+                    property,
+                    value,
+                    read_epoch,
+                    budget,
+                })
+                .await?
+            } else {
+                self.relationships_for_edge_at(
+                    cell_id,
+                    &bound_edge.edge_type,
+                    src,
+                    dst,
+                    read_epoch,
+                    budget,
+                )
+                .await?
             };
-            self.hydrate_binding_metadata(
-                cell_id,
-                read_epoch,
-                &mut matched,
-                &mut metadata_cache,
-                budget,
-            )
-            .await?;
-            self.hydrate_row_relationship_metadata(
-                cell_id,
-                read_epoch,
-                &mut matched,
-                &bound_edge,
-                &mut edge_metadata_cache,
-                budget,
-            )
-            .await?;
-            if row_matches_edge_pattern(&matched, &bound_edge)? {
-                if let Some(joined) = row.join(&matched) {
-                    self.push_binding_row(&mut next_rows, joined, "cypher_expand_into_rows")?;
+            for (relationship, relationship_metadata) in relationships {
+                let Some(mut matched) =
+                    BindingRow::from_relationship(&bound_edge, relationship, relationship_metadata)
+                else {
+                    continue;
+                };
+                self.hydrate_binding_metadata(
+                    cell_id,
+                    read_epoch,
+                    &mut matched,
+                    &mut metadata_cache,
+                    budget,
+                )
+                .await?;
+                self.hydrate_row_relationship_metadata(
+                    cell_id,
+                    read_epoch,
+                    &mut matched,
+                    &bound_edge,
+                    &mut edge_metadata_cache,
+                    budget,
+                )
+                .await?;
+                if row_matches_edge_pattern(&matched, &bound_edge)? {
+                    if let Some(joined) = row.join(&matched) {
+                        self.push_binding_row(&mut next_rows, joined, "cypher_expand_into_rows")?;
+                    }
                 }
             }
         }
@@ -2359,28 +2518,53 @@ impl GraphShard {
         {
             return Ok(());
         }
-        let Some(mut row) = BindingRow::from_edge(edge, src, dst) else {
-            return Ok(());
+        let relationships = if let Some((property, value)) = edge.properties.iter().next() {
+            self.relationships_for_edge_property_at(RelationshipPropertyLookup {
+                cell_id: state.cell_id,
+                edge_type: &edge.edge_type,
+                src,
+                dst,
+                property,
+                value,
+                read_epoch: state.read_epoch,
+                budget: state.budget,
+            })
+            .await?
+        } else {
+            self.relationships_for_edge_at(
+                state.cell_id,
+                &edge.edge_type,
+                src,
+                dst,
+                state.read_epoch,
+                state.budget,
+            )
+            .await?
         };
-        self.hydrate_binding_metadata(
-            state.cell_id,
-            state.read_epoch,
-            &mut row,
-            state.metadata_cache,
-            state.budget,
-        )
-        .await?;
-        self.hydrate_row_relationship_metadata(
-            state.cell_id,
-            state.read_epoch,
-            &mut row,
-            edge,
-            state.edge_metadata_cache,
-            state.budget,
-        )
-        .await?;
-        if row_matches_edge_pattern(&row, edge)? {
-            self.push_binding_row(state.rows, row, "cypher_edge_rows")?;
+        for (relationship, metadata) in relationships {
+            let Some(mut row) = BindingRow::from_relationship(edge, relationship, metadata) else {
+                continue;
+            };
+            self.hydrate_binding_metadata(
+                state.cell_id,
+                state.read_epoch,
+                &mut row,
+                state.metadata_cache,
+                state.budget,
+            )
+            .await?;
+            self.hydrate_row_relationship_metadata(
+                state.cell_id,
+                state.read_epoch,
+                &mut row,
+                edge,
+                state.edge_metadata_cache,
+                state.budget,
+            )
+            .await?;
+            if row_matches_edge_pattern(&row, edge)? {
+                self.push_binding_row(state.rows, row, "cypher_edge_rows")?;
+            }
         }
         Ok(())
     }
@@ -2569,6 +2753,458 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
+    async fn relationship_metadata_at(
+        &self,
+        cell_id: &str,
+        relationship: &BoundRelationship,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<EdgeMetadata> {
+        let Some(relationship_id) = relationship.relationship_id else {
+            return self
+                .edge_metadata_at(
+                    cell_id,
+                    &relationship.edge_type,
+                    relationship.src,
+                    relationship.dst,
+                    read_epoch,
+                    budget,
+                )
+                .await;
+        };
+        budget.check("cypher_relationship_record")?;
+        let tombstone_key = keys::relationship_tombstone(
+            cell_id,
+            &relationship.edge_type,
+            relationship.src,
+            relationship.dst,
+            relationship_id,
+        );
+        if let Some(value) = self.read_remote(&tombstone_key).await? {
+            let tombstone_epoch = decode_u64(&tombstone_key, &value)?;
+            if tombstone_epoch <= read_epoch {
+                return Ok(EdgeMetadata::default());
+            }
+        }
+        let delta_prefix = keys::relationship_metadata_delta_prefix(
+            cell_id,
+            &relationship.edge_type,
+            relationship.src,
+            relationship.dst,
+            relationship_id,
+        );
+        let mut iter = self.scan_remote_prefix(&delta_prefix).await?;
+        let mut latest = None;
+        while let Some(kv) = iter.next().await? {
+            budget.check("cypher_relationship_metadata_delta")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let epoch = parse_relationship_metadata_delta_key(&key)?;
+            if epoch > read_epoch {
+                break;
+            }
+            latest = Some(decode_edge_metadata(&key, &kv.value)?);
+        }
+        if let Some(metadata) = latest {
+            return Ok(metadata);
+        }
+        let key = keys::relationship(
+            cell_id,
+            &relationship.edge_type,
+            relationship.src,
+            relationship.dst,
+            relationship_id,
+        );
+        match self.read_remote(&key).await? {
+            Some(value) => {
+                let record = decode_relationship_record(&key, &value)?;
+                if record.epoch <= read_epoch {
+                    Ok(record.metadata)
+                } else {
+                    Ok(EdgeMetadata::default())
+                }
+            }
+            None => Ok(EdgeMetadata::default()),
+        }
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn relationships_for_edge_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<(BoundRelationship, EdgeMetadata)>> {
+        let cache_key = RelationshipRowsCacheKey::new(cell_id, edge_type, src, dst, read_epoch);
+        if let Some(cached) = self.relationship_rows_cache.lock().await.get(&cache_key) {
+            self.cache_metrics
+                .record_hit(GraphCacheKind::RelationshipRows);
+            return Ok(relationship_rows_from_cache_value(
+                edge_type, src, dst, cached,
+            ));
+        }
+        self.cache_metrics
+            .record_miss(GraphCacheKind::RelationshipRows);
+
+        let mut rows = Vec::new();
+        let mut saw_relationship_record = false;
+        let current_epoch = self.current_epoch(cell_id).await?;
+        let latest_snapshot = read_epoch == current_epoch;
+        let tombstones = self
+            .relationship_tombstone_ids_for_edge_at(
+                cell_id, edge_type, src, dst, read_epoch, budget,
+            )
+            .await?;
+        let prefix = keys::relationship_edge_prefix(cell_id, edge_type, src, dst);
+        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        while let Some(kv) = iter.next().await? {
+            budget.check("cypher_relationship_edge_records")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let record = decode_relationship_record(&key, &kv.value)?;
+            saw_relationship_record = true;
+            if record.epoch > read_epoch {
+                continue;
+            }
+            if tombstones.contains(&record.relationship_id) {
+                continue;
+            }
+            let relationship = BoundRelationship {
+                edge_type: record.edge_type,
+                src: record.src,
+                dst: record.dst,
+                relationship_id: Some(record.relationship_id),
+            };
+            let metadata = if latest_snapshot {
+                record.metadata
+            } else {
+                self.relationship_metadata_at(cell_id, &relationship, read_epoch, budget)
+                    .await?
+            };
+            rows.push((relationship, metadata));
+            self.ensure_query_index_candidates("cypher_relationship_edge_records", rows.len())?;
+        }
+        if saw_relationship_record {
+            let structural_metadata = self
+                .edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget)
+                .await?;
+            if !structural_metadata.properties.is_empty() {
+                rows.push((
+                    BoundRelationship {
+                        edge_type: edge_type.to_string(),
+                        src,
+                        dst,
+                        relationship_id: None,
+                    },
+                    structural_metadata,
+                ));
+            }
+        }
+        if rows.is_empty() && !saw_relationship_record {
+            let metadata = self
+                .edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget)
+                .await?;
+            rows.push((
+                BoundRelationship {
+                    edge_type: edge_type.to_string(),
+                    src,
+                    dst,
+                    relationship_id: None,
+                },
+                metadata,
+            ));
+        }
+        let cache_value = relationship_rows_cache_value(&rows);
+        self.relationship_rows_cache.lock().await.insert(
+            cache_key,
+            cache_value,
+            cell_id.to_string(),
+            false,
+            &self.cache_metrics,
+        );
+        Ok(rows)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn relationship_tombstone_ids_for_edge_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<BTreeSet<RelationshipId>> {
+        let mut tombstones = BTreeSet::new();
+        let prefix = keys::relationship_tombstone_edge_prefix(cell_id, edge_type, src, dst);
+        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        while let Some(kv) = iter.next().await? {
+            budget.check("cypher_relationship_tombstones")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let relationship_id = parse_relationship_tombstone_edge_key(&key)?;
+            let tombstone_epoch = decode_u64(&key, &kv.value)?;
+            if tombstone_epoch <= read_epoch {
+                tombstones.insert(relationship_id);
+            }
+            self.ensure_query_index_candidates("cypher_relationship_tombstones", tombstones.len())?;
+        }
+        Ok(tombstones)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn relationships_for_edge_property_at(
+        &self,
+        lookup: RelationshipPropertyLookup<'_>,
+    ) -> Result<Vec<(BoundRelationship, EdgeMetadata)>> {
+        let RelationshipPropertyLookup {
+            cell_id,
+            edge_type,
+            src,
+            dst,
+            property,
+            value,
+            read_epoch,
+            budget,
+        } = lookup;
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        validate_component("property", property)?;
+        let mut rows = Vec::new();
+        let mut seen_relationship_ids = BTreeSet::new();
+        let current_epoch = self.current_epoch(cell_id).await?;
+        let latest_snapshot = read_epoch == current_epoch;
+        let tombstones = self
+            .relationship_tombstone_ids_for_edge_at(
+                cell_id, edge_type, src, dst, read_epoch, budget,
+            )
+            .await?;
+        for encoded in equivalent_property_index_keys(value) {
+            let encoded_rows = self
+                .relationships_for_edge_encoded_property_at(EncodedRelationshipPropertyLookup {
+                    cell_id,
+                    edge_type,
+                    src,
+                    dst,
+                    property,
+                    encoded: &encoded,
+                    read_epoch,
+                    latest_snapshot,
+                    tombstones: &tombstones,
+                    budget,
+                })
+                .await?;
+            for (relationship, metadata) in encoded_rows {
+                let Some(relationship_id) = relationship.relationship_id else {
+                    continue;
+                };
+                if !seen_relationship_ids.insert(relationship_id) {
+                    continue;
+                }
+                rows.push((relationship, metadata));
+                self.ensure_query_index_candidates(
+                    "cypher_relationship_property_edge_candidates",
+                    rows.len(),
+                )?;
+            }
+        }
+
+        let structural_metadata = self
+            .edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget)
+            .await?;
+        if structural_metadata
+            .properties
+            .get(property)
+            .is_some_and(|existing| vertex_property_values_equal(existing, value))
+        {
+            rows.push((
+                BoundRelationship {
+                    edge_type: edge_type.to_string(),
+                    src,
+                    dst,
+                    relationship_id: None,
+                },
+                structural_metadata,
+            ));
+        }
+        Ok(rows)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn relationships_for_edge_encoded_property_at(
+        &self,
+        lookup: EncodedRelationshipPropertyLookup<'_>,
+    ) -> Result<Vec<(BoundRelationship, EdgeMetadata)>> {
+        let EncodedRelationshipPropertyLookup {
+            cell_id,
+            edge_type,
+            src,
+            dst,
+            property,
+            encoded,
+            read_epoch,
+            latest_snapshot,
+            tombstones,
+            budget,
+        } = lookup;
+        let cache_key = RelationshipPropertyRowsCacheKey::new(
+            cell_id, edge_type, src, dst, property, encoded, read_epoch,
+        );
+        if let Some(cached) = self
+            .relationship_property_rows_cache
+            .lock()
+            .await
+            .get(&cache_key)
+        {
+            self.cache_metrics
+                .record_hit(GraphCacheKind::RelationshipPropertyRows);
+            return Ok(relationship_rows_from_cache_value(
+                edge_type, src, dst, cached,
+            ));
+        }
+        self.cache_metrics
+            .record_miss(GraphCacheKind::RelationshipPropertyRows);
+
+        let relationship_ids = if latest_snapshot {
+            self.scan_relationship_property_index_current_for_edge(
+                RelationshipPropertyEdgeIndexLookup {
+                    cell_id,
+                    edge_type,
+                    property,
+                    encoded,
+                    src,
+                    dst,
+                    budget,
+                },
+            )
+            .await?
+        } else {
+            self.scan_relationship_property_index_at(
+                cell_id, edge_type, property, encoded, read_epoch, budget,
+            )
+            .await?
+            .into_iter()
+            .filter_map(|(candidate_src, candidate_dst, relationship_id)| {
+                (candidate_src == src && candidate_dst == dst).then_some(relationship_id)
+            })
+            .collect()
+        };
+
+        let mut rows = Vec::with_capacity(relationship_ids.len());
+        for relationship_id in relationship_ids {
+            budget.check("cypher_relationship_property_edge_candidates")?;
+            if tombstones.contains(&relationship_id) {
+                continue;
+            }
+            let relationship = BoundRelationship {
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                relationship_id: Some(relationship_id),
+            };
+            let metadata = if latest_snapshot {
+                let key = keys::relationship(cell_id, edge_type, src, dst, relationship_id);
+                match self.read_remote(&key).await? {
+                    Some(value) => decode_relationship_record(&key, &value)?.metadata,
+                    None => continue,
+                }
+            } else {
+                self.relationship_metadata_at(cell_id, &relationship, read_epoch, budget)
+                    .await?
+            };
+            rows.push((relationship, metadata));
+            self.ensure_query_index_candidates(
+                "cypher_relationship_property_edge_candidates",
+                rows.len(),
+            )?;
+        }
+        self.relationship_property_rows_cache.lock().await.insert(
+            cache_key,
+            relationship_rows_cache_value(&rows),
+            cell_id.to_string(),
+            false,
+            &self.cache_metrics,
+        );
+        Ok(rows)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn relationship_count_for_edge_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<u64> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let current_epoch = self.current_epoch(cell_id).await?;
+        if read_epoch == current_epoch {
+            let count = self
+                .read_counter(&keys::relationship_count(cell_id, edge_type, src, dst))
+                .await?;
+            if count > 0 {
+                return Ok(count);
+            }
+        }
+
+        let relationship_records = self
+            .relationship_record_count_for_edge_at(cell_id, edge_type, src, dst, read_epoch, budget)
+            .await?;
+        if relationship_records > 0 {
+            return Ok(relationship_records);
+        }
+
+        let structural_exists = if read_epoch == current_epoch {
+            self.edge_exists(cell_id, edge_type, src, dst).await?
+        } else {
+            self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch)
+                .await?
+        };
+        Ok(u64::from(structural_exists))
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn relationship_record_count_for_edge_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<u64> {
+        let prefix = keys::relationship_edge_prefix(cell_id, edge_type, src, dst);
+        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        let mut count = 0_u64;
+        while let Some(kv) = iter.next().await? {
+            budget.check("cypher_relationship_count_records")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let record = decode_relationship_record(&key, &kv.value)?;
+            if record.epoch > read_epoch {
+                continue;
+            }
+            let tombstone_key = keys::relationship_tombstone(
+                cell_id,
+                &record.edge_type,
+                record.src,
+                record.dst,
+                record.relationship_id,
+            );
+            if let Some(value) = self.read_remote(&tombstone_key).await? {
+                let tombstone_epoch = decode_u64(&tombstone_key, &value)?;
+                if tombstone_epoch <= read_epoch {
+                    continue;
+                }
+            }
+            count = count.saturating_add(1);
+        }
+        Ok(count)
+    }
+
+    #[cfg(feature = "opencypher")]
     async fn scan_edge_property_index_at(
         &self,
         cell_id: &str,
@@ -2622,8 +3258,69 @@ impl GraphShard {
                     edges.len(),
                 )?;
             }
+            let relationship_edges = self
+                .scan_relationship_property_index_at(
+                    cell_id, edge_type, property, &encoded, read_epoch, budget,
+                )
+                .await?;
+            for (src, dst, _relationship_id) in relationship_edges {
+                edges.insert((src, dst));
+                self.ensure_query_index_candidates(
+                    "cypher_edge_property_index_candidates",
+                    edges.len(),
+                )?;
+            }
         }
         Ok(edges.into_iter().collect())
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn scan_relationship_property_index_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        property: &str,
+        encoded: &str,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<(VertexId, VertexId, RelationshipId)>> {
+        let mut iter = self
+            .scan_remote_prefix(&keys::relationship_property_index_delta_prefix(
+                cell_id, edge_type, property, encoded,
+            ))
+            .await?;
+        let mut latest = BTreeMap::<(VertexId, VertexId, RelationshipId), bool>::new();
+        let mut saw_delta = false;
+        while let Some(kv) = iter.next().await? {
+            budget.check("cypher_relationship_property_index_delta")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (epoch, src, dst, relationship_id) =
+                parse_relationship_property_index_delta_key(&key)?;
+            saw_delta = true;
+            if epoch > read_epoch {
+                break;
+            }
+            latest.insert(
+                (src, dst, relationship_id),
+                decode_vertex_index_delta(&key, &kv.value)?,
+            );
+            self.ensure_query_index_candidates(
+                "cypher_relationship_property_index_candidates",
+                latest.len(),
+            )?;
+        }
+        let relationships = if saw_delta {
+            latest
+                .into_iter()
+                .filter_map(|(relationship, present)| present.then_some(relationship))
+                .collect()
+        } else {
+            self.scan_relationship_property_index_current(
+                cell_id, edge_type, property, encoded, budget,
+            )
+            .await?
+        };
+        Ok(relationships)
     }
 
     #[cfg(feature = "opencypher")]
@@ -2653,6 +3350,83 @@ impl GraphShard {
             )?;
         }
         Ok(edges)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn scan_relationship_property_index_current(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        property: &str,
+        encoded: &str,
+        budget: &QueryBudget,
+    ) -> Result<Vec<(VertexId, VertexId, RelationshipId)>> {
+        let mut iter = self
+            .scan_remote_prefix(&keys::relationship_property_index_prefix(
+                cell_id, edge_type, property, encoded,
+            ))
+            .await?;
+        let mut relationships = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            budget.check("cypher_relationship_property_index")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (_cell_id, _edge_type, _property, _encoded, src, dst, relationship_id) =
+                parse_relationship_property_index_key(&key)?;
+            relationships.push((src, dst, relationship_id));
+            self.ensure_query_index_candidates(
+                "cypher_relationship_property_index_candidates",
+                relationships.len(),
+            )?;
+        }
+        Ok(relationships)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn scan_relationship_property_index_current_for_edge(
+        &self,
+        lookup: RelationshipPropertyEdgeIndexLookup<'_>,
+    ) -> Result<Vec<RelationshipId>> {
+        let RelationshipPropertyEdgeIndexLookup {
+            cell_id,
+            edge_type,
+            property,
+            encoded,
+            src,
+            dst,
+            budget,
+        } = lookup;
+        let mut iter = self
+            .scan_remote_prefix(&keys::relationship_property_index_edge_prefix(
+                cell_id, edge_type, property, encoded, src, dst,
+            ))
+            .await?;
+        let mut relationships = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            budget.check("cypher_relationship_property_index_edge")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (
+                _cell_id,
+                _edge_type,
+                _property,
+                _encoded,
+                parsed_src,
+                parsed_dst,
+                relationship_id,
+            ) = parse_relationship_property_index_key(&key)?;
+            if parsed_src != src || parsed_dst != dst {
+                return Err(GraphError::CorruptValue {
+                    key,
+                    reason: "relationship property index edge prefix returned a different endpoint"
+                        .to_string(),
+                });
+            }
+            relationships.push(relationship_id);
+            self.ensure_query_index_candidates(
+                "cypher_relationship_property_index_edge_candidates",
+                relationships.len(),
+            )?;
+        }
+        Ok(relationships)
     }
 
     #[cfg(feature = "opencypher")]
@@ -2846,16 +3620,13 @@ impl GraphShard {
         let metadata = match cache.get(&relationship) {
             Some(metadata) => metadata.clone(),
             None => {
-                let metadata = self
-                    .edge_metadata_at(
-                        cell_id,
-                        &relationship.edge_type,
-                        relationship.src,
-                        relationship.dst,
-                        read_epoch,
-                        budget,
-                    )
-                    .await?;
+                let metadata = match row.relationship_metadata.get(&relationship) {
+                    Some(metadata) => metadata.clone(),
+                    None => {
+                        self.relationship_metadata_at(cell_id, &relationship, read_epoch, budget)
+                            .await?
+                    }
+                };
                 cache.insert(relationship.clone(), metadata.clone());
                 metadata
             }
@@ -4696,6 +5467,110 @@ fn graph_kernel_row_query_request(
 }
 
 #[cfg(feature = "opencypher")]
+fn relationship_count_query_edge(query: &ParsedRowQuery) -> Option<&RowEdgePattern> {
+    if !query.union_arms.is_empty() || query.predicate.is_some() || !query.order_by.is_empty() {
+        return None;
+    }
+    if query.projections.as_slice() != [RowProjection::CountAll] {
+        return None;
+    }
+    let patterns = graph_kernel_query_patterns(query)?;
+    let [pattern] = patterns else {
+        return None;
+    };
+    let RowPattern::Edge(edge) = pattern else {
+        return None;
+    };
+    if edge.hop_range.is_some()
+        || edge.src.id.is_none()
+        || edge.dst.id.is_none()
+        || !edge.properties.is_empty()
+        || !graph_kernel_node_pattern(&edge.src)
+        || !graph_kernel_node_pattern(&edge.dst)
+    {
+        return None;
+    }
+    Some(edge)
+}
+
+#[cfg(feature = "opencypher")]
+fn relationship_rows_query_edge(query: &ParsedRowQuery) -> Option<&RowEdgePattern> {
+    if !query.union_arms.is_empty()
+        || query.predicate.is_some()
+        || row_projections_have_aggregates(&query.projections)
+    {
+        return None;
+    }
+    let patterns = graph_kernel_query_patterns(query)?;
+    let [pattern] = patterns else {
+        return None;
+    };
+    let RowPattern::Edge(edge) = pattern else {
+        return None;
+    };
+    if edge.hop_range.is_some()
+        || edge.src.id.is_none()
+        || edge.dst.id.is_none()
+        || edge.binding.is_none()
+        || !graph_kernel_node_pattern(&edge.src)
+        || !graph_kernel_node_pattern(&edge.dst)
+    {
+        return None;
+    }
+    Some(edge)
+}
+
+#[cfg(feature = "opencypher")]
+fn relationship_rows_projection_supported(
+    edge: &RowEdgePattern,
+    projections: &[RowProjection],
+) -> bool {
+    projections.iter().all(|projection| match projection {
+        RowProjection::NodeId { binding } => {
+            edge.src.binding.as_deref() == Some(binding.as_str())
+                || edge.dst.binding.as_deref() == Some(binding.as_str())
+        }
+        RowProjection::Property { binding, property } => {
+            edge.binding.as_deref() == Some(binding.as_str()) && property != "id"
+        }
+        RowProjection::CountAll | RowProjection::Aggregate { .. } => false,
+    })
+}
+
+#[cfg(feature = "opencypher")]
+fn relationship_rows_order_supported(
+    edge: &RowEdgePattern,
+    projections: &[RowProjection],
+    columns: &[QueryColumn],
+    order_by: &[RowSort],
+) -> bool {
+    order_by.iter().all(|sort| match &sort.expression {
+        RowSortExpression::NodeId { binding } => {
+            edge.src.binding.as_deref() == Some(binding.as_str())
+                || edge.dst.binding.as_deref() == Some(binding.as_str())
+        }
+        RowSortExpression::Property { binding, property } => {
+            edge.binding.as_deref() == Some(binding.as_str()) && property != "id"
+        }
+        RowSortExpression::Column { name } => columns
+            .iter()
+            .position(|column| column.name == *name)
+            .and_then(|idx| projections.get(idx))
+            .is_some_and(|projection| match projection {
+                RowProjection::NodeId { binding } => {
+                    edge.src.binding.as_deref() == Some(binding.as_str())
+                        || edge.dst.binding.as_deref() == Some(binding.as_str())
+                }
+                RowProjection::Property { binding, property } => {
+                    edge.binding.as_deref() == Some(binding.as_str()) && property != "id"
+                }
+                RowProjection::CountAll | RowProjection::Aggregate { .. } => false,
+            }),
+        RowSortExpression::CountAll => false,
+    })
+}
+
+#[cfg(feature = "opencypher")]
 fn graph_kernel_query_patterns(query: &ParsedRowQuery) -> Option<&[RowPattern]> {
     if query.pattern_groups.is_empty() {
         return Some(&query.patterns);
@@ -5053,6 +5928,55 @@ fn parse_edge_property_index_delta_key(key: &str) -> Result<(GraphEpoch, VertexI
 }
 
 #[cfg(feature = "opencypher")]
+fn parse_relationship_metadata_delta_key(key: &str) -> Result<GraphEpoch> {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", _cell_id, "rel_delta", _edge_type, _src, _dst, _relationship_id, epoch] => {
+            parse_u64(key, epoch, "relationship_metadata_epoch")
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected relationship metadata delta key".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn parse_relationship_tombstone_edge_key(key: &str) -> Result<RelationshipId> {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", _cell_id, "rel_tomb", _edge_type, _src, _dst, relationship_id] => {
+            parse_u64(key, relationship_id, "relationship_id")
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected relationship tombstone key".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn parse_relationship_property_index_delta_key(
+    key: &str,
+) -> Result<(GraphEpoch, VertexId, VertexId, RelationshipId)> {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", _cell_id, "rprop_delta", _edge_type, _property, _encoded, epoch, src, dst, relationship_id] => {
+            Ok((
+                parse_u64(key, epoch, "relationship_property_epoch")?,
+                parse_u64(key, src, "src")?,
+                parse_u64(key, dst, "dst")?,
+                parse_u64(key, relationship_id, "relationship_id")?,
+            ))
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected relationship property index delta key".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct BindingRow {
     values: BTreeMap<String, VertexId>,
@@ -5069,6 +5993,44 @@ struct BoundRelationship {
     edge_type: String,
     src: VertexId,
     dst: VertexId,
+    relationship_id: Option<RelationshipId>,
+}
+
+#[cfg(feature = "opencypher")]
+struct RelationshipPropertyLookup<'a> {
+    cell_id: &'a str,
+    edge_type: &'a str,
+    src: VertexId,
+    dst: VertexId,
+    property: &'a str,
+    value: &'a VertexPropertyValue,
+    read_epoch: GraphEpoch,
+    budget: &'a QueryBudget,
+}
+
+#[cfg(feature = "opencypher")]
+struct EncodedRelationshipPropertyLookup<'a> {
+    cell_id: &'a str,
+    edge_type: &'a str,
+    src: VertexId,
+    dst: VertexId,
+    property: &'a str,
+    encoded: &'a str,
+    read_epoch: GraphEpoch,
+    latest_snapshot: bool,
+    tombstones: &'a BTreeSet<RelationshipId>,
+    budget: &'a QueryBudget,
+}
+
+#[cfg(feature = "opencypher")]
+struct RelationshipPropertyEdgeIndexLookup<'a> {
+    cell_id: &'a str,
+    edge_type: &'a str,
+    property: &'a str,
+    encoded: &'a str,
+    src: VertexId,
+    dst: VertexId,
+    budget: &'a QueryBudget,
 }
 
 #[cfg(feature = "opencypher")]
@@ -5082,23 +6044,31 @@ impl BindingRow {
     }
 
     fn from_edge(pattern: &RowEdgePattern, src: VertexId, dst: VertexId) -> Option<Self> {
-        let mut row = Self::default();
         let relationship = BoundRelationship {
             edge_type: pattern.edge_type.clone(),
             src,
             dst,
+            relationship_id: None,
         };
-        if !row.bind(pattern.src.binding.as_deref(), src) {
+        Self::from_relationship(pattern, relationship, EdgeMetadata::default())
+    }
+
+    fn from_relationship(
+        pattern: &RowEdgePattern,
+        relationship: BoundRelationship,
+        metadata: EdgeMetadata,
+    ) -> Option<Self> {
+        let mut row = Self::default();
+        if !row.bind(pattern.src.binding.as_deref(), relationship.src) {
             return None;
         }
-        if !row.bind(pattern.dst.binding.as_deref(), dst) {
+        if !row.bind(pattern.dst.binding.as_deref(), relationship.dst) {
             return None;
         }
         if !row.bind_relationship(pattern.binding.as_deref(), relationship.clone()) {
             return None;
         }
-        row.relationship_metadata
-            .insert(relationship, EdgeMetadata::default());
+        row.relationship_metadata.insert(relationship, metadata);
         Some(row)
     }
 
@@ -5423,6 +6393,16 @@ fn row_matches_edge_pattern(row: &BindingRow, pattern: &RowEdgePattern) -> Resul
 }
 
 #[cfg(feature = "opencypher")]
+fn relationship_metadata_matches(metadata: &EdgeMetadata, pattern: &RowEdgePattern) -> bool {
+    pattern.properties.iter().all(|(property, value)| {
+        metadata
+            .properties
+            .get(property)
+            .is_some_and(|existing| vertex_property_values_equal(existing, value))
+    })
+}
+
+#[cfg(feature = "opencypher")]
 fn relationship_identity_for_pattern(
     row: &BindingRow,
     pattern: &RowEdgePattern,
@@ -5443,6 +6423,7 @@ fn relationship_identity_for_pattern(
             edge_type: pattern.edge_type.clone(),
             src: row.get(src_binding)?,
             dst: row.get(dst_binding)?,
+            relationship_id: None,
         });
     }
     let mut matches = row
@@ -5670,6 +6651,153 @@ fn project_binding_row(row: &BindingRow, projections: &[RowProjection]) -> Resul
         }
     }
     Ok(QueryRow::new(values))
+}
+
+#[cfg(feature = "opencypher")]
+fn project_relationship_row(
+    edge: &RowEdgePattern,
+    relationship: &BoundRelationship,
+    metadata: &EdgeMetadata,
+    projections: &[RowProjection],
+) -> Result<QueryRow> {
+    let mut values = Vec::with_capacity(projections.len());
+    for projection in projections {
+        values.push(match projection {
+            RowProjection::NodeId { binding } => {
+                QueryValue::VertexId(relationship_endpoint_id(edge, relationship, binding)?)
+            }
+            RowProjection::Property { binding, property } => {
+                if edge.binding.as_deref() != Some(binding.as_str()) {
+                    return Err(GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: format!(
+                            "relationship fast path cannot project property {binding}.{property}"
+                        ),
+                    });
+                }
+                if property == "id" {
+                    return Err(GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: "relationship id properties are not executable in Query engine"
+                            .to_string(),
+                    });
+                }
+                metadata
+                    .properties
+                    .get(property)
+                    .cloned()
+                    .map(QueryValue::Property)
+                    .unwrap_or(QueryValue::Null)
+            }
+            RowProjection::CountAll | RowProjection::Aggregate { .. } => {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "aggregate projection must be planned as an aggregate".to_string(),
+                });
+            }
+        });
+    }
+    Ok(QueryRow::new(values))
+}
+
+#[cfg(feature = "opencypher")]
+fn relationship_rows_cache_value(
+    rows: &[(BoundRelationship, EdgeMetadata)],
+) -> RelationshipRowsCacheValue {
+    RelationshipRowsCacheValue::new(
+        rows.iter()
+            .map(|(relationship, metadata)| RelationshipRowsCacheEntry {
+                relationship_id: relationship.relationship_id,
+                metadata: metadata.clone(),
+            })
+            .collect(),
+    )
+}
+
+#[cfg(feature = "opencypher")]
+fn relationship_rows_from_cache_value(
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+    cached: RelationshipRowsCacheValue,
+) -> Vec<(BoundRelationship, EdgeMetadata)> {
+    cached
+        .rows
+        .iter()
+        .map(|entry| {
+            (
+                BoundRelationship {
+                    edge_type: edge_type.to_string(),
+                    src,
+                    dst,
+                    relationship_id: entry.relationship_id,
+                },
+                entry.metadata.clone(),
+            )
+        })
+        .collect()
+}
+
+#[cfg(feature = "opencypher")]
+fn sort_keys_for_relationship_row(
+    edge: &RowEdgePattern,
+    relationship: &BoundRelationship,
+    metadata: &EdgeMetadata,
+    row: &QueryRow,
+    query: &ParsedRowQuery,
+) -> Result<Vec<QueryValue>> {
+    let mut keys = Vec::with_capacity(query.order_by.len());
+    for sort in &query.order_by {
+        keys.push(match &sort.expression {
+            RowSortExpression::NodeId { binding } => {
+                QueryValue::VertexId(relationship_endpoint_id(edge, relationship, binding)?)
+            }
+            RowSortExpression::Property { binding, property } => {
+                if edge.binding.as_deref() != Some(binding.as_str()) {
+                    return Err(GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: format!(
+                            "relationship fast path cannot sort by property {binding}.{property}"
+                        ),
+                    });
+                }
+                metadata
+                    .properties
+                    .get(property)
+                    .cloned()
+                    .map(QueryValue::Property)
+                    .unwrap_or(QueryValue::Null)
+            }
+            RowSortExpression::Column { name } => {
+                projected_column_value(row, &query.columns, name)?
+            }
+            RowSortExpression::CountAll => {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "count(*) ORDER BY is only valid for aggregate rows".to_string(),
+                });
+            }
+        });
+    }
+    Ok(keys)
+}
+
+#[cfg(feature = "opencypher")]
+fn relationship_endpoint_id(
+    edge: &RowEdgePattern,
+    relationship: &BoundRelationship,
+    binding: &str,
+) -> Result<VertexId> {
+    if edge.src.binding.as_deref() == Some(binding) {
+        return Ok(relationship.src);
+    }
+    if edge.dst.binding.as_deref() == Some(binding) {
+        return Ok(relationship.dst);
+    }
+    Err(GraphError::UnsupportedQuery {
+        dialect: "OpenCypher",
+        feature: format!("relationship fast path cannot project unbound node {binding}"),
+    })
 }
 
 #[cfg(feature = "opencypher")]
