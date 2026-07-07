@@ -39,8 +39,22 @@ impl GraphShard {
                     .await?;
                 return Ok(QueryOutput::Mutation(result));
             }
-            let plan = self.plan_opencypher(context, query)?;
-            self.execute_query_plan(plan).await
+            let parsed = match self
+                .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters)
+                .await
+            {
+                Ok(parsed) => parsed,
+                Err(err) if is_non_row_opencypher_query(&err) => {
+                    let plan = self.plan_opencypher(context, query)?;
+                    return self.execute_query_plan(plan).await;
+                }
+                Err(err) => return Err(err),
+            };
+            let context = merge_opencypher_window(context, parsed.window)?;
+            let result_set = self
+                .execute_parsed_opencypher_rows(context, parsed.clone())
+                .await?;
+            Ok(query_result_set_to_output(&parsed, result_set))
         }
         #[cfg(not(feature = "opencypher"))]
         {
@@ -4825,6 +4839,45 @@ fn streaming_neighbor_projection_values(
         }
     }
     Ok(values)
+}
+
+#[cfg(feature = "opencypher")]
+fn is_non_row_opencypher_query(err: &GraphError) -> bool {
+    matches!(
+        err,
+        GraphError::UnsupportedQuery { dialect, feature }
+            if *dialect == "OpenCypher"
+                && feature.starts_with("row execution supports MATCH ... RETURN queries")
+    )
+}
+
+#[cfg(feature = "opencypher")]
+fn query_result_set_to_output(parsed: &ParsedRowQuery, result_set: QueryResultSet) -> QueryOutput {
+    match parsed.projections.as_slice() {
+        [RowProjection::NodeId { .. }] => {
+            let vertices: Option<Vec<VertexId>> = result_set
+                .rows
+                .iter()
+                .map(|row| match row.values.as_slice() {
+                    [QueryValue::VertexId(vertex)] => Some(*vertex),
+                    _ => None,
+                })
+                .collect();
+            vertices.map_or(QueryOutput::Rows(result_set), QueryOutput::Vertices)
+        }
+        [RowProjection::CountAll]
+        | [RowProjection::Aggregate {
+            function: RowAggregateFunction::Count,
+            ..
+        }] => match result_set.rows.as_slice() {
+            [row] => match row.values.as_slice() {
+                [QueryValue::Count(count)] => QueryOutput::Count(*count),
+                _ => QueryOutput::Rows(result_set),
+            },
+            _ => QueryOutput::Rows(result_set),
+        },
+        _ => QueryOutput::Rows(result_set),
+    }
 }
 
 #[cfg(feature = "opencypher")]

@@ -21,7 +21,7 @@ cleanup() {
 trap cleanup EXIT
 
 if ! command -v docker >/dev/null 2>&1; then
-  echo "docker is required for the Phase 0 MinIO smoke" >&2
+  echo "docker is required for the MinIO smoke" >&2
   exit 1
 fi
 

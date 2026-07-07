@@ -6051,6 +6051,74 @@ async fn routed_cluster_executes_read_plans_without_write_lease_and_rejects_writ
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn routed_cluster_execute_cypher_uses_row_engine_for_public_reads() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open(
+        "graph-control/query-routed-row-engine",
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let cluster = RoutedGraphCluster::open_owned_with_control(
+        "query-routed-row-engine",
+        "node-a",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+
+    for user in [1, 3] {
+        cluster
+            .set_vertex_metadata(
+                "reddit-home",
+                user,
+                VertexMetadata::default().with_label("User"),
+            )
+            .await
+            .unwrap();
+    }
+    cluster
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "query-routed-row-engine-edge".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let output = cluster
+        .execute_cypher(
+            QueryContext::new("reddit-home", "query-routed-row-engine-read"),
+            "MATCH (u:User) OPTIONAL MATCH (u)-[:FOLLOWS]->(v) \
+             RETURN u.id AS user, v.id AS followed ORDER BY user",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        output,
+        QueryOutput::Rows(QueryResultSet::new(
+            vec![QueryColumn::new("user"), QueryColumn::new("followed")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::VertexId(2)]),
+                QueryRow::new(vec![QueryValue::VertexId(3), QueryValue::Null]),
+            ],
+        ))
+    );
+
+    cluster.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn routed_cluster_executes_row_queries_across_local_cells() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = GraphControlPlane::open(
@@ -7880,8 +7948,8 @@ async fn cypher_limit_skip_uses_query_window() {
             "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN count(*) LIMIT 1",
         )
         .await
-        .unwrap_err();
-    assert!(matches!(count_window, GraphError::UnsupportedQuery { .. }));
+        .unwrap();
+    assert_eq!(count_window, QueryOutput::Count(4));
 }
 
 #[cfg(feature = "opencypher")]
@@ -9227,6 +9295,85 @@ async fn cypher_optional_match_preserves_required_rows_with_null_bindings() {
             ])],
         )
     );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn execute_cypher_uses_row_engine_for_general_read_queries() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-public-row-engine", object_store).await;
+
+    for user in [1, 3] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                user,
+                VertexMetadata::default().with_label("User"),
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            99,
+            VertexMetadata::default().with_label("Post"),
+        )
+        .await
+        .unwrap();
+    for (idx, (edge_type, src, dst)) in [("FOLLOWS", 1, 2), ("POSTED", 2, 99), ("FOLLOWS", 2, 3)]
+        .into_iter()
+        .enumerate()
+    {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-public-row-engine-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let optional_rows = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "public-optional-read"),
+            "MATCH (u:User) OPTIONAL MATCH (u)-[:FOLLOWS]->(v) \
+             RETURN u.id AS user, v.id AS followed ORDER BY user",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        optional_rows,
+        QueryOutput::Rows(QueryResultSet::new(
+            vec![QueryColumn::new("user"), QueryColumn::new("followed")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(1), QueryValue::VertexId(2)]),
+                QueryRow::new(vec![QueryValue::VertexId(3), QueryValue::Null]),
+            ],
+        ))
+    );
+
+    let multi_edge_path = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "public-multi-edge-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v)-[:POSTED]->(p:Post) \
+             RETURN p.id AS post ORDER BY post",
+        )
+        .await
+        .unwrap();
+    assert_eq!(multi_edge_path, QueryOutput::Vertices(vec![99]));
+
+    let aggregate = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "public-aggregate-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS*1..2]->(v) RETURN count(*) AS total",
+        )
+        .await
+        .unwrap();
+    assert_eq!(aggregate, QueryOutput::Count(2));
 }
 
 #[cfg(feature = "opencypher")]
