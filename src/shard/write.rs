@@ -569,7 +569,18 @@ impl GraphShard {
                             reason: format!("relationship id pointer is not UTF-8: {err}"),
                         })?;
                     match read_txn_remote(&txn, target_key).await? {
-                        Some(value) => Some(decode_relationship_record(target_key, &value)?),
+                        Some(value) => {
+                            let record = decode_relationship_record(target_key, &value)?;
+                            if relationship_tombstone_epoch_txn(&txn, &record)
+                                .await?
+                                .is_some_and(|epoch| epoch <= current_epoch)
+                            {
+                                txn.delete(id_key.as_bytes())?;
+                                None
+                            } else {
+                                Some(record)
+                            }
+                        }
                         None => {
                             return Err(GraphError::CorruptValue {
                                 key: id_key,
@@ -1426,6 +1437,7 @@ impl GraphShard {
             .as_bytes(),
             encode_u64(epoch),
         )?;
+        txn.delete(keys::relationship_id(&mutation.cell_id, relationship_id).as_bytes())?;
         let relationship_count_key = keys::relationship_count(
             &mutation.cell_id,
             &mutation.edge_type,

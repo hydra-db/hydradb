@@ -7867,6 +7867,105 @@ async fn normal_relationship_create_generates_multigraph_records() {
         )
     );
 
+    let missing_edge_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "normal-rel-create-missing-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 99}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert!(missing_edge_rows.rows.is_empty());
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn deleted_relationship_id_pointer_does_not_block_reimport() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/multigraph-reimport-deleted-id", object_store).await;
+
+    let imported = shard
+        .import_relationships_batch(
+            "reddit-home",
+            "FOLLOWS",
+            [RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                relationship_id: 200,
+                metadata: EdgeMetadata::default()
+                    .with_property("_fid", VertexPropertyValue::Integer(200))
+                    .with_property("rank", VertexPropertyValue::Integer(1)),
+            }],
+            "relationship-reimport-seed",
+        )
+        .await
+        .unwrap();
+    assert_eq!(imported.relationships_inserted, 1);
+
+    let deleted = shard
+        .delete_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "relationship-reimport-delete".to_string(),
+            },
+            200,
+        )
+        .await
+        .unwrap();
+    assert!(deleted.deleted);
+
+    let reimported = shard
+        .import_relationships_batch(
+            "reddit-home",
+            "FOLLOWS",
+            [RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 3,
+                relationship_id: 200,
+                metadata: EdgeMetadata::default()
+                    .with_property("_fid", VertexPropertyValue::Integer(200))
+                    .with_property("rank", VertexPropertyValue::Integer(2)),
+            }],
+            "relationship-reimport-same-id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(reimported.relationships_inserted, 1);
+
+    let old_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "relationship-reimport-old-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert!(old_rows.rows.is_empty());
+
+    let new_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "relationship-reimport-new-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 3}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        new_rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("rank")],
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::Integer(2)
+            )])],
+        )
+    );
+
     shard.close().await.unwrap();
 }
 
