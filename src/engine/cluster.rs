@@ -609,17 +609,20 @@ impl RoutedGraphCluster {
         query: &str,
     ) -> Result<crate::QueryOutput> {
         let shard = self.shard(&context.cell_id)?;
-        if crate::parse_opencypher_mutation_query_with_parameters(query, &context.parameters)?
-            .is_some()
-        {
+        let requires_write_lease =
+            if crate::parse_opencypher_mutation_query_with_parameters(query, &context.parameters)?
+                .is_some()
+            {
+                true
+            } else {
+                crate::parse_opencypher_with_parameters(query, &context.parameters)
+                    .map(|parsed| parsed.statement.is_write())
+                    .unwrap_or(false)
+            };
+        if requires_write_lease {
             self.ensure_active_write_lease(&context.cell_id)?;
-            return shard.execute_cypher(context, query).await;
         }
-        let plan = shard.plan_opencypher(context, query)?;
-        if plan.is_write() {
-            self.ensure_active_write_lease(&plan.cell_id)?;
-        }
-        shard.execute_query_plan(plan).await
+        shard.execute_cypher(context, query).await
     }
 
     #[cfg(feature = "opencypher")]
