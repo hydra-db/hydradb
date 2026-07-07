@@ -37,6 +37,16 @@ name = "query_correctness"
 path = "examples/query_correctness.rs"
 required-features = ["opencypher"]
 
+[[example]]
+name = "multigraph_bench"
+path = "examples/multigraph_bench.rs"
+required-features = ["opencypher"]
+
+[[example]]
+name = "falkor_import"
+path = "examples/falkor_import.rs"
+required-features = ["json-properties"]
+
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
