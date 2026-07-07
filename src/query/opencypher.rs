@@ -1058,6 +1058,11 @@ fn lower_simple_merge(
 fn lower_delete_actions(delete_clause: *const AstNode) -> Result<Vec<RowMutationAction>> {
     unsafe {
         let detach = sys::cypher_ast_delete_has_detach(delete_clause);
+        if detach {
+            return unsupported(
+                "DETACH DELETE requires node deletion support, which is not implemented yet",
+            );
+        }
         let expression_count = sys::cypher_ast_delete_nexpressions(delete_clause);
         if expression_count == 0 {
             return unsupported("DELETE requires at least one expression");

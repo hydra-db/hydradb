@@ -578,7 +578,14 @@ impl GraphShard {
         for action in &query.actions {
             budget.check("cypher_mutation_action")?;
             match action {
-                RowMutationAction::DeleteRelationship { binding, detach: _ } => {
+                RowMutationAction::DeleteRelationship { binding, detach } => {
+                    if *detach {
+                        return Err(GraphError::UnsupportedQuery {
+                            dialect: "OpenCypher",
+                            feature: "DETACH DELETE requires node deletion support, which is not implemented yet"
+                                .to_string(),
+                        });
+                    }
                     let mut relationships = BTreeSet::new();
                     for row in &bindings {
                         let Some(relationship) = row.relationships.get(binding) else {

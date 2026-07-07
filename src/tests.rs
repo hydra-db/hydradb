@@ -4685,6 +4685,56 @@ async fn control_plane_repair_refuses_to_advance_on_corrupt_graph_state() {
 }
 
 #[tokio::test]
+async fn matrix_snapshot_abort_cleanup_removes_unpublished_chunks() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/matrix-snapshot-abort-cleanup", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "ABORT_CLEANUP_EDGE";
+
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 1, 2, "cleanup-seed"))
+        .await
+        .unwrap();
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    let epoch = format!("{base_epoch:020}");
+    let keys = vec![
+        format!("cell/{cell_id}/artifact/matrix_manifest/{edge_type}/{epoch}"),
+        format!("cell/{cell_id}/artifact/graphblas_csc/{edge_type}/{epoch}"),
+        format!("cell/{cell_id}/artifact/matrix/{edge_type}/{epoch}/out/00000000000000000000/00000000000000000000"),
+        format!("cell/{cell_id}/artifact/matrix/{edge_type}/{epoch}/in/00000000000000000000/00000000000000000000"),
+        format!("cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/{epoch}/vertices/00000000000000000000"),
+        format!("cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/{epoch}/pointers/00000000000000000000"),
+        format!("cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/{epoch}/indices/00000000000000000000"),
+    ];
+
+    let mut batch = GraphWriteBatch::new();
+    for key in &keys {
+        batch.put(key.as_bytes(), b"unpublished");
+    }
+    shard
+        .write_graph_batch_strict(cell_id, "test_seed_unpublished_matrix_artifacts", batch)
+        .await
+        .unwrap();
+
+    let deleted = engine::delete_matrix_artifact_epoch(
+        &shard,
+        cell_id,
+        edge_type,
+        base_epoch,
+        "test_cleanup_unpublished_matrix_artifacts",
+    )
+    .await
+    .unwrap();
+    assert_eq!(deleted, keys.len() as u64);
+    for key in keys {
+        assert!(
+            shard.read_remote(&key).await.unwrap().is_none(),
+            "expected unpublished artifact key to be deleted: {key}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn graph_limits_reject_unbounded_bulk_artifact_and_traversal_work() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_limits(
@@ -8783,6 +8833,40 @@ async fn cypher_executes_set_remove_delete_and_merge_mutations() {
         replay,
         QueryOutput::Mutation(QueryMutationResult::default())
     );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_rejects_detach_delete_until_node_deletion_is_supported() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-detach-delete-rejects", object_store).await;
+
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-detach-delete-seed"),
+            "MERGE (u:User {id: 1})-[:FOLLOWS]->(v:User {id: 2})",
+        )
+        .await
+        .unwrap();
+
+    let err = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-detach-delete"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) DETACH DELETE r",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature
+        } if feature.contains("DETACH DELETE")
+    ));
+    assert!(shard
+        .edge_exists("reddit-home", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
 }
 
 #[cfg(feature = "opencypher")]
