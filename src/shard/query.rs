@@ -2883,7 +2883,7 @@ impl GraphShard {
             }
             if tombstones
                 .get(&record.relationship_id)
-                .map_or(false, |tombstone_epoch| {
+                .is_some_and(|tombstone_epoch| {
                     relationship_tombstone_hides_record(&record, *tombstone_epoch, read_epoch)
                 })
             {
@@ -3137,7 +3137,7 @@ impl GraphShard {
             }
             if tombstones
                 .get(&relationship_id)
-                .map_or(false, |tombstone_epoch| {
+                .is_some_and(|tombstone_epoch| {
                     relationship_tombstone_hides_record(&record, *tombstone_epoch, read_epoch)
                 })
             {
