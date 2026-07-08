@@ -436,6 +436,58 @@ pub(crate) fn encode_edge_metadata(metadata: &EdgeMetadata) -> Vec<u8> {
     value.into_bytes()
 }
 
+pub(crate) fn encode_relationship_record(record: &RelationshipRecord) -> Vec<u8> {
+    let mut value = format!("relationship1\t{}\n", record.epoch);
+    for (name, property) in &record.metadata.properties {
+        value.push_str("property\t");
+        value.push_str(name);
+        value.push('\t');
+        value.push_str(&encode_vertex_property_value_record(property));
+        value.push('\n');
+    }
+    value.into_bytes()
+}
+
+pub(crate) fn decode_relationship_record(key: &str, value: &[u8]) -> Result<RelationshipRecord> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let mut lines = text.lines();
+    let header = lines.next().ok_or_else(|| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: "empty relationship record".to_string(),
+    })?;
+    let parts: Vec<_> = header.split('\t').collect();
+    if parts.len() != 2 || parts[0] != "relationship1" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected relationship1 header".to_string(),
+        });
+    }
+    let mut record = parse_relationship_record_key(key)?;
+    record.epoch = parse_u64(key, parts[1], "relationship_epoch")?;
+    for line in lines {
+        let parts: Vec<_> = line.split('\t').collect();
+        match parts.as_slice() {
+            ["property", name, encoded] => {
+                validate_component("property", name)?;
+                record.metadata.properties.insert(
+                    (*name).to_string(),
+                    decode_vertex_property_value_record(key, encoded)?,
+                );
+            }
+            _ => {
+                return Err(GraphError::CorruptValue {
+                    key: key.to_string(),
+                    reason: format!("invalid relationship record line {line}"),
+                });
+            }
+        }
+    }
+    Ok(record)
+}
+
 pub(crate) fn decode_edge_metadata(key: &str, value: &[u8]) -> Result<EdgeMetadata> {
     let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
         key: key.to_string(),
@@ -929,6 +981,24 @@ pub(crate) fn encode_delete_idempotency(mutation: &EdgeMutation, result: &Delete
     .into_bytes()
 }
 
+pub(crate) fn encode_relationship_delete_idempotency(
+    mutation: &EdgeMutation,
+    relationship_id: RelationshipId,
+    result: &DeleteResult,
+) -> Vec<u8> {
+    format!(
+        "relationship_delete1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        result.epoch,
+        u8::from(result.deleted),
+        mutation.cell_id,
+        mutation.edge_type,
+        mutation.src,
+        mutation.dst,
+        relationship_id
+    )
+    .into_bytes()
+}
+
 pub(crate) fn encode_bulk_import_idempotency(
     idempotency_key: &str,
     fingerprint: u64,
@@ -942,6 +1012,45 @@ pub(crate) fn encode_bulk_import_idempotency(
         result.already_existed,
         fingerprint,
         idempotency_key
+    )
+    .into_bytes()
+}
+
+pub(crate) fn encode_relationship_import_idempotency(
+    idempotency_key: &str,
+    fingerprint: u64,
+    result: &RelationshipImportResult,
+) -> Vec<u8> {
+    format!(
+        "relationship_import1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        result.start_epoch,
+        result.end_epoch,
+        result.relationships_inserted,
+        result.relationships_already_existed,
+        result.structural_edges_inserted,
+        result.structural_edges_already_existed,
+        fingerprint,
+        idempotency_key
+    )
+    .into_bytes()
+}
+
+pub(crate) fn encode_relationship_create_idempotency(
+    mutation: &EdgeMutation,
+    fingerprint: u64,
+    result: &RelationshipCreateResult,
+) -> Vec<u8> {
+    format!(
+        "relationship_create1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        result.epoch,
+        result.relationship_id,
+        u8::from(result.structural_edge_inserted),
+        u8::from(result.already_created),
+        fingerprint,
+        mutation.cell_id,
+        mutation.edge_type,
+        mutation.src,
+        mutation.dst
     )
     .into_bytes()
 }
@@ -1132,6 +1241,79 @@ pub(crate) fn decode_bulk_import_idempotency(
     })
 }
 
+pub(crate) fn decode_relationship_import_idempotency(
+    key: &str,
+    idempotency_key: &str,
+    fingerprint: u64,
+    value: &[u8],
+) -> Result<RelationshipImportResult> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 9 || parts[0] != "relationship_import1" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected relationship_import1 record with 9 fields".to_string(),
+        });
+    }
+    if parts[8] != idempotency_key || parse_u64(key, parts[7], "fingerprint")? != fingerprint {
+        return Err(GraphError::IdempotencyConflict {
+            operation: "relationship-import",
+            idempotency_key: idempotency_key.to_string(),
+        });
+    }
+    Ok(RelationshipImportResult {
+        start_epoch: parse_u64(key, parts[1], "start_epoch")?,
+        end_epoch: parse_u64(key, parts[2], "end_epoch")?,
+        relationships_inserted: parse_u64(key, parts[3], "relationships_inserted")?,
+        relationships_already_existed: parse_u64(key, parts[4], "relationships_already_existed")?,
+        structural_edges_inserted: parse_u64(key, parts[5], "structural_edges_inserted")?,
+        structural_edges_already_existed: parse_u64(
+            key,
+            parts[6],
+            "structural_edges_already_existed",
+        )?,
+    })
+}
+
+pub(crate) fn decode_relationship_create_idempotency(
+    key: &str,
+    mutation: &EdgeMutation,
+    fingerprint: u64,
+    value: &[u8],
+) -> Result<RelationshipCreateResult> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 10 || parts[0] != "relationship_create1" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected relationship_create1 record with 10 fields".to_string(),
+        });
+    }
+    if parse_u64(key, parts[5], "fingerprint")? != fingerprint
+        || parts[6] != mutation.cell_id
+        || parts[7] != mutation.edge_type
+        || parse_u64(key, parts[8], "src")? != mutation.src
+        || parse_u64(key, parts[9], "dst")? != mutation.dst
+    {
+        return Err(GraphError::IdempotencyConflict {
+            operation: "relationship-create",
+            idempotency_key: mutation.idempotency_key.clone(),
+        });
+    }
+    Ok(RelationshipCreateResult {
+        epoch: parse_u64(key, parts[1], "epoch")?,
+        relationship_id: parse_u64(key, parts[2], "relationship_id")?,
+        structural_edge_inserted: parse_bool_u8(key, parts[3], "structural_edge_inserted")?,
+        already_created: parse_bool_u8(key, parts[4], "already_created")?,
+    })
+}
+
 pub(crate) fn decode_bulk_import_fingerprint_idempotency(
     key: &str,
     fingerprint: u64,
@@ -1245,6 +1427,40 @@ pub(crate) fn decode_commit_result(key: &str, value: &[u8]) -> Result<CommitResu
     })
 }
 
+pub(crate) fn decode_relationship_delete_idempotency(
+    key: &str,
+    mutation: &EdgeMutation,
+    relationship_id: RelationshipId,
+    value: &[u8],
+) -> Result<DeleteResult> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 8 || parts[0] != "relationship_delete1" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected relationship_delete1 record with 8 fields".to_string(),
+        });
+    }
+    if parts[3] != mutation.cell_id
+        || parts[4] != mutation.edge_type
+        || parse_u64(key, parts[5], "src")? != mutation.src
+        || parse_u64(key, parts[6], "dst")? != mutation.dst
+        || parse_u64(key, parts[7], "relationship_id")? != relationship_id
+    {
+        return Err(GraphError::IdempotencyConflict {
+            operation: "relationship-delete",
+            idempotency_key: mutation.idempotency_key.clone(),
+        });
+    }
+    Ok(DeleteResult {
+        epoch: parse_u64(key, parts[1], "epoch")?,
+        deleted: parse_bool_u8(key, parts[2], "deleted")?,
+    })
+}
+
 pub(crate) fn decode_commit_idempotency(
     key: &str,
     mutation: &EdgeMutation,
@@ -1327,6 +1543,89 @@ pub(crate) fn bulk_import_fingerprint(
     for (src, dst) in edges {
         update(&mut hash, &src.to_be_bytes());
         update(&mut hash, &dst.to_be_bytes());
+    }
+    hash
+}
+
+pub(crate) fn relationship_import_fingerprint(
+    cell_id: &str,
+    edge_type: &str,
+    relationships: &[RelationshipMutation],
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    fn update(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    update(&mut hash, cell_id.as_bytes());
+    update(&mut hash, b"\0");
+    update(&mut hash, edge_type.as_bytes());
+    update(&mut hash, b"\0");
+    for relationship in relationships {
+        update(&mut hash, &relationship.src.to_be_bytes());
+        update(&mut hash, &relationship.dst.to_be_bytes());
+        update(&mut hash, &relationship.relationship_id.to_be_bytes());
+        for (property, value) in &relationship.metadata.properties {
+            update(&mut hash, property.as_bytes());
+            update(&mut hash, b"=");
+            update(
+                &mut hash,
+                encode_vertex_property_value_record(value).as_bytes(),
+            );
+            update(&mut hash, b"\0");
+        }
+    }
+    hash
+}
+
+pub(crate) fn relationship_create_fingerprint(
+    mutation: &EdgeMutation,
+    metadata_updates: &[(VertexId, VertexMetadata)],
+    edge_metadata: &EdgeMetadata,
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    fn update(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    update(&mut hash, mutation.cell_id.as_bytes());
+    update(&mut hash, b"\0");
+    update(&mut hash, mutation.edge_type.as_bytes());
+    update(&mut hash, b"\0");
+    update(&mut hash, &mutation.src.to_be_bytes());
+    update(&mut hash, &mutation.dst.to_be_bytes());
+    update(&mut hash, b"\0");
+    for (vertex_id, metadata) in metadata_updates {
+        update(&mut hash, &vertex_id.to_be_bytes());
+        for label in &metadata.labels {
+            update(&mut hash, b"label:");
+            update(&mut hash, label.as_bytes());
+            update(&mut hash, b"\0");
+        }
+        for (property, value) in &metadata.properties {
+            update(&mut hash, b"vprop:");
+            update(&mut hash, property.as_bytes());
+            update(&mut hash, b"=");
+            update(
+                &mut hash,
+                encode_vertex_property_value_record(value).as_bytes(),
+            );
+            update(&mut hash, b"\0");
+        }
+    }
+    for (property, value) in &edge_metadata.properties {
+        update(&mut hash, b"rprop:");
+        update(&mut hash, property.as_bytes());
+        update(&mut hash, b"=");
+        update(
+            &mut hash,
+            encode_vertex_property_value_record(value).as_bytes(),
+        );
+        update(&mut hash, b"\0");
     }
     hash
 }
@@ -1894,6 +2193,61 @@ pub(crate) fn parse_edge_record_key(key: &str) -> Result<EdgeRecord> {
     }
 }
 
+pub(crate) fn parse_relationship_record_key(key: &str) -> Result<RelationshipRecord> {
+    let parts: Vec<&str> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", cell_id, "rel", edge_type, src, dst, relationship_id] => {
+            validate_component("cell_id", cell_id)?;
+            validate_component("edge_type", edge_type)?;
+            Ok(RelationshipRecord {
+                cell_id: (*cell_id).to_string(),
+                edge_type: (*edge_type).to_string(),
+                src: parse_u64(key, src, "src")?,
+                dst: parse_u64(key, dst, "dst")?,
+                relationship_id: parse_u64(key, relationship_id, "relationship_id")?,
+                epoch: 0,
+                metadata: EdgeMetadata::default(),
+            })
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "cannot infer relationship record identity from key".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+pub(crate) fn parse_relationship_property_index_key(
+    key: &str,
+) -> Result<(
+    String,
+    String,
+    String,
+    String,
+    VertexId,
+    VertexId,
+    RelationshipId,
+)> {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", cell_id, "rprop_idx", edge_type, property, encoded, src, dst, relationship_id] => {
+            Ok((
+                (*cell_id).to_string(),
+                (*edge_type).to_string(),
+                (*property).to_string(),
+                (*encoded).to_string(),
+                parse_u64(key, src, "src")?,
+                parse_u64(key, dst, "dst")?,
+                parse_u64(key, relationship_id, "relationship_id")?,
+            ))
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected relationship property index key".to_string(),
+        }),
+    }
+}
+
 pub(crate) fn parse_out_edge_segment_key(
     key: &str,
 ) -> Result<(String, String, VertexId, GraphEpoch, GraphEpoch)> {
@@ -2104,6 +2458,17 @@ pub(crate) fn parse_u64(key: &str, value: &str, field: &str) -> Result<u64> {
             key: key.to_string(),
             reason: format!("invalid {field}: {err}"),
         })
+}
+
+fn parse_bool_u8(key: &str, value: &str, field: &str) -> Result<bool> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("invalid {field}: expected 0 or 1"),
+        }),
+    }
 }
 
 pub(crate) fn ensure_limit(operation: &'static str, actual: u64, limit: u64) -> Result<()> {

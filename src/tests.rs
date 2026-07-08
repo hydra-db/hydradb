@@ -7436,6 +7436,874 @@ fn json_property_values_preserve_integer_and_float_number_shapes() {
     );
 }
 
+#[tokio::test]
+async fn batch_metadata_writes_are_idempotent_and_validate_edges() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/batch-metadata-writes", object_store).await;
+
+    let alice = VertexMetadata::default()
+        .with_label("User")
+        .with_property("name", VertexPropertyValue::String("alice".to_string()));
+    let bob = VertexMetadata::default()
+        .with_label("User")
+        .with_property("score", VertexPropertyValue::Float(QueryFloat(42.5)));
+    assert_eq!(
+        shard
+            .set_vertex_metadata_batch("reddit-home", [(1, alice.clone()), (2, bob.clone())])
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        shard
+            .set_vertex_metadata_batch("reddit-home", [(1, alice.clone()), (2, bob)])
+            .await
+            .unwrap(),
+        0
+    );
+
+    let alice_key = keys::vertex("reddit-home", 1);
+    let stored_alice = decode_vertex_metadata(
+        &alice_key,
+        &shard.read_remote(&alice_key).await.unwrap().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored_alice, alice);
+
+    shard
+        .bulk_import_edges(
+            "reddit-home",
+            "FOLLOWS",
+            [(1, 2), (1, 3)],
+            "batch-metadata-edges",
+        )
+        .await
+        .unwrap();
+    let since = EdgeMetadata::default()
+        .with_property("since", VertexPropertyValue::Integer(2026))
+        .with_property(
+            "timestamp",
+            VertexPropertyValue::Float(QueryFloat(1783112914.47055)),
+        );
+    let confidence = EdgeMetadata::default()
+        .with_property("confidence", VertexPropertyValue::Float(QueryFloat(0.9)));
+    assert_eq!(
+        shard
+            .set_edge_metadata_batch(
+                "reddit-home",
+                "FOLLOWS",
+                [(1, 2, since.clone()), (1, 3, confidence.clone())],
+            )
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        shard
+            .set_edge_metadata_batch(
+                "reddit-home",
+                "FOLLOWS",
+                [(1, 2, since.clone()), (1, 3, confidence)],
+            )
+            .await
+            .unwrap(),
+        0
+    );
+
+    let edge_key = keys::edge_metadata("reddit-home", "FOLLOWS", 1, 2);
+    let stored_edge = decode_edge_metadata(
+        &edge_key,
+        &shard.read_remote(&edge_key).await.unwrap().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored_edge, since);
+
+    let missing = shard
+        .set_edge_metadata_batch("reddit-home", "FOLLOWS", [(9, 9, EdgeMetadata::default())])
+        .await
+        .unwrap_err();
+    assert!(missing
+        .to_string()
+        .contains("cannot set metadata for missing edge"));
+
+    let conflicting = shard
+        .set_edge_metadata_batch(
+            "reddit-home",
+            "FOLLOWS",
+            [
+                (
+                    1,
+                    2,
+                    EdgeMetadata::default()
+                        .with_property("weight", VertexPropertyValue::Integer(1)),
+                ),
+                (
+                    1,
+                    2,
+                    EdgeMetadata::default()
+                        .with_property("weight", VertexPropertyValue::Integer(2)),
+                ),
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert!(conflicting
+        .to_string()
+        .contains("conflicting metadata values"));
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn multigraph_relationship_import_preserves_parallel_relationship_rows() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/multigraph-relationship-import", object_store).await;
+
+    let result = shard
+        .import_relationships_batch(
+            "reddit-home",
+            "FOLLOWS",
+            [
+                RelationshipMutation {
+                    cell_id: "reddit-home".to_string(),
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 1,
+                    dst: 2,
+                    relationship_id: 100,
+                    metadata: EdgeMetadata::default()
+                        .with_property("_fid", VertexPropertyValue::Integer(100))
+                        .with_property("weight", VertexPropertyValue::Integer(7)),
+                },
+                RelationshipMutation {
+                    cell_id: "reddit-home".to_string(),
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 1,
+                    dst: 2,
+                    relationship_id: 101,
+                    metadata: EdgeMetadata::default()
+                        .with_property("_fid", VertexPropertyValue::Integer(101))
+                        .with_property("weight", VertexPropertyValue::Integer(9)),
+                },
+            ],
+            "multigraph-relationship-import",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.relationships_inserted, 2);
+    assert_eq!(result.structural_edges_inserted, 1);
+    assert_eq!(
+        shard.out_degree("reddit-home", "FOLLOWS", 1).await.unwrap(),
+        1
+    );
+
+    let replay = shard
+        .import_relationships_batch(
+            "reddit-home",
+            "FOLLOWS",
+            [
+                RelationshipMutation {
+                    cell_id: "reddit-home".to_string(),
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 1,
+                    dst: 2,
+                    relationship_id: 100,
+                    metadata: EdgeMetadata::default()
+                        .with_property("_fid", VertexPropertyValue::Integer(100))
+                        .with_property("weight", VertexPropertyValue::Integer(7)),
+                },
+                RelationshipMutation {
+                    cell_id: "reddit-home".to_string(),
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 1,
+                    dst: 2,
+                    relationship_id: 101,
+                    metadata: EdgeMetadata::default()
+                        .with_property("_fid", VertexPropertyValue::Integer(101))
+                        .with_property("weight", VertexPropertyValue::Integer(9)),
+                },
+            ],
+            "multigraph-relationship-import",
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, result);
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "multigraph-relationship-rows"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) \
+             RETURN r._fid AS fid, r.weight AS weight ORDER BY fid",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("fid"), QueryColumn::new("weight")],
+            vec![
+                QueryRow::new(vec![
+                    QueryValue::Property(VertexPropertyValue::Integer(100)),
+                    QueryValue::Property(VertexPropertyValue::Integer(7)),
+                ]),
+                QueryRow::new(vec![
+                    QueryValue::Property(VertexPropertyValue::Integer(101)),
+                    QueryValue::Property(VertexPropertyValue::Integer(9)),
+                ]),
+            ],
+        )
+    );
+    let cache_metrics_before = shard.graph_cache_metrics();
+    let cached_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "multigraph-relationship-rows-cached"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) \
+             RETURN r._fid AS fid, r.weight AS weight ORDER BY fid",
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached_rows, rows);
+    let cache_metrics_after = shard.graph_cache_metrics();
+    assert!(
+        cache_metrics_after.relationship_rows_hits > cache_metrics_before.relationship_rows_hits
+    );
+    assert!(shard.graph_cache_entry_counts().await.relationship_row_sets >= 1);
+
+    let indexed = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "multigraph-relationship-indexed"),
+            "MATCH (u)-[r:FOLLOWS {weight: 9}]->(v) RETURN r._fid AS fid",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        indexed,
+        QueryResultSet::new(
+            vec![QueryColumn::new("fid")],
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::Integer(101)
+            )])],
+        )
+    );
+    let property_cache_metrics_before = shard.graph_cache_metrics();
+    let exact_indexed = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "multigraph-relationship-indexed-exact"),
+            "MATCH (u {id: 1})-[r:FOLLOWS {weight: 9}]->(v {id: 2}) RETURN r._fid AS fid",
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact_indexed, indexed);
+    let exact_indexed_cached = shard
+        .execute_cypher_rows(
+            QueryContext::new(
+                "reddit-home",
+                "multigraph-relationship-indexed-exact-cached",
+            ),
+            "MATCH (u {id: 1})-[r:FOLLOWS {weight: 9}]->(v {id: 2}) RETURN r._fid AS fid",
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact_indexed_cached, indexed);
+    let property_cache_metrics_after = shard.graph_cache_metrics();
+    assert!(
+        property_cache_metrics_after.relationship_property_rows_hits
+            > property_cache_metrics_before.relationship_property_rows_hits
+    );
+    assert!(
+        shard
+            .graph_cache_entry_counts()
+            .await
+            .relationship_property_row_sets
+            >= 1
+    );
+
+    let conflict = shard
+        .import_relationships_batch(
+            "reddit-home",
+            "FOLLOWS",
+            [RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 3,
+                relationship_id: 100,
+                metadata: EdgeMetadata::default()
+                    .with_property("_fid", VertexPropertyValue::Integer(100)),
+            }],
+            "multigraph-relationship-conflict",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(conflict, GraphError::IdempotencyConflict { .. }),
+        "{conflict:?}"
+    );
+
+    let generated = shard
+        .create_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "multigraph-generated-after-import".to_string(),
+            },
+            EdgeMetadata::default()
+                .with_property("_fid", VertexPropertyValue::Integer(102))
+                .with_property("weight", VertexPropertyValue::Integer(11)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(generated.relationship_id, 102);
+    assert!(!generated.structural_edge_inserted);
+    assert_eq!(
+        shard.out_degree("reddit-home", "FOLLOWS", 1).await.unwrap(),
+        1
+    );
+    let rows_after_create = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "multigraph-relationship-rows-after-create"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) \
+             RETURN r._fid AS fid, r.weight AS weight ORDER BY fid",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_after_create,
+        QueryResultSet::new(
+            vec![QueryColumn::new("fid"), QueryColumn::new("weight")],
+            vec![
+                QueryRow::new(vec![
+                    QueryValue::Property(VertexPropertyValue::Integer(100)),
+                    QueryValue::Property(VertexPropertyValue::Integer(7)),
+                ]),
+                QueryRow::new(vec![
+                    QueryValue::Property(VertexPropertyValue::Integer(101)),
+                    QueryValue::Property(VertexPropertyValue::Integer(9)),
+                ]),
+                QueryRow::new(vec![
+                    QueryValue::Property(VertexPropertyValue::Integer(102)),
+                    QueryValue::Property(VertexPropertyValue::Integer(11)),
+                ]),
+            ],
+        )
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn normal_relationship_create_generates_multigraph_records() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/multigraph-normal-create", object_store).await;
+
+    let first = shard
+        .create_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "normal-rel-create-1".to_string(),
+            },
+            EdgeMetadata::default().with_property("rank", VertexPropertyValue::Integer(1)),
+        )
+        .await
+        .unwrap();
+    let replay = shard
+        .create_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "normal-rel-create-1".to_string(),
+            },
+            EdgeMetadata::default().with_property("rank", VertexPropertyValue::Integer(1)),
+        )
+        .await
+        .unwrap();
+    let second = shard
+        .create_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "normal-rel-create-2".to_string(),
+            },
+            EdgeMetadata::default().with_property("rank", VertexPropertyValue::Integer(2)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(replay, first);
+    assert_eq!(first.relationship_id, 1);
+    assert_eq!(second.relationship_id, 2);
+    assert!(first.structural_edge_inserted);
+    assert!(!second.structural_edge_inserted);
+    assert_eq!(
+        shard.out_degree("reddit-home", "FOLLOWS", 1).await.unwrap(),
+        1
+    );
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "normal-rel-create-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) RETURN r.rank AS rank ORDER BY rank",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("rank")],
+            vec![
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::Integer(1))]),
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::Integer(2))]),
+            ],
+        )
+    );
+
+    let missing_edge_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "normal-rel-create-missing-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 99}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert!(missing_edge_rows.rows.is_empty());
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn relationship_rows_require_live_structural_edge() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard(
+        "graph/multigraph-structural-delete-hides-rows",
+        object_store,
+    )
+    .await;
+
+    shard
+        .create_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "structural-delete-rel-1".to_string(),
+            },
+            EdgeMetadata::default().with_property("rank", VertexPropertyValue::Integer(1)),
+        )
+        .await
+        .unwrap();
+    shard
+        .create_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "structural-delete-rel-2".to_string(),
+            },
+            EdgeMetadata::default().with_property("rank", VertexPropertyValue::Integer(2)),
+        )
+        .await
+        .unwrap();
+
+    let deleted = shard
+        .delete_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "structural-delete-edge".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(deleted.deleted);
+    assert!(!shard
+        .edge_exists("reddit-home", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+
+    let endpoint_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "structural-delete-endpoint-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) RETURN r.rank AS rank ORDER BY rank",
+        )
+        .await
+        .unwrap();
+    assert!(endpoint_rows.rows.is_empty());
+
+    let property_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "structural-delete-property-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS {rank: 2}]->(v {id: 2}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert!(property_rows.rows.is_empty());
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn deleted_relationship_id_pointer_does_not_block_reimport() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/multigraph-reimport-deleted-id", object_store).await;
+
+    let imported = shard
+        .import_relationships_batch(
+            "reddit-home",
+            "FOLLOWS",
+            [RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                relationship_id: 200,
+                metadata: EdgeMetadata::default()
+                    .with_property("_fid", VertexPropertyValue::Integer(200))
+                    .with_property("rank", VertexPropertyValue::Integer(1)),
+            }],
+            "relationship-reimport-seed",
+        )
+        .await
+        .unwrap();
+    assert_eq!(imported.relationships_inserted, 1);
+
+    let deleted = shard
+        .delete_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "relationship-reimport-delete".to_string(),
+            },
+            200,
+        )
+        .await
+        .unwrap();
+    assert!(deleted.deleted);
+
+    let reimported = shard
+        .import_relationships_batch(
+            "reddit-home",
+            "FOLLOWS",
+            [RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 3,
+                relationship_id: 200,
+                metadata: EdgeMetadata::default()
+                    .with_property("_fid", VertexPropertyValue::Integer(200))
+                    .with_property("rank", VertexPropertyValue::Integer(2)),
+            }],
+            "relationship-reimport-same-id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(reimported.relationships_inserted, 1);
+
+    let old_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "relationship-reimport-old-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert!(old_rows.rows.is_empty());
+
+    let new_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "relationship-reimport-new-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 3}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        new_rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("rank")],
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::Integer(2)
+            )])],
+        )
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn reimported_relationship_id_same_edge_supersedes_tombstone() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/multigraph-reimport-same-edge", object_store).await;
+
+    let imported = shard
+        .import_relationships_batch(
+            "reddit-home",
+            "FOLLOWS",
+            [RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 10,
+                dst: 20,
+                relationship_id: 201,
+                metadata: EdgeMetadata::default()
+                    .with_property("_fid", VertexPropertyValue::Integer(201))
+                    .with_property("rank", VertexPropertyValue::Integer(1)),
+            }],
+            "relationship-reimport-same-edge-seed",
+        )
+        .await
+        .unwrap();
+    assert_eq!(imported.relationships_inserted, 1);
+
+    let deleted = shard
+        .delete_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 10,
+                dst: 20,
+                idempotency_key: "relationship-reimport-same-edge-delete".to_string(),
+            },
+            201,
+        )
+        .await
+        .unwrap();
+    assert!(deleted.deleted);
+
+    let reimported = shard
+        .import_relationships_batch(
+            "reddit-home",
+            "FOLLOWS",
+            [RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 10,
+                dst: 20,
+                relationship_id: 201,
+                metadata: EdgeMetadata::default()
+                    .with_property("_fid", VertexPropertyValue::Integer(201))
+                    .with_property("rank", VertexPropertyValue::Integer(3)),
+            }],
+            "relationship-reimport-same-edge-new",
+        )
+        .await
+        .unwrap();
+    assert_eq!(reimported.relationships_inserted, 1);
+
+    let endpoint_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "relationship-reimport-same-edge-read"),
+            "MATCH (u {id: 10})-[r:FOLLOWS]->(v {id: 20}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        endpoint_rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("rank")],
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::Integer(3)
+            )])],
+        )
+    );
+
+    let property_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new(
+                "reddit-home",
+                "relationship-reimport-same-edge-property-read",
+            ),
+            "MATCH (u {id: 10})-[r:FOLLOWS {rank: 3}]->(v {id: 20}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        property_rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("rank")],
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::Integer(3)
+            )])],
+        )
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_create_set_and_delete_target_individual_relationships() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-multigraph-create", object_store).await;
+
+    let first = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-multi-create-1"),
+            "CREATE (u {id: 1})-[r:FOLLOWS {rank: 7}]->(v {id: 2})",
+        )
+        .await
+        .unwrap();
+    let second = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-multi-create-2"),
+            "CREATE (u {id: 1})-[r:FOLLOWS {rank: 9}]->(v {id: 2})",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        QueryOutput::Write(CommitResult {
+            epoch: 1,
+            already_existed: false
+        })
+    );
+    assert_eq!(
+        second,
+        QueryOutput::Write(CommitResult {
+            epoch: 2,
+            already_existed: false
+        })
+    );
+    assert_eq!(
+        shard.out_degree("reddit-home", "FOLLOWS", 1).await.unwrap(),
+        1
+    );
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-multi-create-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) RETURN r.rank AS rank ORDER BY rank",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("rank")],
+            vec![
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::Integer(7))]),
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::Integer(9))]),
+            ],
+        )
+    );
+
+    let updated = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-multi-set"),
+            "MATCH (u {id: 1})-[r:FOLLOWS {rank: 7}]->(v {id: 2}) SET r.rank = 11",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        updated,
+        QueryOutput::Mutation(QueryMutationResult {
+            matched_rows: 1,
+            updated_relationships: 1,
+            ..QueryMutationResult::default()
+        })
+    );
+
+    let after_update = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-multi-set-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) RETURN r.rank AS rank ORDER BY rank",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        after_update,
+        QueryResultSet::new(
+            vec![QueryColumn::new("rank")],
+            vec![
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::Integer(9))]),
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::Integer(11))]),
+            ],
+        )
+    );
+
+    let deleted_one = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-multi-delete-one"),
+            "MATCH (u {id: 1})-[r:FOLLOWS {rank: 9}]->(v {id: 2}) DELETE r",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted_one,
+        QueryOutput::Mutation(QueryMutationResult {
+            matched_rows: 1,
+            deleted_edges: 1,
+            ..QueryMutationResult::default()
+        })
+    );
+    assert_eq!(
+        shard.out_degree("reddit-home", "FOLLOWS", 1).await.unwrap(),
+        1
+    );
+
+    let remaining = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-multi-delete-one-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining,
+        QueryResultSet::new(
+            vec![QueryColumn::new("rank")],
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::Integer(11)
+            )])],
+        )
+    );
+
+    let deleted_last = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-multi-delete-last"),
+            "MATCH (u {id: 1})-[r:FOLLOWS {rank: 11}]->(v {id: 2}) DELETE r",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted_last,
+        QueryOutput::Mutation(QueryMutationResult {
+            matched_rows: 1,
+            deleted_edges: 1,
+            ..QueryMutationResult::default()
+        })
+    );
+    assert_eq!(
+        shard.out_degree("reddit-home", "FOLLOWS", 1).await.unwrap(),
+        0
+    );
+
+    let empty = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-multi-delete-last-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert!(empty.rows.is_empty());
+
+    shard.close().await.unwrap();
+}
+
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn query_stats_background_refresh_job_publishes_records() {
@@ -8074,25 +8942,22 @@ async fn cypher_create_labels_properties_are_atomic_and_idempotent() {
         metadata_merge,
         QueryOutput::Write(CommitResult {
             epoch: 2,
-            already_existed: true
+            already_existed: false
         })
     );
     let merged_rows = shard
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "cypher-create-metadata-merged-read"),
             "MATCH (u:Moderator {name: 'alice'})-[:FOLLOWS]->(v:User {active: true}) \
-             RETURN u.name AS src, v.name AS dst",
+             RETURN count(*) AS rels",
         )
         .await
         .unwrap();
     assert_eq!(
         merged_rows,
         QueryResultSet::new(
-            vec![QueryColumn::new("src"), QueryColumn::new("dst")],
-            vec![QueryRow::new(vec![
-                QueryValue::Property(VertexPropertyValue::String("alice".to_string())),
-                QueryValue::Property(VertexPropertyValue::String("bob".to_string())),
-            ])],
+            vec![QueryColumn::new("rels")],
+            vec![QueryRow::new(vec![QueryValue::Count(2)])],
         )
     );
 }

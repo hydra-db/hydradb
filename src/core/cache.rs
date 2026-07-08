@@ -1,7 +1,11 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
+#[cfg(feature = "opencypher")]
+use std::sync::Arc;
 
 use crate::{engine, GraphCacheMetrics, GraphEpoch, VertexId};
+#[cfg(feature = "opencypher")]
+use crate::{EdgeMetadata, RelationshipId};
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SupernodeCacheKey {
     pub(crate) cell_id: String,
@@ -59,6 +63,92 @@ impl PostingChunkCacheKey {
             vertex_id: chunk.owner,
             base_epoch: chunk.base_epoch,
             chunk_id: chunk.chunk_id,
+        }
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct RelationshipRowsCacheKey {
+    pub(crate) cell_id: String,
+    pub(crate) edge_type: String,
+    pub(crate) src: VertexId,
+    pub(crate) dst: VertexId,
+    pub(crate) read_epoch: GraphEpoch,
+}
+
+#[cfg(feature = "opencypher")]
+impl RelationshipRowsCacheKey {
+    pub(crate) fn new(
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        read_epoch: GraphEpoch,
+    ) -> Self {
+        Self {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            src,
+            dst,
+            read_epoch,
+        }
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct RelationshipPropertyRowsCacheKey {
+    pub(crate) cell_id: String,
+    pub(crate) edge_type: String,
+    pub(crate) src: VertexId,
+    pub(crate) dst: VertexId,
+    pub(crate) property: String,
+    pub(crate) encoded_value: String,
+    pub(crate) read_epoch: GraphEpoch,
+}
+
+#[cfg(feature = "opencypher")]
+impl RelationshipPropertyRowsCacheKey {
+    pub(crate) fn new(
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        property: &str,
+        encoded_value: &str,
+        read_epoch: GraphEpoch,
+    ) -> Self {
+        Self {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            src,
+            dst,
+            property: property.to_string(),
+            encoded_value: encoded_value.to_string(),
+            read_epoch,
+        }
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RelationshipRowsCacheEntry {
+    pub(crate) relationship_id: Option<RelationshipId>,
+    pub(crate) metadata: EdgeMetadata,
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RelationshipRowsCacheValue {
+    pub(crate) rows: Arc<Vec<RelationshipRowsCacheEntry>>,
+}
+
+#[cfg(feature = "opencypher")]
+impl RelationshipRowsCacheValue {
+    pub(crate) fn new(rows: Vec<RelationshipRowsCacheEntry>) -> Self {
+        Self {
+            rows: Arc::new(rows),
         }
     }
 }

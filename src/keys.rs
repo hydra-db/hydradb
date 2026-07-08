@@ -1,4 +1,4 @@
-use super::{GraphEpoch, VertexId};
+use super::{GraphEpoch, RelationshipId, VertexId};
 
 pub fn write_fence(cell_id: &str) -> String {
     format!("cell/{cell_id}/meta/write_fence")
@@ -14,6 +14,10 @@ pub fn read_lease(cell_id: &str, lease_id: &str) -> String {
 
 pub fn last_epoch(cell_id: &str) -> String {
     format!("cell/{cell_id}/meta/last_epoch")
+}
+
+pub fn last_relationship_id(cell_id: &str) -> String {
+    format!("cell/{cell_id}/meta/last_relationship_id")
 }
 
 pub fn mutation_log_epoch(cell_id: &str) -> String {
@@ -96,6 +100,77 @@ pub fn in_prefix(cell_id: &str, edge_type: &str, dst: VertexId) -> String {
 
 pub fn edge_metadata(cell_id: &str, edge_type: &str, src: VertexId, dst: VertexId) -> String {
     format!("cell/{cell_id}/emeta/{edge_type}/{src:020}/{dst:020}")
+}
+
+pub fn relationship(
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+    relationship_id: RelationshipId,
+) -> String {
+    format!("cell/{cell_id}/rel/{edge_type}/{src:020}/{dst:020}/{relationship_id:020}")
+}
+
+pub fn relationship_edge_prefix(
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+) -> String {
+    format!("cell/{cell_id}/rel/{edge_type}/{src:020}/{dst:020}/")
+}
+
+pub fn relationship_id(cell_id: &str, relationship_id: RelationshipId) -> String {
+    format!("cell/{cell_id}/rel_id/{relationship_id:020}")
+}
+
+pub fn relationship_count(cell_id: &str, edge_type: &str, src: VertexId, dst: VertexId) -> String {
+    format!("cell/{cell_id}/rel_count/{edge_type}/{src:020}/{dst:020}")
+}
+
+pub fn relationship_metadata_delta(
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+    relationship_id: RelationshipId,
+    epoch: GraphEpoch,
+) -> String {
+    format!(
+        "cell/{cell_id}/rel_delta/{edge_type}/{src:020}/{dst:020}/{relationship_id:020}/{epoch:020}"
+    )
+}
+
+#[cfg(feature = "opencypher")]
+pub fn relationship_metadata_delta_prefix(
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+    relationship_id: RelationshipId,
+) -> String {
+    format!("cell/{cell_id}/rel_delta/{edge_type}/{src:020}/{dst:020}/{relationship_id:020}/")
+}
+
+pub fn relationship_tombstone(
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+    relationship_id: RelationshipId,
+) -> String {
+    format!("cell/{cell_id}/rel_tomb/{edge_type}/{src:020}/{dst:020}/{relationship_id:020}")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn relationship_tombstone_edge_prefix(
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+) -> String {
+    format!("cell/{cell_id}/rel_tomb/{edge_type}/{src:020}/{dst:020}/")
 }
 
 pub fn edge_metadata_delta(
@@ -269,6 +344,77 @@ pub fn edge_property_index(
     dst: VertexId,
 ) -> String {
     format!("cell/{cell_id}/eprop_idx/{edge_type}/{property}/{encoded_value}/{src:020}/{dst:020}")
+}
+
+pub fn relationship_property_index(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+    encoded_value: &str,
+    src: VertexId,
+    dst: VertexId,
+    relationship_id: RelationshipId,
+) -> String {
+    format!(
+        "cell/{cell_id}/rprop_idx/{edge_type}/{property}/{encoded_value}/{src:020}/{dst:020}/{relationship_id:020}"
+    )
+}
+
+pub struct RelationshipPropertyIndexDeltaKey<'a> {
+    pub cell_id: &'a str,
+    pub edge_type: &'a str,
+    pub property: &'a str,
+    pub encoded_value: &'a str,
+    pub epoch: GraphEpoch,
+    pub src: VertexId,
+    pub dst: VertexId,
+    pub relationship_id: RelationshipId,
+}
+
+pub fn relationship_property_index_delta(key: RelationshipPropertyIndexDeltaKey<'_>) -> String {
+    format!(
+        "cell/{}/rprop_delta/{}/{}/{}/{:020}/{:020}/{:020}/{:020}",
+        key.cell_id,
+        key.edge_type,
+        key.property,
+        key.encoded_value,
+        key.epoch,
+        key.src,
+        key.dst,
+        key.relationship_id
+    )
+}
+
+#[cfg(feature = "opencypher")]
+pub fn relationship_property_index_delta_prefix(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+    encoded_value: &str,
+) -> String {
+    format!("cell/{cell_id}/rprop_delta/{edge_type}/{property}/{encoded_value}/")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn relationship_property_index_prefix(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+    encoded_value: &str,
+) -> String {
+    format!("cell/{cell_id}/rprop_idx/{edge_type}/{property}/{encoded_value}/")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn relationship_property_index_edge_prefix(
+    cell_id: &str,
+    edge_type: &str,
+    property: &str,
+    encoded_value: &str,
+    src: VertexId,
+    dst: VertexId,
+) -> String {
+    format!("cell/{cell_id}/rprop_idx/{edge_type}/{property}/{encoded_value}/{src:020}/{dst:020}/")
 }
 
 #[cfg(feature = "opencypher")]
