@@ -571,10 +571,7 @@ impl GraphShard {
                     match read_txn_remote(&txn, target_key).await? {
                         Some(value) => {
                             let record = decode_relationship_record(target_key, &value)?;
-                            if relationship_tombstone_epoch_txn(&txn, &record)
-                                .await?
-                                .is_some_and(|epoch| epoch <= current_epoch)
-                            {
+                            if relationship_deleted_at_txn(&txn, &record, current_epoch).await? {
                                 txn.delete(id_key.as_bytes())?;
                                 None
                             } else {
@@ -592,7 +589,14 @@ impl GraphShard {
                     }
                 }
                 None => match read_txn_remote(&txn, &rel_key).await? {
-                    Some(value) => Some(decode_relationship_record(&rel_key, &value)?),
+                    Some(value) => {
+                        let record = decode_relationship_record(&rel_key, &value)?;
+                        if relationship_deleted_at_txn(&txn, &record, current_epoch).await? {
+                            None
+                        } else {
+                            Some(record)
+                        }
+                    }
                     None => None,
                 },
             };
@@ -1258,9 +1262,7 @@ impl GraphShard {
         };
         let mut record = decode_relationship_record(&key, &value)?;
         if record.epoch > current_epoch
-            || relationship_tombstone_epoch_txn(&txn, &record)
-                .await?
-                .is_some_and(|epoch| epoch <= current_epoch)
+            || relationship_deleted_at_txn(&txn, &record, current_epoch).await?
         {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "GraphQuery",
@@ -1388,10 +1390,7 @@ impl GraphShard {
             return Ok(result);
         };
         let record = decode_relationship_record(&key, &value)?;
-        if relationship_tombstone_epoch_txn(&txn, &record)
-            .await?
-            .is_some_and(|epoch| epoch <= current_epoch)
-        {
+        if relationship_deleted_at_txn(&txn, &record, current_epoch).await? {
             let result = DeleteResult {
                 epoch: current_epoch,
                 deleted: false,
@@ -3928,6 +3927,17 @@ async fn relationship_tombstone_epoch_txn(
     }
 }
 
+async fn relationship_deleted_at_txn(
+    txn: &DbTransaction,
+    record: &RelationshipRecord,
+    read_epoch: GraphEpoch,
+) -> Result<bool> {
+    Ok(match relationship_tombstone_epoch_txn(txn, record).await? {
+        Some(tombstone_epoch) => record.epoch <= tombstone_epoch && tombstone_epoch <= read_epoch,
+        None => false,
+    })
+}
+
 async fn live_relationships_for_edge_txn(
     txn: &DbTransaction,
     cell_id: &str,
@@ -3945,10 +3955,7 @@ async fn live_relationships_for_edge_txn(
         if record.epoch > read_epoch {
             continue;
         }
-        if relationship_tombstone_epoch_txn(txn, &record)
-            .await?
-            .is_some_and(|epoch| epoch <= read_epoch)
-        {
+        if relationship_deleted_at_txn(txn, &record, read_epoch).await? {
             continue;
         }
         records.push(record);
