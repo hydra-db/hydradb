@@ -2848,10 +2848,27 @@ impl GraphShard {
         self.cache_metrics
             .record_miss(GraphCacheKind::RelationshipRows);
 
-        let mut rows = Vec::new();
-        let mut saw_relationship_record = false;
         let current_epoch = self.current_epoch(cell_id).await?;
         let latest_snapshot = read_epoch == current_epoch;
+        let structural_exists = if latest_snapshot {
+            self.edge_exists(cell_id, edge_type, src, dst).await?
+        } else {
+            self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch)
+                .await?
+        };
+        if !structural_exists {
+            self.relationship_rows_cache.lock().await.insert(
+                cache_key,
+                relationship_rows_cache_value(&[]),
+                cell_id.to_string(),
+                false,
+                &self.cache_metrics,
+            );
+            return Ok(Vec::new());
+        }
+
+        let mut rows = Vec::new();
+        let mut saw_relationship_record = false;
         let tombstones = self
             .relationship_tombstone_ids_for_edge_at(
                 cell_id, edge_type, src, dst, read_epoch, budget,
@@ -2885,17 +2902,7 @@ impl GraphShard {
             rows.push((relationship, metadata));
             self.ensure_query_index_candidates("cypher_relationship_edge_records", rows.len())?;
         }
-        let structural_exists = if saw_relationship_record || rows.is_empty() {
-            if latest_snapshot {
-                self.edge_exists(cell_id, edge_type, src, dst).await?
-            } else {
-                self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch)
-                    .await?
-            }
-        } else {
-            false
-        };
-        if saw_relationship_record && structural_exists {
+        if saw_relationship_record {
             let structural_metadata = self
                 .edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget)
                 .await?;
@@ -2911,7 +2918,7 @@ impl GraphShard {
                 ));
             }
         }
-        if rows.is_empty() && !saw_relationship_record && structural_exists {
+        if rows.is_empty() && !saw_relationship_record {
             let metadata = self
                 .edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget)
                 .await?;
@@ -2984,6 +2991,15 @@ impl GraphShard {
         let mut seen_relationship_ids = BTreeSet::new();
         let current_epoch = self.current_epoch(cell_id).await?;
         let latest_snapshot = read_epoch == current_epoch;
+        let structural_exists = if latest_snapshot {
+            self.edge_exists(cell_id, edge_type, src, dst).await?
+        } else {
+            self.edge_exists_at(cell_id, edge_type, src, dst, read_epoch)
+                .await?
+        };
+        if !structural_exists {
+            return Ok(Vec::new());
+        }
         let tombstones = self
             .relationship_tombstone_ids_for_edge_at(
                 cell_id, edge_type, src, dst, read_epoch, budget,

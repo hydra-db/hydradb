@@ -748,7 +748,14 @@ fn normalize_source_prefix(source: &str) -> Result<String> {
                 feature: "s3 source prefix must include a bucket name".to_string(),
             });
         }
-        return Ok(key.trim_matches('/').to_string());
+        let key = key.trim_matches('/');
+        if key.is_empty() {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "FalkorImport",
+                feature: "s3 source prefix must include an object key prefix, for example s3://bucket/orgs/graph".to_string(),
+            });
+        }
+        return Ok(key.to_string());
     }
     Ok(source.trim_matches('/').to_string())
 }
@@ -802,4 +809,22 @@ fn print_usage() {
          [--cell-id <graph>] [--duplicate-policy preserve] \\
          [--edge-batch-size 16384] [--metadata-batch-size 4096] [--build-artifacts]"
     );
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s3_source_prefix_requires_key_prefix() {
+        assert_eq!(
+            normalize_source_prefix("s3://graph-benchmark/orgs/demo").unwrap(),
+            "orgs/demo"
+        );
+
+        let err = normalize_source_prefix("s3://graph-benchmark").unwrap_err();
+        assert!(err.to_string().contains("object key prefix"));
+
+        let err = normalize_source_prefix("s3://graph-benchmark/").unwrap_err();
+        assert!(err.to_string().contains("object key prefix"));
+    }
 }

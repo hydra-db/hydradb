@@ -7881,6 +7881,80 @@ async fn normal_relationship_create_generates_multigraph_records() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn relationship_rows_require_live_structural_edge() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard(
+        "graph/multigraph-structural-delete-hides-rows",
+        object_store,
+    )
+    .await;
+
+    shard
+        .create_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "structural-delete-rel-1".to_string(),
+            },
+            EdgeMetadata::default().with_property("rank", VertexPropertyValue::Integer(1)),
+        )
+        .await
+        .unwrap();
+    shard
+        .create_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "structural-delete-rel-2".to_string(),
+            },
+            EdgeMetadata::default().with_property("rank", VertexPropertyValue::Integer(2)),
+        )
+        .await
+        .unwrap();
+
+    let deleted = shard
+        .delete_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "structural-delete-edge".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(deleted.deleted);
+    assert!(!shard
+        .edge_exists("reddit-home", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+
+    let endpoint_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "structural-delete-endpoint-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) RETURN r.rank AS rank ORDER BY rank",
+        )
+        .await
+        .unwrap();
+    assert!(endpoint_rows.rows.is_empty());
+
+    let property_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "structural-delete-property-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS {rank: 2}]->(v {id: 2}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert!(property_rows.rows.is_empty());
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn deleted_relationship_id_pointer_does_not_block_reimport() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/multigraph-reimport-deleted-id", object_store).await;
