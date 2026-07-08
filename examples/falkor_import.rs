@@ -25,21 +25,8 @@ async fn main() -> Result<()> {
 
     let manifest = read_object_text(Arc::clone(&object_store), &manifest_key).await?;
     let source = parse_manifest(&manifest, &manifest_key)?;
-    let edges = scan_edges_object(
-        Arc::clone(&object_store),
-        &edges_key,
-        config.duplicate_policy,
-    )
-    .await?;
-    if config.duplicate_policy == DuplicatePolicy::Reject && edges.duplicate_edges > 0 {
-        return Err(GraphError::UnsupportedQuery {
-            dialect: "FalkorImport",
-            feature: format!(
-                "Falkor dump has {} parallel relationships across {} edge identities; default --duplicate-policy preserve keeps them as multigraph relationship records, while reject/collapse modes build a simple graph view",
-                edges.duplicate_edges, edges.duplicate_keys
-            ),
-        });
-    }
+    let manifest_node_count = usize::try_from(source.node_count).unwrap_or(usize::MAX);
+    let manifest_edge_count = usize::try_from(source.edge_count).unwrap_or(usize::MAX);
 
     let cache = config
         .cache_dir
@@ -52,12 +39,9 @@ async fn main() -> Result<()> {
                 .edge_batch_size
                 .max(config.metadata_batch_size)
                 .max(1),
-            max_artifact_build_edges: edges.unique_edges.max(1) as u64,
-            max_query_scan_edges: edges.unique_edges.max(1) as u64,
-            max_query_index_candidates: usize::try_from(source.node_count)
-                .unwrap_or(usize::MAX)
-                .max(edges.unique_edges)
-                .max(1),
+            max_artifact_build_edges: source.edge_count.max(1),
+            max_query_scan_edges: source.edge_count.max(1),
+            max_query_index_candidates: manifest_node_count.max(manifest_edge_count).max(1),
             ..GraphLimits::default()
         },
         cache,
@@ -83,7 +67,6 @@ async fn main() -> Result<()> {
         &shard,
         &config,
         &source.graph,
-        &edges,
     )
     .await?;
     imported_edges += edge_import.imported_edges;
@@ -92,7 +75,7 @@ async fn main() -> Result<()> {
 
     if config.build_artifacts {
         let epoch = shard.current_epoch(&config.cell_id).await?;
-        for edge_type in edges.type_counts.keys() {
+        for edge_type in edge_import.type_counts.keys() {
             shard
                 .build_posting_chunks(
                     &config.cell_id,
@@ -125,7 +108,7 @@ async fn main() -> Result<()> {
     shard.close().await?;
 
     println!(
-        "falkor_import source={} graph={} cell={} db_path={} manifest_nodes={} manifest_edges={} imported_vertices={} imported_edges={} imported_relationships={} imported_edge_metadata={} unique_edges={} duplicate_edges={} duplicate_keys={} duplicate_policy={:?} edge_types={} epoch={} elapsed_ms={}",
+        "falkor_import source={} graph={} cell={} db_path={} manifest_nodes={} manifest_edges={} imported_vertices={} imported_edges={} imported_relationships={} imported_edge_metadata={} unique_edges={} duplicate_edges={} duplicate_policy={:?} edge_types={} epoch={} elapsed_ms={}",
         source_prefix,
         source.graph,
         config.cell_id,
@@ -136,15 +119,14 @@ async fn main() -> Result<()> {
         imported_edges,
         imported_relationships,
         imported_edge_metadata,
-        edges.unique_edges,
-        edges.duplicate_edges,
-        edges.duplicate_keys,
+        imported_edges,
+        imported_relationships.saturating_sub(imported_edges),
         config.duplicate_policy,
-        edges.type_counts.len(),
+        edge_import.type_counts.len(),
         epoch,
         started.elapsed().as_millis()
     );
-    for (edge_type, count) in &edges.type_counts {
+    for (edge_type, count) in &edge_import.type_counts {
         println!("edge_type,{edge_type},{count}");
     }
     Ok(())
@@ -309,22 +291,22 @@ impl ArgParser {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DuplicatePolicy {
     Preserve,
-    Reject,
-    CollapseFirst,
-    CollapseLast,
 }
 
 impl DuplicatePolicy {
     fn parse(value: &str) -> Result<Self> {
         match value {
             "preserve" => Ok(Self::Preserve),
-            "reject" => Ok(Self::Reject),
-            "collapse-first" => Ok(Self::CollapseFirst),
-            "collapse-last" => Ok(Self::CollapseLast),
+            "reject" | "collapse-first" | "collapse-last" => Err(GraphError::UnsupportedQuery {
+                dialect: "FalkorImport",
+                feature: format!(
+                    "--duplicate-policy {value} requires global edge identity dedupe; this streaming importer supports preserve only so Falkor multigraph relationships are not lost"
+                ),
+            }),
             _ => Err(GraphError::UnsupportedQuery {
                 dialect: "FalkorImport",
                 feature: format!(
-                    "unsupported duplicate policy {value}; expected preserve, reject, collapse-first, or collapse-last"
+                    "unsupported duplicate policy {value}; expected preserve"
                 ),
             }),
         }
@@ -346,21 +328,10 @@ struct ParsedEdge {
     metadata: EdgeMetadata,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ParsedEdgeLine {
     edge_type: String,
     edge: ParsedEdge,
-}
-
-type EdgeIdentity = (String, VertexId, VertexId);
-
-#[derive(Default, Debug)]
-struct ParsedEdges {
-    type_counts: BTreeMap<String, usize>,
-    identity_counts: BTreeMap<EdgeIdentity, usize>,
-    unique_edges: usize,
-    duplicate_edges: usize,
-    duplicate_keys: usize,
 }
 
 #[derive(Default, Debug)]
@@ -368,6 +339,7 @@ struct EdgeImportTotals {
     imported_edges: u64,
     imported_relationships: u64,
     imported_edge_metadata: usize,
+    type_counts: BTreeMap<String, usize>,
 }
 
 #[derive(Default, Debug)]
@@ -523,55 +495,12 @@ fn parse_node_line(key: &str, line_no: usize, line: &str) -> Result<(VertexId, V
     Ok((id, metadata))
 }
 
-async fn scan_edges_object(
-    object_store: Arc<dyn ObjectStore>,
-    key: &str,
-    duplicate_policy: DuplicatePolicy,
-) -> Result<ParsedEdges> {
-    let mut identity_counts = BTreeMap::<EdgeIdentity, usize>::new();
-    let mut type_counts = BTreeMap::<String, usize>::new();
-
-    stream_jsonl_lines(object_store, key, |line_no, line| {
-        let parsed = parse_edge_line(key, line_no, line)?;
-        let identity = edge_identity(&parsed.edge_type, &parsed.edge);
-        *type_counts.entry(parsed.edge_type.clone()).or_default() += 1;
-        let count = identity_counts.entry(identity).or_default();
-        *count += 1;
-        if duplicate_policy == DuplicatePolicy::Reject && *count > 1 {
-            return Err(GraphError::UnsupportedQuery {
-                dialect: "FalkorImport",
-                feature: format!(
-                    "Falkor dump contains parallel relationship {}:{} -> {}; use --duplicate-policy preserve to keep multigraph records or collapse-first/collapse-last for a simple graph view",
-                    parsed.edge_type, parsed.edge.src, parsed.edge.dst
-                ),
-            });
-        }
-        Ok(())
-    })
-    .await?;
-
-    let duplicate_edges = identity_counts
-        .values()
-        .map(|count| count.saturating_sub(1))
-        .sum::<usize>();
-    let duplicate_keys = identity_counts.values().filter(|count| **count > 1).count();
-    let unique_edges = identity_counts.len();
-    Ok(ParsedEdges {
-        type_counts,
-        identity_counts,
-        unique_edges,
-        duplicate_edges,
-        duplicate_keys,
-    })
-}
-
 async fn import_edges_object(
     object_store: Arc<dyn ObjectStore>,
     key: &str,
     shard: &GraphShard,
     config: &ImportConfig,
     source_graph: &str,
-    summary: &ParsedEdges,
 ) -> Result<EdgeImportTotals> {
     let path = Path::from(key.to_string());
     let raw = object_store.get(&path).await?;
@@ -579,7 +508,6 @@ async fn import_edges_object(
     let mut buffer = Vec::new();
     let mut line_no = 0_usize;
     let mut states = BTreeMap::<String, EdgeTypeWriteState>::new();
-    let mut first_seen = BTreeSet::<EdgeIdentity>::new();
     let mut totals = EdgeImportTotals::default();
 
     while let Some(chunk) = stream.next().await {
@@ -601,9 +529,7 @@ async fn import_edges_object(
                 shard,
                 config,
                 source_graph,
-                summary,
                 &mut states,
-                &mut first_seen,
                 &mut totals,
             )
             .await?;
@@ -618,9 +544,7 @@ async fn import_edges_object(
             shard,
             config,
             source_graph,
-            summary,
             &mut states,
-            &mut first_seen,
             &mut totals,
         )
         .await?;
@@ -647,22 +571,17 @@ async fn import_edge_line(
     shard: &GraphShard,
     config: &ImportConfig,
     source_graph: &str,
-    summary: &ParsedEdges,
     states: &mut BTreeMap<String, EdgeTypeWriteState>,
-    first_seen: &mut BTreeSet<EdgeIdentity>,
     totals: &mut EdgeImportTotals,
 ) -> Result<()> {
     let Some(line) = decode_jsonl_line(key, line_no, line)? else {
         return Ok(());
     };
     let parsed = parse_edge_line(key, line_no, line)?;
-    let identity = edge_identity(&parsed.edge_type, &parsed.edge);
-    if config.duplicate_policy == DuplicatePolicy::CollapseFirst
-        && !first_seen.insert(identity.clone())
-    {
-        return Ok(());
-    }
-    let edge = edge_with_parallel_count(parsed.edge, &identity, summary, config.duplicate_policy);
+    *totals
+        .type_counts
+        .entry(parsed.edge_type.clone())
+        .or_default() += 1;
     push_edge_for_import(
         shard,
         config,
@@ -670,7 +589,7 @@ async fn import_edge_line(
         states,
         totals,
         parsed.edge_type,
-        edge,
+        parsed.edge,
     )
     .await
 }
@@ -714,81 +633,30 @@ async fn flush_edge_type_state(
         return Ok(());
     }
     let chunk_idx = state.chunk_idx;
-    if config.duplicate_policy == DuplicatePolicy::Preserve {
-        let result = shard
-            .import_relationships_batch(
-                &config.cell_id,
-                edge_type,
-                state.records.iter().map(|edge| RelationshipMutation {
-                    cell_id: config.cell_id.clone(),
-                    edge_type: edge_type.to_string(),
-                    src: edge.src,
-                    dst: edge.dst,
-                    relationship_id: edge.relationship_id,
-                    metadata: edge.metadata.clone(),
-                }),
-                &format!(
-                    "falkor-rel-{}-{}-{chunk_idx}",
-                    component_slug(source_graph),
-                    component_slug(edge_type)
-                ),
-            )
-            .await?;
-        totals.imported_edges += result.structural_edges_inserted;
-        totals.imported_relationships += result.relationships_inserted;
-    } else {
-        let records = simple_graph_records_for_flush(&state.records, config.duplicate_policy);
-        let structural_edges: Vec<_> = records.iter().map(|edge| (edge.src, edge.dst)).collect();
-        let result = shard
-            .bulk_import_edges_chunked(
-                &config.cell_id,
-                edge_type,
-                structural_edges,
-                &format!(
-                    "falkor-{}-{}-{chunk_idx}",
-                    component_slug(source_graph),
-                    component_slug(edge_type)
-                ),
-                config.edge_batch_size,
-            )
-            .await?;
-        totals.imported_edges += result.inserted;
-        totals.imported_edge_metadata += shard
-            .set_edge_metadata_batch(
-                &config.cell_id,
-                edge_type,
-                records
-                    .iter()
-                    .map(|edge| (edge.src, edge.dst, edge.metadata.clone())),
-            )
-            .await?;
-    }
+    let result = shard
+        .import_relationships_batch(
+            &config.cell_id,
+            edge_type,
+            state.records.iter().map(|edge| RelationshipMutation {
+                cell_id: config.cell_id.clone(),
+                edge_type: edge_type.to_string(),
+                src: edge.src,
+                dst: edge.dst,
+                relationship_id: edge.relationship_id,
+                metadata: edge.metadata.clone(),
+            }),
+            &format!(
+                "falkor-rel-{}-{}-{chunk_idx}",
+                component_slug(source_graph),
+                component_slug(edge_type)
+            ),
+        )
+        .await?;
+    totals.imported_edges += result.structural_edges_inserted;
+    totals.imported_relationships += result.relationships_inserted;
     state.records.clear();
     state.chunk_idx += 1;
     Ok(())
-}
-
-fn simple_graph_records_for_flush(
-    records: &[ParsedEdge],
-    duplicate_policy: DuplicatePolicy,
-) -> Vec<ParsedEdge> {
-    if duplicate_policy == DuplicatePolicy::Preserve {
-        return records.to_vec();
-    }
-    let mut by_edge = BTreeMap::<(VertexId, VertexId), ParsedEdge>::new();
-    for edge in records {
-        let key = (edge.src, edge.dst);
-        match duplicate_policy {
-            DuplicatePolicy::CollapseLast => {
-                by_edge.insert(key, edge.clone());
-            }
-            DuplicatePolicy::Reject | DuplicatePolicy::CollapseFirst => {
-                by_edge.entry(key).or_insert_with(|| edge.clone());
-            }
-            DuplicatePolicy::Preserve => unreachable!("preserve mode is returned above"),
-        }
-    }
-    by_edge.into_values().collect()
 }
 
 fn parse_edge_line(key: &str, line_no: usize, line: &str) -> Result<ParsedEdgeLine> {
@@ -818,29 +686,6 @@ fn parse_edge_line(key: &str, line_no: usize, line: &str) -> Result<ParsedEdgeLi
             metadata,
         },
     })
-}
-
-fn edge_identity(edge_type: &str, edge: &ParsedEdge) -> EdgeIdentity {
-    (edge_type.to_string(), edge.src, edge.dst)
-}
-
-fn edge_with_parallel_count(
-    mut edge: ParsedEdge,
-    identity: &EdgeIdentity,
-    summary: &ParsedEdges,
-    duplicate_policy: DuplicatePolicy,
-) -> ParsedEdge {
-    if duplicate_policy != DuplicatePolicy::Reject {
-        if let Some(count) = summary.identity_counts.get(identity).copied() {
-            if count > 1 {
-                edge.metadata.properties.insert(
-                    "_falkor_parallel_count".to_string(),
-                    VertexPropertyValue::Integer(count as u64),
-                );
-            }
-        }
-    }
-    edge
 }
 
 fn parse_properties(
@@ -873,50 +718,6 @@ async fn read_object_text(object_store: Arc<dyn ObjectStore>, key: &str) -> Resu
         key: key.to_string(),
         reason: format!("object is not valid UTF-8: {err}"),
     })
-}
-
-async fn stream_jsonl_lines(
-    object_store: Arc<dyn ObjectStore>,
-    key: &str,
-    mut on_line: impl FnMut(usize, &str) -> Result<()>,
-) -> Result<()> {
-    let path = Path::from(key.to_string());
-    let raw = object_store.get(&path).await?;
-    let mut stream = raw.into_stream();
-    let mut buffer = Vec::new();
-    let mut line_no = 0_usize;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        buffer.extend_from_slice(&chunk);
-        while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
-            let mut line = buffer.drain(..=newline).collect::<Vec<_>>();
-            if line.last() == Some(&b'\n') {
-                line.pop();
-            }
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            line_no += 1;
-            emit_jsonl_line(key, line_no, &line, &mut on_line)?;
-        }
-    }
-    if !buffer.is_empty() {
-        line_no += 1;
-        emit_jsonl_line(key, line_no, &buffer, &mut on_line)?;
-    }
-    Ok(())
-}
-
-fn emit_jsonl_line(
-    key: &str,
-    line_no: usize,
-    line: &[u8],
-    on_line: &mut impl FnMut(usize, &str) -> Result<()>,
-) -> Result<()> {
-    let Some(line) = decode_jsonl_line(key, line_no, line)? else {
-        return Ok(());
-    };
-    on_line(line_no, line)
 }
 
 fn decode_jsonl_line<'a>(key: &str, line_no: usize, line: &'a [u8]) -> Result<Option<&'a str>> {
@@ -998,7 +799,7 @@ fn print_usage() {
     eprintln!(
         "usage: cargo run --features json-properties --example falkor_import -- \\
          --source-prefix orgs/<org>/<graph> [--env-file .env] [--db-path imports/falkor/<graph>] \\
-         [--cell-id <graph>] [--duplicate-policy preserve|reject|collapse-first|collapse-last] \\
+         [--cell-id <graph>] [--duplicate-policy preserve] \\
          [--edge-batch-size 16384] [--metadata-batch-size 4096] [--build-artifacts]"
     );
 }
