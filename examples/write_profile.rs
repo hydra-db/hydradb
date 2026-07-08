@@ -49,9 +49,10 @@ async fn main() -> ProfileResult<()> {
         await_durable_writes,
         index_policy,
     );
-    let shard_path = format!("graph-write-profile-{}", std::process::id());
+    let default_shard_path = format!("graph-write-profile-{}", std::process::id());
+    let shard_path = string_env("GRAPH_WRITE_PROFILE_DB_PATH", &default_shard_path);
     let shard = GraphShard::open_standalone_writer_with_options(
-        shard_path,
+        shard_path.clone(),
         Arc::clone(&object_store),
         options,
     )
@@ -74,9 +75,18 @@ async fn main() -> ProfileResult<()> {
             started.elapsed().as_millis()
         );
     }
+    if mode == "delete" {
+        let started = Instant::now();
+        seed_delete_profile_edges(&shard, src, batch_size, warmup_batches, batches).await?;
+        eprintln!(
+            "graph write profile delete seed edges={} elapsed_ms={}",
+            batch_size.saturating_mul(warmup_batches.saturating_add(batches)),
+            started.elapsed().as_millis()
+        );
+    }
 
     eprintln!(
-        "graph write profile mode={mode} object_store={object_label} batch_size={batch_size} batches={batches} warmup_batches={warmup_batches} seed_degree={seed_degree} wal_flush_interval_ms={wal_flush_interval_ms} await_durable={await_durable_writes} index_policy={index_policy:?} trusted_chunk_size={trusted_chunk_size}"
+        "graph write profile mode={mode} object_store={object_label} db_path={shard_path} batch_size={batch_size} batches={batches} warmup_batches={warmup_batches} seed_degree={seed_degree} wal_flush_interval_ms={wal_flush_interval_ms} await_durable={await_durable_writes} index_policy={index_policy:?} trusted_chunk_size={trusted_chunk_size}"
     );
     let (stats, metrics_before, metrics_after) = if mode == "log-drain" {
         let metrics_before = shard.graph_operational_metrics();
@@ -216,6 +226,38 @@ async fn run_warmup(
     Ok(())
 }
 
+async fn seed_delete_profile_edges(
+    shard: &GraphShard,
+    src: u64,
+    batch_size: usize,
+    warmup_batches: usize,
+    batches: usize,
+) -> ProfileResult<()> {
+    for batch in 0..warmup_batches {
+        let base = write_base("warmup", batch);
+        shard
+            .bulk_import_edges(
+                CELL_ID,
+                EDGE_TYPE,
+                (0..batch_size).map(|index| (src, base + index as u64)),
+                &format!("write-profile-delete-seed-warmup-{batch}"),
+            )
+            .await?;
+    }
+    for batch in 0..batches {
+        let base = write_base("measure", warmup_batches + batch);
+        shard
+            .bulk_import_edges(
+                CELL_ID,
+                EDGE_TYPE,
+                (0..batch_size).map(|index| (src, base + index as u64)),
+                &format!("write-profile-delete-seed-measure-{batch}"),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 async fn run_measured(
     shard: &GraphShard,
     mode: &str,
@@ -276,6 +318,25 @@ async fn run_batch(
                     .await?;
             }
             Ok(batch_size as u64)
+        }
+        "delete" => {
+            let mut deleted = 0_u64;
+            for index in 0..batch_size {
+                let dst = base + index as u64;
+                let result = shard
+                    .delete_edge(EdgeMutation {
+                        cell_id: CELL_ID.to_string(),
+                        edge_type: EDGE_TYPE.to_string(),
+                        src,
+                        dst,
+                        idempotency_key: format!("write-profile-delete-{phase}-{batch}-{index}"),
+                    })
+                    .await?;
+                if result.deleted {
+                    deleted = deleted.saturating_add(1);
+                }
+            }
+            Ok(deleted)
         }
         "bulk" => {
             let result = shard
