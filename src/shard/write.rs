@@ -45,6 +45,59 @@ impl GraphShard {
         unreachable!("transaction retry loop always returns on final attempt")
     }
 
+    pub async fn set_vertex_metadata_batch(
+        &self,
+        cell_id: &str,
+        updates: impl IntoIterator<Item = (VertexId, VertexMetadata)>,
+    ) -> Result<usize> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_write_authority(cell_id, "set_vertex_metadata_batch")?;
+        let updates = coalesce_vertex_metadata_updates(updates)?;
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        ensure_limit(
+            "set_vertex_metadata_batch",
+            updates.len() as u64,
+            self.limits.max_bulk_import_edges as u64,
+        )?;
+        let _permit = self
+            .acquire_graph_write_permit("set_vertex_metadata_batch")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .set_vertex_metadata_batch_txn(cell_id, updates.clone())
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(changed) => {
+                    if changed > 0 {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(changed);
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
     async fn set_vertex_metadata_txn(
         &self,
         cell_id: &str,
@@ -83,6 +136,52 @@ impl GraphShard {
         commit_txn_strict(txn, self.await_durable_writes).await
     }
 
+    async fn set_vertex_metadata_batch_txn(
+        &self,
+        cell_id: &str,
+        updates: Vec<(VertexId, VertexMetadata)>,
+    ) -> Result<usize> {
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "set_vertex_metadata_batch")
+            .await?;
+        let result = self
+            .set_vertex_metadata_batch_txn_locked(cell_id, updates)
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn set_vertex_metadata_batch_txn_locked(
+        &self,
+        cell_id: &str,
+        updates: Vec<(VertexId, VertexMetadata)>,
+    ) -> Result<usize> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, "set_vertex_metadata_batch")
+            .await?;
+        let mut changed = Vec::new();
+        for (vertex_id, metadata) in updates {
+            let vertex_key = keys::vertex(cell_id, vertex_id);
+            let previous = match read_txn_remote(&txn, &vertex_key).await? {
+                Some(value) => decode_vertex_metadata(&vertex_key, &value)?,
+                None => VertexMetadata::default(),
+            };
+            if previous != metadata {
+                changed.push((vertex_id, previous, metadata));
+            }
+        }
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        let epoch = next_epoch_txn(&txn, cell_id).await?;
+        txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(epoch))?;
+        for (vertex_id, previous, metadata) in &changed {
+            apply_vertex_metadata_update_txn(&txn, cell_id, *vertex_id, previous, metadata, epoch)?;
+        }
+        let changed_count = changed.len();
+        commit_txn_strict(txn, self.await_durable_writes).await?;
+        Ok(changed_count)
+    }
+
     pub async fn set_edge_metadata(
         &self,
         cell_id: &str,
@@ -100,6 +199,141 @@ impl GraphShard {
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
                 .set_edge_metadata_txn(cell_id, edge_type, src, dst, metadata.clone())
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(result) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(result);
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    pub async fn set_edge_metadata_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        updates: impl IntoIterator<Item = (VertexId, VertexId, EdgeMetadata)>,
+    ) -> Result<usize> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        self.ensure_write_authority(cell_id, "set_edge_metadata_batch")?;
+        let updates = coalesce_edge_metadata_updates(updates)?;
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        ensure_limit(
+            "set_edge_metadata_batch",
+            updates.len() as u64,
+            self.limits.max_bulk_import_edges as u64,
+        )?;
+        let _permit = self
+            .acquire_graph_write_permit("set_edge_metadata_batch")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .set_edge_metadata_batch_txn(cell_id, edge_type, updates.clone())
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(changed) => {
+                    if changed > 0 {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(changed);
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    pub async fn import_relationships_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        relationships: impl IntoIterator<Item = RelationshipMutation>,
+        idempotency_key: &str,
+    ) -> Result<RelationshipImportResult> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        validate_component("idempotency_key", idempotency_key)?;
+        self.ensure_write_authority(cell_id, "import_relationships_batch")?;
+
+        let mut relationships = coalesce_relationship_imports(cell_id, edge_type, relationships)?;
+        if relationships.is_empty() {
+            let epoch = self.current_epoch(cell_id).await?;
+            return Ok(RelationshipImportResult {
+                start_epoch: epoch,
+                end_epoch: epoch,
+                relationships_inserted: 0,
+                relationships_already_existed: 0,
+                structural_edges_inserted: 0,
+                structural_edges_already_existed: 0,
+            });
+        }
+        ensure_limit(
+            "import_relationships_batch",
+            relationships.len() as u64,
+            self.limits.max_bulk_import_edges as u64,
+        )?;
+        relationships.sort_by_key(|relationship| {
+            (
+                relationship.relationship_id,
+                relationship.src,
+                relationship.dst,
+                relationship.edge_type.clone(),
+            )
+        });
+        let fingerprint = relationship_import_fingerprint(cell_id, edge_type, &relationships);
+
+        let _permit = self
+            .acquire_graph_write_permit("import_relationships_batch")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .import_relationships_batch_txn(
+                    cell_id,
+                    edge_type,
+                    &relationships,
+                    idempotency_key,
+                    fingerprint,
+                )
                 .await
             {
                 Err(err)
@@ -190,6 +424,1055 @@ impl GraphShard {
         )?;
         commit_txn_strict(txn, self.await_durable_writes).await?;
         Ok(true)
+    }
+
+    async fn set_edge_metadata_batch_txn(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        updates: Vec<(VertexId, VertexId, EdgeMetadata)>,
+    ) -> Result<usize> {
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "set_edge_metadata_batch")
+            .await?;
+        let result = self
+            .set_edge_metadata_batch_txn_locked(cell_id, edge_type, updates)
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn set_edge_metadata_batch_txn_locked(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        updates: Vec<(VertexId, VertexId, EdgeMetadata)>,
+    ) -> Result<usize> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, "set_edge_metadata_batch")
+            .await?;
+        let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
+        let mut changed = Vec::new();
+        for (src, dst, metadata) in updates {
+            if edge_epoch_at_txn(&txn, cell_id, edge_type, src, dst, current_epoch)
+                .await?
+                .is_none()
+            {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "GraphQuery",
+                    feature: format!(
+                        "cannot set metadata for missing edge {edge_type}({src}->{dst})"
+                    ),
+                });
+            }
+            let edge_metadata_key = keys::edge_metadata(cell_id, edge_type, src, dst);
+            let previous = match read_txn_remote(&txn, &edge_metadata_key).await? {
+                Some(value) => decode_edge_metadata(&edge_metadata_key, &value)?,
+                None => EdgeMetadata::default(),
+            };
+            if previous != metadata {
+                changed.push((src, dst, previous, metadata));
+            }
+        }
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        let epoch = next_epoch_txn(&txn, cell_id).await?;
+        txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(epoch))?;
+        for (src, dst, previous, metadata) in &changed {
+            apply_edge_metadata_update_txn(
+                &txn,
+                EdgeMetadataTarget {
+                    cell_id,
+                    edge_type,
+                    src: *src,
+                    dst: *dst,
+                },
+                previous,
+                metadata,
+                epoch,
+            )?;
+        }
+        let changed_count = changed.len();
+        commit_txn_strict(txn, self.await_durable_writes).await?;
+        Ok(changed_count)
+    }
+
+    async fn import_relationships_batch_txn(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        relationships: &[RelationshipMutation],
+        idempotency_key: &str,
+        fingerprint: u64,
+    ) -> Result<RelationshipImportResult> {
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "import_relationships_batch")
+            .await?;
+        let result = self
+            .import_relationships_batch_txn_locked(
+                cell_id,
+                edge_type,
+                relationships,
+                idempotency_key,
+                fingerprint,
+            )
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn import_relationships_batch_txn_locked(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        relationships: &[RelationshipMutation],
+        idempotency_key: &str,
+        fingerprint: u64,
+    ) -> Result<RelationshipImportResult> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, "import_relationships_batch")
+            .await?;
+        let idem_key = keys::idempotency(cell_id, "relationship-import", idempotency_key);
+        if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
+            return decode_relationship_import_idempotency(
+                &idem_key,
+                idempotency_key,
+                fingerprint,
+                &value,
+            );
+        }
+
+        let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
+        let current_relationship_id =
+            read_counter_txn(&txn, &keys::last_relationship_id(cell_id)).await?;
+        let max_requested_relationship_id = relationships
+            .iter()
+            .map(|relationship| relationship.relationship_id)
+            .max()
+            .unwrap_or(0);
+        let fresh_cell = current_epoch == 0;
+        let mut relationships_inserted = Vec::new();
+        let mut relationships_already_existed = 0_u64;
+        for relationship in relationships {
+            let rel_key = keys::relationship(
+                cell_id,
+                edge_type,
+                relationship.src,
+                relationship.dst,
+                relationship.relationship_id,
+            );
+            let id_key = keys::relationship_id(cell_id, relationship.relationship_id);
+            let existing = match read_txn_remote(&txn, &id_key).await? {
+                Some(value) => {
+                    let target_key =
+                        std::str::from_utf8(&value).map_err(|err| GraphError::CorruptValue {
+                            key: id_key.clone(),
+                            reason: format!("relationship id pointer is not UTF-8: {err}"),
+                        })?;
+                    match read_txn_remote(&txn, target_key).await? {
+                        Some(value) => {
+                            let record = decode_relationship_record(target_key, &value)?;
+                            if relationship_deleted_at_txn(&txn, &record, current_epoch).await? {
+                                txn.delete(id_key.as_bytes())?;
+                                None
+                            } else {
+                                Some(record)
+                            }
+                        }
+                        None => {
+                            return Err(GraphError::CorruptValue {
+                                key: id_key,
+                                reason: format!(
+                                    "relationship id points at missing record {target_key}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                None => match read_txn_remote(&txn, &rel_key).await? {
+                    Some(value) => {
+                        let record = decode_relationship_record(&rel_key, &value)?;
+                        if relationship_deleted_at_txn(&txn, &record, current_epoch).await? {
+                            None
+                        } else {
+                            Some(record)
+                        }
+                    }
+                    None => None,
+                },
+            };
+            if let Some(existing) = existing {
+                let requested = RelationshipRecord {
+                    cell_id: cell_id.to_string(),
+                    edge_type: edge_type.to_string(),
+                    src: relationship.src,
+                    dst: relationship.dst,
+                    relationship_id: relationship.relationship_id,
+                    epoch: existing.epoch,
+                    metadata: relationship.metadata.clone(),
+                };
+                if existing != requested {
+                    return Err(GraphError::IdempotencyConflict {
+                        operation: "relationship-import",
+                        idempotency_key: idempotency_key.to_string(),
+                    });
+                }
+                relationships_already_existed = relationships_already_existed.saturating_add(1);
+            } else {
+                relationships_inserted.push(relationship.clone());
+            }
+        }
+
+        let mut structural_edges = BTreeSet::<(VertexId, VertexId)>::new();
+        let mut structural_edges_already_existed = 0_u64;
+        let mut segment_neighbors_by_src = BTreeMap::<VertexId, BTreeSet<VertexId>>::new();
+        for relationship in &relationships_inserted {
+            if !structural_edges.insert((relationship.src, relationship.dst)) {
+                continue;
+            }
+            if !fresh_cell {
+                if read_txn_remote(
+                    &txn,
+                    &keys::out_edge(cell_id, edge_type, relationship.src, relationship.dst),
+                )
+                .await?
+                .is_some()
+                {
+                    structural_edges_already_existed =
+                        structural_edges_already_existed.saturating_add(1);
+                    continue;
+                }
+                let segment_exists = match segment_neighbors_by_src.get(&relationship.src) {
+                    Some(neighbors) => neighbors.contains(&relationship.dst),
+                    None => {
+                        let neighbors = out_segment_neighbors_for_src_txn(
+                            &txn,
+                            cell_id,
+                            edge_type,
+                            relationship.src,
+                            current_epoch,
+                        )
+                        .await?;
+                        let exists = neighbors.contains(&relationship.dst);
+                        segment_neighbors_by_src.insert(relationship.src, neighbors);
+                        exists
+                    }
+                };
+                if segment_exists {
+                    structural_edges_already_existed =
+                        structural_edges_already_existed.saturating_add(1);
+                    continue;
+                }
+            }
+        }
+        let structural_edges_inserted =
+            u64::try_from(structural_edges.len()).map_err(|err| GraphError::CorruptValue {
+                key: "relationship_import".to_string(),
+                reason: format!("too many structural edges in one import: {err}"),
+            })? - structural_edges_already_existed;
+        let relationships_inserted_count =
+            u64::try_from(relationships_inserted.len()).map_err(|err| {
+                GraphError::CorruptValue {
+                    key: "relationship_import".to_string(),
+                    reason: format!("too many relationships in one import: {err}"),
+                }
+            })?;
+        let changed = relationships_inserted_count > 0 || structural_edges_inserted > 0;
+        let epoch = if changed {
+            current_epoch
+                .checked_add(1)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: keys::last_epoch(cell_id),
+                    reason: "epoch overflow during relationship import".to_string(),
+                })?
+        } else {
+            current_epoch
+        };
+        let result = RelationshipImportResult {
+            start_epoch: epoch,
+            end_epoch: epoch,
+            relationships_inserted: relationships_inserted_count,
+            relationships_already_existed,
+            structural_edges_inserted,
+            structural_edges_already_existed,
+        };
+
+        let write_reverse_index = self.writes_reverse_index();
+        let mut out_increments = BTreeMap::<VertexId, u64>::new();
+        let mut in_increments = BTreeMap::<VertexId, u64>::new();
+        for (src, dst) in structural_edges {
+            if !fresh_cell
+                && edge_epoch_at_txn(&txn, cell_id, edge_type, src, dst, current_epoch)
+                    .await?
+                    .is_some()
+            {
+                continue;
+            }
+            let record = EdgeRecord {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                epoch,
+            };
+            let edge_value = encode_edge_record(&record);
+            let delta_value = encode_delta_record(&DeltaRecord {
+                kind: DeltaKind::Plus,
+                edge: record,
+            });
+            txn.put(
+                keys::out_edge(cell_id, edge_type, src, dst).as_bytes(),
+                &edge_value,
+            )?;
+            if write_reverse_index {
+                txn.put(
+                    keys::in_edge(cell_id, edge_type, dst, src).as_bytes(),
+                    &edge_value,
+                )?;
+            }
+            txn.put(
+                keys::outbox(cell_id, epoch, DeltaKind::Plus, edge_type, src, dst).as_bytes(),
+                &delta_value,
+            )?;
+            *out_increments.entry(src).or_insert(0) += 1;
+            if write_reverse_index {
+                *in_increments.entry(dst).or_insert(0) += 1;
+            }
+        }
+        for (src, increment) in out_increments {
+            let key = keys::degree_out(cell_id, edge_type, src);
+            let base = if fresh_cell {
+                0
+            } else {
+                read_counter_txn(&txn, &key).await?
+            };
+            txn.put(key.as_bytes(), encode_u64(base + increment))?;
+        }
+        if write_reverse_index {
+            for (dst, increment) in in_increments {
+                let key = keys::degree_in(cell_id, edge_type, dst);
+                let base = if fresh_cell {
+                    0
+                } else {
+                    read_counter_txn(&txn, &key).await?
+                };
+                txn.put(key.as_bytes(), encode_u64(base + increment))?;
+            }
+        }
+        for relationship in &relationships_inserted {
+            let record = RelationshipRecord {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                src: relationship.src,
+                dst: relationship.dst,
+                relationship_id: relationship.relationship_id,
+                epoch,
+                metadata: relationship.metadata.clone(),
+            };
+            let value = encode_relationship_record(&record);
+            txn.put(
+                keys::relationship(
+                    cell_id,
+                    edge_type,
+                    relationship.src,
+                    relationship.dst,
+                    relationship.relationship_id,
+                )
+                .as_bytes(),
+                &value,
+            )?;
+            txn.put(
+                keys::relationship_id(cell_id, relationship.relationship_id).as_bytes(),
+                keys::relationship(
+                    cell_id,
+                    edge_type,
+                    relationship.src,
+                    relationship.dst,
+                    relationship.relationship_id,
+                )
+                .as_bytes(),
+            )?;
+            put_relationship_metadata_delta_txn(&txn, &record, &record.metadata, epoch)?;
+            put_relationship_property_indexes_txn(&txn, &record)?;
+            put_relationship_property_index_deltas_txn(
+                &txn,
+                &record,
+                &EdgeMetadata::default(),
+                &record.metadata,
+                epoch,
+            )?;
+        }
+        let mut relationship_count_increments = BTreeMap::<(VertexId, VertexId), u64>::new();
+        for relationship in &relationships_inserted {
+            *relationship_count_increments
+                .entry((relationship.src, relationship.dst))
+                .or_insert(0) += 1;
+        }
+        for ((src, dst), increment) in relationship_count_increments {
+            let key = keys::relationship_count(cell_id, edge_type, src, dst);
+            let base = if fresh_cell {
+                0
+            } else {
+                read_counter_txn(&txn, &key).await?
+            };
+            txn.put(key.as_bytes(), encode_u64(base + increment))?;
+        }
+        if max_requested_relationship_id > current_relationship_id {
+            txn.put(
+                keys::last_relationship_id(cell_id).as_bytes(),
+                encode_u64(max_requested_relationship_id),
+            )?;
+        }
+        if changed {
+            txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(epoch))?;
+        }
+        txn.put(
+            idem_key.as_bytes(),
+            encode_relationship_import_idempotency(idempotency_key, fingerprint, &result),
+        )?;
+        commit_txn_strict(txn, self.await_durable_writes).await?;
+        Ok(result)
+    }
+
+    pub async fn create_relationship(
+        &self,
+        mutation: EdgeMutation,
+        edge_metadata: EdgeMetadata,
+    ) -> Result<RelationshipCreateResult> {
+        self.create_relationship_with_full_metadata(
+            mutation,
+            VertexMetadata::default(),
+            VertexMetadata::default(),
+            edge_metadata,
+        )
+        .await
+    }
+
+    pub async fn create_relationship_with_vertex_metadata(
+        &self,
+        mutation: EdgeMutation,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+    ) -> Result<RelationshipCreateResult> {
+        self.create_relationship_with_full_metadata(
+            mutation,
+            src_metadata,
+            dst_metadata,
+            EdgeMetadata::default(),
+        )
+        .await
+    }
+
+    pub async fn create_relationship_with_full_metadata(
+        &self,
+        mutation: EdgeMutation,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+        edge_metadata: EdgeMetadata,
+    ) -> Result<RelationshipCreateResult> {
+        validate_component("cell_id", &mutation.cell_id)?;
+        validate_component("edge_type", &mutation.edge_type)?;
+        validate_component("idempotency_key", &mutation.idempotency_key)?;
+        validate_vertex_metadata(&src_metadata)?;
+        validate_vertex_metadata(&dst_metadata)?;
+        validate_edge_metadata(&edge_metadata)?;
+        self.ensure_write_authority(&mutation.cell_id, "create_relationship")?;
+
+        let metadata_updates = coalesce_vertex_metadata_updates([
+            (mutation.src, src_metadata),
+            (mutation.dst, dst_metadata),
+        ])?;
+        let fingerprint =
+            relationship_create_fingerprint(&mutation, metadata_updates.as_slice(), &edge_metadata);
+        let _permit = self
+            .acquire_graph_write_permit("create_relationship")
+            .await?;
+        let _writer = self.writer_lane(&mutation.cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .create_relationship_txn(&mutation, &metadata_updates, &edge_metadata, fingerprint)
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(result) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(result);
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    async fn create_relationship_txn(
+        &self,
+        mutation: &EdgeMutation,
+        metadata_updates: &[(VertexId, VertexMetadata)],
+        edge_metadata: &EdgeMetadata,
+        fingerprint: u64,
+    ) -> Result<RelationshipCreateResult> {
+        let lock = self
+            .acquire_cell_write_lock(&mutation.cell_id, "create_relationship")
+            .await?;
+        let result = self
+            .create_relationship_txn_locked(mutation, metadata_updates, edge_metadata, fingerprint)
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn create_relationship_txn_locked(
+        &self,
+        mutation: &EdgeMutation,
+        metadata_updates: &[(VertexId, VertexMetadata)],
+        edge_metadata: &EdgeMetadata,
+        fingerprint: u64,
+    ) -> Result<RelationshipCreateResult> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, &mutation.cell_id, "create_relationship")
+            .await?;
+        let idem_key = keys::idempotency(
+            &mutation.cell_id,
+            "relationship-create",
+            &mutation.idempotency_key,
+        );
+        if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
+            return decode_relationship_create_idempotency(
+                &idem_key,
+                mutation,
+                fingerprint,
+                &value,
+            );
+        }
+
+        let current_epoch = read_counter_txn(&txn, &keys::last_epoch(&mutation.cell_id)).await?;
+        let existing_edge_epoch = edge_epoch_at_txn(
+            &txn,
+            &mutation.cell_id,
+            &mutation.edge_type,
+            mutation.src,
+            mutation.dst,
+            current_epoch,
+        )
+        .await?;
+        let structural_edge_inserted = existing_edge_epoch.is_none();
+        let epoch = current_epoch
+            .checked_add(1)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: keys::last_epoch(&mutation.cell_id),
+                reason: "epoch overflow during relationship create".to_string(),
+            })?;
+
+        let mut relationship_id =
+            read_counter_txn(&txn, &keys::last_relationship_id(&mutation.cell_id))
+                .await?
+                .checked_add(1)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: keys::last_relationship_id(&mutation.cell_id),
+                    reason: "relationship id overflow".to_string(),
+                })?;
+        loop {
+            if read_txn_remote(
+                &txn,
+                &keys::relationship_id(&mutation.cell_id, relationship_id),
+            )
+            .await?
+            .is_none()
+            {
+                break;
+            }
+            relationship_id =
+                relationship_id
+                    .checked_add(1)
+                    .ok_or_else(|| GraphError::CorruptValue {
+                        key: keys::last_relationship_id(&mutation.cell_id),
+                        reason: "relationship id overflow".to_string(),
+                    })?;
+        }
+
+        let mut changed_metadata = Vec::new();
+        for (vertex_id, requested) in metadata_updates {
+            let vertex_key = keys::vertex(&mutation.cell_id, *vertex_id);
+            let previous = match read_txn_remote(&txn, &vertex_key).await? {
+                Some(value) => decode_vertex_metadata(&vertex_key, &value)?,
+                None => VertexMetadata::default(),
+            };
+            let next = merge_vertex_metadata(&previous, requested);
+            if previous != next {
+                changed_metadata.push((*vertex_id, previous, next));
+            }
+        }
+
+        txn.put(
+            keys::last_epoch(&mutation.cell_id).as_bytes(),
+            encode_u64(epoch),
+        )?;
+        txn.put(
+            keys::last_relationship_id(&mutation.cell_id).as_bytes(),
+            encode_u64(relationship_id),
+        )?;
+        for (vertex_id, previous, next) in &changed_metadata {
+            apply_vertex_metadata_update_txn(
+                &txn,
+                &mutation.cell_id,
+                *vertex_id,
+                previous,
+                next,
+                epoch,
+            )?;
+        }
+
+        if structural_edge_inserted {
+            let record = EdgeRecord {
+                cell_id: mutation.cell_id.clone(),
+                edge_type: mutation.edge_type.clone(),
+                src: mutation.src,
+                dst: mutation.dst,
+                epoch,
+            };
+            let edge_value = encode_edge_record(&record);
+            let delta_value = encode_delta_record(&DeltaRecord {
+                kind: DeltaKind::Plus,
+                edge: record,
+            });
+            let out_degree_key =
+                keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
+            let out_degree = read_counter_txn(&txn, &out_degree_key).await? + 1;
+            let in_degree = if self.writes_reverse_index() {
+                let in_degree_key =
+                    keys::degree_in(&mutation.cell_id, &mutation.edge_type, mutation.dst);
+                let in_degree = read_counter_txn(&txn, &in_degree_key).await? + 1;
+                Some((in_degree_key, in_degree))
+            } else {
+                None
+            };
+            txn.put(
+                keys::out_edge(
+                    &mutation.cell_id,
+                    &mutation.edge_type,
+                    mutation.src,
+                    mutation.dst,
+                )
+                .as_bytes(),
+                &edge_value,
+            )?;
+            if self.writes_reverse_index() {
+                txn.put(
+                    keys::in_edge(
+                        &mutation.cell_id,
+                        &mutation.edge_type,
+                        mutation.dst,
+                        mutation.src,
+                    )
+                    .as_bytes(),
+                    &edge_value,
+                )?;
+            }
+            txn.put(out_degree_key.as_bytes(), encode_u64(out_degree))?;
+            if let Some((in_degree_key, in_degree)) = in_degree {
+                txn.put(in_degree_key.as_bytes(), encode_u64(in_degree))?;
+            }
+            txn.put(
+                keys::outbox(
+                    &mutation.cell_id,
+                    epoch,
+                    DeltaKind::Plus,
+                    &mutation.edge_type,
+                    mutation.src,
+                    mutation.dst,
+                )
+                .as_bytes(),
+                &delta_value,
+            )?;
+        }
+
+        let record = RelationshipRecord {
+            cell_id: mutation.cell_id.clone(),
+            edge_type: mutation.edge_type.clone(),
+            src: mutation.src,
+            dst: mutation.dst,
+            relationship_id,
+            epoch,
+            metadata: edge_metadata.clone(),
+        };
+        let relationship_key = keys::relationship(
+            &mutation.cell_id,
+            &mutation.edge_type,
+            mutation.src,
+            mutation.dst,
+            relationship_id,
+        );
+        txn.put(
+            relationship_key.as_bytes(),
+            encode_relationship_record(&record),
+        )?;
+        txn.put(
+            keys::relationship_id(&mutation.cell_id, relationship_id).as_bytes(),
+            relationship_key.as_bytes(),
+        )?;
+        let relationship_count_key = keys::relationship_count(
+            &mutation.cell_id,
+            &mutation.edge_type,
+            mutation.src,
+            mutation.dst,
+        );
+        let relationship_count = read_counter_txn(&txn, &relationship_count_key).await? + 1;
+        txn.put(
+            relationship_count_key.as_bytes(),
+            encode_u64(relationship_count),
+        )?;
+        put_relationship_metadata_delta_txn(&txn, &record, edge_metadata, epoch)?;
+        put_relationship_property_indexes_txn(&txn, &record)?;
+        put_relationship_property_index_deltas_txn(
+            &txn,
+            &record,
+            &EdgeMetadata::default(),
+            edge_metadata,
+            epoch,
+        )?;
+
+        let result = RelationshipCreateResult {
+            epoch,
+            relationship_id,
+            structural_edge_inserted,
+            already_created: false,
+        };
+        txn.put(
+            idem_key.as_bytes(),
+            encode_relationship_create_idempotency(mutation, fingerprint, &result),
+        )?;
+        commit_txn_strict(txn, self.await_durable_writes).await?;
+        Ok(result)
+    }
+
+    pub async fn set_relationship_metadata(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        relationship_id: RelationshipId,
+        metadata: EdgeMetadata,
+    ) -> Result<bool> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        validate_edge_metadata(&metadata)?;
+        self.ensure_write_authority(cell_id, "set_relationship_metadata")?;
+        let _permit = self
+            .acquire_graph_write_permit("set_relationship_metadata")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .set_relationship_metadata_txn(
+                    cell_id,
+                    edge_type,
+                    src,
+                    dst,
+                    relationship_id,
+                    metadata.clone(),
+                )
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(changed) => {
+                    if changed {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(changed);
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    async fn set_relationship_metadata_txn(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        relationship_id: RelationshipId,
+        metadata: EdgeMetadata,
+    ) -> Result<bool> {
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "set_relationship_metadata")
+            .await?;
+        let result = self
+            .set_relationship_metadata_txn_locked(
+                cell_id,
+                edge_type,
+                src,
+                dst,
+                relationship_id,
+                metadata,
+            )
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn set_relationship_metadata_txn_locked(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        relationship_id: RelationshipId,
+        metadata: EdgeMetadata,
+    ) -> Result<bool> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, "set_relationship_metadata")
+            .await?;
+        let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
+        let key = keys::relationship(cell_id, edge_type, src, dst, relationship_id);
+        let Some(value) = read_txn_remote(&txn, &key).await? else {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "GraphQuery",
+                feature: "cannot set metadata for a missing relationship".to_string(),
+            });
+        };
+        let mut record = decode_relationship_record(&key, &value)?;
+        if record.epoch > current_epoch
+            || relationship_deleted_at_txn(&txn, &record, current_epoch).await?
+        {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "GraphQuery",
+                feature: "cannot set metadata for a deleted relationship".to_string(),
+            });
+        }
+        if record.metadata == metadata {
+            return Ok(false);
+        }
+        let previous = record.metadata.clone();
+        let epoch = next_epoch_txn(&txn, cell_id).await?;
+        record.metadata = metadata.clone();
+        txn.put(
+            key.as_bytes(),
+            encode_relationship_record(&record).as_slice(),
+        )?;
+        put_relationship_metadata_delta_txn(&txn, &record, &metadata, epoch)?;
+        delete_relationship_property_indexes_txn(&txn, &record, &previous)?;
+        put_relationship_property_indexes_txn(&txn, &record)?;
+        put_relationship_property_index_deltas_txn(&txn, &record, &previous, &metadata, epoch)?;
+        txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(epoch))?;
+        commit_txn_strict(txn, self.await_durable_writes).await?;
+        Ok(true)
+    }
+
+    pub async fn delete_relationship(
+        &self,
+        mutation: EdgeMutation,
+        relationship_id: RelationshipId,
+    ) -> Result<DeleteResult> {
+        validate_component("cell_id", &mutation.cell_id)?;
+        validate_component("edge_type", &mutation.edge_type)?;
+        validate_component("idempotency_key", &mutation.idempotency_key)?;
+        self.ensure_write_authority(&mutation.cell_id, "delete_relationship")?;
+
+        let _permit = self
+            .acquire_graph_write_permit("delete_relationship")
+            .await?;
+        let _writer = self.writer_lane(&mutation.cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .delete_relationship_txn(&mutation, relationship_id)
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(result) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(result);
+                }
+                result => return result,
+            }
+        }
+        unreachable!("transaction retry loop always returns on final attempt")
+    }
+
+    async fn delete_relationship_txn(
+        &self,
+        mutation: &EdgeMutation,
+        relationship_id: RelationshipId,
+    ) -> Result<DeleteResult> {
+        let lock = self
+            .acquire_cell_write_lock(&mutation.cell_id, "delete_relationship")
+            .await?;
+        let result = self
+            .delete_relationship_txn_locked(mutation, relationship_id)
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn delete_relationship_txn_locked(
+        &self,
+        mutation: &EdgeMutation,
+        relationship_id: RelationshipId,
+    ) -> Result<DeleteResult> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, &mutation.cell_id, "delete_relationship")
+            .await?;
+        let idem_key = keys::idempotency(
+            &mutation.cell_id,
+            "relationship-delete",
+            &mutation.idempotency_key,
+        );
+        if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
+            return decode_relationship_delete_idempotency(
+                &idem_key,
+                mutation,
+                relationship_id,
+                &value,
+            );
+        }
+
+        let current_epoch = read_counter_txn(&txn, &keys::last_epoch(&mutation.cell_id)).await?;
+        let key = keys::relationship(
+            &mutation.cell_id,
+            &mutation.edge_type,
+            mutation.src,
+            mutation.dst,
+            relationship_id,
+        );
+        let Some(value) = read_txn_remote(&txn, &key).await? else {
+            let result = DeleteResult {
+                epoch: current_epoch,
+                deleted: false,
+            };
+            txn.put(
+                idem_key.as_bytes(),
+                encode_relationship_delete_idempotency(mutation, relationship_id, &result),
+            )?;
+            commit_txn_strict(txn, self.await_durable_writes).await?;
+            return Ok(result);
+        };
+        let record = decode_relationship_record(&key, &value)?;
+        if relationship_deleted_at_txn(&txn, &record, current_epoch).await? {
+            let result = DeleteResult {
+                epoch: current_epoch,
+                deleted: false,
+            };
+            txn.put(
+                idem_key.as_bytes(),
+                encode_relationship_delete_idempotency(mutation, relationship_id, &result),
+            )?;
+            commit_txn_strict(txn, self.await_durable_writes).await?;
+            return Ok(result);
+        }
+
+        let epoch = current_epoch
+            .checked_add(1)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: keys::last_epoch(&mutation.cell_id),
+                reason: "epoch overflow during relationship delete".to_string(),
+            })?;
+        let other_live_relationships = live_relationships_for_edge_txn(
+            &txn,
+            &mutation.cell_id,
+            &mutation.edge_type,
+            mutation.src,
+            mutation.dst,
+            current_epoch,
+        )
+        .await?
+        .into_iter()
+        .any(|record| record.relationship_id != relationship_id);
+
+        txn.put(
+            keys::last_epoch(&mutation.cell_id).as_bytes(),
+            encode_u64(epoch),
+        )?;
+        txn.put(
+            keys::relationship_tombstone(
+                &mutation.cell_id,
+                &mutation.edge_type,
+                mutation.src,
+                mutation.dst,
+                relationship_id,
+            )
+            .as_bytes(),
+            encode_u64(epoch),
+        )?;
+        txn.delete(keys::relationship_id(&mutation.cell_id, relationship_id).as_bytes())?;
+        let relationship_count_key = keys::relationship_count(
+            &mutation.cell_id,
+            &mutation.edge_type,
+            mutation.src,
+            mutation.dst,
+        );
+        let relationship_count = read_counter_txn(&txn, &relationship_count_key)
+            .await?
+            .saturating_sub(1);
+        txn.put(
+            relationship_count_key.as_bytes(),
+            encode_u64(relationship_count),
+        )?;
+        delete_relationship_property_indexes_txn(&txn, &record, &record.metadata)?;
+        put_relationship_property_index_deltas_txn(
+            &txn,
+            &record,
+            &record.metadata,
+            &EdgeMetadata::default(),
+            epoch,
+        )?;
+
+        if !other_live_relationships {
+            delete_structural_edge_txn(self, &txn, mutation, epoch).await?;
+        }
+
+        let result = DeleteResult {
+            epoch,
+            deleted: true,
+        };
+        txn.put(
+            idem_key.as_bytes(),
+            encode_relationship_delete_idempotency(mutation, relationship_id, &result),
+        )?;
+        commit_txn_strict(txn, self.await_durable_writes).await?;
+        Ok(result)
     }
 
     pub async fn write_edge(&self, mutation: EdgeMutation) -> Result<CommitResult> {
@@ -2295,6 +3578,77 @@ fn coalesce_vertex_metadata_updates(
     Ok(by_vertex.into_iter().collect())
 }
 
+fn coalesce_edge_metadata_updates(
+    updates: impl IntoIterator<Item = (VertexId, VertexId, EdgeMetadata)>,
+) -> Result<Vec<(VertexId, VertexId, EdgeMetadata)>> {
+    let mut by_edge = BTreeMap::<(VertexId, VertexId), EdgeMetadata>::new();
+    for (src, dst, metadata) in updates {
+        validate_edge_metadata(&metadata)?;
+        match by_edge.get(&(src, dst)) {
+            Some(existing) if existing != &metadata => {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "GraphQuery",
+                    feature: format!(
+                        "conflicting metadata values for edge {src}->{dst} in one batch"
+                    ),
+                });
+            }
+            Some(_) => {}
+            None => {
+                by_edge.insert((src, dst), metadata);
+            }
+        }
+    }
+    Ok(by_edge
+        .into_iter()
+        .map(|((src, dst), metadata)| (src, dst, metadata))
+        .collect())
+}
+
+fn coalesce_relationship_imports(
+    cell_id: &str,
+    edge_type: &str,
+    relationships: impl IntoIterator<Item = RelationshipMutation>,
+) -> Result<Vec<RelationshipMutation>> {
+    let mut by_id = BTreeMap::<RelationshipId, RelationshipMutation>::new();
+    for relationship in relationships {
+        validate_component("cell_id", &relationship.cell_id)?;
+        validate_component("edge_type", &relationship.edge_type)?;
+        validate_edge_metadata(&relationship.metadata)?;
+        if relationship.cell_id != cell_id {
+            return Err(GraphError::CorruptValue {
+                key: format!("cell/{cell_id}/relationship_import"),
+                reason: format!(
+                    "batch contains relationship for different cell {}",
+                    relationship.cell_id
+                ),
+            });
+        }
+        if relationship.edge_type != edge_type {
+            return Err(GraphError::CorruptValue {
+                key: format!("cell/{cell_id}/relationship_import/{edge_type}"),
+                reason: format!(
+                    "batch contains relationship for different edge type {}",
+                    relationship.edge_type
+                ),
+            });
+        }
+        match by_id.get(&relationship.relationship_id) {
+            Some(existing) if existing != &relationship => {
+                return Err(GraphError::IdempotencyConflict {
+                    operation: "relationship-import",
+                    idempotency_key: format!("{:020}", relationship.relationship_id),
+                });
+            }
+            Some(_) => {}
+            None => {
+                by_id.insert(relationship.relationship_id, relationship);
+            }
+        }
+    }
+    Ok(by_id.into_values().collect())
+}
+
 fn merge_vertex_metadata(previous: &VertexMetadata, requested: &VertexMetadata) -> VertexMetadata {
     let mut next = previous.clone();
     next.labels.extend(requested.labels.iter().cloned());
@@ -2508,6 +3862,274 @@ fn put_edge_metadata_indexes_txn(
             .as_bytes(),
             encode_u64(target.dst).as_slice(),
         )?;
+    }
+    Ok(())
+}
+
+fn put_relationship_property_indexes_txn(
+    txn: &DbTransaction,
+    record: &RelationshipRecord,
+) -> Result<()> {
+    for (property, value) in &record.metadata.properties {
+        txn.put(
+            keys::relationship_property_index(
+                &record.cell_id,
+                &record.edge_type,
+                property,
+                &encode_vertex_property_value_key(value),
+                record.src,
+                record.dst,
+                record.relationship_id,
+            )
+            .as_bytes(),
+            encode_u64(record.relationship_id).as_slice(),
+        )?;
+    }
+    Ok(())
+}
+
+fn put_relationship_metadata_delta_txn(
+    txn: &DbTransaction,
+    record: &RelationshipRecord,
+    metadata: &EdgeMetadata,
+    epoch: GraphEpoch,
+) -> Result<()> {
+    validate_edge_metadata(metadata)?;
+    txn.put(
+        keys::relationship_metadata_delta(
+            &record.cell_id,
+            &record.edge_type,
+            record.src,
+            record.dst,
+            record.relationship_id,
+            epoch,
+        )
+        .as_bytes(),
+        encode_edge_metadata(metadata).as_slice(),
+    )?;
+    Ok(())
+}
+
+async fn relationship_tombstone_epoch_txn(
+    txn: &DbTransaction,
+    record: &RelationshipRecord,
+) -> Result<Option<GraphEpoch>> {
+    let key = keys::relationship_tombstone(
+        &record.cell_id,
+        &record.edge_type,
+        record.src,
+        record.dst,
+        record.relationship_id,
+    );
+    match read_txn_remote(txn, &key).await? {
+        Some(value) => Ok(Some(decode_u64(&key, &value)?)),
+        None => Ok(None),
+    }
+}
+
+async fn relationship_deleted_at_txn(
+    txn: &DbTransaction,
+    record: &RelationshipRecord,
+    read_epoch: GraphEpoch,
+) -> Result<bool> {
+    Ok(match relationship_tombstone_epoch_txn(txn, record).await? {
+        Some(tombstone_epoch) => record.epoch <= tombstone_epoch && tombstone_epoch <= read_epoch,
+        None => false,
+    })
+}
+
+async fn live_relationships_for_edge_txn(
+    txn: &DbTransaction,
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+    read_epoch: GraphEpoch,
+) -> Result<Vec<RelationshipRecord>> {
+    let prefix = keys::relationship_edge_prefix(cell_id, edge_type, src, dst);
+    let mut iter = txn.scan_prefix(prefix.as_bytes(), ..).await?;
+    let mut records = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        let key = String::from_utf8_lossy(&kv.key).into_owned();
+        let record = decode_relationship_record(&key, &kv.value)?;
+        if record.epoch > read_epoch {
+            continue;
+        }
+        if relationship_deleted_at_txn(txn, &record, read_epoch).await? {
+            continue;
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+async fn delete_structural_edge_txn(
+    shard: &GraphShard,
+    txn: &DbTransaction,
+    mutation: &EdgeMutation,
+    epoch: GraphEpoch,
+) -> Result<()> {
+    let edge_key = keys::out_edge(
+        &mutation.cell_id,
+        &mutation.edge_type,
+        mutation.src,
+        mutation.dst,
+    );
+    if read_txn_remote(txn, &edge_key).await?.is_none() {
+        return Ok(());
+    }
+    let record = EdgeRecord {
+        cell_id: mutation.cell_id.clone(),
+        edge_type: mutation.edge_type.clone(),
+        src: mutation.src,
+        dst: mutation.dst,
+        epoch,
+    };
+    let delta_value = encode_delta_record(&DeltaRecord {
+        kind: DeltaKind::Minus,
+        edge: record,
+    });
+    let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
+    let out_degree = read_counter_txn(txn, &out_degree_key)
+        .await?
+        .saturating_sub(1);
+    let in_degree = if shard.writes_reverse_index() {
+        let in_degree_key = keys::degree_in(&mutation.cell_id, &mutation.edge_type, mutation.dst);
+        let in_degree = read_counter_txn(txn, &in_degree_key)
+            .await?
+            .saturating_sub(1);
+        Some((in_degree_key, in_degree))
+    } else {
+        None
+    };
+    let edge_metadata_key = keys::edge_metadata(
+        &mutation.cell_id,
+        &mutation.edge_type,
+        mutation.src,
+        mutation.dst,
+    );
+    let previous_edge_metadata = match read_txn_remote(txn, &edge_metadata_key).await? {
+        Some(value) => decode_edge_metadata(&edge_metadata_key, &value)?,
+        None => EdgeMetadata::default(),
+    };
+    if !previous_edge_metadata.properties.is_empty() {
+        apply_edge_metadata_update_txn(
+            txn,
+            EdgeMetadataTarget {
+                cell_id: &mutation.cell_id,
+                edge_type: &mutation.edge_type,
+                src: mutation.src,
+                dst: mutation.dst,
+            },
+            &previous_edge_metadata,
+            &EdgeMetadata::default(),
+            epoch,
+        )?;
+    }
+    txn.delete(
+        keys::edge(
+            &mutation.cell_id,
+            &mutation.edge_type,
+            mutation.src,
+            mutation.dst,
+        )
+        .as_bytes(),
+    )?;
+    txn.delete(edge_key.as_bytes())?;
+    if shard.writes_reverse_index() {
+        txn.delete(
+            keys::in_edge(
+                &mutation.cell_id,
+                &mutation.edge_type,
+                mutation.dst,
+                mutation.src,
+            )
+            .as_bytes(),
+        )?;
+    }
+    txn.put(out_degree_key.as_bytes(), encode_u64(out_degree))?;
+    if let Some((in_degree_key, in_degree)) = in_degree {
+        txn.put(in_degree_key.as_bytes(), encode_u64(in_degree))?;
+    }
+    txn.put(
+        keys::outbox(
+            &mutation.cell_id,
+            epoch,
+            DeltaKind::Minus,
+            &mutation.edge_type,
+            mutation.src,
+            mutation.dst,
+        )
+        .as_bytes(),
+        &delta_value,
+    )?;
+    Ok(())
+}
+
+fn delete_relationship_property_indexes_txn(
+    txn: &DbTransaction,
+    record: &RelationshipRecord,
+    metadata: &EdgeMetadata,
+) -> Result<()> {
+    for (property, value) in &metadata.properties {
+        txn.delete(
+            keys::relationship_property_index(
+                &record.cell_id,
+                &record.edge_type,
+                property,
+                &encode_vertex_property_value_key(value),
+                record.src,
+                record.dst,
+                record.relationship_id,
+            )
+            .as_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+fn put_relationship_property_index_deltas_txn(
+    txn: &DbTransaction,
+    record: &RelationshipRecord,
+    previous: &EdgeMetadata,
+    next: &EdgeMetadata,
+    epoch: GraphEpoch,
+) -> Result<()> {
+    for (property, value) in &previous.properties {
+        if next.properties.get(property) != Some(value) {
+            txn.put(
+                keys::relationship_property_index_delta(keys::RelationshipPropertyIndexDeltaKey {
+                    cell_id: &record.cell_id,
+                    edge_type: &record.edge_type,
+                    property,
+                    encoded_value: &encode_vertex_property_value_key(value),
+                    epoch,
+                    src: record.src,
+                    dst: record.dst,
+                    relationship_id: record.relationship_id,
+                })
+                .as_bytes(),
+                encode_vertex_index_delta(false).as_slice(),
+            )?;
+        }
+    }
+    for (property, value) in &next.properties {
+        if previous.properties.get(property) != Some(value) {
+            txn.put(
+                keys::relationship_property_index_delta(keys::RelationshipPropertyIndexDeltaKey {
+                    cell_id: &record.cell_id,
+                    edge_type: &record.edge_type,
+                    property,
+                    encoded_value: &encode_vertex_property_value_key(value),
+                    epoch,
+                    src: record.src,
+                    dst: record.dst,
+                    relationship_id: record.relationship_id,
+                })
+                .as_bytes(),
+                encode_vertex_index_delta(true).as_slice(),
+            )?;
+        }
     }
     Ok(())
 }

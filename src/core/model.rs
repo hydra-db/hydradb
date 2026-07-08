@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{GraphEpoch, VertexId};
+
+pub type RelationshipId = u64;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GraphRepairReport {
     pub cell_id: String,
@@ -63,6 +65,35 @@ pub struct EdgeRecord {
     pub src: VertexId,
     pub dst: VertexId,
     pub epoch: GraphEpoch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationshipMutation {
+    pub cell_id: String,
+    pub edge_type: String,
+    pub src: VertexId,
+    pub dst: VertexId,
+    pub relationship_id: RelationshipId,
+    pub metadata: EdgeMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationshipRecord {
+    pub cell_id: String,
+    pub edge_type: String,
+    pub src: VertexId,
+    pub dst: VertexId,
+    pub relationship_id: RelationshipId,
+    pub epoch: GraphEpoch,
+    pub metadata: EdgeMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationshipCreateResult {
+    pub epoch: GraphEpoch,
+    pub relationship_id: RelationshipId,
+    pub structural_edge_inserted: bool,
+    pub already_created: bool,
 }
 
 #[cfg_attr(
@@ -218,6 +249,16 @@ pub struct BulkImportResult {
     pub end_epoch: GraphEpoch,
     pub inserted: u64,
     pub already_existed: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationshipImportResult {
+    pub start_epoch: GraphEpoch,
+    pub end_epoch: GraphEpoch,
+    pub relationships_inserted: u64,
+    pub relationships_already_existed: u64,
+    pub structural_edges_inserted: u64,
+    pub structural_edges_already_existed: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

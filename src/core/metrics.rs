@@ -10,6 +10,10 @@ pub struct GraphCachePolicy {
     pub max_parsed_row_queries: usize,
     #[cfg(feature = "opencypher")]
     pub max_reachability_results: usize,
+    #[cfg(feature = "opencypher")]
+    pub max_relationship_row_sets: usize,
+    #[cfg(feature = "opencypher")]
+    pub max_relationship_property_row_sets: usize,
     pub max_supernode_groups: usize,
     pub max_posting_chunks: usize,
     pub max_materialized_supernodes: usize,
@@ -30,6 +34,10 @@ impl Default for GraphCachePolicy {
             max_parsed_row_queries: 4_096,
             #[cfg(feature = "opencypher")]
             max_reachability_results: 512,
+            #[cfg(feature = "opencypher")]
+            max_relationship_row_sets: 1_024,
+            #[cfg(feature = "opencypher")]
+            max_relationship_property_row_sets: 4_096,
             max_supernode_groups: 4_096,
             max_posting_chunks: 16_384,
             max_materialized_supernodes: 512,
@@ -63,6 +71,8 @@ pub enum GraphCacheKind {
     GraphBlas,
     ParsedRowQuery,
     ReachabilityResult,
+    RelationshipRows,
+    RelationshipPropertyRows,
     SupernodeGroup,
     PostingChunk,
     MaterializedSupernode,
@@ -80,6 +90,10 @@ pub struct GraphCacheMetricsSnapshot {
     pub parsed_row_query_misses: u64,
     pub reachability_result_hits: u64,
     pub reachability_result_misses: u64,
+    pub relationship_rows_hits: u64,
+    pub relationship_rows_misses: u64,
+    pub relationship_property_rows_hits: u64,
+    pub relationship_property_rows_misses: u64,
     pub supernode_group_hits: u64,
     pub supernode_group_misses: u64,
     pub posting_chunk_hits: u64,
@@ -214,6 +228,10 @@ pub(crate) struct GraphCacheMetrics {
     pub(crate) parsed_row_query_misses: AtomicU64,
     pub(crate) reachability_result_hits: AtomicU64,
     pub(crate) reachability_result_misses: AtomicU64,
+    pub(crate) relationship_rows_hits: AtomicU64,
+    pub(crate) relationship_rows_misses: AtomicU64,
+    pub(crate) relationship_property_rows_hits: AtomicU64,
+    pub(crate) relationship_property_rows_misses: AtomicU64,
     pub(crate) supernode_group_hits: AtomicU64,
     pub(crate) supernode_group_misses: AtomicU64,
     pub(crate) posting_chunk_hits: AtomicU64,
@@ -252,6 +270,14 @@ impl GraphCacheMetrics {
             (GraphCacheKind::ParsedRowQuery, false) => &self.parsed_row_query_misses,
             (GraphCacheKind::ReachabilityResult, true) => &self.reachability_result_hits,
             (GraphCacheKind::ReachabilityResult, false) => &self.reachability_result_misses,
+            (GraphCacheKind::RelationshipRows, true) => &self.relationship_rows_hits,
+            (GraphCacheKind::RelationshipRows, false) => &self.relationship_rows_misses,
+            (GraphCacheKind::RelationshipPropertyRows, true) => {
+                &self.relationship_property_rows_hits
+            }
+            (GraphCacheKind::RelationshipPropertyRows, false) => {
+                &self.relationship_property_rows_misses
+            }
             (GraphCacheKind::SupernodeGroup, true) => &self.supernode_group_hits,
             (GraphCacheKind::SupernodeGroup, false) => &self.supernode_group_misses,
             (GraphCacheKind::PostingChunk, true) => &self.posting_chunk_hits,
@@ -273,6 +299,14 @@ impl GraphCacheMetrics {
             parsed_row_query_misses: self.parsed_row_query_misses.load(Ordering::Relaxed),
             reachability_result_hits: self.reachability_result_hits.load(Ordering::Relaxed),
             reachability_result_misses: self.reachability_result_misses.load(Ordering::Relaxed),
+            relationship_rows_hits: self.relationship_rows_hits.load(Ordering::Relaxed),
+            relationship_rows_misses: self.relationship_rows_misses.load(Ordering::Relaxed),
+            relationship_property_rows_hits: self
+                .relationship_property_rows_hits
+                .load(Ordering::Relaxed),
+            relationship_property_rows_misses: self
+                .relationship_property_rows_misses
+                .load(Ordering::Relaxed),
             supernode_group_hits: self.supernode_group_hits.load(Ordering::Relaxed),
             supernode_group_misses: self.supernode_group_misses.load(Ordering::Relaxed),
             posting_chunk_hits: self.posting_chunk_hits.load(Ordering::Relaxed),
