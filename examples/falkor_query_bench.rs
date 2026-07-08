@@ -9,6 +9,8 @@ use slatedb_graph_kernel::{
     QueryContext, Result,
 };
 
+const CACHE_DIR_MARKER: &str = ".slatedb-graph-query-bench-cache";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = BenchConfig::from_args(std::env::args().skip(1).collect())?;
@@ -202,16 +204,102 @@ fn graph_options(
 fn reset_dir(path: &str) -> Result<()> {
     let path = Path::new(path);
     if path.exists() {
-        fs::remove_dir_all(path).map_err(|err| GraphError::CorruptValue {
+        if !path.is_dir() {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "FalkorQueryBench",
+                feature: format!("--cache-dir {} is not a directory", path.display()),
+            });
+        }
+        let marker = path.join(CACHE_DIR_MARKER);
+        let entries = fs::read_dir(path)
+            .map_err(|err| GraphError::CorruptValue {
+                key: path.display().to_string(),
+                reason: format!("failed to inspect cache directory: {err}"),
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|err| GraphError::CorruptValue {
+                key: path.display().to_string(),
+                reason: format!("failed to inspect cache directory entry: {err}"),
+            })?;
+        let has_non_marker_entries = entries
+            .iter()
+            .any(|entry| entry.file_name() != CACHE_DIR_MARKER);
+        if has_non_marker_entries && !marker.is_file() {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "FalkorQueryBench",
+                feature: format!(
+                    "--cache-dir {} already exists and is not a benchmark cache; choose an empty directory or a directory created by this benchmark",
+                    path.display()
+                ),
+            });
+        }
+        for entry in entries {
+            if entry.file_name() == CACHE_DIR_MARKER {
+                continue;
+            }
+            let entry_path = entry.path();
+            let file_type = entry.file_type().map_err(|err| GraphError::CorruptValue {
+                key: entry_path.display().to_string(),
+                reason: format!("failed to inspect cache entry: {err}"),
+            })?;
+            if file_type.is_dir() {
+                fs::remove_dir_all(&entry_path).map_err(|err| GraphError::CorruptValue {
+                    key: entry_path.display().to_string(),
+                    reason: format!("failed to clear cache directory entry: {err}"),
+                })?;
+            } else {
+                fs::remove_file(&entry_path).map_err(|err| GraphError::CorruptValue {
+                    key: entry_path.display().to_string(),
+                    reason: format!("failed to clear cache file entry: {err}"),
+                })?;
+            }
+        }
+    } else {
+        fs::create_dir_all(path).map_err(|err| GraphError::CorruptValue {
             key: path.display().to_string(),
-            reason: format!("failed to clear cache directory: {err}"),
+            reason: format!("failed to create cache directory: {err}"),
         })?;
     }
-    fs::create_dir_all(path).map_err(|err| GraphError::CorruptValue {
+    fs::write(
+        path.join(CACHE_DIR_MARKER),
+        b"slatedb graph query benchmark cache\n",
+    )
+    .map_err(|err| GraphError::CorruptValue {
         key: path.display().to_string(),
-        reason: format!("failed to create cache directory: {err}"),
+        reason: format!("failed to write cache directory marker: {err}"),
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_dir_refuses_unmarked_non_empty_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("important.txt"), "keep me").unwrap();
+        let err = reset_dir(temp.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, GraphError::UnsupportedQuery { .. }));
+        assert!(temp.path().join("important.txt").exists());
+    }
+
+    #[test]
+    fn reset_dir_cleans_marked_cache_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(CACHE_DIR_MARKER), "marker").unwrap();
+        fs::write(temp.path().join("cache.bin"), "stale").unwrap();
+        reset_dir(temp.path().to_str().unwrap()).unwrap();
+        assert!(temp.path().join(CACHE_DIR_MARKER).exists());
+        assert!(!temp.path().join("cache.bin").exists());
+    }
+
+    #[test]
+    fn reset_dir_allows_empty_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        reset_dir(temp.path().to_str().unwrap()).unwrap();
+        assert!(temp.path().join(CACHE_DIR_MARKER).exists());
+    }
 }
 
 #[derive(Clone, Debug)]
