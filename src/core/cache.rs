@@ -98,6 +98,32 @@ impl RelationshipRowsCacheKey {
 
 #[cfg(feature = "opencypher")]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct SourceRelationshipRowsCacheKey {
+    pub(crate) cell_id: String,
+    pub(crate) edge_type: String,
+    pub(crate) src: VertexId,
+    pub(crate) read_epoch: GraphEpoch,
+}
+
+#[cfg(feature = "opencypher")]
+impl SourceRelationshipRowsCacheKey {
+    pub(crate) fn new(
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        read_epoch: GraphEpoch,
+    ) -> Self {
+        Self {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            src,
+            read_epoch,
+        }
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RelationshipPropertyRowsCacheKey {
     pub(crate) cell_id: String,
     pub(crate) edge_type: String,

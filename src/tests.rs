@@ -7790,6 +7790,50 @@ async fn multigraph_relationship_import_preserves_parallel_relationship_rows() {
         )
     );
 
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 4,
+            idempotency_key: "multigraph-structural-only-edge".to_string(),
+        })
+        .await
+        .unwrap();
+    let anonymous_fanout = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "multigraph-anonymous-source-fanout"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id AS dst ORDER BY dst",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        anonymous_fanout,
+        QueryResultSet::new(
+            vec![QueryColumn::new("dst")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(2)]),
+                QueryRow::new(vec![QueryValue::VertexId(2)]),
+                QueryRow::new(vec![QueryValue::VertexId(2)]),
+                QueryRow::new(vec![QueryValue::VertexId(4)]),
+            ],
+        )
+    );
+    let source_cache_metrics_before = shard.graph_cache_metrics();
+    let cached_anonymous_fanout = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "multigraph-anonymous-source-fanout-cached"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id AS dst ORDER BY dst",
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached_anonymous_fanout, anonymous_fanout);
+    let source_cache_metrics_after = shard.graph_cache_metrics();
+    assert!(
+        source_cache_metrics_after.relationship_rows_hits
+            > source_cache_metrics_before.relationship_rows_hits
+    );
+
     shard.close().await.unwrap();
 }
 
@@ -10922,7 +10966,7 @@ async fn cypher_row_engine_rejects_excess_intermediate_rows() {
     assert!(matches!(
         err,
         GraphError::AdmissionRejected {
-            operation: "cypher_edge_rows",
+            operation: "cypher_source_relationship_structural_fallback",
             actual: 2,
             limit: 1
         }
