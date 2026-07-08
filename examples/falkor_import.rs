@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
 
     let mut imported_edges = 0_u64;
     let mut imported_relationships = 0_u64;
-    let mut imported_edge_metadata = 0_usize;
+    let mut imported_relationship_metadata = 0_usize;
     let edge_import = import_edges_object(
         Arc::clone(&object_store),
         &edges_key,
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
     .await?;
     imported_edges += edge_import.imported_edges;
     imported_relationships += edge_import.imported_relationships;
-    imported_edge_metadata += edge_import.imported_edge_metadata;
+    imported_relationship_metadata += edge_import.imported_relationship_metadata;
 
     if config.build_artifacts {
         let epoch = shard.current_epoch(&config.cell_id).await?;
@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
     shard.close().await?;
 
     println!(
-        "falkor_import source={} graph={} cell={} db_path={} manifest_nodes={} manifest_edges={} imported_vertices={} imported_edges={} imported_relationships={} imported_edge_metadata={} unique_edges={} duplicate_edges={} duplicate_policy={:?} edge_types={} epoch={} elapsed_ms={}",
+        "falkor_import source={} graph={} cell={} db_path={} manifest_nodes={} manifest_edges={} imported_vertices={} imported_edges={} imported_relationships={} imported_relationship_metadata={} unique_edges={} duplicate_edges={} duplicate_policy={:?} edge_types={} epoch={} elapsed_ms={}",
         source_prefix,
         source.graph,
         config.cell_id,
@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
         imported_vertices,
         imported_edges,
         imported_relationships,
-        imported_edge_metadata,
+        imported_relationship_metadata,
         imported_edges,
         imported_relationships.saturating_sub(imported_edges),
         config.duplicate_policy,
@@ -338,7 +338,7 @@ struct ParsedEdgeLine {
 struct EdgeImportTotals {
     imported_edges: u64,
     imported_relationships: u64,
-    imported_edge_metadata: usize,
+    imported_relationship_metadata: usize,
     type_counts: BTreeMap<String, usize>,
 }
 
@@ -659,8 +659,8 @@ async fn flush_edge_type_state(
         .await?;
     totals.imported_edges += result.structural_edges_inserted;
     totals.imported_relationships += result.relationships_inserted;
-    totals.imported_edge_metadata = totals
-        .imported_edge_metadata
+    totals.imported_relationship_metadata = totals
+        .imported_relationship_metadata
         .saturating_add(usize::try_from(result.relationships_inserted).unwrap_or(usize::MAX));
     state.records.clear();
     state.chunk_idx += 1;
