@@ -21,7 +21,7 @@ pub(crate) use core::cache::{BoundedGraphCache, PostingChunkCacheKey, SupernodeC
 #[cfg(feature = "opencypher")]
 pub(crate) use core::cache::{
     RelationshipPropertyRowsCacheKey, RelationshipRowsCacheEntry, RelationshipRowsCacheKey,
-    RelationshipRowsCacheValue,
+    RelationshipRowsCacheValue, SourceRelationshipRowsCacheKey,
 };
 pub(crate) use core::config::open_graph_db;
 pub use core::config::{

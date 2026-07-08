@@ -410,6 +410,14 @@ impl GraphShard {
             return Ok(result);
         }
         if let Some(result) = self
+            .try_execute_source_relationship_id_rows_query(
+                cell_id, read_epoch, &query, window, budget,
+            )
+            .await?
+        {
+            return Ok(result);
+        }
+        if let Some(result) = self
             .try_execute_relationship_count_query(cell_id, read_epoch, &query, window, budget)
             .await?
         {
@@ -607,6 +615,42 @@ impl GraphShard {
                 "cypher_relationship_rows_fast_path",
                 projected.len(),
             )?;
+        }
+        Ok(Some(self.finish_projected_rows(
+            query.columns.clone(),
+            projected,
+            &query.order_by,
+            window,
+            budget,
+        )?))
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn try_execute_source_relationship_id_rows_query(
+        &self,
+        cell_id: &str,
+        read_epoch: GraphEpoch,
+        query: &ParsedRowQuery,
+        window: QueryWindow,
+        budget: &QueryBudget,
+    ) -> Result<Option<QueryResultSet>> {
+        let Some(edge) = source_relationship_id_rows_query_edge(query) else {
+            return Ok(None);
+        };
+        let Some(src) = edge.src.id else {
+            return Ok(None);
+        };
+
+        let mut bindings = self
+            .source_relationship_id_bindings_at(cell_id, edge, src, read_epoch, budget)
+            .await?;
+        self.ensure_query_intermediate_rows("cypher_source_relationship_id_rows", bindings.len())?;
+        let mut projected = Vec::with_capacity(bindings.len());
+        for binding in bindings.drain(..) {
+            budget.check("cypher_source_relationship_id_project")?;
+            let row = project_binding_row(&binding, &query.projections)?;
+            let sort_keys = sort_keys_for_row(&binding, &row, &query.columns, &query.order_by)?;
+            projected.push(ProjectedQueryRow { row, sort_keys });
         }
         Ok(Some(self.finish_projected_rows(
             query.columns.clone(),
@@ -2946,6 +2990,94 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
+    async fn source_relationship_id_bindings_at(
+        &self,
+        cell_id: &str,
+        edge: &RowEdgePattern,
+        src: VertexId,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<BindingRow>> {
+        let cache_key =
+            SourceRelationshipRowsCacheKey::new(cell_id, &edge.edge_type, src, read_epoch);
+        if let Some(cached) = self
+            .source_relationship_rows_cache
+            .lock()
+            .await
+            .get(&cache_key)
+        {
+            self.cache_metrics
+                .record_hit(GraphCacheKind::RelationshipRows);
+            return source_relationship_id_bindings_from_dsts(
+                edge,
+                src,
+                cached.as_slice(),
+                self,
+                budget,
+            );
+        }
+        self.cache_metrics
+            .record_miss(GraphCacheKind::RelationshipRows);
+
+        let tombstones = self
+            .relationship_tombstone_epochs_for_source_at(
+                cell_id,
+                &edge.edge_type,
+                src,
+                read_epoch,
+                budget,
+            )
+            .await?;
+        let prefix = keys::relationship_source_prefix(cell_id, &edge.edge_type, src);
+        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        let mut dsts = Vec::new();
+        let mut relationship_dsts = BTreeSet::new();
+        while let Some(kv) = iter.next().await? {
+            budget.check("cypher_source_relationship_records")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let record = decode_relationship_record(&key, &kv.value)?;
+            if record.epoch > read_epoch {
+                continue;
+            }
+            relationship_dsts.insert(record.dst);
+            if tombstones
+                .get(&(record.dst, record.relationship_id))
+                .is_some_and(|tombstone_epoch| {
+                    relationship_tombstone_hides_record(&record, *tombstone_epoch, read_epoch)
+                })
+            {
+                continue;
+            }
+            dsts.push(record.dst);
+            self.ensure_query_intermediate_rows("cypher_source_relationship_records", dsts.len())?;
+        }
+
+        let structural_neighbors = self
+            .out_neighbors_at_for_query(cell_id, &edge.edge_type, src, read_epoch, budget)
+            .await?;
+        for dst in structural_neighbors {
+            budget.check("cypher_source_relationship_structural_fallback")?;
+            if relationship_dsts.contains(&dst) {
+                continue;
+            }
+            dsts.push(dst);
+            self.ensure_query_intermediate_rows(
+                "cypher_source_relationship_structural_fallback",
+                dsts.len(),
+            )?;
+        }
+        let cached = Arc::new(dsts);
+        self.source_relationship_rows_cache.lock().await.insert(
+            cache_key,
+            Arc::clone(&cached),
+            cell_id.to_string(),
+            false,
+            &self.cache_metrics,
+        );
+        source_relationship_id_bindings_from_dsts(edge, src, cached.as_slice(), self, budget)
+    }
+
+    #[cfg(feature = "opencypher")]
     async fn relationship_tombstone_epochs_for_edge_at(
         &self,
         cell_id: &str,
@@ -2967,6 +3099,34 @@ impl GraphShard {
                 tombstones.insert(relationship_id, tombstone_epoch);
             }
             self.ensure_query_index_candidates("cypher_relationship_tombstones", tombstones.len())?;
+        }
+        Ok(tombstones)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn relationship_tombstone_epochs_for_source_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<BTreeMap<(VertexId, RelationshipId), GraphEpoch>> {
+        let mut tombstones = BTreeMap::new();
+        let prefix = keys::relationship_tombstone_source_prefix(cell_id, edge_type, src);
+        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        while let Some(kv) = iter.next().await? {
+            budget.check("cypher_source_relationship_tombstones")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (dst, relationship_id) = parse_relationship_tombstone_source_key(&key)?;
+            let epoch = decode_u64(&key, &kv.value)?;
+            if epoch <= read_epoch {
+                tombstones.insert((dst, relationship_id), epoch);
+            }
+            self.ensure_query_index_candidates(
+                "cypher_source_relationship_tombstones",
+                tombstones.len(),
+            )?;
         }
         Ok(tombstones)
     }
@@ -5531,6 +5691,109 @@ fn relationship_count_query_edge(query: &ParsedRowQuery) -> Option<&RowEdgePatte
 }
 
 #[cfg(feature = "opencypher")]
+fn source_relationship_id_rows_query_edge(query: &ParsedRowQuery) -> Option<&RowEdgePattern> {
+    if !query.union_arms.is_empty()
+        || query.predicate.is_some()
+        || row_projections_have_aggregates(&query.projections)
+    {
+        return None;
+    }
+    let patterns = graph_kernel_query_patterns(query)?;
+    let [pattern] = patterns else {
+        return None;
+    };
+    let RowPattern::Edge(edge) = pattern else {
+        return None;
+    };
+    if edge.hop_range.is_some()
+        || edge.src.id.is_none()
+        || edge.dst.id.is_some()
+        || edge.binding.is_some()
+        || !edge.properties.is_empty()
+        || !graph_kernel_node_pattern(&edge.src)
+        || !graph_kernel_node_pattern(&edge.dst)
+        || !source_relationship_id_projection_supported(edge, &query.projections)
+        || !source_relationship_id_order_supported(
+            edge,
+            &query.projections,
+            &query.columns,
+            &query.order_by,
+        )
+    {
+        return None;
+    }
+    Some(edge)
+}
+
+#[cfg(feature = "opencypher")]
+fn source_relationship_id_projection_supported(
+    edge: &RowEdgePattern,
+    projections: &[RowProjection],
+) -> bool {
+    !projections.is_empty()
+        && projections.iter().all(|projection| match projection {
+            RowProjection::NodeId { binding } => {
+                edge.src.binding.as_deref() == Some(binding.as_str())
+                    || edge.dst.binding.as_deref() == Some(binding.as_str())
+            }
+            RowProjection::Property { .. }
+            | RowProjection::CountAll
+            | RowProjection::Aggregate { .. } => false,
+        })
+}
+
+#[cfg(feature = "opencypher")]
+fn source_relationship_id_order_supported(
+    edge: &RowEdgePattern,
+    projections: &[RowProjection],
+    columns: &[QueryColumn],
+    order_by: &[RowSort],
+) -> bool {
+    order_by.iter().all(|sort| match &sort.expression {
+        RowSortExpression::NodeId { binding } => {
+            edge.src.binding.as_deref() == Some(binding.as_str())
+                || edge.dst.binding.as_deref() == Some(binding.as_str())
+        }
+        RowSortExpression::Column { name } => columns
+            .iter()
+            .position(|column| column.name == *name)
+            .and_then(|idx| projections.get(idx))
+            .is_some_and(|projection| match projection {
+                RowProjection::NodeId { binding } => {
+                    edge.src.binding.as_deref() == Some(binding.as_str())
+                        || edge.dst.binding.as_deref() == Some(binding.as_str())
+                }
+                RowProjection::Property { .. }
+                | RowProjection::CountAll
+                | RowProjection::Aggregate { .. } => false,
+            }),
+        RowSortExpression::Property { .. } | RowSortExpression::CountAll => false,
+    })
+}
+
+#[cfg(feature = "opencypher")]
+fn source_relationship_id_bindings_from_dsts(
+    edge: &RowEdgePattern,
+    src: VertexId,
+    dsts: &[VertexId],
+    shard: &GraphShard,
+    budget: &QueryBudget,
+) -> Result<Vec<BindingRow>> {
+    let mut rows = Vec::with_capacity(dsts.len());
+    for dst in dsts {
+        budget.check("cypher_source_relationship_id_cached_rows")?;
+        if let Some(row) = BindingRow::from_edge(edge, src, *dst) {
+            rows.push(row);
+            shard.ensure_query_intermediate_rows(
+                "cypher_source_relationship_id_cached_rows",
+                rows.len(),
+            )?;
+        }
+    }
+    Ok(rows)
+}
+
+#[cfg(feature = "opencypher")]
 fn relationship_rows_query_edge(query: &ParsedRowQuery) -> Option<&RowEdgePattern> {
     if !query.union_arms.is_empty()
         || query.predicate.is_some()
@@ -5985,6 +6248,21 @@ fn parse_relationship_tombstone_edge_key(key: &str) -> Result<RelationshipId> {
         ["cell", _cell_id, "rel_tomb", _edge_type, _src, _dst, relationship_id] => {
             parse_u64(key, relationship_id, "relationship_id")
         }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected relationship tombstone key".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn parse_relationship_tombstone_source_key(key: &str) -> Result<(VertexId, RelationshipId)> {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        ["cell", _cell_id, "rel_tomb", _edge_type, _src, dst, relationship_id] => Ok((
+            parse_u64(key, dst, "dst")?,
+            parse_u64(key, relationship_id, "relationship_id")?,
+        )),
         _ => Err(GraphError::CorruptValue {
             key: key.to_string(),
             reason: "expected relationship tombstone key".to_string(),

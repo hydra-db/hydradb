@@ -200,6 +200,24 @@ cargo run --features opencypher --example cypher_query -- \
   --query "MATCH (u)-[r:RELATES]->(v) RETURN count(*) AS total"
 ```
 
+Benchmark the same imported S3 data across cold, warm, and hot cache paths:
+
+```bash
+cargo run --features opencypher --example falkor_query_bench -- \
+  --db-path __slatedb_graph_kernel/imports/gjnh5kebnw/7gezp2vebo \
+  --cell-id 7gezp2vebo \
+  --query "MATCH (u {id: 11})-[r:RELATES]->(v {id: 10}) RETURN r.raw_relation AS raw" \
+  --cache-dir target/slatedb-graph-s3-cache \
+  --cold-iters 3 \
+  --warm-iters 3 \
+  --hot-iters 50
+```
+
+The benchmark opens a fresh reader without disk cache for `cold`, reopens with a
+seeded SlateDB disk cache for `warm`, and reuses one open reader for `hot` so
+graph-layer memory caches are active. Set `--cold-iters 0`, `--warm-iters 0`,
+or `--hot-iters 0` to skip a cache phase during focused investigations.
+
 ## Write And Read APIs
 
 The main embedding type is `GraphShard`. It can be opened as a read shard, a

@@ -215,6 +215,11 @@ impl GraphShard {
                 tenant_quota,
             )),
             #[cfg(feature = "opencypher")]
+            source_relationship_rows_cache: Mutex::new(BoundedGraphCache::new(
+                cache_policy.max_relationship_row_sets,
+                tenant_quota,
+            )),
+            #[cfg(feature = "opencypher")]
             relationship_property_rows_cache: Mutex::new(BoundedGraphCache::new(
                 cache_policy.max_relationship_property_row_sets,
                 tenant_quota,
@@ -392,7 +397,8 @@ impl GraphShard {
             #[cfg(feature = "opencypher")]
             reachability_results: self.reachability_cache.lock().await.len(),
             #[cfg(feature = "opencypher")]
-            relationship_row_sets: self.relationship_rows_cache.lock().await.len(),
+            relationship_row_sets: self.relationship_rows_cache.lock().await.len()
+                + self.source_relationship_rows_cache.lock().await.len(),
             #[cfg(feature = "opencypher")]
             relationship_property_row_sets: self
                 .relationship_property_rows_cache
