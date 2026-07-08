@@ -2773,6 +2773,20 @@ impl GraphShard {
                 .await;
         };
         budget.check("cypher_relationship_record")?;
+        let key = keys::relationship(
+            cell_id,
+            &relationship.edge_type,
+            relationship.src,
+            relationship.dst,
+            relationship_id,
+        );
+        let Some(value) = self.read_remote(&key).await? else {
+            return Ok(EdgeMetadata::default());
+        };
+        let record = decode_relationship_record(&key, &value)?;
+        if record.epoch > read_epoch {
+            return Ok(EdgeMetadata::default());
+        }
         let tombstone_key = keys::relationship_tombstone(
             cell_id,
             &relationship.edge_type,
@@ -2782,7 +2796,7 @@ impl GraphShard {
         );
         if let Some(value) = self.read_remote(&tombstone_key).await? {
             let tombstone_epoch = decode_u64(&tombstone_key, &value)?;
-            if tombstone_epoch <= read_epoch {
+            if relationship_tombstone_hides_record(&record, tombstone_epoch, read_epoch) {
                 return Ok(EdgeMetadata::default());
             }
         }
@@ -2807,24 +2821,7 @@ impl GraphShard {
         if let Some(metadata) = latest {
             return Ok(metadata);
         }
-        let key = keys::relationship(
-            cell_id,
-            &relationship.edge_type,
-            relationship.src,
-            relationship.dst,
-            relationship_id,
-        );
-        match self.read_remote(&key).await? {
-            Some(value) => {
-                let record = decode_relationship_record(&key, &value)?;
-                if record.epoch <= read_epoch {
-                    Ok(record.metadata)
-                } else {
-                    Ok(EdgeMetadata::default())
-                }
-            }
-            None => Ok(EdgeMetadata::default()),
-        }
+        Ok(record.metadata)
     }
 
     #[cfg(feature = "opencypher")]
@@ -2870,7 +2867,7 @@ impl GraphShard {
         let mut rows = Vec::new();
         let mut saw_relationship_record = false;
         let tombstones = self
-            .relationship_tombstone_ids_for_edge_at(
+            .relationship_tombstone_epochs_for_edge_at(
                 cell_id, edge_type, src, dst, read_epoch, budget,
             )
             .await?;
@@ -2884,7 +2881,12 @@ impl GraphShard {
             if record.epoch > read_epoch {
                 continue;
             }
-            if tombstones.contains(&record.relationship_id) {
+            if tombstones
+                .get(&record.relationship_id)
+                .map_or(false, |tombstone_epoch| {
+                    relationship_tombstone_hides_record(&record, *tombstone_epoch, read_epoch)
+                })
+            {
                 continue;
             }
             let relationship = BoundRelationship {
@@ -2944,7 +2946,7 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    async fn relationship_tombstone_ids_for_edge_at(
+    async fn relationship_tombstone_epochs_for_edge_at(
         &self,
         cell_id: &str,
         edge_type: &str,
@@ -2952,8 +2954,8 @@ impl GraphShard {
         dst: VertexId,
         read_epoch: GraphEpoch,
         budget: &QueryBudget,
-    ) -> Result<BTreeSet<RelationshipId>> {
-        let mut tombstones = BTreeSet::new();
+    ) -> Result<BTreeMap<RelationshipId, GraphEpoch>> {
+        let mut tombstones = BTreeMap::new();
         let prefix = keys::relationship_tombstone_edge_prefix(cell_id, edge_type, src, dst);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
         while let Some(kv) = iter.next().await? {
@@ -2962,7 +2964,7 @@ impl GraphShard {
             let relationship_id = parse_relationship_tombstone_edge_key(&key)?;
             let tombstone_epoch = decode_u64(&key, &kv.value)?;
             if tombstone_epoch <= read_epoch {
-                tombstones.insert(relationship_id);
+                tombstones.insert(relationship_id, tombstone_epoch);
             }
             self.ensure_query_index_candidates("cypher_relationship_tombstones", tombstones.len())?;
         }
@@ -3001,7 +3003,7 @@ impl GraphShard {
             return Ok(Vec::new());
         }
         let tombstones = self
-            .relationship_tombstone_ids_for_edge_at(
+            .relationship_tombstone_epochs_for_edge_at(
                 cell_id, edge_type, src, dst, read_epoch, budget,
             )
             .await?;
@@ -3119,21 +3121,30 @@ impl GraphShard {
         let mut rows = Vec::with_capacity(relationship_ids.len());
         for relationship_id in relationship_ids {
             budget.check("cypher_relationship_property_edge_candidates")?;
-            if tombstones.contains(&relationship_id) {
-                continue;
-            }
             let relationship = BoundRelationship {
                 edge_type: edge_type.to_string(),
                 src,
                 dst,
                 relationship_id: Some(relationship_id),
             };
+            let key = keys::relationship(cell_id, edge_type, src, dst, relationship_id);
+            let Some(value) = self.read_remote(&key).await? else {
+                continue;
+            };
+            let record = decode_relationship_record(&key, &value)?;
+            if record.epoch > read_epoch {
+                continue;
+            }
+            if tombstones
+                .get(&relationship_id)
+                .map_or(false, |tombstone_epoch| {
+                    relationship_tombstone_hides_record(&record, *tombstone_epoch, read_epoch)
+                })
+            {
+                continue;
+            }
             let metadata = if latest_snapshot {
-                let key = keys::relationship(cell_id, edge_type, src, dst, relationship_id);
-                match self.read_remote(&key).await? {
-                    Some(value) => decode_relationship_record(&key, &value)?.metadata,
-                    None => continue,
-                }
+                record.metadata
             } else {
                 self.relationship_metadata_at(cell_id, &relationship, read_epoch, budget)
                     .await?
@@ -3221,7 +3232,7 @@ impl GraphShard {
             );
             if let Some(value) = self.read_remote(&tombstone_key).await? {
                 let tombstone_epoch = decode_u64(&tombstone_key, &value)?;
-                if tombstone_epoch <= read_epoch {
+                if relationship_tombstone_hides_record(&record, tombstone_epoch, read_epoch) {
                     continue;
                 }
             }
@@ -5982,6 +5993,15 @@ fn parse_relationship_tombstone_edge_key(key: &str) -> Result<RelationshipId> {
 }
 
 #[cfg(feature = "opencypher")]
+fn relationship_tombstone_hides_record(
+    record: &RelationshipRecord,
+    tombstone_epoch: GraphEpoch,
+    read_epoch: GraphEpoch,
+) -> bool {
+    record.epoch <= tombstone_epoch && tombstone_epoch <= read_epoch
+}
+
+#[cfg(feature = "opencypher")]
 fn parse_relationship_property_index_delta_key(
     key: &str,
 ) -> Result<(GraphEpoch, VertexId, VertexId, RelationshipId)> {
@@ -6044,7 +6064,7 @@ struct EncodedRelationshipPropertyLookup<'a> {
     encoded: &'a str,
     read_epoch: GraphEpoch,
     latest_snapshot: bool,
-    tombstones: &'a BTreeSet<RelationshipId>,
+    tombstones: &'a BTreeMap<RelationshipId, GraphEpoch>,
     budget: &'a QueryBudget,
 }
 
