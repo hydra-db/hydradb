@@ -136,8 +136,10 @@ The object store is the durable graph store. For local development use
 The MinIO scripts generate env files containing values such as:
 
 ```text
+CLOUD_PROVIDER=aws
 AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=us-east-1
 AWS_DEFAULT_REGION=us-east-1
 AWS_ENDPOINT=http://127.0.0.1:19000
 AWS_BUCKET=...
@@ -153,6 +155,50 @@ Caching is two-layer:
   matrix artifacts, matrix adjacencies, compiled GraphBLAS matrices, parsed
   row queries, reachability results, supernode groups, posting chunks, and
   hydration concurrency.
+
+## Falkor S3 Import
+
+Falkor JSONL exports can be imported directly from the same object store used by
+the graph kernel. The importer accepts manifests with either a legacy `graph`
+field or the Falkor export identity fields `org_id` plus `tenant_id`.
+
+Expected source prefix layout:
+
+```text
+<source-prefix>/manifest.json
+<source-prefix>/nodes.jsonl
+<source-prefix>/edges.jsonl
+```
+
+Run an S3 import by pointing `object_store_from_env` at the destination bucket
+and passing the export object prefix:
+
+```bash
+export CLOUD_PROVIDER=aws
+export AWS_BUCKET=graph-benchmark
+export AWS_REGION=us-east-1
+export AWS_DEFAULT_REGION=us-east-1
+
+cargo run --features json-properties --example falkor_import -- \
+  --source-prefix 2026-07-08/gjnh5kebnw/7gezp2vebo \
+  --db-path __slatedb_graph_kernel/imports/gjnh5kebnw/7gezp2vebo \
+  --cell-id 7gezp2vebo \
+  --duplicate-policy preserve \
+  --build-artifacts
+```
+
+`preserve` is the only supported duplicate policy because Falkor exports can be
+multigraphs. Relationship ids from Falkor are stored as graph relationship ids,
+and non-integral JSON numbers such as timestamps are stored as float properties.
+
+After import, reopen the graph from S3 and run a row query:
+
+```bash
+cargo run --features opencypher --example cypher_query -- \
+  --db-path __slatedb_graph_kernel/imports/gjnh5kebnw/7gezp2vebo \
+  --cell-id 7gezp2vebo \
+  --query "MATCH (u)-[r:RELATES]->(v) RETURN count(*) AS total"
+```
 
 ## Write And Read APIs
 
