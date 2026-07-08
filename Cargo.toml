@@ -47,6 +47,11 @@ name = "falkor_import"
 path = "examples/falkor_import.rs"
 required-features = ["json-properties"]
 
+[[example]]
+name = "cypher_query"
+path = "examples/cypher_query.rs"
+required-features = ["opencypher"]
+
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
