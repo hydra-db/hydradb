@@ -573,18 +573,6 @@ async fn import_edges_object(
     source_graph: &str,
     summary: &ParsedEdges,
 ) -> Result<EdgeImportTotals> {
-    if config.duplicate_policy == DuplicatePolicy::CollapseLast {
-        return import_collapse_last_edges_object(
-            object_store,
-            key,
-            shard,
-            config,
-            source_graph,
-            summary,
-        )
-        .await;
-    }
-
     let path = Path::from(key.to_string());
     let raw = object_store.get(&path).await?;
     let mut stream = raw.into_stream();
@@ -638,52 +626,6 @@ async fn import_edges_object(
         .await?;
     }
 
-    for (edge_type, mut state) in states {
-        flush_edge_type_state(
-            shard,
-            config,
-            source_graph,
-            &edge_type,
-            &mut state,
-            &mut totals,
-        )
-        .await?;
-    }
-    Ok(totals)
-}
-
-async fn import_collapse_last_edges_object(
-    object_store: Arc<dyn ObjectStore>,
-    key: &str,
-    shard: &GraphShard,
-    config: &ImportConfig,
-    source_graph: &str,
-    summary: &ParsedEdges,
-) -> Result<EdgeImportTotals> {
-    let mut last_by_identity = BTreeMap::<EdgeIdentity, ParsedEdge>::new();
-    stream_jsonl_lines(object_store, key, |line_no, line| {
-        let parsed = parse_edge_line(key, line_no, line)?;
-        last_by_identity.insert(edge_identity(&parsed.edge_type, &parsed.edge), parsed.edge);
-        Ok(())
-    })
-    .await?;
-
-    let mut states = BTreeMap::<String, EdgeTypeWriteState>::new();
-    let mut totals = EdgeImportTotals::default();
-    for (identity, edge) in last_by_identity {
-        let edge_type = identity.0.clone();
-        let edge = edge_with_parallel_count(edge, &identity, summary, config.duplicate_policy);
-        push_edge_for_import(
-            shard,
-            config,
-            source_graph,
-            &mut states,
-            &mut totals,
-            edge_type,
-            edge,
-        )
-        .await?;
-    }
     for (edge_type, mut state) in states {
         flush_edge_type_state(
             shard,
@@ -795,11 +737,8 @@ async fn flush_edge_type_state(
         totals.imported_edges += result.structural_edges_inserted;
         totals.imported_relationships += result.relationships_inserted;
     } else {
-        let structural_edges: Vec<_> = state
-            .records
-            .iter()
-            .map(|edge| (edge.src, edge.dst))
-            .collect();
+        let records = simple_graph_records_for_flush(&state.records, config.duplicate_policy);
+        let structural_edges: Vec<_> = records.iter().map(|edge| (edge.src, edge.dst)).collect();
         let result = shard
             .bulk_import_edges_chunked(
                 &config.cell_id,
@@ -818,8 +757,7 @@ async fn flush_edge_type_state(
             .set_edge_metadata_batch(
                 &config.cell_id,
                 edge_type,
-                state
-                    .records
+                records
                     .iter()
                     .map(|edge| (edge.src, edge.dst, edge.metadata.clone())),
             )
@@ -828,6 +766,29 @@ async fn flush_edge_type_state(
     state.records.clear();
     state.chunk_idx += 1;
     Ok(())
+}
+
+fn simple_graph_records_for_flush(
+    records: &[ParsedEdge],
+    duplicate_policy: DuplicatePolicy,
+) -> Vec<ParsedEdge> {
+    if duplicate_policy == DuplicatePolicy::Preserve {
+        return records.to_vec();
+    }
+    let mut by_edge = BTreeMap::<(VertexId, VertexId), ParsedEdge>::new();
+    for edge in records {
+        let key = (edge.src, edge.dst);
+        match duplicate_policy {
+            DuplicatePolicy::CollapseLast => {
+                by_edge.insert(key, edge.clone());
+            }
+            DuplicatePolicy::Reject | DuplicatePolicy::CollapseFirst => {
+                by_edge.entry(key).or_insert_with(|| edge.clone());
+            }
+            DuplicatePolicy::Preserve => unreachable!("preserve mode is returned above"),
+        }
+    }
+    by_edge.into_values().collect()
 }
 
 fn parse_edge_line(key: &str, line_no: usize, line: &str) -> Result<ParsedEdgeLine> {
