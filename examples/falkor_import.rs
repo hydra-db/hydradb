@@ -25,7 +25,6 @@ async fn main() -> Result<()> {
 
     let manifest = read_object_text(Arc::clone(&object_store), &manifest_key).await?;
     let source = parse_manifest(&manifest, &manifest_key)?;
-    let nodes = parse_nodes_object(Arc::clone(&object_store), &nodes_key).await?;
     let edges = scan_edges_object(
         Arc::clone(&object_store),
         &edges_key,
@@ -55,7 +54,10 @@ async fn main() -> Result<()> {
                 .max(1),
             max_artifact_build_edges: edges.unique_edges.max(1) as u64,
             max_query_scan_edges: edges.unique_edges.max(1) as u64,
-            max_query_index_candidates: nodes.len().max(edges.unique_edges).max(1),
+            max_query_index_candidates: usize::try_from(source.node_count)
+                .unwrap_or(usize::MAX)
+                .max(edges.unique_edges)
+                .max(1),
             ..GraphLimits::default()
         },
         cache,
@@ -69,12 +71,8 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let mut imported_vertices = 0_usize;
-    for chunk in nodes.chunks(config.metadata_batch_size) {
-        imported_vertices += shard
-            .set_vertex_metadata_batch(&config.cell_id, chunk.iter().cloned())
-            .await?;
-    }
+    let imported_vertices =
+        import_nodes_object(Arc::clone(&object_store), &nodes_key, &shard, &config).await?;
 
     let mut imported_edges = 0_u64;
     let mut imported_relationships = 0_u64;
@@ -391,55 +389,138 @@ fn parse_manifest(text: &str, key: &str) -> Result<Manifest> {
     })
 }
 
-async fn parse_nodes_object(
+async fn import_nodes_object(
     object_store: Arc<dyn ObjectStore>,
     key: &str,
-) -> Result<Vec<(VertexId, VertexMetadata)>> {
-    let mut nodes = Vec::new();
+    shard: &GraphShard,
+    config: &ImportConfig,
+) -> Result<usize> {
+    let path = Path::from(key.to_string());
+    let raw = object_store.get(&path).await?;
+    let mut stream = raw.into_stream();
+    let mut buffer = Vec::new();
+    let mut line_no = 0_usize;
     let mut seen = BTreeSet::new();
-    stream_jsonl_lines(object_store, key, |line_no, line| {
-        let line_key = format!("{key}:{line_no}");
-        let value: serde_json::Value =
-            serde_json::from_str(line).map_err(|err| GraphError::CorruptValue {
-                key: line_key.clone(),
-                reason: format!("invalid node JSON: {err}"),
-            })?;
-        let id = json_u64(&value, "id", &line_key)?;
-        if !seen.insert(id) {
-            return Err(GraphError::CorruptValue {
-                key: line_key,
-                reason: format!("duplicate node id {id}"),
-            });
+    let mut batch = Vec::new();
+    let mut imported = 0_usize;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        buffer.extend_from_slice(&chunk);
+        while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line = buffer.drain(..=newline).collect::<Vec<_>>();
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            line_no += 1;
+            import_node_line(
+                key,
+                line_no,
+                &line,
+                shard,
+                config,
+                &mut seen,
+                &mut batch,
+                &mut imported,
+            )
+            .await?;
         }
-        let mut metadata = VertexMetadata::default();
-        let labels = value
-            .get("labels")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| GraphError::CorruptValue {
-                key: line_key.clone(),
-                reason: "node labels must be an array".to_string(),
-            })?;
-        for label in labels {
-            metadata.labels.insert(
-                label
-                    .as_str()
-                    .ok_or_else(|| GraphError::CorruptValue {
-                        key: line_key.clone(),
-                        reason: "node label must be a string".to_string(),
-                    })?
-                    .to_string(),
-            );
-        }
-        metadata.properties = parse_properties(value.get("properties"), &line_key)?;
-        metadata
-            .properties
-            .entry("_fid".to_string())
-            .or_insert(VertexPropertyValue::Integer(id));
-        nodes.push((id, metadata));
-        Ok(())
-    })
-    .await?;
-    Ok(nodes)
+    }
+    if !buffer.is_empty() {
+        line_no += 1;
+        import_node_line(
+            key,
+            line_no,
+            &buffer,
+            shard,
+            config,
+            &mut seen,
+            &mut batch,
+            &mut imported,
+        )
+        .await?;
+    }
+    imported += flush_node_batch(shard, config, &mut batch).await?;
+    Ok(imported)
+}
+
+async fn import_node_line(
+    key: &str,
+    line_no: usize,
+    line: &[u8],
+    shard: &GraphShard,
+    config: &ImportConfig,
+    seen: &mut BTreeSet<VertexId>,
+    batch: &mut Vec<(VertexId, VertexMetadata)>,
+    imported: &mut usize,
+) -> Result<()> {
+    let Some(line) = decode_jsonl_line(key, line_no, line)? else {
+        return Ok(());
+    };
+    let (id, metadata) = parse_node_line(key, line_no, line)?;
+    if !seen.insert(id) {
+        return Err(GraphError::CorruptValue {
+            key: format!("{key}:{line_no}"),
+            reason: format!("duplicate node id {id}"),
+        });
+    }
+    batch.push((id, metadata));
+    if batch.len() >= config.metadata_batch_size {
+        *imported += flush_node_batch(shard, config, batch).await?;
+    }
+    Ok(())
+}
+
+async fn flush_node_batch(
+    shard: &GraphShard,
+    config: &ImportConfig,
+    batch: &mut Vec<(VertexId, VertexMetadata)>,
+) -> Result<usize> {
+    if batch.is_empty() {
+        return Ok(0);
+    }
+    let updates = std::mem::take(batch);
+    shard
+        .set_vertex_metadata_batch(&config.cell_id, updates)
+        .await
+}
+
+fn parse_node_line(key: &str, line_no: usize, line: &str) -> Result<(VertexId, VertexMetadata)> {
+    let line_key = format!("{key}:{line_no}");
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|err| GraphError::CorruptValue {
+            key: line_key.clone(),
+            reason: format!("invalid node JSON: {err}"),
+        })?;
+    let id = json_u64(&value, "id", &line_key)?;
+    let mut metadata = VertexMetadata::default();
+    let labels = value
+        .get("labels")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| GraphError::CorruptValue {
+            key: line_key.clone(),
+            reason: "node labels must be an array".to_string(),
+        })?;
+    for label in labels {
+        metadata.labels.insert(
+            label
+                .as_str()
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: line_key.clone(),
+                    reason: "node label must be a string".to_string(),
+                })?
+                .to_string(),
+        );
+    }
+    metadata.properties = parse_properties(value.get("properties"), &line_key)?;
+    metadata
+        .properties
+        .entry("_fid".to_string())
+        .or_insert(VertexPropertyValue::Integer(id));
+    Ok((id, metadata))
 }
 
 async fn scan_edges_object(
