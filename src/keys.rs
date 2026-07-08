@@ -121,6 +121,11 @@ pub fn relationship_edge_prefix(
     format!("cell/{cell_id}/rel/{edge_type}/{src:020}/{dst:020}/")
 }
 
+#[cfg(feature = "opencypher")]
+pub fn relationship_source_prefix(cell_id: &str, edge_type: &str, src: VertexId) -> String {
+    format!("cell/{cell_id}/rel/{edge_type}/{src:020}/")
+}
+
 pub fn relationship_id(cell_id: &str, relationship_id: RelationshipId) -> String {
     format!("cell/{cell_id}/rel_id/{relationship_id:020}")
 }
@@ -171,6 +176,15 @@ pub fn relationship_tombstone_edge_prefix(
     dst: VertexId,
 ) -> String {
     format!("cell/{cell_id}/rel_tomb/{edge_type}/{src:020}/{dst:020}/")
+}
+
+#[cfg(feature = "opencypher")]
+pub fn relationship_tombstone_source_prefix(
+    cell_id: &str,
+    edge_type: &str,
+    src: VertexId,
+) -> String {
+    format!("cell/{cell_id}/rel_tomb/{edge_type}/{src:020}/")
 }
 
 pub fn edge_metadata_delta(

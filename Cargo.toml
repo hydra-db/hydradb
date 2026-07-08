@@ -52,6 +52,11 @@ name = "cypher_query"
 path = "examples/cypher_query.rs"
 required-features = ["opencypher"]
 
+[[example]]
+name = "falkor_query_bench"
+path = "examples/falkor_query_bench.rs"
+required-features = ["opencypher"]
+
 [dependencies]
 async-trait = "0.1"
 bytes = "1"

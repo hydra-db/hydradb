@@ -21,6 +21,7 @@ use crate::{
 use crate::{
     ParsedRowQueryCacheKey, ReachabilityCacheKey, ReachabilityCacheValue,
     RelationshipPropertyRowsCacheKey, RelationshipRowsCacheKey, RelationshipRowsCacheValue,
+    SourceRelationshipRowsCacheKey,
 };
 
 pub struct GraphShard {
@@ -54,6 +55,9 @@ pub struct GraphShard {
     #[cfg(feature = "opencypher")]
     pub(crate) relationship_rows_cache:
         Mutex<BoundedGraphCache<RelationshipRowsCacheKey, RelationshipRowsCacheValue>>,
+    #[cfg(feature = "opencypher")]
+    pub(crate) source_relationship_rows_cache:
+        Mutex<BoundedGraphCache<SourceRelationshipRowsCacheKey, Arc<Vec<VertexId>>>>,
     #[cfg(feature = "opencypher")]
     pub(crate) relationship_property_rows_cache:
         Mutex<BoundedGraphCache<RelationshipPropertyRowsCacheKey, RelationshipRowsCacheValue>>,
