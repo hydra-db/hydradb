@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
 
     let mut imported_edges = 0_u64;
     let mut imported_relationships = 0_u64;
-    let mut imported_edge_metadata = 0_usize;
+    let mut imported_relationship_metadata = 0_usize;
     let edge_import = import_edges_object(
         Arc::clone(&object_store),
         &edges_key,
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
     .await?;
     imported_edges += edge_import.imported_edges;
     imported_relationships += edge_import.imported_relationships;
-    imported_edge_metadata += edge_import.imported_edge_metadata;
+    imported_relationship_metadata += edge_import.imported_relationship_metadata;
 
     if config.build_artifacts {
         let epoch = shard.current_epoch(&config.cell_id).await?;
@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
     shard.close().await?;
 
     println!(
-        "falkor_import source={} graph={} cell={} db_path={} manifest_nodes={} manifest_edges={} imported_vertices={} imported_edges={} imported_relationships={} imported_edge_metadata={} unique_edges={} duplicate_edges={} duplicate_policy={:?} edge_types={} epoch={} elapsed_ms={}",
+        "falkor_import source={} graph={} cell={} db_path={} manifest_nodes={} manifest_edges={} imported_vertices={} imported_edges={} imported_relationships={} imported_relationship_metadata={} unique_edges={} duplicate_edges={} duplicate_policy={:?} edge_types={} epoch={} elapsed_ms={}",
         source_prefix,
         source.graph,
         config.cell_id,
@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
         imported_vertices,
         imported_edges,
         imported_relationships,
-        imported_edge_metadata,
+        imported_relationship_metadata,
         imported_edges,
         imported_relationships.saturating_sub(imported_edges),
         config.duplicate_policy,
@@ -338,8 +338,21 @@ struct ParsedEdgeLine {
 struct EdgeImportTotals {
     imported_edges: u64,
     imported_relationships: u64,
-    imported_edge_metadata: usize,
+    imported_relationship_metadata: usize,
     type_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Default, Debug)]
+struct NodeImportState {
+    seen: BTreeSet<VertexId>,
+    batch: Vec<(VertexId, VertexMetadata)>,
+    imported: usize,
+}
+
+#[derive(Default, Debug)]
+struct EdgeImportState {
+    states: BTreeMap<String, EdgeTypeWriteState>,
+    totals: EdgeImportTotals,
 }
 
 #[derive(Default, Debug)]
@@ -354,11 +367,31 @@ fn parse_manifest(text: &str, key: &str) -> Result<Manifest> {
             key: key.to_string(),
             reason: format!("invalid manifest JSON: {err}"),
         })?;
+    let graph = manifest_graph_name(&value, key)?;
     Ok(Manifest {
-        graph: json_string(&value, "graph", key)?.to_string(),
+        graph,
         node_count: json_u64(&value, "node_count", key)?,
         edge_count: json_u64(&value, "edge_count", key)?,
     })
+}
+
+fn manifest_graph_name(value: &serde_json::Value, key: &str) -> Result<String> {
+    if let Some(graph) = value.get("graph").and_then(serde_json::Value::as_str) {
+        if !graph.trim().is_empty() {
+            return Ok(graph.to_string());
+        }
+    }
+    let org_id = value.get("org_id").and_then(serde_json::Value::as_str);
+    let tenant_id = value.get("tenant_id").and_then(serde_json::Value::as_str);
+    match (org_id, tenant_id) {
+        (Some(org_id), Some(tenant_id)) if !org_id.is_empty() && !tenant_id.is_empty() => {
+            Ok(format!("{org_id}/{tenant_id}"))
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "manifest must include graph or org_id plus tenant_id".to_string(),
+        }),
+    }
 }
 
 async fn import_nodes_object(
@@ -372,9 +405,7 @@ async fn import_nodes_object(
     let mut stream = raw.into_stream();
     let mut buffer = Vec::new();
     let mut line_no = 0_usize;
-    let mut seen = BTreeSet::new();
-    let mut batch = Vec::new();
-    let mut imported = 0_usize;
+    let mut state = NodeImportState::default();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -388,35 +419,15 @@ async fn import_nodes_object(
                 line.pop();
             }
             line_no += 1;
-            import_node_line(
-                key,
-                line_no,
-                &line,
-                shard,
-                config,
-                &mut seen,
-                &mut batch,
-                &mut imported,
-            )
-            .await?;
+            import_node_line(key, line_no, &line, shard, config, &mut state).await?;
         }
     }
     if !buffer.is_empty() {
         line_no += 1;
-        import_node_line(
-            key,
-            line_no,
-            &buffer,
-            shard,
-            config,
-            &mut seen,
-            &mut batch,
-            &mut imported,
-        )
-        .await?;
+        import_node_line(key, line_no, &buffer, shard, config, &mut state).await?;
     }
-    imported += flush_node_batch(shard, config, &mut batch).await?;
-    Ok(imported)
+    state.imported += flush_node_batch(shard, config, &mut state.batch).await?;
+    Ok(state.imported)
 }
 
 async fn import_node_line(
@@ -425,23 +436,21 @@ async fn import_node_line(
     line: &[u8],
     shard: &GraphShard,
     config: &ImportConfig,
-    seen: &mut BTreeSet<VertexId>,
-    batch: &mut Vec<(VertexId, VertexMetadata)>,
-    imported: &mut usize,
+    state: &mut NodeImportState,
 ) -> Result<()> {
     let Some(line) = decode_jsonl_line(key, line_no, line)? else {
         return Ok(());
     };
     let (id, metadata) = parse_node_line(key, line_no, line)?;
-    if !seen.insert(id) {
+    if !state.seen.insert(id) {
         return Err(GraphError::CorruptValue {
             key: format!("{key}:{line_no}"),
             reason: format!("duplicate node id {id}"),
         });
     }
-    batch.push((id, metadata));
-    if batch.len() >= config.metadata_batch_size {
-        *imported += flush_node_batch(shard, config, batch).await?;
+    state.batch.push((id, metadata));
+    if state.batch.len() >= config.metadata_batch_size {
+        state.imported += flush_node_batch(shard, config, &mut state.batch).await?;
     }
     Ok(())
 }
@@ -507,8 +516,7 @@ async fn import_edges_object(
     let mut stream = raw.into_stream();
     let mut buffer = Vec::new();
     let mut line_no = 0_usize;
-    let mut states = BTreeMap::<String, EdgeTypeWriteState>::new();
-    let mut totals = EdgeImportTotals::default();
+    let mut state = EdgeImportState::default();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -522,17 +530,7 @@ async fn import_edges_object(
                 line.pop();
             }
             line_no += 1;
-            import_edge_line(
-                key,
-                line_no,
-                &line,
-                shard,
-                config,
-                source_graph,
-                &mut states,
-                &mut totals,
-            )
-            .await?;
+            import_edge_line(key, line_no, &line, shard, config, source_graph, &mut state).await?;
         }
     }
     if !buffer.is_empty() {
@@ -544,24 +542,23 @@ async fn import_edges_object(
             shard,
             config,
             source_graph,
-            &mut states,
-            &mut totals,
+            &mut state,
         )
         .await?;
     }
 
-    for (edge_type, mut state) in states {
+    for (edge_type, mut write_state) in std::mem::take(&mut state.states) {
         flush_edge_type_state(
             shard,
             config,
             source_graph,
             &edge_type,
-            &mut state,
-            &mut totals,
+            &mut write_state,
+            &mut state.totals,
         )
         .await?;
     }
-    Ok(totals)
+    Ok(state.totals)
 }
 
 async fn import_edge_line(
@@ -571,14 +568,14 @@ async fn import_edge_line(
     shard: &GraphShard,
     config: &ImportConfig,
     source_graph: &str,
-    states: &mut BTreeMap<String, EdgeTypeWriteState>,
-    totals: &mut EdgeImportTotals,
+    state: &mut EdgeImportState,
 ) -> Result<()> {
     let Some(line) = decode_jsonl_line(key, line_no, line)? else {
         return Ok(());
     };
     let parsed = parse_edge_line(key, line_no, line)?;
-    *totals
+    *state
+        .totals
         .type_counts
         .entry(parsed.edge_type.clone())
         .or_default() += 1;
@@ -586,8 +583,7 @@ async fn import_edge_line(
         shard,
         config,
         source_graph,
-        states,
-        totals,
+        state,
         parsed.edge_type,
         parsed.edge,
     )
@@ -598,25 +594,34 @@ async fn push_edge_for_import(
     shard: &GraphShard,
     config: &ImportConfig,
     source_graph: &str,
-    states: &mut BTreeMap<String, EdgeTypeWriteState>,
-    totals: &mut EdgeImportTotals,
+    state: &mut EdgeImportState,
     edge_type: String,
     edge: ParsedEdge,
 ) -> Result<()> {
     let should_flush = {
-        let state = states.entry(edge_type.clone()).or_default();
-        state.records.push(edge);
-        state.records.len() >= config.edge_batch_size
+        let write_state = state.states.entry(edge_type.clone()).or_default();
+        write_state.records.push(edge);
+        write_state.records.len() >= config.edge_batch_size
     };
     if should_flush {
-        let mut state = states
-            .remove(&edge_type)
-            .ok_or_else(|| GraphError::CorruptValue {
-                key: format!("falkor_import/{edge_type}"),
-                reason: "missing edge import state after flush trigger".to_string(),
-            })?;
-        flush_edge_type_state(shard, config, source_graph, &edge_type, &mut state, totals).await?;
-        states.insert(edge_type, state);
+        let mut write_state =
+            state
+                .states
+                .remove(&edge_type)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: format!("falkor_import/{edge_type}"),
+                    reason: "missing edge import state after flush trigger".to_string(),
+                })?;
+        flush_edge_type_state(
+            shard,
+            config,
+            source_graph,
+            &edge_type,
+            &mut write_state,
+            &mut state.totals,
+        )
+        .await?;
+        state.states.insert(edge_type, write_state);
     }
     Ok(())
 }
@@ -654,6 +659,9 @@ async fn flush_edge_type_state(
         .await?;
     totals.imported_edges += result.structural_edges_inserted;
     totals.imported_relationships += result.relationships_inserted;
+    totals.imported_relationship_metadata = totals
+        .imported_relationship_metadata
+        .saturating_add(usize::try_from(result.relationships_inserted).unwrap_or(usize::MAX));
     state.records.clear();
     state.chunk_idx += 1;
     Ok(())
@@ -813,6 +821,37 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_legacy_graph_manifest() {
+        let manifest = parse_manifest(
+            r#"{"graph":"demo","node_count":2,"edge_count":3}"#,
+            "manifest.json",
+        )
+        .unwrap();
+        assert_eq!(manifest.graph, "demo");
+        assert_eq!(manifest.node_count, 2);
+        assert_eq!(manifest.edge_count, 3);
+    }
+
+    #[test]
+    fn parses_falkor_org_tenant_manifest() {
+        let manifest = parse_manifest(
+            r#"{"org_id":"gjnh5kebnw","tenant_id":"7gezp2vebo","node_count":11,"edge_count":18,"format":"both","exported_at":"2026-07-08T05:36:32.526115+00:00"}"#,
+            "manifest.json",
+        )
+        .unwrap();
+        assert_eq!(manifest.graph, "gjnh5kebnw/7gezp2vebo");
+        assert_eq!(manifest.node_count, 11);
+        assert_eq!(manifest.edge_count, 18);
+    }
+
+    #[test]
+    fn rejects_manifest_without_graph_identity() {
+        let err =
+            parse_manifest(r#"{"node_count":11,"edge_count":18}"#, "manifest.json").unwrap_err();
+        assert!(err.to_string().contains("org_id plus tenant_id"));
+    }
 
     #[test]
     fn s3_source_prefix_requires_key_prefix() {
