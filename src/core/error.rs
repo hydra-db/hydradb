@@ -79,6 +79,11 @@ pub enum GraphError {
         operation: &'static str,
         cell_id: String,
     },
+    #[error("cell {cell_id} has been dropped; {operation} is rejected")]
+    CellDropped {
+        operation: &'static str,
+        cell_id: String,
+    },
     #[error(
         "snapshot epoch {read_epoch} for cell {cell_id} edge {edge_type} is below compacted watermark {min_epoch}"
     )]

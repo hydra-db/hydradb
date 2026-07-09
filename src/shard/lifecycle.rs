@@ -606,6 +606,18 @@ impl GraphShard {
         cell_id: &str,
         operation: &'static str,
     ) -> Result<()> {
+        if operation != "drop_cell" {
+            let drop_marker = keys::cell_drop_marker(cell_id);
+            let pending_drop_marker = keys::cell_drop_pending_marker(cell_id);
+            if read_txn_remote(txn, &drop_marker).await?.is_some()
+                || read_txn_remote(txn, &pending_drop_marker).await?.is_some()
+            {
+                return Err(GraphError::CellDropped {
+                    operation,
+                    cell_id: cell_id.to_string(),
+                });
+            }
+        }
         let Some(lease) = self.active_write_lease(cell_id, operation)? else {
             return Ok(());
         };

@@ -497,6 +497,81 @@ impl RoutedGraphCluster {
         shard.delete_edge(mutation).await
     }
 
+    pub async fn delete_edges_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        idempotency_key: &str,
+    ) -> Result<crate::EdgeDeleteBatchResult> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard
+            .delete_edges_batch(cell_id, edge_type, edges, idempotency_key)
+            .await
+    }
+
+    pub async fn delete_edges_batch_chunked(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        idempotency_key: &str,
+        chunk_size: usize,
+    ) -> Result<crate::EdgeDeleteBatchResult> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard
+            .delete_edges_batch_chunked(cell_id, edge_type, edges, idempotency_key, chunk_size)
+            .await
+    }
+
+    pub async fn delete_edge_mutations_batch(
+        &self,
+        cell_id: &str,
+        mutations: impl IntoIterator<Item = crate::EdgeMutation>,
+    ) -> Result<crate::EdgeDeleteBatchResult> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard.delete_edge_mutations_batch(cell_id, mutations).await
+    }
+
+    pub async fn delete_vertex(
+        &self,
+        cell_id: &str,
+        vertex_id: crate::VertexId,
+        idempotency_key: &str,
+    ) -> Result<crate::VertexDeleteResult> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard
+            .delete_vertex(cell_id, vertex_id, idempotency_key)
+            .await
+    }
+
+    pub async fn detach_delete_vertex(
+        &self,
+        cell_id: &str,
+        vertex_id: crate::VertexId,
+        idempotency_key: &str,
+    ) -> Result<crate::VertexDeleteResult> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard
+            .detach_delete_vertex(cell_id, vertex_id, idempotency_key)
+            .await
+    }
+
+    pub async fn drop_cell(
+        &self,
+        cell_id: &str,
+        idempotency_key: &str,
+    ) -> Result<crate::GraphCellDropResult> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard.drop_cell(cell_id, idempotency_key).await
+    }
+
     pub async fn ingest_edge_mutations(
         &self,
         cell_id: &str,
