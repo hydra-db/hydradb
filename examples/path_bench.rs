@@ -18,6 +18,7 @@ const EDGE_TYPE: &str = "USER_FOLLOWS_USER";
 const WRITE_SAMPLE_EDGE_TYPE: &str = "USER_BLOCKED_USER";
 const DEFAULT_FANOUTS: &[u64] = &[50, 100, 1_000, 10_000, 50_000, 100_000];
 const DEFAULT_HOPS: &[u8] = &[1, 3, 5, 10, 12];
+const CACHE_DIR_MARKER: &str = ".slatedb-graph-path-bench-cache";
 
 #[tokio::main]
 async fn main() -> BenchResult<()> {
@@ -525,10 +526,68 @@ fn layer_vertex(hop: u8, index: u64) -> u64 {
 
 fn reset_dir(path: &Path) -> BenchResult<()> {
     if path.exists() {
-        fs::remove_dir_all(path)?;
+        let marker = path.join(CACHE_DIR_MARKER);
+        let entries = fs::read_dir(path)?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_non_marker_entries = entries
+            .iter()
+            .any(|entry| entry.file_name() != CACHE_DIR_MARKER);
+        if has_non_marker_entries && !marker.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already exists and is not a marked path benchmark cache directory",
+                    path.display()
+                ),
+            )
+            .into());
+        }
+        for entry in entries {
+            if entry.file_name() == CACHE_DIR_MARKER {
+                continue;
+            }
+            let entry_path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                fs::remove_dir_all(&entry_path)?;
+            } else {
+                fs::remove_file(&entry_path)?;
+            }
+        }
+    } else {
+        fs::create_dir_all(path)?;
     }
-    fs::create_dir_all(path)?;
+    fs::write(
+        path.join(CACHE_DIR_MARKER),
+        b"slatedb graph path benchmark cache\n",
+    )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_dir_refuses_unmarked_non_empty_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("important.txt"), "keep me").unwrap();
+        let err = reset_dir(temp.path()).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::AlreadyExists)
+        );
+        assert!(temp.path().join("important.txt").exists());
+    }
+
+    #[test]
+    fn reset_dir_cleans_marked_cache_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(CACHE_DIR_MARKER), "marker").unwrap();
+        fs::write(temp.path().join("cache.bin"), "stale").unwrap();
+        reset_dir(temp.path()).unwrap();
+        assert!(temp.path().join(CACHE_DIR_MARKER).exists());
+        assert!(!temp.path().join("cache.bin").exists());
+    }
 }
 
 fn selected_matrix_kernel() -> SparseKernelBackend {
