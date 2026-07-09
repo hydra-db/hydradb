@@ -233,6 +233,31 @@ pub struct DeleteResult {
     pub deleted: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EdgeDeleteBatchResult {
+    pub start_epoch: GraphEpoch,
+    pub end_epoch: GraphEpoch,
+    pub deleted: u64,
+    pub already_deleted: u64,
+    pub results: Vec<DeleteResult>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VertexDeleteResult {
+    pub epoch: GraphEpoch,
+    pub vertex_deleted: bool,
+    pub incident_edges_deleted: u64,
+    pub relationships_deleted: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphCellDropResult {
+    pub marker_epoch: GraphEpoch,
+    pub deleted_keys: u64,
+    pub batches: u64,
+    pub already_dropped: bool,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SegmentCompactionResult {
     pub compacted_through_epoch: GraphEpoch,

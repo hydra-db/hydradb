@@ -999,6 +999,40 @@ pub(crate) fn encode_relationship_delete_idempotency(
     .into_bytes()
 }
 
+pub(crate) fn encode_vertex_delete_idempotency(
+    cell_id: &str,
+    vertex_id: VertexId,
+    result: &VertexDeleteResult,
+) -> Vec<u8> {
+    format!(
+        "vertex_delete1\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        result.epoch,
+        u8::from(result.vertex_deleted),
+        result.incident_edges_deleted,
+        result.relationships_deleted,
+        cell_id,
+        vertex_id
+    )
+    .into_bytes()
+}
+
+pub(crate) fn encode_cell_drop_idempotency(
+    cell_id: &str,
+    idempotency_key: &str,
+    result: &GraphCellDropResult,
+) -> Vec<u8> {
+    format!(
+        "cell_drop1\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        result.marker_epoch,
+        result.deleted_keys,
+        result.batches,
+        u8::from(result.already_dropped),
+        cell_id,
+        idempotency_key
+    )
+    .into_bytes()
+}
+
 pub(crate) fn encode_bulk_import_idempotency(
     idempotency_key: &str,
     fingerprint: u64,
@@ -1458,6 +1492,69 @@ pub(crate) fn decode_relationship_delete_idempotency(
     Ok(DeleteResult {
         epoch: parse_u64(key, parts[1], "epoch")?,
         deleted: parse_bool_u8(key, parts[2], "deleted")?,
+    })
+}
+
+pub(crate) fn decode_vertex_delete_idempotency(
+    key: &str,
+    cell_id: &str,
+    vertex_id: VertexId,
+    idempotency_key: &str,
+    value: &[u8],
+) -> Result<VertexDeleteResult> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 7 || parts[0] != "vertex_delete1" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected vertex_delete1 record with 7 fields".to_string(),
+        });
+    }
+    if parts[5] != cell_id || parse_u64(key, parts[6], "vertex_id")? != vertex_id {
+        return Err(GraphError::IdempotencyConflict {
+            operation: "vertex-delete",
+            idempotency_key: idempotency_key.to_string(),
+        });
+    }
+    Ok(VertexDeleteResult {
+        epoch: parse_u64(key, parts[1], "epoch")?,
+        vertex_deleted: parse_bool_u8(key, parts[2], "vertex_deleted")?,
+        incident_edges_deleted: parse_u64(key, parts[3], "incident_edges_deleted")?,
+        relationships_deleted: parse_u64(key, parts[4], "relationships_deleted")?,
+    })
+}
+
+pub(crate) fn decode_cell_drop_idempotency(
+    key: &str,
+    cell_id: &str,
+    idempotency_key: &str,
+    value: &[u8],
+) -> Result<GraphCellDropResult> {
+    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: err.to_string(),
+    })?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 7 || parts[0] != "cell_drop1" {
+        return Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected cell_drop1 record with 7 fields".to_string(),
+        });
+    }
+    if parts[5] != cell_id || parts[6] != idempotency_key {
+        return Err(GraphError::IdempotencyConflict {
+            operation: "cell-drop",
+            idempotency_key: idempotency_key.to_string(),
+        });
+    }
+    Ok(GraphCellDropResult {
+        marker_epoch: parse_u64(key, parts[1], "marker_epoch")?,
+        deleted_keys: parse_u64(key, parts[2], "deleted_keys")?,
+        batches: parse_u64(key, parts[3], "batches")?,
+        already_dropped: parse_bool_u8(key, parts[4], "already_dropped")?,
     })
 }
 
@@ -2388,6 +2485,18 @@ pub(crate) fn sort_deltas(records: &mut [DeltaRecord]) {
             delta.edge.src,
             delta.edge.dst,
         )
+    });
+}
+
+pub(crate) fn sort_and_dedup_deltas(records: &mut Vec<DeltaRecord>) {
+    sort_deltas(records);
+    records.dedup_by(|left, right| {
+        left.kind == right.kind
+            && left.edge.cell_id == right.edge.cell_id
+            && left.edge.edge_type == right.edge.edge_type
+            && left.edge.src == right.edge.src
+            && left.edge.dst == right.edge.dst
+            && left.edge.epoch == right.edge.epoch
     });
 }
 
