@@ -545,7 +545,10 @@ fn lower_row_query_clauses(
         if clauses.len() < 2 {
             return unsupported("row execution supports MATCH ... RETURN queries");
         }
-        let return_clause = checked_node(*clauses.last().expect("checked non-empty clauses"))?;
+        let Some(return_clause_ptr) = clauses.last().copied() else {
+            return unsupported("row execution supports MATCH ... RETURN queries");
+        };
+        let return_clause = checked_node(return_clause_ptr)?;
         if !is_instance(return_clause, sys::CYPHER_AST_RETURN) {
             return unsupported("row execution supports MATCH ... RETURN queries ending in RETURN");
         }

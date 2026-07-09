@@ -2514,10 +2514,10 @@ fn decode_binary_u64s(
             })?,
         field,
     )?;
-    Ok(bytes
+    bytes
         .chunks_exact(std::mem::size_of::<u64>())
-        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("chunk length is exactly 8")))
-        .collect())
+        .map(|chunk| decode_binary_u64_bytes(key, chunk, field))
+        .collect()
 }
 
 fn decode_binary_u32s_from_u64s(
@@ -2540,7 +2540,7 @@ fn decode_binary_u32s_from_u64s(
     )?;
     let mut out = Vec::with_capacity(len);
     for chunk in bytes.chunks_exact(std::mem::size_of::<u64>()) {
-        let value = u64::from_le_bytes(chunk.try_into().expect("chunk length is exactly 8"));
+        let value = decode_binary_u64_bytes(key, chunk, field)?;
         out.push(u32::try_from(value).map_err(|_| GraphError::CorruptValue {
             key: key.to_string(),
             reason: format!("binary array {field} value {value} does not fit u32"),
@@ -2559,9 +2559,15 @@ fn decode_binary_len(key: &str, value: &[u8], cursor: &mut usize, field: &str) -
 
 fn decode_binary_u64(key: &str, value: &[u8], cursor: &mut usize, field: &str) -> Result<u64> {
     let bytes = take_binary(key, value, cursor, std::mem::size_of::<u64>(), field)?;
-    Ok(u64::from_le_bytes(
-        bytes.try_into().expect("u64 field length is exactly 8"),
-    ))
+    decode_binary_u64_bytes(key, bytes, field)
+}
+
+fn decode_binary_u64_bytes(key: &str, bytes: &[u8], field: &str) -> Result<u64> {
+    let bytes: [u8; 8] = bytes.try_into().map_err(|_| GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: format!("binary field {field} has invalid u64 length"),
+    })?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn take_binary<'a>(
