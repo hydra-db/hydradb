@@ -202,19 +202,9 @@ impl GraphControlPlane {
                 });
             }
         }
-        let mut prefix_keys = self
-            .control_keys_with_prefix(&control_edge_watermark_cell_prefix(cell_id))
-            .await?;
-        prefix_keys.extend(
-            self.control_keys_with_prefix(&control_idempotency_cell_prefix(cell_id))
-                .await?,
-        );
-        prefix_keys.sort();
-        prefix_keys.dedup();
-
         for attempt in 0..GRAPH_CONTROL_TXN_MAX_RETRIES {
             match self
-                .drop_cell_control_state_txn(cell_id, expected_lease, &prefix_keys)
+                .drop_cell_control_state_txn(cell_id, expected_lease)
                 .await
             {
                 Err(GraphError::Slate(err))
@@ -236,7 +226,6 @@ impl GraphControlPlane {
         &self,
         cell_id: &str,
         expected_lease: Option<&ShardLease>,
-        prefix_keys: &[String],
     ) -> Result<GraphControlCellDropReport> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
         let lease_key = control_lease_key(cell_id);
@@ -262,7 +251,13 @@ impl GraphControlPlane {
             control_catalog_key(cell_id),
             control_watermark_key(cell_id),
         ];
-        keys.extend(prefix_keys.iter().cloned());
+        keys.extend(
+            control_keys_with_prefix_txn(&txn, &control_edge_watermark_cell_prefix(cell_id))
+                .await?,
+        );
+        keys.extend(
+            control_keys_with_prefix_txn(&txn, &control_idempotency_cell_prefix(cell_id)).await?,
+        );
         keys.sort();
         keys.dedup();
         let deleted_control_keys = keys.len() as u64;
@@ -274,18 +269,6 @@ impl GraphControlPlane {
             cell_id: cell_id.to_string(),
             deleted_control_keys,
         })
-    }
-
-    async fn control_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut iter = self
-            .db
-            .scan_prefix_with_options(prefix.as_bytes(), .., &control_scan_options())
-            .await?;
-        let mut keys = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            keys.push(String::from_utf8_lossy(&kv.key).into_owned());
-        }
-        Ok(keys)
     }
 
     pub async fn compare_and_publish_shard_metadata(
@@ -841,6 +824,15 @@ fn control_watermark_key(cell_id: &str) -> String {
 
 fn control_edge_watermark_key(cell_id: &str, edge_type: &str) -> String {
     format!("{CONTROL_EDGE_WATERMARK_PREFIX}{cell_id}/{edge_type}")
+}
+
+async fn control_keys_with_prefix_txn(txn: &DbTransaction, prefix: &str) -> Result<Vec<String>> {
+    let mut iter = txn.scan_prefix(prefix.as_bytes(), ..).await?;
+    let mut keys = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        keys.push(String::from_utf8_lossy(&kv.key).into_owned());
+    }
+    Ok(keys)
 }
 
 fn control_edge_watermark_cell_prefix(cell_id: &str) -> String {
