@@ -143,18 +143,25 @@ impl GraphShard {
             )
             .await?;
         }
-        let ending_epoch = self.current_epoch(cell_id).await?;
-        if ending_epoch != base_epoch {
-            return Err(GraphError::SnapshotChanged {
-                operation: "build_supernode_groups",
-                cell_id: cell_id.to_string(),
-                edge_type: edge_type.to_string(),
-                read_epoch: base_epoch,
-                current_epoch: ending_epoch,
-            });
-        }
-        self.persist_supernode_artifacts(cell_id, &chunks, &groups)
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "build_supernode_groups")
             .await?;
+        let publish_result = async {
+            let ending_epoch = self.current_epoch(cell_id).await?;
+            if ending_epoch != base_epoch {
+                return Err(GraphError::SnapshotChanged {
+                    operation: "build_supernode_groups",
+                    cell_id: cell_id.to_string(),
+                    edge_type: edge_type.to_string(),
+                    read_epoch: base_epoch,
+                    current_epoch: ending_epoch,
+                });
+            }
+            self.persist_supernode_artifacts(cell_id, &chunks, &groups)
+                .await
+        }
+        .await;
+        crate::release_cell_write_lock(lock, publish_result).await?;
         Ok(groups)
     }
 

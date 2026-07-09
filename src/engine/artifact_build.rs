@@ -376,17 +376,6 @@ impl GraphShard {
             )
             .await?;
 
-            let ending_epoch = self.current_epoch(cell_id).await?;
-            if ending_epoch != base_epoch {
-                return Err(GraphError::SnapshotChanged {
-                    operation: "build_matrix_tiles",
-                    cell_id: cell_id.to_string(),
-                    edge_type: edge_type.to_string(),
-                    read_epoch: base_epoch,
-                    current_epoch: ending_epoch,
-                });
-            }
-
             let artifact = MatrixArtifact {
                 cell_id: cell_id.to_string(),
                 edge_type: edge_type.to_string(),
@@ -397,17 +386,35 @@ impl GraphShard {
                 edge_count: rows.live_edges,
             };
 
-            let mut manifest_batch = GraphWriteBatch::new();
-            manifest_batch.put(
-                matrix_manifest_key(cell_id, edge_type, base_epoch),
-                encode_matrix_artifact(&artifact),
-            );
-            manifest_batch.put(
-                graphblas_csc_key(cell_id, edge_type, base_epoch),
-                encode_graphblas_csc_manifest(&graphblas_manifest),
-            );
-            self.write_graph_batch_strict(cell_id, "build_matrix_tiles", manifest_batch)
+            let lock = self
+                .acquire_cell_write_lock(cell_id, "build_matrix_tiles")
                 .await?;
+            let publish_result = async {
+                let ending_epoch = self.current_epoch(cell_id).await?;
+                if ending_epoch != base_epoch {
+                    return Err(GraphError::SnapshotChanged {
+                        operation: "build_matrix_tiles",
+                        cell_id: cell_id.to_string(),
+                        edge_type: edge_type.to_string(),
+                        read_epoch: base_epoch,
+                        current_epoch: ending_epoch,
+                    });
+                }
+
+                let mut manifest_batch = GraphWriteBatch::new();
+                manifest_batch.put(
+                    matrix_manifest_key(cell_id, edge_type, base_epoch),
+                    encode_matrix_artifact(&artifact),
+                );
+                manifest_batch.put(
+                    graphblas_csc_key(cell_id, edge_type, base_epoch),
+                    encode_graphblas_csc_manifest(&graphblas_manifest),
+                );
+                self.write_graph_batch_strict(cell_id, "build_matrix_tiles", manifest_batch)
+                    .await
+            }
+            .await;
+            crate::release_cell_write_lock(lock, publish_result).await?;
 
             Ok(artifact)
         }
