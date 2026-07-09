@@ -92,7 +92,10 @@ impl GraphControlPlane {
                 result => return result,
             }
         }
-        unreachable!("control transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "control transaction",
+            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
+        })
     }
 
     async fn publish_placement_with_catalog_txn(
@@ -223,7 +226,10 @@ impl GraphControlPlane {
                 result => return result,
             }
         }
-        unreachable!("control transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "control transaction",
+            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
+        })
     }
 
     async fn drop_cell_control_state_txn(
@@ -317,7 +323,10 @@ impl GraphControlPlane {
                 result => return result,
             }
         }
-        unreachable!("control transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "control transaction",
+            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
+        })
     }
 
     async fn compare_and_publish_shard_metadata_txn(
@@ -404,7 +413,10 @@ impl GraphControlPlane {
                 result => return result.map(|(watermark, _)| watermark),
             }
         }
-        unreachable!("control transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "control transaction",
+            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
+        })
     }
 
     async fn advance_watermark_txn(
@@ -534,7 +546,10 @@ impl GraphControlPlane {
                 result => return result.map(|(watermark, _)| watermark),
             }
         }
-        unreachable!("control transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "control transaction",
+            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
+        })
     }
 
     async fn advance_edge_watermark_txn(
@@ -646,7 +661,10 @@ impl GraphControlPlane {
                 result => return result,
             }
         }
-        unreachable!("control transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "control transaction",
+            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
+        })
     }
 
     async fn commit_control_idempotency_txn(

@@ -135,7 +135,10 @@ impl GraphControlPlane {
                 result => return result,
             }
         }
-        unreachable!("control transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "control transaction",
+            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
+        })
     }
 
     async fn publish_node_heartbeat_txn(
@@ -490,7 +493,10 @@ impl GraphControlPlane {
                 result => return result,
             }
         }
-        unreachable!("control transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "control transaction",
+            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
+        })
     }
 
     async fn publish_controller_reassignments_txn(

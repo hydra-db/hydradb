@@ -57,7 +57,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub async fn set_vertex_metadata_batch(
@@ -110,7 +113,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn set_vertex_metadata_txn(
@@ -264,7 +270,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn delete_vertex_txn_locked(
@@ -591,7 +600,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn drop_cell_locked(
@@ -769,7 +781,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub async fn set_edge_metadata_batch(
@@ -824,7 +839,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub async fn import_relationships_batch(
@@ -904,7 +922,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn set_edge_metadata_txn(
@@ -1460,7 +1481,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn create_relationship_txn(
@@ -1757,7 +1781,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn set_relationship_metadata_txn(
@@ -1875,7 +1902,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn delete_relationship_txn(
@@ -2053,7 +2083,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub(crate) async fn write_edge_txn(&self, mutation: &EdgeMutation) -> Result<CommitResult> {
@@ -2123,7 +2156,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn write_edge_with_vertex_metadata_txn(
@@ -2196,7 +2232,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn write_edge_with_full_metadata_txn(
@@ -2573,7 +2612,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn delete_edge_mutations_batch_txn(
@@ -2855,7 +2897,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub(crate) async fn delete_edge_txn(&self, mutation: &EdgeMutation) -> Result<DeleteResult> {
@@ -3262,7 +3307,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub async fn bulk_import_edges_with_options(
@@ -3325,7 +3373,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub async fn write_edge_mutations_batch(
@@ -3404,7 +3455,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub async fn ingest_edge_mutations(
@@ -3537,7 +3591,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub(crate) async fn append_edge_mutation_log_txn(
@@ -3766,7 +3823,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub(crate) async fn write_edge_mutations_batch_txn(
