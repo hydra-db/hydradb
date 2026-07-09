@@ -508,6 +508,13 @@ impl GraphShard {
                 )
                 .await?;
             let publish_result = async {
+                prepare_artifact_build(
+                    self,
+                    cell_id,
+                    "prepare_supernode_groups_build",
+                    &[supernode_cleanup_marker_key(cell_id, edge_type, base_epoch)],
+                )
+                .await?;
                 ensure_supernode_artifact_publish_compatible(
                     self,
                     cell_id,
@@ -521,7 +528,7 @@ impl GraphShard {
                 for group in &groups {
                     put_artifact_record(
                         self,
-                        Some(&artifact_lock),
+                        &[&artifact_lock],
                         cell_id,
                         "persist_supernode_groups_from_chunks",
                         &mut batch,
@@ -533,7 +540,7 @@ impl GraphShard {
                 }
                 flush_artifact_put_batch(
                     self,
-                    Some(&artifact_lock),
+                    &[&artifact_lock],
                     cell_id,
                     "persist_supernode_groups_from_chunks",
                     &mut batch,
@@ -546,17 +553,16 @@ impl GraphShard {
                         supernode_artifact_manifest_key(cell_id, edge_type, base_epoch),
                         encode_supernode_artifact_manifest(manifest),
                     );
-                    pending_writes += 1;
+                    publish_artifact_records_guarded(
+                        self,
+                        cell_id,
+                        "persist_supernode_groups_manifest",
+                        &[supernode_cleanup_marker_key(cell_id, edge_type, base_epoch)],
+                        batch,
+                    )
+                    .await?;
                 }
-                flush_artifact_put_batch(
-                    self,
-                    Some(&artifact_lock),
-                    cell_id,
-                    "persist_supernode_groups_manifest",
-                    &mut batch,
-                    &mut pending_writes,
-                )
-                .await
+                artifact_lock.renew().await
             }
             .await;
             if let Err(err) = crate::release_cell_write_lock(artifact_lock, publish_result).await {
@@ -606,7 +612,7 @@ impl GraphShard {
         if let Some(base_epoch) = base_epoch {
             let manifest =
                 supernode_artifact_manifest_from_groups(cell_id, edge_type, base_epoch, groups)?;
-            let artifact_lock = self
+            let supernode_lock = self
                 .acquire_supernode_artifact_write_lock(
                     cell_id,
                     edge_type,
@@ -614,7 +620,31 @@ impl GraphShard {
                     "persist_supernode_artifacts",
                 )
                 .await?;
+            let posting_lock = match self
+                .acquire_posting_artifact_write_lock(
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    "persist_supernode_artifacts",
+                )
+                .await
+            {
+                Ok(lock) => lock,
+                Err(err) => {
+                    return crate::release_cell_write_lock(supernode_lock, Err(err)).await;
+                }
+            };
             let publish_result = async {
+                prepare_artifact_build(
+                    self,
+                    cell_id,
+                    "prepare_supernode_artifacts_build",
+                    &[
+                        supernode_cleanup_marker_key(cell_id, edge_type, base_epoch),
+                        posting_cleanup_marker_key(cell_id, edge_type, base_epoch),
+                    ],
+                )
+                .await?;
                 ensure_supernode_artifact_publish_compatible(
                     self,
                     cell_id,
@@ -628,7 +658,7 @@ impl GraphShard {
                 for chunk in chunks {
                     put_artifact_record(
                         self,
-                        Some(&artifact_lock),
+                        &[&supernode_lock, &posting_lock],
                         cell_id,
                         "persist_supernode_artifacts",
                         &mut batch,
@@ -641,7 +671,7 @@ impl GraphShard {
                 for group in groups {
                     put_artifact_record(
                         self,
-                        Some(&artifact_lock),
+                        &[&supernode_lock, &posting_lock],
                         cell_id,
                         "persist_supernode_artifacts",
                         &mut batch,
@@ -653,39 +683,52 @@ impl GraphShard {
                 }
                 flush_artifact_put_batch(
                     self,
-                    Some(&artifact_lock),
+                    &[&supernode_lock, &posting_lock],
                     cell_id,
                     "persist_supernode_artifacts",
                     &mut batch,
                     &mut pending_writes,
                 )
                 .await?;
-                artifact_lock.renew().await?;
+                supernode_lock.renew().await?;
+                posting_lock.renew().await?;
                 if let Some(manifest) = manifest.as_ref() {
                     batch.put(
                         supernode_artifact_manifest_key(cell_id, edge_type, base_epoch),
                         encode_supernode_artifact_manifest(manifest),
                     );
-                    pending_writes += 1;
+                    publish_artifact_records_guarded(
+                        self,
+                        cell_id,
+                        "persist_supernode_artifacts_manifest",
+                        &[
+                            supernode_cleanup_marker_key(cell_id, edge_type, base_epoch),
+                            posting_cleanup_marker_key(cell_id, edge_type, base_epoch),
+                        ],
+                        batch,
+                    )
+                    .await?;
                 }
-                flush_artifact_put_batch(
-                    self,
-                    Some(&artifact_lock),
-                    cell_id,
-                    "persist_supernode_artifacts_manifest",
-                    &mut batch,
-                    &mut pending_writes,
-                )
-                .await
+                supernode_lock.renew().await?;
+                posting_lock.renew().await
             }
             .await;
-            if let Err(err) = crate::release_cell_write_lock(artifact_lock, publish_result).await {
+            let publish_result = crate::release_cell_write_lock(posting_lock, publish_result).await;
+            if let Err(err) = crate::release_cell_write_lock(supernode_lock, publish_result).await {
                 cleanup_unpublished_supernode_artifact_epoch(
                     self,
                     cell_id,
                     edge_type,
                     base_epoch,
                     "persist_supernode_artifacts_abort",
+                )
+                .await;
+                cleanup_unpublished_posting_artifact_epoch(
+                    self,
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    "persist_supernode_posting_artifacts_abort",
                 )
                 .await;
                 return Err(err);

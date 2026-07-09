@@ -75,6 +75,13 @@ impl GraphShard {
             )
             .await?;
         let publish_result = async {
+            prepare_artifact_build(
+                self,
+                cell_id,
+                "prepare_posting_artifact_build",
+                &[posting_cleanup_marker_key(cell_id, edge_type, base_epoch)],
+            )
+            .await?;
             ensure_posting_artifact_publish_compatible(
                 self,
                 cell_id,
@@ -89,7 +96,7 @@ impl GraphShard {
             for chunk in &chunks {
                 put_artifact_record(
                     self,
-                    Some(&artifact_lock),
+                    &[&artifact_lock],
                     cell_id,
                     "build_posting_chunks",
                     &mut batch,
@@ -101,7 +108,7 @@ impl GraphShard {
             }
             flush_artifact_put_batch(
                 self,
-                Some(&artifact_lock),
+                &[&artifact_lock],
                 cell_id,
                 "build_posting_chunks",
                 &mut batch,
@@ -112,7 +119,7 @@ impl GraphShard {
             for manifest in &manifests {
                 put_artifact_record(
                     self,
-                    Some(&artifact_lock),
+                    &[&artifact_lock],
                     cell_id,
                     "build_posting_chunks_manifest",
                     &mut batch,
@@ -130,7 +137,7 @@ impl GraphShard {
             }
             flush_artifact_put_batch(
                 self,
-                Some(&artifact_lock),
+                &[&artifact_lock],
                 cell_id,
                 "build_posting_chunks_manifest",
                 &mut batch,
@@ -143,17 +150,16 @@ impl GraphShard {
                     posting_artifact_manifest_key(cell_id, edge_type, base_epoch),
                     encode_posting_artifact_manifest(artifact_manifest),
                 );
-                pending_writes += 1;
+                publish_artifact_records_guarded(
+                    self,
+                    cell_id,
+                    "build_posting_chunks_epoch_manifest",
+                    &[posting_cleanup_marker_key(cell_id, edge_type, base_epoch)],
+                    batch,
+                )
+                .await?;
             }
-            flush_artifact_put_batch(
-                self,
-                Some(&artifact_lock),
-                cell_id,
-                "build_posting_chunks_epoch_manifest",
-                &mut batch,
-                &mut pending_writes,
-            )
-            .await
+            artifact_lock.renew().await
         }
         .await;
         if let Err(err) = crate::release_cell_write_lock(artifact_lock, publish_result).await {
@@ -347,7 +353,7 @@ impl GraphShard {
                 for tile in out_tiles.iter().chain(transpose_tiles.iter()) {
                     put_artifact_record(
                         self,
-                        Some(&artifact_lock),
+                        &[&artifact_lock],
                         cell_id,
                         "build_matrix_tiles",
                         &mut data_batch,
@@ -372,7 +378,7 @@ impl GraphShard {
                 artifact_lock.renew().await?;
                 flush_artifact_put_batch(
                     self,
-                    Some(&artifact_lock),
+                    &[&artifact_lock],
                     cell_id,
                     "build_matrix_tiles",
                     &mut data_batch,
@@ -548,7 +554,7 @@ impl GraphShard {
                 artifact_lock.renew().await?;
                 flush_artifact_put_batch(
                     self,
-                    Some(&artifact_lock),
+                    &[&artifact_lock],
                     cell_id,
                     "build_matrix_tiles",
                     &mut data_batch,
@@ -869,20 +875,13 @@ async fn prepare_matrix_artifact_build(
     edge_type: &str,
     base_epoch: GraphEpoch,
 ) -> Result<()> {
-    let marker_key = matrix_cleanup_marker_key(cell_id, edge_type, base_epoch);
-    let Some(marker) = shard.read_remote(&marker_key).await? else {
-        return Ok(());
-    };
-    let mut batch = GraphWriteBatch::new();
-    batch.delete(&marker_key);
-    shard
-        .write_graph_batch_strict_guarded(
-            cell_id,
-            "prepare_matrix_artifact_build",
-            vec![GraphWriteGuard::equals(&marker_key, marker.as_ref())],
-            batch,
-        )
-        .await
+    prepare_artifact_build(
+        shard,
+        cell_id,
+        "prepare_matrix_artifact_build",
+        &[matrix_cleanup_marker_key(cell_id, edge_type, base_epoch)],
+    )
+    .await
 }
 
 async fn publish_matrix_artifact_manifests(
@@ -893,16 +892,14 @@ async fn publish_matrix_artifact_manifests(
     base_epoch: GraphEpoch,
     batch: GraphWriteBatch,
 ) -> Result<()> {
-    shard
-        .write_graph_batch_strict_guarded(
-            cell_id,
-            operation,
-            vec![GraphWriteGuard::absent(matrix_cleanup_marker_key(
-                cell_id, edge_type, base_epoch,
-            ))],
-            batch,
-        )
-        .await
+    publish_artifact_records_guarded(
+        shard,
+        cell_id,
+        operation,
+        &[matrix_cleanup_marker_key(cell_id, edge_type, base_epoch)],
+        batch,
+    )
+    .await
 }
 
 async fn publish_matrix_artifact_manifests_with_cell_lock(
@@ -913,11 +910,14 @@ async fn publish_matrix_artifact_manifests_with_cell_lock(
     base_epoch: GraphEpoch,
     batch: GraphWriteBatch,
 ) -> Result<()> {
-    let lock = shard.acquire_cell_write_lock(cell_id, operation).await?;
-    let result =
-        publish_matrix_artifact_manifests(shard, cell_id, operation, edge_type, base_epoch, batch)
-            .await;
-    crate::release_cell_write_lock(lock, result).await
+    publish_artifact_records_guarded_with_cell_lock(
+        shard,
+        cell_id,
+        operation,
+        &[matrix_cleanup_marker_key(cell_id, edge_type, base_epoch)],
+        batch,
+    )
+    .await
 }
 
 async fn ensure_posting_artifact_publish_compatible(
