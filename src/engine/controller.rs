@@ -25,6 +25,19 @@ impl GraphClusterControllerConfig {
             heartbeat_ttl,
             lease_ttl,
             rebalance_mode: GraphClusterRebalanceMode::StabilityFirst,
+            discover_existing_cells: true,
+        })
+    }
+
+    pub fn discover_existing(heartbeat_ttl: Duration, lease_ttl: Duration) -> Result<Self> {
+        validate_controller_duration("heartbeat_ttl", heartbeat_ttl)?;
+        lease_ttl_ms(lease_ttl)?;
+        Ok(Self {
+            cell_ids: Vec::new(),
+            heartbeat_ttl,
+            lease_ttl,
+            rebalance_mode: GraphClusterRebalanceMode::StabilityFirst,
+            discover_existing_cells: true,
         })
     }
 
@@ -33,13 +46,18 @@ impl GraphClusterControllerConfig {
         self
     }
 
-    fn validated_cells(&self) -> Result<Vec<String>> {
+    pub fn with_existing_cell_discovery(mut self, enabled: bool) -> Self {
+        self.discover_existing_cells = enabled;
+        self
+    }
+
+    fn validated_configured_cells(&self) -> Result<Vec<String>> {
         let mut normalized = BTreeSet::new();
         for cell_id in &self.cell_ids {
             validate_component("cell_id", cell_id)?;
             normalized.insert(cell_id.clone());
         }
-        if normalized.is_empty() {
+        if normalized.is_empty() && !self.discover_existing_cells {
             return Err(GraphError::CorruptValue {
                 key: "control/controller/cells".to_string(),
                 reason: "cluster controller needs at least one cell".to_string(),
@@ -204,7 +222,7 @@ impl GraphControlPlane {
         now_ms: u64,
     ) -> Result<GraphClusterControllerReport> {
         self.metrics.controller_runs.fetch_add(1, Ordering::Relaxed);
-        let cell_ids = config.validated_cells()?;
+        config.validated_configured_cells()?;
         let heartbeat_ttl_ms = validate_controller_duration("heartbeat_ttl", config.heartbeat_ttl)?;
         let mut report = GraphClusterControllerReport {
             now_ms,
@@ -234,6 +252,8 @@ impl GraphControlPlane {
         report.expired_nodes.dedup();
 
         let mut placement = self.load_placement_map().await?;
+        let cell_ids = self.controller_cell_ids(config, &placement).await?;
+        report.controlled_cells = cell_ids.clone();
         let active_nodes: BTreeSet<_> = report.active_nodes.iter().cloned().collect();
         let draining_nodes: BTreeSet<_> = report.draining_nodes.iter().cloned().collect();
         for cell_id in &cell_ids {
@@ -374,7 +394,7 @@ impl GraphControlPlane {
                 reason: "cluster controller interval must be greater than zero".to_string(),
             });
         }
-        config.validated_cells()?;
+        config.validated_configured_cells()?;
         let control = Arc::clone(&self);
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
@@ -432,6 +452,24 @@ impl GraphControlPlane {
             placement.insert(cell_id, node_id);
         }
         Ok(placement)
+    }
+
+    async fn controller_cell_ids(
+        &self,
+        config: &GraphClusterControllerConfig,
+        placement: &BTreeMap<String, String>,
+    ) -> Result<Vec<String>> {
+        let mut cells = BTreeSet::new();
+        for cell_id in config.validated_configured_cells()? {
+            cells.insert(cell_id);
+        }
+        if config.discover_existing_cells {
+            cells.extend(placement.keys().cloned());
+            for entry in self.list_shard_metadata().await? {
+                cells.insert(entry.cell_id);
+            }
+        }
+        Ok(cells.into_iter().collect())
     }
 
     async fn publish_controller_reassignments(

@@ -159,6 +159,24 @@ impl GraphControlPlane {
             .transpose()
     }
 
+    pub async fn list_shard_metadata(&self) -> Result<Vec<GraphShardCatalogEntry>> {
+        let mut iter = self
+            .db
+            .scan_prefix_with_options(
+                CONTROL_CATALOG_PREFIX.as_bytes(),
+                ..,
+                &control_scan_options(),
+            )
+            .await?;
+        let mut entries = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            entries.push(decode_control_catalog(&key, &kv.value)?);
+        }
+        entries.sort_by(|left, right| left.cell_id.cmp(&right.cell_id));
+        Ok(entries)
+    }
+
     pub async fn compare_and_publish_shard_metadata(
         &self,
         mut entry: GraphShardCatalogEntry,

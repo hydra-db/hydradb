@@ -281,6 +281,7 @@ pub struct GraphClusterControllerConfig {
     pub heartbeat_ttl: Duration,
     pub lease_ttl: Duration,
     pub rebalance_mode: GraphClusterRebalanceMode,
+    pub discover_existing_cells: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -307,6 +308,7 @@ pub struct GraphPendingFailover {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GraphClusterControllerReport {
     pub now_ms: u64,
+    pub controlled_cells: Vec<String>,
     pub active_nodes: Vec<String>,
     pub draining_nodes: Vec<String>,
     pub expired_nodes: Vec<String>,
