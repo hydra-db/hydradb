@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use slatedb::bytes::Bytes;
 use slatedb::config::{DurabilityLevel, ReadOptions, ScanOptions, WriteOptions};
-use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
+use slatedb::object_store::{path::Path, ObjectStore};
+#[cfg(test)]
+use slatedb::object_store::{ObjectStoreExt, PutMode};
 #[cfg(test)]
 use slatedb::ErrorKind;
 use slatedb::{Db, DbTransaction, IsolationLevel, WriteBatch};
@@ -48,20 +50,27 @@ pub use core::snapshot::GraphSnapshot;
 #[cfg(feature = "opencypher")]
 pub use core::state::QueryStatsRefreshHandle;
 pub(crate) use core::state::{
-    decode_cell_write_lock_record, encode_cell_write_lock_record, is_retryable_write_conflict,
-    release_cell_write_lock, CellWriteLock, CellWriteLockState, GraphReadLease,
-    GraphWriteAuthority, GraphWriteFence, GraphWriteOp,
+    acquire_distributed_write_lock, is_retryable_write_conflict, release_cell_write_lock,
+    CellWriteLock, GraphReadLease, GraphWriteAuthority, GraphWriteFence, GraphWriteOp,
+};
+#[cfg(test)]
+pub(crate) use core::state::{
+    decode_cell_write_lock_record, encode_cell_write_lock_record, CellWriteLockState,
 };
 pub use core::state::{GraphCacheEntryCounts, GraphShard};
-pub(crate) use core::write_batch::GraphWriteBatch;
+pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
 pub use engine::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
-    BenchmarkResult, DeltaGcResult, GraphCluster, GraphControlEdgeWatermark,
-    GraphControlIdempotencyRecord, GraphControlMetricsSnapshot, GraphControlPlane,
-    GraphControlRepairReport, GraphControlWatermark, GraphNode, GraphRollup,
-    GraphShardCatalogEntry, LeaseRenewalHandle, MatrixArtifact, MatrixTraversalResult,
-    PostingChunk, RoutedGraphCluster, ShardLease, ShardPlacement, SupernodeGroup, SupernodePage,
-    TraversalBackend,
+    BenchmarkResult, DeltaGcResult, GraphCluster, GraphClusterControllerConfig,
+    GraphClusterControllerHandle, GraphClusterControllerReport, GraphClusterRebalanceMode,
+    GraphControlCellDropReport, GraphControlEdgeWatermark, GraphControlIdempotencyRecord,
+    GraphControlMetricsSnapshot, GraphControlPlane, GraphControlRepairReport,
+    GraphControlWatermark, GraphNode, GraphNodeHealthState, GraphNodeHeartbeat,
+    GraphNodeMaintenanceMetricsSnapshot, GraphNodeRuntimeConfig, GraphPendingFailover, GraphRollup,
+    GraphShardCatalogEntry, GraphShardReassignment, GraphShardRefreshReport, LeaseRenewalHandle,
+    ManagedGraphNode, MatrixArtifact, MatrixTraversalResult, NodeHeartbeatHandle, PostingChunk,
+    RoutedGraphCluster, ShardLease, ShardPlacement, ShardRefreshHandle, SupernodeGroup,
+    SupernodePage, TraversalBackend,
 };
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,

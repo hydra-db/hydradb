@@ -24,7 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 #[cfg(feature = "query-transport")]
 use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 #[cfg(feature = "query-transport")]
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 #[cfg(feature = "query-transport-tls")]
 use tokio_rustls::rustls::{
     pki_types::ServerName, ClientConfig as RustlsClientConfig, ServerConfig as RustlsServerConfig,
@@ -83,18 +83,39 @@ impl Default for QueryTransportClientConfig {
 #[derive(Clone, Eq, PartialEq)]
 pub struct QueryTransportSecret {
     value: Arc<str>,
+    valid: bool,
 }
 
 #[cfg(feature = "query-transport")]
 impl QueryTransportSecret {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self {
-            value: Arc::from(value.into()),
+    pub fn try_new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "QueryTransport",
+                feature: "bearer token cannot be empty".to_string(),
+            });
         }
+        Ok(Self {
+            value: Arc::from(value),
+            valid: true,
+        })
+    }
+
+    pub fn new(value: impl Into<String>) -> Self {
+        let value = value.into();
+        Self::try_new(value).unwrap_or_else(|_| Self {
+            value: Arc::from(""),
+            valid: false,
+        })
     }
 
     pub fn expose_secret(&self) -> &str {
         &self.value
+    }
+
+    fn is_valid(&self) -> bool {
+        self.valid
     }
 }
 
@@ -122,7 +143,7 @@ impl From<&str> for QueryTransportSecret {
 #[cfg(feature = "query-transport")]
 impl QueryTransportClientConfig {
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.bearer_token = Some(QueryTransportSecret::new(token));
+        self.bearer_token = QueryTransportSecret::try_new(token).ok();
         self
     }
 
@@ -189,7 +210,8 @@ impl QueryTransportAuthPolicy {
         match self {
             Self::RejectAll => false,
             Self::BearerToken(required) => {
-                auth.bearer_token.as_deref() == Some(required.expose_secret())
+                required.is_valid()
+                    && auth.bearer_token.as_deref() == Some(required.expose_secret())
             }
             #[cfg(feature = "query-transport-tls")]
             Self::MtlsPeerFingerprint {
@@ -198,7 +220,8 @@ impl QueryTransportAuthPolicy {
             } => {
                 let bearer_ok = match bearer_token {
                     Some(required) => {
-                        auth.bearer_token.as_deref() == Some(required.expose_secret())
+                        required.is_valid()
+                            && auth.bearer_token.as_deref() == Some(required.expose_secret())
                     }
                     None => true,
                 };
@@ -368,7 +391,10 @@ impl Default for QueryTransportServerConfig {
 #[cfg(feature = "query-transport")]
 impl QueryTransportServerConfig {
     pub fn with_required_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_policy = QueryTransportAuthPolicy::BearerToken(QueryTransportSecret::new(token));
+        self.auth_policy = match QueryTransportSecret::try_new(token) {
+            Ok(secret) => QueryTransportAuthPolicy::BearerToken(secret),
+            Err(_) => QueryTransportAuthPolicy::RejectAll,
+        };
         self
     }
 
@@ -427,9 +453,12 @@ impl QueryTransportServerConfig {
         allowed_fingerprints: impl IntoIterator<Item = String>,
         token: impl Into<String>,
     ) -> Self {
-        self.auth_policy = QueryTransportAuthPolicy::MtlsPeerFingerprint {
-            allowed_fingerprints: allowed_fingerprints.into_iter().collect(),
-            bearer_token: Some(QueryTransportSecret::new(token)),
+        self.auth_policy = match QueryTransportSecret::try_new(token) {
+            Ok(secret) => QueryTransportAuthPolicy::MtlsPeerFingerprint {
+                allowed_fingerprints: allowed_fingerprints.into_iter().collect(),
+                bearer_token: Some(secret),
+            },
+            Err(_) => QueryTransportAuthPolicy::RejectAll,
         };
         self
     }
@@ -608,7 +637,7 @@ impl KubernetesQueryServiceDiscovery {
     }
 
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.bearer_token = Some(QueryTransportSecret::new(token));
+        self.bearer_token = QueryTransportSecret::try_new(token).ok();
         self
     }
 
@@ -681,7 +710,7 @@ impl ConsulQueryServiceDiscovery {
     }
 
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
-        self.token = Some(QueryTransportSecret::new(token));
+        self.token = QueryTransportSecret::try_new(token).ok();
         self
     }
 
@@ -743,7 +772,7 @@ impl EtcdQueryServiceDiscovery {
     }
 
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
-        self.token = Some(QueryTransportSecret::new(token));
+        self.token = QueryTransportSecret::try_new(token).ok();
         self
     }
 
@@ -838,7 +867,7 @@ impl TcpQueryCellClient {
     }
 
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.config.bearer_token = Some(QueryTransportSecret::new(token));
+        self.config.bearer_token = QueryTransportSecret::try_new(token).ok();
         self
     }
 
@@ -959,6 +988,7 @@ impl TcpQueryServer {
             request_gate: Arc::new(Semaphore::new(max_concurrent_requests)),
         });
         let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
                     changed = stop_rx.changed() => {
@@ -970,7 +1000,7 @@ impl TcpQueryServer {
                         let (stream, _) = accepted.map_err(|err| transport_error("accept", err))?;
                         let client = Arc::clone(&client);
                         let runtime = Arc::clone(&runtime);
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             if let Err(err) = serve_query_transport_stream(stream, client, runtime).await {
                                 tracing::warn!(
                                     target: "slatedb_graph_kernel",
@@ -979,6 +1009,27 @@ impl TcpQueryServer {
                                 );
                             }
                         });
+                    }
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Err(err)) = joined {
+                            tracing::warn!(
+                                target: "slatedb_graph_kernel",
+                                error = %err,
+                                "query transport connection task failed"
+                            );
+                        }
+                    }
+                }
+            }
+            connections.abort_all();
+            while let Some(joined) = connections.join_next().await {
+                if let Err(err) = joined {
+                    if !err.is_cancelled() {
+                        tracing::warn!(
+                            target: "slatedb_graph_kernel",
+                            error = %err,
+                            "query transport connection task failed during shutdown"
+                        );
                     }
                 }
             }
@@ -1144,6 +1195,7 @@ impl TcpQueryCellClient {
                 .config
                 .bearer_token
                 .as_ref()
+                .filter(|secret| secret.is_valid())
                 .map(|secret| secret.expose_secret().to_string()),
         }
     }

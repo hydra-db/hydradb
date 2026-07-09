@@ -15,6 +15,8 @@ struct DeleteOutboxRun {
     edges: Vec<(VertexId, VertexId)>,
 }
 
+const VERTEX_DELETE_LOCK_RENEW_ITEMS: u64 = 64;
+
 impl GraphShard {
     pub async fn set_vertex_metadata(
         &self,
@@ -57,7 +59,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub async fn set_vertex_metadata_batch(
@@ -110,7 +115,66 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
+    }
+
+    pub async fn import_vertex_metadata_batch(
+        &self,
+        cell_id: &str,
+        updates: impl IntoIterator<Item = (VertexId, VertexMetadata)>,
+    ) -> Result<usize> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_write_authority(cell_id, "import_vertex_metadata_batch")?;
+        let updates = coalesce_vertex_metadata_updates(updates)?;
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        ensure_limit(
+            "import_vertex_metadata_batch",
+            updates.len() as u64,
+            self.limits.max_bulk_import_edges as u64,
+        )?;
+        let _permit = self
+            .acquire_graph_write_permit("import_vertex_metadata_batch")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .import_vertex_metadata_batch_txn(cell_id, updates.clone())
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(changed) => {
+                    if changed > 0 {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(changed);
+                }
+                result => return result,
+            }
+        }
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn set_vertex_metadata_txn(
@@ -197,6 +261,61 @@ impl GraphShard {
         Ok(changed_count)
     }
 
+    async fn import_vertex_metadata_batch_txn(
+        &self,
+        cell_id: &str,
+        updates: Vec<(VertexId, VertexMetadata)>,
+    ) -> Result<usize> {
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "import_vertex_metadata_batch")
+            .await?;
+        let result = self
+            .import_vertex_metadata_batch_txn_locked(cell_id, updates)
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn import_vertex_metadata_batch_txn_locked(
+        &self,
+        cell_id: &str,
+        updates: Vec<(VertexId, VertexMetadata)>,
+    ) -> Result<usize> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, "import_vertex_metadata_batch")
+            .await?;
+        let mut changed = Vec::new();
+        for (vertex_id, metadata) in updates {
+            let vertex_key = keys::vertex(cell_id, vertex_id);
+            let previous = match read_txn_remote(&txn, &vertex_key).await? {
+                Some(value) => decode_vertex_metadata(&vertex_key, &value)?,
+                None => VertexMetadata::default(),
+            };
+            if previous == metadata {
+                continue;
+            }
+            if previous != VertexMetadata::default() {
+                return Err(GraphError::CorruptValue {
+                    key: vertex_key,
+                    reason: format!(
+                        "vertex {vertex_id} already has different metadata during import"
+                    ),
+                });
+            }
+            changed.push((vertex_id, previous, metadata));
+        }
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        let epoch = next_epoch_txn(&txn, cell_id).await?;
+        txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(epoch))?;
+        for (vertex_id, previous, metadata) in &changed {
+            apply_vertex_metadata_update_txn(&txn, cell_id, *vertex_id, previous, metadata, epoch)?;
+        }
+        let changed_count = changed.len();
+        commit_txn_strict(txn, self.await_durable_writes).await?;
+        Ok(changed_count)
+    }
+
     pub async fn delete_vertex(
         &self,
         cell_id: &str,
@@ -238,7 +357,14 @@ impl GraphShard {
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             let lock = self.acquire_cell_write_lock(cell_id, operation).await?;
             let result = self
-                .delete_vertex_txn_locked(cell_id, vertex_id, idempotency_key, detach, operation)
+                .delete_vertex_txn_locked(
+                    cell_id,
+                    vertex_id,
+                    idempotency_key,
+                    detach,
+                    operation,
+                    &lock,
+                )
                 .await;
             match release_cell_write_lock(lock, result).await {
                 Err(err)
@@ -264,7 +390,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn delete_vertex_txn_locked(
@@ -274,6 +403,7 @@ impl GraphShard {
         idempotency_key: &str,
         detach: bool,
         operation: &'static str,
+        lock: &CellWriteLock,
     ) -> Result<VertexDeleteResult> {
         let idem_key = keys::idempotency(cell_id, "vertex-delete", idempotency_key);
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
@@ -292,7 +422,7 @@ impl GraphShard {
         drop(txn);
 
         let incident_edges = self
-            .incident_edges_for_vertex_at(cell_id, vertex_id, read_epoch)
+            .incident_edges_for_vertex_at(cell_id, vertex_id, read_epoch, lock)
             .await?;
         if !detach && !incident_edges.is_empty() {
             return Err(GraphError::UnsupportedQuery {
@@ -307,7 +437,8 @@ impl GraphShard {
         let mut incident_edges_deleted = 0_u64;
         let mut relationships_deleted = 0_u64;
         if detach {
-            for edge in incident_edges {
+            for (idx, edge) in incident_edges.into_iter().enumerate() {
+                renew_vertex_delete_lock_after_items(lock, idx as u64).await?;
                 let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
                 self.validate_write_fence_txn(&txn, cell_id, operation)
                     .await?;
@@ -338,10 +469,12 @@ impl GraphShard {
                     if delete.deleted {
                         incident_edges_deleted = incident_edges_deleted.saturating_add(1);
                     }
+                    lock.renew().await?;
                     continue;
                 }
 
                 for relationship in relationships {
+                    lock.renew().await?;
                     let mutation = EdgeMutation {
                         cell_id: cell_id.to_string(),
                         edge_type: relationship.edge_type.clone(),
@@ -360,6 +493,7 @@ impl GraphShard {
                     }
                 }
                 incident_edges_deleted = incident_edges_deleted.saturating_add(1);
+                lock.renew().await?;
             }
         }
 
@@ -445,6 +579,7 @@ impl GraphShard {
         cell_id: &str,
         vertex_id: VertexId,
         read_epoch: GraphEpoch,
+        lock: &CellWriteLock,
     ) -> Result<BTreeSet<IncidentEdge>> {
         let mut edges = BTreeSet::new();
         let mut scanned = 0_u64;
@@ -454,6 +589,7 @@ impl GraphShard {
             .await?;
         while let Some(kv) = out_iter.next().await? {
             scanned = scanned.saturating_add(1);
+            renew_vertex_delete_lock_after_items(lock, scanned).await?;
             ensure_limit(
                 "delete_vertex_scan_edges",
                 scanned,
@@ -475,6 +611,7 @@ impl GraphShard {
             .await?;
         while let Some(kv) = relationship_iter.next().await? {
             scanned = scanned.saturating_add(1);
+            renew_vertex_delete_lock_after_items(lock, scanned).await?;
             ensure_limit(
                 "delete_vertex_scan_relationships",
                 scanned,
@@ -512,6 +649,7 @@ impl GraphShard {
             .await?;
         while let Some(kv) = segment_iter.next().await? {
             scanned = scanned.saturating_add(1);
+            renew_vertex_delete_lock_after_items(lock, scanned).await?;
             ensure_limit(
                 "delete_vertex_scan_segments",
                 scanned,
@@ -566,7 +704,7 @@ impl GraphShard {
         let _writer = self.writer_lane(cell_id).lock().await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             let lock = self.acquire_cell_write_lock(cell_id, "drop_cell").await?;
-            let result = self.drop_cell_locked(cell_id, idempotency_key).await;
+            let result = self.drop_cell_locked(cell_id, idempotency_key, &lock).await;
             match release_cell_write_lock(lock, result).await {
                 Err(err)
                     if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
@@ -591,21 +729,23 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn drop_cell_locked(
         &self,
         cell_id: &str,
         idempotency_key: &str,
+        lock: &CellWriteLock,
     ) -> Result<GraphCellDropResult> {
         let idem_key = keys::cell_drop_idempotency(cell_id, idempotency_key);
         let marker_key = keys::cell_drop_marker(cell_id);
         let pending_marker_key = keys::cell_drop_pending_marker(cell_id);
         let write_fence_key = keys::write_fence(cell_id);
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
-        self.validate_write_fence_txn(&txn, cell_id, "drop_cell")
-            .await?;
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
             return decode_cell_drop_idempotency(&idem_key, cell_id, idempotency_key, &value);
         }
@@ -623,6 +763,8 @@ impl GraphShard {
             commit_txn_strict(txn, self.await_durable_writes).await?;
             return Ok(result);
         }
+        self.validate_write_fence_txn(&txn, cell_id, "drop_cell")
+            .await?;
         let marker_epoch = match read_txn_remote(&txn, &pending_marker_key).await? {
             Some(value) => decode_u64(&pending_marker_key, &value)?,
             None => {
@@ -635,24 +777,31 @@ impl GraphShard {
         };
         commit_txn_strict(txn, self.await_durable_writes).await?;
 
+        self.wait_for_drop_read_leases(cell_id, lock).await?;
+        lock.renew().await?;
+
         let mut deleted_keys = 0_u64;
         let mut batches = 0_u64;
         let mut pending = Vec::new();
         let mut iter = self.scan_remote_prefix(&keys::cell_prefix(cell_id)).await?;
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            if key == write_fence_key {
+            if key == write_fence_key || key == pending_marker_key {
                 continue;
             }
             pending.push(key);
             if pending.len() >= GRAPH_DELTA_GC_BATCH_KEYS {
+                lock.renew().await?;
                 let deleted = self.flush_drop_cell_batch(cell_id, &mut pending).await?;
+                lock.renew().await?;
                 deleted_keys = deleted_keys.saturating_add(deleted);
                 batches = batches.saturating_add(1);
             }
         }
         if !pending.is_empty() {
+            lock.renew().await?;
             let deleted = self.flush_drop_cell_batch(cell_id, &mut pending).await?;
+            lock.renew().await?;
             deleted_keys = deleted_keys.saturating_add(deleted);
             batches = batches.saturating_add(1);
         }
@@ -700,6 +849,32 @@ impl GraphShard {
         Ok(deleted)
     }
 
+    async fn wait_for_drop_read_leases(&self, cell_id: &str, lock: &CellWriteLock) -> Result<()> {
+        if self.retention_policy.read_lease_ttl_ms == 0 {
+            return Ok(());
+        }
+        let started_ms = graph_now_millis();
+        let timeout_ms = self
+            .retention_policy
+            .read_lease_ttl_ms
+            .saturating_add(1_000);
+        loop {
+            let Some(read_epoch) = self.min_active_read_epoch(cell_id).await? else {
+                return Ok(());
+            };
+            if graph_now_millis().saturating_sub(started_ms) >= timeout_ms {
+                return Err(GraphError::ActiveReadLease {
+                    operation: "drop_cell",
+                    cell_id: cell_id.to_string(),
+                    read_epoch,
+                });
+            }
+            lock.renew().await?;
+            let sleep_ms = self.retention_policy.read_lease_ttl_ms.clamp(1, 50);
+            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+        }
+    }
+
     pub async fn set_edge_metadata(
         &self,
         cell_id: &str,
@@ -742,7 +917,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub async fn set_edge_metadata_batch(
@@ -797,7 +975,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub async fn import_relationships_batch(
@@ -877,7 +1058,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn set_edge_metadata_txn(
@@ -1433,7 +1617,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn create_relationship_txn(
@@ -1730,7 +1917,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn set_relationship_metadata_txn(
@@ -1848,7 +2038,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn delete_relationship_txn(
@@ -1964,10 +2157,14 @@ impl GraphShard {
         let relationship_count = read_counter_txn(&txn, &relationship_count_key)
             .await?
             .saturating_sub(1);
-        txn.put(
-            relationship_count_key.as_bytes(),
-            encode_u64(relationship_count),
-        )?;
+        if relationship_count == 0 {
+            txn.delete(relationship_count_key.as_bytes())?;
+        } else {
+            txn.put(
+                relationship_count_key.as_bytes(),
+                encode_u64(relationship_count),
+            )?;
+        }
         delete_relationship_property_indexes_txn(&txn, &record, &record.metadata)?;
         put_relationship_property_index_deltas_txn(
             &txn,
@@ -2026,7 +2223,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub(crate) async fn write_edge_txn(&self, mutation: &EdgeMutation) -> Result<CommitResult> {
@@ -2096,7 +2296,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn write_edge_with_vertex_metadata_txn(
@@ -2169,7 +2372,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn write_edge_with_full_metadata_txn(
@@ -2546,7 +2752,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn delete_edge_mutations_batch_txn(
@@ -2655,6 +2864,13 @@ impl GraphShard {
                 Some(value) => decode_edge_metadata(&edge_metadata_key, &value)?,
                 None => EdgeMetadata::default(),
             };
+            tombstone_relationships_for_structural_edge_delete_txn(
+                &txn,
+                mutation,
+                next_epoch,
+                current_epoch,
+            )
+            .await?;
             if !previous_edge_metadata.properties.is_empty() {
                 apply_edge_metadata_update_txn(
                     &txn,
@@ -2708,7 +2924,7 @@ impl GraphShard {
                 next_epoch,
                 mutation.src,
                 mutation.dst,
-            );
+            )?;
             txn.put(
                 idem_key.as_bytes(),
                 encode_delete_idempotency(mutation, &result),
@@ -2828,7 +3044,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub(crate) async fn delete_edge_txn(&self, mutation: &EdgeMutation) -> Result<DeleteResult> {
@@ -2947,6 +3166,13 @@ impl GraphShard {
                 None => EdgeMetadata::default(),
             };
 
+            tombstone_relationships_for_structural_edge_delete_txn(
+                &txn,
+                mutation,
+                epoch,
+                current_epoch,
+            )
+            .await?;
             txn.put(
                 keys::last_epoch(&mutation.cell_id).as_bytes(),
                 encode_u64(epoch),
@@ -3030,6 +3256,13 @@ impl GraphShard {
             None => EdgeMetadata::default(),
         };
 
+        tombstone_relationships_for_structural_edge_delete_txn(
+            &txn,
+            mutation,
+            epoch,
+            epoch.saturating_sub(1),
+        )
+        .await?;
         txn.put(
             keys::last_epoch(&mutation.cell_id).as_bytes(),
             encode_u64(epoch),
@@ -3235,7 +3468,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub async fn bulk_import_edges_with_options(
@@ -3298,7 +3534,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub async fn write_edge_mutations_batch(
@@ -3377,7 +3616,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub async fn ingest_edge_mutations(
@@ -3510,7 +3752,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub(crate) async fn append_edge_mutation_log_txn(
@@ -3739,7 +3984,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     pub(crate) async fn write_edge_mutations_batch_txn(
@@ -4478,7 +4726,7 @@ fn push_delete_outbox_run(
     epoch: GraphEpoch,
     src: VertexId,
     dst: VertexId,
-) {
+) -> Result<()> {
     let can_extend = current
         .as_ref()
         .is_some_and(|run| run.edge_type == edge_type && run.end_epoch.saturating_add(1) == epoch);
@@ -4493,11 +4741,15 @@ fn push_delete_outbox_run(
             edges: Vec::new(),
         });
     }
-    let run = current
-        .as_mut()
-        .expect("delete outbox run exists after initialization");
+    let Some(run) = current.as_mut() else {
+        return Err(GraphError::CorruptValue {
+            key: format!("delete/outbox/{edge_type}/{epoch}"),
+            reason: "delete outbox run was not initialized".to_string(),
+        });
+    };
     run.end_epoch = epoch;
     run.edges.push((src, dst));
+    Ok(())
 }
 
 fn validate_unique_delete_mutation_identities(mutations: &[EdgeMutation]) -> Result<()> {
@@ -4510,6 +4762,16 @@ fn validate_unique_delete_mutation_identities(mutations: &[EdgeMutation]) -> Res
                 idempotency_key: format!("{first_key},{}", mutation.idempotency_key),
             });
         }
+    }
+    Ok(())
+}
+
+async fn renew_vertex_delete_lock_after_items(lock: &CellWriteLock, items: u64) -> Result<()> {
+    if items == 0
+        || (items >= VERTEX_DELETE_LOCK_RENEW_ITEMS
+            && items / VERTEX_DELETE_LOCK_RENEW_ITEMS * VERTEX_DELETE_LOCK_RENEW_ITEMS == items)
+    {
+        lock.renew().await?;
     }
     Ok(())
 }
@@ -5044,6 +5306,63 @@ async fn delete_structural_edge_txn(
         &delta_value,
     )?;
     Ok(())
+}
+
+async fn tombstone_relationships_for_structural_edge_delete_txn(
+    txn: &DbTransaction,
+    mutation: &EdgeMutation,
+    delete_epoch: GraphEpoch,
+    read_epoch: GraphEpoch,
+) -> Result<u64> {
+    let relationships = live_relationships_for_edge_txn(
+        txn,
+        &mutation.cell_id,
+        &mutation.edge_type,
+        mutation.src,
+        mutation.dst,
+        read_epoch,
+    )
+    .await?;
+    for record in &relationships {
+        txn.put(
+            keys::relationship_tombstone(
+                &record.cell_id,
+                &record.edge_type,
+                record.src,
+                record.dst,
+                record.relationship_id,
+            )
+            .as_bytes(),
+            encode_u64(delete_epoch),
+        )?;
+        txn.delete(keys::relationship_id(&record.cell_id, record.relationship_id).as_bytes())?;
+        delete_relationship_property_indexes_txn(txn, record, &record.metadata)?;
+        put_relationship_property_index_deltas_txn(
+            txn,
+            record,
+            &record.metadata,
+            &EdgeMetadata::default(),
+            delete_epoch,
+        )?;
+    }
+    txn.delete(
+        keys::relationship_count(
+            &mutation.cell_id,
+            &mutation.edge_type,
+            mutation.src,
+            mutation.dst,
+        )
+        .as_bytes(),
+    )?;
+    u64::try_from(relationships.len()).map_err(|err| GraphError::CorruptValue {
+        key: keys::relationship_edge_prefix(
+            &mutation.cell_id,
+            &mutation.edge_type,
+            mutation.src,
+            mutation.dst,
+        ),
+        reason: format!("too many relationships to tombstone during edge delete: {err}"),
+    })
 }
 
 fn delete_relationship_property_indexes_txn(

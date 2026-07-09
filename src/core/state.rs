@@ -5,6 +5,8 @@ use slatedb::bytes::Bytes;
 use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
 use slatedb::Db;
 use slatedb::ErrorKind;
+#[cfg(feature = "opencypher")]
+use tokio::sync::watch;
 use tokio::sync::{Mutex, Semaphore};
 #[cfg(feature = "opencypher")]
 use tokio::task::JoinHandle;
@@ -12,10 +14,12 @@ use tokio::task::JoinHandle;
 #[cfg(feature = "opencypher")]
 use crate::query::opencypher::ParsedRowQuery;
 use crate::{
-    engine, parse_u64, sparse_kernel, validate_component, BoundedGraphCache, GraphCacheMetrics,
-    GraphCachePolicy, GraphEpoch, GraphError, GraphIndexPolicy, GraphLimits,
-    GraphOperationalMetrics, GraphRetentionPolicy, MatrixAdjacency, MatrixCacheKey,
-    PostingChunkCacheKey, Result, SupernodeCacheKey, VertexId, GRAPH_CELL_WRITE_LOCK_TTL_MS,
+    engine, graph_now_millis, new_cell_write_lock_owner_token, parse_u64, sparse_kernel,
+    validate_component, BoundedGraphCache, GraphCacheMetrics, GraphCachePolicy, GraphEpoch,
+    GraphError, GraphIndexPolicy, GraphLimits, GraphOperationalMetrics, GraphRetentionPolicy,
+    MatrixAdjacency, MatrixCacheKey, PostingChunkCacheKey, Result, SupernodeCacheKey, VertexId,
+    GRAPH_CELL_WRITE_LOCK_BACKOFF_MS, GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS,
+    GRAPH_CELL_WRITE_LOCK_TTL_MS,
 };
 #[cfg(feature = "opencypher")]
 use crate::{
@@ -71,20 +75,41 @@ pub struct GraphShard {
 
 #[cfg(feature = "opencypher")]
 pub struct QueryStatsRefreshHandle {
-    pub(crate) handle: JoinHandle<()>,
+    pub(crate) stop_tx: Option<watch::Sender<bool>>,
+    pub(crate) handle: Option<JoinHandle<Result<()>>>,
 }
 
 #[cfg(feature = "opencypher")]
 impl QueryStatsRefreshHandle {
     pub fn abort(&self) {
-        self.handle.abort();
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
+    pub async fn stop(mut self) -> Result<()> {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        match handle.await {
+            Ok(result) => result,
+            Err(err) => Err(GraphError::CorruptValue {
+                key: "query/stats_refresh_job".to_string(),
+                reason: format!("query stats refresh task failed: {err}"),
+            }),
+        }
     }
 }
 
 #[cfg(feature = "opencypher")]
 impl Drop for QueryStatsRefreshHandle {
     fn drop(&mut self) {
-        self.handle.abort();
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
     }
 }
 
@@ -153,9 +178,57 @@ pub(crate) struct CellWriteLock {
     pub(crate) object_store: Arc<dyn ObjectStore>,
     pub(crate) path: Path,
     pub(crate) owner_token: String,
+    pub(crate) ttl_ms: u64,
 }
 
 impl CellWriteLock {
+    pub(crate) async fn renew(&self) -> Result<()> {
+        let current = self.object_store.get(&self.path).await?;
+        let version = UpdateVersion {
+            e_tag: current.meta.e_tag.clone(),
+            version: current.meta.version.clone(),
+        };
+        let value = current.bytes().await?;
+        let record = decode_cell_write_lock_record(self.path.as_ref(), &value)?;
+        if record.owner_token != self.owner_token || record.state != CellWriteLockState::Active {
+            return Err(GraphError::CellWriteConflict {
+                operation: "renew_cell_write_lock",
+                cell_id: record.cell_id,
+            });
+        }
+        let now_ms = graph_now_millis();
+        let payload = encode_cell_write_lock_record(
+            &record.cell_id,
+            &record.operation,
+            &self.owner_token,
+            record.created_ms,
+            now_ms.saturating_add(self.ttl_ms),
+            CellWriteLockState::Active,
+        );
+        match self
+            .object_store
+            .put_opts(&self.path, payload.into(), PutMode::Update(version).into())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(slatedb::object_store::Error::Precondition { .. })
+            | Err(slatedb::object_store::Error::NotFound { .. }) => {
+                Err(GraphError::CellWriteConflict {
+                    operation: "renew_cell_write_lock",
+                    cell_id: record.cell_id,
+                })
+            }
+            Err(slatedb::object_store::Error::NotImplemented { .. })
+            | Err(slatedb::object_store::Error::NotSupported { .. }) => {
+                // Some local object-store backends do not support conditional update. We already
+                // verified that this owner still holds an active lock; those backends also cannot
+                // safely CAS-reclaim the lock, so accepting the renewal preserves exclusivity.
+                Ok(())
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub(crate) async fn release(self) -> Result<()> {
         let current = match self.object_store.get(&self.path).await {
             Ok(current) => current,
@@ -195,6 +268,135 @@ impl CellWriteLock {
             }
             Err(err) => Err(err.into()),
         }
+    }
+}
+
+pub(crate) async fn acquire_distributed_write_lock(
+    object_store: Arc<dyn ObjectStore>,
+    path: Path,
+    scope_id: &str,
+    operation: &'static str,
+    ttl_ms: u64,
+) -> Result<CellWriteLock> {
+    validate_component("lock_scope", scope_id)?;
+    if ttl_ms == 0 {
+        return Err(GraphError::CorruptValue {
+            key: path.to_string(),
+            reason: "distributed write lock TTL must be greater than zero".to_string(),
+        });
+    }
+    let owner_token = new_cell_write_lock_owner_token();
+    for attempt in 0..GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS {
+        let now_ms = graph_now_millis();
+        let payload = encode_cell_write_lock_record(
+            scope_id,
+            operation,
+            &owner_token,
+            now_ms,
+            now_ms.saturating_add(ttl_ms),
+            CellWriteLockState::Active,
+        );
+        match object_store
+            .put_opts(&path, payload.clone().into(), PutMode::Create.into())
+            .await
+        {
+            Ok(_) => {
+                return Ok(CellWriteLock {
+                    object_store,
+                    path,
+                    owner_token,
+                    ttl_ms,
+                });
+            }
+            Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+                if let Some(lock) = try_reclaim_distributed_write_lock(
+                    Arc::clone(&object_store),
+                    &path,
+                    scope_id,
+                    operation,
+                    &owner_token,
+                    ttl_ms,
+                )
+                .await?
+                {
+                    return Ok(lock);
+                }
+                if attempt + 1 < GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        GRAPH_CELL_WRITE_LOCK_BACKOFF_MS,
+                    ))
+                    .await;
+                    continue;
+                }
+                return Err(GraphError::CellWriteConflict {
+                    operation,
+                    cell_id: scope_id.to_string(),
+                });
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(GraphError::CellWriteConflict {
+        operation,
+        cell_id: scope_id.to_string(),
+    })
+}
+
+async fn try_reclaim_distributed_write_lock(
+    object_store: Arc<dyn ObjectStore>,
+    path: &Path,
+    scope_id: &str,
+    operation: &'static str,
+    owner_token: &str,
+    ttl_ms: u64,
+) -> Result<Option<CellWriteLock>> {
+    let current = match object_store.get(path).await {
+        Ok(current) => current,
+        Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let version = UpdateVersion {
+        e_tag: current.meta.e_tag.clone(),
+        version: current.meta.version.clone(),
+    };
+    let value = current.bytes().await?;
+    let record = decode_cell_write_lock_record(path.as_ref(), &value)?;
+    if record.cell_id != scope_id {
+        return Err(GraphError::CorruptValue {
+            key: path.to_string(),
+            reason: format!(
+                "distributed write lock belongs to scope {}, expected {scope_id}",
+                record.cell_id
+            ),
+        });
+    }
+    let now_ms = graph_now_millis();
+    if !record.is_expired(now_ms) {
+        return Ok(None);
+    }
+    let payload = encode_cell_write_lock_record(
+        scope_id,
+        operation,
+        owner_token,
+        now_ms,
+        now_ms.saturating_add(ttl_ms),
+        CellWriteLockState::Active,
+    );
+    match object_store
+        .put_opts(path, payload.into(), PutMode::Update(version).into())
+        .await
+    {
+        Ok(_) => Ok(Some(CellWriteLock {
+            object_store,
+            path: path.clone(),
+            owner_token: owner_token.to_string(),
+            ttl_ms,
+        })),
+        Err(slatedb::object_store::Error::Precondition { .. })
+        | Err(slatedb::object_store::Error::NotFound { .. })
+        | Err(slatedb::object_store::Error::NotImplemented { .. })
+        | Err(slatedb::object_store::Error::NotSupported { .. }) => Ok(None),
+        Err(err) => Err(err.into()),
     }
 }
 

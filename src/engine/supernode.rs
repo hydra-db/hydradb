@@ -101,7 +101,7 @@ impl GraphShard {
                     &mut groups,
                 );
             }
-            self.persist_supernode_artifacts(cell_id, &chunks, &groups)
+            self.persist_supernode_artifacts(cell_id, edge_type, &chunks, &groups)
                 .await?;
             groups
         };
@@ -143,18 +143,25 @@ impl GraphShard {
             )
             .await?;
         }
-        let ending_epoch = self.current_epoch(cell_id).await?;
-        if ending_epoch != base_epoch {
-            return Err(GraphError::SnapshotChanged {
-                operation: "build_supernode_groups",
-                cell_id: cell_id.to_string(),
-                edge_type: edge_type.to_string(),
-                read_epoch: base_epoch,
-                current_epoch: ending_epoch,
-            });
-        }
-        self.persist_supernode_artifacts(cell_id, &chunks, &groups)
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "build_supernode_groups")
             .await?;
+        let publish_result = async {
+            let ending_epoch = self.current_epoch(cell_id).await?;
+            if ending_epoch != base_epoch {
+                return Err(GraphError::SnapshotChanged {
+                    operation: "build_supernode_groups",
+                    cell_id: cell_id.to_string(),
+                    edge_type: edge_type.to_string(),
+                    read_epoch: base_epoch,
+                    current_epoch: ending_epoch,
+                });
+            }
+            self.persist_supernode_artifacts(cell_id, edge_type, &chunks, &groups)
+                .await
+        }
+        .await;
+        crate::release_cell_write_lock(lock, publish_result).await?;
         Ok(groups)
     }
 
@@ -314,7 +321,7 @@ impl GraphShard {
             rollup_key(cell_id, edge_type, base_epoch),
             encode_graph_rollup(&rollup),
         );
-        self.write_graph_batch_strict(cell_id, "rollup_artifacts", batch)
+        self.write_graph_batch_strict_with_cell_lock(cell_id, "rollup_artifacts", batch)
             .await?;
         tracing::info!(
             target: "slatedb_graph_kernel",
@@ -339,14 +346,15 @@ impl GraphShard {
         validate_component("edge_type", edge_type)?;
         let prefix = rollup_prefix(cell_id, edge_type);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
-        let mut latest = None;
+        let mut latest: Option<GraphRollup> = None;
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let rollup = decode_graph_rollup(&key, &kv.value)?;
             if rollup.base_epoch <= read_epoch
-                && latest
-                    .as_ref()
-                    .is_none_or(|current: &GraphRollup| rollup.base_epoch > current.base_epoch)
+                && match latest.as_ref() {
+                    Some(current) => rollup.base_epoch > current.base_epoch,
+                    None => true,
+                }
             {
                 latest = Some(rollup);
             }
@@ -460,8 +468,6 @@ impl GraphShard {
         chunks: &[PostingChunk],
     ) -> Result<Vec<SupernodeGroup>> {
         let mut groups = Vec::new();
-        let mut batch = GraphWriteBatch::new();
-        let mut pending_writes = 0_usize;
         for direction in [ArtifactDirection::Out, ArtifactDirection::In] {
             let mut owners: BTreeMap<VertexId, Vec<&PostingChunk>> = BTreeMap::new();
             for chunk in chunks.iter().filter(|chunk| chunk.direction == direction) {
@@ -486,27 +492,91 @@ impl GraphShard {
                     page_size: chunk_size as u64,
                     chunk_bounds: supernode_chunk_bounds(&owner_chunks),
                 };
-                put_artifact_record(
+                groups.push(group);
+            }
+        }
+
+        let manifest =
+            supernode_artifact_manifest_from_groups(cell_id, edge_type, base_epoch, &groups)?;
+        if manifest.is_some() {
+            let artifact_lock = self
+                .acquire_supernode_artifact_write_lock(
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    "persist_supernode_groups_from_chunks",
+                )
+                .await?;
+            let publish_result = async {
+                prepare_artifact_build(
                     self,
+                    cell_id,
+                    "prepare_supernode_groups_build",
+                    &[supernode_cleanup_marker_key(cell_id, edge_type, base_epoch)],
+                )
+                .await?;
+                ensure_supernode_artifact_publish_compatible(
+                    self,
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    manifest.as_ref(),
+                )
+                .await?;
+                let mut batch = GraphWriteBatch::new();
+                let mut pending_writes = 0_usize;
+                for group in &groups {
+                    put_artifact_record(
+                        self,
+                        &[&artifact_lock],
+                        cell_id,
+                        "persist_supernode_groups_from_chunks",
+                        &mut batch,
+                        &mut pending_writes,
+                        supernode_group_key(group),
+                        encode_supernode_group(group),
+                    )
+                    .await?;
+                }
+                flush_artifact_put_batch(
+                    self,
+                    &[&artifact_lock],
                     cell_id,
                     "persist_supernode_groups_from_chunks",
                     &mut batch,
                     &mut pending_writes,
-                    supernode_group_key(&group),
-                    encode_supernode_group(&group),
                 )
                 .await?;
-                groups.push(group);
+                artifact_lock.renew().await?;
+                if let Some(manifest) = manifest.as_ref() {
+                    batch.put(
+                        supernode_artifact_manifest_key(cell_id, edge_type, base_epoch),
+                        encode_supernode_artifact_manifest(manifest),
+                    );
+                    publish_artifact_records_guarded(
+                        self,
+                        cell_id,
+                        "persist_supernode_groups_manifest",
+                        &[supernode_cleanup_marker_key(cell_id, edge_type, base_epoch)],
+                        batch,
+                    )
+                    .await?;
+                }
+                artifact_lock.renew().await
+            }
+            .await;
+            if let Err(err) = crate::release_cell_write_lock(artifact_lock, publish_result).await {
+                cleanup_unpublished_supernode_artifact_epoch(
+                    self,
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    "persist_supernode_groups_abort",
+                )
+                .await;
+                return Err(err);
             }
         }
-        flush_artifact_put_batch(
-            self,
-            cell_id,
-            "persist_supernode_groups_from_chunks",
-            &mut batch,
-            &mut pending_writes,
-        )
-        .await?;
         if !groups.is_empty() {
             let mut cache = self.supernode_group_cache.lock().await;
             for group in &groups {
@@ -531,43 +601,139 @@ impl GraphShard {
     async fn persist_supernode_artifacts(
         &self,
         cell_id: &str,
+        edge_type: &str,
         chunks: &[PostingChunk],
         groups: &[SupernodeGroup],
     ) -> Result<()> {
-        let mut batch = GraphWriteBatch::new();
-        let mut pending_writes = 0_usize;
-        for chunk in chunks {
-            put_artifact_record(
-                self,
-                cell_id,
-                "persist_supernode_artifacts",
-                &mut batch,
-                &mut pending_writes,
-                posting_key(chunk),
-                encode_posting_chunk(chunk),
-            )
-            .await?;
+        let base_epoch = groups
+            .first()
+            .map(|group| group.base_epoch)
+            .or_else(|| chunks.first().map(|chunk| chunk.base_epoch));
+        if let Some(base_epoch) = base_epoch {
+            let manifest =
+                supernode_artifact_manifest_from_groups(cell_id, edge_type, base_epoch, groups)?;
+            let supernode_lock = self
+                .acquire_supernode_artifact_write_lock(
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    "persist_supernode_artifacts",
+                )
+                .await?;
+            let posting_lock = match self
+                .acquire_posting_artifact_write_lock(
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    "persist_supernode_artifacts",
+                )
+                .await
+            {
+                Ok(lock) => lock,
+                Err(err) => {
+                    return crate::release_cell_write_lock(supernode_lock, Err(err)).await;
+                }
+            };
+            let publish_result = async {
+                prepare_artifact_build(
+                    self,
+                    cell_id,
+                    "prepare_supernode_artifacts_build",
+                    &[
+                        supernode_cleanup_marker_key(cell_id, edge_type, base_epoch),
+                        posting_cleanup_marker_key(cell_id, edge_type, base_epoch),
+                    ],
+                )
+                .await?;
+                ensure_supernode_artifact_publish_compatible(
+                    self,
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    manifest.as_ref(),
+                )
+                .await?;
+                let mut batch = GraphWriteBatch::new();
+                let mut pending_writes = 0_usize;
+                for chunk in chunks {
+                    put_artifact_record(
+                        self,
+                        &[&supernode_lock, &posting_lock],
+                        cell_id,
+                        "persist_supernode_artifacts",
+                        &mut batch,
+                        &mut pending_writes,
+                        posting_key(chunk),
+                        encode_posting_chunk(chunk),
+                    )
+                    .await?;
+                }
+                for group in groups {
+                    put_artifact_record(
+                        self,
+                        &[&supernode_lock, &posting_lock],
+                        cell_id,
+                        "persist_supernode_artifacts",
+                        &mut batch,
+                        &mut pending_writes,
+                        supernode_group_key(group),
+                        encode_supernode_group(group),
+                    )
+                    .await?;
+                }
+                flush_artifact_put_batch(
+                    self,
+                    &[&supernode_lock, &posting_lock],
+                    cell_id,
+                    "persist_supernode_artifacts",
+                    &mut batch,
+                    &mut pending_writes,
+                )
+                .await?;
+                supernode_lock.renew().await?;
+                posting_lock.renew().await?;
+                if let Some(manifest) = manifest.as_ref() {
+                    batch.put(
+                        supernode_artifact_manifest_key(cell_id, edge_type, base_epoch),
+                        encode_supernode_artifact_manifest(manifest),
+                    );
+                    publish_artifact_records_guarded(
+                        self,
+                        cell_id,
+                        "persist_supernode_artifacts_manifest",
+                        &[
+                            supernode_cleanup_marker_key(cell_id, edge_type, base_epoch),
+                            posting_cleanup_marker_key(cell_id, edge_type, base_epoch),
+                        ],
+                        batch,
+                    )
+                    .await?;
+                }
+                supernode_lock.renew().await?;
+                posting_lock.renew().await
+            }
+            .await;
+            let publish_result = crate::release_cell_write_lock(posting_lock, publish_result).await;
+            if let Err(err) = crate::release_cell_write_lock(supernode_lock, publish_result).await {
+                cleanup_unpublished_supernode_artifact_epoch(
+                    self,
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    "persist_supernode_artifacts_abort",
+                )
+                .await;
+                cleanup_unpublished_posting_artifact_epoch(
+                    self,
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    "persist_supernode_posting_artifacts_abort",
+                )
+                .await;
+                return Err(err);
+            }
         }
-        for group in groups {
-            put_artifact_record(
-                self,
-                cell_id,
-                "persist_supernode_artifacts",
-                &mut batch,
-                &mut pending_writes,
-                supernode_group_key(group),
-                encode_supernode_group(group),
-            )
-            .await?;
-        }
-        flush_artifact_put_batch(
-            self,
-            cell_id,
-            "persist_supernode_artifacts",
-            &mut batch,
-            &mut pending_writes,
-        )
-        .await?;
         if !chunks.is_empty() {
             let mut cache = self.posting_chunk_cache.lock().await;
             for chunk in chunks {
@@ -609,6 +775,22 @@ impl GraphShard {
         Ok(())
     }
 
+    async fn supernode_artifact_published(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+    ) -> Result<bool> {
+        let key = supernode_artifact_manifest_key(cell_id, edge_type, base_epoch);
+        match self.read_remote(&key).await? {
+            Some(value) => {
+                decode_supernode_artifact_manifest(&key, &value)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     pub async fn supernode_group(
         &self,
         cell_id: &str,
@@ -640,16 +822,23 @@ impl GraphShard {
         let _permit = self.acquire_hydration_permit("supernode_group").await?;
         let prefix = supernode_group_prefix(cell_id, edge_type, direction, vertex_id);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
-        let mut latest = None;
+        let mut latest: Option<SupernodeGroup> = None;
         let mut decoded = Vec::new();
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let group = decode_supernode_group(&key, &kv.value)?;
+            if !self
+                .supernode_artifact_published(cell_id, edge_type, group.base_epoch)
+                .await?
+            {
+                continue;
+            }
             decoded.push(group.clone());
             if group.base_epoch <= read_epoch
-                && latest
-                    .as_ref()
-                    .is_none_or(|current: &SupernodeGroup| group.base_epoch > current.base_epoch)
+                && match latest.as_ref() {
+                    Some(current) => group.base_epoch > current.base_epoch,
+                    None => true,
+                }
             {
                 latest = Some(group);
             }

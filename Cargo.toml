@@ -2,7 +2,7 @@
 name = "slatedb-graph-kernel"
 version = "0.1.0"
 edition = "2021"
-description = "A SlateDB-backed object-store graph kernel prototype"
+description = "A SlateDB-backed object-store graph kernel"
 repository = "https://github.com/usecortex/slatedb-graph-kernel"
 readme = "README.md"
 publish = false
