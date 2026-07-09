@@ -186,9 +186,22 @@ impl GraphNode {
     }
 
     pub async fn close(self) -> Result<()> {
-        let heartbeat_result = self.heartbeat.stop().await;
-        let lease_result = self.lease_renewer.stop().await;
-        let cluster_result = self.cluster.close().await;
+        let GraphNode {
+            cluster,
+            control,
+            lease_renewer,
+            heartbeat,
+        } = self;
+        let node_id = cluster.local_node_id().to_string();
+        let drain_state_result = heartbeat.set_state(GraphNodeHealthState::Draining);
+        let drain_publish_result = control
+            .publish_node_heartbeat(&node_id, GraphNodeHealthState::Draining)
+            .await;
+        let heartbeat_result = heartbeat.stop().await;
+        let lease_result = lease_renewer.stop().await;
+        let cluster_result = cluster.close().await;
+        drain_state_result?;
+        drain_publish_result?;
         heartbeat_result?;
         lease_result?;
         cluster_result
