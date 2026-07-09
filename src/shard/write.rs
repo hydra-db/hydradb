@@ -616,8 +616,6 @@ impl GraphShard {
         let pending_marker_key = keys::cell_drop_pending_marker(cell_id);
         let write_fence_key = keys::write_fence(cell_id);
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
-        self.validate_write_fence_txn(&txn, cell_id, "drop_cell")
-            .await?;
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
             return decode_cell_drop_idempotency(&idem_key, cell_id, idempotency_key, &value);
         }
@@ -635,6 +633,8 @@ impl GraphShard {
             commit_txn_strict(txn, self.await_durable_writes).await?;
             return Ok(result);
         }
+        self.validate_write_fence_txn(&txn, cell_id, "drop_cell")
+            .await?;
         let marker_epoch = match read_txn_remote(&txn, &pending_marker_key).await? {
             Some(value) => decode_u64(&pending_marker_key, &value)?,
             None => {

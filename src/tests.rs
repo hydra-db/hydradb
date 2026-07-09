@@ -10218,6 +10218,58 @@ async fn drop_cell_purges_namespace_and_blocks_future_writes() {
 }
 
 #[tokio::test]
+async fn leased_drop_cell_replays_after_write_fence_is_deleted() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let lease = ShardLease {
+        cell_id: "reddit-home".to_string(),
+        owner_node_id: "node-a".to_string(),
+        lease_token: 1,
+        expires_at_ms: graph_now_millis() + 60_000,
+    };
+    let leases = Arc::new(RwLock::new(BTreeMap::from([(
+        lease.cell_id.clone(),
+        lease.clone(),
+    )])));
+    let shard = GraphShard::open_leased_writer(
+        "graph/drop-cell-leased-replay",
+        Arc::clone(&object_store),
+        GraphOpenOptions::default(),
+        "node-a".to_string(),
+        Arc::clone(&leases),
+    )
+    .await
+    .unwrap();
+    shard
+        .install_write_fence("reddit-home", &lease)
+        .await
+        .unwrap();
+    shard
+        .write_edge(mutation(1, 2, "leased-drop-seed"))
+        .await
+        .unwrap();
+
+    let dropped = shard.drop_cell("reddit-home", "leased-drop").await.unwrap();
+    assert!(!dropped.already_dropped);
+    assert!(shard
+        .read_remote(&keys::write_fence("reddit-home"))
+        .await
+        .unwrap()
+        .is_none());
+
+    let replay = shard.drop_cell("reddit-home", "leased-drop").await.unwrap();
+    assert_eq!(replay, dropped);
+
+    let already = shard
+        .drop_cell("reddit-home", "leased-drop-again")
+        .await
+        .unwrap();
+    assert_eq!(already.marker_epoch, dropped.marker_epoch);
+    assert_eq!(already.deleted_keys, 0);
+    assert!(already.already_dropped);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn pending_drop_marker_blocks_writes_and_drop_cell_finalizes_cleanup() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/drop-cell-pending", object_store).await;
