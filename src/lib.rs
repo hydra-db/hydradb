@@ -56,12 +56,14 @@ pub use core::state::{GraphCacheEntryCounts, GraphShard};
 pub(crate) use core::write_batch::GraphWriteBatch;
 pub use engine::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
-    BenchmarkResult, DeltaGcResult, GraphCluster, GraphControlEdgeWatermark,
+    BenchmarkResult, DeltaGcResult, GraphCluster, GraphClusterControllerConfig,
+    GraphClusterControllerHandle, GraphClusterControllerReport, GraphControlEdgeWatermark,
     GraphControlIdempotencyRecord, GraphControlMetricsSnapshot, GraphControlPlane,
-    GraphControlRepairReport, GraphControlWatermark, GraphNode, GraphRollup,
-    GraphShardCatalogEntry, LeaseRenewalHandle, MatrixArtifact, MatrixTraversalResult,
-    PostingChunk, RoutedGraphCluster, ShardLease, ShardPlacement, SupernodeGroup, SupernodePage,
-    TraversalBackend,
+    GraphControlRepairReport, GraphControlWatermark, GraphNode, GraphNodeHealthState,
+    GraphNodeHeartbeat, GraphPendingFailover, GraphRollup, GraphShardCatalogEntry,
+    GraphShardReassignment, GraphShardRefreshReport, LeaseRenewalHandle, MatrixArtifact,
+    MatrixTraversalResult, NodeHeartbeatHandle, PostingChunk, RoutedGraphCluster, ShardLease,
+    ShardPlacement, SupernodeGroup, SupernodePage, TraversalBackend,
 };
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,

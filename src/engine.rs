@@ -143,6 +143,11 @@ pub struct GraphControlMetricsSnapshot {
     pub control_idempotency_replays: u64,
     pub repair_runs: u64,
     pub repair_actions: u64,
+    pub node_heartbeat_writes: u64,
+    pub controller_runs: u64,
+    pub controller_reassignments: u64,
+    pub controller_failovers: u64,
+    pub controller_pending_failovers: u64,
 }
 
 #[derive(Default)]
@@ -164,6 +169,11 @@ struct GraphControlMetrics {
     control_idempotency_replays: AtomicU64,
     repair_runs: AtomicU64,
     repair_actions: AtomicU64,
+    node_heartbeat_writes: AtomicU64,
+    controller_runs: AtomicU64,
+    controller_reassignments: AtomicU64,
+    controller_failovers: AtomicU64,
+    controller_pending_failovers: AtomicU64,
 }
 
 impl GraphControlMetrics {
@@ -186,6 +196,11 @@ impl GraphControlMetrics {
             control_idempotency_replays: self.control_idempotency_replays.load(Ordering::Relaxed),
             repair_runs: self.repair_runs.load(Ordering::Relaxed),
             repair_actions: self.repair_actions.load(Ordering::Relaxed),
+            node_heartbeat_writes: self.node_heartbeat_writes.load(Ordering::Relaxed),
+            controller_runs: self.controller_runs.load(Ordering::Relaxed),
+            controller_reassignments: self.controller_reassignments.load(Ordering::Relaxed),
+            controller_failovers: self.controller_failovers.load(Ordering::Relaxed),
+            controller_pending_failovers: self.controller_pending_failovers.load(Ordering::Relaxed),
         }
     }
 }
@@ -196,15 +211,20 @@ pub struct ShardPlacement {
 }
 
 pub struct RoutedGraphCluster {
+    base_path: String,
     local_node_id: String,
     placement: ShardPlacement,
+    object_store: Arc<dyn ObjectStore>,
+    options: GraphOpenOptions,
     shards: BTreeMap<String, GraphShard>,
     leases: Arc<RwLock<BTreeMap<String, ShardLease>>>,
 }
 
 pub struct GraphNode {
     cluster: RoutedGraphCluster,
+    control: Arc<GraphControlPlane>,
     lease_renewer: LeaseRenewalHandle,
+    heartbeat: NodeHeartbeatHandle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,6 +238,73 @@ pub struct ShardLease {
 pub struct LeaseRenewalHandle {
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<Result<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphNodeHealthState {
+    Active,
+    Draining,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphNodeHeartbeat {
+    pub node_id: String,
+    pub state: GraphNodeHealthState,
+    pub started_at_ms: u64,
+    pub last_seen_ms: u64,
+    pub generation: u64,
+}
+
+pub struct NodeHeartbeatHandle {
+    stop_tx: watch::Sender<bool>,
+    state_tx: watch::Sender<GraphNodeHealthState>,
+    task: JoinHandle<Result<()>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphClusterControllerConfig {
+    pub cell_ids: Vec<String>,
+    pub heartbeat_ttl: Duration,
+    pub lease_ttl: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphShardReassignment {
+    pub cell_id: String,
+    pub previous_owner_node_id: Option<String>,
+    pub new_owner_node_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphPendingFailover {
+    pub cell_id: String,
+    pub current_owner_node_id: String,
+    pub target_owner_node_id: String,
+    pub lease_expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphClusterControllerReport {
+    pub now_ms: u64,
+    pub active_nodes: Vec<String>,
+    pub draining_nodes: Vec<String>,
+    pub expired_nodes: Vec<String>,
+    pub unassigned_cells: Vec<String>,
+    pub reassignments: Vec<GraphShardReassignment>,
+    pub failed_over_leases: Vec<ShardLease>,
+    pub pending_failovers: Vec<GraphPendingFailover>,
+}
+
+pub struct GraphClusterControllerHandle {
+    stop_tx: watch::Sender<bool>,
+    task: JoinHandle<Result<()>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphShardRefreshReport {
+    pub opened_cells: Vec<String>,
+    pub closed_cells: Vec<String>,
+    pub retained_cells: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -338,6 +425,7 @@ mod artifact_build;
 mod cluster;
 mod control_metadata;
 mod control_plane;
+mod controller;
 mod supernode;
 mod traversal;
 mod verify;
@@ -357,9 +445,14 @@ pub fn object_store_from_env(env_file: Option<String>) -> Result<Arc<dyn ObjectS
 
 const GRAPH_CONTROL_TXN_MAX_RETRIES: usize = 32;
 const CONTROL_PLACEMENT_PREFIX: &str = "control/placement/";
+const CONTROL_NODE_PREFIX: &str = "control/node/";
 
 fn control_placement_key(cell_id: &str) -> String {
     format!("{CONTROL_PLACEMENT_PREFIX}{cell_id}")
+}
+
+fn control_node_key(node_id: &str) -> String {
+    format!("{CONTROL_NODE_PREFIX}{node_id}")
 }
 
 fn control_lease_key(cell_id: &str) -> String {
@@ -383,6 +476,49 @@ fn decode_control_placement(key: &str, value: &[u8]) -> Result<(String, String)>
     validate_component("cell_id", parts[1])?;
     validate_component("node_id", parts[2])?;
     Ok((parts[1].to_string(), parts[2].to_string()))
+}
+
+fn encode_node_health_state(state: GraphNodeHealthState) -> &'static str {
+    match state {
+        GraphNodeHealthState::Active => "active",
+        GraphNodeHealthState::Draining => "draining",
+    }
+}
+
+fn decode_node_health_state(key: &str, value: &str) -> Result<GraphNodeHealthState> {
+    match value {
+        "active" => Ok(GraphNodeHealthState::Active),
+        "draining" => Ok(GraphNodeHealthState::Draining),
+        _ => corrupt(key, format!("unknown node health state {value}")),
+    }
+}
+
+fn encode_node_heartbeat(heartbeat: &GraphNodeHeartbeat) -> Vec<u8> {
+    format!(
+        "node1\t{}\t{}\t{}\t{}\t{}\n",
+        heartbeat.node_id,
+        encode_node_health_state(heartbeat.state),
+        heartbeat.started_at_ms,
+        heartbeat.last_seen_ms,
+        heartbeat.generation
+    )
+    .into_bytes()
+}
+
+fn decode_node_heartbeat(key: &str, value: &[u8]) -> Result<GraphNodeHeartbeat> {
+    let text = text_value(key, value)?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 6 || parts[0] != "node1" {
+        return corrupt(key, "expected node1 record with 6 fields");
+    }
+    validate_component("node_id", parts[1])?;
+    Ok(GraphNodeHeartbeat {
+        node_id: parts[1].to_string(),
+        state: decode_node_health_state(key, parts[2])?,
+        started_at_ms: parse_u64(key, parts[3], "started_at_ms")?,
+        last_seen_ms: parse_u64(key, parts[4], "last_seen_ms")?,
+        generation: parse_u64(key, parts[5], "generation")?,
+    })
 }
 
 fn encode_shard_lease(lease: &ShardLease) -> Vec<u8> {

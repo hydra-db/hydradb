@@ -52,11 +52,29 @@ impl GraphNode {
             options,
         )
         .await?;
-        let lease_renewer =
-            cluster.start_lease_renewer(control, lease_ttl, lease_renew_interval)?;
+        let heartbeat = Arc::clone(&control)
+            .start_node_heartbeat(
+                cluster.local_node_id().to_string(),
+                GraphNodeHealthState::Active,
+                lease_renew_interval,
+            )
+            .await?;
+        let lease_renewer = match cluster.start_lease_renewer(
+            Arc::clone(&control),
+            lease_ttl,
+            lease_renew_interval,
+        ) {
+            Ok(handle) => handle,
+            Err(err) => {
+                heartbeat.stop().await?;
+                return Err(err);
+            }
+        };
         Ok(Self {
             cluster,
+            control,
             lease_renewer,
+            heartbeat,
         })
     }
 
@@ -64,9 +82,36 @@ impl GraphNode {
         &self.cluster
     }
 
+    pub fn heartbeat(&self) -> &NodeHeartbeatHandle {
+        &self.heartbeat
+    }
+
+    pub async fn set_health_state(
+        &self,
+        state: GraphNodeHealthState,
+    ) -> Result<GraphNodeHeartbeat> {
+        self.heartbeat.set_state(state)?;
+        self.control
+            .publish_node_heartbeat(self.cluster.local_node_id(), state)
+            .await
+    }
+
+    pub async fn refresh_owned_shards(
+        &mut self,
+        lease_ttl: Duration,
+    ) -> Result<GraphShardRefreshReport> {
+        self.cluster
+            .refresh_owned_shards(self.control.as_ref(), lease_ttl)
+            .await
+    }
+
     pub async fn close(self) -> Result<()> {
-        self.lease_renewer.stop().await?;
-        self.cluster.close().await
+        let heartbeat_result = self.heartbeat.stop().await;
+        let lease_result = self.lease_renewer.stop().await;
+        let cluster_result = self.cluster.close().await;
+        heartbeat_result?;
+        lease_result?;
+        cluster_result
     }
 }
 
@@ -255,8 +300,11 @@ impl RoutedGraphCluster {
         }
 
         Ok(Self {
+            base_path,
             local_node_id,
             placement,
+            object_store,
+            options: GraphOpenOptions::default(),
             shards,
             leases: Arc::new(RwLock::new(BTreeMap::new())),
         })
@@ -329,8 +377,11 @@ impl RoutedGraphCluster {
         }
 
         Ok(Self {
+            base_path,
             local_node_id,
             placement,
+            object_store,
+            options,
             shards,
             leases,
         })
@@ -375,6 +426,86 @@ impl RoutedGraphCluster {
                 .insert(renewed.cell_id.clone(), renewed);
         }
         Ok(())
+    }
+
+    pub async fn refresh_owned_shards(
+        &mut self,
+        control: &GraphControlPlane,
+        lease_ttl: Duration,
+    ) -> Result<GraphShardRefreshReport> {
+        let placement = control.load_placement().await?;
+        let target_cells = placement
+            .cells_for_node(&self.local_node_id)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let current_cells = self.shards.keys().cloned().collect::<BTreeSet<_>>();
+        let mut report = GraphShardRefreshReport::default();
+
+        for cell_id in current_cells.difference(&target_cells) {
+            self.leases.write().map_err(lock_error)?.remove(cell_id);
+            if let Some(shard) = self.shards.remove(cell_id) {
+                match shard.close().await {
+                    Ok(()) => {}
+                    Err(GraphError::Slate(err)) if matches!(err.kind(), ErrorKind::Closed(_)) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            report.closed_cells.push(cell_id.clone());
+        }
+
+        for cell_id in target_cells.difference(&current_cells) {
+            let lease = control
+                .acquire_lease(cell_id, &self.local_node_id, lease_ttl)
+                .await?;
+            self.leases
+                .write()
+                .map_err(lock_error)?
+                .insert(cell_id.clone(), lease.clone());
+            let path = format!("{}/{}", self.base_path, cell_id);
+            let shard = GraphShard::open_leased_writer(
+                path,
+                Arc::clone(&self.object_store),
+                self.options.clone(),
+                self.local_node_id.clone(),
+                Arc::clone(&self.leases),
+            )
+            .await?;
+            shard.install_write_fence(cell_id, &lease).await?;
+            self.shards.insert(cell_id.clone(), shard);
+            report.opened_cells.push(cell_id.clone());
+        }
+
+        for cell_id in target_cells.intersection(&current_cells) {
+            let needs_lease = match self.leases.read().map_err(lock_error)?.get(cell_id) {
+                Some(lease) => {
+                    lease.owner_node_id != self.local_node_id || lease.expires_at_ms <= now_millis()
+                }
+                None => true,
+            };
+            if needs_lease {
+                let lease = control
+                    .acquire_lease(cell_id, &self.local_node_id, lease_ttl)
+                    .await?;
+                self.leases
+                    .write()
+                    .map_err(lock_error)?
+                    .insert(cell_id.clone(), lease.clone());
+                let shard = self
+                    .shards
+                    .get(cell_id)
+                    .ok_or_else(|| GraphError::UnknownShard {
+                        cell_id: cell_id.clone(),
+                    })?;
+                shard.install_write_fence(cell_id, &lease).await?;
+            }
+            report.retained_cells.push(cell_id.clone());
+        }
+
+        report.opened_cells.sort();
+        report.closed_cells.sort();
+        report.retained_cells.sort();
+        self.placement = placement;
+        Ok(report)
     }
 
     pub fn start_lease_renewer(
