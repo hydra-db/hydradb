@@ -435,9 +435,18 @@ impl GraphCluster {
         let mut shards = BTreeMap::new();
         for cell_id in cell_ids {
             let cell_id = cell_id.into();
-            validate_component("cell_id", &cell_id)?;
+            if let Err(err) = validate_component("cell_id", &cell_id) {
+                close_shards_best_effort(shards).await;
+                return Err(err);
+            }
             let path = format!("{base_path}/{cell_id}");
-            let shard = GraphShard::open(path, Arc::clone(&object_store)).await?;
+            let shard = match GraphShard::open(path, Arc::clone(&object_store)).await {
+                Ok(shard) => shard,
+                Err(err) => {
+                    close_shards_best_effort(shards).await;
+                    return Err(err);
+                }
+            };
             shards.insert(cell_id, shard);
         }
         Ok(Self { shards })
@@ -452,9 +461,19 @@ impl GraphCluster {
         let mut shards = BTreeMap::new();
         for cell_id in cell_ids {
             let cell_id = cell_id.into();
-            validate_component("cell_id", &cell_id)?;
+            if let Err(err) = validate_component("cell_id", &cell_id) {
+                close_shards_best_effort(shards).await;
+                return Err(err);
+            }
             let path = format!("{base_path}/{cell_id}");
-            let shard = GraphShard::open_standalone_writer(path, Arc::clone(&object_store)).await?;
+            let shard =
+                match GraphShard::open_standalone_writer(path, Arc::clone(&object_store)).await {
+                    Ok(shard) => shard,
+                    Err(err) => {
+                        close_shards_best_effort(shards).await;
+                        return Err(err);
+                    }
+                };
             shards.insert(cell_id, shard);
         }
         Ok(Self { shards })
@@ -610,7 +629,13 @@ impl RoutedGraphCluster {
         let mut shards = BTreeMap::new();
         for cell_id in placement.cells_for_node(&local_node_id)? {
             let path = format!("{base_path}/{cell_id}");
-            let shard = GraphShard::open(path, Arc::clone(&object_store)).await?;
+            let shard = match GraphShard::open(path, Arc::clone(&object_store)).await {
+                Ok(shard) => shard,
+                Err(err) => {
+                    close_shards_best_effort(shards).await;
+                    return Err(err);
+                }
+            };
             shards.insert(cell_id, shard);
         }
 
@@ -1470,6 +1495,12 @@ async fn close_cluster_and_release_leases(
     let release_result = release_graph_node_leases(control, leases_to_release).await;
     close_result?;
     release_result
+}
+
+async fn close_shards_best_effort(shards: BTreeMap<String, GraphShard>) {
+    for shard in shards.into_values() {
+        let _ = shard.close().await;
+    }
 }
 
 async fn cleanup_partial_cluster_open(
