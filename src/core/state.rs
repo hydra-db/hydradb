@@ -5,6 +5,8 @@ use slatedb::bytes::Bytes;
 use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
 use slatedb::Db;
 use slatedb::ErrorKind;
+#[cfg(feature = "opencypher")]
+use tokio::sync::watch;
 use tokio::sync::{Mutex, Semaphore};
 #[cfg(feature = "opencypher")]
 use tokio::task::JoinHandle;
@@ -71,20 +73,41 @@ pub struct GraphShard {
 
 #[cfg(feature = "opencypher")]
 pub struct QueryStatsRefreshHandle {
-    pub(crate) handle: JoinHandle<()>,
+    pub(crate) stop_tx: Option<watch::Sender<bool>>,
+    pub(crate) handle: Option<JoinHandle<Result<()>>>,
 }
 
 #[cfg(feature = "opencypher")]
 impl QueryStatsRefreshHandle {
     pub fn abort(&self) {
-        self.handle.abort();
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
+    pub async fn stop(mut self) -> Result<()> {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        match handle.await {
+            Ok(result) => result,
+            Err(err) => Err(GraphError::CorruptValue {
+                key: "query/stats_refresh_job".to_string(),
+                reason: format!("query stats refresh task failed: {err}"),
+            }),
+        }
     }
 }
 
 #[cfg(feature = "opencypher")]
 impl Drop for QueryStatsRefreshHandle {
     fn drop(&mut self) {
-        self.handle.abort();
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
     }
 }
 

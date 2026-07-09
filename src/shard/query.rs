@@ -1383,9 +1383,13 @@ impl GraphShard {
             validate_component("cell_id", &spec.cell_id)?;
             validate_query_stats_refresh_kind(&spec.kind)?;
         }
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(async move {
             loop {
                 for spec in &specs {
+                    if *stop_rx.borrow() {
+                        return Ok(());
+                    }
                     if let Err(err) = self.refresh_query_stats_spec(spec).await {
                         tracing::warn!(
                             target: "slatedb_graph_kernel",
@@ -1395,10 +1399,20 @@ impl GraphShard {
                         );
                     }
                 }
-                tokio::time::sleep(interval).await;
+                tokio::select! {
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            return Ok(());
+                        }
+                    }
+                    _ = tokio::time::sleep(interval) => {}
+                }
             }
         });
-        Ok(QueryStatsRefreshHandle { handle })
+        Ok(QueryStatsRefreshHandle {
+            stop_tx: Some(stop_tx),
+            handle: Some(handle),
+        })
     }
 
     #[cfg(feature = "opencypher")]

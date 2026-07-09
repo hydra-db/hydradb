@@ -11114,7 +11114,7 @@ async fn query_stats_background_refresh_job_publishes_records() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    handle.abort();
+    handle.stop().await.unwrap();
     assert_eq!(shard.read_counter(&key).await.unwrap(), 1);
     let record = read_query_stats_record_for_test(&shard, &key).await;
     assert_eq!(record.count, 1);
@@ -11123,6 +11123,30 @@ async fn query_stats_background_refresh_job_publishes_records() {
     let histogram_record = read_query_stats_record_for_test(&shard, &histogram_key).await;
     assert_eq!(histogram_record.count, 1);
     assert_eq!(histogram_record.distinct_values, 1);
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn query_stats_background_refresh_job_stops_during_long_interval() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = Arc::new(open_test_shard("graph/query-stats-background-stop", object_store).await);
+    let handle = Arc::clone(&shard)
+        .start_query_stats_refresh_job(
+            vec![QueryStatsRefreshSpec::new(
+                "reddit-home",
+                QueryCardinalityStatsKind::VertexLabel {
+                    label: "User".to_string(),
+                },
+            )],
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), handle.stop())
+        .await
+        .expect("query stats refresh stop should not wait for the full interval")
+        .unwrap();
     shard.close().await.unwrap();
 }
 
