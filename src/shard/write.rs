@@ -768,7 +768,7 @@ impl GraphShard {
         let mut iter = self.scan_remote_prefix(&keys::cell_prefix(cell_id)).await?;
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            if key == write_fence_key {
+            if key == write_fence_key || key == pending_marker_key {
                 continue;
             }
             pending.push(key);

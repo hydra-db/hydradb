@@ -10718,6 +10718,37 @@ async fn pending_drop_marker_blocks_writes_and_drop_cell_finalizes_cleanup() {
 }
 
 #[tokio::test]
+async fn resumed_drop_cell_preserves_pending_marker_until_final_commit() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/resumed-drop-keeps-pending-marker", object_store).await;
+    let pending_epoch = 42;
+    let pending_key = keys::cell_drop_pending_marker("reddit-home");
+    let mut batch = GraphWriteBatch::new();
+    batch.put(pending_key.as_bytes(), encode_u64(pending_epoch));
+    shard
+        .write_graph_batch_strict("reddit-home", "drop_cell", batch)
+        .await
+        .unwrap();
+
+    let result = shard
+        .drop_cell("reddit-home", "resume-empty-pending-drop")
+        .await
+        .unwrap();
+    assert_eq!(result.marker_epoch, pending_epoch);
+    assert_eq!(result.deleted_keys, 0);
+    assert!(!result.already_dropped);
+    assert!(shard.read_remote(&pending_key).await.unwrap().is_none());
+    assert_eq!(
+        shard
+            .read_counter(&keys::cell_drop_marker("reddit-home"))
+            .await
+            .unwrap(),
+        pending_epoch
+    );
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn drop_cell_waits_for_active_read_leases_before_deleting_data() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
