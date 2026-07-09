@@ -4618,6 +4618,55 @@ async fn control_plane_release_lease_requires_matching_owner_and_token() {
 }
 
 #[tokio::test]
+async fn routed_cluster_open_cleans_up_leases_after_partial_start_failure() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/open-cleanup", Arc::clone(&object_store))
+        .await
+        .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("b-blocked", "node-b")]).unwrap())
+        .await
+        .unwrap();
+    let blocked = control
+        .acquire_lease("b-blocked", "node-b", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    control
+        .publish_placement(
+            &ShardPlacement::fixed([("a-ok", "node-a"), ("b-blocked", "node-a")]).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let err = match RoutedGraphCluster::open_owned_with_control(
+        "graph-open-cleanup",
+        "node-a",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    {
+        Ok(_) => panic!("routed cluster opened despite held second lease"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        GraphError::ShardLeaseHeld {
+            ref cell_id,
+            ref owner_node_id,
+            ..
+        } if cell_id == "b-blocked" && owner_node_id == "node-b"
+    ));
+    assert!(control.current_lease("a-ok").await.unwrap().is_none());
+    assert_eq!(
+        control.current_lease("b-blocked").await.unwrap().unwrap(),
+        blocked
+    );
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn routed_cluster_refreshes_owned_shards_after_failover() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = GraphControlPlane::open("graph-control/refresh-owned", Arc::clone(&object_store))
