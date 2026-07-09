@@ -1,5 +1,21 @@
 use super::{GraphEpoch, RelationshipId, VertexId};
 
+pub fn cell_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/")
+}
+
+pub fn cell_drop_marker(cell_id: &str) -> String {
+    format!("graph/drop/cell/{cell_id}")
+}
+
+pub fn cell_drop_pending_marker(cell_id: &str) -> String {
+    format!("graph/drop/pending/{cell_id}")
+}
+
+pub fn cell_drop_idempotency(cell_id: &str, idempotency_key: &str) -> String {
+    format!("graph/drop/idem/{cell_id}/{idempotency_key}")
+}
+
 pub fn write_fence(cell_id: &str) -> String {
     format!("cell/{cell_id}/meta/write_fence")
 }
@@ -48,6 +64,10 @@ pub fn out_edge_type_prefix(cell_id: &str, edge_type: &str) -> String {
     format!("cell/{cell_id}/e/out/{edge_type}/")
 }
 
+pub fn out_edge_cell_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/e/out/")
+}
+
 pub fn in_edge_type_prefix(cell_id: &str, edge_type: &str) -> String {
     format!("cell/{cell_id}/e/in/{edge_type}/")
 }
@@ -71,6 +91,10 @@ pub fn out_segment(
 
 pub fn out_segment_edge_type_prefix(cell_id: &str, edge_type: &str) -> String {
     format!("cell/{cell_id}/seg/out/{edge_type}/")
+}
+
+pub fn out_segment_cell_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/seg/out/")
 }
 
 pub fn out_segment_src_prefix(cell_id: &str, edge_type: &str, src: VertexId) -> String {
@@ -119,6 +143,10 @@ pub fn relationship_edge_prefix(
     dst: VertexId,
 ) -> String {
     format!("cell/{cell_id}/rel/{edge_type}/{src:020}/{dst:020}/")
+}
+
+pub fn relationship_cell_prefix(cell_id: &str) -> String {
+    format!("cell/{cell_id}/rel/")
 }
 
 #[cfg(feature = "opencypher")]

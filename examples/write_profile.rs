@@ -75,7 +75,7 @@ async fn main() -> ProfileResult<()> {
             started.elapsed().as_millis()
         );
     }
-    if mode == "delete" {
+    if mode == "delete" || mode == "delete-strict" {
         let started = Instant::now();
         seed_delete_profile_edges(&shard, src, batch_size, warmup_batches, batches).await?;
         eprintln!(
@@ -319,7 +319,7 @@ async fn run_batch(
             }
             Ok(batch_size as u64)
         }
-        "delete" => {
+        "delete-strict" => {
             let mut deleted = 0_u64;
             for index in 0..batch_size {
                 let dst = base + index as u64;
@@ -337,6 +337,17 @@ async fn run_batch(
                 }
             }
             Ok(deleted)
+        }
+        "delete" => {
+            let result = shard
+                .delete_edges_batch(
+                    CELL_ID,
+                    EDGE_TYPE,
+                    (0..batch_size).map(|index| (src, base + index as u64)),
+                    &format!("write-profile-delete-{phase}-{batch}"),
+                )
+                .await?;
+            Ok(result.deleted)
         }
         "bulk" => {
             let result = shard

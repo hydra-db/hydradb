@@ -738,14 +738,80 @@ impl GraphShard {
         for action in &query.actions {
             budget.check("cypher_mutation_action")?;
             match action {
-                RowMutationAction::DeleteRelationship { binding, detach } => {
-                    if *detach {
-                        return Err(GraphError::UnsupportedQuery {
-                            dialect: "OpenCypher",
-                            feature: "DETACH DELETE requires node deletion support, which is not implemented yet"
-                                .to_string(),
-                        });
+                RowMutationAction::DeleteBinding { binding, detach } => {
+                    let mut relationships = BTreeSet::new();
+                    let mut vertices = BTreeSet::new();
+                    for row in &bindings {
+                        if let Some(relationship) = row.relationships.get(binding) {
+                            relationships.insert(relationship.clone());
+                        } else {
+                            vertices.insert(row.get(binding)?);
+                        }
                     }
+                    for relationship in relationships {
+                        budget.check("cypher_delete_relationship")?;
+                        let edge_type = relationship.edge_type.clone();
+                        let mutation = EdgeMutation {
+                            cell_id: context.cell_id.clone(),
+                            edge_type: edge_type.clone(),
+                            src: relationship.src,
+                            dst: relationship.dst,
+                            idempotency_key: format!(
+                                "{}.delete.{}.{}.{}.{}",
+                                context.idempotency_key,
+                                edge_type,
+                                relationship.src,
+                                relationship.dst,
+                                relationship
+                                    .relationship_id
+                                    .map_or_else(|| "edge".to_string(), |id| id.to_string())
+                            ),
+                        };
+                        let delete = if let Some(relationship_id) = relationship.relationship_id {
+                            self.delete_relationship(mutation, relationship_id).await?
+                        } else {
+                            self.delete_edge(mutation).await?
+                        };
+                        if delete.deleted {
+                            result.deleted_edges = result.deleted_edges.saturating_add(1);
+                        } else {
+                            result.noops = result.noops.saturating_add(1);
+                        }
+                    }
+                    for vertex_id in vertices {
+                        budget.check("cypher_delete_vertex")?;
+                        let delete = if *detach {
+                            self.detach_delete_vertex(
+                                &context.cell_id,
+                                vertex_id,
+                                &format!(
+                                    "{}.detach-delete-node.{vertex_id}",
+                                    context.idempotency_key
+                                ),
+                            )
+                            .await?
+                        } else {
+                            self.delete_vertex(
+                                &context.cell_id,
+                                vertex_id,
+                                &format!("{}.delete-node.{vertex_id}", context.idempotency_key),
+                            )
+                            .await?
+                        };
+                        result.deleted_edges = result
+                            .deleted_edges
+                            .saturating_add(delete.incident_edges_deleted);
+                        if delete.vertex_deleted {
+                            result.updated_vertices = result.updated_vertices.saturating_add(1);
+                        } else if delete.incident_edges_deleted == 0
+                            && delete.relationships_deleted == 0
+                        {
+                            result.noops = result.noops.saturating_add(1);
+                        }
+                    }
+                }
+                RowMutationAction::DeleteRelationship { binding, detach } => {
+                    let _ = detach;
                     let mut relationships = BTreeSet::new();
                     for row in &bindings {
                         let Some(relationship) = row.relationships.get(binding) else {
@@ -5076,7 +5142,7 @@ impl GraphShard {
             )
             .await?,
         );
-        sort_deltas(&mut records);
+        sort_and_dedup_deltas(&mut records);
         Ok(records)
     }
 
@@ -5149,7 +5215,7 @@ impl GraphShard {
             });
         }
 
-        sort_deltas(&mut records);
+        sort_and_dedup_deltas(&mut records);
         Ok(records)
     }
 

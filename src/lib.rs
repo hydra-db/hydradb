@@ -35,12 +35,13 @@ pub use core::metrics::{
 pub(crate) use core::metrics::{GraphCacheMetrics, GraphOperationalMetrics};
 pub use core::model::{
     BulkImportDeltaLogPolicy, BulkImportDuplicatePolicy, BulkImportOptions, BulkImportResult,
-    CommitResult, DeleteResult, DeltaKind, DeltaRecord, EdgeIngestOptions, EdgeIngestResult,
-    EdgeMetadata, EdgeMutation, EdgeMutationBatchResult, EdgeMutationLogAppendResult,
-    EdgeMutationLogMaterializeResult, EdgeRecord, GraphCorrectnessReport, GraphExportDigest,
-    GraphRepairReport, QueryFloat, RelationshipCreateResult, RelationshipId,
-    RelationshipImportResult, RelationshipMutation, RelationshipRecord, SegmentCompactionResult,
-    VertexMetadata, VertexPropertyValue,
+    CommitResult, DeleteResult, DeltaKind, DeltaRecord, EdgeDeleteBatchResult, EdgeIngestOptions,
+    EdgeIngestResult, EdgeMetadata, EdgeMutation, EdgeMutationBatchResult,
+    EdgeMutationLogAppendResult, EdgeMutationLogMaterializeResult, EdgeRecord, GraphCellDropResult,
+    GraphCorrectnessReport, GraphExportDigest, GraphRepairReport, QueryFloat,
+    RelationshipCreateResult, RelationshipId, RelationshipImportResult, RelationshipMutation,
+    RelationshipRecord, SegmentCompactionResult, VertexDeleteResult, VertexMetadata,
+    VertexPropertyValue,
 };
 pub(crate) use core::model::{EdgeMutationLogBatch, OutEdgeSegment, OutboxDeltaBatch};
 pub use core::snapshot::GraphSnapshot;
