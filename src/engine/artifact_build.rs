@@ -628,16 +628,17 @@ impl GraphShard {
             .await?;
         let prefix = matrix_manifest_prefix(cell_id, edge_type);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
-        let mut latest = None;
+        let mut latest: Option<MatrixArtifact> = None;
         let mut decoded = Vec::new();
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let artifact = decode_matrix_artifact(&key, &kv.value)?;
             decoded.push(artifact.clone());
             if artifact.base_epoch <= read_epoch
-                && latest
-                    .as_ref()
-                    .is_none_or(|current: &MatrixArtifact| artifact.base_epoch > current.base_epoch)
+                && match latest.as_ref() {
+                    Some(current) => artifact.base_epoch > current.base_epoch,
+                    None => true,
+                }
             {
                 latest = Some(artifact);
             }

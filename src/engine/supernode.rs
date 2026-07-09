@@ -339,14 +339,15 @@ impl GraphShard {
         validate_component("edge_type", edge_type)?;
         let prefix = rollup_prefix(cell_id, edge_type);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
-        let mut latest = None;
+        let mut latest: Option<GraphRollup> = None;
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let rollup = decode_graph_rollup(&key, &kv.value)?;
             if rollup.base_epoch <= read_epoch
-                && latest
-                    .as_ref()
-                    .is_none_or(|current: &GraphRollup| rollup.base_epoch > current.base_epoch)
+                && match latest.as_ref() {
+                    Some(current) => rollup.base_epoch > current.base_epoch,
+                    None => true,
+                }
             {
                 latest = Some(rollup);
             }
@@ -640,16 +641,17 @@ impl GraphShard {
         let _permit = self.acquire_hydration_permit("supernode_group").await?;
         let prefix = supernode_group_prefix(cell_id, edge_type, direction, vertex_id);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
-        let mut latest = None;
+        let mut latest: Option<SupernodeGroup> = None;
         let mut decoded = Vec::new();
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let group = decode_supernode_group(&key, &kv.value)?;
             decoded.push(group.clone());
             if group.base_epoch <= read_epoch
-                && latest
-                    .as_ref()
-                    .is_none_or(|current: &SupernodeGroup| group.base_epoch > current.base_epoch)
+                && match latest.as_ref() {
+                    Some(current) => group.base_epoch > current.base_epoch,
+                    None => true,
+                }
             {
                 latest = Some(group);
             }
