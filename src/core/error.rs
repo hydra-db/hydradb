@@ -12,6 +12,11 @@ pub enum GraphError {
         operation: &'static str,
         cell_id: String,
     },
+    #[error("conditional graph write conflict for {operation} at {key}")]
+    ConditionalWriteConflict {
+        operation: &'static str,
+        key: String,
+    },
     #[error("{operation} requires await_durable_writes=true: {reason}")]
     UnsafeDurabilityConfig {
         operation: &'static str,
@@ -36,6 +41,11 @@ pub enum GraphError {
         key: String,
         expected_generation: Option<u64>,
         actual_generation: Option<u64>,
+    },
+    #[error("{operation} exhausted retry budget after {attempts} attempts")]
+    RetryExhausted {
+        operation: &'static str,
+        attempts: usize,
     },
     #[error(
         "control watermark regression for {field} on cell {cell_id}: requested {requested_epoch}, current {current_epoch}"
@@ -83,6 +93,14 @@ pub enum GraphError {
     CellDropped {
         operation: &'static str,
         cell_id: String,
+    },
+    #[error(
+        "{operation} for cell {cell_id} is waiting for active readers at epoch {read_epoch} to drain"
+    )]
+    ActiveReadLease {
+        operation: &'static str,
+        cell_id: String,
+        read_epoch: GraphEpoch,
     },
     #[error(
         "snapshot epoch {read_epoch} for cell {cell_id} edge {edge_type} is below compacted watermark {min_epoch}"

@@ -28,6 +28,8 @@ jobs:
         run: cargo clippy --locked --all-targets --features chaos-harness -- -D warnings
       - name: Clippy native feature set
         run: cargo clippy --locked --all-targets --features opencypher,graphblas -- -D warnings
+      - name: Clippy full native feature set
+        run: cargo clippy --locked --all-targets --features opencypher,graphblas,query-transport,query-transport-tls,query-service-discovery -- -D warnings
       - name: Test default feature set
         run: cargo test --locked --lib
       - name: Test chaos harness feature set
@@ -36,6 +38,8 @@ jobs:
         run: cargo test --locked --features opencypher --lib
       - name: Test GraphBLAS and OpenCypher feature set
         run: cargo test --locked --features opencypher,graphblas --lib
+      - name: Test full native feature set
+        run: cargo test --locked --all-targets --features opencypher,graphblas,query-transport,query-transport-tls,query-service-discovery
       - name: Check default examples
         run: cargo check --locked --examples
       - name: Check chaos harness example

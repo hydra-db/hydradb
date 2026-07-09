@@ -273,118 +273,110 @@ impl GraphShard {
         Path::from_iter(["__slatedb_graph_kernel", "write_locks", db_path, cell_id])
     }
 
+    pub(crate) fn graph_artifact_write_lock_path(
+        &self,
+        artifact_kind: &'static str,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+    ) -> Path {
+        let db_path = if self.store_path.as_ref().is_empty() {
+            "__root__"
+        } else {
+            self.store_path.as_ref()
+        };
+        let base_epoch = format!("{base_epoch:020}");
+        let lock_namespace = match artifact_kind {
+            "matrix" => "matrix_artifact_locks",
+            "posting" => "posting_artifact_locks",
+            "supernode" => "supernode_artifact_locks",
+            _ => "artifact_locks",
+        };
+        Path::from_iter([
+            "__slatedb_graph_kernel",
+            lock_namespace,
+            db_path,
+            cell_id,
+            edge_type,
+            &base_epoch,
+        ])
+    }
+
+    pub(crate) fn matrix_artifact_write_lock_path(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+    ) -> Path {
+        self.graph_artifact_write_lock_path("matrix", cell_id, edge_type, base_epoch)
+    }
+
     pub(crate) async fn acquire_cell_write_lock(
         &self,
         cell_id: &str,
         operation: &'static str,
     ) -> Result<CellWriteLock> {
         let path = self.cell_write_lock_path(cell_id);
-        let owner_token = new_cell_write_lock_owner_token();
-
-        for attempt in 0..GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS {
-            let now_ms = graph_now_millis();
-            let payload = encode_cell_write_lock_record(
-                cell_id,
-                operation,
-                &owner_token,
-                now_ms,
-                now_ms.saturating_add(GRAPH_CELL_WRITE_LOCK_TTL_MS),
-                CellWriteLockState::Active,
-            );
-            match self
-                .object_store
-                .put_opts(&path, payload.clone().into(), PutMode::Create.into())
-                .await
-            {
-                Ok(_) => {
-                    return Ok(CellWriteLock {
-                        object_store: Arc::clone(&self.object_store),
-                        path,
-                        owner_token,
-                    });
-                }
-                Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
-                    if let Some(lock) = self
-                        .try_reclaim_cell_write_lock(&path, cell_id, operation, &owner_token)
-                        .await?
-                    {
-                        return Ok(lock);
-                    }
-                    if attempt + 1 < GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(GRAPH_CELL_WRITE_LOCK_BACKOFF_MS))
-                            .await;
-                        continue;
-                    }
-                    return Err(GraphError::CellWriteConflict {
-                        operation,
-                        cell_id: cell_id.to_string(),
-                    });
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
-
-        Err(GraphError::CellWriteConflict {
-            operation,
-            cell_id: cell_id.to_string(),
-        })
+        self.acquire_write_lock_at_path(path, cell_id, operation)
+            .await
     }
 
-    async fn try_reclaim_cell_write_lock(
+    pub(crate) async fn acquire_matrix_artifact_write_lock(
         &self,
-        path: &Path,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+        operation: &'static str,
+    ) -> Result<CellWriteLock> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let path = self.matrix_artifact_write_lock_path(cell_id, edge_type, base_epoch);
+        self.acquire_write_lock_at_path(path, cell_id, operation)
+            .await
+    }
+
+    pub(crate) async fn acquire_posting_artifact_write_lock(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+        operation: &'static str,
+    ) -> Result<CellWriteLock> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let path = self.graph_artifact_write_lock_path("posting", cell_id, edge_type, base_epoch);
+        self.acquire_write_lock_at_path(path, cell_id, operation)
+            .await
+    }
+
+    pub(crate) async fn acquire_supernode_artifact_write_lock(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+        operation: &'static str,
+    ) -> Result<CellWriteLock> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let path = self.graph_artifact_write_lock_path("supernode", cell_id, edge_type, base_epoch);
+        self.acquire_write_lock_at_path(path, cell_id, operation)
+            .await
+    }
+
+    async fn acquire_write_lock_at_path(
+        &self,
+        path: Path,
         cell_id: &str,
         operation: &'static str,
-        owner_token: &str,
-    ) -> Result<Option<CellWriteLock>> {
-        let current = match self.object_store.get(path).await {
-            Ok(current) => current,
-            Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
-        let version = UpdateVersion {
-            e_tag: current.meta.e_tag.clone(),
-            version: current.meta.version.clone(),
-        };
-        let value = current.bytes().await?;
-        let record = decode_cell_write_lock_record(path.as_ref(), &value)?;
-        if record.cell_id != cell_id {
-            return Err(GraphError::CorruptValue {
-                key: path.to_string(),
-                reason: format!(
-                    "cell write lock belongs to cell {}, expected {cell_id}",
-                    record.cell_id
-                ),
-            });
-        }
-        let now_ms = graph_now_millis();
-        if !record.is_expired(now_ms) {
-            return Ok(None);
-        }
-        let payload = encode_cell_write_lock_record(
+    ) -> Result<CellWriteLock> {
+        acquire_distributed_write_lock(
+            Arc::clone(&self.object_store),
+            path,
             cell_id,
             operation,
-            owner_token,
-            now_ms,
-            now_ms.saturating_add(GRAPH_CELL_WRITE_LOCK_TTL_MS),
-            CellWriteLockState::Active,
-        );
-        match self
-            .object_store
-            .put_opts(path, payload.into(), PutMode::Update(version).into())
-            .await
-        {
-            Ok(_) => Ok(Some(CellWriteLock {
-                object_store: Arc::clone(&self.object_store),
-                path: path.clone(),
-                owner_token: owner_token.to_string(),
-            })),
-            Err(slatedb::object_store::Error::Precondition { .. })
-            | Err(slatedb::object_store::Error::NotFound { .. })
-            | Err(slatedb::object_store::Error::NotImplemented { .. })
-            | Err(slatedb::object_store::Error::NotSupported { .. }) => Ok(None),
-            Err(err) => Err(err.into()),
-        }
+            GRAPH_CELL_WRITE_LOCK_TTL_MS,
+        )
+        .await
     }
 
     pub async fn graph_cache_entry_counts(&self) -> GraphCacheEntryCounts {
@@ -570,7 +562,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn install_write_fence_txn(
@@ -606,7 +601,7 @@ impl GraphShard {
         cell_id: &str,
         operation: &'static str,
     ) -> Result<()> {
-        if operation != "drop_cell" {
+        if operation != "drop_cell" && operation != "prune_read_leases" {
             let drop_marker = keys::cell_drop_marker(cell_id);
             let pending_drop_marker = keys::cell_drop_pending_marker(cell_id);
             if read_txn_remote(txn, &drop_marker).await?.is_some()
@@ -643,7 +638,11 @@ impl GraphShard {
         }
     }
 
-    async fn publish_read_lease(&self, cell_id: &str, read_epoch: GraphEpoch) -> Result<()> {
+    pub(crate) async fn publish_read_lease(
+        &self,
+        cell_id: &str,
+        read_epoch: GraphEpoch,
+    ) -> Result<()> {
         if self.retention_policy.read_lease_ttl_ms == 0 {
             return Ok(());
         }
@@ -674,7 +673,7 @@ impl GraphShard {
         Ok(())
     }
 
-    async fn min_active_read_epoch(&self, cell_id: &str) -> Result<Option<GraphEpoch>> {
+    pub(crate) async fn min_active_read_epoch(&self, cell_id: &str) -> Result<Option<GraphEpoch>> {
         if self.retention_policy.read_lease_ttl_ms == 0 {
             return Ok(None);
         }
@@ -890,8 +889,7 @@ impl GraphShard {
 
     pub async fn snapshot(&self, cell_id: &str) -> Result<GraphSnapshot<'_>> {
         validate_component("cell_id", cell_id)?;
-        let read_epoch = self.current_epoch(cell_id).await?;
-        self.publish_read_lease(cell_id, read_epoch).await?;
+        let read_epoch = self.pin_current_read_epoch(cell_id, "snapshot").await?;
         Ok(GraphSnapshot {
             shard: self,
             cell_id: cell_id.to_string(),
@@ -913,7 +911,8 @@ impl GraphShard {
                 current_epoch,
             });
         }
-        self.publish_read_lease(cell_id, read_epoch).await?;
+        self.pin_read_epoch(cell_id, "snapshot_at", read_epoch)
+            .await?;
         Ok(GraphSnapshot {
             shard: self,
             cell_id: cell_id.to_string(),
