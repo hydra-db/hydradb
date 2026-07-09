@@ -5281,6 +5281,136 @@ async fn managed_graph_node_drop_cell_unregisters_control_state() {
     control.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn routed_cluster_open_cleans_control_state_for_final_dropped_cell() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open(
+        "graph-control/final-dropped-cell-recovery",
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    control
+        .publish_placement_with_catalog(
+            &ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap(),
+            "reddit",
+            1,
+        )
+        .await
+        .unwrap();
+    let cluster = RoutedGraphCluster::open_owned_with_control(
+        "graph-final-dropped-cell-recovery",
+        "node-a",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    cluster
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "final-drop-seed".to_string(),
+        })
+        .await
+        .unwrap();
+    let original_lease = cluster.lease("reddit-home").unwrap();
+    let dropped = cluster
+        .drop_cell("reddit-home", "final-drop-data-only")
+        .await
+        .unwrap();
+    assert!(!dropped.already_dropped);
+    assert!(control.release_lease(&original_lease).await.unwrap());
+    cluster.close().await.unwrap();
+
+    let reopened = RoutedGraphCluster::open_owned_with_control(
+        "graph-final-dropped-cell-recovery",
+        "node-a",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    assert!(reopened.local_cells().is_empty());
+    assert!(control
+        .current_lease("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    reopened.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn routed_cluster_refresh_cleans_control_state_for_retained_final_dropped_cell() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open(
+        "graph-control/final-dropped-cell-refresh",
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    control
+        .publish_placement_with_catalog(
+            &ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap(),
+            "reddit",
+            1,
+        )
+        .await
+        .unwrap();
+    let mut cluster = RoutedGraphCluster::open_owned_with_control(
+        "graph-final-dropped-cell-refresh",
+        "node-a",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    cluster
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "final-drop-refresh-seed".to_string(),
+        })
+        .await
+        .unwrap();
+    cluster
+        .drop_cell("reddit-home", "final-drop-refresh-data-only")
+        .await
+        .unwrap();
+
+    let report = cluster
+        .refresh_owned_shards(&control, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(report.closed_cells, vec!["reddit-home".to_string()]);
+    assert!(cluster.local_cells().is_empty());
+    assert!(control
+        .current_lease("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    cluster.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn managed_graph_node_executes_cypher_rows() {
