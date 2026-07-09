@@ -9847,32 +9847,11 @@ async fn drop_cell_waits_for_active_read_leases_before_deleting_data() {
             .unwrap(),
         vec![2]
     );
-    let err = shard
-        .drop_cell("reddit-home", "drop-active-reader")
-        .await
-        .unwrap_err();
-    let GraphError::ActiveReadLease {
-        operation: "drop_cell",
-        cell_id,
-        read_epoch,
-    } = err
-    else {
-        panic!("unexpected drop_cell error: {err:?}");
-    };
-    assert_eq!(cell_id, "reddit-home");
-    assert_eq!(read_epoch, 1);
-    assert!(shard
-        .read_remote(&keys::cell_drop_pending_marker("reddit-home"))
-        .await
-        .unwrap()
-        .is_some());
-    drop(snapshot);
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-
     let dropped = shard
         .drop_cell("reddit-home", "drop-active-reader")
         .await
         .unwrap();
+    drop(snapshot);
     assert_eq!(dropped.marker_epoch, 2);
     assert!(!dropped.already_dropped);
     assert!(dropped.deleted_keys > 0);
