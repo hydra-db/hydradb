@@ -521,6 +521,7 @@ impl GraphShard {
                 for group in &groups {
                     put_artifact_record(
                         self,
+                        Some(&artifact_lock),
                         cell_id,
                         "persist_supernode_groups_from_chunks",
                         &mut batch,
@@ -532,6 +533,7 @@ impl GraphShard {
                 }
                 flush_artifact_put_batch(
                     self,
+                    Some(&artifact_lock),
                     cell_id,
                     "persist_supernode_groups_from_chunks",
                     &mut batch,
@@ -548,6 +550,7 @@ impl GraphShard {
                 }
                 flush_artifact_put_batch(
                     self,
+                    Some(&artifact_lock),
                     cell_id,
                     "persist_supernode_groups_manifest",
                     &mut batch,
@@ -625,6 +628,7 @@ impl GraphShard {
                 for chunk in chunks {
                     put_artifact_record(
                         self,
+                        Some(&artifact_lock),
                         cell_id,
                         "persist_supernode_artifacts",
                         &mut batch,
@@ -637,6 +641,7 @@ impl GraphShard {
                 for group in groups {
                     put_artifact_record(
                         self,
+                        Some(&artifact_lock),
                         cell_id,
                         "persist_supernode_artifacts",
                         &mut batch,
@@ -648,6 +653,7 @@ impl GraphShard {
                 }
                 flush_artifact_put_batch(
                     self,
+                    Some(&artifact_lock),
                     cell_id,
                     "persist_supernode_artifacts",
                     &mut batch,
@@ -664,6 +670,7 @@ impl GraphShard {
                 }
                 flush_artifact_put_batch(
                     self,
+                    Some(&artifact_lock),
                     cell_id,
                     "persist_supernode_artifacts_manifest",
                     &mut batch,

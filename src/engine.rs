@@ -1015,6 +1015,7 @@ fn matrix_tiles_from_edges(
 #[allow(clippy::too_many_arguments)]
 async fn append_matrix_tiles_from_rows(
     shard: &GraphShard,
+    artifact_lock: &CellWriteLock,
     batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
     cell_id: &str,
@@ -1034,6 +1035,7 @@ async fn append_matrix_tiles_from_rows(
             tile_count = tile_count.saturating_add(
                 flush_matrix_tile_row(
                     shard,
+                    artifact_lock,
                     batch,
                     pending_writes,
                     cell_id,
@@ -1062,6 +1064,7 @@ async fn append_matrix_tiles_from_rows(
         tile_count = tile_count.saturating_add(
             flush_matrix_tile_row(
                 shard,
+                artifact_lock,
                 batch,
                 pending_writes,
                 cell_id,
@@ -1081,6 +1084,7 @@ async fn append_matrix_tiles_from_rows(
 #[allow(clippy::too_many_arguments)]
 async fn flush_matrix_tile_row(
     shard: &GraphShard,
+    artifact_lock: &CellWriteLock,
     batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
     cell_id: &str,
@@ -1110,6 +1114,7 @@ async fn flush_matrix_tile_row(
         };
         put_artifact_record(
             shard,
+            Some(artifact_lock),
             cell_id,
             "build_matrix_tiles",
             batch,
@@ -1887,8 +1892,10 @@ fn graph_artifact_epoch_from_key(key: &str) -> Result<Option<GraphEpoch>> {
 const GRAPH_ARTIFACT_WRITE_BATCH_KEYS: usize = 512;
 const GRAPH_ARTIFACT_GC_BATCH_KEYS: usize = 512;
 
+#[allow(clippy::too_many_arguments)]
 async fn put_artifact_record(
     shard: &GraphShard,
+    artifact_lock: Option<&CellWriteLock>,
     cell_id: &str,
     operation: &'static str,
     batch: &mut GraphWriteBatch,
@@ -1899,13 +1906,22 @@ async fn put_artifact_record(
     batch.put(key, value);
     *pending_writes += 1;
     if *pending_writes >= GRAPH_ARTIFACT_WRITE_BATCH_KEYS {
-        flush_artifact_put_batch(shard, cell_id, operation, batch, pending_writes).await?;
+        flush_artifact_put_batch(
+            shard,
+            artifact_lock,
+            cell_id,
+            operation,
+            batch,
+            pending_writes,
+        )
+        .await?;
     }
     Ok(())
 }
 
 async fn flush_artifact_put_batch(
     shard: &GraphShard,
+    artifact_lock: Option<&CellWriteLock>,
     cell_id: &str,
     operation: &'static str,
     batch: &mut GraphWriteBatch,
@@ -1914,10 +1930,16 @@ async fn flush_artifact_put_batch(
     if *pending_writes == 0 {
         return Ok(());
     }
+    if let Some(lock) = artifact_lock {
+        lock.renew().await?;
+    }
     let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
     shard
         .write_graph_batch_strict(cell_id, operation, batch_to_write)
         .await?;
+    if let Some(lock) = artifact_lock {
+        lock.renew().await?;
+    }
     *pending_writes = 0;
     Ok(())
 }
@@ -2937,8 +2959,10 @@ const GRAPHBLAS_CSC_MANIFEST_MAGIC: &str = "graphblas_csc_manifest2";
 const GRAPHBLAS_CSC_CHUNK_MAGIC: &[u8] = b"graphblas_csc_chunk1\n";
 const GRAPHBLAS_CSC_CHUNK_U64S: usize = 64 * 1024;
 
+#[allow(clippy::too_many_arguments)]
 async fn append_graphblas_csc_chunks(
     shard: &GraphShard,
+    artifact_lock: &CellWriteLock,
     batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
     cell_id: &str,
@@ -2948,6 +2972,7 @@ async fn append_graphblas_csc_chunks(
 ) -> Result<GraphBlasCscManifest> {
     let vertex_chunks = append_graphblas_csc_field_chunks(
         shard,
+        artifact_lock,
         batch,
         pending_writes,
         cell_id,
@@ -2959,6 +2984,7 @@ async fn append_graphblas_csc_chunks(
     .await?;
     let pointer_chunks = append_graphblas_csc_field_chunks(
         shard,
+        artifact_lock,
         batch,
         pending_writes,
         cell_id,
@@ -2970,6 +2996,7 @@ async fn append_graphblas_csc_chunks(
     .await?;
     let index_chunks = append_graphblas_csc_field_chunks(
         shard,
+        artifact_lock,
         batch,
         pending_writes,
         cell_id,
@@ -2997,6 +3024,7 @@ async fn append_graphblas_csc_chunks(
 #[allow(clippy::too_many_arguments)]
 async fn append_graphblas_csc_chunks_from_rows(
     shard: &GraphShard,
+    artifact_lock: &CellWriteLock,
     batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
     cell_id: &str,
@@ -3019,6 +3047,7 @@ async fn append_graphblas_csc_chunks_from_rows(
 
     let vertex_chunks = append_graphblas_csc_field_chunks(
         shard,
+        artifact_lock,
         batch,
         pending_writes,
         cell_id,
@@ -3030,6 +3059,7 @@ async fn append_graphblas_csc_chunks_from_rows(
     .await?;
     let pointer_chunks = append_graphblas_csc_field_chunks(
         shard,
+        artifact_lock,
         batch,
         pending_writes,
         cell_id,
@@ -3061,6 +3091,7 @@ async fn append_graphblas_csc_chunks_from_rows(
                 let values = std::mem::take(&mut index_chunk);
                 put_artifact_record(
                     shard,
+                    Some(artifact_lock),
                     cell_id,
                     "build_matrix_tiles",
                     batch,
@@ -3078,6 +3109,7 @@ async fn append_graphblas_csc_chunks_from_rows(
         index_chunks = index_chunks.saturating_add(1);
         put_artifact_record(
             shard,
+            Some(artifact_lock),
             cell_id,
             "build_matrix_tiles",
             batch,
@@ -3106,6 +3138,7 @@ async fn append_graphblas_csc_chunks_from_rows(
 #[allow(clippy::too_many_arguments)]
 async fn append_graphblas_csc_field_chunks(
     shard: &GraphShard,
+    artifact_lock: &CellWriteLock,
     batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
     cell_id: &str,
@@ -3118,6 +3151,7 @@ async fn append_graphblas_csc_field_chunks(
     for (chunk_id, chunk) in values.chunks(GRAPHBLAS_CSC_CHUNK_U64S).enumerate() {
         put_artifact_record(
             shard,
+            Some(artifact_lock),
             cell_id,
             "build_matrix_tiles",
             batch,
@@ -3938,3 +3972,69 @@ fn trim_process_memory() {
 
 #[cfg(not(target_os = "linux"))]
 fn trim_process_memory() {}
+
+#[cfg(test)]
+mod artifact_publish_tests {
+    use super::*;
+    use crate::graph_now_millis;
+    use slatedb::object_store::{memory::InMemory, ObjectStoreExt};
+
+    #[tokio::test]
+    async fn artifact_batch_flush_renews_held_lock() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer(
+            "graph/artifact-lock-renew",
+            Arc::clone(&object_store),
+        )
+        .await
+        .unwrap();
+        let cell_id = "reddit-home";
+        let edge_type = "LOCK_RENEW_EDGE";
+        let lock = shard
+            .acquire_posting_artifact_write_lock(
+                cell_id,
+                edge_type,
+                1,
+                "artifact_batch_flush_renews_held_lock",
+            )
+            .await
+            .unwrap();
+        let stale_payload = crate::encode_cell_write_lock_record(
+            cell_id,
+            "artifact_batch_flush_renews_held_lock",
+            &lock.owner_token,
+            0,
+            1,
+            crate::CellWriteLockState::Active,
+        );
+        lock.object_store
+            .put(&lock.path, stale_payload.into())
+            .await
+            .unwrap();
+
+        let mut batch = GraphWriteBatch::new();
+        let mut pending_writes = 0_usize;
+        for idx in 0..GRAPH_ARTIFACT_WRITE_BATCH_KEYS {
+            put_artifact_record(
+                &shard,
+                Some(&lock),
+                cell_id,
+                "artifact_batch_flush_renews_held_lock",
+                &mut batch,
+                &mut pending_writes,
+                format!("cell/{cell_id}/artifact/test/{edge_type}/{idx:020}"),
+                b"artifact-test".to_vec(),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(pending_writes, 0);
+
+        let current = lock.object_store.get(&lock.path).await.unwrap();
+        let value = current.bytes().await.unwrap();
+        let record = crate::decode_cell_write_lock_record(lock.path.as_ref(), &value).unwrap();
+        assert_eq!(record.owner_token, lock.owner_token);
+        assert!(record.expires_at_ms > graph_now_millis());
+        lock.release().await.unwrap();
+    }
+}
