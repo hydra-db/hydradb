@@ -120,6 +120,10 @@ pub enum RowAggregateFunction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowMutationAction {
+    DeleteBinding {
+        binding: String,
+        detach: bool,
+    },
     DeleteRelationship {
         binding: String,
         detach: bool,
@@ -1068,11 +1072,6 @@ fn lower_simple_merge(
 fn lower_delete_actions(delete_clause: *const AstNode) -> Result<Vec<RowMutationAction>> {
     unsafe {
         let detach = sys::cypher_ast_delete_has_detach(delete_clause);
-        if detach {
-            return unsupported(
-                "DETACH DELETE requires node deletion support, which is not implemented yet",
-            );
-        }
         let expression_count = sys::cypher_ast_delete_nexpressions(delete_clause);
         if expression_count == 0 {
             return unsupported("DELETE requires at least one expression");
@@ -1082,14 +1081,12 @@ fn lower_delete_actions(delete_clause: *const AstNode) -> Result<Vec<RowMutation
             let expression =
                 checked_node(sys::cypher_ast_delete_get_expression(delete_clause, idx))?;
             if is_instance(expression, sys::CYPHER_AST_IDENTIFIER) {
-                actions.push(RowMutationAction::DeleteRelationship {
+                actions.push(RowMutationAction::DeleteBinding {
                     binding: identifier_name(expression)?,
                     detach,
                 });
             } else {
-                return unsupported(
-                    "DELETE currently supports relationship variables, for example DELETE r",
-                );
+                return unsupported("DELETE currently supports node or relationship variables");
             }
         }
         Ok(actions)
@@ -2933,7 +2930,7 @@ mod tests {
                     binding: "v".to_string(),
                     property: "name".to_string(),
                 },
-                RowMutationAction::DeleteRelationship {
+                RowMutationAction::DeleteBinding {
                     binding: "r".to_string(),
                     detach: false,
                 },

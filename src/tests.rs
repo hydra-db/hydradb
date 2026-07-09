@@ -3473,6 +3473,279 @@ async fn delete_edge_publishes_delta_minus_and_snapshot_reads_stay_correct() {
 }
 
 #[tokio::test]
+async fn delete_edges_batch_publishes_delta_minus_and_replays_idempotently() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/delete-edges-batch", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+    shard
+        .bulk_import_edges(
+            cell_id,
+            edge_type,
+            [(1, 2), (1, 3), (1, 4)],
+            "delete-batch-seed",
+        )
+        .await
+        .unwrap();
+
+    let result = shard
+        .delete_edges_batch(
+            cell_id,
+            edge_type,
+            [(1, 2), (1, 4), (1, 2), (1, 99)],
+            "delete-batch-1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.start_epoch, 4);
+    assert_eq!(result.end_epoch, 5);
+    assert_eq!(result.deleted, 2);
+    assert_eq!(result.already_deleted, 1);
+    assert_eq!(
+        result.results,
+        vec![
+            DeleteResult {
+                epoch: 4,
+                deleted: true,
+            },
+            DeleteResult {
+                epoch: 5,
+                deleted: true,
+            },
+            DeleteResult {
+                epoch: 3,
+                deleted: false,
+            },
+        ]
+    );
+    assert_eq!(
+        shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+        vec![3]
+    );
+    assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 1);
+    assert!(!shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap());
+    assert!(shard.edge_exists(cell_id, edge_type, 1, 3).await.unwrap());
+    assert!(!shard.edge_exists(cell_id, edge_type, 1, 4).await.unwrap());
+    assert_eq!(
+        shard
+            .out_neighbors_at(cell_id, edge_type, 1, 3)
+            .await
+            .unwrap(),
+        vec![2, 3, 4]
+    );
+
+    let deltas = shard
+        .deltas_since(cell_id, edge_type, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|delta| (delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        deltas,
+        vec![
+            (DeltaKind::Plus, 1, 2, 1),
+            (DeltaKind::Plus, 1, 3, 2),
+            (DeltaKind::Plus, 1, 4, 3),
+            (DeltaKind::Minus, 1, 2, 4),
+            (DeltaKind::Minus, 1, 4, 5),
+        ]
+    );
+    assert_eq!(
+        shard
+            .outbox_since(cell_id, 3)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|delta| (delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch))
+            .collect::<Vec<_>>(),
+        vec![(DeltaKind::Minus, 1, 2, 4), (DeltaKind::Minus, 1, 4, 5),]
+    );
+    let mut legacy_iter = shard
+        .scan_remote_prefix(&keys::outbox_prefix(cell_id))
+        .await
+        .unwrap();
+    let mut legacy_minus = Vec::new();
+    while let Some(kv) = legacy_iter.next().await.unwrap() {
+        let key = String::from_utf8_lossy(&kv.key).into_owned();
+        let delta = decode_delta_record(&key, &kv.value).unwrap();
+        if delta.kind == DeltaKind::Minus && delta.edge.epoch > 3 {
+            legacy_minus.push((delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch));
+        }
+    }
+    assert_eq!(
+        legacy_minus,
+        vec![(DeltaKind::Minus, 1, 2, 4), (DeltaKind::Minus, 1, 4, 5)]
+    );
+
+    let retry = shard
+        .delete_edges_batch(
+            cell_id,
+            edge_type,
+            [(1, 99), (1, 4), (1, 2)],
+            "delete-batch-1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry, result);
+    assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 5);
+
+    shard
+        .bulk_import_edges(
+            cell_id,
+            edge_type,
+            [(2, 10), (2, 11), (2, 12)],
+            "delete-batch-chunked-seed",
+        )
+        .await
+        .unwrap();
+    let chunked = shard
+        .delete_edges_batch_chunked(
+            cell_id,
+            edge_type,
+            [(2, 10), (2, 11), (2, 12), (2, 99)],
+            "delete-batch-chunked-1",
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(chunked.deleted, 3);
+    assert_eq!(chunked.already_deleted, 1);
+    assert_eq!(
+        shard.out_neighbors(cell_id, edge_type, 2).await.unwrap(),
+        Vec::<VertexId>::new()
+    );
+    let report = shard
+        .verify_current_graph(cell_id, edge_type, 3, 8)
+        .await
+        .unwrap();
+    assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+}
+
+#[tokio::test]
+async fn delete_edge_mutations_batch_rejects_duplicate_edge_identities() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/delete-edge-mutations-batch-duplicates", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+    shard
+        .write_edge(mutation(1, 2, "delete-batch-duplicate-seed"))
+        .await
+        .unwrap();
+    let err = shard
+        .delete_edge_mutations_batch(
+            cell_id,
+            [
+                mutation(1, 2, "delete-batch-duplicate-a"),
+                mutation(1, 2, "delete-batch-duplicate-b"),
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::IdempotencyConflict {
+            operation: "delete",
+            idempotency_key
+        } if idempotency_key.contains("delete-batch-duplicate-a")
+            && idempotency_key.contains("delete-batch-duplicate-b")
+    ));
+    assert!(shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap());
+    assert!(shard
+        .read_remote(&keys::idempotency(
+            cell_id,
+            "delete",
+            "delete-batch-duplicate-a"
+        ))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(shard
+        .read_remote(&keys::idempotency(
+            cell_id,
+            "delete",
+            "delete-batch-duplicate-b"
+        ))
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn delete_edges_batch_tombstones_segment_edges_without_degree_drift() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/delete-segment-edges-batch",
+        object_store,
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+    shard
+        .bulk_append_supernode_segment_trusted(
+            cell_id,
+            edge_type,
+            1,
+            [2, 3, 4],
+            "segment-delete-batch-seed",
+        )
+        .await
+        .unwrap();
+    let result = shard
+        .delete_edges_batch(
+            cell_id,
+            edge_type,
+            [(1, 2), (1, 4), (1, 8)],
+            "segment-delete-batch-1",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.start_epoch, 4);
+    assert_eq!(result.end_epoch, 5);
+    assert_eq!(result.deleted, 2);
+    assert_eq!(result.already_deleted, 1);
+    assert_eq!(
+        shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+        vec![3]
+    );
+    assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 1);
+    assert!(!shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap());
+    assert!(shard.edge_exists(cell_id, edge_type, 1, 3).await.unwrap());
+    assert!(!shard.edge_exists(cell_id, edge_type, 1, 4).await.unwrap());
+    assert_eq!(
+        shard
+            .out_neighbors_at(cell_id, edge_type, 1, 3)
+            .await
+            .unwrap(),
+        vec![2, 3, 4]
+    );
+    assert_eq!(
+        shard
+            .outbox_since(cell_id, 3)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|delta| (delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch))
+            .collect::<Vec<_>>(),
+        vec![(DeltaKind::Minus, 1, 2, 4), (DeltaKind::Minus, 1, 4, 5),]
+    );
+    let report = shard
+        .verify_current_graph(cell_id, edge_type, 3, 8)
+        .await
+        .unwrap();
+    assert!(report.is_clean(), "{:?}", report.mismatch_samples);
+}
+
+#[tokio::test]
 async fn snapshot_api_pins_epoch_across_deletes_and_artifact_rebuilds() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/snapshot-api", object_store).await;
@@ -7997,6 +8270,207 @@ async fn relationship_rows_require_live_structural_edge() {
     shard.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn delete_vertex_requires_detach_and_detach_cascades_incident_edges() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/delete-vertex-detach", object_store).await;
+
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("name", VertexPropertyValue::String("alice".to_string())),
+        )
+        .await
+        .unwrap();
+    shard
+        .write_edge(mutation(1, 2, "vertex-delete-edge-out"))
+        .await
+        .unwrap();
+
+    let err = shard
+        .delete_vertex("reddit-home", 1, "vertex-delete-with-edge")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::UnsupportedQuery {
+            dialect: "Graph",
+            feature
+        } if feature.contains("requires DETACH")
+    ));
+    assert!(shard
+        .read_remote(&keys::vertex("reddit-home", 1))
+        .await
+        .unwrap()
+        .is_some());
+
+    shard
+        .write_edge(typed_mutation(
+            "reddit-home",
+            "LIKES",
+            3,
+            1,
+            "vertex-delete-edge-in",
+        ))
+        .await
+        .unwrap();
+    shard
+        .create_relationship(
+            typed_mutation("reddit-home", "MENTIONS", 1, 4, "vertex-delete-rel"),
+            EdgeMetadata::default().with_property("rank", VertexPropertyValue::Integer(1)),
+        )
+        .await
+        .unwrap();
+
+    let deleted = shard
+        .detach_delete_vertex("reddit-home", 1, "vertex-detach-delete")
+        .await
+        .unwrap();
+    assert!(deleted.vertex_deleted);
+    assert_eq!(deleted.incident_edges_deleted, 3);
+    assert_eq!(deleted.relationships_deleted, 1);
+    assert!(!shard
+        .edge_exists("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 1, 2)
+        .await
+        .unwrap());
+    assert!(!shard
+        .edge_exists("reddit-home", "LIKES", 3, 1)
+        .await
+        .unwrap());
+    assert!(!shard
+        .edge_exists("reddit-home", "MENTIONS", 1, 4)
+        .await
+        .unwrap());
+    assert!(shard
+        .read_remote(&keys::vertex("reddit-home", 1))
+        .await
+        .unwrap()
+        .is_none());
+
+    let retry = shard
+        .detach_delete_vertex("reddit-home", 1, "vertex-detach-delete")
+        .await
+        .unwrap();
+    assert_eq!(retry, deleted);
+
+    let tombstone_only = shard
+        .delete_vertex("reddit-home", 4, "vertex-delete-tombstone-only")
+        .await
+        .unwrap();
+    assert!(!tombstone_only.vertex_deleted);
+    assert_eq!(tombstone_only.incident_edges_deleted, 0);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn drop_cell_purges_namespace_and_blocks_future_writes() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/drop-cell", object_store).await;
+
+    shard
+        .write_edge(mutation(1, 2, "drop-cell-edge"))
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default().with_label("User"),
+        )
+        .await
+        .unwrap();
+
+    let dropped = shard.drop_cell("reddit-home", "drop-cell-1").await.unwrap();
+    assert!(!dropped.already_dropped);
+    assert!(dropped.deleted_keys > 0);
+    assert!(dropped.batches > 0);
+    assert!(shard
+        .read_remote(&keys::cell_drop_marker("reddit-home"))
+        .await
+        .unwrap()
+        .is_some());
+
+    let mut iter = shard
+        .scan_remote_prefix(&keys::cell_prefix("reddit-home"))
+        .await
+        .unwrap();
+    assert!(iter.next().await.unwrap().is_none());
+
+    let retry = shard.drop_cell("reddit-home", "drop-cell-1").await.unwrap();
+    assert_eq!(retry, dropped);
+    let err = shard
+        .write_edge(mutation(1, 3, "drop-cell-write-after"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::CellDropped {
+            operation: "write_edge",
+            cell_id
+        } if cell_id == "reddit-home"
+    ));
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_drop_marker_blocks_writes_and_drop_cell_finalizes_cleanup() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/drop-cell-pending", object_store).await;
+
+    shard
+        .write_edge(mutation(1, 2, "pending-drop-seed"))
+        .await
+        .unwrap();
+    let mut batch = GraphWriteBatch::new();
+    batch.put(
+        keys::cell_drop_pending_marker("reddit-home").as_bytes(),
+        encode_u64(77),
+    );
+    shard
+        .write_graph_batch_strict("reddit-home", "drop_cell", batch)
+        .await
+        .unwrap();
+
+    let err = shard
+        .write_edge(mutation(1, 3, "pending-drop-write-after"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::CellDropped {
+            operation: "write_edge",
+            cell_id
+        } if cell_id == "reddit-home"
+    ));
+
+    let dropped = shard
+        .drop_cell("reddit-home", "pending-drop-finalize")
+        .await
+        .unwrap();
+    assert_eq!(dropped.marker_epoch, 77);
+    assert!(!dropped.already_dropped);
+    assert!(dropped.deleted_keys > 0);
+    assert!(shard
+        .read_remote(&keys::cell_drop_pending_marker("reddit-home"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(shard
+        .read_remote(&keys::cell_drop_marker("reddit-home"))
+        .await
+        .unwrap()
+        .is_some());
+    let mut iter = shard
+        .scan_remote_prefix(&keys::cell_prefix("reddit-home"))
+        .await
+        .unwrap();
+    assert!(iter.next().await.unwrap().is_none());
+    shard.close().await.unwrap();
+}
+
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn deleted_relationship_id_pointer_does_not_block_reimport() {
@@ -10128,36 +10602,57 @@ async fn cypher_executes_set_remove_delete_and_merge_mutations() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
-async fn cypher_rejects_detach_delete_until_node_deletion_is_supported() {
+async fn cypher_detach_delete_node_cascades_edges_and_metadata() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard("graph/cypher-detach-delete-rejects", object_store).await;
+    let shard = open_test_shard("graph/cypher-detach-delete-node", object_store).await;
 
     shard
         .execute_cypher(
             QueryContext::new("reddit-home", "cypher-detach-delete-seed"),
-            "MERGE (u:User {id: 1})-[:FOLLOWS]->(v:User {id: 2})",
+            "MERGE (u:User {id: 1, name: 'alice'})-[:FOLLOWS]->(v:User {id: 2})",
+        )
+        .await
+        .unwrap();
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-detach-delete-seed-2"),
+            "MERGE (v:User {id: 3})-[:LIKES]->(u:User {id: 1})",
         )
         .await
         .unwrap();
 
-    let err = shard
+    let deleted = shard
         .execute_cypher(
             QueryContext::new("reddit-home", "cypher-detach-delete"),
-            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) DETACH DELETE r",
+            "MATCH (u:User {id: 1}) DETACH DELETE u",
         )
         .await
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        GraphError::UnsupportedQuery {
-            dialect: "OpenCypher",
-            feature
-        } if feature.contains("DETACH DELETE")
-    ));
-    assert!(shard
+        .unwrap();
+    assert_eq!(
+        deleted,
+        QueryOutput::Mutation(QueryMutationResult {
+            matched_rows: 1,
+            deleted_edges: 2,
+            updated_vertices: 1,
+            ..QueryMutationResult::default()
+        })
+    );
+    assert!(!shard
         .edge_exists("reddit-home", "FOLLOWS", 1, 2)
         .await
         .unwrap());
+    assert!(!shard
+        .edge_exists("reddit-home", "LIKES", 3, 1)
+        .await
+        .unwrap());
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-detach-delete-read"),
+            "MATCH (u:User {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert!(rows.rows.is_empty());
 }
 
 #[cfg(feature = "opencypher")]
