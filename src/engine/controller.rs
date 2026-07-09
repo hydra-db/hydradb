@@ -293,7 +293,13 @@ impl GraphControlPlane {
         now_ms: u64,
     ) -> Result<GraphClusterControllerReport> {
         self.metrics.controller_runs.fetch_add(1, Ordering::Relaxed);
-        let result = self.reconcile_cluster_at_inner(config, now_ms).await;
+        let result = match self.acquire_controller_reconcile_lock().await {
+            Ok(lock) => {
+                let reconcile = self.reconcile_cluster_at_inner(config, now_ms, &lock).await;
+                release_cell_write_lock(lock, reconcile).await
+            }
+            Err(err) => Err(err),
+        };
         match &result {
             Ok(_) => {
                 self.metrics
@@ -313,8 +319,10 @@ impl GraphControlPlane {
         &self,
         config: &GraphClusterControllerConfig,
         now_ms: u64,
+        controller_lock: &CellWriteLock,
     ) -> Result<GraphClusterControllerReport> {
         config.validated_configured_cells()?;
+        controller_lock.renew().await?;
         let heartbeat_ttl_ms = validate_controller_duration("heartbeat_ttl", config.heartbeat_ttl)?;
         let mut report = GraphClusterControllerReport {
             now_ms,
@@ -352,6 +360,7 @@ impl GraphControlPlane {
                 )
                 .await?;
         }
+        controller_lock.renew().await?;
 
         let mut placement = self.load_placement_map().await?;
         let cell_ids = self.controller_cell_ids(config, &placement).await?;
@@ -359,67 +368,78 @@ impl GraphControlPlane {
         let active_nodes: BTreeSet<_> = report.active_nodes.iter().cloned().collect();
         let draining_nodes: BTreeSet<_> = report.draining_nodes.iter().cloned().collect();
         for cell_id in &cell_ids {
+            controller_lock.renew().await?;
             let previous = placement.get(cell_id).cloned();
-            let previous_is_usable = match previous.as_ref() {
-                Some(owner) => active_nodes.contains(owner) && !draining_nodes.contains(owner),
-                None => false,
+            let previous_is_usable = previous.as_ref().is_some_and(|owner| {
+                active_nodes.contains(owner) && !draining_nodes.contains(owner)
+            });
+            let target_owner = if previous_is_usable
+                && config.rebalance_mode == GraphClusterRebalanceMode::StabilityFirst
+            {
+                previous.clone()
+            } else {
+                choose_controller_owner(cell_id, &report.active_nodes)
             };
-            let Some(new_owner) = choose_controller_owner(cell_id, &report.active_nodes) else {
+            let Some(target_owner) = target_owner else {
                 report.unassigned_cells.push(cell_id.clone());
                 continue;
             };
-            if previous_is_usable
-                && (config.rebalance_mode == GraphClusterRebalanceMode::StabilityFirst
-                    || previous.as_deref() == Some(new_owner.as_str()))
+            let current_lease = self.current_lease(cell_id).await?;
+            if let Some(lease) = current_lease
+                .as_ref()
+                .filter(|lease| lease.expires_at_ms > now_ms)
             {
-                continue;
-            }
-            if previous.as_deref() == Some(new_owner.as_str()) {
-                continue;
-            }
-            placement.insert(cell_id.clone(), new_owner.clone());
-            report.reassignments.push(GraphShardReassignment {
-                cell_id: cell_id.clone(),
-                previous_owner_node_id: previous,
-                new_owner_node_id: new_owner,
-            });
-        }
-
-        if !report.reassignments.is_empty() {
-            self.publish_controller_reassignments(&report.reassignments)
-                .await?;
-            self.metrics
-                .controller_reassignments
-                .fetch_add(report.reassignments.len() as u64, Ordering::Relaxed);
-        }
-
-        for cell_id in &cell_ids {
-            let Some(target_owner) = placement.get(cell_id).cloned() else {
-                continue;
-            };
-            if !active_nodes.contains(&target_owner) {
-                continue;
-            }
-            match self.current_lease(cell_id).await? {
-                Some(lease)
-                    if lease.owner_node_id == target_owner && lease.expires_at_ms > now_ms => {}
-                Some(lease)
-                    if lease.owner_node_id != target_owner && lease.expires_at_ms > now_ms =>
-                {
+                if lease.owner_node_id != target_owner {
                     report.pending_failovers.push(GraphPendingFailover {
                         cell_id: cell_id.clone(),
-                        current_owner_node_id: lease.owner_node_id,
+                        current_owner_node_id: lease.owner_node_id.clone(),
                         target_owner_node_id: target_owner,
                         lease_expires_at_ms: lease.expires_at_ms,
                     });
+                    continue;
                 }
-                Some(_) | None => {
-                    let lease = self
-                        .failover_expired_cell_at(cell_id, &target_owner, config.lease_ttl, now_ms)
-                        .await?;
-                    report.failed_over_leases.push(lease);
+                if previous.as_deref() == Some(target_owner.as_str()) {
+                    continue;
                 }
             }
+
+            let (lease, lease_changed, committed_previous) = match self
+                .assign_controller_cell_at(cell_id, &target_owner, config.lease_ttl, now_ms)
+                .await
+            {
+                Ok(assignment) => assignment,
+                Err(GraphError::ShardLeaseHeld {
+                    owner_node_id,
+                    expires_at_ms,
+                    ..
+                }) => {
+                    report.pending_failovers.push(GraphPendingFailover {
+                        cell_id: cell_id.clone(),
+                        current_owner_node_id: owner_node_id,
+                        target_owner_node_id: target_owner,
+                        lease_expires_at_ms: expires_at_ms,
+                    });
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            if committed_previous.as_deref() != Some(target_owner.as_str()) {
+                report.reassignments.push(GraphShardReassignment {
+                    cell_id: cell_id.clone(),
+                    previous_owner_node_id: committed_previous,
+                    new_owner_node_id: target_owner.clone(),
+                });
+            }
+            placement.insert(cell_id.clone(), target_owner);
+            if lease_changed {
+                report.failed_over_leases.push(lease);
+            }
+        }
+
+        if !report.reassignments.is_empty() {
+            self.metrics
+                .controller_reassignments
+                .fetch_add(report.reassignments.len() as u64, Ordering::Relaxed);
         }
 
         if !report.failed_over_leases.is_empty() {
@@ -434,7 +454,30 @@ impl GraphControlPlane {
         }
         report.unassigned_cells.sort();
         report.unassigned_cells.dedup();
+        controller_lock.renew().await?;
         Ok(report)
+    }
+
+    async fn acquire_controller_reconcile_lock(&self) -> Result<CellWriteLock> {
+        let db_path = if self.store_path.as_ref().is_empty() {
+            "__root__"
+        } else {
+            self.store_path.as_ref()
+        };
+        let path = Path::from_iter([
+            "__slatedb_graph_kernel",
+            "controller_locks",
+            db_path,
+            "reconcile",
+        ]);
+        acquire_distributed_write_lock(
+            Arc::clone(&self.object_store),
+            path,
+            "controller",
+            "reconcile_cluster",
+            GRAPH_CONTROLLER_LOCK_TTL_MS,
+        )
+        .await
     }
 
     pub async fn start_node_heartbeat(
@@ -572,59 +615,6 @@ impl GraphControlPlane {
             }
         }
         Ok(cells.into_iter().collect())
-    }
-
-    async fn publish_controller_reassignments(
-        &self,
-        reassignments: &[GraphShardReassignment],
-    ) -> Result<()> {
-        for attempt in 0..GRAPH_CONTROL_TXN_MAX_RETRIES {
-            match self
-                .publish_controller_reassignments_txn(reassignments)
-                .await
-            {
-                Err(GraphError::Slate(err))
-                    if err.kind() == ErrorKind::Transaction
-                        && attempt + 1 < GRAPH_CONTROL_TXN_MAX_RETRIES =>
-                {
-                    tokio::task::yield_now().await;
-                }
-                result => return result,
-            }
-        }
-        Err(GraphError::RetryExhausted {
-            operation: "control transaction",
-            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
-        })
-    }
-
-    async fn publish_controller_reassignments_txn(
-        &self,
-        reassignments: &[GraphShardReassignment],
-    ) -> Result<()> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
-        for reassignment in reassignments {
-            validate_component("cell_id", &reassignment.cell_id)?;
-            validate_component("node_id", &reassignment.new_owner_node_id)?;
-            let placement_key = control_placement_key(&reassignment.cell_id);
-            let current = read_control_txn(&txn, &placement_key)
-                .await?
-                .map(|value| decode_control_placement(&placement_key, &value))
-                .transpose()?
-                .map(|(_, owner)| owner);
-            if current != reassignment.previous_owner_node_id {
-                return Err(GraphError::ControlMetadataConflict {
-                    key: placement_key,
-                    expected_generation: None,
-                    actual_generation: None,
-                });
-            }
-            txn.put(
-                control_placement_key(&reassignment.cell_id).as_bytes(),
-                encode_control_placement(&reassignment.cell_id, &reassignment.new_owner_node_id),
-            )?;
-        }
-        commit_control_txn(txn).await
     }
 }
 

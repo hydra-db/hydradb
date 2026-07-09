@@ -4561,6 +4561,86 @@ async fn lease_renewer_extends_owned_shard_leases_in_background() {
 }
 
 #[tokio::test]
+async fn lease_renewer_revokes_and_closes_shard_after_lease_loss() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = Arc::new(
+        GraphControlPlane::open(
+            "graph-control/renewer-revocation",
+            Arc::clone(&object_store),
+        )
+        .await
+        .unwrap(),
+    );
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let cluster = RoutedGraphCluster::open_owned_with_control(
+        "graph-renewer-revocation-cluster",
+        "node-a",
+        control.as_ref(),
+        object_store,
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let old_lease = cluster.lease("reddit-home").unwrap();
+    control.release_lease(&old_lease).await.unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-b")]).unwrap())
+        .await
+        .unwrap();
+    control
+        .acquire_lease("reddit-home", "node-b", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    let handle = cluster
+        .start_lease_renewer(
+            Arc::clone(&control),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_millis(10),
+        )
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while cluster.lease("reddit-home").is_some() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(cluster.lease("reddit-home").is_none());
+    let write_err = cluster
+        .write_edge(typed_mutation(
+            "reddit-home",
+            "FOLLOWS",
+            1,
+            2,
+            "revoked-writer",
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        write_err,
+        GraphError::WriteRequiresLease {
+            ref cell_id,
+            ..
+        } if cell_id == "reddit-home"
+    ));
+    let read_err = cluster
+        .shard("reddit-home")
+        .unwrap()
+        .current_epoch("reddit-home")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        read_err,
+        GraphError::Slate(ref err) if matches!(err.kind(), ErrorKind::Closed(_))
+    ));
+
+    handle.stop().await.unwrap();
+    cluster.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn control_plane_metrics_count_lease_renewal_failures() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = GraphControlPlane::open("graph-control/renew-metrics", object_store)
@@ -5990,6 +6070,52 @@ async fn cluster_controller_assigns_unplaced_cells_to_live_nodes() {
 }
 
 #[tokio::test]
+async fn concurrent_cluster_controllers_publish_one_atomic_assignment() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = Arc::new(
+        GraphControlPlane::open("graph-control/controller-concurrent", object_store)
+            .await
+            .unwrap(),
+    );
+    control
+        .publish_node_heartbeat_at("node-a", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    let config = GraphClusterControllerConfig::new(
+        ["reddit-home"],
+        std::time::Duration::from_millis(1_000),
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+
+    let (left, right) = tokio::join!(
+        control.reconcile_cluster_at(&config, 1_100),
+        control.reconcile_cluster_at(&config, 1_100),
+    );
+    let reports = [left.unwrap(), right.unwrap()];
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report.reassignments.len())
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report.failed_over_leases.len())
+            .sum::<usize>(),
+        1
+    );
+    let placement = control.load_placement().await.unwrap();
+    let lease = control.current_lease("reddit-home").await.unwrap().unwrap();
+    assert_eq!(placement.owner("reddit-home").unwrap(), "node-a");
+    assert_eq!(lease.owner_node_id, "node-a");
+    assert_eq!(lease.lease_token, 1);
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn cluster_controller_metrics_count_reconcile_failures() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = GraphControlPlane::open("graph-control/controller-failure-metrics", object_store)
@@ -6113,12 +6239,7 @@ async fn cluster_controller_rendezvous_rebalance_waits_for_old_lease_expiry() {
     .with_rebalance_mode(GraphClusterRebalanceMode::Rendezvous);
 
     let pending = control.reconcile_cluster_at(&config, 1_100).await.unwrap();
-    assert_eq!(pending.reassignments.len(), 1);
-    assert_eq!(
-        pending.reassignments[0].previous_owner_node_id.as_deref(),
-        Some("node-a")
-    );
-    assert_eq!(pending.reassignments[0].new_owner_node_id, "node-b");
+    assert!(pending.reassignments.is_empty());
     assert!(pending.failed_over_leases.is_empty());
     assert_eq!(
         pending.pending_failovers,
@@ -6136,7 +6257,7 @@ async fn cluster_controller_rendezvous_rebalance_waits_for_old_lease_expiry() {
             .unwrap()
             .owner(&cell_id)
             .unwrap(),
-        "node-b"
+        "node-a"
     );
     assert_eq!(
         control
@@ -6150,6 +6271,14 @@ async fn cluster_controller_rendezvous_rebalance_waits_for_old_lease_expiry() {
 
     let failed_over = control.reconcile_cluster_at(&config, 2_001).await.unwrap();
     assert!(failed_over.pending_failovers.is_empty());
+    assert_eq!(failed_over.reassignments.len(), 1);
+    assert_eq!(
+        failed_over.reassignments[0]
+            .previous_owner_node_id
+            .as_deref(),
+        Some("node-a")
+    );
+    assert_eq!(failed_over.reassignments[0].new_owner_node_id, "node-b");
     assert_eq!(failed_over.failed_over_leases.len(), 1);
     assert_eq!(failed_over.failed_over_leases[0].owner_node_id, "node-b");
     control.close().await.unwrap();
@@ -6199,8 +6328,7 @@ async fn cluster_controller_moves_draining_cells_after_lease_expiry() {
 
     let pending = control.reconcile_cluster_at(&config, 1_200).await.unwrap();
     assert_eq!(pending.draining_nodes, vec!["node-a"]);
-    assert_eq!(pending.reassignments.len(), 1);
-    assert_eq!(pending.reassignments[0].new_owner_node_id, "node-b");
+    assert!(pending.reassignments.is_empty());
     assert_eq!(pending.failed_over_leases, Vec::<ShardLease>::new());
     assert_eq!(
         pending.pending_failovers,
@@ -6223,6 +6351,8 @@ async fn cluster_controller_moves_draining_cells_after_lease_expiry() {
 
     let failed_over = control.reconcile_cluster_at(&config, 2_001).await.unwrap();
     assert!(failed_over.pending_failovers.is_empty());
+    assert_eq!(failed_over.reassignments.len(), 1);
+    assert_eq!(failed_over.reassignments[0].new_owner_node_id, "node-b");
     assert_eq!(failed_over.failed_over_leases.len(), 1);
     assert_eq!(failed_over.failed_over_leases[0].owner_node_id, "node-b");
     assert_eq!(
@@ -7170,6 +7300,61 @@ async fn matrix_snapshot_abort_cleanup_respects_inflight_artifact_builder_lock()
         "cleanup must not delete chunks while the same artifact epoch is locked by a builder"
     );
     builder_lock.release().await.unwrap();
+}
+
+#[tokio::test]
+async fn matrix_publish_is_fenced_by_cleanup_generation_and_reclaims_stale_marker() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/matrix-cleanup-generation", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "MATRIX_CLEANUP_GENERATION_EDGE";
+    shard
+        .write_edge(typed_mutation(
+            cell_id,
+            edge_type,
+            1,
+            2,
+            "matrix-cleanup-generation-seed",
+        ))
+        .await
+        .unwrap();
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    let cleanup_marker = engine::matrix_cleanup_marker_key(cell_id, edge_type, base_epoch);
+    let manifest_key =
+        format!("cell/{cell_id}/artifact/matrix_manifest/{edge_type}/{base_epoch:020}");
+
+    let mut marker_batch = GraphWriteBatch::new();
+    marker_batch.put(&cleanup_marker, b"cleanup-owner");
+    shard
+        .write_graph_batch_strict(cell_id, "test_claim_matrix_cleanup", marker_batch)
+        .await
+        .unwrap();
+
+    let mut unsafe_publish = GraphWriteBatch::new();
+    unsafe_publish.put(&manifest_key, b"incomplete-manifest");
+    let err = shard
+        .write_graph_batch_strict_guarded(
+            cell_id,
+            "test_publish_matrix_manifest",
+            vec![GraphWriteGuard::absent(&cleanup_marker)],
+            unsafe_publish,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::ConditionalWriteConflict { ref key, .. } if key == &cleanup_marker
+    ));
+    assert!(shard.read_remote(&manifest_key).await.unwrap().is_none());
+
+    let artifact = shard
+        .build_matrix_tiles(cell_id, edge_type, base_epoch, 64)
+        .await
+        .unwrap();
+    assert_eq!(artifact.base_epoch, base_epoch);
+    assert!(shard.read_remote(&cleanup_marker).await.unwrap().is_none());
+    assert!(shard.read_remote(&manifest_key).await.unwrap().is_some());
+    shard.close().await.unwrap();
 }
 
 #[tokio::test]

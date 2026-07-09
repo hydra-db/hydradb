@@ -341,6 +341,7 @@ impl GraphShard {
                 )
                 .await?;
             let result = async {
+                prepare_matrix_artifact_build(self, cell_id, edge_type, base_epoch).await?;
                 let mut data_batch = GraphWriteBatch::new();
                 let mut pending_writes = 0_usize;
                 for tile in out_tiles.iter().chain(transpose_tiles.iter()) {
@@ -389,9 +390,12 @@ impl GraphShard {
                     graphblas_csc_key(cell_id, edge_type, base_epoch),
                     encode_graphblas_csc_manifest(&graphblas_manifest),
                 );
-                self.write_graph_batch_strict_with_cell_lock(
+                publish_matrix_artifact_manifests_with_cell_lock(
+                    self,
                     cell_id,
                     "build_matrix_tiles",
+                    edge_type,
+                    base_epoch,
                     manifest_batch,
                 )
                 .await
@@ -496,6 +500,7 @@ impl GraphShard {
                 )
                 .await?;
             let result = async {
+                prepare_matrix_artifact_build(self, cell_id, edge_type, base_epoch).await?;
                 let mut data_batch = GraphWriteBatch::new();
                 let mut pending_writes = 0_usize;
                 let out_tiles = append_matrix_tiles_from_rows(
@@ -586,8 +591,15 @@ impl GraphShard {
                         graphblas_csc_key(cell_id, edge_type, base_epoch),
                         encode_graphblas_csc_manifest(&graphblas_manifest),
                     );
-                    self.write_graph_batch_strict(cell_id, "build_matrix_tiles", manifest_batch)
-                        .await
+                    publish_matrix_artifact_manifests(
+                        self,
+                        cell_id,
+                        "build_matrix_tiles",
+                        edge_type,
+                        base_epoch,
+                        manifest_batch,
+                    )
+                    .await
                 }
                 .await;
                 crate::release_cell_write_lock(lock, publish_result).await?;
@@ -849,6 +861,63 @@ impl GraphShard {
         }
         Ok(latest)
     }
+}
+
+async fn prepare_matrix_artifact_build(
+    shard: &GraphShard,
+    cell_id: &str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+) -> Result<()> {
+    let marker_key = matrix_cleanup_marker_key(cell_id, edge_type, base_epoch);
+    let Some(marker) = shard.read_remote(&marker_key).await? else {
+        return Ok(());
+    };
+    let mut batch = GraphWriteBatch::new();
+    batch.delete(&marker_key);
+    shard
+        .write_graph_batch_strict_guarded(
+            cell_id,
+            "prepare_matrix_artifact_build",
+            vec![GraphWriteGuard::equals(&marker_key, marker.as_ref())],
+            batch,
+        )
+        .await
+}
+
+async fn publish_matrix_artifact_manifests(
+    shard: &GraphShard,
+    cell_id: &str,
+    operation: &'static str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+    batch: GraphWriteBatch,
+) -> Result<()> {
+    shard
+        .write_graph_batch_strict_guarded(
+            cell_id,
+            operation,
+            vec![GraphWriteGuard::absent(matrix_cleanup_marker_key(
+                cell_id, edge_type, base_epoch,
+            ))],
+            batch,
+        )
+        .await
+}
+
+async fn publish_matrix_artifact_manifests_with_cell_lock(
+    shard: &GraphShard,
+    cell_id: &str,
+    operation: &'static str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+    batch: GraphWriteBatch,
+) -> Result<()> {
+    let lock = shard.acquire_cell_write_lock(cell_id, operation).await?;
+    let result =
+        publish_matrix_artifact_manifests(shard, cell_id, operation, edge_type, base_epoch, batch)
+            .await;
+    crate::release_cell_write_lock(lock, result).await
 }
 
 async fn ensure_posting_artifact_publish_compatible(
