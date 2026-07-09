@@ -336,6 +336,157 @@ impl ManagedGraphNode {
         node.cluster().delete_edge(mutation).await
     }
 
+    pub async fn delete_edges_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        idempotency_key: &str,
+    ) -> Result<crate::EdgeDeleteBatchResult> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .delete_edges_batch(cell_id, edge_type, edges, idempotency_key)
+            .await
+    }
+
+    pub async fn delete_edges_batch_chunked(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        idempotency_key: &str,
+        chunk_size: usize,
+    ) -> Result<crate::EdgeDeleteBatchResult> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .delete_edges_batch_chunked(cell_id, edge_type, edges, idempotency_key, chunk_size)
+            .await
+    }
+
+    pub async fn delete_edge_mutations_batch(
+        &self,
+        cell_id: &str,
+        mutations: impl IntoIterator<Item = crate::EdgeMutation>,
+    ) -> Result<crate::EdgeDeleteBatchResult> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .delete_edge_mutations_batch(cell_id, mutations)
+            .await
+    }
+
+    pub async fn delete_vertex(
+        &self,
+        cell_id: &str,
+        vertex_id: crate::VertexId,
+        idempotency_key: &str,
+    ) -> Result<crate::VertexDeleteResult> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .delete_vertex(cell_id, vertex_id, idempotency_key)
+            .await
+    }
+
+    pub async fn detach_delete_vertex(
+        &self,
+        cell_id: &str,
+        vertex_id: crate::VertexId,
+        idempotency_key: &str,
+    ) -> Result<crate::VertexDeleteResult> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .detach_delete_vertex(cell_id, vertex_id, idempotency_key)
+            .await
+    }
+
+    pub async fn ingest_edge_mutations(
+        &self,
+        cell_id: &str,
+        mutations: impl IntoIterator<Item = crate::EdgeMutation>,
+        options: crate::EdgeIngestOptions,
+    ) -> Result<crate::EdgeIngestResult> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .ingest_edge_mutations(cell_id, mutations, options)
+            .await
+    }
+
+    pub async fn bulk_import_edges(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        idempotency_key: &str,
+    ) -> Result<crate::BulkImportResult> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .bulk_import_edges(cell_id, edge_type, edges, idempotency_key)
+            .await
+    }
+
+    pub async fn write_edges_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        idempotency_key: &str,
+    ) -> Result<crate::BulkImportResult> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .write_edges_batch(cell_id, edge_type, edges, idempotency_key)
+            .await
+    }
+
+    pub async fn write_edges_batch_chunked(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        idempotency_key: &str,
+        chunk_size: usize,
+    ) -> Result<crate::BulkImportResult> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .write_edges_batch_chunked(cell_id, edge_type, edges, idempotency_key, chunk_size)
+            .await
+    }
+
+    pub async fn set_vertex_metadata(
+        &self,
+        cell_id: &str,
+        vertex_id: crate::VertexId,
+        metadata: crate::VertexMetadata,
+    ) -> Result<()> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .set_vertex_metadata(cell_id, vertex_id, metadata)
+            .await
+    }
+
+    pub async fn set_edge_metadata(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: crate::VertexId,
+        dst: crate::VertexId,
+        metadata: crate::EdgeMetadata,
+    ) -> Result<bool> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .set_edge_metadata(cell_id, edge_type, src, dst, metadata)
+            .await
+    }
+
     pub async fn out_neighbors(
         &self,
         cell_id: &str,

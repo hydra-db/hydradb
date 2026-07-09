@@ -5467,6 +5467,90 @@ async fn managed_graph_node_allows_concurrent_routed_writes() {
 }
 
 #[tokio::test]
+async fn managed_graph_node_exposes_fenced_batch_metadata_and_delete_apis() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = Arc::new(
+        GraphControlPlane::open(
+            "graph-control/managed-batch-apis",
+            Arc::clone(&object_store),
+        )
+        .await
+        .unwrap(),
+    );
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let node = GraphNode::open_managed(
+        "graph-managed-batch-apis",
+        "node-a",
+        Arc::clone(&control),
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(50),
+    )
+    .await
+    .unwrap();
+
+    let write = node
+        .write_edges_batch(
+            "reddit-home",
+            "FOLLOWS",
+            [(1, 2), (1, 3)],
+            "managed-batch-write",
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.inserted, 2);
+    node.set_vertex_metadata(
+        "reddit-home",
+        1,
+        VertexMetadata::default()
+            .with_label("User")
+            .with_property("name", VertexPropertyValue::String("alice".to_string())),
+    )
+    .await
+    .unwrap();
+    assert!(node
+        .set_edge_metadata(
+            "reddit-home",
+            "FOLLOWS",
+            1,
+            2,
+            EdgeMetadata::default().with_property("weight", VertexPropertyValue::Integer(7)),
+        )
+        .await
+        .unwrap());
+
+    let deleted = node
+        .delete_edges_batch("reddit-home", "FOLLOWS", [(1, 2)], "managed-batch-delete")
+        .await
+        .unwrap();
+    assert_eq!(deleted.deleted, 1);
+    assert_eq!(
+        node.out_neighbors("reddit-home", "FOLLOWS", 1)
+            .await
+            .unwrap(),
+        vec![3]
+    );
+
+    let detached = node
+        .detach_delete_vertex("reddit-home", 1, "managed-detach-delete")
+        .await
+        .unwrap();
+    assert_eq!(detached.incident_edges_deleted, 1);
+    assert!(node
+        .out_neighbors("reddit-home", "FOLLOWS", 1)
+        .await
+        .unwrap()
+        .is_empty());
+
+    node.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn managed_graph_node_drop_cell_unregisters_control_state() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = Arc::new(
