@@ -64,6 +64,12 @@ pub struct GraphControlRepairReport {
     pub repaired_watermark: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphControlCellDropReport {
+    pub cell_id: String,
+    pub deleted_control_keys: u64,
+}
+
 impl GraphControlPlane {
     pub async fn publish_placement_with_catalog(
         &self,
@@ -175,6 +181,105 @@ impl GraphControlPlane {
         }
         entries.sort_by(|left, right| left.cell_id.cmp(&right.cell_id));
         Ok(entries)
+    }
+
+    pub async fn drop_cell_control_state(
+        &self,
+        cell_id: &str,
+        expected_lease: Option<&ShardLease>,
+    ) -> Result<GraphControlCellDropReport> {
+        validate_component("cell_id", cell_id)?;
+        if let Some(lease) = expected_lease {
+            validate_component("node_id", &lease.owner_node_id)?;
+            if lease.cell_id != cell_id {
+                return Err(GraphError::StaleShardLease {
+                    cell_id: cell_id.to_string(),
+                    node_id: lease.owner_node_id.clone(),
+                    lease_token: lease.lease_token,
+                });
+            }
+        }
+        let mut prefix_keys = self
+            .control_keys_with_prefix(&control_edge_watermark_cell_prefix(cell_id))
+            .await?;
+        prefix_keys.extend(
+            self.control_keys_with_prefix(&control_idempotency_cell_prefix(cell_id))
+                .await?,
+        );
+        prefix_keys.sort();
+        prefix_keys.dedup();
+
+        for attempt in 0..GRAPH_CONTROL_TXN_MAX_RETRIES {
+            match self
+                .drop_cell_control_state_txn(cell_id, expected_lease, &prefix_keys)
+                .await
+            {
+                Err(GraphError::Slate(err))
+                    if err.kind() == ErrorKind::Transaction
+                        && attempt + 1 < GRAPH_CONTROL_TXN_MAX_RETRIES =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("control transaction retry loop always returns on final attempt")
+    }
+
+    async fn drop_cell_control_state_txn(
+        &self,
+        cell_id: &str,
+        expected_lease: Option<&ShardLease>,
+        prefix_keys: &[String],
+    ) -> Result<GraphControlCellDropReport> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let lease_key = control_lease_key(cell_id);
+        if let Some(expected) = expected_lease {
+            if let Some(value) = read_control_txn(&txn, &lease_key).await? {
+                let current = decode_shard_lease(&lease_key, &value)?;
+                if current.owner_node_id != expected.owner_node_id
+                    || current.lease_token != expected.lease_token
+                {
+                    return Err(GraphError::StaleShardLease {
+                        cell_id: cell_id.to_string(),
+                        node_id: expected.owner_node_id.clone(),
+                        lease_token: expected.lease_token,
+                    });
+                }
+            }
+        }
+
+        let mut keys = vec![
+            control_placement_key(cell_id),
+            lease_key,
+            control_lease_token_key(cell_id),
+            control_catalog_key(cell_id),
+            control_watermark_key(cell_id),
+        ];
+        keys.extend(prefix_keys.iter().cloned());
+        keys.sort();
+        keys.dedup();
+        let deleted_control_keys = keys.len() as u64;
+        for key in keys {
+            txn.delete(key.as_bytes())?;
+        }
+        commit_control_txn(txn).await?;
+        Ok(GraphControlCellDropReport {
+            cell_id: cell_id.to_string(),
+            deleted_control_keys,
+        })
+    }
+
+    async fn control_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut iter = self
+            .db
+            .scan_prefix_with_options(prefix.as_bytes(), .., &control_scan_options())
+            .await?;
+        let mut keys = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            keys.push(String::from_utf8_lossy(&kv.key).into_owned());
+        }
+        Ok(keys)
     }
 
     pub async fn compare_and_publish_shard_metadata(
@@ -720,8 +825,16 @@ fn control_edge_watermark_key(cell_id: &str, edge_type: &str) -> String {
     format!("{CONTROL_EDGE_WATERMARK_PREFIX}{cell_id}/{edge_type}")
 }
 
+fn control_edge_watermark_cell_prefix(cell_id: &str) -> String {
+    format!("{CONTROL_EDGE_WATERMARK_PREFIX}{cell_id}/")
+}
+
 fn control_idempotency_key(cell_id: &str, operation: &str, idempotency_key: &str) -> String {
     format!("{CONTROL_IDEMPOTENCY_PREFIX}{cell_id}/{operation}/{idempotency_key}")
+}
+
+fn control_idempotency_cell_prefix(cell_id: &str) -> String {
+    format!("{CONTROL_IDEMPOTENCY_PREFIX}{cell_id}/")
 }
 
 fn validate_catalog_entry(entry: &GraphShardCatalogEntry) -> Result<()> {

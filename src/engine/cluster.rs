@@ -203,6 +203,18 @@ impl GraphNode {
             .await
     }
 
+    pub async fn drop_cell(
+        &mut self,
+        cell_id: &str,
+        idempotency_key: &str,
+    ) -> Result<crate::GraphCellDropResult> {
+        let result = self
+            .cluster
+            .drop_cell_with_control(self.control.as_ref(), cell_id, idempotency_key)
+            .await?;
+        Ok(result)
+    }
+
     pub async fn close(self) -> Result<()> {
         let GraphNode {
             cluster,
@@ -296,6 +308,16 @@ impl ManagedGraphNode {
         let mut guard = self.node.write().await;
         let node = guard.as_mut().ok_or_else(managed_node_closed_error)?;
         node.refresh_owned_shards(lease_ttl).await
+    }
+
+    pub async fn drop_cell(
+        &self,
+        cell_id: &str,
+        idempotency_key: &str,
+    ) -> Result<crate::GraphCellDropResult> {
+        let mut guard = self.node.write().await;
+        let node = guard.as_mut().ok_or_else(managed_node_closed_error)?;
+        node.drop_cell(cell_id, idempotency_key).await
     }
 
     pub async fn write_edge(&self, mutation: crate::EdgeMutation) -> Result<crate::CommitResult> {
@@ -1009,6 +1031,21 @@ impl RoutedGraphCluster {
         shard.drop_cell(cell_id, idempotency_key).await
     }
 
+    pub async fn drop_cell_with_control(
+        &mut self,
+        control: &GraphControlPlane,
+        cell_id: &str,
+        idempotency_key: &str,
+    ) -> Result<crate::GraphCellDropResult> {
+        let lease = self.lease(cell_id);
+        let result = self.drop_cell(cell_id, idempotency_key).await?;
+        control
+            .drop_cell_control_state(cell_id, lease.as_ref())
+            .await?;
+        self.remove_local_cell(cell_id).await?;
+        Ok(result)
+    }
+
     pub async fn ingest_edge_mutations(
         &self,
         cell_id: &str,
@@ -1197,6 +1234,20 @@ impl RoutedGraphCluster {
     pub async fn close(&self) -> Result<()> {
         for shard in self.shards.values() {
             shard.close().await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_local_cell(&mut self, cell_id: &str) -> Result<()> {
+        validate_component("cell_id", cell_id)?;
+        self.leases.write().map_err(lock_error)?.remove(cell_id);
+        self.placement.owners.remove(cell_id);
+        if let Some(shard) = self.shards.remove(cell_id) {
+            match shard.close().await {
+                Ok(()) => {}
+                Err(GraphError::Slate(err)) if matches!(err.kind(), ErrorKind::Closed(_)) => {}
+                Err(err) => return Err(err),
+            }
         }
         Ok(())
     }
