@@ -5105,6 +5105,113 @@ async fn cluster_controller_fails_closed_without_active_nodes() {
 }
 
 #[tokio::test]
+async fn cluster_controller_discovers_cells_from_control_state() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/controller-discovery", object_store)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-b", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("placement-only", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    control
+        .compare_and_publish_shard_metadata(
+            GraphShardCatalogEntry {
+                graph_id: Some("reddit".to_string()),
+                cell_id: "catalog-only".to_string(),
+                owner_node_id: "node-a".to_string(),
+                lease_token: 0,
+                schema_epoch: Some(1),
+                graph_epoch: Some(0),
+                generation: 0,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let config = GraphClusterControllerConfig::discover_existing(
+        std::time::Duration::from_millis(1_000),
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+
+    let report = control.reconcile_cluster_at(&config, 1_100).await.unwrap();
+    assert_eq!(
+        report.controlled_cells,
+        vec!["catalog-only", "placement-only"]
+    );
+    assert_eq!(report.reassignments.len(), 2);
+    assert_eq!(report.failed_over_leases.len(), 2);
+    assert!(report.unassigned_cells.is_empty());
+    assert_eq!(
+        control
+            .load_placement()
+            .await
+            .unwrap()
+            .cells()
+            .collect::<Vec<_>>(),
+        vec!["catalog-only", "placement-only"]
+    );
+    for cell_id in ["catalog-only", "placement-only"] {
+        let lease = control.current_lease(cell_id).await.unwrap().unwrap();
+        assert_eq!(lease.owner_node_id, "node-b");
+    }
+    let catalog = control
+        .current_shard_metadata("catalog-only")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog.graph_id.as_deref(), Some("reddit"));
+    assert_eq!(catalog.owner_node_id, "node-b");
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cluster_controller_can_disable_existing_cell_discovery() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/controller-static-only", object_store)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-b", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("existing-cell", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let config = GraphClusterControllerConfig::new(
+        ["configured-cell"],
+        std::time::Duration::from_millis(1_000),
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap()
+    .with_existing_cell_discovery(false);
+
+    let report = control.reconcile_cluster_at(&config, 1_100).await.unwrap();
+    assert_eq!(report.controlled_cells, vec!["configured-cell"]);
+    assert!(control
+        .current_lease("existing-cell")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        control
+            .current_lease("configured-cell")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_node_id,
+        "node-b"
+    );
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn control_plane_catalog_uses_generation_cas() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = GraphControlPlane::open("graph-control/catalog-cas", object_store)
