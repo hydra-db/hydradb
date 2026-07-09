@@ -1656,73 +1656,96 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
         }
     }
 
-    let mut batch = GraphWriteBatch::new();
-    let mut pending_deletes = 0_usize;
-    let graphblas_key = graphblas_csc_key(cell_id, edge_type, base_epoch);
-    match shard.read_remote(&graphblas_key).await {
-        Ok(Some(_)) => {
-            batch.delete(graphblas_key.as_bytes());
-            pending_deletes += 1;
-        }
-        Ok(None) => {}
-        Err(err) => result.record_error(
-            cell_id,
-            edge_type,
-            base_epoch,
-            operation,
-            "read_graphblas_manifest",
-            &err,
-        ),
-    }
-    if pending_deletes >= GRAPH_ARTIFACT_GC_BATCH_KEYS
-        && !flush_unpublished_artifact_gc_batch_best_effort(
-            shard,
-            cell_id,
-            edge_type,
-            base_epoch,
-            operation,
-            &manifest_key,
-            &mut batch,
-            &mut pending_deletes,
-            &mut result,
-        )
+    let artifact_lock = match shard
+        .acquire_matrix_artifact_write_lock(cell_id, edge_type, base_epoch, operation)
         .await
     {
-        return result;
-    }
+        Ok(lock) => lock,
+        Err(err) => {
+            result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "acquire_matrix_artifact_lock",
+                &err,
+            );
+            return result;
+        }
+    };
 
-    for (cleanup_step, prefix) in [
-        (
-            "scan_matrix_out_tiles",
-            matrix_tile_prefix(cell_id, edge_type, base_epoch, ArtifactDirection::Out),
-        ),
-        (
-            "scan_matrix_in_tiles",
-            matrix_tile_prefix(cell_id, edge_type, base_epoch, ArtifactDirection::In),
-        ),
-        (
-            "scan_graphblas_chunks",
-            graphblas_csc_chunk_epoch_prefix(cell_id, edge_type, base_epoch),
-        ),
-    ] {
-        let mut iter = match shard.scan_remote_prefix(&prefix).await {
-            Ok(iter) => iter,
+    let cleanup_run = async {
+        match shard.read_remote(&manifest_key).await {
+            Ok(Some(_)) => {
+                result.skipped_published_manifest = true;
+                return Ok(());
+            }
+            Ok(None) => {}
             Err(err) => {
                 result.record_error(
                     cell_id,
                     edge_type,
                     base_epoch,
                     operation,
-                    cleanup_step,
+                    "recheck_matrix_manifest",
                     &err,
                 );
-                continue;
+                return Ok(());
             }
-        };
-        loop {
-            let kv = match iter.next().await {
-                Ok(Some(kv)) => kv,
-                Ok(None) => break,
+        }
+
+        let mut batch = GraphWriteBatch::new();
+        let mut pending_deletes = 0_usize;
+        let graphblas_key = graphblas_csc_key(cell_id, edge_type, base_epoch);
+        match shard.read_remote(&graphblas_key).await {
+            Ok(Some(_)) => {
+                batch.delete(graphblas_key.as_bytes());
+                pending_deletes += 1;
+            }
+            Ok(None) => {}
+            Err(err) => result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "read_graphblas_manifest",
+                &err,
+            ),
+        }
+        if pending_deletes >= GRAPH_ARTIFACT_GC_BATCH_KEYS
+            && !flush_unpublished_artifact_gc_batch_best_effort(
+                shard,
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                &manifest_key,
+                &artifact_lock,
+                &mut batch,
+                &mut pending_deletes,
+                &mut result,
+            )
+            .await
+        {
+            return Ok(());
+        }
+
+        for (cleanup_step, prefix) in [
+            (
+                "scan_matrix_out_tiles",
+                matrix_tile_prefix(cell_id, edge_type, base_epoch, ArtifactDirection::Out),
+            ),
+            (
+                "scan_matrix_in_tiles",
+                matrix_tile_prefix(cell_id, edge_type, base_epoch, ArtifactDirection::In),
+            ),
+            (
+                "scan_graphblas_chunks",
+                graphblas_csc_chunk_epoch_prefix(cell_id, edge_type, base_epoch),
+            ),
+        ] {
+            let mut iter = match shard.scan_remote_prefix(&prefix).await {
+                Ok(iter) => iter,
                 Err(err) => {
                     result.record_error(
                         cell_id,
@@ -1732,53 +1755,85 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
                         cleanup_step,
                         &err,
                     );
-                    break;
+                    continue;
                 }
             };
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            batch.delete(key.as_bytes());
-            pending_deletes += 1;
-            if pending_deletes >= GRAPH_ARTIFACT_GC_BATCH_KEYS
-                && !flush_unpublished_artifact_gc_batch_best_effort(
-                    shard,
-                    cell_id,
-                    edge_type,
-                    base_epoch,
-                    operation,
-                    &manifest_key,
-                    &mut batch,
-                    &mut pending_deletes,
-                    &mut result,
-                )
-                .await
-            {
-                return result;
+            loop {
+                let kv = match iter.next().await {
+                    Ok(Some(kv)) => kv,
+                    Ok(None) => break,
+                    Err(err) => {
+                        result.record_error(
+                            cell_id,
+                            edge_type,
+                            base_epoch,
+                            operation,
+                            cleanup_step,
+                            &err,
+                        );
+                        break;
+                    }
+                };
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                batch.delete(key.as_bytes());
+                pending_deletes += 1;
+                if pending_deletes >= GRAPH_ARTIFACT_GC_BATCH_KEYS
+                    && !flush_unpublished_artifact_gc_batch_best_effort(
+                        shard,
+                        cell_id,
+                        edge_type,
+                        base_epoch,
+                        operation,
+                        &manifest_key,
+                        &artifact_lock,
+                        &mut batch,
+                        &mut pending_deletes,
+                        &mut result,
+                    )
+                    .await
+                {
+                    return Ok(());
+                }
             }
         }
-    }
 
-    if flush_unpublished_artifact_gc_batch_best_effort(
-        shard,
-        cell_id,
-        edge_type,
-        base_epoch,
-        operation,
-        &manifest_key,
-        &mut batch,
-        &mut pending_deletes,
-        &mut result,
-    )
-    .await
-    {
-        shard.matrix_artifact_cache.lock().await.retain(|key, _| {
-            key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch
-        });
-        shard.matrix_cache.lock().await.retain(|key, _| {
-            key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch
-        });
-        shard.graphblas_cache.lock().await.retain(|key, _| {
-            key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch
-        });
+        if flush_unpublished_artifact_gc_batch_best_effort(
+            shard,
+            cell_id,
+            edge_type,
+            base_epoch,
+            operation,
+            &manifest_key,
+            &artifact_lock,
+            &mut batch,
+            &mut pending_deletes,
+            &mut result,
+        )
+        .await
+        {
+            shard.matrix_artifact_cache.lock().await.retain(|key, _| {
+                key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch
+            });
+            shard.matrix_cache.lock().await.retain(|key, _| {
+                key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch
+            });
+            shard.graphblas_cache.lock().await.retain(|key, _| {
+                key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch
+            });
+        }
+
+        Ok(())
+    }
+    .await;
+    if let Err(err) = crate::release_cell_write_lock(artifact_lock, cleanup_run).await {
+        result.record_error(
+            cell_id,
+            edge_type,
+            base_epoch,
+            operation,
+            "release_matrix_artifact_lock",
+            &err,
+        );
     }
 
     result
@@ -1792,6 +1847,7 @@ async fn flush_unpublished_artifact_gc_batch_best_effort(
     base_epoch: GraphEpoch,
     operation: &'static str,
     manifest_key: &str,
+    artifact_lock: &crate::CellWriteLock,
     batch: &mut GraphWriteBatch,
     pending_deletes: &mut usize,
     result: &mut MatrixArtifactCleanupResult,
@@ -1803,24 +1859,21 @@ async fn flush_unpublished_artifact_gc_batch_best_effort(
     let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
     *pending_deletes = 0;
     let locked_delete = async {
-        let lock = shard.acquire_cell_write_lock(cell_id, operation).await?;
-        let result = async {
-            match shard.read_remote(manifest_key).await {
-                Ok(Some(_)) => {
-                    return Err(GraphError::CorruptValue {
-                        key: manifest_key.to_string(),
-                        reason: "matrix manifest appeared before abort cleanup flush".to_string(),
-                    });
-                }
-                Ok(None) => {}
-                Err(err) => return Err(err),
+        artifact_lock.renew().await?;
+        match shard.read_remote(manifest_key).await {
+            Ok(Some(_)) => {
+                return Err(GraphError::CorruptValue {
+                    key: manifest_key.to_string(),
+                    reason: "matrix manifest appeared before abort cleanup flush".to_string(),
+                });
             }
-            shard
-                .write_graph_batch_strict(cell_id, operation, batch_to_write)
-                .await
+            Ok(None) => {}
+            Err(err) => return Err(err),
         }
-        .await;
-        crate::release_cell_write_lock(lock, result).await
+        shard
+            .write_graph_batch_strict(cell_id, operation, batch_to_write)
+            .await?;
+        artifact_lock.renew().await
     }
     .await;
     match locked_delete {
@@ -1837,6 +1890,17 @@ async fn flush_unpublished_artifact_gc_batch_best_effort(
                 operation,
                 reason,
                 "matrix artifact abort cleanup skipped published manifest"
+            );
+            return false;
+        }
+        Err(err @ GraphError::CellWriteConflict { .. }) => {
+            result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "delete_artifact_batch",
+                &err,
             );
             return false;
         }

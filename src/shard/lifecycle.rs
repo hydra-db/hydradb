@@ -273,12 +273,58 @@ impl GraphShard {
         Path::from_iter(["__slatedb_graph_kernel", "write_locks", db_path, cell_id])
     }
 
+    pub(crate) fn matrix_artifact_write_lock_path(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+    ) -> Path {
+        let db_path = if self.store_path.as_ref().is_empty() {
+            "__root__"
+        } else {
+            self.store_path.as_ref()
+        };
+        let base_epoch = format!("{base_epoch:020}");
+        Path::from_iter([
+            "__slatedb_graph_kernel",
+            "matrix_artifact_locks",
+            db_path,
+            cell_id,
+            edge_type,
+            &base_epoch,
+        ])
+    }
+
     pub(crate) async fn acquire_cell_write_lock(
         &self,
         cell_id: &str,
         operation: &'static str,
     ) -> Result<CellWriteLock> {
         let path = self.cell_write_lock_path(cell_id);
+        self.acquire_write_lock_at_path(path, cell_id, operation)
+            .await
+    }
+
+    pub(crate) async fn acquire_matrix_artifact_write_lock(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+        operation: &'static str,
+    ) -> Result<CellWriteLock> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let path = self.matrix_artifact_write_lock_path(cell_id, edge_type, base_epoch);
+        self.acquire_write_lock_at_path(path, cell_id, operation)
+            .await
+    }
+
+    async fn acquire_write_lock_at_path(
+        &self,
+        path: Path,
+        cell_id: &str,
+        operation: &'static str,
+    ) -> Result<CellWriteLock> {
         let owner_token = new_cell_write_lock_owner_token();
 
         for attempt in 0..GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS {
@@ -299,8 +345,8 @@ impl GraphShard {
                 Ok(_) => {
                     return Ok(CellWriteLock {
                         object_store: Arc::clone(&self.object_store),
-                        path,
-                        owner_token,
+                        path: path.clone(),
+                        owner_token: owner_token.clone(),
                     });
                 }
                 Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
