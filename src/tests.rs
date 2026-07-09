@@ -12642,6 +12642,55 @@ async fn cypher_rows_return_columns_and_typed_values() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_rows_distinct_deduplicates_before_windowing() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-distinct", object_store).await;
+
+    for (idx, dst) in [10, 11, 12].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst,
+                idempotency_key: format!("cypher-row-distinct-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let distinct = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-distinct-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) \
+             RETURN DISTINCT u.id AS src ORDER BY src",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        distinct,
+        QueryResultSet::new(
+            vec![QueryColumn::new("src")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+        )
+    );
+
+    let windowed = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-row-distinct-window"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) \
+             RETURN DISTINCT u.id AS src ORDER BY src SKIP 1 LIMIT 10",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        windowed,
+        QueryResultSet::new(vec![QueryColumn::new("src")], Vec::new())
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_rows_page_returns_bounded_cursor_pages() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-row-pages", object_store).await;
