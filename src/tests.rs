@@ -9818,6 +9818,72 @@ async fn pending_drop_marker_blocks_writes_and_drop_cell_finalizes_cleanup() {
     shard.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn drop_cell_waits_for_active_read_leases_before_deleting_data() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/drop-cell-active-reader",
+        object_store,
+        GraphOpenOptions {
+            retention_policy: GraphRetentionPolicy {
+                read_lease_ttl_ms: 25,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    shard
+        .write_edge(mutation(1, 2, "drop-active-reader-seed"))
+        .await
+        .unwrap();
+    let snapshot = shard.snapshot("reddit-home").await.unwrap();
+    assert_eq!(
+        snapshot
+            .out_neighbors("USER_SUBSCRIBED_TO_SUBREDDIT", 1)
+            .await
+            .unwrap(),
+        vec![2]
+    );
+    let err = shard
+        .drop_cell("reddit-home", "drop-active-reader")
+        .await
+        .unwrap_err();
+    let GraphError::ActiveReadLease {
+        operation: "drop_cell",
+        cell_id,
+        read_epoch,
+    } = err
+    else {
+        panic!("unexpected drop_cell error: {err:?}");
+    };
+    assert_eq!(cell_id, "reddit-home");
+    assert_eq!(read_epoch, 1);
+    assert!(shard
+        .read_remote(&keys::cell_drop_pending_marker("reddit-home"))
+        .await
+        .unwrap()
+        .is_some());
+    drop(snapshot);
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+    let dropped = shard
+        .drop_cell("reddit-home", "drop-active-reader")
+        .await
+        .unwrap();
+    assert_eq!(dropped.marker_epoch, 2);
+    assert!(!dropped.already_dropped);
+    assert!(dropped.deleted_keys > 0);
+    let mut iter = shard
+        .scan_remote_prefix(&keys::cell_prefix("reddit-home"))
+        .await
+        .unwrap();
+    assert!(iter.next().await.unwrap().is_none());
+    shard.close().await.unwrap();
+}
+
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn deleted_relationship_id_pointer_does_not_block_reimport() {

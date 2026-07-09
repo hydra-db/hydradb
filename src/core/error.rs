@@ -85,6 +85,14 @@ pub enum GraphError {
         cell_id: String,
     },
     #[error(
+        "{operation} for cell {cell_id} is waiting for active readers at epoch {read_epoch} to drain"
+    )]
+    ActiveReadLease {
+        operation: &'static str,
+        cell_id: String,
+        read_epoch: GraphEpoch,
+    },
+    #[error(
         "snapshot epoch {read_epoch} for cell {cell_id} edge {edge_type} is below compacted watermark {min_epoch}"
     )]
     SnapshotExpired {

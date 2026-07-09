@@ -1349,9 +1349,14 @@ impl GraphShard {
                         current_epoch,
                     });
                 }
+                self.pin_read_epoch(&context.cell_id, "query_read_epoch", read_epoch)
+                    .await?;
                 Ok(read_epoch)
             }
-            None => self.current_epoch(&context.cell_id).await,
+            None => {
+                self.pin_current_read_epoch(&context.cell_id, "query_read_epoch")
+                    .await
+            }
         }
     }
 
@@ -5314,6 +5319,31 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         self.ensure_cell_readable(cell_id, "current_epoch").await?;
         self.read_counter(&keys::last_epoch(cell_id)).await
+    }
+
+    pub(crate) async fn pin_current_read_epoch(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+    ) -> Result<GraphEpoch> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_cell_readable(cell_id, operation).await?;
+        let read_epoch = self.read_counter(&keys::last_epoch(cell_id)).await?;
+        self.publish_read_lease(cell_id, read_epoch).await?;
+        self.ensure_cell_readable(cell_id, operation).await?;
+        Ok(read_epoch)
+    }
+
+    pub(crate) async fn pin_read_epoch(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+        read_epoch: GraphEpoch,
+    ) -> Result<()> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_cell_readable(cell_id, operation).await?;
+        self.publish_read_lease(cell_id, read_epoch).await?;
+        self.ensure_cell_readable(cell_id, operation).await
     }
 
     pub(crate) async fn ensure_cell_readable(
