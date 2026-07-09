@@ -4924,6 +4924,77 @@ async fn routed_cluster_refresh_releases_closed_shard_lease_for_handoff() {
 }
 
 #[tokio::test]
+async fn routed_cluster_refresh_restores_lease_after_retained_fence_failure() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open(
+        "graph-control/refresh-retained-fence-failure",
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let mut cluster = RoutedGraphCluster::open_owned_with_control(
+        "graph-refresh-retained-fence-failure",
+        "node-a",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let original = cluster.lease("reddit-home").unwrap();
+
+    let newer = ShardLease {
+        cell_id: "reddit-home".to_string(),
+        owner_node_id: "node-z".to_string(),
+        lease_token: 999,
+        expires_at_ms: graph_now_millis() + 60_000,
+    };
+    let mut batch = WriteBatch::new();
+    batch.put(
+        keys::write_fence("reddit-home"),
+        encode_write_fence(&GraphWriteFence::from(&newer)),
+    );
+    cluster
+        .shard("reddit-home")
+        .unwrap()
+        .write_strict_for_test(batch)
+        .await
+        .unwrap();
+    control.release_lease(&original).await.unwrap();
+    cluster
+        .set_local_lease_expiry_for_test("reddit-home", 0)
+        .unwrap();
+
+    let err = cluster
+        .refresh_owned_shards(&control, std::time::Duration::from_secs(60))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::StaleShardLease {
+            cell_id,
+            node_id,
+            lease_token: 2,
+        } if cell_id == "reddit-home" && node_id == "node-a"
+    ));
+    assert_eq!(
+        cluster.lease("reddit-home").unwrap().lease_token,
+        original.lease_token
+    );
+    assert!(control
+        .current_lease("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    cluster.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn managed_graph_nodes_refresh_shards_in_background_after_failover() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = Arc::new(

@@ -723,6 +723,22 @@ impl RoutedGraphCluster {
             .collect())
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_local_lease_expiry_for_test(
+        &self,
+        cell_id: &str,
+        expires_at_ms: u64,
+    ) -> Result<()> {
+        let mut leases = self.leases.write().map_err(lock_error)?;
+        let lease = leases
+            .get_mut(cell_id)
+            .ok_or_else(|| GraphError::UnknownShard {
+                cell_id: cell_id.to_string(),
+            })?;
+        lease.expires_at_ms = expires_at_ms;
+        Ok(())
+    }
+
     pub async fn renew_leases(
         &mut self,
         control: &GraphControlPlane,
@@ -820,7 +836,8 @@ impl RoutedGraphCluster {
                 let lease = control
                     .acquire_lease(cell_id, &self.local_node_id, lease_ttl)
                     .await?;
-                self.leases
+                let previous_lease = self
+                    .leases
                     .write()
                     .map_err(lock_error)?
                     .insert(cell_id.clone(), lease.clone());
@@ -830,7 +847,18 @@ impl RoutedGraphCluster {
                     .ok_or_else(|| GraphError::UnknownShard {
                         cell_id: cell_id.clone(),
                     })?;
-                shard.install_write_fence(cell_id, &lease).await?;
+                if let Err(err) = shard.install_write_fence(cell_id, &lease).await {
+                    {
+                        let mut leases = self.leases.write().map_err(lock_error)?;
+                        if let Some(previous) = previous_lease {
+                            leases.insert(cell_id.clone(), previous);
+                        } else {
+                            leases.remove(cell_id);
+                        }
+                    }
+                    let _ = release_graph_node_leases(control, vec![lease]).await;
+                    return Err(err);
+                }
             }
             report.retained_cells.push(cell_id.clone());
         }
