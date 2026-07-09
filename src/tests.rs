@@ -7461,6 +7461,61 @@ async fn posting_abort_cleanup_removes_unpublished_chunks_and_owner_manifests() 
 }
 
 #[tokio::test]
+async fn posting_publish_is_fenced_by_cleanup_generation_and_reclaims_stale_marker() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/posting-cleanup-generation", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "POSTING_CLEANUP_GENERATION_EDGE";
+    shard
+        .write_edge(typed_mutation(
+            cell_id,
+            edge_type,
+            1,
+            2,
+            "posting-cleanup-generation-seed",
+        ))
+        .await
+        .unwrap();
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    let cleanup_marker = engine::posting_cleanup_marker_key(cell_id, edge_type, base_epoch);
+    let manifest_key =
+        format!("cell/{cell_id}/artifact/posting_epoch_manifest/{edge_type}/{base_epoch:020}");
+
+    let mut marker_batch = GraphWriteBatch::new();
+    marker_batch.put(&cleanup_marker, b"cleanup-owner");
+    shard
+        .write_graph_batch_strict(cell_id, "test_claim_posting_cleanup", marker_batch)
+        .await
+        .unwrap();
+
+    let mut unsafe_publish = GraphWriteBatch::new();
+    unsafe_publish.put(&manifest_key, b"incomplete-manifest");
+    let err = shard
+        .write_graph_batch_strict_guarded(
+            cell_id,
+            "test_publish_posting_manifest",
+            vec![GraphWriteGuard::absent(&cleanup_marker)],
+            unsafe_publish,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::ConditionalWriteConflict { ref key, .. } if key == &cleanup_marker
+    ));
+    assert!(shard.read_remote(&manifest_key).await.unwrap().is_none());
+
+    let chunks = shard
+        .build_posting_chunks(cell_id, edge_type, base_epoch, 64)
+        .await
+        .unwrap();
+    assert!(!chunks.is_empty());
+    assert!(shard.read_remote(&cleanup_marker).await.unwrap().is_none());
+    assert!(shard.read_remote(&manifest_key).await.unwrap().is_some());
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn posting_abort_cleanup_preserves_published_epoch_manifest() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/posting-abort-cleanup-published", object_store).await;
@@ -7549,11 +7604,24 @@ async fn supernode_groups_ignore_unpublished_orphan_records() {
         "test_cleanup_unpublished_supernode_artifacts",
     )
     .await;
-    assert_eq!(cleanup.deleted_keys, 2);
+    assert_eq!(cleanup.deleted_keys, 1);
     assert_eq!(cleanup.cleanup_errors, 0);
     assert!(!cleanup.skipped_published_manifest);
-    assert!(shard.read_remote(&chunk_key).await.unwrap().is_none());
+    assert!(shard.read_remote(&chunk_key).await.unwrap().is_some());
     assert!(shard.read_remote(&group_key).await.unwrap().is_none());
+
+    let posting_cleanup = engine::cleanup_unpublished_posting_artifact_epoch(
+        &shard,
+        cell_id,
+        edge_type,
+        base_epoch,
+        "test_cleanup_unpublished_supernode_posting_chunks",
+    )
+    .await;
+    assert_eq!(posting_cleanup.deleted_keys, 1);
+    assert_eq!(posting_cleanup.cleanup_errors, 0);
+    assert!(!posting_cleanup.skipped_published_manifest);
+    assert!(shard.read_remote(&chunk_key).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -7591,6 +7659,106 @@ async fn supernode_build_publishes_epoch_manifest() {
             .vertices,
         vec![10, 11]
     );
+}
+
+#[tokio::test]
+async fn supernode_publish_is_fenced_by_cleanup_generation_and_reclaims_stale_marker() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/supernode-cleanup-generation", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "SUPER_CLEANUP_GENERATION_EDGE";
+    for dst in 10..14 {
+        shard
+            .write_edge(typed_mutation(
+                cell_id,
+                edge_type,
+                1,
+                dst,
+                &format!("super-cleanup-generation-{dst}"),
+            ))
+            .await
+            .unwrap();
+    }
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    let cleanup_marker = engine::supernode_cleanup_marker_key(cell_id, edge_type, base_epoch);
+    let manifest_key =
+        format!("cell/{cell_id}/artifact/supernode_epoch_manifest/{edge_type}/{base_epoch:020}");
+
+    let mut marker_batch = GraphWriteBatch::new();
+    marker_batch.put(&cleanup_marker, b"cleanup-owner");
+    shard
+        .write_graph_batch_strict(cell_id, "test_claim_supernode_cleanup", marker_batch)
+        .await
+        .unwrap();
+
+    let mut unsafe_publish = GraphWriteBatch::new();
+    unsafe_publish.put(&manifest_key, b"incomplete-manifest");
+    let err = shard
+        .write_graph_batch_strict_guarded(
+            cell_id,
+            "test_publish_supernode_manifest",
+            vec![GraphWriteGuard::absent(&cleanup_marker)],
+            unsafe_publish,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::ConditionalWriteConflict { ref key, .. } if key == &cleanup_marker
+    ));
+
+    let groups = shard
+        .build_supernode_groups(cell_id, edge_type, base_epoch, 2, 2)
+        .await
+        .unwrap();
+    assert!(!groups.is_empty());
+    assert!(shard.read_remote(&cleanup_marker).await.unwrap().is_none());
+    assert!(shard.read_remote(&manifest_key).await.unwrap().is_some());
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn published_supernode_manifest_protects_shared_posting_chunks_from_cleanup() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/supernode-protects-posting", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "SUPER_PROTECTS_POSTING_EDGE";
+    for dst in 20..24 {
+        shard
+            .write_edge(typed_mutation(
+                cell_id,
+                edge_type,
+                1,
+                dst,
+                &format!("super-protects-posting-{dst}"),
+            ))
+            .await
+            .unwrap();
+    }
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    shard
+        .build_supernode_groups(cell_id, edge_type, base_epoch, 2, 2)
+        .await
+        .unwrap();
+    let chunk_key = format!(
+        "cell/{cell_id}/artifact/posting/{edge_type}/out/{:020}/{base_epoch:020}/{:020}",
+        1, 0
+    );
+    assert!(shard.read_remote(&chunk_key).await.unwrap().is_some());
+
+    let cleanup = engine::cleanup_unpublished_posting_artifact_epoch(
+        &shard,
+        cell_id,
+        edge_type,
+        base_epoch,
+        "test_posting_cleanup_after_supernode_publish",
+    )
+    .await;
+    assert_eq!(cleanup.deleted_keys, 0);
+    assert_eq!(cleanup.cleanup_errors, 0);
+    assert!(cleanup.skipped_published_manifest);
+    assert!(shard.read_remote(&chunk_key).await.unwrap().is_some());
+    shard.close().await.unwrap();
 }
 
 #[tokio::test]

@@ -1132,7 +1132,7 @@ async fn flush_matrix_tile_row(
         };
         put_artifact_record(
             shard,
-            Some(artifact_lock),
+            &[artifact_lock],
             cell_id,
             "build_matrix_tiles",
             batch,
@@ -1611,6 +1611,14 @@ fn posting_artifact_manifest_key(cell_id: &str, edge_type: &str, base_epoch: Gra
     format!("cell/{cell_id}/artifact/posting_epoch_manifest/{edge_type}/{base_epoch:020}")
 }
 
+pub(crate) fn posting_cleanup_marker_key(
+    cell_id: &str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+) -> String {
+    format!("cell/{cell_id}/meta/posting_cleanup/{edge_type}/{base_epoch:020}")
+}
+
 fn posting_artifact_manifest_prefix(cell_id: &str, edge_type: &str) -> String {
     format!("cell/{cell_id}/artifact/posting_epoch_manifest/{edge_type}/")
 }
@@ -1812,6 +1820,58 @@ pub(crate) fn matrix_cleanup_marker_key(
     format!("cell/{cell_id}/meta/matrix_cleanup/{edge_type}/{base_epoch:020}")
 }
 
+async fn prepare_artifact_build(
+    shard: &GraphShard,
+    cell_id: &str,
+    operation: &'static str,
+    cleanup_marker_keys: &[String],
+) -> Result<()> {
+    let mut guards = Vec::new();
+    let mut batch = GraphWriteBatch::new();
+    for marker_key in cleanup_marker_keys {
+        if let Some(marker) = shard.read_remote(marker_key).await? {
+            guards.push(GraphWriteGuard::equals(marker_key, marker.as_ref()));
+            batch.delete(marker_key);
+        }
+    }
+    if batch.is_empty() {
+        return Ok(());
+    }
+    shard
+        .write_graph_batch_strict_guarded(cell_id, operation, guards, batch)
+        .await
+}
+
+async fn publish_artifact_records_guarded(
+    shard: &GraphShard,
+    cell_id: &str,
+    operation: &'static str,
+    cleanup_marker_keys: &[String],
+    batch: GraphWriteBatch,
+) -> Result<()> {
+    let guards = cleanup_marker_keys
+        .iter()
+        .map(GraphWriteGuard::absent)
+        .collect();
+    shard
+        .write_graph_batch_strict_guarded(cell_id, operation, guards, batch)
+        .await
+}
+
+async fn publish_artifact_records_guarded_with_cell_lock(
+    shard: &GraphShard,
+    cell_id: &str,
+    operation: &'static str,
+    cleanup_marker_keys: &[String],
+    batch: GraphWriteBatch,
+) -> Result<()> {
+    let lock = shard.acquire_cell_write_lock(cell_id, operation).await?;
+    let result =
+        publish_artifact_records_guarded(shard, cell_id, operation, cleanup_marker_keys, batch)
+            .await;
+    crate::release_cell_write_lock(lock, result).await
+}
+
 fn matrix_manifest_prefix(cell_id: &str, edge_type: &str) -> String {
     format!("cell/{cell_id}/artifact/matrix_manifest/{edge_type}/")
 }
@@ -1921,7 +1981,7 @@ const GRAPH_ARTIFACT_GC_BATCH_KEYS: usize = 512;
 #[allow(clippy::too_many_arguments)]
 async fn put_artifact_record(
     shard: &GraphShard,
-    artifact_lock: Option<&CellWriteLock>,
+    artifact_locks: &[&CellWriteLock],
     cell_id: &str,
     operation: &'static str,
     batch: &mut GraphWriteBatch,
@@ -1934,7 +1994,7 @@ async fn put_artifact_record(
     if *pending_writes >= GRAPH_ARTIFACT_WRITE_BATCH_KEYS {
         flush_artifact_put_batch(
             shard,
-            artifact_lock,
+            artifact_locks,
             cell_id,
             operation,
             batch,
@@ -1947,7 +2007,7 @@ async fn put_artifact_record(
 
 async fn flush_artifact_put_batch(
     shard: &GraphShard,
-    artifact_lock: Option<&CellWriteLock>,
+    artifact_locks: &[&CellWriteLock],
     cell_id: &str,
     operation: &'static str,
     batch: &mut GraphWriteBatch,
@@ -1956,14 +2016,14 @@ async fn flush_artifact_put_batch(
     if *pending_writes == 0 {
         return Ok(());
     }
-    if let Some(lock) = artifact_lock {
+    for lock in artifact_locks {
         lock.renew().await?;
     }
     let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
     shard
         .write_graph_batch_strict(cell_id, operation, batch_to_write)
         .await?;
-    if let Some(lock) = artifact_lock {
+    for lock in artifact_locks {
         lock.renew().await?;
     }
     *pending_writes = 0;
@@ -2049,20 +2109,67 @@ pub(crate) async fn cleanup_unpublished_posting_artifact_epoch(
         }
     };
 
+    let cleanup_marker_key = posting_cleanup_marker_key(cell_id, edge_type, base_epoch);
+    let cleanup_token = artifact_lock.owner_token.as_bytes().to_vec();
+    let supernode_manifest_key = supernode_artifact_manifest_key(cell_id, edge_type, base_epoch);
+    let mut cleanup_claimed = false;
+
     let cleanup_run = async {
-        match shard.read_remote(&manifest_key).await {
-            Ok(Some(_)) => {
+        for (cleanup_step, protected_manifest_key) in [
+            ("recheck_posting_epoch_manifest", manifest_key.as_str()),
+            (
+                "recheck_supernode_epoch_manifest_before_posting_cleanup",
+                supernode_manifest_key.as_str(),
+            ),
+        ] {
+            match shard.read_remote(protected_manifest_key).await {
+                Ok(Some(_)) => {
+                    result.skipped_published_manifest = true;
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    result.record_error(
+                        cell_id,
+                        edge_type,
+                        base_epoch,
+                        operation,
+                        cleanup_step,
+                        &err,
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        let mut claim_batch = GraphWriteBatch::new();
+        claim_batch.put(&cleanup_marker_key, &cleanup_token);
+        match shard
+            .write_graph_batch_strict_guarded(
+                cell_id,
+                operation,
+                vec![
+                    GraphWriteGuard::absent(&manifest_key),
+                    GraphWriteGuard::absent(&supernode_manifest_key),
+                ],
+                claim_batch,
+            )
+            .await
+        {
+            Ok(()) => cleanup_claimed = true,
+            Err(GraphError::ConditionalWriteConflict { key, .. })
+                if key == manifest_key || key == supernode_manifest_key =>
+            {
                 result.skipped_published_manifest = true;
                 return Ok(());
             }
-            Ok(None) => {}
             Err(err) => {
                 result.record_error(
                     cell_id,
                     edge_type,
                     base_epoch,
                     operation,
-                    "recheck_posting_epoch_manifest",
+                    "claim_posting_cleanup_generation",
                     &err,
                 );
                 return Ok(());
@@ -2135,6 +2242,9 @@ pub(crate) async fn cleanup_unpublished_posting_artifact_epoch(
                         base_epoch,
                         operation,
                         &manifest_key,
+                        &supernode_manifest_key,
+                        &cleanup_marker_key,
+                        &cleanup_token,
                         &artifact_lock,
                         &mut batch,
                         &mut pending_deletes,
@@ -2154,6 +2264,9 @@ pub(crate) async fn cleanup_unpublished_posting_artifact_epoch(
             base_epoch,
             operation,
             &manifest_key,
+            &supernode_manifest_key,
+            &cleanup_marker_key,
+            &cleanup_token,
             &artifact_lock,
             &mut batch,
             &mut pending_deletes,
@@ -2169,6 +2282,28 @@ pub(crate) async fn cleanup_unpublished_posting_artifact_epoch(
         Ok(())
     }
     .await;
+    if cleanup_claimed {
+        let mut release_batch = GraphWriteBatch::new();
+        release_batch.delete(&cleanup_marker_key);
+        if let Err(err) = shard
+            .write_graph_batch_strict_guarded(
+                cell_id,
+                operation,
+                vec![GraphWriteGuard::equals(&cleanup_marker_key, &cleanup_token)],
+                release_batch,
+            )
+            .await
+        {
+            result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "release_posting_cleanup_generation",
+                &err,
+            );
+        }
+    }
     if let Err(err) = crate::release_cell_write_lock(artifact_lock, cleanup_run).await {
         result.record_error(
             cell_id,
@@ -2191,6 +2326,9 @@ async fn flush_unpublished_posting_artifact_gc_batch_best_effort(
     base_epoch: GraphEpoch,
     operation: &'static str,
     manifest_key: &str,
+    supernode_manifest_key: &str,
+    cleanup_marker_key: &str,
+    cleanup_token: &[u8],
     artifact_lock: &CellWriteLock,
     batch: &mut GraphWriteBatch,
     pending_deletes: &mut usize,
@@ -2210,34 +2348,49 @@ async fn flush_unpublished_posting_artifact_gc_batch_best_effort(
         );
         return false;
     }
-    match shard.read_remote(manifest_key).await {
-        Ok(Some(_)) => {
-            result.skipped_published_manifest = true;
-            return false;
-        }
-        Ok(None) => {}
-        Err(err) => {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "recheck_posting_epoch_manifest_before_delete",
-                &err,
-            );
-            return false;
-        }
-    }
     let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
     let delete_count = *pending_deletes as u64;
     match shard
-        .write_graph_batch_strict(cell_id, operation, batch_to_write)
+        .write_graph_batch_strict_guarded(
+            cell_id,
+            operation,
+            vec![
+                GraphWriteGuard::absent(manifest_key),
+                GraphWriteGuard::absent(supernode_manifest_key),
+                GraphWriteGuard::equals(cleanup_marker_key, cleanup_token),
+            ],
+            batch_to_write,
+        )
         .await
     {
         Ok(()) => {
             result.deleted_keys = result.deleted_keys.saturating_add(delete_count);
             *pending_deletes = 0;
             true
+        }
+        Err(GraphError::ConditionalWriteConflict { key, .. })
+            if key == manifest_key || key == supernode_manifest_key =>
+        {
+            result.skipped_published_manifest = true;
+            false
+        }
+        Err(GraphError::ConditionalWriteConflict {
+            operation: conflict_operation,
+            key,
+        }) if key == cleanup_marker_key => {
+            let err = GraphError::ConditionalWriteConflict {
+                operation: conflict_operation,
+                key,
+            };
+            result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "lost_posting_cleanup_generation",
+                &err,
+            );
+            false
         }
         Err(err) => {
             result.record_error(
@@ -2333,6 +2486,10 @@ pub(crate) async fn cleanup_unpublished_supernode_artifact_epoch(
         }
     };
 
+    let cleanup_marker_key = supernode_cleanup_marker_key(cell_id, edge_type, base_epoch);
+    let cleanup_token = artifact_lock.owner_token.as_bytes().to_vec();
+    let mut cleanup_claimed = false;
+
     let cleanup_run = async {
         match shard.read_remote(&manifest_key).await {
             Ok(Some(_)) => {
@@ -2353,34 +2510,41 @@ pub(crate) async fn cleanup_unpublished_supernode_artifact_epoch(
             }
         }
 
-        let mut batch = GraphWriteBatch::new();
-        let mut pending_deletes = 0_usize;
-        let posting_manifest_key = posting_artifact_manifest_key(cell_id, edge_type, base_epoch);
-        let posting_epoch_published = match shard.read_remote(&posting_manifest_key).await {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
+        let mut claim_batch = GraphWriteBatch::new();
+        claim_batch.put(&cleanup_marker_key, &cleanup_token);
+        match shard
+            .write_graph_batch_strict_guarded(
+                cell_id,
+                operation,
+                vec![GraphWriteGuard::absent(&manifest_key)],
+                claim_batch,
+            )
+            .await
+        {
+            Ok(()) => cleanup_claimed = true,
+            Err(GraphError::ConditionalWriteConflict { key, .. }) if key == manifest_key => {
+                result.skipped_published_manifest = true;
+                return Ok(());
+            }
             Err(err) => {
                 result.record_error(
                     cell_id,
                     edge_type,
                     base_epoch,
                     operation,
-                    "read_posting_epoch_manifest_before_supernode_cleanup",
+                    "claim_supernode_cleanup_generation",
                     &err,
                 );
-                true
+                return Ok(());
             }
-        };
-        let mut prefixes = vec![(
+        }
+
+        let mut batch = GraphWriteBatch::new();
+        let mut pending_deletes = 0_usize;
+        let prefixes = [(
             "scan_supernode_groups",
             format!("cell/{cell_id}/artifact/supernode/{edge_type}/"),
         )];
-        if !posting_epoch_published {
-            prefixes.push((
-                "scan_unprotected_supernode_posting_chunks",
-                format!("cell/{cell_id}/artifact/posting/{edge_type}/"),
-            ));
-        }
         for (cleanup_step, prefix) in prefixes {
             let mut iter = match shard.scan_remote_prefix(&prefix).await {
                 Ok(iter) => iter,
@@ -2436,6 +2600,8 @@ pub(crate) async fn cleanup_unpublished_supernode_artifact_epoch(
                         base_epoch,
                         operation,
                         &manifest_key,
+                        &cleanup_marker_key,
+                        &cleanup_token,
                         &artifact_lock,
                         &mut batch,
                         &mut pending_deletes,
@@ -2455,6 +2621,8 @@ pub(crate) async fn cleanup_unpublished_supernode_artifact_epoch(
             base_epoch,
             operation,
             &manifest_key,
+            &cleanup_marker_key,
+            &cleanup_token,
             &artifact_lock,
             &mut batch,
             &mut pending_deletes,
@@ -2474,18 +2642,33 @@ pub(crate) async fn cleanup_unpublished_supernode_artifact_epoch(
                         || key.edge_type != edge_type
                         || key.base_epoch != base_epoch
                 });
-            if !posting_epoch_published {
-                shard.posting_chunk_cache.lock().await.retain(|key, _| {
-                    key.cell_id != cell_id
-                        || key.edge_type != edge_type
-                        || key.base_epoch != base_epoch
-                });
-            }
         }
 
         Ok(())
     }
     .await;
+    if cleanup_claimed {
+        let mut release_batch = GraphWriteBatch::new();
+        release_batch.delete(&cleanup_marker_key);
+        if let Err(err) = shard
+            .write_graph_batch_strict_guarded(
+                cell_id,
+                operation,
+                vec![GraphWriteGuard::equals(&cleanup_marker_key, &cleanup_token)],
+                release_batch,
+            )
+            .await
+        {
+            result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "release_supernode_cleanup_generation",
+                &err,
+            );
+        }
+    }
     if let Err(err) = crate::release_cell_write_lock(artifact_lock, cleanup_run).await {
         result.record_error(
             cell_id,
@@ -2508,6 +2691,8 @@ async fn flush_unpublished_supernode_artifact_gc_batch_best_effort(
     base_epoch: GraphEpoch,
     operation: &'static str,
     manifest_key: &str,
+    cleanup_marker_key: &str,
+    cleanup_token: &[u8],
     artifact_lock: &CellWriteLock,
     batch: &mut GraphWriteBatch,
     pending_deletes: &mut usize,
@@ -2521,18 +2706,16 @@ async fn flush_unpublished_supernode_artifact_gc_batch_best_effort(
     *pending_deletes = 0;
     let locked_delete = async {
         artifact_lock.renew().await?;
-        match shard.read_remote(manifest_key).await {
-            Ok(Some(_)) => {
-                return Err(GraphError::CorruptValue {
-                    key: manifest_key.to_string(),
-                    reason: "supernode manifest appeared before abort cleanup flush".to_string(),
-                });
-            }
-            Ok(None) => {}
-            Err(err) => return Err(err),
-        }
         shard
-            .write_graph_batch_strict(cell_id, operation, batch_to_write)
+            .write_graph_batch_strict_guarded(
+                cell_id,
+                operation,
+                vec![
+                    GraphWriteGuard::absent(manifest_key),
+                    GraphWriteGuard::equals(cleanup_marker_key, cleanup_token),
+                ],
+                batch_to_write,
+            )
             .await?;
         artifact_lock.renew().await
     }
@@ -2541,16 +2724,25 @@ async fn flush_unpublished_supernode_artifact_gc_batch_best_effort(
         Ok(()) => {
             result.deleted_keys = result.deleted_keys.saturating_add(attempted_deletes);
         }
-        Err(GraphError::CorruptValue { key, reason }) if key == manifest_key => {
+        Err(GraphError::ConditionalWriteConflict { key, .. }) if key == manifest_key => {
             result.skipped_published_manifest = true;
-            tracing::warn!(
-                target: "slatedb_graph_kernel",
+            return false;
+        }
+        Err(GraphError::ConditionalWriteConflict {
+            operation: conflict_operation,
+            key,
+        }) if key == cleanup_marker_key => {
+            let err = GraphError::ConditionalWriteConflict {
+                operation: conflict_operation,
+                key,
+            };
+            result.record_error(
                 cell_id,
                 edge_type,
                 base_epoch,
                 operation,
-                reason,
-                "supernode artifact abort cleanup skipped published manifest"
+                "lost_supernode_cleanup_generation",
+                &err,
             );
             return false;
         }
@@ -3195,7 +3387,7 @@ async fn append_graphblas_csc_chunks_from_rows(
                 let values = std::mem::take(&mut index_chunk);
                 put_artifact_record(
                     shard,
-                    Some(artifact_lock),
+                    &[artifact_lock],
                     cell_id,
                     "build_matrix_tiles",
                     batch,
@@ -3213,7 +3405,7 @@ async fn append_graphblas_csc_chunks_from_rows(
         index_chunks = index_chunks.saturating_add(1);
         put_artifact_record(
             shard,
-            Some(artifact_lock),
+            &[artifact_lock],
             cell_id,
             "build_matrix_tiles",
             batch,
@@ -3255,7 +3447,7 @@ async fn append_graphblas_csc_field_chunks(
     for (chunk_id, chunk) in values.chunks(GRAPHBLAS_CSC_CHUNK_U64S).enumerate() {
         put_artifact_record(
             shard,
-            Some(artifact_lock),
+            &[artifact_lock],
             cell_id,
             "build_matrix_tiles",
             batch,
@@ -3569,6 +3761,14 @@ fn supernode_artifact_manifest_key(
     base_epoch: GraphEpoch,
 ) -> String {
     format!("cell/{cell_id}/artifact/supernode_epoch_manifest/{edge_type}/{base_epoch:020}")
+}
+
+pub(crate) fn supernode_cleanup_marker_key(
+    cell_id: &str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+) -> String {
+    format!("cell/{cell_id}/meta/supernode_cleanup/{edge_type}/{base_epoch:020}")
 }
 
 fn supernode_artifact_manifest_prefix(cell_id: &str, edge_type: &str) -> String {
@@ -4123,7 +4323,7 @@ mod artifact_publish_tests {
         for idx in 0..GRAPH_ARTIFACT_WRITE_BATCH_KEYS {
             put_artifact_record(
                 &shard,
-                Some(&lock),
+                &[&lock],
                 cell_id,
                 "artifact_batch_flush_renews_held_lock",
                 &mut batch,
