@@ -6916,6 +6916,40 @@ async fn posting_chunks_ignore_unpublished_orphan_chunks() {
 }
 
 #[tokio::test]
+async fn posting_chunks_ignore_owner_manifest_without_epoch_manifest() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/posting-owner-manifest-hidden", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "PARTIAL_POSTING_MANIFEST_EDGE";
+    let base_epoch = 11;
+    let chunk_key = format!(
+        "cell/{cell_id}/artifact/posting/{edge_type}/out/{:020}/{base_epoch:020}/{:020}",
+        1, 0
+    );
+    let manifest_key = format!(
+        "cell/{cell_id}/artifact/posting_manifest/{edge_type}/out/{:020}/{base_epoch:020}",
+        1
+    );
+    let chunk_value = format!("posting1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t0\t2,3\n");
+    let manifest_value =
+        format!("posting_manifest1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t1\t2\t0\n");
+
+    let mut batch = GraphWriteBatch::new();
+    batch.put(chunk_key.as_bytes(), chunk_value.as_bytes());
+    batch.put(manifest_key.as_bytes(), manifest_value.as_bytes());
+    shard
+        .write_graph_batch_strict(cell_id, "test_seed_partial_posting_manifest", batch)
+        .await
+        .unwrap();
+
+    assert!(shard
+        .posting_chunks(cell_id, edge_type, ArtifactDirection::Out, 1, base_epoch)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn posting_chunks_require_all_manifest_chunks() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/posting-manifest-missing-chunk", object_store).await;
@@ -7028,6 +7062,13 @@ async fn build_posting_chunks_rejects_incompatible_republish() {
         .build_posting_chunks(cell_id, edge_type, base_epoch, 2)
         .await
         .unwrap();
+    let epoch_manifest_key =
+        format!("cell/{cell_id}/artifact/posting_epoch_manifest/{edge_type}/{base_epoch:020}");
+    assert!(shard
+        .read_remote(&epoch_manifest_key)
+        .await
+        .unwrap()
+        .is_some());
 
     let err = shard
         .build_posting_chunks(cell_id, edge_type, base_epoch, 3)
@@ -7528,6 +7569,13 @@ async fn rollup_artifact_gc_keeps_latest_artifacts_and_retains_snapshot_deltas()
             .await
             .unwrap();
         assert_eq!(first.base_epoch, epoch_one);
+        let epoch_one_posting_manifest =
+            format!("cell/{cell_id}/artifact/posting_epoch_manifest/{edge_type}/{epoch_one:020}");
+        assert!(shard
+            .read_remote(&epoch_one_posting_manifest)
+            .await
+            .unwrap()
+            .is_some());
 
         shard
             .write_edge(mutation(1, 3, "rollup-base-2"))
@@ -7552,6 +7600,15 @@ async fn rollup_artifact_gc_keeps_latest_artifacts_and_retains_snapshot_deltas()
     let reopened = open_test_shard(path, object_store).await;
     assert!(reopened
         .latest_matrix_artifact(cell_id, edge_type, 1)
+        .await
+        .unwrap()
+        .is_none());
+    let epoch_one_posting_manifest = format!(
+        "cell/{cell_id}/artifact/posting_epoch_manifest/{edge_type}/{:020}",
+        1
+    );
+    assert!(reopened
+        .read_remote(&epoch_one_posting_manifest)
         .await
         .unwrap()
         .is_none());

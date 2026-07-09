@@ -62,6 +62,9 @@ impl GraphShard {
         );
 
         let manifests = posting_manifests_from_chunks(&chunks)?;
+        let artifact_manifest = posting_artifact_manifest_from_owner_manifests(
+            cell_id, edge_type, base_epoch, &manifests,
+        )?;
 
         let artifact_lock = self
             .acquire_posting_artifact_write_lock(
@@ -72,7 +75,15 @@ impl GraphShard {
             )
             .await?;
         let publish_result = async {
-            ensure_posting_manifests_publish_compatible(self, &manifests).await?;
+            ensure_posting_artifact_publish_compatible(
+                self,
+                cell_id,
+                edge_type,
+                base_epoch,
+                artifact_manifest.as_ref(),
+                &manifests,
+            )
+            .await?;
             let mut batch = GraphWriteBatch::new();
             let mut pending_writes = 0_usize;
             for chunk in &chunks {
@@ -118,6 +129,22 @@ impl GraphShard {
                 self,
                 cell_id,
                 "build_posting_chunks_manifest",
+                &mut batch,
+                &mut pending_writes,
+            )
+            .await?;
+            artifact_lock.renew().await?;
+            if let Some(artifact_manifest) = artifact_manifest.as_ref() {
+                batch.put(
+                    posting_artifact_manifest_key(cell_id, edge_type, base_epoch),
+                    encode_posting_artifact_manifest(artifact_manifest),
+                );
+                pending_writes += 1;
+            }
+            flush_artifact_put_batch(
+                self,
+                cell_id,
+                "build_posting_chunks_epoch_manifest",
                 &mut batch,
                 &mut pending_writes,
             )
@@ -176,6 +203,13 @@ impl GraphShard {
                 chunk_checksums: Vec::new(),
             })
         } else {
+            let artifact_manifest_key =
+                posting_artifact_manifest_key(cell_id, edge_type, base_epoch);
+            if let Some(value) = self.read_remote(&artifact_manifest_key).await? {
+                decode_posting_artifact_manifest(&artifact_manifest_key, &value)?;
+            } else {
+                return Ok(Vec::new());
+            }
             let manifest_key =
                 posting_manifest_key(cell_id, edge_type, direction, owner, base_epoch);
             match self.read_remote(&manifest_key).await? {
@@ -795,10 +829,26 @@ impl GraphShard {
     }
 }
 
-async fn ensure_posting_manifests_publish_compatible(
+async fn ensure_posting_artifact_publish_compatible(
     shard: &GraphShard,
+    cell_id: &str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+    artifact_manifest: Option<&PostingArtifactManifest>,
     manifests: &[PostingChunkManifest],
 ) -> Result<()> {
+    let artifact_key = posting_artifact_manifest_key(cell_id, edge_type, base_epoch);
+    let Some(value) = shard.read_remote(&artifact_key).await? else {
+        return Ok(());
+    };
+    let existing_artifact = decode_posting_artifact_manifest(&artifact_key, &value)?;
+    if Some(&existing_artifact) != artifact_manifest {
+        return Err(GraphError::CorruptValue {
+            key: artifact_key,
+            reason: "posting artifact epoch is already published with a different layout"
+                .to_string(),
+        });
+    }
     for manifest in manifests {
         let key = posting_manifest_key(
             &manifest.cell_id,
