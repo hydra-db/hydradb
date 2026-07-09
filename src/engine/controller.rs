@@ -26,6 +26,7 @@ impl GraphClusterControllerConfig {
             lease_ttl,
             rebalance_mode: GraphClusterRebalanceMode::StabilityFirst,
             discover_existing_cells: true,
+            max_expired_heartbeats_to_prune: GRAPH_CONTROLLER_EXPIRED_HEARTBEAT_PRUNE_LIMIT,
         })
     }
 
@@ -38,6 +39,7 @@ impl GraphClusterControllerConfig {
             lease_ttl,
             rebalance_mode: GraphClusterRebalanceMode::StabilityFirst,
             discover_existing_cells: true,
+            max_expired_heartbeats_to_prune: GRAPH_CONTROLLER_EXPIRED_HEARTBEAT_PRUNE_LIMIT,
         })
     }
 
@@ -48,6 +50,11 @@ impl GraphClusterControllerConfig {
 
     pub fn with_existing_cell_discovery(mut self, enabled: bool) -> Self {
         self.discover_existing_cells = enabled;
+        self
+    }
+
+    pub fn with_expired_heartbeat_prune_limit(mut self, max_records: usize) -> Self {
+        self.max_expired_heartbeats_to_prune = max_records;
         self
     }
 
@@ -212,6 +219,67 @@ impl GraphControlPlane {
         Ok(heartbeats)
     }
 
+    pub(crate) async fn prune_expired_node_heartbeats(
+        &self,
+        expired_heartbeats: &[GraphNodeHeartbeat],
+        max_records: usize,
+    ) -> Result<Vec<String>> {
+        let bounded: Vec<_> = expired_heartbeats
+            .iter()
+            .take(max_records)
+            .cloned()
+            .collect();
+        if bounded.is_empty() {
+            return Ok(Vec::new());
+        }
+        for attempt in 0..GRAPH_CONTROL_TXN_MAX_RETRIES {
+            match self.prune_expired_node_heartbeats_txn(&bounded).await {
+                Err(GraphError::Slate(err))
+                    if err.kind() == ErrorKind::Transaction
+                        && attempt + 1 < GRAPH_CONTROL_TXN_MAX_RETRIES =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+        Err(GraphError::RetryExhausted {
+            operation: "control transaction",
+            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
+        })
+    }
+
+    async fn prune_expired_node_heartbeats_txn(
+        &self,
+        expired_heartbeats: &[GraphNodeHeartbeat],
+    ) -> Result<Vec<String>> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let mut pruned = Vec::new();
+        for expired in expired_heartbeats {
+            validate_component("node_id", &expired.node_id)?;
+            let key = control_node_key(&expired.node_id);
+            let Some(current) = read_control_txn(&txn, &key)
+                .await?
+                .map(|value| decode_node_heartbeat(&key, &value))
+                .transpose()?
+            else {
+                continue;
+            };
+            if current == *expired {
+                txn.delete(key.as_bytes())?;
+                pruned.push(expired.node_id.clone());
+            }
+        }
+        commit_control_txn(txn).await?;
+        if !pruned.is_empty() {
+            self.metrics
+                .node_heartbeat_prunes
+                .fetch_add(pruned.len() as u64, Ordering::Relaxed);
+            pruned.sort();
+        }
+        Ok(pruned)
+    }
+
     pub async fn reconcile_cluster(
         &self,
         config: &GraphClusterControllerConfig,
@@ -233,13 +301,15 @@ impl GraphControlPlane {
         };
 
         let heartbeats = self.load_node_heartbeats().await?;
+        let mut expired_heartbeats = Vec::new();
         for heartbeat in heartbeats {
             let expired = match heartbeat.last_seen_ms.checked_add(heartbeat_ttl_ms) {
                 Some(expires_at) => expires_at <= now_ms,
                 None => true,
             };
             if expired {
-                report.expired_nodes.push(heartbeat.node_id);
+                report.expired_nodes.push(heartbeat.node_id.clone());
+                expired_heartbeats.push(heartbeat);
                 continue;
             }
             match heartbeat.state {
@@ -253,6 +323,14 @@ impl GraphControlPlane {
         report.draining_nodes.dedup();
         report.expired_nodes.sort();
         report.expired_nodes.dedup();
+        if config.max_expired_heartbeats_to_prune > 0 && !expired_heartbeats.is_empty() {
+            report.pruned_expired_nodes = self
+                .prune_expired_node_heartbeats(
+                    &expired_heartbeats,
+                    config.max_expired_heartbeats_to_prune,
+                )
+                .await?;
+        }
 
         let mut placement = self.load_placement_map().await?;
         let cell_ids = self.controller_cell_ids(config, &placement).await?;
