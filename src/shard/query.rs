@@ -391,7 +391,7 @@ impl GraphShard {
                 sort_keys: Vec::new(),
             })
             .collect();
-        self.finish_projected_rows(columns, projected, &[], window, budget)
+        self.finish_projected_rows(columns, projected, &[], false, window, budget)
     }
 
     #[cfg(feature = "opencypher")]
@@ -462,6 +462,7 @@ impl GraphShard {
                 query.columns,
                 projected,
                 &query.order_by,
+                query.distinct,
                 window,
                 budget,
             );
@@ -474,7 +475,14 @@ impl GraphShard {
             let sort_keys = sort_keys_for_row(binding, &row, &query.columns, &query.order_by)?;
             projected.push(ProjectedQueryRow { row, sort_keys });
         }
-        self.finish_projected_rows(query.columns, projected, &query.order_by, window, budget)
+        self.finish_projected_rows(
+            query.columns,
+            projected,
+            &query.order_by,
+            query.distinct,
+            window,
+            budget,
+        )
     }
 
     #[cfg(feature = "opencypher")]
@@ -510,6 +518,7 @@ impl GraphShard {
         if request.projection == GraphKernelProjection::NodeId
             && request.edge.dst.id.is_none()
             && !window.is_default()
+            && !query.distinct
         {
             let (vertices, edge_visits) = self
                 .reachable_vertices_window_in_hop_range_at(ReachableWindowRequest {
@@ -546,18 +555,29 @@ impl GraphShard {
         graph_kernel_order_vertices(&mut vertices, request.ascending);
         self.ensure_query_intermediate_rows("cypher_graph_kernel_rows", vertices.len())?;
 
-        let rows = match request.projection {
-            GraphKernelProjection::NodeId => graph_kernel_node_id_rows(vertices, budget)?,
+        let projected = match request.projection {
+            GraphKernelProjection::NodeId => graph_kernel_node_id_rows(vertices, budget)?
+                .into_iter()
+                .map(|row| ProjectedQueryRow {
+                    row,
+                    sort_keys: Vec::new(),
+                })
+                .collect(),
             GraphKernelProjection::CountAll => {
-                vec![QueryRow::new(vec![
-                    QueryValue::Count(vertices.len() as u64),
-                ])]
+                vec![ProjectedQueryRow {
+                    row: QueryRow::new(vec![QueryValue::Count(vertices.len() as u64)]),
+                    sort_keys: Vec::new(),
+                }]
             }
         };
-        Ok(Some(QueryResultSet::new(
+        Ok(Some(self.finish_projected_rows(
             query.columns.clone(),
-            self.apply_query_row_window(rows, window)?,
-        )))
+            projected,
+            &[],
+            query.distinct,
+            window,
+            budget,
+        )?))
     }
 
     #[cfg(feature = "opencypher")]
@@ -620,6 +640,7 @@ impl GraphShard {
             query.columns.clone(),
             projected,
             &query.order_by,
+            query.distinct,
             window,
             budget,
         )?))
@@ -656,6 +677,7 @@ impl GraphShard {
             query.columns.clone(),
             projected,
             &query.order_by,
+            query.distinct,
             window,
             budget,
         )?))
@@ -4298,10 +4320,23 @@ impl GraphShard {
         columns: Vec<QueryColumn>,
         mut projected: Vec<ProjectedQueryRow>,
         order_by: &[RowSort],
+        distinct: bool,
         window: QueryWindow,
         budget: &QueryBudget,
     ) -> Result<QueryResultSet> {
         budget.check("cypher_finish_rows")?;
+        if distinct {
+            let mut deduped = Vec::with_capacity(projected.len());
+            let mut seen = BTreeSet::new();
+            for row in projected {
+                budget.check("cypher_distinct_rows")?;
+                if seen.insert(row.row.values.clone()) {
+                    deduped.push(row);
+                }
+            }
+            projected = deduped;
+            self.ensure_query_intermediate_rows("cypher_distinct_rows", projected.len())?;
+        }
         if !order_by.is_empty() {
             projected.sort_by(|left, right| compare_projected_rows(left, right, order_by));
         }

@@ -54,6 +54,7 @@ pub struct ParsedRowQuery {
     pub order_by: Vec<RowSort>,
     pub window: QueryWindow,
     pub columns: Vec<QueryColumn>,
+    pub distinct: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -876,11 +877,10 @@ fn lower_match_return_rows(
         if patterns.is_empty() {
             return unsupported("MATCH requires at least one executable row pattern");
         }
-        if sys::cypher_ast_return_is_distinct(return_clause)
-            || sys::cypher_ast_return_has_include_existing(return_clause)
-        {
-            return unsupported("DISTINCT and RETURN * are not executable in Query engine");
+        if sys::cypher_ast_return_has_include_existing(return_clause) {
+            return unsupported("RETURN * is not executable in Query engine");
         }
+        let distinct = sys::cypher_ast_return_is_distinct(return_clause);
 
         let projection_count = sys::cypher_ast_return_nprojections(return_clause);
         if projection_count == 0 {
@@ -933,6 +933,9 @@ fn lower_match_return_rows(
         }
 
         let order_by = lower_return_order_by(return_clause)?;
+        if distinct {
+            validate_distinct_order_by(&order_by, &projections, &columns)?;
+        }
         let window = lower_return_window(return_clause, parameters)?;
         Ok(ParsedRowQuery {
             patterns,
@@ -944,6 +947,7 @@ fn lower_match_return_rows(
             order_by,
             window,
             columns,
+            distinct,
         })
     }
 }
@@ -1247,6 +1251,58 @@ fn lower_return_order_by(return_clause: *const AstNode) -> Result<Vec<RowSort>> 
             });
         }
         Ok(items)
+    }
+}
+
+fn validate_distinct_order_by(
+    order_by: &[RowSort],
+    projections: &[RowProjection],
+    columns: &[QueryColumn],
+) -> Result<()> {
+    for sort in order_by {
+        if distinct_order_expression_is_projected(&sort.expression, projections, columns) {
+            continue;
+        }
+        return unsupported(
+            "ORDER BY expressions with RETURN DISTINCT must be projected by the RETURN clause",
+        );
+    }
+    Ok(())
+}
+
+fn distinct_order_expression_is_projected(
+    expression: &RowSortExpression,
+    projections: &[RowProjection],
+    columns: &[QueryColumn],
+) -> bool {
+    if let RowSortExpression::Column { name } = expression {
+        return columns.iter().any(|column| column.name == *name);
+    }
+    projections
+        .iter()
+        .any(|projection| row_projection_matches_sort_expression(projection, expression))
+}
+
+fn row_projection_matches_sort_expression(
+    projection: &RowProjection,
+    expression: &RowSortExpression,
+) -> bool {
+    match (projection, expression) {
+        (RowProjection::NodeId { binding: left }, RowSortExpression::NodeId { binding: right }) => {
+            left == right
+        }
+        (
+            RowProjection::Property {
+                binding: left_binding,
+                property: left_property,
+            },
+            RowSortExpression::Property {
+                binding: right_binding,
+                property: right_property,
+            },
+        ) => left_binding == right_binding && left_property == right_property,
+        (RowProjection::CountAll, RowSortExpression::CountAll) => true,
+        _ => false,
     }
 }
 
@@ -2623,6 +2679,22 @@ mod tests {
                 limit: Some(2),
             }
         );
+    }
+
+    #[test]
+    fn lowers_distinct_row_query() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN DISTINCT u.id AS src",
+        )
+        .unwrap();
+        assert!(parsed.distinct);
+        assert_eq!(parsed.columns, vec![QueryColumn::new("src")]);
+
+        let err = parse_opencypher_row_query(
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN DISTINCT u.id ORDER BY v.id",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GraphError::UnsupportedQuery { .. }));
     }
 
     #[test]
