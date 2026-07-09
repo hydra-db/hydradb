@@ -52,6 +52,18 @@ pub struct PostingChunk {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct PostingChunkManifest {
+    cell_id: String,
+    edge_type: String,
+    direction: ArtifactDirection,
+    owner: VertexId,
+    base_epoch: GraphEpoch,
+    chunk_count: u64,
+    vertex_count: u64,
+    chunk_checksums: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MatrixArtifact {
     pub cell_id: String,
     pub edge_type: String,
@@ -706,6 +718,57 @@ fn append_posting_chunks(
             });
         }
     }
+}
+
+fn posting_manifests_from_chunks(chunks: &[PostingChunk]) -> Result<Vec<PostingChunkManifest>> {
+    let mut grouped = BTreeMap::<
+        (String, String, ArtifactDirection, VertexId, GraphEpoch),
+        Vec<&PostingChunk>,
+    >::new();
+    for chunk in chunks {
+        grouped
+            .entry((
+                chunk.cell_id.clone(),
+                chunk.edge_type.clone(),
+                chunk.direction,
+                chunk.owner,
+                chunk.base_epoch,
+            ))
+            .or_default()
+            .push(chunk);
+    }
+
+    let mut manifests = Vec::with_capacity(grouped.len());
+    for ((cell_id, edge_type, direction, owner, base_epoch), mut owner_chunks) in grouped {
+        owner_chunks.sort_by_key(|chunk| chunk.chunk_id);
+        let mut vertex_count = 0_u64;
+        let mut chunk_checksums = Vec::with_capacity(owner_chunks.len());
+        for (expected_id, chunk) in owner_chunks.iter().enumerate() {
+            let expected_id = expected_id as u64;
+            if chunk.chunk_id != expected_id {
+                return Err(GraphError::CorruptValue {
+                    key: posting_key(chunk),
+                    reason: format!(
+                        "posting chunk ids must be contiguous before publish: expected {expected_id}, got {}",
+                        chunk.chunk_id
+                    ),
+                });
+            }
+            vertex_count = vertex_count.saturating_add(chunk.vertices.len() as u64);
+            chunk_checksums.push(posting_chunk_checksum(chunk));
+        }
+        manifests.push(PostingChunkManifest {
+            cell_id,
+            edge_type,
+            direction,
+            owner,
+            base_epoch,
+            chunk_count: owner_chunks.len() as u64,
+            vertex_count,
+            chunk_checksums,
+        });
+    }
+    Ok(manifests)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1425,6 +1488,23 @@ fn posting_prefix(
     )
 }
 
+fn posting_manifest_key(
+    cell_id: &str,
+    edge_type: &str,
+    direction: ArtifactDirection,
+    owner: VertexId,
+    base_epoch: GraphEpoch,
+) -> String {
+    format!(
+        "cell/{cell_id}/artifact/posting_manifest/{edge_type}/{}/{owner:020}/{base_epoch:020}",
+        direction_str(direction)
+    )
+}
+
+fn posting_manifest_prefix(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/artifact/posting_manifest/{edge_type}/")
+}
+
 fn encode_posting_chunk(chunk: &PostingChunk) -> Vec<u8> {
     format!(
         "posting1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -1454,6 +1534,98 @@ fn decode_posting_chunk(key: &str, value: &[u8]) -> Result<PostingChunk> {
         chunk_id: parse_u64(key, parts[6], "chunk_id")?,
         vertices: decode_vertices(key, parts[7])?,
     })
+}
+
+fn posting_chunk_checksum(chunk: &PostingChunk) -> u64 {
+    let mut checksum = 0xcbf2_9ce4_8422_2325_u64;
+    checksum_u64(
+        &mut checksum,
+        match chunk.direction {
+            ArtifactDirection::Out => 1,
+            ArtifactDirection::In => 2,
+        },
+    );
+    checksum_u64(&mut checksum, chunk.owner);
+    checksum_u64(&mut checksum, chunk.base_epoch);
+    checksum_u64(&mut checksum, chunk.chunk_id);
+    checksum_u64(&mut checksum, chunk.vertices.len() as u64);
+    for vertex in &chunk.vertices {
+        checksum_u64(&mut checksum, *vertex);
+    }
+    checksum
+}
+
+fn encode_posting_manifest(manifest: &PostingChunkManifest) -> Vec<u8> {
+    format!(
+        "posting_manifest1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        manifest.cell_id,
+        manifest.edge_type,
+        direction_str(manifest.direction),
+        manifest.owner,
+        manifest.base_epoch,
+        manifest.chunk_count,
+        manifest.vertex_count,
+        encode_u64_list(&manifest.chunk_checksums)
+    )
+    .into_bytes()
+}
+
+fn decode_posting_manifest(key: &str, value: &[u8]) -> Result<PostingChunkManifest> {
+    let text = text_value(key, value)?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 9 || parts[0] != "posting_manifest1" {
+        return corrupt(key, "expected posting_manifest1 record with 9 fields");
+    }
+    let chunk_count = parse_u64(key, parts[6], "chunk_count")?;
+    let chunk_checksums = decode_u64_list(key, parts[8])?;
+    let expected_checksums =
+        usize::try_from(chunk_count).map_err(|err| GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: format!("posting manifest chunk count does not fit usize: {err}"),
+        })?;
+    if chunk_checksums.len() != expected_checksums {
+        return corrupt(
+            key,
+            "posting manifest checksum count does not match chunk count",
+        );
+    }
+    validate_posting_manifest(
+        key,
+        PostingChunkManifest {
+            cell_id: parts[1].to_string(),
+            edge_type: parts[2].to_string(),
+            direction: parse_direction(parts[3])?,
+            owner: parse_u64(key, parts[4], "owner")?,
+            base_epoch: parse_u64(key, parts[5], "base_epoch")?,
+            chunk_count,
+            vertex_count: parse_u64(key, parts[7], "vertex_count")?,
+            chunk_checksums,
+        },
+    )
+}
+
+fn validate_posting_manifest(
+    key: &str,
+    manifest: PostingChunkManifest,
+) -> Result<PostingChunkManifest> {
+    if manifest.vertex_count > 0 && manifest.chunk_count == 0 {
+        return corrupt(key, "posting manifest vertex count requires chunks");
+    }
+    let parts: Vec<_> = key.split('/').collect();
+    let ["cell", cell_id, "artifact", "posting_manifest", edge_type, direction, owner, base_epoch] =
+        parts.as_slice()
+    else {
+        return corrupt(key, "invalid posting manifest key");
+    };
+    if manifest.cell_id != *cell_id
+        || manifest.edge_type != *edge_type
+        || direction_str(manifest.direction) != *direction
+        || manifest.owner != parse_u64(key, owner, "owner")?
+        || manifest.base_epoch != parse_u64(key, base_epoch, "base_epoch")?
+    {
+        return corrupt(key, "posting manifest key does not match value");
+    }
+    Ok(manifest)
 }
 
 fn matrix_manifest_key(cell_id: &str, edge_type: &str, base_epoch: GraphEpoch) -> String {
@@ -1531,6 +1703,7 @@ fn rollup_prefix(cell_id: &str, edge_type: &str) -> String {
 fn graph_artifact_gc_prefixes(cell_id: &str, edge_type: &str) -> Vec<String> {
     vec![
         format!("cell/{cell_id}/artifact/posting/{edge_type}/"),
+        posting_manifest_prefix(cell_id, edge_type),
         matrix_manifest_prefix(cell_id, edge_type),
         format!("cell/{cell_id}/artifact/matrix/{edge_type}/"),
         graphblas_csc_prefix(cell_id, edge_type),
@@ -1544,6 +1717,7 @@ fn graph_artifact_epoch_from_key(key: &str) -> Result<Option<GraphEpoch>> {
     let parts: Vec<_> = key.split('/').collect();
     let epoch = match parts.as_slice() {
         ["cell", _, "artifact", "posting", _, _, _, base_epoch, ..] => Some(*base_epoch),
+        ["cell", _, "artifact", "posting_manifest", _, _, _, base_epoch] => Some(*base_epoch),
         ["cell", _, "artifact", "matrix_manifest", _, base_epoch] => Some(*base_epoch),
         ["cell", _, "artifact", "matrix", _, base_epoch, ..] => Some(*base_epoch),
         ["cell", _, "artifact", "graphblas_csc", _, base_epoch] => Some(*base_epoch),
@@ -2645,6 +2819,24 @@ fn decode_vertices(key: &str, value: &str) -> Result<Vec<VertexId>> {
     value
         .split(',')
         .map(|part| parse_u64(key, part, "vertex"))
+        .collect()
+}
+
+fn encode_u64_list(values: &[u64]) -> String {
+    values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn decode_u64_list(key: &str, value: &str) -> Result<Vec<u64>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|part| parse_u64(key, part, "u64_list_value"))
         .collect()
 }
 

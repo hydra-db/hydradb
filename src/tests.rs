@@ -6834,6 +6834,122 @@ async fn matrix_snapshot_abort_cleanup_respects_inflight_artifact_builder_lock()
 }
 
 #[tokio::test]
+async fn posting_chunks_ignore_unpublished_orphan_chunks() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/posting-orphan-chunk-hidden", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "ORPHAN_POSTING_EDGE";
+    let base_epoch = 7;
+    let chunk_key = format!(
+        "cell/{cell_id}/artifact/posting/{edge_type}/out/{:020}/{base_epoch:020}/{:020}",
+        1, 0
+    );
+    let chunk_value = format!("posting1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t0\t2,3\n");
+
+    let mut batch = GraphWriteBatch::new();
+    batch.put(chunk_key.as_bytes(), chunk_value.as_bytes());
+    shard
+        .write_graph_batch_strict(cell_id, "test_seed_orphan_posting_chunk", batch)
+        .await
+        .unwrap();
+
+    assert!(shard
+        .posting_chunks(cell_id, edge_type, ArtifactDirection::Out, 1, base_epoch)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn posting_chunks_require_all_manifest_chunks() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/posting-manifest-missing-chunk", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "MISSING_POSTING_CHUNK_EDGE";
+
+    for (idx, dst) in [2, 3, 4].into_iter().enumerate() {
+        shard
+            .write_edge(typed_mutation(
+                cell_id,
+                edge_type,
+                1,
+                dst,
+                &format!("posting-missing-seed-{idx}"),
+            ))
+            .await
+            .unwrap();
+    }
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    assert_eq!(
+        shard
+            .build_posting_chunks(cell_id, edge_type, base_epoch, 2)
+            .await
+            .unwrap()
+            .len(),
+        5
+    );
+    let missing_key = format!(
+        "cell/{cell_id}/artifact/posting/{edge_type}/out/{:020}/{base_epoch:020}/{:020}",
+        1, 1
+    );
+    let mut batch = GraphWriteBatch::new();
+    batch.delete(missing_key.as_bytes());
+    shard
+        .write_graph_batch_strict(cell_id, "test_delete_manifest_chunk", batch)
+        .await
+        .unwrap();
+
+    let err = shard
+        .posting_chunks(cell_id, edge_type, ArtifactDirection::Out, 1, base_epoch)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GraphError::CorruptValue { .. }));
+}
+
+#[tokio::test]
+async fn posting_chunks_validate_manifest_checksums() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/posting-manifest-checksum", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "CHECKSUM_POSTING_EDGE";
+
+    for (idx, dst) in [2, 3, 4].into_iter().enumerate() {
+        shard
+            .write_edge(typed_mutation(
+                cell_id,
+                edge_type,
+                1,
+                dst,
+                &format!("posting-checksum-seed-{idx}"),
+            ))
+            .await
+            .unwrap();
+    }
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    shard
+        .build_posting_chunks(cell_id, edge_type, base_epoch, 2)
+        .await
+        .unwrap();
+    let chunk_key = format!(
+        "cell/{cell_id}/artifact/posting/{edge_type}/out/{:020}/{base_epoch:020}/{:020}",
+        1, 0
+    );
+    let bad_chunk = format!("posting1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t0\t999\n");
+    let mut batch = GraphWriteBatch::new();
+    batch.put(chunk_key.as_bytes(), bad_chunk.as_bytes());
+    shard
+        .write_graph_batch_strict(cell_id, "test_corrupt_manifest_chunk", batch)
+        .await
+        .unwrap();
+
+    let err = shard
+        .posting_chunks(cell_id, edge_type, ArtifactDirection::Out, 1, base_epoch)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GraphError::CorruptValue { .. }));
+}
+
+#[tokio::test]
 async fn graph_limits_reject_unbounded_bulk_artifact_and_traversal_work() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_limits(

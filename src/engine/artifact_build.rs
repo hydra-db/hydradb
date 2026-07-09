@@ -83,6 +83,33 @@ impl GraphShard {
             &mut pending_writes,
         )
         .await?;
+        let manifests = posting_manifests_from_chunks(&chunks)?;
+        for manifest in &manifests {
+            put_artifact_record(
+                self,
+                cell_id,
+                "build_posting_chunks_manifest",
+                &mut batch,
+                &mut pending_writes,
+                posting_manifest_key(
+                    &manifest.cell_id,
+                    &manifest.edge_type,
+                    manifest.direction,
+                    manifest.owner,
+                    manifest.base_epoch,
+                ),
+                encode_posting_manifest(manifest),
+            )
+            .await?;
+        }
+        flush_artifact_put_batch(
+            self,
+            cell_id,
+            "build_posting_chunks_manifest",
+            &mut batch,
+            &mut pending_writes,
+        )
+        .await?;
         if !chunks.is_empty() {
             let mut cache = self.posting_chunk_cache.lock().await;
             for chunk in &chunks {
@@ -111,18 +138,64 @@ impl GraphShard {
         validate_component("edge_type", edge_type)?;
         let prefix = posting_prefix(cell_id, edge_type, direction, owner, base_epoch);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
-        let mut chunks = Vec::new();
+        let mut chunks_by_id = BTreeMap::new();
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            chunks.push(decode_posting_chunk(&key, &kv.value)?);
+            let chunk = decode_posting_chunk(&key, &kv.value)?;
+            chunks_by_id.insert(chunk.chunk_id, chunk);
         }
-        chunks.sort_by_key(|chunk| chunk.chunk_id);
-        if let Some(group) = self
+
+        let expected = if let Some(group) = self
             .supernode_group(cell_id, edge_type, direction, owner, base_epoch)
             .await?
             .filter(|group| group.base_epoch == base_epoch)
         {
-            chunks.retain(|chunk| chunk.chunk_id < group.chunk_count);
+            Some(PostingChunkManifest {
+                cell_id: group.cell_id,
+                edge_type: group.edge_type,
+                direction: group.direction,
+                owner: group.vertex_id,
+                base_epoch: group.base_epoch,
+                chunk_count: group.chunk_count,
+                vertex_count: group.degree,
+                chunk_checksums: Vec::new(),
+            })
+        } else {
+            let manifest_key =
+                posting_manifest_key(cell_id, edge_type, direction, owner, base_epoch);
+            match self.read_remote(&manifest_key).await? {
+                Some(value) => Some(decode_posting_manifest(&manifest_key, &value)?),
+                None => None,
+            }
+        };
+
+        let Some(expected) = expected else {
+            return Ok(Vec::new());
+        };
+        let mut chunks = Vec::with_capacity(
+            usize::try_from(expected.chunk_count).unwrap_or(GRAPH_CHUNK_PREALLOC_LIMIT),
+        );
+        for chunk_id in 0..expected.chunk_count {
+            let Some(chunk) = chunks_by_id.remove(&chunk_id) else {
+                return Err(GraphError::CorruptValue {
+                    key: posting_chunk_key(
+                        cell_id, edge_type, direction, owner, base_epoch, chunk_id,
+                    ),
+                    reason: "posting manifest references missing chunk".to_string(),
+                });
+            };
+            if let Some(checksum) = expected.chunk_checksums.get(chunk_id as usize) {
+                let actual = posting_chunk_checksum(&chunk);
+                if actual != *checksum {
+                    return Err(GraphError::CorruptValue {
+                        key: posting_chunk_key(
+                            cell_id, edge_type, direction, owner, base_epoch, chunk_id,
+                        ),
+                        reason: "posting chunk checksum does not match manifest".to_string(),
+                    });
+                }
+            }
+            chunks.push(chunk);
         }
         Ok(chunks)
     }
