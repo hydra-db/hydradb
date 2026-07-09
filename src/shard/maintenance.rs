@@ -1,5 +1,15 @@
 use super::*;
 
+struct SegmentCompactionRequest<'a> {
+    cell_id: &'a str,
+    edge_type: &'a str,
+    src: VertexId,
+    compacted_through_epoch: GraphEpoch,
+    idempotency_key: &'a str,
+    started: std::time::Instant,
+    lock: &'a CellWriteLock,
+}
+
 impl GraphShard {
     pub async fn delete_deltas_through_rollup(
         &self,
@@ -326,27 +336,32 @@ impl GraphShard {
             .acquire_cell_write_lock(cell_id, "compact_supernode_segments")
             .await?;
         let result = self
-            .compact_supernode_segments_locked(
+            .compact_supernode_segments_locked(SegmentCompactionRequest {
                 cell_id,
                 edge_type,
                 src,
                 compacted_through_epoch,
                 idempotency_key,
                 started,
-            )
+                lock: &lock,
+            })
             .await;
         release_cell_write_lock(lock, result).await
     }
 
     async fn compact_supernode_segments_locked(
         &self,
-        cell_id: &str,
-        edge_type: &str,
-        src: VertexId,
-        compacted_through_epoch: GraphEpoch,
-        idempotency_key: &str,
-        started: std::time::Instant,
+        request: SegmentCompactionRequest<'_>,
     ) -> Result<SegmentCompactionResult> {
+        let SegmentCompactionRequest {
+            cell_id,
+            edge_type,
+            src,
+            compacted_through_epoch,
+            idempotency_key,
+            started,
+            lock,
+        } = request;
         let idempotency_operation = segment_compaction_idempotency_operation(edge_type, src);
         let idem_key = keys::idempotency(cell_id, &idempotency_operation, idempotency_key);
         if let Some(value) = self.read_remote(&idem_key).await? {
@@ -392,6 +407,9 @@ impl GraphShard {
         let mut source_segments = Vec::new();
         let mut input_edges = 0_u64;
         while let Some(kv) = segment_iter.next().await? {
+            if should_renew_cell_lock_after_items(source_segments.len()) {
+                lock.renew().await?;
+            }
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let segment = decode_out_edge_segment(&key, &kv.value)?;
             if segment.start_epoch > compacted_through_epoch {
@@ -411,6 +429,9 @@ impl GraphShard {
             .await?;
         let mut tombstones = BTreeMap::<VertexId, (GraphEpoch, String)>::new();
         while let Some(kv) = tombstone_iter.next().await? {
+            if should_renew_cell_lock_after_items(tombstones.len()) {
+                lock.renew().await?;
+            }
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let (key_cell_id, key_edge_type, key_src, dst) =
                 parse_out_edge_segment_tombstone_key(&key)?;
@@ -489,6 +510,7 @@ impl GraphShard {
             idem_key.as_bytes(),
             encode_segment_compaction_idempotency(idempotency_key, &result),
         );
+        lock.renew().await?;
         self.write_graph_batch_strict(cell_id, "compact_supernode_segments", batch)
             .await?;
         self.record_gc_completed(
@@ -626,4 +648,10 @@ impl GraphShard {
         }
         commit_txn_strict(txn, self.await_durable_writes).await
     }
+}
+
+fn should_renew_cell_lock_after_items(items: usize) -> bool {
+    items == 0
+        || (items >= GRAPH_DELTA_GC_BATCH_KEYS
+            && items / GRAPH_DELTA_GC_BATCH_KEYS * GRAPH_DELTA_GC_BATCH_KEYS == items)
 }

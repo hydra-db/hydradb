@@ -12,8 +12,8 @@ use tokio::task::JoinHandle;
 #[cfg(feature = "opencypher")]
 use crate::query::opencypher::ParsedRowQuery;
 use crate::{
-    engine, parse_u64, sparse_kernel, validate_component, BoundedGraphCache, GraphCacheMetrics,
-    GraphCachePolicy, GraphEpoch, GraphError, GraphIndexPolicy, GraphLimits,
+    engine, graph_now_millis, parse_u64, sparse_kernel, validate_component, BoundedGraphCache,
+    GraphCacheMetrics, GraphCachePolicy, GraphEpoch, GraphError, GraphIndexPolicy, GraphLimits,
     GraphOperationalMetrics, GraphRetentionPolicy, MatrixAdjacency, MatrixCacheKey,
     PostingChunkCacheKey, Result, SupernodeCacheKey, VertexId, GRAPH_CELL_WRITE_LOCK_TTL_MS,
 };
@@ -156,6 +156,46 @@ pub(crate) struct CellWriteLock {
 }
 
 impl CellWriteLock {
+    pub(crate) async fn renew(&self) -> Result<()> {
+        let current = self.object_store.get(&self.path).await?;
+        let version = UpdateVersion {
+            e_tag: current.meta.e_tag.clone(),
+            version: current.meta.version.clone(),
+        };
+        let value = current.bytes().await?;
+        let record = decode_cell_write_lock_record(self.path.as_ref(), &value)?;
+        if record.owner_token != self.owner_token || record.state != CellWriteLockState::Active {
+            return Err(GraphError::CellWriteConflict {
+                operation: "renew_cell_write_lock",
+                cell_id: record.cell_id,
+            });
+        }
+        let now_ms = graph_now_millis();
+        let payload = encode_cell_write_lock_record(
+            &record.cell_id,
+            &record.operation,
+            &self.owner_token,
+            record.created_ms,
+            now_ms.saturating_add(GRAPH_CELL_WRITE_LOCK_TTL_MS),
+            CellWriteLockState::Active,
+        );
+        match self
+            .object_store
+            .put_opts(&self.path, payload.into(), PutMode::Update(version).into())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(slatedb::object_store::Error::Precondition { .. })
+            | Err(slatedb::object_store::Error::NotFound { .. }) => {
+                Err(GraphError::CellWriteConflict {
+                    operation: "renew_cell_write_lock",
+                    cell_id: record.cell_id,
+                })
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub(crate) async fn release(self) -> Result<()> {
         let current = match self.object_store.get(&self.path).await {
             Ok(current) => current,

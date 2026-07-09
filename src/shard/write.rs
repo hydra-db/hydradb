@@ -686,7 +686,7 @@ impl GraphShard {
         let _writer = self.writer_lane(cell_id).lock().await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             let lock = self.acquire_cell_write_lock(cell_id, "drop_cell").await?;
-            let result = self.drop_cell_locked(cell_id, idempotency_key).await;
+            let result = self.drop_cell_locked(cell_id, idempotency_key, &lock).await;
             match release_cell_write_lock(lock, result).await {
                 Err(err)
                     if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
@@ -721,6 +721,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         idempotency_key: &str,
+        lock: &CellWriteLock,
     ) -> Result<GraphCellDropResult> {
         let idem_key = keys::cell_drop_idempotency(cell_id, idempotency_key);
         let marker_key = keys::cell_drop_marker(cell_id);
@@ -758,7 +759,8 @@ impl GraphShard {
         };
         commit_txn_strict(txn, self.await_durable_writes).await?;
 
-        self.wait_for_drop_read_leases(cell_id).await?;
+        self.wait_for_drop_read_leases(cell_id, lock).await?;
+        lock.renew().await?;
 
         let mut deleted_keys = 0_u64;
         let mut batches = 0_u64;
@@ -771,13 +773,17 @@ impl GraphShard {
             }
             pending.push(key);
             if pending.len() >= GRAPH_DELTA_GC_BATCH_KEYS {
+                lock.renew().await?;
                 let deleted = self.flush_drop_cell_batch(cell_id, &mut pending).await?;
+                lock.renew().await?;
                 deleted_keys = deleted_keys.saturating_add(deleted);
                 batches = batches.saturating_add(1);
             }
         }
         if !pending.is_empty() {
+            lock.renew().await?;
             let deleted = self.flush_drop_cell_batch(cell_id, &mut pending).await?;
+            lock.renew().await?;
             deleted_keys = deleted_keys.saturating_add(deleted);
             batches = batches.saturating_add(1);
         }
@@ -825,7 +831,7 @@ impl GraphShard {
         Ok(deleted)
     }
 
-    async fn wait_for_drop_read_leases(&self, cell_id: &str) -> Result<()> {
+    async fn wait_for_drop_read_leases(&self, cell_id: &str, lock: &CellWriteLock) -> Result<()> {
         if self.retention_policy.read_lease_ttl_ms == 0 {
             return Ok(());
         }
@@ -845,6 +851,7 @@ impl GraphShard {
                     read_epoch,
                 });
             }
+            lock.renew().await?;
             let sleep_ms = self.retention_policy.read_lease_ttl_ms.clamp(1, 50);
             tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
         }

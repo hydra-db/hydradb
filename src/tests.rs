@@ -2016,6 +2016,104 @@ async fn stale_owner_release_does_not_remove_reclaimed_cell_write_lock() {
 }
 
 #[tokio::test]
+async fn cell_write_lock_renew_extends_owner_expiry() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard(
+        "graph/cell-write-lock-renew-extends-expiry",
+        Arc::clone(&object_store),
+    )
+    .await;
+    let cell_id = "reddit-home";
+    let path = shard.cell_write_lock_path(cell_id);
+    let lock = shard
+        .acquire_cell_write_lock(cell_id, "long-maintenance")
+        .await
+        .unwrap();
+    let stale_created_ms = graph_now_millis()
+        .saturating_sub(GRAPH_CELL_WRITE_LOCK_TTL_MS)
+        .saturating_sub(1);
+    let stale_payload = encode_cell_write_lock_record(
+        cell_id,
+        "long-maintenance",
+        &lock.owner_token,
+        stale_created_ms,
+        stale_created_ms,
+        CellWriteLockState::Active,
+    );
+    object_store
+        .put_opts(&path, stale_payload.into(), PutMode::Overwrite.into())
+        .await
+        .unwrap();
+
+    lock.renew().await.unwrap();
+    let current = object_store.get(&path).await.unwrap();
+    let current_value = current.bytes().await.unwrap();
+    let current_record = decode_cell_write_lock_record(path.as_ref(), &current_value).unwrap();
+    assert_eq!(current_record.owner_token, lock.owner_token);
+    assert_eq!(current_record.state, CellWriteLockState::Active);
+    assert!(current_record.expires_at_ms > graph_now_millis());
+
+    let err = match shard
+        .acquire_cell_write_lock(cell_id, "contending-writer")
+        .await
+    {
+        Ok(_) => panic!("contending writer acquired renewed cell write lock"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        GraphError::CellWriteConflict {
+            operation: "contending-writer",
+            ref cell_id
+        } if cell_id == "reddit-home"
+    ));
+    lock.release().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_owner_cannot_renew_reclaimed_cell_write_lock() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard(
+        "graph/stale-owner-renew-cell-write-lock",
+        Arc::clone(&object_store),
+    )
+    .await;
+    let cell_id = "reddit-home";
+    let path = shard.cell_write_lock_path(cell_id);
+    let stale_owner = shard
+        .acquire_cell_write_lock(cell_id, "slow-writer")
+        .await
+        .unwrap();
+    let replacement_payload = encode_cell_write_lock_record(
+        cell_id,
+        "new-writer",
+        "replacement-owner-token",
+        graph_now_millis(),
+        graph_now_millis().saturating_add(GRAPH_CELL_WRITE_LOCK_TTL_MS),
+        CellWriteLockState::Active,
+    );
+    object_store
+        .put_opts(&path, replacement_payload.into(), PutMode::Overwrite.into())
+        .await
+        .unwrap();
+
+    let err = stale_owner.renew().await.unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::CellWriteConflict {
+            operation: "renew_cell_write_lock",
+            ref cell_id
+        } if cell_id == "reddit-home"
+    ));
+    stale_owner.release().await.unwrap();
+    let current = object_store.get(&path).await.unwrap();
+    let current_value = current.bytes().await.unwrap();
+    let current_record = decode_cell_write_lock_record(path.as_ref(), &current_value).unwrap();
+    assert_eq!(current_record.owner_token, "replacement-owner-token");
+    assert_eq!(current_record.state, CellWriteLockState::Active);
+}
+
+#[tokio::test]
 async fn trusted_segment_append_replay_with_new_job_id_does_not_double_count_degree() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
