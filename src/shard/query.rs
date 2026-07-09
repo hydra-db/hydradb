@@ -1502,9 +1502,8 @@ impl GraphShard {
         let read_epoch = self.snapshot(cell_id).await?.read_epoch();
         let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
         let count = self
-            .scan_vertex_label_index_at(cell_id, label, read_epoch, &budget)
-            .await?
-            .len() as u64;
+            .count_vertex_label_index_at(cell_id, label, read_epoch, &budget)
+            .await?;
         let stats = QueryStatsRecord::point_count(count, read_epoch, graph_now_millis());
         self.publish_query_stats_record_after_snapshot(
             cell_id,
@@ -1538,9 +1537,8 @@ impl GraphShard {
         let read_epoch = self.snapshot(cell_id).await?.read_epoch();
         let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
         let count = self
-            .scan_vertex_property_index_at(cell_id, property, value, read_epoch, &budget)
-            .await?
-            .len() as u64;
+            .count_vertex_property_index_at(cell_id, property, value, read_epoch, &budget)
+            .await?;
         let encoded = encode_vertex_property_value_key(value);
         let histogram = self
             .vertex_property_histogram_counts(cell_id, property, read_epoch, &budget)
@@ -1581,9 +1579,8 @@ impl GraphShard {
         let read_epoch = self.snapshot(cell_id).await?.read_epoch();
         let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
         let count = self
-            .scan_edge_property_index_at(cell_id, edge_type, property, value, read_epoch, &budget)
-            .await?
-            .len() as u64;
+            .count_edge_property_index_at(cell_id, edge_type, property, value, read_epoch, &budget)
+            .await?;
         let encoded = encode_vertex_property_value_key(value);
         let histogram = self
             .edge_property_histogram_counts(cell_id, edge_type, property, read_epoch, &budget)
@@ -1931,6 +1928,373 @@ impl GraphShard {
             )?;
         }
         Ok(buckets)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn count_vertex_label_index_at(
+        &self,
+        cell_id: &str,
+        label: &str,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<u64> {
+        let mut iter = self
+            .scan_remote_prefix(&keys::vertex_label_delta_prefix(cell_id, label))
+            .await?;
+        let mut latest = BTreeMap::<VertexId, bool>::new();
+        let mut saw_delta = false;
+        while let Some(kv) = iter.next().await? {
+            budget.check("query_stats_vertex_label_count_delta")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (epoch, vertex_id) = parse_vertex_label_delta_key(&key)?;
+            saw_delta = true;
+            if epoch > read_epoch {
+                break;
+            }
+            latest.insert(vertex_id, decode_vertex_index_delta(&key, &kv.value)?);
+            self.ensure_query_index_candidates(
+                "query_stats_vertex_label_count_candidates",
+                latest.len(),
+            )?;
+        }
+        if saw_delta {
+            return Ok(latest.values().filter(|present| **present).count() as u64);
+        }
+
+        let mut iter = self
+            .scan_remote_prefix(&keys::vertex_label_prefix(cell_id, label))
+            .await?;
+        let mut count = 0_u64;
+        while let Some(kv) = iter.next().await? {
+            budget.check("query_stats_vertex_label_count_current")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let _vertex_id = decode_u64(&key, &kv.value)?;
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key,
+                    reason: "vertex-label stats count overflow".to_string(),
+                })?;
+            self.ensure_query_index_candidates(
+                "query_stats_vertex_label_count_candidates",
+                count as usize,
+            )?;
+        }
+        Ok(count)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn count_vertex_property_index_at(
+        &self,
+        cell_id: &str,
+        property: &str,
+        value: &VertexPropertyValue,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<u64> {
+        let encoded_keys = equivalent_property_index_keys(value);
+        if encoded_keys.len() == 1 {
+            return self
+                .count_vertex_property_encoded_index_at(
+                    cell_id,
+                    property,
+                    &encoded_keys[0],
+                    read_epoch,
+                    budget,
+                )
+                .await;
+        }
+
+        let mut vertices = BTreeSet::<VertexId>::new();
+        for encoded in encoded_keys {
+            self.collect_vertex_property_encoded_index_at(
+                cell_id,
+                property,
+                &encoded,
+                read_epoch,
+                budget,
+                &mut vertices,
+            )
+            .await?;
+        }
+        Ok(vertices.len() as u64)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn collect_vertex_property_encoded_index_at(
+        &self,
+        cell_id: &str,
+        property: &str,
+        encoded: &str,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+        vertices: &mut BTreeSet<VertexId>,
+    ) -> Result<()> {
+        let mut iter = self
+            .scan_remote_prefix(&keys::vertex_property_index_delta_prefix(
+                cell_id, property, encoded,
+            ))
+            .await?;
+        let mut latest = BTreeMap::<VertexId, bool>::new();
+        let mut saw_delta = false;
+        while let Some(kv) = iter.next().await? {
+            budget.check("query_stats_vertex_property_collect_delta")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (epoch, vertex_id) = parse_vertex_property_index_delta_key(&key)?;
+            saw_delta = true;
+            if epoch > read_epoch {
+                break;
+            }
+            latest.insert(vertex_id, decode_vertex_index_delta(&key, &kv.value)?);
+            self.ensure_query_index_candidates(
+                "query_stats_vertex_property_collect_candidates",
+                latest.len(),
+            )?;
+        }
+        if saw_delta {
+            for (vertex_id, present) in latest {
+                if present {
+                    vertices.insert(vertex_id);
+                    self.ensure_query_index_candidates(
+                        "query_stats_vertex_property_collect_candidates",
+                        vertices.len(),
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+
+        let mut iter = self
+            .scan_remote_prefix(&keys::vertex_property_index_prefix(
+                cell_id, property, encoded,
+            ))
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            budget.check("query_stats_vertex_property_collect_current")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (_cell_id, _property, _encoded, vertex_id) = parse_vertex_property_index_key(&key)?;
+            vertices.insert(vertex_id);
+            self.ensure_query_index_candidates(
+                "query_stats_vertex_property_collect_candidates",
+                vertices.len(),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn count_vertex_property_encoded_index_at(
+        &self,
+        cell_id: &str,
+        property: &str,
+        encoded: &str,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<u64> {
+        let mut iter = self
+            .scan_remote_prefix(&keys::vertex_property_index_delta_prefix(
+                cell_id, property, encoded,
+            ))
+            .await?;
+        let mut latest = BTreeMap::<VertexId, bool>::new();
+        let mut saw_delta = false;
+        while let Some(kv) = iter.next().await? {
+            budget.check("query_stats_vertex_property_count_delta")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (epoch, vertex_id) = parse_vertex_property_index_delta_key(&key)?;
+            saw_delta = true;
+            if epoch > read_epoch {
+                break;
+            }
+            latest.insert(vertex_id, decode_vertex_index_delta(&key, &kv.value)?);
+            self.ensure_query_index_candidates(
+                "query_stats_vertex_property_count_candidates",
+                latest.len(),
+            )?;
+        }
+        if saw_delta {
+            return Ok(latest.values().filter(|present| **present).count() as u64);
+        }
+
+        let mut iter = self
+            .scan_remote_prefix(&keys::vertex_property_index_prefix(
+                cell_id, property, encoded,
+            ))
+            .await?;
+        let mut count = 0_u64;
+        while let Some(kv) = iter.next().await? {
+            budget.check("query_stats_vertex_property_count_current")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (_cell_id, _property, _encoded, _vertex_id) =
+                parse_vertex_property_index_key(&key)?;
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key,
+                    reason: "vertex-property stats count overflow".to_string(),
+                })?;
+            self.ensure_query_index_candidates(
+                "query_stats_vertex_property_count_candidates",
+                count as usize,
+            )?;
+        }
+        Ok(count)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn count_edge_property_index_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        property: &str,
+        value: &VertexPropertyValue,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<u64> {
+        let mut edges = BTreeSet::<(VertexId, VertexId)>::new();
+        for encoded in equivalent_property_index_keys(value) {
+            self.collect_edge_property_encoded_index_at(
+                cell_id, edge_type, property, &encoded, read_epoch, budget, &mut edges,
+            )
+            .await?;
+        }
+        Ok(edges.len() as u64)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn collect_edge_property_encoded_index_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        property: &str,
+        encoded: &str,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+        edges: &mut BTreeSet<(VertexId, VertexId)>,
+    ) -> Result<()> {
+        let mut iter = self
+            .scan_remote_prefix(&keys::edge_property_index_delta_prefix(
+                cell_id, edge_type, property, encoded,
+            ))
+            .await?;
+        let mut latest = BTreeMap::<(VertexId, VertexId), bool>::new();
+        let mut saw_delta = false;
+        while let Some(kv) = iter.next().await? {
+            budget.check("query_stats_edge_property_count_delta")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (epoch, src, dst) = parse_edge_property_index_delta_key(&key)?;
+            saw_delta = true;
+            if epoch > read_epoch {
+                break;
+            }
+            latest.insert((src, dst), decode_vertex_index_delta(&key, &kv.value)?);
+            self.ensure_query_index_candidates(
+                "query_stats_edge_property_count_candidates",
+                latest.len(),
+            )?;
+        }
+        if saw_delta {
+            for (edge, present) in latest {
+                if present {
+                    edges.insert(edge);
+                    self.ensure_query_index_candidates(
+                        "query_stats_edge_property_count_candidates",
+                        edges.len(),
+                    )?;
+                }
+            }
+        } else {
+            let mut iter = self
+                .scan_remote_prefix(&keys::edge_property_index_prefix(
+                    cell_id, edge_type, property, encoded,
+                ))
+                .await?;
+            while let Some(kv) = iter.next().await? {
+                budget.check("query_stats_edge_property_count_current")?;
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let (_cell_id, _edge_type, _property, _encoded, src, dst) =
+                    parse_edge_property_index_key(&key)?;
+                edges.insert((src, dst));
+                self.ensure_query_index_candidates(
+                    "query_stats_edge_property_count_candidates",
+                    edges.len(),
+                )?;
+            }
+        }
+
+        self.collect_relationship_property_encoded_index_at(
+            cell_id, edge_type, property, encoded, read_epoch, budget, edges,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn collect_relationship_property_encoded_index_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        property: &str,
+        encoded: &str,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+        edges: &mut BTreeSet<(VertexId, VertexId)>,
+    ) -> Result<()> {
+        let mut iter = self
+            .scan_remote_prefix(&keys::relationship_property_index_delta_prefix(
+                cell_id, edge_type, property, encoded,
+            ))
+            .await?;
+        let mut latest = BTreeMap::<(VertexId, VertexId, RelationshipId), bool>::new();
+        let mut saw_delta = false;
+        while let Some(kv) = iter.next().await? {
+            budget.check("query_stats_relationship_property_count_delta")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (epoch, src, dst, relationship_id) =
+                parse_relationship_property_index_delta_key(&key)?;
+            saw_delta = true;
+            if epoch > read_epoch {
+                break;
+            }
+            latest.insert(
+                (src, dst, relationship_id),
+                decode_vertex_index_delta(&key, &kv.value)?,
+            );
+            self.ensure_query_index_candidates(
+                "query_stats_relationship_property_count_candidates",
+                latest.len(),
+            )?;
+        }
+        if saw_delta {
+            for ((src, dst, _relationship_id), present) in latest {
+                if present {
+                    edges.insert((src, dst));
+                    self.ensure_query_index_candidates(
+                        "query_stats_relationship_property_count_candidates",
+                        edges.len(),
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+
+        let mut iter = self
+            .scan_remote_prefix(&keys::relationship_property_index_prefix(
+                cell_id, edge_type, property, encoded,
+            ))
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            budget.check("query_stats_relationship_property_count_current")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (_cell_id, _edge_type, _property, _encoded, src, dst, _relationship_id) =
+                parse_relationship_property_index_key(&key)?;
+            edges.insert((src, dst));
+            self.ensure_query_index_candidates(
+                "query_stats_relationship_property_count_candidates",
+                edges.len(),
+            )?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "opencypher")]
