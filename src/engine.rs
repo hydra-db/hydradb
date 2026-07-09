@@ -10,7 +10,7 @@ use slatedb::bytes::Bytes;
 use slatedb::config::{DurabilityLevel, ReadOptions, ScanOptions, WriteOptions};
 use slatedb::object_store::{local::LocalFileSystem, ObjectStore};
 use slatedb::{Db, DbTransaction, ErrorKind, IsolationLevel, WriteBatch};
-use tokio::sync::{watch, Mutex as TokioMutex};
+use tokio::sync::{watch, RwLock as TokioRwLock};
 use tokio::task::JoinHandle;
 
 #[cfg(feature = "graphblas")]
@@ -228,7 +228,7 @@ pub struct GraphNode {
 }
 
 pub struct ManagedGraphNode {
-    node: Arc<TokioMutex<Option<GraphNode>>>,
+    node: Arc<TokioRwLock<Option<GraphNode>>>,
     shard_refresher: ShardRefreshHandle,
     metrics: Arc<GraphNodeMaintenanceMetrics>,
 }
