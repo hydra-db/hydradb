@@ -521,11 +521,16 @@ impl ShardPlacement {
         for cell_id in cell_ids {
             let cell_id = cell_id.into();
             validate_component("cell_id", &cell_id)?;
-            let owner = nodes
+            let Some(owner) = nodes
                 .iter()
                 .max_by_key(|node_id| rendezvous_score(&cell_id, node_id))
-                .expect("nodes is not empty")
-                .clone();
+                .cloned()
+            else {
+                return Err(GraphError::CorruptValue {
+                    key: "placement".to_string(),
+                    reason: "at least one owner node is required".to_string(),
+                });
+            };
             if owners.insert(cell_id.clone(), owner).is_some() {
                 return Err(GraphError::CorruptValue {
                     key: format!("placement/{cell_id}"),
