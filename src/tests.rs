@@ -4618,6 +4618,100 @@ async fn control_plane_release_lease_requires_matching_owner_and_token() {
 }
 
 #[tokio::test]
+async fn control_plane_drop_cell_control_state_removes_discovery_and_watermarks() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/drop-cell-state", object_store)
+        .await
+        .unwrap();
+    let placement = ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap();
+    control
+        .publish_placement_with_catalog(&placement, "reddit", 1)
+        .await
+        .unwrap();
+    let lease = control
+        .acquire_lease("reddit-home", "node-a", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    control
+        .advance_watermark(
+            GraphControlWatermark {
+                cell_id: "reddit-home".to_string(),
+                durable_epoch: 10,
+                safe_read_epoch: 10,
+                outbox_epoch: 9,
+                artifact_epoch: 8,
+                generation: 0,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    control
+        .advance_edge_watermark(
+            GraphControlEdgeWatermark {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                durable_epoch: 10,
+                safe_read_epoch: 10,
+                outbox_epoch: 9,
+                artifact_epoch: 8,
+                generation: 0,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    control
+        .commit_control_idempotency("reddit-home", "drop-test", "idem-1", b"ok")
+        .await
+        .unwrap();
+
+    let report = control
+        .drop_cell_control_state("reddit-home", Some(&lease))
+        .await
+        .unwrap();
+    assert_eq!(report.cell_id, "reddit-home");
+    assert!(report.deleted_control_keys >= 7);
+    assert!(control
+        .current_lease("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(control
+        .current_watermark("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(control
+        .current_edge_watermark("reddit-home", "FOLLOWS")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(control
+        .control_idempotency_result("reddit-home", "drop-test", "idem-1")
+        .await
+        .unwrap()
+        .is_none());
+    let controller_report = control
+        .reconcile_cluster(
+            &GraphClusterControllerConfig::discover_existing(
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(controller_report.controlled_cells.is_empty());
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn routed_cluster_open_cleans_up_leases_after_partial_start_failure() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = GraphControlPlane::open("graph-control/open-cleanup", Arc::clone(&object_store))
@@ -5025,6 +5119,93 @@ async fn managed_graph_node_allows_concurrent_routed_writes() {
     );
 
     let node = Arc::try_unwrap(node).unwrap_or_else(|_| panic!("managed node still shared"));
+    node.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn managed_graph_node_drop_cell_unregisters_control_state() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = Arc::new(
+        GraphControlPlane::open("graph-control/managed-drop-cell", Arc::clone(&object_store))
+            .await
+            .unwrap(),
+    );
+    control
+        .publish_placement_with_catalog(
+            &ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap(),
+            "reddit",
+            1,
+        )
+        .await
+        .unwrap();
+    let node = GraphNode::open_managed(
+        "graph-managed-drop-cell",
+        "node-a",
+        Arc::clone(&control),
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(50),
+    )
+    .await
+    .unwrap();
+    node.write_edge(EdgeMutation {
+        cell_id: "reddit-home".to_string(),
+        edge_type: "FOLLOWS".to_string(),
+        src: 1,
+        dst: 2,
+        idempotency_key: "managed-drop-before".to_string(),
+    })
+    .await
+    .unwrap();
+
+    let dropped = node
+        .drop_cell("reddit-home", "managed-drop-cell")
+        .await
+        .unwrap();
+    assert!(!dropped.already_dropped);
+    assert!(node.local_cells().await.unwrap().is_empty());
+    assert!(control
+        .current_lease("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(control
+        .current_shard_metadata("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    control
+        .publish_node_heartbeat("node-b", GraphNodeHealthState::Active)
+        .await
+        .unwrap();
+    let report = control
+        .reconcile_cluster(
+            &GraphClusterControllerConfig::discover_existing(
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(report.controlled_cells.is_empty());
+    assert!(report.failed_over_leases.is_empty());
+    let err = node
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 2,
+            dst: 3,
+            idempotency_key: "managed-drop-after".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::UnknownShard { ref cell_id } if cell_id == "reddit-home"
+    ));
     node.close().await.unwrap();
     control.close().await.unwrap();
 }
