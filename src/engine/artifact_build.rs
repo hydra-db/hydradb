@@ -89,6 +89,7 @@ impl GraphShard {
             for chunk in &chunks {
                 put_artifact_record(
                     self,
+                    Some(&artifact_lock),
                     cell_id,
                     "build_posting_chunks",
                     &mut batch,
@@ -100,6 +101,7 @@ impl GraphShard {
             }
             flush_artifact_put_batch(
                 self,
+                Some(&artifact_lock),
                 cell_id,
                 "build_posting_chunks",
                 &mut batch,
@@ -110,6 +112,7 @@ impl GraphShard {
             for manifest in &manifests {
                 put_artifact_record(
                     self,
+                    Some(&artifact_lock),
                     cell_id,
                     "build_posting_chunks_manifest",
                     &mut batch,
@@ -127,6 +130,7 @@ impl GraphShard {
             }
             flush_artifact_put_batch(
                 self,
+                Some(&artifact_lock),
                 cell_id,
                 "build_posting_chunks_manifest",
                 &mut batch,
@@ -143,6 +147,7 @@ impl GraphShard {
             }
             flush_artifact_put_batch(
                 self,
+                Some(&artifact_lock),
                 cell_id,
                 "build_posting_chunks_epoch_manifest",
                 &mut batch,
@@ -341,6 +346,7 @@ impl GraphShard {
                 for tile in out_tiles.iter().chain(transpose_tiles.iter()) {
                     put_artifact_record(
                         self,
+                        Some(&artifact_lock),
                         cell_id,
                         "build_matrix_tiles",
                         &mut data_batch,
@@ -353,6 +359,7 @@ impl GraphShard {
                 artifact_lock.renew().await?;
                 let graphblas_manifest = append_graphblas_csc_chunks(
                     self,
+                    &artifact_lock,
                     &mut data_batch,
                     &mut pending_writes,
                     cell_id,
@@ -364,6 +371,7 @@ impl GraphShard {
                 artifact_lock.renew().await?;
                 flush_artifact_put_batch(
                     self,
+                    Some(&artifact_lock),
                     cell_id,
                     "build_matrix_tiles",
                     &mut data_batch,
@@ -492,6 +500,7 @@ impl GraphShard {
                 let mut pending_writes = 0_usize;
                 let out_tiles = append_matrix_tiles_from_rows(
                     self,
+                    &artifact_lock,
                     &mut data_batch,
                     &mut pending_writes,
                     cell_id,
@@ -506,6 +515,7 @@ impl GraphShard {
                 let reversed = rows.reversed();
                 let transpose_tiles = append_matrix_tiles_from_rows(
                     self,
+                    &artifact_lock,
                     &mut data_batch,
                     &mut pending_writes,
                     cell_id,
@@ -521,6 +531,7 @@ impl GraphShard {
                 artifact_lock.renew().await?;
                 let graphblas_manifest = append_graphblas_csc_chunks_from_rows(
                     self,
+                    &artifact_lock,
                     &mut data_batch,
                     &mut pending_writes,
                     cell_id,
@@ -532,6 +543,7 @@ impl GraphShard {
                 artifact_lock.renew().await?;
                 flush_artifact_put_batch(
                     self,
+                    Some(&artifact_lock),
                     cell_id,
                     "build_matrix_tiles",
                     &mut data_batch,
