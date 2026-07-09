@@ -61,55 +61,70 @@ impl GraphShard {
             &mut chunks,
         );
 
-        let mut batch = GraphWriteBatch::new();
-        let mut pending_writes = 0_usize;
-        for chunk in &chunks {
-            put_artifact_record(
+        let manifests = posting_manifests_from_chunks(&chunks)?;
+
+        let artifact_lock = self
+            .acquire_posting_artifact_write_lock(
+                cell_id,
+                edge_type,
+                base_epoch,
+                "build_posting_chunks",
+            )
+            .await?;
+        let publish_result = async {
+            ensure_posting_manifests_publish_compatible(self, &manifests).await?;
+            let mut batch = GraphWriteBatch::new();
+            let mut pending_writes = 0_usize;
+            for chunk in &chunks {
+                put_artifact_record(
+                    self,
+                    cell_id,
+                    "build_posting_chunks",
+                    &mut batch,
+                    &mut pending_writes,
+                    posting_key(chunk),
+                    encode_posting_chunk(chunk),
+                )
+                .await?;
+            }
+            flush_artifact_put_batch(
                 self,
                 cell_id,
                 "build_posting_chunks",
                 &mut batch,
                 &mut pending_writes,
-                posting_key(chunk),
-                encode_posting_chunk(chunk),
             )
             .await?;
-        }
-        flush_artifact_put_batch(
-            self,
-            cell_id,
-            "build_posting_chunks",
-            &mut batch,
-            &mut pending_writes,
-        )
-        .await?;
-        let manifests = posting_manifests_from_chunks(&chunks)?;
-        for manifest in &manifests {
-            put_artifact_record(
+            artifact_lock.renew().await?;
+            for manifest in &manifests {
+                put_artifact_record(
+                    self,
+                    cell_id,
+                    "build_posting_chunks_manifest",
+                    &mut batch,
+                    &mut pending_writes,
+                    posting_manifest_key(
+                        &manifest.cell_id,
+                        &manifest.edge_type,
+                        manifest.direction,
+                        manifest.owner,
+                        manifest.base_epoch,
+                    ),
+                    encode_posting_manifest(manifest),
+                )
+                .await?;
+            }
+            flush_artifact_put_batch(
                 self,
                 cell_id,
                 "build_posting_chunks_manifest",
                 &mut batch,
                 &mut pending_writes,
-                posting_manifest_key(
-                    &manifest.cell_id,
-                    &manifest.edge_type,
-                    manifest.direction,
-                    manifest.owner,
-                    manifest.base_epoch,
-                ),
-                encode_posting_manifest(manifest),
             )
-            .await?;
+            .await
         }
-        flush_artifact_put_batch(
-            self,
-            cell_id,
-            "build_posting_chunks_manifest",
-            &mut batch,
-            &mut pending_writes,
-        )
-        .await?;
+        .await;
+        crate::release_cell_write_lock(artifact_lock, publish_result).await?;
         if !chunks.is_empty() {
             let mut cache = self.posting_chunk_cache.lock().await;
             for chunk in &chunks {
@@ -778,4 +793,31 @@ impl GraphShard {
         }
         Ok(latest)
     }
+}
+
+async fn ensure_posting_manifests_publish_compatible(
+    shard: &GraphShard,
+    manifests: &[PostingChunkManifest],
+) -> Result<()> {
+    for manifest in manifests {
+        let key = posting_manifest_key(
+            &manifest.cell_id,
+            &manifest.edge_type,
+            manifest.direction,
+            manifest.owner,
+            manifest.base_epoch,
+        );
+        let Some(value) = shard.read_remote(&key).await? else {
+            continue;
+        };
+        let existing = decode_posting_manifest(&key, &value)?;
+        if existing != *manifest {
+            return Err(GraphError::CorruptValue {
+                key,
+                reason: "posting artifact epoch is already published with a different chunk layout"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(())
 }
