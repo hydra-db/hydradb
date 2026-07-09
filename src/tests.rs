@@ -2114,6 +2114,66 @@ async fn stale_owner_cannot_renew_reclaimed_cell_write_lock() {
 }
 
 #[tokio::test]
+async fn matrix_artifact_write_lock_is_epoch_scoped_and_cell_lock_independent() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard(
+        "graph/matrix-artifact-write-lock-scope",
+        Arc::clone(&object_store),
+    )
+    .await;
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+    let base_epoch = 7;
+
+    let artifact_lock = shard
+        .acquire_matrix_artifact_write_lock(cell_id, edge_type, base_epoch, "build_matrix_tiles")
+        .await
+        .unwrap();
+    let same_epoch_err = match shard
+        .acquire_matrix_artifact_write_lock(cell_id, edge_type, base_epoch, "contending-builder")
+        .await
+    {
+        Ok(_) => panic!("contending builder acquired matrix artifact write lock"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        same_epoch_err,
+        GraphError::CellWriteConflict {
+            operation: "contending-builder",
+            ref cell_id
+        } if cell_id == "reddit-home"
+    ));
+
+    let next_epoch_lock = shard
+        .acquire_matrix_artifact_write_lock(
+            cell_id,
+            edge_type,
+            base_epoch + 1,
+            "different-epoch-builder",
+        )
+        .await
+        .unwrap();
+    let different_edge_type_lock = shard
+        .acquire_matrix_artifact_write_lock(
+            cell_id,
+            "OTHER_EDGE_TYPE",
+            base_epoch,
+            "different-edge-builder",
+        )
+        .await
+        .unwrap();
+    let cell_lock = shard
+        .acquire_cell_write_lock(cell_id, "ordinary-cell-writer")
+        .await
+        .unwrap();
+
+    cell_lock.release().await.unwrap();
+    different_edge_type_lock.release().await.unwrap();
+    next_epoch_lock.release().await.unwrap();
+    artifact_lock.release().await.unwrap();
+}
+
+#[tokio::test]
 async fn trusted_segment_append_replay_with_new_job_id_does_not_double_count_degree() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
@@ -6715,6 +6775,62 @@ async fn matrix_snapshot_abort_cleanup_preserves_published_manifest_epoch() {
     assert!(cleanup.skipped_published_manifest);
     assert!(shard.read_remote(&manifest_key).await.unwrap().is_some());
     assert!(shard.read_remote(&chunk_key).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn matrix_snapshot_abort_cleanup_respects_inflight_artifact_builder_lock() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard(
+        "graph/matrix-snapshot-abort-cleanup-builder-lock",
+        object_store,
+    )
+    .await;
+    let cell_id = "reddit-home";
+    let edge_type = "ABORT_CLEANUP_LOCKED_EDGE";
+
+    shard
+        .write_edge(typed_mutation(
+            cell_id,
+            edge_type,
+            1,
+            2,
+            "cleanup-builder-lock-seed",
+        ))
+        .await
+        .unwrap();
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    let epoch = format!("{base_epoch:020}");
+    let chunk_key = format!(
+        "cell/{cell_id}/artifact/matrix/{edge_type}/{epoch}/out/00000000000000000000/00000000000000000000"
+    );
+
+    let mut batch = GraphWriteBatch::new();
+    batch.put(chunk_key.as_bytes(), b"inflight-builder-chunk");
+    shard
+        .write_graph_batch_strict(cell_id, "test_seed_inflight_matrix_artifact", batch)
+        .await
+        .unwrap();
+
+    let builder_lock = shard
+        .acquire_matrix_artifact_write_lock(cell_id, edge_type, base_epoch, "held-by-test-builder")
+        .await
+        .unwrap();
+    let cleanup = engine::cleanup_unpublished_matrix_artifact_epoch(
+        &shard,
+        cell_id,
+        edge_type,
+        base_epoch,
+        "test_cleanup_contended_matrix_artifact",
+    )
+    .await;
+    assert_eq!(cleanup.deleted_keys, 0);
+    assert!(cleanup.cleanup_errors > 0);
+    assert!(!cleanup.skipped_published_manifest);
+    assert!(
+        shard.read_remote(&chunk_key).await.unwrap().is_some(),
+        "cleanup must not delete chunks while the same artifact epoch is locked by a builder"
+    );
+    builder_lock.release().await.unwrap();
 }
 
 #[tokio::test]

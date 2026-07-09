@@ -192,6 +192,13 @@ impl CellWriteLock {
                     cell_id: record.cell_id,
                 })
             }
+            Err(slatedb::object_store::Error::NotImplemented { .. })
+            | Err(slatedb::object_store::Error::NotSupported { .. }) => {
+                // Some local object-store backends do not support conditional update. We already
+                // verified that this owner still holds an active lock; those backends also cannot
+                // safely CAS-reclaim the lock, so accepting the renewal preserves exclusivity.
+                Ok(())
+            }
             Err(err) => Err(err.into()),
         }
     }
