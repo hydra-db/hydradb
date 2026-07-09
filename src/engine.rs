@@ -64,6 +64,17 @@ struct PostingChunkManifest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct PostingArtifactManifest {
+    cell_id: String,
+    edge_type: String,
+    base_epoch: GraphEpoch,
+    owner_manifest_count: u64,
+    chunk_count: u64,
+    vertex_count: u64,
+    checksum: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MatrixArtifact {
     pub cell_id: String,
     pub edge_type: String,
@@ -769,6 +780,62 @@ fn posting_manifests_from_chunks(chunks: &[PostingChunk]) -> Result<Vec<PostingC
         });
     }
     Ok(manifests)
+}
+
+fn posting_artifact_manifest_from_owner_manifests(
+    cell_id: &str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+    manifests: &[PostingChunkManifest],
+) -> Result<Option<PostingArtifactManifest>> {
+    if manifests.is_empty() {
+        return Ok(None);
+    }
+    let mut checksum = 0xcbf2_9ce4_8422_2325_u64;
+    checksum_u64(&mut checksum, base_epoch);
+    let mut chunk_count = 0_u64;
+    let mut vertex_count = 0_u64;
+    for manifest in manifests {
+        if manifest.cell_id != cell_id
+            || manifest.edge_type != edge_type
+            || manifest.base_epoch != base_epoch
+        {
+            return Err(GraphError::CorruptValue {
+                key: posting_manifest_key(
+                    &manifest.cell_id,
+                    &manifest.edge_type,
+                    manifest.direction,
+                    manifest.owner,
+                    manifest.base_epoch,
+                ),
+                reason: "posting owner manifest does not belong to artifact epoch".to_string(),
+            });
+        }
+        checksum_u64(
+            &mut checksum,
+            match manifest.direction {
+                ArtifactDirection::Out => 1,
+                ArtifactDirection::In => 2,
+            },
+        );
+        checksum_u64(&mut checksum, manifest.owner);
+        checksum_u64(&mut checksum, manifest.chunk_count);
+        checksum_u64(&mut checksum, manifest.vertex_count);
+        for chunk_checksum in &manifest.chunk_checksums {
+            checksum_u64(&mut checksum, *chunk_checksum);
+        }
+        chunk_count = chunk_count.saturating_add(manifest.chunk_count);
+        vertex_count = vertex_count.saturating_add(manifest.vertex_count);
+    }
+    Ok(Some(PostingArtifactManifest {
+        cell_id: cell_id.to_string(),
+        edge_type: edge_type.to_string(),
+        base_epoch,
+        owner_manifest_count: manifests.len() as u64,
+        chunk_count,
+        vertex_count,
+        checksum,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1505,6 +1572,14 @@ fn posting_manifest_prefix(cell_id: &str, edge_type: &str) -> String {
     format!("cell/{cell_id}/artifact/posting_manifest/{edge_type}/")
 }
 
+fn posting_artifact_manifest_key(cell_id: &str, edge_type: &str, base_epoch: GraphEpoch) -> String {
+    format!("cell/{cell_id}/artifact/posting_epoch_manifest/{edge_type}/{base_epoch:020}")
+}
+
+fn posting_artifact_manifest_prefix(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/artifact/posting_epoch_manifest/{edge_type}/")
+}
+
 fn encode_posting_chunk(chunk: &PostingChunk) -> Vec<u8> {
     format!(
         "posting1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -1628,6 +1703,68 @@ fn validate_posting_manifest(
     Ok(manifest)
 }
 
+fn encode_posting_artifact_manifest(manifest: &PostingArtifactManifest) -> Vec<u8> {
+    format!(
+        "posting_epoch_manifest1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        manifest.cell_id,
+        manifest.edge_type,
+        manifest.base_epoch,
+        manifest.owner_manifest_count,
+        manifest.chunk_count,
+        manifest.vertex_count,
+        manifest.checksum
+    )
+    .into_bytes()
+}
+
+fn decode_posting_artifact_manifest(key: &str, value: &[u8]) -> Result<PostingArtifactManifest> {
+    let text = text_value(key, value)?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 8 || parts[0] != "posting_epoch_manifest1" {
+        return corrupt(key, "expected posting_epoch_manifest1 record with 8 fields");
+    }
+    validate_posting_artifact_manifest(
+        key,
+        PostingArtifactManifest {
+            cell_id: parts[1].to_string(),
+            edge_type: parts[2].to_string(),
+            base_epoch: parse_u64(key, parts[3], "base_epoch")?,
+            owner_manifest_count: parse_u64(key, parts[4], "owner_manifest_count")?,
+            chunk_count: parse_u64(key, parts[5], "chunk_count")?,
+            vertex_count: parse_u64(key, parts[6], "vertex_count")?,
+            checksum: parse_u64(key, parts[7], "checksum")?,
+        },
+    )
+}
+
+fn validate_posting_artifact_manifest(
+    key: &str,
+    manifest: PostingArtifactManifest,
+) -> Result<PostingArtifactManifest> {
+    if manifest.vertex_count > 0 && manifest.chunk_count == 0 {
+        return corrupt(key, "posting epoch manifest vertex count requires chunks");
+    }
+    if manifest.chunk_count > 0 && manifest.owner_manifest_count == 0 {
+        return corrupt(
+            key,
+            "posting epoch manifest chunk count requires owner manifests",
+        );
+    }
+    let parts: Vec<_> = key.split('/').collect();
+    let ["cell", cell_id, "artifact", "posting_epoch_manifest", edge_type, base_epoch] =
+        parts.as_slice()
+    else {
+        return corrupt(key, "invalid posting epoch manifest key");
+    };
+    if manifest.cell_id != *cell_id
+        || manifest.edge_type != *edge_type
+        || manifest.base_epoch != parse_u64(key, base_epoch, "base_epoch")?
+    {
+        return corrupt(key, "posting epoch manifest key does not match value");
+    }
+    Ok(manifest)
+}
+
 fn matrix_manifest_key(cell_id: &str, edge_type: &str, base_epoch: GraphEpoch) -> String {
     format!("cell/{cell_id}/artifact/matrix_manifest/{edge_type}/{base_epoch:020}")
 }
@@ -1704,6 +1841,7 @@ fn graph_artifact_gc_prefixes(cell_id: &str, edge_type: &str) -> Vec<String> {
     vec![
         format!("cell/{cell_id}/artifact/posting/{edge_type}/"),
         posting_manifest_prefix(cell_id, edge_type),
+        posting_artifact_manifest_prefix(cell_id, edge_type),
         matrix_manifest_prefix(cell_id, edge_type),
         format!("cell/{cell_id}/artifact/matrix/{edge_type}/"),
         graphblas_csc_prefix(cell_id, edge_type),
@@ -1718,6 +1856,7 @@ fn graph_artifact_epoch_from_key(key: &str) -> Result<Option<GraphEpoch>> {
     let epoch = match parts.as_slice() {
         ["cell", _, "artifact", "posting", _, _, _, base_epoch, ..] => Some(*base_epoch),
         ["cell", _, "artifact", "posting_manifest", _, _, _, base_epoch] => Some(*base_epoch),
+        ["cell", _, "artifact", "posting_epoch_manifest", _, base_epoch] => Some(*base_epoch),
         ["cell", _, "artifact", "matrix_manifest", _, base_epoch] => Some(*base_epoch),
         ["cell", _, "artifact", "matrix", _, base_epoch, ..] => Some(*base_epoch),
         ["cell", _, "artifact", "graphblas_csc", _, base_epoch] => Some(*base_epoch),
