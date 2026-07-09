@@ -4399,6 +4399,45 @@ async fn graph_node_starts_lease_renewal_automatically() {
 }
 
 #[tokio::test]
+async fn graph_node_close_publishes_draining_heartbeat() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = Arc::new(
+        GraphControlPlane::open("graph-control/node-close-drain", Arc::clone(&object_store))
+            .await
+            .unwrap(),
+    );
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+
+    let node = GraphNode::open(
+        "graph-node-close-drain",
+        "node-a",
+        Arc::clone(&control),
+        object_store,
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(25),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        control
+            .node_heartbeat("node-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        GraphNodeHealthState::Active
+    );
+
+    node.close().await.unwrap();
+    let heartbeat = control.node_heartbeat("node-a").await.unwrap().unwrap();
+    assert_eq!(heartbeat.state, GraphNodeHealthState::Draining);
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn control_plane_can_fail_over_after_lease_expiry() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = GraphControlPlane::open("graph-control/failover", object_store)
