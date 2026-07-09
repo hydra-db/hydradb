@@ -37,6 +37,11 @@ pub enum GraphError {
         expected_generation: Option<u64>,
         actual_generation: Option<u64>,
     },
+    #[error("{operation} exhausted retry budget after {attempts} attempts")]
+    RetryExhausted {
+        operation: &'static str,
+        attempts: usize,
+    },
     #[error(
         "control watermark regression for {field} on cell {cell_id}: requested {requested_epoch}, current {current_epoch}"
     )]

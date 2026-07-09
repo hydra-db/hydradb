@@ -579,7 +579,10 @@ impl GraphShard {
                 result => return result,
             }
         }
-        unreachable!("transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
     }
 
     async fn write_graph_batch_txn(

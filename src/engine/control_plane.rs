@@ -116,7 +116,10 @@ impl GraphControlPlane {
                 }
             }
         }
-        unreachable!("control transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "control transaction",
+            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
+        })
     }
 
     pub(crate) async fn acquire_lease_at(
@@ -165,7 +168,10 @@ impl GraphControlPlane {
                 }
             }
         }
-        unreachable!("control transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "control transaction",
+            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
+        })
     }
 
     async fn acquire_lease_txn(
@@ -291,7 +297,10 @@ impl GraphControlPlane {
                 }
             }
         }
-        unreachable!("control transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "control transaction",
+            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
+        })
     }
 
     async fn renew_lease_txn(
@@ -430,7 +439,10 @@ impl GraphControlPlane {
                 result => return result,
             }
         }
-        unreachable!("control transaction retry loop always returns on final attempt")
+        Err(GraphError::RetryExhausted {
+            operation: "control transaction",
+            attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
+        })
     }
 
     async fn failover_expired_cell_txn(
