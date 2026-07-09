@@ -4194,7 +4194,9 @@ impl GraphShard {
             context.cancellation_token.clone(),
         );
         budget.check("cypher_rows_page_stream")?;
-        let src = edge.src.id.expect("streaming edge has fixed source");
+        let Some(src) = edge.src.id else {
+            return Ok(None);
+        };
         let mut vertices = self
             .out_neighbors_window_at(
                 &context.cell_id,

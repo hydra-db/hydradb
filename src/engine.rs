@@ -887,7 +887,7 @@ async fn append_matrix_tiles_from_rows(
 
     for (row, cols) in rows {
         let tile_row = row / tile_size;
-        if current_tile_row.is_some_and(|current| current != tile_row) {
+        if let Some(flush_tile_row) = current_tile_row.filter(|current| *current != tile_row) {
             tile_count = tile_count.saturating_add(
                 flush_matrix_tile_row(
                     shard,
@@ -898,7 +898,7 @@ async fn append_matrix_tiles_from_rows(
                     base_epoch,
                     tile_size,
                     direction,
-                    current_tile_row.expect("tile row exists"),
+                    flush_tile_row,
                     &mut tile_columns,
                 )
                 .await?,

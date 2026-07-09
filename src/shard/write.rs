@@ -2708,7 +2708,7 @@ impl GraphShard {
                 next_epoch,
                 mutation.src,
                 mutation.dst,
-            );
+            )?;
             txn.put(
                 idem_key.as_bytes(),
                 encode_delete_idempotency(mutation, &result),
@@ -4478,7 +4478,7 @@ fn push_delete_outbox_run(
     epoch: GraphEpoch,
     src: VertexId,
     dst: VertexId,
-) {
+) -> Result<()> {
     let can_extend = current
         .as_ref()
         .is_some_and(|run| run.edge_type == edge_type && run.end_epoch.saturating_add(1) == epoch);
@@ -4493,11 +4493,15 @@ fn push_delete_outbox_run(
             edges: Vec::new(),
         });
     }
-    let run = current
-        .as_mut()
-        .expect("delete outbox run exists after initialization");
+    let Some(run) = current.as_mut() else {
+        return Err(GraphError::CorruptValue {
+            key: format!("delete/outbox/{edge_type}/{epoch}"),
+            reason: "delete outbox run was not initialized".to_string(),
+        });
+    };
     run.end_epoch = epoch;
     run.edges.push((src, dst));
+    Ok(())
 }
 
 fn validate_unique_delete_mutation_identities(mutations: &[EdgeMutation]) -> Result<()> {
