@@ -24,7 +24,13 @@ impl GraphClusterControllerConfig {
             cell_ids: normalized.into_iter().collect(),
             heartbeat_ttl,
             lease_ttl,
+            rebalance_mode: GraphClusterRebalanceMode::StabilityFirst,
         })
+    }
+
+    pub fn with_rebalance_mode(mut self, rebalance_mode: GraphClusterRebalanceMode) -> Self {
+        self.rebalance_mode = rebalance_mode;
+        self
     }
 
     fn validated_cells(&self) -> Result<Vec<String>> {
@@ -236,13 +242,16 @@ impl GraphControlPlane {
                 Some(owner) => active_nodes.contains(owner) && !draining_nodes.contains(owner),
                 None => false,
             };
-            if previous_is_usable {
-                continue;
-            }
             let Some(new_owner) = choose_controller_owner(cell_id, &report.active_nodes) else {
                 report.unassigned_cells.push(cell_id.clone());
                 continue;
             };
+            if previous_is_usable
+                && (config.rebalance_mode == GraphClusterRebalanceMode::StabilityFirst
+                    || previous.as_deref() == Some(new_owner.as_str()))
+            {
+                continue;
+            }
             if previous.as_deref() == Some(new_owner.as_str()) {
                 continue;
             }
