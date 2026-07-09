@@ -119,6 +119,62 @@ impl GraphShard {
         })
     }
 
+    pub async fn import_vertex_metadata_batch(
+        &self,
+        cell_id: &str,
+        updates: impl IntoIterator<Item = (VertexId, VertexMetadata)>,
+    ) -> Result<usize> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_write_authority(cell_id, "import_vertex_metadata_batch")?;
+        let updates = coalesce_vertex_metadata_updates(updates)?;
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        ensure_limit(
+            "import_vertex_metadata_batch",
+            updates.len() as u64,
+            self.limits.max_bulk_import_edges as u64,
+        )?;
+        let _permit = self
+            .acquire_graph_write_permit("import_vertex_metadata_batch")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .import_vertex_metadata_batch_txn(cell_id, updates.clone())
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(changed) => {
+                    if changed > 0 {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(changed);
+                }
+                result => return result,
+            }
+        }
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
+    }
+
     async fn set_vertex_metadata_txn(
         &self,
         cell_id: &str,
@@ -189,6 +245,61 @@ impl GraphShard {
             if previous != metadata {
                 changed.push((vertex_id, previous, metadata));
             }
+        }
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        let epoch = next_epoch_txn(&txn, cell_id).await?;
+        txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(epoch))?;
+        for (vertex_id, previous, metadata) in &changed {
+            apply_vertex_metadata_update_txn(&txn, cell_id, *vertex_id, previous, metadata, epoch)?;
+        }
+        let changed_count = changed.len();
+        commit_txn_strict(txn, self.await_durable_writes).await?;
+        Ok(changed_count)
+    }
+
+    async fn import_vertex_metadata_batch_txn(
+        &self,
+        cell_id: &str,
+        updates: Vec<(VertexId, VertexMetadata)>,
+    ) -> Result<usize> {
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "import_vertex_metadata_batch")
+            .await?;
+        let result = self
+            .import_vertex_metadata_batch_txn_locked(cell_id, updates)
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn import_vertex_metadata_batch_txn_locked(
+        &self,
+        cell_id: &str,
+        updates: Vec<(VertexId, VertexMetadata)>,
+    ) -> Result<usize> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, "import_vertex_metadata_batch")
+            .await?;
+        let mut changed = Vec::new();
+        for (vertex_id, metadata) in updates {
+            let vertex_key = keys::vertex(cell_id, vertex_id);
+            let previous = match read_txn_remote(&txn, &vertex_key).await? {
+                Some(value) => decode_vertex_metadata(&vertex_key, &value)?,
+                None => VertexMetadata::default(),
+            };
+            if previous == metadata {
+                continue;
+            }
+            if previous != VertexMetadata::default() {
+                return Err(GraphError::CorruptValue {
+                    key: vertex_key,
+                    reason: format!(
+                        "vertex {vertex_id} already has different metadata during import"
+                    ),
+                });
+            }
+            changed.push((vertex_id, previous, metadata));
         }
         if changed.is_empty() {
             return Ok(0);

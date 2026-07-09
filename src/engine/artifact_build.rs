@@ -237,8 +237,12 @@ impl GraphShard {
                 graphblas_csc_key(cell_id, edge_type, base_epoch),
                 encode_graphblas_csc_manifest(&graphblas_manifest),
             );
-            self.write_graph_batch_strict(cell_id, "build_matrix_tiles", manifest_batch)
-                .await
+            self.write_graph_batch_strict_with_cell_lock(
+                cell_id,
+                "build_matrix_tiles",
+                manifest_batch,
+            )
+            .await
         }
         .await
         {
