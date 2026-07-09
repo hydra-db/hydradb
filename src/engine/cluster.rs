@@ -105,7 +105,7 @@ impl GraphNode {
         {
             Ok(heartbeat) => heartbeat,
             Err(err) => {
-                cluster.close().await?;
+                close_cluster_and_release_leases(control.as_ref(), &cluster).await?;
                 return Err(err);
             }
         };
@@ -116,8 +116,11 @@ impl GraphNode {
         ) {
             Ok(handle) => handle,
             Err(err) => {
-                heartbeat.stop().await?;
-                cluster.close().await?;
+                let heartbeat_result = heartbeat.stop().await;
+                let cleanup_result =
+                    close_cluster_and_release_leases(control.as_ref(), &cluster).await;
+                heartbeat_result?;
+                cleanup_result?;
                 return Err(err);
             }
         };
@@ -1456,6 +1459,17 @@ async fn release_graph_node_leases(
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+async fn close_cluster_and_release_leases(
+    control: &GraphControlPlane,
+    cluster: &RoutedGraphCluster,
+) -> Result<()> {
+    let leases_to_release = cluster.local_leases()?;
+    let close_result = cluster.close().await;
+    let release_result = release_graph_node_leases(control, leases_to_release).await;
+    close_result?;
+    release_result
 }
 
 async fn cleanup_partial_cluster_open(
