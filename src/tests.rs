@@ -4528,6 +4528,185 @@ async fn routed_cluster_refreshes_owned_shards_after_failover() {
 }
 
 #[tokio::test]
+async fn managed_graph_nodes_refresh_shards_in_background_after_failover() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = Arc::new(
+        GraphControlPlane::open("graph-control/managed-refresh", Arc::clone(&object_store))
+            .await
+            .unwrap(),
+    );
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let node_a = GraphNode::open_managed(
+        "graph-managed-refresh",
+        "node-a",
+        Arc::clone(&control),
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .unwrap();
+    let node_b = GraphNode::open_managed(
+        "graph-managed-refresh",
+        "node-b",
+        Arc::clone(&control),
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(20),
+    )
+    .await
+    .unwrap();
+    assert_eq!(node_a.local_cells().await.unwrap(), vec!["reddit-home"]);
+    assert!(node_b.local_cells().await.unwrap().is_empty());
+    node_a
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "managed-before".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let lease_expires_at = node_a
+        .lease("reddit-home")
+        .await
+        .unwrap()
+        .unwrap()
+        .expires_at_ms;
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-b")]).unwrap())
+        .await
+        .unwrap();
+    control
+        .failover_expired_cell_at(
+            "reddit-home",
+            "node-b",
+            std::time::Duration::from_secs(60),
+            lease_expires_at + 1,
+        )
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let node_a_cells = node_a.local_cells().await.unwrap();
+        let node_b_cells = node_b.local_cells().await.unwrap();
+        if node_a_cells.is_empty() && node_b_cells == vec!["reddit-home"] {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "managed nodes did not refresh ownership: node-a={node_a_cells:?} node-b={node_b_cells:?}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        node_b
+            .out_neighbors("reddit-home", "FOLLOWS", 1)
+            .await
+            .unwrap(),
+        vec![2]
+    );
+    node_b
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 2,
+            dst: 3,
+            idempotency_key: "managed-after".to_string(),
+        })
+        .await
+        .unwrap();
+    let err = node_a
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 3,
+            dst: 4,
+            idempotency_key: "managed-stale".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::ShardNotOwned {
+            ref cell_id,
+            ref owner_node_id,
+            ref local_node_id
+        } if cell_id == "reddit-home"
+            && owner_node_id == "node-b"
+            && local_node_id == "node-a"
+    ));
+    let metrics_a = node_a.maintenance_metrics();
+    let metrics_b = node_b.maintenance_metrics();
+    assert!(metrics_a.shard_refresh_closed_cells >= 1);
+    assert!(metrics_b.shard_refresh_opened_cells >= 1);
+    assert!(metrics_a.shard_refresh_attempts >= metrics_a.shard_refresh_successes);
+    assert!(metrics_b.shard_refresh_attempts >= metrics_b.shard_refresh_successes);
+
+    node_a.close().await.unwrap();
+    node_b.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn managed_graph_node_executes_cypher_rows() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = Arc::new(
+        GraphControlPlane::open("graph-control/managed-cypher", Arc::clone(&object_store))
+            .await
+            .unwrap(),
+    );
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let node = GraphNode::open_managed(
+        "graph-managed-cypher",
+        "node-a",
+        Arc::clone(&control),
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(50),
+    )
+    .await
+    .unwrap();
+    node.write_edge(EdgeMutation {
+        cell_id: "reddit-home".to_string(),
+        edge_type: "FOLLOWS".to_string(),
+        src: 1,
+        dst: 2,
+        idempotency_key: "managed-cypher-seed".to_string(),
+    })
+    .await
+    .unwrap();
+
+    let rows = node
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "managed-cypher-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.rows[0].values, vec![QueryValue::VertexId(2)]);
+
+    node.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn control_plane_records_node_heartbeats_and_metrics() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = GraphControlPlane::open("graph-control/node-heartbeat", object_store)

@@ -10,7 +10,7 @@ use slatedb::bytes::Bytes;
 use slatedb::config::{DurabilityLevel, ReadOptions, ScanOptions, WriteOptions};
 use slatedb::object_store::{local::LocalFileSystem, ObjectStore};
 use slatedb::{Db, DbTransaction, ErrorKind, IsolationLevel, WriteBatch};
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 
 #[cfg(feature = "graphblas")]
@@ -227,6 +227,20 @@ pub struct GraphNode {
     heartbeat: NodeHeartbeatHandle,
 }
 
+pub struct ManagedGraphNode {
+    node: Arc<TokioMutex<Option<GraphNode>>>,
+    shard_refresher: ShardRefreshHandle,
+    metrics: Arc<GraphNodeMaintenanceMetrics>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphNodeRuntimeConfig {
+    pub lease_ttl: Duration,
+    pub lease_renew_interval: Duration,
+    pub shard_refresh_interval: Duration,
+    pub options: GraphOpenOptions,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardLease {
     pub cell_id: String,
@@ -300,11 +314,46 @@ pub struct GraphClusterControllerHandle {
     task: JoinHandle<Result<()>>,
 }
 
+pub struct ShardRefreshHandle {
+    stop_tx: watch::Sender<bool>,
+    task: JoinHandle<Result<()>>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GraphShardRefreshReport {
     pub opened_cells: Vec<String>,
     pub closed_cells: Vec<String>,
     pub retained_cells: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphNodeMaintenanceMetricsSnapshot {
+    pub shard_refresh_attempts: u64,
+    pub shard_refresh_successes: u64,
+    pub shard_refresh_failures: u64,
+    pub shard_refresh_opened_cells: u64,
+    pub shard_refresh_closed_cells: u64,
+}
+
+#[derive(Default)]
+struct GraphNodeMaintenanceMetrics {
+    shard_refresh_attempts: AtomicU64,
+    shard_refresh_successes: AtomicU64,
+    shard_refresh_failures: AtomicU64,
+    shard_refresh_opened_cells: AtomicU64,
+    shard_refresh_closed_cells: AtomicU64,
+}
+
+impl GraphNodeMaintenanceMetrics {
+    fn snapshot(&self) -> GraphNodeMaintenanceMetricsSnapshot {
+        GraphNodeMaintenanceMetricsSnapshot {
+            shard_refresh_attempts: self.shard_refresh_attempts.load(Ordering::Relaxed),
+            shard_refresh_successes: self.shard_refresh_successes.load(Ordering::Relaxed),
+            shard_refresh_failures: self.shard_refresh_failures.load(Ordering::Relaxed),
+            shard_refresh_opened_cells: self.shard_refresh_opened_cells.load(Ordering::Relaxed),
+            shard_refresh_closed_cells: self.shard_refresh_closed_cells.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
