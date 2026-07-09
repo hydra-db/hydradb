@@ -44,6 +44,13 @@ impl GraphNodeRuntimeConfig {
         self.options = options;
         self
     }
+
+    fn validate(&self) -> Result<()> {
+        lease_ttl_ms(self.lease_ttl)?;
+        validate_graph_node_interval("lease_renew_interval", self.lease_renew_interval)?;
+        validate_graph_node_interval("shard_refresh_interval", self.shard_refresh_interval)?;
+        Ok(())
+    }
 }
 
 impl GraphNode {
@@ -76,6 +83,8 @@ impl GraphNode {
         lease_renew_interval: Duration,
         options: GraphOpenOptions,
     ) -> Result<Self> {
+        lease_ttl_ms(lease_ttl)?;
+        validate_graph_node_interval("lease_renew_interval", lease_renew_interval)?;
         let cluster = RoutedGraphCluster::open_owned_with_control_and_options(
             base_path,
             local_node_id,
@@ -85,13 +94,20 @@ impl GraphNode {
             options,
         )
         .await?;
-        let heartbeat = Arc::clone(&control)
+        let heartbeat = match Arc::clone(&control)
             .start_node_heartbeat(
                 cluster.local_node_id().to_string(),
                 GraphNodeHealthState::Active,
                 lease_renew_interval,
             )
-            .await?;
+            .await
+        {
+            Ok(heartbeat) => heartbeat,
+            Err(err) => {
+                cluster.close().await?;
+                return Err(err);
+            }
+        };
         let lease_renewer = match cluster.start_lease_renewer(
             Arc::clone(&control),
             lease_ttl,
@@ -100,6 +116,7 @@ impl GraphNode {
             Ok(handle) => handle,
             Err(err) => {
                 heartbeat.stop().await?;
+                cluster.close().await?;
                 return Err(err);
             }
         };
@@ -137,6 +154,7 @@ impl GraphNode {
         object_store: Arc<dyn ObjectStore>,
         config: GraphNodeRuntimeConfig,
     ) -> Result<ManagedGraphNode> {
+        config.validate()?;
         let node = Self::open_with_options(
             base_path,
             local_node_id,
@@ -1233,6 +1251,16 @@ async fn with_managed_node<R>(
     let guard = node.read().await;
     let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
     f(node)
+}
+
+fn validate_graph_node_interval(field: &'static str, interval: Duration) -> Result<()> {
+    if interval.is_zero() {
+        return Err(GraphError::CorruptValue {
+            key: format!("control/{field}"),
+            reason: format!("{field} must be greater than zero"),
+        });
+    }
+    Ok(())
 }
 
 fn managed_node_closed_error() -> GraphError {
