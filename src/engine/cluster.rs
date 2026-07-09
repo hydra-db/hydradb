@@ -626,38 +626,34 @@ impl RoutedGraphCluster {
         validate_component("node_id", &local_node_id)?;
         let local_cells = placement.cells_for_node(&local_node_id)?;
         let leases = Arc::new(RwLock::new(BTreeMap::new()));
-        for cell_id in &local_cells {
-            let lease = control
-                .acquire_lease(cell_id, &local_node_id, lease_ttl)
-                .await?;
-            leases
-                .write()
-                .map_err(lock_error)?
-                .insert(cell_id.clone(), lease);
-        }
-
         let mut shards = BTreeMap::new();
         for cell_id in local_cells {
-            let path = format!("{base_path}/{cell_id}");
-            let shard = GraphShard::open_leased_writer(
-                path,
-                Arc::clone(&object_store),
-                options.clone(),
-                local_node_id.clone(),
-                Arc::clone(&leases),
-            )
-            .await?;
-            let lease = leases
-                .read()
-                .map_err(lock_error)?
-                .get(&cell_id)
-                .cloned()
-                .ok_or_else(|| GraphError::WriteRequiresLease {
-                    operation: "install_write_fence",
-                    cell_id: cell_id.clone(),
-                })?;
-            shard.install_write_fence(&cell_id, &lease).await?;
-            shards.insert(cell_id, shard);
+            let result = async {
+                let lease = control
+                    .acquire_lease(&cell_id, &local_node_id, lease_ttl)
+                    .await?;
+                leases
+                    .write()
+                    .map_err(lock_error)?
+                    .insert(cell_id.clone(), lease.clone());
+                let path = format!("{base_path}/{cell_id}");
+                let shard = GraphShard::open_leased_writer(
+                    path,
+                    Arc::clone(&object_store),
+                    options.clone(),
+                    local_node_id.clone(),
+                    Arc::clone(&leases),
+                )
+                .await?;
+                shard.install_write_fence(&cell_id, &lease).await?;
+                shards.insert(cell_id.clone(), shard);
+                Ok(())
+            }
+            .await;
+            if let Err(err) = result {
+                cleanup_partial_cluster_open(control, &leases, shards).await;
+                return Err(err);
+            }
         }
 
         Ok(Self {
@@ -734,6 +730,7 @@ impl RoutedGraphCluster {
             .collect::<BTreeSet<_>>();
         let current_cells = self.shards.keys().cloned().collect::<BTreeSet<_>>();
         let mut report = GraphShardRefreshReport::default();
+        self.placement = placement;
 
         for cell_id in current_cells.difference(&target_cells) {
             let released_lease = self.leases.write().map_err(lock_error)?.remove(cell_id);
@@ -759,15 +756,28 @@ impl RoutedGraphCluster {
                 .map_err(lock_error)?
                 .insert(cell_id.clone(), lease.clone());
             let path = format!("{}/{}", self.base_path, cell_id);
-            let shard = GraphShard::open_leased_writer(
+            let shard = match GraphShard::open_leased_writer(
                 path,
                 Arc::clone(&self.object_store),
                 self.options.clone(),
                 self.local_node_id.clone(),
                 Arc::clone(&self.leases),
             )
-            .await?;
-            shard.install_write_fence(cell_id, &lease).await?;
+            .await
+            {
+                Ok(shard) => shard,
+                Err(err) => {
+                    self.leases.write().map_err(lock_error)?.remove(cell_id);
+                    release_graph_node_leases(control, vec![lease]).await?;
+                    return Err(err);
+                }
+            };
+            if let Err(err) = shard.install_write_fence(cell_id, &lease).await {
+                self.leases.write().map_err(lock_error)?.remove(cell_id);
+                let _ = shard.close().await;
+                release_graph_node_leases(control, vec![lease]).await?;
+                return Err(err);
+            }
             self.shards.insert(cell_id.clone(), shard);
             report.opened_cells.push(cell_id.clone());
         }
@@ -801,7 +811,6 @@ impl RoutedGraphCluster {
         report.opened_cells.sort();
         report.closed_cells.sort();
         report.retained_cells.sort();
-        self.placement = placement;
         Ok(report)
     }
 
@@ -1297,6 +1306,24 @@ async fn release_graph_node_leases(
     match first_error {
         Some(err) => Err(err),
         None => Ok(()),
+    }
+}
+
+async fn cleanup_partial_cluster_open(
+    control: &GraphControlPlane,
+    leases: &Arc<RwLock<BTreeMap<String, ShardLease>>>,
+    shards: BTreeMap<String, GraphShard>,
+) {
+    for shard in shards.into_values() {
+        let _ = shard.close().await;
+    }
+    let leases_to_release = leases
+        .read()
+        .map(|leases| leases.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let _ = release_graph_node_leases(control, leases_to_release).await;
+    if let Ok(mut leases) = leases.write() {
+        leases.clear();
     }
 }
 
