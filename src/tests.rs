@@ -4717,6 +4717,70 @@ async fn routed_cluster_refreshes_owned_shards_after_failover() {
 }
 
 #[tokio::test]
+async fn routed_cluster_refresh_releases_closed_shard_lease_for_handoff() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control =
+        GraphControlPlane::open("graph-control/refresh-release", Arc::clone(&object_store))
+            .await
+            .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let mut cluster_a = RoutedGraphCluster::open_owned_with_control(
+        "graph-refresh-release",
+        "node-a",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    assert!(control
+        .current_lease("reddit-home")
+        .await
+        .unwrap()
+        .is_some());
+
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-b")]).unwrap())
+        .await
+        .unwrap();
+    let report_a = cluster_a
+        .refresh_owned_shards(&control, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(report_a.closed_cells, vec!["reddit-home"]);
+    assert!(control
+        .current_lease("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+
+    let cluster_b = RoutedGraphCluster::open_owned_with_control(
+        "graph-refresh-release",
+        "node-b",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        control
+            .current_lease("reddit-home")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_node_id,
+        "node-b"
+    );
+    cluster_a.close().await.unwrap();
+    cluster_b.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn managed_graph_nodes_refresh_shards_in_background_after_failover() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = Arc::new(
