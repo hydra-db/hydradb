@@ -7767,6 +7767,57 @@ async fn current_graph_verifier_detects_relationship_index_corruption() {
 }
 
 #[tokio::test]
+async fn current_graph_verifier_detects_unpublished_artifacts() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let cell_id = "reddit-home";
+    let edge_type = "VERIFY_UNPUBLISHED_EDGE";
+    let shard = open_test_shard("graph/current-verifier-unpublished-artifacts", object_store).await;
+    let base_epoch = 0;
+    let chunk_key = format!(
+        "cell/{cell_id}/artifact/posting/{edge_type}/out/{:020}/{base_epoch:020}/{:020}",
+        1, 0
+    );
+    let group_key = format!(
+        "cell/{cell_id}/artifact/supernode/{edge_type}/out/{:020}/{base_epoch:020}",
+        1
+    );
+    let chunk_value = format!("posting1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t0\t2,3\n");
+    let group_value =
+        format!("supernode3\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t2\t1\t2\t0:2:3\n");
+
+    let mut batch = GraphWriteBatch::new();
+    batch.put(chunk_key.as_bytes(), chunk_value.as_bytes());
+    batch.put(group_key.as_bytes(), group_value.as_bytes());
+    shard
+        .write_graph_batch_strict(cell_id, "test_seed_unpublished_artifacts", batch)
+        .await
+        .unwrap();
+
+    let report = shard
+        .verify_current_graph(cell_id, edge_type, 0, 0)
+        .await
+        .unwrap();
+    assert!(!report.is_clean());
+    assert!(
+        report
+            .mismatch_samples
+            .iter()
+            .any(|sample| sample.contains("posting:unpublished-chunk")),
+        "{:?}",
+        report.mismatch_samples
+    );
+    assert!(
+        report
+            .mismatch_samples
+            .iter()
+            .any(|sample| sample.contains("supernode:unpublished-group")),
+        "{:?}",
+        report.mismatch_samples
+    );
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn rollup_artifact_gc_keeps_latest_artifacts_and_retains_snapshot_deltas() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let path = "graph/rollup-artifact-gc";

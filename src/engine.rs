@@ -3484,7 +3484,9 @@ fn supernode_artifact_manifest_from_groups(
     checksum_u64(&mut checksum, base_epoch);
     let mut chunk_count = 0_u64;
     let mut degree = 0_u64;
-    for group in groups {
+    let mut ordered_groups: Vec<_> = groups.iter().collect();
+    ordered_groups.sort_by_key(|group| (group.direction, group.vertex_id));
+    for group in ordered_groups {
         if group.cell_id != cell_id
             || group.edge_type != edge_type
             || group.base_epoch != base_epoch
