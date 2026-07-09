@@ -4434,6 +4434,36 @@ async fn graph_node_close_publishes_draining_heartbeat() {
     node.close().await.unwrap();
     let heartbeat = control.node_heartbeat("node-a").await.unwrap().unwrap();
     assert_eq!(heartbeat.state, GraphNodeHealthState::Draining);
+    assert!(control
+        .current_lease("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    control
+        .publish_node_heartbeat("node-b", GraphNodeHealthState::Active)
+        .await
+        .unwrap();
+    let report = control
+        .reconcile_cluster(
+            &GraphClusterControllerConfig::discover_existing(
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.failed_over_leases.len(), 1);
+    assert_eq!(report.failed_over_leases[0].owner_node_id, "node-b");
+    assert_eq!(
+        control
+            .current_lease("reddit-home")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_node_id,
+        "node-b"
+    );
     control.close().await.unwrap();
 }
 
@@ -4537,6 +4567,53 @@ async fn control_plane_can_fail_over_after_lease_expiry() {
             .unwrap(),
         "node-b"
     );
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn control_plane_release_lease_requires_matching_owner_and_token() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/release-lease", object_store)
+        .await
+        .unwrap();
+    let placement = ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap();
+    control.publish_placement(&placement).await.unwrap();
+    let lease = control
+        .acquire_lease("reddit-home", "node-a", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let stale = ShardLease {
+        lease_token: lease.lease_token + 1,
+        ..lease.clone()
+    };
+
+    let err = control.release_lease(&stale).await.unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::StaleShardLease {
+            ref cell_id,
+            ref node_id,
+            lease_token
+        } if cell_id == "reddit-home"
+            && node_id == "node-a"
+            && lease_token == stale.lease_token
+    ));
+    assert_eq!(
+        control.current_lease("reddit-home").await.unwrap().unwrap(),
+        lease
+    );
+
+    assert!(control.release_lease(&lease).await.unwrap());
+    assert!(!control.release_lease(&lease).await.unwrap());
+    assert!(control
+        .current_lease("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    let metrics = control.graph_control_metrics();
+    assert_eq!(metrics.lease_release_attempts, 3);
+    assert_eq!(metrics.lease_release_successes, 1);
+    assert_eq!(metrics.lease_release_failures, 1);
     control.close().await.unwrap();
 }
 

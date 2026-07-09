@@ -88,6 +88,37 @@ impl GraphControlPlane {
         self.renew_lease_at(lease, ttl, now_millis()).await
     }
 
+    pub async fn release_lease(&self, lease: &ShardLease) -> Result<bool> {
+        validate_component("cell_id", &lease.cell_id)?;
+        validate_component("node_id", &lease.owner_node_id)?;
+        self.metrics
+            .lease_release_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        for attempt in 0..GRAPH_CONTROL_TXN_MAX_RETRIES {
+            match self.release_lease_txn(lease).await {
+                Err(GraphError::Slate(err))
+                    if err.kind() == ErrorKind::Transaction
+                        && attempt + 1 < GRAPH_CONTROL_TXN_MAX_RETRIES =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Ok(released) => {
+                    self.metrics
+                        .lease_release_successes
+                        .fetch_add(if released { 1 } else { 0 }, Ordering::Relaxed);
+                    return Ok(released);
+                }
+                Err(err) => {
+                    self.metrics
+                        .lease_release_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+            }
+        }
+        unreachable!("control transaction retry loop always returns on final attempt")
+    }
+
     pub(crate) async fn acquire_lease_at(
         &self,
         cell_id: &str,
@@ -326,6 +357,49 @@ impl GraphControlPlane {
             "renewed shard lease"
         );
         Ok(renewed)
+    }
+
+    async fn release_lease_txn(&self, lease: &ShardLease) -> Result<bool> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let placement_key = control_placement_key(&lease.cell_id);
+        let owner = read_control_txn(&txn, &placement_key)
+            .await?
+            .map(|value| decode_control_placement(&placement_key, &value))
+            .transpose()?
+            .map(|(_, owner)| owner)
+            .ok_or_else(|| GraphError::UnknownShard {
+                cell_id: lease.cell_id.clone(),
+            })?;
+        if owner != lease.owner_node_id {
+            return Err(GraphError::StaleShardLease {
+                cell_id: lease.cell_id.clone(),
+                node_id: lease.owner_node_id.clone(),
+                lease_token: lease.lease_token,
+            });
+        }
+        let lease_key = control_lease_key(&lease.cell_id);
+        let Some(value) = read_control_txn(&txn, &lease_key).await? else {
+            return Ok(false);
+        };
+        let current = decode_shard_lease(&lease_key, &value)?;
+        if current.owner_node_id != lease.owner_node_id || current.lease_token != lease.lease_token
+        {
+            return Err(GraphError::StaleShardLease {
+                cell_id: lease.cell_id.clone(),
+                node_id: lease.owner_node_id.clone(),
+                lease_token: lease.lease_token,
+            });
+        }
+        txn.delete(lease_key.as_bytes())?;
+        commit_control_txn(txn).await?;
+        tracing::info!(
+            target: "slatedb_graph_kernel",
+            cell_id = %lease.cell_id,
+            node_id = %lease.owner_node_id,
+            lease_token = lease.lease_token,
+            "released shard lease"
+        );
+        Ok(true)
     }
 
     pub async fn current_lease(&self, cell_id: &str) -> Result<Option<ShardLease>> {

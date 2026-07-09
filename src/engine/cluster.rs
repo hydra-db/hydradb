@@ -211,6 +211,7 @@ impl GraphNode {
             heartbeat,
         } = self;
         let node_id = cluster.local_node_id().to_string();
+        let leases_to_release = cluster.local_leases()?;
         let drain_state_result = heartbeat.set_state(GraphNodeHealthState::Draining);
         let drain_publish_result = control
             .publish_node_heartbeat(&node_id, GraphNodeHealthState::Draining)
@@ -218,11 +219,13 @@ impl GraphNode {
         let heartbeat_result = heartbeat.stop().await;
         let lease_result = lease_renewer.stop().await;
         let cluster_result = cluster.close().await;
+        let release_result = release_graph_node_leases(control.as_ref(), leases_to_release).await;
         drain_state_result?;
         drain_publish_result?;
         heartbeat_result?;
         lease_result?;
-        cluster_result
+        cluster_result?;
+        release_result
     }
 }
 
@@ -685,6 +688,16 @@ impl RoutedGraphCluster {
             .read()
             .ok()
             .and_then(|leases| leases.get(cell_id).cloned())
+    }
+
+    pub fn local_leases(&self) -> Result<Vec<ShardLease>> {
+        Ok(self
+            .leases
+            .read()
+            .map_err(lock_error)?
+            .values()
+            .cloned()
+            .collect())
     }
 
     pub async fn renew_leases(
@@ -1261,6 +1274,27 @@ fn validate_graph_node_interval(field: &'static str, interval: Duration) -> Resu
         });
     }
     Ok(())
+}
+
+async fn release_graph_node_leases(
+    control: &GraphControlPlane,
+    leases: Vec<ShardLease>,
+) -> Result<()> {
+    let mut first_error = None;
+    for lease in leases {
+        match control.release_lease(&lease).await {
+            Ok(_) => {}
+            Err(GraphError::StaleShardLease { .. }) => {}
+            Err(err) if first_error.is_none() => {
+                first_error = Some(err);
+            }
+            Err(_) => {}
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 fn managed_node_closed_error() -> GraphError {
