@@ -635,13 +635,7 @@ impl GraphShard {
         };
         commit_txn_strict(txn, self.await_durable_writes).await?;
 
-        if let Some(read_epoch) = self.min_active_read_epoch(cell_id).await? {
-            return Err(GraphError::ActiveReadLease {
-                operation: "drop_cell",
-                cell_id: cell_id.to_string(),
-                read_epoch,
-            });
-        }
+        self.wait_for_drop_read_leases(cell_id).await?;
 
         let mut deleted_keys = 0_u64;
         let mut batches = 0_u64;
@@ -706,6 +700,31 @@ impl GraphShard {
         let deleted = keys.len() as u64;
         commit_txn_strict(txn, self.await_durable_writes).await?;
         Ok(deleted)
+    }
+
+    async fn wait_for_drop_read_leases(&self, cell_id: &str) -> Result<()> {
+        if self.retention_policy.read_lease_ttl_ms == 0 {
+            return Ok(());
+        }
+        let started_ms = graph_now_millis();
+        let timeout_ms = self
+            .retention_policy
+            .read_lease_ttl_ms
+            .saturating_add(1_000);
+        loop {
+            let Some(read_epoch) = self.min_active_read_epoch(cell_id).await? else {
+                return Ok(());
+            };
+            if graph_now_millis().saturating_sub(started_ms) >= timeout_ms {
+                return Err(GraphError::ActiveReadLease {
+                    operation: "drop_cell",
+                    cell_id: cell_id.to_string(),
+                    read_epoch,
+                });
+            }
+            let sleep_ms = self.retention_policy.read_lease_ttl_ms.clamp(1, 50);
+            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+        }
     }
 
     pub async fn set_edge_metadata(
