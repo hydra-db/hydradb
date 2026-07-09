@@ -273,8 +273,9 @@ impl GraphShard {
         Path::from_iter(["__slatedb_graph_kernel", "write_locks", db_path, cell_id])
     }
 
-    pub(crate) fn matrix_artifact_write_lock_path(
+    pub(crate) fn graph_artifact_write_lock_path(
         &self,
+        artifact_kind: &'static str,
         cell_id: &str,
         edge_type: &str,
         base_epoch: GraphEpoch,
@@ -285,14 +286,28 @@ impl GraphShard {
             self.store_path.as_ref()
         };
         let base_epoch = format!("{base_epoch:020}");
+        let lock_namespace = match artifact_kind {
+            "matrix" => "matrix_artifact_locks",
+            "posting" => "posting_artifact_locks",
+            _ => "artifact_locks",
+        };
         Path::from_iter([
             "__slatedb_graph_kernel",
-            "matrix_artifact_locks",
+            lock_namespace,
             db_path,
             cell_id,
             edge_type,
             &base_epoch,
         ])
+    }
+
+    pub(crate) fn matrix_artifact_write_lock_path(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+    ) -> Path {
+        self.graph_artifact_write_lock_path("matrix", cell_id, edge_type, base_epoch)
     }
 
     pub(crate) async fn acquire_cell_write_lock(
@@ -315,6 +330,20 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         let path = self.matrix_artifact_write_lock_path(cell_id, edge_type, base_epoch);
+        self.acquire_write_lock_at_path(path, cell_id, operation)
+            .await
+    }
+
+    pub(crate) async fn acquire_posting_artifact_write_lock(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+        operation: &'static str,
+    ) -> Result<CellWriteLock> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let path = self.graph_artifact_write_lock_path("posting", cell_id, edge_type, base_epoch);
         self.acquire_write_lock_at_path(path, cell_id, operation)
             .await
     }

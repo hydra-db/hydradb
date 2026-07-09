@@ -2174,6 +2174,61 @@ async fn matrix_artifact_write_lock_is_epoch_scoped_and_cell_lock_independent() 
 }
 
 #[tokio::test]
+async fn posting_artifact_write_lock_is_epoch_scoped_and_matrix_independent() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard(
+        "graph/posting-artifact-write-lock-scope",
+        Arc::clone(&object_store),
+    )
+    .await;
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+    let base_epoch = 9;
+
+    let posting_lock = shard
+        .acquire_posting_artifact_write_lock(cell_id, edge_type, base_epoch, "build_posting_chunks")
+        .await
+        .unwrap();
+    let same_epoch_err = match shard
+        .acquire_posting_artifact_write_lock(
+            cell_id,
+            edge_type,
+            base_epoch,
+            "contending-posting-builder",
+        )
+        .await
+    {
+        Ok(_) => panic!("contending builder acquired posting artifact write lock"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        same_epoch_err,
+        GraphError::CellWriteConflict {
+            operation: "contending-posting-builder",
+            ref cell_id
+        } if cell_id == "reddit-home"
+    ));
+
+    let matrix_lock = shard
+        .acquire_matrix_artifact_write_lock(cell_id, edge_type, base_epoch, "matrix-builder")
+        .await
+        .unwrap();
+    let next_epoch_lock = shard
+        .acquire_posting_artifact_write_lock(
+            cell_id,
+            edge_type,
+            base_epoch + 1,
+            "different-posting-epoch",
+        )
+        .await
+        .unwrap();
+
+    next_epoch_lock.release().await.unwrap();
+    matrix_lock.release().await.unwrap();
+    posting_lock.release().await.unwrap();
+}
+
+#[tokio::test]
 async fn trusted_segment_append_replay_with_new_job_id_does_not_double_count_degree() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
@@ -6947,6 +7002,46 @@ async fn posting_chunks_validate_manifest_checksums() {
         .await
         .unwrap_err();
     assert!(matches!(err, GraphError::CorruptValue { .. }));
+}
+
+#[tokio::test]
+async fn build_posting_chunks_rejects_incompatible_republish() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/posting-incompatible-republish", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "REBUILD_POSTING_EDGE";
+
+    for (idx, dst) in [2, 3, 4].into_iter().enumerate() {
+        shard
+            .write_edge(typed_mutation(
+                cell_id,
+                edge_type,
+                1,
+                dst,
+                &format!("posting-republish-seed-{idx}"),
+            ))
+            .await
+            .unwrap();
+    }
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    shard
+        .build_posting_chunks(cell_id, edge_type, base_epoch, 2)
+        .await
+        .unwrap();
+
+    let err = shard
+        .build_posting_chunks(cell_id, edge_type, base_epoch, 3)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GraphError::CorruptValue { .. }));
+
+    let chunks = shard
+        .posting_chunks(cell_id, edge_type, ArtifactDirection::Out, 1, base_epoch)
+        .await
+        .unwrap();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].vertices, vec![2, 3]);
+    assert_eq!(chunks[1].vertices, vec![4]);
 }
 
 #[tokio::test]
