@@ -5644,6 +5644,13 @@ impl GraphShard {
                         epoch,
                     },
                 });
+                if budget.is_some() {
+                    ensure_limit(
+                        "query_outbox_batch_records",
+                        records.len() as u64,
+                        self.limits.max_query_scan_edges,
+                    )?;
+                }
             }
         }
         sort_deltas(&mut records);
@@ -5675,6 +5682,13 @@ impl GraphShard {
             }
             if record.edge.edge_type == edge_type && record.edge.epoch > after_epoch {
                 records.push(record);
+                if budget.is_some() {
+                    ensure_limit(
+                        "query_outbox_delta_records",
+                        records.len() as u64,
+                        self.limits.max_query_scan_edges,
+                    )?;
+                }
             }
         }
         sort_deltas(&mut records);
@@ -5778,6 +5792,13 @@ impl GraphShard {
                             epoch: artifact.base_epoch,
                         },
                     );
+                    if budget.is_some() {
+                        ensure_limit(
+                            "query_edges_at_base",
+                            edges.len() as u64,
+                            self.limits.max_query_scan_edges,
+                        )?;
+                    }
                 }
             }
             artifact.base_epoch
@@ -5793,6 +5814,13 @@ impl GraphShard {
             match delta.kind {
                 DeltaKind::Plus => {
                     edges.insert(key, delta.edge);
+                    if budget.is_some() {
+                        ensure_limit(
+                            "query_edges_at_overlay",
+                            edges.len() as u64,
+                            self.limits.max_query_scan_edges,
+                        )?;
+                    }
                 }
                 DeltaKind::Minus => {
                     edges.remove(&key);
