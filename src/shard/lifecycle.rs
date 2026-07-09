@@ -606,7 +606,7 @@ impl GraphShard {
         cell_id: &str,
         operation: &'static str,
     ) -> Result<()> {
-        if operation != "drop_cell" {
+        if operation != "drop_cell" && operation != "prune_read_leases" {
             let drop_marker = keys::cell_drop_marker(cell_id);
             let pending_drop_marker = keys::cell_drop_pending_marker(cell_id);
             if read_txn_remote(txn, &drop_marker).await?.is_some()
@@ -643,7 +643,11 @@ impl GraphShard {
         }
     }
 
-    async fn publish_read_lease(&self, cell_id: &str, read_epoch: GraphEpoch) -> Result<()> {
+    pub(crate) async fn publish_read_lease(
+        &self,
+        cell_id: &str,
+        read_epoch: GraphEpoch,
+    ) -> Result<()> {
         if self.retention_policy.read_lease_ttl_ms == 0 {
             return Ok(());
         }
@@ -674,7 +678,7 @@ impl GraphShard {
         Ok(())
     }
 
-    async fn min_active_read_epoch(&self, cell_id: &str) -> Result<Option<GraphEpoch>> {
+    pub(crate) async fn min_active_read_epoch(&self, cell_id: &str) -> Result<Option<GraphEpoch>> {
         if self.retention_policy.read_lease_ttl_ms == 0 {
             return Ok(None);
         }
@@ -890,8 +894,7 @@ impl GraphShard {
 
     pub async fn snapshot(&self, cell_id: &str) -> Result<GraphSnapshot<'_>> {
         validate_component("cell_id", cell_id)?;
-        let read_epoch = self.current_epoch(cell_id).await?;
-        self.publish_read_lease(cell_id, read_epoch).await?;
+        let read_epoch = self.pin_current_read_epoch(cell_id, "snapshot").await?;
         Ok(GraphSnapshot {
             shard: self,
             cell_id: cell_id.to_string(),
@@ -913,7 +916,8 @@ impl GraphShard {
                 current_epoch,
             });
         }
-        self.publish_read_lease(cell_id, read_epoch).await?;
+        self.pin_read_epoch(cell_id, "snapshot_at", read_epoch)
+            .await?;
         Ok(GraphSnapshot {
             shard: self,
             cell_id: cell_id.to_string(),

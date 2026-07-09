@@ -635,6 +635,14 @@ impl GraphShard {
         };
         commit_txn_strict(txn, self.await_durable_writes).await?;
 
+        if let Some(read_epoch) = self.min_active_read_epoch(cell_id).await? {
+            return Err(GraphError::ActiveReadLease {
+                operation: "drop_cell",
+                cell_id: cell_id.to_string(),
+                read_epoch,
+            });
+        }
+
         let mut deleted_keys = 0_u64;
         let mut batches = 0_u64;
         let mut pending = Vec::new();
