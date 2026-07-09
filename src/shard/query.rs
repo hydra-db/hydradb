@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "opencypher")]
+use std::time::Duration;
 
 impl GraphShard {
     pub async fn execute_cypher(&self, context: QueryContext, query: &str) -> Result<QueryOutput> {

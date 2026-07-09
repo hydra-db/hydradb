@@ -369,112 +369,14 @@ impl GraphShard {
         cell_id: &str,
         operation: &'static str,
     ) -> Result<CellWriteLock> {
-        let owner_token = new_cell_write_lock_owner_token();
-
-        for attempt in 0..GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS {
-            let now_ms = graph_now_millis();
-            let payload = encode_cell_write_lock_record(
-                cell_id,
-                operation,
-                &owner_token,
-                now_ms,
-                now_ms.saturating_add(GRAPH_CELL_WRITE_LOCK_TTL_MS),
-                CellWriteLockState::Active,
-            );
-            match self
-                .object_store
-                .put_opts(&path, payload.clone().into(), PutMode::Create.into())
-                .await
-            {
-                Ok(_) => {
-                    return Ok(CellWriteLock {
-                        object_store: Arc::clone(&self.object_store),
-                        path: path.clone(),
-                        owner_token: owner_token.clone(),
-                    });
-                }
-                Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
-                    if let Some(lock) = self
-                        .try_reclaim_cell_write_lock(&path, cell_id, operation, &owner_token)
-                        .await?
-                    {
-                        return Ok(lock);
-                    }
-                    if attempt + 1 < GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(GRAPH_CELL_WRITE_LOCK_BACKOFF_MS))
-                            .await;
-                        continue;
-                    }
-                    return Err(GraphError::CellWriteConflict {
-                        operation,
-                        cell_id: cell_id.to_string(),
-                    });
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
-
-        Err(GraphError::CellWriteConflict {
-            operation,
-            cell_id: cell_id.to_string(),
-        })
-    }
-
-    async fn try_reclaim_cell_write_lock(
-        &self,
-        path: &Path,
-        cell_id: &str,
-        operation: &'static str,
-        owner_token: &str,
-    ) -> Result<Option<CellWriteLock>> {
-        let current = match self.object_store.get(path).await {
-            Ok(current) => current,
-            Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
-        let version = UpdateVersion {
-            e_tag: current.meta.e_tag.clone(),
-            version: current.meta.version.clone(),
-        };
-        let value = current.bytes().await?;
-        let record = decode_cell_write_lock_record(path.as_ref(), &value)?;
-        if record.cell_id != cell_id {
-            return Err(GraphError::CorruptValue {
-                key: path.to_string(),
-                reason: format!(
-                    "cell write lock belongs to cell {}, expected {cell_id}",
-                    record.cell_id
-                ),
-            });
-        }
-        let now_ms = graph_now_millis();
-        if !record.is_expired(now_ms) {
-            return Ok(None);
-        }
-        let payload = encode_cell_write_lock_record(
+        acquire_distributed_write_lock(
+            Arc::clone(&self.object_store),
+            path,
             cell_id,
             operation,
-            owner_token,
-            now_ms,
-            now_ms.saturating_add(GRAPH_CELL_WRITE_LOCK_TTL_MS),
-            CellWriteLockState::Active,
-        );
-        match self
-            .object_store
-            .put_opts(path, payload.into(), PutMode::Update(version).into())
-            .await
-        {
-            Ok(_) => Ok(Some(CellWriteLock {
-                object_store: Arc::clone(&self.object_store),
-                path: path.clone(),
-                owner_token: owner_token.to_string(),
-            })),
-            Err(slatedb::object_store::Error::Precondition { .. })
-            | Err(slatedb::object_store::Error::NotFound { .. })
-            | Err(slatedb::object_store::Error::NotImplemented { .. })
-            | Err(slatedb::object_store::Error::NotSupported { .. }) => Ok(None),
-            Err(err) => Err(err.into()),
-        }
+            GRAPH_CELL_WRITE_LOCK_TTL_MS,
+        )
+        .await
     }
 
     pub async fn graph_cache_entry_counts(&self) -> GraphCacheEntryCounts {

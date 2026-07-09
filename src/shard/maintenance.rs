@@ -615,6 +615,51 @@ impl GraphShard {
         })
     }
 
+    pub(crate) async fn write_graph_batch_strict_guarded(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+        guards: Vec<GraphWriteGuard>,
+        batch: GraphWriteBatch,
+    ) -> Result<()> {
+        validate_component("cell_id", cell_id)?;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let record_count = batch.len();
+        let started = std::time::Instant::now();
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .write_graph_batch_guarded_txn(cell_id, operation, &guards, batch.clone())
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(()) => {
+                    self.record_graph_batch_commit(operation, record_count, started.elapsed());
+                    return Ok(());
+                }
+                result => return result,
+            }
+        }
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
+    }
+
     pub(crate) async fn write_graph_batch_strict_with_cell_lock(
         &self,
         cell_id: &str,
@@ -640,6 +685,45 @@ impl GraphShard {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
         self.validate_write_fence_txn(&txn, cell_id, operation)
             .await?;
+        for op in batch.ops {
+            match op {
+                GraphWriteOp::Put(key, value) => txn.put(key.as_ref(), value.as_ref())?,
+                GraphWriteOp::Delete(key) => txn.delete(key.as_ref())?,
+            }
+        }
+        commit_txn_strict(txn, self.await_durable_writes).await
+    }
+
+    async fn write_graph_batch_guarded_txn(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+        guards: &[GraphWriteGuard],
+        batch: GraphWriteBatch,
+    ) -> Result<()> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, operation)
+            .await?;
+        for guard in guards {
+            let (key, matches) = match guard {
+                GraphWriteGuard::Absent(key) => {
+                    let key_text = String::from_utf8_lossy(key).into_owned();
+                    let matches = read_txn_remote(&txn, &key_text).await?.is_none();
+                    (key_text, matches)
+                }
+                GraphWriteGuard::Equals(key, expected) => {
+                    let key_text = String::from_utf8_lossy(key).into_owned();
+                    let matches = read_txn_remote(&txn, &key_text)
+                        .await?
+                        .as_ref()
+                        .is_some_and(|actual| actual.as_ref() == expected.as_ref());
+                    (key_text, matches)
+                }
+            };
+            if !matches {
+                return Err(GraphError::ConditionalWriteConflict { operation, key });
+            }
+        }
         for op in batch.ops {
             match op {
                 GraphWriteOp::Put(key, value) => txn.put(key.as_ref(), value.as_ref())?,

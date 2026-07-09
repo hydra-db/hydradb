@@ -859,6 +859,13 @@ impl RoutedGraphCluster {
             placement,
             object_store,
             options: GraphOpenOptions::default(),
+            shard_db_handles: Arc::new(RwLock::new(
+                shards
+                    .iter()
+                    .map(|(cell_id, shard)| (cell_id.clone(), shard.db.clone()))
+                    .collect(),
+            )),
+            revoked_cells: Arc::new(RwLock::new(BTreeSet::new())),
             shards,
             leases: Arc::new(RwLock::new(BTreeMap::new())),
         })
@@ -955,6 +962,13 @@ impl RoutedGraphCluster {
             placement,
             object_store,
             options,
+            shard_db_handles: Arc::new(RwLock::new(
+                shards
+                    .iter()
+                    .map(|(cell_id, shard)| (cell_id.clone(), shard.db.clone()))
+                    .collect(),
+            )),
+            revoked_cells: Arc::new(RwLock::new(BTreeSet::new())),
             shards,
             leases,
         })
@@ -1018,11 +1032,33 @@ impl RoutedGraphCluster {
             .cloned()
             .collect();
         for lease in leases {
-            let renewed = control.renew_lease(&lease, lease_ttl).await?;
-            self.leases
-                .write()
-                .map_err(lock_error)?
-                .insert(renewed.cell_id.clone(), renewed);
+            match control.renew_lease(&lease, lease_ttl).await {
+                Ok(renewed) => {
+                    self.leases
+                        .write()
+                        .map_err(lock_error)?
+                        .insert(renewed.cell_id.clone(), renewed);
+                }
+                Err(GraphError::StaleShardLease {
+                    cell_id,
+                    node_id,
+                    lease_token,
+                }) => {
+                    revoke_local_shard_after_lease_loss(
+                        &self.leases,
+                        &self.shard_db_handles,
+                        &self.revoked_cells,
+                        &cell_id,
+                    )
+                    .await?;
+                    return Err(GraphError::StaleShardLease {
+                        cell_id,
+                        node_id,
+                        lease_token,
+                    });
+                }
+                Err(err) => return Err(err),
+            }
         }
         Ok(())
     }
@@ -1037,17 +1073,34 @@ impl RoutedGraphCluster {
             .cells_for_node(&self.local_node_id)?
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let current_cells = self.shards.keys().cloned().collect::<BTreeSet<_>>();
         let mut report = GraphShardRefreshReport::default();
+
+        let revoked_cells = {
+            let mut revoked = self.revoked_cells.write().map_err(lock_error)?;
+            std::mem::take(&mut *revoked)
+        };
+        for cell_id in revoked_cells {
+            self.leases.write().map_err(lock_error)?.remove(&cell_id);
+            self.shard_db_handles
+                .write()
+                .map_err(lock_error)?
+                .remove(&cell_id);
+            if let Some(shard) = self.shards.remove(&cell_id) {
+                close_revoked_shard(&shard).await?;
+                report.closed_cells.push(cell_id);
+            }
+        }
+
+        let current_cells = self.shards.keys().cloned().collect::<BTreeSet<_>>();
 
         for cell_id in current_cells.difference(&target_cells) {
             let released_lease = self.leases.write().map_err(lock_error)?.remove(cell_id);
+            self.shard_db_handles
+                .write()
+                .map_err(lock_error)?
+                .remove(cell_id);
             if let Some(shard) = self.shards.remove(cell_id) {
-                match shard.close().await {
-                    Ok(()) => {}
-                    Err(GraphError::Slate(err)) if matches!(err.kind(), ErrorKind::Closed(_)) => {}
-                    Err(err) => return Err(err),
-                }
+                close_revoked_shard(&shard).await?;
             }
             if let Some(lease) = released_lease {
                 release_graph_node_leases(control, vec![lease]).await?;
@@ -1103,6 +1156,10 @@ impl RoutedGraphCluster {
                 release_graph_node_leases(control, vec![lease]).await?;
                 return Err(err);
             }
+            self.shard_db_handles
+                .write()
+                .map_err(lock_error)?
+                .insert(cell_id.clone(), shard.db.clone());
             self.shards.insert(cell_id.clone(), shard);
             report.opened_cells.push(cell_id.clone());
         }
@@ -1189,6 +1246,8 @@ impl RoutedGraphCluster {
             });
         }
         let leases = Arc::clone(&self.leases);
+        let shard_db_handles = Arc::clone(&self.shard_db_handles);
+        let revoked_cells = Arc::clone(&self.revoked_cells);
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
             loop {
@@ -1219,7 +1278,13 @@ impl RoutedGraphCluster {
                                         cell_id,
                                         "lease renewal lost shard lease"
                                     );
-                                    leases.write().map_err(lock_error)?.remove(&cell_id);
+                                    revoke_local_shard_after_lease_loss(
+                                        &leases,
+                                        &shard_db_handles,
+                                        &revoked_cells,
+                                        &cell_id,
+                                    )
+                                    .await?;
                                 }
                                 Err(GraphError::Slate(err))
                                     if err.kind() == ErrorKind::Transaction =>
@@ -1630,7 +1695,7 @@ impl RoutedGraphCluster {
 
     pub async fn close(&self) -> Result<()> {
         for shard in self.shards.values() {
-            shard.close().await?;
+            close_revoked_shard(shard).await?;
         }
         Ok(())
     }
@@ -1638,15 +1703,53 @@ impl RoutedGraphCluster {
     async fn remove_local_cell(&mut self, cell_id: &str) -> Result<()> {
         validate_component("cell_id", cell_id)?;
         self.leases.write().map_err(lock_error)?.remove(cell_id);
+        self.shard_db_handles
+            .write()
+            .map_err(lock_error)?
+            .remove(cell_id);
+        self.revoked_cells
+            .write()
+            .map_err(lock_error)?
+            .remove(cell_id);
         self.placement.owners.remove(cell_id);
         if let Some(shard) = self.shards.remove(cell_id) {
-            match shard.close().await {
-                Ok(()) => {}
-                Err(GraphError::Slate(err)) if matches!(err.kind(), ErrorKind::Closed(_)) => {}
-                Err(err) => return Err(err),
-            }
+            close_revoked_shard(&shard).await?;
         }
         Ok(())
+    }
+}
+
+async fn revoke_local_shard_after_lease_loss(
+    leases: &Arc<RwLock<BTreeMap<String, ShardLease>>>,
+    shard_db_handles: &Arc<RwLock<BTreeMap<String, Db>>>,
+    revoked_cells: &Arc<RwLock<BTreeSet<String>>>,
+    cell_id: &str,
+) -> Result<()> {
+    leases.write().map_err(lock_error)?.remove(cell_id);
+    revoked_cells
+        .write()
+        .map_err(lock_error)?
+        .insert(cell_id.to_string());
+    let db = shard_db_handles
+        .read()
+        .map_err(lock_error)?
+        .get(cell_id)
+        .cloned();
+    if let Some(db) = db {
+        match db.close().await {
+            Ok(()) => {}
+            Err(err) if matches!(err.kind(), ErrorKind::Closed(_)) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+async fn close_revoked_shard(shard: &GraphShard) -> Result<()> {
+    match shard.close().await {
+        Ok(()) => Ok(()),
+        Err(GraphError::Slate(err)) if matches!(err.kind(), ErrorKind::Closed(_)) => Ok(()),
+        Err(err) => Err(err),
     }
 }
 

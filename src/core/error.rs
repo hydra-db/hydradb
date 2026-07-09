@@ -12,6 +12,11 @@ pub enum GraphError {
         operation: &'static str,
         cell_id: String,
     },
+    #[error("conditional graph write conflict for {operation} at {key}")]
+    ConditionalWriteConflict {
+        operation: &'static str,
+        key: String,
+    },
     #[error("{operation} requires await_durable_writes=true: {reason}")]
     UnsafeDurabilityConfig {
         operation: &'static str,
