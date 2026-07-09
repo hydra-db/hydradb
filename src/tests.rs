@@ -7040,6 +7040,132 @@ async fn posting_abort_cleanup_preserves_published_epoch_manifest() {
 }
 
 #[tokio::test]
+async fn supernode_groups_ignore_unpublished_orphan_records() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/supernode-orphan-hidden", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "SUPER_ORPHAN_EDGE";
+    let base_epoch = 13;
+    let chunk_key = format!(
+        "cell/{cell_id}/artifact/posting/{edge_type}/out/{:020}/{base_epoch:020}/{:020}",
+        1, 0
+    );
+    let group_key = format!(
+        "cell/{cell_id}/artifact/supernode/{edge_type}/out/{:020}/{base_epoch:020}",
+        1
+    );
+    let chunk_value = format!("posting1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t0\t2,3\n");
+    let group_value =
+        format!("supernode3\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t2\t1\t2\t0:2:3\n");
+
+    let mut batch = GraphWriteBatch::new();
+    batch.put(chunk_key.as_bytes(), chunk_value.as_bytes());
+    batch.put(group_key.as_bytes(), group_value.as_bytes());
+    shard
+        .write_graph_batch_strict(cell_id, "test_seed_unpublished_supernode_artifacts", batch)
+        .await
+        .unwrap();
+
+    assert!(shard
+        .supernode_group(cell_id, edge_type, ArtifactDirection::Out, 1, base_epoch)
+        .await
+        .unwrap()
+        .is_none());
+
+    let cleanup = engine::cleanup_unpublished_supernode_artifact_epoch(
+        &shard,
+        cell_id,
+        edge_type,
+        base_epoch,
+        "test_cleanup_unpublished_supernode_artifacts",
+    )
+    .await;
+    assert_eq!(cleanup.deleted_keys, 2);
+    assert_eq!(cleanup.cleanup_errors, 0);
+    assert!(!cleanup.skipped_published_manifest);
+    assert!(shard.read_remote(&chunk_key).await.unwrap().is_none());
+    assert!(shard.read_remote(&group_key).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn supernode_build_publishes_epoch_manifest() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/supernode-publishes-manifest", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "SUPER_MANIFEST_EDGE";
+    for dst in 10..14 {
+        shard
+            .write_edge(typed_mutation(
+                cell_id,
+                edge_type,
+                1,
+                dst,
+                &format!("super-manifest-{dst}"),
+            ))
+            .await
+            .unwrap();
+    }
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    shard
+        .build_supernode_groups(cell_id, edge_type, base_epoch, 2, 2)
+        .await
+        .unwrap();
+    let manifest_key =
+        format!("cell/{cell_id}/artifact/supernode_epoch_manifest/{edge_type}/{base_epoch:020}");
+    assert!(shard.read_remote(&manifest_key).await.unwrap().is_some());
+    assert_eq!(
+        shard
+            .supernode_page(cell_id, edge_type, ArtifactDirection::Out, 1, base_epoch, 0)
+            .await
+            .unwrap()
+            .unwrap()
+            .vertices,
+        vec![10, 11]
+    );
+}
+
+#[tokio::test]
+async fn supernode_abort_cleanup_preserves_published_epoch_manifest() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/supernode-cleanup-published", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "SUPER_CLEANUP_PUBLISHED_EDGE";
+    for dst in 20..24 {
+        shard
+            .write_edge(typed_mutation(
+                cell_id,
+                edge_type,
+                1,
+                dst,
+                &format!("super-cleanup-published-{dst}"),
+            ))
+            .await
+            .unwrap();
+    }
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    shard
+        .build_supernode_groups(cell_id, edge_type, base_epoch, 2, 2)
+        .await
+        .unwrap();
+    let manifest_key =
+        format!("cell/{cell_id}/artifact/supernode_epoch_manifest/{edge_type}/{base_epoch:020}");
+    assert!(shard.read_remote(&manifest_key).await.unwrap().is_some());
+
+    let cleanup = engine::cleanup_unpublished_supernode_artifact_epoch(
+        &shard,
+        cell_id,
+        edge_type,
+        base_epoch,
+        "test_cleanup_published_supernode_artifacts",
+    )
+    .await;
+    assert_eq!(cleanup.deleted_keys, 0);
+    assert_eq!(cleanup.cleanup_errors, 0);
+    assert!(cleanup.skipped_published_manifest);
+    assert!(shard.read_remote(&manifest_key).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn posting_chunks_require_all_manifest_chunks() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/posting-manifest-missing-chunk", object_store).await;

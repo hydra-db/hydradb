@@ -289,6 +289,7 @@ impl GraphShard {
         let lock_namespace = match artifact_kind {
             "matrix" => "matrix_artifact_locks",
             "posting" => "posting_artifact_locks",
+            "supernode" => "supernode_artifact_locks",
             _ => "artifact_locks",
         };
         Path::from_iter([
@@ -344,6 +345,20 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         let path = self.graph_artifact_write_lock_path("posting", cell_id, edge_type, base_epoch);
+        self.acquire_write_lock_at_path(path, cell_id, operation)
+            .await
+    }
+
+    pub(crate) async fn acquire_supernode_artifact_write_lock(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+        operation: &'static str,
+    ) -> Result<CellWriteLock> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let path = self.graph_artifact_write_lock_path("supernode", cell_id, edge_type, base_epoch);
         self.acquire_write_lock_at_path(path, cell_id, operation)
             .await
     }
