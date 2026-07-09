@@ -736,13 +736,16 @@ impl RoutedGraphCluster {
         let mut report = GraphShardRefreshReport::default();
 
         for cell_id in current_cells.difference(&target_cells) {
-            self.leases.write().map_err(lock_error)?.remove(cell_id);
+            let released_lease = self.leases.write().map_err(lock_error)?.remove(cell_id);
             if let Some(shard) = self.shards.remove(cell_id) {
                 match shard.close().await {
                     Ok(()) => {}
                     Err(GraphError::Slate(err)) if matches!(err.kind(), ErrorKind::Closed(_)) => {}
                     Err(err) => return Err(err),
                 }
+            }
+            if let Some(lease) = released_lease {
+                release_graph_node_leases(control, vec![lease]).await?;
             }
             report.closed_cells.push(cell_id.clone());
         }
