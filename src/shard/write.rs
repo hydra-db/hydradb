@@ -15,6 +15,8 @@ struct DeleteOutboxRun {
     edges: Vec<(VertexId, VertexId)>,
 }
 
+const VERTEX_DELETE_LOCK_RENEW_ITEMS: u64 = 64;
+
 impl GraphShard {
     pub async fn set_vertex_metadata(
         &self,
@@ -355,7 +357,14 @@ impl GraphShard {
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             let lock = self.acquire_cell_write_lock(cell_id, operation).await?;
             let result = self
-                .delete_vertex_txn_locked(cell_id, vertex_id, idempotency_key, detach, operation)
+                .delete_vertex_txn_locked(
+                    cell_id,
+                    vertex_id,
+                    idempotency_key,
+                    detach,
+                    operation,
+                    &lock,
+                )
                 .await;
             match release_cell_write_lock(lock, result).await {
                 Err(err)
@@ -394,6 +403,7 @@ impl GraphShard {
         idempotency_key: &str,
         detach: bool,
         operation: &'static str,
+        lock: &CellWriteLock,
     ) -> Result<VertexDeleteResult> {
         let idem_key = keys::idempotency(cell_id, "vertex-delete", idempotency_key);
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
@@ -412,7 +422,7 @@ impl GraphShard {
         drop(txn);
 
         let incident_edges = self
-            .incident_edges_for_vertex_at(cell_id, vertex_id, read_epoch)
+            .incident_edges_for_vertex_at(cell_id, vertex_id, read_epoch, lock)
             .await?;
         if !detach && !incident_edges.is_empty() {
             return Err(GraphError::UnsupportedQuery {
@@ -427,7 +437,8 @@ impl GraphShard {
         let mut incident_edges_deleted = 0_u64;
         let mut relationships_deleted = 0_u64;
         if detach {
-            for edge in incident_edges {
+            for (idx, edge) in incident_edges.into_iter().enumerate() {
+                renew_vertex_delete_lock_after_items(lock, idx as u64).await?;
                 let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
                 self.validate_write_fence_txn(&txn, cell_id, operation)
                     .await?;
@@ -458,10 +469,12 @@ impl GraphShard {
                     if delete.deleted {
                         incident_edges_deleted = incident_edges_deleted.saturating_add(1);
                     }
+                    lock.renew().await?;
                     continue;
                 }
 
                 for relationship in relationships {
+                    lock.renew().await?;
                     let mutation = EdgeMutation {
                         cell_id: cell_id.to_string(),
                         edge_type: relationship.edge_type.clone(),
@@ -480,6 +493,7 @@ impl GraphShard {
                     }
                 }
                 incident_edges_deleted = incident_edges_deleted.saturating_add(1);
+                lock.renew().await?;
             }
         }
 
@@ -565,6 +579,7 @@ impl GraphShard {
         cell_id: &str,
         vertex_id: VertexId,
         read_epoch: GraphEpoch,
+        lock: &CellWriteLock,
     ) -> Result<BTreeSet<IncidentEdge>> {
         let mut edges = BTreeSet::new();
         let mut scanned = 0_u64;
@@ -574,6 +589,7 @@ impl GraphShard {
             .await?;
         while let Some(kv) = out_iter.next().await? {
             scanned = scanned.saturating_add(1);
+            renew_vertex_delete_lock_after_items(lock, scanned).await?;
             ensure_limit(
                 "delete_vertex_scan_edges",
                 scanned,
@@ -595,6 +611,7 @@ impl GraphShard {
             .await?;
         while let Some(kv) = relationship_iter.next().await? {
             scanned = scanned.saturating_add(1);
+            renew_vertex_delete_lock_after_items(lock, scanned).await?;
             ensure_limit(
                 "delete_vertex_scan_relationships",
                 scanned,
@@ -632,6 +649,7 @@ impl GraphShard {
             .await?;
         while let Some(kv) = segment_iter.next().await? {
             scanned = scanned.saturating_add(1);
+            renew_vertex_delete_lock_after_items(lock, scanned).await?;
             ensure_limit(
                 "delete_vertex_scan_segments",
                 scanned,
@@ -4744,6 +4762,16 @@ fn validate_unique_delete_mutation_identities(mutations: &[EdgeMutation]) -> Res
                 idempotency_key: format!("{first_key},{}", mutation.idempotency_key),
             });
         }
+    }
+    Ok(())
+}
+
+async fn renew_vertex_delete_lock_after_items(lock: &CellWriteLock, items: u64) -> Result<()> {
+    if items == 0
+        || (items >= VERTEX_DELETE_LOCK_RENEW_ITEMS
+            && items / VERTEX_DELETE_LOCK_RENEW_ITEMS * VERTEX_DELETE_LOCK_RENEW_ITEMS == items)
+    {
+        lock.renew().await?;
     }
     Ok(())
 }
