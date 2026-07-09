@@ -6061,6 +6061,70 @@ async fn cluster_controller_fails_closed_without_active_nodes() {
 }
 
 #[tokio::test]
+async fn cluster_controller_prunes_expired_heartbeats_boundedly() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/controller-heartbeat-prune", object_store)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-a", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-b", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-live", GraphNodeHealthState::Active, 1_200)
+        .await
+        .unwrap();
+    let config = GraphClusterControllerConfig::new(
+        ["reddit-home"],
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap()
+    .with_expired_heartbeat_prune_limit(1);
+
+    let report = control.reconcile_cluster_at(&config, 1_101).await.unwrap();
+    assert_eq!(report.expired_nodes, vec!["node-a", "node-b"]);
+    assert_eq!(report.pruned_expired_nodes, vec!["node-a"]);
+    assert!(control.node_heartbeat("node-a").await.unwrap().is_none());
+    assert!(control.node_heartbeat("node-b").await.unwrap().is_some());
+    assert!(control.node_heartbeat("node-live").await.unwrap().is_some());
+    assert_eq!(control.graph_control_metrics().node_heartbeat_prunes, 1);
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_heartbeat_prune_does_not_delete_refreshed_generation() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/controller-heartbeat-race", object_store)
+        .await
+        .unwrap();
+    let expired = control
+        .publish_node_heartbeat_at("node-a", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    let refreshed = control
+        .publish_node_heartbeat_at("node-a", GraphNodeHealthState::Active, 1_200)
+        .await
+        .unwrap();
+
+    let pruned = control
+        .prune_expired_node_heartbeats(&[expired], 1)
+        .await
+        .unwrap();
+    assert!(pruned.is_empty());
+    assert_eq!(
+        control.node_heartbeat("node-a").await.unwrap(),
+        Some(refreshed)
+    );
+    assert_eq!(control.graph_control_metrics().node_heartbeat_prunes, 0);
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn cluster_controller_discovers_cells_from_control_state() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = GraphControlPlane::open("graph-control/controller-discovery", object_store)

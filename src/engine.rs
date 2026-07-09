@@ -183,6 +183,7 @@ pub struct GraphControlMetricsSnapshot {
     pub repair_runs: u64,
     pub repair_actions: u64,
     pub node_heartbeat_writes: u64,
+    pub node_heartbeat_prunes: u64,
     pub controller_runs: u64,
     pub controller_reassignments: u64,
     pub controller_failovers: u64,
@@ -212,6 +213,7 @@ struct GraphControlMetrics {
     repair_runs: AtomicU64,
     repair_actions: AtomicU64,
     node_heartbeat_writes: AtomicU64,
+    node_heartbeat_prunes: AtomicU64,
     controller_runs: AtomicU64,
     controller_reassignments: AtomicU64,
     controller_failovers: AtomicU64,
@@ -242,6 +244,7 @@ impl GraphControlMetrics {
             repair_runs: self.repair_runs.load(Ordering::Relaxed),
             repair_actions: self.repair_actions.load(Ordering::Relaxed),
             node_heartbeat_writes: self.node_heartbeat_writes.load(Ordering::Relaxed),
+            node_heartbeat_prunes: self.node_heartbeat_prunes.load(Ordering::Relaxed),
             controller_runs: self.controller_runs.load(Ordering::Relaxed),
             controller_reassignments: self.controller_reassignments.load(Ordering::Relaxed),
             controller_failovers: self.controller_failovers.load(Ordering::Relaxed),
@@ -327,6 +330,7 @@ pub struct GraphClusterControllerConfig {
     pub lease_ttl: Duration,
     pub rebalance_mode: GraphClusterRebalanceMode,
     pub discover_existing_cells: bool,
+    pub max_expired_heartbeats_to_prune: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,6 +361,7 @@ pub struct GraphClusterControllerReport {
     pub active_nodes: Vec<String>,
     pub draining_nodes: Vec<String>,
     pub expired_nodes: Vec<String>,
+    pub pruned_expired_nodes: Vec<String>,
     pub unassigned_cells: Vec<String>,
     pub reassignments: Vec<GraphShardReassignment>,
     pub failed_over_leases: Vec<ShardLease>,
@@ -547,6 +552,7 @@ pub fn object_store_from_env(env_file: Option<String>) -> Result<Arc<dyn ObjectS
 }
 
 const GRAPH_CONTROL_TXN_MAX_RETRIES: usize = 32;
+const GRAPH_CONTROLLER_EXPIRED_HEARTBEAT_PRUNE_LIMIT: usize = 1024;
 const CONTROL_PLACEMENT_PREFIX: &str = "control/placement/";
 const CONTROL_NODE_PREFIX: &str = "control/node/";
 
