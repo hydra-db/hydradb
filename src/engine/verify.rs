@@ -392,21 +392,62 @@ impl GraphShard {
             {
                 record_mismatch(report, format!("posting:unsorted key={key}"));
             }
+            if !self
+                .posting_chunk_is_published_or_supernode_referenced(&chunk)
+                .await?
+            {
+                record_mismatch(report, format!("posting:unpublished-chunk key={key}"));
+            }
             posting_count = posting_count.saturating_add(1);
         }
         report.posting_chunks_checked = posting_count;
 
         let mut group_count = 0_u64;
+        let mut groups_by_epoch = BTreeMap::<GraphEpoch, Vec<SupernodeGroup>>::new();
         let mut group_iter = self
             .scan_remote_prefix(&format!("cell/{cell_id}/artifact/supernode/{edge_type}/"))
             .await?;
         while let Some(kv) = group_iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let group = decode_supernode_group(&key, &kv.value)?;
+            if self
+                .supernode_artifact_manifest(cell_id, edge_type, group.base_epoch)
+                .await?
+                .is_none()
+            {
+                record_mismatch(report, format!("supernode:unpublished-group key={key}"));
+            }
             group_count = group_count.saturating_add(1);
+            groups_by_epoch
+                .entry(group.base_epoch)
+                .or_default()
+                .push(group.clone());
             self.verify_supernode_group_chunks(&group, report).await?;
         }
         report.supernode_groups_checked = group_count;
+        for (base_epoch, groups) in groups_by_epoch {
+            if let Some(actual) = self
+                .supernode_artifact_manifest(cell_id, edge_type, base_epoch)
+                .await?
+            {
+                match supernode_artifact_manifest_from_groups(
+                    cell_id, edge_type, base_epoch, &groups,
+                )? {
+                    Some(expected) if expected == actual => {}
+                    Some(expected) => record_mismatch(
+                        report,
+                        format!(
+                            "supernode:manifest-mismatch base_epoch={base_epoch} expected_groups={} actual_groups={}",
+                            expected.group_count, actual.group_count
+                        ),
+                    ),
+                    None => record_mismatch(
+                        report,
+                        format!("supernode:empty-groups-with-manifest base_epoch={base_epoch}"),
+                    ),
+                }
+            }
+        }
 
         if let Some(rollup) = self.latest_rollup(cell_id, edge_type, read_epoch).await? {
             if let Some(artifact) = self
@@ -431,6 +472,46 @@ impl GraphShard {
             }
         }
         Ok(())
+    }
+
+    async fn posting_chunk_is_published_or_supernode_referenced(
+        &self,
+        chunk: &PostingChunk,
+    ) -> Result<bool> {
+        let posting_manifest_key =
+            posting_artifact_manifest_key(&chunk.cell_id, &chunk.edge_type, chunk.base_epoch);
+        if let Some(value) = self.read_remote(&posting_manifest_key).await? {
+            decode_posting_artifact_manifest(&posting_manifest_key, &value)?;
+            return Ok(true);
+        }
+        let group_key = format!(
+            "cell/{}/artifact/supernode/{}/{}/{:020}/{:020}",
+            chunk.cell_id,
+            chunk.edge_type,
+            direction_str(chunk.direction),
+            chunk.owner,
+            chunk.base_epoch
+        );
+        if self.read_remote(&group_key).await?.is_none() {
+            return Ok(false);
+        }
+        Ok(self
+            .supernode_artifact_manifest(&chunk.cell_id, &chunk.edge_type, chunk.base_epoch)
+            .await?
+            .is_some())
+    }
+
+    async fn supernode_artifact_manifest(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+    ) -> Result<Option<SupernodeArtifactManifest>> {
+        let key = supernode_artifact_manifest_key(cell_id, edge_type, base_epoch);
+        self.read_remote(&key)
+            .await?
+            .map(|value| decode_supernode_artifact_manifest(&key, &value))
+            .transpose()
     }
 
     async fn verify_supernode_group_chunks(
