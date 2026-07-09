@@ -4658,6 +4658,75 @@ async fn managed_graph_nodes_refresh_shards_in_background_after_failover() {
     control.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn managed_graph_node_allows_concurrent_routed_writes() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = Arc::new(
+        GraphControlPlane::open(
+            "graph-control/managed-concurrent",
+            Arc::clone(&object_store),
+        )
+        .await
+        .unwrap(),
+    );
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let node = Arc::new(
+        GraphNode::open_managed(
+            "graph-managed-concurrent",
+            "node-a",
+            Arc::clone(&control),
+            Arc::clone(&object_store),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .unwrap(),
+    );
+
+    let left = {
+        let node = Arc::clone(&node);
+        tokio::spawn(async move {
+            node.write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "managed-concurrent-left".to_string(),
+            })
+            .await
+        })
+    };
+    let right = {
+        let node = Arc::clone(&node);
+        tokio::spawn(async move {
+            node.write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 3,
+                idempotency_key: "managed-concurrent-right".to_string(),
+            })
+            .await
+        })
+    };
+    left.await.unwrap().unwrap();
+    right.await.unwrap().unwrap();
+    assert_eq!(
+        node.out_neighbors("reddit-home", "FOLLOWS", 1)
+            .await
+            .unwrap(),
+        vec![2, 3]
+    );
+
+    let node = Arc::try_unwrap(node).unwrap_or_else(|_| panic!("managed node still shared"));
+    node.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn managed_graph_node_executes_cypher_rows() {
