@@ -369,6 +369,13 @@ impl GraphShard {
             }
         }
 
+        let posting_manifests = self
+            .published_posting_artifact_manifests(cell_id, edge_type)
+            .await?;
+        let supernode_manifests = self
+            .published_supernode_artifact_manifests(cell_id, edge_type)
+            .await?;
+
         let mut posting_count = 0_u64;
         let mut posting_iter = self
             .scan_remote_prefix(&format!("cell/{cell_id}/artifact/posting/{edge_type}/"))
@@ -393,7 +400,11 @@ impl GraphShard {
                 record_mismatch(report, format!("posting:unsorted key={key}"));
             }
             if !self
-                .posting_chunk_is_published_or_supernode_referenced(&chunk)
+                .posting_chunk_is_published_or_supernode_referenced(
+                    &chunk,
+                    &posting_manifests,
+                    &supernode_manifests,
+                )
                 .await?
             {
                 record_mismatch(report, format!("posting:unpublished-chunk key={key}"));
@@ -403,49 +414,49 @@ impl GraphShard {
         report.posting_chunks_checked = posting_count;
 
         let mut group_count = 0_u64;
-        let mut groups_by_epoch = BTreeMap::<GraphEpoch, Vec<SupernodeGroup>>::new();
-        let mut group_iter = self
-            .scan_remote_prefix(&format!("cell/{cell_id}/artifact/supernode/{edge_type}/"))
-            .await?;
-        while let Some(kv) = group_iter.next().await? {
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let group = decode_supernode_group(&key, &kv.value)?;
-            if self
-                .supernode_artifact_manifest(cell_id, edge_type, group.base_epoch)
-                .await?
-                .is_none()
-            {
-                record_mismatch(report, format!("supernode:unpublished-group key={key}"));
+        let mut group_manifests = BTreeMap::<GraphEpoch, SupernodeManifestAccumulator>::new();
+        for direction in [ArtifactDirection::Out, ArtifactDirection::In] {
+            let mut group_iter = self
+                .scan_remote_prefix(&format!(
+                    "cell/{cell_id}/artifact/supernode/{edge_type}/{}/",
+                    direction_str(direction)
+                ))
+                .await?;
+            while let Some(kv) = group_iter.next().await? {
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let group = decode_supernode_group(&key, &kv.value)?;
+                if !supernode_manifests.contains_key(&group.base_epoch) {
+                    record_mismatch(report, format!("supernode:unpublished-group key={key}"));
+                }
+                group_count = group_count.saturating_add(1);
+                group_manifests
+                    .entry(group.base_epoch)
+                    .or_insert_with(|| SupernodeManifestAccumulator::new(group.base_epoch))
+                    .apply(cell_id, edge_type, &group)?;
+                self.verify_supernode_group_chunks(&group, report).await?;
             }
-            group_count = group_count.saturating_add(1);
-            groups_by_epoch
-                .entry(group.base_epoch)
-                .or_default()
-                .push(group.clone());
-            self.verify_supernode_group_chunks(&group, report).await?;
         }
         report.supernode_groups_checked = group_count;
-        for (base_epoch, groups) in groups_by_epoch {
-            if let Some(actual) = self
-                .supernode_artifact_manifest(cell_id, edge_type, base_epoch)
-                .await?
-            {
-                match supernode_artifact_manifest_from_groups(
-                    cell_id, edge_type, base_epoch, &groups,
-                )? {
-                    Some(expected) if expected == actual => {}
-                    Some(expected) => record_mismatch(
+        for (base_epoch, accumulator) in &group_manifests {
+            if let Some(actual) = supernode_manifests.get(base_epoch) {
+                let expected = accumulator.finish(cell_id, edge_type);
+                if expected != *actual {
+                    record_mismatch(
                         report,
                         format!(
                             "supernode:manifest-mismatch base_epoch={base_epoch} expected_groups={} actual_groups={}",
                             expected.group_count, actual.group_count
                         ),
-                    ),
-                    None => record_mismatch(
-                        report,
-                        format!("supernode:empty-groups-with-manifest base_epoch={base_epoch}"),
-                    ),
+                    );
                 }
+            }
+        }
+        for base_epoch in supernode_manifests.keys() {
+            if !group_manifests.contains_key(base_epoch) {
+                record_mismatch(
+                    report,
+                    format!("supernode:manifest-without-groups base_epoch={base_epoch}"),
+                );
             }
         }
 
@@ -477,11 +488,10 @@ impl GraphShard {
     async fn posting_chunk_is_published_or_supernode_referenced(
         &self,
         chunk: &PostingChunk,
+        posting_manifests: &BTreeMap<GraphEpoch, PostingArtifactManifest>,
+        supernode_manifests: &BTreeMap<GraphEpoch, SupernodeArtifactManifest>,
     ) -> Result<bool> {
-        let posting_manifest_key =
-            posting_artifact_manifest_key(&chunk.cell_id, &chunk.edge_type, chunk.base_epoch);
-        if let Some(value) = self.read_remote(&posting_manifest_key).await? {
-            decode_posting_artifact_manifest(&posting_manifest_key, &value)?;
+        if posting_manifests.contains_key(&chunk.base_epoch) {
             return Ok(true);
         }
         let group_key = format!(
@@ -495,23 +505,41 @@ impl GraphShard {
         if self.read_remote(&group_key).await?.is_none() {
             return Ok(false);
         }
-        Ok(self
-            .supernode_artifact_manifest(&chunk.cell_id, &chunk.edge_type, chunk.base_epoch)
-            .await?
-            .is_some())
+        Ok(supernode_manifests.contains_key(&chunk.base_epoch))
     }
 
-    async fn supernode_artifact_manifest(
+    async fn published_posting_artifact_manifests(
         &self,
         cell_id: &str,
         edge_type: &str,
-        base_epoch: GraphEpoch,
-    ) -> Result<Option<SupernodeArtifactManifest>> {
-        let key = supernode_artifact_manifest_key(cell_id, edge_type, base_epoch);
-        self.read_remote(&key)
-            .await?
-            .map(|value| decode_supernode_artifact_manifest(&key, &value))
-            .transpose()
+    ) -> Result<BTreeMap<GraphEpoch, PostingArtifactManifest>> {
+        let mut iter = self
+            .scan_remote_prefix(&posting_artifact_manifest_prefix(cell_id, edge_type))
+            .await?;
+        let mut manifests = BTreeMap::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let manifest = decode_posting_artifact_manifest(&key, &kv.value)?;
+            manifests.insert(manifest.base_epoch, manifest);
+        }
+        Ok(manifests)
+    }
+
+    async fn published_supernode_artifact_manifests(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+    ) -> Result<BTreeMap<GraphEpoch, SupernodeArtifactManifest>> {
+        let mut iter = self
+            .scan_remote_prefix(&supernode_artifact_manifest_prefix(cell_id, edge_type))
+            .await?;
+        let mut manifests = BTreeMap::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let manifest = decode_supernode_artifact_manifest(&key, &kv.value)?;
+            manifests.insert(manifest.base_epoch, manifest);
+        }
+        Ok(manifests)
     }
 
     async fn verify_supernode_group_chunks(
@@ -646,5 +674,72 @@ impl GraphShard {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SupernodeManifestAccumulator {
+    base_epoch: GraphEpoch,
+    group_count: u64,
+    chunk_count: u64,
+    degree: u64,
+    checksum: u64,
+}
+
+impl SupernodeManifestAccumulator {
+    fn new(base_epoch: GraphEpoch) -> Self {
+        let mut checksum = 0xcbf2_9ce4_8422_2325_u64;
+        checksum_u64(&mut checksum, base_epoch);
+        Self {
+            base_epoch,
+            group_count: 0,
+            chunk_count: 0,
+            degree: 0,
+            checksum,
+        }
+    }
+
+    fn apply(&mut self, cell_id: &str, edge_type: &str, group: &SupernodeGroup) -> Result<()> {
+        if group.cell_id != cell_id
+            || group.edge_type != edge_type
+            || group.base_epoch != self.base_epoch
+        {
+            return Err(GraphError::CorruptValue {
+                key: supernode_group_key(group),
+                reason: "supernode group does not belong to artifact epoch".to_string(),
+            });
+        }
+        checksum_u64(
+            &mut self.checksum,
+            match group.direction {
+                ArtifactDirection::Out => 1,
+                ArtifactDirection::In => 2,
+            },
+        );
+        checksum_u64(&mut self.checksum, group.vertex_id);
+        checksum_u64(&mut self.checksum, group.degree);
+        checksum_u64(&mut self.checksum, group.chunk_count);
+        checksum_u64(&mut self.checksum, group.page_size);
+        for bound in &group.chunk_bounds {
+            checksum_u64(&mut self.checksum, bound.chunk_id);
+            checksum_u64(&mut self.checksum, bound.first);
+            checksum_u64(&mut self.checksum, bound.last);
+        }
+        self.group_count = self.group_count.saturating_add(1);
+        self.chunk_count = self.chunk_count.saturating_add(group.chunk_count);
+        self.degree = self.degree.saturating_add(group.degree);
+        Ok(())
+    }
+
+    fn finish(&self, cell_id: &str, edge_type: &str) -> SupernodeArtifactManifest {
+        SupernodeArtifactManifest {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            base_epoch: self.base_epoch,
+            group_count: self.group_count,
+            chunk_count: self.chunk_count,
+            degree: self.degree,
+            checksum: self.checksum,
+        }
     }
 }
