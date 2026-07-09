@@ -2381,9 +2381,11 @@ impl GraphShard {
                 self.match_edge_row_pattern_full_scan(cell_id, edge, read_epoch, budget)
                     .await
             }
-            RowQueryAccess::VariableLengthExpand { .. } => {
-                unreachable!("variable-length edge patterns return before access planning")
-            }
+            RowQueryAccess::VariableLengthExpand { .. } => Err(GraphError::CorruptValue {
+                key: format!("cell/{cell_id}/query/edge-access/{}", edge.edge_type),
+                reason: "optimizer sent variable-length edge pattern to single-edge matcher"
+                    .to_string(),
+            }),
             RowQueryAccess::VertexIdSeek
             | RowQueryAccess::VertexPropertyIndex { .. }
             | RowQueryAccess::VertexLabelScan { .. }
