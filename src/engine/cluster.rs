@@ -472,6 +472,30 @@ impl ManagedGraphNode {
             .await
     }
 
+    pub async fn set_vertex_metadata_batch(
+        &self,
+        cell_id: &str,
+        updates: impl IntoIterator<Item = (crate::VertexId, crate::VertexMetadata)>,
+    ) -> Result<usize> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .set_vertex_metadata_batch(cell_id, updates)
+            .await
+    }
+
+    pub async fn import_vertex_metadata_batch(
+        &self,
+        cell_id: &str,
+        updates: impl IntoIterator<Item = (crate::VertexId, crate::VertexMetadata)>,
+    ) -> Result<usize> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .import_vertex_metadata_batch(cell_id, updates)
+            .await
+    }
+
     pub async fn set_edge_metadata(
         &self,
         cell_id: &str,
@@ -484,6 +508,45 @@ impl ManagedGraphNode {
         let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
         node.cluster()
             .set_edge_metadata(cell_id, edge_type, src, dst, metadata)
+            .await
+    }
+
+    pub async fn set_edge_metadata_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        updates: impl IntoIterator<Item = (crate::VertexId, crate::VertexId, crate::EdgeMetadata)>,
+    ) -> Result<usize> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .set_edge_metadata_batch(cell_id, edge_type, updates)
+            .await
+    }
+
+    pub async fn import_relationships_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        relationships: impl IntoIterator<Item = crate::RelationshipMutation>,
+        idempotency_key: &str,
+    ) -> Result<crate::RelationshipImportResult> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .import_relationships_batch(cell_id, edge_type, relationships, idempotency_key)
+            .await
+    }
+
+    pub async fn write_edge_mutations_batch(
+        &self,
+        cell_id: &str,
+        mutations: impl IntoIterator<Item = crate::EdgeMutation>,
+    ) -> Result<crate::EdgeMutationBatchResult> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .write_edge_mutations_batch(cell_id, mutations)
             .await
     }
 
@@ -1392,6 +1455,26 @@ impl RoutedGraphCluster {
             .await
     }
 
+    pub async fn set_vertex_metadata_batch(
+        &self,
+        cell_id: &str,
+        updates: impl IntoIterator<Item = (crate::VertexId, crate::VertexMetadata)>,
+    ) -> Result<usize> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard.set_vertex_metadata_batch(cell_id, updates).await
+    }
+
+    pub async fn import_vertex_metadata_batch(
+        &self,
+        cell_id: &str,
+        updates: impl IntoIterator<Item = (crate::VertexId, crate::VertexMetadata)>,
+    ) -> Result<usize> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard.import_vertex_metadata_batch(cell_id, updates).await
+    }
+
     pub async fn set_edge_metadata(
         &self,
         cell_id: &str,
@@ -1405,6 +1488,43 @@ impl RoutedGraphCluster {
         shard
             .set_edge_metadata(cell_id, edge_type, src, dst, metadata)
             .await
+    }
+
+    pub async fn set_edge_metadata_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        updates: impl IntoIterator<Item = (crate::VertexId, crate::VertexId, crate::EdgeMetadata)>,
+    ) -> Result<usize> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard
+            .set_edge_metadata_batch(cell_id, edge_type, updates)
+            .await
+    }
+
+    pub async fn import_relationships_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        relationships: impl IntoIterator<Item = crate::RelationshipMutation>,
+        idempotency_key: &str,
+    ) -> Result<crate::RelationshipImportResult> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard
+            .import_relationships_batch(cell_id, edge_type, relationships, idempotency_key)
+            .await
+    }
+
+    pub async fn write_edge_mutations_batch(
+        &self,
+        cell_id: &str,
+        mutations: impl IntoIterator<Item = crate::EdgeMutation>,
+    ) -> Result<crate::EdgeMutationBatchResult> {
+        let shard = self.shard(cell_id)?;
+        self.ensure_active_write_lease(cell_id)?;
+        shard.write_edge_mutations_batch(cell_id, mutations).await
     }
 
     pub async fn execute_query_statement(

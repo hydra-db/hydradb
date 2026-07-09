@@ -5503,6 +5503,22 @@ async fn managed_graph_node_exposes_fenced_batch_metadata_and_delete_apis() {
         .await
         .unwrap();
     assert_eq!(write.inserted, 2);
+    assert_eq!(
+        node.write_edge_mutations_batch(
+            "reddit-home",
+            [EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "LIKES".to_string(),
+                src: 2,
+                dst: 4,
+                idempotency_key: "managed-mutation-batch-edge".to_string(),
+            }],
+        )
+        .await
+        .unwrap()
+        .inserted,
+        1
+    );
     node.set_vertex_metadata(
         "reddit-home",
         1,
@@ -5512,6 +5528,42 @@ async fn managed_graph_node_exposes_fenced_batch_metadata_and_delete_apis() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        node.set_vertex_metadata_batch(
+            "reddit-home",
+            [
+                (
+                    2,
+                    VertexMetadata::default()
+                        .with_label("User")
+                        .with_property("name", VertexPropertyValue::String("bob".to_string())),
+                ),
+                (
+                    3,
+                    VertexMetadata::default()
+                        .with_label("User")
+                        .with_property("name", VertexPropertyValue::String("cyd".to_string())),
+                ),
+            ],
+        )
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        node.import_vertex_metadata_batch(
+            "reddit-home",
+            [(
+                4,
+                VertexMetadata::default()
+                    .with_label("Post")
+                    .with_property("score", VertexPropertyValue::Integer(42)),
+            )],
+        )
+        .await
+        .unwrap(),
+        1
+    );
     assert!(node
         .set_edge_metadata(
             "reddit-home",
@@ -5522,6 +5574,54 @@ async fn managed_graph_node_exposes_fenced_batch_metadata_and_delete_apis() {
         )
         .await
         .unwrap());
+    assert_eq!(
+        node.set_edge_metadata_batch(
+            "reddit-home",
+            "FOLLOWS",
+            [(
+                1,
+                3,
+                EdgeMetadata::default().with_property("weight", VertexPropertyValue::Integer(5)),
+            )],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let relationships = node
+        .import_relationships_batch(
+            "reddit-home",
+            "LIKES",
+            [
+                RelationshipMutation {
+                    cell_id: "reddit-home".to_string(),
+                    edge_type: "LIKES".to_string(),
+                    src: 2,
+                    dst: 4,
+                    relationship_id: 500,
+                    metadata: EdgeMetadata::default()
+                        .with_property("_fid", VertexPropertyValue::Integer(500)),
+                },
+                RelationshipMutation {
+                    cell_id: "reddit-home".to_string(),
+                    edge_type: "LIKES".to_string(),
+                    src: 2,
+                    dst: 4,
+                    relationship_id: 501,
+                    metadata: EdgeMetadata::default()
+                        .with_property("_fid", VertexPropertyValue::Integer(501)),
+                },
+            ],
+            "managed-relationship-import",
+        )
+        .await
+        .unwrap();
+    assert_eq!(relationships.relationships_inserted, 2);
+    assert_eq!(relationships.structural_edges_inserted, 0);
+    assert_eq!(
+        node.out_neighbors("reddit-home", "LIKES", 2).await.unwrap(),
+        vec![4]
+    );
 
     let deleted = node
         .delete_edges_batch("reddit-home", "FOLLOWS", [(1, 2)], "managed-batch-delete")
