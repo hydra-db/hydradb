@@ -9751,6 +9751,47 @@ async fn pending_drop_marker_blocks_writes_and_drop_cell_finalizes_cleanup() {
             cell_id
         } if cell_id == "reddit-home"
     ));
+    let err = shard
+        .edge_exists("reddit-home", "FOLLOWS", 1, 2)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::CellDropped {
+            operation: "edge_exists",
+            cell_id
+        } if cell_id == "reddit-home"
+    ));
+    let err = shard
+        .out_neighbors("reddit-home", "FOLLOWS", 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::CellDropped {
+            operation: "out_neighbors",
+            cell_id
+        } if cell_id == "reddit-home"
+    ));
+    let err = shard
+        .out_degree("reddit-home", "FOLLOWS", 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::CellDropped {
+            operation: "out_degree",
+            cell_id
+        } if cell_id == "reddit-home"
+    ));
+    let err = shard.current_epoch("reddit-home").await.unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::CellDropped {
+            operation: "current_epoch",
+            cell_id
+        } if cell_id == "reddit-home"
+    ));
 
     let dropped = shard
         .drop_cell("reddit-home", "pending-drop-finalize")

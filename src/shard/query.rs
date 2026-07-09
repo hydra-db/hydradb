@@ -4792,6 +4792,7 @@ impl GraphShard {
     ) -> Result<bool> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
+        self.ensure_cell_readable(cell_id, "edge_exists").await?;
         let key = keys::out_edge(cell_id, edge_type, src, dst);
         if self.read_remote(&key).await?.is_some() {
             return Ok(true);
@@ -4811,6 +4812,7 @@ impl GraphShard {
     ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
+        self.ensure_cell_readable(cell_id, "out_neighbors").await?;
         let prefix = keys::out_prefix(cell_id, edge_type, src);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
         let mut neighbors = Vec::new();
@@ -5114,6 +5116,7 @@ impl GraphShard {
     pub async fn out_degree(&self, cell_id: &str, edge_type: &str, src: VertexId) -> Result<u64> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
+        self.ensure_cell_readable(cell_id, "out_degree").await?;
         self.read_counter(&keys::degree_out(cell_id, edge_type, src))
             .await
     }
@@ -5124,6 +5127,7 @@ impl GraphShard {
         after_epoch: GraphEpoch,
     ) -> Result<Vec<DeltaRecord>> {
         validate_component("cell_id", cell_id)?;
+        self.ensure_cell_readable(cell_id, "outbox_since").await?;
         let prefix = keys::outbox_prefix(cell_id);
         let mut iter = self.scan_remote_prefix(&prefix).await?;
         let mut records = Vec::new();
@@ -5179,6 +5183,7 @@ impl GraphShard {
     ) -> Result<Vec<DeltaRecord>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
+        self.ensure_cell_readable(cell_id, "deltas_between").await?;
         check_optional_query_budget(budget, "query_deltas_between")?;
         if after_epoch >= read_epoch {
             return Ok(Vec::new());
@@ -5307,7 +5312,31 @@ impl GraphShard {
 
     pub async fn current_epoch(&self, cell_id: &str) -> Result<GraphEpoch> {
         validate_component("cell_id", cell_id)?;
+        self.ensure_cell_readable(cell_id, "current_epoch").await?;
         self.read_counter(&keys::last_epoch(cell_id)).await
+    }
+
+    pub(crate) async fn ensure_cell_readable(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+    ) -> Result<()> {
+        validate_component("cell_id", cell_id)?;
+        if self
+            .read_remote(&keys::cell_drop_marker(cell_id))
+            .await?
+            .is_some()
+            || self
+                .read_remote(&keys::cell_drop_pending_marker(cell_id))
+                .await?
+                .is_some()
+        {
+            return Err(GraphError::CellDropped {
+                operation,
+                cell_id: cell_id.to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub async fn edges_at(
@@ -5329,6 +5358,7 @@ impl GraphShard {
     ) -> Result<Vec<EdgeRecord>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
+        self.ensure_cell_readable(cell_id, "edges_at").await?;
         check_optional_query_budget(budget, "query_edges_at")?;
         let mut edges = std::collections::BTreeMap::new();
         let base_epoch = if let Some(artifact) = self
