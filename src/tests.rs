@@ -8722,6 +8722,45 @@ async fn tcp_query_transport_blank_bearer_token_fails_closed() {
 
 #[cfg(feature = "query-transport")]
 #[tokio::test]
+async fn tcp_query_transport_stop_aborts_idle_connections() {
+    struct StaticQueryClient;
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for StaticQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    let server = TcpQueryServer::bind("127.0.0.1:0".parse().unwrap(), Arc::new(StaticQueryClient))
+        .await
+        .unwrap();
+    let _idle_connection = tokio::net::TcpStream::connect(server.local_addr())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), server.stop())
+        .await
+        .expect("query transport stop should abort idle connection tasks")
+        .unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
 async fn tcp_query_transport_enforces_auth_cancellation_streaming_metrics_and_discovery() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = GraphControlPlane::open(

@@ -24,7 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 #[cfg(feature = "query-transport")]
 use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 #[cfg(feature = "query-transport")]
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 #[cfg(feature = "query-transport-tls")]
 use tokio_rustls::rustls::{
     pki_types::ServerName, ClientConfig as RustlsClientConfig, ServerConfig as RustlsServerConfig,
@@ -988,6 +988,7 @@ impl TcpQueryServer {
             request_gate: Arc::new(Semaphore::new(max_concurrent_requests)),
         });
         let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
                     changed = stop_rx.changed() => {
@@ -999,7 +1000,7 @@ impl TcpQueryServer {
                         let (stream, _) = accepted.map_err(|err| transport_error("accept", err))?;
                         let client = Arc::clone(&client);
                         let runtime = Arc::clone(&runtime);
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             if let Err(err) = serve_query_transport_stream(stream, client, runtime).await {
                                 tracing::warn!(
                                     target: "slatedb_graph_kernel",
@@ -1008,6 +1009,27 @@ impl TcpQueryServer {
                                 );
                             }
                         });
+                    }
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Err(err)) = joined {
+                            tracing::warn!(
+                                target: "slatedb_graph_kernel",
+                                error = %err,
+                                "query transport connection task failed"
+                            );
+                        }
+                    }
+                }
+            }
+            connections.abort_all();
+            while let Some(joined) = connections.join_next().await {
+                if let Err(err) = joined {
+                    if !err.is_cancelled() {
+                        tracing::warn!(
+                            target: "slatedb_graph_kernel",
+                            error = %err,
+                            "query transport connection task failed during shutdown"
+                        );
                     }
                 }
             }
