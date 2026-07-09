@@ -280,6 +280,13 @@ pub struct GraphClusterControllerConfig {
     pub cell_ids: Vec<String>,
     pub heartbeat_ttl: Duration,
     pub lease_ttl: Duration,
+    pub rebalance_mode: GraphClusterRebalanceMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphClusterRebalanceMode {
+    StabilityFirst,
+    Rendezvous,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

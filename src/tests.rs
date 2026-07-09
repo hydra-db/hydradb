@@ -4778,6 +4778,138 @@ async fn cluster_controller_assigns_unplaced_cells_to_live_nodes() {
     control.close().await.unwrap();
 }
 
+fn rendezvous_prefers_node_b_cell_for_test() -> String {
+    for idx in 0..10_000 {
+        let cell_id = format!("rebalance-{idx}");
+        let placement = ShardPlacement::rendezvous([cell_id.as_str()], ["node-a", "node-b"])
+            .unwrap_or_else(|err| panic!("rendezvous placement failed for {cell_id}: {err}"));
+        if placement.owner(&cell_id).unwrap() == "node-b" {
+            return cell_id;
+        }
+    }
+    panic!("could not find test cell preferring node-b");
+}
+
+#[tokio::test]
+async fn cluster_controller_stability_first_keeps_live_owner() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/controller-stable", object_store)
+        .await
+        .unwrap();
+    let cell_id = rendezvous_prefers_node_b_cell_for_test();
+    control
+        .publish_node_heartbeat_at("node-a", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-b", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([(cell_id.as_str(), "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let config = GraphClusterControllerConfig::new(
+        [cell_id.as_str()],
+        std::time::Duration::from_millis(5_000),
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+
+    let report = control.reconcile_cluster_at(&config, 1_100).await.unwrap();
+    assert!(report.reassignments.is_empty());
+    assert!(report.pending_failovers.is_empty());
+    assert_eq!(
+        control
+            .load_placement()
+            .await
+            .unwrap()
+            .owner(&cell_id)
+            .unwrap(),
+        "node-a"
+    );
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cluster_controller_rendezvous_rebalance_waits_for_old_lease_expiry() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/controller-rebalance", object_store)
+        .await
+        .unwrap();
+    let cell_id = rendezvous_prefers_node_b_cell_for_test();
+    control
+        .publish_node_heartbeat_at("node-a", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-b", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([(cell_id.as_str(), "node-a")]).unwrap())
+        .await
+        .unwrap();
+    control
+        .acquire_lease_at(
+            &cell_id,
+            "node-a",
+            std::time::Duration::from_millis(1_000),
+            1_000,
+        )
+        .await
+        .unwrap();
+    let config = GraphClusterControllerConfig::new(
+        [cell_id.as_str()],
+        std::time::Duration::from_millis(5_000),
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap()
+    .with_rebalance_mode(GraphClusterRebalanceMode::Rendezvous);
+
+    let pending = control.reconcile_cluster_at(&config, 1_100).await.unwrap();
+    assert_eq!(pending.reassignments.len(), 1);
+    assert_eq!(
+        pending.reassignments[0].previous_owner_node_id.as_deref(),
+        Some("node-a")
+    );
+    assert_eq!(pending.reassignments[0].new_owner_node_id, "node-b");
+    assert!(pending.failed_over_leases.is_empty());
+    assert_eq!(
+        pending.pending_failovers,
+        vec![GraphPendingFailover {
+            cell_id: cell_id.clone(),
+            current_owner_node_id: "node-a".to_string(),
+            target_owner_node_id: "node-b".to_string(),
+            lease_expires_at_ms: 2_000,
+        }]
+    );
+    assert_eq!(
+        control
+            .load_placement()
+            .await
+            .unwrap()
+            .owner(&cell_id)
+            .unwrap(),
+        "node-b"
+    );
+    assert_eq!(
+        control
+            .current_lease(&cell_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_node_id,
+        "node-a"
+    );
+
+    let failed_over = control.reconcile_cluster_at(&config, 2_001).await.unwrap();
+    assert!(failed_over.pending_failovers.is_empty());
+    assert_eq!(failed_over.failed_over_leases.len(), 1);
+    assert_eq!(failed_over.failed_over_leases[0].owner_node_id, "node-b");
+    control.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn cluster_controller_moves_draining_cells_after_lease_expiry() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
