@@ -2153,10 +2153,16 @@ impl GraphShard {
     ) -> Result<u64> {
         let mut edges = BTreeSet::<(VertexId, VertexId)>::new();
         for encoded in equivalent_property_index_keys(value) {
-            self.collect_edge_property_encoded_index_at(
-                cell_id, edge_type, property, &encoded, read_epoch, budget, &mut edges,
-            )
-            .await?;
+            let scan = EncodedPropertyIndexScan {
+                cell_id,
+                edge_type,
+                property,
+                encoded: &encoded,
+                read_epoch,
+                budget,
+            };
+            self.collect_edge_property_encoded_index_at(scan, &mut edges)
+                .await?;
         }
         Ok(edges.len() as u64)
     }
@@ -2164,27 +2170,25 @@ impl GraphShard {
     #[cfg(feature = "opencypher")]
     async fn collect_edge_property_encoded_index_at(
         &self,
-        cell_id: &str,
-        edge_type: &str,
-        property: &str,
-        encoded: &str,
-        read_epoch: GraphEpoch,
-        budget: &QueryBudget,
+        scan: EncodedPropertyIndexScan<'_>,
         edges: &mut BTreeSet<(VertexId, VertexId)>,
     ) -> Result<()> {
         let mut iter = self
             .scan_remote_prefix(&keys::edge_property_index_delta_prefix(
-                cell_id, edge_type, property, encoded,
+                scan.cell_id,
+                scan.edge_type,
+                scan.property,
+                scan.encoded,
             ))
             .await?;
         let mut latest = BTreeMap::<(VertexId, VertexId), bool>::new();
         let mut saw_delta = false;
         while let Some(kv) = iter.next().await? {
-            budget.check("query_stats_edge_property_count_delta")?;
+            scan.budget.check("query_stats_edge_property_count_delta")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let (epoch, src, dst) = parse_edge_property_index_delta_key(&key)?;
             saw_delta = true;
-            if epoch > read_epoch {
+            if epoch > scan.read_epoch {
                 break;
             }
             latest.insert((src, dst), decode_vertex_index_delta(&key, &kv.value)?);
@@ -2206,11 +2210,15 @@ impl GraphShard {
         } else {
             let mut iter = self
                 .scan_remote_prefix(&keys::edge_property_index_prefix(
-                    cell_id, edge_type, property, encoded,
+                    scan.cell_id,
+                    scan.edge_type,
+                    scan.property,
+                    scan.encoded,
                 ))
                 .await?;
             while let Some(kv) = iter.next().await? {
-                budget.check("query_stats_edge_property_count_current")?;
+                scan.budget
+                    .check("query_stats_edge_property_count_current")?;
                 let key = String::from_utf8_lossy(&kv.key).into_owned();
                 let (_cell_id, _edge_type, _property, _encoded, src, dst) =
                     parse_edge_property_index_key(&key)?;
@@ -2222,38 +2230,35 @@ impl GraphShard {
             }
         }
 
-        self.collect_relationship_property_encoded_index_at(
-            cell_id, edge_type, property, encoded, read_epoch, budget, edges,
-        )
-        .await?;
+        self.collect_relationship_property_encoded_index_at(scan, edges)
+            .await?;
         Ok(())
     }
 
     #[cfg(feature = "opencypher")]
     async fn collect_relationship_property_encoded_index_at(
         &self,
-        cell_id: &str,
-        edge_type: &str,
-        property: &str,
-        encoded: &str,
-        read_epoch: GraphEpoch,
-        budget: &QueryBudget,
+        scan: EncodedPropertyIndexScan<'_>,
         edges: &mut BTreeSet<(VertexId, VertexId)>,
     ) -> Result<()> {
         let mut iter = self
             .scan_remote_prefix(&keys::relationship_property_index_delta_prefix(
-                cell_id, edge_type, property, encoded,
+                scan.cell_id,
+                scan.edge_type,
+                scan.property,
+                scan.encoded,
             ))
             .await?;
         let mut latest = BTreeMap::<(VertexId, VertexId, RelationshipId), bool>::new();
         let mut saw_delta = false;
         while let Some(kv) = iter.next().await? {
-            budget.check("query_stats_relationship_property_count_delta")?;
+            scan.budget
+                .check("query_stats_relationship_property_count_delta")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let (epoch, src, dst, relationship_id) =
                 parse_relationship_property_index_delta_key(&key)?;
             saw_delta = true;
-            if epoch > read_epoch {
+            if epoch > scan.read_epoch {
                 break;
             }
             latest.insert(
@@ -2280,11 +2285,15 @@ impl GraphShard {
 
         let mut iter = self
             .scan_remote_prefix(&keys::relationship_property_index_prefix(
-                cell_id, edge_type, property, encoded,
+                scan.cell_id,
+                scan.edge_type,
+                scan.property,
+                scan.encoded,
             ))
             .await?;
         while let Some(kv) = iter.next().await? {
-            budget.check("query_stats_relationship_property_count_current")?;
+            scan.budget
+                .check("query_stats_relationship_property_count_current")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let (_cell_id, _edge_type, _property, _encoded, src, dst, _relationship_id) =
                 parse_relationship_property_index_key(&key)?;
@@ -8017,6 +8026,17 @@ fn compare_projected_rows(
         }
     }
     std::cmp::Ordering::Equal
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Copy)]
+struct EncodedPropertyIndexScan<'a> {
+    cell_id: &'a str,
+    edge_type: &'a str,
+    property: &'a str,
+    encoded: &'a str,
+    read_epoch: GraphEpoch,
+    budget: &'a QueryBudget,
 }
 
 #[cfg(feature = "opencypher")]
