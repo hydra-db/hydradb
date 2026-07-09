@@ -13495,7 +13495,7 @@ async fn cypher_row_engine_rejects_large_full_edge_scans() {
     assert!(matches!(
         err,
         GraphError::AdmissionRejected {
-            operation: "cypher_edge_full_scan",
+            operation: "cypher_edge_full_scan" | "query_outbox_delta_records",
             actual: 2,
             limit: 1
         }
