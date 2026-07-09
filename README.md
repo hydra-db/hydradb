@@ -384,14 +384,15 @@ just query-bench
 ## Production Boundary
 
 This crate is a kernel/library, not a complete hosted database service. It now
-contains the major storage, query, routing, fencing, artifact, stress, and
-verification pieces needed for an object-store graph database, but production
-use still requires an embedding service and operational validation around it:
+contains the major storage, query, routing, fencing, controller, artifact,
+stress, and verification pieces needed for an object-store graph database, but
+production use still requires an embedding service and operational validation
+around it:
 
-- real deployment controller for placement, failover, lease renewal, and rollout
-  policy;
-- production metrics export, dashboards, alerts, tenant quotas, and backpressure
-  policy choices;
+- deployment-specific rollout policy and service lifecycle integration around
+  `GraphControlPlane`, `GraphClusterControllerHandle`, and `ManagedGraphNode`;
+- production metrics export, dashboards, alerts, tenant quotas, and
+  backpressure policy choices;
 - long-running multi-process and real S3 soak tests under throttling, latency,
   timeout, and restart faults;
 - complete compatibility policy for the OpenCypher subset, including larger TCK
