@@ -4438,6 +4438,79 @@ async fn graph_node_close_publishes_draining_heartbeat() {
 }
 
 #[tokio::test]
+async fn graph_node_rejects_bad_runtime_config_before_acquiring_lease() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = Arc::new(
+        GraphControlPlane::open(
+            "graph-control/node-open-validation",
+            Arc::clone(&object_store),
+        )
+        .await
+        .unwrap(),
+    );
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+
+    let err = match GraphNode::open(
+        "graph-node-open-validation",
+        "node-a",
+        Arc::clone(&control),
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(2),
+        std::time::Duration::ZERO,
+    )
+    .await
+    {
+        Ok(_) => panic!("graph node accepted zero lease renewal interval"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        GraphError::CorruptValue {
+            ref key,
+            ..
+        } if key == "control/lease_renew_interval"
+    ));
+    assert!(control
+        .current_lease("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(control.node_heartbeat("node-a").await.unwrap().is_none());
+
+    let err = match GraphNode::open_managed(
+        "graph-managed-open-validation",
+        "node-a",
+        Arc::clone(&control),
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(25),
+        std::time::Duration::ZERO,
+    )
+    .await
+    {
+        Ok(_) => panic!("managed graph node accepted zero shard refresh interval"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        GraphError::CorruptValue {
+            ref key,
+            ..
+        } if key == "control/shard_refresh_interval"
+    ));
+    assert!(control
+        .current_lease("reddit-home")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(control.node_heartbeat("node-a").await.unwrap().is_none());
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn control_plane_can_fail_over_after_lease_expiry() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = GraphControlPlane::open("graph-control/failover", object_store)
