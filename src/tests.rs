@@ -7019,6 +7019,72 @@ async fn current_graph_verifier_detects_index_corruption() {
 }
 
 #[tokio::test]
+async fn current_graph_verifier_detects_relationship_index_corruption() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let cell_id = "reddit-home";
+    let edge_type = "FOLLOWS";
+    let shard = open_test_shard("graph/current-verifier-rel-corrupt", object_store).await;
+    let relationship = shard
+        .create_relationship(
+            typed_mutation(cell_id, edge_type, 1, 2, "verify-rel-corrupt"),
+            EdgeMetadata::default().with_property("rank", VertexPropertyValue::Integer(7)),
+        )
+        .await
+        .unwrap();
+
+    let clean = shard
+        .verify_current_graph(cell_id, edge_type, 1, 4)
+        .await
+        .unwrap();
+    assert!(clean.is_clean(), "{:?}", clean.mismatch_samples);
+    assert_eq!(clean.relationship_records, 1);
+    assert_eq!(clean.relationship_count_counters, 1);
+    assert_eq!(clean.relationship_property_indexes, 1);
+
+    let mut batch = WriteBatch::new();
+    batch.put(
+        keys::relationship_count(cell_id, edge_type, 1, 2).as_bytes(),
+        encode_u64(99),
+    );
+    batch.delete(
+        keys::relationship_property_index(
+            cell_id,
+            edge_type,
+            "rank",
+            &encode_vertex_property_value_key(&VertexPropertyValue::Integer(7)),
+            1,
+            2,
+            relationship.relationship_id,
+        )
+        .as_bytes(),
+    );
+    shard.write_strict_for_test(batch).await.unwrap();
+
+    let corrupt = shard
+        .verify_current_graph(cell_id, edge_type, 1, 4)
+        .await
+        .unwrap();
+    assert!(!corrupt.is_clean());
+    assert!(
+        corrupt
+            .mismatch_samples
+            .iter()
+            .any(|sample| sample.contains("relationship_count:mismatch")),
+        "{:?}",
+        corrupt.mismatch_samples
+    );
+    assert!(
+        corrupt
+            .mismatch_samples
+            .iter()
+            .any(|sample| sample.contains("relationship_property_index:missing")),
+        "{:?}",
+        corrupt.mismatch_samples
+    );
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn rollup_artifact_gc_keeps_latest_artifacts_and_retains_snapshot_deltas() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let path = "graph/rollup-artifact-gc";
@@ -9832,6 +9898,176 @@ async fn relationship_rows_require_live_structural_edge() {
         .await
         .unwrap();
     assert!(property_rows.rows.is_empty());
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn structural_edge_delete_tombstones_relationships_before_recreate() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/multigraph-structural-delete-recreate", object_store).await;
+
+    shard
+        .create_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "structural-recreate-rel-1".to_string(),
+            },
+            EdgeMetadata::default().with_property("rank", VertexPropertyValue::Integer(1)),
+        )
+        .await
+        .unwrap();
+    shard
+        .create_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "structural-recreate-rel-2".to_string(),
+            },
+            EdgeMetadata::default().with_property("rank", VertexPropertyValue::Integer(2)),
+        )
+        .await
+        .unwrap();
+
+    let deleted = shard
+        .delete_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "structural-recreate-delete".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(deleted.deleted);
+
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "structural-recreate-edge".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let resurrected_property_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "structural-recreate-property-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS {rank: 2}]->(v {id: 2}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert!(resurrected_property_rows.rows.is_empty());
+
+    let endpoint_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "structural-recreate-endpoint-read"),
+            "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) RETURN v.id AS dst",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        endpoint_rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("dst")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(2)])],
+        )
+    );
+
+    let source_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "structural-recreate-source-read"),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id AS dst",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        source_rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("dst")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(2)])],
+        )
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn batch_structural_edge_delete_tombstones_relationships_before_recreate() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard(
+        "graph/multigraph-batch-structural-delete-recreate",
+        object_store,
+    )
+    .await;
+
+    shard
+        .create_relationship(
+            EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "LIKES".to_string(),
+                src: 5,
+                dst: 6,
+                idempotency_key: "batch-structural-recreate-rel".to_string(),
+            },
+            EdgeMetadata::default().with_property("rank", VertexPropertyValue::Integer(9)),
+        )
+        .await
+        .unwrap();
+    let deleted = shard
+        .delete_edges_batch(
+            "reddit-home",
+            "LIKES",
+            [(5, 6)],
+            "batch-structural-recreate-delete",
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.deleted, 1);
+
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "LIKES".to_string(),
+            src: 5,
+            dst: 6,
+            idempotency_key: "batch-structural-recreate-edge".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let property_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "batch-structural-recreate-property-read"),
+            "MATCH (u {id: 5})-[r:LIKES {rank: 9}]->(v {id: 6}) RETURN r.rank AS rank",
+        )
+        .await
+        .unwrap();
+    assert!(property_rows.rows.is_empty());
+
+    let endpoint_rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "batch-structural-recreate-endpoint-read"),
+            "MATCH (u {id: 5})-[r:LIKES]->(v {id: 6}) RETURN v.id AS dst",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        endpoint_rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("dst")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(6)])],
+        )
+    );
 
     shard.close().await.unwrap();
 }

@@ -99,6 +99,14 @@ impl GraphShard {
             );
         }
 
+        self.verify_relationship_indexes(
+            cell_id,
+            edge_type,
+            read_epoch,
+            &expected_edges,
+            &mut report,
+        )
+        .await?;
         self.verify_rollup_and_artifacts(cell_id, edge_type, read_epoch, &mut report)
             .await?;
         self.verify_traversals(
@@ -115,6 +123,159 @@ impl GraphShard {
         .await?;
         self.record_verifier_completed(report.mismatch_count, started.elapsed());
         Ok(report)
+    }
+
+    async fn verify_relationship_indexes(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        read_epoch: GraphEpoch,
+        expected_edges: &BTreeSet<(VertexId, VertexId)>,
+        report: &mut GraphCorrectnessReport,
+    ) -> Result<()> {
+        let relationships = self
+            .scan_live_relationship_records(cell_id, edge_type, read_epoch, report)
+            .await?;
+        report.relationship_records = relationships.len() as u64;
+
+        let mut expected_counts = BTreeMap::<(VertexId, VertexId), u64>::new();
+        let mut expected_property_indexes = BTreeSet::<RelationshipPropertyIndexEntry>::new();
+        for record in &relationships {
+            if !expected_edges.contains(&(record.src, record.dst)) {
+                record_mismatch(
+                    report,
+                    format!(
+                        "relationship:missing-structural-edge relationship_id={} src={} dst={}",
+                        record.relationship_id, record.src, record.dst
+                    ),
+                );
+            }
+            *expected_counts.entry((record.src, record.dst)).or_insert(0) += 1;
+            for (property, value) in &record.metadata.properties {
+                expected_property_indexes.insert((
+                    property.clone(),
+                    encode_vertex_property_value_key(value),
+                    record.src,
+                    record.dst,
+                    record.relationship_id,
+                ));
+            }
+        }
+
+        let actual_counts = self
+            .scan_relationship_count_counters(cell_id, edge_type)
+            .await?;
+        report.relationship_count_counters = actual_counts.len() as u64;
+        compare_relationship_count_maps(
+            "relationship_count",
+            &expected_counts,
+            &actual_counts,
+            report,
+        );
+
+        let actual_property_indexes = self
+            .scan_relationship_property_index_entries(cell_id, edge_type)
+            .await?;
+        report.relationship_property_indexes = actual_property_indexes.len() as u64;
+        compare_relationship_property_index_sets(
+            "relationship_property_index",
+            &expected_property_indexes,
+            &actual_property_indexes,
+            report,
+        );
+        Ok(())
+    }
+
+    async fn scan_live_relationship_records(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        read_epoch: GraphEpoch,
+        report: &mut GraphCorrectnessReport,
+    ) -> Result<Vec<RelationshipRecord>> {
+        let mut iter = self
+            .scan_remote_prefix(&crate::keys::relationship_cell_prefix(cell_id))
+            .await?;
+        let mut records = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let record = decode_relationship_record(&key, &kv.value)?;
+            if record.edge_type != edge_type {
+                continue;
+            }
+            if record.cell_id != cell_id {
+                record_mismatch(
+                    report,
+                    format!(
+                        "relationship:record-identity key={key} got={}/{}",
+                        record.cell_id, record.edge_type
+                    ),
+                );
+            }
+            if record.epoch > read_epoch {
+                record_mismatch(
+                    report,
+                    format!(
+                        "relationship:future-record key={key} relationship_epoch={} read_epoch={read_epoch}",
+                        record.epoch
+                    ),
+                );
+                continue;
+            }
+            let tombstone_key = crate::keys::relationship_tombstone(
+                cell_id,
+                &record.edge_type,
+                record.src,
+                record.dst,
+                record.relationship_id,
+            );
+            if let Some(value) = self.read_remote(&tombstone_key).await? {
+                let tombstone_epoch = decode_u64(&tombstone_key, &value)?;
+                if record.epoch <= tombstone_epoch && tombstone_epoch <= read_epoch {
+                    continue;
+                }
+            }
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    async fn scan_relationship_count_counters(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+    ) -> Result<BTreeMap<(VertexId, VertexId), u64>> {
+        let mut iter = self
+            .scan_remote_prefix(&format!("cell/{cell_id}/rel_count/{edge_type}/"))
+            .await?;
+        let mut counters = BTreeMap::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (src, dst) = parse_relationship_count_key(&key)?;
+            let count = decode_u64(&key, &kv.value)?;
+            if count > 0 {
+                counters.insert((src, dst), count);
+            }
+        }
+        Ok(counters)
+    }
+
+    async fn scan_relationship_property_index_entries(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+    ) -> Result<BTreeSet<RelationshipPropertyIndexEntry>> {
+        let mut iter = self
+            .scan_remote_prefix(&format!("cell/{cell_id}/rprop_idx/{edge_type}/"))
+            .await?;
+        let mut entries = BTreeSet::new();
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (_cell_id, _edge_type, property, encoded, src, dst, relationship_id) =
+                parse_relationship_property_index_key_for_verify(&key)?;
+            entries.insert((property, encoded, src, dst, relationship_id));
+        }
+        Ok(entries)
     }
 
     async fn scan_edge_index_pairs(

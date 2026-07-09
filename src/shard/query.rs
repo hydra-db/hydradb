@@ -2982,7 +2982,7 @@ impl GraphShard {
         }
 
         let mut rows = Vec::new();
-        let mut saw_relationship_record = false;
+        let mut saw_live_relationship_record = false;
         let tombstones = self
             .relationship_tombstone_epochs_for_edge_at(
                 cell_id, edge_type, src, dst, read_epoch, budget,
@@ -2994,7 +2994,6 @@ impl GraphShard {
             budget.check("cypher_relationship_edge_records")?;
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let record = decode_relationship_record(&key, &kv.value)?;
-            saw_relationship_record = true;
             if record.epoch > read_epoch {
                 continue;
             }
@@ -3006,6 +3005,7 @@ impl GraphShard {
             {
                 continue;
             }
+            saw_live_relationship_record = true;
             let relationship = BoundRelationship {
                 edge_type: record.edge_type,
                 src: record.src,
@@ -3021,7 +3021,7 @@ impl GraphShard {
             rows.push((relationship, metadata));
             self.ensure_query_index_candidates("cypher_relationship_edge_records", rows.len())?;
         }
-        if saw_relationship_record {
+        if saw_live_relationship_record {
             let structural_metadata = self
                 .edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget)
                 .await?;
@@ -3037,7 +3037,7 @@ impl GraphShard {
                 ));
             }
         }
-        if rows.is_empty() && !saw_relationship_record {
+        if rows.is_empty() && !saw_live_relationship_record {
             let metadata = self
                 .edge_metadata_at(cell_id, edge_type, src, dst, read_epoch, budget)
                 .await?;
@@ -3112,7 +3112,6 @@ impl GraphShard {
             if record.epoch > read_epoch {
                 continue;
             }
-            relationship_dsts.insert(record.dst);
             if tombstones
                 .get(&(record.dst, record.relationship_id))
                 .is_some_and(|tombstone_epoch| {
@@ -3121,6 +3120,7 @@ impl GraphShard {
             {
                 continue;
             }
+            relationship_dsts.insert(record.dst);
             dsts.push(record.dst);
             self.ensure_query_intermediate_rows("cypher_source_relationship_records", dsts.len())?;
         }

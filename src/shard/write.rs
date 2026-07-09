@@ -2021,10 +2021,14 @@ impl GraphShard {
         let relationship_count = read_counter_txn(&txn, &relationship_count_key)
             .await?
             .saturating_sub(1);
-        txn.put(
-            relationship_count_key.as_bytes(),
-            encode_u64(relationship_count),
-        )?;
+        if relationship_count == 0 {
+            txn.delete(relationship_count_key.as_bytes())?;
+        } else {
+            txn.put(
+                relationship_count_key.as_bytes(),
+                encode_u64(relationship_count),
+            )?;
+        }
         delete_relationship_property_indexes_txn(&txn, &record, &record.metadata)?;
         put_relationship_property_index_deltas_txn(
             &txn,
@@ -2724,6 +2728,13 @@ impl GraphShard {
                 Some(value) => decode_edge_metadata(&edge_metadata_key, &value)?,
                 None => EdgeMetadata::default(),
             };
+            tombstone_relationships_for_structural_edge_delete_txn(
+                &txn,
+                mutation,
+                next_epoch,
+                current_epoch,
+            )
+            .await?;
             if !previous_edge_metadata.properties.is_empty() {
                 apply_edge_metadata_update_txn(
                     &txn,
@@ -3019,6 +3030,13 @@ impl GraphShard {
                 None => EdgeMetadata::default(),
             };
 
+            tombstone_relationships_for_structural_edge_delete_txn(
+                &txn,
+                mutation,
+                epoch,
+                current_epoch,
+            )
+            .await?;
             txn.put(
                 keys::last_epoch(&mutation.cell_id).as_bytes(),
                 encode_u64(epoch),
@@ -3102,6 +3120,13 @@ impl GraphShard {
             None => EdgeMetadata::default(),
         };
 
+        tombstone_relationships_for_structural_edge_delete_txn(
+            &txn,
+            mutation,
+            epoch,
+            epoch.saturating_sub(1),
+        )
+        .await?;
         txn.put(
             keys::last_epoch(&mutation.cell_id).as_bytes(),
             encode_u64(epoch),
@@ -5135,6 +5160,63 @@ async fn delete_structural_edge_txn(
         &delta_value,
     )?;
     Ok(())
+}
+
+async fn tombstone_relationships_for_structural_edge_delete_txn(
+    txn: &DbTransaction,
+    mutation: &EdgeMutation,
+    delete_epoch: GraphEpoch,
+    read_epoch: GraphEpoch,
+) -> Result<u64> {
+    let relationships = live_relationships_for_edge_txn(
+        txn,
+        &mutation.cell_id,
+        &mutation.edge_type,
+        mutation.src,
+        mutation.dst,
+        read_epoch,
+    )
+    .await?;
+    for record in &relationships {
+        txn.put(
+            keys::relationship_tombstone(
+                &record.cell_id,
+                &record.edge_type,
+                record.src,
+                record.dst,
+                record.relationship_id,
+            )
+            .as_bytes(),
+            encode_u64(delete_epoch),
+        )?;
+        txn.delete(keys::relationship_id(&record.cell_id, record.relationship_id).as_bytes())?;
+        delete_relationship_property_indexes_txn(txn, record, &record.metadata)?;
+        put_relationship_property_index_deltas_txn(
+            txn,
+            record,
+            &record.metadata,
+            &EdgeMetadata::default(),
+            delete_epoch,
+        )?;
+    }
+    txn.delete(
+        keys::relationship_count(
+            &mutation.cell_id,
+            &mutation.edge_type,
+            mutation.src,
+            mutation.dst,
+        )
+        .as_bytes(),
+    )?;
+    u64::try_from(relationships.len()).map_err(|err| GraphError::CorruptValue {
+        key: keys::relationship_edge_prefix(
+            &mutation.cell_id,
+            &mutation.edge_type,
+            mutation.src,
+            mutation.dst,
+        ),
+        reason: format!("too many relationships to tombstone during edge delete: {err}"),
+    })
 }
 
 fn delete_relationship_property_indexes_txn(

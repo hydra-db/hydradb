@@ -22,12 +22,13 @@ use crate::sparse_kernel::{
     SparseKernelBackend,
 };
 use crate::{
-    decode_delta_record, decode_edge_record, decode_out_edge_segment, decode_u64, ensure_limit,
-    open_graph_db, parse_out_edge_segment_tombstone_key, parse_u64, segment_edge_visible,
-    sort_deltas, validate_component, DeltaKind, DeltaRecord, EdgeRecord, GraphCacheConfig,
-    GraphCacheKind, GraphCorrectnessReport, GraphDurabilityConfig, GraphEpoch, GraphError,
-    GraphExportDigest, GraphOpenOptions, GraphShard, GraphWriteBatch, MatrixAdjacency,
-    MatrixCacheKey, PostingChunkCacheKey, Result, SupernodeCacheKey, VertexId,
+    decode_delta_record, decode_edge_record, decode_out_edge_segment, decode_relationship_record,
+    decode_u64, encode_vertex_property_value_key, ensure_limit, open_graph_db,
+    parse_out_edge_segment_tombstone_key, parse_u64, segment_edge_visible, sort_deltas,
+    validate_component, DeltaKind, DeltaRecord, EdgeRecord, GraphCacheConfig, GraphCacheKind,
+    GraphCorrectnessReport, GraphDurabilityConfig, GraphEpoch, GraphError, GraphExportDigest,
+    GraphOpenOptions, GraphShard, GraphWriteBatch, MatrixAdjacency, MatrixCacheKey,
+    PostingChunkCacheKey, RelationshipId, RelationshipRecord, Result, SupernodeCacheKey, VertexId,
 };
 
 const GRAPH_PREALLOC_LIMIT: usize = 1_000_000;
@@ -1067,6 +1068,8 @@ fn adjacency_edge_count(adjacency: &MatrixAdjacency) -> u64 {
 
 const GRAPH_VERIFY_MISMATCH_SAMPLES: usize = 64;
 
+type RelationshipPropertyIndexEntry = (String, String, VertexId, VertexId, RelationshipId);
+
 fn graph_export_digest(
     cell_id: &str,
     edge_type: &str,
@@ -1171,6 +1174,113 @@ fn compare_degree_maps(
                 format!("{label}:extra vertex={vertex} actual={actual_degree}"),
             );
         }
+    }
+}
+
+fn compare_relationship_count_maps(
+    label: &'static str,
+    expected: &BTreeMap<(VertexId, VertexId), u64>,
+    actual: &BTreeMap<(VertexId, VertexId), u64>,
+    report: &mut GraphCorrectnessReport,
+) {
+    for ((src, dst), expected_count) in expected {
+        let actual_count = actual.get(&(*src, *dst)).copied().unwrap_or_default();
+        if actual_count != *expected_count {
+            record_mismatch(
+                report,
+                format!(
+                    "{label}:mismatch src={src} dst={dst} expected={expected_count} actual={actual_count}"
+                ),
+            );
+        }
+    }
+    for ((src, dst), actual_count) in actual {
+        if *actual_count > 0 && !expected.contains_key(&(*src, *dst)) {
+            record_mismatch(
+                report,
+                format!("{label}:extra src={src} dst={dst} actual={actual_count}"),
+            );
+        }
+    }
+}
+
+fn compare_relationship_property_index_sets(
+    label: &'static str,
+    expected: &BTreeSet<RelationshipPropertyIndexEntry>,
+    actual: &BTreeSet<RelationshipPropertyIndexEntry>,
+    report: &mut GraphCorrectnessReport,
+) {
+    for (property, encoded, src, dst, relationship_id) in expected
+        .difference(actual)
+        .take(GRAPH_VERIFY_MISMATCH_SAMPLES)
+    {
+        record_mismatch(
+            report,
+            format!(
+                "{label}:missing property={property} value={encoded} src={src} dst={dst} relationship_id={relationship_id}"
+            ),
+        );
+    }
+    for (property, encoded, src, dst, relationship_id) in actual
+        .difference(expected)
+        .take(GRAPH_VERIFY_MISMATCH_SAMPLES)
+    {
+        record_mismatch(
+            report,
+            format!(
+                "{label}:extra property={property} value={encoded} src={src} dst={dst} relationship_id={relationship_id}"
+            ),
+        );
+    }
+    let missing = expected.difference(actual).count();
+    let extra = actual.difference(expected).count();
+    let sampled = missing
+        .min(GRAPH_VERIFY_MISMATCH_SAMPLES)
+        .saturating_add(extra.min(GRAPH_VERIFY_MISMATCH_SAMPLES));
+    let unsampled = missing.saturating_add(extra).saturating_sub(sampled);
+    report.mismatch_count = report.mismatch_count.saturating_add(unsampled as u64);
+}
+
+fn parse_relationship_count_key(key: &str) -> Result<(VertexId, VertexId)> {
+    match key.split('/').collect::<Vec<_>>().as_slice() {
+        ["cell", _cell_id, "rel_count", _edge_type, src, dst] => Ok((
+            parse_u64(key, src, "relationship_count_src")?,
+            parse_u64(key, dst, "relationship_count_dst")?,
+        )),
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected relationship count key".to_string(),
+        }),
+    }
+}
+
+fn parse_relationship_property_index_key_for_verify(
+    key: &str,
+) -> Result<(
+    String,
+    String,
+    String,
+    String,
+    VertexId,
+    VertexId,
+    RelationshipId,
+)> {
+    match key.split('/').collect::<Vec<_>>().as_slice() {
+        ["cell", cell_id, "rprop_idx", edge_type, property, encoded, src, dst, relationship_id] => {
+            Ok((
+                (*cell_id).to_string(),
+                (*edge_type).to_string(),
+                (*property).to_string(),
+                (*encoded).to_string(),
+                parse_u64(key, src, "src")?,
+                parse_u64(key, dst, "dst")?,
+                parse_u64(key, relationship_id, "relationship_id")?,
+            ))
+        }
+        _ => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "expected relationship property index key".to_string(),
+        }),
     }
 }
 
