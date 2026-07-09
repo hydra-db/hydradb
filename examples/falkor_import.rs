@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -344,7 +344,6 @@ struct EdgeImportTotals {
 
 #[derive(Default, Debug)]
 struct NodeImportState {
-    seen: BTreeSet<VertexId>,
     batch: Vec<(VertexId, VertexMetadata)>,
     imported: usize,
 }
@@ -442,12 +441,6 @@ async fn import_node_line(
         return Ok(());
     };
     let (id, metadata) = parse_node_line(key, line_no, line)?;
-    if !state.seen.insert(id) {
-        return Err(GraphError::CorruptValue {
-            key: format!("{key}:{line_no}"),
-            reason: format!("duplicate node id {id}"),
-        });
-    }
     state.batch.push((id, metadata));
     if state.batch.len() >= config.metadata_batch_size {
         state.imported += flush_node_batch(shard, config, &mut state.batch).await?;
@@ -465,7 +458,7 @@ async fn flush_node_batch(
     }
     let updates = std::mem::take(batch);
     shard
-        .set_vertex_metadata_batch(&config.cell_id, updates)
+        .import_vertex_metadata_batch(&config.cell_id, updates)
         .await
 }
 

@@ -1799,38 +1799,46 @@ async fn flush_unpublished_artifact_gc_batch_best_effort(
     if *pending_deletes == 0 {
         return true;
     }
-    match shard.read_remote(manifest_key).await {
-        Ok(Some(_)) => {
-            result.skipped_published_manifest = true;
-            *batch = GraphWriteBatch::new();
-            *pending_deletes = 0;
-            return false;
+    let attempted_deletes = *pending_deletes as u64;
+    let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
+    *pending_deletes = 0;
+    let locked_delete = async {
+        let lock = shard.acquire_cell_write_lock(cell_id, operation).await?;
+        let result = async {
+            match shard.read_remote(manifest_key).await {
+                Ok(Some(_)) => {
+                    return Err(GraphError::CorruptValue {
+                        key: manifest_key.to_string(),
+                        reason: "matrix manifest appeared before abort cleanup flush".to_string(),
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => return Err(err),
+            }
+            shard
+                .write_graph_batch_strict(cell_id, operation, batch_to_write)
+                .await
         }
-        Ok(None) => {}
-        Err(err) => {
-            result.record_error(
+        .await;
+        crate::release_cell_write_lock(lock, result).await
+    }
+    .await;
+    match locked_delete {
+        Ok(()) => {
+            result.deleted_keys = result.deleted_keys.saturating_add(attempted_deletes);
+        }
+        Err(GraphError::CorruptValue { key, reason }) if key == manifest_key => {
+            result.skipped_published_manifest = true;
+            tracing::warn!(
+                target: "slatedb_graph_kernel",
                 cell_id,
                 edge_type,
                 base_epoch,
                 operation,
-                "recheck_matrix_manifest",
-                &err,
+                reason,
+                "matrix artifact abort cleanup skipped published manifest"
             );
-            *batch = GraphWriteBatch::new();
-            *pending_deletes = 0;
             return false;
-        }
-    }
-
-    let attempted_deletes = *pending_deletes as u64;
-    let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
-    *pending_deletes = 0;
-    match shard
-        .write_graph_batch_strict(cell_id, operation, batch_to_write)
-        .await
-    {
-        Ok(()) => {
-            result.deleted_keys = result.deleted_keys.saturating_add(attempted_deletes);
         }
         Err(err) => {
             result.record_error(
@@ -1858,7 +1866,7 @@ async fn flush_artifact_gc_batch(
     }
     let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
     shard
-        .write_graph_batch_strict(cell_id, operation, batch_to_write)
+        .write_graph_batch_strict_with_cell_lock(cell_id, operation, batch_to_write)
         .await?;
     *pending_deletes = 0;
     Ok(())

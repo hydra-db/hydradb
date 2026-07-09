@@ -8455,6 +8455,59 @@ async fn tcp_query_transport_default_bind_rejects_unauthenticated_requests() {
 
 #[cfg(feature = "query-transport")]
 #[tokio::test]
+async fn tcp_query_transport_blank_bearer_token_fails_closed() {
+    struct StaticQueryClient;
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for StaticQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            Ok(QueryResultSet::new(
+                vec![QueryColumn::new("v.id")],
+                vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+            ))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    assert!(QueryTransportSecret::try_new("").is_err());
+    assert!(QueryTransportSecret::try_new("   ").is_err());
+
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(StaticQueryClient),
+        QueryTransportServerConfig::default().with_required_bearer_token("   "),
+    )
+    .await
+    .unwrap();
+    let err = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("   ")
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "query-transport-blank-deny"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("unauthorized"));
+    assert!(server.metrics().auth_failures >= 1);
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
 async fn tcp_query_transport_enforces_auth_cancellation_streaming_metrics_and_discovery() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let control = GraphControlPlane::open(
@@ -9455,6 +9508,51 @@ async fn batch_metadata_writes_are_idempotent_and_validate_edges() {
     assert!(conflicting
         .to_string()
         .contains("conflicting metadata values"));
+
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn import_vertex_metadata_batch_is_bounded_and_rejects_conflicts() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/import-vertex-metadata-batch", object_store).await;
+
+    let alice = VertexMetadata::default()
+        .with_label("User")
+        .with_property("_fid", VertexPropertyValue::Integer(1))
+        .with_property("name", VertexPropertyValue::String("alice".to_string()));
+    assert_eq!(
+        shard
+            .import_vertex_metadata_batch("reddit-home", [(1, alice.clone())])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        shard
+            .import_vertex_metadata_batch("reddit-home", [(1, alice.clone())])
+            .await
+            .unwrap(),
+        0
+    );
+
+    let conflicting = VertexMetadata::default()
+        .with_label("User")
+        .with_property("_fid", VertexPropertyValue::Integer(1))
+        .with_property(
+            "name",
+            VertexPropertyValue::String("alice-updated".to_string()),
+        );
+    let err = shard
+        .import_vertex_metadata_batch("reddit-home", [(1, conflicting)])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("different metadata during import"));
+
+    let key = keys::vertex("reddit-home", 1);
+    let stored =
+        decode_vertex_metadata(&key, &shard.read_remote(&key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(stored, alice);
 
     shard.close().await.unwrap();
 }

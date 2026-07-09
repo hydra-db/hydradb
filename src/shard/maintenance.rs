@@ -47,8 +47,12 @@ impl GraphShard {
             keys::delta_gc_watermark(cell_id, edge_type),
             encode_u64(compact_through_epoch),
         );
-        self.write_graph_batch_strict(cell_id, "delete_deltas_through_rollup", watermark_batch)
-            .await?;
+        self.write_graph_batch_strict_with_cell_lock(
+            cell_id,
+            "delete_deltas_through_rollup",
+            watermark_batch,
+        )
+        .await?;
 
         let mut result = DeltaGcResult {
             compacted_through_epoch: compact_through_epoch,
@@ -247,8 +251,12 @@ impl GraphShard {
             return Ok(());
         }
         let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
-        self.write_graph_batch_strict(cell_id, "delete_deltas_through_rollup", batch_to_write)
-            .await?;
+        self.write_graph_batch_strict_with_cell_lock(
+            cell_id,
+            "delete_deltas_through_rollup",
+            batch_to_write,
+        )
+        .await?;
         *pending_deletes = 0;
         Ok(())
     }
@@ -583,6 +591,22 @@ impl GraphShard {
             operation: "graph transaction",
             attempts: GRAPH_TXN_MAX_RETRIES,
         })
+    }
+
+    pub(crate) async fn write_graph_batch_strict_with_cell_lock(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+        batch: GraphWriteBatch,
+    ) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let lock = self.acquire_cell_write_lock(cell_id, operation).await?;
+        let result = self
+            .write_graph_batch_strict(cell_id, operation, batch)
+            .await;
+        release_cell_write_lock(lock, result).await
     }
 
     async fn write_graph_batch_txn(

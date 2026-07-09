@@ -321,7 +321,7 @@ impl GraphShard {
             rollup_key(cell_id, edge_type, base_epoch),
             encode_graph_rollup(&rollup),
         );
-        self.write_graph_batch_strict(cell_id, "rollup_artifacts", batch)
+        self.write_graph_batch_strict_with_cell_lock(cell_id, "rollup_artifacts", batch)
             .await?;
         tracing::info!(
             target: "slatedb_graph_kernel",
