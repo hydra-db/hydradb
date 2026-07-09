@@ -321,8 +321,10 @@ where
             .entries
             .iter()
             .filter(|(_, entry)| {
-                tenant.is_none_or(|tenant| tenant == entry.tenant)
-                    && (allow_pinned || !entry.pinned)
+                (match tenant {
+                    Some(tenant) => tenant == entry.tenant,
+                    None => true,
+                }) && (allow_pinned || !entry.pinned)
             })
             .min_by_key(|(_, entry)| entry.last_access)
             .map(|(key, _)| key.clone())?;
