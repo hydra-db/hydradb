@@ -4126,6 +4126,65 @@ async fn graph_cluster_runs_multiple_local_shards_on_one_object_store() {
 }
 
 #[tokio::test]
+async fn graph_cluster_open_cleans_previously_opened_shards_after_later_validation_error() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let err = match GraphCluster::open_cells(
+        "graph-cluster-partial-open-cleanup",
+        ["cell-a", "bad/cell"],
+        Arc::clone(&object_store),
+    )
+    .await
+    {
+        Ok(_) => panic!("partial reader open unexpectedly succeeded"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        GraphError::InvalidKeyComponent {
+            component: "cell_id",
+            ..
+        }
+    ));
+
+    let reopened = GraphCluster::open_cells(
+        "graph-cluster-partial-open-cleanup",
+        ["cell-a"],
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.shard_count(), 1);
+    reopened.close().await.unwrap();
+
+    let err = match GraphCluster::open_cells_standalone_writers(
+        "graph-cluster-partial-open-cleanup-writer",
+        ["cell-a", "bad/cell"],
+        Arc::clone(&object_store),
+    )
+    .await
+    {
+        Ok(_) => panic!("partial writer open unexpectedly succeeded"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        GraphError::InvalidKeyComponent {
+            component: "cell_id",
+            ..
+        }
+    ));
+    let reopened = GraphCluster::open_cells_standalone_writers(
+        "graph-cluster-partial-open-cleanup-writer",
+        ["cell-a"],
+        object_store,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.shard_count(), 1);
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn routed_cluster_rejects_writes_for_non_owned_cells() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let placement =
