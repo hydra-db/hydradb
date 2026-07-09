@@ -293,6 +293,27 @@ impl GraphControlPlane {
         now_ms: u64,
     ) -> Result<GraphClusterControllerReport> {
         self.metrics.controller_runs.fetch_add(1, Ordering::Relaxed);
+        let result = self.reconcile_cluster_at_inner(config, now_ms).await;
+        match &result {
+            Ok(_) => {
+                self.metrics
+                    .controller_successes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.metrics
+                    .controller_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
+    }
+
+    async fn reconcile_cluster_at_inner(
+        &self,
+        config: &GraphClusterControllerConfig,
+        now_ms: u64,
+    ) -> Result<GraphClusterControllerReport> {
         config.validated_configured_cells()?;
         let heartbeat_ttl_ms = validate_controller_duration("heartbeat_ttl", config.heartbeat_ttl)?;
         let mut report = GraphClusterControllerReport {

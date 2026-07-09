@@ -5798,8 +5798,44 @@ async fn cluster_controller_assigns_unplaced_cells_to_live_nodes() {
     }
     let metrics = control.graph_control_metrics();
     assert_eq!(metrics.controller_runs, 1);
+    assert_eq!(metrics.controller_successes, 1);
+    assert_eq!(metrics.controller_failures, 0);
     assert_eq!(metrics.controller_reassignments, 2);
     assert_eq!(metrics.controller_failovers, 2);
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cluster_controller_metrics_count_reconcile_failures() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/controller-failure-metrics", object_store)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-a", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    let mut config = GraphClusterControllerConfig::new(
+        ["reddit-home"],
+        std::time::Duration::from_millis(1_000),
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+    config.heartbeat_ttl = std::time::Duration::ZERO;
+
+    let err = control
+        .reconcile_cluster_at(&config, 1_100)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GraphError::CorruptValue { .. }));
+    let metrics = control.graph_control_metrics();
+    assert_eq!(metrics.controller_runs, 1);
+    assert_eq!(metrics.controller_successes, 0);
+    assert_eq!(metrics.controller_failures, 1);
+    assert!(matches!(
+        control.load_placement().await.unwrap_err(),
+        GraphError::CorruptValue { .. }
+    ));
     control.close().await.unwrap();
 }
 
