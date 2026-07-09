@@ -13,6 +13,39 @@ impl LeaseRenewalHandle {
     }
 }
 
+impl ShardRefreshHandle {
+    pub async fn stop(self) -> Result<()> {
+        let _ = self.stop_tx.send(true);
+        match self.task.await {
+            Ok(result) => result,
+            Err(err) => Err(GraphError::CorruptValue {
+                key: "control/shard_refresher".to_string(),
+                reason: format!("shard refresher task failed: {err}"),
+            }),
+        }
+    }
+}
+
+impl GraphNodeRuntimeConfig {
+    pub fn new(
+        lease_ttl: Duration,
+        lease_renew_interval: Duration,
+        shard_refresh_interval: Duration,
+    ) -> Self {
+        Self {
+            lease_ttl,
+            lease_renew_interval,
+            shard_refresh_interval,
+            options: GraphOpenOptions::default(),
+        }
+    }
+
+    pub fn with_options(mut self, options: GraphOpenOptions) -> Self {
+        self.options = options;
+        self
+    }
+}
+
 impl GraphNode {
     pub async fn open(
         base_path: impl Into<String>,
@@ -78,6 +111,53 @@ impl GraphNode {
         })
     }
 
+    pub async fn open_managed(
+        base_path: impl Into<String>,
+        local_node_id: impl Into<String>,
+        control: Arc<GraphControlPlane>,
+        object_store: Arc<dyn ObjectStore>,
+        lease_ttl: Duration,
+        lease_renew_interval: Duration,
+        shard_refresh_interval: Duration,
+    ) -> Result<ManagedGraphNode> {
+        Self::open_managed_with_config(
+            base_path,
+            local_node_id,
+            control,
+            object_store,
+            GraphNodeRuntimeConfig::new(lease_ttl, lease_renew_interval, shard_refresh_interval),
+        )
+        .await
+    }
+
+    pub async fn open_managed_with_config(
+        base_path: impl Into<String>,
+        local_node_id: impl Into<String>,
+        control: Arc<GraphControlPlane>,
+        object_store: Arc<dyn ObjectStore>,
+        config: GraphNodeRuntimeConfig,
+    ) -> Result<ManagedGraphNode> {
+        let node = Self::open_with_options(
+            base_path,
+            local_node_id,
+            control,
+            object_store,
+            config.lease_ttl,
+            config.lease_renew_interval,
+            config.options,
+        )
+        .await?;
+        node.into_managed(config.lease_ttl, config.shard_refresh_interval)
+    }
+
+    pub fn into_managed(
+        self,
+        lease_ttl: Duration,
+        shard_refresh_interval: Duration,
+    ) -> Result<ManagedGraphNode> {
+        ManagedGraphNode::new(self, lease_ttl, shard_refresh_interval)
+    }
+
     pub fn cluster(&self) -> &RoutedGraphCluster {
         &self.cluster
     }
@@ -112,6 +192,176 @@ impl GraphNode {
         heartbeat_result?;
         lease_result?;
         cluster_result
+    }
+}
+
+impl ManagedGraphNode {
+    fn new(node: GraphNode, lease_ttl: Duration, shard_refresh_interval: Duration) -> Result<Self> {
+        if shard_refresh_interval.is_zero() {
+            return Err(GraphError::CorruptValue {
+                key: "control/shard_refresh_interval".to_string(),
+                reason: "shard refresh interval must be greater than zero".to_string(),
+            });
+        }
+        if lease_ttl.is_zero() {
+            return Err(GraphError::CorruptValue {
+                key: "control/managed_node_lease_ttl".to_string(),
+                reason: "managed node lease ttl must be greater than zero".to_string(),
+            });
+        }
+        lease_ttl_ms(lease_ttl)?;
+        let node = Arc::new(TokioMutex::new(Some(node)));
+        let metrics = Arc::new(GraphNodeMaintenanceMetrics::default());
+        let shard_refresher = start_managed_shard_refresher(
+            Arc::clone(&node),
+            lease_ttl,
+            shard_refresh_interval,
+            Arc::clone(&metrics),
+        );
+        Ok(Self {
+            node,
+            shard_refresher,
+            metrics,
+        })
+    }
+
+    pub fn maintenance_metrics(&self) -> GraphNodeMaintenanceMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    pub async fn local_cells(&self) -> Result<Vec<String>> {
+        with_managed_node(&self.node, |node| {
+            Ok(node
+                .cluster()
+                .local_cells()
+                .into_iter()
+                .map(str::to_string)
+                .collect())
+        })
+        .await
+    }
+
+    pub async fn lease(&self, cell_id: &str) -> Result<Option<ShardLease>> {
+        validate_component("cell_id", cell_id)?;
+        with_managed_node(&self.node, |node| Ok(node.cluster().lease(cell_id))).await
+    }
+
+    pub async fn set_health_state(
+        &self,
+        state: GraphNodeHealthState,
+    ) -> Result<GraphNodeHeartbeat> {
+        let guard = self.node.lock().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.set_health_state(state).await
+    }
+
+    pub async fn refresh_owned_shards(
+        &self,
+        lease_ttl: Duration,
+    ) -> Result<GraphShardRefreshReport> {
+        let mut guard = self.node.lock().await;
+        let node = guard.as_mut().ok_or_else(managed_node_closed_error)?;
+        node.refresh_owned_shards(lease_ttl).await
+    }
+
+    pub async fn write_edge(&self, mutation: crate::EdgeMutation) -> Result<crate::CommitResult> {
+        let guard = self.node.lock().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster().write_edge(mutation).await
+    }
+
+    pub async fn delete_edge(&self, mutation: crate::EdgeMutation) -> Result<crate::DeleteResult> {
+        let guard = self.node.lock().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster().delete_edge(mutation).await
+    }
+
+    pub async fn out_neighbors(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+    ) -> Result<Vec<VertexId>> {
+        let guard = self.node.lock().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .shard(cell_id)?
+            .out_neighbors(cell_id, edge_type, src)
+            .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn execute_cypher(
+        &self,
+        context: crate::QueryContext,
+        query: &str,
+    ) -> Result<crate::QueryOutput> {
+        let guard = self.node.lock().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster().execute_cypher(context, query).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn execute_cypher_rows(
+        &self,
+        context: crate::QueryContext,
+        query: &str,
+    ) -> Result<crate::QueryResultSet> {
+        let guard = self.node.lock().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster().execute_cypher_rows(context, query).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn execute_cypher_rows_page(
+        &self,
+        context: crate::QueryContext,
+        query: &str,
+        cursor: Option<crate::QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<crate::QueryResultPage> {
+        let guard = self.node.lock().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .execute_cypher_rows_page(context, query, cursor, page_size)
+            .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn execute_cypher_rows_many(
+        &self,
+        contexts: impl IntoIterator<Item = crate::QueryContext>,
+        query: &str,
+    ) -> Result<BTreeMap<String, crate::QueryResultSet>> {
+        let guard = self.node.lock().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .execute_cypher_rows_many(contexts, query)
+            .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub async fn explain_cypher(
+        &self,
+        context: crate::QueryContext,
+        query: &str,
+    ) -> Result<crate::QueryPlan> {
+        let guard = self.node.lock().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster().explain_cypher(context, query)
+    }
+
+    pub async fn close(self) -> Result<()> {
+        let refresh_result = self.shard_refresher.stop().await;
+        let mut guard = self.node.lock().await;
+        let node = guard.take();
+        drop(guard);
+        let close_result = match node {
+            Some(node) => node.close().await,
+            None => Ok(()),
+        };
+        refresh_result?;
+        close_result
     }
 }
 
@@ -893,5 +1143,88 @@ impl RoutedGraphCluster {
             shard.close().await?;
         }
         Ok(())
+    }
+}
+
+fn start_managed_shard_refresher(
+    node: Arc<TokioMutex<Option<GraphNode>>>,
+    lease_ttl: Duration,
+    interval: Duration,
+    metrics: Arc<GraphNodeMaintenanceMetrics>,
+) -> ShardRefreshHandle {
+    let (stop_tx, mut stop_rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        loop {
+            metrics
+                .shard_refresh_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            let result = {
+                let mut guard = node.lock().await;
+                let Some(node) = guard.as_mut() else {
+                    break;
+                };
+                node.refresh_owned_shards(lease_ttl).await
+            };
+            match result {
+                Ok(report) => {
+                    metrics
+                        .shard_refresh_successes
+                        .fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .shard_refresh_opened_cells
+                        .fetch_add(report.opened_cells.len() as u64, Ordering::Relaxed);
+                    metrics
+                        .shard_refresh_closed_cells
+                        .fetch_add(report.closed_cells.len() as u64, Ordering::Relaxed);
+                    if !report.opened_cells.is_empty() || !report.closed_cells.is_empty() {
+                        tracing::info!(
+                            target: "slatedb_graph_kernel",
+                            opened_cells = ?report.opened_cells,
+                            closed_cells = ?report.closed_cells,
+                            retained_cells = ?report.retained_cells,
+                            "managed graph node refreshed shard ownership"
+                        );
+                    }
+                }
+                Err(err) => {
+                    metrics
+                        .shard_refresh_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        target: "slatedb_graph_kernel",
+                        error = %err,
+                        "managed graph node shard refresh failed"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(interval) => {}
+            }
+        }
+        Ok(())
+    });
+    ShardRefreshHandle { stop_tx, task }
+}
+
+async fn with_managed_node<R>(
+    node: &Arc<TokioMutex<Option<GraphNode>>>,
+    f: impl FnOnce(&GraphNode) -> Result<R>,
+) -> Result<R> {
+    let guard = node.lock().await;
+    let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+    f(node)
+}
+
+fn managed_node_closed_error() -> GraphError {
+    GraphError::CorruptValue {
+        key: "control/managed_node".to_string(),
+        reason: "managed graph node is closed".to_string(),
     }
 }

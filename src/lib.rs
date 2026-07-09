@@ -60,10 +60,11 @@ pub use engine::{
     GraphClusterControllerHandle, GraphClusterControllerReport, GraphControlEdgeWatermark,
     GraphControlIdempotencyRecord, GraphControlMetricsSnapshot, GraphControlPlane,
     GraphControlRepairReport, GraphControlWatermark, GraphNode, GraphNodeHealthState,
-    GraphNodeHeartbeat, GraphPendingFailover, GraphRollup, GraphShardCatalogEntry,
-    GraphShardReassignment, GraphShardRefreshReport, LeaseRenewalHandle, MatrixArtifact,
+    GraphNodeHeartbeat, GraphNodeMaintenanceMetricsSnapshot, GraphNodeRuntimeConfig,
+    GraphPendingFailover, GraphRollup, GraphShardCatalogEntry, GraphShardReassignment,
+    GraphShardRefreshReport, LeaseRenewalHandle, ManagedGraphNode, MatrixArtifact,
     MatrixTraversalResult, NodeHeartbeatHandle, PostingChunk, RoutedGraphCluster, ShardLease,
-    ShardPlacement, SupernodeGroup, SupernodePage, TraversalBackend,
+    ShardPlacement, ShardRefreshHandle, SupernodeGroup, SupernodePage, TraversalBackend,
 };
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
