@@ -131,6 +131,17 @@ pub struct SupernodeChunkBound {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct SupernodeArtifactManifest {
+    cell_id: String,
+    edge_type: String,
+    base_epoch: GraphEpoch,
+    group_count: u64,
+    chunk_count: u64,
+    degree: u64,
+    checksum: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SupernodePage {
     pub vertex_id: VertexId,
     pub edge_type: String,
@@ -1848,6 +1859,7 @@ fn graph_artifact_gc_prefixes(cell_id: &str, edge_type: &str) -> Vec<String> {
         graphblas_csc_prefix(cell_id, edge_type),
         graphblas_csc_chunk_prefix(cell_id, edge_type),
         format!("cell/{cell_id}/artifact/supernode/{edge_type}/"),
+        supernode_artifact_manifest_prefix(cell_id, edge_type),
         rollup_prefix(cell_id, edge_type),
     ]
 }
@@ -1863,6 +1875,7 @@ fn graph_artifact_epoch_from_key(key: &str) -> Result<Option<GraphEpoch>> {
         ["cell", _, "artifact", "graphblas_csc", _, base_epoch] => Some(*base_epoch),
         ["cell", _, "artifact", "graphblas_csc_chunk", _, base_epoch, ..] => Some(*base_epoch),
         ["cell", _, "artifact", "supernode", _, _, _, base_epoch] => Some(*base_epoch),
+        ["cell", _, "artifact", "supernode_epoch_manifest", _, base_epoch] => Some(*base_epoch),
         ["cell", _, "rollup", _, base_epoch] => Some(*base_epoch),
         _ => None,
     };
@@ -2191,6 +2204,331 @@ async fn flush_unpublished_posting_artifact_gc_batch_best_effort(
             true
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SupernodeArtifactCleanupResult {
+    pub(crate) deleted_keys: u64,
+    pub(crate) cleanup_errors: u64,
+    pub(crate) skipped_published_manifest: bool,
+}
+
+impl SupernodeArtifactCleanupResult {
+    fn record_error<E>(
+        &mut self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+        operation: &'static str,
+        cleanup_step: &'static str,
+        err: &E,
+    ) where
+        E: std::fmt::Display + ?Sized,
+    {
+        self.cleanup_errors = self.cleanup_errors.saturating_add(1);
+        tracing::warn!(
+            target: "slatedb_graph_kernel",
+            cell_id,
+            edge_type,
+            base_epoch,
+            operation,
+            cleanup_step,
+            error = %err,
+            "supernode artifact abort cleanup step failed"
+        );
+    }
+}
+
+pub(crate) async fn cleanup_unpublished_supernode_artifact_epoch(
+    shard: &GraphShard,
+    cell_id: &str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+    operation: &'static str,
+) -> SupernodeArtifactCleanupResult {
+    let mut result = SupernodeArtifactCleanupResult::default();
+    let manifest_key = supernode_artifact_manifest_key(cell_id, edge_type, base_epoch);
+    match shard.read_remote(&manifest_key).await {
+        Ok(Some(_)) => {
+            result.skipped_published_manifest = true;
+            return result;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "read_supernode_epoch_manifest",
+                &err,
+            );
+            return result;
+        }
+    }
+
+    let artifact_lock = match shard
+        .acquire_supernode_artifact_write_lock(cell_id, edge_type, base_epoch, operation)
+        .await
+    {
+        Ok(lock) => lock,
+        Err(err) => {
+            result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "acquire_supernode_artifact_lock",
+                &err,
+            );
+            return result;
+        }
+    };
+
+    let cleanup_run = async {
+        match shard.read_remote(&manifest_key).await {
+            Ok(Some(_)) => {
+                result.skipped_published_manifest = true;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(err) => {
+                result.record_error(
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    operation,
+                    "recheck_supernode_epoch_manifest",
+                    &err,
+                );
+                return Ok(());
+            }
+        }
+
+        let mut batch = GraphWriteBatch::new();
+        let mut pending_deletes = 0_usize;
+        let posting_manifest_key = posting_artifact_manifest_key(cell_id, edge_type, base_epoch);
+        let posting_epoch_published = match shard.read_remote(&posting_manifest_key).await {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(err) => {
+                result.record_error(
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    operation,
+                    "read_posting_epoch_manifest_before_supernode_cleanup",
+                    &err,
+                );
+                true
+            }
+        };
+        let mut prefixes = vec![(
+            "scan_supernode_groups",
+            format!("cell/{cell_id}/artifact/supernode/{edge_type}/"),
+        )];
+        if !posting_epoch_published {
+            prefixes.push((
+                "scan_unprotected_supernode_posting_chunks",
+                format!("cell/{cell_id}/artifact/posting/{edge_type}/"),
+            ));
+        }
+        for (cleanup_step, prefix) in prefixes {
+            let mut iter = match shard.scan_remote_prefix(&prefix).await {
+                Ok(iter) => iter,
+                Err(err) => {
+                    result.record_error(
+                        cell_id,
+                        edge_type,
+                        base_epoch,
+                        operation,
+                        cleanup_step,
+                        &err,
+                    );
+                    continue;
+                }
+            };
+            loop {
+                let kv = match iter.next().await {
+                    Ok(Some(kv)) => kv,
+                    Ok(None) => break,
+                    Err(err) => {
+                        result.record_error(
+                            cell_id,
+                            edge_type,
+                            base_epoch,
+                            operation,
+                            cleanup_step,
+                            &err,
+                        );
+                        break;
+                    }
+                };
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                match graph_artifact_epoch_from_key(&key) {
+                    Ok(Some(epoch)) if epoch == base_epoch => {
+                        batch.delete(key.as_bytes());
+                        pending_deletes += 1;
+                    }
+                    Ok(_) => {}
+                    Err(err) => result.record_error(
+                        cell_id,
+                        edge_type,
+                        base_epoch,
+                        operation,
+                        cleanup_step,
+                        &err,
+                    ),
+                }
+                if pending_deletes >= GRAPH_ARTIFACT_GC_BATCH_KEYS
+                    && !flush_unpublished_supernode_artifact_gc_batch_best_effort(
+                        shard,
+                        cell_id,
+                        edge_type,
+                        base_epoch,
+                        operation,
+                        &manifest_key,
+                        &artifact_lock,
+                        &mut batch,
+                        &mut pending_deletes,
+                        &mut result,
+                    )
+                    .await
+                {
+                    return Ok(());
+                }
+            }
+        }
+
+        if flush_unpublished_supernode_artifact_gc_batch_best_effort(
+            shard,
+            cell_id,
+            edge_type,
+            base_epoch,
+            operation,
+            &manifest_key,
+            &artifact_lock,
+            &mut batch,
+            &mut pending_deletes,
+            &mut result,
+        )
+        .await
+        {
+            shard.supernode_group_cache.lock().await.retain(|key, _| {
+                key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch
+            });
+            shard
+                .materialized_supernode_cache
+                .lock()
+                .await
+                .retain(|key, _| {
+                    key.cell_id != cell_id
+                        || key.edge_type != edge_type
+                        || key.base_epoch != base_epoch
+                });
+            if !posting_epoch_published {
+                shard.posting_chunk_cache.lock().await.retain(|key, _| {
+                    key.cell_id != cell_id
+                        || key.edge_type != edge_type
+                        || key.base_epoch != base_epoch
+                });
+            }
+        }
+
+        Ok(())
+    }
+    .await;
+    if let Err(err) = crate::release_cell_write_lock(artifact_lock, cleanup_run).await {
+        result.record_error(
+            cell_id,
+            edge_type,
+            base_epoch,
+            operation,
+            "release_supernode_artifact_lock",
+            &err,
+        );
+    }
+
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_unpublished_supernode_artifact_gc_batch_best_effort(
+    shard: &GraphShard,
+    cell_id: &str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+    operation: &'static str,
+    manifest_key: &str,
+    artifact_lock: &CellWriteLock,
+    batch: &mut GraphWriteBatch,
+    pending_deletes: &mut usize,
+    result: &mut SupernodeArtifactCleanupResult,
+) -> bool {
+    if *pending_deletes == 0 {
+        return true;
+    }
+    let attempted_deletes = *pending_deletes as u64;
+    let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
+    *pending_deletes = 0;
+    let locked_delete = async {
+        artifact_lock.renew().await?;
+        match shard.read_remote(manifest_key).await {
+            Ok(Some(_)) => {
+                return Err(GraphError::CorruptValue {
+                    key: manifest_key.to_string(),
+                    reason: "supernode manifest appeared before abort cleanup flush".to_string(),
+                });
+            }
+            Ok(None) => {}
+            Err(err) => return Err(err),
+        }
+        shard
+            .write_graph_batch_strict(cell_id, operation, batch_to_write)
+            .await?;
+        artifact_lock.renew().await
+    }
+    .await;
+    match locked_delete {
+        Ok(()) => {
+            result.deleted_keys = result.deleted_keys.saturating_add(attempted_deletes);
+        }
+        Err(GraphError::CorruptValue { key, reason }) if key == manifest_key => {
+            result.skipped_published_manifest = true;
+            tracing::warn!(
+                target: "slatedb_graph_kernel",
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                reason,
+                "supernode artifact abort cleanup skipped published manifest"
+            );
+            return false;
+        }
+        Err(err @ GraphError::CellWriteConflict { .. }) => {
+            result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "delete_unpublished_supernode_artifacts",
+                &err,
+            );
+            return false;
+        }
+        Err(err) => {
+            result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "delete_unpublished_supernode_artifacts",
+                &err,
+            );
+        }
+    }
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3087,6 +3425,96 @@ fn supernode_group_prefix(
     )
 }
 
+fn supernode_artifact_manifest_key(
+    cell_id: &str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+) -> String {
+    format!("cell/{cell_id}/artifact/supernode_epoch_manifest/{edge_type}/{base_epoch:020}")
+}
+
+fn supernode_artifact_manifest_prefix(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/artifact/supernode_epoch_manifest/{edge_type}/")
+}
+
+fn supernode_artifact_manifest_from_groups(
+    cell_id: &str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+    groups: &[SupernodeGroup],
+) -> Result<Option<SupernodeArtifactManifest>> {
+    if groups.is_empty() {
+        return Ok(None);
+    }
+    let mut checksum = 0xcbf2_9ce4_8422_2325_u64;
+    checksum_u64(&mut checksum, base_epoch);
+    let mut chunk_count = 0_u64;
+    let mut degree = 0_u64;
+    for group in groups {
+        if group.cell_id != cell_id
+            || group.edge_type != edge_type
+            || group.base_epoch != base_epoch
+        {
+            return Err(GraphError::CorruptValue {
+                key: supernode_group_key(group),
+                reason: "supernode group does not belong to artifact epoch".to_string(),
+            });
+        }
+        checksum_u64(
+            &mut checksum,
+            match group.direction {
+                ArtifactDirection::Out => 1,
+                ArtifactDirection::In => 2,
+            },
+        );
+        checksum_u64(&mut checksum, group.vertex_id);
+        checksum_u64(&mut checksum, group.degree);
+        checksum_u64(&mut checksum, group.chunk_count);
+        checksum_u64(&mut checksum, group.page_size);
+        for bound in &group.chunk_bounds {
+            checksum_u64(&mut checksum, bound.chunk_id);
+            checksum_u64(&mut checksum, bound.first);
+            checksum_u64(&mut checksum, bound.last);
+        }
+        chunk_count = chunk_count.saturating_add(group.chunk_count);
+        degree = degree.saturating_add(group.degree);
+    }
+    Ok(Some(SupernodeArtifactManifest {
+        cell_id: cell_id.to_string(),
+        edge_type: edge_type.to_string(),
+        base_epoch,
+        group_count: groups.len() as u64,
+        chunk_count,
+        degree,
+        checksum,
+    }))
+}
+
+async fn ensure_supernode_artifact_publish_compatible(
+    shard: &GraphShard,
+    cell_id: &str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+    manifest: Option<&SupernodeArtifactManifest>,
+) -> Result<()> {
+    let key = supernode_artifact_manifest_key(cell_id, edge_type, base_epoch);
+    let Some(value) = shard.read_remote(&key).await? else {
+        return Ok(());
+    };
+    let existing = decode_supernode_artifact_manifest(&key, &value)?;
+    match manifest {
+        Some(manifest) if existing == *manifest => Ok(()),
+        Some(_) => Err(GraphError::CorruptValue {
+            key,
+            reason: "existing supernode artifact manifest is incompatible with rebuild".to_string(),
+        }),
+        None => Err(GraphError::CorruptValue {
+            key,
+            reason: "existing supernode artifact manifest exists for empty rebuild".to_string(),
+        }),
+    }
+}
+
 fn encode_supernode_group(group: &SupernodeGroup) -> Vec<u8> {
     format!(
         "supernode3\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -3161,6 +3589,71 @@ fn decode_supernode_group(key: &str, value: &[u8]) -> Result<SupernodeGroup> {
             chunk_bounds: decode_supernode_chunk_bounds(key, parts[9])?,
         },
     )
+}
+
+fn encode_supernode_artifact_manifest(manifest: &SupernodeArtifactManifest) -> Vec<u8> {
+    format!(
+        "supernode_epoch_manifest1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        manifest.cell_id,
+        manifest.edge_type,
+        manifest.base_epoch,
+        manifest.group_count,
+        manifest.chunk_count,
+        manifest.degree,
+        manifest.checksum
+    )
+    .into_bytes()
+}
+
+fn decode_supernode_artifact_manifest(
+    key: &str,
+    value: &[u8],
+) -> Result<SupernodeArtifactManifest> {
+    let text = text_value(key, value)?;
+    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
+    if parts.len() != 8 || parts[0] != "supernode_epoch_manifest1" {
+        return corrupt(
+            key,
+            "expected supernode_epoch_manifest1 record with 8 fields",
+        );
+    }
+    validate_supernode_artifact_manifest(
+        key,
+        SupernodeArtifactManifest {
+            cell_id: parts[1].to_string(),
+            edge_type: parts[2].to_string(),
+            base_epoch: parse_u64(key, parts[3], "base_epoch")?,
+            group_count: parse_u64(key, parts[4], "group_count")?,
+            chunk_count: parse_u64(key, parts[5], "chunk_count")?,
+            degree: parse_u64(key, parts[6], "degree")?,
+            checksum: parse_u64(key, parts[7], "checksum")?,
+        },
+    )
+}
+
+fn validate_supernode_artifact_manifest(
+    key: &str,
+    manifest: SupernodeArtifactManifest,
+) -> Result<SupernodeArtifactManifest> {
+    if manifest.degree > 0 && manifest.chunk_count == 0 {
+        return corrupt(key, "supernode epoch manifest degree requires chunks");
+    }
+    if manifest.chunk_count > 0 && manifest.group_count == 0 {
+        return corrupt(key, "supernode epoch manifest chunks require groups");
+    }
+    let parts: Vec<_> = key.split('/').collect();
+    let ["cell", cell_id, "artifact", "supernode_epoch_manifest", edge_type, base_epoch] =
+        parts.as_slice()
+    else {
+        return corrupt(key, "invalid supernode epoch manifest key");
+    };
+    if manifest.cell_id != *cell_id
+        || manifest.edge_type != *edge_type
+        || manifest.base_epoch != parse_u64(key, base_epoch, "base_epoch")?
+    {
+        return corrupt(key, "supernode epoch manifest key does not match value");
+    }
+    Ok(manifest)
 }
 
 fn validate_supernode_group(key: &str, group: SupernodeGroup) -> Result<SupernodeGroup> {
