@@ -151,7 +151,17 @@ impl GraphShard {
             .await
         }
         .await;
-        crate::release_cell_write_lock(artifact_lock, publish_result).await?;
+        if let Err(err) = crate::release_cell_write_lock(artifact_lock, publish_result).await {
+            cleanup_unpublished_posting_artifact_epoch(
+                self,
+                cell_id,
+                edge_type,
+                base_epoch,
+                "build_posting_chunks_abort",
+            )
+            .await;
+            return Err(err);
+        }
         if !chunks.is_empty() {
             let mut cache = self.posting_chunk_cache.lock().await;
             for chunk in &chunks {

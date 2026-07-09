@@ -25,10 +25,11 @@ use crate::{
     decode_delta_record, decode_edge_record, decode_out_edge_segment, decode_relationship_record,
     decode_u64, encode_vertex_property_value_key, ensure_limit, open_graph_db,
     parse_out_edge_segment_tombstone_key, parse_u64, segment_edge_visible, sort_deltas,
-    validate_component, DeltaKind, DeltaRecord, EdgeRecord, GraphCacheConfig, GraphCacheKind,
-    GraphCorrectnessReport, GraphDurabilityConfig, GraphEpoch, GraphError, GraphExportDigest,
-    GraphOpenOptions, GraphShard, GraphWriteBatch, MatrixAdjacency, MatrixCacheKey,
-    PostingChunkCacheKey, RelationshipId, RelationshipRecord, Result, SupernodeCacheKey, VertexId,
+    validate_component, CellWriteLock, DeltaKind, DeltaRecord, EdgeRecord, GraphCacheConfig,
+    GraphCacheKind, GraphCorrectnessReport, GraphDurabilityConfig, GraphEpoch, GraphError,
+    GraphExportDigest, GraphOpenOptions, GraphShard, GraphWriteBatch, MatrixAdjacency,
+    MatrixCacheKey, PostingChunkCacheKey, RelationshipId, RelationshipRecord, Result,
+    SupernodeCacheKey, VertexId,
 };
 
 const GRAPH_PREALLOC_LIMIT: usize = 1_000_000;
@@ -1906,6 +1907,290 @@ async fn flush_artifact_put_batch(
         .await?;
     *pending_writes = 0;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PostingArtifactCleanupResult {
+    pub(crate) deleted_keys: u64,
+    pub(crate) cleanup_errors: u64,
+    pub(crate) skipped_published_manifest: bool,
+}
+
+impl PostingArtifactCleanupResult {
+    fn record_error<E>(
+        &mut self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: GraphEpoch,
+        operation: &'static str,
+        cleanup_step: &'static str,
+        err: &E,
+    ) where
+        E: std::fmt::Display + ?Sized,
+    {
+        self.cleanup_errors = self.cleanup_errors.saturating_add(1);
+        tracing::warn!(
+            target: "slatedb_graph_kernel",
+            cell_id,
+            edge_type,
+            base_epoch,
+            operation,
+            cleanup_step,
+            error = %err,
+            "posting artifact abort cleanup step failed"
+        );
+    }
+}
+
+pub(crate) async fn cleanup_unpublished_posting_artifact_epoch(
+    shard: &GraphShard,
+    cell_id: &str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+    operation: &'static str,
+) -> PostingArtifactCleanupResult {
+    let mut result = PostingArtifactCleanupResult::default();
+    let manifest_key = posting_artifact_manifest_key(cell_id, edge_type, base_epoch);
+    match shard.read_remote(&manifest_key).await {
+        Ok(Some(_)) => {
+            result.skipped_published_manifest = true;
+            return result;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "read_posting_epoch_manifest",
+                &err,
+            );
+            return result;
+        }
+    }
+
+    let artifact_lock = match shard
+        .acquire_posting_artifact_write_lock(cell_id, edge_type, base_epoch, operation)
+        .await
+    {
+        Ok(lock) => lock,
+        Err(err) => {
+            result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "acquire_posting_artifact_lock",
+                &err,
+            );
+            return result;
+        }
+    };
+
+    let cleanup_run = async {
+        match shard.read_remote(&manifest_key).await {
+            Ok(Some(_)) => {
+                result.skipped_published_manifest = true;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(err) => {
+                result.record_error(
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    operation,
+                    "recheck_posting_epoch_manifest",
+                    &err,
+                );
+                return Ok(());
+            }
+        }
+
+        let mut batch = GraphWriteBatch::new();
+        let mut pending_deletes = 0_usize;
+        for (cleanup_step, prefix) in [
+            (
+                "scan_posting_chunks",
+                format!("cell/{cell_id}/artifact/posting/{edge_type}/"),
+            ),
+            (
+                "scan_posting_owner_manifests",
+                posting_manifest_prefix(cell_id, edge_type),
+            ),
+        ] {
+            let mut iter = match shard.scan_remote_prefix(&prefix).await {
+                Ok(iter) => iter,
+                Err(err) => {
+                    result.record_error(
+                        cell_id,
+                        edge_type,
+                        base_epoch,
+                        operation,
+                        cleanup_step,
+                        &err,
+                    );
+                    continue;
+                }
+            };
+            loop {
+                let kv = match iter.next().await {
+                    Ok(Some(kv)) => kv,
+                    Ok(None) => break,
+                    Err(err) => {
+                        result.record_error(
+                            cell_id,
+                            edge_type,
+                            base_epoch,
+                            operation,
+                            cleanup_step,
+                            &err,
+                        );
+                        break;
+                    }
+                };
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                match graph_artifact_epoch_from_key(&key) {
+                    Ok(Some(epoch)) if epoch == base_epoch => {
+                        batch.delete(key.as_bytes());
+                        pending_deletes += 1;
+                    }
+                    Ok(_) => {}
+                    Err(err) => result.record_error(
+                        cell_id,
+                        edge_type,
+                        base_epoch,
+                        operation,
+                        cleanup_step,
+                        &err,
+                    ),
+                }
+                if pending_deletes >= GRAPH_ARTIFACT_GC_BATCH_KEYS
+                    && !flush_unpublished_posting_artifact_gc_batch_best_effort(
+                        shard,
+                        cell_id,
+                        edge_type,
+                        base_epoch,
+                        operation,
+                        &manifest_key,
+                        &artifact_lock,
+                        &mut batch,
+                        &mut pending_deletes,
+                        &mut result,
+                    )
+                    .await
+                {
+                    return Ok(());
+                }
+            }
+        }
+
+        if flush_unpublished_posting_artifact_gc_batch_best_effort(
+            shard,
+            cell_id,
+            edge_type,
+            base_epoch,
+            operation,
+            &manifest_key,
+            &artifact_lock,
+            &mut batch,
+            &mut pending_deletes,
+            &mut result,
+        )
+        .await
+        {
+            shard.posting_chunk_cache.lock().await.retain(|key, _| {
+                key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch
+            });
+        }
+
+        Ok(())
+    }
+    .await;
+    if let Err(err) = crate::release_cell_write_lock(artifact_lock, cleanup_run).await {
+        result.record_error(
+            cell_id,
+            edge_type,
+            base_epoch,
+            operation,
+            "release_posting_artifact_lock",
+            &err,
+        );
+    }
+
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_unpublished_posting_artifact_gc_batch_best_effort(
+    shard: &GraphShard,
+    cell_id: &str,
+    edge_type: &str,
+    base_epoch: GraphEpoch,
+    operation: &'static str,
+    manifest_key: &str,
+    artifact_lock: &CellWriteLock,
+    batch: &mut GraphWriteBatch,
+    pending_deletes: &mut usize,
+    result: &mut PostingArtifactCleanupResult,
+) -> bool {
+    if *pending_deletes == 0 {
+        return true;
+    }
+    if let Err(err) = artifact_lock.renew().await {
+        result.record_error(
+            cell_id,
+            edge_type,
+            base_epoch,
+            operation,
+            "renew_posting_artifact_lock",
+            &err,
+        );
+        return false;
+    }
+    match shard.read_remote(manifest_key).await {
+        Ok(Some(_)) => {
+            result.skipped_published_manifest = true;
+            return false;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "recheck_posting_epoch_manifest_before_delete",
+                &err,
+            );
+            return false;
+        }
+    }
+    let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
+    let delete_count = *pending_deletes as u64;
+    match shard
+        .write_graph_batch_strict(cell_id, operation, batch_to_write)
+        .await
+    {
+        Ok(()) => {
+            result.deleted_keys = result.deleted_keys.saturating_add(delete_count);
+            *pending_deletes = 0;
+            true
+        }
+        Err(err) => {
+            result.record_error(
+                cell_id,
+                edge_type,
+                base_epoch,
+                operation,
+                "delete_unpublished_posting_artifacts",
+                &err,
+            );
+            *pending_deletes = 0;
+            true
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
