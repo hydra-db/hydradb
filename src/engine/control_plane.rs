@@ -88,7 +88,7 @@ impl GraphControlPlane {
         self.renew_lease_at(lease, ttl, now_millis()).await
     }
 
-    async fn acquire_lease_at(
+    pub(crate) async fn acquire_lease_at(
         &self,
         cell_id: &str,
         node_id: &str,
@@ -270,6 +270,22 @@ impl GraphControlPlane {
         now_ms: u64,
     ) -> Result<ShardLease> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let placement_key = control_placement_key(&lease.cell_id);
+        let owner = read_control_txn(&txn, &placement_key)
+            .await?
+            .map(|value| decode_control_placement(&placement_key, &value))
+            .transpose()?
+            .map(|(_, owner)| owner)
+            .ok_or_else(|| GraphError::UnknownShard {
+                cell_id: lease.cell_id.clone(),
+            })?;
+        if owner != lease.owner_node_id {
+            return Err(GraphError::StaleShardLease {
+                cell_id: lease.cell_id.clone(),
+                node_id: lease.owner_node_id.clone(),
+                lease_token: lease.lease_token,
+            });
+        }
         let lease_key = control_lease_key(&lease.cell_id);
         let Some(value) = read_control_txn(&txn, &lease_key).await? else {
             return Err(GraphError::StaleShardLease {
@@ -332,7 +348,7 @@ impl GraphControlPlane {
             .await
     }
 
-    async fn failover_expired_cell_at(
+    pub(crate) async fn failover_expired_cell_at(
         &self,
         cell_id: &str,
         new_node_id: &str,

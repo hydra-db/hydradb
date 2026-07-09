@@ -4218,6 +4218,18 @@ async fn control_plane_persists_placement_and_enforces_active_leases() {
 
     let failover = ShardPlacement::fixed([("reddit-home", "node-b")]).unwrap();
     control.publish_placement(&failover).await.unwrap();
+    let stale_renewal = cluster
+        .renew_leases(&control, std::time::Duration::from_secs(60))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale_renewal,
+        GraphError::StaleShardLease {
+            ref cell_id,
+            ref node_id,
+            lease_token
+        } if cell_id == "reddit-home" && node_id == "node-a" && lease_token == first_token
+    ));
     let held = control
         .acquire_lease("reddit-home", "node-b", std::time::Duration::from_secs(60))
         .await
@@ -4337,6 +4349,29 @@ async fn graph_node_starts_lease_renewal_automatically() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        control
+            .node_heartbeat("node-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        GraphNodeHealthState::Active
+    );
+    let draining = node
+        .set_health_state(GraphNodeHealthState::Draining)
+        .await
+        .unwrap();
+    assert_eq!(draining.state, GraphNodeHealthState::Draining);
+    assert_eq!(
+        control
+            .node_heartbeat("node-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        GraphNodeHealthState::Draining
+    );
     let first_expiry = node.cluster().lease("reddit-home").unwrap().expires_at_ms;
     node.cluster()
         .write_edge(EdgeMutation {
@@ -4390,6 +4425,302 @@ async fn control_plane_can_fail_over_after_lease_expiry() {
             .unwrap(),
         "node-b"
     );
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn routed_cluster_refreshes_owned_shards_after_failover() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/refresh-owned", Arc::clone(&object_store))
+        .await
+        .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let mut cluster_a = RoutedGraphCluster::open_owned_with_control(
+        "graph-refresh-owned",
+        "node-a",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let mut cluster_b = RoutedGraphCluster::open_owned_with_control(
+        "graph-refresh-owned",
+        "node-b",
+        &control,
+        Arc::clone(&object_store),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cluster_a.local_cells(), vec!["reddit-home"]);
+    assert!(cluster_b.local_cells().is_empty());
+    cluster_a
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "refresh-before".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let expired_at = cluster_a.lease("reddit-home").unwrap().expires_at_ms + 1;
+    control
+        .failover_expired_cell_at(
+            "reddit-home",
+            "node-b",
+            std::time::Duration::from_secs(60),
+            expired_at,
+        )
+        .await
+        .unwrap();
+    let opened = cluster_b
+        .refresh_owned_shards(&control, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(opened.opened_cells, vec!["reddit-home"]);
+    assert!(opened.closed_cells.is_empty());
+    let closed = cluster_a
+        .refresh_owned_shards(&control, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(closed.closed_cells, vec!["reddit-home"]);
+    assert!(closed.opened_cells.is_empty());
+
+    cluster_b
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 2,
+            dst: 3,
+            idempotency_key: "refresh-after".to_string(),
+        })
+        .await
+        .unwrap();
+    let err = cluster_a
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 3,
+            dst: 4,
+            idempotency_key: "refresh-stale".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::ShardNotOwned {
+            ref cell_id,
+            ref owner_node_id,
+            ref local_node_id
+        } if cell_id == "reddit-home"
+            && owner_node_id == "node-b"
+            && local_node_id == "node-a"
+    ));
+    cluster_a.close().await.unwrap();
+    cluster_b.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn control_plane_records_node_heartbeats_and_metrics() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/node-heartbeat", object_store)
+        .await
+        .unwrap();
+    let first = control
+        .publish_node_heartbeat_at("node-a", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    let second = control
+        .publish_node_heartbeat_at("node-a", GraphNodeHealthState::Draining, 1_500)
+        .await
+        .unwrap();
+
+    assert_eq!(first.started_at_ms, 1_000);
+    assert_eq!(first.generation, 1);
+    assert_eq!(second.started_at_ms, 1_000);
+    assert_eq!(second.last_seen_ms, 1_500);
+    assert_eq!(second.generation, 2);
+    assert_eq!(second.state, GraphNodeHealthState::Draining);
+
+    let loaded = control.node_heartbeat("node-a").await.unwrap().unwrap();
+    assert_eq!(loaded, second);
+    assert_eq!(control.load_node_heartbeats().await.unwrap(), vec![second]);
+    assert_eq!(control.graph_control_metrics().node_heartbeat_writes, 2);
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cluster_controller_assigns_unplaced_cells_to_live_nodes() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/controller-bootstrap", object_store)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-a", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-b", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    let config = GraphClusterControllerConfig::new(
+        ["reddit-home", "reddit-search"],
+        std::time::Duration::from_millis(1_000),
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+
+    let report = control.reconcile_cluster_at(&config, 1_100).await.unwrap();
+    assert_eq!(report.active_nodes, vec!["node-a", "node-b"]);
+    assert_eq!(report.reassignments.len(), 2);
+    assert_eq!(report.failed_over_leases.len(), 2);
+    assert!(report.pending_failovers.is_empty());
+    assert!(report.unassigned_cells.is_empty());
+
+    let placement = control.load_placement().await.unwrap();
+    for cell_id in ["reddit-home", "reddit-search"] {
+        let owner = placement.owner(cell_id).unwrap();
+        assert!(owner == "node-a" || owner == "node-b");
+        let lease = control.current_lease(cell_id).await.unwrap().unwrap();
+        assert_eq!(lease.owner_node_id, owner);
+        assert_eq!(lease.expires_at_ms, 61_100);
+    }
+    let metrics = control.graph_control_metrics();
+    assert_eq!(metrics.controller_runs, 1);
+    assert_eq!(metrics.controller_reassignments, 2);
+    assert_eq!(metrics.controller_failovers, 2);
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cluster_controller_moves_draining_cells_after_lease_expiry() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/controller-drain", object_store)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-a", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-b", GraphNodeHealthState::Active, 1_000)
+        .await
+        .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    control
+        .acquire_lease_at(
+            "reddit-home",
+            "node-a",
+            std::time::Duration::from_millis(1_000),
+            1_000,
+        )
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-a", GraphNodeHealthState::Draining, 1_100)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-b", GraphNodeHealthState::Active, 1_100)
+        .await
+        .unwrap();
+    let config = GraphClusterControllerConfig::new(
+        ["reddit-home"],
+        std::time::Duration::from_millis(1_000),
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+
+    let pending = control.reconcile_cluster_at(&config, 1_200).await.unwrap();
+    assert_eq!(pending.draining_nodes, vec!["node-a"]);
+    assert_eq!(pending.reassignments.len(), 1);
+    assert_eq!(pending.reassignments[0].new_owner_node_id, "node-b");
+    assert_eq!(pending.failed_over_leases, Vec::<ShardLease>::new());
+    assert_eq!(
+        pending.pending_failovers,
+        vec![GraphPendingFailover {
+            cell_id: "reddit-home".to_string(),
+            current_owner_node_id: "node-a".to_string(),
+            target_owner_node_id: "node-b".to_string(),
+            lease_expires_at_ms: 2_000,
+        }]
+    );
+    assert_eq!(
+        control
+            .current_lease("reddit-home")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_node_id,
+        "node-a"
+    );
+
+    let failed_over = control.reconcile_cluster_at(&config, 2_001).await.unwrap();
+    assert!(failed_over.pending_failovers.is_empty());
+    assert_eq!(failed_over.failed_over_leases.len(), 1);
+    assert_eq!(failed_over.failed_over_leases[0].owner_node_id, "node-b");
+    assert_eq!(
+        control
+            .current_lease("reddit-home")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_node_id,
+        "node-b"
+    );
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cluster_controller_fails_closed_without_active_nodes() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("graph-control/controller-no-live", object_store)
+        .await
+        .unwrap();
+    control
+        .publish_node_heartbeat_at("node-a", GraphNodeHealthState::Draining, 1_000)
+        .await
+        .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let config = GraphClusterControllerConfig::new(
+        ["reddit-home"],
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+
+    let report = control.reconcile_cluster_at(&config, 1_050).await.unwrap();
+    assert_eq!(report.draining_nodes, vec!["node-a"]);
+    assert_eq!(report.unassigned_cells, vec!["reddit-home"]);
+    assert!(report.reassignments.is_empty());
+    assert!(report.failed_over_leases.is_empty());
+    assert_eq!(
+        control
+            .load_placement()
+            .await
+            .unwrap()
+            .owner("reddit-home")
+            .unwrap(),
+        "node-a"
+    );
+
+    let expired = control.reconcile_cluster_at(&config, 1_101).await.unwrap();
+    assert_eq!(expired.expired_nodes, vec!["node-a"]);
+    assert_eq!(expired.unassigned_cells, vec!["reddit-home"]);
+    assert!(expired.reassignments.is_empty());
     control.close().await.unwrap();
 }
 
@@ -4799,10 +5130,11 @@ async fn control_plane_empty_compute_node_replacement_reads_object_store_state()
         "node-a",
         &control,
         Arc::clone(&object_store),
-        std::time::Duration::from_millis(100),
+        std::time::Duration::from_secs(60),
     )
     .await
     .unwrap();
+    let cluster_a_lease_expires_at = cluster_a.lease("reddit-home").unwrap().expires_at_ms;
     cluster_a
         .write_edge(EdgeMutation {
             cell_id: "reddit-home".to_string(),
@@ -4819,9 +5151,13 @@ async fn control_plane_empty_compute_node_replacement_reads_object_store_state()
     let control = GraphControlPlane::open(control_path, Arc::clone(&object_store))
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(125)).await;
     control
-        .failover_expired_cell("reddit-home", "node-b", std::time::Duration::from_secs(60))
+        .failover_expired_cell_at(
+            "reddit-home",
+            "node-b",
+            std::time::Duration::from_secs(60),
+            cluster_a_lease_expires_at + 1,
+        )
         .await
         .unwrap();
     let cluster_b = RoutedGraphCluster::open_owned_with_control(
