@@ -1555,6 +1555,7 @@ fn row_expression_name(expression: &RowExpression) -> String {
         RowExpression::NodeId { binding } => format!("{binding}.id"),
         RowExpression::Property { binding, property } => format!("{binding}.{property}"),
         RowExpression::Literal(VertexPropertyValue::Integer(value)) => value.to_string(),
+        RowExpression::Literal(VertexPropertyValue::SignedInteger(value)) => value.to_string(),
         RowExpression::Literal(VertexPropertyValue::Bool(value)) => value.to_string(),
         RowExpression::Literal(VertexPropertyValue::Float(value)) => value.0.to_string(),
         RowExpression::Literal(VertexPropertyValue::String(value)) => format!("'{value}'"),
@@ -2127,7 +2128,9 @@ fn scalar_property_value(
             let value = scalar_property_value(arg, parameters)?;
             if op == sys::CYPHER_OP_UNARY_PLUS {
                 return match value {
-                    VertexPropertyValue::Integer(_) | VertexPropertyValue::Float(_) => Ok(value),
+                    VertexPropertyValue::Integer(_)
+                    | VertexPropertyValue::SignedInteger(_)
+                    | VertexPropertyValue::Float(_) => Ok(value),
                     VertexPropertyValue::Bool(_) | VertexPropertyValue::String(_) => {
                         unsupported("unary plus requires a numeric property value")
                     }
@@ -2141,17 +2144,32 @@ fn scalar_property_value(
                     VertexPropertyValue::Integer(0) => {
                         Ok(VertexPropertyValue::Float(QueryFloat(-0.0)))
                     }
-                    VertexPropertyValue::Integer(_)
-                    | VertexPropertyValue::Bool(_)
-                    | VertexPropertyValue::String(_) => {
-                        unsupported("unary minus requires a float property value")
+                    VertexPropertyValue::Integer(value) => {
+                        let value = if value == (1_u64 << 63) {
+                            Some(i64::MIN)
+                        } else {
+                            i64::try_from(value).ok().and_then(i64::checked_neg)
+                        };
+                        value
+                            .map(VertexPropertyValue::SignedInteger)
+                            .ok_or_else(|| GraphError::UnsupportedQuery {
+                                dialect: "OpenCypher",
+                                feature: "integer literal exceeds the signed 64-bit range"
+                                    .to_string(),
+                            })
+                    }
+                    VertexPropertyValue::SignedInteger(value) => {
+                        Ok(VertexPropertyValue::Integer(value.unsigned_abs()))
+                    }
+                    VertexPropertyValue::Bool(_) | VertexPropertyValue::String(_) => {
+                        unsupported("unary minus requires a numeric property value")
                     }
                 };
             }
             return unsupported("property value unary operator must be plus or minus");
         }
     }
-    unsupported("property values currently support integer, float, boolean, and string literals")
+    unsupported("property values support integer, float, boolean, and string literals")
 }
 
 fn integer_vertex_id(
@@ -2163,6 +2181,9 @@ fn integer_vertex_id(
             let name = parameter_name(node)?;
             return match parameter_value_by_name(&name, parameters)? {
                 VertexPropertyValue::Integer(value) => Ok(*value),
+                VertexPropertyValue::SignedInteger(_) => {
+                    unsupported(format!("parameter ${name} cannot be a negative node id"))
+                }
                 _ => unsupported(format!("parameter ${name} must be an integer")),
             };
         }
@@ -2205,6 +2226,7 @@ fn constant_integer_expression(
             let name = parameter_name(node)?;
             return match parameter_value_by_name(&name, parameters)? {
                 VertexPropertyValue::Integer(value) => Ok(i128::from(*value)),
+                VertexPropertyValue::SignedInteger(value) => Ok(i128::from(*value)),
                 _ => unsupported(format!("{field} parameter ${name} must be an integer")),
             };
         }
@@ -3172,6 +3194,21 @@ mod tests {
             ),
             Err(GraphError::UnsupportedQuery { .. })
         ));
+    }
+
+    #[test]
+    fn lowers_full_signed_integer_literal_range() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (n:Score {score: -9223372036854775808}) RETURN n.score",
+        )
+        .unwrap();
+        let RowPattern::Node(node) = &parsed.patterns[0] else {
+            panic!("expected node pattern");
+        };
+        assert_eq!(
+            node.properties.get("score"),
+            Some(&VertexPropertyValue::SignedInteger(i64::MIN))
+        );
     }
 
     #[test]

@@ -535,6 +535,9 @@ pub(crate) fn decode_edge_metadata(key: &str, value: &[u8]) -> Result<EdgeMetada
 pub(crate) fn encode_vertex_property_value_key(value: &VertexPropertyValue) -> String {
     match value {
         VertexPropertyValue::Integer(value) => format!("i{value:020}"),
+        VertexPropertyValue::SignedInteger(value) => {
+            format!("j{:016x}", (*value as u64) ^ (1_u64 << 63))
+        }
         VertexPropertyValue::Bool(false) => "b0".to_string(),
         VertexPropertyValue::Bool(true) => "b1".to_string(),
         VertexPropertyValue::Float(value) => format!("n{:016x}", sortable_float_bits(value.0)),
@@ -561,6 +564,7 @@ pub(crate) fn decode_vertex_index_delta(key: &str, value: &[u8]) -> Result<bool>
 fn encode_vertex_property_value_record(value: &VertexPropertyValue) -> String {
     match value {
         VertexPropertyValue::Integer(value) => format!("i:{value}"),
+        VertexPropertyValue::SignedInteger(value) => format!("j:{value}"),
         VertexPropertyValue::Bool(false) => "b:false".to_string(),
         VertexPropertyValue::Bool(true) => "b:true".to_string(),
         VertexPropertyValue::Float(value) => format!("f:{:016x}", value.0.to_bits()),
@@ -582,6 +586,13 @@ fn decode_vertex_property_value_record(key: &str, value: &str) -> Result<VertexP
             .map_err(|err| GraphError::CorruptValue {
                 key: key.to_string(),
                 reason: format!("invalid integer vertex property {payload}: {err}"),
+            }),
+        "j" => payload
+            .parse::<i64>()
+            .map(VertexPropertyValue::from_i64)
+            .map_err(|err| GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!("invalid signed integer vertex property {payload}: {err}"),
             }),
         "b" => match payload {
             "true" => Ok(VertexPropertyValue::Bool(true)),

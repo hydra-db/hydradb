@@ -133,12 +133,20 @@ impl Ord for QueryFloat {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum VertexPropertyValue {
     Integer(u64),
+    SignedInteger(i64),
     Bool(bool),
     Float(QueryFloat),
     String(String),
 }
 
 impl VertexPropertyValue {
+    pub fn from_i64(value: i64) -> Self {
+        match u64::try_from(value) {
+            Ok(value) => Self::Integer(value),
+            Err(_) => Self::SignedInteger(value),
+        }
+    }
+
     #[cfg_attr(
         not(any(feature = "json-properties", feature = "opencypher")),
         allow(dead_code)
@@ -155,10 +163,33 @@ impl VertexPropertyValue {
         ((integer as f64) == value).then_some(integer)
     }
 
+    #[cfg_attr(
+        not(any(feature = "json-properties", feature = "opencypher")),
+        allow(dead_code)
+    )]
+    pub(crate) fn exact_i64_from_f64(value: f64) -> Option<i64> {
+        const I64_INCLUSIVE_LOWER: f64 = -9223372036854775808.0;
+        const I64_EXCLUSIVE_UPPER: f64 = 9223372036854775808.0;
+        if !value.is_finite()
+            || !(I64_INCLUSIVE_LOWER..I64_EXCLUSIVE_UPPER).contains(&value)
+            || value.fract() != 0.0
+        {
+            return None;
+        }
+        let integer = value as i64;
+        ((integer as f64) == value).then_some(integer)
+    }
+
     #[cfg(feature = "opencypher")]
     pub(crate) fn exact_f64_from_u64(value: u64) -> Option<f64> {
         let float = value as f64;
         (Self::exact_u64_from_f64(float) == Some(value)).then_some(float)
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn exact_f64_from_i64(value: i64) -> Option<f64> {
+        let float = value as f64;
+        (Self::exact_i64_from_f64(float) == Some(value)).then_some(float)
     }
 
     #[cfg(feature = "json-properties")]
@@ -168,9 +199,12 @@ impl VertexPropertyValue {
             serde_json::Value::Number(value) => {
                 if let Some(value) = value.as_u64() {
                     Self::Integer(value)
+                } else if let Some(value) = value.as_i64() {
+                    Self::from_i64(value)
                 } else if let Some(value) = value.as_f64() {
                     Self::exact_u64_from_f64(value)
                         .map(Self::Integer)
+                        .or_else(|| Self::exact_i64_from_f64(value).map(Self::from_i64))
                         .unwrap_or(Self::Float(QueryFloat(value)))
                 } else {
                     Self::String(value.to_string())

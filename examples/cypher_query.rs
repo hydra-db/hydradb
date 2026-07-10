@@ -149,6 +149,7 @@ fn format_query_value(value: &QueryValue) -> String {
 fn format_property_value(value: &VertexPropertyValue) -> String {
     match value {
         VertexPropertyValue::Integer(value) => value.to_string(),
+        VertexPropertyValue::SignedInteger(value) => value.to_string(),
         VertexPropertyValue::Bool(value) => value.to_string(),
         VertexPropertyValue::Float(value) => format_float(value.0),
         VertexPropertyValue::String(value) => value.clone(),
