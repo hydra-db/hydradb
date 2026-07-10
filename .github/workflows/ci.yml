@@ -29,7 +29,9 @@ jobs:
       - name: Clippy native feature set
         run: cargo clippy --locked --all-targets --features opencypher,graphblas -- -D warnings
       - name: Clippy full native feature set
-        run: cargo clippy --locked --all-targets --features opencypher,graphblas,query-transport,query-transport-tls,query-service-discovery -- -D warnings
+        run: cargo clippy --locked --all-targets --features opencypher,graphblas,query-transport,query-transport-tls,query-service-discovery,public-client-protocols -- -D warnings
+      - name: Clippy public client protocols
+        run: cargo clippy --locked --all-targets --features public-client-protocols -- -D warnings
       - name: Test default feature set
         run: cargo test --locked --lib
       - name: Test chaos harness feature set
@@ -39,7 +41,13 @@ jobs:
       - name: Test GraphBLAS and OpenCypher feature set
         run: cargo test --locked --features opencypher,graphblas --lib
       - name: Test full native feature set
-        run: cargo test --locked --all-targets --features opencypher,graphblas,query-transport,query-transport-tls,query-service-discovery
+        run: cargo test --locked --all-targets --features opencypher,graphblas,query-transport,query-transport-tls,query-service-discovery,public-client-protocols
+      - name: Test public client protocols
+        run: cargo test --locked --all-targets --features public-client-protocols
+      - name: Test official Neo4j driver compatibility
+        run: |
+          python3 -m pip install 'neo4j>=6,<7'
+          bash scripts/bolt_neo4j_driver_smoke.sh
       - name: Check default examples
         run: cargo check --locked --examples
       - name: Check chaos harness example

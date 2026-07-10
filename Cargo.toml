@@ -2,6 +2,7 @@
 name = "slatedb-graph-kernel"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.91"
 description = "A SlateDB-backed object-store graph kernel"
 repository = "https://github.com/usecortex/slatedb-graph-kernel"
 readme = "README.md"
@@ -16,6 +17,10 @@ json-properties = ["dep:serde_json"]
 query-transport = ["opencypher", "dep:serde", "dep:sha2", "dep:subtle", "json-properties", "tokio/io-util", "tokio/net"]
 query-transport-tls = ["query-transport", "dep:tokio-rustls"]
 query-service-discovery = ["query-transport", "dep:base64", "dep:reqwest"]
+client-api = ["query-transport"]
+bolt-server = ["client-api", "query-transport-tls", "dep:boltr"]
+http-api = ["client-api", "query-transport-tls", "dep:axum", "dep:axum-server"]
+public-client-protocols = ["bolt-server", "http-api"]
 
 [[example]]
 name = "fence_worker"
@@ -57,8 +62,16 @@ name = "falkor_query_bench"
 path = "examples/falkor_query_bench.rs"
 required-features = ["opencypher"]
 
+[[example]]
+name = "bolt_compat_server"
+path = "examples/bolt_compat_server.rs"
+required-features = ["bolt-server"]
+
 [dependencies]
 async-trait = "0.1"
+axum = { version = "0.8.9", optional = true }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
+boltr = { version = "0.2.0", optional = true }
 bytes = "1"
 base64 = { version = "0.22", optional = true }
 futures = "0.3"
@@ -75,5 +88,7 @@ subtle = { version = "2", optional = true }
 tracing = "0.1"
 
 [dev-dependencies]
+boltr = { version = "0.2.0", features = ["client"] }
 rcgen = "0.13"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tempfile = "3"
