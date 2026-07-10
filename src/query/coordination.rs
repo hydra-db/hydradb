@@ -4,19 +4,25 @@ use std::future::Future;
 #[cfg(feature = "query-transport")]
 use std::net::SocketAddr;
 #[cfg(feature = "query-transport")]
+use std::panic::AssertUnwindSafe;
+#[cfg(feature = "query-transport")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "query-transport-tls")]
 use std::sync::RwLock;
 #[cfg(feature = "query-transport")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 #[cfg(feature = "query-service-discovery")]
 use base64::Engine;
 use futures::future::join_all;
-#[cfg(feature = "query-transport-tls")]
+#[cfg(feature = "query-transport")]
+use futures::FutureExt;
+#[cfg(feature = "query-transport")]
 use sha2::{Digest, Sha256};
+#[cfg(feature = "query-transport")]
+use subtle::ConstantTimeEq;
 #[cfg(feature = "query-transport")]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(feature = "query-transport")]
@@ -40,11 +46,33 @@ use crate::{
 };
 
 #[cfg(feature = "query-transport")]
-const QUERY_TRANSPORT_VERSION: u16 = 1;
+const QUERY_TRANSPORT_VERSION: u16 = 2;
+#[cfg(feature = "query-transport")]
+const QUERY_TRANSPORT_LEGACY_VERSION: u16 = 1;
 #[cfg(feature = "query-transport")]
 const DEFAULT_QUERY_TRANSPORT_MAX_FRAME_BYTES: usize = 1 << 20;
 #[cfg(feature = "query-transport")]
 const DEFAULT_QUERY_TRANSPORT_TIMEOUT_MS: u64 = 30_000;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_MAX_CONNECTIONS: usize = 256;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_MAX_REQUESTS_PER_CONNECTION: usize = 1_024;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_IDLE_TIMEOUT_MS: u64 = 30_000;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_GRACEFUL_SHUTDOWN_MS: u64 = 30_000;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_MAX_IDLE_CONNECTIONS: usize = 16;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_CLIENT_MAX_CONNECTIONS: usize = 128;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_CLIENT_MAX_CONTROL_CONNECTIONS: usize = 8;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_RESERVED_CONTROL_CONNECTIONS: usize = 8;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_MAX_CONNECTION_AGE_MS: u64 = 300_000;
 
 #[cfg(feature = "query-transport")]
 #[derive(Clone)]
@@ -53,6 +81,11 @@ pub struct QueryTransportClientConfig {
     pub timeout: Duration,
     pub bearer_token: Option<QueryTransportSecret>,
     pub max_retries: usize,
+    pub max_idle_connections: usize,
+    pub max_connections: usize,
+    pub max_control_connections: usize,
+    pub max_connection_age: Duration,
+    pub allow_plaintext: bool,
     #[cfg(feature = "query-transport-tls")]
     pub tls_server_name: Option<String>,
     #[cfg(feature = "query-transport-tls")]
@@ -69,6 +102,13 @@ impl Default for QueryTransportClientConfig {
             timeout: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_TIMEOUT_MS),
             bearer_token: None,
             max_retries: 0,
+            max_idle_connections: DEFAULT_QUERY_TRANSPORT_MAX_IDLE_CONNECTIONS,
+            max_connections: DEFAULT_QUERY_TRANSPORT_CLIENT_MAX_CONNECTIONS,
+            max_control_connections: DEFAULT_QUERY_TRANSPORT_CLIENT_MAX_CONTROL_CONNECTIONS,
+            max_connection_age: Duration::from_millis(
+                DEFAULT_QUERY_TRANSPORT_MAX_CONNECTION_AGE_MS,
+            ),
+            allow_plaintext: false,
             #[cfg(feature = "query-transport-tls")]
             tls_server_name: None,
             #[cfg(feature = "query-transport-tls")]
@@ -162,6 +202,31 @@ impl QueryTransportClientConfig {
         self
     }
 
+    pub fn with_max_idle_connections(mut self, max_idle_connections: usize) -> Self {
+        self.max_idle_connections = max_idle_connections;
+        self
+    }
+
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections.max(1);
+        self
+    }
+
+    pub fn with_max_control_connections(mut self, max_control_connections: usize) -> Self {
+        self.max_control_connections = max_control_connections.max(1);
+        self
+    }
+
+    pub fn with_max_connection_age(mut self, max_connection_age: Duration) -> Self {
+        self.max_connection_age = max_connection_age;
+        self
+    }
+
+    pub fn insecure_allow_plaintext(mut self) -> Self {
+        self.allow_plaintext = true;
+        self
+    }
+
     #[cfg(feature = "query-transport-tls")]
     pub fn with_tls(
         mut self,
@@ -185,6 +250,54 @@ impl QueryTransportClientConfig {
         self.tls_config_provider = Some(provider);
         self
     }
+
+    fn validate(&self) -> Result<()> {
+        if self.max_frame_bytes < 2 {
+            return transport_config_error("max_frame_bytes must be at least 2");
+        }
+        if self.timeout.is_zero() {
+            return transport_config_error("client timeout must be greater than zero");
+        }
+        if self.max_connection_age.is_zero() {
+            return transport_config_error("max_connection_age must be greater than zero");
+        }
+        if self.max_connections == 0 || self.max_control_connections == 0 {
+            return transport_config_error(
+                "client connection and control-connection limits must be greater than zero",
+            );
+        }
+        #[cfg(feature = "query-transport-tls")]
+        {
+            if self.tls_config.is_some() && self.tls_config_provider.is_some() {
+                return transport_config_error(
+                    "set either a static TLS config or a TLS provider, not both",
+                );
+            }
+            let has_tls = self.tls_config.is_some() || self.tls_config_provider.is_some();
+            let missing_server_name = match self.tls_server_name.as_deref() {
+                Some(server_name) => server_name.is_empty(),
+                None => true,
+            };
+            if has_tls && missing_server_name {
+                return transport_config_error("TLS requires a non-empty server name");
+            }
+            if !has_tls && self.tls_server_name.is_some() {
+                return transport_config_error("TLS server name was set without a TLS config");
+            }
+            if self.bearer_token.is_some() && !has_tls && !self.allow_plaintext {
+                return transport_config_error(
+                    "bearer authentication requires TLS unless plaintext is explicitly allowed",
+                );
+            }
+        }
+        #[cfg(not(feature = "query-transport-tls"))]
+        if self.bearer_token.is_some() && !self.allow_plaintext {
+            return transport_config_error(
+                "bearer authentication requires TLS unless plaintext is explicitly allowed",
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "query-transport")]
@@ -202,16 +315,17 @@ pub enum QueryTransportAuthPolicy {
 
 #[cfg(feature = "query-transport")]
 impl QueryTransportAuthPolicy {
-    fn accepts(
+    fn authenticate(
         &self,
         auth: &QueryTransportAuth,
         _identity: &QueryTransportConnectionIdentity,
-    ) -> bool {
+    ) -> Option<QueryTransportPrincipal> {
         match self {
-            Self::RejectAll => false,
+            Self::RejectAll => None,
             Self::BearerToken(required) => {
-                required.is_valid()
-                    && auth.bearer_token.as_deref() == Some(required.expose_secret())
+                let supplied = auth.bearer_token.as_deref()?;
+                (required.is_valid() && constant_time_secret_eq(supplied, required.expose_secret()))
+                    .then(|| QueryTransportPrincipal::bearer(required.expose_secret()))
             }
             #[cfg(feature = "query-transport-tls")]
             Self::MtlsPeerFingerprint {
@@ -219,21 +333,99 @@ impl QueryTransportAuthPolicy {
                 bearer_token,
             } => {
                 let bearer_ok = match bearer_token {
-                    Some(required) => {
-                        required.is_valid()
-                            && auth.bearer_token.as_deref() == Some(required.expose_secret())
-                    }
+                    Some(required) => match auth.bearer_token.as_deref() {
+                        Some(supplied) => {
+                            required.is_valid()
+                                && constant_time_secret_eq(supplied, required.expose_secret())
+                        }
+                        None => false,
+                    },
                     None => true,
                 };
-                bearer_ok
-                    && _identity
-                        .tls_peer_fingerprints
-                        .iter()
-                        .any(|fingerprint| allowed_fingerprints.contains(fingerprint))
+                if !bearer_ok {
+                    return None;
+                }
+                let authorized = _identity
+                    .tls_peer_fingerprints
+                    .iter()
+                    .any(|fingerprint| allowed_fingerprints.contains(fingerprint));
+                authorized
+                    .then_some(_identity.tls_peer_leaf_fingerprint.as_deref())
+                    .flatten()
+                    .map(QueryTransportPrincipal::mtls)
             }
-            Self::InsecureAllowAll => true,
+            Self::InsecureAllowAll => Some(QueryTransportPrincipal::insecure()),
         }
     }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct QueryTransportPrincipal(String);
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportPrincipal {
+    fn bearer(token: &str) -> Self {
+        Self(format!(
+            "bearer:sha256:{}",
+            lowercase_hex(&Sha256::digest(token.as_bytes()))
+        ))
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    fn mtls(fingerprint: &str) -> Self {
+        Self(format!("mtls:{fingerprint}"))
+    }
+
+    fn insecure() -> Self {
+        Self("insecure".to_string())
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryTransportCancellationPrincipal(QueryTransportPrincipal);
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportCancellationPrincipal {
+    pub fn bearer_token(token: impl Into<String>) -> Result<Self> {
+        let secret = QueryTransportSecret::try_new(token)?;
+        Ok(Self(QueryTransportPrincipal::bearer(
+            secret.expose_secret(),
+        )))
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn mtls_peer_fingerprint(fingerprint: impl Into<String>) -> Result<Self> {
+        let fingerprints =
+            normalized_sha256_fingerprints([fingerprint.into()]).ok_or_else(|| {
+                GraphError::UnsupportedQuery {
+                    dialect: "QueryTransport",
+                    feature: "mTLS cancellation principal requires a canonical sha256 fingerprint"
+                        .to_string(),
+                }
+            })?;
+        let fingerprint =
+            fingerprints
+                .into_iter()
+                .next()
+                .ok_or_else(|| GraphError::UnsupportedQuery {
+                    dialect: "QueryTransport",
+                    feature: "mTLS cancellation principal requires a fingerprint".to_string(),
+                })?;
+        Ok(Self(QueryTransportPrincipal::mtls(&fingerprint)))
+    }
+
+    pub fn insecure() -> Self {
+        Self(QueryTransportPrincipal::insecure())
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn constant_time_secret_eq(left: &str, right: &str) -> bool {
+    let left = Sha256::digest(left.as_bytes());
+    let right = Sha256::digest(right.as_bytes());
+    left.as_slice().ct_eq(right.as_slice()).into()
 }
 
 #[cfg(feature = "query-transport")]
@@ -241,16 +433,26 @@ impl QueryTransportAuthPolicy {
 pub struct QueryTransportConnectionIdentity {
     #[cfg(feature = "query-transport-tls")]
     pub tls_peer_fingerprints: BTreeSet<String>,
+    #[cfg(feature = "query-transport-tls")]
+    pub tls_peer_leaf_fingerprint: Option<String>,
 }
 
 #[cfg(feature = "query-transport-tls")]
 pub trait QueryTransportTlsServerConfigProvider: Send + Sync {
     fn current_server_config(&self) -> Result<Arc<RustlsServerConfig>>;
+
+    fn generation(&self) -> u64 {
+        0
+    }
 }
 
 #[cfg(feature = "query-transport-tls")]
 pub trait QueryTransportTlsClientConfigProvider: Send + Sync {
     fn current_client_config(&self) -> Result<Arc<RustlsClientConfig>>;
+
+    fn generation(&self) -> u64 {
+        0
+    }
 }
 
 #[cfg(feature = "query-transport-tls")]
@@ -294,6 +496,7 @@ impl QueryTransportTlsClientConfigProvider for StaticQueryTransportTlsClientConf
 #[cfg(feature = "query-transport-tls")]
 pub struct ReloadableQueryTransportTlsServerConfigProvider {
     config: RwLock<Arc<RustlsServerConfig>>,
+    generation: AtomicU64,
 }
 
 #[cfg(feature = "query-transport-tls")]
@@ -301,6 +504,7 @@ impl ReloadableQueryTransportTlsServerConfigProvider {
     pub fn new(config: Arc<RustlsServerConfig>) -> Self {
         Self {
             config: RwLock::new(config),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -310,6 +514,7 @@ impl ReloadableQueryTransportTlsServerConfigProvider {
             reason: "TLS server config lock is poisoned".to_string(),
         })?;
         *guard = config;
+        self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -323,11 +528,16 @@ impl QueryTransportTlsServerConfigProvider for ReloadableQueryTransportTlsServer
         })?;
         Ok(Arc::clone(&guard))
     }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(feature = "query-transport-tls")]
 pub struct ReloadableQueryTransportTlsClientConfigProvider {
     config: RwLock<Arc<RustlsClientConfig>>,
+    generation: AtomicU64,
 }
 
 #[cfg(feature = "query-transport-tls")]
@@ -335,6 +545,7 @@ impl ReloadableQueryTransportTlsClientConfigProvider {
     pub fn new(config: Arc<RustlsClientConfig>) -> Self {
         Self {
             config: RwLock::new(config),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -344,6 +555,7 @@ impl ReloadableQueryTransportTlsClientConfigProvider {
             reason: "TLS client config lock is poisoned".to_string(),
         })?;
         *guard = config;
+        self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -357,6 +569,10 @@ impl QueryTransportTlsClientConfigProvider for ReloadableQueryTransportTlsClient
         })?;
         Ok(Arc::clone(&guard))
     }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(feature = "query-transport")]
@@ -365,6 +581,15 @@ pub struct QueryTransportServerConfig {
     pub max_frame_bytes: usize,
     pub auth_policy: QueryTransportAuthPolicy,
     pub max_concurrent_requests: usize,
+    pub max_connections: usize,
+    pub reserved_control_connections: usize,
+    pub max_requests_per_connection: usize,
+    pub max_connection_age: Duration,
+    pub handshake_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub write_timeout: Duration,
+    pub graceful_shutdown_timeout: Duration,
+    pub allow_plaintext: bool,
     pub slow_query_log_threshold: Option<Duration>,
     #[cfg(feature = "query-transport-tls")]
     pub tls_config: Option<Arc<RustlsServerConfig>>,
@@ -379,6 +604,19 @@ impl Default for QueryTransportServerConfig {
             max_frame_bytes: DEFAULT_QUERY_TRANSPORT_MAX_FRAME_BYTES,
             auth_policy: QueryTransportAuthPolicy::RejectAll,
             max_concurrent_requests: 128,
+            max_connections: DEFAULT_QUERY_TRANSPORT_MAX_CONNECTIONS,
+            reserved_control_connections: DEFAULT_QUERY_TRANSPORT_RESERVED_CONTROL_CONNECTIONS,
+            max_requests_per_connection: DEFAULT_QUERY_TRANSPORT_MAX_REQUESTS_PER_CONNECTION,
+            max_connection_age: Duration::from_millis(
+                DEFAULT_QUERY_TRANSPORT_MAX_CONNECTION_AGE_MS,
+            ),
+            handshake_timeout: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_HANDSHAKE_TIMEOUT_MS),
+            idle_timeout: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_IDLE_TIMEOUT_MS),
+            write_timeout: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_TIMEOUT_MS),
+            graceful_shutdown_timeout: Duration::from_millis(
+                DEFAULT_QUERY_TRANSPORT_GRACEFUL_SHUTDOWN_MS,
+            ),
+            allow_plaintext: false,
             slow_query_log_threshold: Some(Duration::from_millis(500)),
             #[cfg(feature = "query-transport-tls")]
             tls_config: None,
@@ -400,6 +638,12 @@ impl QueryTransportServerConfig {
 
     pub fn insecure_allow_unauthenticated(mut self) -> Self {
         self.auth_policy = QueryTransportAuthPolicy::InsecureAllowAll;
+        self.allow_plaintext = true;
+        self
+    }
+
+    pub fn insecure_allow_plaintext(mut self) -> Self {
+        self.allow_plaintext = true;
         self
     }
 
@@ -410,6 +654,49 @@ impl QueryTransportServerConfig {
 
     pub fn with_max_concurrent_requests(mut self, max_concurrent_requests: usize) -> Self {
         self.max_concurrent_requests = max_concurrent_requests.max(1);
+        self
+    }
+
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections.max(1);
+        self
+    }
+
+    pub fn with_reserved_control_connections(
+        mut self,
+        reserved_control_connections: usize,
+    ) -> Self {
+        self.reserved_control_connections = reserved_control_connections.max(1);
+        self
+    }
+
+    pub fn with_max_requests_per_connection(mut self, max_requests_per_connection: usize) -> Self {
+        self.max_requests_per_connection = max_requests_per_connection.max(1);
+        self
+    }
+
+    pub fn with_max_connection_age(mut self, max_connection_age: Duration) -> Self {
+        self.max_connection_age = max_connection_age;
+        self
+    }
+
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
+    }
+
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
+    pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout;
+        self
+    }
+
+    pub fn with_graceful_shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.graceful_shutdown_timeout = timeout;
         self
     }
 
@@ -440,10 +727,13 @@ impl QueryTransportServerConfig {
         mut self,
         allowed_fingerprints: impl IntoIterator<Item = String>,
     ) -> Self {
-        self.auth_policy = QueryTransportAuthPolicy::MtlsPeerFingerprint {
-            allowed_fingerprints: allowed_fingerprints.into_iter().collect(),
-            bearer_token: None,
-        };
+        self.auth_policy = normalized_sha256_fingerprints(allowed_fingerprints).map_or(
+            QueryTransportAuthPolicy::RejectAll,
+            |allowed_fingerprints| QueryTransportAuthPolicy::MtlsPeerFingerprint {
+                allowed_fingerprints,
+                bearer_token: None,
+            },
+        );
         self
     }
 
@@ -454,14 +744,113 @@ impl QueryTransportServerConfig {
         token: impl Into<String>,
     ) -> Self {
         self.auth_policy = match QueryTransportSecret::try_new(token) {
-            Ok(secret) => QueryTransportAuthPolicy::MtlsPeerFingerprint {
-                allowed_fingerprints: allowed_fingerprints.into_iter().collect(),
-                bearer_token: Some(secret),
-            },
+            Ok(secret) => normalized_sha256_fingerprints(allowed_fingerprints).map_or(
+                QueryTransportAuthPolicy::RejectAll,
+                |allowed_fingerprints| QueryTransportAuthPolicy::MtlsPeerFingerprint {
+                    allowed_fingerprints,
+                    bearer_token: Some(secret),
+                },
+            ),
             Err(_) => QueryTransportAuthPolicy::RejectAll,
         };
         self
     }
+
+    fn validate(&self) -> Result<()> {
+        if self.max_frame_bytes < 2 {
+            return transport_config_error("max_frame_bytes must be at least 2");
+        }
+        if self.max_connections == 0
+            || self.reserved_control_connections == 0
+            || self.max_concurrent_requests == 0
+        {
+            return transport_config_error(
+                "connection, reserved control-connection, and request limits must be greater than zero",
+            );
+        }
+        if self.max_requests_per_connection == 0 {
+            return transport_config_error("max_requests_per_connection must be greater than zero");
+        }
+        if self.handshake_timeout.is_zero()
+            || self.max_connection_age.is_zero()
+            || self.idle_timeout.is_zero()
+            || self.write_timeout.is_zero()
+            || self.graceful_shutdown_timeout.is_zero()
+        {
+            return transport_config_error("transport timeouts must be greater than zero");
+        }
+        #[cfg(feature = "query-transport-tls")]
+        let tls_configured = self.tls_config.is_some() || self.tls_config_provider.is_some();
+        #[cfg(not(feature = "query-transport-tls"))]
+        let tls_configured = false;
+
+        #[cfg(feature = "query-transport-tls")]
+        if self.tls_config.is_some() && self.tls_config_provider.is_some() {
+            return transport_config_error(
+                "set either a static TLS config or a TLS provider, not both",
+            );
+        }
+
+        match &self.auth_policy {
+            QueryTransportAuthPolicy::BearerToken(secret) if !secret.is_valid() => {
+                return transport_config_error("bearer token cannot be empty");
+            }
+            #[cfg(feature = "query-transport-tls")]
+            QueryTransportAuthPolicy::MtlsPeerFingerprint {
+                allowed_fingerprints,
+                bearer_token,
+            } => {
+                let normalized =
+                    normalized_sha256_fingerprints(allowed_fingerprints.iter().cloned());
+                if normalized.as_ref() != Some(allowed_fingerprints) {
+                    return transport_config_error(
+                        "mTLS fingerprints must be canonical sha256 values",
+                    );
+                }
+                if bearer_token
+                    .as_ref()
+                    .is_some_and(|secret| !secret.is_valid())
+                {
+                    return transport_config_error("bearer token cannot be empty");
+                }
+            }
+            _ => {}
+        }
+
+        if !tls_configured
+            && !self.allow_plaintext
+            && !matches!(self.auth_policy, QueryTransportAuthPolicy::RejectAll)
+        {
+            return transport_config_error(
+                "authenticated query transport requires TLS unless plaintext is explicitly allowed",
+            );
+        }
+        #[cfg(feature = "query-transport-tls")]
+        if matches!(
+            self.auth_policy,
+            QueryTransportAuthPolicy::MtlsPeerFingerprint { .. }
+        ) && !tls_configured
+        {
+            return transport_config_error("mTLS authentication requires a TLS server config");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+fn normalized_sha256_fingerprints(
+    fingerprints: impl IntoIterator<Item = String>,
+) -> Option<BTreeSet<String>> {
+    let mut normalized = BTreeSet::new();
+    for fingerprint in fingerprints {
+        let fingerprint = fingerprint.trim().to_ascii_lowercase();
+        let digest = fingerprint.strip_prefix("sha256:")?;
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        normalized.insert(format!("sha256:{digest}"));
+    }
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 #[cfg(feature = "query-transport")]
@@ -479,6 +868,15 @@ pub struct QueryTransportMetricsSnapshot {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub remote_latency_us: u64,
+    pub connections_accepted: u64,
+    pub connections_active: u64,
+    pub connections_rejected: u64,
+    pub connections_created: u64,
+    pub connections_reused: u64,
+    pub client_connection_waits: u64,
+    pub handshake_failures: u64,
+    pub idle_timeouts: u64,
+    pub forced_shutdowns: u64,
 }
 
 #[cfg(feature = "query-transport")]
@@ -496,6 +894,15 @@ struct QueryTransportMetrics {
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
     remote_latency_us: AtomicU64,
+    connections_accepted: AtomicU64,
+    connections_active: AtomicU64,
+    connections_rejected: AtomicU64,
+    connections_created: AtomicU64,
+    connections_reused: AtomicU64,
+    client_connection_waits: AtomicU64,
+    handshake_failures: AtomicU64,
+    idle_timeouts: AtomicU64,
+    forced_shutdowns: AtomicU64,
 }
 
 #[cfg(feature = "query-transport")]
@@ -514,6 +921,15 @@ impl QueryTransportMetrics {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
             remote_latency_us: self.remote_latency_us.load(Ordering::Relaxed),
+            connections_accepted: self.connections_accepted.load(Ordering::Relaxed),
+            connections_active: self.connections_active.load(Ordering::Relaxed),
+            connections_rejected: self.connections_rejected.load(Ordering::Relaxed),
+            connections_created: self.connections_created.load(Ordering::Relaxed),
+            connections_reused: self.connections_reused.load(Ordering::Relaxed),
+            client_connection_waits: self.client_connection_waits.load(Ordering::Relaxed),
+            handshake_failures: self.handshake_failures.load(Ordering::Relaxed),
+            idle_timeouts: self.idle_timeouts.load(Ordering::Relaxed),
+            forced_shutdowns: self.forced_shutdowns.load(Ordering::Relaxed),
         }
     }
 }
@@ -835,11 +1251,27 @@ pub trait QueryCellClient: Send + Sync {
 }
 
 #[cfg(feature = "query-transport")]
+trait QueryTransportIo: AsyncRead + AsyncWrite + Send + Unpin {}
+
+#[cfg(feature = "query-transport")]
+impl<T> QueryTransportIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
+
+#[cfg(feature = "query-transport")]
+struct PooledQueryTransportConnection {
+    io: Box<dyn QueryTransportIo>,
+    created_at: Instant,
+    tls_generation: u64,
+}
+
+#[cfg(feature = "query-transport")]
 #[derive(Clone)]
 pub struct TcpQueryCellClient {
     addr: SocketAddr,
     config: QueryTransportClientConfig,
     metrics: Arc<QueryTransportMetrics>,
+    pool: Arc<Mutex<Vec<PooledQueryTransportConnection>>>,
+    connection_gate: Arc<Semaphore>,
+    control_connection_gate: Arc<Semaphore>,
 }
 
 #[cfg(feature = "query-transport")]
@@ -849,10 +1281,15 @@ impl TcpQueryCellClient {
     }
 
     pub fn with_config(addr: SocketAddr, config: QueryTransportClientConfig) -> Self {
+        let max_connections = config.max_connections.max(1);
+        let max_control_connections = config.max_control_connections.max(1);
         Self {
             addr,
             config,
             metrics: Arc::new(QueryTransportMetrics::default()),
+            pool: Arc::new(Mutex::new(Vec::new())),
+            connection_gate: Arc::new(Semaphore::new(max_connections)),
+            control_connection_gate: Arc::new(Semaphore::new(max_control_connections)),
         }
     }
 
@@ -876,6 +1313,34 @@ impl TcpQueryCellClient {
         self
     }
 
+    pub fn with_max_idle_connections(mut self, max_idle_connections: usize) -> Self {
+        self.config.max_idle_connections = max_idle_connections;
+        self
+    }
+
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.config.max_connections = max_connections.max(1);
+        self.connection_gate = Arc::new(Semaphore::new(self.config.max_connections));
+        self
+    }
+
+    pub fn with_max_control_connections(mut self, max_control_connections: usize) -> Self {
+        self.config.max_control_connections = max_control_connections.max(1);
+        self.control_connection_gate =
+            Arc::new(Semaphore::new(self.config.max_control_connections));
+        self
+    }
+
+    pub fn with_max_connection_age(mut self, max_connection_age: Duration) -> Self {
+        self.config.max_connection_age = max_connection_age;
+        self
+    }
+
+    pub fn insecure_allow_plaintext(mut self) -> Self {
+        self.config.allow_plaintext = true;
+        self
+    }
+
     #[cfg(feature = "query-transport-tls")]
     pub fn with_tls(
         mut self,
@@ -885,6 +1350,7 @@ impl TcpQueryCellClient {
         self.config.tls_server_name = Some(server_name.into());
         self.config.tls_config = Some(config);
         self.config.tls_config_provider = None;
+        self.pool = Arc::new(Mutex::new(Vec::new()));
         self
     }
 
@@ -897,11 +1363,20 @@ impl TcpQueryCellClient {
         self.config.tls_server_name = Some(server_name.into());
         self.config.tls_config = None;
         self.config.tls_config_provider = Some(provider);
+        self.pool = Arc::new(Mutex::new(Vec::new()));
         self
     }
 
     pub fn metrics(&self) -> QueryTransportMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    pub async fn clear_idle_connections(&self) {
+        self.pool.lock().await.clear();
+    }
+
+    pub async fn idle_connection_count(&self) -> usize {
+        self.pool.lock().await.len()
     }
 }
 
@@ -920,13 +1395,38 @@ struct QueryTransportServerRuntime {
     metrics: Arc<QueryTransportMetrics>,
     lifecycle: Arc<Mutex<QueryTransportLifecycle>>,
     request_gate: Arc<Semaphore>,
+    connection_gate: Arc<Semaphore>,
+    control_connection_gate: Arc<Semaphore>,
+}
+
+#[cfg(feature = "query-transport")]
+struct QueryTransportConnectionAdmission {
+    _permit: OwnedSemaphorePermit,
+    control_only: bool,
 }
 
 #[cfg(feature = "query-transport")]
 #[derive(Default)]
 struct QueryTransportLifecycle {
     next_token: QueryLifecycleToken,
-    queries: BTreeMap<String, QueryLifecycleEntry>,
+    queries: BTreeMap<QueryLifecycleKey, QueryLifecycleEntry>,
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct QueryLifecycleKey {
+    principal: QueryTransportPrincipal,
+    query_id: String,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryLifecycleKey {
+    fn new(principal: QueryTransportPrincipal, query_id: impl Into<String>) -> Self {
+        Self {
+            principal,
+            query_id: query_id.into(),
+        }
+    }
 }
 
 #[cfg(feature = "query-transport")]
@@ -937,6 +1437,28 @@ struct QueryLifecycleEntry {
     token: QueryLifecycleToken,
     state: QueryLifecycleState,
     cancellation_token: QueryCancellationToken,
+}
+
+#[cfg(feature = "query-transport")]
+struct ActiveQueryTransportConnection {
+    metrics: Arc<QueryTransportMetrics>,
+}
+
+#[cfg(feature = "query-transport")]
+impl ActiveQueryTransportConnection {
+    fn new(metrics: Arc<QueryTransportMetrics>) -> Self {
+        metrics.connections_active.fetch_add(1, Ordering::Relaxed);
+        Self { metrics }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl Drop for ActiveQueryTransportConnection {
+    fn drop(&mut self) {
+        self.metrics
+            .connections_active
+            .fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(feature = "query-transport")]
@@ -971,6 +1493,7 @@ impl TcpQueryServer {
         client: Arc<dyn QueryCellClient>,
         config: QueryTransportServerConfig,
     ) -> Result<Self> {
+        config.validate()?;
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|err| transport_error("bind", err))?;
@@ -981,11 +1504,16 @@ impl TcpQueryServer {
         let metrics = Arc::new(QueryTransportMetrics::default());
         let lifecycle = Arc::new(Mutex::new(QueryTransportLifecycle::default()));
         let max_concurrent_requests = config.max_concurrent_requests.max(1);
+        let max_connections = config.max_connections.max(1);
+        let reserved_control_connections = config.reserved_control_connections.max(1);
+        let graceful_shutdown_timeout = config.graceful_shutdown_timeout;
         let runtime = Arc::new(QueryTransportServerRuntime {
             config,
             metrics: Arc::clone(&metrics),
             lifecycle: Arc::clone(&lifecycle),
             request_gate: Arc::new(Semaphore::new(max_concurrent_requests)),
+            connection_gate: Arc::new(Semaphore::new(max_connections)),
+            control_connection_gate: Arc::new(Semaphore::new(reserved_control_connections)),
         });
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
@@ -998,10 +1526,50 @@ impl TcpQueryServer {
                     }
                     accepted = listener.accept() => {
                         let (stream, _) = accepted.map_err(|err| transport_error("accept", err))?;
+                        if let Err(err) = stream.set_nodelay(true) {
+                            tracing::warn!(
+                                target: "slatedb_graph_kernel",
+                                error = %err,
+                                "query transport failed to configure accepted socket"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                        let admission = match Arc::clone(&runtime.connection_gate).try_acquire_owned() {
+                            Ok(permit) => QueryTransportConnectionAdmission {
+                                _permit: permit,
+                                control_only: false,
+                            },
+                            Err(_) => match Arc::clone(&runtime.control_connection_gate).try_acquire_owned() {
+                                Ok(permit) => QueryTransportConnectionAdmission {
+                                    _permit: permit,
+                                    control_only: true,
+                                },
+                                Err(_) => {
+                                    runtime.metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
+                                    drop(stream);
+                                    continue;
+                                }
+                            },
+                        };
+                        runtime.metrics.connections_accepted.fetch_add(1, Ordering::Relaxed);
                         let client = Arc::clone(&client);
                         let runtime = Arc::clone(&runtime);
+                        let connection_stop_rx = stop_rx.clone();
                         connections.spawn(async move {
-                            if let Err(err) = serve_query_transport_stream(stream, client, runtime).await {
+                            let control_only = admission.control_only;
+                            let _admission = admission;
+                            let _active_connection =
+                                ActiveQueryTransportConnection::new(Arc::clone(&runtime.metrics));
+                            if let Err(err) = serve_query_transport_stream(
+                                stream,
+                                client,
+                                runtime,
+                                connection_stop_rx,
+                                control_only,
+                            )
+                            .await
+                            {
                                 tracing::warn!(
                                     target: "slatedb_graph_kernel",
                                     error = %err,
@@ -1021,15 +1589,37 @@ impl TcpQueryServer {
                     }
                 }
             }
-            connections.abort_all();
-            while let Some(joined) = connections.join_next().await {
-                if let Err(err) = joined {
-                    if !err.is_cancelled() {
-                        tracing::warn!(
-                            target: "slatedb_graph_kernel",
-                            error = %err,
-                            "query transport connection task failed during shutdown"
-                        );
+            let graceful_drain = async {
+                while let Some(joined) = connections.join_next().await {
+                    if let Err(err) = joined {
+                        if !err.is_cancelled() {
+                            tracing::warn!(
+                                target: "slatedb_graph_kernel",
+                                error = %err,
+                                "query transport connection task failed during shutdown"
+                            );
+                        }
+                    }
+                }
+            };
+            if tokio::time::timeout(graceful_shutdown_timeout, graceful_drain)
+                .await
+                .is_err()
+            {
+                runtime
+                    .metrics
+                    .forced_shutdowns
+                    .fetch_add(1, Ordering::Relaxed);
+                connections.abort_all();
+                while let Some(joined) = connections.join_next().await {
+                    if let Err(err) = joined {
+                        if !err.is_cancelled() {
+                            tracing::warn!(
+                                target: "slatedb_graph_kernel",
+                                error = %err,
+                                "query transport connection task failed during forced shutdown"
+                            );
+                        }
                     }
                 }
             }
@@ -1053,24 +1643,20 @@ impl TcpQueryServer {
     }
 
     pub async fn cancel_query(&self, query_id: impl Into<String>) -> Result<()> {
+        self.cancel_query_for_principal(QueryTransportCancellationPrincipal::insecure(), query_id)
+            .await
+    }
+
+    pub async fn cancel_query_for_principal(
+        &self,
+        principal: QueryTransportCancellationPrincipal,
+        query_id: impl Into<String>,
+    ) -> Result<()> {
         let query_id = query_id.into();
         validate_component("query_id", &query_id)?;
+        let lifecycle_key = QueryLifecycleKey::new(principal.0, &query_id);
         let mut lifecycle = self.lifecycle.lock().await;
-        let Some(entry) = lifecycle.queries.get(&query_id) else {
-            return Err(inactive_query_cancel_error(&query_id));
-        };
-        let queued = entry.state == QueryLifecycleState::Queued;
-        if queued {
-            lifecycle.queries.remove(&query_id);
-            self.metrics
-                .cancelled_rejections
-                .fetch_add(1, Ordering::Relaxed);
-        } else if let Some(entry) = lifecycle.queries.get_mut(&query_id) {
-            entry.cancellation_token.cancel();
-            entry.state = QueryLifecycleState::Cancelled;
-        }
-        self.metrics.cancellations.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        cancel_query_lifecycle_entry(&mut lifecycle, &self.metrics, &lifecycle_key)
     }
 
     pub async fn stop(self) -> Result<()> {
@@ -1175,7 +1761,7 @@ impl TcpQueryCellClient {
             auth: self.auth(),
             query_id,
         };
-        match self.send(request).await? {
+        match self.send_control(request).await? {
             QueryTransportResponse::Cancelled => Ok(()),
             QueryTransportResponse::Rows { .. } | QueryTransportResponse::Page { .. } => {
                 Err(transport_protocol_error(
@@ -1201,48 +1787,135 @@ impl TcpQueryCellClient {
     }
 
     async fn send(&self, request: QueryTransportRequest) -> Result<QueryTransportResponse> {
+        let started = std::time::Instant::now();
+        let result = match tokio::time::timeout(self.config.timeout, self.send_once(&request)).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(query_transport_client_timeout(self.config.timeout)),
+        };
+        let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.metrics
+            .remote_latency_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
+        result
+    }
+
+    async fn send_control(&self, request: QueryTransportRequest) -> Result<QueryTransportResponse> {
+        let started = std::time::Instant::now();
+        let result =
+            match tokio::time::timeout(self.config.timeout, self.send_control_once(&request)).await
+            {
+                Ok(result) => result,
+                Err(_) => Err(query_transport_client_timeout(self.config.timeout)),
+            };
+        let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.metrics
+            .remote_latency_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
+        result
+    }
+
+    async fn send_once(&self, request: &QueryTransportRequest) -> Result<QueryTransportResponse> {
+        self.config.validate()?;
+        let _connection_permit = match Arc::clone(&self.connection_gate).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.metrics
+                    .client_connection_waits
+                    .fetch_add(1, Ordering::Relaxed);
+                Arc::clone(&self.connection_gate)
+                    .acquire_owned()
+                    .await
+                    .map_err(|err| GraphError::CorruptValue {
+                        key: "query/transport/client_connections".to_string(),
+                        reason: err.to_string(),
+                    })?
+            }
+        };
+        let mut connection = match self.take_idle_connection().await {
+            Some(connection) => {
+                self.metrics
+                    .connections_reused
+                    .fetch_add(1, Ordering::Relaxed);
+                connection
+            }
+            None => self.open_connection_with_retries().await?,
+        };
+        let decoded = self.send_on_io(&mut *connection.io, request).await?;
+        if requires_legacy_version_fallback(request, &decoded) {
+            self.metrics.client_retries.fetch_add(1, Ordering::Relaxed);
+            let mut legacy_request = request.clone();
+            legacy_request.set_version(QUERY_TRANSPORT_LEGACY_VERSION);
+            let mut legacy_connection = self.open_connection_with_retries().await?;
+            let legacy = self
+                .send_on_io(&mut *legacy_connection.io, &legacy_request)
+                .await?;
+            if !legacy.close_connection {
+                self.recycle_connection(legacy_connection).await;
+            }
+            return Ok(legacy.response);
+        }
+        if !decoded.close_connection {
+            self.recycle_connection(connection).await;
+        }
+        Ok(decoded.response)
+    }
+
+    async fn send_control_once(
+        &self,
+        request: &QueryTransportRequest,
+    ) -> Result<QueryTransportResponse> {
+        self.config.validate()?;
+        let _control_permit = Arc::clone(&self.control_connection_gate)
+            .acquire_owned()
+            .await
+            .map_err(|err| GraphError::CorruptValue {
+                key: "query/transport/client_control_connections".to_string(),
+                reason: err.to_string(),
+            })?;
+        let mut connection = self.open_connection_with_retries().await?;
+        let decoded = self.send_on_io(&mut *connection.io, request).await?;
+        if requires_legacy_version_fallback(request, &decoded) {
+            self.metrics.client_retries.fetch_add(1, Ordering::Relaxed);
+            let mut legacy_request = request.clone();
+            legacy_request.set_version(QUERY_TRANSPORT_LEGACY_VERSION);
+            let mut legacy_connection = self.open_connection_with_retries().await?;
+            return Ok(self
+                .send_on_io(&mut *legacy_connection.io, &legacy_request)
+                .await?
+                .response);
+        }
+        Ok(decoded.response)
+    }
+
+    async fn open_connection_with_retries(&self) -> Result<PooledQueryTransportConnection> {
         let attempts = self.config.max_retries.saturating_add(1);
         let mut last_err = None;
         for attempt in 0..attempts {
             if attempt > 0 {
                 self.metrics.client_retries.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
             }
-            let started = std::time::Instant::now();
-            let future = self.send_once(&request);
-            match tokio::time::timeout(self.config.timeout, future).await {
-                Ok(Ok(response)) => {
-                    let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                    self.metrics
-                        .remote_latency_us
-                        .fetch_add(elapsed_us, Ordering::Relaxed);
-                    return Ok(response);
-                }
-                Ok(Err(err)) => last_err = Some(err),
-                Err(_) => {
-                    last_err = Some(GraphError::QueryTimeout {
-                        operation: "query_transport",
-                        elapsed_ms: self.config.timeout.as_millis().min(u128::from(u64::MAX))
-                            as u64,
-                        limit_ms: self.config.timeout.as_millis().min(u128::from(u64::MAX)) as u64,
-                    });
-                }
+            match self.open_connection().await {
+                Ok(connection) => return Ok(connection),
+                Err(err) => last_err = Some(err),
             }
         }
-        Err(last_err.unwrap_or_else(|| transport_protocol_error("query/transport", "no attempts")))
+        Err(last_err.unwrap_or_else(|| {
+            transport_protocol_error("query/transport/connect", "no connection attempts")
+        }))
     }
 
-    async fn send_once(&self, request: &QueryTransportRequest) -> Result<QueryTransportResponse> {
+    async fn open_connection(&self) -> Result<PooledQueryTransportConnection> {
         let stream = TcpStream::connect(self.addr)
             .await
             .map_err(|err| transport_error("connect", err))?;
-        self.send_on_stream(stream, request).await
-    }
-
-    async fn send_on_stream(
-        &self,
-        stream: TcpStream,
-        request: &QueryTransportRequest,
-    ) -> Result<QueryTransportResponse> {
+        stream
+            .set_nodelay(true)
+            .map_err(|err| transport_error("set_nodelay", err))?;
+        self.metrics
+            .connections_created
+            .fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "query-transport-tls")]
         {
             let tls_config = if let Some(provider) = &self.config.tls_config_provider {
@@ -1259,31 +1932,101 @@ impl TcpQueryCellClient {
                         key: "query/transport/tls/server_name".to_string(),
                         reason: err.to_string(),
                     })?;
-                let mut stream = TlsConnector::from(tls_config)
+                let stream = TlsConnector::from(tls_config)
                     .connect(server_name, stream)
                     .await
                     .map_err(|err| transport_error("tls_connect", err))?;
-                return self.send_on_io(&mut stream, request).await;
+                return Ok(PooledQueryTransportConnection {
+                    io: Box::new(stream),
+                    created_at: Instant::now(),
+                    tls_generation: self.current_tls_generation(),
+                });
             }
         }
 
-        let mut stream = stream;
-        self.send_on_io(&mut stream, request).await
+        Ok(PooledQueryTransportConnection {
+            io: Box::new(stream),
+            created_at: Instant::now(),
+            tls_generation: self.current_tls_generation(),
+        })
+    }
+
+    async fn take_idle_connection(&self) -> Option<PooledQueryTransportConnection> {
+        let mut pool = self.pool.lock().await;
+        while let Some(connection) = pool.pop() {
+            if connection.created_at.elapsed() < self.config.max_connection_age
+                && connection.tls_generation == self.current_tls_generation()
+            {
+                return Some(connection);
+            }
+        }
+        None
+    }
+
+    async fn recycle_connection(&self, connection: PooledQueryTransportConnection) {
+        if self.config.max_idle_connections == 0
+            || connection.created_at.elapsed() >= self.config.max_connection_age
+            || connection.tls_generation != self.current_tls_generation()
+        {
+            return;
+        }
+        let mut pool = self.pool.lock().await;
+        if pool.len() < self.config.max_idle_connections {
+            pool.push(connection);
+        }
+    }
+
+    fn current_tls_generation(&self) -> u64 {
+        #[cfg(feature = "query-transport-tls")]
+        if let Some(provider) = &self.config.tls_config_provider {
+            return provider.generation();
+        }
+        0
     }
 
     async fn send_on_io<S>(
         &self,
         stream: &mut S,
         request: &QueryTransportRequest,
-    ) -> Result<QueryTransportResponse>
+    ) -> Result<DecodedQueryTransportResponse>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + ?Sized,
     {
         write_query_transport_frame(stream, request, self.config.max_frame_bytes, &self.metrics)
             .await?;
         let frame =
             read_query_transport_frame(stream, self.config.max_frame_bytes, &self.metrics).await?;
-        serde_json::from_slice(&frame).map_err(|err| transport_json_error("decode", err))
+        let frame: QueryTransportResponseWire =
+            serde_json::from_slice(&frame).map_err(|err| transport_json_error("decode", err))?;
+        Ok(frame.decode())
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn requires_legacy_version_fallback(
+    request: &QueryTransportRequest,
+    decoded: &DecodedQueryTransportResponse,
+) -> bool {
+    if !decoded.legacy || request.version() != QUERY_TRANSPORT_VERSION {
+        return false;
+    }
+    matches!(
+        &decoded.response,
+        QueryTransportResponse::Error { message }
+            if message
+                == &format!(
+                    "unsupported query transport version {QUERY_TRANSPORT_VERSION}; expected {QUERY_TRANSPORT_LEGACY_VERSION}"
+                )
+    )
+}
+
+#[cfg(feature = "query-transport")]
+fn query_transport_client_timeout(timeout: Duration) -> GraphError {
+    let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+    GraphError::QueryTimeout {
+        operation: "query_transport",
+        elapsed_ms: timeout_ms,
+        limit_ms: timeout_ms,
     }
 }
 
@@ -2031,13 +2774,13 @@ fn service_discovery_error(provider: &'static str, err: impl std::fmt::Display) 
 }
 
 #[cfg(feature = "query-transport")]
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct QueryTransportAuth {
     bearer_token: Option<String>,
 }
 
 #[cfg(feature = "query-transport")]
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum QueryTransportRequest {
     Rows {
@@ -2062,6 +2805,29 @@ enum QueryTransportRequest {
 }
 
 #[cfg(feature = "query-transport")]
+impl QueryTransportRequest {
+    fn version(&self) -> u16 {
+        match self {
+            Self::Rows { version, .. }
+            | Self::Page { version, .. }
+            | Self::Cancel { version, .. } => *version,
+        }
+    }
+
+    fn set_version(&mut self, new_version: u16) {
+        match self {
+            Self::Rows { version, .. }
+            | Self::Page { version, .. }
+            | Self::Cancel { version, .. } => *version = new_version,
+        }
+    }
+
+    fn is_cancel(&self) -> bool {
+        matches!(self, Self::Cancel { .. })
+    }
+}
+
+#[cfg(feature = "query-transport")]
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum QueryTransportResponse {
@@ -2072,10 +2838,52 @@ enum QueryTransportResponse {
 }
 
 #[cfg(feature = "query-transport")]
+#[derive(serde::Deserialize, serde::Serialize)]
+struct QueryTransportResponseFrame {
+    response: QueryTransportResponse,
+    close_connection: bool,
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+enum QueryTransportResponseWire {
+    Current(QueryTransportResponseFrame),
+    Legacy(QueryTransportResponse),
+}
+
+#[cfg(feature = "query-transport")]
+struct DecodedQueryTransportResponse {
+    response: QueryTransportResponse,
+    close_connection: bool,
+    legacy: bool,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportResponseWire {
+    fn decode(self) -> DecodedQueryTransportResponse {
+        match self {
+            Self::Current(frame) => DecodedQueryTransportResponse {
+                response: frame.response,
+                close_connection: frame.close_connection,
+                legacy: false,
+            },
+            Self::Legacy(response) => DecodedQueryTransportResponse {
+                response,
+                close_connection: true,
+                legacy: true,
+            },
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
 async fn serve_query_transport_stream(
     stream: TcpStream,
     client: Arc<dyn QueryCellClient>,
     runtime: Arc<QueryTransportServerRuntime>,
+    shutdown: watch::Receiver<bool>,
+    control_only: bool,
 ) -> Result<()> {
     #[cfg(feature = "query-transport-tls")]
     {
@@ -2086,12 +2894,46 @@ async fn serve_query_transport_stream(
         };
         if let Some(tls_config) = tls_config {
             let acceptor = TlsAcceptor::from(tls_config);
-            let mut stream = acceptor
-                .accept(stream)
-                .await
-                .map_err(|err| transport_error("tls_accept", err))?;
+            let handshake =
+                tokio::time::timeout(runtime.config.handshake_timeout, acceptor.accept(stream));
+            let mut handshake_shutdown = shutdown.clone();
+            let handshake = tokio::select! {
+                changed = handshake_shutdown.changed() => {
+                    let _ = changed;
+                    return Ok(());
+                }
+                handshake = handshake => handshake,
+            };
+            let mut stream = match handshake {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(err)) => {
+                    runtime
+                        .metrics
+                        .handshake_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(transport_error("tls_accept", err));
+                }
+                Err(_) => {
+                    runtime
+                        .metrics
+                        .handshake_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(transport_timeout_error(
+                        "tls_handshake",
+                        runtime.config.handshake_timeout,
+                    ));
+                }
+            };
             let identity = query_transport_tls_identity(&stream);
-            return serve_query_transport_io(&mut stream, client, runtime, identity).await;
+            return serve_query_transport_io(
+                &mut stream,
+                client,
+                runtime,
+                identity,
+                shutdown,
+                control_only,
+            )
+            .await;
         }
     }
 
@@ -2101,6 +2943,8 @@ async fn serve_query_transport_stream(
         client,
         runtime,
         QueryTransportConnectionIdentity::default(),
+        shutdown,
+        control_only,
     )
     .await
 }
@@ -2112,17 +2956,19 @@ fn query_transport_tls_identity<S>(
     let mut identity = QueryTransportConnectionIdentity::default();
     let (_, connection) = stream.get_ref();
     if let Some(certs) = connection.peer_certificates() {
-        for cert in certs {
+        for (index, cert) in certs.iter().enumerate() {
             let digest = Sha256::digest(cert.as_ref());
-            identity
-                .tls_peer_fingerprints
-                .insert(format!("sha256:{}", lowercase_hex(&digest)));
+            let fingerprint = format!("sha256:{}", lowercase_hex(&digest));
+            if index == 0 {
+                identity.tls_peer_leaf_fingerprint = Some(fingerprint.clone());
+            }
+            identity.tls_peer_fingerprints.insert(fingerprint);
         }
     }
     identity
 }
 
-#[cfg(feature = "query-transport-tls")]
+#[cfg(feature = "query-transport")]
 fn lowercase_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -2139,28 +2985,105 @@ async fn serve_query_transport_io<S>(
     client: Arc<dyn QueryCellClient>,
     runtime: Arc<QueryTransportServerRuntime>,
     identity: QueryTransportConnectionIdentity,
+    mut shutdown: watch::Receiver<bool>,
+    control_only: bool,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let frame =
-        read_query_transport_frame(stream, runtime.config.max_frame_bytes, &runtime.metrics)
-            .await?;
-    let response = match serde_json::from_slice::<QueryTransportRequest>(&frame) {
-        Ok(request) => {
-            execute_query_transport_request(client, request, Arc::clone(&runtime), identity).await
+    let mut read_buffer = Vec::new();
+    let connection_started = Instant::now();
+    for request_index in 0..runtime.config.max_requests_per_connection {
+        if *shutdown.borrow() {
+            return Ok(());
         }
-        Err(err) => QueryTransportResponse::Error {
-            message: format!("invalid query transport request: {err}"),
-        },
-    };
-    write_query_transport_frame(
-        stream,
-        &response,
-        runtime.config.max_frame_bytes,
-        &runtime.metrics,
-    )
-    .await
+        let read = read_optional_query_transport_frame(
+            stream,
+            runtime.config.max_frame_bytes,
+            &runtime.metrics,
+            &mut read_buffer,
+        );
+        let frame = tokio::select! {
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return Ok(());
+            }
+            frame = tokio::time::timeout(runtime.config.idle_timeout, read) => {
+                match frame {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        runtime.metrics.idle_timeouts.fetch_add(1, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        let Some(frame) = frame else {
+            return Ok(());
+        };
+        let (response, request_version) =
+            match serde_json::from_slice::<QueryTransportRequest>(&frame) {
+                Ok(request) => {
+                    let request_version = request.version();
+                    let response = if control_only && !request.is_cancel() {
+                        QueryTransportResponse::Error {
+                            message: "connection is reserved for query cancellation".to_string(),
+                        }
+                    } else {
+                        execute_query_transport_request(
+                            Arc::clone(&client),
+                            request,
+                            Arc::clone(&runtime),
+                            identity.clone(),
+                        )
+                        .await
+                    };
+                    (response, request_version)
+                }
+                Err(err) => (
+                    QueryTransportResponse::Error {
+                        message: format!("invalid query transport request: {err}"),
+                    },
+                    QUERY_TRANSPORT_VERSION,
+                ),
+            };
+        let legacy_response = request_version == QUERY_TRANSPORT_LEGACY_VERSION;
+        let close_connection = legacy_response
+            || control_only
+            || request_index + 1 >= runtime.config.max_requests_per_connection
+            || connection_started.elapsed() >= runtime.config.max_connection_age;
+        let wire_response = if legacy_response {
+            QueryTransportResponseWire::Legacy(response)
+        } else {
+            QueryTransportResponseWire::Current(QueryTransportResponseFrame {
+                response,
+                close_connection,
+            })
+        };
+        match tokio::time::timeout(
+            runtime.config.write_timeout,
+            write_query_transport_frame(
+                stream,
+                &wire_response,
+                runtime.config.max_frame_bytes,
+                &runtime.metrics,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(transport_timeout_error(
+                    "frame_write",
+                    runtime.config.write_timeout,
+                ));
+            }
+        }
+        if close_connection {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "query-transport")]
@@ -2177,14 +3100,16 @@ async fn execute_query_transport_request(
             context,
             query,
         } => {
-            if version != QUERY_TRANSPORT_VERSION {
+            if !query_transport_version_supported(version) {
                 return transport_version_error(version);
             }
-            if let Err(err) = authenticate_query_transport(&runtime, &auth, &identity) {
-                return transport_error_response(&runtime, err);
-            }
+            let principal = match authenticate_query_transport(&runtime, &auth, &identity) {
+                Ok(principal) => principal,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
             let query_id = context.idempotency_key.clone();
-            match execute_metered_query(&runtime, &query_id, |cancellation_token| {
+            let lifecycle_key = QueryLifecycleKey::new(principal, &query_id);
+            match execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
                 client.execute_cypher_rows(
                     context.with_cancellation_token(cancellation_token),
                     &query,
@@ -2204,14 +3129,16 @@ async fn execute_query_transport_request(
             cursor,
             page_size,
         } => {
-            if version != QUERY_TRANSPORT_VERSION {
+            if !query_transport_version_supported(version) {
                 return transport_version_error(version);
             }
-            if let Err(err) = authenticate_query_transport(&runtime, &auth, &identity) {
-                return transport_error_response(&runtime, err);
-            }
+            let principal = match authenticate_query_transport(&runtime, &auth, &identity) {
+                Ok(principal) => principal,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
             let query_id = context.idempotency_key.clone();
-            match execute_metered_query(&runtime, &query_id, |cancellation_token| {
+            let lifecycle_key = QueryLifecycleKey::new(principal, &query_id);
+            match execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
                 client.execute_cypher_rows_page(
                     context.with_cancellation_token(cancellation_token),
                     &query,
@@ -2230,13 +3157,15 @@ async fn execute_query_transport_request(
             auth,
             query_id,
         } => {
-            if version != QUERY_TRANSPORT_VERSION {
+            if !query_transport_version_supported(version) {
                 return transport_version_error(version);
             }
-            if let Err(err) = authenticate_query_transport(&runtime, &auth, &identity) {
-                return transport_error_response(&runtime, err);
-            }
-            match cancel_active_query(&runtime, &query_id).await {
+            let principal = match authenticate_query_transport(&runtime, &auth, &identity) {
+                Ok(principal) => principal,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            let lifecycle_key = QueryLifecycleKey::new(principal, &query_id);
+            match cancel_active_query(&runtime, &lifecycle_key).await {
                 Ok(()) => QueryTransportResponse::Cancelled,
                 Err(err) => transport_error_response(&runtime, err),
             }
@@ -2248,32 +3177,50 @@ async fn execute_query_transport_request(
 fn transport_version_error(version: u16) -> QueryTransportResponse {
     QueryTransportResponse::Error {
         message: format!(
-            "unsupported query transport version {version}; expected {QUERY_TRANSPORT_VERSION}"
+            "unsupported query transport version {version}; supported versions are {QUERY_TRANSPORT_LEGACY_VERSION} and {QUERY_TRANSPORT_VERSION}"
         ),
     }
 }
 
 #[cfg(feature = "query-transport")]
+fn query_transport_version_supported(version: u16) -> bool {
+    matches!(
+        version,
+        QUERY_TRANSPORT_LEGACY_VERSION | QUERY_TRANSPORT_VERSION
+    )
+}
+
+#[cfg(feature = "query-transport")]
 async fn execute_metered_query<F, Fut, T>(
     runtime: &Arc<QueryTransportServerRuntime>,
-    query_id: &str,
+    lifecycle_key: &QueryLifecycleKey,
     execute: F,
 ) -> Result<T>
 where
     F: FnOnce(QueryCancellationToken) -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    let (lifecycle_token, cancellation_token) = begin_query_lifecycle(runtime, query_id).await?;
+    let (lifecycle_token, cancellation_token) =
+        begin_query_lifecycle(runtime, lifecycle_key).await?;
     let result = async {
         let _permit = acquire_query_transport_permit(runtime).await?;
-        activate_query_lifecycle(runtime, query_id, lifecycle_token).await?;
-        ensure_query_not_cancelled(runtime, query_id, lifecycle_token).await?;
+        activate_query_lifecycle(runtime, lifecycle_key, lifecycle_token).await?;
+        ensure_query_not_cancelled(runtime, lifecycle_key, lifecycle_token).await?;
         runtime
             .metrics
             .requests_started
             .fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
-        let result = execute(cancellation_token).await;
+        let result = match AssertUnwindSafe(execute(cancellation_token))
+            .catch_unwind()
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(GraphError::CorruptValue {
+                key: "query/transport/executor".to_string(),
+                reason: "query executor panicked".to_string(),
+            }),
+        };
         let elapsed = started.elapsed();
         runtime.metrics.remote_latency_us.fetch_add(
             elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
@@ -2287,7 +3234,7 @@ where
             runtime.metrics.slow_queries.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 target: "slatedb_graph_kernel",
-                query_id,
+                query_id = lifecycle_key.query_id,
                 elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
                 "slow query transport request"
             );
@@ -2295,7 +3242,7 @@ where
         result
     }
     .await;
-    let result = match finish_query_lifecycle(runtime, query_id, lifecycle_token).await {
+    let result = match finish_query_lifecycle(runtime, lifecycle_key, lifecycle_token).await {
         QueryLifecycleFinish::Cancelled => Err(cancelled_query_error()),
         QueryLifecycleFinish::NotCancelled | QueryLifecycleFinish::NotOwned => result,
     };
@@ -2315,20 +3262,20 @@ where
 #[cfg(feature = "query-transport")]
 async fn begin_query_lifecycle(
     runtime: &QueryTransportServerRuntime,
-    query_id: &str,
+    lifecycle_key: &QueryLifecycleKey,
 ) -> Result<(QueryLifecycleToken, QueryCancellationToken)> {
     let mut lifecycle = runtime.lifecycle.lock().await;
-    if lifecycle.queries.contains_key(query_id) {
+    if lifecycle.queries.contains_key(lifecycle_key) {
         return Err(GraphError::UnsupportedQuery {
             dialect: "QueryTransport",
-            feature: format!("query id {query_id} is already active"),
+            feature: format!("query id {} is already active", lifecycle_key.query_id),
         });
     }
     let token = lifecycle.next_token;
     lifecycle.next_token = lifecycle.next_token.wrapping_add(1);
     let cancellation_token = QueryCancellationToken::new();
     lifecycle.queries.insert(
-        query_id.to_string(),
+        lifecycle_key.clone(),
         QueryLifecycleEntry {
             token,
             state: QueryLifecycleState::Queued,
@@ -2341,11 +3288,11 @@ async fn begin_query_lifecycle(
 #[cfg(feature = "query-transport")]
 async fn activate_query_lifecycle(
     runtime: &QueryTransportServerRuntime,
-    query_id: &str,
+    lifecycle_key: &QueryLifecycleKey,
     token: QueryLifecycleToken,
 ) -> Result<()> {
     let mut lifecycle = runtime.lifecycle.lock().await;
-    let Some(entry) = lifecycle.queries.get_mut(query_id) else {
+    let Some(entry) = lifecycle.queries.get_mut(lifecycle_key) else {
         return Err(cancelled_query_error());
     };
     if entry.token != token {
@@ -2361,18 +3308,18 @@ async fn activate_query_lifecycle(
 #[cfg(feature = "query-transport")]
 async fn finish_query_lifecycle(
     runtime: &QueryTransportServerRuntime,
-    query_id: &str,
+    lifecycle_key: &QueryLifecycleKey,
     token: QueryLifecycleToken,
 ) -> QueryLifecycleFinish {
     let mut lifecycle = runtime.lifecycle.lock().await;
-    let Some(entry) = lifecycle.queries.get(query_id) else {
+    let Some(entry) = lifecycle.queries.get(lifecycle_key) else {
         return QueryLifecycleFinish::NotOwned;
     };
     if entry.token != token {
         return QueryLifecycleFinish::NotOwned;
     }
     let state = entry.state;
-    lifecycle.queries.remove(query_id);
+    lifecycle.queries.remove(lifecycle_key);
     match state {
         QueryLifecycleState::Cancelled => {
             runtime
@@ -2395,27 +3342,33 @@ enum QueryLifecycleFinish {
 }
 
 #[cfg(feature = "query-transport")]
-async fn cancel_active_query(runtime: &QueryTransportServerRuntime, query_id: &str) -> Result<()> {
-    validate_component("query_id", query_id)?;
+async fn cancel_active_query(
+    runtime: &QueryTransportServerRuntime,
+    lifecycle_key: &QueryLifecycleKey,
+) -> Result<()> {
+    validate_component("query_id", &lifecycle_key.query_id)?;
     let mut lifecycle = runtime.lifecycle.lock().await;
-    let Some(entry) = lifecycle.queries.get(query_id) else {
-        return Err(inactive_query_cancel_error(query_id));
+    cancel_query_lifecycle_entry(&mut lifecycle, &runtime.metrics, lifecycle_key)
+}
+
+#[cfg(feature = "query-transport")]
+fn cancel_query_lifecycle_entry(
+    lifecycle: &mut QueryTransportLifecycle,
+    metrics: &QueryTransportMetrics,
+    lifecycle_key: &QueryLifecycleKey,
+) -> Result<()> {
+    let Some(entry) = lifecycle.queries.get(lifecycle_key) else {
+        return Err(inactive_query_cancel_error(&lifecycle_key.query_id));
     };
     let queued = entry.state == QueryLifecycleState::Queued;
     if queued {
-        lifecycle.queries.remove(query_id);
-        runtime
-            .metrics
-            .cancelled_rejections
-            .fetch_add(1, Ordering::Relaxed);
-    } else if let Some(entry) = lifecycle.queries.get_mut(query_id) {
+        lifecycle.queries.remove(lifecycle_key);
+        metrics.cancelled_rejections.fetch_add(1, Ordering::Relaxed);
+    } else if let Some(entry) = lifecycle.queries.get_mut(lifecycle_key) {
         entry.cancellation_token.cancel();
         entry.state = QueryLifecycleState::Cancelled;
     }
-    runtime
-        .metrics
-        .cancellations
-        .fetch_add(1, Ordering::Relaxed);
+    metrics.cancellations.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -2444,11 +3397,11 @@ async fn acquire_query_transport_permit(
 #[cfg(feature = "query-transport")]
 async fn ensure_query_not_cancelled(
     runtime: &QueryTransportServerRuntime,
-    query_id: &str,
+    lifecycle_key: &QueryLifecycleKey,
     token: QueryLifecycleToken,
 ) -> Result<()> {
     let lifecycle = runtime.lifecycle.lock().await;
-    let Some(entry) = lifecycle.queries.get(query_id) else {
+    let Some(entry) = lifecycle.queries.get(lifecycle_key) else {
         return Err(cancelled_query_error());
     };
     if entry.token != token || entry.state == QueryLifecycleState::Cancelled {
@@ -2479,9 +3432,9 @@ fn authenticate_query_transport(
     runtime: &QueryTransportServerRuntime,
     auth: &QueryTransportAuth,
     identity: &QueryTransportConnectionIdentity,
-) -> Result<()> {
-    if runtime.config.auth_policy.accepts(auth, identity) {
-        return Ok(());
+) -> Result<QueryTransportPrincipal> {
+    if let Some(principal) = runtime.config.auth_policy.authenticate(auth, identity) {
+        return Ok(principal);
     }
     runtime
         .metrics
@@ -2502,9 +3455,22 @@ fn transport_error_response(
         .metrics
         .requests_failed
         .fetch_add(1, Ordering::Relaxed);
-    QueryTransportResponse::Error {
-        message: err.to_string(),
-    }
+    let message = match &err {
+        GraphError::AdmissionRejected { .. }
+        | GraphError::MissingQueryParameter { .. }
+        | GraphError::QueryParse { .. }
+        | GraphError::QueryTimeout { .. }
+        | GraphError::UnsupportedQuery { .. } => err.to_string(),
+        _ => {
+            tracing::warn!(
+                target: "slatedb_graph_kernel",
+                error = %err,
+                "query transport suppressed internal error details"
+            );
+            "internal query execution error".to_string()
+        }
+    };
+    QueryTransportResponse::Error { message }
 }
 
 #[cfg(feature = "query-transport")]
@@ -2515,7 +3481,7 @@ async fn write_query_transport_frame<S, T>(
     metrics: &QueryTransportMetrics,
 ) -> Result<()>
 where
-    S: AsyncWrite + Unpin,
+    S: AsyncWrite + Unpin + ?Sized,
     T: serde::Serialize,
 {
     let mut bytes =
@@ -2544,51 +3510,74 @@ async fn read_query_transport_frame<S>(
     metrics: &QueryTransportMetrics,
 ) -> Result<Vec<u8>>
 where
-    S: AsyncRead + Unpin,
+    S: AsyncRead + Unpin + ?Sized,
 {
-    let mut frame = Vec::new();
+    let mut read_buffer = Vec::new();
+    read_optional_query_transport_frame(stream, max_frame_bytes, metrics, &mut read_buffer)
+        .await?
+        .ok_or_else(|| {
+            transport_protocol_error(
+                "query/transport/frame",
+                "connection closed before a response frame",
+            )
+        })
+}
+
+#[cfg(feature = "query-transport")]
+async fn read_optional_query_transport_frame<S>(
+    stream: &mut S,
+    max_frame_bytes: usize,
+    metrics: &QueryTransportMetrics,
+    read_buffer: &mut Vec<u8>,
+) -> Result<Option<Vec<u8>>>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
     let mut buf = [0_u8; 4096];
-    let mut saw_newline = false;
     loop {
+        if let Some(newline) = read_buffer.iter().position(|byte| *byte == b'\n') {
+            if newline >= max_frame_bytes {
+                return Err(GraphError::AdmissionRejected {
+                    operation: "query_transport_frame",
+                    actual: newline as u64,
+                    limit: max_frame_bytes as u64,
+                });
+            }
+            let mut frame: Vec<u8> = read_buffer.drain(..=newline).collect();
+            frame.pop();
+            if frame.is_empty() {
+                return Err(transport_protocol_error(
+                    "query/transport/frame",
+                    "empty query transport frame",
+                ));
+            }
+            metrics
+                .bytes_received
+                .fetch_add((frame.len() + 1) as u64, Ordering::Relaxed);
+            return Ok(Some(frame));
+        }
+        if read_buffer.len() >= max_frame_bytes {
+            return Err(GraphError::AdmissionRejected {
+                operation: "query_transport_frame",
+                actual: read_buffer.len() as u64,
+                limit: max_frame_bytes as u64,
+            });
+        }
         let read = stream
             .read(&mut buf)
             .await
             .map_err(|err| transport_error("read", err))?;
         if read == 0 {
-            break;
+            if read_buffer.is_empty() {
+                return Ok(None);
+            }
+            return Err(transport_protocol_error(
+                "query/transport/frame",
+                "connection closed before the frame delimiter",
+            ));
         }
-        if let Some(newline) = buf[..read].iter().position(|byte| *byte == b'\n') {
-            frame.extend_from_slice(&buf[..newline]);
-            saw_newline = true;
-            break;
-        }
-        frame.extend_from_slice(&buf[..read]);
-        if frame.len() > max_frame_bytes {
-            return Err(GraphError::AdmissionRejected {
-                operation: "query_transport_frame",
-                actual: frame.len() as u64,
-                limit: max_frame_bytes as u64,
-            });
-        }
+        read_buffer.extend_from_slice(&buf[..read]);
     }
-    if frame.is_empty() {
-        return Err(transport_protocol_error(
-            "query/transport/frame",
-            "empty query transport frame",
-        ));
-    }
-    if frame.len() > max_frame_bytes {
-        return Err(GraphError::AdmissionRejected {
-            operation: "query_transport_frame",
-            actual: frame.len() as u64,
-            limit: max_frame_bytes as u64,
-        });
-    }
-    metrics.bytes_received.fetch_add(
-        (frame.len() + usize::from(saw_newline)) as u64,
-        Ordering::Relaxed,
-    );
-    Ok(frame)
 }
 
 #[cfg(feature = "query-transport")]
@@ -2596,6 +3585,24 @@ fn transport_error(operation: &'static str, err: std::io::Error) -> GraphError {
     GraphError::CorruptValue {
         key: format!("query/transport/{operation}"),
         reason: err.to_string(),
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn transport_config_error(reason: &str) -> Result<()> {
+    Err(GraphError::UnsafeDurabilityConfig {
+        operation: "query_transport_config",
+        reason: reason.to_string(),
+    })
+}
+
+#[cfg(feature = "query-transport")]
+fn transport_timeout_error(operation: &'static str, timeout: Duration) -> GraphError {
+    let limit_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+    GraphError::QueryTimeout {
+        operation,
+        elapsed_ms: limit_ms,
+        limit_ms,
     }
 }
 
