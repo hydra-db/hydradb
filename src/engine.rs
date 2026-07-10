@@ -28,9 +28,9 @@ use crate::{
     parse_out_edge_segment_tombstone_key, parse_u64, release_cell_write_lock, segment_edge_visible,
     sort_deltas, validate_component, CellWriteLock, DeltaKind, DeltaRecord, EdgeRecord,
     GraphCacheConfig, GraphCacheKind, GraphCorrectnessReport, GraphDurabilityConfig, GraphEpoch,
-    GraphError, GraphExportDigest, GraphOpenOptions, GraphShard, GraphWriteBatch, GraphWriteGuard,
-    MatrixAdjacency, MatrixCacheKey, PostingChunkCacheKey, RelationshipId, RelationshipRecord,
-    Result, SupernodeCacheKey, VertexId,
+    GraphError, GraphExportDigest, GraphId, GraphOpenOptions, GraphScope, GraphShard,
+    GraphWriteBatch, GraphWriteGuard, MatrixAdjacency, MatrixCacheKey, PostingChunkCacheKey,
+    RelationshipId, RelationshipRecord, Result, SupernodeCacheKey, VertexId,
 };
 
 const GRAPH_PREALLOC_LIMIT: usize = 1_000_000;
@@ -153,6 +153,7 @@ pub struct SupernodePage {
 }
 
 pub struct GraphCluster {
+    scope: GraphScope,
     shards: BTreeMap<String, GraphShard>,
 }
 
@@ -160,6 +161,7 @@ pub struct GraphControlPlane {
     db: Db,
     object_store: Arc<dyn ObjectStore>,
     store_path: Path,
+    scope: GraphScope,
     metrics: Arc<GraphControlMetrics>,
 }
 
@@ -268,6 +270,7 @@ pub struct ShardPlacement {
 }
 
 pub struct RoutedGraphCluster {
+    scope: GraphScope,
     base_path: String,
     local_node_id: String,
     placement: ShardPlacement,

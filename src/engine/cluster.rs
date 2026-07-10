@@ -645,7 +645,68 @@ impl GraphCluster {
         cell_ids: impl IntoIterator<Item = impl Into<String>>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
+        Self::open_cells_at_path(
+            base_path.into(),
+            GraphScope::default(),
+            cell_ids,
+            object_store,
+            false,
+        )
+        .await
+    }
+
+    pub async fn open_cells_scoped(
+        base_path: impl Into<String>,
+        scope: GraphScope,
+        cell_ids: impl IntoIterator<Item = impl Into<String>>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Result<Self> {
         let base_path = base_path.into();
+        let store_path = if scope.is_default() {
+            base_path
+        } else {
+            scope.scoped_store_path(&base_path)
+        };
+        Self::open_cells_at_path(store_path, scope, cell_ids, object_store, false).await
+    }
+
+    pub async fn open_cells_standalone_writers(
+        base_path: impl Into<String>,
+        cell_ids: impl IntoIterator<Item = impl Into<String>>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Result<Self> {
+        Self::open_cells_at_path(
+            base_path.into(),
+            GraphScope::default(),
+            cell_ids,
+            object_store,
+            true,
+        )
+        .await
+    }
+
+    pub async fn open_cells_standalone_writers_scoped(
+        base_path: impl Into<String>,
+        scope: GraphScope,
+        cell_ids: impl IntoIterator<Item = impl Into<String>>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Result<Self> {
+        let base_path = base_path.into();
+        let store_path = if scope.is_default() {
+            base_path
+        } else {
+            scope.scoped_store_path(&base_path)
+        };
+        Self::open_cells_at_path(store_path, scope, cell_ids, object_store, true).await
+    }
+
+    async fn open_cells_at_path(
+        base_path: String,
+        scope: GraphScope,
+        cell_ids: impl IntoIterator<Item = impl Into<String>>,
+        object_store: Arc<dyn ObjectStore>,
+        writable: bool,
+    ) -> Result<Self> {
         let mut shards = BTreeMap::new();
         for cell_id in cell_ids {
             let cell_id = cell_id.into();
@@ -654,7 +715,12 @@ impl GraphCluster {
                 return Err(err);
             }
             let path = format!("{base_path}/{cell_id}");
-            let shard = match GraphShard::open(path, Arc::clone(&object_store)).await {
+            let opened = if writable {
+                GraphShard::open_standalone_writer(path, Arc::clone(&object_store)).await
+            } else {
+                GraphShard::open(path, Arc::clone(&object_store)).await
+            };
+            let shard = match opened {
                 Ok(shard) => shard,
                 Err(err) => {
                     close_shards_best_effort(shards).await;
@@ -663,34 +729,11 @@ impl GraphCluster {
             };
             shards.insert(cell_id, shard);
         }
-        Ok(Self { shards })
+        Ok(Self { scope, shards })
     }
 
-    pub async fn open_cells_standalone_writers(
-        base_path: impl Into<String>,
-        cell_ids: impl IntoIterator<Item = impl Into<String>>,
-        object_store: Arc<dyn ObjectStore>,
-    ) -> Result<Self> {
-        let base_path = base_path.into();
-        let mut shards = BTreeMap::new();
-        for cell_id in cell_ids {
-            let cell_id = cell_id.into();
-            if let Err(err) = validate_component("cell_id", &cell_id) {
-                close_shards_best_effort(shards).await;
-                return Err(err);
-            }
-            let path = format!("{base_path}/{cell_id}");
-            let shard =
-                match GraphShard::open_standalone_writer(path, Arc::clone(&object_store)).await {
-                    Ok(shard) => shard,
-                    Err(err) => {
-                        close_shards_best_effort(shards).await;
-                        return Err(err);
-                    }
-                };
-            shards.insert(cell_id, shard);
-        }
-        Ok(Self { shards })
+    pub fn scope(&self) -> &GraphScope {
+        &self.scope
     }
 
     pub fn shard(&self, cell_id: &str) -> Option<&GraphShard> {
@@ -836,8 +879,46 @@ impl RoutedGraphCluster {
         placement: ShardPlacement,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
+        Self::open_owned_at_path(
+            base_path.into(),
+            GraphScope::default(),
+            local_node_id.into(),
+            placement,
+            object_store,
+        )
+        .await
+    }
+
+    pub async fn open_owned_scoped(
+        base_path: impl Into<String>,
+        scope: GraphScope,
+        local_node_id: impl Into<String>,
+        placement: ShardPlacement,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Result<Self> {
         let base_path = base_path.into();
-        let local_node_id = local_node_id.into();
+        let scoped_path = if scope.is_default() {
+            base_path
+        } else {
+            scope.scoped_store_path(&base_path)
+        };
+        Self::open_owned_at_path(
+            scoped_path,
+            scope,
+            local_node_id.into(),
+            placement,
+            object_store,
+        )
+        .await
+    }
+
+    async fn open_owned_at_path(
+        base_path: String,
+        scope: GraphScope,
+        local_node_id: String,
+        placement: ShardPlacement,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Result<Self> {
         validate_component("node_id", &local_node_id)?;
 
         let mut shards = BTreeMap::new();
@@ -854,6 +935,7 @@ impl RoutedGraphCluster {
         }
 
         Ok(Self {
+            scope,
             base_path,
             local_node_id,
             placement,
@@ -897,8 +979,67 @@ impl RoutedGraphCluster {
         lease_ttl: Duration,
         options: GraphOpenOptions,
     ) -> Result<Self> {
+        let scope = control.scope().clone();
         let base_path = base_path.into();
-        let local_node_id = local_node_id.into();
+        let base_path = if scope.is_default() {
+            base_path
+        } else {
+            scope.scoped_store_path(&base_path)
+        };
+        Self::open_owned_with_control_at_path(
+            base_path,
+            scope,
+            local_node_id.into(),
+            control,
+            object_store,
+            lease_ttl,
+            options,
+        )
+        .await
+    }
+
+    pub async fn open_owned_scoped_with_control_and_options(
+        base_path: impl Into<String>,
+        scope: GraphScope,
+        local_node_id: impl Into<String>,
+        control: &GraphControlPlane,
+        object_store: Arc<dyn ObjectStore>,
+        lease_ttl: Duration,
+        options: GraphOpenOptions,
+    ) -> Result<Self> {
+        if control.scope() != &scope {
+            return Err(GraphError::GraphScopeMismatch {
+                expected: control.scope().to_string(),
+                actual: scope.to_string(),
+            });
+        }
+        let base_path = base_path.into();
+        let scoped_path = if scope.is_default() {
+            base_path
+        } else {
+            scope.scoped_store_path(&base_path)
+        };
+        Self::open_owned_with_control_at_path(
+            scoped_path,
+            scope,
+            local_node_id.into(),
+            control,
+            object_store,
+            lease_ttl,
+            options,
+        )
+        .await
+    }
+
+    async fn open_owned_with_control_at_path(
+        base_path: String,
+        scope: GraphScope,
+        local_node_id: String,
+        control: &GraphControlPlane,
+        object_store: Arc<dyn ObjectStore>,
+        lease_ttl: Duration,
+        options: GraphOpenOptions,
+    ) -> Result<Self> {
         let mut placement = control.load_placement().await?;
         validate_component("node_id", &local_node_id)?;
         let local_cells = placement.cells_for_node(&local_node_id)?;
@@ -957,6 +1098,7 @@ impl RoutedGraphCluster {
         }
 
         Ok(Self {
+            scope,
             base_path,
             local_node_id,
             placement,
@@ -976,6 +1118,10 @@ impl RoutedGraphCluster {
 
     pub fn local_node_id(&self) -> &str {
         &self.local_node_id
+    }
+
+    pub fn scope(&self) -> &GraphScope {
+        &self.scope
     }
 
     pub fn placement(&self) -> &ShardPlacement {
@@ -1597,6 +1743,7 @@ impl RoutedGraphCluster {
         context: crate::QueryContext,
         statement: crate::QueryStatement,
     ) -> Result<crate::QueryOutput> {
+        self.ensure_query_scope(&context.scope)?;
         let shard = self.shard(&context.cell_id)?;
         let plan = shard.plan_query_statement(context, statement)?;
         if plan.is_write() {
@@ -1619,6 +1766,7 @@ impl RoutedGraphCluster {
         context: crate::QueryContext,
         query: &str,
     ) -> Result<crate::QueryOutput> {
+        self.ensure_query_scope(&context.scope)?;
         let shard = self.shard(&context.cell_id)?;
         let requires_write_lease =
             if crate::parse_opencypher_mutation_query_with_parameters(query, &context.parameters)?
@@ -1642,6 +1790,7 @@ impl RoutedGraphCluster {
         context: crate::QueryContext,
         query: &str,
     ) -> Result<crate::QueryResultSet> {
+        self.ensure_query_scope(&context.scope)?;
         let shard = self.shard(&context.cell_id)?;
         shard.execute_cypher_rows(context, query).await
     }
@@ -1654,6 +1803,7 @@ impl RoutedGraphCluster {
         cursor: Option<crate::QueryCursorToken>,
         page_size: usize,
     ) -> Result<crate::QueryResultPage> {
+        self.ensure_query_scope(&context.scope)?;
         let shard = self.shard(&context.cell_id)?;
         shard
             .execute_cypher_rows_page(context, query, cursor, page_size)
@@ -1668,6 +1818,7 @@ impl RoutedGraphCluster {
     ) -> Result<BTreeMap<String, crate::QueryResultSet>> {
         let mut result_sets = BTreeMap::new();
         for context in contexts {
+            self.ensure_query_scope(&context.scope)?;
             validate_component("cell_id", &context.cell_id)?;
             if result_sets.contains_key(&context.cell_id) {
                 return Err(GraphError::CorruptValue {
@@ -1689,8 +1840,19 @@ impl RoutedGraphCluster {
         context: crate::QueryContext,
         query: &str,
     ) -> Result<crate::QueryPlan> {
+        self.ensure_query_scope(&context.scope)?;
         let shard = self.shard(&context.cell_id)?;
         shard.explain_cypher(context, query)
+    }
+
+    fn ensure_query_scope(&self, scope: &GraphScope) -> Result<()> {
+        if scope == &self.scope {
+            return Ok(());
+        }
+        Err(GraphError::GraphScopeMismatch {
+            expected: self.scope.to_string(),
+            actual: scope.to_string(),
+        })
     }
 
     pub async fn close(&self) -> Result<()> {
