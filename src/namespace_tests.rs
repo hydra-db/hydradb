@@ -651,7 +651,6 @@ async fn parent_namespace_quota_limits_queries_across_subtenants() {
 #[cfg(feature = "query-transport")]
 struct ScopeCancellationQueryClient {
     started: std::sync::atomic::AtomicUsize,
-    started_notify: tokio::sync::Notify,
 }
 
 #[cfg(feature = "query-transport")]
@@ -662,14 +661,8 @@ impl QueryCellClient for ScopeCancellationQueryClient {
         _context: QueryContext,
         _query: &str,
     ) -> Result<QueryResultSet> {
-        if self
-            .started
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1
-            >= 2
-        {
-            self.started_notify.notify_waiters();
-        }
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         Ok(QueryResultSet::new(Vec::new(), Vec::new()))
     }
@@ -694,7 +687,6 @@ async fn query_cancellation_is_isolated_by_graph_scope() {
     let billing = scope("acme", "billing", "ledger");
     let query_client = Arc::new(ScopeCancellationQueryClient {
         started: std::sync::atomic::AtomicUsize::new(0),
-        started_notify: tokio::sync::Notify::new(),
     });
     let authorizer = StaticQueryTransportScopeAuthorizer::new()
         .with_bearer_grant(
@@ -750,7 +742,7 @@ async fn query_cancellation_is_isolated_by_graph_scope() {
             {
                 break;
             }
-            query_client.started_notify.notified().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     })
     .await
@@ -766,5 +758,83 @@ async fn query_cancellation_is_isolated_by_graph_scope() {
         .contains("query_transport_cancelled"));
     billing_task.await.unwrap().unwrap();
     assert_eq!(server.metrics().cancellations, 1);
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn query_cancellation_requires_access_to_the_requested_graph_scope() {
+    let search = scope("acme", "search", "social");
+    let billing = scope("acme", "billing", "ledger");
+    let query_client = Arc::new(ScopeCancellationQueryClient {
+        started: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "search-token",
+            QueryTransportScopeGrant::read_graph(search.clone()),
+        )
+        .unwrap();
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        query_client.clone(),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("search-token")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_max_concurrent_requests(2)
+            .insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let client = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("search-token")
+        .insecure_allow_plaintext();
+
+    let query_task = {
+        let client = client.clone();
+        let search = search.clone();
+        tokio::spawn(async move {
+            client
+                .execute_cypher_rows(
+                    QueryContext::new("cell-a", "scoped-cancel-target").in_scope(search),
+                    "MATCH (u {id: 1}) RETURN u.id",
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if query_client
+                .started
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let unauthorized = client
+        .cancel_query_in_scope(billing, "scoped-cancel-target")
+        .await
+        .unwrap_err();
+    assert!(unauthorized
+        .to_string()
+        .contains("not authorized to cancel queries in"));
+
+    client
+        .cancel_query_in_scope(search, "scoped-cancel-target")
+        .await
+        .unwrap();
+    let query_error = query_task.await.unwrap().unwrap_err();
+    assert!(query_error
+        .to_string()
+        .contains("query_transport_cancelled"));
+    let metrics = server.metrics();
+    assert_eq!(metrics.namespace_access_denials, 1);
+    assert_eq!(metrics.cancellations, 1);
     server.stop().await.unwrap();
 }
