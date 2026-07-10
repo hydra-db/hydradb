@@ -64,6 +64,13 @@ pub struct ParsedMutationQuery {
     pub actions: Vec<RowMutationAction>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "query-transport")]
+pub(crate) enum OpenCypherQueryAccess {
+    Read,
+    Write,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowPattern {
     Node(RowNodePattern),
@@ -250,6 +257,11 @@ pub fn parse_opencypher_mutation_query_with_parameters(
     parsed.lower_mutation_query(parameters)
 }
 
+#[cfg(feature = "query-transport")]
+pub(crate) fn classify_opencypher_query_access(query: &str) -> Result<OpenCypherQueryAccess> {
+    ParsedCypher::parse(query)?.query_access()
+}
+
 impl CypherFrontend for LibCypherParserFrontend {
     fn parse(&self, query: &str) -> Result<QueryStatement> {
         let parsed = ParsedCypher::parse(query)?;
@@ -292,6 +304,51 @@ impl ParsedCypher {
             );
         }
         Ok(lowered.statement)
+    }
+
+    #[cfg(feature = "query-transport")]
+    fn query_access(&self) -> Result<OpenCypherQueryAccess> {
+        unsafe {
+            let directives = sys::cypher_parse_result_ndirectives(self.result);
+            if directives != 1 {
+                return unsupported("query transport requires exactly one Cypher statement");
+            }
+
+            let statement = checked_node(sys::cypher_parse_result_get_directive(self.result, 0))?;
+            ensure_instance(statement, sys::CYPHER_AST_STATEMENT, "statement")?;
+            let body = checked_node(sys::cypher_ast_statement_get_body(statement))?;
+            ensure_instance(body, sys::CYPHER_AST_QUERY, "query")?;
+            let clause_count = sys::cypher_ast_query_nclauses(body);
+            if clause_count == 0 {
+                return unsupported("query transport requires at least one Cypher clause");
+            }
+
+            let mut has_unknown_clause = false;
+            for index in 0..clause_count {
+                let clause = checked_node(sys::cypher_ast_query_get_clause(body, index))?;
+                if is_instance(clause, sys::CYPHER_AST_CREATE)
+                    || is_instance(clause, sys::CYPHER_AST_MERGE)
+                    || is_instance(clause, sys::CYPHER_AST_DELETE)
+                    || is_instance(clause, sys::CYPHER_AST_SET)
+                    || is_instance(clause, sys::CYPHER_AST_REMOVE)
+                {
+                    return Ok(OpenCypherQueryAccess::Write);
+                }
+                if !is_instance(clause, sys::CYPHER_AST_MATCH)
+                    && !is_instance(clause, sys::CYPHER_AST_WITH)
+                    && !is_instance(clause, sys::CYPHER_AST_RETURN)
+                    && !is_instance(clause, sys::CYPHER_AST_UNION)
+                {
+                    has_unknown_clause = true;
+                }
+            }
+            if has_unknown_clause {
+                return unsupported(
+                    "query transport cannot authorize an unsupported Cypher clause",
+                );
+            }
+            Ok(OpenCypherQueryAccess::Read)
+        }
     }
 
     fn lower_with_window(

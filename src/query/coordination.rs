@@ -41,10 +41,11 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 #[cfg(feature = "query-transport")]
 use crate::QueryCancellationToken;
 use crate::{
-    validate_component, GraphError, GraphId, GraphScope, NamespacePath, QueryContext,
-    QueryCursorToken, QueryResultPage, QueryResultSet, QueryRow, QueryValue, Result,
-    RoutedGraphCluster, ShardPlacement,
+    validate_component, GraphError, QueryContext, QueryCursorToken, QueryResultPage,
+    QueryResultSet, QueryRow, QueryValue, Result, RoutedGraphCluster, ShardPlacement,
 };
+#[cfg(feature = "query-transport")]
+use crate::{GraphId, GraphScope, NamespacePath};
 
 #[cfg(feature = "query-transport")]
 const QUERY_TRANSPORT_VERSION: u16 = 2;
@@ -3456,12 +3457,13 @@ async fn execute_query_transport_request(
                 Ok(principal) => principal,
                 Err(err) => return transport_error_response(&runtime, err),
             };
-            if let Err(err) = authorize_query_transport_scope(
-                &runtime,
-                &principal,
-                &context.scope,
-                QueryTransportAction::Read,
-            ) {
+            let action = match classify_query_transport_action(&query) {
+                Ok(action) => action,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            if let Err(err) =
+                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
+            {
                 return transport_error_response(&runtime, err);
             }
             let query_id = context.idempotency_key.clone();
@@ -3493,13 +3495,23 @@ async fn execute_query_transport_request(
                 Ok(principal) => principal,
                 Err(err) => return transport_error_response(&runtime, err),
             };
-            if let Err(err) = authorize_query_transport_scope(
-                &runtime,
-                &principal,
-                &context.scope,
-                QueryTransportAction::Read,
-            ) {
+            let action = match classify_query_transport_action(&query) {
+                Ok(action) => action,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            if let Err(err) =
+                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
+            {
                 return transport_error_response(&runtime, err);
+            }
+            if action == QueryTransportAction::Write {
+                return transport_error_response(
+                    &runtime,
+                    GraphError::UnsupportedQuery {
+                        dialect: "QueryTransport",
+                        feature: "mutation queries cannot use paged row execution".to_string(),
+                    },
+                );
             }
             let query_id = context.idempotency_key.clone();
             let lifecycle_key = QueryLifecycleKey::new(principal, context.scope.clone(), &query_id);
@@ -3554,6 +3566,14 @@ fn query_transport_version_supported(version: u16) -> bool {
         version,
         QUERY_TRANSPORT_LEGACY_VERSION | QUERY_TRANSPORT_VERSION
     )
+}
+
+#[cfg(feature = "query-transport")]
+fn classify_query_transport_action(query: &str) -> Result<QueryTransportAction> {
+    match crate::query::opencypher::classify_opencypher_query_access(query)? {
+        crate::query::opencypher::OpenCypherQueryAccess::Read => Ok(QueryTransportAction::Read),
+        crate::query::opencypher::OpenCypherQueryAccess::Write => Ok(QueryTransportAction::Write),
+    }
 }
 
 #[cfg(feature = "query-transport")]
