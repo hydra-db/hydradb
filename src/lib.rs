@@ -46,6 +46,10 @@ pub use core::model::{
     VertexPropertyValue,
 };
 pub(crate) use core::model::{EdgeMutationLogBatch, OutEdgeSegment, OutboxDeltaBatch};
+pub use core::namespace::{
+    GraphId, GraphScope, NamespaceId, NamespacePath, DEFAULT_GRAPH_ID, DEFAULT_NAMESPACE_ID,
+    MAX_NAMESPACE_DEPTH,
+};
 pub use core::snapshot::GraphSnapshot;
 #[cfg(feature = "opencypher")]
 pub use core::state::QueryStatsRefreshHandle;
@@ -95,11 +99,12 @@ pub use query::coordination::{
 };
 #[cfg(feature = "query-transport")]
 pub use query::coordination::{
-    QueryServiceDirectory, QueryServiceDiscovery, QueryServiceEndpoint, QueryTransportAuthPolicy,
-    QueryTransportCancellationPrincipal, QueryTransportClientConfig,
-    QueryTransportConnectionIdentity, QueryTransportMetricsSnapshot, QueryTransportSecret,
-    QueryTransportServerConfig, StaticQueryServiceDiscovery, TcpQueryCellClient, TcpQueryRowStream,
-    TcpQueryServer,
+    QueryServiceDirectory, QueryServiceDiscovery, QueryServiceEndpoint, QueryTransportAction,
+    QueryTransportAuthPolicy, QueryTransportCancellationPrincipal, QueryTransportClientConfig,
+    QueryTransportConnectionIdentity, QueryTransportMetricsSnapshot, QueryTransportNamespaceQuotas,
+    QueryTransportPrincipal, QueryTransportScopeAuthorizer, QueryTransportScopeGrant,
+    QueryTransportSecret, QueryTransportServerConfig, StaticQueryServiceDiscovery,
+    StaticQueryTransportScopeAuthorizer, TcpQueryCellClient, TcpQueryRowStream, TcpQueryServer,
 };
 #[cfg(feature = "query-transport-tls")]
 pub use query::coordination::{
@@ -291,5 +296,7 @@ pub(crate) use codec::*;
 mod keys;
 mod shard;
 
+#[cfg(test)]
+mod namespace_tests;
 #[cfg(test)]
 mod tests;

@@ -78,6 +78,16 @@ impl GraphControlPlane {
         schema_epoch: GraphEpoch,
     ) -> Result<Vec<GraphShardCatalogEntry>> {
         validate_component("graph_id", graph_id)?;
+        if !self.scope().is_default() && graph_id != self.scope().graph_id.as_str() {
+            return Err(GraphError::GraphScopeMismatch {
+                expected: self.scope().to_string(),
+                actual: GraphScope::new(
+                    self.scope().namespace.clone(),
+                    GraphId::new(graph_id.to_string())?,
+                )
+                .to_string(),
+            });
+        }
         for attempt in 0..GRAPH_CONTROL_TXN_MAX_RETRIES {
             match self
                 .publish_placement_with_catalog_txn(placement, graph_id, schema_epoch)
@@ -96,6 +106,15 @@ impl GraphControlPlane {
             operation: "control transaction",
             attempts: GRAPH_CONTROL_TXN_MAX_RETRIES,
         })
+    }
+
+    pub async fn publish_scoped_placement_with_catalog(
+        &self,
+        placement: &ShardPlacement,
+        schema_epoch: GraphEpoch,
+    ) -> Result<Vec<GraphShardCatalogEntry>> {
+        self.publish_placement_with_catalog(placement, self.scope().graph_id.as_str(), schema_epoch)
+            .await
     }
 
     async fn publish_placement_with_catalog_txn(
