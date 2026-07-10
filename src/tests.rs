@@ -9642,6 +9642,108 @@ async fn distributed_query_coordinator_routes_to_remote_cell_clients() {
     control.close().await.unwrap();
 }
 
+#[cfg(feature = "query-transport-tls")]
+struct TestMtlsBundle {
+    server: Arc<tokio_rustls::rustls::ServerConfig>,
+    clients: Vec<(Arc<tokio_rustls::rustls::ClientConfig>, String)>,
+    anonymous_client: Arc<tokio_rustls::rustls::ClientConfig>,
+}
+
+#[cfg(feature = "query-transport-tls")]
+fn test_mtls_bundle(expired: bool) -> TestMtlsBundle {
+    use rcgen::{
+        date_time_ymd, BasicConstraints, CertificateParams, DistinguishedName, DnType,
+        ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    };
+    use sha2::Digest;
+    use tokio_rustls::rustls::{
+        pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+        server::WebPkiClientVerifier,
+        ClientConfig, RootCertStore, ServerConfig,
+    };
+
+    fn private_key(key: &KeyPair) -> PrivateKeyDer<'static> {
+        PrivatePkcs8KeyDer::from(key.serialize_der()).into()
+    }
+
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::default();
+    let mut ca_name = DistinguishedName::new();
+    ca_name.push(DnType::CommonName, "query-transport-test-ca");
+    ca_params.distinguished_name = ca_name;
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+    let server_key = KeyPair::generate().unwrap();
+    let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    if expired {
+        server_params.not_before = date_time_ymd(2000, 1, 1);
+        server_params.not_after = date_time_ymd(2001, 1, 1);
+    }
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    let mut client_roots = RootCertStore::empty();
+    client_roots.add(ca_cert.der().clone()).unwrap();
+    let anonymous_client = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(client_roots.clone())
+            .with_no_client_auth(),
+    );
+
+    let mut clients = Vec::new();
+    let mut server_client_roots = RootCertStore::empty();
+    server_client_roots.add(ca_cert.der().clone()).unwrap();
+    for index in 0..2 {
+        let client_key = KeyPair::generate().unwrap();
+        let mut client_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        let mut client_name = DistinguishedName::new();
+        client_name.push(DnType::CommonName, format!("query-client-{index}"));
+        client_params.distinguished_name = client_name;
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        if expired {
+            client_params.not_before = date_time_ymd(2000, 1, 1);
+            client_params.not_after = date_time_ymd(2001, 1, 1);
+        }
+        let client_cert = client_params
+            .signed_by(&client_key, &ca_cert, &ca_key)
+            .unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(client_roots.clone())
+            .with_client_auth_cert(vec![client_cert.der().clone()], private_key(&client_key))
+            .unwrap();
+        let digest = sha2::Sha256::digest(client_cert.der().as_ref());
+        let fingerprint = format!(
+            "sha256:{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        clients.push((Arc::new(client_config), fingerprint));
+    }
+
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(server_client_roots))
+        .build()
+        .unwrap();
+    let server = ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(vec![server_cert.der().clone()], private_key(&server_key))
+        .unwrap();
+    TestMtlsBundle {
+        server: Arc::new(server),
+        clients,
+        anonymous_client,
+    }
+}
+
 #[cfg(feature = "query-transport")]
 #[tokio::test]
 async fn tcp_query_transport_routes_distributed_cypher_pages() {
@@ -9702,26 +9804,38 @@ async fn tcp_query_transport_routes_distributed_cypher_pages() {
     let server_a = TcpQueryServer::bind_with_config(
         "127.0.0.1:0".parse().unwrap(),
         client_a,
-        QueryTransportServerConfig::default().with_required_bearer_token("secret-a"),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("secret-a")
+            .insecure_allow_plaintext(),
     )
     .await
     .unwrap();
     let server_b = TcpQueryServer::bind_with_config(
         "127.0.0.1:0".parse().unwrap(),
         client_b,
-        QueryTransportServerConfig::default().with_required_bearer_token("secret-b"),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("secret-b")
+            .insecure_allow_plaintext(),
     )
     .await
     .unwrap();
     let coordinator = DistributedQueryCoordinator::new(placement)
         .with_client(
             "node-a",
-            Arc::new(TcpQueryCellClient::new(server_a.local_addr()).with_bearer_token("secret-a")),
+            Arc::new(
+                TcpQueryCellClient::new(server_a.local_addr())
+                    .with_bearer_token("secret-a")
+                    .insecure_allow_plaintext(),
+            ),
         )
         .unwrap()
         .with_client(
             "node-b",
-            Arc::new(TcpQueryCellClient::new(server_b.local_addr()).with_bearer_token("secret-b")),
+            Arc::new(
+                TcpQueryCellClient::new(server_b.local_addr())
+                    .with_bearer_token("secret-b")
+                    .insecure_allow_plaintext(),
+            ),
         )
         .unwrap();
 
@@ -9894,6 +10008,613 @@ async fn tcp_query_transport_blank_bearer_token_fails_closed() {
 
 #[cfg(feature = "query-transport")]
 #[tokio::test]
+async fn tcp_query_transport_requires_explicit_plaintext_for_authenticated_servers() {
+    struct StaticQueryClient;
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for StaticQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            Ok(QueryResultPage::new(Vec::new(), Vec::new(), None))
+        }
+    }
+
+    let result = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(StaticQueryClient),
+        QueryTransportServerConfig::default().with_required_bearer_token("secret"),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(GraphError::UnsafeDurabilityConfig {
+            operation: "query_transport_config",
+            ..
+        })
+    ));
+
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(StaticQueryClient),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("secret")
+            .insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let client_err = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("secret")
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "plaintext-client-denied"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        client_err,
+        GraphError::UnsafeDurabilityConfig {
+            operation: "query_transport_config",
+            ..
+        }
+    ));
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_reuses_bounded_connections() {
+    struct StaticQueryClient;
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for StaticQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            Ok(QueryResultSet::new(
+                vec![QueryColumn::new("v.id")],
+                vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+            ))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(StaticQueryClient),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("secret")
+            .insecure_allow_plaintext()
+            .with_idle_timeout(std::time::Duration::from_millis(40))
+            .with_max_requests_per_connection(8),
+    )
+    .await
+    .unwrap();
+    let client = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("secret")
+        .insecure_allow_plaintext()
+        .with_max_idle_connections(1);
+    for index in 0..3 {
+        let result = client
+            .execute_cypher_rows(
+                QueryContext::new("reddit-home", format!("connection-reuse-{index}")),
+                "MATCH (u {id: 1}) RETURN u.id",
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+    assert_eq!(client.idle_connection_count().await, 1);
+    assert_eq!(client.metrics().connections_created, 1);
+    assert_eq!(client.metrics().connections_reused, 2);
+    assert_eq!(server.metrics().connections_accepted, 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let recovered = client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "connection-reuse-after-idle-close"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.rows.len(), 1);
+    assert_eq!(client.metrics().connections_created, 2);
+    assert!(client.metrics().client_retries >= 1);
+    assert!(server.metrics().idle_timeouts >= 1);
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_cleans_lifecycle_after_executor_panic() {
+    struct PanicOnceQueryClient {
+        should_panic: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for PanicOnceQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            if self
+                .should_panic
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                panic!("intentional query transport test panic");
+            }
+            Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(PanicOnceQueryClient {
+            should_panic: std::sync::atomic::AtomicBool::new(true),
+        }),
+        QueryTransportServerConfig::default().insecure_allow_unauthenticated(),
+    )
+    .await
+    .unwrap();
+    let client = TcpQueryCellClient::new(server.local_addr());
+    let context = QueryContext::new("reddit-home", "panic-lifecycle-reuse");
+    let first = client
+        .execute_cypher_rows(context.clone(), "MATCH (u {id: 1}) RETURN u.id")
+        .await
+        .unwrap_err();
+    assert!(first.to_string().contains("internal query execution error"));
+    client
+        .execute_cypher_rows(context, "MATCH (u {id: 1}) RETURN u.id")
+        .await
+        .unwrap();
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_limits_idle_and_concurrent_connections() {
+    struct StaticQueryClient;
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for StaticQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            Ok(QueryResultPage::new(Vec::new(), Vec::new(), None))
+        }
+    }
+
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(StaticQueryClient),
+        QueryTransportServerConfig::default()
+            .with_max_connections(1)
+            .with_idle_timeout(std::time::Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+    let first = tokio::net::TcpStream::connect(server.local_addr())
+        .await
+        .unwrap();
+    for _ in 0..50 {
+        if server.metrics().connections_active == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    let second = tokio::net::TcpStream::connect(server.local_addr())
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(server.metrics().connections_accepted, 1);
+    assert!(server.metrics().connections_rejected >= 1);
+    drop(second);
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert!(server.metrics().idle_timeouts >= 1);
+    assert_eq!(server.metrics().connections_active, 0);
+    drop(first);
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_graceful_shutdown_drains_active_query() {
+    struct ControlledQueryClient {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for ControlledQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(QueryResultSet::new(
+                vec![QueryColumn::new("v.id")],
+                vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+            ))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(ControlledQueryClient {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        }),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("secret")
+            .insecure_allow_plaintext()
+            .with_graceful_shutdown_timeout(std::time::Duration::from_secs(2)),
+    )
+    .await
+    .unwrap();
+    let client = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("secret")
+        .insecure_allow_plaintext();
+    let query = tokio::spawn(async move {
+        client
+            .execute_cypher_rows(
+                QueryContext::new("reddit-home", "graceful-drain"),
+                "MATCH (u {id: 1}) RETURN u.id",
+            )
+            .await
+    });
+    started.notified().await;
+    let stop = tokio::spawn(server.stop());
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(!stop.is_finished());
+    release.notify_one();
+    assert_eq!(query.await.unwrap().unwrap().rows.len(), 1);
+    stop.await.unwrap().unwrap();
+}
+
+#[cfg(feature = "query-transport-tls")]
+#[tokio::test]
+async fn tcp_query_transport_mtls_authenticates_certificates_and_rejects_invalid_peers() {
+    struct StaticQueryClient;
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for StaticQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            Ok(QueryResultSet::new(
+                vec![QueryColumn::new("v.id")],
+                vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+            ))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    let bundle = test_mtls_bundle(false);
+    let allowed_fingerprint = bundle.clients[0].1.to_ascii_uppercase();
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(StaticQueryClient),
+        QueryTransportServerConfig::default()
+            .with_tls(Arc::clone(&bundle.server))
+            .with_required_mtls_fingerprints([allowed_fingerprint])
+            .with_handshake_timeout(std::time::Duration::from_millis(40)),
+    )
+    .await
+    .unwrap();
+
+    let valid = TcpQueryCellClient::new(server.local_addr())
+        .with_tls("localhost", Arc::clone(&bundle.clients[0].0));
+    assert_eq!(
+        valid
+            .execute_cypher_rows(
+                QueryContext::new("reddit-home", "mtls-valid"),
+                "MATCH (u {id: 1}) RETURN u.id",
+            )
+            .await
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+
+    let wrong_identity = TcpQueryCellClient::new(server.local_addr())
+        .with_tls("localhost", Arc::clone(&bundle.clients[1].0));
+    let wrong_identity_err = wrong_identity
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "mtls-wrong-identity"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(wrong_identity_err.to_string().contains("unauthorized"));
+
+    let anonymous = TcpQueryCellClient::new(server.local_addr())
+        .with_tls("localhost", Arc::clone(&bundle.anonymous_client));
+    assert!(anonymous
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "mtls-anonymous"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .is_err());
+
+    let wrong_hostname = TcpQueryCellClient::new(server.local_addr())
+        .with_tls("not-localhost", Arc::clone(&bundle.clients[0].0));
+    assert!(wrong_hostname
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "mtls-wrong-hostname"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .is_err());
+    let slow_handshake = tokio::net::TcpStream::connect(server.local_addr())
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert!(server.metrics().handshake_failures >= 1);
+    drop(slow_handshake);
+    server.stop().await.unwrap();
+
+    let expired = test_mtls_bundle(true);
+    let expired_server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(StaticQueryClient),
+        QueryTransportServerConfig::default()
+            .with_tls(Arc::clone(&expired.server))
+            .with_required_mtls_fingerprints([expired.clients[0].1.clone()]),
+    )
+    .await
+    .unwrap();
+    let expired_client = TcpQueryCellClient::new(expired_server.local_addr())
+        .with_tls("localhost", Arc::clone(&expired.clients[0].0));
+    assert!(expired_client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "mtls-expired"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .is_err());
+    expired_server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport-tls")]
+#[tokio::test]
+async fn tcp_query_transport_rotates_server_and_client_certificates() {
+    struct StaticQueryClient;
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for StaticQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            Ok(QueryResultPage::new(Vec::new(), Vec::new(), None))
+        }
+    }
+
+    let first = test_mtls_bundle(false);
+    let second = test_mtls_bundle(false);
+    let server_provider = Arc::new(ReloadableQueryTransportTlsServerConfigProvider::new(
+        Arc::clone(&first.server),
+    ));
+    let client_provider = Arc::new(ReloadableQueryTransportTlsClientConfigProvider::new(
+        Arc::clone(&first.clients[0].0),
+    ));
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(StaticQueryClient),
+        QueryTransportServerConfig::default()
+            .with_tls_provider(server_provider.clone())
+            .with_required_mtls_fingerprints([
+                first.clients[0].1.clone(),
+                second.clients[0].1.clone(),
+            ])
+            .with_max_requests_per_connection(1),
+    )
+    .await
+    .unwrap();
+    let client = TcpQueryCellClient::new(server.local_addr())
+        .with_tls_provider("localhost", client_provider.clone());
+    client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "mtls-before-rotation"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+
+    server_provider.rotate(Arc::clone(&second.server)).unwrap();
+    client_provider
+        .rotate(Arc::clone(&second.clients[0].0))
+        .unwrap();
+    client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "mtls-after-rotation"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+
+    let stale_client = TcpQueryCellClient::new(server.local_addr())
+        .with_tls("localhost", Arc::clone(&first.clients[0].0));
+    assert!(stale_client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "mtls-stale-after-rotation"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .is_err());
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport-tls")]
+#[tokio::test]
+async fn tcp_query_transport_cancellation_is_scoped_to_mtls_identity() {
+    struct ControlledQueryClient {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for ControlledQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    let bundle = test_mtls_bundle(false);
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(ControlledQueryClient {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        }),
+        QueryTransportServerConfig::default()
+            .with_tls(Arc::clone(&bundle.server))
+            .with_required_mtls_fingerprints([
+                bundle.clients[0].1.clone(),
+                bundle.clients[1].1.clone(),
+            ]),
+    )
+    .await
+    .unwrap();
+    let owner = TcpQueryCellClient::new(server.local_addr())
+        .with_tls("localhost", Arc::clone(&bundle.clients[0].0));
+    let other = TcpQueryCellClient::new(server.local_addr())
+        .with_tls("localhost", Arc::clone(&bundle.clients[1].0));
+    let owner_query = owner.clone();
+    let query = tokio::spawn(async move {
+        owner_query
+            .execute_cypher_rows(
+                QueryContext::new("reddit-home", "identity-scoped-cancel"),
+                "MATCH (u {id: 1}) RETURN u.id",
+            )
+            .await
+    });
+    started.notified().await;
+    let other_err = other
+        .cancel_query("identity-scoped-cancel")
+        .await
+        .unwrap_err();
+    assert!(other_err.to_string().contains("no active query"));
+    owner.cancel_query("identity-scoped-cancel").await.unwrap();
+    release.notify_one();
+    assert!(query
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string()
+        .contains("query_transport_cancelled"));
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
 async fn tcp_query_transport_stop_aborts_idle_connections() {
     struct StaticQueryClient;
 
@@ -9974,6 +10695,7 @@ async fn tcp_query_transport_enforces_auth_cancellation_streaming_metrics_and_di
         cluster_client,
         QueryTransportServerConfig::default()
             .with_required_bearer_token("secret")
+            .insecure_allow_plaintext()
             .with_max_concurrent_requests(1)
             .with_slow_query_log_threshold(Some(std::time::Duration::ZERO)),
     )
@@ -9994,7 +10716,9 @@ async fn tcp_query_transport_enforces_auth_cancellation_streaming_metrics_and_di
     directory
         .insert(
             QueryServiceEndpoint::new("node-a", server.local_addr()).with_client_config(
-                QueryTransportClientConfig::default().with_bearer_token("secret"),
+                QueryTransportClientConfig::default()
+                    .with_bearer_token("secret")
+                    .insecure_allow_plaintext(),
             ),
         )
         .unwrap();
@@ -10012,7 +10736,9 @@ async fn tcp_query_transport_enforces_auth_cancellation_streaming_metrics_and_di
         .unwrap();
     assert_eq!(rows["reddit-home"].rows.len(), 3);
 
-    let client = TcpQueryCellClient::new(server.local_addr()).with_bearer_token("secret");
+    let client = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("secret")
+        .insecure_allow_plaintext();
     let mut stream = client.stream_cypher_rows(
         QueryContext::new("reddit-home", "query-transport-stream"),
         "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
@@ -10100,13 +10826,16 @@ async fn tcp_query_transport_applies_server_backpressure_under_load() {
         Arc::new(SlowQueryClient),
         QueryTransportServerConfig::default()
             .with_required_bearer_token("secret")
+            .insecure_allow_plaintext()
             .with_max_concurrent_requests(1),
     )
     .await
     .unwrap();
     let mut tasks = Vec::new();
     for idx in 0..6 {
-        let client = TcpQueryCellClient::new(server.local_addr()).with_bearer_token("secret");
+        let client = TcpQueryCellClient::new(server.local_addr())
+            .with_bearer_token("secret")
+            .insecure_allow_plaintext();
         tasks.push(tokio::spawn(async move {
             client
                 .execute_cypher_rows(
@@ -10123,7 +10852,9 @@ async fn tcp_query_transport_applies_server_backpressure_under_load() {
     }
     assert!(server.metrics().backpressure_waits >= 1);
 
-    let client = TcpQueryCellClient::new(server.local_addr()).with_bearer_token("secret");
+    let client = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("secret")
+        .insecure_allow_plaintext();
     let blocker_client = client.clone();
     let blocker = tokio::spawn(async move {
         blocker_client
@@ -12728,7 +13459,9 @@ fn query_transport_child_process_entry() {
         let server = TcpQueryServer::bind_with_config(
             addr,
             client,
-            QueryTransportServerConfig::default().with_required_bearer_token(token),
+            QueryTransportServerConfig::default()
+                .with_required_bearer_token(token)
+                .insecure_allow_plaintext(),
         )
         .await
         .unwrap();
@@ -12776,7 +13509,9 @@ async fn tcp_query_transport_runs_against_separate_child_process_and_local_objec
     }
     assert!(ready_file.exists(), "query child did not become ready");
 
-    let client = TcpQueryCellClient::new(addr).with_bearer_token("child-secret");
+    let client = TcpQueryCellClient::new(addr)
+        .with_bearer_token("child-secret")
+        .insecure_allow_plaintext();
     let rows = client
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "query-child-process-read"),
