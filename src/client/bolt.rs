@@ -564,6 +564,7 @@ struct PendingBoltResult {
     request: ClientQueryRequest,
     deadline: Instant,
     columns: Vec<QueryColumn>,
+    started: bool,
     rows: VecDeque<QueryRow>,
     next_cursor: Option<QueryCursorToken>,
     bookmark: Option<ClientBookmark>,
@@ -772,7 +773,7 @@ async fn run_bolt_protocol(
                     extra,
                 },
             ) => {
-                let (authenticated, database, target, request, query_id) =
+                let (authenticated, database, request) =
                     match prepare_bolt_run(&mut session, &context, query, parameters, extra) {
                         Ok(prepared) => prepared,
                         Err(error) => {
@@ -781,80 +782,48 @@ async fn run_bolt_protocol(
                             continue;
                         }
                     };
-                let mut request = request;
+                let (request, columns) = match context
+                    .service
+                    .prepare_page_request(&authenticated, request, config.prefetch_rows)
+                    .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        send_bolt_failure(&mut writer, &graph_error_to_bolt(error)).await?;
+                        state = BoltState::Failed;
+                        continue;
+                    }
+                };
                 let query_deadline = Instant::now()
                     + Duration::from_millis(
                         request
                             .max_runtime_ms
                             .expect("Bolt requests are normalized before execution"),
                     );
-                let task = spawn_bolt_page(
-                    context.service.clone(),
-                    authenticated.clone(),
-                    request.clone(),
-                    None,
-                    config.prefetch_rows,
-                );
-                let page_result = {
-                    let mut channels = BoltConnectionChannels {
-                        message_rx: &mut message_rx,
-                        queued: &mut queued,
-                        writer: &mut writer,
-                        max_queued_messages: config.max_pipelined_messages,
-                    };
-                    await_bolt_page(
-                        task,
-                        &context.service,
-                        &authenticated,
-                        &target.scope,
-                        &query_id,
-                        &mut channels,
-                    )
-                    .await
-                };
-                match page_result {
-                    Err(error) => {
-                        send_bolt_failure(&mut writer, &error).await?;
-                        state = BoltState::Failed;
-                    }
-                    Ok(PageAwaitResult::Complete(Ok(page))) => {
-                        request.read_epoch = page.read_epoch;
-                        let fields = page
-                            .page
-                            .columns
-                            .iter()
-                            .map(|column| BoltValue::String(column.name.clone()))
-                            .collect();
-                        send_bolt_success(
-                            &mut writer,
-                            BoltDict::from([
-                                ("fields".to_string(), BoltValue::List(fields)),
-                                ("t_first".to_string(), BoltValue::Integer(0)),
-                                ("db".to_string(), BoltValue::String(database.clone())),
-                            ]),
-                        )
-                        .await?;
-                        session.pending = Some(PendingBoltResult {
-                            database,
-                            request,
-                            deadline: query_deadline,
-                            columns: page.page.columns,
-                            rows: page.page.rows.into(),
-                            next_cursor: page.page.next_cursor,
-                            bookmark: page.bookmark,
-                        });
-                        state = BoltState::Streaming;
-                    }
-                    Ok(PageAwaitResult::Complete(Err(error))) => {
-                        send_bolt_failure(&mut writer, &graph_error_to_bolt(error)).await?;
-                        state = BoltState::Failed;
-                    }
-                    Ok(PageAwaitResult::Reset) => {
-                        session.pending = None;
-                        state = BoltState::Ready;
-                    }
-                    Ok(PageAwaitResult::Goodbye) => break,
-                }
+                let fields = columns
+                    .iter()
+                    .map(|column| BoltValue::String(column.name.clone()))
+                    .collect();
+                send_bolt_success(
+                    &mut writer,
+                    BoltDict::from([
+                        ("fields".to_string(), BoltValue::List(fields)),
+                        ("t_first".to_string(), BoltValue::Integer(0)),
+                        ("db".to_string(), BoltValue::String(database.clone())),
+                    ]),
+                )
+                .await?;
+                session.pending = Some(PendingBoltResult {
+                    database,
+                    request,
+                    deadline: query_deadline,
+                    columns,
+                    started: false,
+                    rows: VecDeque::new(),
+                    next_cursor: None,
+                    bookmark: None,
+                });
+                state = BoltState::Streaming;
             }
             (BoltState::Streaming, ClientMessage::Pull { extra }) => {
                 let n = match bolt_stream_count(&extra, "PULL") {
@@ -937,18 +906,6 @@ async fn run_bolt_protocol(
                         continue;
                     }
                 };
-                if count.is_none() {
-                    let Some(pending) = session.pending.take() else {
-                        let error = BoltError::Protocol("no pending result".to_string());
-                        send_bolt_failure(&mut writer, &error).await?;
-                        state = BoltState::Failed;
-                        continue;
-                    };
-                    send_bolt_success(&mut writer, bolt_result_summary_metadata(&pending, false))
-                        .await?;
-                    state = BoltState::Ready;
-                    continue;
-                }
                 let authenticated = match session.authenticated() {
                     Ok(authenticated) => authenticated,
                     Err(error) => {
@@ -991,7 +948,7 @@ async fn run_bolt_protocol(
                         let pending = session
                             .pending
                             .as_ref()
-                            .expect("bounded DISCARD keeps pending state until summary");
+                            .expect("DISCARD keeps pending state until summary");
                         let has_more = !pending.rows.is_empty() || pending.next_cursor.is_some();
                         send_bolt_success(
                             &mut writer,
@@ -1116,16 +1073,7 @@ fn prepare_bolt_run(
     query: String,
     parameters: BoltDict,
     extra: BoltDict,
-) -> std::result::Result<
-    (
-        ClientQuerySession,
-        String,
-        ClientQueryTarget,
-        ClientQueryRequest,
-        String,
-    ),
-    BoltError,
-> {
+) -> std::result::Result<(ClientQuerySession, String, ClientQueryRequest), BoltError> {
     let authenticated = session.authenticated()?;
     validate_bolt_run_extra(&extra)?;
     let database = selected_bolt_database(session, context, &extra)?;
@@ -1145,7 +1093,7 @@ fn prepare_bolt_run(
     {
         request = request.after_bookmark(bookmark);
     }
-    Ok((authenticated, database, target, request, query_id))
+    Ok((authenticated, database, request))
 }
 
 fn bolt_query_request(
@@ -1255,8 +1203,10 @@ where
                         let _ = service.cancel(authenticated, scope, query_id).await;
                         task.abort();
                         let _ = task.await;
+                        let queued_before_reset = channels.queued.len();
                         send_bolt_message(channels.writer, &ServerMessage::Ignored).await?;
-                        while channels.queued.pop_front().is_some() {
+                        for _ in 0..queued_before_reset {
+                            channels.queued.pop_front();
                             send_bolt_message(channels.writer, &ServerMessage::Ignored).await?;
                         }
                         send_bolt_success(channels.writer, BoltDict::new()).await?;
@@ -1315,8 +1265,14 @@ where
             remaining -= 1;
             continue;
         }
-        let Some(cursor) = pending.next_cursor.take() else {
-            break;
+        let cursor = if pending.started {
+            let Some(cursor) = pending.next_cursor.take() else {
+                break;
+            };
+            Some(cursor)
+        } else {
+            pending.started = true;
+            None
         };
         pending.request.max_runtime_ms = Some(remaining_bolt_runtime_ms(pending.deadline)?);
         let fetch_size = count.map_or(prefetch_rows, |count| prefetch_rows.min(count.max(1)));
@@ -1326,7 +1282,7 @@ where
             context.service.clone(),
             authenticated.clone(),
             pending.request.clone(),
-            Some(cursor),
+            cursor,
             fetch_size,
         );
         match await_bolt_page(

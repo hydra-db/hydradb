@@ -1579,7 +1579,7 @@ pub trait QueryCellClient: Send + Sync {
 
     async fn current_graph_epoch(
         &self,
-        _scope: &GraphScope,
+        _scope: &crate::GraphScope,
         _cell_id: &str,
     ) -> Result<Option<crate::GraphEpoch>> {
         Ok(None)
@@ -2923,7 +2923,7 @@ impl QueryCellClient for RoutedGraphCluster {
 
     async fn current_graph_epoch(
         &self,
-        scope: &GraphScope,
+        scope: &crate::GraphScope,
         cell_id: &str,
     ) -> Result<Option<crate::GraphEpoch>> {
         if scope != self.scope() {

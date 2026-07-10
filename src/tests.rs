@@ -11722,6 +11722,9 @@ async fn cypher_float_properties_roundtrip_index_compare_and_order() {
         (11, VertexPropertyValue::Float(QueryFloat(42.0))),
         (12, VertexPropertyValue::Integer(999)),
         (13, VertexPropertyValue::Float(QueryFloat(1.0))),
+        (14, VertexPropertyValue::SignedInteger(-2)),
+        (15, VertexPropertyValue::Float(QueryFloat(-2.0))),
+        (16, VertexPropertyValue::Float(QueryFloat(-1.5))),
     ] {
         shard
             .set_vertex_metadata(
@@ -11815,6 +11818,50 @@ async fn cypher_float_properties_roundtrip_index_compare_and_order() {
         .unwrap();
     assert_eq!(float_literal_exact, integer_literal_exact);
 
+    let signed_literal_exact = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-mixed-numeric-signed-exact"),
+            "MATCH (s:Score {score: -2}) RETURN s.id AS score_id ORDER BY score_id",
+        )
+        .await
+        .unwrap();
+    let signed_parameter_exact = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-mixed-numeric-signed-parameter")
+                .with_parameter("score", VertexPropertyValue::SignedInteger(-2)),
+            "MATCH (s:Score {score: $score}) RETURN s.id AS score_id ORDER BY score_id",
+        )
+        .await
+        .unwrap();
+    let expected_signed_exact = QueryResultSet::new(
+        vec![QueryColumn::new("score_id")],
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(14)]),
+            QueryRow::new(vec![QueryValue::VertexId(15)]),
+        ],
+    );
+    assert_eq!(signed_literal_exact, expected_signed_exact);
+    assert_eq!(signed_parameter_exact, expected_signed_exact);
+
+    let signed_range = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-mixed-numeric-signed-range"),
+            "MATCH (s:Score) WHERE s.score < 0.0 RETURN s.id AS score_id ORDER BY score_id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        signed_range,
+        QueryResultSet::new(
+            vec![QueryColumn::new("score_id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(14)]),
+                QueryRow::new(vec![QueryValue::VertexId(15)]),
+                QueryRow::new(vec![QueryValue::VertexId(16)]),
+            ],
+        )
+    );
+
     let float_range = shard
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "cypher-mixed-numeric-float-range"),
@@ -11891,6 +11938,18 @@ async fn cypher_float_properties_roundtrip_index_compare_and_order() {
             vec![QueryColumn::new("score_id"), QueryColumn::new("score")],
             vec![
                 QueryRow::new(vec![
+                    QueryValue::VertexId(14),
+                    QueryValue::Property(VertexPropertyValue::SignedInteger(-2)),
+                ]),
+                QueryRow::new(vec![
+                    QueryValue::VertexId(15),
+                    QueryValue::Property(VertexPropertyValue::Float(QueryFloat(-2.0))),
+                ]),
+                QueryRow::new(vec![
+                    QueryValue::VertexId(16),
+                    QueryValue::Property(VertexPropertyValue::Float(QueryFloat(-1.5))),
+                ]),
+                QueryRow::new(vec![
                     QueryValue::VertexId(13),
                     QueryValue::Property(VertexPropertyValue::Float(QueryFloat(1.0))),
                 ]),
@@ -11925,6 +11984,10 @@ fn json_property_values_preserve_integer_and_float_number_shapes() {
         VertexPropertyValue::Integer(42)
     );
     assert_eq!(
+        VertexPropertyValue::from_json_value(&serde_json::json!(-42)),
+        VertexPropertyValue::SignedInteger(-42)
+    );
+    assert_eq!(
         VertexPropertyValue::from_json_value(&serde_json::json!(42.0)),
         VertexPropertyValue::Integer(42)
     );
@@ -11947,6 +12010,21 @@ fn json_property_values_preserve_integer_and_float_number_shapes() {
     assert_eq!(
         VertexPropertyValue::from_json_value(&serde_json::json!({"raw": ["value"]})),
         VertexPropertyValue::String("{\"raw\":[\"value\"]}".to_string())
+    );
+}
+
+#[test]
+fn signed_integer_property_records_round_trip() {
+    let metadata =
+        VertexMetadata::default().with_property("offset", VertexPropertyValue::SignedInteger(-42));
+    let encoded = encode_vertex_metadata(&metadata);
+    assert_eq!(
+        decode_vertex_metadata("vertex/signed", &encoded).unwrap(),
+        metadata
+    );
+    assert_ne!(
+        encode_vertex_property_value_key(&VertexPropertyValue::SignedInteger(-1)),
+        encode_vertex_property_value_key(&VertexPropertyValue::Integer(1))
     );
 }
 

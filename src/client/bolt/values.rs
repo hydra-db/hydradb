@@ -33,9 +33,7 @@ pub(super) fn bolt_parameter_to_property(
 ) -> std::result::Result<VertexPropertyValue, BoltError> {
     match value {
         BoltValue::Boolean(value) => Ok(VertexPropertyValue::Bool(*value)),
-        BoltValue::Integer(value) => u64::try_from(*value)
-            .map(VertexPropertyValue::Integer)
-            .map_err(|_| invalid_bolt_parameter(name, "negative integers are unsupported")),
+        BoltValue::Integer(value) => Ok(VertexPropertyValue::from_i64(*value)),
         BoltValue::Float(value) if value.is_finite() => {
             Ok(VertexPropertyValue::Float(QueryFloat(*value)))
         }
@@ -43,7 +41,7 @@ pub(super) fn bolt_parameter_to_property(
         BoltValue::Float(_) => Err(invalid_bolt_parameter(name, "float must be finite")),
         _ => Err(invalid_bolt_parameter(
             name,
-            "only boolean, non-negative integer, finite float, and string parameters are supported",
+            "only boolean, signed integer, finite float, and string parameters are supported",
         )),
     }
 }
@@ -79,6 +77,7 @@ fn property_value_to_bolt(
         VertexPropertyValue::Integer(value) => i64::try_from(*value)
             .map(BoltValue::Integer)
             .map_err(|_| bolt_integer_overflow(*value)),
+        VertexPropertyValue::SignedInteger(value) => Ok(BoltValue::Integer(*value)),
         VertexPropertyValue::Bool(value) => Ok(BoltValue::Boolean(*value)),
         VertexPropertyValue::Float(value) => Ok(BoltValue::Float(value.0)),
         VertexPropertyValue::String(value) => Ok(BoltValue::String(value.clone())),

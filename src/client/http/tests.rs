@@ -81,6 +81,22 @@ fn http_service(client: Arc<HttpTestClient>) -> ClientQueryService {
     .unwrap()
 }
 
+#[test]
+fn http_parameters_preserve_integer_sign_and_precision() {
+    assert_eq!(
+        http_parameter_to_property("large", &serde_json::json!(9007199254740993_u64)).ok(),
+        Some(VertexPropertyValue::Integer(9007199254740993))
+    );
+    assert_eq!(
+        http_parameter_to_property("negative", &serde_json::json!(-1)).ok(),
+        Some(VertexPropertyValue::SignedInteger(-1))
+    );
+    assert_eq!(
+        http_parameter_to_property("fraction", &serde_json::json!(-1.5)).ok(),
+        Some(VertexPropertyValue::Float(QueryFloat(-1.5)))
+    );
+}
+
 #[tokio::test]
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {
