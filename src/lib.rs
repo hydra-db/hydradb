@@ -13,12 +13,27 @@ use slatedb::ErrorKind;
 use slatedb::{Db, DbTransaction, IsolationLevel, WriteBatch};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
+#[cfg(feature = "client-api")]
+mod client;
 mod core;
 mod engine;
 mod placement;
 mod query;
 mod sparse_kernel;
 
+#[cfg(feature = "bolt-server")]
+pub use client::bolt::{
+    BoltRoutingServer, BoltRoutingTable, BoltRoutingTableProvider, BoltServerConfig,
+    BoltServerHandle, ClientBoltServer, ControllerBoltRoutingTableProvider,
+};
+#[cfg(feature = "http-api")]
+pub use client::http::{ClientHttpServer, HttpQueryServerConfig, HttpQueryServerHandle};
+#[cfg(feature = "client-api")]
+pub use client::service::{
+    ClientBookmark, ClientDatabaseResolver, ClientQueryCredentials, ClientQueryMetricsSnapshot,
+    ClientQueryPage, ClientQueryRequest, ClientQueryResult, ClientQueryService,
+    ClientQueryServiceConfig, ClientQuerySession, ClientQueryTarget, StaticClientDatabaseResolver,
+};
 pub(crate) use core::cache::{BoundedGraphCache, PostingChunkCacheKey, SupernodeCacheKey};
 #[cfg(feature = "opencypher")]
 pub(crate) use core::cache::{
