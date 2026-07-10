@@ -445,6 +445,7 @@ impl QueryTransportPrincipal {
 pub enum QueryTransportAction {
     Read,
     Write,
+    Cancel,
     Admin,
 }
 
@@ -454,6 +455,7 @@ impl QueryTransportAction {
         match self {
             Self::Read => "read",
             Self::Write => "write",
+            Self::Cancel => "cancel queries in",
             Self::Admin => "administer",
         }
     }
@@ -496,11 +498,18 @@ impl QueryTransportScopeGrant {
     }
 
     pub fn read_graph(scope: GraphScope) -> Self {
-        Self::graph(scope, [QueryTransportAction::Read])
+        Self::graph(
+            scope,
+            [QueryTransportAction::Read, QueryTransportAction::Cancel],
+        )
     }
 
     pub fn read_namespace(namespace: NamespacePath, include_descendants: bool) -> Self {
-        Self::namespace(namespace, include_descendants, [QueryTransportAction::Read])
+        Self::namespace(
+            namespace,
+            include_descendants,
+            [QueryTransportAction::Read, QueryTransportAction::Cancel],
+        )
     }
 
     fn allows(&self, scope: &GraphScope, action: QueryTransportAction) -> bool {
@@ -3542,6 +3551,14 @@ async fn execute_query_transport_request(
                 Ok(principal) => principal,
                 Err(err) => return transport_error_response(&runtime, err),
             };
+            if let Err(err) = authorize_query_transport_scope(
+                &runtime,
+                &principal,
+                &scope,
+                QueryTransportAction::Cancel,
+            ) {
+                return transport_error_response(&runtime, err);
+            }
             let lifecycle_key = QueryLifecycleKey::new(principal, scope, &query_id);
             match cancel_active_query(&runtime, &lifecycle_key).await {
                 Ok(()) => QueryTransportResponse::Cancelled,
@@ -3888,6 +3905,12 @@ fn authorize_query_transport_scope(
         .config
         .scope_authorizer
         .authorize(principal, scope, action)
+        || (action != QueryTransportAction::Admin
+            && runtime.config.scope_authorizer.authorize(
+                principal,
+                scope,
+                QueryTransportAction::Admin,
+            ))
     {
         return Ok(());
     }
