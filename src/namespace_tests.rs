@@ -423,12 +423,24 @@ async fn transport_tokens_are_confined_to_granted_namespace_and_graph_scopes() {
             "billing-token",
             QueryTransportScopeGrant::read_graph(billing.clone()),
         )
+        .unwrap()
+        .with_bearer_grant(
+            "writer-token",
+            QueryTransportScopeGrant::graph(
+                search.clone(),
+                [QueryTransportAction::Read, QueryTransportAction::Write],
+            ),
+        )
         .unwrap();
     let server = TcpQueryServer::bind_with_config(
         "127.0.0.1:0".parse().unwrap(),
         Arc::new(StaticNamespaceQueryClient),
         QueryTransportServerConfig::default()
-            .with_required_bearer_tokens(["tenant-token".to_string(), "billing-token".to_string()])
+            .with_required_bearer_tokens([
+                "tenant-token".to_string(),
+                "billing-token".to_string(),
+                "writer-token".to_string(),
+            ])
             .with_scope_authorizer(Arc::new(authorizer))
             .insecure_allow_plaintext(),
     )
@@ -441,7 +453,7 @@ async fn transport_tokens_are_confined_to_granted_namespace_and_graph_scopes() {
     let result = tenant_client
         .execute_cypher_rows(
             QueryContext::new("cell-a", "tenant-child-read").in_scope(search.clone()),
-            "RETURN 1",
+            "MATCH (u {id: 1}) RETURN u.id",
         )
         .await
         .unwrap();
@@ -452,12 +464,66 @@ async fn transport_tokens_are_confined_to_granted_namespace_and_graph_scopes() {
     let denied = tenant_client
         .execute_cypher_rows(
             QueryContext::new("cell-a", "tenant-cross-read").in_scope(other_tenant),
-            "RETURN 1",
+            "MATCH (u {id: 1}) RETURN u.id",
         )
         .await
         .unwrap_err();
     assert!(matches!(denied, GraphError::UnsupportedQuery { .. }));
     assert!(denied.to_string().contains("not authorized"));
+
+    for (index, mutation_query) in [
+        "CREATE (u {id: 1})-[:FOLLOWS]->(v {id: 2})",
+        "MERGE (u {id: 1})-[:FOLLOWS]->(v {id: 2})",
+        "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) DELETE r",
+        "MATCH (u {id: 1}) SET u.name = 'alice'",
+        "MATCH (u {id: 1}) REMOVE u.name",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let denied = tenant_client
+            .execute_cypher_rows(
+                QueryContext::new("cell-a", format!("read-token-mutation-{index}"))
+                    .in_scope(search.clone()),
+                mutation_query,
+            )
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("not authorized to write"));
+    }
+    let unclassified = tenant_client
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "unsupported-clause").in_scope(search.clone()),
+            "UNWIND [1] AS value RETURN value",
+        )
+        .await
+        .unwrap_err();
+    assert!(unclassified
+        .to_string()
+        .contains("cannot authorize an unsupported Cypher clause"));
+
+    let writer_client = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("writer-token")
+        .insecure_allow_plaintext();
+    writer_client
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "write-token-mutation").in_scope(search.clone()),
+            "CREATE (u {id: 1})-[:FOLLOWS]->(v {id: 2})",
+        )
+        .await
+        .unwrap();
+    let paged_mutation = writer_client
+        .execute_cypher_rows_page(
+            QueryContext::new("cell-a", "paged-mutation").in_scope(search),
+            "CREATE (u {id: 2})-[:FOLLOWS]->(v {id: 3})",
+            None,
+            10,
+        )
+        .await
+        .unwrap_err();
+    assert!(paged_mutation
+        .to_string()
+        .contains("mutation queries cannot use paged row execution"));
 
     let billing_client = TcpQueryCellClient::new(server.local_addr())
         .with_bearer_token("billing-token")
@@ -465,14 +531,14 @@ async fn transport_tokens_are_confined_to_granted_namespace_and_graph_scopes() {
     billing_client
         .execute_cypher_rows(
             QueryContext::new("cell-a", "billing-exact-read").in_scope(billing),
-            "RETURN 1",
+            "MATCH (u {id: 1}) RETURN u.id",
         )
         .await
         .unwrap();
     let denied = billing_client
         .execute_cypher_rows(
             QueryContext::new("cell-a", "billing-other-graph").in_scope(billing_other_graph),
-            "RETURN 1",
+            "MATCH (u {id: 1}) RETURN u.id",
         )
         .await
         .unwrap_err();
@@ -480,7 +546,7 @@ async fn transport_tokens_are_confined_to_granted_namespace_and_graph_scopes() {
 
     let metrics = server.metrics();
     assert_eq!(metrics.auth_failures, 0);
-    assert_eq!(metrics.namespace_access_denials, 2);
+    assert_eq!(metrics.namespace_access_denials, 7);
     server.stop().await.unwrap();
 }
 
@@ -563,7 +629,7 @@ async fn parent_namespace_quota_limits_queries_across_subtenants() {
             client
                 .execute_cypher_rows(
                     QueryContext::new("cell-a", query_id).in_scope(graph_scope),
-                    "RETURN 1",
+                    "MATCH (u {id: 1}) RETURN u.id",
                 )
                 .await
         }));
@@ -658,7 +724,7 @@ async fn query_cancellation_is_isolated_by_graph_scope() {
             client
                 .execute_cypher_rows(
                     QueryContext::new("cell-a", "shared-query-id").in_scope(search),
-                    "RETURN 1",
+                    "MATCH (u {id: 1}) RETURN u.id",
                 )
                 .await
         })
@@ -670,7 +736,7 @@ async fn query_cancellation_is_isolated_by_graph_scope() {
             client
                 .execute_cypher_rows(
                     QueryContext::new("cell-a", "shared-query-id").in_scope(billing),
-                    "RETURN 1",
+                    "MATCH (u {id: 1}) RETURN u.id",
                 )
                 .await
         })
