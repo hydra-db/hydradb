@@ -8147,7 +8147,9 @@ fn query_value_rank(value: &QueryValue) -> u8 {
 fn vertex_property_rank(value: &VertexPropertyValue) -> u8 {
     match value {
         VertexPropertyValue::Bool(_) => 0,
-        VertexPropertyValue::Integer(_) | VertexPropertyValue::Float(_) => 1,
+        VertexPropertyValue::Integer(_)
+        | VertexPropertyValue::SignedInteger(_)
+        | VertexPropertyValue::Float(_) => 1,
         VertexPropertyValue::String(_) => 2,
     }
 }
@@ -8165,6 +8167,11 @@ fn equivalent_property_index_keys(value: &VertexPropertyValue) -> Vec<String> {
                 }
             }
         }
+        VertexPropertyValue::SignedInteger(value) => {
+            if let Some(float) = VertexPropertyValue::exact_f64_from_i64(*value) {
+                insert_float_property_index_key(&mut keys, float);
+            }
+        }
         VertexPropertyValue::Float(value) => {
             if value.0 == 0.0 {
                 insert_float_property_index_key(&mut keys, 0.0);
@@ -8173,6 +8180,10 @@ fn equivalent_property_index_keys(value: &VertexPropertyValue) -> Vec<String> {
             if let Some(integer) = VertexPropertyValue::exact_u64_from_f64(value.0) {
                 keys.insert(encode_vertex_property_value_key(
                     &VertexPropertyValue::Integer(integer),
+                ));
+            } else if let Some(integer) = VertexPropertyValue::exact_i64_from_f64(value.0) {
+                keys.insert(encode_vertex_property_value_key(
+                    &VertexPropertyValue::from_i64(integer),
                 ));
             }
         }
@@ -8197,6 +8208,15 @@ fn numeric_property_order(
         (VertexPropertyValue::Integer(left), VertexPropertyValue::Integer(right)) => {
             Some(left.cmp(right))
         }
+        (VertexPropertyValue::SignedInteger(left), VertexPropertyValue::SignedInteger(right)) => {
+            Some(left.cmp(right))
+        }
+        (VertexPropertyValue::SignedInteger(left), VertexPropertyValue::Integer(right)) => {
+            Some(compare_i64_u64(*left, *right))
+        }
+        (VertexPropertyValue::Integer(left), VertexPropertyValue::SignedInteger(right)) => {
+            Some(compare_i64_u64(*right, *left).reverse())
+        }
         (VertexPropertyValue::Float(left), VertexPropertyValue::Float(right)) => {
             Some(compare_f64_numeric(left.0, right.0))
         }
@@ -8206,7 +8226,43 @@ fn numeric_property_order(
         (VertexPropertyValue::Float(left), VertexPropertyValue::Integer(right)) => {
             Some(compare_u64_f64(*right, left.0).reverse())
         }
+        (VertexPropertyValue::SignedInteger(left), VertexPropertyValue::Float(right)) => {
+            Some(compare_i64_f64(*left, right.0))
+        }
+        (VertexPropertyValue::Float(left), VertexPropertyValue::SignedInteger(right)) => {
+            Some(compare_i64_f64(*right, left.0).reverse())
+        }
         _ => None,
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_i64_u64(left: i64, right: u64) -> std::cmp::Ordering {
+    match u64::try_from(left) {
+        Ok(left) => left.cmp(&right),
+        Err(_) => std::cmp::Ordering::Less,
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn compare_i64_f64(left: i64, right: f64) -> std::cmp::Ordering {
+    const I64_INCLUSIVE_LOWER: f64 = -9223372036854775808.0;
+    const I64_EXCLUSIVE_UPPER: f64 = 9223372036854775808.0;
+    if right.is_nan() {
+        return (left as f64).total_cmp(&right);
+    }
+    if right < I64_INCLUSIVE_LOWER {
+        return std::cmp::Ordering::Greater;
+    }
+    if right >= I64_EXCLUSIVE_UPPER {
+        return std::cmp::Ordering::Less;
+    }
+    let floor = right.floor();
+    let floor_integer = floor as i64;
+    match left.cmp(&floor_integer) {
+        std::cmp::Ordering::Equal if floor == right => std::cmp::Ordering::Equal,
+        std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
+        ordering => ordering,
     }
 }
 

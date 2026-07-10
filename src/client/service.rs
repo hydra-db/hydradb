@@ -14,11 +14,14 @@ use crate::query::coordination::{
     QueryTransportConnectionIdentity, QueryTransportNamespaceQuotas, QueryTransportPrincipal,
     QueryTransportScopeAuthorizer, QueryTransportSecret, QueryTransportServerConfig,
 };
-use crate::query::opencypher::{classify_opencypher_query_access, OpenCypherQueryAccess};
+use crate::query::opencypher::{
+    classify_opencypher_query_access, parse_opencypher_mutation_query_with_parameters,
+    parse_opencypher_row_query_with_parameters, OpenCypherQueryAccess,
+};
 use crate::{
     validate_component, GraphEpoch, GraphError, GraphId, GraphScope, NamespaceId, NamespacePath,
-    QueryCancellationToken, QueryContext, QueryCursorToken, QueryResultPage, QueryResultSet,
-    Result, VertexPropertyValue,
+    QueryCancellationToken, QueryColumn, QueryContext, QueryCursorToken, QueryResultPage,
+    QueryResultSet, Result, VertexPropertyValue,
 };
 
 const DEFAULT_MAX_QUERY_BYTES: usize = 1024 * 1024;
@@ -764,6 +767,44 @@ impl ClientQueryService {
             result.is_ok(),
         );
         result
+    }
+
+    pub(crate) async fn prepare_page_request(
+        &self,
+        session: &ClientQuerySession,
+        mut request: ClientQueryRequest,
+        page_size: usize,
+    ) -> Result<(ClientQueryRequest, Vec<QueryColumn>)> {
+        self.validate_request(&request, Some(page_size))?;
+        self.normalize_runtime_limit(&mut request)?;
+        let action = self.authorize_query(session, &request)?;
+        self.validate_bookmark(&request).await?;
+        self.pin_read_epoch(action, &mut request).await?;
+
+        let columns = match action {
+            QueryTransportAction::Read => {
+                parse_opencypher_row_query_with_parameters(&request.query, &request.parameters)?
+                    .columns
+            }
+            QueryTransportAction::Write => {
+                if parse_opencypher_mutation_query_with_parameters(
+                    &request.query,
+                    &request.parameters,
+                )?
+                .is_none()
+                {
+                    return Err(GraphError::UnsupportedQuery {
+                        dialect: "ClientProtocol",
+                        feature: "write query is not executable by the mutation engine".to_string(),
+                    });
+                }
+                Vec::new()
+            }
+            QueryTransportAction::Cancel | QueryTransportAction::Admin => {
+                unreachable!("query access classification only returns read or write")
+            }
+        };
+        Ok((request, columns))
     }
 
     pub async fn cancel(

@@ -221,6 +221,17 @@ fn bolt_value_conversion_rejects_unsigned_overflow() {
         .unwrap(),
         BoltValue::Float(42.5)
     );
+    assert_eq!(
+        bolt_parameter_to_property("offset", &BoltValue::Integer(-1)).unwrap(),
+        VertexPropertyValue::SignedInteger(-1)
+    );
+    assert_eq!(
+        query_value_to_bolt(&QueryValue::Property(VertexPropertyValue::SignedInteger(
+            -1
+        )))
+        .unwrap(),
+        BoltValue::Integer(-1)
+    );
 }
 
 #[test]
@@ -423,6 +434,15 @@ async fn bolt_reset_interrupts_active_query_and_returns_connection_to_ready() {
         })
         .await
         .unwrap();
+    assert!(matches!(
+        session.connection().recv().await.unwrap(),
+        ServerMessage::Success { .. }
+    ));
+    session
+        .connection()
+        .send(&ClientMessage::pull_all())
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         while !backend.started.load(std::sync::atomic::Ordering::SeqCst) {
             tokio::task::yield_now().await;
@@ -432,9 +452,18 @@ async fn bolt_reset_interrupts_active_query_and_returns_connection_to_ready() {
     .unwrap();
     session
         .connection()
+        .send(&ClientMessage::pull_all())
+        .await
+        .unwrap();
+    session
+        .connection()
         .send(&ClientMessage::Reset)
         .await
         .unwrap();
+    assert!(matches!(
+        session.connection().recv().await.unwrap(),
+        ServerMessage::Ignored
+    ));
     assert!(matches!(
         session.connection().recv().await.unwrap(),
         ServerMessage::Ignored
@@ -450,6 +479,48 @@ async fn bolt_reset_interrupts_active_query_and_returns_connection_to_ready() {
     })
     .await
     .unwrap();
+    session.close().await.unwrap();
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn bolt_reset_after_run_does_not_start_backend_execution() {
+    let backend = Arc::new(BlockingBoltTestClient {
+        started: std::sync::atomic::AtomicBool::new(false),
+    });
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        bolt_service_for(backend.clone()),
+        bolt_test_config(),
+    )
+    .await
+    .unwrap();
+    let mut session = BoltSession::connect_basic(server.local_addr(), "neo4j", "bolt-secret")
+        .await
+        .unwrap();
+    session
+        .connection()
+        .send(&ClientMessage::Run {
+            query: "MATCH (n {id: 1}) RETURN n.id".to_string(),
+            parameters: BoltDict::new(),
+            extra: BoltDict::new(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        session.connection().recv().await.unwrap(),
+        ServerMessage::Success { .. }
+    ));
+    session
+        .connection()
+        .send(&ClientMessage::Reset)
+        .await
+        .unwrap();
+    assert!(matches!(
+        session.connection().recv().await.unwrap(),
+        ServerMessage::Success { .. }
+    ));
+    assert!(!backend.started.load(std::sync::atomic::Ordering::SeqCst));
     session.close().await.unwrap();
     server.stop().await.unwrap();
 }

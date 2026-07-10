@@ -23,7 +23,7 @@ use super::service::{
     ClientQueryService, ClientQuerySession, ClientQueryTarget,
 };
 use crate::{
-    GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryCursorToken,
+    GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryCursorToken, QueryFloat,
     QueryTransportConnectionIdentity, QueryTransportTlsServerConfigProvider, QueryValue, Result,
     VertexPropertyValue,
 };
@@ -315,6 +315,7 @@ enum HttpQueryValue {
     Null,
     VertexId(u64),
     Integer(u64),
+    SignedInteger(i64),
     Float(f64),
     Boolean(bool),
     String(String),
@@ -597,10 +598,13 @@ fn http_parameter_to_property(
             if let Some(value) = value.as_u64() {
                 return Ok(VertexPropertyValue::Integer(value));
             }
-            if let Some(value) = value.as_f64().filter(|value| value.is_finite()) {
-                return Ok(VertexPropertyValue::from_json_value(&serde_json::json!(
-                    value
-                )));
+            if let Some(value) = value.as_i64() {
+                return Ok(VertexPropertyValue::from_i64(value));
+            }
+            if value.is_f64() {
+                if let Some(value) = value.as_f64().filter(|value| value.is_finite()) {
+                    return Ok(VertexPropertyValue::Float(QueryFloat(value)));
+                }
             }
             Err(invalid_http_parameter(name))
         }
@@ -614,7 +618,7 @@ fn invalid_http_parameter(name: &str) -> HttpApiError {
         status: StatusCode::BAD_REQUEST,
         code: "invalid_parameter",
         message: format!(
-            "parameter ${name} must be a boolean, non-negative integer, finite float, or string"
+            "parameter ${name} must be a boolean, signed or unsigned integer, finite float, or string"
         ),
         authenticate: false,
     }
@@ -656,6 +660,7 @@ fn http_query_value(value: &QueryValue) -> Result<HttpQueryValue> {
         QueryValue::Float(_) => Err(non_finite_json_error()),
         QueryValue::Property(value) => match value {
             VertexPropertyValue::Integer(value) => Ok(HttpQueryValue::Integer(*value)),
+            VertexPropertyValue::SignedInteger(value) => Ok(HttpQueryValue::SignedInteger(*value)),
             VertexPropertyValue::Bool(value) => Ok(HttpQueryValue::Boolean(*value)),
             VertexPropertyValue::Float(value) if value.0.is_finite() => {
                 Ok(HttpQueryValue::Float(value.0))
