@@ -29,6 +29,10 @@ and operational harnesses.
   cancellation, limits, stats, and optimizer passes.
 - Optional TCP query transport with required auth by default, optional TLS/mTLS,
   static directory discovery, and Kubernetes/Consul/etcd discovery helpers.
+- Public Bolt 5.1-5.4 over TLS for Neo4j-driver compatibility and an HTTPS
+  query API with typed JSON or streaming NDJSON responses. Both adapters share
+  one scoped authentication, authorization, quota, cancellation, bookmark, and
+  deadline service.
 - Local filesystem, MinIO, and S3-compatible object-store workflows through
   SlateDB/object-store configuration.
 
@@ -39,6 +43,7 @@ src/core/        configuration, error types, public model types, cache policy
 src/shard/       GraphShard lifecycle, writes, reads, query execution, maintenance
 src/engine/      artifacts, supernodes, rollup/GC, cluster/control-plane helpers
 src/query/       OpenCypher lowering, algebra, optimizer, transport, TCK parser
+src/client/      shared public query service plus Bolt/TLS and HTTPS adapters
 src/sparse_kernel.rs
                  Rust sparse traversal and optional SuiteSparse GraphBLAS FFI
 examples/        smoke, stress, correctness, benchmark, and profiling binaries
@@ -49,7 +54,7 @@ scripts/         local, MinIO, query, write, stress, and chaos harnesses
 
 Base build:
 
-- Rust stable
+- Rust stable 1.91 or newer
 - `pkg-config`, `cmake`, `clang`, and normal C/C++ build tools
 - Optional: `just` for recipe shortcuts
 
@@ -100,6 +105,7 @@ cargo test --locked --features opencypher --lib
 cargo test --locked --features graphblas --lib
 cargo test --locked --features opencypher,graphblas --lib
 cargo check --locked --examples --features opencypher,graphblas
+cargo test --locked --all-targets --features public-client-protocols
 ```
 
 With `just`:
@@ -124,6 +130,10 @@ on macOS should be checked locally when those libraries are installed.
 | `query-transport` | Enables TCP query client/server types and serde row frames |
 | `query-transport-tls` | Adds TLS/mTLS config provider support for TCP query transport |
 | `query-service-discovery` | Adds Kubernetes EndpointSlice, Consul, and etcd discovery helpers |
+| `client-api` | Enables the protocol-independent authenticated client query service |
+| `bolt-server` | Adds the Bolt 5.1-5.4 server and requires TLS unless plaintext is explicitly enabled |
+| `http-api` | Adds the HTTPS typed JSON and NDJSON query API |
+| `public-client-protocols` | Enables both Bolt and HTTPS public adapters |
 
 The GraphBLAS path does not depend on a Rust GraphBLAS crate. It links directly
 to the system library with `#[link(name = "graphblas")]`.
@@ -296,17 +306,17 @@ Currently supported query shapes include:
 - `WHERE` boolean combinations over property/id comparisons with `=`, `<>`,
   `<`, `>`, `<=`, and `>=`.
 - `ORDER BY`, `SKIP`, `LIMIT`, aliases, and parameter values.
+- `DISTINCT` row projection and deduplication before windowing.
 - Aggregates: `count(*)`, `count(expr)`, `sum(expr)`, `avg(expr)`,
   and `collect(expr)`.
-- Mutations: `CREATE` edge patterns, `MERGE` edge patterns, `DELETE r`,
-  `SET`/`REMOVE` labels and properties.
+- Mutations: `CREATE` edge patterns, `MERGE` edge patterns, relationship and
+  vertex `DELETE`, `DETACH DELETE`, and `SET`/`REMOVE` labels and properties.
 
 Known query limits:
 
-- `DETACH DELETE` is rejected because node deletion is not implemented.
 - Unbounded variable-length paths are rejected; provide an explicit max hop.
 - Undirected relationships are rejected.
-- `RETURN *` and `DISTINCT` are rejected.
+- `RETURN *` is rejected.
 - `WITH` is pass-through only; it must keep every in-scope binding unchanged.
 - Native row execution is materialized for many plans; page APIs and the graph
   kernel fast path avoid materializing the hottest bounded reachability cases.
@@ -330,6 +340,43 @@ for row in rows.rows {
     }
 }
 ```
+
+## Public Client Protocols
+
+Enable both public adapters with `--features public-client-protocols`. Create a
+single `ClientQueryService` over the routed cluster, then pass clones of that
+service to `ClientBoltServer` and `ClientHttpServer`. The shared service:
+
+- classifies OpenCypher before authorization so read grants cannot run writes;
+- enforces graph and hierarchical namespace grants;
+- applies global and namespace concurrency limits;
+- caps query size, parameter count, page size, and total stream runtime;
+- pins paged reads to one graph epoch and emits scoped graph bookmarks;
+- supports cancellation without letting query ids cross principals or scopes.
+
+Bolt supports `HELLO`, `LOGON`, `LOGOFF`, auto-commit `RUN`, bounded or complete
+`PULL`/`DISCARD`, `RESET`, `GOODBYE`, `ROUTE`, and telemetry acknowledgement.
+Explicit `BEGIN`, `COMMIT`, and `ROLLBACK` are rejected until cross-query
+transaction semantics exist. TLS is required by default. Configure
+`ControllerBoltRoutingTableProvider` with public Bolt addresses to derive read
+and route endpoints from live controller heartbeats and the write endpoint from
+the current unexpired cell lease. If no routing provider or complete static
+routing table is configured, `ROUTE` fails closed; direct `bolt://` sessions
+continue to work.
+
+The HTTPS API exposes:
+
+```text
+POST /v1/graphs/{graph_id}/query
+POST /v1/graphs/{graph_id}/queries/{query_id}/cancel
+GET  /healthz
+```
+
+Query requests require `Authorization: Bearer ...` and, by default, an
+`x-graph-namespace` header. Send `Accept: application/x-ndjson` to stream a
+header, typed row records, and a final bookmark summary across bounded backend
+cursor pages. HTTPS and Bolt plaintext modes are available only through methods
+whose names explicitly begin with `insecure_`.
 
 ## Optimizer And Stats
 

@@ -372,6 +372,19 @@ impl QueryTransportAuthPolicy {
             Self::InsecureAllowAll => Some(QueryTransportPrincipal::insecure()),
         }
     }
+
+    pub(crate) fn authenticate_client(
+        &self,
+        bearer_token: Option<&str>,
+        identity: &QueryTransportConnectionIdentity,
+    ) -> Option<QueryTransportPrincipal> {
+        self.authenticate(
+            &QueryTransportAuth {
+                bearer_token: bearer_token.map(str::to_string),
+            },
+            identity,
+        )
+    }
 }
 
 #[cfg(feature = "query-transport")]
@@ -429,7 +442,7 @@ impl QueryTransportPrincipal {
         &self.0
     }
 
-    fn error_label(&self) -> &'static str {
+    pub(crate) fn error_label(&self) -> &'static str {
         if self.0.starts_with("bearer:") {
             "bearer principal"
         } else if self.0.starts_with("mtls:") {
@@ -451,7 +464,7 @@ pub enum QueryTransportAction {
 
 #[cfg(feature = "query-transport")]
 impl QueryTransportAction {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Read => "read",
             Self::Write => "write",
@@ -633,7 +646,7 @@ impl QueryTransportNamespaceQuotas {
         self.max_concurrent_queries.get(namespace).copied()
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self
             .max_concurrent_queries
             .values()
@@ -646,7 +659,7 @@ impl QueryTransportNamespaceQuotas {
         Ok(())
     }
 
-    fn gates(&self) -> BTreeMap<NamespacePath, Arc<Semaphore>> {
+    pub(crate) fn gates(&self) -> BTreeMap<NamespacePath, Arc<Semaphore>> {
         self.max_concurrent_queries
             .iter()
             .map(|(namespace, limit)| (namespace.clone(), Arc::new(Semaphore::new(*limit))))
@@ -1563,6 +1576,14 @@ pub trait QueryCellClient: Send + Sync {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<QueryResultPage>;
+
+    async fn current_graph_epoch(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<crate::GraphEpoch>> {
+        Ok(None)
+    }
 }
 
 #[cfg(feature = "query-transport")]
@@ -2898,6 +2919,20 @@ impl QueryCellClient for RoutedGraphCluster {
         page_size: usize,
     ) -> Result<QueryResultPage> {
         RoutedGraphCluster::execute_cypher_rows_page(self, context, query, cursor, page_size).await
+    }
+
+    async fn current_graph_epoch(
+        &self,
+        scope: &GraphScope,
+        cell_id: &str,
+    ) -> Result<Option<crate::GraphEpoch>> {
+        if scope != self.scope() {
+            return Err(GraphError::GraphScopeMismatch {
+                expected: self.scope().to_string(),
+                actual: scope.to_string(),
+            });
+        }
+        Ok(Some(self.shard(cell_id)?.current_epoch(cell_id).await?))
     }
 }
 
