@@ -9642,11 +9642,222 @@ async fn distributed_query_coordinator_routes_to_remote_cell_clients() {
     control.close().await.unwrap();
 }
 
+#[cfg(feature = "query-transport")]
+async fn test_read_transport_json(
+    reader: &mut tokio::io::BufReader<tokio::net::TcpStream>,
+) -> serde_json::Value {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut line = String::new();
+    let read = reader.read_line(&mut line).await.unwrap();
+    assert!(read > 0, "transport peer closed before sending a frame");
+    serde_json::from_str(&line).unwrap()
+}
+
+#[cfg(feature = "query-transport")]
+async fn test_write_transport_json(
+    reader: &mut tokio::io::BufReader<tokio::net::TcpStream>,
+    value: &serde_json::Value,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let mut frame = serde_json::to_vec(value).unwrap();
+    frame.push(b'\n');
+    reader.get_mut().write_all(&frame).await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+fn test_transport_rows_response() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "rows",
+        "result": QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+        ),
+    })
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_new_client_falls_back_to_legacy_server() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let legacy_server = tokio::spawn(async move {
+        for expected_version in [2_u64, 1_u64] {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let request = test_read_transport_json(&mut reader).await;
+            assert_eq!(request["version"].as_u64(), Some(expected_version));
+            let response = if expected_version == 2 {
+                serde_json::json!({
+                    "kind": "error",
+                    "message": "unsupported query transport version 2; expected 1",
+                })
+            } else {
+                test_transport_rows_response()
+            };
+            test_write_transport_json(&mut reader, &response).await;
+        }
+    });
+
+    let client = TcpQueryCellClient::new(addr).with_timeout(std::time::Duration::from_secs(2));
+    let result = client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "rolling-new-client-old-server"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(client.metrics().connections_created, 2);
+    assert_eq!(client.metrics().client_retries, 1);
+    legacy_server.await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_new_server_serves_legacy_client_shape() {
+    struct StaticQueryClient;
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for StaticQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            Ok(QueryResultSet::new(
+                vec![QueryColumn::new("v.id")],
+                vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
+            ))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(StaticQueryClient),
+        QueryTransportServerConfig::default().insecure_allow_unauthenticated(),
+    )
+    .await
+    .unwrap();
+    let stream = tokio::net::TcpStream::connect(server.local_addr())
+        .await
+        .unwrap();
+    let mut reader = tokio::io::BufReader::new(stream);
+    let request = serde_json::json!({
+        "kind": "rows",
+        "version": 1,
+        "auth": { "bearer_token": null },
+        "context": QueryContext::new("reddit-home", "rolling-old-client-new-server"),
+        "query": "MATCH (u {id: 1}) RETURN u.id",
+    });
+    test_write_transport_json(&mut reader, &request).await;
+    let response = test_read_transport_json(&mut reader).await;
+    assert_eq!(response["kind"], "rows");
+    assert!(response.get("response").is_none());
+
+    use tokio::io::AsyncBufReadExt;
+    let mut tail = String::new();
+    let eof = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        reader.read_line(&mut tail),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(eof, 0, "legacy response connection must close");
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_never_replays_after_execution_loses_response() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let raw_server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut first = tokio::io::BufReader::new(stream);
+        let warm = test_read_transport_json(&mut first).await;
+        assert_eq!(warm["context"]["idempotency_key"], "at-most-once-warm");
+        test_write_transport_json(
+            &mut first,
+            &serde_json::json!({
+                "response": test_transport_rows_response(),
+                "close_connection": false,
+            }),
+        )
+        .await;
+
+        let ambiguous = test_read_transport_json(&mut first).await;
+        assert_eq!(
+            ambiguous["context"]["idempotency_key"],
+            "at-most-once-ambiguous"
+        );
+        drop(first);
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut recovery = tokio::io::BufReader::new(stream);
+        let request = test_read_transport_json(&mut recovery).await;
+        assert_eq!(
+            request["context"]["idempotency_key"], "at-most-once-explicit-retry",
+            "the ambiguous request was automatically replayed"
+        );
+        test_write_transport_json(
+            &mut recovery,
+            &serde_json::json!({
+                "response": test_transport_rows_response(),
+                "close_connection": true,
+            }),
+        )
+        .await;
+    });
+
+    let client = TcpQueryCellClient::new(addr)
+        .with_max_retries(3)
+        .with_timeout(std::time::Duration::from_secs(2));
+    client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "at-most-once-warm"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "at-most-once-ambiguous"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    let recovered = client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "at-most-once-explicit-retry"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.rows.len(), 1);
+    assert_eq!(client.metrics().client_retries, 0);
+    raw_server.await.unwrap();
+}
+
 #[cfg(feature = "query-transport-tls")]
 struct TestMtlsBundle {
     server: Arc<tokio_rustls::rustls::ServerConfig>,
     clients: Vec<(Arc<tokio_rustls::rustls::ClientConfig>, String)>,
     anonymous_client: Arc<tokio_rustls::rustls::ClientConfig>,
+    intermediate_fingerprint: String,
 }
 
 #[cfg(feature = "query-transport-tls")]
@@ -9679,6 +9890,29 @@ fn test_mtls_bundle(expired: bool) -> TestMtlsBundle {
     ];
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
+    let intermediate_key = KeyPair::generate().unwrap();
+    let mut intermediate_params = CertificateParams::default();
+    let mut intermediate_name = DistinguishedName::new();
+    intermediate_name.push(DnType::CommonName, "query-transport-test-intermediate");
+    intermediate_params.distinguished_name = intermediate_name;
+    intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    intermediate_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let intermediate_cert = intermediate_params
+        .signed_by(&intermediate_key, &ca_cert, &ca_key)
+        .unwrap();
+    let intermediate_digest = sha2::Sha256::digest(intermediate_cert.der().as_ref());
+    let intermediate_fingerprint = format!(
+        "sha256:{}",
+        intermediate_digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+
     let server_key = KeyPair::generate().unwrap();
     let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
@@ -9687,7 +9921,7 @@ fn test_mtls_bundle(expired: bool) -> TestMtlsBundle {
         server_params.not_after = date_time_ymd(2001, 1, 1);
     }
     let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
+        .signed_by(&server_key, &intermediate_cert, &intermediate_key)
         .unwrap();
 
     let mut client_roots = RootCertStore::empty();
@@ -9713,11 +9947,14 @@ fn test_mtls_bundle(expired: bool) -> TestMtlsBundle {
             client_params.not_after = date_time_ymd(2001, 1, 1);
         }
         let client_cert = client_params
-            .signed_by(&client_key, &ca_cert, &ca_key)
+            .signed_by(&client_key, &intermediate_cert, &intermediate_key)
             .unwrap();
         let client_config = ClientConfig::builder()
             .with_root_certificates(client_roots.clone())
-            .with_client_auth_cert(vec![client_cert.der().clone()], private_key(&client_key))
+            .with_client_auth_cert(
+                vec![client_cert.der().clone(), intermediate_cert.der().clone()],
+                private_key(&client_key),
+            )
             .unwrap();
         let digest = sha2::Sha256::digest(client_cert.der().as_ref());
         let fingerprint = format!(
@@ -9735,12 +9972,16 @@ fn test_mtls_bundle(expired: bool) -> TestMtlsBundle {
         .unwrap();
     let server = ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
-        .with_single_cert(vec![server_cert.der().clone()], private_key(&server_key))
+        .with_single_cert(
+            vec![server_cert.der().clone(), intermediate_cert.der().clone()],
+            private_key(&server_key),
+        )
         .unwrap();
     TestMtlsBundle {
         server: Arc::new(server),
         clients,
         anonymous_client,
+        intermediate_fingerprint,
     }
 }
 
@@ -10075,7 +10316,7 @@ async fn tcp_query_transport_requires_explicit_plaintext_for_authenticated_serve
 
 #[cfg(feature = "query-transport")]
 #[tokio::test]
-async fn tcp_query_transport_reuses_bounded_connections() {
+async fn tcp_query_transport_does_not_replay_a_stale_pooled_request() {
     struct StaticQueryClient;
 
     #[async_trait::async_trait]
@@ -10134,16 +10375,26 @@ async fn tcp_query_transport_reuses_bounded_connections() {
     assert_eq!(server.metrics().connections_accepted, 1);
 
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-    let recovered = client
+    let ambiguous = client
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "connection-reuse-after-idle-close"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(ambiguous.to_string().contains("query/transport"));
+    assert_eq!(client.metrics().connections_created, 1);
+
+    let recovered = client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "connection-reuse-explicit-retry"),
             "MATCH (u {id: 1}) RETURN u.id",
         )
         .await
         .unwrap();
     assert_eq!(recovered.rows.len(), 1);
     assert_eq!(client.metrics().connections_created, 2);
-    assert!(client.metrics().client_retries >= 1);
+    assert_eq!(client.metrics().client_retries, 0);
     assert!(server.metrics().idle_timeouts >= 1);
     server.stop().await.unwrap();
 }
@@ -10237,6 +10488,7 @@ async fn tcp_query_transport_limits_idle_and_concurrent_connections() {
         Arc::new(StaticQueryClient),
         QueryTransportServerConfig::default()
             .with_max_connections(1)
+            .with_reserved_control_connections(1)
             .with_idle_timeout(std::time::Duration::from_millis(50)),
     )
     .await
@@ -10253,13 +10505,23 @@ async fn tcp_query_transport_limits_idle_and_concurrent_connections() {
     let second = tokio::net::TcpStream::connect(server.local_addr())
         .await
         .unwrap();
+    for _ in 0..50 {
+        if server.metrics().connections_active == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    let third = tokio::net::TcpStream::connect(server.local_addr())
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    assert_eq!(server.metrics().connections_accepted, 1);
+    assert_eq!(server.metrics().connections_accepted, 2);
     assert!(server.metrics().connections_rejected >= 1);
-    drop(second);
+    drop(third);
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
     assert!(server.metrics().idle_timeouts >= 1);
     assert_eq!(server.metrics().connections_active, 0);
+    drop(second);
     drop(first);
     server.stop().await.unwrap();
 }
@@ -10454,6 +10716,53 @@ async fn tcp_query_transport_mtls_authenticates_certificates_and_rejects_invalid
 
 #[cfg(feature = "query-transport-tls")]
 #[tokio::test]
+async fn tcp_query_transport_mtls_accepts_an_allowed_presented_chain_fingerprint() {
+    struct StaticQueryClient;
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for StaticQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            Ok(QueryResultPage::new(Vec::new(), Vec::new(), None))
+        }
+    }
+
+    let bundle = test_mtls_bundle(false);
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(StaticQueryClient),
+        QueryTransportServerConfig::default()
+            .with_tls(Arc::clone(&bundle.server))
+            .with_required_mtls_fingerprints([bundle.intermediate_fingerprint.clone()]),
+    )
+    .await
+    .unwrap();
+    TcpQueryCellClient::new(server.local_addr())
+        .with_tls("localhost", Arc::clone(&bundle.clients[0].0))
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "mtls-intermediate-fingerprint"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport-tls")]
+#[tokio::test]
 async fn tcp_query_transport_rotates_server_and_client_certificates() {
     struct StaticQueryClient;
 
@@ -10576,10 +10885,7 @@ async fn tcp_query_transport_cancellation_is_scoped_to_mtls_identity() {
         }),
         QueryTransportServerConfig::default()
             .with_tls(Arc::clone(&bundle.server))
-            .with_required_mtls_fingerprints([
-                bundle.clients[0].1.clone(),
-                bundle.clients[1].1.clone(),
-            ]),
+            .with_required_mtls_fingerprints([bundle.intermediate_fingerprint.clone()]),
     )
     .await
     .unwrap();
@@ -10597,6 +10903,19 @@ async fn tcp_query_transport_cancellation_is_scoped_to_mtls_identity() {
             .await
     });
     started.notified().await;
+    let unscoped_err = server
+        .cancel_query("identity-scoped-cancel")
+        .await
+        .unwrap_err();
+    assert!(unscoped_err.to_string().contains("no active query"));
+    let wrong_server_principal =
+        QueryTransportCancellationPrincipal::mtls_peer_fingerprint(bundle.clients[1].1.clone())
+            .unwrap();
+    let wrong_server_err = server
+        .cancel_query_for_principal(wrong_server_principal, "identity-scoped-cancel")
+        .await
+        .unwrap_err();
+    assert!(wrong_server_err.to_string().contains("no active query"));
     let other_err = other
         .cancel_query("identity-scoped-cancel")
         .await
@@ -10945,6 +11264,87 @@ async fn tcp_query_transport_applies_server_backpressure_under_load() {
     let metrics = server.metrics();
     assert!(metrics.cancellations >= 1);
     assert!(metrics.cancelled_rejections >= 1);
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_cancellation_bypasses_saturated_query_connections() {
+    struct ControlledQueryClient {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for ControlledQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(ControlledQueryClient {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        }),
+        QueryTransportServerConfig::default()
+            .insecure_allow_unauthenticated()
+            .with_max_connections(1)
+            .with_reserved_control_connections(1)
+            .with_max_concurrent_requests(1),
+    )
+    .await
+    .unwrap();
+    let client = TcpQueryCellClient::new(server.local_addr())
+        .with_max_connections(1)
+        .with_max_control_connections(1)
+        .with_timeout(std::time::Duration::from_secs(2));
+    let query_client = client.clone();
+    let query = tokio::spawn(async move {
+        query_client
+            .execute_cypher_rows(
+                QueryContext::new("reddit-home", "cancel-saturated-query"),
+                "MATCH (u {id: 1}) RETURN u.id",
+            )
+            .await
+    });
+    started.notified().await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        client.cancel_query("cancel-saturated-query"),
+    )
+    .await
+    .expect("cancellation waited behind the saturated query connection")
+    .unwrap();
+    release.notify_one();
+    assert!(query
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string()
+        .contains("query_transport_cancelled"));
+    assert!(server.metrics().connections_accepted >= 2);
     server.stop().await.unwrap();
 }
 

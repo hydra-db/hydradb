@@ -96,9 +96,10 @@ pub use query::coordination::{
 #[cfg(feature = "query-transport")]
 pub use query::coordination::{
     QueryServiceDirectory, QueryServiceDiscovery, QueryServiceEndpoint, QueryTransportAuthPolicy,
-    QueryTransportClientConfig, QueryTransportConnectionIdentity, QueryTransportMetricsSnapshot,
-    QueryTransportSecret, QueryTransportServerConfig, StaticQueryServiceDiscovery,
-    TcpQueryCellClient, TcpQueryRowStream, TcpQueryServer,
+    QueryTransportCancellationPrincipal, QueryTransportClientConfig,
+    QueryTransportConnectionIdentity, QueryTransportMetricsSnapshot, QueryTransportSecret,
+    QueryTransportServerConfig, StaticQueryServiceDiscovery, TcpQueryCellClient, TcpQueryRowStream,
+    TcpQueryServer,
 };
 #[cfg(feature = "query-transport-tls")]
 pub use query::coordination::{
