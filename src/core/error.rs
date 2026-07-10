@@ -66,6 +66,14 @@ pub enum GraphError {
     },
     #[error("no shard placement exists for cell {cell_id}")]
     UnknownShard { cell_id: String },
+    #[error("graph scope mismatch: expected {expected}, received {actual}")]
+    GraphScopeMismatch { expected: String, actual: String },
+    #[error("principal {principal} is not authorized to {action} graph scope {scope}")]
+    GraphScopeAccessDenied {
+        principal: String,
+        action: &'static str,
+        scope: String,
+    },
     #[error("cell {cell_id} is owned by node {owner_node_id}, not local node {local_node_id}")]
     ShardNotOwned {
         cell_id: String,

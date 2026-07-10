@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 use crate::{
-    validate_component, CommitResult, EdgeMetadata, GraphEpoch, GraphError, QueryFloat, Result,
-    VertexId, VertexMetadata, VertexPropertyValue,
+    validate_component, CommitResult, EdgeMetadata, GraphEpoch, GraphError, GraphScope, QueryFloat,
+    Result, VertexId, VertexMetadata, VertexPropertyValue,
 };
 
 #[cfg_attr(
@@ -13,6 +14,8 @@ use crate::{
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryContext {
+    #[cfg_attr(feature = "query-transport", serde(default))]
+    pub scope: GraphScope,
     pub cell_id: String,
     pub idempotency_key: String,
     pub read_epoch: Option<GraphEpoch>,
@@ -26,6 +29,7 @@ pub struct QueryContext {
 impl QueryContext {
     pub fn new(cell_id: impl Into<String>, idempotency_key: impl Into<String>) -> Self {
         Self {
+            scope: GraphScope::default(),
             cell_id: cell_id.into(),
             idempotency_key: idempotency_key.into(),
             read_epoch: None,
@@ -34,6 +38,11 @@ impl QueryContext {
             max_runtime_ms: None,
             cancellation_token: None,
         }
+    }
+
+    pub fn in_scope(mut self, scope: GraphScope) -> Self {
+        self.scope = scope;
+        self
     }
 
     pub fn at_epoch(mut self, read_epoch: GraphEpoch) -> Self {
@@ -73,6 +82,7 @@ impl QueryContext {
 #[derive(Clone, Debug, Default)]
 pub struct QueryCancellationToken {
     cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 }
 
 impl QueryCancellationToken {
@@ -81,11 +91,23 @@ impl QueryCancellationToken {
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        if !self.cancelled.swap(true, Ordering::SeqCst) {
+            self.notify.notify_waiters();
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 

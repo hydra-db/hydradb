@@ -14,6 +14,39 @@ impl GraphControlPlane {
         cache: GraphCacheConfig,
     ) -> Result<Self> {
         let store_path = path.into();
+        Self::open_at_path(store_path, object_store, cache, GraphScope::default()).await
+    }
+
+    pub async fn open_scoped(
+        base_path: impl Into<slatedb::object_store::path::Path>,
+        object_store: Arc<dyn ObjectStore>,
+        scope: GraphScope,
+    ) -> Result<Self> {
+        Self::open_scoped_with_cache(base_path, object_store, scope, GraphCacheConfig::default())
+            .await
+    }
+
+    pub async fn open_scoped_with_cache(
+        base_path: impl Into<slatedb::object_store::path::Path>,
+        object_store: Arc<dyn ObjectStore>,
+        scope: GraphScope,
+        cache: GraphCacheConfig,
+    ) -> Result<Self> {
+        let base_path = base_path.into();
+        let store_path = if scope.is_default() {
+            base_path
+        } else {
+            slatedb::object_store::path::Path::from(scope.scoped_store_path(base_path.as_ref()))
+        };
+        Self::open_at_path(store_path, object_store, cache, scope).await
+    }
+
+    async fn open_at_path(
+        store_path: slatedb::object_store::path::Path,
+        object_store: Arc<dyn ObjectStore>,
+        cache: GraphCacheConfig,
+        scope: GraphScope,
+    ) -> Result<Self> {
         Ok(Self {
             db: open_graph_db(
                 store_path.clone(),
@@ -24,8 +57,13 @@ impl GraphControlPlane {
             .await?,
             object_store,
             store_path,
+            scope,
             metrics: Arc::new(GraphControlMetrics::default()),
         })
+    }
+
+    pub fn scope(&self) -> &GraphScope {
+        &self.scope
     }
 
     pub fn graph_control_metrics(&self) -> GraphControlMetricsSnapshot {

@@ -44,6 +44,8 @@ use crate::{
     validate_component, GraphError, QueryContext, QueryCursorToken, QueryResultPage,
     QueryResultSet, QueryRow, QueryValue, Result, RoutedGraphCluster, ShardPlacement,
 };
+#[cfg(feature = "query-transport")]
+use crate::{GraphId, GraphScope, NamespacePath};
 
 #[cfg(feature = "query-transport")]
 const QUERY_TRANSPORT_VERSION: u16 = 2;
@@ -305,6 +307,7 @@ impl QueryTransportClientConfig {
 pub enum QueryTransportAuthPolicy {
     RejectAll,
     BearerToken(QueryTransportSecret),
+    BearerTokens(Vec<QueryTransportSecret>),
     #[cfg(feature = "query-transport-tls")]
     MtlsPeerFingerprint {
         allowed_fingerprints: BTreeSet<String>,
@@ -326,6 +329,18 @@ impl QueryTransportAuthPolicy {
                 let supplied = auth.bearer_token.as_deref()?;
                 (required.is_valid() && constant_time_secret_eq(supplied, required.expose_secret()))
                     .then(|| QueryTransportPrincipal::bearer(required.expose_secret()))
+            }
+            Self::BearerTokens(required_tokens) => {
+                let supplied = auth.bearer_token.as_deref()?;
+                let mut matched = None;
+                for required in required_tokens {
+                    if required.is_valid()
+                        && constant_time_secret_eq(supplied, required.expose_secret())
+                    {
+                        matched = Some(QueryTransportPrincipal::bearer(required.expose_secret()));
+                    }
+                }
+                matched
             }
             #[cfg(feature = "query-transport-tls")]
             Self::MtlsPeerFingerprint {
@@ -361,7 +376,7 @@ impl QueryTransportAuthPolicy {
 
 #[cfg(feature = "query-transport")]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct QueryTransportPrincipal(String);
+pub struct QueryTransportPrincipal(String);
 
 #[cfg(feature = "query-transport")]
 impl QueryTransportPrincipal {
@@ -379,6 +394,263 @@ impl QueryTransportPrincipal {
 
     fn insecure() -> Self {
         Self("insecure".to_string())
+    }
+
+    pub fn from_bearer_token(token: impl Into<String>) -> Result<Self> {
+        let secret = QueryTransportSecret::try_new(token)?;
+        Ok(Self::bearer(secret.expose_secret()))
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn from_mtls_peer_fingerprint(fingerprint: impl Into<String>) -> Result<Self> {
+        let fingerprints =
+            normalized_sha256_fingerprints([fingerprint.into()]).ok_or_else(|| {
+                GraphError::UnsupportedQuery {
+                    dialect: "QueryTransport",
+                    feature: "mTLS principal requires a canonical sha256 fingerprint".to_string(),
+                }
+            })?;
+        let fingerprint =
+            fingerprints
+                .into_iter()
+                .next()
+                .ok_or_else(|| GraphError::UnsupportedQuery {
+                    dialect: "QueryTransport",
+                    feature: "mTLS principal requires a fingerprint".to_string(),
+                })?;
+        Ok(Self::mtls(&fingerprint))
+    }
+
+    pub fn insecure_principal() -> Self {
+        Self::insecure()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn error_label(&self) -> &'static str {
+        if self.0.starts_with("bearer:") {
+            "bearer principal"
+        } else if self.0.starts_with("mtls:") {
+            "mTLS principal"
+        } else {
+            "unauthenticated principal"
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum QueryTransportAction {
+    Read,
+    Write,
+    Cancel,
+    Admin,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Cancel => "cancel queries in",
+            Self::Admin => "administer",
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryTransportScopeGrant {
+    namespace: NamespacePath,
+    graph_id: Option<GraphId>,
+    include_descendants: bool,
+    actions: BTreeSet<QueryTransportAction>,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportScopeGrant {
+    pub fn graph(
+        scope: GraphScope,
+        actions: impl IntoIterator<Item = QueryTransportAction>,
+    ) -> Self {
+        Self {
+            namespace: scope.namespace,
+            graph_id: Some(scope.graph_id),
+            include_descendants: false,
+            actions: actions.into_iter().collect(),
+        }
+    }
+
+    pub fn namespace(
+        namespace: NamespacePath,
+        include_descendants: bool,
+        actions: impl IntoIterator<Item = QueryTransportAction>,
+    ) -> Self {
+        Self {
+            namespace,
+            graph_id: None,
+            include_descendants,
+            actions: actions.into_iter().collect(),
+        }
+    }
+
+    pub fn read_graph(scope: GraphScope) -> Self {
+        Self::graph(
+            scope,
+            [QueryTransportAction::Read, QueryTransportAction::Cancel],
+        )
+    }
+
+    pub fn read_namespace(namespace: NamespacePath, include_descendants: bool) -> Self {
+        Self::namespace(
+            namespace,
+            include_descendants,
+            [QueryTransportAction::Read, QueryTransportAction::Cancel],
+        )
+    }
+
+    fn allows(&self, scope: &GraphScope, action: QueryTransportAction) -> bool {
+        let namespace_allowed = if self.include_descendants {
+            scope.namespace.is_descendant_of(&self.namespace)
+        } else {
+            scope.namespace == self.namespace
+        };
+        let graph_allowed = match &self.graph_id {
+            Some(graph_id) => graph_id == &scope.graph_id,
+            None => true,
+        };
+        namespace_allowed && graph_allowed && self.actions.contains(&action)
+    }
+}
+
+#[cfg(feature = "query-transport")]
+pub trait QueryTransportScopeAuthorizer: Send + Sync {
+    fn authorize(
+        &self,
+        principal: &QueryTransportPrincipal,
+        scope: &GraphScope,
+        action: QueryTransportAction,
+    ) -> bool;
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Default)]
+pub struct StaticQueryTransportScopeAuthorizer {
+    grants: BTreeMap<QueryTransportPrincipal, Vec<QueryTransportScopeGrant>>,
+}
+
+#[cfg(feature = "query-transport")]
+impl StaticQueryTransportScopeAuthorizer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn grant(&mut self, principal: QueryTransportPrincipal, grant: QueryTransportScopeGrant) {
+        self.grants.entry(principal).or_default().push(grant);
+    }
+
+    pub fn with_grant(
+        mut self,
+        principal: QueryTransportPrincipal,
+        grant: QueryTransportScopeGrant,
+    ) -> Self {
+        self.grant(principal, grant);
+        self
+    }
+
+    pub fn with_bearer_grant(
+        self,
+        token: impl Into<String>,
+        grant: QueryTransportScopeGrant,
+    ) -> Result<Self> {
+        Ok(self.with_grant(QueryTransportPrincipal::from_bearer_token(token)?, grant))
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_mtls_grant(
+        self,
+        fingerprint: impl Into<String>,
+        grant: QueryTransportScopeGrant,
+    ) -> Result<Self> {
+        Ok(self.with_grant(
+            QueryTransportPrincipal::from_mtls_peer_fingerprint(fingerprint)?,
+            grant,
+        ))
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportScopeAuthorizer for StaticQueryTransportScopeAuthorizer {
+    fn authorize(
+        &self,
+        principal: &QueryTransportPrincipal,
+        scope: &GraphScope,
+        action: QueryTransportAction,
+    ) -> bool {
+        self.grants
+            .get(principal)
+            .is_some_and(|grants| grants.iter().any(|grant| grant.allows(scope, action)))
+    }
+}
+
+#[cfg(feature = "query-transport")]
+struct DefaultQueryTransportScopeAuthorizer;
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportScopeAuthorizer for DefaultQueryTransportScopeAuthorizer {
+    fn authorize(
+        &self,
+        _principal: &QueryTransportPrincipal,
+        scope: &GraphScope,
+        _action: QueryTransportAction,
+    ) -> bool {
+        scope.is_default()
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueryTransportNamespaceQuotas {
+    max_concurrent_queries: BTreeMap<NamespacePath, usize>,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportNamespaceQuotas {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_query_limit(mut self, namespace: NamespacePath, max_concurrent: usize) -> Self {
+        self.max_concurrent_queries
+            .insert(namespace, max_concurrent);
+        self
+    }
+
+    pub fn query_limit(&self, namespace: &NamespacePath) -> Option<usize> {
+        self.max_concurrent_queries.get(namespace).copied()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self
+            .max_concurrent_queries
+            .values()
+            .any(|limit| *limit == 0)
+        {
+            return transport_config_error(
+                "namespace query concurrency limits must be greater than zero",
+            );
+        }
+        Ok(())
+    }
+
+    fn gates(&self) -> BTreeMap<NamespacePath, Arc<Semaphore>> {
+        self.max_concurrent_queries
+            .iter()
+            .map(|(namespace, limit)| (namespace.clone(), Arc::new(Semaphore::new(*limit))))
+            .collect()
     }
 }
 
@@ -580,6 +852,8 @@ impl QueryTransportTlsClientConfigProvider for ReloadableQueryTransportTlsClient
 pub struct QueryTransportServerConfig {
     pub max_frame_bytes: usize,
     pub auth_policy: QueryTransportAuthPolicy,
+    pub scope_authorizer: Arc<dyn QueryTransportScopeAuthorizer>,
+    pub namespace_quotas: QueryTransportNamespaceQuotas,
     pub max_concurrent_requests: usize,
     pub max_connections: usize,
     pub reserved_control_connections: usize,
@@ -603,6 +877,8 @@ impl Default for QueryTransportServerConfig {
         Self {
             max_frame_bytes: DEFAULT_QUERY_TRANSPORT_MAX_FRAME_BYTES,
             auth_policy: QueryTransportAuthPolicy::RejectAll,
+            scope_authorizer: Arc::new(DefaultQueryTransportScopeAuthorizer),
+            namespace_quotas: QueryTransportNamespaceQuotas::default(),
             max_concurrent_requests: 128,
             max_connections: DEFAULT_QUERY_TRANSPORT_MAX_CONNECTIONS,
             reserved_control_connections: DEFAULT_QUERY_TRANSPORT_RESERVED_CONTROL_CONNECTIONS,
@@ -636,6 +912,18 @@ impl QueryTransportServerConfig {
         self
     }
 
+    pub fn with_required_bearer_tokens(mut self, tokens: impl IntoIterator<Item = String>) -> Self {
+        let tokens: Result<Vec<_>> = tokens
+            .into_iter()
+            .map(QueryTransportSecret::try_new)
+            .collect();
+        self.auth_policy = match tokens {
+            Ok(tokens) if !tokens.is_empty() => QueryTransportAuthPolicy::BearerTokens(tokens),
+            _ => QueryTransportAuthPolicy::RejectAll,
+        };
+        self
+    }
+
     pub fn insecure_allow_unauthenticated(mut self) -> Self {
         self.auth_policy = QueryTransportAuthPolicy::InsecureAllowAll;
         self.allow_plaintext = true;
@@ -644,6 +932,19 @@ impl QueryTransportServerConfig {
 
     pub fn insecure_allow_plaintext(mut self) -> Self {
         self.allow_plaintext = true;
+        self
+    }
+
+    pub fn with_scope_authorizer(
+        mut self,
+        authorizer: Arc<dyn QueryTransportScopeAuthorizer>,
+    ) -> Self {
+        self.scope_authorizer = authorizer;
+        self
+    }
+
+    pub fn with_namespace_quotas(mut self, quotas: QueryTransportNamespaceQuotas) -> Self {
+        self.namespace_quotas = quotas;
         self
     }
 
@@ -757,6 +1058,7 @@ impl QueryTransportServerConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        self.namespace_quotas.validate()?;
         if self.max_frame_bytes < 2 {
             return transport_config_error("max_frame_bytes must be at least 2");
         }
@@ -794,6 +1096,13 @@ impl QueryTransportServerConfig {
         match &self.auth_policy {
             QueryTransportAuthPolicy::BearerToken(secret) if !secret.is_valid() => {
                 return transport_config_error("bearer token cannot be empty");
+            }
+            QueryTransportAuthPolicy::BearerTokens(tokens)
+                if tokens.is_empty() || tokens.iter().any(|secret| !secret.is_valid()) =>
+            {
+                return transport_config_error(
+                    "bearer token list must be non-empty and cannot contain empty tokens",
+                );
             }
             #[cfg(feature = "query-transport-tls")]
             QueryTransportAuthPolicy::MtlsPeerFingerprint {
@@ -860,6 +1169,8 @@ pub struct QueryTransportMetricsSnapshot {
     pub requests_completed: u64,
     pub requests_failed: u64,
     pub auth_failures: u64,
+    pub namespace_access_denials: u64,
+    pub namespace_quota_waits: u64,
     pub cancellations: u64,
     pub cancelled_rejections: u64,
     pub slow_queries: u64,
@@ -886,6 +1197,8 @@ struct QueryTransportMetrics {
     requests_completed: AtomicU64,
     requests_failed: AtomicU64,
     auth_failures: AtomicU64,
+    namespace_access_denials: AtomicU64,
+    namespace_quota_waits: AtomicU64,
     cancellations: AtomicU64,
     cancelled_rejections: AtomicU64,
     slow_queries: AtomicU64,
@@ -913,6 +1226,8 @@ impl QueryTransportMetrics {
             requests_completed: self.requests_completed.load(Ordering::Relaxed),
             requests_failed: self.requests_failed.load(Ordering::Relaxed),
             auth_failures: self.auth_failures.load(Ordering::Relaxed),
+            namespace_access_denials: self.namespace_access_denials.load(Ordering::Relaxed),
+            namespace_quota_waits: self.namespace_quota_waits.load(Ordering::Relaxed),
             cancellations: self.cancellations.load(Ordering::Relaxed),
             cancelled_rejections: self.cancelled_rejections.load(Ordering::Relaxed),
             slow_queries: self.slow_queries.load(Ordering::Relaxed),
@@ -1395,6 +1710,7 @@ struct QueryTransportServerRuntime {
     metrics: Arc<QueryTransportMetrics>,
     lifecycle: Arc<Mutex<QueryTransportLifecycle>>,
     request_gate: Arc<Semaphore>,
+    namespace_query_gates: BTreeMap<NamespacePath, Arc<Semaphore>>,
     connection_gate: Arc<Semaphore>,
     control_connection_gate: Arc<Semaphore>,
 }
@@ -1416,14 +1732,20 @@ struct QueryTransportLifecycle {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct QueryLifecycleKey {
     principal: QueryTransportPrincipal,
+    scope: GraphScope,
     query_id: String,
 }
 
 #[cfg(feature = "query-transport")]
 impl QueryLifecycleKey {
-    fn new(principal: QueryTransportPrincipal, query_id: impl Into<String>) -> Self {
+    fn new(
+        principal: QueryTransportPrincipal,
+        scope: GraphScope,
+        query_id: impl Into<String>,
+    ) -> Self {
         Self {
             principal,
+            scope,
             query_id: query_id.into(),
         }
     }
@@ -1506,12 +1828,14 @@ impl TcpQueryServer {
         let max_concurrent_requests = config.max_concurrent_requests.max(1);
         let max_connections = config.max_connections.max(1);
         let reserved_control_connections = config.reserved_control_connections.max(1);
+        let namespace_query_gates = config.namespace_quotas.gates();
         let graceful_shutdown_timeout = config.graceful_shutdown_timeout;
         let runtime = Arc::new(QueryTransportServerRuntime {
             config,
             metrics: Arc::clone(&metrics),
             lifecycle: Arc::clone(&lifecycle),
             request_gate: Arc::new(Semaphore::new(max_concurrent_requests)),
+            namespace_query_gates,
             connection_gate: Arc::new(Semaphore::new(max_connections)),
             control_connection_gate: Arc::new(Semaphore::new(reserved_control_connections)),
         });
@@ -1643,8 +1967,21 @@ impl TcpQueryServer {
     }
 
     pub async fn cancel_query(&self, query_id: impl Into<String>) -> Result<()> {
-        self.cancel_query_for_principal(QueryTransportCancellationPrincipal::insecure(), query_id)
+        self.cancel_query_in_scope(GraphScope::default(), query_id)
             .await
+    }
+
+    pub async fn cancel_query_in_scope(
+        &self,
+        scope: GraphScope,
+        query_id: impl Into<String>,
+    ) -> Result<()> {
+        self.cancel_query_for_principal_in_scope(
+            QueryTransportCancellationPrincipal::insecure(),
+            scope,
+            query_id,
+        )
+        .await
     }
 
     pub async fn cancel_query_for_principal(
@@ -1652,9 +1989,19 @@ impl TcpQueryServer {
         principal: QueryTransportCancellationPrincipal,
         query_id: impl Into<String>,
     ) -> Result<()> {
+        self.cancel_query_for_principal_in_scope(principal, GraphScope::default(), query_id)
+            .await
+    }
+
+    pub async fn cancel_query_for_principal_in_scope(
+        &self,
+        principal: QueryTransportCancellationPrincipal,
+        scope: GraphScope,
+        query_id: impl Into<String>,
+    ) -> Result<()> {
         let query_id = query_id.into();
         validate_component("query_id", &query_id)?;
-        let lifecycle_key = QueryLifecycleKey::new(principal.0, &query_id);
+        let lifecycle_key = QueryLifecycleKey::new(principal.0, scope, &query_id);
         let mut lifecycle = self.lifecycle.lock().await;
         cancel_query_lifecycle_entry(&mut lifecycle, &self.metrics, &lifecycle_key)
     }
@@ -1754,11 +2101,21 @@ impl TcpQueryCellClient {
     }
 
     pub async fn cancel_query(&self, query_id: impl Into<String>) -> Result<()> {
+        self.cancel_query_in_scope(GraphScope::default(), query_id)
+            .await
+    }
+
+    pub async fn cancel_query_in_scope(
+        &self,
+        scope: GraphScope,
+        query_id: impl Into<String>,
+    ) -> Result<()> {
         let query_id = query_id.into();
         validate_component("query_id", &query_id)?;
         let request = QueryTransportRequest::Cancel {
             version: QUERY_TRANSPORT_VERSION,
             auth: self.auth(),
+            scope,
             query_id,
         };
         match self.send_control(request).await? {
@@ -2800,6 +3157,8 @@ enum QueryTransportRequest {
     Cancel {
         version: u16,
         auth: QueryTransportAuth,
+        #[serde(default)]
+        scope: GraphScope,
         query_id: String,
     },
 }
@@ -3107,8 +3466,17 @@ async fn execute_query_transport_request(
                 Ok(principal) => principal,
                 Err(err) => return transport_error_response(&runtime, err),
             };
+            let action = match classify_query_transport_action(&query) {
+                Ok(action) => action,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            if let Err(err) =
+                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
+            {
+                return transport_error_response(&runtime, err);
+            }
             let query_id = context.idempotency_key.clone();
-            let lifecycle_key = QueryLifecycleKey::new(principal, &query_id);
+            let lifecycle_key = QueryLifecycleKey::new(principal, context.scope.clone(), &query_id);
             match execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
                 client.execute_cypher_rows(
                     context.with_cancellation_token(cancellation_token),
@@ -3136,8 +3504,26 @@ async fn execute_query_transport_request(
                 Ok(principal) => principal,
                 Err(err) => return transport_error_response(&runtime, err),
             };
+            let action = match classify_query_transport_action(&query) {
+                Ok(action) => action,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            if let Err(err) =
+                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
+            {
+                return transport_error_response(&runtime, err);
+            }
+            if action == QueryTransportAction::Write {
+                return transport_error_response(
+                    &runtime,
+                    GraphError::UnsupportedQuery {
+                        dialect: "QueryTransport",
+                        feature: "mutation queries cannot use paged row execution".to_string(),
+                    },
+                );
+            }
             let query_id = context.idempotency_key.clone();
-            let lifecycle_key = QueryLifecycleKey::new(principal, &query_id);
+            let lifecycle_key = QueryLifecycleKey::new(principal, context.scope.clone(), &query_id);
             match execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
                 client.execute_cypher_rows_page(
                     context.with_cancellation_token(cancellation_token),
@@ -3155,6 +3541,7 @@ async fn execute_query_transport_request(
         QueryTransportRequest::Cancel {
             version,
             auth,
+            scope,
             query_id,
         } => {
             if !query_transport_version_supported(version) {
@@ -3164,7 +3551,15 @@ async fn execute_query_transport_request(
                 Ok(principal) => principal,
                 Err(err) => return transport_error_response(&runtime, err),
             };
-            let lifecycle_key = QueryLifecycleKey::new(principal, &query_id);
+            if let Err(err) = authorize_query_transport_scope(
+                &runtime,
+                &principal,
+                &scope,
+                QueryTransportAction::Cancel,
+            ) {
+                return transport_error_response(&runtime, err);
+            }
+            let lifecycle_key = QueryLifecycleKey::new(principal, scope, &query_id);
             match cancel_active_query(&runtime, &lifecycle_key).await {
                 Ok(()) => QueryTransportResponse::Cancelled,
                 Err(err) => transport_error_response(&runtime, err),
@@ -3191,6 +3586,14 @@ fn query_transport_version_supported(version: u16) -> bool {
 }
 
 #[cfg(feature = "query-transport")]
+fn classify_query_transport_action(query: &str) -> Result<QueryTransportAction> {
+    match crate::query::opencypher::classify_opencypher_query_access(query)? {
+        crate::query::opencypher::OpenCypherQueryAccess::Read => Ok(QueryTransportAction::Read),
+        crate::query::opencypher::OpenCypherQueryAccess::Write => Ok(QueryTransportAction::Write),
+    }
+}
+
+#[cfg(feature = "query-transport")]
 async fn execute_metered_query<F, Fut, T>(
     runtime: &Arc<QueryTransportServerRuntime>,
     lifecycle_key: &QueryLifecycleKey,
@@ -3203,7 +3606,13 @@ where
     let (lifecycle_token, cancellation_token) =
         begin_query_lifecycle(runtime, lifecycle_key).await?;
     let result = async {
-        let _permit = acquire_query_transport_permit(runtime).await?;
+        let _namespace_permits = acquire_namespace_query_permits(
+            runtime,
+            &lifecycle_key.scope.namespace,
+            &cancellation_token,
+        )
+        .await?;
+        let _permit = acquire_query_transport_permit(runtime, &cancellation_token).await?;
         activate_query_lifecycle(runtime, lifecycle_key, lifecycle_token).await?;
         ensure_query_not_cancelled(runtime, lifecycle_key, lifecycle_token).await?;
         runtime
@@ -3362,7 +3771,9 @@ fn cancel_query_lifecycle_entry(
     };
     let queued = entry.state == QueryLifecycleState::Queued;
     if queued {
-        lifecycle.queries.remove(lifecycle_key);
+        if let Some(entry) = lifecycle.queries.remove(lifecycle_key) {
+            entry.cancellation_token.cancel();
+        }
         metrics.cancelled_rejections.fetch_add(1, Ordering::Relaxed);
     } else if let Some(entry) = lifecycle.queries.get_mut(lifecycle_key) {
         entry.cancellation_token.cancel();
@@ -3375,6 +3786,7 @@ fn cancel_query_lifecycle_entry(
 #[cfg(feature = "query-transport")]
 async fn acquire_query_transport_permit(
     runtime: &Arc<QueryTransportServerRuntime>,
+    cancellation_token: &QueryCancellationToken,
 ) -> Result<OwnedSemaphorePermit> {
     match Arc::clone(&runtime.request_gate).try_acquire_owned() {
         Ok(permit) => Ok(permit),
@@ -3383,15 +3795,51 @@ async fn acquire_query_transport_permit(
                 .metrics
                 .backpressure_waits
                 .fetch_add(1, Ordering::Relaxed);
-            Arc::clone(&runtime.request_gate)
-                .acquire_owned()
-                .await
-                .map_err(|err| GraphError::CorruptValue {
-                    key: "query/transport/backpressure".to_string(),
-                    reason: err.to_string(),
-                })
+            tokio::select! {
+                permit = Arc::clone(&runtime.request_gate).acquire_owned() => {
+                    permit.map_err(|err| GraphError::CorruptValue {
+                        key: "query/transport/backpressure".to_string(),
+                        reason: err.to_string(),
+                    })
+                }
+                _ = cancellation_token.cancelled() => Err(cancelled_query_error()),
+            }
         }
     }
+}
+
+#[cfg(feature = "query-transport")]
+async fn acquire_namespace_query_permits(
+    runtime: &Arc<QueryTransportServerRuntime>,
+    namespace: &NamespacePath,
+    cancellation_token: &QueryCancellationToken,
+) -> Result<Vec<OwnedSemaphorePermit>> {
+    let mut permits = Vec::new();
+    for ancestor in namespace.ancestors_inclusive().rev() {
+        let Some(gate) = runtime.namespace_query_gates.get(&ancestor) else {
+            continue;
+        };
+        let permit = match Arc::clone(gate).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                runtime
+                    .metrics
+                    .namespace_quota_waits
+                    .fetch_add(1, Ordering::Relaxed);
+                tokio::select! {
+                    permit = Arc::clone(gate).acquire_owned() => {
+                        permit.map_err(|err| GraphError::CorruptValue {
+                            key: format!("query/transport/namespace_quota/{ancestor}"),
+                            reason: err.to_string(),
+                        })?
+                    }
+                    _ = cancellation_token.cancelled() => return Err(cancelled_query_error()),
+                }
+            }
+        };
+        permits.push(permit);
+    }
+    Ok(permits)
 }
 
 #[cfg(feature = "query-transport")]
@@ -3447,6 +3895,37 @@ fn authenticate_query_transport(
 }
 
 #[cfg(feature = "query-transport")]
+fn authorize_query_transport_scope(
+    runtime: &QueryTransportServerRuntime,
+    principal: &QueryTransportPrincipal,
+    scope: &GraphScope,
+    action: QueryTransportAction,
+) -> Result<()> {
+    if runtime
+        .config
+        .scope_authorizer
+        .authorize(principal, scope, action)
+        || (action != QueryTransportAction::Admin
+            && runtime.config.scope_authorizer.authorize(
+                principal,
+                scope,
+                QueryTransportAction::Admin,
+            ))
+    {
+        return Ok(());
+    }
+    runtime
+        .metrics
+        .namespace_access_denials
+        .fetch_add(1, Ordering::Relaxed);
+    Err(GraphError::GraphScopeAccessDenied {
+        principal: principal.error_label().to_string(),
+        action: action.as_str(),
+        scope: scope.to_string(),
+    })
+}
+
+#[cfg(feature = "query-transport")]
 fn transport_error_response(
     runtime: &QueryTransportServerRuntime,
     err: GraphError,
@@ -3457,6 +3936,7 @@ fn transport_error_response(
         .fetch_add(1, Ordering::Relaxed);
     let message = match &err {
         GraphError::AdmissionRejected { .. }
+        | GraphError::GraphScopeAccessDenied { .. }
         | GraphError::MissingQueryParameter { .. }
         | GraphError::QueryParse { .. }
         | GraphError::QueryTimeout { .. }
