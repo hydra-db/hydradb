@@ -271,6 +271,36 @@ impl GraphShard {
         Ok(chunks)
     }
 
+    pub(crate) async fn latest_posting_artifact_epoch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        read_epoch: GraphEpoch,
+    ) -> Result<Option<GraphEpoch>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let mut iter = self
+            .scan_remote_prefix(&posting_artifact_manifest_prefix(cell_id, edge_type))
+            .await?;
+        let mut latest = None;
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let manifest = decode_posting_artifact_manifest(&key, &kv.value)?;
+            if manifest.cell_id != cell_id || manifest.edge_type != edge_type {
+                return corrupt(
+                    &key,
+                    "posting artifact manifest identity does not match prefix",
+                );
+            }
+            if manifest.base_epoch <= read_epoch
+                && latest.is_none_or(|epoch| manifest.base_epoch > epoch)
+            {
+                latest = Some(manifest.base_epoch);
+            }
+        }
+        Ok(latest)
+    }
+
     pub async fn build_matrix_tiles(
         &self,
         cell_id: &str,
