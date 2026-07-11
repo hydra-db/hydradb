@@ -64,12 +64,14 @@ pub struct ParsedMutationQuery {
     pub actions: Vec<RowMutationAction>,
 }
 
+#[cfg(feature = "query-transport")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ParsedUnwindBatch {
     pub(crate) parameter: String,
     pub(crate) kind: ParsedUnwindBatchKind,
 }
 
+#[cfg(feature = "query-transport")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ParsedUnwindBatchKind {
     OutNeighbors {
@@ -291,6 +293,7 @@ pub fn parse_opencypher_mutation_query_with_parameters(
     parsed.lower_mutation_query(parameters)
 }
 
+#[cfg(feature = "public-client-protocols")]
 pub(crate) fn parse_opencypher_unwind_batch(query: &str) -> Result<Option<ParsedUnwindBatch>> {
     ParsedCypher::parse(query)?.lower_unwind_batch()
 }
@@ -426,6 +429,7 @@ impl ParsedCypher {
         }
     }
 
+    #[cfg(feature = "query-transport")]
     fn lower_unwind_batch(&self) -> Result<Option<ParsedUnwindBatch>> {
         unsafe {
             let directives = sys::cypher_parse_result_ndirectives(self.result);
@@ -1922,6 +1926,7 @@ fn lower_create_edge_pattern(
     }
 }
 
+#[cfg(feature = "query-transport")]
 struct UnwindEdgeTemplate {
     edge_type: String,
     source_field: String,
@@ -1930,6 +1935,7 @@ struct UnwindEdgeTemplate {
     relationship_binding: Option<String>,
 }
 
+#[cfg(feature = "query-transport")]
 fn unwind_edge_template(
     pattern: *const AstNode,
     unwind_alias: &str,
@@ -2000,6 +2006,7 @@ fn unwind_edge_template(
     }
 }
 
+#[cfg(feature = "query-transport")]
 fn unwind_node_id_field(
     node: *const AstNode,
     unwind_alias: &str,

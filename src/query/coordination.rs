@@ -2347,18 +2347,18 @@ impl TcpQueryCellClient {
             None => self.open_connection_with_retries().await?,
         };
         let decoded = self.send_on_io(&mut *connection.io, request).await?;
-        if requires_legacy_version_fallback(request, &decoded) {
+        if let Some(fallback_version) = query_transport_fallback_version(request, &decoded) {
             self.metrics.client_retries.fetch_add(1, Ordering::Relaxed);
-            let mut legacy_request = request.clone();
-            legacy_request.set_version(QUERY_TRANSPORT_LEGACY_VERSION);
-            let mut legacy_connection = self.open_connection_with_retries().await?;
-            let legacy = self
-                .send_on_io(&mut *legacy_connection.io, &legacy_request)
+            let mut fallback_request = request.clone();
+            fallback_request.set_version(fallback_version);
+            let mut fallback_connection = self.open_connection_with_retries().await?;
+            let fallback = self
+                .send_on_io(&mut *fallback_connection.io, &fallback_request)
                 .await?;
-            if !legacy.close_connection {
-                self.recycle_connection(legacy_connection).await;
+            if !fallback.close_connection {
+                self.recycle_connection(fallback_connection).await;
             }
-            return Ok(legacy.response);
+            return Ok(fallback.response);
         }
         if !decoded.close_connection {
             self.recycle_connection(connection).await;
@@ -2380,13 +2380,13 @@ impl TcpQueryCellClient {
             })?;
         let mut connection = self.open_connection_with_retries().await?;
         let decoded = self.send_on_io(&mut *connection.io, request).await?;
-        if requires_legacy_version_fallback(request, &decoded) {
+        if let Some(fallback_version) = query_transport_fallback_version(request, &decoded) {
             self.metrics.client_retries.fetch_add(1, Ordering::Relaxed);
-            let mut legacy_request = request.clone();
-            legacy_request.set_version(QUERY_TRANSPORT_LEGACY_VERSION);
-            let mut legacy_connection = self.open_connection_with_retries().await?;
+            let mut fallback_request = request.clone();
+            fallback_request.set_version(fallback_version);
+            let mut fallback_connection = self.open_connection_with_retries().await?;
             return Ok(self
-                .send_on_io(&mut *legacy_connection.io, &legacy_request)
+                .send_on_io(&mut *fallback_connection.io, &fallback_request)
                 .await?
                 .response);
         }
@@ -2508,21 +2508,29 @@ impl TcpQueryCellClient {
 }
 
 #[cfg(feature = "query-transport")]
-fn requires_legacy_version_fallback(
+fn query_transport_fallback_version(
     request: &QueryTransportRequest,
     decoded: &DecodedQueryTransportResponse,
-) -> bool {
-    if !decoded.legacy || request.version() != QUERY_TRANSPORT_VERSION {
-        return false;
+) -> Option<u16> {
+    if request.version() != QUERY_TRANSPORT_VERSION || !request.can_downgrade() {
+        return None;
     }
-    matches!(
-        &decoded.response,
-        QueryTransportResponse::Error { message }
-            if message
-                == &format!(
-                    "unsupported query transport version {QUERY_TRANSPORT_VERSION}; expected {QUERY_TRANSPORT_LEGACY_VERSION}"
-                )
-    )
+    let QueryTransportResponse::Error { message } = &decoded.response else {
+        return None;
+    };
+    if decoded.legacy
+        && message
+            == &format!(
+                "unsupported query transport version {QUERY_TRANSPORT_VERSION}; expected {QUERY_TRANSPORT_LEGACY_VERSION}"
+            )
+    {
+        return Some(QUERY_TRANSPORT_LEGACY_VERSION);
+    }
+    (message
+        == &format!(
+            "unsupported query transport version {QUERY_TRANSPORT_VERSION}; supported versions are {QUERY_TRANSPORT_LEGACY_VERSION} and {QUERY_TRANSPORT_PREVIOUS_VERSION}"
+        ))
+    .then_some(QUERY_TRANSPORT_PREVIOUS_VERSION)
 }
 
 #[cfg(feature = "query-transport")]
@@ -3099,7 +3107,13 @@ impl QueryCellClient for RoutedGraphCluster {
                     .read_epoch
                     .unwrap_or(shard.current_epoch(&context.cell_id).await?);
                 let entries = shard
-                    .out_neighbors_batch_at(&context.cell_id, &edge_type, sources, read_epoch)
+                    .out_neighbors_batch_at_with_cancellation(
+                        &context.cell_id,
+                        &edge_type,
+                        sources,
+                        read_epoch,
+                        context.cancellation_token.clone(),
+                    )
                     .await?;
                 let row_count = entries
                     .iter()
@@ -3539,6 +3553,13 @@ impl QueryTransportRequest {
 
     fn is_cancel(&self) -> bool {
         matches!(self, Self::Cancel { .. })
+    }
+
+    fn can_downgrade(&self) -> bool {
+        matches!(
+            self,
+            Self::Rows { .. } | Self::Page { .. } | Self::Cancel { .. }
+        )
     }
 }
 

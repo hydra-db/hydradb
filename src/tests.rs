@@ -331,6 +331,27 @@ async fn batch_reads_enforce_configured_request_limit_before_scanning() {
     ));
 }
 
+#[tokio::test]
+async fn batch_neighbor_reads_honor_cancellation_before_storage_scans() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/batch-read-cancel", object_store).await;
+    let token = QueryCancellationToken::new();
+    token.cancel();
+
+    let error = shard
+        .out_neighbors_batch_at_with_cancellation("reddit-home", "FOLLOWS", [1], 0, Some(token))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GraphError::QueryTimeout {
+            operation: "query_cancelled",
+            limit_ms: 0,
+            ..
+        }
+    ));
+}
+
 async fn bulk_import_txn_retry_for_test(
     shard: Arc<GraphShard>,
     cell_id: &str,
@@ -10075,6 +10096,49 @@ fn test_transport_rows_response() -> serde_json::Value {
             vec![QueryRow::new(vec![QueryValue::VertexId(1)])],
         ),
     })
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_v3_client_falls_back_to_v2_server() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let version_two_server = tokio::spawn(async move {
+        for expected_version in [3_u64, 2_u64] {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let request = test_read_transport_json(&mut reader).await;
+            assert_eq!(request["version"].as_u64(), Some(expected_version));
+            let response = if expected_version == 3 {
+                serde_json::json!({
+                    "response": {
+                        "kind": "error",
+                        "message": "unsupported query transport version 3; supported versions are 1 and 2",
+                    },
+                    "close_connection": true,
+                })
+            } else {
+                serde_json::json!({
+                    "response": test_transport_rows_response(),
+                    "close_connection": true,
+                })
+            };
+            test_write_transport_json(&mut reader, &response).await;
+        }
+    });
+
+    let client = TcpQueryCellClient::new(addr).with_timeout(std::time::Duration::from_secs(2));
+    let result = client
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "rolling-v3-client-v2-server"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(client.metrics().connections_created, 2);
+    assert_eq!(client.metrics().client_retries, 1);
+    version_two_server.await.unwrap();
 }
 
 #[cfg(feature = "query-transport")]
