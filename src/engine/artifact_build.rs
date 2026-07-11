@@ -322,11 +322,35 @@ impl GraphShard {
             return Ok(false);
         };
         let manifest = decode_posting_manifest(&manifest_key, &value)?;
-        if manifest.chunk_count > 0 && manifest.chunk_bounds.is_empty() {
-            return corrupt(
-                &manifest_key,
-                "posting_manifest1 lacks point-lookup bounds; rebuild this artifact epoch",
-            );
+        if manifest.chunk_count == 0 {
+            return Ok(false);
+        }
+        if manifest.chunk_bounds.is_empty() {
+            let mut low = 0_u64;
+            let mut high = manifest.chunk_count;
+            while low < high {
+                let chunk_id = low + (high - low) / 2;
+                let chunk = self
+                    .posting_point_lookup_chunk(
+                        cell_id, edge_type, src, base_epoch, &manifest, chunk_id,
+                    )
+                    .await?;
+                let Some(first) = chunk.vertices.first().copied() else {
+                    return corrupt(
+                        &manifest_key,
+                        "legacy posting manifest references empty chunk",
+                    );
+                };
+                let last = chunk.vertices.last().copied().unwrap_or(first);
+                if dst < first {
+                    high = chunk_id;
+                } else if dst > last {
+                    low = chunk_id.saturating_add(1);
+                } else {
+                    return Ok(chunk.vertices.binary_search(&dst).is_ok());
+                }
+            }
+            return Ok(false);
         }
         let Some(bound) = manifest
             .chunk_bounds
@@ -335,13 +359,40 @@ impl GraphShard {
         else {
             return Ok(false);
         };
+        let chunk = self
+            .posting_point_lookup_chunk(
+                cell_id,
+                edge_type,
+                src,
+                base_epoch,
+                &manifest,
+                bound.chunk_id,
+            )
+            .await?;
+        if chunk.vertices.first().copied() != Some(bound.first)
+            || chunk.vertices.last().copied() != Some(bound.last)
+        {
+            return corrupt(&manifest_key, "posting point-lookup chunk bounds mismatch");
+        }
+        Ok(chunk.vertices.binary_search(&dst).is_ok())
+    }
+
+    async fn posting_point_lookup_chunk(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        base_epoch: GraphEpoch,
+        manifest: &PostingChunkManifest,
+        chunk_id: u64,
+    ) -> Result<PostingChunk> {
         let key = posting_chunk_key(
             cell_id,
             edge_type,
             ArtifactDirection::Out,
             src,
             base_epoch,
-            bound.chunk_id,
+            chunk_id,
         );
         let Some(value) = self.read_remote(&key).await? else {
             return corrupt(
@@ -350,17 +401,21 @@ impl GraphShard {
             );
         };
         let chunk = decode_posting_chunk(&key, &value)?;
-        if chunk.vertices.first().copied() != Some(bound.first)
-            || chunk.vertices.last().copied() != Some(bound.last)
-        {
-            return corrupt(&key, "posting point-lookup chunk bounds mismatch");
+        let checksum_index = usize::try_from(chunk_id).map_err(|err| GraphError::CorruptValue {
+            key: key.clone(),
+            reason: format!("posting chunk id does not fit usize: {err}"),
+        })?;
+        let expected = manifest
+            .chunk_checksums
+            .get(checksum_index)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: key.clone(),
+                reason: "posting manifest is missing point-lookup chunk checksum".to_string(),
+            })?;
+        if posting_chunk_checksum(&chunk) != *expected {
+            return corrupt(&key, "posting point-lookup chunk checksum mismatch");
         }
-        if let Some(expected) = manifest.chunk_checksums.get(bound.chunk_id as usize) {
-            if posting_chunk_checksum(&chunk) != *expected {
-                return corrupt(&key, "posting point-lookup chunk checksum mismatch");
-            }
-        }
-        Ok(chunk.vertices.binary_search(&dst).is_ok())
+        Ok(chunk)
     }
 
     pub async fn build_matrix_tiles(
