@@ -32,6 +32,8 @@ jobs:
         run: cargo clippy --locked --all-targets --features opencypher,graphblas,query-transport,query-transport-tls,query-service-discovery,public-client-protocols -- -D warnings
       - name: Clippy public client protocols
         run: cargo clippy --locked --all-targets --features public-client-protocols -- -D warnings
+      - name: Check standalone Bolt server
+        run: cargo check --locked --all-targets --features bolt-server
       - name: Test default feature set
         run: cargo test --locked --lib
       - name: Test chaos harness feature set

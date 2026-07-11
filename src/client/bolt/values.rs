@@ -2,7 +2,9 @@ use boltr::error::BoltError;
 use boltr::types::BoltValue;
 
 use super::{ClientBookmark, ClientQueryTarget};
-use crate::{GraphError, QueryFloat, QueryValue, VertexPropertyValue};
+use crate::{GraphError, QueryFloat, QueryParameterValue, QueryValue, VertexPropertyValue};
+
+const MAX_QUERY_PARAMETER_DEPTH: usize = 16;
 
 pub(super) fn highest_matching_bookmark(
     target: &ClientQueryTarget,
@@ -43,6 +45,44 @@ pub(super) fn bolt_parameter_to_property(
             name,
             "only boolean, signed integer, finite float, and string parameters are supported",
         )),
+    }
+}
+
+pub(super) fn bolt_parameter_to_query_value(
+    name: &str,
+    value: &BoltValue,
+) -> std::result::Result<QueryParameterValue, BoltError> {
+    bolt_parameter_to_query_value_at_depth(name, value, 0)
+}
+
+fn bolt_parameter_to_query_value_at_depth(
+    name: &str,
+    value: &BoltValue,
+    depth: usize,
+) -> std::result::Result<QueryParameterValue, BoltError> {
+    if depth > MAX_QUERY_PARAMETER_DEPTH {
+        return Err(invalid_bolt_parameter(
+            name,
+            "nested parameter depth exceeds 16",
+        ));
+    }
+    match value {
+        BoltValue::List(values) => values
+            .iter()
+            .map(|value| bolt_parameter_to_query_value_at_depth(name, value, depth + 1))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(QueryParameterValue::List),
+        BoltValue::Dict(values) => values
+            .iter()
+            .map(|(key, value)| {
+                Ok((
+                    key.clone(),
+                    bolt_parameter_to_query_value_at_depth(name, value, depth + 1)?,
+                ))
+            })
+            .collect::<std::result::Result<std::collections::BTreeMap<_, _>, BoltError>>()
+            .map(QueryParameterValue::Map),
+        _ => bolt_parameter_to_property(name, value).map(QueryParameterValue::Scalar),
     }
 }
 

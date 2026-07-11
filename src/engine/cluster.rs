@@ -564,6 +564,45 @@ impl ManagedGraphNode {
             .await
     }
 
+    pub async fn out_neighbors_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        sources: impl IntoIterator<Item = VertexId>,
+    ) -> Result<Vec<crate::NeighborBatchEntry>> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .out_neighbors_batch(cell_id, edge_type, sources)
+            .await
+    }
+
+    pub async fn in_neighbors_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        destinations: impl IntoIterator<Item = VertexId>,
+    ) -> Result<Vec<crate::NeighborBatchEntry>> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .in_neighbors_batch(cell_id, edge_type, destinations)
+            .await
+    }
+
+    pub async fn edge_exists_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+    ) -> Result<Vec<crate::EdgeExistenceBatchEntry>> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        node.cluster()
+            .edge_exists_batch(cell_id, edge_type, edges)
+            .await
+    }
+
     #[cfg(feature = "opencypher")]
     pub async fn execute_cypher(
         &self,
@@ -1472,7 +1511,7 @@ impl RoutedGraphCluster {
             })
     }
 
-    fn ensure_active_write_lease(&self, cell_id: &str) -> Result<()> {
+    pub(crate) fn ensure_active_write_lease(&self, cell_id: &str) -> Result<()> {
         if let Some(lease) = self
             .leases
             .read()
@@ -1736,6 +1775,39 @@ impl RoutedGraphCluster {
         let shard = self.shard(cell_id)?;
         self.ensure_active_write_lease(cell_id)?;
         shard.write_edge_mutations_batch(cell_id, mutations).await
+    }
+
+    pub async fn out_neighbors_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        sources: impl IntoIterator<Item = VertexId>,
+    ) -> Result<Vec<crate::NeighborBatchEntry>> {
+        self.shard(cell_id)?
+            .out_neighbors_batch(cell_id, edge_type, sources)
+            .await
+    }
+
+    pub async fn in_neighbors_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        destinations: impl IntoIterator<Item = VertexId>,
+    ) -> Result<Vec<crate::NeighborBatchEntry>> {
+        self.shard(cell_id)?
+            .in_neighbors_batch(cell_id, edge_type, destinations)
+            .await
+    }
+
+    pub async fn edge_exists_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+    ) -> Result<Vec<crate::EdgeExistenceBatchEntry>> {
+        self.shard(cell_id)?
+            .edge_exists_batch(cell_id, edge_type, edges)
+            .await
     }
 
     pub async fn execute_query_statement(
