@@ -31,7 +31,8 @@ impl GraphShard {
     ) -> Result<Vec<SupernodeGroup>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        self.ensure_write_authority(cell_id, "build_supernode_groups_for_directions")?;
+        self.validate_write_fence(cell_id, "build_supernode_groups")
+            .await?;
         if chunk_size == 0 {
             return Err(GraphError::CorruptValue {
                 key: "supernode_chunk_size".to_string(),
