@@ -350,6 +350,21 @@ async fn batch_neighbor_reads_honor_cancellation_before_storage_scans() {
             ..
         }
     ));
+
+    let token = QueryCancellationToken::new();
+    token.cancel();
+    let error = shard
+        .in_neighbors_batch_at_with_cancellation("reddit-home", "FOLLOWS", [1], 0, Some(token))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GraphError::QueryTimeout {
+            operation: "query_cancelled",
+            limit_ms: 0,
+            ..
+        }
+    ));
 }
 
 async fn bulk_import_txn_retry_for_test(
@@ -1637,6 +1652,76 @@ async fn outbound_only_index_policy_skips_reverse_rows_with_read_fallback() {
         .unwrap();
     assert!(report.is_clean(), "{:?}", report.mismatch_samples);
     assert_eq!(report.in_index_edges, 0);
+
+    assert_eq!(
+        shard
+            .in_neighbors_batch(
+                "reddit-home",
+                "USER_SUBSCRIBED_TO_SUBREDDIT",
+                [2, 3, 404, 2],
+            )
+            .await
+            .unwrap(),
+        vec![
+            NeighborBatchEntry {
+                vertex: 2,
+                neighbors: vec![1, 4],
+            },
+            NeighborBatchEntry {
+                vertex: 3,
+                neighbors: vec![1],
+            },
+            NeighborBatchEntry {
+                vertex: 404,
+                neighbors: Vec::new(),
+            },
+            NeighborBatchEntry {
+                vertex: 2,
+                neighbors: vec![1, 4],
+            },
+        ]
+    );
+
+    shard
+        .build_posting_chunks(
+            "reddit-home",
+            "USER_SUBSCRIBED_TO_SUBREDDIT",
+            result.end_epoch,
+            2,
+        )
+        .await
+        .unwrap();
+    shard
+        .delete_edge(typed_mutation(
+            "reddit-home",
+            "USER_SUBSCRIBED_TO_SUBREDDIT",
+            1,
+            2,
+            "outbound-only-delete",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        shard
+            .in_neighbors_batch_at(
+                "reddit-home",
+                "USER_SUBSCRIBED_TO_SUBREDDIT",
+                [2],
+                result.end_epoch,
+            )
+            .await
+            .unwrap()[0]
+            .neighbors,
+        vec![1, 4]
+    );
+    assert_eq!(
+        shard
+            .in_neighbors_batch("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", [2],)
+            .await
+            .unwrap()[0]
+            .neighbors,
+        vec![4]
+    );
 }
 
 #[tokio::test]
