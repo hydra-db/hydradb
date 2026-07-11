@@ -4,6 +4,22 @@ use crate::{
     StaticQueryTransportScopeAuthorizer,
 };
 use async_trait::async_trait;
+use std::sync::atomic::AtomicBool;
+
+struct RevocableScopeAuthorizer {
+    allowed: Arc<AtomicBool>,
+}
+
+impl QueryTransportScopeAuthorizer for RevocableScopeAuthorizer {
+    fn authorize(
+        &self,
+        _principal: &QueryTransportPrincipal,
+        _scope: &GraphScope,
+        action: QueryTransportAction,
+    ) -> bool {
+        self.allowed.load(Ordering::SeqCst) && action == QueryTransportAction::Read
+    }
+}
 
 struct TestClient {
     epoch: AtomicU64,
@@ -102,6 +118,48 @@ async fn service_authenticates_authorizes_and_returns_epoch_bookmark() {
         .unwrap();
     assert_eq!(response.result.rows.len(), 1);
     assert_eq!(response.bookmark.unwrap().epoch, 7);
+}
+
+#[tokio::test]
+async fn prepared_pages_reauthorize_after_scope_grant_revocation() {
+    let allowed = Arc::new(AtomicBool::new(true));
+    let service = ClientQueryService::new(
+        Arc::new(TestClient {
+            epoch: AtomicU64::new(7),
+        }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(RevocableScopeAuthorizer {
+                allowed: Arc::clone(&allowed),
+            })),
+    )
+    .unwrap();
+    let session = service
+        .authenticate(
+            &ClientQueryCredentials::Bearer("secret".to_string()),
+            &QueryTransportConnectionIdentity::default(),
+        )
+        .unwrap();
+    let prepared = service
+        .prepare_page_request(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "query-revoked-cursor",
+                "MATCH (n {id: 1}) RETURN n.id",
+            ),
+            1,
+        )
+        .await
+        .unwrap();
+
+    allowed.store(false, Ordering::SeqCst);
+    let error = service
+        .execute_prepared_page(&session, prepared, Some(QueryCursorToken::new(1)), 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, GraphError::GraphScopeAccessDenied { .. }));
+    assert_eq!(service.active_query_count().await, 0);
 }
 
 #[tokio::test]
@@ -283,4 +341,84 @@ async fn service_enforces_server_runtime_ceiling_and_cleans_timed_out_queries() 
     })
     .await
     .unwrap();
+}
+
+struct CancellationIgnoringClient;
+
+#[async_trait]
+impl QueryCellClient for CancellationIgnoringClient {
+    async fn execute_cypher_rows(
+        &self,
+        _context: QueryContext,
+        _query: &str,
+    ) -> Result<QueryResultSet> {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let result = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(result.columns, result.rows, None))
+    }
+
+    async fn current_graph_epoch(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<GraphEpoch>> {
+        Ok(Some(7))
+    }
+}
+
+#[tokio::test]
+async fn timeout_keeps_admission_owned_until_non_cooperative_work_stops() {
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::read_graph(GraphScope::default()),
+        )
+        .unwrap();
+    let service = ClientQueryService::new(
+        Arc::new(CancellationIgnoringClient),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_max_concurrent_queries(1)
+            .with_max_query_runtime_ms(5),
+    )
+    .unwrap();
+    let session = service
+        .authenticate(
+            &ClientQueryCredentials::Bearer("secret".to_string()),
+            &QueryTransportConnectionIdentity::default(),
+        )
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let error = service
+        .execute_rows(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "query-non-cooperative-timeout",
+                "MATCH (n {id: 1}) RETURN n.id",
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GraphError::QueryTimeout {
+            operation: "client_query_runtime",
+            ..
+        }
+    ));
+    assert!(started.elapsed() >= Duration::from_millis(25));
+    assert_eq!(service.active_query_count().await, 0);
 }

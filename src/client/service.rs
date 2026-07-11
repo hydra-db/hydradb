@@ -760,6 +760,9 @@ impl ClientQueryService {
             columns: _,
             read_context,
         } = prepared;
+        // Grants can change while a Bolt cursor is open. The parsed query and
+        // access classification are reusable, but authorization is not.
+        self.authorize_scope(session, &request.target.scope, action)?;
         if action == QueryTransportAction::Write && cursor.is_some() {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "ClientProtocol",
@@ -1116,14 +1119,18 @@ impl ClientQueryService {
     where
         F: Future<Output = Result<T>>,
     {
-        match tokio::time::timeout(
-            Duration::from_millis(runtime_limit_ms),
-            self.run_query(key, generation, cancellation_token, execute),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(client_query_runtime_exceeded(runtime_limit_ms)),
+        let query = self.run_query(key, generation, cancellation_token, execute);
+        tokio::pin!(query);
+        tokio::select! {
+            result = &mut query => result,
+            _ = tokio::time::sleep(Duration::from_millis(runtime_limit_ms)) => {
+                // spawn_blocking work cannot be aborted once native GraphBLAS has
+                // started. Signal cooperative cancellation, then keep the query
+                // and namespace permits until the executor has actually stopped.
+                cancellation_token.cancel();
+                let _ = query.await;
+                Err(client_query_runtime_exceeded(runtime_limit_ms))
+            }
         }
     }
 
