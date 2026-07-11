@@ -1775,6 +1775,40 @@ async fn outbound_only_index_policy_skips_reverse_rows_with_read_fallback() {
         )
         .await
         .unwrap();
+    let legacy_manifest_key = format!(
+        "cell/reddit-home/artifact/posting_manifest/USER_SUBSCRIBED_TO_SUBREDDIT/out/{:020}/{:020}",
+        1, result.end_epoch
+    );
+    let manifest_value = shard
+        .read_remote(&legacy_manifest_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest_text = std::str::from_utf8(&manifest_value).unwrap();
+    let mut manifest_parts = manifest_text
+        .trim_end_matches('\n')
+        .split('\t')
+        .collect::<Vec<_>>();
+    assert_eq!(manifest_parts.len(), 10);
+    assert_eq!(manifest_parts[0], "posting_manifest2");
+    manifest_parts[0] = "posting_manifest1";
+    let legacy_manifest = format!("{}\n", manifest_parts[..9].join("\t"));
+    let mut batch = GraphWriteBatch::new();
+    batch.put(legacy_manifest_key.as_bytes(), legacy_manifest.as_bytes());
+    shard
+        .write_graph_batch_strict("reddit-home", "test_legacy_posting_manifest", batch)
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation(
+            "reddit-home",
+            "USER_SUBSCRIBED_TO_SUBREDDIT",
+            99,
+            100,
+            "legacy-posting-after-snapshot",
+        ))
+        .await
+        .unwrap();
     assert!(
         shard
             .edge_exists_batch_at(
