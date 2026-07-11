@@ -90,6 +90,247 @@ async fn segment_append_txn_retry_for_test(
     unreachable!("transaction retry loop always returns on final attempt")
 }
 
+#[tokio::test]
+async fn batch_reads_share_one_snapshot_and_preserve_input_order() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/batch-reads", object_store).await;
+    shard
+        .write_edge_mutations_batch(
+            "reddit-home",
+            [
+                typed_mutation("reddit-home", "FOLLOWS", 1, 10, "batch-read-1"),
+                typed_mutation("reddit-home", "FOLLOWS", 1, 11, "batch-read-2"),
+                typed_mutation("reddit-home", "FOLLOWS", 2, 11, "batch-read-3"),
+                typed_mutation("reddit-home", "FOLLOWS", 3, 12, "batch-read-4"),
+            ],
+        )
+        .await
+        .unwrap();
+    let snapshot_epoch = shard.current_epoch("reddit-home").await.unwrap();
+
+    assert_eq!(
+        shard
+            .out_neighbors_batch("reddit-home", "FOLLOWS", [2, 1, 404, 1])
+            .await
+            .unwrap(),
+        vec![
+            NeighborBatchEntry {
+                vertex: 2,
+                neighbors: vec![11],
+            },
+            NeighborBatchEntry {
+                vertex: 1,
+                neighbors: vec![10, 11],
+            },
+            NeighborBatchEntry {
+                vertex: 404,
+                neighbors: Vec::new(),
+            },
+            NeighborBatchEntry {
+                vertex: 1,
+                neighbors: vec![10, 11],
+            },
+        ]
+    );
+    assert_eq!(
+        shard
+            .in_neighbors_batch("reddit-home", "FOLLOWS", [11, 12, 404])
+            .await
+            .unwrap(),
+        vec![
+            NeighborBatchEntry {
+                vertex: 11,
+                neighbors: vec![1, 2],
+            },
+            NeighborBatchEntry {
+                vertex: 12,
+                neighbors: vec![3],
+            },
+            NeighborBatchEntry {
+                vertex: 404,
+                neighbors: Vec::new(),
+            },
+        ]
+    );
+    assert_eq!(
+        shard
+            .edge_exists_batch(
+                "reddit-home",
+                "FOLLOWS",
+                [(1, 10), (2, 10), (3, 12), (1, 10)],
+            )
+            .await
+            .unwrap(),
+        vec![
+            EdgeExistenceBatchEntry {
+                src: 1,
+                dst: 10,
+                exists: true,
+            },
+            EdgeExistenceBatchEntry {
+                src: 2,
+                dst: 10,
+                exists: false,
+            },
+            EdgeExistenceBatchEntry {
+                src: 3,
+                dst: 12,
+                exists: true,
+            },
+            EdgeExistenceBatchEntry {
+                src: 1,
+                dst: 10,
+                exists: true,
+            },
+        ]
+    );
+
+    shard
+        .delete_edge(typed_mutation(
+            "reddit-home",
+            "FOLLOWS",
+            1,
+            10,
+            "batch-read-delete",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        shard
+            .edge_exists_batch_at("reddit-home", "FOLLOWS", [(1, 10)], snapshot_epoch,)
+            .await
+            .unwrap()[0]
+            .exists
+    );
+    assert!(
+        !shard
+            .edge_exists_batch("reddit-home", "FOLLOWS", [(1, 10)])
+            .await
+            .unwrap()[0]
+            .exists
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_batches_multi_pattern_create_and_multi_row_delete() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-batch-mutations", object_store).await;
+    let query = "CREATE ({id: 1})-[:FOLLOWS]->({id: 10}), \
+                 ({id: 1})-[:FOLLOWS]->({id: 11}), \
+                 ({id: 2})-[:FOLLOWS]->({id: 11})";
+    assert_eq!(
+        shard
+            .execute_cypher(
+                QueryContext::new("reddit-home", "cypher-batch-create"),
+                query,
+            )
+            .await
+            .unwrap(),
+        QueryOutput::Mutation(QueryMutationResult {
+            created_edges: 3,
+            ..QueryMutationResult::default()
+        })
+    );
+    assert_eq!(
+        shard
+            .execute_cypher(
+                QueryContext::new("reddit-home", "cypher-batch-create"),
+                query,
+            )
+            .await
+            .unwrap(),
+        QueryOutput::Mutation(QueryMutationResult {
+            created_edges: 3,
+            ..QueryMutationResult::default()
+        })
+    );
+
+    assert_eq!(
+        shard
+            .execute_cypher(
+                QueryContext::new("reddit-home", "cypher-batch-delete"),
+                "MATCH (u {id: 1})-[r:FOLLOWS]->(v) DELETE r",
+            )
+            .await
+            .unwrap(),
+        QueryOutput::Mutation(QueryMutationResult {
+            matched_rows: 2,
+            deleted_edges: 2,
+            ..QueryMutationResult::default()
+        })
+    );
+    assert_eq!(
+        shard
+            .out_neighbors_batch("reddit-home", "FOLLOWS", [1, 2])
+            .await
+            .unwrap(),
+        vec![
+            NeighborBatchEntry {
+                vertex: 1,
+                neighbors: Vec::new(),
+            },
+            NeighborBatchEntry {
+                vertex: 2,
+                neighbors: vec![11],
+            },
+        ]
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_rejects_metadata_multi_create_before_writing_any_edge() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-batch-metadata-reject", object_store).await;
+    let error = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-batch-metadata-reject"),
+            "CREATE (:User {id: 1, name: 'alice'})-[:FOLLOWS]->({id: 2}), \
+             ({id: 3})-[:FOLLOWS]->({id: 4})",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, GraphError::UnsupportedQuery { .. }));
+    assert!(shard
+        .edges_at(
+            "reddit-home",
+            "FOLLOWS",
+            shard.current_epoch("reddit-home").await.unwrap(),
+        )
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn batch_reads_enforce_configured_request_limit_before_scanning() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let limits = GraphLimits {
+        max_query_intermediate_rows: 2,
+        ..GraphLimits::default()
+    };
+    let shard = GraphShard::open_standalone_writer_with_limits(
+        "graph/batch-read-limits",
+        object_store,
+        limits,
+    )
+    .await
+    .unwrap();
+    let error = shard
+        .out_neighbors_batch("reddit-home", "FOLLOWS", [1, 2, 3])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GraphError::AdmissionRejected {
+            operation: "out_neighbors_batch_sources",
+            actual: 3,
+            limit: 2,
+        }
+    ));
+}
+
 async fn bulk_import_txn_retry_for_test(
     shard: Arc<GraphShard>,
     cell_id: &str,
@@ -9842,15 +10083,15 @@ async fn tcp_query_transport_new_client_falls_back_to_legacy_server() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let legacy_server = tokio::spawn(async move {
-        for expected_version in [2_u64, 1_u64] {
+        for expected_version in [3_u64, 1_u64] {
             let (stream, _) = listener.accept().await.unwrap();
             let mut reader = tokio::io::BufReader::new(stream);
             let request = test_read_transport_json(&mut reader).await;
             assert_eq!(request["version"].as_u64(), Some(expected_version));
-            let response = if expected_version == 2 {
+            let response = if expected_version == 3 {
                 serde_json::json!({
                     "kind": "error",
-                    "message": "unsupported query transport version 2; expected 1",
+                    "message": "unsupported query transport version 3; expected 1",
                 })
             } else {
                 test_transport_rows_response()
@@ -10350,6 +10591,122 @@ async fn tcp_query_transport_default_bind_rejects_unauthenticated_requests() {
         .unwrap_err();
     assert!(err.to_string().contains("unauthorized"));
     assert!(server.metrics().auth_failures >= 1);
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn tcp_query_transport_batches_page_rows_and_enforce_write_grants() {
+    struct StaticBatchClient;
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for StaticBatchClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            unreachable!("batch transport test does not execute Cypher rows")
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            unreachable!("batch transport test does not execute Cypher pages")
+        }
+
+        async fn execute_batch(
+            &self,
+            _context: QueryContext,
+            operation: QueryBatchOperation,
+        ) -> Result<QueryResultSet> {
+            let QueryBatchOperation::OutNeighbors {
+                sources,
+                source_column,
+                destination_column,
+                ..
+            } = operation
+            else {
+                return Ok(QueryResultSet::new(Vec::new(), Vec::new()));
+            };
+            Ok(QueryResultSet::new(
+                vec![source_column, destination_column],
+                sources
+                    .into_iter()
+                    .map(|source| {
+                        QueryRow::new(vec![
+                            QueryValue::VertexId(source),
+                            QueryValue::VertexId(source + 100),
+                        ])
+                    })
+                    .collect(),
+            ))
+        }
+    }
+
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "batch-reader",
+            QueryTransportScopeGrant::read_graph(GraphScope::default()),
+        )
+        .unwrap();
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(StaticBatchClient),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("batch-reader")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let client = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("batch-reader")
+        .insecure_allow_plaintext();
+    let operation = QueryBatchOperation::OutNeighbors {
+        edge_type: "FOLLOWS".to_string(),
+        sources: vec![1, 2, 3],
+        source_column: QueryColumn::new("src"),
+        destination_column: QueryColumn::new("dst"),
+    };
+    let first = client
+        .execute_batch_page(
+            QueryContext::new("cell-a", "tcp-batch-page-1"),
+            operation.clone(),
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.rows.len(), 2);
+    assert_eq!(first.next_cursor, Some(QueryCursorToken::new(2)));
+    let second = client
+        .execute_batch_page(
+            QueryContext::new("cell-a", "tcp-batch-page-2"),
+            operation,
+            first.next_cursor,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.rows.len(), 1);
+    assert_eq!(second.next_cursor, None);
+
+    let denied = client
+        .execute_batch(
+            QueryContext::new("cell-a", "tcp-batch-write-denied"),
+            QueryBatchOperation::CreateEdges {
+                edge_type: "FOLLOWS".to_string(),
+                edges: vec![QueryBatchEdge { src: 1, dst: 2 }],
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(denied.to_string().contains("not authorized to write"));
     server.stop().await.unwrap();
 }
 
