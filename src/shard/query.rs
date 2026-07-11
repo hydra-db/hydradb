@@ -5595,13 +5595,15 @@ impl GraphShard {
                 }
             }
             for delta in self
-                .deltas_between_with_budget(
+                .owner_deltas_between_with_budget(OwnerDeltaScan {
                     cell_id,
                     edge_type,
-                    base_epoch,
+                    direction: "out",
+                    owners: &requested,
+                    after_epoch: base_epoch,
                     read_epoch,
-                    Some(&budget),
-                )
+                    budget: &budget,
+                })
                 .await?
             {
                 budget.check("out_neighbors_batch_delta_overlay")?;
@@ -5793,13 +5795,15 @@ impl GraphShard {
                 }
             }
             for delta in self
-                .deltas_between_with_budget(
+                .owner_deltas_between_with_budget(OwnerDeltaScan {
                     cell_id,
                     edge_type,
-                    base_epoch,
+                    direction: "in",
+                    owners: &requested,
+                    after_epoch: base_epoch,
                     read_epoch,
-                    Some(&budget),
-                )
+                    budget: &budget,
+                })
                 .await?
             {
                 budget.check("in_neighbors_batch_delta_overlay")?;
@@ -5877,19 +5881,40 @@ impl GraphShard {
             }
             live
         } else {
-            let sources = edges.iter().map(|(src, _)| *src).collect::<BTreeSet<_>>();
-            self.out_neighbors_batch_at_with_cancellation(
-                cell_id, edge_type, sources, read_epoch, None,
-            )
-            .await?
-            .into_iter()
-            .flat_map(|entry| {
-                entry
-                    .neighbors
-                    .into_iter()
-                    .map(move |dst| (entry.vertex, dst))
-            })
-            .collect()
+            let requested = edges.iter().copied().collect::<BTreeSet<_>>();
+            let base_epoch = self
+                .latest_posting_artifact_epoch(cell_id, edge_type, read_epoch)
+                .await?
+                .unwrap_or(0);
+            let mut live = BTreeSet::new();
+            if base_epoch > 0 {
+                for (src, dst) in requested.iter().copied() {
+                    budget.check("edge_exists_batch_posting_point")?;
+                    if self
+                        .posting_edge_exists_at_base(cell_id, edge_type, src, dst, base_epoch)
+                        .await?
+                    {
+                        live.insert((src, dst));
+                    }
+                }
+            }
+            for delta in self
+                .pair_deltas_between_with_budget(
+                    cell_id, edge_type, &requested, base_epoch, read_epoch, &budget,
+                )
+                .await?
+            {
+                let identity = (delta.edge.src, delta.edge.dst);
+                match delta.kind {
+                    DeltaKind::Plus => {
+                        live.insert(identity);
+                    }
+                    DeltaKind::Minus => {
+                        live.remove(&identity);
+                    }
+                }
+            }
+            live
         };
         Ok(edges
             .into_iter()
@@ -6238,6 +6263,155 @@ impl GraphShard {
     ) -> Result<Vec<DeltaRecord>> {
         self.deltas_between(cell_id, edge_type, after_epoch, GraphEpoch::MAX)
             .await
+    }
+
+    async fn owner_deltas_between_with_budget(
+        &self,
+        request: OwnerDeltaScan<'_>,
+    ) -> Result<Vec<DeltaRecord>> {
+        let OwnerDeltaScan {
+            cell_id,
+            edge_type,
+            direction,
+            owners,
+            after_epoch,
+            read_epoch,
+            budget,
+        } = request;
+        if after_epoch >= read_epoch || owners.is_empty() {
+            return Ok(Vec::new());
+        }
+        let watermark = self.delta_gc_watermark(cell_id, edge_type).await?;
+        if after_epoch < watermark {
+            return Err(GraphError::SnapshotExpired {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch: after_epoch,
+                min_epoch: watermark,
+            });
+        }
+        let start_suffix = format!("{:020}/", after_epoch.saturating_add(1));
+        let mut records = Vec::new();
+        for owner in owners.iter().copied() {
+            for kind in [DeltaKind::Plus, DeltaKind::Minus] {
+                budget.check("query_owner_delta_prefix")?;
+                let prefix = keys::owner_delta_prefix(cell_id, kind, edge_type, direction, owner);
+                let mut iter = self.scan_remote_prefix_from(&prefix, &start_suffix).await?;
+                while let Some(kv) = iter.next().await? {
+                    budget.check("query_owner_delta_scan")?;
+                    let key = String::from_utf8_lossy(&kv.key).into_owned();
+                    let record = decode_delta_record(&key, &kv.value)?;
+                    if record.edge.epoch > read_epoch {
+                        break;
+                    }
+                    let record_owner = match direction {
+                        "out" => record.edge.src,
+                        "in" => record.edge.dst,
+                        _ => {
+                            return Err(GraphError::CorruptValue {
+                                key: key.clone(),
+                                reason: format!("invalid owner delta direction {direction}"),
+                            })
+                        }
+                    };
+                    if record.kind != kind
+                        || record.edge.cell_id != cell_id
+                        || record.edge.edge_type != edge_type
+                        || record_owner != owner
+                    {
+                        return Err(GraphError::CorruptValue {
+                            key,
+                            reason: "owner delta identity does not match key prefix".to_string(),
+                        });
+                    }
+                    records.push(record);
+                    ensure_limit(
+                        "query_owner_delta_records",
+                        records.len() as u64,
+                        self.limits.max_query_scan_edges,
+                    )?;
+                }
+            }
+        }
+        let final_watermark = self.delta_gc_watermark(cell_id, edge_type).await?;
+        if after_epoch < final_watermark {
+            return Err(GraphError::SnapshotExpired {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch: after_epoch,
+                min_epoch: final_watermark,
+            });
+        }
+        sort_deltas(&mut records);
+        Ok(records)
+    }
+
+    async fn pair_deltas_between_with_budget(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: &BTreeSet<(VertexId, VertexId)>,
+        after_epoch: GraphEpoch,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<DeltaRecord>> {
+        if after_epoch >= read_epoch || edges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let watermark = self.delta_gc_watermark(cell_id, edge_type).await?;
+        if after_epoch < watermark {
+            return Err(GraphError::SnapshotExpired {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch: after_epoch,
+                min_epoch: watermark,
+            });
+        }
+        let start_suffix = format!("{:020}", after_epoch.saturating_add(1));
+        let mut records = Vec::new();
+        for (src, dst) in edges.iter().copied() {
+            for kind in [DeltaKind::Plus, DeltaKind::Minus] {
+                budget.check("query_pair_delta_prefix")?;
+                let prefix = keys::pair_delta_prefix(cell_id, kind, edge_type, src, dst);
+                let mut iter = self.scan_remote_prefix_from(&prefix, &start_suffix).await?;
+                while let Some(kv) = iter.next().await? {
+                    budget.check("query_pair_delta_scan")?;
+                    let key = String::from_utf8_lossy(&kv.key).into_owned();
+                    let record = decode_delta_record(&key, &kv.value)?;
+                    if record.edge.epoch > read_epoch {
+                        break;
+                    }
+                    if record.kind != kind
+                        || record.edge.cell_id != cell_id
+                        || record.edge.edge_type != edge_type
+                        || record.edge.src != src
+                        || record.edge.dst != dst
+                    {
+                        return Err(GraphError::CorruptValue {
+                            key,
+                            reason: "pair delta identity does not match key prefix".to_string(),
+                        });
+                    }
+                    records.push(record);
+                    ensure_limit(
+                        "query_pair_delta_records",
+                        records.len() as u64,
+                        self.limits.max_query_scan_edges,
+                    )?;
+                }
+            }
+        }
+        let final_watermark = self.delta_gc_watermark(cell_id, edge_type).await?;
+        if after_epoch < final_watermark {
+            return Err(GraphError::SnapshotExpired {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch: after_epoch,
+                min_epoch: final_watermark,
+            });
+        }
+        sort_deltas(&mut records);
+        Ok(records)
     }
 
     pub async fn deltas_between(
@@ -6589,6 +6763,16 @@ impl GraphShard {
             degree_mismatches,
         })
     }
+}
+
+struct OwnerDeltaScan<'a> {
+    cell_id: &'a str,
+    edge_type: &'a str,
+    direction: &'static str,
+    owners: &'a BTreeSet<VertexId>,
+    after_epoch: GraphEpoch,
+    read_epoch: GraphEpoch,
+    budget: &'a QueryBudget,
 }
 
 #[derive(Clone, Debug)]

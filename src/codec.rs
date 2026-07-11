@@ -2467,6 +2467,20 @@ pub(crate) fn parse_delta_record_key(key: &str) -> Result<DeltaRecord> {
                 },
             })
         }
+        ["cell", cell_id, "delta_pair", kind, edge_type, src, dst, epoch] => {
+            validate_component("cell_id", cell_id)?;
+            validate_component("edge_type", edge_type)?;
+            Ok(DeltaRecord {
+                kind: parse_delta_kind(key, kind)?,
+                edge: EdgeRecord {
+                    cell_id: (*cell_id).to_string(),
+                    edge_type: (*edge_type).to_string(),
+                    src: parse_u64(key, src, "src")?,
+                    dst: parse_u64(key, dst, "dst")?,
+                    epoch: parse_u64(key, epoch, "epoch")?,
+                },
+            })
+        }
         _ => Err(GraphError::CorruptValue {
             key: key.to_string(),
             reason: "cannot infer delta record identity from key".to_string(),
