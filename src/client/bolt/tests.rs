@@ -3,9 +3,9 @@ use super::*;
 use crate::{
     ClientQueryServiceConfig, GraphControlPlane, GraphNodeHealthState, QueryCellClient,
     QueryColumn, QueryContext, QueryCursorToken, QueryFloat, QueryResultPage, QueryResultSet,
-    QueryRow, QueryTransportScopeGrant, QueryValue, ShardPlacement, StaticClientDatabaseResolver,
-    StaticQueryTransportScopeAuthorizer, StaticQueryTransportTlsServerConfigProvider,
-    VertexPropertyValue,
+    QueryRow, QueryTransportAction, QueryTransportScopeGrant, QueryValue, RoutedGraphCluster,
+    ShardPlacement, StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer,
+    StaticQueryTransportTlsServerConfigProvider, VertexPropertyValue,
 };
 use boltr::chunk::{ChunkReader, ChunkWriter};
 use boltr::client::BoltSession;
@@ -305,6 +305,82 @@ async fn bolt_server_runs_autocommit_queries_and_rejects_fake_transactions() {
     );
     session.close().await.unwrap();
     server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control = GraphControlPlane::open("bolt-create/control", Arc::clone(&object_store))
+        .await
+        .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("cell-a", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let cluster = Arc::new(
+        RoutedGraphCluster::open_owned_with_control(
+            "bolt-create/data",
+            "node-a",
+            &control,
+            object_store,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap(),
+    );
+    let scope = GraphScope::default();
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "bolt-secret",
+            QueryTransportScopeGrant::graph(
+                scope.clone(),
+                [
+                    QueryTransportAction::Read,
+                    QueryTransportAction::Write,
+                    QueryTransportAction::Cancel,
+                ],
+            ),
+        )
+        .unwrap();
+    let service = ClientQueryService::new(
+        cluster.clone(),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("bolt-secret")
+            .with_scope_authorizer(Arc::new(authorizer)),
+    )
+    .unwrap();
+    let resolver = StaticClientDatabaseResolver::single(
+        "default",
+        ClientQueryTarget::new(scope, "cell-a").unwrap(),
+    )
+    .unwrap();
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        service,
+        BoltServerConfig::new(Arc::new(resolver)).insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let mut session = BoltSession::connect_basic(server.local_addr(), "neo4j", "bolt-secret")
+        .await
+        .unwrap();
+    let result = session
+        .run("CREATE (a {id: 1})-[:FOLLOWS]->(b {id: 2})")
+        .await
+        .unwrap();
+    assert!(result.columns.is_empty());
+    assert!(result.records.is_empty());
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+
+    session.close().await.unwrap();
+    server.stop().await.unwrap();
+    cluster.close().await.unwrap();
+    control.close().await.unwrap();
 }
 
 #[tokio::test]

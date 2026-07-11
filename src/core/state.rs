@@ -6,6 +6,8 @@ use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, Up
 use slatedb::Db;
 use slatedb::ErrorKind;
 #[cfg(feature = "opencypher")]
+use slatedb::IsolationLevel;
+#[cfg(feature = "opencypher")]
 use tokio::sync::watch;
 use tokio::sync::{Mutex, Semaphore};
 #[cfg(feature = "opencypher")]
@@ -35,6 +37,8 @@ pub struct GraphShard {
     pub(crate) limits: GraphLimits,
     pub(crate) cache_policy: GraphCachePolicy,
     pub(crate) retention_policy: GraphRetentionPolicy,
+    #[cfg(feature = "opencypher")]
+    pub(crate) query_read_leases: Arc<QueryReadLeaseManager>,
     pub(crate) cache_metrics: Arc<GraphCacheMetrics>,
     pub(crate) operation_metrics: Arc<GraphOperationalMetrics>,
     pub(crate) hydration_gate: Arc<Semaphore>,
@@ -155,6 +159,187 @@ pub(crate) struct GraphReadLease {
     pub(crate) lease_id: String,
     pub(crate) read_epoch: GraphEpoch,
     pub(crate) expires_at_ms: u64,
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Default)]
+struct QueryReadLeaseCellState {
+    active_epochs: BTreeMap<GraphEpoch, u64>,
+    persisted_epoch: Option<GraphEpoch>,
+    persisted_expires_at_ms: u64,
+}
+
+#[cfg(feature = "opencypher")]
+pub(crate) struct QueryReadLeaseManager {
+    db: Db,
+    lease_id: String,
+    ttl_ms: u64,
+    cells: Mutex<BTreeMap<String, QueryReadLeaseCellState>>,
+    metrics: Arc<GraphOperationalMetrics>,
+}
+
+#[cfg(feature = "opencypher")]
+impl QueryReadLeaseManager {
+    pub(crate) fn new(db: Db, ttl_ms: u64, metrics: Arc<GraphOperationalMetrics>) -> Arc<Self> {
+        Arc::new(Self {
+            db,
+            lease_id: format!(
+                "query-{:020}",
+                crate::GRAPH_READ_LEASE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+            ttl_ms,
+            cells: Mutex::new(BTreeMap::new()),
+            metrics,
+        })
+    }
+
+    pub(crate) async fn acquire(
+        self: &Arc<Self>,
+        cell_id: &str,
+        read_epoch: GraphEpoch,
+        max_runtime_ms: Option<u64>,
+    ) -> Result<Arc<QueryReadLeaseRegistration>> {
+        if self.ttl_ms == 0 {
+            return Ok(Arc::new(QueryReadLeaseRegistration {
+                manager: None,
+                cell_id: cell_id.to_string(),
+                read_epoch,
+            }));
+        }
+
+        let now_ms = graph_now_millis();
+        let hold_ms = self
+            .ttl_ms
+            .max(max_runtime_ms.unwrap_or(0).saturating_add(5_000));
+        let required_expiry = now_ms.saturating_add(hold_ms);
+        let published_expiry = required_expiry.saturating_add(self.ttl_ms);
+        let mut cells = self.cells.lock().await;
+        let state = cells.entry(cell_id.to_string()).or_default();
+        *state.active_epochs.entry(read_epoch).or_default() += 1;
+        let min_epoch = state
+            .active_epochs
+            .keys()
+            .next()
+            .copied()
+            .expect("the acquired epoch is active");
+        let lease_covers_query = state
+            .persisted_epoch
+            .is_some_and(|persisted| persisted <= min_epoch)
+            && state.persisted_expires_at_ms >= required_expiry;
+        if !lease_covers_query {
+            let lease = GraphReadLease {
+                cell_id: cell_id.to_string(),
+                lease_id: self.lease_id.clone(),
+                read_epoch: min_epoch,
+                expires_at_ms: published_expiry,
+            };
+            let publish = async {
+                let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+                let drop_marker = crate::keys::cell_drop_marker(cell_id);
+                let pending_drop_marker = crate::keys::cell_drop_pending_marker(cell_id);
+                if crate::read_txn_remote(&txn, &drop_marker).await?.is_some()
+                    || crate::read_txn_remote(&txn, &pending_drop_marker)
+                        .await?
+                        .is_some()
+                {
+                    return Err(GraphError::CellDropped {
+                        operation: "pin_query_read",
+                        cell_id: cell_id.to_string(),
+                    });
+                }
+                txn.put(
+                    crate::keys::read_lease(cell_id, &self.lease_id).as_bytes(),
+                    crate::encode_read_lease(&lease),
+                )?;
+                crate::commit_txn_strict(txn, true).await
+            }
+            .await;
+            if let Err(err) = publish {
+                decrement_active_read_epoch(state, read_epoch);
+                return Err(err);
+            }
+            state.persisted_epoch = Some(min_epoch);
+            state.persisted_expires_at_ms = published_expiry;
+            self.metrics
+                .read_leases_created
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        drop(cells);
+
+        Ok(Arc::new(QueryReadLeaseRegistration {
+            manager: Some(Arc::clone(self)),
+            cell_id: cell_id.to_string(),
+            read_epoch,
+        }))
+    }
+
+    async fn release(&self, cell_id: &str, read_epoch: GraphEpoch) {
+        let mut cells = self.cells.lock().await;
+        if let Some(state) = cells.get_mut(cell_id) {
+            decrement_active_read_epoch(state, read_epoch);
+        }
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn decrement_active_read_epoch(state: &mut QueryReadLeaseCellState, read_epoch: GraphEpoch) {
+    let Some(count) = state.active_epochs.get_mut(&read_epoch) else {
+        return;
+    };
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        state.active_epochs.remove(&read_epoch);
+    }
+}
+
+#[cfg(feature = "opencypher")]
+pub(crate) struct QueryReadLeaseRegistration {
+    manager: Option<Arc<QueryReadLeaseManager>>,
+    cell_id: String,
+    read_epoch: GraphEpoch,
+}
+
+#[cfg(feature = "opencypher")]
+impl std::fmt::Debug for QueryReadLeaseRegistration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QueryReadLeaseRegistration")
+            .field("cell_id", &self.cell_id)
+            .field("read_epoch", &self.read_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "opencypher")]
+impl PartialEq for QueryReadLeaseRegistration {
+    fn eq(&self, other: &Self) -> bool {
+        self.cell_id == other.cell_id
+            && self.read_epoch == other.read_epoch
+            && match (&self.manager, &other.manager) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+#[cfg(feature = "opencypher")]
+impl Eq for QueryReadLeaseRegistration {}
+
+#[cfg(feature = "opencypher")]
+impl Drop for QueryReadLeaseRegistration {
+    fn drop(&mut self) {
+        let Some(manager) = self.manager.take() else {
+            return;
+        };
+        let cell_id = self.cell_id.clone();
+        let read_epoch = self.read_epoch;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                manager.release(&cell_id, read_epoch).await;
+            });
+        }
+    }
 }
 
 impl From<&engine::ShardLease> for GraphWriteFence {

@@ -67,6 +67,11 @@ name = "bolt_compat_server"
 path = "examples/bolt_compat_server.rs"
 required-features = ["bolt-server"]
 
+[[example]]
+name = "bolt_benchmark"
+path = "examples/bolt_benchmark.rs"
+required-features = ["public-client-protocols"]
+
 [dependencies]
 async-trait = "0.1"
 axum = { version = "0.8.9", optional = true }

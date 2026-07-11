@@ -2,6 +2,48 @@ use super::*;
 #[cfg(feature = "opencypher")]
 use std::time::Duration;
 
+#[cfg(feature = "graphblas")]
+async fn run_graph_compute<T, F>(
+    metrics: Arc<GraphOperationalMetrics>,
+    operation: &'static str,
+    compute: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let queued_at = std::time::Instant::now();
+    tokio::task::spawn_blocking(move || {
+        let queue_us = queued_at
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        metrics
+            .graph_compute_tasks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .graph_compute_queue_us
+            .fetch_add(queue_us, std::sync::atomic::Ordering::Relaxed);
+        let compute_started = std::time::Instant::now();
+        let result = compute();
+        metrics.graph_compute_duration_us.fetch_add(
+            compute_started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        result
+    })
+    .await
+    .map_err(|err| GraphError::CorruptValue {
+        key: format!("query/compute/{operation}"),
+        reason: format!("graph compute task failed: {err}"),
+    })?
+}
+
 impl GraphShard {
     pub async fn execute_cypher(&self, context: QueryContext, query: &str) -> Result<QueryOutput> {
         self.execute_opencypher(context, query).await
@@ -1363,6 +1405,9 @@ impl GraphShard {
 
     #[cfg(feature = "opencypher")]
     async fn query_read_epoch(&self, context: &QueryContext) -> Result<GraphEpoch> {
+        if let Some(read_epoch) = context.validated_read_epoch() {
+            return Ok(read_epoch);
+        }
         match context.read_epoch {
             Some(read_epoch) => {
                 let current_epoch = self.current_epoch(&context.cell_id).await?;
@@ -5071,14 +5116,21 @@ impl GraphShard {
             let compiled = self
                 .cached_graphblas_matrix(cell_id, edge_type, artifact.base_epoch)
                 .await?;
-            let empty_adjacency = BTreeMap::new();
-            let traversal = crate::sparse_kernel::expand_range_compiled_graphblas(
-                &compiled,
-                &empty_adjacency,
-                &[src],
-                min_hops,
-                max_hops,
-            )?;
+            let traversal = run_graph_compute(
+                Arc::clone(&self.operation_metrics),
+                "graphblas_expand_range",
+                move || {
+                    let empty_adjacency = BTreeMap::new();
+                    crate::sparse_kernel::expand_range_compiled_graphblas(
+                        &compiled,
+                        &empty_adjacency,
+                        &[src],
+                        min_hops,
+                        max_hops,
+                    )
+                },
+            )
+            .await?;
             Ok(Some((traversal.vertices, traversal.edge_visits)))
         }
         #[cfg(not(feature = "graphblas"))]
@@ -5102,27 +5154,52 @@ impl GraphShard {
         {
             let (min_hops, max_hops) = hop_range;
             budget.check("cypher_graphblas_count_artifact_lookup")?;
+            let artifact_started = std::time::Instant::now();
             let Some(artifact) = self
                 .latest_matrix_artifact(cell_id, edge_type, read_epoch)
                 .await?
             else {
                 return Ok(None);
             };
+            self.operation_metrics.query_artifact_lookup_us.fetch_add(
+                artifact_started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if artifact.base_epoch != read_epoch {
                 return Ok(None);
             }
             budget.check("cypher_graphblas_count_compiled_matrix")?;
+            let cache_started = std::time::Instant::now();
             let compiled = self
                 .cached_graphblas_matrix(cell_id, edge_type, artifact.base_epoch)
                 .await?;
-            let empty_adjacency = BTreeMap::new();
-            let traversal = crate::sparse_kernel::expand_range_count_compiled_graphblas(
-                &compiled,
-                &empty_adjacency,
-                &[src],
-                min_hops,
-                max_hops,
-            )?;
+            self.operation_metrics.query_graphblas_cache_us.fetch_add(
+                cache_started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let traversal = run_graph_compute(
+                Arc::clone(&self.operation_metrics),
+                "graphblas_expand_range_count",
+                move || {
+                    let empty_adjacency = BTreeMap::new();
+                    crate::sparse_kernel::expand_range_count_compiled_graphblas(
+                        &compiled,
+                        &empty_adjacency,
+                        &[src],
+                        min_hops,
+                        max_hops,
+                    )
+                },
+            )
+            .await?;
             Ok(Some((traversal.vertices, traversal.edge_visits)))
         }
         #[cfg(not(feature = "graphblas"))]
@@ -5158,19 +5235,28 @@ impl GraphShard {
             let compiled = self
                 .cached_graphblas_matrix(request.cell_id, request.edge_type, artifact.base_epoch)
                 .await?;
-            let empty_adjacency = BTreeMap::new();
-            let traversal = crate::sparse_kernel::expand_range_window_compiled_graphblas(
-                &compiled,
-                &empty_adjacency,
-                &[request.src],
-                min_hops,
-                max_hops,
-                crate::sparse_kernel::SparseTraversalWindow {
-                    skip: request.window.skip,
-                    limit: request.window.limit,
-                    ascending: request.ascending,
+            let src = request.src;
+            let window = crate::sparse_kernel::SparseTraversalWindow {
+                skip: request.window.skip,
+                limit: request.window.limit,
+                ascending: request.ascending,
+            };
+            let traversal = run_graph_compute(
+                Arc::clone(&self.operation_metrics),
+                "graphblas_expand_range_window",
+                move || {
+                    let empty_adjacency = BTreeMap::new();
+                    crate::sparse_kernel::expand_range_window_compiled_graphblas(
+                        &compiled,
+                        &empty_adjacency,
+                        &[src],
+                        min_hops,
+                        max_hops,
+                        window,
+                    )
                 },
-            )?;
+            )
+            .await?;
             Ok(Some((traversal.vertices, traversal.edge_visits)))
         }
         #[cfg(not(feature = "graphblas"))]

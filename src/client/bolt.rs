@@ -21,6 +21,7 @@ use tokio_rustls::TlsAcceptor;
 use super::service::{
     ClientBookmark, ClientDatabaseResolver, ClientQueryCredentials, ClientQueryPage,
     ClientQueryRequest, ClientQueryService, ClientQuerySession, ClientQueryTarget,
+    PreparedClientQuery,
 };
 use crate::{
     GraphError, GraphScope, QueryColumn, QueryCursorToken, QueryRow, QueryTransportAction,
@@ -561,7 +562,7 @@ impl BoltProtocolSession {
 
 struct PendingBoltResult {
     database: String,
-    request: ClientQueryRequest,
+    prepared: PreparedClientQuery,
     deadline: Instant,
     columns: Vec<QueryColumn>,
     started: bool,
@@ -782,7 +783,7 @@ async fn run_bolt_protocol(
                             continue;
                         }
                     };
-                let (request, columns) = match context
+                let prepared = match context
                     .service
                     .prepare_page_request(&authenticated, request, config.prefetch_rows)
                     .await
@@ -796,11 +797,13 @@ async fn run_bolt_protocol(
                 };
                 let query_deadline = Instant::now()
                     + Duration::from_millis(
-                        request
+                        prepared
+                            .request
                             .max_runtime_ms
                             .expect("Bolt requests are normalized before execution"),
                     );
-                let fields = columns
+                let fields = prepared
+                    .columns
                     .iter()
                     .map(|column| BoltValue::String(column.name.clone()))
                     .collect();
@@ -815,9 +818,9 @@ async fn run_bolt_protocol(
                 .await?;
                 session.pending = Some(PendingBoltResult {
                     database,
-                    request,
+                    columns: prepared.columns.clone(),
+                    prepared,
                     deadline: query_deadline,
-                    columns,
                     started: false,
                     rows: VecDeque::new(),
                     next_cursor: None,
@@ -1163,13 +1166,13 @@ fn bolt_bookmarks_from_extra(extra: &BoltDict) -> std::result::Result<Vec<String
 fn spawn_bolt_page(
     service: ClientQueryService,
     authenticated: ClientQuerySession,
-    request: ClientQueryRequest,
+    prepared: PreparedClientQuery,
     cursor: Option<QueryCursorToken>,
     page_size: usize,
 ) -> JoinHandle<Result<ClientQueryPage>> {
     tokio::spawn(async move {
         service
-            .execute_page(&authenticated, request, cursor, page_size)
+            .execute_prepared_page(&authenticated, prepared, cursor, page_size)
             .await
     })
 }
@@ -1274,14 +1277,15 @@ where
             pending.started = true;
             None
         };
-        pending.request.max_runtime_ms = Some(remaining_bolt_runtime_ms(pending.deadline)?);
+        pending.prepared.request.max_runtime_ms =
+            Some(remaining_bolt_runtime_ms(pending.deadline)?);
         let fetch_size = count.map_or(prefetch_rows, |count| prefetch_rows.min(count.max(1)));
-        let query_id = pending.request.query_id.clone();
-        let scope = pending.request.target.scope.clone();
+        let query_id = pending.prepared.request.query_id.clone();
+        let scope = pending.prepared.request.target.scope.clone();
         let task = spawn_bolt_page(
             context.service.clone(),
             authenticated.clone(),
-            pending.request.clone(),
+            pending.prepared.clone(),
             cursor,
             fetch_size,
         );
@@ -1302,7 +1306,7 @@ where
                         reason: "result columns changed between cursor pages".to_string(),
                     })));
                 }
-                pending.request.read_epoch = page.read_epoch;
+                pending.prepared.request.read_epoch = page.read_epoch;
                 pending.rows.extend(page.page.rows);
                 pending.next_cursor = page.page.next_cursor;
                 pending.bookmark = page.bookmark;
@@ -1311,9 +1315,9 @@ where
         }
     }
     Ok(PageAwaitResult::Complete(Ok(ClientQueryPage {
-        query_id: pending.request.query_id.clone(),
+        query_id: pending.prepared.request.query_id.clone(),
         page: crate::QueryResultPage::new(pending.columns.clone(), Vec::new(), pending.next_cursor),
-        read_epoch: pending.request.read_epoch,
+        read_epoch: pending.prepared.request.read_epoch,
         bookmark: pending.bookmark.clone(),
     })))
 }

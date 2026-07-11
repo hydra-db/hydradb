@@ -1584,6 +1584,15 @@ pub trait QueryCellClient: Send + Sync {
     ) -> Result<Option<crate::GraphEpoch>> {
         Ok(None)
     }
+
+    async fn pin_query_read_context(&self, mut context: QueryContext) -> Result<QueryContext> {
+        if context.read_epoch.is_none() {
+            context.read_epoch = self
+                .current_graph_epoch(&context.scope, &context.cell_id)
+                .await?;
+        }
+        Ok(context)
+    }
 }
 
 #[cfg(feature = "query-transport")]
@@ -2908,6 +2917,17 @@ impl QueryCellClient for RoutedGraphCluster {
         context: QueryContext,
         query: &str,
     ) -> Result<QueryResultSet> {
+        if routed_client_query_is_mutation(&context, query)? {
+            return match RoutedGraphCluster::execute_cypher(self, context, query).await? {
+                crate::QueryOutput::Mutation(_) | crate::QueryOutput::Write(_) => {
+                    Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+                }
+                output => Err(GraphError::CorruptValue {
+                    key: "query/client/mutation_output".to_string(),
+                    reason: format!("mutation query returned non-mutation output {output:?}"),
+                }),
+            };
+        }
         RoutedGraphCluster::execute_cypher_rows(self, context, query).await
     }
 
@@ -2918,6 +2938,23 @@ impl QueryCellClient for RoutedGraphCluster {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<QueryResultPage> {
+        if routed_client_query_is_mutation(&context, query)? {
+            if cursor.is_some() {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "ClientProtocol",
+                    feature: "mutation queries cannot continue from a result cursor".to_string(),
+                });
+            }
+            return match RoutedGraphCluster::execute_cypher(self, context, query).await? {
+                crate::QueryOutput::Mutation(_) | crate::QueryOutput::Write(_) => {
+                    Ok(QueryResultPage::new(Vec::new(), Vec::new(), None))
+                }
+                output => Err(GraphError::CorruptValue {
+                    key: "query/client/mutation_page_output".to_string(),
+                    reason: format!("mutation query returned non-mutation output {output:?}"),
+                }),
+            };
+        }
         RoutedGraphCluster::execute_cypher_rows_page(self, context, query, cursor, page_size).await
     }
 
@@ -2934,6 +2971,50 @@ impl QueryCellClient for RoutedGraphCluster {
         }
         Ok(Some(self.shard(cell_id)?.current_epoch(cell_id).await?))
     }
+
+    async fn pin_query_read_context(&self, context: QueryContext) -> Result<QueryContext> {
+        if &context.scope != self.scope() {
+            return Err(GraphError::GraphScopeMismatch {
+                expected: self.scope().to_string(),
+                actual: context.scope.to_string(),
+            });
+        }
+        let shard = self.shard(&context.cell_id)?;
+        let read_epoch = match context.read_epoch {
+            Some(read_epoch) => {
+                let current_epoch = shard.current_epoch(&context.cell_id).await?;
+                if read_epoch > current_epoch {
+                    return Err(GraphError::SnapshotAhead {
+                        cell_id: context.cell_id.clone(),
+                        read_epoch,
+                        current_epoch,
+                    });
+                }
+                read_epoch
+            }
+            None => shard.current_epoch(&context.cell_id).await?,
+        };
+        if shard.retention_policy.read_lease_ttl_ms == 0 {
+            return Ok(context.at_epoch(read_epoch));
+        }
+        let retention = shard
+            .query_read_leases
+            .acquire(&context.cell_id, read_epoch, context.max_runtime_ms)
+            .await?;
+        Ok(context.with_validated_read_epoch(read_epoch, retention))
+    }
+}
+
+fn routed_client_query_is_mutation(context: &QueryContext, query: &str) -> Result<bool> {
+    if crate::parse_opencypher_mutation_query_with_parameters(query, &context.parameters)?.is_some()
+    {
+        return Ok(true);
+    }
+    Ok(
+        crate::parse_opencypher_with_parameters(query, &context.parameters)
+            .map(|parsed| parsed.statement.is_write())
+            .unwrap_or(false),
+    )
 }
 
 fn checked_unique_cell(seen: &mut BTreeSet<String>, cell_id: &str) -> Result<String> {

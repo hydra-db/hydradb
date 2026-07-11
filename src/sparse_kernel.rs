@@ -452,7 +452,7 @@ mod graphblas {
     use std::os::raw::c_int;
     use std::ptr::null_mut;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use super::{
         graphblas_csc_from_adjacency, Adjacency, GraphBlasCsc, SparseKernelBackend, SparseTraversal,
@@ -599,6 +599,8 @@ mod graphblas {
         matrix: Option<Matrix>,
         ordinal_map: OrdinalMap,
         degree_vector: Option<Vector>,
+        #[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
+        degrees: Arc<CompactOrdinalVec>,
     }
 
     unsafe impl Send for CompiledGraphBlasMatrixInner {}
@@ -944,9 +946,10 @@ mod graphblas {
             } else {
                 graphblas_replica_count()
             };
+            let degrees = compact_degrees(csc);
             let mut replicas = Vec::with_capacity(replica_count);
             for _ in 0..replica_count {
-                replicas.push(Mutex::new(build_compiled_inner(csc)?));
+                replicas.push(Mutex::new(build_compiled_inner(csc, Arc::clone(&degrees))?));
             }
             Ok(Self {
                 compact: None,
@@ -1081,7 +1084,7 @@ mod graphblas {
         init()?;
 
         let csc = graphblas_csc_from_adjacency(adjacency)?;
-        let compiled = build_compiled_inner(&csc)?;
+        let compiled = build_compiled_inner(&csc, compact_degrees(&csc))?;
         expand_with_compiled(adjacency, starts, hops, &compiled)
     }
 
@@ -1094,11 +1097,23 @@ mod graphblas {
         init()?;
 
         let csc = graphblas_csc_from_adjacency(adjacency)?;
-        let compiled = build_compiled_inner(&csc)?;
+        let compiled = build_compiled_inner(&csc, compact_degrees(&csc))?;
         expand_range_with_compiled(adjacency, starts, min_hops, max_hops, &compiled)
     }
 
-    fn build_compiled_inner(csc: &GraphBlasCsc) -> Result<CompiledGraphBlasMatrixInner> {
+    fn compact_degrees(csc: &GraphBlasCsc) -> Arc<CompactOrdinalVec> {
+        Arc::new(CompactOrdinalVec::from_u64(
+            csc.pointers
+                .windows(2)
+                .map(|window| window[1].saturating_sub(window[0]))
+                .collect(),
+        ))
+    }
+
+    fn build_compiled_inner(
+        csc: &GraphBlasCsc,
+        degrees: Arc<CompactOrdinalVec>,
+    ) -> Result<CompiledGraphBlasMatrixInner> {
         let ordinal_map = OrdinalMap::from_vertices(&csc.vertices)?;
         let matrix = if ordinal_map.is_empty() {
             None
@@ -1113,6 +1128,7 @@ mod graphblas {
         Ok(CompiledGraphBlasMatrixInner {
             matrix,
             degree_vector,
+            degrees,
             ordinal_map,
         })
     }
@@ -1214,6 +1230,9 @@ mod graphblas {
         max_hops: u8,
         compiled: &CompiledGraphBlasMatrixInner,
     ) -> Result<SparseTraversalCount> {
+        if min_hops == max_hops {
+            return exact_hop_count_with_compiled(starts, min_hops, compiled);
+        }
         let range = range_result_vector(starts, min_hops, max_hops, compiled)?;
         let Some(result) = range.result.as_ref() else {
             return Ok(SparseTraversalCount {
@@ -1227,6 +1246,91 @@ mod graphblas {
             edge_visits: range.edge_visits,
             backend: SparseKernelBackend::SuiteSparseGraphBlas,
         })
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn exact_hop_count_with_compiled(
+        starts: &[VertexId],
+        hops: u8,
+        compiled: &CompiledGraphBlasMatrixInner,
+    ) -> Result<SparseTraversalCount> {
+        let Some(matrix) = compiled.matrix.as_ref() else {
+            return Ok(SparseTraversalCount {
+                vertices: 0,
+                edge_visits: 0,
+                backend: SparseKernelBackend::SuiteSparseGraphBlas,
+            });
+        };
+        let Some(degree_vector) = compiled.degree_vector.as_ref() else {
+            return Ok(SparseTraversalCount {
+                vertices: 0,
+                edge_visits: 0,
+                backend: SparseKernelBackend::SuiteSparseGraphBlas,
+            });
+        };
+        if compiled.ordinal_map.is_empty() || starts.is_empty() {
+            return Ok(SparseTraversalCount {
+                vertices: 0,
+                edge_visits: 0,
+                backend: SparseKernelBackend::SuiteSparseGraphBlas,
+            });
+        }
+
+        let mut start_ordinals = Vec::with_capacity(starts.len());
+        for start in starts {
+            if let Some(ordinal) = compiled.ordinal_map.try_ordinal(*start) {
+                start_ordinals.push(ordinal);
+            }
+        }
+        start_ordinals.sort_unstable();
+        start_ordinals.dedup();
+        if start_ordinals.is_empty() {
+            return Ok(SparseTraversalCount {
+                vertices: 0,
+                edge_visits: 0,
+                backend: SparseKernelBackend::SuiteSparseGraphBlas,
+            });
+        }
+
+        let dimension = compiled.ordinal_map.len();
+        let mut frontier = vector_from_ordinals(dimension, &start_ordinals)?;
+        let mut degree_scratch = uint64_vector(dimension)?;
+        let mut edge_visits = 0_u64;
+        for _ in 0..hops {
+            let frontier_count = vector_nvals(&frontier)?;
+            if frontier_count == 0 {
+                break;
+            }
+            let frontier_visits = if frontier_count < 2_048 {
+                frontier_edge_visits_graphblas(degree_vector, &frontier, &mut degree_scratch)?
+            } else {
+                frontier_edge_visits_from_degrees(&compiled.degrees, &frontier)?
+            };
+            edge_visits = edge_visits.saturating_add(frontier_visits);
+            frontier = multiply(matrix, &frontier, dimension)?;
+        }
+        Ok(SparseTraversalCount {
+            vertices: vector_nvals(&frontier)?,
+            edge_visits,
+            backend: SparseKernelBackend::SuiteSparseGraphBlas,
+        })
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn frontier_edge_visits_from_degrees(
+        degrees: &CompactOrdinalVec,
+        frontier: &Vector,
+    ) -> Result<u64> {
+        let ordinals = extract_ordinals(frontier)?;
+        let mut edge_visits = 0_u64;
+        for ordinal in &ordinals {
+            let ordinal = usize::try_from(*ordinal).map_err(|_| GraphError::SparseKernel {
+                backend: "SuiteSparseGraphBlas",
+                reason: format!("frontier ordinal {ordinal} does not fit in usize"),
+            })?;
+            edge_visits = edge_visits.saturating_add(degrees.get(ordinal) as u64);
+        }
+        Ok(edge_visits)
     }
 
     #[cfg(feature = "opencypher")]
@@ -1884,6 +1988,24 @@ mod tests {
         assert_eq!(graphblas.backend, SparseKernelBackend::SuiteSparseGraphBlas);
         assert_eq!(graphblas.vertices, rust.vertices);
         assert_eq!(graphblas.edge_visits, rust.edge_visits);
+    }
+
+    #[cfg(all(feature = "graphblas", feature = "opencypher"))]
+    #[test]
+    fn graphblas_exact_hop_count_matches_materialized_range() {
+        let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
+        let adjacency = test_adjacency();
+        let compiled = compile_graphblas_matrix(&adjacency).expect("matrix should compile");
+        for hops in 0..=4 {
+            let materialized =
+                expand_range_compiled_graphblas(&compiled, &adjacency, &[1], hops, hops)
+                    .expect("range expansion should succeed");
+            let counted =
+                expand_range_count_compiled_graphblas(&compiled, &adjacency, &[1], hops, hops)
+                    .expect("count expansion should succeed");
+            assert_eq!(counted.vertices, materialized.vertices.len() as u64);
+            assert_eq!(counted.edge_visits, materialized.edge_visits);
+        }
     }
 
     #[cfg(feature = "graphblas")]
