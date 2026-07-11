@@ -71,6 +71,19 @@ pub struct EdgeRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NeighborBatchEntry {
+    pub vertex: VertexId,
+    pub neighbors: Vec<VertexId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EdgeExistenceBatchEntry {
+    pub src: VertexId,
+    pub dst: VertexId,
+    pub exists: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelationshipMutation {
     pub cell_id: String,
     pub edge_type: String,

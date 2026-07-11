@@ -814,36 +814,11 @@ impl GraphShard {
                             vertices.insert(row.get(binding)?);
                         }
                     }
-                    for relationship in relationships {
-                        budget.check("cypher_delete_relationship")?;
-                        let edge_type = relationship.edge_type.clone();
-                        let mutation = EdgeMutation {
-                            cell_id: context.cell_id.clone(),
-                            edge_type: edge_type.clone(),
-                            src: relationship.src,
-                            dst: relationship.dst,
-                            idempotency_key: format!(
-                                "{}.delete.{}.{}.{}.{}",
-                                context.idempotency_key,
-                                edge_type,
-                                relationship.src,
-                                relationship.dst,
-                                relationship
-                                    .relationship_id
-                                    .map_or_else(|| "edge".to_string(), |id| id.to_string())
-                            ),
-                        };
-                        let delete = if let Some(relationship_id) = relationship.relationship_id {
-                            self.delete_relationship(mutation, relationship_id).await?
-                        } else {
-                            self.delete_edge(mutation).await?
-                        };
-                        if delete.deleted {
-                            result.deleted_edges = result.deleted_edges.saturating_add(1);
-                        } else {
-                            result.noops = result.noops.saturating_add(1);
-                        }
-                    }
+                    let (deleted, noops) = self
+                        .delete_bound_relationships_batch(&context, relationships, &budget)
+                        .await?;
+                    result.deleted_edges = result.deleted_edges.saturating_add(deleted);
+                    result.noops = result.noops.saturating_add(noops);
                     for vertex_id in vertices {
                         budget.check("cypher_delete_vertex")?;
                         let delete = if *detach {
@@ -890,36 +865,11 @@ impl GraphShard {
                         };
                         relationships.insert(relationship.clone());
                     }
-                    for relationship in relationships {
-                        budget.check("cypher_delete_relationship")?;
-                        let edge_type = relationship.edge_type.clone();
-                        let mutation = EdgeMutation {
-                            cell_id: context.cell_id.clone(),
-                            edge_type: edge_type.clone(),
-                            src: relationship.src,
-                            dst: relationship.dst,
-                            idempotency_key: format!(
-                                "{}.delete.{}.{}.{}.{}",
-                                context.idempotency_key,
-                                edge_type,
-                                relationship.src,
-                                relationship.dst,
-                                relationship
-                                    .relationship_id
-                                    .map_or_else(|| "edge".to_string(), |id| id.to_string())
-                            ),
-                        };
-                        let delete = if let Some(relationship_id) = relationship.relationship_id {
-                            self.delete_relationship(mutation, relationship_id).await?
-                        } else {
-                            self.delete_edge(mutation).await?
-                        };
-                        if delete.deleted {
-                            result.deleted_edges = result.deleted_edges.saturating_add(1);
-                        } else {
-                            result.noops = result.noops.saturating_add(1);
-                        }
-                    }
+                    let (deleted, noops) = self
+                        .delete_bound_relationships_batch(&context, relationships, &budget)
+                        .await?;
+                    result.deleted_edges = result.deleted_edges.saturating_add(deleted);
+                    result.noops = result.noops.saturating_add(noops);
                 }
                 RowMutationAction::SetProperty { .. }
                 | RowMutationAction::SetLabels { .. }
@@ -939,10 +889,11 @@ impl GraphShard {
                             .await?;
                     }
                 }
-                RowMutationAction::MergeEdge { .. } => {
+                RowMutationAction::CreateEdge { .. } | RowMutationAction::MergeEdge { .. } => {
                     return Err(GraphError::UnsupportedQuery {
                         dialect: "OpenCypher",
-                        feature: "MERGE is executable only as a standalone clause".to_string(),
+                        feature: "CREATE and MERGE are executable only as standalone clauses"
+                            .to_string(),
                     });
                 }
             }
@@ -995,12 +946,194 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
+    async fn delete_bound_relationships_batch(
+        &self,
+        context: &QueryContext,
+        relationships: BTreeSet<BoundRelationship>,
+        budget: &QueryBudget,
+    ) -> Result<(u64, u64)> {
+        let mut structural = Vec::new();
+        let mut identified = Vec::new();
+        for relationship in relationships {
+            budget.check("cypher_delete_relationship_collect")?;
+            let mutation = EdgeMutation {
+                cell_id: context.cell_id.clone(),
+                edge_type: relationship.edge_type.clone(),
+                src: relationship.src,
+                dst: relationship.dst,
+                idempotency_key: format!(
+                    "{}.delete.{}.{}.{}.{}",
+                    context.idempotency_key,
+                    relationship.edge_type,
+                    relationship.src,
+                    relationship.dst,
+                    relationship
+                        .relationship_id
+                        .map_or_else(|| "edge".to_string(), |id| id.to_string())
+                ),
+            };
+            match relationship.relationship_id {
+                Some(relationship_id) => identified.push((mutation, relationship_id)),
+                None => structural.push(mutation),
+            }
+        }
+
+        let mut deleted = 0_u64;
+        let mut noops = 0_u64;
+        if !structural.is_empty() {
+            budget.check("cypher_delete_edge_batch")?;
+            let batch = self
+                .delete_edge_mutations_batch(&context.cell_id, structural)
+                .await?;
+            deleted = deleted.saturating_add(batch.deleted);
+            noops = noops.saturating_add(batch.already_deleted);
+        }
+        for (mutation, relationship_id) in identified {
+            budget.check("cypher_delete_relationship")?;
+            if self
+                .delete_relationship(mutation, relationship_id)
+                .await?
+                .deleted
+            {
+                deleted = deleted.saturating_add(1);
+            } else {
+                noops = noops.saturating_add(1);
+            }
+        }
+        Ok((deleted, noops))
+    }
+
+    #[cfg(feature = "opencypher")]
     async fn execute_patternless_mutation(
         &self,
         context: &QueryContext,
         actions: &[RowMutationAction],
         budget: &QueryBudget,
     ) -> Result<QueryMutationResult> {
+        if actions
+            .iter()
+            .any(|action| matches!(action, RowMutationAction::CreateEdge { .. }))
+        {
+            if !actions
+                .iter()
+                .all(|action| matches!(action, RowMutationAction::CreateEdge { .. }))
+            {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "CREATE batches cannot mix mutation action types".to_string(),
+                });
+            }
+            if actions.len() > 1
+                && actions.iter().any(|action| match action {
+                    RowMutationAction::CreateEdge {
+                        src_metadata,
+                        dst_metadata,
+                        edge_metadata,
+                        ..
+                    } => {
+                        !src_metadata.labels.is_empty()
+                            || !src_metadata.properties.is_empty()
+                            || !dst_metadata.labels.is_empty()
+                            || !dst_metadata.properties.is_empty()
+                            || !edge_metadata.properties.is_empty()
+                    }
+                    _ => false,
+                })
+            {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "multi-pattern CREATE with labels or properties requires the metadata batch writer"
+                        .to_string(),
+                });
+            }
+
+            if actions.len() == 1 {
+                let RowMutationAction::CreateEdge {
+                    edge_type,
+                    src,
+                    dst,
+                    src_metadata,
+                    dst_metadata,
+                    edge_metadata,
+                } = &actions[0]
+                else {
+                    unreachable!("CREATE batch was validated above")
+                };
+                let mutation = EdgeMutation {
+                    cell_id: context.cell_id.clone(),
+                    edge_type: edge_type.clone(),
+                    src: *src,
+                    dst: *dst,
+                    idempotency_key: format!(
+                        "{}.create.{}.{}.{}.00000000000000000000",
+                        context.idempotency_key, edge_type, src, dst
+                    ),
+                };
+                let commit = if src_metadata.labels.is_empty()
+                    && src_metadata.properties.is_empty()
+                    && dst_metadata.labels.is_empty()
+                    && dst_metadata.properties.is_empty()
+                    && edge_metadata.properties.is_empty()
+                {
+                    self.write_edge(mutation).await?
+                } else if edge_metadata.properties.is_empty() {
+                    self.write_edge_with_vertex_metadata(
+                        mutation,
+                        src_metadata.clone(),
+                        dst_metadata.clone(),
+                    )
+                    .await?
+                } else {
+                    self.write_edge_with_full_metadata(
+                        mutation,
+                        src_metadata.clone(),
+                        dst_metadata.clone(),
+                        edge_metadata.clone(),
+                    )
+                    .await?
+                };
+                return Ok(QueryMutationResult {
+                    created_edges: u64::from(!commit.already_existed),
+                    noops: u64::from(commit.already_existed),
+                    ..QueryMutationResult::default()
+                });
+            }
+
+            let mutations = actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let RowMutationAction::CreateEdge {
+                        edge_type,
+                        src,
+                        dst,
+                        ..
+                    } = action
+                    else {
+                        unreachable!("CREATE batch was validated above")
+                    };
+                    EdgeMutation {
+                        cell_id: context.cell_id.clone(),
+                        edge_type: edge_type.clone(),
+                        src: *src,
+                        dst: *dst,
+                        idempotency_key: format!(
+                            "{}.create.{}.{}.{}.{index:020}",
+                            context.idempotency_key, edge_type, src, dst
+                        ),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let batch = self
+                .write_edge_mutations_batch(&context.cell_id, mutations)
+                .await?;
+            return Ok(QueryMutationResult {
+                created_edges: batch.inserted,
+                noops: batch.already_existed,
+                ..QueryMutationResult::default()
+            });
+        }
+
         let mut result = QueryMutationResult::default();
         for action in actions {
             budget.check("cypher_patternless_mutation")?;
@@ -5354,6 +5487,445 @@ impl GraphShard {
         Ok(neighbors)
     }
 
+    pub async fn out_neighbors_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        sources: impl IntoIterator<Item = VertexId>,
+    ) -> Result<Vec<NeighborBatchEntry>> {
+        let read_epoch = self.current_epoch(cell_id).await?;
+        self.out_neighbors_batch_at(cell_id, edge_type, sources, read_epoch)
+            .await
+    }
+
+    pub async fn out_neighbors_batch_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        sources: impl IntoIterator<Item = VertexId>,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<NeighborBatchEntry>> {
+        self.out_neighbors_batch_at_with_cancellation(cell_id, edge_type, sources, read_epoch, None)
+            .await
+    }
+
+    pub(crate) async fn out_neighbors_batch_at_with_cancellation(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        sources: impl IntoIterator<Item = VertexId>,
+        read_epoch: GraphEpoch,
+        cancellation_token: Option<QueryCancellationToken>,
+    ) -> Result<Vec<NeighborBatchEntry>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        self.ensure_cell_readable(cell_id, "out_neighbors_batch")
+            .await?;
+        let sources: Vec<_> = sources.into_iter().collect();
+        ensure_limit(
+            "out_neighbors_batch_sources",
+            sources.len() as u64,
+            self.limits.max_query_intermediate_rows as u64,
+        )?;
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, cancellation_token);
+        let current_epoch = self.current_epoch(cell_id).await?;
+        if read_epoch > current_epoch {
+            return Err(GraphError::SnapshotAhead {
+                cell_id: cell_id.to_string(),
+                read_epoch,
+                current_epoch,
+            });
+        }
+        let requested: BTreeSet<_> = sources.iter().copied().collect();
+        let mut by_source = requested
+            .iter()
+            .copied()
+            .map(|source| (source, BTreeSet::new()))
+            .collect::<BTreeMap<_, _>>();
+        let mut scanned_edges = 0_u64;
+
+        if read_epoch == current_epoch {
+            for source in requested.iter().copied() {
+                budget.check("out_neighbors_batch_current_source")?;
+                let (neighbors, source_scanned_edges) = self
+                    .current_out_neighbors_for_source_with_budget(
+                        cell_id, edge_type, source, read_epoch, &budget,
+                    )
+                    .await?;
+                scanned_edges = scanned_edges.saturating_add(source_scanned_edges);
+                ensure_limit(
+                    "out_neighbors_batch_scanned_edges",
+                    scanned_edges,
+                    self.limits.max_query_scan_edges,
+                )?;
+                by_source.insert(source, neighbors);
+            }
+        } else {
+            let base_epoch = self
+                .latest_posting_artifact_epoch(cell_id, edge_type, read_epoch)
+                .await?
+                .unwrap_or(0);
+            if base_epoch > 0 {
+                for source in requested.iter().copied() {
+                    budget.check("out_neighbors_batch_posting_source")?;
+                    let chunks = self
+                        .posting_chunks(
+                            cell_id,
+                            edge_type,
+                            ArtifactDirection::Out,
+                            source,
+                            base_epoch,
+                        )
+                        .await?;
+                    let neighbors = by_source.entry(source).or_default();
+                    for chunk in chunks {
+                        budget.check("out_neighbors_batch_posting_chunk")?;
+                        scanned_edges = scanned_edges.saturating_add(chunk.vertices.len() as u64);
+                        ensure_limit(
+                            "out_neighbors_batch_scanned_edges",
+                            scanned_edges,
+                            self.limits.max_query_scan_edges,
+                        )?;
+                        neighbors.extend(chunk.vertices);
+                    }
+                }
+            }
+            for delta in self
+                .owner_deltas_between_with_budget(OwnerDeltaScan {
+                    cell_id,
+                    edge_type,
+                    direction: "out",
+                    owners: &requested,
+                    after_epoch: base_epoch,
+                    read_epoch,
+                    budget: &budget,
+                })
+                .await?
+            {
+                budget.check("out_neighbors_batch_delta_overlay")?;
+                if let Some(neighbors) = by_source.get_mut(&delta.edge.src) {
+                    match delta.kind {
+                        DeltaKind::Plus => {
+                            neighbors.insert(delta.edge.dst);
+                        }
+                        DeltaKind::Minus => {
+                            neighbors.remove(&delta.edge.dst);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(sources
+            .into_iter()
+            .map(|vertex| NeighborBatchEntry {
+                vertex,
+                neighbors: by_source
+                    .get(&vertex)
+                    .map(|neighbors| neighbors.iter().copied().collect())
+                    .unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    async fn current_out_neighbors_for_source_with_budget(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        source: VertexId,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<(BTreeSet<VertexId>, u64)> {
+        let mut neighbors = BTreeSet::new();
+        let mut scanned_edges = 0_u64;
+        let mut iter = self
+            .scan_remote_prefix(&keys::out_prefix(cell_id, edge_type, source))
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            budget.check("out_neighbors_batch_canonical_scan")?;
+            scanned_edges = scanned_edges.saturating_add(1);
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let record = decode_edge_record(&key, &kv.value)?;
+            if record.epoch <= read_epoch {
+                neighbors.insert(record.dst);
+            }
+        }
+        let tombstones = self
+            .scan_out_segment_tombstones_for_src_at(
+                cell_id,
+                edge_type,
+                source,
+                read_epoch,
+                Some(budget),
+            )
+            .await?;
+        for edge in self
+            .scan_out_segments_for_src_at(cell_id, edge_type, source, read_epoch, Some(budget))
+            .await?
+        {
+            budget.check("out_neighbors_batch_segment_overlay")?;
+            scanned_edges = scanned_edges.saturating_add(1);
+            if segment_edge_visible(edge.epoch, tombstones.get(&edge.dst).copied()) {
+                neighbors.insert(edge.dst);
+            }
+        }
+        Ok((neighbors, scanned_edges))
+    }
+
+    pub async fn in_neighbors_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        destinations: impl IntoIterator<Item = VertexId>,
+    ) -> Result<Vec<NeighborBatchEntry>> {
+        let read_epoch = self.current_epoch(cell_id).await?;
+        self.in_neighbors_batch_at(cell_id, edge_type, destinations, read_epoch)
+            .await
+    }
+
+    pub async fn in_neighbors_batch_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        destinations: impl IntoIterator<Item = VertexId>,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<NeighborBatchEntry>> {
+        self.in_neighbors_batch_at_with_cancellation(
+            cell_id,
+            edge_type,
+            destinations,
+            read_epoch,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn in_neighbors_batch_at_with_cancellation(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        destinations: impl IntoIterator<Item = VertexId>,
+        read_epoch: GraphEpoch,
+        cancellation_token: Option<QueryCancellationToken>,
+    ) -> Result<Vec<NeighborBatchEntry>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        self.ensure_cell_readable(cell_id, "in_neighbors_batch")
+            .await?;
+        let destinations: Vec<_> = destinations.into_iter().collect();
+        ensure_limit(
+            "in_neighbors_batch_destinations",
+            destinations.len() as u64,
+            self.limits.max_query_intermediate_rows as u64,
+        )?;
+        if destinations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, cancellation_token);
+        let current_epoch = self.current_epoch(cell_id).await?;
+        if read_epoch > current_epoch {
+            return Err(GraphError::SnapshotAhead {
+                cell_id: cell_id.to_string(),
+                read_epoch,
+                current_epoch,
+            });
+        }
+        let requested: BTreeSet<_> = destinations.iter().copied().collect();
+        let mut by_destination = requested
+            .iter()
+            .copied()
+            .map(|destination| (destination, BTreeSet::new()))
+            .collect::<BTreeMap<_, _>>();
+        let mut scanned_edges = 0_u64;
+
+        if read_epoch == current_epoch && self.writes_reverse_index() {
+            for destination in requested.iter().copied() {
+                budget.check("in_neighbors_batch_current_destination")?;
+                let mut iter = self
+                    .scan_remote_prefix(&keys::in_prefix(cell_id, edge_type, destination))
+                    .await?;
+                let neighbors = by_destination.entry(destination).or_default();
+                while let Some(kv) = iter.next().await? {
+                    budget.check("in_neighbors_batch_reverse_scan")?;
+                    scanned_edges = scanned_edges.saturating_add(1);
+                    ensure_limit(
+                        "in_neighbors_batch_scanned_edges",
+                        scanned_edges,
+                        self.limits.max_query_scan_edges,
+                    )?;
+                    let key = String::from_utf8_lossy(&kv.key).into_owned();
+                    let record = decode_edge_record(&key, &kv.value)?;
+                    if record.epoch <= read_epoch {
+                        neighbors.insert(record.src);
+                    }
+                }
+            }
+        } else {
+            let base_epoch = self
+                .latest_posting_artifact_epoch(cell_id, edge_type, read_epoch)
+                .await?
+                .unwrap_or(0);
+            if base_epoch > 0 {
+                for destination in requested.iter().copied() {
+                    budget.check("in_neighbors_batch_posting_destination")?;
+                    let chunks = self
+                        .posting_chunks(
+                            cell_id,
+                            edge_type,
+                            ArtifactDirection::In,
+                            destination,
+                            base_epoch,
+                        )
+                        .await?;
+                    let neighbors = by_destination.entry(destination).or_default();
+                    for chunk in chunks {
+                        budget.check("in_neighbors_batch_posting_chunk")?;
+                        scanned_edges = scanned_edges.saturating_add(chunk.vertices.len() as u64);
+                        ensure_limit(
+                            "in_neighbors_batch_scanned_edges",
+                            scanned_edges,
+                            self.limits.max_query_scan_edges,
+                        )?;
+                        neighbors.extend(chunk.vertices);
+                    }
+                }
+            }
+            for delta in self
+                .owner_deltas_between_with_budget(OwnerDeltaScan {
+                    cell_id,
+                    edge_type,
+                    direction: "in",
+                    owners: &requested,
+                    after_epoch: base_epoch,
+                    read_epoch,
+                    budget: &budget,
+                })
+                .await?
+            {
+                budget.check("in_neighbors_batch_delta_overlay")?;
+                if let Some(neighbors) = by_destination.get_mut(&delta.edge.dst) {
+                    match delta.kind {
+                        DeltaKind::Plus => {
+                            neighbors.insert(delta.edge.src);
+                        }
+                        DeltaKind::Minus => {
+                            neighbors.remove(&delta.edge.src);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(destinations
+            .into_iter()
+            .map(|vertex| NeighborBatchEntry {
+                vertex,
+                neighbors: by_destination
+                    .get(&vertex)
+                    .map(|neighbors| neighbors.iter().copied().collect())
+                    .unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    pub async fn edge_exists_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+    ) -> Result<Vec<EdgeExistenceBatchEntry>> {
+        let read_epoch = self.current_epoch(cell_id).await?;
+        self.edge_exists_batch_at(cell_id, edge_type, edges, read_epoch)
+            .await
+    }
+
+    pub async fn edge_exists_batch_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<EdgeExistenceBatchEntry>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        self.ensure_cell_readable(cell_id, "edge_exists_batch")
+            .await?;
+        let edges: Vec<_> = edges.into_iter().collect();
+        ensure_limit(
+            "edge_exists_batch_edges",
+            edges.len() as u64,
+            self.limits.max_query_intermediate_rows as u64,
+        )?;
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
+        let current_epoch = self.current_epoch(cell_id).await?;
+        if read_epoch > current_epoch {
+            return Err(GraphError::SnapshotAhead {
+                cell_id: cell_id.to_string(),
+                read_epoch,
+                current_epoch,
+            });
+        }
+        let live = if read_epoch == current_epoch {
+            let mut live = BTreeSet::new();
+            for (src, dst) in edges.iter().copied().collect::<BTreeSet<_>>() {
+                budget.check("edge_exists_batch_point_lookup")?;
+                if self.edge_exists(cell_id, edge_type, src, dst).await? {
+                    live.insert((src, dst));
+                }
+            }
+            live
+        } else {
+            let requested = edges.iter().copied().collect::<BTreeSet<_>>();
+            let base_epoch = self
+                .latest_posting_artifact_epoch(cell_id, edge_type, read_epoch)
+                .await?
+                .unwrap_or(0);
+            let mut live = BTreeSet::new();
+            if base_epoch > 0 {
+                for (src, dst) in requested.iter().copied() {
+                    budget.check("edge_exists_batch_posting_point")?;
+                    if self
+                        .posting_edge_exists_at_base(cell_id, edge_type, src, dst, base_epoch)
+                        .await?
+                    {
+                        live.insert((src, dst));
+                    }
+                }
+            }
+            for delta in self
+                .pair_deltas_between_with_budget(
+                    cell_id, edge_type, &requested, base_epoch, read_epoch, &budget,
+                )
+                .await?
+            {
+                let identity = (delta.edge.src, delta.edge.dst);
+                match delta.kind {
+                    DeltaKind::Plus => {
+                        live.insert(identity);
+                    }
+                    DeltaKind::Minus => {
+                        live.remove(&identity);
+                    }
+                }
+            }
+            live
+        };
+        Ok(edges
+            .into_iter()
+            .map(|(src, dst)| EdgeExistenceBatchEntry {
+                src,
+                dst,
+                exists: live.contains(&(src, dst)),
+            })
+            .collect())
+    }
+
     async fn out_neighbors_at_for_query(
         &self,
         cell_id: &str,
@@ -5431,6 +6003,13 @@ impl GraphShard {
                     dst,
                     epoch,
                 });
+                if budget.is_some() {
+                    ensure_limit(
+                        "query_out_segment_records",
+                        edges.len() as u64,
+                        self.limits.max_query_scan_edges,
+                    )?;
+                }
             }
         }
         Ok(edges)
@@ -5477,6 +6056,13 @@ impl GraphShard {
             let epoch = decode_u64(&key, &kv.value)?;
             if epoch <= read_epoch {
                 tombstones.insert(dst, epoch);
+                if budget.is_some() {
+                    ensure_limit(
+                        "query_out_segment_tombstones",
+                        tombstones.len() as u64,
+                        self.limits.max_query_scan_edges,
+                    )?;
+                }
             }
         }
         Ok(tombstones)
@@ -5677,6 +6263,155 @@ impl GraphShard {
     ) -> Result<Vec<DeltaRecord>> {
         self.deltas_between(cell_id, edge_type, after_epoch, GraphEpoch::MAX)
             .await
+    }
+
+    async fn owner_deltas_between_with_budget(
+        &self,
+        request: OwnerDeltaScan<'_>,
+    ) -> Result<Vec<DeltaRecord>> {
+        let OwnerDeltaScan {
+            cell_id,
+            edge_type,
+            direction,
+            owners,
+            after_epoch,
+            read_epoch,
+            budget,
+        } = request;
+        if after_epoch >= read_epoch || owners.is_empty() {
+            return Ok(Vec::new());
+        }
+        let watermark = self.delta_gc_watermark(cell_id, edge_type).await?;
+        if after_epoch < watermark {
+            return Err(GraphError::SnapshotExpired {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch: after_epoch,
+                min_epoch: watermark,
+            });
+        }
+        let start_suffix = format!("{:020}/", after_epoch.saturating_add(1));
+        let mut records = Vec::new();
+        for owner in owners.iter().copied() {
+            for kind in [DeltaKind::Plus, DeltaKind::Minus] {
+                budget.check("query_owner_delta_prefix")?;
+                let prefix = keys::owner_delta_prefix(cell_id, kind, edge_type, direction, owner);
+                let mut iter = self.scan_remote_prefix_from(&prefix, &start_suffix).await?;
+                while let Some(kv) = iter.next().await? {
+                    budget.check("query_owner_delta_scan")?;
+                    let key = String::from_utf8_lossy(&kv.key).into_owned();
+                    let record = decode_delta_record(&key, &kv.value)?;
+                    if record.edge.epoch > read_epoch {
+                        break;
+                    }
+                    let record_owner = match direction {
+                        "out" => record.edge.src,
+                        "in" => record.edge.dst,
+                        _ => {
+                            return Err(GraphError::CorruptValue {
+                                key: key.clone(),
+                                reason: format!("invalid owner delta direction {direction}"),
+                            })
+                        }
+                    };
+                    if record.kind != kind
+                        || record.edge.cell_id != cell_id
+                        || record.edge.edge_type != edge_type
+                        || record_owner != owner
+                    {
+                        return Err(GraphError::CorruptValue {
+                            key,
+                            reason: "owner delta identity does not match key prefix".to_string(),
+                        });
+                    }
+                    records.push(record);
+                    ensure_limit(
+                        "query_owner_delta_records",
+                        records.len() as u64,
+                        self.limits.max_query_scan_edges,
+                    )?;
+                }
+            }
+        }
+        let final_watermark = self.delta_gc_watermark(cell_id, edge_type).await?;
+        if after_epoch < final_watermark {
+            return Err(GraphError::SnapshotExpired {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch: after_epoch,
+                min_epoch: final_watermark,
+            });
+        }
+        sort_deltas(&mut records);
+        Ok(records)
+    }
+
+    async fn pair_deltas_between_with_budget(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: &BTreeSet<(VertexId, VertexId)>,
+        after_epoch: GraphEpoch,
+        read_epoch: GraphEpoch,
+        budget: &QueryBudget,
+    ) -> Result<Vec<DeltaRecord>> {
+        if after_epoch >= read_epoch || edges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let watermark = self.delta_gc_watermark(cell_id, edge_type).await?;
+        if after_epoch < watermark {
+            return Err(GraphError::SnapshotExpired {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch: after_epoch,
+                min_epoch: watermark,
+            });
+        }
+        let start_suffix = format!("{:020}", after_epoch.saturating_add(1));
+        let mut records = Vec::new();
+        for (src, dst) in edges.iter().copied() {
+            for kind in [DeltaKind::Plus, DeltaKind::Minus] {
+                budget.check("query_pair_delta_prefix")?;
+                let prefix = keys::pair_delta_prefix(cell_id, kind, edge_type, src, dst);
+                let mut iter = self.scan_remote_prefix_from(&prefix, &start_suffix).await?;
+                while let Some(kv) = iter.next().await? {
+                    budget.check("query_pair_delta_scan")?;
+                    let key = String::from_utf8_lossy(&kv.key).into_owned();
+                    let record = decode_delta_record(&key, &kv.value)?;
+                    if record.edge.epoch > read_epoch {
+                        break;
+                    }
+                    if record.kind != kind
+                        || record.edge.cell_id != cell_id
+                        || record.edge.edge_type != edge_type
+                        || record.edge.src != src
+                        || record.edge.dst != dst
+                    {
+                        return Err(GraphError::CorruptValue {
+                            key,
+                            reason: "pair delta identity does not match key prefix".to_string(),
+                        });
+                    }
+                    records.push(record);
+                    ensure_limit(
+                        "query_pair_delta_records",
+                        records.len() as u64,
+                        self.limits.max_query_scan_edges,
+                    )?;
+                }
+            }
+        }
+        let final_watermark = self.delta_gc_watermark(cell_id, edge_type).await?;
+        if after_epoch < final_watermark {
+            return Err(GraphError::SnapshotExpired {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch: after_epoch,
+                min_epoch: final_watermark,
+            });
+        }
+        sort_deltas(&mut records);
+        Ok(records)
     }
 
     pub async fn deltas_between(
@@ -6028,6 +6763,16 @@ impl GraphShard {
             degree_mismatches,
         })
     }
+}
+
+struct OwnerDeltaScan<'a> {
+    cell_id: &'a str,
+    edge_type: &'a str,
+    direction: &'static str,
+    owners: &'a BTreeSet<VertexId>,
+    after_epoch: GraphEpoch,
+    read_epoch: GraphEpoch,
+    budget: &'a QueryBudget,
 }
 
 #[derive(Clone, Debug)]

@@ -1417,10 +1417,12 @@ impl GraphShard {
                 epoch,
             };
             let edge_value = encode_edge_record(&record);
-            let delta_value = encode_delta_record(&DeltaRecord {
+            let delta = DeltaRecord {
                 kind: DeltaKind::Plus,
                 edge: record,
-            });
+            };
+            let delta_value = encode_delta_record(&delta);
+            put_scoped_delta_indexes_txn(&txn, &delta)?;
             txn.put(
                 keys::out_edge(cell_id, edge_type, src, dst).as_bytes(),
                 &edge_value,
@@ -1749,10 +1751,12 @@ impl GraphShard {
                 epoch,
             };
             let edge_value = encode_edge_record(&record);
-            let delta_value = encode_delta_record(&DeltaRecord {
+            let delta = DeltaRecord {
                 kind: DeltaKind::Plus,
                 edge: record,
-            });
+            };
+            let delta_value = encode_delta_record(&delta);
+            put_scoped_delta_indexes_txn(&txn, &delta)?;
             let out_degree_key =
                 keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
             let out_degree = read_counter_txn(&txn, &out_degree_key).await? + 1;
@@ -2520,10 +2524,12 @@ impl GraphShard {
             epoch,
         };
         let edge_value = encode_edge_record(&record);
-        let delta_value = encode_delta_record(&DeltaRecord {
+        let delta = DeltaRecord {
             kind: DeltaKind::Plus,
             edge: record.clone(),
-        });
+        };
+        let delta_value = encode_delta_record(&delta);
+        put_scoped_delta_indexes_txn(&txn, &delta)?;
         let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
         let out_degree = read_counter_txn(&txn, &out_degree_key).await? + 1;
         let in_degree = if self.writes_reverse_index() {
@@ -2966,6 +2972,7 @@ impl GraphShard {
                         .as_bytes(),
                     encode_delta_record(&delta),
                 )?;
+                put_scoped_delta_indexes_txn(&txn, &delta)?;
             }
             txn.put(
                 keys::outbox_batch(
@@ -3146,10 +3153,12 @@ impl GraphShard {
                 dst: mutation.dst,
                 epoch,
             };
-            let delta_value = encode_delta_record(&DeltaRecord {
+            let delta = DeltaRecord {
                 kind: DeltaKind::Minus,
                 edge: record,
-            });
+            };
+            let delta_value = encode_delta_record(&delta);
+            put_scoped_delta_indexes_txn(&txn, &delta)?;
             let out_degree_key =
                 keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
             let out_degree = read_counter_txn(&txn, &out_degree_key)
@@ -3226,10 +3235,12 @@ impl GraphShard {
             epoch,
             deleted: true,
         };
-        let delta_value = encode_delta_record(&DeltaRecord {
+        let delta = DeltaRecord {
             kind: DeltaKind::Minus,
             edge: record.clone(),
-        });
+        };
+        let delta_value = encode_delta_record(&delta);
+        put_scoped_delta_indexes_txn(&txn, &delta)?;
 
         let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
         let out_degree = read_counter_txn(&txn, &out_degree_key)
@@ -4137,10 +4148,12 @@ impl GraphShard {
                 already_existed: false,
             };
             let edge_value = encode_edge_record(&record);
-            let delta_value = encode_delta_record(&DeltaRecord {
+            let delta = DeltaRecord {
                 kind: DeltaKind::Plus,
                 edge: record.clone(),
-            });
+            };
+            let delta_value = encode_delta_record(&delta);
+            put_scoped_delta_indexes_txn(&txn, &delta)?;
             txn.put(
                 keys::out_edge(cell_id, &mutation.edge_type, mutation.src, mutation.dst).as_bytes(),
                 &edge_value,
@@ -4466,6 +4479,19 @@ impl GraphShard {
                 read_counter_txn(&txn, &degree_key).await?
             };
             txn.put(degree_key.as_bytes(), encode_u64(base + inserted))?;
+            for (offset, dst) in inserted_dsts.iter().copied().enumerate() {
+                let delta = DeltaRecord {
+                    kind: DeltaKind::Plus,
+                    edge: EdgeRecord {
+                        cell_id: cell_id.to_string(),
+                        edge_type: edge_type.to_string(),
+                        src,
+                        dst,
+                        epoch: start_epoch + offset as u64,
+                    },
+                };
+                put_scoped_delta_indexes_txn(&txn, &delta)?;
+            }
             txn.put(
                 keys::outbox_batch(
                     cell_id,
@@ -4624,10 +4650,12 @@ impl GraphShard {
                 epoch,
             };
             let edge_value = encode_edge_record(&record);
-            let delta_value = encode_delta_record(&DeltaRecord {
+            let delta = DeltaRecord {
                 kind: DeltaKind::Plus,
                 edge: record.clone(),
-            });
+            };
+            let delta_value = encode_delta_record(&delta);
+            put_scoped_delta_indexes_txn(&txn, &delta)?;
             txn.put(
                 keys::out_edge(cell_id, edge_type, src, dst).as_bytes(),
                 &edge_value,
@@ -5227,10 +5255,12 @@ async fn delete_structural_edge_txn(
         dst: mutation.dst,
         epoch,
     };
-    let delta_value = encode_delta_record(&DeltaRecord {
+    let delta = DeltaRecord {
         kind: DeltaKind::Minus,
         edge: record,
-    });
+    };
+    let delta_value = encode_delta_record(&delta);
+    put_scoped_delta_indexes_txn(txn, &delta)?;
     let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
     let out_degree = read_counter_txn(txn, &out_degree_key)
         .await?
@@ -5304,6 +5334,50 @@ async fn delete_structural_edge_txn(
         )
         .as_bytes(),
         &delta_value,
+    )?;
+    Ok(())
+}
+
+fn put_scoped_delta_indexes_txn(txn: &DbTransaction, delta: &DeltaRecord) -> Result<()> {
+    let value = encode_delta_record(delta);
+    let edge = &delta.edge;
+    txn.put(
+        keys::owner_delta(
+            &edge.cell_id,
+            delta.kind,
+            &edge.edge_type,
+            "out",
+            edge.src,
+            edge.epoch,
+            edge.dst,
+        )
+        .as_bytes(),
+        &value,
+    )?;
+    txn.put(
+        keys::owner_delta(
+            &edge.cell_id,
+            delta.kind,
+            &edge.edge_type,
+            "in",
+            edge.dst,
+            edge.epoch,
+            edge.src,
+        )
+        .as_bytes(),
+        &value,
+    )?;
+    txn.put(
+        keys::pair_delta(
+            &edge.cell_id,
+            delta.kind,
+            &edge.edge_type,
+            edge.src,
+            edge.dst,
+            edge.epoch,
+        )
+        .as_bytes(),
+        value,
     )?;
     Ok(())
 }

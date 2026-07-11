@@ -24,8 +24,8 @@ use super::service::{
 };
 use crate::{
     GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryCursorToken, QueryFloat,
-    QueryTransportConnectionIdentity, QueryTransportTlsServerConfigProvider, QueryValue, Result,
-    VertexPropertyValue,
+    QueryParameterValue, QueryTransportConnectionIdentity, QueryTransportTlsServerConfigProvider,
+    QueryValue, Result, VertexPropertyValue,
 };
 
 const GRAPH_NAMESPACE_HEADER: &str = "x-graph-namespace";
@@ -457,10 +457,10 @@ async fn execute_query_inner(
     let parameters = body
         .parameters
         .iter()
-        .map(|(name, value)| Ok((name.clone(), http_parameter_to_property(name, value)?)))
+        .map(|(name, value)| Ok((name.clone(), http_parameter_to_query_value(name, value)?)))
         .collect::<std::result::Result<BTreeMap<_, _>, HttpApiError>>()?;
     let mut request =
-        ClientQueryRequest::new(target, query_id, body.query).with_parameters(parameters);
+        ClientQueryRequest::new(target, query_id, body.query).with_query_parameters(parameters);
     if let Some(read_epoch) = body.read_epoch {
         request = request.at_epoch(read_epoch);
     }
@@ -613,12 +613,47 @@ fn http_parameter_to_property(
     }
 }
 
+fn http_parameter_to_query_value(
+    name: &str,
+    value: &serde_json::Value,
+) -> std::result::Result<QueryParameterValue, HttpApiError> {
+    http_parameter_to_query_value_at_depth(name, value, 0)
+}
+
+fn http_parameter_to_query_value_at_depth(
+    name: &str,
+    value: &serde_json::Value,
+    depth: usize,
+) -> std::result::Result<QueryParameterValue, HttpApiError> {
+    if depth > 16 {
+        return Err(invalid_http_parameter(name));
+    }
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| http_parameter_to_query_value_at_depth(name, value, depth + 1))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(QueryParameterValue::List),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| {
+                Ok((
+                    key.clone(),
+                    http_parameter_to_query_value_at_depth(name, value, depth + 1)?,
+                ))
+            })
+            .collect::<std::result::Result<BTreeMap<_, _>, HttpApiError>>()
+            .map(QueryParameterValue::Map),
+        _ => http_parameter_to_property(name, value).map(QueryParameterValue::Scalar),
+    }
+}
+
 fn invalid_http_parameter(name: &str) -> HttpApiError {
     HttpApiError {
         status: StatusCode::BAD_REQUEST,
         code: "invalid_parameter",
         message: format!(
-            "parameter ${name} must be a boolean, signed or unsigned integer, finite float, or string"
+            "parameter ${name} must contain booleans, signed or unsigned integers, finite floats, strings, lists, or string-keyed maps"
         ),
         authenticate: false,
     }

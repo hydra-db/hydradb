@@ -13,6 +13,72 @@ use crate::{
     derive(serde::Deserialize, serde::Serialize)
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryParameterValue {
+    Scalar(VertexPropertyValue),
+    List(Vec<QueryParameterValue>),
+    Map(BTreeMap<String, QueryParameterValue>),
+}
+
+impl From<VertexPropertyValue> for QueryParameterValue {
+    fn from(value: VertexPropertyValue) -> Self {
+        Self::Scalar(value)
+    }
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct QueryBatchEdge {
+    pub src: VertexId,
+    pub dst: VertexId,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryBatchOperation {
+    OutNeighbors {
+        edge_type: String,
+        sources: Vec<VertexId>,
+        source_column: QueryColumn,
+        destination_column: QueryColumn,
+    },
+    CreateEdges {
+        edge_type: String,
+        edges: Vec<QueryBatchEdge>,
+    },
+    DeleteEdges {
+        edge_type: String,
+        edges: Vec<QueryBatchEdge>,
+    },
+}
+
+impl QueryBatchOperation {
+    pub fn is_write(&self) -> bool {
+        matches!(self, Self::CreateEdges { .. } | Self::DeleteEdges { .. })
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::OutNeighbors { sources, .. } => sources.len(),
+            Self::CreateEdges { edges, .. } | Self::DeleteEdges { edges, .. } => edges.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryContext {
     #[cfg_attr(feature = "query-transport", serde(default))]
     pub scope: GraphScope,

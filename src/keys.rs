@@ -608,7 +608,6 @@ pub fn owner_delta_kind_prefix(cell_id: &str, edge_type: &str, kind: super::Delt
     format!("cell/{cell_id}/delta_owner/{kind}/{edge_type}/")
 }
 
-#[cfg(test)]
 pub fn owner_delta(
     cell_id: &str,
     kind: super::DeltaKind,
@@ -621,6 +620,41 @@ pub fn owner_delta(
     format!(
         "{}{epoch:020}/{neighbor:020}",
         owner_delta_prefix(cell_id, kind, edge_type, direction, owner)
+    )
+}
+
+pub fn pair_delta_kind_prefix(cell_id: &str, edge_type: &str, kind: super::DeltaKind) -> String {
+    let kind = match kind {
+        super::DeltaKind::Plus => "plus",
+        super::DeltaKind::Minus => "minus",
+    };
+    format!("cell/{cell_id}/delta_pair/{kind}/{edge_type}/")
+}
+
+pub fn pair_delta_prefix(
+    cell_id: &str,
+    kind: super::DeltaKind,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+) -> String {
+    format!(
+        "{}{src:020}/{dst:020}/",
+        pair_delta_kind_prefix(cell_id, edge_type, kind)
+    )
+}
+
+pub fn pair_delta(
+    cell_id: &str,
+    kind: super::DeltaKind,
+    edge_type: &str,
+    src: VertexId,
+    dst: VertexId,
+    epoch: GraphEpoch,
+) -> String {
+    format!(
+        "{}{epoch:020}",
+        pair_delta_prefix(cell_id, kind, edge_type, src, dst)
     )
 }
 

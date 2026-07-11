@@ -223,6 +223,7 @@ impl GraphShard {
                 chunk_count: group.chunk_count,
                 vertex_count: group.degree,
                 chunk_checksums: Vec::new(),
+                chunk_bounds: group.chunk_bounds,
             })
         } else {
             let artifact_manifest_key =
@@ -269,6 +270,152 @@ impl GraphShard {
             chunks.push(chunk);
         }
         Ok(chunks)
+    }
+
+    pub(crate) async fn latest_posting_artifact_epoch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        read_epoch: GraphEpoch,
+    ) -> Result<Option<GraphEpoch>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let mut iter = self
+            .scan_remote_prefix(&posting_artifact_manifest_prefix(cell_id, edge_type))
+            .await?;
+        let mut latest = None;
+        while let Some(kv) = iter.next().await? {
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let manifest = decode_posting_artifact_manifest(&key, &kv.value)?;
+            if manifest.cell_id != cell_id || manifest.edge_type != edge_type {
+                return corrupt(
+                    &key,
+                    "posting artifact manifest identity does not match prefix",
+                );
+            }
+            if manifest.base_epoch <= read_epoch
+                && latest.is_none_or(|epoch| manifest.base_epoch > epoch)
+            {
+                latest = Some(manifest.base_epoch);
+            }
+        }
+        Ok(latest)
+    }
+
+    pub(crate) async fn posting_edge_exists_at_base(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        base_epoch: GraphEpoch,
+    ) -> Result<bool> {
+        let artifact_key = posting_artifact_manifest_key(cell_id, edge_type, base_epoch);
+        let Some(value) = self.read_remote(&artifact_key).await? else {
+            return corrupt(&artifact_key, "missing posting artifact epoch manifest");
+        };
+        decode_posting_artifact_manifest(&artifact_key, &value)?;
+
+        let manifest_key =
+            posting_manifest_key(cell_id, edge_type, ArtifactDirection::Out, src, base_epoch);
+        let Some(value) = self.read_remote(&manifest_key).await? else {
+            return Ok(false);
+        };
+        let manifest = decode_posting_manifest(&manifest_key, &value)?;
+        if manifest.chunk_count == 0 {
+            return Ok(false);
+        }
+        if manifest.chunk_bounds.is_empty() {
+            let mut low = 0_u64;
+            let mut high = manifest.chunk_count;
+            while low < high {
+                let chunk_id = low + (high - low) / 2;
+                let chunk = self
+                    .posting_point_lookup_chunk(
+                        cell_id, edge_type, src, base_epoch, &manifest, chunk_id,
+                    )
+                    .await?;
+                let Some(first) = chunk.vertices.first().copied() else {
+                    return corrupt(
+                        &manifest_key,
+                        "legacy posting manifest references empty chunk",
+                    );
+                };
+                let last = chunk.vertices.last().copied().unwrap_or(first);
+                if dst < first {
+                    high = chunk_id;
+                } else if dst > last {
+                    low = chunk_id.saturating_add(1);
+                } else {
+                    return Ok(chunk.vertices.binary_search(&dst).is_ok());
+                }
+            }
+            return Ok(false);
+        }
+        let Some(bound) = manifest
+            .chunk_bounds
+            .iter()
+            .find(|bound| bound.first <= dst && dst <= bound.last)
+        else {
+            return Ok(false);
+        };
+        let chunk = self
+            .posting_point_lookup_chunk(
+                cell_id,
+                edge_type,
+                src,
+                base_epoch,
+                &manifest,
+                bound.chunk_id,
+            )
+            .await?;
+        if chunk.vertices.first().copied() != Some(bound.first)
+            || chunk.vertices.last().copied() != Some(bound.last)
+        {
+            return corrupt(&manifest_key, "posting point-lookup chunk bounds mismatch");
+        }
+        Ok(chunk.vertices.binary_search(&dst).is_ok())
+    }
+
+    async fn posting_point_lookup_chunk(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        base_epoch: GraphEpoch,
+        manifest: &PostingChunkManifest,
+        chunk_id: u64,
+    ) -> Result<PostingChunk> {
+        let key = posting_chunk_key(
+            cell_id,
+            edge_type,
+            ArtifactDirection::Out,
+            src,
+            base_epoch,
+            chunk_id,
+        );
+        let Some(value) = self.read_remote(&key).await? else {
+            return corrupt(
+                &key,
+                "posting manifest references missing point-lookup chunk",
+            );
+        };
+        let chunk = decode_posting_chunk(&key, &value)?;
+        let checksum_index = usize::try_from(chunk_id).map_err(|err| GraphError::CorruptValue {
+            key: key.clone(),
+            reason: format!("posting chunk id does not fit usize: {err}"),
+        })?;
+        let expected = manifest
+            .chunk_checksums
+            .get(checksum_index)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: key.clone(),
+                reason: "posting manifest is missing point-lookup chunk checksum".to_string(),
+            })?;
+        if posting_chunk_checksum(&chunk) != *expected {
+            return corrupt(&key, "posting point-lookup chunk checksum mismatch");
+        }
+        Ok(chunk)
     }
 
     pub async fn build_matrix_tiles(
