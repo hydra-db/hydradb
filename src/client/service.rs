@@ -310,6 +310,14 @@ pub struct ClientQueryPage {
     pub bookmark: Option<ClientBookmark>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedClientQuery {
+    pub(crate) request: ClientQueryRequest,
+    pub(crate) action: QueryTransportAction,
+    pub(crate) columns: Vec<QueryColumn>,
+    pub(crate) read_context: Option<QueryContext>,
+}
+
 #[derive(Clone)]
 pub struct ClientQueryServiceConfig {
     pub auth_policy: QueryTransportAuthPolicy,
@@ -420,6 +428,9 @@ pub struct ClientQueryMetricsSnapshot {
     pub scope_denials: u64,
     pub cancellations: u64,
     pub backpressure_waits: u64,
+    pub prepare_requests: u64,
+    pub prepare_duration_us: u64,
+    pub execution_duration_us: u64,
 }
 
 #[derive(Default)]
@@ -432,6 +443,9 @@ struct ClientQueryMetrics {
     scope_denials: AtomicU64,
     cancellations: AtomicU64,
     backpressure_waits: AtomicU64,
+    prepare_requests: AtomicU64,
+    prepare_duration_us: AtomicU64,
+    execution_duration_us: AtomicU64,
 }
 
 impl ClientQueryMetrics {
@@ -445,6 +459,9 @@ impl ClientQueryMetrics {
             scope_denials: self.scope_denials.load(Ordering::Relaxed),
             cancellations: self.cancellations.load(Ordering::Relaxed),
             backpressure_waits: self.backpressure_waits.load(Ordering::Relaxed),
+            prepare_requests: self.prepare_requests.load(Ordering::Relaxed),
+            prepare_duration_us: self.prepare_duration_us.load(Ordering::Relaxed),
+            execution_duration_us: self.execution_duration_us.load(Ordering::Relaxed),
         }
     }
 }
@@ -718,19 +735,43 @@ impl ClientQueryService {
     pub async fn execute_page(
         &self,
         session: &ClientQuerySession,
-        mut request: ClientQueryRequest,
+        request: ClientQueryRequest,
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<ClientQueryPage> {
-        self.validate_request(&request, Some(page_size))?;
-        let runtime_limit_ms = self.normalize_runtime_limit(&mut request)?;
-        let action = self.authorize_query(session, &request)?;
+        let prepared = self
+            .prepare_page_request(session, request, page_size)
+            .await?;
+        self.execute_prepared_page(session, prepared, cursor, page_size)
+            .await
+    }
+
+    pub(crate) async fn execute_prepared_page(
+        &self,
+        session: &ClientQuerySession,
+        prepared: PreparedClientQuery,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<ClientQueryPage> {
+        let execution_started = std::time::Instant::now();
+        let PreparedClientQuery {
+            request,
+            action,
+            columns: _,
+            read_context,
+        } = prepared;
+        // Grants can change while a Bolt cursor is open. The parsed query and
+        // access classification are reusable, but authorization is not.
+        self.authorize_scope(session, &request.target.scope, action)?;
         if action == QueryTransportAction::Write && cursor.is_some() {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "ClientProtocol",
                 feature: "mutation queries cannot continue from a result cursor".to_string(),
             });
         }
+        let runtime_limit_ms = request
+            .max_runtime_ms
+            .expect("prepared client queries have a normalized runtime limit");
         let key = client_query_key(session, &request);
         let (generation, cancellation_token) = self.begin_query(key.clone()).await?;
         let result = self
@@ -740,9 +781,12 @@ impl ClientQueryService {
                 &cancellation_token,
                 runtime_limit_ms,
                 async {
-                    self.validate_bookmark(&request).await?;
-                    self.pin_read_epoch(action, &mut request).await?;
-                    let context = query_context(&request, cancellation_token.clone());
+                    let mut context = match read_context {
+                        Some(context) => context,
+                        None => query_context(&request, cancellation_token.clone()),
+                    };
+                    context.max_runtime_ms = request.max_runtime_ms;
+                    context.cancellation_token = Some(cancellation_token.clone());
                     let page = self
                         .inner
                         .client
@@ -766,6 +810,14 @@ impl ClientQueryService {
                 .unwrap_or(0),
             result.is_ok(),
         );
+        self.inner.metrics.execution_duration_us.fetch_add(
+            execution_started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         result
     }
 
@@ -774,12 +826,16 @@ impl ClientQueryService {
         session: &ClientQuerySession,
         mut request: ClientQueryRequest,
         page_size: usize,
-    ) -> Result<(ClientQueryRequest, Vec<QueryColumn>)> {
+    ) -> Result<PreparedClientQuery> {
+        let prepare_started = std::time::Instant::now();
+        self.inner
+            .metrics
+            .prepare_requests
+            .fetch_add(1, Ordering::Relaxed);
         self.validate_request(&request, Some(page_size))?;
         self.normalize_runtime_limit(&mut request)?;
         let action = self.authorize_query(session, &request)?;
         self.validate_bookmark(&request).await?;
-        self.pin_read_epoch(action, &mut request).await?;
 
         let columns = match action {
             QueryTransportAction::Read => {
@@ -787,12 +843,19 @@ impl ClientQueryService {
                     .columns
             }
             QueryTransportAction::Write => {
-                if parse_opencypher_mutation_query_with_parameters(
+                let row_mutation = parse_opencypher_mutation_query_with_parameters(
                     &request.query,
                     &request.parameters,
                 )?
-                .is_none()
-                {
+                .is_some();
+                let scalar_mutation = if row_mutation {
+                    false
+                } else {
+                    crate::parse_opencypher_with_parameters(&request.query, &request.parameters)
+                        .map(|parsed| parsed.statement.is_write())
+                        .unwrap_or(false)
+                };
+                if !row_mutation && !scalar_mutation {
                     return Err(GraphError::UnsupportedQuery {
                         dialect: "ClientProtocol",
                         feature: "write query is not executable by the mutation engine".to_string(),
@@ -804,7 +867,30 @@ impl ClientQueryService {
                 unreachable!("query access classification only returns read or write")
             }
         };
-        Ok((request, columns))
+        let read_context = if action == QueryTransportAction::Read {
+            let mut context = query_context(&request, QueryCancellationToken::new());
+            context.cancellation_token = None;
+            let context = self.inner.client.pin_query_read_context(context).await?;
+            request.read_epoch = context.read_epoch;
+            Some(context)
+        } else {
+            None
+        };
+        let prepared = PreparedClientQuery {
+            request,
+            action,
+            columns,
+            read_context,
+        };
+        self.inner.metrics.prepare_duration_us.fetch_add(
+            prepare_started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        Ok(prepared)
     }
 
     pub async fn cancel(
@@ -1033,14 +1119,18 @@ impl ClientQueryService {
     where
         F: Future<Output = Result<T>>,
     {
-        match tokio::time::timeout(
-            Duration::from_millis(runtime_limit_ms),
-            self.run_query(key, generation, cancellation_token, execute),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(client_query_runtime_exceeded(runtime_limit_ms)),
+        let query = self.run_query(key, generation, cancellation_token, execute);
+        tokio::pin!(query);
+        tokio::select! {
+            result = &mut query => result,
+            _ = tokio::time::sleep(Duration::from_millis(runtime_limit_ms)) => {
+                // spawn_blocking work cannot be aborted once native GraphBLAS has
+                // started. Signal cooperative cancellation, then keep the query
+                // and namespace permits until the executor has actually stopped.
+                cancellation_token.cancel();
+                let _ = query.await;
+                Err(client_query_runtime_exceeded(runtime_limit_ms))
+            }
         }
     }
 

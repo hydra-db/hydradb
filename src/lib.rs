@@ -77,6 +77,8 @@ pub(crate) use core::state::{
     decode_cell_write_lock_record, encode_cell_write_lock_record, CellWriteLockState,
 };
 pub use core::state::{GraphCacheEntryCounts, GraphShard};
+#[cfg(feature = "opencypher")]
+pub(crate) use core::state::{QueryReadLeaseManager, QueryReadLeaseRegistration};
 pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
 pub use engine::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,

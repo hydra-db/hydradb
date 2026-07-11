@@ -142,6 +142,11 @@ pub struct GraphOperationalMetricsSnapshot {
     pub query_rows_failed: u64,
     pub query_rows_returned: u64,
     pub query_rows_duration_us: u64,
+    pub query_artifact_lookup_us: u64,
+    pub query_graphblas_cache_us: u64,
+    pub graph_compute_tasks: u64,
+    pub graph_compute_queue_us: u64,
+    pub graph_compute_duration_us: u64,
     pub backpressure_waits: u64,
 }
 
@@ -176,6 +181,11 @@ pub(crate) struct GraphOperationalMetrics {
     pub(crate) query_rows_failed: AtomicU64,
     pub(crate) query_rows_returned: AtomicU64,
     pub(crate) query_rows_duration_us: AtomicU64,
+    pub(crate) query_artifact_lookup_us: AtomicU64,
+    pub(crate) query_graphblas_cache_us: AtomicU64,
+    pub(crate) graph_compute_tasks: AtomicU64,
+    pub(crate) graph_compute_queue_us: AtomicU64,
+    pub(crate) graph_compute_duration_us: AtomicU64,
     pub(crate) backpressure_waits: AtomicU64,
 }
 
@@ -211,6 +221,11 @@ impl GraphOperationalMetrics {
             query_rows_failed: self.query_rows_failed.load(Ordering::Relaxed),
             query_rows_returned: self.query_rows_returned.load(Ordering::Relaxed),
             query_rows_duration_us: self.query_rows_duration_us.load(Ordering::Relaxed),
+            query_artifact_lookup_us: self.query_artifact_lookup_us.load(Ordering::Relaxed),
+            query_graphblas_cache_us: self.query_graphblas_cache_us.load(Ordering::Relaxed),
+            graph_compute_tasks: self.graph_compute_tasks.load(Ordering::Relaxed),
+            graph_compute_queue_us: self.graph_compute_queue_us.load(Ordering::Relaxed),
+            graph_compute_duration_us: self.graph_compute_duration_us.load(Ordering::Relaxed),
             backpressure_waits: self.backpressure_waits.load(Ordering::Relaxed),
         }
     }

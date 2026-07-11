@@ -4449,6 +4449,61 @@ async fn routed_cluster_rejects_writes_for_non_owned_cells() {
     cluster.close().await.unwrap();
 }
 
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn routed_query_cell_client_executes_autocommit_mutations() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let control =
+        GraphControlPlane::open("graph-client-mutation/control", Arc::clone(&object_store))
+            .await
+            .unwrap();
+    control
+        .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
+        .await
+        .unwrap();
+    let cluster = RoutedGraphCluster::open_owned_with_control(
+        "graph-client-mutation/data",
+        "node-a",
+        &control,
+        object_store,
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+
+    let page = QueryCellClient::execute_cypher_rows_page(
+        &cluster,
+        QueryContext::new("reddit-home", "client-create-edge"),
+        "CREATE (a {id: 1})-[:FOLLOWS]->(b {id: 2})",
+        None,
+        64,
+    )
+    .await
+    .unwrap();
+    assert!(page.columns.is_empty());
+    assert!(page.rows.is_empty());
+    assert!(page.next_cursor.is_none());
+    assert!(cluster
+        .shard("reddit-home")
+        .unwrap()
+        .edge_exists("reddit-home", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+
+    let err = QueryCellClient::execute_cypher_rows_page(
+        &cluster,
+        QueryContext::new("reddit-home", "client-create-cursor"),
+        "CREATE (a {id: 3})-[:FOLLOWS]->(b {id: 4})",
+        Some(QueryCursorToken::new(1)),
+        64,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, GraphError::UnsupportedQuery { .. }));
+    cluster.close().await.unwrap();
+    control.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn control_plane_persists_placement_and_enforces_active_leases() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -8064,6 +8119,110 @@ async fn read_leases_block_delta_and_artifact_gc_until_ttl() {
     let metrics = shard.graph_operational_metrics();
     assert!(metrics.read_leases_created >= 1);
     assert!(metrics.retention_rejects >= 2);
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn query_read_leases_are_aggregated_per_process_and_cell() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/query-read-lease-aggregation",
+        object_store,
+        GraphOpenOptions {
+            retention_policy: GraphRetentionPolicy {
+                read_lease_ttl_ms: 60_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    shard
+        .write_edge(mutation(1, 2, "query-lease-1"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(mutation(2, 3, "query-lease-2"))
+        .await
+        .unwrap();
+    let epoch = shard.current_epoch("reddit-home").await.unwrap();
+
+    let first = shard
+        .query_read_leases
+        .acquire("reddit-home", epoch, Some(30_000))
+        .await
+        .unwrap();
+    let second = shard
+        .query_read_leases
+        .acquire("reddit-home", epoch, Some(30_000))
+        .await
+        .unwrap();
+    assert_eq!(shard.graph_operational_metrics().read_leases_created, 1);
+    assert_eq!(
+        shard.min_active_read_epoch("reddit-home").await.unwrap(),
+        Some(epoch)
+    );
+
+    drop(first);
+    drop(second);
+    tokio::task::yield_now().await;
+    let third = shard
+        .query_read_leases
+        .acquire("reddit-home", epoch, Some(30_000))
+        .await
+        .unwrap();
+    assert_eq!(shard.graph_operational_metrics().read_leases_created, 1);
+    drop(third);
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn query_read_lease_moves_back_to_protect_an_older_active_snapshot() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/query-read-lease-minimum",
+        object_store,
+        GraphOpenOptions {
+            retention_policy: GraphRetentionPolicy {
+                read_lease_ttl_ms: 60_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    shard
+        .write_edge(mutation(1, 2, "query-min-1"))
+        .await
+        .unwrap();
+    let old_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    shard
+        .write_edge(mutation(2, 3, "query-min-2"))
+        .await
+        .unwrap();
+    let current_epoch = shard.current_epoch("reddit-home").await.unwrap();
+
+    let current = shard
+        .query_read_leases
+        .acquire("reddit-home", current_epoch, Some(30_000))
+        .await
+        .unwrap();
+    let old = shard
+        .query_read_leases
+        .acquire("reddit-home", old_epoch, Some(30_000))
+        .await
+        .unwrap();
+    assert_eq!(shard.graph_operational_metrics().read_leases_created, 2);
+    assert_eq!(
+        shard.min_active_read_epoch("reddit-home").await.unwrap(),
+        Some(old_epoch)
+    );
+    drop(current);
+    drop(old);
     shard.close().await.unwrap();
 }
 

@@ -1886,6 +1886,42 @@ mod tests {
         assert_eq!(graphblas.edge_visits, rust.edge_visits);
     }
 
+    #[cfg(all(feature = "graphblas", feature = "opencypher"))]
+    #[test]
+    fn graphblas_exact_hop_count_matches_materialized_range() {
+        let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
+        let adjacency = test_adjacency();
+        let compiled = compile_graphblas_matrix(&adjacency).expect("matrix should compile");
+        for hops in 0..=4 {
+            let materialized =
+                expand_range_compiled_graphblas(&compiled, &adjacency, &[1], hops, hops)
+                    .expect("range expansion should succeed");
+            let counted =
+                expand_range_count_compiled_graphblas(&compiled, &adjacency, &[1], hops, hops)
+                    .expect("count expansion should succeed");
+            assert_eq!(counted.vertices, materialized.vertices.len() as u64);
+            assert_eq!(counted.edge_visits, materialized.edge_visits);
+        }
+    }
+
+    #[cfg(all(feature = "graphblas", feature = "opencypher"))]
+    #[test]
+    fn graphblas_exact_hop_count_preserves_materialized_cycle_semantics() {
+        let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
+        let adjacency = BTreeMap::from([(1, BTreeSet::from([2])), (2, BTreeSet::from([1, 3]))]);
+        let compiled = compile_graphblas_matrix(&adjacency).expect("matrix should compile");
+        for hops in 0..=4 {
+            let materialized =
+                expand_range_compiled_graphblas(&compiled, &adjacency, &[1], hops, hops)
+                    .expect("cyclic range expansion should succeed");
+            let counted =
+                expand_range_count_compiled_graphblas(&compiled, &adjacency, &[1], hops, hops)
+                    .expect("cyclic count expansion should succeed");
+            assert_eq!(counted.vertices, materialized.vertices.len() as u64);
+            assert_eq!(counted.edge_visits, materialized.edge_visits);
+        }
+    }
+
     #[cfg(feature = "graphblas")]
     #[test]
     fn compact_csc_kernel_matches_rust_sparse_kernel() {
