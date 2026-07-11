@@ -5691,6 +5691,24 @@ impl GraphShard {
         destinations: impl IntoIterator<Item = VertexId>,
         read_epoch: GraphEpoch,
     ) -> Result<Vec<NeighborBatchEntry>> {
+        self.in_neighbors_batch_at_with_cancellation(
+            cell_id,
+            edge_type,
+            destinations,
+            read_epoch,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn in_neighbors_batch_at_with_cancellation(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        destinations: impl IntoIterator<Item = VertexId>,
+        read_epoch: GraphEpoch,
+        cancellation_token: Option<QueryCancellationToken>,
+    ) -> Result<Vec<NeighborBatchEntry>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         self.ensure_cell_readable(cell_id, "in_neighbors_batch")
@@ -5705,22 +5723,106 @@ impl GraphShard {
             return Ok(Vec::new());
         }
 
-        let requested: BTreeSet<_> = destinations.iter().copied().collect();
-        let mut by_destination = BTreeMap::<VertexId, Vec<VertexId>>::new();
-        for edge in self.edges_at(cell_id, edge_type, read_epoch).await? {
-            if requested.contains(&edge.dst) {
-                by_destination.entry(edge.dst).or_default().push(edge.src);
-            }
+        let budget = QueryBudget::new(self.limits.max_query_runtime_ms, cancellation_token);
+        let current_epoch = self.current_epoch(cell_id).await?;
+        if read_epoch > current_epoch {
+            return Err(GraphError::SnapshotAhead {
+                cell_id: cell_id.to_string(),
+                read_epoch,
+                current_epoch,
+            });
         }
-        for neighbors in by_destination.values_mut() {
-            neighbors.sort_unstable();
-            neighbors.dedup();
+        let requested: BTreeSet<_> = destinations.iter().copied().collect();
+        let mut by_destination = requested
+            .iter()
+            .copied()
+            .map(|destination| (destination, BTreeSet::new()))
+            .collect::<BTreeMap<_, _>>();
+        let mut scanned_edges = 0_u64;
+
+        if read_epoch == current_epoch && self.writes_reverse_index() {
+            for destination in requested.iter().copied() {
+                budget.check("in_neighbors_batch_current_destination")?;
+                let mut iter = self
+                    .scan_remote_prefix(&keys::in_prefix(cell_id, edge_type, destination))
+                    .await?;
+                let neighbors = by_destination.entry(destination).or_default();
+                while let Some(kv) = iter.next().await? {
+                    budget.check("in_neighbors_batch_reverse_scan")?;
+                    scanned_edges = scanned_edges.saturating_add(1);
+                    ensure_limit(
+                        "in_neighbors_batch_scanned_edges",
+                        scanned_edges,
+                        self.limits.max_query_scan_edges,
+                    )?;
+                    let key = String::from_utf8_lossy(&kv.key).into_owned();
+                    let record = decode_edge_record(&key, &kv.value)?;
+                    if record.epoch <= read_epoch {
+                        neighbors.insert(record.src);
+                    }
+                }
+            }
+        } else {
+            let base_epoch = self
+                .latest_posting_artifact_epoch(cell_id, edge_type, read_epoch)
+                .await?
+                .unwrap_or(0);
+            if base_epoch > 0 {
+                for destination in requested.iter().copied() {
+                    budget.check("in_neighbors_batch_posting_destination")?;
+                    let chunks = self
+                        .posting_chunks(
+                            cell_id,
+                            edge_type,
+                            ArtifactDirection::In,
+                            destination,
+                            base_epoch,
+                        )
+                        .await?;
+                    let neighbors = by_destination.entry(destination).or_default();
+                    for chunk in chunks {
+                        budget.check("in_neighbors_batch_posting_chunk")?;
+                        scanned_edges = scanned_edges.saturating_add(chunk.vertices.len() as u64);
+                        ensure_limit(
+                            "in_neighbors_batch_scanned_edges",
+                            scanned_edges,
+                            self.limits.max_query_scan_edges,
+                        )?;
+                        neighbors.extend(chunk.vertices);
+                    }
+                }
+            }
+            for delta in self
+                .deltas_between_with_budget(
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    read_epoch,
+                    Some(&budget),
+                )
+                .await?
+            {
+                budget.check("in_neighbors_batch_delta_overlay")?;
+                if let Some(neighbors) = by_destination.get_mut(&delta.edge.dst) {
+                    match delta.kind {
+                        DeltaKind::Plus => {
+                            neighbors.insert(delta.edge.src);
+                        }
+                        DeltaKind::Minus => {
+                            neighbors.remove(&delta.edge.src);
+                        }
+                    }
+                }
+            }
         }
         Ok(destinations
             .into_iter()
             .map(|vertex| NeighborBatchEntry {
                 vertex,
-                neighbors: by_destination.get(&vertex).cloned().unwrap_or_default(),
+                neighbors: by_destination
+                    .get(&vertex)
+                    .map(|neighbors| neighbors.iter().copied().collect())
+                    .unwrap_or_default(),
             })
             .collect())
     }
