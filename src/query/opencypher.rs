@@ -293,7 +293,7 @@ pub fn parse_opencypher_mutation_query_with_parameters(
     parsed.lower_mutation_query(parameters)
 }
 
-#[cfg(feature = "public-client-protocols")]
+#[cfg(feature = "query-transport")]
 pub(crate) fn parse_opencypher_unwind_batch(query: &str) -> Result<Option<ParsedUnwindBatch>> {
     ParsedCypher::parse(query)?.lower_unwind_batch()
 }
