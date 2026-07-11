@@ -223,6 +223,7 @@ impl GraphShard {
                 chunk_count: group.chunk_count,
                 vertex_count: group.degree,
                 chunk_checksums: Vec::new(),
+                chunk_bounds: group.chunk_bounds,
             })
         } else {
             let artifact_manifest_key =
@@ -299,6 +300,67 @@ impl GraphShard {
             }
         }
         Ok(latest)
+    }
+
+    pub(crate) async fn posting_edge_exists_at_base(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        base_epoch: GraphEpoch,
+    ) -> Result<bool> {
+        let artifact_key = posting_artifact_manifest_key(cell_id, edge_type, base_epoch);
+        let Some(value) = self.read_remote(&artifact_key).await? else {
+            return corrupt(&artifact_key, "missing posting artifact epoch manifest");
+        };
+        decode_posting_artifact_manifest(&artifact_key, &value)?;
+
+        let manifest_key =
+            posting_manifest_key(cell_id, edge_type, ArtifactDirection::Out, src, base_epoch);
+        let Some(value) = self.read_remote(&manifest_key).await? else {
+            return Ok(false);
+        };
+        let manifest = decode_posting_manifest(&manifest_key, &value)?;
+        if manifest.chunk_count > 0 && manifest.chunk_bounds.is_empty() {
+            return corrupt(
+                &manifest_key,
+                "posting_manifest1 lacks point-lookup bounds; rebuild this artifact epoch",
+            );
+        }
+        let Some(bound) = manifest
+            .chunk_bounds
+            .iter()
+            .find(|bound| bound.first <= dst && dst <= bound.last)
+        else {
+            return Ok(false);
+        };
+        let key = posting_chunk_key(
+            cell_id,
+            edge_type,
+            ArtifactDirection::Out,
+            src,
+            base_epoch,
+            bound.chunk_id,
+        );
+        let Some(value) = self.read_remote(&key).await? else {
+            return corrupt(
+                &key,
+                "posting manifest references missing point-lookup chunk",
+            );
+        };
+        let chunk = decode_posting_chunk(&key, &value)?;
+        if chunk.vertices.first().copied() != Some(bound.first)
+            || chunk.vertices.last().copied() != Some(bound.last)
+        {
+            return corrupt(&key, "posting point-lookup chunk bounds mismatch");
+        }
+        if let Some(expected) = manifest.chunk_checksums.get(bound.chunk_id as usize) {
+            if posting_chunk_checksum(&chunk) != *expected {
+                return corrupt(&key, "posting point-lookup chunk checksum mismatch");
+            }
+        }
+        Ok(chunk.vertices.binary_search(&dst).is_ok())
     }
 
     pub async fn build_matrix_tiles(

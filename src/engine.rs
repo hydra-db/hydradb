@@ -63,6 +63,7 @@ struct PostingChunkManifest {
     chunk_count: u64,
     vertex_count: u64,
     chunk_checksums: Vec<u64>,
+    chunk_bounds: Vec<SupernodeChunkBound>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -810,6 +811,7 @@ fn posting_manifests_from_chunks(chunks: &[PostingChunk]) -> Result<Vec<PostingC
             chunk_count: owner_chunks.len() as u64,
             vertex_count,
             chunk_checksums,
+            chunk_bounds: supernode_chunk_bounds(&owner_chunks),
         });
     }
     Ok(manifests)
@@ -1678,7 +1680,7 @@ fn posting_chunk_checksum(chunk: &PostingChunk) -> u64 {
 
 fn encode_posting_manifest(manifest: &PostingChunkManifest) -> Vec<u8> {
     format!(
-        "posting_manifest1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        "posting_manifest2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         manifest.cell_id,
         manifest.edge_type,
         direction_str(manifest.direction),
@@ -1686,7 +1688,8 @@ fn encode_posting_manifest(manifest: &PostingChunkManifest) -> Vec<u8> {
         manifest.base_epoch,
         manifest.chunk_count,
         manifest.vertex_count,
-        encode_u64_list(&manifest.chunk_checksums)
+        encode_u64_list(&manifest.chunk_checksums),
+        encode_supernode_chunk_bounds(&manifest.chunk_bounds)
     )
     .into_bytes()
 }
@@ -1694,8 +1697,13 @@ fn encode_posting_manifest(manifest: &PostingChunkManifest) -> Vec<u8> {
 fn decode_posting_manifest(key: &str, value: &[u8]) -> Result<PostingChunkManifest> {
     let text = text_value(key, value)?;
     let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 9 || parts[0] != "posting_manifest1" {
-        return corrupt(key, "expected posting_manifest1 record with 9 fields");
+    if !matches!(parts.as_slice(), ["posting_manifest1", ..] if parts.len() == 9)
+        && !matches!(parts.as_slice(), ["posting_manifest2", ..] if parts.len() == 10)
+    {
+        return corrupt(
+            key,
+            "expected posting_manifest1 or posting_manifest2 record",
+        );
     }
     let chunk_count = parse_u64(key, parts[6], "chunk_count")?;
     let chunk_checksums = decode_u64_list(key, parts[8])?;
@@ -1721,6 +1729,11 @@ fn decode_posting_manifest(key: &str, value: &[u8]) -> Result<PostingChunkManife
             chunk_count,
             vertex_count: parse_u64(key, parts[7], "vertex_count")?,
             chunk_checksums,
+            chunk_bounds: if parts[0] == "posting_manifest2" {
+                decode_supernode_chunk_bounds(key, parts[9])?
+            } else {
+                Vec::new()
+            },
         },
     )
 }
@@ -1731,6 +1744,21 @@ fn validate_posting_manifest(
 ) -> Result<PostingChunkManifest> {
     if manifest.vertex_count > 0 && manifest.chunk_count == 0 {
         return corrupt(key, "posting manifest vertex count requires chunks");
+    }
+    if !manifest.chunk_bounds.is_empty() {
+        if manifest.chunk_bounds.len() as u64 != manifest.chunk_count {
+            return corrupt(key, "posting manifest bounds must cover every chunk");
+        }
+        let mut previous_last = None;
+        for (expected_id, bound) in manifest.chunk_bounds.iter().enumerate() {
+            if bound.chunk_id != expected_id as u64 || bound.first > bound.last {
+                return corrupt(key, "posting manifest contains invalid chunk bounds");
+            }
+            if previous_last.is_some_and(|last| bound.first <= last) {
+                return corrupt(key, "posting manifest chunk bounds overlap or are unsorted");
+            }
+            previous_last = Some(bound.last);
+        }
     }
     let parts: Vec<_> = key.split('/').collect();
     let ["cell", cell_id, "artifact", "posting_manifest", edge_type, direction, owner, base_epoch] =

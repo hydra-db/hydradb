@@ -367,6 +367,76 @@ async fn batch_neighbor_reads_honor_cancellation_before_storage_scans() {
     ));
 }
 
+#[tokio::test]
+async fn historical_batch_reads_scan_only_requested_owner_and_pair_deltas() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_limits(
+        "graph/batch-read-scoped-deltas",
+        object_store,
+        GraphLimits {
+            max_query_scan_edges: 2,
+            ..GraphLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut mutations = vec![typed_mutation(
+        "reddit-home",
+        "FOLLOWS",
+        1,
+        10,
+        "scoped-requested",
+    )];
+    mutations.extend((0..32).map(|index| {
+        typed_mutation(
+            "reddit-home",
+            "FOLLOWS",
+            100 + index,
+            1_000 + index,
+            &format!("scoped-unrelated-{index}"),
+        )
+    }));
+    shard
+        .write_edge_mutations_batch("reddit-home", mutations)
+        .await
+        .unwrap();
+    let read_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    shard
+        .write_edge(typed_mutation(
+            "reddit-home",
+            "FOLLOWS",
+            9_999,
+            8_888,
+            "scoped-after-snapshot",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        shard
+            .out_neighbors_batch_at("reddit-home", "FOLLOWS", [1], read_epoch)
+            .await
+            .unwrap()[0]
+            .neighbors,
+        vec![10]
+    );
+    assert_eq!(
+        shard
+            .in_neighbors_batch_at("reddit-home", "FOLLOWS", [10], read_epoch)
+            .await
+            .unwrap()[0]
+            .neighbors,
+        vec![1]
+    );
+    assert!(
+        shard
+            .edge_exists_batch_at("reddit-home", "FOLLOWS", [(1, 10)], read_epoch)
+            .await
+            .unwrap()[0]
+            .exists
+    );
+}
+
 async fn bulk_import_txn_retry_for_test(
     shard: Arc<GraphShard>,
     cell_id: &str,
@@ -1080,6 +1150,20 @@ fn compact_v2_values_decode_alongside_legacy_v1_values() {
     assert_eq!(owner_delta.edge.src, 1);
     assert_eq!(owner_delta.edge.dst, 2);
 
+    let pair_key = keys::pair_delta(
+        "reddit-home",
+        DeltaKind::Plus,
+        "USER_FOLLOWS_USER",
+        1,
+        2,
+        12,
+    );
+    let pair_delta = decode_delta_record(&pair_key, b"delta2\n").unwrap();
+    assert_eq!(pair_delta.kind, DeltaKind::Plus);
+    assert_eq!(pair_delta.edge.epoch, 12);
+    assert_eq!(pair_delta.edge.src, 1);
+    assert_eq!(pair_delta.edge.dst, 2);
+
     let legacy_delta = b"delta1\t+\t11\treddit-home\tUSER_FOLLOWS_USER\t3\t4\n";
     let decoded_legacy = decode_delta_record(&outbox_key, legacy_delta).unwrap();
     assert_eq!(decoded_legacy.kind, DeltaKind::Plus);
@@ -1561,7 +1645,7 @@ async fn trusted_bulk_append_uses_batch_delta_log_and_survives_rollup_gc() {
         .delete_deltas_through_rollup(cell_id, edge_type, result.end_epoch)
         .await
         .unwrap();
-    assert_eq!(gc.deleted_delta_keys, 1);
+    assert_eq!(gc.deleted_delta_keys, 10); // batch outbox plus three scoped keys per edge
     assert!(matches!(
         shard.deltas_since(cell_id, edge_type, 0).await.unwrap_err(),
         GraphError::SnapshotExpired { min_epoch: 3, .. }
@@ -1691,6 +1775,30 @@ async fn outbound_only_index_policy_skips_reverse_rows_with_read_fallback() {
         )
         .await
         .unwrap();
+    assert!(
+        shard
+            .edge_exists_batch_at(
+                "reddit-home",
+                "USER_SUBSCRIBED_TO_SUBREDDIT",
+                [(1, 2)],
+                result.end_epoch,
+            )
+            .await
+            .unwrap()[0]
+            .exists
+    );
+    assert!(
+        !shard
+            .edge_exists_batch_at(
+                "reddit-home",
+                "USER_SUBSCRIBED_TO_SUBREDDIT",
+                [(1, 404)],
+                result.end_epoch,
+            )
+            .await
+            .unwrap()[0]
+            .exists
+    );
     shard
         .delete_edge(typed_mutation(
             "reddit-home",
@@ -2090,7 +2198,7 @@ async fn trusted_supernode_segment_append_skips_canonical_rows_and_survives_roll
         .delete_deltas_through_rollup(cell_id, edge_type, delete.epoch)
         .await
         .unwrap();
-    assert_eq!(gc.deleted_delta_keys, 2);
+    assert_eq!(gc.deleted_delta_keys, 14); // two outbox records plus scoped indexes
     assert!(shard.outbox_since(cell_id, 0).await.unwrap().is_empty());
     assert_eq!(
         shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
@@ -9074,7 +9182,7 @@ async fn delta_gc_requires_rollup_and_preserves_reads_after_watermark() {
         .await
         .unwrap();
     assert_eq!(gc.compacted_through_epoch, base_epoch);
-    assert_eq!(gc.deleted_delta_keys, 2);
+    assert_eq!(gc.deleted_delta_keys, 8); // outbox plus three scoped keys per edge
     assert_eq!(
         shard
             .out_neighbors_at(cell_id, edge_type, 1, read_epoch)

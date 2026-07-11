@@ -105,6 +105,20 @@ impl GraphShard {
             &mut result,
         )
         .await?;
+        self.delete_owner_delta_prefix_through(
+            cell_id,
+            &keys::pair_delta_kind_prefix(cell_id, edge_type, DeltaKind::Plus),
+            compact_through_epoch,
+            &mut result,
+        )
+        .await?;
+        self.delete_owner_delta_prefix_through(
+            cell_id,
+            &keys::pair_delta_kind_prefix(cell_id, edge_type, DeltaKind::Minus),
+            compact_through_epoch,
+            &mut result,
+        )
+        .await?;
         tracing::info!(
             target: "slatedb_graph_kernel",
             cell_id,
