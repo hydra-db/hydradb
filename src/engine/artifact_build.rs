@@ -11,7 +11,8 @@ impl GraphShard {
     ) -> Result<Vec<PostingChunk>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        self.ensure_write_authority(cell_id, "build_posting_chunks")?;
+        self.validate_write_fence(cell_id, "build_posting_chunks")
+            .await?;
         if chunk_size == 0 {
             return Err(GraphError::CorruptValue {
                 key: "posting_chunk_size".to_string(),
@@ -279,7 +280,8 @@ impl GraphShard {
     ) -> Result<MatrixArtifact> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        self.ensure_write_authority(cell_id, "build_matrix_tiles")?;
+        self.validate_write_fence(cell_id, "build_matrix_tiles")
+            .await?;
         if tile_size == 0 {
             return Err(GraphError::CorruptValue {
                 key: "matrix_tile_size".to_string(),

@@ -24,6 +24,9 @@ pub struct QueryContext {
     pub max_runtime_ms: Option<u64>,
     #[cfg_attr(feature = "query-transport", serde(skip, default))]
     pub cancellation_token: Option<QueryCancellationToken>,
+    #[cfg(feature = "opencypher")]
+    #[cfg_attr(feature = "query-transport", serde(skip, default))]
+    validated_read: Option<ValidatedQueryRead>,
 }
 
 impl QueryContext {
@@ -37,6 +40,8 @@ impl QueryContext {
             parameters: BTreeMap::new(),
             max_runtime_ms: None,
             cancellation_token: None,
+            #[cfg(feature = "opencypher")]
+            validated_read: None,
         }
     }
 
@@ -77,6 +82,38 @@ impl QueryContext {
         self.cancellation_token = Some(token);
         self
     }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn with_validated_read_epoch(
+        mut self,
+        read_epoch: GraphEpoch,
+        retention: Arc<crate::QueryReadLeaseRegistration>,
+    ) -> Self {
+        self.read_epoch = Some(read_epoch);
+        self.validated_read = Some(ValidatedQueryRead {
+            cell_id: self.cell_id.clone(),
+            read_epoch,
+            retention,
+        });
+        self
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn validated_read_epoch(&self) -> Option<GraphEpoch> {
+        self.validated_read.as_ref().and_then(|validated| {
+            let _retention = &validated.retention;
+            (validated.cell_id == self.cell_id && self.read_epoch == Some(validated.read_epoch))
+                .then_some(validated.read_epoch)
+        })
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedQueryRead {
+    cell_id: String,
+    read_epoch: GraphEpoch,
+    retention: Arc<crate::QueryReadLeaseRegistration>,
 }
 
 #[derive(Clone, Debug, Default)]

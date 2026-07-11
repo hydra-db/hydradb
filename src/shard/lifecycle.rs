@@ -160,6 +160,12 @@ impl GraphShard {
         let tenant_quota = cache_policy.max_entries_per_cell;
         let cache_metrics = Arc::new(GraphCacheMetrics::default());
         let operation_metrics = Arc::new(GraphOperationalMetrics::default());
+        #[cfg(feature = "opencypher")]
+        let query_read_leases = QueryReadLeaseManager::new(
+            db.clone(),
+            options.retention_policy.read_lease_ttl_ms,
+            Arc::clone(&operation_metrics),
+        );
         let hydration_gate = Arc::new(Semaphore::new(cache_policy.hydration_permits()));
         let graph_write_gate = Arc::new(Semaphore::new(
             backpressure_policy.max_concurrent_graph_writes.max(1),
@@ -177,6 +183,8 @@ impl GraphShard {
             limits: options.limits,
             cache_policy: cache_policy.clone(),
             retention_policy: options.retention_policy,
+            #[cfg(feature = "opencypher")]
+            query_read_leases,
             cache_metrics,
             operation_metrics,
             hydration_gate,
@@ -636,6 +644,16 @@ impl GraphShard {
                 lease_token: lease.lease_token,
             })
         }
+    }
+
+    pub(crate) async fn validate_write_fence(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+    ) -> Result<()> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        self.validate_write_fence_txn(&txn, cell_id, operation)
+            .await
     }
 
     pub(crate) async fn publish_read_lease(
