@@ -498,9 +498,8 @@ async fn transport_tokens_are_confined_to_granted_namespace_and_graph_scopes() {
         )
         .await
         .unwrap_err();
-    assert!(unclassified
-        .to_string()
-        .contains("cannot authorize an unsupported Cypher clause"));
+    let unclassified = unclassified.to_string();
+    assert!(unclassified.contains("UNWIND"), "{unclassified}");
 
     let writer_client = TcpQueryCellClient::new(server.local_addr())
         .with_bearer_token("writer-token")

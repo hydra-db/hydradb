@@ -48,7 +48,9 @@ use crate::{
 use crate::{GraphId, GraphScope, NamespacePath};
 
 #[cfg(feature = "query-transport")]
-const QUERY_TRANSPORT_VERSION: u16 = 2;
+const QUERY_TRANSPORT_VERSION: u16 = 3;
+#[cfg(feature = "query-transport")]
+const QUERY_TRANSPORT_PREVIOUS_VERSION: u16 = 2;
 #[cfg(feature = "query-transport")]
 const QUERY_TRANSPORT_LEGACY_VERSION: u16 = 1;
 #[cfg(feature = "query-transport")]
@@ -1577,6 +1579,31 @@ pub trait QueryCellClient: Send + Sync {
         page_size: usize,
     ) -> Result<QueryResultPage>;
 
+    async fn execute_batch(
+        &self,
+        _context: QueryContext,
+        _operation: crate::QueryBatchOperation,
+    ) -> Result<QueryResultSet> {
+        Err(GraphError::UnsupportedQuery {
+            dialect: "QueryCellClient",
+            feature: "batch execution is not implemented by this query client".to_string(),
+        })
+    }
+
+    async fn execute_batch_page(
+        &self,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        paginate_query_batch_result(
+            self.execute_batch(context, operation).await?,
+            cursor,
+            page_size,
+        )
+    }
+
     async fn current_graph_epoch(
         &self,
         _scope: &crate::GraphScope,
@@ -1593,6 +1620,38 @@ pub trait QueryCellClient: Send + Sync {
         }
         Ok(context)
     }
+}
+
+fn paginate_query_batch_result(
+    result: QueryResultSet,
+    cursor: Option<QueryCursorToken>,
+    page_size: usize,
+) -> Result<QueryResultPage> {
+    if page_size == 0 {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "QueryCellClient",
+            feature: "batch page size must be greater than zero".to_string(),
+        });
+    }
+    let raw_offset = cursor.map_or(0, |cursor| cursor.offset);
+    let offset = usize::try_from(raw_offset).map_err(|_| GraphError::AdmissionRejected {
+        operation: "query_batch_cursor_offset",
+        actual: raw_offset,
+        limit: usize::MAX as u64,
+    })?;
+    if offset > result.rows.len() {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "QueryCellClient",
+            feature: "batch cursor offset exceeds result length".to_string(),
+        });
+    }
+    let end = offset.saturating_add(page_size).min(result.rows.len());
+    let next_cursor = (end < result.rows.len()).then(|| QueryCursorToken::new(end as u64));
+    Ok(QueryResultPage::new(
+        result.columns,
+        result.rows[offset..end].to_vec(),
+        next_cursor,
+    ))
 }
 
 #[cfg(feature = "query-transport")]
@@ -2106,6 +2165,65 @@ impl QueryCellClient for TcpQueryCellClient {
             QueryTransportResponse::Error { message } => {
                 Err(transport_remote_error("query/transport/page", message))
             }
+        }
+    }
+
+    async fn execute_batch(
+        &self,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+    ) -> Result<QueryResultSet> {
+        let request = QueryTransportRequest::Batch {
+            version: QUERY_TRANSPORT_VERSION,
+            auth: self.auth(),
+            context,
+            operation,
+        };
+        match self.send(request).await? {
+            QueryTransportResponse::Rows { result } => Ok(result),
+            QueryTransportResponse::Page { .. } => Err(transport_protocol_error(
+                "query/transport/batch",
+                "server returned page response for batch request",
+            )),
+            QueryTransportResponse::Cancelled => Err(transport_protocol_error(
+                "query/transport/batch",
+                "server returned cancel response for batch request",
+            )),
+            QueryTransportResponse::Error { message } => {
+                Err(transport_remote_error("query/transport/batch", message))
+            }
+        }
+    }
+
+    async fn execute_batch_page(
+        &self,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let request = QueryTransportRequest::BatchPage {
+            version: QUERY_TRANSPORT_VERSION,
+            auth: self.auth(),
+            context,
+            operation,
+            cursor,
+            page_size,
+        };
+        match self.send(request).await? {
+            QueryTransportResponse::Page { result } => Ok(result),
+            QueryTransportResponse::Rows { .. } => Err(transport_protocol_error(
+                "query/transport/batch_page",
+                "server returned rows response for batch page request",
+            )),
+            QueryTransportResponse::Cancelled => Err(transport_protocol_error(
+                "query/transport/batch_page",
+                "server returned cancel response for batch page request",
+            )),
+            QueryTransportResponse::Error { message } => Err(transport_remote_error(
+                "query/transport/batch_page",
+                message,
+            )),
         }
     }
 }
@@ -2958,6 +3076,110 @@ impl QueryCellClient for RoutedGraphCluster {
         RoutedGraphCluster::execute_cypher_rows_page(self, context, query, cursor, page_size).await
     }
 
+    async fn execute_batch(
+        &self,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+    ) -> Result<QueryResultSet> {
+        if &context.scope != self.scope() {
+            return Err(GraphError::GraphScopeMismatch {
+                expected: self.scope().to_string(),
+                actual: context.scope.to_string(),
+            });
+        }
+        let shard = self.shard(&context.cell_id)?;
+        match operation {
+            crate::QueryBatchOperation::OutNeighbors {
+                edge_type,
+                sources,
+                source_column,
+                destination_column,
+            } => {
+                let read_epoch = context
+                    .read_epoch
+                    .unwrap_or(shard.current_epoch(&context.cell_id).await?);
+                let entries = shard
+                    .out_neighbors_batch_at(&context.cell_id, &edge_type, sources, read_epoch)
+                    .await?;
+                let row_count = entries
+                    .iter()
+                    .map(|entry| entry.neighbors.len())
+                    .sum::<usize>();
+                crate::codec::ensure_limit(
+                    "query_batch_result_rows",
+                    row_count as u64,
+                    shard.limits.max_query_result_vertices as u64,
+                )?;
+                let mut rows = Vec::with_capacity(row_count);
+                for entry in entries {
+                    if context
+                        .cancellation_token
+                        .as_ref()
+                        .is_some_and(crate::QueryCancellationToken::is_cancelled)
+                    {
+                        return Err(GraphError::QueryTimeout {
+                            operation: "query_cancelled",
+                            elapsed_ms: 0,
+                            limit_ms: 0,
+                        });
+                    }
+                    rows.extend(entry.neighbors.into_iter().map(|destination| {
+                        QueryRow::new(vec![
+                            QueryValue::VertexId(entry.vertex),
+                            QueryValue::VertexId(destination),
+                        ])
+                    }));
+                }
+                Ok(QueryResultSet::new(
+                    vec![source_column, destination_column],
+                    rows,
+                ))
+            }
+            crate::QueryBatchOperation::CreateEdges { edge_type, edges } => {
+                self.ensure_active_write_lease(&context.cell_id)?;
+                let mutations =
+                    edges
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, edge)| crate::EdgeMutation {
+                            cell_id: context.cell_id.clone(),
+                            edge_type: edge_type.clone(),
+                            src: edge.src,
+                            dst: edge.dst,
+                            idempotency_key: format!(
+                                "{}.unwind-create.{index:020}",
+                                context.idempotency_key
+                            ),
+                        });
+                shard
+                    .write_edge_mutations_batch(&context.cell_id, mutations)
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::DeleteEdges { edge_type, edges } => {
+                self.ensure_active_write_lease(&context.cell_id)?;
+                let mutations =
+                    edges
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, edge)| crate::EdgeMutation {
+                            cell_id: context.cell_id.clone(),
+                            edge_type: edge_type.clone(),
+                            src: edge.src,
+                            dst: edge.dst,
+                            idempotency_key: format!(
+                                "{}.unwind-delete.{index:020}",
+                                context.idempotency_key
+                            ),
+                        });
+                shard
+                    .delete_edge_mutations_batch(&context.cell_id, mutations)
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+        }
+    }
+
     async fn current_graph_epoch(
         &self,
         scope: &crate::GraphScope,
@@ -3270,6 +3492,20 @@ enum QueryTransportRequest {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     },
+    Batch {
+        version: u16,
+        auth: QueryTransportAuth,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+    },
+    BatchPage {
+        version: u16,
+        auth: QueryTransportAuth,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    },
     Cancel {
         version: u16,
         auth: QueryTransportAuth,
@@ -3285,6 +3521,8 @@ impl QueryTransportRequest {
         match self {
             Self::Rows { version, .. }
             | Self::Page { version, .. }
+            | Self::Batch { version, .. }
+            | Self::BatchPage { version, .. }
             | Self::Cancel { version, .. } => *version,
         }
     }
@@ -3293,6 +3531,8 @@ impl QueryTransportRequest {
         match self {
             Self::Rows { version, .. }
             | Self::Page { version, .. }
+            | Self::Batch { version, .. }
+            | Self::BatchPage { version, .. }
             | Self::Cancel { version, .. } => *version = new_version,
         }
     }
@@ -3654,6 +3894,107 @@ async fn execute_query_transport_request(
                 Err(err) => transport_error_response(&runtime, err),
             }
         }
+        QueryTransportRequest::Batch {
+            version,
+            auth,
+            context,
+            operation,
+        } => {
+            if !query_transport_version_supported(version) {
+                return transport_version_error(version);
+            }
+            let principal = match authenticate_query_transport(&runtime, &auth, &identity) {
+                Ok(principal) => principal,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            let action = if operation.is_write() {
+                QueryTransportAction::Write
+            } else {
+                QueryTransportAction::Read
+            };
+            if let Err(err) =
+                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
+            {
+                return transport_error_response(&runtime, err);
+            }
+            let query_id = context.idempotency_key.clone();
+            let lifecycle_key = QueryLifecycleKey::new(principal, context.scope.clone(), &query_id);
+            match execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
+                client.execute_batch(
+                    context.with_cancellation_token(cancellation_token),
+                    operation,
+                )
+            })
+            .await
+            {
+                Ok(result) => QueryTransportResponse::Rows { result },
+                Err(err) => transport_error_response(&runtime, err),
+            }
+        }
+        QueryTransportRequest::BatchPage {
+            version,
+            auth,
+            context,
+            operation,
+            cursor,
+            page_size,
+        } => {
+            if !query_transport_version_supported(version) {
+                return transport_version_error(version);
+            }
+            let principal = match authenticate_query_transport(&runtime, &auth, &identity) {
+                Ok(principal) => principal,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            if operation.is_write() && cursor.is_some() {
+                return transport_error_response(
+                    &runtime,
+                    GraphError::UnsupportedQuery {
+                        dialect: "QueryTransport",
+                        feature: "mutation batches cannot continue from a result cursor"
+                            .to_string(),
+                    },
+                );
+            }
+            let action = if operation.is_write() {
+                QueryTransportAction::Write
+            } else {
+                QueryTransportAction::Read
+            };
+            if let Err(err) =
+                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
+            {
+                return transport_error_response(&runtime, err);
+            }
+            let query_id = context.idempotency_key.clone();
+            let lifecycle_key = QueryLifecycleKey::new(principal, context.scope.clone(), &query_id);
+            let result = if action == QueryTransportAction::Write {
+                execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| async {
+                    let result = client
+                        .execute_batch(
+                            context.with_cancellation_token(cancellation_token),
+                            operation,
+                        )
+                        .await?;
+                    paginate_query_batch_result(result, None, page_size)
+                })
+                .await
+            } else {
+                execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
+                    client.execute_batch_page(
+                        context.with_cancellation_token(cancellation_token),
+                        operation,
+                        cursor,
+                        page_size,
+                    )
+                })
+                .await
+            };
+            match result {
+                Ok(result) => QueryTransportResponse::Page { result },
+                Err(err) => transport_error_response(&runtime, err),
+            }
+        }
         QueryTransportRequest::Cancel {
             version,
             auth,
@@ -3688,7 +4029,7 @@ async fn execute_query_transport_request(
 fn transport_version_error(version: u16) -> QueryTransportResponse {
     QueryTransportResponse::Error {
         message: format!(
-            "unsupported query transport version {version}; supported versions are {QUERY_TRANSPORT_LEGACY_VERSION} and {QUERY_TRANSPORT_VERSION}"
+            "unsupported query transport version {version}; supported versions are {QUERY_TRANSPORT_LEGACY_VERSION}, {QUERY_TRANSPORT_PREVIOUS_VERSION}, and {QUERY_TRANSPORT_VERSION}"
         ),
     }
 }
@@ -3697,7 +4038,7 @@ fn transport_version_error(version: u16) -> QueryTransportResponse {
 fn query_transport_version_supported(version: u16) -> bool {
     matches!(
         version,
-        QUERY_TRANSPORT_LEGACY_VERSION | QUERY_TRANSPORT_VERSION
+        QUERY_TRANSPORT_LEGACY_VERSION | QUERY_TRANSPORT_PREVIOUS_VERSION | QUERY_TRANSPORT_VERSION
     )
 }
 

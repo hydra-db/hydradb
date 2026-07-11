@@ -1,11 +1,13 @@
+use super::values::bolt_parameter_to_property;
 use super::wire::strict_decode_client_message;
 use super::*;
 use crate::{
     ClientQueryServiceConfig, GraphControlPlane, GraphNodeHealthState, QueryCellClient,
-    QueryColumn, QueryContext, QueryCursorToken, QueryFloat, QueryResultPage, QueryResultSet,
-    QueryRow, QueryTransportAction, QueryTransportScopeGrant, QueryValue, RoutedGraphCluster,
-    ShardPlacement, StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer,
-    StaticQueryTransportTlsServerConfigProvider, VertexPropertyValue,
+    QueryColumn, QueryContext, QueryCursorToken, QueryFloat, QueryParameterValue, QueryResultPage,
+    QueryResultSet, QueryRow, QueryTransportAction, QueryTransportScopeGrant, QueryValue,
+    RoutedGraphCluster, ShardPlacement, StaticClientDatabaseResolver,
+    StaticQueryTransportScopeAuthorizer, StaticQueryTransportTlsServerConfigProvider,
+    VertexPropertyValue,
 };
 use boltr::chunk::{ChunkReader, ChunkWriter};
 use boltr::client::BoltSession;
@@ -235,6 +237,27 @@ fn bolt_value_conversion_rejects_unsigned_overflow() {
 }
 
 #[test]
+fn bolt_parameters_decode_nested_unwind_rows_without_changing_scalar_types() {
+    let value = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("src".to_string(), BoltValue::Integer(7)),
+        ("active".to_string(), BoltValue::Boolean(true)),
+    ]))]);
+    assert_eq!(
+        bolt_parameter_to_query_value("rows", &value).unwrap(),
+        QueryParameterValue::List(vec![QueryParameterValue::Map(BTreeMap::from([
+            (
+                "active".to_string(),
+                QueryParameterValue::Scalar(VertexPropertyValue::Bool(true)),
+            ),
+            (
+                "src".to_string(),
+                QueryParameterValue::Scalar(VertexPropertyValue::Integer(7)),
+            ),
+        ]))])
+    );
+}
+
+#[test]
 fn strict_decoder_rejects_surplus_fields_and_excessive_nesting() {
     let mut hello = BytesMut::new();
     encode_client_message(
@@ -376,6 +399,133 @@ async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
         .edge_exists("cell-a", "FOLLOWS", 1, 2)
         .await
         .unwrap());
+
+    let _ = session
+        .run(
+            "CREATE ({id: 1})-[:FOLLOWS]->({id: 3}), \
+             ({id: 1})-[:FOLLOWS]->({id: 4})",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cluster
+            .shard("cell-a")
+            .unwrap()
+            .out_neighbors_batch("cell-a", "FOLLOWS", [1])
+            .await
+            .unwrap()[0]
+            .neighbors,
+        vec![2, 3, 4]
+    );
+
+    let _ = session
+        .run("MATCH ({id: 1})-[r:FOLLOWS]->() DELETE r")
+        .await
+        .unwrap();
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .out_neighbors_batch("cell-a", "FOLLOWS", [1])
+        .await
+        .unwrap()[0]
+        .neighbors
+        .is_empty());
+
+    let edge_rows = BoltValue::List(vec![
+        BoltValue::Dict(BoltDict::from([
+            ("src".to_string(), BoltValue::Integer(10)),
+            ("dst".to_string(), BoltValue::Integer(20)),
+        ])),
+        BoltValue::Dict(BoltDict::from([
+            ("src".to_string(), BoltValue::Integer(10)),
+            ("dst".to_string(), BoltValue::Integer(21)),
+        ])),
+        BoltValue::Dict(BoltDict::from([
+            ("src".to_string(), BoltValue::Integer(11)),
+            ("dst".to_string(), BoltValue::Integer(22)),
+        ])),
+    ]);
+    let _ = session
+        .run_with_params(
+            "UNWIND $edges AS edge \
+             CREATE ({id: edge.src})-[:FOLLOWS]->({id: edge.dst})",
+            BoltDict::from([("edges".to_string(), edge_rows.clone())]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    let rows = session
+        .run_with_params(
+            "UNWIND $sources AS row \
+             MATCH ({id: row.src})-[:FOLLOWS]->(v) \
+             RETURN row.src AS src, v.id AS dst",
+            BoltDict::from([(
+                "sources".to_string(),
+                BoltValue::List(vec![
+                    BoltValue::Dict(BoltDict::from([(
+                        "src".to_string(),
+                        BoltValue::Integer(10),
+                    )])),
+                    BoltValue::Dict(BoltDict::from([(
+                        "src".to_string(),
+                        BoltValue::Integer(11),
+                    )])),
+                ]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.columns, vec!["src", "dst"]);
+    assert_eq!(
+        rows.records,
+        vec![
+            vec![BoltValue::Integer(10), BoltValue::Integer(20)],
+            vec![BoltValue::Integer(10), BoltValue::Integer(21)],
+            vec![BoltValue::Integer(11), BoltValue::Integer(22)],
+        ]
+    );
+    let _ = session
+        .run_with_params(
+            "UNWIND $edges AS edge \
+             MATCH ({id: edge.src})-[r:FOLLOWS]->({id: edge.dst}) DELETE r",
+            BoltDict::from([("edges".to_string(), edge_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists_batch("cell-a", "FOLLOWS", [(10, 20), (10, 21), (11, 22)])
+        .await
+        .unwrap()
+        .iter()
+        .all(|entry| !entry.exists));
+
+    let malformed = session
+        .run_with_params(
+            "UNWIND $edges AS edge \
+             CREATE ({id: edge.src})-[:FOLLOWS]->({id: edge.dst})",
+            BoltDict::from([(
+                "edges".to_string(),
+                BoltValue::List(vec![BoltValue::Dict(BoltDict::from([(
+                    "src".to_string(),
+                    BoltValue::Integer(30),
+                )]))]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(malformed.to_string().contains("missing field dst"));
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .out_neighbors("cell-a", "FOLLOWS", 30)
+        .await
+        .unwrap()
+        .is_empty());
 
     session.close().await.unwrap();
     server.stop().await.unwrap();

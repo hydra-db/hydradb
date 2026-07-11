@@ -52,13 +52,13 @@ pub use core::metrics::{
 pub(crate) use core::metrics::{GraphCacheMetrics, GraphOperationalMetrics};
 pub use core::model::{
     BulkImportDeltaLogPolicy, BulkImportDuplicatePolicy, BulkImportOptions, BulkImportResult,
-    CommitResult, DeleteResult, DeltaKind, DeltaRecord, EdgeDeleteBatchResult, EdgeIngestOptions,
-    EdgeIngestResult, EdgeMetadata, EdgeMutation, EdgeMutationBatchResult,
-    EdgeMutationLogAppendResult, EdgeMutationLogMaterializeResult, EdgeRecord, GraphCellDropResult,
-    GraphCorrectnessReport, GraphExportDigest, GraphRepairReport, QueryFloat,
-    RelationshipCreateResult, RelationshipId, RelationshipImportResult, RelationshipMutation,
-    RelationshipRecord, SegmentCompactionResult, VertexDeleteResult, VertexMetadata,
-    VertexPropertyValue,
+    CommitResult, DeleteResult, DeltaKind, DeltaRecord, EdgeDeleteBatchResult,
+    EdgeExistenceBatchEntry, EdgeIngestOptions, EdgeIngestResult, EdgeMetadata, EdgeMutation,
+    EdgeMutationBatchResult, EdgeMutationLogAppendResult, EdgeMutationLogMaterializeResult,
+    EdgeRecord, GraphCellDropResult, GraphCorrectnessReport, GraphExportDigest, GraphRepairReport,
+    NeighborBatchEntry, QueryFloat, RelationshipCreateResult, RelationshipId,
+    RelationshipImportResult, RelationshipMutation, RelationshipRecord, SegmentCompactionResult,
+    VertexDeleteResult, VertexMetadata, VertexPropertyValue,
 };
 pub(crate) use core::model::{EdgeMutationLogBatch, OutEdgeSegment, OutboxDeltaBatch};
 pub use core::namespace::{
@@ -98,12 +98,13 @@ pub use placement::{
     LocalityCellExtractor, LocalityLayoutExperiment, StorageLayout,
 };
 pub use query::algebra::{
-    LogicalQueryPlan, PhysicalQueryPlan, QueryCancellationToken, QueryCardinalityStatsKind,
-    QueryCardinalityStatsRefresh, QueryColumn, QueryContext, QueryCursorToken, QueryMutationResult,
-    QueryOutput, QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet, QueryRow,
-    QueryStatement, QueryStatsHistogramRefresh, QueryStatsRecord, QueryStatsRefreshKind,
-    QueryStatsRefreshResult, QueryStatsRefreshSpec, QueryValue, QueryWindow, RowQueryAccess,
-    RowQueryOptimizerPass, RowQueryPlan, RowQueryPlanGroup, RowQueryPlanPattern,
+    LogicalQueryPlan, PhysicalQueryPlan, QueryBatchEdge, QueryBatchOperation,
+    QueryCancellationToken, QueryCardinalityStatsKind, QueryCardinalityStatsRefresh, QueryColumn,
+    QueryContext, QueryCursorToken, QueryMutationResult, QueryOutput, QueryParameterValue,
+    QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet, QueryRow, QueryStatement,
+    QueryStatsHistogramRefresh, QueryStatsRecord, QueryStatsRefreshKind, QueryStatsRefreshResult,
+    QueryStatsRefreshSpec, QueryValue, QueryWindow, RowQueryAccess, RowQueryOptimizerPass,
+    RowQueryPlan, RowQueryPlanGroup, RowQueryPlanPattern,
 };
 #[cfg(feature = "query-service-discovery")]
 pub use query::coordination::{

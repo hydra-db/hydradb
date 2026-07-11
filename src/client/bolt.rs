@@ -37,7 +37,7 @@ pub use routing::{
     ControllerBoltRoutingTableProvider,
 };
 use values::{
-    bolt_parameter_to_property, explicit_transactions_unsupported, graph_error_to_bolt,
+    bolt_parameter_to_query_value, explicit_transactions_unsupported, graph_error_to_bolt,
     highest_matching_bookmark, query_value_to_bolt,
 };
 use wire::{bolt_server_handshake, read_bolt_messages};
@@ -1108,9 +1108,10 @@ fn bolt_query_request(
 ) -> std::result::Result<ClientQueryRequest, BoltError> {
     let parameters = parameters
         .iter()
-        .map(|(name, value)| Ok((name.clone(), bolt_parameter_to_property(name, value)?)))
+        .map(|(name, value)| Ok((name.clone(), bolt_parameter_to_query_value(name, value)?)))
         .collect::<std::result::Result<BTreeMap<_, _>, BoltError>>()?;
-    let mut request = ClientQueryRequest::new(target, query_id, query).with_parameters(parameters);
+    let mut request =
+        ClientQueryRequest::new(target, query_id, query).with_query_parameters(parameters);
     match extra.get("tx_timeout") {
         Some(BoltValue::Integer(timeout_ms)) => {
             request = request.with_timeout_ms(u64::try_from(*timeout_ms).map_err(|_| {

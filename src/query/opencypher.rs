@@ -64,6 +64,32 @@ pub struct ParsedMutationQuery {
     pub actions: Vec<RowMutationAction>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ParsedUnwindBatch {
+    pub(crate) parameter: String,
+    pub(crate) kind: ParsedUnwindBatchKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ParsedUnwindBatchKind {
+    OutNeighbors {
+        edge_type: String,
+        source_field: String,
+        source_column: QueryColumn,
+        destination_column: QueryColumn,
+    },
+    CreateEdges {
+        edge_type: String,
+        source_field: String,
+        destination_field: String,
+    },
+    DeleteEdges {
+        edge_type: String,
+        source_field: String,
+        destination_field: String,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg(feature = "query-transport")]
 pub(crate) enum OpenCypherQueryAccess {
@@ -128,6 +154,14 @@ pub enum RowAggregateFunction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowMutationAction {
+    CreateEdge {
+        edge_type: String,
+        src: VertexId,
+        dst: VertexId,
+        src_metadata: VertexMetadata,
+        dst_metadata: VertexMetadata,
+        edge_metadata: EdgeMetadata,
+    },
     DeleteBinding {
         binding: String,
         detach: bool,
@@ -257,6 +291,10 @@ pub fn parse_opencypher_mutation_query_with_parameters(
     parsed.lower_mutation_query(parameters)
 }
 
+pub(crate) fn parse_opencypher_unwind_batch(query: &str) -> Result<Option<ParsedUnwindBatch>> {
+    ParsedCypher::parse(query)?.lower_unwind_batch()
+}
+
 #[cfg(feature = "query-transport")]
 pub(crate) fn classify_opencypher_query_access(query: &str) -> Result<OpenCypherQueryAccess> {
     ParsedCypher::parse(query)?.query_access()
@@ -324,6 +362,8 @@ impl ParsedCypher {
             }
 
             let mut has_unknown_clause = false;
+            let mut has_write_clause = false;
+            let mut has_unwind = false;
             for index in 0..clause_count {
                 let clause = checked_node(sys::cypher_ast_query_get_clause(body, index))?;
                 if is_instance(clause, sys::CYPHER_AST_CREATE)
@@ -332,7 +372,12 @@ impl ParsedCypher {
                     || is_instance(clause, sys::CYPHER_AST_SET)
                     || is_instance(clause, sys::CYPHER_AST_REMOVE)
                 {
-                    return Ok(OpenCypherQueryAccess::Write);
+                    has_write_clause = true;
+                    continue;
+                }
+                if is_instance(clause, sys::CYPHER_AST_UNWIND) {
+                    has_unwind = true;
+                    continue;
                 }
                 if !is_instance(clause, sys::CYPHER_AST_MATCH)
                     && !is_instance(clause, sys::CYPHER_AST_WITH)
@@ -347,7 +392,173 @@ impl ParsedCypher {
                     "query transport cannot authorize an unsupported Cypher clause",
                 );
             }
-            Ok(OpenCypherQueryAccess::Read)
+            if has_unwind {
+                let batch =
+                    self.lower_unwind_batch()?
+                        .ok_or_else(|| GraphError::UnsupportedQuery {
+                            dialect: "OpenCypher",
+                            feature: "query transport cannot authorize an unsupported UNWIND query"
+                                .to_string(),
+                        })?;
+                let batch_is_write = matches!(
+                    batch.kind,
+                    ParsedUnwindBatchKind::CreateEdges { .. }
+                        | ParsedUnwindBatchKind::DeleteEdges { .. }
+                );
+                if batch_is_write != has_write_clause {
+                    return Err(GraphError::CorruptValue {
+                        key: "opencypher/unwind_access".to_string(),
+                        reason: "UNWIND access classification disagrees with its clauses"
+                            .to_string(),
+                    });
+                }
+                return Ok(if batch_is_write {
+                    OpenCypherQueryAccess::Write
+                } else {
+                    OpenCypherQueryAccess::Read
+                });
+            }
+            Ok(if has_write_clause {
+                OpenCypherQueryAccess::Write
+            } else {
+                OpenCypherQueryAccess::Read
+            })
+        }
+    }
+
+    fn lower_unwind_batch(&self) -> Result<Option<ParsedUnwindBatch>> {
+        unsafe {
+            let directives = sys::cypher_parse_result_ndirectives(self.result);
+            if directives != 1 {
+                return Ok(None);
+            }
+            let statement = checked_node(sys::cypher_parse_result_get_directive(self.result, 0))?;
+            ensure_instance(statement, sys::CYPHER_AST_STATEMENT, "statement")?;
+            let query = checked_node(sys::cypher_ast_statement_get_body(statement))?;
+            ensure_instance(query, sys::CYPHER_AST_QUERY, "query")?;
+            let clause_count = sys::cypher_ast_query_nclauses(query);
+            if clause_count < 2 {
+                return Ok(None);
+            }
+            let unwind = checked_node(sys::cypher_ast_query_get_clause(query, 0))?;
+            if !is_instance(unwind, sys::CYPHER_AST_UNWIND) {
+                return Ok(None);
+            }
+            let expression = checked_node(sys::cypher_ast_unwind_get_expression(unwind))?;
+            if !is_instance(expression, sys::CYPHER_AST_PARAMETER) {
+                return unsupported("UNWIND batch input must be a parameter");
+            }
+            let parameter = parameter_name(expression)?;
+            let alias = identifier_name(checked_node(sys::cypher_ast_unwind_get_alias(unwind))?)?;
+            let second = checked_node(sys::cypher_ast_query_get_clause(query, 1))?;
+
+            if is_instance(second, sys::CYPHER_AST_CREATE) {
+                if clause_count != 2 {
+                    return unsupported("UNWIND CREATE cannot be followed by another clause");
+                }
+                let pattern = checked_node(sys::cypher_ast_create_get_pattern(second))?;
+                let edge = unwind_edge_template(pattern, &alias, true)?;
+                return Ok(Some(ParsedUnwindBatch {
+                    parameter,
+                    kind: ParsedUnwindBatchKind::CreateEdges {
+                        edge_type: edge.edge_type,
+                        source_field: edge.source_field,
+                        destination_field: edge.destination_field.ok_or_else(|| {
+                            unsupported_value("UNWIND CREATE requires destination id field")
+                        })?,
+                    },
+                }));
+            }
+
+            if !is_instance(second, sys::CYPHER_AST_MATCH) || clause_count != 3 {
+                return unsupported(
+                    "UNWIND batches support CREATE or MATCH followed by RETURN/DELETE",
+                );
+            }
+            if sys::cypher_ast_match_is_optional(second)
+                || sys::cypher_ast_match_nhints(second) != 0
+                || !sys::cypher_ast_match_get_predicate(second).is_null()
+            {
+                return unsupported("UNWIND MATCH does not support OPTIONAL, hints, or WHERE");
+            }
+            let pattern = checked_node(sys::cypher_ast_match_get_pattern(second))?;
+            let third = checked_node(sys::cypher_ast_query_get_clause(query, 2))?;
+            if is_instance(third, sys::CYPHER_AST_DELETE) {
+                let edge = unwind_edge_template(pattern, &alias, true)?;
+                let relationship_binding = edge.relationship_binding.ok_or_else(|| {
+                    unsupported_value("UNWIND DELETE requires a named relationship")
+                })?;
+                if sys::cypher_ast_delete_has_detach(third)
+                    || sys::cypher_ast_delete_nexpressions(third) != 1
+                {
+                    return unsupported("UNWIND DELETE requires exactly one relationship variable");
+                }
+                let deleted = checked_node(sys::cypher_ast_delete_get_expression(third, 0))?;
+                if identifier_name(deleted)? != relationship_binding {
+                    return unsupported("UNWIND DELETE must delete the matched relationship");
+                }
+                return Ok(Some(ParsedUnwindBatch {
+                    parameter,
+                    kind: ParsedUnwindBatchKind::DeleteEdges {
+                        edge_type: edge.edge_type,
+                        source_field: edge.source_field,
+                        destination_field: edge.destination_field.ok_or_else(|| {
+                            unsupported_value("UNWIND DELETE requires destination id field")
+                        })?,
+                    },
+                }));
+            }
+            if !is_instance(third, sys::CYPHER_AST_RETURN) {
+                return unsupported("UNWIND MATCH must end in RETURN or DELETE");
+            }
+            let edge = unwind_edge_template(pattern, &alias, false)?;
+            let destination_binding = edge.destination_binding.ok_or_else(|| {
+                unsupported_value("UNWIND batch read requires a named destination node")
+            })?;
+            if edge.destination_field.is_some()
+                || sys::cypher_ast_return_is_distinct(third)
+                || !sys::cypher_ast_return_get_order_by(third).is_null()
+                || !sys::cypher_ast_return_get_skip(third).is_null()
+                || !sys::cypher_ast_return_get_limit(third).is_null()
+                || sys::cypher_ast_return_nprojections(third) != 2
+            {
+                return unsupported(
+                    "UNWIND batch read requires two unsorted projections without a destination id constraint",
+                );
+            }
+            let source_projection = checked_node(sys::cypher_ast_return_get_projection(third, 0))?;
+            let source_expression =
+                checked_node(sys::cypher_ast_projection_get_expression(source_projection))?;
+            if property_expression_binding(source_expression)?
+                != Some((alias.clone(), edge.source_field.clone()))
+            {
+                return unsupported("UNWIND batch read first projection must be the source field");
+            }
+            let destination_projection =
+                checked_node(sys::cypher_ast_return_get_projection(third, 1))?;
+            let destination_expression = checked_node(sys::cypher_ast_projection_get_expression(
+                destination_projection,
+            ))?;
+            if node_id_expression_binding(destination_expression)?.as_deref()
+                != Some(destination_binding.as_str())
+            {
+                return unsupported("UNWIND batch read second projection must be destination.id");
+            }
+            Ok(Some(ParsedUnwindBatch {
+                parameter,
+                kind: ParsedUnwindBatchKind::OutNeighbors {
+                    edge_type: edge.edge_type,
+                    source_field: edge.source_field.clone(),
+                    source_column: QueryColumn::new(projection_column_name(
+                        source_projection,
+                        format!("{}.{}", alias, edge.source_field),
+                    )?),
+                    destination_column: QueryColumn::new(projection_column_name(
+                        destination_projection,
+                        format!("{destination_binding}.id"),
+                    )?),
+                },
+            }))
         }
     }
 
@@ -480,6 +691,19 @@ impl ParsedCypher {
             }
 
             let first_clause = checked_node(sys::cypher_ast_query_get_clause(query, 0))?;
+            if is_instance(first_clause, sys::CYPHER_AST_CREATE) {
+                if clause_count != 1 {
+                    return unsupported(
+                        "CREATE with following clauses is not executable in Query engine",
+                    );
+                }
+                let pattern = checked_node(sys::cypher_ast_create_get_pattern(first_clause))?;
+                if sys::cypher_ast_pattern_npaths(pattern) == 1 {
+                    // Preserve the established scalar CREATE result contract.
+                    return Ok(None);
+                }
+                return Ok(Some(lower_create_mutations(first_clause, parameters)?));
+            }
             if is_instance(first_clause, sys::CYPHER_AST_MERGE) {
                 if clause_count != 1 {
                     return unsupported(
@@ -1133,6 +1357,53 @@ fn lower_simple_merge(
     }
 }
 
+fn lower_create_mutations(
+    create_clause: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<ParsedMutationQuery> {
+    unsafe {
+        if sys::cypher_ast_create_is_unique(create_clause) {
+            return unsupported("CREATE UNIQUE is not executable in Query engine");
+        }
+        let pattern = checked_node(sys::cypher_ast_create_get_pattern(create_clause))?;
+        let path_count = sys::cypher_ast_pattern_npaths(pattern);
+        if path_count == 0 {
+            return unsupported("CREATE requires at least one relationship path");
+        }
+        let mut actions = Vec::with_capacity(path_count as usize);
+        for index in 0..path_count {
+            let path = checked_node(sys::cypher_ast_pattern_get_path(pattern, index))?;
+            let edge = lower_create_edge_path(path, parameters, "CREATE")?;
+            if edge.hop_range.is_some() {
+                return unsupported(
+                    "CREATE does not support variable-length relationships in Query engine",
+                );
+            }
+            let src = edge
+                .src
+                .id
+                .ok_or_else(|| unsupported_value("CREATE requires source id"))?;
+            let dst = edge
+                .dst
+                .id
+                .ok_or_else(|| unsupported_value("CREATE requires destination id"))?;
+            actions.push(RowMutationAction::CreateEdge {
+                edge_type: edge.edge_type.clone(),
+                src,
+                dst,
+                src_metadata: vertex_metadata_from_node_pattern(&edge.src),
+                dst_metadata: vertex_metadata_from_node_pattern(&edge.dst),
+                edge_metadata: edge_metadata_from_edge_pattern(&edge),
+            });
+        }
+        Ok(ParsedMutationQuery {
+            patterns: Vec::new(),
+            predicate: None,
+            actions,
+        })
+    }
+}
+
 fn lower_delete_actions(delete_clause: *const AstNode) -> Result<Vec<RowMutationAction>> {
     unsafe {
         let detach = sys::cypher_ast_delete_has_detach(delete_clause);
@@ -1648,6 +1919,119 @@ fn lower_create_edge_pattern(
 
         let path = checked_node(sys::cypher_ast_pattern_get_path(pattern, 0))?;
         lower_create_edge_path(path, parameters, "CREATE")
+    }
+}
+
+struct UnwindEdgeTemplate {
+    edge_type: String,
+    source_field: String,
+    destination_field: Option<String>,
+    destination_binding: Option<String>,
+    relationship_binding: Option<String>,
+}
+
+fn unwind_edge_template(
+    pattern: *const AstNode,
+    unwind_alias: &str,
+    require_destination_field: bool,
+) -> Result<UnwindEdgeTemplate> {
+    unsafe {
+        ensure_instance(pattern, sys::CYPHER_AST_PATTERN, "UNWIND edge pattern")?;
+        if sys::cypher_ast_pattern_npaths(pattern) != 1 {
+            return unsupported("UNWIND batch requires exactly one edge pattern");
+        }
+        let path = checked_node(sys::cypher_ast_pattern_get_path(pattern, 0))?;
+        ensure_instance(path, sys::CYPHER_AST_PATTERN_PATH, "UNWIND edge path")?;
+        if sys::cypher_ast_pattern_path_nelements(path) != 3 {
+            return unsupported("UNWIND batch supports one-hop relationships only");
+        }
+        let left = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
+        let relationship = checked_node(sys::cypher_ast_pattern_path_get_element(path, 1))?;
+        let right = checked_node(sys::cypher_ast_pattern_path_get_element(path, 2))?;
+        ensure_instance(left, sys::CYPHER_AST_NODE_PATTERN, "UNWIND source node")?;
+        ensure_instance(
+            relationship,
+            sys::CYPHER_AST_REL_PATTERN,
+            "UNWIND relationship",
+        )?;
+        ensure_instance(
+            right,
+            sys::CYPHER_AST_NODE_PATTERN,
+            "UNWIND destination node",
+        )?;
+        if !sys::cypher_ast_rel_pattern_get_varlength(relationship).is_null()
+            || !sys::cypher_ast_rel_pattern_get_properties(relationship).is_null()
+            || sys::cypher_ast_rel_pattern_nreltypes(relationship) != 1
+        {
+            return unsupported(
+                "UNWIND batch requires one fixed relationship type without properties",
+            );
+        }
+        let edge_type = reltype_name(checked_node(sys::cypher_ast_rel_pattern_get_reltype(
+            relationship,
+            0,
+        ))?)?;
+        let relationship_binding = rel_identifier(relationship)?;
+        let left_field = unwind_node_id_field(left, unwind_alias, true)?;
+        let right_field = unwind_node_id_field(right, unwind_alias, require_destination_field)?;
+        let left_binding = node_identifier(left)?;
+        let right_binding = node_identifier(right)?;
+        match sys::cypher_ast_rel_pattern_get_direction(relationship) {
+            sys::cypher_rel_direction::CYPHER_REL_OUTBOUND => Ok(UnwindEdgeTemplate {
+                edge_type,
+                source_field: left_field
+                    .ok_or_else(|| unsupported_value("UNWIND source requires an id field"))?,
+                destination_field: right_field,
+                destination_binding: right_binding,
+                relationship_binding,
+            }),
+            sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(UnwindEdgeTemplate {
+                edge_type,
+                source_field: right_field
+                    .ok_or_else(|| unsupported_value("UNWIND source requires an id field"))?,
+                destination_field: left_field,
+                destination_binding: left_binding,
+                relationship_binding,
+            }),
+            sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => {
+                unsupported("UNWIND batch does not support undirected relationships")
+            }
+        }
+    }
+}
+
+fn unwind_node_id_field(
+    node: *const AstNode,
+    unwind_alias: &str,
+    required: bool,
+) -> Result<Option<String>> {
+    unsafe {
+        if sys::cypher_ast_node_pattern_nlabels(node) != 0 {
+            return unsupported("UNWIND batch node patterns do not support labels");
+        }
+        let properties = sys::cypher_ast_node_pattern_get_properties(node);
+        if properties.is_null() {
+            if required {
+                return unsupported("UNWIND batch node requires an id property");
+            }
+            return Ok(None);
+        }
+        ensure_instance(properties, sys::CYPHER_AST_MAP, "UNWIND node properties")?;
+        if sys::cypher_ast_map_nentries(properties) != 1 {
+            return unsupported("UNWIND batch node supports only the id property");
+        }
+        let key = prop_name(checked_node(sys::cypher_ast_map_get_key(properties, 0))?)?;
+        if key != "id" {
+            return unsupported("UNWIND batch node property must be id");
+        }
+        let value = checked_node(sys::cypher_ast_map_get_value(properties, 0))?;
+        let Some((binding, field)) = property_expression_binding(value)? else {
+            return unsupported("UNWIND batch node id must read a field from the row map");
+        };
+        if binding != unwind_alias {
+            return unsupported("UNWIND batch node id references the wrong row alias");
+        }
+        Ok(Some(field))
     }
 }
 

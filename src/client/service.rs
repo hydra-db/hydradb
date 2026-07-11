@@ -16,12 +16,14 @@ use crate::query::coordination::{
 };
 use crate::query::opencypher::{
     classify_opencypher_query_access, parse_opencypher_mutation_query_with_parameters,
-    parse_opencypher_row_query_with_parameters, OpenCypherQueryAccess,
+    parse_opencypher_row_query_with_parameters, parse_opencypher_unwind_batch,
+    OpenCypherQueryAccess, ParsedUnwindBatchKind,
 };
 use crate::{
     validate_component, GraphEpoch, GraphError, GraphId, GraphScope, NamespaceId, NamespacePath,
-    QueryCancellationToken, QueryColumn, QueryContext, QueryCursorToken, QueryResultPage,
-    QueryResultSet, Result, VertexPropertyValue,
+    QueryBatchEdge, QueryBatchOperation, QueryCancellationToken, QueryColumn, QueryContext,
+    QueryCursorToken, QueryParameterValue, QueryResultPage, QueryResultSet, Result,
+    VertexPropertyValue,
 };
 
 const DEFAULT_MAX_QUERY_BYTES: usize = 1024 * 1024;
@@ -247,7 +249,7 @@ pub struct ClientQueryRequest {
     pub target: ClientQueryTarget,
     pub query_id: String,
     pub query: String,
-    pub parameters: BTreeMap<String, VertexPropertyValue>,
+    pub parameters: BTreeMap<String, QueryParameterValue>,
     pub read_epoch: Option<GraphEpoch>,
     pub max_runtime_ms: Option<u64>,
     pub bookmark: Option<ClientBookmark>,
@@ -273,6 +275,18 @@ impl ClientQueryRequest {
     pub fn with_parameters(
         mut self,
         parameters: impl IntoIterator<Item = (String, VertexPropertyValue)>,
+    ) -> Self {
+        self.parameters.extend(
+            parameters
+                .into_iter()
+                .map(|(name, value)| (name, QueryParameterValue::Scalar(value))),
+        );
+        self
+    }
+
+    pub fn with_query_parameters(
+        mut self,
+        parameters: impl IntoIterator<Item = (String, QueryParameterValue)>,
     ) -> Self {
         self.parameters.extend(parameters);
         self
@@ -316,6 +330,8 @@ pub(crate) struct PreparedClientQuery {
     pub(crate) action: QueryTransportAction,
     pub(crate) columns: Vec<QueryColumn>,
     pub(crate) read_context: Option<QueryContext>,
+    pub(crate) scalar_parameters: BTreeMap<String, VertexPropertyValue>,
+    pub(crate) batch_operation: Option<QueryBatchOperation>,
 }
 
 #[derive(Clone)]
@@ -694,6 +710,30 @@ impl ClientQueryService {
         self.validate_request(&request, None)?;
         let runtime_limit_ms = self.normalize_runtime_limit(&mut request)?;
         let action = self.authorize_query(session, &request)?;
+        let parsed_unwind = parse_opencypher_unwind_batch(&request.query)?;
+        let (batch_operation, scalar_parameters) = match parsed_unwind {
+            Some(parsed) => (
+                Some(resolve_unwind_batch(parsed, &request.parameters)?),
+                BTreeMap::new(),
+            ),
+            None => (None, scalar_query_parameters(&request.parameters)?),
+        };
+        if batch_operation.as_ref().is_some_and(|operation| {
+            operation.is_write() != (action == QueryTransportAction::Write)
+        }) {
+            return Err(GraphError::CorruptValue {
+                key: "client/query/unwind_access".to_string(),
+                reason: "UNWIND batch access classification does not match its operation"
+                    .to_string(),
+            });
+        }
+        if let Some(operation) = &batch_operation {
+            enforce_limit(
+                "client_query_batch_items",
+                operation.len(),
+                self.inner.config.max_parameters,
+            )?;
+        }
         let key = client_query_key(session, &request);
         let (generation, cancellation_token) = self.begin_query(key.clone()).await?;
         let result = self
@@ -705,12 +745,22 @@ impl ClientQueryService {
                 async {
                     self.validate_bookmark(&request).await?;
                     self.pin_read_epoch(action, &mut request).await?;
-                    let context = query_context(&request, cancellation_token.clone());
-                    let result = self
-                        .inner
-                        .client
-                        .execute_cypher_rows(context, &request.query)
-                        .await?;
+                    let context = query_context(
+                        &request,
+                        scalar_parameters.clone(),
+                        cancellation_token.clone(),
+                    );
+                    let result = match batch_operation {
+                        Some(operation) => {
+                            self.inner.client.execute_batch(context, operation).await?
+                        }
+                        None => {
+                            self.inner
+                                .client
+                                .execute_cypher_rows(context, &request.query)
+                                .await?
+                        }
+                    };
                     let bookmark = self.bookmark_after(&request, action).await?;
                     Ok(ClientQueryResult {
                         query_id: request.query_id.clone(),
@@ -759,6 +809,8 @@ impl ClientQueryService {
             action,
             columns: _,
             read_context,
+            scalar_parameters,
+            batch_operation,
         } = prepared;
         // Grants can change while a Bolt cursor is open. The parsed query and
         // access classification are reusable, but authorization is not.
@@ -783,15 +835,33 @@ impl ClientQueryService {
                 async {
                     let mut context = match read_context {
                         Some(context) => context,
-                        None => query_context(&request, cancellation_token.clone()),
+                        None => query_context(
+                            &request,
+                            scalar_parameters.clone(),
+                            cancellation_token.clone(),
+                        ),
                     };
                     context.max_runtime_ms = request.max_runtime_ms;
                     context.cancellation_token = Some(cancellation_token.clone());
-                    let page = self
-                        .inner
-                        .client
-                        .execute_cypher_rows_page(context, &request.query, cursor, page_size)
-                        .await?;
+                    let page = match batch_operation {
+                        Some(operation) => {
+                            self.inner
+                                .client
+                                .execute_batch_page(context, operation, cursor, page_size)
+                                .await?
+                        }
+                        None => {
+                            self.inner
+                                .client
+                                .execute_cypher_rows_page(
+                                    context,
+                                    &request.query,
+                                    cursor,
+                                    page_size,
+                                )
+                                .await?
+                        }
+                    };
                     let bookmark = self.bookmark_after(&request, action).await?;
                     Ok(ClientQueryPage {
                         query_id: request.query_id.clone(),
@@ -837,38 +907,72 @@ impl ClientQueryService {
         let action = self.authorize_query(session, &request)?;
         self.validate_bookmark(&request).await?;
 
-        let columns = match action {
-            QueryTransportAction::Read => {
-                parse_opencypher_row_query_with_parameters(&request.query, &request.parameters)?
-                    .columns
-            }
-            QueryTransportAction::Write => {
-                let row_mutation = parse_opencypher_mutation_query_with_parameters(
-                    &request.query,
-                    &request.parameters,
-                )?
-                .is_some();
-                let scalar_mutation = if row_mutation {
-                    false
-                } else {
-                    crate::parse_opencypher_with_parameters(&request.query, &request.parameters)
-                        .map(|parsed| parsed.statement.is_write())
-                        .unwrap_or(false)
-                };
-                if !row_mutation && !scalar_mutation {
-                    return Err(GraphError::UnsupportedQuery {
-                        dialect: "ClientProtocol",
-                        feature: "write query is not executable by the mutation engine".to_string(),
-                    });
+        let parsed_unwind = parse_opencypher_unwind_batch(&request.query)?;
+        let (batch_operation, scalar_parameters) = match parsed_unwind {
+            Some(parsed) => (
+                Some(resolve_unwind_batch(parsed, &request.parameters)?),
+                BTreeMap::new(),
+            ),
+            None => (None, scalar_query_parameters(&request.parameters)?),
+        };
+
+        let columns = if let Some(operation) = &batch_operation {
+            batch_operation_columns(operation)
+        } else {
+            match action {
+                QueryTransportAction::Read => {
+                    parse_opencypher_row_query_with_parameters(&request.query, &scalar_parameters)?
+                        .columns
                 }
-                Vec::new()
-            }
-            QueryTransportAction::Cancel | QueryTransportAction::Admin => {
-                unreachable!("query access classification only returns read or write")
+                QueryTransportAction::Write => {
+                    let row_mutation = parse_opencypher_mutation_query_with_parameters(
+                        &request.query,
+                        &scalar_parameters,
+                    )?
+                    .is_some();
+                    let scalar_mutation = if row_mutation {
+                        false
+                    } else {
+                        crate::parse_opencypher_with_parameters(&request.query, &scalar_parameters)
+                            .map(|parsed| parsed.statement.is_write())
+                            .unwrap_or(false)
+                    };
+                    if !row_mutation && !scalar_mutation {
+                        return Err(GraphError::UnsupportedQuery {
+                            dialect: "ClientProtocol",
+                            feature: "write query is not executable by the mutation engine"
+                                .to_string(),
+                        });
+                    }
+                    Vec::new()
+                }
+                QueryTransportAction::Cancel | QueryTransportAction::Admin => {
+                    unreachable!("query access classification only returns read or write")
+                }
             }
         };
+        if batch_operation.as_ref().is_some_and(|operation| {
+            operation.is_write() != (action == QueryTransportAction::Write)
+        }) {
+            return Err(GraphError::CorruptValue {
+                key: "client/query/unwind_access".to_string(),
+                reason: "UNWIND batch access classification does not match its operation"
+                    .to_string(),
+            });
+        }
+        if let Some(operation) = &batch_operation {
+            enforce_limit(
+                "client_query_batch_items",
+                operation.len(),
+                self.inner.config.max_parameters,
+            )?;
+        }
         let read_context = if action == QueryTransportAction::Read {
-            let mut context = query_context(&request, QueryCancellationToken::new());
+            let mut context = query_context(
+                &request,
+                scalar_parameters.clone(),
+                QueryCancellationToken::new(),
+            );
             context.cancellation_token = None;
             let context = self.inner.client.pin_query_read_context(context).await?;
             request.read_epoch = context.read_epoch;
@@ -881,6 +985,8 @@ impl ClientQueryService {
             action,
             columns,
             read_context,
+            scalar_parameters,
+            batch_operation,
         };
         self.inner.metrics.prepare_duration_us.fetch_add(
             prepare_started
@@ -1215,11 +1321,12 @@ fn client_query_key(session: &ClientQuerySession, request: &ClientQueryRequest) 
 
 fn query_context(
     request: &ClientQueryRequest,
+    parameters: BTreeMap<String, VertexPropertyValue>,
     cancellation_token: QueryCancellationToken,
 ) -> QueryContext {
     let mut context = QueryContext::new(&request.target.cell_id, &request.query_id)
         .in_scope(request.target.scope.clone())
-        .with_parameters(request.parameters.clone())
+        .with_parameters(parameters)
         .with_cancellation_token(cancellation_token);
     if let Some(read_epoch) = request.read_epoch {
         context = context.at_epoch(read_epoch);
@@ -1228,6 +1335,137 @@ fn query_context(
         context = context.with_timeout_ms(max_runtime_ms);
     }
     context
+}
+
+fn scalar_query_parameters(
+    parameters: &BTreeMap<String, QueryParameterValue>,
+) -> Result<BTreeMap<String, VertexPropertyValue>> {
+    parameters
+        .iter()
+        .map(|(name, value)| match value {
+            QueryParameterValue::Scalar(value) => Ok((name.clone(), value.clone())),
+            QueryParameterValue::List(_) | QueryParameterValue::Map(_) => {
+                Err(GraphError::UnsupportedQuery {
+                    dialect: "ClientProtocol",
+                    feature: format!(
+                        "composite parameter ${name} is only supported as an UNWIND input"
+                    ),
+                })
+            }
+        })
+        .collect()
+}
+
+fn resolve_unwind_batch(
+    parsed: crate::query::opencypher::ParsedUnwindBatch,
+    parameters: &BTreeMap<String, QueryParameterValue>,
+) -> Result<QueryBatchOperation> {
+    let value = parameters
+        .get(&parsed.parameter)
+        .or_else(|| parameters.get(&format!("${}", parsed.parameter)))
+        .ok_or_else(|| GraphError::MissingQueryParameter {
+            dialect: "OpenCypher",
+            name: parsed.parameter.clone(),
+        })?;
+    let QueryParameterValue::List(rows) = value else {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: format!("UNWIND parameter ${} must be a list", parsed.parameter),
+        });
+    };
+    match parsed.kind {
+        ParsedUnwindBatchKind::OutNeighbors {
+            edge_type,
+            source_field,
+            source_column,
+            destination_column,
+        } => Ok(QueryBatchOperation::OutNeighbors {
+            edge_type,
+            sources: rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| unwind_row_vertex_id(row, index, &source_field))
+                .collect::<Result<Vec<_>>>()?,
+            source_column,
+            destination_column,
+        }),
+        ParsedUnwindBatchKind::CreateEdges {
+            edge_type,
+            source_field,
+            destination_field,
+        } => Ok(QueryBatchOperation::CreateEdges {
+            edge_type,
+            edges: unwind_batch_edges(rows, &source_field, &destination_field)?,
+        }),
+        ParsedUnwindBatchKind::DeleteEdges {
+            edge_type,
+            source_field,
+            destination_field,
+        } => {
+            let mut edges = unwind_batch_edges(rows, &source_field, &destination_field)?;
+            let mut seen = std::collections::BTreeSet::new();
+            edges.retain(|edge| seen.insert(*edge));
+            Ok(QueryBatchOperation::DeleteEdges { edge_type, edges })
+        }
+    }
+}
+
+fn unwind_batch_edges(
+    rows: &[QueryParameterValue],
+    source_field: &str,
+    destination_field: &str,
+) -> Result<Vec<QueryBatchEdge>> {
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            Ok(QueryBatchEdge {
+                src: unwind_row_vertex_id(row, index, source_field)?,
+                dst: unwind_row_vertex_id(row, index, destination_field)?,
+            })
+        })
+        .collect()
+}
+
+fn unwind_row_vertex_id(
+    row: &QueryParameterValue,
+    index: usize,
+    field: &str,
+) -> Result<crate::VertexId> {
+    let QueryParameterValue::Map(row) = row else {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: format!("UNWIND row {index} must be a map"),
+        });
+    };
+    let value = row.get(field).ok_or_else(|| GraphError::UnsupportedQuery {
+        dialect: "OpenCypher",
+        feature: format!("UNWIND row {index} is missing field {field}"),
+    })?;
+    match value {
+        QueryParameterValue::Scalar(VertexPropertyValue::Integer(value)) => Ok(*value),
+        QueryParameterValue::Scalar(VertexPropertyValue::SignedInteger(value)) if *value >= 0 => {
+            Ok(*value as u64)
+        }
+        QueryParameterValue::Scalar(_)
+        | QueryParameterValue::List(_)
+        | QueryParameterValue::Map(_) => Err(GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: format!("UNWIND row {index} field {field} must be a non-negative integer"),
+        }),
+    }
+}
+
+fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> {
+    match operation {
+        QueryBatchOperation::OutNeighbors {
+            source_column,
+            destination_column,
+            ..
+        } => vec![source_column.clone(), destination_column.clone()],
+        QueryBatchOperation::CreateEdges { .. } | QueryBatchOperation::DeleteEdges { .. } => {
+            Vec::new()
+        }
+    }
 }
 
 fn enforce_limit(operation: &'static str, actual: usize, limit: usize) -> Result<()> {

@@ -814,36 +814,11 @@ impl GraphShard {
                             vertices.insert(row.get(binding)?);
                         }
                     }
-                    for relationship in relationships {
-                        budget.check("cypher_delete_relationship")?;
-                        let edge_type = relationship.edge_type.clone();
-                        let mutation = EdgeMutation {
-                            cell_id: context.cell_id.clone(),
-                            edge_type: edge_type.clone(),
-                            src: relationship.src,
-                            dst: relationship.dst,
-                            idempotency_key: format!(
-                                "{}.delete.{}.{}.{}.{}",
-                                context.idempotency_key,
-                                edge_type,
-                                relationship.src,
-                                relationship.dst,
-                                relationship
-                                    .relationship_id
-                                    .map_or_else(|| "edge".to_string(), |id| id.to_string())
-                            ),
-                        };
-                        let delete = if let Some(relationship_id) = relationship.relationship_id {
-                            self.delete_relationship(mutation, relationship_id).await?
-                        } else {
-                            self.delete_edge(mutation).await?
-                        };
-                        if delete.deleted {
-                            result.deleted_edges = result.deleted_edges.saturating_add(1);
-                        } else {
-                            result.noops = result.noops.saturating_add(1);
-                        }
-                    }
+                    let (deleted, noops) = self
+                        .delete_bound_relationships_batch(&context, relationships, &budget)
+                        .await?;
+                    result.deleted_edges = result.deleted_edges.saturating_add(deleted);
+                    result.noops = result.noops.saturating_add(noops);
                     for vertex_id in vertices {
                         budget.check("cypher_delete_vertex")?;
                         let delete = if *detach {
@@ -890,36 +865,11 @@ impl GraphShard {
                         };
                         relationships.insert(relationship.clone());
                     }
-                    for relationship in relationships {
-                        budget.check("cypher_delete_relationship")?;
-                        let edge_type = relationship.edge_type.clone();
-                        let mutation = EdgeMutation {
-                            cell_id: context.cell_id.clone(),
-                            edge_type: edge_type.clone(),
-                            src: relationship.src,
-                            dst: relationship.dst,
-                            idempotency_key: format!(
-                                "{}.delete.{}.{}.{}.{}",
-                                context.idempotency_key,
-                                edge_type,
-                                relationship.src,
-                                relationship.dst,
-                                relationship
-                                    .relationship_id
-                                    .map_or_else(|| "edge".to_string(), |id| id.to_string())
-                            ),
-                        };
-                        let delete = if let Some(relationship_id) = relationship.relationship_id {
-                            self.delete_relationship(mutation, relationship_id).await?
-                        } else {
-                            self.delete_edge(mutation).await?
-                        };
-                        if delete.deleted {
-                            result.deleted_edges = result.deleted_edges.saturating_add(1);
-                        } else {
-                            result.noops = result.noops.saturating_add(1);
-                        }
-                    }
+                    let (deleted, noops) = self
+                        .delete_bound_relationships_batch(&context, relationships, &budget)
+                        .await?;
+                    result.deleted_edges = result.deleted_edges.saturating_add(deleted);
+                    result.noops = result.noops.saturating_add(noops);
                 }
                 RowMutationAction::SetProperty { .. }
                 | RowMutationAction::SetLabels { .. }
@@ -939,10 +889,11 @@ impl GraphShard {
                             .await?;
                     }
                 }
-                RowMutationAction::MergeEdge { .. } => {
+                RowMutationAction::CreateEdge { .. } | RowMutationAction::MergeEdge { .. } => {
                     return Err(GraphError::UnsupportedQuery {
                         dialect: "OpenCypher",
-                        feature: "MERGE is executable only as a standalone clause".to_string(),
+                        feature: "CREATE and MERGE are executable only as standalone clauses"
+                            .to_string(),
                     });
                 }
             }
@@ -995,12 +946,194 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
+    async fn delete_bound_relationships_batch(
+        &self,
+        context: &QueryContext,
+        relationships: BTreeSet<BoundRelationship>,
+        budget: &QueryBudget,
+    ) -> Result<(u64, u64)> {
+        let mut structural = Vec::new();
+        let mut identified = Vec::new();
+        for relationship in relationships {
+            budget.check("cypher_delete_relationship_collect")?;
+            let mutation = EdgeMutation {
+                cell_id: context.cell_id.clone(),
+                edge_type: relationship.edge_type.clone(),
+                src: relationship.src,
+                dst: relationship.dst,
+                idempotency_key: format!(
+                    "{}.delete.{}.{}.{}.{}",
+                    context.idempotency_key,
+                    relationship.edge_type,
+                    relationship.src,
+                    relationship.dst,
+                    relationship
+                        .relationship_id
+                        .map_or_else(|| "edge".to_string(), |id| id.to_string())
+                ),
+            };
+            match relationship.relationship_id {
+                Some(relationship_id) => identified.push((mutation, relationship_id)),
+                None => structural.push(mutation),
+            }
+        }
+
+        let mut deleted = 0_u64;
+        let mut noops = 0_u64;
+        if !structural.is_empty() {
+            budget.check("cypher_delete_edge_batch")?;
+            let batch = self
+                .delete_edge_mutations_batch(&context.cell_id, structural)
+                .await?;
+            deleted = deleted.saturating_add(batch.deleted);
+            noops = noops.saturating_add(batch.already_deleted);
+        }
+        for (mutation, relationship_id) in identified {
+            budget.check("cypher_delete_relationship")?;
+            if self
+                .delete_relationship(mutation, relationship_id)
+                .await?
+                .deleted
+            {
+                deleted = deleted.saturating_add(1);
+            } else {
+                noops = noops.saturating_add(1);
+            }
+        }
+        Ok((deleted, noops))
+    }
+
+    #[cfg(feature = "opencypher")]
     async fn execute_patternless_mutation(
         &self,
         context: &QueryContext,
         actions: &[RowMutationAction],
         budget: &QueryBudget,
     ) -> Result<QueryMutationResult> {
+        if actions
+            .iter()
+            .any(|action| matches!(action, RowMutationAction::CreateEdge { .. }))
+        {
+            if !actions
+                .iter()
+                .all(|action| matches!(action, RowMutationAction::CreateEdge { .. }))
+            {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "CREATE batches cannot mix mutation action types".to_string(),
+                });
+            }
+            if actions.len() > 1
+                && actions.iter().any(|action| match action {
+                    RowMutationAction::CreateEdge {
+                        src_metadata,
+                        dst_metadata,
+                        edge_metadata,
+                        ..
+                    } => {
+                        !src_metadata.labels.is_empty()
+                            || !src_metadata.properties.is_empty()
+                            || !dst_metadata.labels.is_empty()
+                            || !dst_metadata.properties.is_empty()
+                            || !edge_metadata.properties.is_empty()
+                    }
+                    _ => false,
+                })
+            {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "multi-pattern CREATE with labels or properties requires the metadata batch writer"
+                        .to_string(),
+                });
+            }
+
+            if actions.len() == 1 {
+                let RowMutationAction::CreateEdge {
+                    edge_type,
+                    src,
+                    dst,
+                    src_metadata,
+                    dst_metadata,
+                    edge_metadata,
+                } = &actions[0]
+                else {
+                    unreachable!("CREATE batch was validated above")
+                };
+                let mutation = EdgeMutation {
+                    cell_id: context.cell_id.clone(),
+                    edge_type: edge_type.clone(),
+                    src: *src,
+                    dst: *dst,
+                    idempotency_key: format!(
+                        "{}.create.{}.{}.{}.00000000000000000000",
+                        context.idempotency_key, edge_type, src, dst
+                    ),
+                };
+                let commit = if src_metadata.labels.is_empty()
+                    && src_metadata.properties.is_empty()
+                    && dst_metadata.labels.is_empty()
+                    && dst_metadata.properties.is_empty()
+                    && edge_metadata.properties.is_empty()
+                {
+                    self.write_edge(mutation).await?
+                } else if edge_metadata.properties.is_empty() {
+                    self.write_edge_with_vertex_metadata(
+                        mutation,
+                        src_metadata.clone(),
+                        dst_metadata.clone(),
+                    )
+                    .await?
+                } else {
+                    self.write_edge_with_full_metadata(
+                        mutation,
+                        src_metadata.clone(),
+                        dst_metadata.clone(),
+                        edge_metadata.clone(),
+                    )
+                    .await?
+                };
+                return Ok(QueryMutationResult {
+                    created_edges: u64::from(!commit.already_existed),
+                    noops: u64::from(commit.already_existed),
+                    ..QueryMutationResult::default()
+                });
+            }
+
+            let mutations = actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let RowMutationAction::CreateEdge {
+                        edge_type,
+                        src,
+                        dst,
+                        ..
+                    } = action
+                    else {
+                        unreachable!("CREATE batch was validated above")
+                    };
+                    EdgeMutation {
+                        cell_id: context.cell_id.clone(),
+                        edge_type: edge_type.clone(),
+                        src: *src,
+                        dst: *dst,
+                        idempotency_key: format!(
+                            "{}.create.{}.{}.{}.{index:020}",
+                            context.idempotency_key, edge_type, src, dst
+                        ),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let batch = self
+                .write_edge_mutations_batch(&context.cell_id, mutations)
+                .await?;
+            return Ok(QueryMutationResult {
+                created_edges: batch.inserted,
+                noops: batch.already_existed,
+                ..QueryMutationResult::default()
+            });
+        }
+
         let mut result = QueryMutationResult::default();
         for action in actions {
             budget.check("cypher_patternless_mutation")?;
@@ -5352,6 +5485,157 @@ impl GraphShard {
         neighbors.sort_unstable();
         neighbors.dedup();
         Ok(neighbors)
+    }
+
+    pub async fn out_neighbors_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        sources: impl IntoIterator<Item = VertexId>,
+    ) -> Result<Vec<NeighborBatchEntry>> {
+        let read_epoch = self.current_epoch(cell_id).await?;
+        self.out_neighbors_batch_at(cell_id, edge_type, sources, read_epoch)
+            .await
+    }
+
+    pub async fn out_neighbors_batch_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        sources: impl IntoIterator<Item = VertexId>,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<NeighborBatchEntry>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        self.ensure_cell_readable(cell_id, "out_neighbors_batch")
+            .await?;
+        let sources: Vec<_> = sources.into_iter().collect();
+        ensure_limit(
+            "out_neighbors_batch_sources",
+            sources.len() as u64,
+            self.limits.max_query_intermediate_rows as u64,
+        )?;
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requested: BTreeSet<_> = sources.iter().copied().collect();
+        let mut by_source = BTreeMap::<VertexId, Vec<VertexId>>::new();
+        for edge in self.edges_at(cell_id, edge_type, read_epoch).await? {
+            if requested.contains(&edge.src) {
+                by_source.entry(edge.src).or_default().push(edge.dst);
+            }
+        }
+        for neighbors in by_source.values_mut() {
+            neighbors.sort_unstable();
+            neighbors.dedup();
+        }
+        Ok(sources
+            .into_iter()
+            .map(|vertex| NeighborBatchEntry {
+                vertex,
+                neighbors: by_source.get(&vertex).cloned().unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    pub async fn in_neighbors_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        destinations: impl IntoIterator<Item = VertexId>,
+    ) -> Result<Vec<NeighborBatchEntry>> {
+        let read_epoch = self.current_epoch(cell_id).await?;
+        self.in_neighbors_batch_at(cell_id, edge_type, destinations, read_epoch)
+            .await
+    }
+
+    pub async fn in_neighbors_batch_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        destinations: impl IntoIterator<Item = VertexId>,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<NeighborBatchEntry>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        self.ensure_cell_readable(cell_id, "in_neighbors_batch")
+            .await?;
+        let destinations: Vec<_> = destinations.into_iter().collect();
+        ensure_limit(
+            "in_neighbors_batch_destinations",
+            destinations.len() as u64,
+            self.limits.max_query_intermediate_rows as u64,
+        )?;
+        if destinations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requested: BTreeSet<_> = destinations.iter().copied().collect();
+        let mut by_destination = BTreeMap::<VertexId, Vec<VertexId>>::new();
+        for edge in self.edges_at(cell_id, edge_type, read_epoch).await? {
+            if requested.contains(&edge.dst) {
+                by_destination.entry(edge.dst).or_default().push(edge.src);
+            }
+        }
+        for neighbors in by_destination.values_mut() {
+            neighbors.sort_unstable();
+            neighbors.dedup();
+        }
+        Ok(destinations
+            .into_iter()
+            .map(|vertex| NeighborBatchEntry {
+                vertex,
+                neighbors: by_destination.get(&vertex).cloned().unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    pub async fn edge_exists_batch(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+    ) -> Result<Vec<EdgeExistenceBatchEntry>> {
+        let read_epoch = self.current_epoch(cell_id).await?;
+        self.edge_exists_batch_at(cell_id, edge_type, edges, read_epoch)
+            .await
+    }
+
+    pub async fn edge_exists_batch_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        edges: impl IntoIterator<Item = (VertexId, VertexId)>,
+        read_epoch: GraphEpoch,
+    ) -> Result<Vec<EdgeExistenceBatchEntry>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        self.ensure_cell_readable(cell_id, "edge_exists_batch")
+            .await?;
+        let edges: Vec<_> = edges.into_iter().collect();
+        ensure_limit(
+            "edge_exists_batch_edges",
+            edges.len() as u64,
+            self.limits.max_query_intermediate_rows as u64,
+        )?;
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let live: BTreeSet<_> = self
+            .edges_at(cell_id, edge_type, read_epoch)
+            .await?
+            .into_iter()
+            .map(|edge| (edge.src, edge.dst))
+            .collect();
+        Ok(edges
+            .into_iter()
+            .map(|(src, dst)| EdgeExistenceBatchEntry {
+                src,
+                dst,
+                exists: live.contains(&(src, dst)),
+            })
+            .collect())
     }
 
     async fn out_neighbors_at_for_query(
