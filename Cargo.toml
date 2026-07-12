@@ -118,6 +118,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 
 [dev-dependencies]
 boltr = { version = "0.2.0", features = ["client"] }
+serde = "1"
+serde_yaml = "0.9"
 rcgen = "0.13"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tempfile = "3"
