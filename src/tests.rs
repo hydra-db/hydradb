@@ -16611,6 +16611,107 @@ async fn cypher_union_merges_row_query_arms_with_distinct_or_all_semantics() {
             ],
         )
     );
+
+    let windowed = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-union-windowed-arms"),
+            "MATCH (u:User) RETURN u.id AS id ORDER BY id DESC LIMIT 1 \
+			 UNION ALL MATCH (m:Moderator) RETURN m.id AS id ORDER BY id ASC LIMIT 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        windowed,
+        QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![
+                QueryRow::new(vec![QueryValue::VertexId(2)]),
+                QueryRow::new(vec![QueryValue::VertexId(2)]),
+            ],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_starts_with_uses_current_index_and_preserves_historical_results() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-prefix-index", object_store).await;
+
+    for (vertex, value) in [(1, "thread-alpha"), (2, "thread-beta")] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex,
+                VertexMetadata::default()
+                    .with_label("Source")
+                    .with_property("thread_id", VertexPropertyValue::String(value.to_string())),
+            )
+            .await
+            .unwrap();
+    }
+    let historical_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            2,
+            VertexMetadata::default()
+                .with_label("Source")
+                .with_property(
+                    "thread_id",
+                    VertexPropertyValue::String("other".to_string()),
+                ),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            3,
+            VertexMetadata::default()
+                .with_label("Source")
+                .with_property(
+                    "thread_id",
+                    VertexPropertyValue::String("thread-current".to_string()),
+                ),
+        )
+        .await
+        .unwrap();
+
+    let query = "MATCH (s:Source) WHERE s.thread_id STARTS WITH $prefix \
+                 RETURN s.id ORDER BY s.id";
+    let current = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "prefix-current")
+                .with_parameter("prefix", VertexPropertyValue::String("thread-".to_string())),
+            query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        current.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(1)]),
+            QueryRow::new(vec![QueryValue::VertexId(3)]),
+        ]
+    );
+
+    let historical = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "prefix-historical")
+                .at_epoch(historical_epoch)
+                .with_parameter("prefix", VertexPropertyValue::String("thread-".to_string())),
+            query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        historical.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(1)]),
+            QueryRow::new(vec![QueryValue::VertexId(2)]),
+        ]
+    );
 }
 
 #[cfg(feature = "opencypher")]
