@@ -86,3 +86,19 @@ fn internal_mtls_projects_a_deterministic_ca_bundle() {
         assert!(internal_tls_volume_projects_ca(stateful_set));
     }
 }
+
+#[test]
+fn eks_overlay_includes_production_secret_provisioners() {
+    let manifests = documents(include_str!("../deploy/overlays/eks/kustomization.yaml"));
+    let resources = manifests[0]["resources"]
+        .as_sequence()
+        .expect("EKS resources");
+    for required in ["../../addons/cert-manager", "../../addons/external-secrets"] {
+        assert!(
+            resources
+                .iter()
+                .any(|resource| resource.as_str() == Some(required)),
+            "EKS overlay is missing {required}"
+        );
+    }
+}

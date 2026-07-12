@@ -3,6 +3,8 @@ kind: Kustomization
 namespace: slatedb-graph
 resources:
   - ../../base
+  - ../../addons/cert-manager
+  - ../../addons/external-secrets
 patches:
   - path: service-account-patch.yaml
   - path: runtime-config-patch.yaml
