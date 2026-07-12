@@ -90,16 +90,44 @@ impl GraphNode {
     where
         C: GraphControlClient + 'static,
     {
+        Self::open_with_memory_options(
+            base_path,
+            local_node_id,
+            control,
+            object_store,
+            lease_ttl,
+            lease_renew_interval,
+            options,
+            GraphMemoryConfig::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_with_memory_options<C>(
+        base_path: impl Into<String>,
+        local_node_id: impl Into<String>,
+        control: Arc<C>,
+        object_store: Arc<dyn ObjectStore>,
+        lease_ttl: Duration,
+        lease_renew_interval: Duration,
+        options: GraphOpenOptions,
+        memory: GraphMemoryConfig,
+    ) -> Result<Self>
+    where
+        C: GraphControlClient + 'static,
+    {
         let control: Arc<dyn GraphControlClient> = control;
         lease_ttl_ms(lease_ttl)?;
         validate_graph_node_interval("lease_renew_interval", lease_renew_interval)?;
-        let cluster = RoutedGraphCluster::open_owned_with_control_and_options(
+        let cluster = RoutedGraphCluster::open_owned_with_control_and_memory_options(
             base_path,
             local_node_id,
             control.as_ref(),
             object_store,
             lease_ttl,
             options,
+            memory,
         )
         .await?;
         let heartbeat = match super::control_client::start_control_client_heartbeat(
@@ -171,8 +199,30 @@ impl GraphNode {
     where
         C: GraphControlClient + 'static,
     {
+        Self::open_managed_with_memory_config(
+            base_path,
+            local_node_id,
+            control,
+            object_store,
+            config,
+            GraphMemoryConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn open_managed_with_memory_config<C>(
+        base_path: impl Into<String>,
+        local_node_id: impl Into<String>,
+        control: Arc<C>,
+        object_store: Arc<dyn ObjectStore>,
+        config: GraphNodeRuntimeConfig,
+        memory: GraphMemoryConfig,
+    ) -> Result<ManagedGraphNode>
+    where
+        C: GraphControlClient + 'static,
+    {
         config.validate()?;
-        let node = Self::open_with_options(
+        let node = Self::open_with_memory_options(
             base_path,
             local_node_id,
             control,
@@ -180,6 +230,7 @@ impl GraphNode {
             config.lease_ttl,
             config.lease_renew_interval,
             config.options,
+            memory,
         )
         .await?;
         node.into_managed(config.lease_ttl, config.shard_refresh_interval)
@@ -1045,6 +1096,7 @@ impl RoutedGraphCluster {
             placement,
             object_store,
             options: GraphOpenOptions::default(),
+            memory: GraphMemoryConfig::default(),
             shard_db_handles: Arc::new(RwLock::new(
                 shards
                     .iter()
@@ -1083,6 +1135,27 @@ impl RoutedGraphCluster {
         lease_ttl: Duration,
         options: GraphOpenOptions,
     ) -> Result<Self> {
+        Self::open_owned_with_control_and_memory_options(
+            base_path,
+            local_node_id,
+            control,
+            object_store,
+            lease_ttl,
+            options,
+            GraphMemoryConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn open_owned_with_control_and_memory_options(
+        base_path: impl Into<String>,
+        local_node_id: impl Into<String>,
+        control: &dyn GraphControlClient,
+        object_store: Arc<dyn ObjectStore>,
+        lease_ttl: Duration,
+        options: GraphOpenOptions,
+        memory: GraphMemoryConfig,
+    ) -> Result<Self> {
         let scope = control.scope().clone();
         let base_path = scope.scoped_store_path(&base_path.into());
         Self::open_owned_with_control_at_path(
@@ -1093,6 +1166,7 @@ impl RoutedGraphCluster {
             object_store,
             lease_ttl,
             options,
+            memory,
         )
         .await
     }
@@ -1105,6 +1179,30 @@ impl RoutedGraphCluster {
         object_store: Arc<dyn ObjectStore>,
         lease_ttl: Duration,
         options: GraphOpenOptions,
+    ) -> Result<Self> {
+        Self::open_owned_scoped_with_control_and_memory_options(
+            base_path,
+            scope,
+            local_node_id,
+            control,
+            object_store,
+            lease_ttl,
+            options,
+            GraphMemoryConfig::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_owned_scoped_with_control_and_memory_options(
+        base_path: impl Into<String>,
+        scope: GraphScope,
+        local_node_id: impl Into<String>,
+        control: &dyn GraphControlClient,
+        object_store: Arc<dyn ObjectStore>,
+        lease_ttl: Duration,
+        options: GraphOpenOptions,
+        memory: GraphMemoryConfig,
     ) -> Result<Self> {
         if control.scope() != &scope {
             return Err(GraphError::GraphScopeMismatch {
@@ -1121,10 +1219,12 @@ impl RoutedGraphCluster {
             object_store,
             lease_ttl,
             options,
+            memory,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn open_owned_with_control_at_path(
         base_path: String,
         scope: GraphScope,
@@ -1133,6 +1233,7 @@ impl RoutedGraphCluster {
         object_store: Arc<dyn ObjectStore>,
         lease_ttl: Duration,
         options: GraphOpenOptions,
+        memory: GraphMemoryConfig,
     ) -> Result<Self> {
         let mut placement = control.load_placement().await?;
         validate_component("node_id", &local_node_id)?;
@@ -1149,10 +1250,11 @@ impl RoutedGraphCluster {
                     .map_err(lock_error)?
                     .insert(cell_id.clone(), lease.clone());
                 let path = format!("{base_path}/{cell_id}");
-                let shard = GraphShard::open_leased_writer(
+                let shard = GraphShard::open_leased_writer_with_memory_options(
                     path,
                     Arc::clone(&object_store),
                     options.clone(),
+                    memory.clone(),
                     local_node_id.clone(),
                     Arc::clone(&leases),
                 )
@@ -1198,6 +1300,7 @@ impl RoutedGraphCluster {
             placement,
             object_store,
             options,
+            memory,
             shard_db_handles: Arc::new(RwLock::new(
                 shards
                     .iter()
@@ -1357,10 +1460,11 @@ impl RoutedGraphCluster {
                 .map_err(lock_error)?
                 .insert(cell_id.clone(), lease.clone());
             let path = format!("{}/{}", self.base_path, cell_id);
-            let shard = match GraphShard::open_leased_writer(
+            let shard = match GraphShard::open_leased_writer_with_memory_options(
                 path,
                 Arc::clone(&self.object_store),
                 self.options.clone(),
+                self.memory.clone(),
                 self.local_node_id.clone(),
                 Arc::clone(&self.leases),
             )

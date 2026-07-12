@@ -26,7 +26,24 @@ impl GraphShard {
         object_store: Arc<dyn ObjectStore>,
         options: GraphOpenOptions,
     ) -> Result<Self> {
-        Self::open_internal(path, object_store, options, GraphWriteAuthority::ReadOnly).await
+        Self::open_with_memory_options(path, object_store, options, GraphMemoryConfig::default())
+            .await
+    }
+
+    pub async fn open_with_memory_options(
+        path: impl Into<Path>,
+        object_store: Arc<dyn ObjectStore>,
+        options: GraphOpenOptions,
+        memory: GraphMemoryConfig,
+    ) -> Result<Self> {
+        Self::open_internal(
+            path,
+            object_store,
+            options,
+            memory,
+            GraphWriteAuthority::ReadOnly,
+        )
+        .await
     }
 
     pub async fn open_standalone_writer(
@@ -58,9 +75,32 @@ impl GraphShard {
         object_store: Arc<dyn ObjectStore>,
         options: GraphOpenOptions,
     ) -> Result<Self> {
-        Self::open_internal(path, object_store, options, GraphWriteAuthority::Standalone).await
+        Self::open_standalone_writer_with_memory_options(
+            path,
+            object_store,
+            options,
+            GraphMemoryConfig::default(),
+        )
+        .await
     }
 
+    pub async fn open_standalone_writer_with_memory_options(
+        path: impl Into<Path>,
+        object_store: Arc<dyn ObjectStore>,
+        options: GraphOpenOptions,
+        memory: GraphMemoryConfig,
+    ) -> Result<Self> {
+        Self::open_internal(
+            path,
+            object_store,
+            options,
+            memory,
+            GraphWriteAuthority::Standalone,
+        )
+        .await
+    }
+
+    #[cfg(any(test, feature = "chaos-harness"))]
     pub(crate) async fn open_leased_writer(
         path: impl Into<Path>,
         object_store: Arc<dyn ObjectStore>,
@@ -68,10 +108,30 @@ impl GraphShard {
         local_node_id: String,
         leases: Arc<RwLock<BTreeMap<String, engine::ShardLease>>>,
     ) -> Result<Self> {
+        Self::open_leased_writer_with_memory_options(
+            path,
+            object_store,
+            options,
+            GraphMemoryConfig::default(),
+            local_node_id,
+            leases,
+        )
+        .await
+    }
+
+    pub(crate) async fn open_leased_writer_with_memory_options(
+        path: impl Into<Path>,
+        object_store: Arc<dyn ObjectStore>,
+        options: GraphOpenOptions,
+        memory: GraphMemoryConfig,
+        local_node_id: String,
+        leases: Arc<RwLock<BTreeMap<String, engine::ShardLease>>>,
+    ) -> Result<Self> {
         Self::open_internal(
             path,
             object_store,
             options,
+            memory,
             GraphWriteAuthority::Leased {
                 local_node_id,
                 leases,
@@ -125,6 +185,7 @@ impl GraphShard {
         path: impl Into<Path>,
         object_store: Arc<dyn ObjectStore>,
         options: GraphOpenOptions,
+        memory: GraphMemoryConfig,
         write_authority: GraphWriteAuthority,
     ) -> Result<Self> {
         if !options.durability.await_durable_writes
@@ -152,7 +213,7 @@ impl GraphShard {
                         store_path.clone(),
                         Arc::clone(&object_store),
                         &options.cache,
-                        &options.storage_memory,
+                        &memory.storage,
                         &options.durability,
                     )
                     .await?,
@@ -172,8 +233,7 @@ impl GraphShard {
             Arc::clone(&operation_metrics),
         );
         let hydration_gate = Arc::new(Semaphore::new(cache_policy.hydration_permits()));
-        let matrix_compilation_gate =
-            Arc::new(Semaphore::new(cache_policy.matrix_compilation_permits()));
+        let matrix_compilation_gate = Arc::new(Semaphore::new(memory.matrix_compilation_permits()));
         let graph_write_gate = Arc::new(Semaphore::new(
             backpressure_policy.max_concurrent_graph_writes.max(1),
         ));
@@ -210,12 +270,12 @@ impl GraphShard {
             matrix_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_matrix_adjacencies,
                 tenant_quota,
-                cache_policy.max_matrix_adjacency_bytes,
+                memory.max_matrix_adjacency_bytes,
             )),
             graphblas_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_graphblas_matrices,
                 tenant_quota,
-                cache_policy.max_graphblas_bytes,
+                memory.max_graphblas_bytes,
             )),
             #[cfg(feature = "opencypher")]
             parsed_row_query_cache: Mutex::new(BoundedGraphCache::new(
@@ -246,13 +306,15 @@ impl GraphShard {
                 cache_policy.max_supernode_groups,
                 tenant_quota,
             )),
-            posting_chunk_cache: Mutex::new(BoundedGraphCache::new(
+            posting_chunk_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_posting_chunks,
                 tenant_quota,
+                memory.max_posting_chunk_bytes,
             )),
-            materialized_supernode_cache: Mutex::new(BoundedGraphCache::new(
+            materialized_supernode_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_materialized_supernodes,
                 tenant_quota,
+                memory.max_materialized_supernode_bytes,
             )),
         })
     }
@@ -398,20 +460,10 @@ impl GraphShard {
     }
 
     pub async fn graph_cache_entry_counts(&self) -> GraphCacheEntryCounts {
-        let (matrix_adjacencies, matrix_adjacency_bytes) = {
-            let cache = self.matrix_cache.lock().await;
-            (cache.len(), cache.resident_bytes())
-        };
-        let (graphblas_matrices, graphblas_bytes) = {
-            let cache = self.graphblas_cache.lock().await;
-            (cache.len(), cache.resident_bytes())
-        };
         GraphCacheEntryCounts {
             matrix_artifacts: self.matrix_artifact_cache.lock().await.len(),
-            matrix_adjacencies,
-            matrix_adjacency_bytes,
-            graphblas_matrices,
-            graphblas_bytes,
+            matrix_adjacencies: self.matrix_cache.lock().await.len(),
+            graphblas_matrices: self.graphblas_cache.lock().await.len(),
             #[cfg(feature = "opencypher")]
             parsed_row_queries: self.parsed_row_query_cache.lock().await.len(),
             #[cfg(feature = "opencypher")]
@@ -428,6 +480,19 @@ impl GraphShard {
             supernode_groups: self.supernode_group_cache.lock().await.len(),
             posting_chunks: self.posting_chunk_cache.lock().await.len(),
             materialized_supernodes: self.materialized_supernode_cache.lock().await.len(),
+        }
+    }
+
+    pub async fn graph_cache_resident_bytes(&self) -> GraphCacheResidentBytes {
+        GraphCacheResidentBytes {
+            matrix_adjacencies: self.matrix_cache.lock().await.resident_bytes(),
+            graphblas_matrices: self.graphblas_cache.lock().await.resident_bytes(),
+            posting_chunks: self.posting_chunk_cache.lock().await.resident_bytes(),
+            materialized_supernodes: self
+                .materialized_supernode_cache
+                .lock()
+                .await
+                .resident_bytes(),
         }
     }
 

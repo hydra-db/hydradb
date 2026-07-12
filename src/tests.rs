@@ -18340,8 +18340,9 @@ async fn graphblas_matrix_kernel_reuses_compiled_base_matrix_cache() {
     assert_eq!(shard.graphblas_cache.lock().await.len(), 1);
     let cache_counts = shard.graph_cache_entry_counts().await;
     assert_eq!(cache_counts.graphblas_matrices, 1);
-    assert!(cache_counts.graphblas_bytes > 0);
-    assert!(cache_counts.graphblas_bytes <= GraphCachePolicy::default().max_graphblas_bytes);
+    let resident_bytes = shard.graph_cache_resident_bytes().await;
+    assert!(resident_bytes.graphblas_matrices > 0);
+    assert!(resident_bytes.graphblas_matrices <= GraphMemoryConfig::default().max_graphblas_bytes);
     let first = shard
         .matrix_reachable_with_kernel(
             "reddit-home",
@@ -18683,4 +18684,65 @@ async fn supernode_groups_count_exists_intersect_and_page_without_full_scan() {
         .unwrap();
     assert_eq!(current_page_2.vertices, vec![15, 16]);
     assert!(!current_page_2.has_next);
+}
+
+#[tokio::test]
+async fn oversized_supernode_artifacts_are_not_retained_past_byte_budgets() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let memory = GraphMemoryConfig {
+        max_posting_chunk_bytes: 1,
+        max_materialized_supernode_bytes: 1,
+        ..GraphMemoryConfig::default()
+    };
+    let shard = GraphShard::open_standalone_writer_with_memory_options(
+        "graph/supernode-byte-budget",
+        object_store,
+        GraphOpenOptions::default(),
+        memory,
+    )
+    .await
+    .unwrap();
+
+    for dst in 10..50 {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "USER_FOLLOWS_USER".to_string(),
+                src: 1,
+                dst,
+                idempotency_key: format!("bounded-supernode-{dst}"),
+            })
+            .await
+            .unwrap();
+    }
+    let base_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    shard
+        .build_supernode_groups("reddit-home", "USER_FOLLOWS_USER", base_epoch, 4, 8)
+        .await
+        .unwrap();
+
+    let result = shard
+        .matrix_reachable_with_kernel(
+            "reddit-home",
+            "USER_FOLLOWS_USER",
+            &[1],
+            1,
+            base_epoch,
+            SparseKernelBackend::RustSparse,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.vertices, (10..50).collect::<Vec<_>>());
+
+    let resident = shard.graph_cache_resident_bytes().await;
+    assert!(resident.posting_chunks <= 1);
+    assert!(resident.materialized_supernodes <= 1);
+    assert_eq!(shard.graph_cache_entry_counts().await.posting_chunks, 0);
+    assert_eq!(
+        shard
+            .graph_cache_entry_counts()
+            .await
+            .materialized_supernodes,
+        0
+    );
 }

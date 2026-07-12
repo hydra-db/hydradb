@@ -43,8 +43,8 @@ pub(crate) use core::cache::{
 pub(crate) use core::config::{open_graph_db, open_graph_reader};
 pub use core::config::{
     GraphBackpressurePolicy, GraphCacheConfig, GraphDurabilityConfig, GraphIndexPolicy,
-    GraphLimits, GraphOpenOptions, GraphRetentionPolicy, GraphStorageMemoryConfig,
-    DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
+    GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphRetentionPolicy,
+    GraphStorageMemoryConfig, DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
 };
 pub use core::error::{GraphError, Result};
 pub use core::metrics::{
@@ -77,7 +77,7 @@ pub(crate) use core::state::{
 pub(crate) use core::state::{
     decode_cell_write_lock_record, encode_cell_write_lock_record, CellWriteLockState,
 };
-pub use core::state::{GraphCacheEntryCounts, GraphShard};
+pub use core::state::{GraphCacheEntryCounts, GraphCacheResidentBytes, GraphShard};
 #[cfg(feature = "opencypher")]
 pub(crate) use core::state::{QueryReadLeaseManager, QueryReadLeaseRegistration};
 pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};

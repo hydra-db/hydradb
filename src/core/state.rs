@@ -182,9 +182,7 @@ impl Drop for QueryStatsRefreshHandle {
 pub struct GraphCacheEntryCounts {
     pub matrix_artifacts: usize,
     pub matrix_adjacencies: usize,
-    pub matrix_adjacency_bytes: usize,
     pub graphblas_matrices: usize,
-    pub graphblas_bytes: usize,
     #[cfg(feature = "opencypher")]
     pub parsed_row_queries: usize,
     #[cfg(feature = "opencypher")]
@@ -196,6 +194,23 @@ pub struct GraphCacheEntryCounts {
     pub supernode_groups: usize,
     pub posting_chunks: usize,
     pub materialized_supernodes: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphCacheResidentBytes {
+    pub matrix_adjacencies: usize,
+    pub graphblas_matrices: usize,
+    pub posting_chunks: usize,
+    pub materialized_supernodes: usize,
+}
+
+impl GraphCacheResidentBytes {
+    pub fn total(&self) -> usize {
+        self.matrix_adjacencies
+            .saturating_add(self.graphblas_matrices)
+            .saturating_add(self.posting_chunks)
+            .saturating_add(self.materialized_supernodes)
+    }
 }
 
 #[derive(Clone)]

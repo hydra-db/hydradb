@@ -69,9 +69,10 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         control_config,
     )?);
     let open_options = config.graph_open_options();
+    let memory_config = config.graph_memory_config();
     wait_for_initial_placement(&config, control.as_ref()).await?;
     let node = Arc::new(
-        GraphNode::open_managed_with_config(
+        GraphNode::open_managed_with_memory_config(
             config.data_path.clone(),
             config.node_id.clone(),
             Arc::clone(&control),
@@ -82,6 +83,7 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
                 config.shard_refresh_interval,
             )
             .with_options(open_options),
+            memory_config,
         )
         .await?,
     );

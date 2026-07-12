@@ -75,6 +75,13 @@ pub(crate) use graphblas::CompiledGraphBlasMatrix;
 #[cfg(not(feature = "graphblas"))]
 pub(crate) struct CompiledGraphBlasMatrix;
 
+#[cfg(not(feature = "graphblas"))]
+impl CompiledGraphBlasMatrix {
+    pub(crate) fn estimated_resident_bytes(&self) -> usize {
+        0
+    }
+}
+
 pub(crate) fn compile_graphblas_matrix(adjacency: &Adjacency) -> Result<CompiledGraphBlasMatrix> {
     compile_graphblas(adjacency)
 }

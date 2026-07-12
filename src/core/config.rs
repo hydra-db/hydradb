@@ -144,12 +144,51 @@ impl GraphCacheConfig {
 pub struct GraphOpenOptions {
     pub limits: GraphLimits,
     pub cache: GraphCacheConfig,
-    pub storage_memory: GraphStorageMemoryConfig,
     pub durability: GraphDurabilityConfig,
     pub cache_policy: GraphCachePolicy,
     pub retention_policy: GraphRetentionPolicy,
     pub backpressure_policy: GraphBackpressurePolicy,
     pub index_policy: GraphIndexPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphMemoryConfig {
+    pub storage: GraphStorageMemoryConfig,
+    pub max_matrix_adjacency_bytes: usize,
+    pub max_graphblas_bytes: usize,
+    pub max_posting_chunk_bytes: usize,
+    pub max_materialized_supernode_bytes: usize,
+    pub max_concurrent_matrix_compilations: usize,
+}
+
+impl Default for GraphMemoryConfig {
+    fn default() -> Self {
+        Self {
+            storage: GraphStorageMemoryConfig::default(),
+            max_matrix_adjacency_bytes: 64 * 1024 * 1024,
+            max_graphblas_bytes: 128 * 1024 * 1024,
+            max_posting_chunk_bytes: 64 * 1024 * 1024,
+            max_materialized_supernode_bytes: 64 * 1024 * 1024,
+            max_concurrent_matrix_compilations: 1,
+        }
+    }
+}
+
+impl GraphMemoryConfig {
+    pub fn low_memory() -> Self {
+        Self {
+            storage: GraphStorageMemoryConfig::low_memory(),
+            max_matrix_adjacency_bytes: 16 * 1024 * 1024,
+            max_graphblas_bytes: 32 * 1024 * 1024,
+            max_posting_chunk_bytes: 16 * 1024 * 1024,
+            max_materialized_supernode_bytes: 16 * 1024 * 1024,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn matrix_compilation_permits(&self) -> usize {
+        self.max_concurrent_matrix_compilations.max(1)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -319,6 +358,10 @@ mod tests {
         low_memory.validate().unwrap();
         assert_eq!(low_memory.l0_sst_size_bytes, 4 * 1024 * 1024);
         assert_eq!(low_memory.max_unflushed_bytes, 16 * 1024 * 1024);
+
+        let memory = GraphMemoryConfig::low_memory();
+        assert_eq!(memory.max_posting_chunk_bytes, 16 * 1024 * 1024);
+        assert_eq!(memory.max_materialized_supernode_bytes, 16 * 1024 * 1024);
     }
 
     #[test]
@@ -338,5 +381,39 @@ mod tests {
             ..GraphStorageMemoryConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn existing_public_option_literals_remain_source_compatible() {
+        let cache_policy = GraphCachePolicy {
+            max_matrix_artifacts: 1,
+            max_matrix_adjacencies: 1,
+            max_graphblas_matrices: 1,
+            #[cfg(feature = "opencypher")]
+            max_parsed_row_queries: 1,
+            #[cfg(feature = "opencypher")]
+            max_reachability_results: 1,
+            #[cfg(feature = "opencypher")]
+            max_relationship_row_sets: 1,
+            #[cfg(feature = "opencypher")]
+            max_relationship_property_row_sets: 1,
+            max_supernode_groups: 1,
+            max_posting_chunks: 1,
+            max_materialized_supernodes: 1,
+            max_entries_per_cell: Some(1),
+            pin_matrix_min_edges: 1,
+            pin_supernode_min_degree: 1,
+            prefetch_supernode_chunks: 1,
+            max_concurrent_hydrations: 1,
+        };
+        let _options = GraphOpenOptions {
+            limits: GraphLimits::default(),
+            cache: GraphCacheConfig::default(),
+            durability: GraphDurabilityConfig::default(),
+            cache_policy,
+            retention_policy: GraphRetentionPolicy::default(),
+            backpressure_policy: GraphBackpressurePolicy::default(),
+            index_policy: GraphIndexPolicy::default(),
+        };
     }
 }
