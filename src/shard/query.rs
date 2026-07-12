@@ -917,22 +917,7 @@ impl GraphShard {
         let mut identified = Vec::new();
         for relationship in relationships {
             budget.check("cypher_delete_relationship_collect")?;
-            let mutation = EdgeMutation {
-                cell_id: context.cell_id.clone(),
-                edge_type: relationship.edge_type.clone(),
-                src: relationship.src,
-                dst: relationship.dst,
-                idempotency_key: format!(
-                    "{}.delete.{}.{}.{}.{}",
-                    context.idempotency_key,
-                    relationship.edge_type,
-                    relationship.src,
-                    relationship.dst,
-                    relationship
-                        .relationship_id
-                        .map_or_else(|| "edge".to_string(), |id| id.to_string())
-                ),
-            };
+            let mutation = bound_relationship_delete_mutation(context, &relationship);
             match relationship.relationship_id {
                 Some(relationship_id) => identified.push((mutation, relationship_id)),
                 None => structural.push(mutation),
@@ -1065,6 +1050,26 @@ impl GraphShard {
                     }
                 }
             }
+        }
+        let structural_delete_guards = relationships
+            .iter()
+            .filter(|relationship| relationship.relationship_id.is_some())
+            .map(|relationship| {
+                let mut structural = relationship.clone();
+                structural.relationship_id = None;
+                (
+                    (structural.edge_type.clone(), structural.src, structural.dst),
+                    bound_relationship_delete_mutation(context, &structural),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if !structural_delete_guards.is_empty() {
+            budget.check("cypher_delete_relationship_reserve_scope")?;
+            self.reserve_edge_delete_noops_batch(
+                &context.cell_id,
+                structural_delete_guards.into_values(),
+            )
+            .await?;
         }
         self.delete_bound_relationships_batch(context, relationships, &budget)
             .await
@@ -7871,6 +7876,29 @@ struct BoundRelationship {
     src: VertexId,
     dst: VertexId,
     relationship_id: Option<RelationshipId>,
+}
+
+#[cfg(feature = "opencypher")]
+fn bound_relationship_delete_mutation(
+    context: &QueryContext,
+    relationship: &BoundRelationship,
+) -> EdgeMutation {
+    EdgeMutation {
+        cell_id: context.cell_id.clone(),
+        edge_type: relationship.edge_type.clone(),
+        src: relationship.src,
+        dst: relationship.dst,
+        idempotency_key: format!(
+            "{}.delete.{}.{}.{}.{}",
+            context.idempotency_key,
+            relationship.edge_type,
+            relationship.src,
+            relationship.dst,
+            relationship
+                .relationship_id
+                .map_or_else(|| "edge".to_string(), |id| id.to_string())
+        ),
+    }
 }
 
 #[cfg(feature = "opencypher")]

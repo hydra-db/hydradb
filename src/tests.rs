@@ -12965,6 +12965,104 @@ async fn import_vertex_metadata_batch_is_bounded_and_rejects_conflicts() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn relationship_property_delete_retry_does_not_expand_to_recreated_structural_edge() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard(
+        "graph/relationship-property-delete-stable-scope",
+        object_store,
+    )
+    .await;
+    let metadata = EdgeMetadata::default().with_property(
+        "chunk_id",
+        VertexPropertyValue::String("chunk-a".to_string()),
+    );
+    shard
+        .import_relationships_batch(
+            "reddit-home",
+            "RELATES",
+            [RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "RELATES".to_string(),
+                src: 40,
+                dst: 41,
+                relationship_id: 100,
+                metadata: metadata.clone(),
+            }],
+            "relationship-property-delete-stable-scope-import",
+        )
+        .await
+        .unwrap();
+    shard
+        .set_edge_metadata("reddit-home", "RELATES", 40, 41, metadata.clone())
+        .await
+        .unwrap();
+
+    let context = QueryContext::new("reddit-home", "relationship-property-delete-stable-scope");
+    assert_eq!(
+        shard
+            .delete_relationships_by_property_values_batch(
+                &context,
+                "RELATES",
+                "chunk_id",
+                vec![VertexPropertyValue::String("chunk-a".to_string())],
+            )
+            .await
+            .unwrap(),
+        (1, 0)
+    );
+
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "RELATES".to_string(),
+            src: 40,
+            dst: 41,
+            idempotency_key: "relationship-property-delete-recreated-edge".to_string(),
+        })
+        .await
+        .unwrap();
+    shard
+        .set_edge_metadata("reddit-home", "RELATES", 40, 41, metadata)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        shard
+            .delete_relationships_by_property_values_batch(
+                &context,
+                "RELATES",
+                "chunk_id",
+                vec![VertexPropertyValue::String("chunk-a".to_string())],
+            )
+            .await
+            .unwrap(),
+        (0, 0)
+    );
+    let structural_retry = shard
+        .delete_edge_mutations_batch(
+            "reddit-home",
+            [EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "RELATES".to_string(),
+                src: 40,
+                dst: 41,
+                idempotency_key:
+                    "relationship-property-delete-stable-scope.delete.RELATES.40.41.edge"
+                        .to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(structural_retry.deleted, 0);
+    assert_eq!(structural_retry.already_deleted, 1);
+    assert!(shard
+        .edge_exists("reddit-home", "RELATES", 40, 41)
+        .await
+        .unwrap());
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn multigraph_relationship_import_preserves_parallel_relationship_rows() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/multigraph-relationship-import", object_store).await;

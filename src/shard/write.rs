@@ -2828,6 +2828,113 @@ impl GraphShard {
         })
     }
 
+    pub(crate) async fn reserve_edge_delete_noops_batch(
+        &self,
+        cell_id: &str,
+        mutations: impl IntoIterator<Item = EdgeMutation>,
+    ) -> Result<()> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_write_authority(cell_id, "reserve_edge_delete_noops_batch")?;
+
+        let mutations: Vec<_> = mutations.into_iter().collect();
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        ensure_limit(
+            "reserve_edge_delete_noops_batch",
+            mutations.len() as u64,
+            self.limits.max_bulk_import_edges as u64,
+        )?;
+        validate_edge_mutations_for_cell(cell_id, &mutations, "reserve_edge_delete_noops_batch")?;
+        validate_unique_delete_mutation_identities(&mutations)?;
+
+        let _permit = self
+            .acquire_graph_write_permit("reserve_edge_delete_noops_batch")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .reserve_edge_delete_noops_batch_txn(cell_id, &mutations)
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(()) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                result => return result,
+            }
+        }
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
+    }
+
+    async fn reserve_edge_delete_noops_batch_txn(
+        &self,
+        cell_id: &str,
+        mutations: &[EdgeMutation],
+    ) -> Result<()> {
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "reserve_edge_delete_noops_batch")
+            .await?;
+        let result = self
+            .reserve_edge_delete_noops_batch_txn_locked(cell_id, mutations)
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    async fn reserve_edge_delete_noops_batch_txn_locked(
+        &self,
+        cell_id: &str,
+        mutations: &[EdgeMutation],
+    ) -> Result<()> {
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
+        self.validate_write_fence_txn(&txn, cell_id, "reserve_edge_delete_noops_batch")
+            .await?;
+        let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
+
+        for mutation in mutations {
+            let idem_key = keys::idempotency(cell_id, "delete", &mutation.idempotency_key);
+            if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
+                decode_delete_idempotency(&idem_key, mutation, &value)?;
+                continue;
+            }
+            txn.put(
+                idem_key.as_bytes(),
+                encode_delete_idempotency(
+                    mutation,
+                    &DeleteResult {
+                        epoch: current_epoch,
+                        deleted: false,
+                    },
+                ),
+            )?;
+        }
+
+        commit_txn_strict(txn, self.await_durable_writes).await
+    }
+
     async fn delete_edge_mutations_batch_txn(
         &self,
         cell_id: &str,
