@@ -1,0 +1,10 @@
+.git
+.github
+.idea
+.vscode
+deploy
+target
+*.csv
+*.log
+*.svg
+*.txt

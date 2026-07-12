@@ -13,8 +13,7 @@ impl GraphControlPlane {
         object_store: Arc<dyn ObjectStore>,
         cache: GraphCacheConfig,
     ) -> Result<Self> {
-        let store_path = path.into();
-        Self::open_at_path(store_path, object_store, cache, GraphScope::default()).await
+        Self::open_scoped_with_cache(path, object_store, GraphScope::default(), cache).await
     }
 
     pub async fn open_scoped(
@@ -33,11 +32,8 @@ impl GraphControlPlane {
         cache: GraphCacheConfig,
     ) -> Result<Self> {
         let base_path = base_path.into();
-        let store_path = if scope.is_default() {
-            base_path
-        } else {
-            slatedb::object_store::path::Path::from(scope.scoped_store_path(base_path.as_ref()))
-        };
+        let store_path =
+            slatedb::object_store::path::Path::from(scope.scoped_store_path(base_path.as_ref()));
         Self::open_at_path(store_path, object_store, cache, scope).await
     }
 
@@ -76,16 +72,9 @@ impl GraphControlPlane {
     }
 
     pub async fn publish_placement(&self, placement: &ShardPlacement) -> Result<()> {
-        let mut batch = WriteBatch::new();
-        for (cell_id, node_id) in &placement.owners {
-            validate_component("cell_id", cell_id)?;
-            validate_component("node_id", node_id)?;
-            batch.put(
-                control_placement_key(cell_id),
-                encode_control_placement(cell_id, node_id),
-            );
-        }
-        self.write_strict(batch).await
+        self.publish_scoped_placement_with_catalog(placement, 0)
+            .await
+            .map(|_| ())
     }
 
     pub async fn rebalance_rendezvous(
@@ -273,7 +262,14 @@ impl GraphControlPlane {
         };
         txn.put(token_key.as_bytes(), encode_u64_be(token))?;
         txn.put(lease_key.as_bytes(), encode_shard_lease(&lease))?;
-        control_metadata::bump_catalog_lease_txn(&txn, cell_id, node_id, token).await?;
+        control_metadata::bump_catalog_lease_txn(
+            &txn,
+            self.scope.graph_id.as_str(),
+            cell_id,
+            node_id,
+            token,
+        )
+        .await?;
         commit_control_txn(txn).await?;
         tracing::info!(
             target: "slatedb_graph_kernel",
@@ -554,6 +550,7 @@ impl GraphControlPlane {
                 )?;
                 control_metadata::bump_catalog_lease_txn(
                     &txn,
+                    self.scope.graph_id.as_str(),
                     cell_id,
                     new_node_id,
                     current.lease_token,
@@ -589,7 +586,14 @@ impl GraphControlPlane {
         )?;
         txn.put(token_key.as_bytes(), encode_u64_be(token))?;
         txn.put(lease_key.as_bytes(), encode_shard_lease(&lease))?;
-        control_metadata::bump_catalog_lease_txn(&txn, cell_id, new_node_id, token).await?;
+        control_metadata::bump_catalog_lease_txn(
+            &txn,
+            self.scope.graph_id.as_str(),
+            cell_id,
+            new_node_id,
+            token,
+        )
+        .await?;
         commit_control_txn(txn).await?;
         tracing::warn!(
             target: "slatedb_graph_kernel",
@@ -660,7 +664,14 @@ impl GraphControlPlane {
         )?;
         txn.put(token_key.as_bytes(), encode_u64_be(token))?;
         txn.put(lease_key.as_bytes(), encode_shard_lease(&lease))?;
-        control_metadata::bump_catalog_lease_txn(&txn, cell_id, new_node_id, token).await?;
+        control_metadata::bump_catalog_lease_txn(
+            &txn,
+            self.scope.graph_id.as_str(),
+            cell_id,
+            new_node_id,
+            token,
+        )
+        .await?;
         commit_control_txn(txn).await?;
         tracing::warn!(
             target: "slatedb_graph_kernel",
@@ -671,14 +682,5 @@ impl GraphControlPlane {
             "failed over expired shard lease"
         );
         Ok(lease)
-    }
-
-    async fn write_strict(&self, batch: WriteBatch) -> Result<()> {
-        let options = WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        };
-        self.db.write_with_options(batch, &options).await?;
-        Ok(())
     }
 }

@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use slatedb::config::{PreloadLevel, Settings};
+use slatedb::config::{DbReaderOptions, PreloadLevel, Settings};
 use slatedb::object_store::{path::Path, ObjectStore};
-use slatedb::Db;
+use slatedb::{Db, DbReader};
 
 use crate::{GraphCachePolicy, GraphEpoch, Result};
 
@@ -123,6 +123,21 @@ impl GraphCacheConfig {
                 .preload_disk_cache_on_startup = Some(PreloadLevel::AllSst);
         }
     }
+
+    fn apply_to_reader_options(&self, options: &mut DbReaderOptions) {
+        if let Some(cache_dir) = &self.object_store_cache_dir {
+            options.object_store_cache_options.root_folder = Some(cache_dir.clone());
+        }
+        if let Some(max_cache_size_bytes) = self.object_store_cache_bytes {
+            options.object_store_cache_options.max_cache_size_bytes = Some(max_cache_size_bytes);
+        }
+        options.object_store_cache_options.cache_puts = false;
+        if self.preload_sst_on_startup {
+            options
+                .object_store_cache_options
+                .preload_disk_cache_on_startup = Some(PreloadLevel::AllSst);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -200,6 +215,19 @@ pub(crate) async fn open_graph_db(
     durability.apply_to_settings(&mut settings);
     Ok(Db::builder(path, object_store)
         .with_settings(settings)
+        .build()
+        .await?)
+}
+
+pub(crate) async fn open_graph_reader(
+    path: impl Into<Path>,
+    object_store: Arc<dyn ObjectStore>,
+    cache: &GraphCacheConfig,
+) -> Result<DbReader> {
+    let mut options = DbReaderOptions::default();
+    cache.apply_to_reader_options(&mut options);
+    Ok(DbReader::builder(path, object_store)
+        .with_options(options)
         .build()
         .await?)
 }

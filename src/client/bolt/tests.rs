@@ -176,7 +176,7 @@ fn bolt_test_config() -> BoltServerConfig {
 }
 
 #[tokio::test]
-async fn legacy_handshake_selects_highest_supported_version_in_client_order() {
+async fn classic_handshake_selects_highest_supported_version_in_client_order() {
     let (mut client, mut server) = duplex(64);
     let server_task = tokio::spawn(async move { bolt_server_handshake(&mut server).await });
     client.write_all(&BOLT_MAGIC).await.unwrap();
@@ -928,10 +928,7 @@ async fn controller_routing_uses_live_nodes_and_current_lease_owner() {
         .iter()
         .find(|server| server.role == "READ")
         .unwrap();
-    assert_eq!(
-        read.addresses,
-        vec!["node-a.example:7687", "node-b.example:7687"]
-    );
+    assert_eq!(read.addresses, vec!["node-a.example:7687"]);
     control.close().await.unwrap();
 }
 

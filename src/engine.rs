@@ -9,7 +9,7 @@ use futures::future::join_all;
 use slatedb::bytes::Bytes;
 use slatedb::config::{DurabilityLevel, ReadOptions, ScanOptions, WriteOptions};
 use slatedb::object_store::{local::LocalFileSystem, path::Path, ObjectStore};
-use slatedb::{Db, DbTransaction, ErrorKind, IsolationLevel, WriteBatch};
+use slatedb::{Db, DbTransaction, ErrorKind, IsolationLevel};
 use tokio::sync::{watch, RwLock as TokioRwLock};
 use tokio::task::JoinHandle;
 
@@ -28,7 +28,7 @@ use crate::{
     parse_out_edge_segment_tombstone_key, parse_u64, release_cell_write_lock, segment_edge_visible,
     sort_deltas, validate_component, CellWriteLock, DeltaKind, DeltaRecord, EdgeRecord,
     GraphCacheConfig, GraphCacheKind, GraphCorrectnessReport, GraphDurabilityConfig, GraphEpoch,
-    GraphError, GraphExportDigest, GraphId, GraphOpenOptions, GraphScope, GraphShard,
+    GraphError, GraphExportDigest, GraphId, GraphOpenOptions, GraphScope, GraphShard, GraphStore,
     GraphWriteBatch, GraphWriteGuard, MatrixAdjacency, MatrixCacheKey, PostingChunkCacheKey,
     RelationshipId, RelationshipRecord, Result, SupernodeCacheKey, VertexId,
 };
@@ -167,6 +167,10 @@ pub struct GraphControlPlane {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct GraphControlMetricsSnapshot {
     pub lease_acquire_attempts: u64,
     pub lease_acquire_successes: u64,
@@ -266,6 +270,10 @@ impl GraphControlMetrics {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct ShardPlacement {
     owners: BTreeMap<String, String>,
 }
@@ -279,13 +287,13 @@ pub struct RoutedGraphCluster {
     options: GraphOpenOptions,
     shards: BTreeMap<String, GraphShard>,
     leases: Arc<RwLock<BTreeMap<String, ShardLease>>>,
-    shard_db_handles: Arc<RwLock<BTreeMap<String, Db>>>,
+    shard_db_handles: Arc<RwLock<BTreeMap<String, GraphStore>>>,
     revoked_cells: Arc<RwLock<BTreeSet<String>>>,
 }
 
 pub struct GraphNode {
     cluster: RoutedGraphCluster,
-    control: Arc<GraphControlPlane>,
+    control: Arc<dyn GraphControlClient>,
     lease_renewer: LeaseRenewalHandle,
     heartbeat: NodeHeartbeatHandle,
 }
@@ -305,6 +313,10 @@ pub struct GraphNodeRuntimeConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct ShardLease {
     pub cell_id: String,
     pub owner_node_id: String,
@@ -318,12 +330,20 @@ pub struct LeaseRenewalHandle {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub enum GraphNodeHealthState {
     Active,
     Draining,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct GraphNodeHeartbeat {
     pub node_id: String,
     pub state: GraphNodeHealthState,
@@ -386,6 +406,105 @@ pub struct GraphClusterControllerReport {
 pub struct GraphClusterControllerHandle {
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<Result<()>>,
+}
+
+mod control_client;
+pub use control_client::GraphControlClient;
+#[cfg(feature = "query-transport-tls")]
+mod control_transport;
+#[cfg(feature = "query-transport-tls")]
+pub use control_transport::{
+    GraphControlRpcClient, GraphControlRpcClientConfig, GraphControlRpcServer,
+    GraphControlRpcServerConfig,
+};
+
+pub struct GraphRuntimeLease {
+    stop_tx: watch::Sender<bool>,
+    lost_rx: watch::Receiver<Option<String>>,
+    task: JoinHandle<Result<()>>,
+}
+
+impl GraphRuntimeLease {
+    pub async fn acquire(
+        base_path: &str,
+        scope: &GraphScope,
+        object_store: Arc<dyn ObjectStore>,
+        ttl: Duration,
+        renew_interval: Duration,
+    ) -> Result<Self> {
+        let ttl_ms = u64::try_from(ttl.as_millis()).map_err(|_| GraphError::CorruptValue {
+            key: "runtime/lease_ttl".to_string(),
+            reason: "runtime lease TTL does not fit u64 milliseconds".to_string(),
+        })?;
+        if ttl_ms == 0 || renew_interval.is_zero() || renew_interval >= ttl {
+            return Err(GraphError::CorruptValue {
+                key: "runtime/lease_config".to_string(),
+                reason: "runtime lease requires 0 < renew interval < TTL".to_string(),
+            });
+        }
+        let lock_path = scope.scoped_store_path(&format!(
+            "{}/runtime/single-writer.lock",
+            base_path.trim_end_matches('/')
+        ));
+        let lock = acquire_distributed_write_lock(
+            object_store,
+            Path::from(lock_path),
+            "graph-runtime",
+            "hold_graph_runtime_lease",
+            ttl_ms,
+        )
+        .await?;
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let (lost_tx, lost_rx) = watch::channel(None);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            return lock.release().await;
+                        }
+                    }
+                    _ = tokio::time::sleep(renew_interval) => {
+                        if let Err(error) = lock.renew().await {
+                            let _ = lost_tx.send(Some(error.to_string()));
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            stop_tx,
+            lost_rx,
+            task,
+        })
+    }
+
+    pub async fn wait_until_lost(&mut self) -> Result<()> {
+        loop {
+            if let Some(reason) = self.lost_rx.borrow().clone() {
+                return Err(GraphError::CorruptValue {
+                    key: "runtime/lease".to_string(),
+                    reason,
+                });
+            }
+            self.lost_rx
+                .changed()
+                .await
+                .map_err(|_| GraphError::CorruptValue {
+                    key: "runtime/lease".to_string(),
+                    reason: "runtime lease renewal task stopped unexpectedly".to_string(),
+                })?;
+        }
+    }
+
+    pub async fn stop(self) -> Result<()> {
+        let _ = self.stop_tx.send(true);
+        self.task.await.map_err(|error| GraphError::CorruptValue {
+            key: "runtime/lease".to_string(),
+            reason: format!("runtime lease task failed: {error}"),
+        })?
+    }
 }
 
 pub struct ShardRefreshHandle {
@@ -1680,7 +1799,7 @@ fn posting_chunk_checksum(chunk: &PostingChunk) -> u64 {
 
 fn encode_posting_manifest(manifest: &PostingChunkManifest) -> Vec<u8> {
     format!(
-        "posting_manifest2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        "graph-posting-manifest-v1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         manifest.cell_id,
         manifest.edge_type,
         direction_str(manifest.direction),
@@ -1697,13 +1816,8 @@ fn encode_posting_manifest(manifest: &PostingChunkManifest) -> Vec<u8> {
 fn decode_posting_manifest(key: &str, value: &[u8]) -> Result<PostingChunkManifest> {
     let text = text_value(key, value)?;
     let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if !matches!(parts.as_slice(), ["posting_manifest1", ..] if parts.len() == 9)
-        && !matches!(parts.as_slice(), ["posting_manifest2", ..] if parts.len() == 10)
-    {
-        return corrupt(
-            key,
-            "expected posting_manifest1 or posting_manifest2 record",
-        );
+    if parts.len() != 10 || parts[0] != "graph-posting-manifest-v1" {
+        return corrupt(key, "expected graph-posting-manifest-v1 record");
     }
     let chunk_count = parse_u64(key, parts[6], "chunk_count")?;
     let chunk_checksums = decode_u64_list(key, parts[8])?;
@@ -1729,11 +1843,7 @@ fn decode_posting_manifest(key: &str, value: &[u8]) -> Result<PostingChunkManife
             chunk_count,
             vertex_count: parse_u64(key, parts[7], "vertex_count")?,
             chunk_checksums,
-            chunk_bounds: if parts[0] == "posting_manifest2" {
-                decode_supernode_chunk_bounds(key, parts[9])?
-            } else {
-                Vec::new()
-            },
+            chunk_bounds: decode_supernode_chunk_bounds(key, parts[9])?,
         },
     )
 }
@@ -3282,7 +3392,7 @@ fn decode_graph_rollup(key: &str, value: &[u8]) -> Result<GraphRollup> {
 }
 
 const GRAPHBLAS_CSC_MAGIC: &[u8] = b"graphblas_csc1\n";
-const GRAPHBLAS_CSC_MANIFEST_MAGIC: &str = "graphblas_csc_manifest2";
+const GRAPHBLAS_CSC_MANIFEST_MAGIC: &str = "graph-graphblas-csc-manifest-v1";
 const GRAPHBLAS_CSC_CHUNK_MAGIC: &[u8] = b"graphblas_csc_chunk1\n";
 const GRAPHBLAS_CSC_CHUNK_U64S: usize = 64 * 1024;
 
@@ -3516,7 +3626,7 @@ fn decode_graphblas_csc_manifest(key: &str, value: &[u8]) -> Result<GraphBlasCsc
     if parts.len() != 12 || parts[0] != GRAPHBLAS_CSC_MANIFEST_MAGIC {
         return corrupt(
             key,
-            "expected graphblas_csc_manifest2 record with 12 fields",
+            "expected graph-graphblas-csc-manifest-v1 record with 12 fields",
         );
     }
     let manifest = GraphBlasCscManifest {
@@ -3888,7 +3998,7 @@ async fn ensure_supernode_artifact_publish_compatible(
 
 fn encode_supernode_group(group: &SupernodeGroup) -> Vec<u8> {
     format!(
-        "supernode3\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        "graph-supernode-v1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         group.cell_id,
         group.edge_type,
         direction_str(group.direction),
@@ -3905,46 +4015,8 @@ fn encode_supernode_group(group: &SupernodeGroup) -> Vec<u8> {
 fn decode_supernode_group(key: &str, value: &[u8]) -> Result<SupernodeGroup> {
     let text = text_value(key, value)?;
     let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts[0] == "supernode1" {
-        if parts.len() != 8 {
-            return corrupt(key, "expected supernode1 record with 8 fields");
-        }
-        return validate_supernode_group(
-            key,
-            SupernodeGroup {
-                cell_id: parts[1].to_string(),
-                edge_type: parts[2].to_string(),
-                direction: parse_direction(parts[3])?,
-                vertex_id: parse_u64(key, parts[4], "vertex_id")?,
-                base_epoch: parse_u64(key, parts[5], "base_epoch")?,
-                degree: parse_u64(key, parts[6], "degree")?,
-                chunk_count: parse_u64(key, parts[7], "chunk_count")?,
-                page_size: 0,
-                chunk_bounds: Vec::new(),
-            },
-        );
-    }
-    if parts[0] == "supernode2" {
-        if parts.len() != 9 {
-            return corrupt(key, "expected supernode2 record with 9 fields");
-        }
-        return validate_supernode_group(
-            key,
-            SupernodeGroup {
-                cell_id: parts[1].to_string(),
-                edge_type: parts[2].to_string(),
-                direction: parse_direction(parts[3])?,
-                vertex_id: parse_u64(key, parts[4], "vertex_id")?,
-                base_epoch: parse_u64(key, parts[5], "base_epoch")?,
-                degree: parse_u64(key, parts[6], "degree")?,
-                chunk_count: parse_u64(key, parts[7], "chunk_count")?,
-                page_size: parse_u64(key, parts[8], "page_size")?,
-                chunk_bounds: Vec::new(),
-            },
-        );
-    }
-    if parts.len() != 10 || parts[0] != "supernode3" {
-        return corrupt(key, "expected supernode3 record with 10 fields");
+    if parts.len() != 10 || parts[0] != "graph-supernode-v1" {
+        return corrupt(key, "expected graph-supernode-v1 record with 10 fields");
     }
     validate_supernode_group(
         key,

@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: graph-node
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: graph-node
+          imagePullPolicy: Never
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+              ephemeral-storage: 2Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+              ephemeral-storage: 6Gi
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 4Gi
