@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: graph-runtime-config
+data:
+  AWS_BUCKET_NAME: graph-benchmark
+  AWS_DEFAULT_REGION: us-east-1
+  GRAPH_ADVERTISED_BOLT_ADDR: graph-bolt.REPLACE_PRIVATE_DNS_ZONE:7687
+  GRAPH_DATA_CACHE_BYTES: "34359738368"

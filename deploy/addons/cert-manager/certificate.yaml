@@ -1,0 +1,68 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: graph-server
+  namespace: slatedb-graph
+spec:
+  secretName: graph-server-tls
+  duration: 2160h
+  renewBefore: 360h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - server auth
+  dnsNames:
+    - graph-bolt.slatedb-graph.svc
+    - graph-bolt.slatedb-graph.svc.cluster.local
+    - graph-https.slatedb-graph.svc
+    - graph-https.slatedb-graph.svc.cluster.local
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: REPLACE_GRAPH_CLUSTER_ISSUER
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: graph-controller-mtls
+  namespace: slatedb-graph
+spec:
+  secretName: graph-controller-mtls
+  duration: 720h
+  renewBefore: 120h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - server auth
+  dnsNames:
+    - graph-controller.slatedb-graph.svc
+    - graph-controller.slatedb-graph.svc.cluster.local
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: REPLACE_GRAPH_INTERNAL_CA_ISSUER
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: graph-node-mtls
+  namespace: slatedb-graph
+spec:
+  secretName: graph-node-mtls
+  duration: 720h
+  renewBefore: 120h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - client auth
+  commonName: graph-node
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: REPLACE_GRAPH_INTERNAL_CA_ISSUER

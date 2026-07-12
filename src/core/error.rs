@@ -97,6 +97,10 @@ pub enum GraphError {
         operation: &'static str,
         cell_id: String,
     },
+    #[error("operation requires writable SlateDB shard storage")]
+    ReadOnlyShardStorage,
+    #[error("read snapshot retention for cell {cell_id} requires a writer-side lease coordinator")]
+    ReadLeaseCoordinatorUnavailable { cell_id: String },
     #[error("cell {cell_id} has been dropped; {operation} is rejected")]
     CellDropped {
         operation: &'static str,

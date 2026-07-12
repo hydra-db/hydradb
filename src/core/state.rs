@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use slatedb::bytes::Bytes;
+use slatedb::config::{ReadOptions, ScanOptions};
 use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
-use slatedb::Db;
 use slatedb::ErrorKind;
 #[cfg(feature = "opencypher")]
 use slatedb::IsolationLevel;
+use slatedb::{Db, DbReader};
 #[cfg(feature = "opencypher")]
 use tokio::sync::watch;
 use tokio::sync::{Mutex, Semaphore};
@@ -21,7 +22,6 @@ use crate::{
     GraphError, GraphIndexPolicy, GraphLimits, GraphOperationalMetrics, GraphRetentionPolicy,
     MatrixAdjacency, MatrixCacheKey, PostingChunkCacheKey, Result, SupernodeCacheKey, VertexId,
     GRAPH_CELL_WRITE_LOCK_BACKOFF_MS, GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS,
-    GRAPH_CELL_WRITE_LOCK_TTL_MS,
 };
 #[cfg(feature = "opencypher")]
 use crate::{
@@ -31,7 +31,7 @@ use crate::{
 };
 
 pub struct GraphShard {
-    pub(crate) db: Db,
+    pub(crate) db: GraphStore,
     pub(crate) object_store: Arc<dyn ObjectStore>,
     pub(crate) store_path: Path,
     pub(crate) limits: GraphLimits,
@@ -75,6 +75,66 @@ pub struct GraphShard {
         Mutex<BoundedGraphCache<PostingChunkCacheKey, engine::PostingChunk>>,
     pub(crate) materialized_supernode_cache:
         Mutex<BoundedGraphCache<SupernodeCacheKey, Arc<Vec<VertexId>>>>,
+}
+
+#[derive(Clone)]
+pub(crate) enum GraphStore {
+    Writer(Db),
+    Reader(Arc<DbReader>),
+}
+
+impl GraphStore {
+    pub(crate) fn writer(&self) -> Result<&Db> {
+        match self {
+            Self::Writer(db) => Ok(db),
+            Self::Reader(_) => Err(GraphError::ReadOnlyShardStorage),
+        }
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn writer_clone(&self) -> Result<Db> {
+        self.writer().cloned()
+    }
+
+    pub(crate) async fn get_with_options(
+        &self,
+        key: &[u8],
+        options: &ReadOptions,
+    ) -> std::result::Result<Option<Bytes>, slatedb::Error> {
+        match self {
+            Self::Writer(db) => db.get_with_options(key, options).await,
+            Self::Reader(reader) => reader.get_with_options(key, options).await,
+        }
+    }
+
+    pub(crate) async fn scan_prefix_with_options(
+        &self,
+        prefix: &[u8],
+        start_suffix: Option<Vec<u8>>,
+        options: &ScanOptions,
+    ) -> std::result::Result<slatedb::DbIterator, slatedb::Error> {
+        match (self, start_suffix) {
+            (Self::Writer(db), Some(start)) => {
+                db.scan_prefix_with_options(prefix, start.., options).await
+            }
+            (Self::Writer(db), None) => db.scan_prefix_with_options(prefix, .., options).await,
+            (Self::Reader(reader), Some(start)) => {
+                reader
+                    .scan_prefix_with_options(prefix, start.., options)
+                    .await
+            }
+            (Self::Reader(reader), None) => {
+                reader.scan_prefix_with_options(prefix, .., options).await
+            }
+        }
+    }
+
+    pub(crate) async fn close(&self) -> std::result::Result<(), slatedb::Error> {
+        match self {
+            Self::Writer(db) => db.close().await,
+            Self::Reader(reader) => reader.close().await,
+        }
+    }
 }
 
 #[cfg(feature = "opencypher")]
@@ -171,7 +231,7 @@ struct QueryReadLeaseCellState {
 
 #[cfg(feature = "opencypher")]
 pub(crate) struct QueryReadLeaseManager {
-    db: Db,
+    db: Option<Db>,
     lease_id: String,
     ttl_ms: u64,
     cells: Mutex<BTreeMap<String, QueryReadLeaseCellState>>,
@@ -180,7 +240,11 @@ pub(crate) struct QueryReadLeaseManager {
 
 #[cfg(feature = "opencypher")]
 impl QueryReadLeaseManager {
-    pub(crate) fn new(db: Db, ttl_ms: u64, metrics: Arc<GraphOperationalMetrics>) -> Arc<Self> {
+    pub(crate) fn new(
+        db: Option<Db>,
+        ttl_ms: u64,
+        metrics: Arc<GraphOperationalMetrics>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             db,
             lease_id: format!(
@@ -206,6 +270,12 @@ impl QueryReadLeaseManager {
                 read_epoch,
             }));
         }
+
+        let Some(db) = &self.db else {
+            return Err(GraphError::ReadLeaseCoordinatorUnavailable {
+                cell_id: cell_id.to_string(),
+            });
+        };
 
         let now_ms = graph_now_millis();
         let hold_ms = self
@@ -234,7 +304,7 @@ impl QueryReadLeaseManager {
                 expires_at_ms: published_expiry,
             };
             let publish = async {
-                let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+                let txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
                 let drop_marker = crate::keys::cell_drop_marker(cell_id);
                 let pending_drop_marker = crate::keys::cell_drop_pending_marker(cell_id);
                 if crate::read_txn_remote(&txn, &drop_marker).await?.is_some()
@@ -620,7 +690,7 @@ pub(crate) fn encode_cell_write_lock_record(
         CellWriteLockState::Released => "released",
     };
     Bytes::from(format!(
-        "graph-cell-write-lock-v2\ncell={cell_id}\noperation={operation}\nowner_token={owner_token}\ncreated_ms={created_ms}\nexpires_at_ms={expires_at_ms}\nstate={state}\n"
+        "graph-cell-write-lock-v1\ncell={cell_id}\noperation={operation}\nowner_token={owner_token}\ncreated_ms={created_ms}\nexpires_at_ms={expires_at_ms}\nstate={state}\n"
     ))
 }
 
@@ -665,17 +735,6 @@ pub(crate) fn decode_cell_write_lock_record(
 
     match header {
         "graph-cell-write-lock-v1" => {
-            let created_ms = parse_u64(key, field("created_ms")?, "created_ms")?;
-            Ok(CellWriteLockRecord {
-                cell_id: cell_id.to_string(),
-                operation: operation.to_string(),
-                owner_token: String::new(),
-                created_ms,
-                expires_at_ms: created_ms.saturating_add(GRAPH_CELL_WRITE_LOCK_TTL_MS),
-                state: CellWriteLockState::Active,
-            })
-        }
-        "graph-cell-write-lock-v2" => {
             let owner_token = field("owner_token")?;
             let created_ms = parse_u64(key, field("created_ms")?, "created_ms")?;
             let expires_at_ms = parse_u64(key, field("expires_at_ms")?, "expires_at_ms")?;

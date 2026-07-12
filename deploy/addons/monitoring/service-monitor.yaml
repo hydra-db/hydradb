@@ -1,0 +1,16 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: slatedb-graph
+  namespace: slatedb-graph
+spec:
+  namespaceSelector:
+    matchNames: ["slatedb-graph"]
+  selector:
+    matchLabels:
+      graph.usecortex.io/metrics: "true"
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 5s

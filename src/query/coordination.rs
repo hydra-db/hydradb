@@ -48,11 +48,7 @@ use crate::{
 use crate::{GraphId, GraphScope, NamespacePath};
 
 #[cfg(feature = "query-transport")]
-const QUERY_TRANSPORT_VERSION: u16 = 3;
-#[cfg(feature = "query-transport")]
-const QUERY_TRANSPORT_PREVIOUS_VERSION: u16 = 2;
-#[cfg(feature = "query-transport")]
-const QUERY_TRANSPORT_LEGACY_VERSION: u16 = 1;
+const QUERY_TRANSPORT_VERSION: u16 = 1;
 #[cfg(feature = "query-transport")]
 const DEFAULT_QUERY_TRANSPORT_MAX_FRAME_BYTES: usize = 1 << 20;
 #[cfg(feature = "query-transport")]
@@ -375,6 +371,7 @@ impl QueryTransportAuthPolicy {
         }
     }
 
+    #[cfg(feature = "client-api")]
     pub(crate) fn authenticate_client(
         &self,
         bearer_token: Option<&str>,
@@ -2347,19 +2344,6 @@ impl TcpQueryCellClient {
             None => self.open_connection_with_retries().await?,
         };
         let decoded = self.send_on_io(&mut *connection.io, request).await?;
-        if let Some(fallback_version) = query_transport_fallback_version(request, &decoded) {
-            self.metrics.client_retries.fetch_add(1, Ordering::Relaxed);
-            let mut fallback_request = request.clone();
-            fallback_request.set_version(fallback_version);
-            let mut fallback_connection = self.open_connection_with_retries().await?;
-            let fallback = self
-                .send_on_io(&mut *fallback_connection.io, &fallback_request)
-                .await?;
-            if !fallback.close_connection {
-                self.recycle_connection(fallback_connection).await;
-            }
-            return Ok(fallback.response);
-        }
         if !decoded.close_connection {
             self.recycle_connection(connection).await;
         }
@@ -2380,16 +2364,6 @@ impl TcpQueryCellClient {
             })?;
         let mut connection = self.open_connection_with_retries().await?;
         let decoded = self.send_on_io(&mut *connection.io, request).await?;
-        if let Some(fallback_version) = query_transport_fallback_version(request, &decoded) {
-            self.metrics.client_retries.fetch_add(1, Ordering::Relaxed);
-            let mut fallback_request = request.clone();
-            fallback_request.set_version(fallback_version);
-            let mut fallback_connection = self.open_connection_with_retries().await?;
-            return Ok(self
-                .send_on_io(&mut *fallback_connection.io, &fallback_request)
-                .await?
-                .response);
-        }
         Ok(decoded.response)
     }
 
@@ -2501,36 +2475,13 @@ impl TcpQueryCellClient {
             .await?;
         let frame =
             read_query_transport_frame(stream, self.config.max_frame_bytes, &self.metrics).await?;
-        let frame: QueryTransportResponseWire =
+        let frame: QueryTransportResponseFrame =
             serde_json::from_slice(&frame).map_err(|err| transport_json_error("decode", err))?;
-        Ok(frame.decode())
+        Ok(DecodedQueryTransportResponse {
+            response: frame.response,
+            close_connection: frame.close_connection,
+        })
     }
-}
-
-#[cfg(feature = "query-transport")]
-fn query_transport_fallback_version(
-    request: &QueryTransportRequest,
-    decoded: &DecodedQueryTransportResponse,
-) -> Option<u16> {
-    if request.version() != QUERY_TRANSPORT_VERSION || !request.can_downgrade() {
-        return None;
-    }
-    let QueryTransportResponse::Error { message } = &decoded.response else {
-        return None;
-    };
-    if decoded.legacy
-        && message
-            == &format!(
-                "unsupported query transport version {QUERY_TRANSPORT_VERSION}; expected {QUERY_TRANSPORT_LEGACY_VERSION}"
-            )
-    {
-        return Some(QUERY_TRANSPORT_LEGACY_VERSION);
-    }
-    (message
-        == &format!(
-            "unsupported query transport version {QUERY_TRANSPORT_VERSION}; supported versions are {QUERY_TRANSPORT_LEGACY_VERSION} and {QUERY_TRANSPORT_PREVIOUS_VERSION}"
-        ))
-    .then_some(QUERY_TRANSPORT_PREVIOUS_VERSION)
 }
 
 #[cfg(feature = "query-transport")]
@@ -3242,15 +3193,11 @@ impl QueryCellClient for RoutedGraphCluster {
 }
 
 fn routed_client_query_is_mutation(context: &QueryContext, query: &str) -> Result<bool> {
-    if crate::parse_opencypher_mutation_query_with_parameters(query, &context.parameters)?.is_some()
-    {
-        return Ok(true);
-    }
-    Ok(
-        crate::parse_opencypher_with_parameters(query, &context.parameters)
-            .map(|parsed| parsed.statement.is_write())
-            .unwrap_or(false),
-    )
+    let _ = context;
+    Ok(matches!(
+        crate::query::opencypher::classify_opencypher_query_access(query)?,
+        crate::query::opencypher::OpenCypherQueryAccess::Write
+    ))
 }
 
 fn checked_unique_cell(seen: &mut BTreeSet<String>, cell_id: &str) -> Result<String> {
@@ -3523,7 +3470,6 @@ enum QueryTransportRequest {
     Cancel {
         version: u16,
         auth: QueryTransportAuth,
-        #[serde(default)]
         scope: GraphScope,
         query_id: String,
     },
@@ -3531,35 +3477,8 @@ enum QueryTransportRequest {
 
 #[cfg(feature = "query-transport")]
 impl QueryTransportRequest {
-    fn version(&self) -> u16 {
-        match self {
-            Self::Rows { version, .. }
-            | Self::Page { version, .. }
-            | Self::Batch { version, .. }
-            | Self::BatchPage { version, .. }
-            | Self::Cancel { version, .. } => *version,
-        }
-    }
-
-    fn set_version(&mut self, new_version: u16) {
-        match self {
-            Self::Rows { version, .. }
-            | Self::Page { version, .. }
-            | Self::Batch { version, .. }
-            | Self::BatchPage { version, .. }
-            | Self::Cancel { version, .. } => *version = new_version,
-        }
-    }
-
     fn is_cancel(&self) -> bool {
         matches!(self, Self::Cancel { .. })
-    }
-
-    fn can_downgrade(&self) -> bool {
-        matches!(
-            self,
-            Self::Rows { .. } | Self::Page { .. } | Self::Cancel { .. }
-        )
     }
 }
 
@@ -3581,36 +3500,9 @@ struct QueryTransportResponseFrame {
 }
 
 #[cfg(feature = "query-transport")]
-#[derive(serde::Deserialize, serde::Serialize)]
-#[serde(untagged)]
-enum QueryTransportResponseWire {
-    Current(QueryTransportResponseFrame),
-    Legacy(QueryTransportResponse),
-}
-
-#[cfg(feature = "query-transport")]
 struct DecodedQueryTransportResponse {
     response: QueryTransportResponse,
     close_connection: bool,
-    legacy: bool,
-}
-
-#[cfg(feature = "query-transport")]
-impl QueryTransportResponseWire {
-    fn decode(self) -> DecodedQueryTransportResponse {
-        match self {
-            Self::Current(frame) => DecodedQueryTransportResponse {
-                response: frame.response,
-                close_connection: frame.close_connection,
-                legacy: false,
-            },
-            Self::Legacy(response) => DecodedQueryTransportResponse {
-                response,
-                close_connection: true,
-                legacy: true,
-            },
-        }
-    }
 }
 
 #[cfg(feature = "query-transport")]
@@ -3757,44 +3649,32 @@ where
         let Some(frame) = frame else {
             return Ok(());
         };
-        let (response, request_version) =
-            match serde_json::from_slice::<QueryTransportRequest>(&frame) {
-                Ok(request) => {
-                    let request_version = request.version();
-                    let response = if control_only && !request.is_cancel() {
-                        QueryTransportResponse::Error {
-                            message: "connection is reserved for query cancellation".to_string(),
-                        }
-                    } else {
-                        execute_query_transport_request(
-                            Arc::clone(&client),
-                            request,
-                            Arc::clone(&runtime),
-                            identity.clone(),
-                        )
-                        .await
-                    };
-                    (response, request_version)
-                }
-                Err(err) => (
+        let response = match serde_json::from_slice::<QueryTransportRequest>(&frame) {
+            Ok(request) => {
+                if control_only && !request.is_cancel() {
                     QueryTransportResponse::Error {
-                        message: format!("invalid query transport request: {err}"),
-                    },
-                    QUERY_TRANSPORT_VERSION,
-                ),
-            };
-        let legacy_response = request_version == QUERY_TRANSPORT_LEGACY_VERSION;
-        let close_connection = legacy_response
-            || control_only
+                        message: "connection is reserved for query cancellation".to_string(),
+                    }
+                } else {
+                    execute_query_transport_request(
+                        Arc::clone(&client),
+                        request,
+                        Arc::clone(&runtime),
+                        identity.clone(),
+                    )
+                    .await
+                }
+            }
+            Err(err) => QueryTransportResponse::Error {
+                message: format!("invalid query transport request: {err}"),
+            },
+        };
+        let close_connection = control_only
             || request_index + 1 >= runtime.config.max_requests_per_connection
             || connection_started.elapsed() >= runtime.config.max_connection_age;
-        let wire_response = if legacy_response {
-            QueryTransportResponseWire::Legacy(response)
-        } else {
-            QueryTransportResponseWire::Current(QueryTransportResponseFrame {
-                response,
-                close_connection,
-            })
+        let wire_response = QueryTransportResponseFrame {
+            response,
+            close_connection,
         };
         match tokio::time::timeout(
             runtime.config.write_timeout,
@@ -4050,17 +3930,14 @@ async fn execute_query_transport_request(
 fn transport_version_error(version: u16) -> QueryTransportResponse {
     QueryTransportResponse::Error {
         message: format!(
-            "unsupported query transport version {version}; supported versions are {QUERY_TRANSPORT_LEGACY_VERSION}, {QUERY_TRANSPORT_PREVIOUS_VERSION}, and {QUERY_TRANSPORT_VERSION}"
+            "unsupported query transport version {version}; expected {QUERY_TRANSPORT_VERSION}"
         ),
     }
 }
 
 #[cfg(feature = "query-transport")]
 fn query_transport_version_supported(version: u16) -> bool {
-    matches!(
-        version,
-        QUERY_TRANSPORT_LEGACY_VERSION | QUERY_TRANSPORT_PREVIOUS_VERSION | QUERY_TRANSPORT_VERSION
-    )
+    version == QUERY_TRANSPORT_VERSION
 }
 
 #[cfg(feature = "query-transport")]

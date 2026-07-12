@@ -10,7 +10,7 @@ use slatedb::object_store::{path::Path, ObjectStore};
 use slatedb::object_store::{ObjectStoreExt, PutMode};
 #[cfg(test)]
 use slatedb::ErrorKind;
-use slatedb::{Db, DbTransaction, IsolationLevel, WriteBatch};
+use slatedb::{DbTransaction, IsolationLevel, WriteBatch};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 #[cfg(feature = "client-api")]
@@ -40,7 +40,7 @@ pub(crate) use core::cache::{
     RelationshipPropertyRowsCacheKey, RelationshipRowsCacheEntry, RelationshipRowsCacheKey,
     RelationshipRowsCacheValue, SourceRelationshipRowsCacheKey,
 };
-pub(crate) use core::config::open_graph_db;
+pub(crate) use core::config::{open_graph_db, open_graph_reader};
 pub use core::config::{
     GraphBackpressurePolicy, GraphCacheConfig, GraphDurabilityConfig, GraphIndexPolicy,
     GraphLimits, GraphOpenOptions, GraphRetentionPolicy, DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
@@ -70,7 +70,7 @@ pub use core::snapshot::GraphSnapshot;
 pub use core::state::QueryStatsRefreshHandle;
 pub(crate) use core::state::{
     acquire_distributed_write_lock, is_retryable_write_conflict, release_cell_write_lock,
-    CellWriteLock, GraphReadLease, GraphWriteAuthority, GraphWriteFence, GraphWriteOp,
+    CellWriteLock, GraphReadLease, GraphStore, GraphWriteAuthority, GraphWriteFence, GraphWriteOp,
 };
 #[cfg(test)]
 pub(crate) use core::state::{
@@ -84,14 +84,20 @@ pub use engine::{
     local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
     BenchmarkResult, DeltaGcResult, GraphCluster, GraphClusterControllerConfig,
     GraphClusterControllerHandle, GraphClusterControllerReport, GraphClusterRebalanceMode,
-    GraphControlCellDropReport, GraphControlEdgeWatermark, GraphControlIdempotencyRecord,
-    GraphControlMetricsSnapshot, GraphControlPlane, GraphControlRepairReport,
-    GraphControlWatermark, GraphNode, GraphNodeHealthState, GraphNodeHeartbeat,
-    GraphNodeMaintenanceMetricsSnapshot, GraphNodeRuntimeConfig, GraphPendingFailover, GraphRollup,
-    GraphShardCatalogEntry, GraphShardReassignment, GraphShardRefreshReport, LeaseRenewalHandle,
-    ManagedGraphNode, MatrixArtifact, MatrixTraversalResult, NodeHeartbeatHandle, PostingChunk,
-    RoutedGraphCluster, ShardLease, ShardPlacement, ShardRefreshHandle, SupernodeGroup,
-    SupernodePage, TraversalBackend,
+    GraphControlCellDropReport, GraphControlClient, GraphControlEdgeWatermark,
+    GraphControlIdempotencyRecord, GraphControlMetricsSnapshot, GraphControlPlane,
+    GraphControlRepairReport, GraphControlWatermark, GraphNode, GraphNodeHealthState,
+    GraphNodeHeartbeat, GraphNodeMaintenanceMetricsSnapshot, GraphNodeRuntimeConfig,
+    GraphPendingFailover, GraphRollup, GraphRuntimeLease, GraphShardCatalogEntry,
+    GraphShardReassignment, GraphShardRefreshReport, LeaseRenewalHandle, ManagedGraphNode,
+    MatrixArtifact, MatrixTraversalResult, NodeHeartbeatHandle, PostingChunk, RoutedGraphCluster,
+    ShardLease, ShardPlacement, ShardRefreshHandle, SupernodeGroup, SupernodePage,
+    TraversalBackend,
+};
+#[cfg(feature = "query-transport-tls")]
+pub use engine::{
+    GraphControlRpcClient, GraphControlRpcClientConfig, GraphControlRpcServer,
+    GraphControlRpcServerConfig,
 };
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
@@ -138,13 +144,11 @@ pub use query::corpus::{
 };
 #[cfg(feature = "opencypher")]
 pub use query::opencypher::{
-    parse_cypher, parse_cypher_with_parameters, parse_cypher_with_window, parse_opencypher,
     parse_opencypher_mutation_query_with_parameters, parse_opencypher_row_query,
-    parse_opencypher_row_query_with_parameters, parse_opencypher_with_parameters,
-    parse_opencypher_with_window, CypherFrontend, DefaultCypherFrontend, LibCypherParserFrontend,
-    ParsedMutationQuery, ParsedQuery, ParsedRowQuery, RowAggregateFunction, RowComparisonOp,
-    RowEdgePattern, RowExpression, RowMatchGroup, RowMutationAction, RowNodePattern, RowPattern,
-    RowPredicate, RowProjection, RowSort, RowSortExpression,
+    parse_opencypher_row_query_with_parameters, ParsedMutationQuery, ParsedRowQuery,
+    RowAggregateFunction, RowComparisonOp, RowEdgePattern, RowExpression, RowMatchGroup,
+    RowMutationAction, RowNodePattern, RowPattern, RowPredicate, RowProjection, RowSort,
+    RowSortExpression,
 };
 pub use sparse_kernel::SparseKernelBackend;
 

@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: graph-controller
+spec:
+  serviceName: graph-controller-headless
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: graph-controller
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: graph-controller
+          image: ghcr.io/usecortex/slatedb-graph-kernel:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/graph-controller"]
+          envFrom:
+            - configMapRef:
+                name: graph-runtime-config
+          ports:
+            - name: control
+              containerPort: 9443
+            - name: admin
+              containerPort: 9090
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: admin
+            failureThreshold: 60
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+              ephemeral-storage: 2Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/slatedb
+            - name: tmp
+              mountPath: /tmp
+            - name: internal-tls
+              mountPath: /var/run/secrets/slatedb-graph/internal
+              readOnly: true
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: internal-tls
+          secret:
+            secretName: graph-controller-mtls
