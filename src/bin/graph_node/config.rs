@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use slatedb_graph_kernel::{
     GraphBackpressurePolicy, GraphCacheConfig, GraphCachePolicy, GraphDurabilityConfig, GraphId,
-    GraphIndexPolicy, GraphLimits, GraphOpenOptions, GraphRetentionPolicy, GraphScope,
-    GraphStorageMemoryConfig, NamespaceId, NamespacePath,
+    GraphIndexPolicy, GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphRetentionPolicy,
+    GraphScope, GraphStorageMemoryConfig, NamespaceId, NamespacePath,
 };
 
 type ConfigResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -29,6 +29,8 @@ pub struct RuntimeConfig {
     pub max_matrix_adjacency_bytes: usize,
     pub max_graphblas_matrices: usize,
     pub max_graphblas_bytes: usize,
+    pub max_posting_chunk_bytes: usize,
+    pub max_materialized_supernode_bytes: usize,
     pub max_concurrent_hydrations: usize,
     pub max_concurrent_matrix_compilations: usize,
     pub lease_ttl: Duration,
@@ -181,6 +183,16 @@ impl RuntimeConfig {
                 "GRAPH_MAX_GRAPHBLAS_BYTES",
                 128 * 1024 * 1024,
             )?,
+            max_posting_chunk_bytes: parse_usize_allow_zero(
+                &values,
+                "GRAPH_MAX_POSTING_CHUNK_BYTES",
+                64 * 1024 * 1024,
+            )?,
+            max_materialized_supernode_bytes: parse_usize_allow_zero(
+                &values,
+                "GRAPH_MAX_MATERIALIZED_SUPERNODE_BYTES",
+                64 * 1024 * 1024,
+            )?,
             max_concurrent_hydrations: parse_usize(&values, "GRAPH_MAX_CONCURRENT_HYDRATIONS", 2)?,
             max_concurrent_matrix_compilations: parse_usize(
                 &values,
@@ -243,25 +255,32 @@ impl RuntimeConfig {
                 &self.data_cache_dir,
                 self.data_cache_bytes,
             ),
-            storage_memory: GraphStorageMemoryConfig {
-                l0_sst_size_bytes: self.l0_sst_size_bytes,
-                max_unflushed_bytes: self.max_unflushed_bytes,
-                max_wal_flushes_before_l0_flush: self.max_wal_flushes_before_l0_flush,
-                l0_flush_parallelism: self.l0_flush_parallelism,
-            },
             durability: GraphDurabilityConfig::default(),
             cache_policy: GraphCachePolicy {
                 max_matrix_adjacencies: self.max_matrix_adjacencies,
-                max_matrix_adjacency_bytes: self.max_matrix_adjacency_bytes,
                 max_graphblas_matrices: self.max_graphblas_matrices,
-                max_graphblas_bytes: self.max_graphblas_bytes,
                 max_concurrent_hydrations: self.max_concurrent_hydrations,
-                max_concurrent_matrix_compilations: self.max_concurrent_matrix_compilations,
                 ..GraphCachePolicy::default()
             },
             retention_policy: GraphRetentionPolicy::default(),
             backpressure_policy: GraphBackpressurePolicy::default(),
             index_policy: GraphIndexPolicy::Full,
+        }
+    }
+
+    pub fn graph_memory_config(&self) -> GraphMemoryConfig {
+        GraphMemoryConfig {
+            storage: GraphStorageMemoryConfig {
+                l0_sst_size_bytes: self.l0_sst_size_bytes,
+                max_unflushed_bytes: self.max_unflushed_bytes,
+                max_wal_flushes_before_l0_flush: self.max_wal_flushes_before_l0_flush,
+                l0_flush_parallelism: self.l0_flush_parallelism,
+            },
+            max_matrix_adjacency_bytes: self.max_matrix_adjacency_bytes,
+            max_graphblas_bytes: self.max_graphblas_bytes,
+            max_posting_chunk_bytes: self.max_posting_chunk_bytes,
+            max_materialized_supernode_bytes: self.max_materialized_supernode_bytes,
+            max_concurrent_matrix_compilations: self.max_concurrent_matrix_compilations,
         }
     }
 
@@ -520,8 +539,9 @@ mod tests {
         assert_eq!(config.l0_sst_size_bytes, 16 * 1024 * 1024);
         assert_eq!(config.max_unflushed_bytes, 64 * 1024 * 1024);
         assert_eq!(config.max_concurrent_hydrations, 2);
-        let options = config.graph_open_options();
-        assert_eq!(options.cache_policy.max_graphblas_bytes, 128 * 1024 * 1024);
+        let memory = config.graph_memory_config();
+        assert_eq!(memory.max_graphblas_bytes, 128 * 1024 * 1024);
+        assert_eq!(memory.max_posting_chunk_bytes, 64 * 1024 * 1024);
     }
 
     #[test]
@@ -552,13 +572,20 @@ mod tests {
             ),
             ("GRAPH_MAX_GRAPHBLAS_MATRICES".to_string(), "0".to_string()),
             ("GRAPH_MAX_GRAPHBLAS_BYTES".to_string(), "0".to_string()),
+            ("GRAPH_MAX_POSTING_CHUNK_BYTES".to_string(), "0".to_string()),
+            (
+                "GRAPH_MAX_MATERIALIZED_SUPERNODE_BYTES".to_string(),
+                "0".to_string(),
+            ),
         ]);
-        let options = RuntimeConfig::from_values(values)
-            .unwrap()
-            .graph_open_options();
+        let config = RuntimeConfig::from_values(values).unwrap();
+        let options = config.graph_open_options();
+        let memory = config.graph_memory_config();
         assert_eq!(options.cache_policy.max_matrix_adjacencies, 0);
-        assert_eq!(options.cache_policy.max_matrix_adjacency_bytes, 0);
+        assert_eq!(memory.max_matrix_adjacency_bytes, 0);
         assert_eq!(options.cache_policy.max_graphblas_matrices, 0);
-        assert_eq!(options.cache_policy.max_graphblas_bytes, 0);
+        assert_eq!(memory.max_graphblas_bytes, 0);
+        assert_eq!(memory.max_posting_chunk_bytes, 0);
+        assert_eq!(memory.max_materialized_supernode_bytes, 0);
     }
 }

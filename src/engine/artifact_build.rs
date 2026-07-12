@@ -177,11 +177,12 @@ impl GraphShard {
         if !chunks.is_empty() {
             let mut cache = self.posting_chunk_cache.lock().await;
             for chunk in &chunks {
-                cache.insert(
+                cache.insert_sized(
                     PostingChunkCacheKey::from_chunk(chunk),
                     chunk.clone(),
                     chunk.cell_id.clone(),
                     false,
+                    posting_chunk_resident_bytes(chunk),
                     &self.cache_metrics,
                 );
             }

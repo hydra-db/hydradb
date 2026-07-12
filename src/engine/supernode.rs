@@ -746,11 +746,12 @@ impl GraphShard {
                         && group.base_epoch == chunk.base_epoch
                         && self.cache_policy.pin_supernode_group(group)
                 });
-                cache.insert(
+                cache.insert_sized(
                     PostingChunkCacheKey::from_chunk(chunk),
                     chunk.clone(),
                     chunk.cell_id.clone(),
                     pinned,
+                    posting_chunk_resident_bytes(chunk),
                     &self.cache_metrics,
                 );
             }
@@ -1519,11 +1520,12 @@ impl GraphShard {
         );
         let mut cache = self.materialized_supernode_cache.lock().await;
         Ok(cache
-            .insert(
+            .insert_sized(
                 cache_key,
                 Arc::clone(&vertices),
                 group.cell_id.clone(),
                 self.cache_policy.pin_supernode_group(group),
+                materialized_supernode_resident_bytes(vertices.as_slice()),
                 &self.cache_metrics,
             )
             .unwrap_or(vertices))
@@ -1596,11 +1598,12 @@ impl GraphShard {
             .transpose()?;
         self.record_hydration_complete();
         if let Some(chunk) = decoded.clone() {
-            self.posting_chunk_cache.lock().await.insert(
+            self.posting_chunk_cache.lock().await.insert_sized(
                 cache_key,
-                chunk,
+                chunk.clone(),
                 group.cell_id.clone(),
                 self.cache_policy.pin_supernode_group(group),
+                posting_chunk_resident_bytes(&chunk),
                 &self.cache_metrics,
             );
         }
