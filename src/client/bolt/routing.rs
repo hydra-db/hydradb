@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 
 use super::*;
-use crate::{validate_component, GraphControlPlane, GraphNodeHealthState};
+use crate::{validate_component, GraphControlClient, GraphNodeHealthState};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoltRoutingServer {
@@ -35,19 +35,22 @@ pub trait BoltRoutingTableProvider: Send + Sync {
 
 #[derive(Clone)]
 pub struct ControllerBoltRoutingTableProvider {
-    control: Arc<GraphControlPlane>,
+    control: Arc<dyn GraphControlClient>,
     node_addresses: BTreeMap<String, String>,
     heartbeat_ttl: Duration,
     routing_ttl_secs: i64,
 }
 
 impl ControllerBoltRoutingTableProvider {
-    pub fn new(
-        control: Arc<GraphControlPlane>,
+    pub fn new<C>(
+        control: Arc<C>,
         node_addresses: impl IntoIterator<Item = (String, String)>,
         heartbeat_ttl: Duration,
         routing_ttl_secs: i64,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        C: GraphControlClient + 'static,
+    {
         if heartbeat_ttl.is_zero() || routing_ttl_secs <= 0 {
             return bolt_config_error(
                 "controller routing heartbeat TTL and routing TTL must be greater than zero",
@@ -128,7 +131,7 @@ impl BoltRoutingTableProvider for ControllerBoltRoutingTableProvider {
                 owner_node_id: lease.owner_node_id.clone(),
                 local_node_id: "no live Bolt endpoint".to_string(),
             })?;
-        let read_addresses: Vec<_> = live_addresses.into_values().collect();
+        let route_addresses: Vec<_> = live_addresses.into_values().collect();
         let lease_remaining_secs = lease.expires_at_ms.saturating_sub(now_ms) / 1_000;
         let heartbeat_remaining_secs = heartbeat_remaining_ms / 1_000;
         let ttl_secs = self
@@ -138,8 +141,10 @@ impl BoltRoutingTableProvider for ControllerBoltRoutingTableProvider {
         BoltRoutingTable::new(
             ttl_secs,
             vec![
-                BoltRoutingServer::new("ROUTE", read_addresses.clone())?,
-                BoltRoutingServer::new("READ", read_addresses)?,
+                BoltRoutingServer::new("ROUTE", route_addresses)?,
+                // Only the lease owner opens this cell's shard. Advertising non-owners as
+                // readers would send Bolt clients to nodes that must reject the query.
+                BoltRoutingServer::new("READ", [write_address.clone()])?,
                 BoltRoutingServer::new("WRITE", [write_address])?,
             ],
         )

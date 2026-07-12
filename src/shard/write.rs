@@ -198,7 +198,11 @@ impl GraphShard {
         vertex_id: VertexId,
         metadata: VertexMetadata,
     ) -> Result<()> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, "set_vertex_metadata")
             .await?;
         let vertex_key = keys::vertex(cell_id, vertex_id);
@@ -234,7 +238,11 @@ impl GraphShard {
         cell_id: &str,
         updates: Vec<(VertexId, VertexMetadata)>,
     ) -> Result<usize> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, "set_vertex_metadata_batch")
             .await?;
         let mut changed = Vec::new();
@@ -280,7 +288,11 @@ impl GraphShard {
         cell_id: &str,
         updates: Vec<(VertexId, VertexMetadata)>,
     ) -> Result<usize> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, "import_vertex_metadata_batch")
             .await?;
         let mut changed = Vec::new();
@@ -406,7 +418,11 @@ impl GraphShard {
         lock: &CellWriteLock,
     ) -> Result<VertexDeleteResult> {
         let idem_key = keys::idempotency(cell_id, "vertex-delete", idempotency_key);
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, operation)
             .await?;
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
@@ -439,7 +455,11 @@ impl GraphShard {
         if detach {
             for (idx, edge) in incident_edges.into_iter().enumerate() {
                 renew_vertex_delete_lock_after_items(lock, idx as u64).await?;
-                let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+                let txn = self
+                    .db
+                    .writer()?
+                    .begin(IsolationLevel::SerializableSnapshot)
+                    .await?;
                 self.validate_write_fence_txn(&txn, cell_id, operation)
                     .await?;
                 let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
@@ -517,7 +537,11 @@ impl GraphShard {
         incident_edges_deleted: u64,
         relationships_deleted: u64,
     ) -> Result<VertexDeleteResult> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, operation)
             .await?;
         let idem_key = keys::idempotency(cell_id, "vertex-delete", idempotency_key);
@@ -745,7 +769,11 @@ impl GraphShard {
         let marker_key = keys::cell_drop_marker(cell_id);
         let pending_marker_key = keys::cell_drop_pending_marker(cell_id);
         let write_fence_key = keys::write_fence(cell_id);
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
             return decode_cell_drop_idempotency(&idem_key, cell_id, idempotency_key, &value);
         }
@@ -812,7 +840,11 @@ impl GraphShard {
             batches,
             already_dropped: false,
         };
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, "drop_cell")
             .await?;
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
@@ -838,7 +870,11 @@ impl GraphShard {
             return Ok(0);
         }
         let keys = std::mem::take(keys_to_delete);
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, "drop_cell")
             .await?;
         for key in &keys {
@@ -1089,7 +1125,11 @@ impl GraphShard {
         dst: VertexId,
         metadata: EdgeMetadata,
     ) -> Result<bool> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, "set_edge_metadata")
             .await?;
         let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
@@ -1149,7 +1189,11 @@ impl GraphShard {
         edge_type: &str,
         updates: Vec<(VertexId, VertexId, EdgeMetadata)>,
     ) -> Result<usize> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, "set_edge_metadata_batch")
             .await?;
         let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
@@ -1230,7 +1274,11 @@ impl GraphShard {
         idempotency_key: &str,
         fingerprint: u64,
     ) -> Result<RelationshipImportResult> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, "import_relationships_batch")
             .await?;
         let idem_key = keys::idempotency(cell_id, "relationship-import", idempotency_key);
@@ -1648,7 +1696,11 @@ impl GraphShard {
         edge_metadata: &EdgeMetadata,
         fingerprint: u64,
     ) -> Result<RelationshipCreateResult> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, &mutation.cell_id, "create_relationship")
             .await?;
         let idem_key = keys::idempotency(
@@ -1961,7 +2013,11 @@ impl GraphShard {
         relationship_id: RelationshipId,
         metadata: EdgeMetadata,
     ) -> Result<bool> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, "set_relationship_metadata")
             .await?;
         let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
@@ -2067,7 +2123,11 @@ impl GraphShard {
         mutation: &EdgeMutation,
         relationship_id: RelationshipId,
     ) -> Result<DeleteResult> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, &mutation.cell_id, "delete_relationship")
             .await?;
         let idem_key = keys::idempotency(
@@ -2409,7 +2469,11 @@ impl GraphShard {
         edge_metadata: &EdgeMetadata,
         operation: &'static str,
     ) -> Result<CommitResult> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, &mutation.cell_id, operation)
             .await?;
         let idem_key = keys::idempotency(&mutation.cell_id, "create", &mutation.idempotency_key);
@@ -2783,7 +2847,11 @@ impl GraphShard {
         cell_id: &str,
         mutations: &[EdgeMutation],
     ) -> Result<EdgeDeleteBatchResult> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, "delete_edge_mutations_batch")
             .await?;
 
@@ -3066,7 +3134,11 @@ impl GraphShard {
     }
 
     async fn delete_edge_txn_locked(&self, mutation: &EdgeMutation) -> Result<DeleteResult> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, &mutation.cell_id, "delete_edge")
             .await?;
         let idem_key = keys::idempotency(&mutation.cell_id, "delete", &mutation.idempotency_key);
@@ -3792,7 +3864,11 @@ impl GraphShard {
         mutations: &[EdgeMutation],
         fingerprint: u64,
     ) -> Result<EdgeMutationLogAppendResult> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, "append_edge_mutation_log")
             .await?;
         let idem_key = keys::idempotency(cell_id, "mutation-log", batch_id);
@@ -4027,7 +4103,11 @@ impl GraphShard {
         operation: &'static str,
         materialized_log_epoch: Option<GraphEpoch>,
     ) -> Result<EdgeMutationBatchResult> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, operation)
             .await?;
 
@@ -4405,7 +4485,11 @@ impl GraphShard {
         idempotency_key: &str,
         fingerprint: u64,
     ) -> Result<BulkImportResult> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, "bulk_append_supernode_segment_trusted")
             .await?;
         let idem_key = keys::idempotency(cell_id, "segment-import", idempotency_key);
@@ -4459,6 +4543,12 @@ impl GraphShard {
         };
 
         if inserted > 0 {
+            let segment_edges: Vec<_> = inserted_dsts
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(offset, dst)| (start_epoch + offset as u64, dst))
+                .collect();
             txn.put(
                 keys::out_segment(
                     cell_id,
@@ -4469,7 +4559,7 @@ impl GraphShard {
                     idempotency_key,
                 )
                 .as_bytes(),
-                encode_out_edge_segment(&inserted_dsts),
+                encode_out_edge_segment_records(&segment_edges),
             )?;
             txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(end_epoch))?;
             let degree_key = keys::degree_out(cell_id, edge_type, src);
@@ -4565,7 +4655,11 @@ impl GraphShard {
         options: BulkImportOptions,
     ) -> Result<BulkImportResult> {
         let preflight_started = std::time::Instant::now();
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, "bulk_import_edges")
             .await?;
         let idem_key = keys::idempotency(cell_id, "bulk-import", idempotency_key);

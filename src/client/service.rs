@@ -925,19 +925,12 @@ impl ClientQueryService {
                         .columns
                 }
                 QueryTransportAction::Write => {
-                    let row_mutation = parse_opencypher_mutation_query_with_parameters(
+                    let mutation = parse_opencypher_mutation_query_with_parameters(
                         &request.query,
                         &scalar_parameters,
                     )?
                     .is_some();
-                    let scalar_mutation = if row_mutation {
-                        false
-                    } else {
-                        crate::parse_opencypher_with_parameters(&request.query, &scalar_parameters)
-                            .map(|parsed| parsed.statement.is_write())
-                            .unwrap_or(false)
-                    };
-                    if !row_mutation && !scalar_mutation {
+                    if !mutation {
                         return Err(GraphError::UnsupportedQuery {
                             dialect: "ClientProtocol",
                             feature: "write query is not executable by the mutation engine"

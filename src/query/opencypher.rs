@@ -5,43 +5,11 @@ use std::ptr::null_mut;
 use libcypher_parser_sys as sys;
 
 use crate::{
-    validate_component, EdgeMetadata, GraphError, QueryColumn, QueryFloat, QueryStatement,
-    QueryWindow, Result, VertexId, VertexMetadata, VertexPropertyValue,
+    validate_component, EdgeMetadata, GraphError, QueryColumn, QueryFloat, QueryWindow, Result,
+    VertexId, VertexMetadata, VertexPropertyValue,
 };
 
 type AstNode = sys::cypher_astnode_t;
-
-pub trait CypherFrontend {
-    fn parse(&self, query: &str) -> Result<QueryStatement>;
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LibCypherParserFrontend;
-
-pub type DefaultCypherFrontend = LibCypherParserFrontend;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct EdgePattern {
-    edge_type: String,
-    src: Option<VertexId>,
-    src_binding: Option<String>,
-    dst: Option<VertexId>,
-    dst_binding: Option<String>,
-    hop_range: Option<(u8, u8)>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct NodePattern {
-    binding: Option<String>,
-    id: Option<VertexId>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ParsedQuery {
-    pub statement: QueryStatement,
-    pub window: QueryWindow,
-    pub columns: Vec<QueryColumn>,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedRowQuery {
@@ -64,14 +32,14 @@ pub struct ParsedMutationQuery {
     pub actions: Vec<RowMutationAction>,
 }
 
-#[cfg(feature = "query-transport")]
+#[cfg(feature = "client-api")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ParsedUnwindBatch {
     pub(crate) parameter: String,
     pub(crate) kind: ParsedUnwindBatchKind,
 }
 
-#[cfg(feature = "query-transport")]
+#[cfg(feature = "client-api")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ParsedUnwindBatchKind {
     OutNeighbors {
@@ -93,7 +61,6 @@ pub(crate) enum ParsedUnwindBatchKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(feature = "query-transport")]
 pub(crate) enum OpenCypherQueryAccess {
     Read,
     Write,
@@ -242,37 +209,6 @@ pub enum RowComparisonOp {
     Gte,
 }
 
-pub fn parse_cypher(query: &str) -> Result<QueryStatement> {
-    LibCypherParserFrontend.parse(query)
-}
-
-pub fn parse_opencypher(query: &str) -> Result<QueryStatement> {
-    parse_cypher(query)
-}
-
-pub fn parse_cypher_with_window(query: &str) -> Result<ParsedQuery> {
-    parse_cypher_with_parameters(query, &BTreeMap::new())
-}
-
-pub fn parse_cypher_with_parameters(
-    query: &str,
-    parameters: &BTreeMap<String, VertexPropertyValue>,
-) -> Result<ParsedQuery> {
-    let parsed = ParsedCypher::parse(query)?;
-    parsed.lower_with_window(parameters)
-}
-
-pub fn parse_opencypher_with_window(query: &str) -> Result<ParsedQuery> {
-    parse_cypher_with_window(query)
-}
-
-pub fn parse_opencypher_with_parameters(
-    query: &str,
-    parameters: &BTreeMap<String, VertexPropertyValue>,
-) -> Result<ParsedQuery> {
-    parse_cypher_with_parameters(query, parameters)
-}
-
 pub fn parse_opencypher_row_query(query: &str) -> Result<ParsedRowQuery> {
     parse_opencypher_row_query_with_parameters(query, &BTreeMap::new())
 }
@@ -293,21 +229,13 @@ pub fn parse_opencypher_mutation_query_with_parameters(
     parsed.lower_mutation_query(parameters)
 }
 
-#[cfg(feature = "query-transport")]
+#[cfg(feature = "client-api")]
 pub(crate) fn parse_opencypher_unwind_batch(query: &str) -> Result<Option<ParsedUnwindBatch>> {
     ParsedCypher::parse(query)?.lower_unwind_batch()
 }
 
-#[cfg(feature = "query-transport")]
 pub(crate) fn classify_opencypher_query_access(query: &str) -> Result<OpenCypherQueryAccess> {
     ParsedCypher::parse(query)?.query_access()
-}
-
-impl CypherFrontend for LibCypherParserFrontend {
-    fn parse(&self, query: &str) -> Result<QueryStatement> {
-        let parsed = ParsedCypher::parse(query)?;
-        parsed.lower()
-    }
 }
 
 struct ParsedCypher {
@@ -337,17 +265,6 @@ impl ParsedCypher {
         }
     }
 
-    fn lower(&self) -> Result<QueryStatement> {
-        let lowered = self.lower_with_window(&BTreeMap::new())?;
-        if !lowered.window.is_default() {
-            return unsupported(
-                "statement-only Cypher parsing cannot drop SKIP/LIMIT; use parse_cypher_with_window",
-            );
-        }
-        Ok(lowered.statement)
-    }
-
-    #[cfg(feature = "query-transport")]
     fn query_access(&self) -> Result<OpenCypherQueryAccess> {
         unsafe {
             let directives = sys::cypher_parse_result_ndirectives(self.result);
@@ -395,6 +312,7 @@ impl ParsedCypher {
                     "query transport cannot authorize an unsupported Cypher clause",
                 );
             }
+            #[cfg(feature = "client-api")]
             if has_unwind {
                 let batch =
                     self.lower_unwind_batch()?
@@ -421,6 +339,10 @@ impl ParsedCypher {
                     OpenCypherQueryAccess::Read
                 });
             }
+            #[cfg(not(feature = "client-api"))]
+            if has_unwind {
+                return unsupported("UNWIND execution requires the client-api feature");
+            }
             Ok(if has_write_clause {
                 OpenCypherQueryAccess::Write
             } else {
@@ -429,7 +351,7 @@ impl ParsedCypher {
         }
     }
 
-    #[cfg(feature = "query-transport")]
+    #[cfg(feature = "client-api")]
     fn lower_unwind_batch(&self) -> Result<Option<ParsedUnwindBatch>> {
         unsafe {
             let directives = sys::cypher_parse_result_ndirectives(self.result);
@@ -566,60 +488,6 @@ impl ParsedCypher {
         }
     }
 
-    fn lower_with_window(
-        &self,
-        parameters: &BTreeMap<String, VertexPropertyValue>,
-    ) -> Result<ParsedQuery> {
-        unsafe {
-            let directives = sys::cypher_parse_result_ndirectives(self.result);
-            if directives != 1 {
-                return unsupported(
-                    "only a single Cypher statement is supported in the legacy scalar Cypher planner",
-                );
-            }
-
-            let statement = checked_node(sys::cypher_parse_result_get_directive(self.result, 0))?;
-            ensure_instance(statement, sys::CYPHER_AST_STATEMENT, "statement")?;
-            let body = checked_node(sys::cypher_ast_statement_get_body(statement))?;
-            ensure_instance(body, sys::CYPHER_AST_QUERY, "query")?;
-            self.lower_query(body, parameters)
-        }
-    }
-
-    fn lower_query(
-        &self,
-        query: *const AstNode,
-        parameters: &BTreeMap<String, VertexPropertyValue>,
-    ) -> Result<ParsedQuery> {
-        unsafe {
-            let clause_count = sys::cypher_ast_query_nclauses(query);
-            if clause_count == 1 {
-                let clause = checked_node(sys::cypher_ast_query_get_clause(query, 0))?;
-                if is_instance(clause, sys::CYPHER_AST_CREATE) {
-                    return Ok(ParsedQuery {
-                        statement: lower_create(clause, parameters)?,
-                        window: QueryWindow::default(),
-                        columns: Vec::new(),
-                    });
-                }
-            }
-
-            if clause_count == 2 {
-                let match_clause = checked_node(sys::cypher_ast_query_get_clause(query, 0))?;
-                let return_clause = checked_node(sys::cypher_ast_query_get_clause(query, 1))?;
-                if is_instance(match_clause, sys::CYPHER_AST_MATCH)
-                    && is_instance(return_clause, sys::CYPHER_AST_RETURN)
-                {
-                    return lower_match_return(match_clause, return_clause, parameters);
-                }
-            }
-
-            unsupported(
-                "only CREATE and simple MATCH edge patterns are supported in the legacy scalar Cypher planner",
-            )
-        }
-    }
-
     fn lower_row_query(
         &self,
         parameters: &BTreeMap<String, VertexPropertyValue>,
@@ -700,11 +568,6 @@ impl ParsedCypher {
                     return unsupported(
                         "CREATE with following clauses is not executable in Query engine",
                     );
-                }
-                let pattern = checked_node(sys::cypher_ast_create_get_pattern(first_clause))?;
-                if sys::cypher_ast_pattern_npaths(pattern) == 1 {
-                    // Preserve the established scalar CREATE result contract.
-                    return Ok(None);
                 }
                 return Ok(Some(lower_create_mutations(first_clause, parameters)?));
             }
@@ -907,223 +770,6 @@ fn lower_row_union_query_clauses(
     first.union_all = union_all.unwrap_or(false);
     first.union_arms = arms;
     Ok(first)
-}
-
-fn lower_create(
-    create: *const AstNode,
-    parameters: &BTreeMap<String, VertexPropertyValue>,
-) -> Result<QueryStatement> {
-    unsafe {
-        if sys::cypher_ast_create_is_unique(create) {
-            return unsupported(
-                "CREATE UNIQUE is not executable in the legacy scalar Cypher planner",
-            );
-        }
-
-        let pattern = checked_node(sys::cypher_ast_create_get_pattern(create))?;
-        let edge = lower_create_edge_pattern(pattern, parameters)?;
-        if edge.hop_range.is_some() {
-            return unsupported(
-                "CREATE does not support variable-length relationships in Query engine",
-            );
-        }
-        let src = edge
-            .src
-            .id
-            .ok_or_else(|| unsupported_value("CREATE requires source id"))?;
-        let dst = edge
-            .dst
-            .id
-            .ok_or_else(|| unsupported_value("CREATE requires destination id"))?;
-        let src_metadata = vertex_metadata_from_node_pattern(&edge.src);
-        let dst_metadata = vertex_metadata_from_node_pattern(&edge.dst);
-        let edge_metadata = edge_metadata_from_edge_pattern(&edge);
-        if src_metadata.labels.is_empty()
-            && src_metadata.properties.is_empty()
-            && dst_metadata.labels.is_empty()
-            && dst_metadata.properties.is_empty()
-            && edge_metadata.properties.is_empty()
-        {
-            return Ok(QueryStatement::CreateEdge {
-                edge_type: edge.edge_type,
-                src,
-                dst,
-            });
-        }
-        if !edge_metadata.properties.is_empty() {
-            return Ok(QueryStatement::CreateEdgeWithFullMetadata {
-                edge_type: edge.edge_type,
-                src,
-                dst,
-                src_metadata,
-                dst_metadata,
-                edge_metadata,
-            });
-        }
-        Ok(QueryStatement::CreateEdgeWithMetadata {
-            edge_type: edge.edge_type,
-            src,
-            dst,
-            src_metadata,
-            dst_metadata,
-        })
-    }
-}
-
-fn lower_match_return(
-    match_clause: *const AstNode,
-    return_clause: *const AstNode,
-    parameters: &BTreeMap<String, VertexPropertyValue>,
-) -> Result<ParsedQuery> {
-    unsafe {
-        if sys::cypher_ast_match_is_optional(match_clause) {
-            return unsupported(
-                "OPTIONAL MATCH is not executable in the legacy scalar Cypher planner",
-            );
-        }
-        if sys::cypher_ast_match_nhints(match_clause) != 0 {
-            return unsupported(
-                "MATCH hints are not executable in the legacy scalar Cypher planner",
-            );
-        }
-        if sys::cypher_ast_return_is_distinct(return_clause)
-            || sys::cypher_ast_return_has_include_existing(return_clause)
-            || !sys::cypher_ast_return_get_order_by(return_clause).is_null()
-            || sys::cypher_ast_return_nprojections(return_clause) != 1
-        {
-            return unsupported("MATCH edge currently supports a single RETURN projection only");
-        }
-        let window = lower_return_window(return_clause, parameters)?;
-
-        let pattern = checked_node(sys::cypher_ast_match_get_pattern(match_clause))?;
-        let edge = lower_single_edge_pattern(pattern, parameters)?;
-        let predicate = sys::cypher_ast_match_get_predicate(match_clause);
-        let where_dst = if predicate.is_null() {
-            None
-        } else {
-            Some(lower_where_node_id_with_parameters(
-                predicate,
-                edge.dst_binding.as_deref(),
-                parameters,
-            )?)
-        };
-        let fixed_dst = resolve_node_id_constraint(edge.dst, where_dst)?;
-        let src = edge
-            .src
-            .ok_or_else(|| unsupported_value("MATCH requires source id"))?;
-        let projection = checked_node(sys::cypher_ast_return_get_projection(return_clause, 0))?;
-        let expression = checked_node(sys::cypher_ast_projection_get_expression(projection))?;
-
-        if is_count_star(expression)? {
-            let columns = vec![QueryColumn::new(projection_column_name(
-                projection, "count(*)",
-            )?)];
-            if let Some((min_hops, max_hops)) = edge.hop_range {
-                if fixed_dst.is_some() {
-                    return unsupported(
-                        "variable-length MATCH with fixed destination is not executable in the legacy scalar Cypher planner",
-                    );
-                }
-                return Ok(ParsedQuery {
-                    statement: QueryStatement::MatchReachable {
-                        edge_type: edge.edge_type,
-                        src,
-                        min_hops,
-                        max_hops,
-                        return_count: true,
-                    },
-                    window,
-                    columns,
-                });
-            }
-            if let Some(dst) = fixed_dst {
-                return Ok(ParsedQuery {
-                    statement: QueryStatement::MatchOutFiltered {
-                        edge_type: edge.edge_type,
-                        src,
-                        dst,
-                        return_count: true,
-                    },
-                    window,
-                    columns,
-                });
-            }
-            return Ok(ParsedQuery {
-                statement: QueryStatement::MatchOut {
-                    edge_type: edge.edge_type,
-                    src,
-                    return_count: true,
-                },
-                window,
-                columns,
-            });
-        }
-
-        if let Some((min_hops, max_hops)) = edge.hop_range {
-            if fixed_dst.is_some() {
-                return unsupported(
-                    "variable-length MATCH with fixed destination is not executable in the legacy scalar Cypher planner",
-                );
-            }
-            if !projects_node_id(expression, edge.dst_binding.as_deref())? {
-                return unsupported("variable-length MATCH currently requires RETURN <dst>.id");
-            }
-            let columns = vec![QueryColumn::new(projection_column_name(
-                projection,
-                node_id_column_name(edge.dst_binding.as_deref())?,
-            )?)];
-            return Ok(ParsedQuery {
-                statement: QueryStatement::MatchReachable {
-                    edge_type: edge.edge_type,
-                    src,
-                    min_hops,
-                    max_hops,
-                    return_count: false,
-                },
-                window,
-                columns,
-            });
-        }
-
-        if let Some(dst) = fixed_dst {
-            if !projects_node_id(expression, edge.dst_binding.as_deref())? {
-                return unsupported(
-                    "exact edge MATCH currently supports RETURN <dst>.id or count(*)",
-                );
-            }
-            let columns = vec![QueryColumn::new(projection_column_name(
-                projection,
-                node_id_column_name(edge.dst_binding.as_deref())?,
-            )?)];
-            return Ok(ParsedQuery {
-                statement: QueryStatement::MatchOutFiltered {
-                    edge_type: edge.edge_type,
-                    src,
-                    dst,
-                    return_count: false,
-                },
-                window,
-                columns,
-            });
-        }
-        if !projects_node_id(expression, edge.dst_binding.as_deref())? {
-            return unsupported("open-ended MATCH currently requires RETURN <dst>.id");
-        }
-        let columns = vec![QueryColumn::new(projection_column_name(
-            projection,
-            node_id_column_name(edge.dst_binding.as_deref())?,
-        )?)];
-
-        Ok(ParsedQuery {
-            statement: QueryStatement::MatchOut {
-                edge_type: edge.edge_type,
-                src,
-                return_count: false,
-            },
-            window,
-            columns,
-        })
-    }
 }
 
 fn lower_match_return_rows(
@@ -1837,96 +1483,7 @@ fn row_expression_name(expression: &RowExpression) -> String {
     }
 }
 
-fn lower_single_edge_pattern(
-    pattern: *const AstNode,
-    parameters: &BTreeMap<String, VertexPropertyValue>,
-) -> Result<EdgePattern> {
-    unsafe {
-        ensure_instance(pattern, sys::CYPHER_AST_PATTERN, "pattern")?;
-        if sys::cypher_ast_pattern_npaths(pattern) != 1 {
-            return unsupported(
-                "only one path pattern is executable in the legacy scalar Cypher planner",
-            );
-        }
-
-        let path = checked_node(sys::cypher_ast_pattern_get_path(pattern, 0))?;
-        ensure_instance(path, sys::CYPHER_AST_PATTERN_PATH, "pattern path")?;
-        if sys::cypher_ast_pattern_path_nelements(path) != 3 {
-            return unsupported(
-                "only one-hop edge patterns are executable in the legacy scalar Cypher planner",
-            );
-        }
-
-        let left = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
-        let rel = checked_node(sys::cypher_ast_pattern_path_get_element(path, 1))?;
-        let right = checked_node(sys::cypher_ast_pattern_path_get_element(path, 2))?;
-        ensure_instance(left, sys::CYPHER_AST_NODE_PATTERN, "left node pattern")?;
-        ensure_instance(rel, sys::CYPHER_AST_REL_PATTERN, "relationship pattern")?;
-        ensure_instance(right, sys::CYPHER_AST_NODE_PATTERN, "right node pattern")?;
-
-        let varlength = sys::cypher_ast_rel_pattern_get_varlength(rel);
-        let hop_range = if varlength.is_null() {
-            None
-        } else {
-            Some(lower_hop_range(varlength)?)
-        };
-        if !sys::cypher_ast_rel_pattern_get_properties(rel).is_null() {
-            return unsupported(
-                "relationship properties are not executable in the legacy scalar Cypher planner",
-            );
-        }
-        if sys::cypher_ast_rel_pattern_nreltypes(rel) != 1 {
-            return unsupported(
-                "relationship pattern must have exactly one type in the legacy scalar Cypher planner",
-            );
-        }
-
-        let edge_type_node = checked_node(sys::cypher_ast_rel_pattern_get_reltype(rel, 0))?;
-        let edge_type = reltype_name(edge_type_node)?;
-
-        let left_node = lower_node_pattern(left, parameters)?;
-        let right_node = lower_node_pattern(right, parameters)?;
-
-        match sys::cypher_ast_rel_pattern_get_direction(rel) {
-            sys::cypher_rel_direction::CYPHER_REL_OUTBOUND => Ok(EdgePattern {
-                edge_type,
-                src: left_node.id,
-                src_binding: left_node.binding,
-                dst: right_node.id,
-                dst_binding: right_node.binding,
-                hop_range,
-            }),
-            sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(EdgePattern {
-                edge_type,
-                src: right_node.id,
-                src_binding: right_node.binding,
-                dst: left_node.id,
-                dst_binding: left_node.binding,
-                hop_range,
-            }),
-            sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => {
-                unsupported("undirected relationships are not executable in the query engine")
-            }
-        }
-    }
-}
-
-fn lower_create_edge_pattern(
-    pattern: *const AstNode,
-    parameters: &BTreeMap<String, VertexPropertyValue>,
-) -> Result<RowEdgePattern> {
-    unsafe {
-        ensure_instance(pattern, sys::CYPHER_AST_PATTERN, "pattern")?;
-        if sys::cypher_ast_pattern_npaths(pattern) != 1 {
-            return unsupported("only one path pattern is executable in Query engine CREATE");
-        }
-
-        let path = checked_node(sys::cypher_ast_pattern_get_path(pattern, 0))?;
-        lower_create_edge_path(path, parameters, "CREATE")
-    }
-}
-
-#[cfg(feature = "query-transport")]
+#[cfg(feature = "client-api")]
 struct UnwindEdgeTemplate {
     edge_type: String,
     source_field: String,
@@ -1935,7 +1492,7 @@ struct UnwindEdgeTemplate {
     relationship_binding: Option<String>,
 }
 
-#[cfg(feature = "query-transport")]
+#[cfg(feature = "client-api")]
 fn unwind_edge_template(
     pattern: *const AstNode,
     unwind_alias: &str,
@@ -2006,7 +1563,7 @@ fn unwind_edge_template(
     }
 }
 
-#[cfg(feature = "query-transport")]
+#[cfg(feature = "client-api")]
 fn unwind_node_id_field(
     node: *const AstNode,
     unwind_alias: &str,
@@ -2295,98 +1852,6 @@ fn lower_hop_range(range: *const AstNode) -> Result<(u8, u8)> {
     }
 }
 
-fn lower_where_node_id_with_parameters(
-    predicate: *const AstNode,
-    binding: Option<&str>,
-    parameters: &BTreeMap<String, VertexPropertyValue>,
-) -> Result<VertexId> {
-    let Some(binding) = binding else {
-        return unsupported("WHERE id filter requires a named destination binding");
-    };
-    unsafe {
-        if is_instance(predicate, sys::CYPHER_AST_COMPARISON) {
-            if sys::cypher_ast_comparison_get_length(predicate) != 1 {
-                return unsupported(
-                    "WHERE supports only one equality comparison in the legacy scalar Cypher planner",
-                );
-            }
-            let op = sys::cypher_ast_comparison_get_operator(predicate, 0);
-            if op != sys::CYPHER_OP_EQUAL {
-                return unsupported(
-                    "WHERE supports only equality on node id in the legacy scalar Cypher planner",
-                );
-            }
-            let left = checked_node(sys::cypher_ast_comparison_get_argument(predicate, 0))?;
-            let right = checked_node(sys::cypher_ast_comparison_get_argument(predicate, 1))?;
-            return lower_node_id_equality(left, right, binding, parameters);
-        }
-        if is_instance(predicate, sys::CYPHER_AST_BINARY_OPERATOR) {
-            let op = sys::cypher_ast_binary_operator_get_operator(predicate);
-            if op != sys::CYPHER_OP_EQUAL {
-                return unsupported(
-                    "WHERE supports only equality on node id in the legacy scalar Cypher planner",
-                );
-            }
-            let left = checked_node(sys::cypher_ast_binary_operator_get_argument1(predicate))?;
-            let right = checked_node(sys::cypher_ast_binary_operator_get_argument2(predicate))?;
-            return lower_node_id_equality(left, right, binding, parameters);
-        }
-    }
-    unsupported("WHERE supports only <dst>.id = <integer> in the legacy scalar Cypher planner")
-}
-
-fn lower_node_id_equality(
-    left: *const AstNode,
-    right: *const AstNode,
-    binding: &str,
-    parameters: &BTreeMap<String, VertexPropertyValue>,
-) -> Result<VertexId> {
-    if projects_node_id(left, Some(binding))? {
-        return integer_vertex_id(right, parameters);
-    }
-    if projects_node_id(right, Some(binding))? {
-        return integer_vertex_id(left, parameters);
-    }
-    unsupported("WHERE supports only <dst>.id = <integer> in the legacy scalar Cypher planner")
-}
-
-fn resolve_node_id_constraint(
-    pattern_id: Option<VertexId>,
-    where_id: Option<VertexId>,
-) -> Result<Option<VertexId>> {
-    match (pattern_id, where_id) {
-        (Some(left), Some(right)) if left != right => {
-            unsupported(
-                "conflicting node id constraints are not executable in the legacy scalar Cypher planner",
-            )
-        }
-        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
-        (None, None) => Ok(None),
-    }
-}
-
-fn lower_node_pattern(
-    node: *const AstNode,
-    parameters: &BTreeMap<String, VertexPropertyValue>,
-) -> Result<NodePattern> {
-    unsafe {
-        ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "node pattern")?;
-        if sys::cypher_ast_node_pattern_nlabels(node) != 0 {
-            return unsupported(
-                "node labels are not executable in the legacy scalar Cypher planner",
-            );
-        }
-        let binding = node_identifier(node)?;
-        let properties = sys::cypher_ast_node_pattern_get_properties(node);
-        let id = if properties.is_null() {
-            None
-        } else {
-            Some(node_id_property(properties, parameters)?)
-        };
-        Ok(NodePattern { binding, id })
-    }
-}
-
 fn lower_row_node_pattern(
     node: *const AstNode,
     parameters: &BTreeMap<String, VertexPropertyValue>,
@@ -2454,31 +1919,6 @@ fn property_map(
             }
         }
         Ok(result)
-    }
-}
-
-fn node_id_property(
-    properties: *const AstNode,
-    parameters: &BTreeMap<String, VertexPropertyValue>,
-) -> Result<VertexId> {
-    unsafe {
-        ensure_instance(properties, sys::CYPHER_AST_MAP, "node property map")?;
-        if sys::cypher_ast_map_nentries(properties) != 1 {
-            return unsupported(
-                "node property map must contain only id in the legacy scalar Cypher planner",
-            );
-        }
-
-        let key = checked_node(sys::cypher_ast_map_get_key(properties, 0))?;
-        let key_name = prop_name(key)?;
-        if !key_name.eq_ignore_ascii_case("id") {
-            return unsupported(
-                "node property map must contain id in the legacy scalar Cypher planner",
-            );
-        }
-
-        let value = checked_node(sys::cypher_ast_map_get_value(properties, 0))?;
-        integer_vertex_id(value, parameters)
     }
 }
 
@@ -2697,13 +2137,6 @@ fn is_count_star(expression: *const AstNode) -> Result<bool> {
     }
 }
 
-fn projects_node_id(expression: *const AstNode, binding: Option<&str>) -> Result<bool> {
-    let Some(binding) = binding else {
-        return Ok(false);
-    };
-    Ok(node_id_expression_binding(expression)?.as_deref() == Some(binding))
-}
-
 fn node_id_expression_binding(expression: *const AstNode) -> Result<Option<String>> {
     match property_expression_binding(expression)? {
         Some((binding, property)) if property.eq_ignore_ascii_case("id") => Ok(Some(binding)),
@@ -2726,12 +2159,6 @@ fn property_expression_binding(expression: *const AstNode) -> Result<Option<(Str
         }
         Ok(Some((identifier_name(base)?, property)))
     }
-}
-
-fn node_id_column_name(binding: Option<&str>) -> Result<String> {
-    binding
-        .map(|binding| format!("{binding}.id"))
-        .ok_or_else(|| unsupported_value("RETURN <dst>.id requires a named destination node"))
 }
 
 fn projection_column_name(
@@ -2904,211 +2331,6 @@ fn parse_error(reason: impl Into<String>) -> GraphError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lowers_create_edge_through_libcypher_parser() {
-        assert_eq!(
-            parse_opencypher("CREATE (u {id: 1})-[:USER_SUBSCRIBED_TO_SUBREDDIT]->(s {id: 2})")
-                .unwrap(),
-            QueryStatement::CreateEdge {
-                edge_type: "USER_SUBSCRIBED_TO_SUBREDDIT".to_string(),
-                src: 1,
-                dst: 2
-            }
-        );
-    }
-
-    #[test]
-    fn lowers_create_edge_with_relationship_properties() {
-        assert_eq!(
-            parse_opencypher(
-                "CREATE (u:User {id: 1, name: 'alice'})-[r:FOLLOWS {since: 2020, close: true}]->\
-                 (v {id: 2})"
-            )
-            .unwrap(),
-            QueryStatement::CreateEdgeWithFullMetadata {
-                edge_type: "FOLLOWS".to_string(),
-                src: 1,
-                dst: 2,
-                src_metadata: VertexMetadata::default()
-                    .with_label("User")
-                    .with_property("name", VertexPropertyValue::String("alice".to_string())),
-                dst_metadata: VertexMetadata::default(),
-                edge_metadata: EdgeMetadata::default()
-                    .with_property("close", VertexPropertyValue::Bool(true))
-                    .with_property("since", VertexPropertyValue::Integer(2020)),
-            }
-        );
-    }
-
-    #[test]
-    fn lowers_match_out_neighbors_through_libcypher_parser() {
-        assert_eq!(
-            parse_opencypher("MATCH (u {id: 1})-[:USER_SUBSCRIBED_TO_SUBREDDIT]->(s) RETURN s.id")
-                .unwrap(),
-            QueryStatement::MatchOut {
-                edge_type: "USER_SUBSCRIBED_TO_SUBREDDIT".to_string(),
-                src: 1,
-                return_count: false
-            }
-        );
-    }
-
-    #[test]
-    fn lowers_match_edge_count_through_libcypher_parser() {
-        assert_eq!(
-            parse_opencypher(
-                "MATCH (u {id: 1})-[:USER_SUBSCRIBED_TO_SUBREDDIT]->(s {id: 2}) RETURN count(*)"
-            )
-            .unwrap(),
-            QueryStatement::MatchOutFiltered {
-                edge_type: "USER_SUBSCRIBED_TO_SUBREDDIT".to_string(),
-                src: 1,
-                dst: 2,
-                return_count: true
-            }
-        );
-    }
-
-    #[test]
-    fn frontend_trait_uses_libcypher_parser() {
-        let frontend = LibCypherParserFrontend;
-        assert_eq!(
-            frontend
-                .parse("MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN count(*)")
-                .unwrap(),
-            QueryStatement::MatchOut {
-                edge_type: "FOLLOWS".to_string(),
-                src: 1,
-                return_count: true
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_cypher_syntax_errors_from_libcypher_parser() {
-        assert!(matches!(
-            parse_opencypher("MATCH (u {id: 1})-[:FOLLOWS]-> RETURN u.id"),
-            Err(GraphError::QueryParse { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_labels_instead_of_silently_dropping_them() {
-        assert!(matches!(
-            parse_opencypher("MATCH (u {id: 1})-[:FOLLOWS]->(v:User) RETURN v.id"),
-            Err(GraphError::UnsupportedQuery { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_unbounded_variable_length_paths() {
-        assert!(matches!(
-            parse_opencypher("MATCH (u {id: 1})-[:FOLLOWS*]->(v) RETURN v.id"),
-            Err(GraphError::UnsupportedQuery { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_conflicting_pattern_and_where_ids() {
-        assert!(matches!(
-            parse_opencypher(
-                "MATCH (u {id: 1})-[:FOLLOWS]->(v {id: 2}) WHERE v.id = 3 RETURN v.id"
-            ),
-            Err(GraphError::UnsupportedQuery { .. })
-        ));
-    }
-
-    #[test]
-    fn lowers_variable_length_paths_through_libcypher_parser() {
-        assert_eq!(
-            parse_opencypher("MATCH (u {id: 1})-[:FOLLOWS*1..3]->(v) RETURN v.id").unwrap(),
-            QueryStatement::MatchReachable {
-                edge_type: "FOLLOWS".to_string(),
-                src: 1,
-                min_hops: 1,
-                max_hops: 3,
-                return_count: false,
-            }
-        );
-    }
-
-    #[test]
-    fn lowers_where_id_predicates_through_libcypher_parser() {
-        assert_eq!(
-            parse_opencypher("MATCH (u {id: 1})-[:FOLLOWS]->(v) WHERE v.id = 2 RETURN v.id")
-                .unwrap(),
-            QueryStatement::MatchOutFiltered {
-                edge_type: "FOLLOWS".to_string(),
-                src: 1,
-                dst: 2,
-                return_count: false,
-            }
-        );
-    }
-
-    #[test]
-    fn preserves_return_skip_and_limit_for_planning() {
-        let parsed = parse_opencypher_with_window(
-            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 2 LIMIT 3",
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.statement,
-            QueryStatement::MatchOut {
-                edge_type: "FOLLOWS".to_string(),
-                src: 1,
-                return_count: false,
-            }
-        );
-        assert_eq!(
-            parsed.window,
-            QueryWindow {
-                skip: 2,
-                limit: Some(3)
-            }
-        );
-        assert_eq!(parsed.columns, vec![QueryColumn::new("v.id")]);
-    }
-
-    #[test]
-    fn folds_constant_return_skip_and_limit_expressions() {
-        let parsed = parse_opencypher_with_window(
-            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 1 + 1 LIMIT 6 / 2",
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.window,
-            QueryWindow {
-                skip: 2,
-                limit: Some(3)
-            }
-        );
-        assert_eq!(parsed.columns, vec![QueryColumn::new("v.id")]);
-    }
-
-    #[test]
-    fn preserves_count_projection_column_for_planning() {
-        let parsed =
-            parse_opencypher_with_window("MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN count(*)")
-                .unwrap();
-        assert_eq!(parsed.columns, vec![QueryColumn::new("count(*)")]);
-    }
-
-    #[test]
-    fn preserves_aliased_projection_columns_for_planning() {
-        let vertex = parse_opencypher_with_window(
-            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id AS vertex_id",
-        )
-        .unwrap();
-        assert_eq!(vertex.columns, vec![QueryColumn::new("vertex_id")]);
-
-        let count = parse_opencypher_with_window(
-            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN count(*) AS total",
-        )
-        .unwrap();
-        assert_eq!(count.columns, vec![QueryColumn::new("total")]);
-    }
 
     #[test]
     fn lowers_row_query_with_multiple_projections_where_and_order() {
@@ -3502,92 +2724,6 @@ mod tests {
     }
 
     #[test]
-    fn lowers_parameterized_statement_queries() {
-        let parameters = BTreeMap::from([
-            ("src".to_string(), VertexPropertyValue::Integer(1)),
-            ("dst".to_string(), VertexPropertyValue::Integer(2)),
-            ("skip".to_string(), VertexPropertyValue::Integer(3)),
-            ("limit".to_string(), VertexPropertyValue::Integer(4)),
-        ]);
-        let parsed = parse_opencypher_with_parameters(
-            "MATCH (u {id: $src})-[:FOLLOWS]->(v {id: $dst}) \
-             RETURN v.id SKIP $skip LIMIT $limit",
-            &parameters,
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.statement,
-            QueryStatement::MatchOutFiltered {
-                edge_type: "FOLLOWS".to_string(),
-                src: 1,
-                dst: 2,
-                return_count: false,
-            }
-        );
-        assert_eq!(
-            parsed.window,
-            QueryWindow {
-                skip: 3,
-                limit: Some(4),
-            }
-        );
-    }
-
-    #[test]
-    fn lowers_parameterized_create_metadata() {
-        let parameters = BTreeMap::from([
-            ("src".to_string(), VertexPropertyValue::Integer(1)),
-            ("dst".to_string(), VertexPropertyValue::Integer(2)),
-            (
-                "name".to_string(),
-                VertexPropertyValue::String("alice".to_string()),
-            ),
-            ("active".to_string(), VertexPropertyValue::Bool(true)),
-        ]);
-        let parsed = parse_opencypher_with_parameters(
-            "CREATE (u:User {id: $src, name: $name, active: $active})-[:FOLLOWS]->\
-             (v {id: $dst})",
-            &parameters,
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.statement,
-            QueryStatement::CreateEdgeWithMetadata {
-                edge_type: "FOLLOWS".to_string(),
-                src: 1,
-                dst: 2,
-                src_metadata: VertexMetadata::default()
-                    .with_label("User")
-                    .with_property("active", VertexPropertyValue::Bool(true))
-                    .with_property("name", VertexPropertyValue::String("alice".to_string())),
-                dst_metadata: VertexMetadata::default(),
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_missing_or_mistyped_parameters() {
-        assert!(matches!(
-            parse_opencypher_with_parameters(
-                "MATCH (u {id: $src})-[:FOLLOWS]->(v) RETURN v.id",
-                &BTreeMap::new(),
-            ),
-            Err(GraphError::MissingQueryParameter { ref name, .. }) if name == "src"
-        ));
-        let parameters = BTreeMap::from([(
-            "src".to_string(),
-            VertexPropertyValue::String("bad".to_string()),
-        )]);
-        assert!(matches!(
-            parse_opencypher_with_parameters(
-                "MATCH (u {id: $src})-[:FOLLOWS]->(v) RETURN v.id",
-                &parameters,
-            ),
-            Err(GraphError::UnsupportedQuery { .. })
-        ));
-    }
-
-    #[test]
     fn lowers_full_signed_integer_literal_range() {
         let parsed = parse_opencypher_row_query(
             "MATCH (n:Score {score: -9223372036854775808}) RETURN n.score",
@@ -3600,23 +2736,5 @@ mod tests {
             node.properties.get("score"),
             Some(&VertexPropertyValue::SignedInteger(i64::MIN))
         );
-    }
-
-    #[test]
-    fn rejects_negative_return_window_expressions() {
-        assert!(matches!(
-            parse_opencypher_with_window(
-                "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 1 - 2 LIMIT 3"
-            ),
-            Err(GraphError::UnsupportedQuery { .. })
-        ));
-    }
-
-    #[test]
-    fn statement_only_parser_rejects_windowed_returns() {
-        assert!(matches!(
-            parse_opencypher("MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id LIMIT 1"),
-            Err(GraphError::UnsupportedQuery { .. })
-        ));
     }
 }

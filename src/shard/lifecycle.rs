@@ -147,13 +147,27 @@ impl GraphShard {
         }
 
         let store_path = path.into();
-        let db = open_graph_db(
-            store_path.clone(),
-            Arc::clone(&object_store),
-            &options.cache,
-            &options.durability,
-        )
-        .await?;
+        let db = match &write_authority {
+            GraphWriteAuthority::ReadOnly => GraphStore::Reader(Arc::new(
+                open_graph_reader(
+                    store_path.clone(),
+                    Arc::clone(&object_store),
+                    &options.cache,
+                )
+                .await?,
+            )),
+            GraphWriteAuthority::Standalone | GraphWriteAuthority::Leased { .. } => {
+                GraphStore::Writer(
+                    open_graph_db(
+                        store_path.clone(),
+                        Arc::clone(&object_store),
+                        &options.cache,
+                        &options.durability,
+                    )
+                    .await?,
+                )
+            }
+        };
         ensure_store_format(&db, &write_authority).await?;
         let cache_policy = options.cache_policy;
         let backpressure_policy = options.backpressure_policy;
@@ -162,7 +176,7 @@ impl GraphShard {
         let operation_metrics = Arc::new(GraphOperationalMetrics::default());
         #[cfg(feature = "opencypher")]
         let query_read_leases = QueryReadLeaseManager::new(
-            db.clone(),
+            db.writer_clone().ok(),
             options.retention_policy.read_lease_ttl_ms,
             Arc::clone(&operation_metrics),
         );
@@ -581,7 +595,11 @@ impl GraphShard {
         cell_id: &str,
         lease: &engine::ShardLease,
     ) -> Result<()> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         let key = keys::write_fence(cell_id);
         if let Some(value) = read_txn_remote(&txn, &key).await? {
             let current = decode_write_fence(&key, &value)?;
@@ -651,7 +669,11 @@ impl GraphShard {
         cell_id: &str,
         operation: &'static str,
     ) -> Result<()> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, operation)
             .await
     }
@@ -684,7 +706,10 @@ impl GraphShard {
             await_durable: true,
             ..Default::default()
         };
-        self.db.write_with_options(batch, &options).await?;
+        self.db
+            .writer()?
+            .write_with_options(batch, &options)
+            .await?;
         self.operation_metrics
             .read_leases_created
             .fetch_add(1, Ordering::Relaxed);

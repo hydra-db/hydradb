@@ -55,14 +55,17 @@ impl GraphNodeRuntimeConfig {
 }
 
 impl GraphNode {
-    pub async fn open(
+    pub async fn open<C>(
         base_path: impl Into<String>,
         local_node_id: impl Into<String>,
-        control: Arc<GraphControlPlane>,
+        control: Arc<C>,
         object_store: Arc<dyn ObjectStore>,
         lease_ttl: Duration,
         lease_renew_interval: Duration,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        C: GraphControlClient + 'static,
+    {
         Self::open_with_options(
             base_path,
             local_node_id,
@@ -75,15 +78,19 @@ impl GraphNode {
         .await
     }
 
-    pub async fn open_with_options(
+    pub async fn open_with_options<C>(
         base_path: impl Into<String>,
         local_node_id: impl Into<String>,
-        control: Arc<GraphControlPlane>,
+        control: Arc<C>,
         object_store: Arc<dyn ObjectStore>,
         lease_ttl: Duration,
         lease_renew_interval: Duration,
         options: GraphOpenOptions,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        C: GraphControlClient + 'static,
+    {
+        let control: Arc<dyn GraphControlClient> = control;
         lease_ttl_ms(lease_ttl)?;
         validate_graph_node_interval("lease_renew_interval", lease_renew_interval)?;
         let cluster = RoutedGraphCluster::open_owned_with_control_and_options(
@@ -95,13 +102,13 @@ impl GraphNode {
             options,
         )
         .await?;
-        let heartbeat = match Arc::clone(&control)
-            .start_node_heartbeat(
-                cluster.local_node_id().to_string(),
-                GraphNodeHealthState::Active,
-                lease_renew_interval,
-            )
-            .await
+        let heartbeat = match super::control_client::start_control_client_heartbeat(
+            Arc::clone(&control),
+            cluster.local_node_id().to_string(),
+            GraphNodeHealthState::Active,
+            lease_renew_interval,
+        )
+        .await
         {
             Ok(heartbeat) => heartbeat,
             Err(err) => {
@@ -109,7 +116,7 @@ impl GraphNode {
                 return Err(err);
             }
         };
-        let lease_renewer = match cluster.start_lease_renewer(
+        let lease_renewer = match cluster.start_lease_renewer_dyn(
             Arc::clone(&control),
             lease_ttl,
             lease_renew_interval,
@@ -132,15 +139,18 @@ impl GraphNode {
         })
     }
 
-    pub async fn open_managed(
+    pub async fn open_managed<C>(
         base_path: impl Into<String>,
         local_node_id: impl Into<String>,
-        control: Arc<GraphControlPlane>,
+        control: Arc<C>,
         object_store: Arc<dyn ObjectStore>,
         lease_ttl: Duration,
         lease_renew_interval: Duration,
         shard_refresh_interval: Duration,
-    ) -> Result<ManagedGraphNode> {
+    ) -> Result<ManagedGraphNode>
+    where
+        C: GraphControlClient + 'static,
+    {
         Self::open_managed_with_config(
             base_path,
             local_node_id,
@@ -151,13 +161,16 @@ impl GraphNode {
         .await
     }
 
-    pub async fn open_managed_with_config(
+    pub async fn open_managed_with_config<C>(
         base_path: impl Into<String>,
         local_node_id: impl Into<String>,
-        control: Arc<GraphControlPlane>,
+        control: Arc<C>,
         object_store: Arc<dyn ObjectStore>,
         config: GraphNodeRuntimeConfig,
-    ) -> Result<ManagedGraphNode> {
+    ) -> Result<ManagedGraphNode>
+    where
+        C: GraphControlClient + 'static,
+    {
         config.validate()?;
         let node = Self::open_with_options(
             base_path,
@@ -653,17 +666,6 @@ impl ManagedGraphNode {
             .await
     }
 
-    #[cfg(feature = "opencypher")]
-    pub async fn explain_cypher(
-        &self,
-        context: crate::QueryContext,
-        query: &str,
-    ) -> Result<crate::QueryPlan> {
-        let guard = self.node.read().await;
-        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
-        node.cluster().explain_cypher(context, query)
-    }
-
     pub async fn close(self) -> Result<()> {
         let refresh_result = self.shard_refresher.stop().await;
         let mut guard = self.node.write().await;
@@ -678,20 +680,94 @@ impl ManagedGraphNode {
     }
 }
 
+#[cfg(feature = "query-transport")]
+#[async_trait::async_trait]
+impl crate::QueryCellClient for ManagedGraphNode {
+    async fn execute_cypher_rows(
+        &self,
+        context: crate::QueryContext,
+        query: &str,
+    ) -> Result<crate::QueryResultSet> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        crate::QueryCellClient::execute_cypher_rows(node.cluster(), context, query).await
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: crate::QueryContext,
+        query: &str,
+        cursor: Option<crate::QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<crate::QueryResultPage> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        crate::QueryCellClient::execute_cypher_rows_page(
+            node.cluster(),
+            context,
+            query,
+            cursor,
+            page_size,
+        )
+        .await
+    }
+
+    async fn execute_batch(
+        &self,
+        context: crate::QueryContext,
+        operation: crate::QueryBatchOperation,
+    ) -> Result<crate::QueryResultSet> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        crate::QueryCellClient::execute_batch(node.cluster(), context, operation).await
+    }
+
+    async fn execute_batch_page(
+        &self,
+        context: crate::QueryContext,
+        operation: crate::QueryBatchOperation,
+        cursor: Option<crate::QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<crate::QueryResultPage> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        crate::QueryCellClient::execute_batch_page(
+            node.cluster(),
+            context,
+            operation,
+            cursor,
+            page_size,
+        )
+        .await
+    }
+
+    async fn current_graph_epoch(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+    ) -> Result<Option<crate::GraphEpoch>> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        crate::QueryCellClient::current_graph_epoch(node.cluster(), scope, cell_id).await
+    }
+
+    async fn pin_query_read_context(
+        &self,
+        context: crate::QueryContext,
+    ) -> Result<crate::QueryContext> {
+        let guard = self.node.read().await;
+        let node = guard.as_ref().ok_or_else(managed_node_closed_error)?;
+        crate::QueryCellClient::pin_query_read_context(node.cluster(), context).await
+    }
+}
+
 impl GraphCluster {
     pub async fn open_cells(
         base_path: impl Into<String>,
         cell_ids: impl IntoIterator<Item = impl Into<String>>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
-        Self::open_cells_at_path(
-            base_path.into(),
-            GraphScope::default(),
-            cell_ids,
-            object_store,
-            false,
-        )
-        .await
+        Self::open_cells_scoped(base_path, GraphScope::default(), cell_ids, object_store).await
     }
 
     pub async fn open_cells_scoped(
@@ -700,12 +776,7 @@ impl GraphCluster {
         cell_ids: impl IntoIterator<Item = impl Into<String>>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
-        let base_path = base_path.into();
-        let store_path = if scope.is_default() {
-            base_path
-        } else {
-            scope.scoped_store_path(&base_path)
-        };
+        let store_path = scope.scoped_store_path(&base_path.into());
         Self::open_cells_at_path(store_path, scope, cell_ids, object_store, false).await
     }
 
@@ -714,12 +785,11 @@ impl GraphCluster {
         cell_ids: impl IntoIterator<Item = impl Into<String>>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
-        Self::open_cells_at_path(
-            base_path.into(),
+        Self::open_cells_standalone_writers_scoped(
+            base_path,
             GraphScope::default(),
             cell_ids,
             object_store,
-            true,
         )
         .await
     }
@@ -730,12 +800,7 @@ impl GraphCluster {
         cell_ids: impl IntoIterator<Item = impl Into<String>>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
-        let base_path = base_path.into();
-        let store_path = if scope.is_default() {
-            base_path
-        } else {
-            scope.scoped_store_path(&base_path)
-        };
+        let store_path = scope.scoped_store_path(&base_path.into());
         Self::open_cells_at_path(store_path, scope, cell_ids, object_store, true).await
     }
 
@@ -746,13 +811,15 @@ impl GraphCluster {
         object_store: Arc<dyn ObjectStore>,
         writable: bool,
     ) -> Result<Self> {
+        let cell_ids = cell_ids
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<String>>();
+        for cell_id in &cell_ids {
+            validate_component("cell_id", cell_id)?;
+        }
         let mut shards = BTreeMap::new();
         for cell_id in cell_ids {
-            let cell_id = cell_id.into();
-            if let Err(err) = validate_component("cell_id", &cell_id) {
-                close_shards_best_effort(shards).await;
-                return Err(err);
-            }
             let path = format!("{base_path}/{cell_id}");
             let opened = if writable {
                 GraphShard::open_standalone_writer(path, Arc::clone(&object_store)).await
@@ -918,10 +985,10 @@ impl RoutedGraphCluster {
         placement: ShardPlacement,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
-        Self::open_owned_at_path(
-            base_path.into(),
+        Self::open_owned_scoped(
+            base_path,
             GraphScope::default(),
-            local_node_id.into(),
+            local_node_id,
             placement,
             object_store,
         )
@@ -935,12 +1002,7 @@ impl RoutedGraphCluster {
         placement: ShardPlacement,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
-        let base_path = base_path.into();
-        let scoped_path = if scope.is_default() {
-            base_path
-        } else {
-            scope.scoped_store_path(&base_path)
-        };
+        let scoped_path = scope.scoped_store_path(&base_path.into());
         Self::open_owned_at_path(
             scoped_path,
             scope,
@@ -959,6 +1021,9 @@ impl RoutedGraphCluster {
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
         validate_component("node_id", &local_node_id)?;
+        for cell_id in placement.cells() {
+            validate_component("cell_id", cell_id)?;
+        }
 
         let mut shards = BTreeMap::new();
         for cell_id in placement.cells_for_node(&local_node_id)? {
@@ -995,7 +1060,7 @@ impl RoutedGraphCluster {
     pub async fn open_owned_with_control(
         base_path: impl Into<String>,
         local_node_id: impl Into<String>,
-        control: &GraphControlPlane,
+        control: &dyn GraphControlClient,
         object_store: Arc<dyn ObjectStore>,
         lease_ttl: Duration,
     ) -> Result<Self> {
@@ -1013,18 +1078,13 @@ impl RoutedGraphCluster {
     pub async fn open_owned_with_control_and_options(
         base_path: impl Into<String>,
         local_node_id: impl Into<String>,
-        control: &GraphControlPlane,
+        control: &dyn GraphControlClient,
         object_store: Arc<dyn ObjectStore>,
         lease_ttl: Duration,
         options: GraphOpenOptions,
     ) -> Result<Self> {
         let scope = control.scope().clone();
-        let base_path = base_path.into();
-        let base_path = if scope.is_default() {
-            base_path
-        } else {
-            scope.scoped_store_path(&base_path)
-        };
+        let base_path = scope.scoped_store_path(&base_path.into());
         Self::open_owned_with_control_at_path(
             base_path,
             scope,
@@ -1041,7 +1101,7 @@ impl RoutedGraphCluster {
         base_path: impl Into<String>,
         scope: GraphScope,
         local_node_id: impl Into<String>,
-        control: &GraphControlPlane,
+        control: &dyn GraphControlClient,
         object_store: Arc<dyn ObjectStore>,
         lease_ttl: Duration,
         options: GraphOpenOptions,
@@ -1052,12 +1112,7 @@ impl RoutedGraphCluster {
                 actual: scope.to_string(),
             });
         }
-        let base_path = base_path.into();
-        let scoped_path = if scope.is_default() {
-            base_path
-        } else {
-            scope.scoped_store_path(&base_path)
-        };
+        let scoped_path = scope.scoped_store_path(&base_path.into());
         Self::open_owned_with_control_at_path(
             scoped_path,
             scope,
@@ -1074,7 +1129,7 @@ impl RoutedGraphCluster {
         base_path: String,
         scope: GraphScope,
         local_node_id: String,
-        control: &GraphControlPlane,
+        control: &dyn GraphControlClient,
         object_store: Arc<dyn ObjectStore>,
         lease_ttl: Duration,
         options: GraphOpenOptions,
@@ -1206,7 +1261,7 @@ impl RoutedGraphCluster {
 
     pub async fn renew_leases(
         &mut self,
-        control: &GraphControlPlane,
+        control: &dyn GraphControlClient,
         lease_ttl: Duration,
     ) -> Result<()> {
         let leases: Vec<_> = self
@@ -1250,7 +1305,7 @@ impl RoutedGraphCluster {
 
     pub async fn refresh_owned_shards(
         &mut self,
-        control: &GraphControlPlane,
+        control: &dyn GraphControlClient,
         lease_ttl: Duration,
     ) -> Result<GraphShardRefreshReport> {
         let mut placement = control.load_placement().await?;
@@ -1418,9 +1473,22 @@ impl RoutedGraphCluster {
         Ok(report)
     }
 
-    pub fn start_lease_renewer(
+    pub fn start_lease_renewer<C>(
         &self,
-        control: Arc<GraphControlPlane>,
+        control: Arc<C>,
+        lease_ttl: Duration,
+        interval: Duration,
+    ) -> Result<LeaseRenewalHandle>
+    where
+        C: GraphControlClient + 'static,
+    {
+        let control: Arc<dyn GraphControlClient> = control;
+        self.start_lease_renewer_dyn(control, lease_ttl, interval)
+    }
+
+    fn start_lease_renewer_dyn(
+        &self,
+        control: Arc<dyn GraphControlClient>,
         lease_ttl: Duration,
         interval: Duration,
     ) -> Result<LeaseRenewalHandle> {
@@ -1490,6 +1558,20 @@ impl RoutedGraphCluster {
                                         "lease renewal failed"
                                     );
                                     tokio::task::yield_now().await;
+                                    if lease.expires_at_ms <= now_millis() {
+                                        tracing::error!(
+                                            target: "slatedb_graph_kernel",
+                                            cell_id = %lease.cell_id,
+                                            "control plane remained unavailable through local lease expiry; revoking shard"
+                                        );
+                                        revoke_local_shard_after_lease_loss(
+                                            &leases,
+                                            &shard_db_handles,
+                                            &revoked_cells,
+                                            &lease.cell_id,
+                                        )
+                                        .await?;
+                                    }
                                 }
                             }
                         }
@@ -1623,7 +1705,7 @@ impl RoutedGraphCluster {
 
     pub async fn drop_cell_with_control(
         &mut self,
-        control: &GraphControlPlane,
+        control: &dyn GraphControlClient,
         cell_id: &str,
         idempotency_key: &str,
     ) -> Result<crate::GraphCellDropResult> {
@@ -1840,16 +1922,10 @@ impl RoutedGraphCluster {
     ) -> Result<crate::QueryOutput> {
         self.ensure_query_scope(&context.scope)?;
         let shard = self.shard(&context.cell_id)?;
-        let requires_write_lease =
-            if crate::parse_opencypher_mutation_query_with_parameters(query, &context.parameters)?
-                .is_some()
-            {
-                true
-            } else {
-                crate::parse_opencypher_with_parameters(query, &context.parameters)
-                    .map(|parsed| parsed.statement.is_write())
-                    .unwrap_or(false)
-            };
+        let requires_write_lease = matches!(
+            crate::query::opencypher::classify_opencypher_query_access(query)?,
+            crate::query::opencypher::OpenCypherQueryAccess::Write
+        );
         if requires_write_lease {
             self.ensure_active_write_lease(&context.cell_id)?;
         }
@@ -1906,17 +1982,6 @@ impl RoutedGraphCluster {
         Ok(result_sets)
     }
 
-    #[cfg(feature = "opencypher")]
-    pub fn explain_cypher(
-        &self,
-        context: crate::QueryContext,
-        query: &str,
-    ) -> Result<crate::QueryPlan> {
-        self.ensure_query_scope(&context.scope)?;
-        let shard = self.shard(&context.cell_id)?;
-        shard.explain_cypher(context, query)
-    }
-
     fn ensure_query_scope(&self, scope: &GraphScope) -> Result<()> {
         if scope == &self.scope {
             return Ok(());
@@ -1955,7 +2020,7 @@ impl RoutedGraphCluster {
 
 async fn revoke_local_shard_after_lease_loss(
     leases: &Arc<RwLock<BTreeMap<String, ShardLease>>>,
-    shard_db_handles: &Arc<RwLock<BTreeMap<String, Db>>>,
+    shard_db_handles: &Arc<RwLock<BTreeMap<String, GraphStore>>>,
     revoked_cells: &Arc<RwLock<BTreeSet<String>>>,
     cell_id: &str,
 ) -> Result<()> {
@@ -2074,7 +2139,7 @@ fn validate_graph_node_interval(field: &'static str, interval: Duration) -> Resu
 }
 
 async fn release_graph_node_leases(
-    control: &GraphControlPlane,
+    control: &dyn GraphControlClient,
     leases: Vec<ShardLease>,
 ) -> Result<()> {
     let mut first_error = None;
@@ -2095,7 +2160,7 @@ async fn release_graph_node_leases(
 }
 
 async fn close_cluster_and_release_leases(
-    control: &GraphControlPlane,
+    control: &dyn GraphControlClient,
     cluster: &RoutedGraphCluster,
 ) -> Result<()> {
     let leases_to_release = cluster.local_leases()?;
@@ -2112,7 +2177,7 @@ async fn close_shards_best_effort(shards: BTreeMap<String, GraphShard>) {
 }
 
 async fn cleanup_partial_cluster_open(
-    control: &GraphControlPlane,
+    control: &dyn GraphControlClient,
     leases: &Arc<RwLock<BTreeMap<String, ShardLease>>>,
     shards: BTreeMap<String, GraphShard>,
 ) {
