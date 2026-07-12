@@ -55,17 +55,34 @@ pub enum QueryBatchOperation {
         edge_type: String,
         edges: Vec<QueryBatchEdge>,
     },
+    DeleteVertices {
+        vertices: Vec<VertexId>,
+        detach: bool,
+    },
+    DeleteRelationshipsByProperty {
+        edge_type: String,
+        property: String,
+        values: Vec<VertexPropertyValue>,
+    },
 }
 
 impl QueryBatchOperation {
     pub fn is_write(&self) -> bool {
-        matches!(self, Self::CreateEdges { .. } | Self::DeleteEdges { .. })
+        matches!(
+            self,
+            Self::CreateEdges { .. }
+                | Self::DeleteEdges { .. }
+                | Self::DeleteVertices { .. }
+                | Self::DeleteRelationshipsByProperty { .. }
+        )
     }
 
     pub fn len(&self) -> usize {
         match self {
             Self::OutNeighbors { sources, .. } => sources.len(),
             Self::CreateEdges { edges, .. } | Self::DeleteEdges { edges, .. } => edges.len(),
+            Self::DeleteVertices { vertices, .. } => vertices.len(),
+            Self::DeleteRelationshipsByProperty { values, .. } => values.len(),
         }
     }
 

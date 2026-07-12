@@ -503,6 +503,77 @@ async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
         .iter()
         .all(|entry| !entry.exists));
 
+    let _ = session
+        .run("CREATE ({id: 30})-[:FOLLOWS]->({id: 31})")
+        .await
+        .unwrap();
+    let _ = session
+        .run_with_params(
+            "UNWIND $vertices AS row MATCH (n {id: row.vertex}) DETACH DELETE n",
+            BoltDict::from([(
+                "vertices".to_string(),
+                BoltValue::List(vec![BoltValue::Dict(BoltDict::from([(
+                    "vertex".to_string(),
+                    BoltValue::Integer(30),
+                )]))]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert!(!cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "FOLLOWS", 30, 31)
+        .await
+        .unwrap());
+
+    let _ = session
+        .run("CREATE ({id: 40})-[:RELATES {chunk_id: 'chunk-a'}]->({id: 41})")
+        .await
+        .unwrap();
+    let _ = session
+        .run("CREATE ({id: 40})-[:RELATES {chunk_id: 'chunk-b'}]->({id: 41})")
+        .await
+        .unwrap();
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MATCH ()-[r:RELATES {chunk_id: row.chunk_id}]->() DELETE r",
+            BoltDict::from([(
+                "rows".to_string(),
+                BoltValue::List(vec![BoltValue::Dict(BoltDict::from([(
+                    "chunk_id".to_string(),
+                    BoltValue::String("chunk-a".to_string()),
+                )]))]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "RELATES", 40, 41)
+        .await
+        .unwrap());
+    let chunk_a = session
+        .run(
+            "MATCH ({id: 40})-[r:RELATES {chunk_id: 'chunk-a'}]->({id: 41}) \
+             RETURN count(*) AS count",
+        )
+        .await
+        .unwrap();
+    let chunk_b = session
+        .run(
+            "MATCH ({id: 40})-[r:RELATES {chunk_id: 'chunk-b'}]->({id: 41}) \
+             RETURN count(*) AS count",
+        )
+        .await
+        .unwrap();
+    assert_eq!(chunk_a.records, vec![vec![BoltValue::Integer(0)]]);
+    assert_eq!(chunk_b.records, vec![vec![BoltValue::Integer(1)]]);
+
     let malformed = session
         .run_with_params(
             "UNWIND $edges AS edge \

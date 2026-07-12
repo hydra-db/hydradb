@@ -3144,6 +3144,49 @@ impl QueryCellClient for RoutedGraphCluster {
                     .await?;
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
+            crate::QueryBatchOperation::DeleteVertices { vertices, detach } => {
+                self.ensure_active_write_lease(&context.cell_id)?;
+                for (index, vertex) in vertices.into_iter().enumerate() {
+                    if context
+                        .cancellation_token
+                        .as_ref()
+                        .is_some_and(crate::QueryCancellationToken::is_cancelled)
+                    {
+                        return Err(GraphError::QueryTimeout {
+                            operation: "query_cancelled",
+                            elapsed_ms: 0,
+                            limit_ms: 0,
+                        });
+                    }
+                    let idempotency_key = format!(
+                        "{}.unwind-delete-vertex.{index:020}.{vertex}",
+                        context.idempotency_key
+                    );
+                    if detach {
+                        shard
+                            .detach_delete_vertex(&context.cell_id, vertex, &idempotency_key)
+                            .await?;
+                    } else {
+                        shard
+                            .delete_vertex(&context.cell_id, vertex, &idempotency_key)
+                            .await?;
+                    }
+                }
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::DeleteRelationshipsByProperty {
+                edge_type,
+                property,
+                values,
+            } => {
+                self.ensure_active_write_lease(&context.cell_id)?;
+                shard
+                    .delete_relationships_by_property_values_batch(
+                        &context, &edge_type, &property, values,
+                    )
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
         }
     }
 
