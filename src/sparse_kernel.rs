@@ -75,6 +75,13 @@ pub(crate) use graphblas::CompiledGraphBlasMatrix;
 #[cfg(not(feature = "graphblas"))]
 pub(crate) struct CompiledGraphBlasMatrix;
 
+#[cfg(not(feature = "graphblas"))]
+impl CompiledGraphBlasMatrix {
+    pub(crate) fn estimated_resident_bytes(&self) -> usize {
+        0
+    }
+}
+
 pub(crate) fn compile_graphblas_matrix(adjacency: &Adjacency) -> Result<CompiledGraphBlasMatrix> {
     compile_graphblas(adjacency)
 }
@@ -582,6 +589,7 @@ mod graphblas {
         compact: Option<CompiledCompactCscMatrix>,
         replicas: Vec<Mutex<CompiledGraphBlasMatrixInner>>,
         next_replica: AtomicUsize,
+        estimated_resident_bytes: usize,
     }
 
     struct CompiledCompactCscMatrix {
@@ -936,6 +944,7 @@ mod graphblas {
                     compact: Some(CompiledCompactCscMatrix::from_csc(csc)),
                     replicas: Vec::new(),
                     next_replica: AtomicUsize::new(0),
+                    estimated_resident_bytes: compact_csc_resident_bytes(csc),
                 });
             }
             init()?;
@@ -952,16 +961,19 @@ mod graphblas {
                 compact: None,
                 replicas,
                 next_replica: AtomicUsize::new(0),
+                estimated_resident_bytes: native_graphblas_resident_bytes(csc, replica_count),
             })
         }
 
         pub(crate) fn new_from_csc_owned(csc: GraphBlasCsc) -> Result<Self> {
             validate_csc(&csc)?;
             if use_compact_csc_kernel() {
+                let compact_bytes = compact_csc_resident_bytes(&csc);
                 return Ok(Self {
                     compact: Some(CompiledCompactCscMatrix::from_owned_csc(csc)),
                     replicas: Vec::new(),
                     next_replica: AtomicUsize::new(0),
+                    estimated_resident_bytes: compact_bytes,
                 });
             }
             Self::new_from_csc(&csc)
@@ -974,12 +986,26 @@ mod graphblas {
         ) -> Result<Self> {
             validate_compact_u32_csc(&vertices, &pointers, &indices)?;
             if use_compact_csc_kernel() {
+                let estimated_resident_bytes = vertices
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<VertexId>())
+                    .saturating_add(
+                        pointers
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<u32>()),
+                    )
+                    .saturating_add(
+                        indices
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<u32>()),
+                    );
                 return Ok(Self {
                     compact: Some(CompiledCompactCscMatrix::from_u32_parts(
                         vertices, pointers, indices,
                     )),
                     replicas: Vec::new(),
                     next_replica: AtomicUsize::new(0),
+                    estimated_resident_bytes,
                 });
             }
             let csc = GraphBlasCsc {
@@ -1007,6 +1033,10 @@ mod graphblas {
                     reason: "compiled matrix cache lock was poisoned".to_string(),
                 })?;
             expand_with_compiled(adjacency, starts, hops, &inner)
+        }
+
+        pub(crate) fn estimated_resident_bytes(&self) -> usize {
+            self.estimated_resident_bytes
         }
 
         pub(crate) fn expand_range(
@@ -1071,6 +1101,50 @@ mod graphblas {
                 })?;
             expand_range_window_with_compiled(adjacency, starts, min_hops, max_hops, window, &inner)
         }
+    }
+
+    fn compact_csc_resident_bytes(csc: &GraphBlasCsc) -> usize {
+        let pointer_bytes = if csc
+            .pointers
+            .iter()
+            .all(|value| u32::try_from(*value).is_ok())
+        {
+            std::mem::size_of::<u32>()
+        } else {
+            std::mem::size_of::<u64>()
+        };
+        let index_bytes = if csc
+            .indices
+            .iter()
+            .all(|value| u32::try_from(*value).is_ok())
+        {
+            std::mem::size_of::<u32>()
+        } else {
+            std::mem::size_of::<u64>()
+        };
+        csc.vertices
+            .len()
+            .saturating_mul(std::mem::size_of::<VertexId>())
+            .saturating_add(csc.pointers.len().saturating_mul(pointer_bytes))
+            .saturating_add(csc.indices.len().saturating_mul(index_bytes))
+    }
+
+    fn native_graphblas_resident_bytes(csc: &GraphBlasCsc, replicas: usize) -> usize {
+        let per_replica = csc
+            .vertices
+            .len()
+            .saturating_mul(std::mem::size_of::<VertexId>().saturating_mul(2))
+            .saturating_add(
+                csc.pointers
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+            .saturating_add(
+                csc.indices
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u64>() + std::mem::size_of::<bool>()),
+            );
+        per_replica.saturating_mul(replicas).saturating_mul(2)
     }
 
     pub(super) fn expand(

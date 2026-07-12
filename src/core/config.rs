@@ -8,7 +8,7 @@ use slatedb::{Db, DbReader};
 
 use crate::{GraphCachePolicy, GraphEpoch, Result};
 
-pub const DEFAULT_TRUSTED_APPEND_CHUNK_EDGES: usize = 32_768;
+pub const DEFAULT_TRUSTED_APPEND_CHUNK_EDGES: usize = 4_096;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphLimits {
     pub max_bulk_import_edges: usize,
@@ -151,6 +151,115 @@ pub struct GraphOpenOptions {
     pub index_policy: GraphIndexPolicy,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphMemoryConfig {
+    pub storage: GraphStorageMemoryConfig,
+    pub max_matrix_adjacency_bytes: usize,
+    pub max_graphblas_bytes: usize,
+    pub max_posting_chunk_bytes: usize,
+    pub max_materialized_supernode_bytes: usize,
+    pub max_concurrent_matrix_compilations: usize,
+}
+
+impl Default for GraphMemoryConfig {
+    fn default() -> Self {
+        Self {
+            storage: GraphStorageMemoryConfig::default(),
+            max_matrix_adjacency_bytes: 64 * 1024 * 1024,
+            max_graphblas_bytes: 128 * 1024 * 1024,
+            max_posting_chunk_bytes: 64 * 1024 * 1024,
+            max_materialized_supernode_bytes: 64 * 1024 * 1024,
+            max_concurrent_matrix_compilations: 1,
+        }
+    }
+}
+
+impl GraphMemoryConfig {
+    pub fn low_memory() -> Self {
+        Self {
+            storage: GraphStorageMemoryConfig::low_memory(),
+            max_matrix_adjacency_bytes: 16 * 1024 * 1024,
+            max_graphblas_bytes: 32 * 1024 * 1024,
+            max_posting_chunk_bytes: 16 * 1024 * 1024,
+            max_materialized_supernode_bytes: 16 * 1024 * 1024,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn matrix_compilation_permits(&self) -> usize {
+        self.max_concurrent_matrix_compilations.max(1)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphStorageMemoryConfig {
+    pub l0_sst_size_bytes: usize,
+    pub max_unflushed_bytes: usize,
+    pub max_wal_flushes_before_l0_flush: u64,
+    pub l0_flush_parallelism: usize,
+}
+
+impl Default for GraphStorageMemoryConfig {
+    fn default() -> Self {
+        Self {
+            l0_sst_size_bytes: 16 * 1024 * 1024,
+            max_unflushed_bytes: 64 * 1024 * 1024,
+            max_wal_flushes_before_l0_flush: 4_096,
+            l0_flush_parallelism: 1,
+        }
+    }
+}
+
+impl GraphStorageMemoryConfig {
+    pub fn low_memory() -> Self {
+        Self {
+            l0_sst_size_bytes: 4 * 1024 * 1024,
+            max_unflushed_bytes: 16 * 1024 * 1024,
+            ..Self::default()
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.l0_sst_size_bytes == 0 {
+            return Err(crate::GraphError::CorruptValue {
+                key: "storage_memory/l0_sst_size_bytes".to_string(),
+                reason: "L0 SST size must be greater than zero".to_string(),
+            });
+        }
+        if self.max_unflushed_bytes < self.l0_sst_size_bytes {
+            return Err(crate::GraphError::CorruptValue {
+                key: "storage_memory/max_unflushed_bytes".to_string(),
+                reason: format!(
+                    "max unflushed bytes {} must be at least the L0 SST size {}",
+                    self.max_unflushed_bytes, self.l0_sst_size_bytes
+                ),
+            });
+        }
+        if self.max_wal_flushes_before_l0_flush < 4_096 {
+            return Err(crate::GraphError::CorruptValue {
+                key: "storage_memory/max_wal_flushes_before_l0_flush".to_string(),
+                reason: "maximum WAL flush count must be at least 4096".to_string(),
+            });
+        }
+        if self.l0_flush_parallelism == 0 {
+            return Err(crate::GraphError::CorruptValue {
+                key: "storage_memory/l0_flush_parallelism".to_string(),
+                reason: "L0 flush parallelism must be greater than zero".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn apply_to_settings(&self, settings: &mut Settings) -> Result<()> {
+        self.validate()?;
+        settings.l0_sst_size_bytes = self.l0_sst_size_bytes;
+        settings.max_unflushed_bytes = self.max_unflushed_bytes;
+        settings.max_wal_flushes_before_l0_flush = self.max_wal_flushes_before_l0_flush;
+        settings.l0_flush_parallelism = self.l0_flush_parallelism;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum GraphIndexPolicy {
     #[default]
@@ -208,10 +317,12 @@ pub(crate) async fn open_graph_db(
     path: impl Into<Path>,
     object_store: Arc<dyn ObjectStore>,
     cache: &GraphCacheConfig,
+    storage_memory: &GraphStorageMemoryConfig,
     durability: &GraphDurabilityConfig,
 ) -> Result<Db> {
     let mut settings = Settings::default();
     cache.apply_to_settings(&mut settings);
+    storage_memory.apply_to_settings(&mut settings)?;
     durability.apply_to_settings(&mut settings);
     Ok(Db::builder(path, object_store)
         .with_settings(settings)
@@ -230,4 +341,79 @@ pub(crate) async fn open_graph_reader(
         .with_options(options)
         .build()
         .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_memory_profiles_are_valid_and_bounded() {
+        let balanced = GraphStorageMemoryConfig::default();
+        balanced.validate().unwrap();
+        assert_eq!(balanced.l0_sst_size_bytes, 16 * 1024 * 1024);
+        assert_eq!(balanced.max_unflushed_bytes, 64 * 1024 * 1024);
+
+        let low_memory = GraphStorageMemoryConfig::low_memory();
+        low_memory.validate().unwrap();
+        assert_eq!(low_memory.l0_sst_size_bytes, 4 * 1024 * 1024);
+        assert_eq!(low_memory.max_unflushed_bytes, 16 * 1024 * 1024);
+
+        let memory = GraphMemoryConfig::low_memory();
+        assert_eq!(memory.max_posting_chunk_bytes, 16 * 1024 * 1024);
+        assert_eq!(memory.max_materialized_supernode_bytes, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn storage_memory_rejects_invalid_limits() {
+        let mut config = GraphStorageMemoryConfig::default();
+        config.max_unflushed_bytes = config.l0_sst_size_bytes - 1;
+        assert!(config.validate().is_err());
+
+        let config = GraphStorageMemoryConfig {
+            max_wal_flushes_before_l0_flush: 4_095,
+            ..GraphStorageMemoryConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = GraphStorageMemoryConfig {
+            l0_flush_parallelism: 0,
+            ..GraphStorageMemoryConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn existing_public_option_literals_remain_source_compatible() {
+        let cache_policy = GraphCachePolicy {
+            max_matrix_artifacts: 1,
+            max_matrix_adjacencies: 1,
+            max_graphblas_matrices: 1,
+            #[cfg(feature = "opencypher")]
+            max_parsed_row_queries: 1,
+            #[cfg(feature = "opencypher")]
+            max_reachability_results: 1,
+            #[cfg(feature = "opencypher")]
+            max_relationship_row_sets: 1,
+            #[cfg(feature = "opencypher")]
+            max_relationship_property_row_sets: 1,
+            max_supernode_groups: 1,
+            max_posting_chunks: 1,
+            max_materialized_supernodes: 1,
+            max_entries_per_cell: Some(1),
+            pin_matrix_min_edges: 1,
+            pin_supernode_min_degree: 1,
+            prefetch_supernode_chunks: 1,
+            max_concurrent_hydrations: 1,
+        };
+        let _options = GraphOpenOptions {
+            limits: GraphLimits::default(),
+            cache: GraphCacheConfig::default(),
+            durability: GraphDurabilityConfig::default(),
+            cache_policy,
+            retention_policy: GraphRetentionPolicy::default(),
+            backpressure_policy: GraphBackpressurePolicy::default(),
+            index_policy: GraphIndexPolicy::default(),
+        };
+    }
 }
