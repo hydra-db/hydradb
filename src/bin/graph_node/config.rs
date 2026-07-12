@@ -1,0 +1,453 @@
+use std::collections::BTreeMap;
+use std::io::{Error, ErrorKind};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use slatedb_graph_kernel::{
+    GraphBackpressurePolicy, GraphCacheConfig, GraphDurabilityConfig, GraphId, GraphIndexPolicy,
+    GraphLimits, GraphOpenOptions, GraphRetentionPolicy, GraphScope, NamespaceId, NamespacePath,
+};
+
+type ConfigResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    pub node_id: String,
+    pub scope: GraphScope,
+    pub cell_id: String,
+    pub database: String,
+    pub data_path: String,
+    pub data_cache_dir: PathBuf,
+    pub data_cache_bytes: usize,
+    pub lease_ttl: Duration,
+    pub lease_renew_interval: Duration,
+    pub shard_refresh_interval: Duration,
+    pub heartbeat_ttl: Duration,
+    pub bolt_addr: SocketAddr,
+    pub http_addr: SocketAddr,
+    pub admin_addr: SocketAddr,
+    pub bolt_node_addresses: BTreeMap<String, String>,
+    pub auth_token_file: PathBuf,
+    pub tls_certificate: Option<PathBuf>,
+    pub tls_private_key: Option<PathBuf>,
+    pub allow_plaintext: bool,
+    pub max_concurrent_queries: usize,
+    pub max_query_runtime_ms: u64,
+    pub max_bolt_connections: usize,
+    pub default_page_size: usize,
+    pub graceful_shutdown_timeout: Duration,
+    pub control_rpc_endpoint: SocketAddr,
+    pub control_rpc_server_name: String,
+    pub internal_tls_certificate: Option<PathBuf>,
+    pub internal_tls_private_key: Option<PathBuf>,
+    pub internal_tls_ca: Option<PathBuf>,
+    pub internal_allow_plaintext: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ControllerRuntimeConfig {
+    pub scope: GraphScope,
+    pub cells: Vec<String>,
+    pub control_path: String,
+    pub control_cache_dir: PathBuf,
+    pub control_cache_bytes: usize,
+    pub lease_ttl: Duration,
+    pub heartbeat_ttl: Duration,
+    pub controller_interval: Duration,
+    pub rebalance_mode: GraphClusterRebalanceMode,
+    pub control_rpc_addr: SocketAddr,
+    pub admin_addr: SocketAddr,
+    pub internal_tls_certificate: Option<PathBuf>,
+    pub internal_tls_private_key: Option<PathBuf>,
+    pub internal_tls_ca: Option<PathBuf>,
+    pub internal_allow_plaintext: bool,
+    pub runtime_lease_ttl: Duration,
+    pub runtime_lease_renew_interval: Duration,
+}
+
+use slatedb_graph_kernel::GraphClusterRebalanceMode;
+
+impl RuntimeConfig {
+    pub fn from_env() -> ConfigResult<Self> {
+        Self::from_values(std::env::vars().collect())
+    }
+
+    fn from_values(values: BTreeMap<String, String>) -> ConfigResult<Self> {
+        let namespace = value(&values, "GRAPH_NAMESPACE", "default");
+        let namespace = NamespacePath::new(
+            namespace
+                .split('/')
+                .map(|segment| NamespaceId::new(segment.to_string()))
+                .collect::<slatedb_graph_kernel::Result<Vec<_>>>()?,
+        )?;
+        let scope = GraphScope::new(
+            namespace,
+            GraphId::new(value(&values, "GRAPH_ID", "default"))?,
+        );
+        let cell_id = value(&values, "GRAPH_CELL_ID", "cell-0");
+        let allow_plaintext = parse_bool(&values, "GRAPH_ALLOW_PLAINTEXT", false)?;
+        let tls_certificate = optional_path(&values, "GRAPH_TLS_CERTIFICATE");
+        let tls_private_key = optional_path(&values, "GRAPH_TLS_PRIVATE_KEY");
+        if !allow_plaintext && (tls_certificate.is_none() || tls_private_key.is_none()) {
+            return invalid(
+                "graph runtime requires GRAPH_TLS_CERTIFICATE and GRAPH_TLS_PRIVATE_KEY unless GRAPH_ALLOW_PLAINTEXT=true",
+            );
+        }
+        let advertised_bolt_addr = value(&values, "GRAPH_ADVERTISED_BOLT_ADDR", "localhost:7687");
+        if advertised_bolt_addr.trim().is_empty()
+            || advertised_bolt_addr.chars().any(char::is_whitespace)
+        {
+            return invalid("GRAPH_ADVERTISED_BOLT_ADDR must be a non-empty host:port");
+        }
+        let bolt_node_addresses = parse_node_addresses(
+            &values,
+            &value(
+                &values,
+                "GRAPH_BOLT_NODE_ADDRESSES",
+                &format!(
+                    "{}={advertised_bolt_addr}",
+                    value(&values, "GRAPH_NODE_ID", "graph-node-0")
+                ),
+            ),
+        )?;
+        let internal_allow_plaintext =
+            parse_bool(&values, "GRAPH_INTERNAL_ALLOW_PLAINTEXT", false)?;
+        let internal_tls_certificate = optional_path(&values, "GRAPH_INTERNAL_TLS_CERTIFICATE");
+        let internal_tls_private_key = optional_path(&values, "GRAPH_INTERNAL_TLS_PRIVATE_KEY");
+        let internal_tls_ca = optional_path(&values, "GRAPH_INTERNAL_TLS_CA");
+        validate_internal_tls(
+            internal_allow_plaintext,
+            &internal_tls_certificate,
+            &internal_tls_private_key,
+            &internal_tls_ca,
+        )?;
+        Ok(Self {
+            node_id: value(&values, "GRAPH_NODE_ID", "graph-node-0"),
+            scope,
+            cell_id,
+            database: value(&values, "GRAPH_DATABASE", "default"),
+            data_path: value(&values, "GRAPH_DATA_PATH", "graph/data"),
+            data_cache_dir: PathBuf::from(value(
+                &values,
+                "GRAPH_DATA_CACHE_DIR",
+                "/var/cache/slatedb/data",
+            )),
+            data_cache_bytes: parse_usize(
+                &values,
+                "GRAPH_DATA_CACHE_BYTES",
+                8 * 1024 * 1024 * 1024,
+            )?,
+            lease_ttl: parse_duration(&values, "GRAPH_LEASE_TTL_MS", 30_000)?,
+            lease_renew_interval: parse_duration(&values, "GRAPH_LEASE_RENEW_INTERVAL_MS", 5_000)?,
+            shard_refresh_interval: parse_duration(
+                &values,
+                "GRAPH_SHARD_REFRESH_INTERVAL_MS",
+                2_000,
+            )?,
+            heartbeat_ttl: parse_duration(&values, "GRAPH_HEARTBEAT_TTL_MS", 20_000)?,
+            bolt_addr: parse_socket(&values, "GRAPH_BOLT_ADDR", "0.0.0.0:7687")?,
+            http_addr: parse_socket(&values, "GRAPH_HTTP_ADDR", "0.0.0.0:8443")?,
+            admin_addr: parse_socket(&values, "GRAPH_ADMIN_ADDR", "0.0.0.0:9090")?,
+            bolt_node_addresses,
+            auth_token_file: PathBuf::from(value(
+                &values,
+                "GRAPH_AUTH_TOKEN_FILE",
+                "/var/run/secrets/slatedb-graph/auth-token",
+            )),
+            tls_certificate,
+            tls_private_key,
+            allow_plaintext,
+            max_concurrent_queries: parse_usize(&values, "GRAPH_MAX_CONCURRENT_QUERIES", 256)?,
+            max_query_runtime_ms: parse_u64(&values, "GRAPH_MAX_QUERY_RUNTIME_MS", 30_000)?,
+            max_bolt_connections: parse_usize(&values, "GRAPH_MAX_BOLT_CONNECTIONS", 4_096)?,
+            default_page_size: parse_usize(&values, "GRAPH_DEFAULT_PAGE_SIZE", 1_024)?,
+            graceful_shutdown_timeout: parse_duration(
+                &values,
+                "GRAPH_GRACEFUL_SHUTDOWN_MS",
+                30_000,
+            )?,
+            control_rpc_endpoint: parse_socket(
+                &values,
+                "GRAPH_CONTROL_RPC_ENDPOINT",
+                "127.0.0.1:9443",
+            )?,
+            control_rpc_server_name: value(
+                &values,
+                "GRAPH_CONTROL_RPC_SERVER_NAME",
+                "graph-controller.slatedb-graph.svc.cluster.local",
+            ),
+            internal_tls_certificate,
+            internal_tls_private_key,
+            internal_tls_ca,
+            internal_allow_plaintext,
+        })
+    }
+
+    pub fn graph_open_options(&self) -> GraphOpenOptions {
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_runtime_ms: Some(self.max_query_runtime_ms),
+                ..GraphLimits::default()
+            },
+            cache: GraphCacheConfig::disk_cache_without_preload(
+                &self.data_cache_dir,
+                self.data_cache_bytes,
+            ),
+            durability: GraphDurabilityConfig::default(),
+            cache_policy: Default::default(),
+            retention_policy: GraphRetentionPolicy::default(),
+            backpressure_policy: GraphBackpressurePolicy::default(),
+            index_policy: GraphIndexPolicy::Full,
+        }
+    }
+
+    pub fn read_auth_token(&self) -> ConfigResult<String> {
+        let token = std::fs::read_to_string(&self.auth_token_file)?
+            .trim()
+            .to_string();
+        if token.len() < 32 || token.eq_ignore_ascii_case("change-me") {
+            return invalid("graph auth token must contain at least 32 non-placeholder characters");
+        }
+        Ok(token)
+    }
+}
+
+impl ControllerRuntimeConfig {
+    pub fn from_env() -> ConfigResult<Self> {
+        let values: BTreeMap<_, _> = std::env::vars().collect();
+        let namespace = value(&values, "GRAPH_NAMESPACE", "default");
+        let namespace = NamespacePath::new(
+            namespace
+                .split('/')
+                .map(|segment| NamespaceId::new(segment.to_string()))
+                .collect::<slatedb_graph_kernel::Result<Vec<_>>>()?,
+        )?;
+        let scope = GraphScope::new(
+            namespace,
+            GraphId::new(value(&values, "GRAPH_ID", "default"))?,
+        );
+        let cells = value(&values, "GRAPH_CELLS", "cell-0")
+            .split(',')
+            .map(str::trim)
+            .filter(|cell| !cell.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if cells.is_empty() {
+            return invalid("GRAPH_CELLS must contain at least one cell");
+        }
+        let internal_allow_plaintext =
+            parse_bool(&values, "GRAPH_INTERNAL_ALLOW_PLAINTEXT", false)?;
+        let internal_tls_certificate = optional_path(&values, "GRAPH_INTERNAL_TLS_CERTIFICATE");
+        let internal_tls_private_key = optional_path(&values, "GRAPH_INTERNAL_TLS_PRIVATE_KEY");
+        let internal_tls_ca = optional_path(&values, "GRAPH_INTERNAL_TLS_CA");
+        validate_internal_tls(
+            internal_allow_plaintext,
+            &internal_tls_certificate,
+            &internal_tls_private_key,
+            &internal_tls_ca,
+        )?;
+        Ok(Self {
+            scope,
+            cells,
+            control_path: value(&values, "GRAPH_CONTROL_PATH", "graph/control"),
+            control_cache_dir: PathBuf::from(value(
+                &values,
+                "GRAPH_CONTROL_CACHE_DIR",
+                "/var/cache/slatedb/control",
+            )),
+            control_cache_bytes: parse_usize(
+                &values,
+                "GRAPH_CONTROL_CACHE_BYTES",
+                512 * 1024 * 1024,
+            )?,
+            lease_ttl: parse_duration(&values, "GRAPH_LEASE_TTL_MS", 30_000)?,
+            heartbeat_ttl: parse_duration(&values, "GRAPH_HEARTBEAT_TTL_MS", 20_000)?,
+            controller_interval: parse_duration(&values, "GRAPH_CONTROLLER_INTERVAL_MS", 2_000)?,
+            rebalance_mode: match value(&values, "GRAPH_REBALANCE_MODE", "stability-first").as_str()
+            {
+                "stability-first" => GraphClusterRebalanceMode::StabilityFirst,
+                "rendezvous" => GraphClusterRebalanceMode::Rendezvous,
+                other => return invalid(format!("unsupported GRAPH_REBALANCE_MODE {other}")),
+            },
+            control_rpc_addr: parse_socket(&values, "GRAPH_CONTROL_RPC_ADDR", "0.0.0.0:9443")?,
+            admin_addr: parse_socket(&values, "GRAPH_ADMIN_ADDR", "0.0.0.0:9090")?,
+            internal_tls_certificate,
+            internal_tls_private_key,
+            internal_tls_ca,
+            internal_allow_plaintext,
+            runtime_lease_ttl: parse_duration(&values, "GRAPH_RUNTIME_LEASE_TTL_MS", 30_000)?,
+            runtime_lease_renew_interval: parse_duration(
+                &values,
+                "GRAPH_RUNTIME_LEASE_RENEW_INTERVAL_MS",
+                5_000,
+            )?,
+        })
+    }
+}
+
+fn validate_internal_tls(
+    allow_plaintext: bool,
+    certificate: &Option<PathBuf>,
+    private_key: &Option<PathBuf>,
+    ca: &Option<PathBuf>,
+) -> ConfigResult<()> {
+    if !allow_plaintext && (certificate.is_none() || private_key.is_none() || ca.is_none()) {
+        return invalid(
+            "internal control RPC requires GRAPH_INTERNAL_TLS_CERTIFICATE, GRAPH_INTERNAL_TLS_PRIVATE_KEY, and GRAPH_INTERNAL_TLS_CA unless GRAPH_INTERNAL_ALLOW_PLAINTEXT=true",
+        );
+    }
+    Ok(())
+}
+
+fn value(values: &BTreeMap<String, String>, name: &str, default: &str) -> String {
+    values
+        .get(name)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn optional_path(values: &BTreeMap<String, String>, name: &str) -> Option<PathBuf> {
+    values
+        .get(name)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn parse_socket(
+    values: &BTreeMap<String, String>,
+    name: &str,
+    default: &str,
+) -> ConfigResult<SocketAddr> {
+    Ok(value(values, name, default)
+        .parse()
+        .map_err(|err| Error::new(ErrorKind::InvalidInput, format!("invalid {name}: {err}")))?)
+}
+
+fn parse_duration(
+    values: &BTreeMap<String, String>,
+    name: &str,
+    default_ms: u64,
+) -> ConfigResult<Duration> {
+    let millis = parse_u64(values, name, default_ms)?;
+    if millis == 0 {
+        return invalid(format!("{name} must be greater than zero"));
+    }
+    Ok(Duration::from_millis(millis))
+}
+
+fn parse_u64(values: &BTreeMap<String, String>, name: &str, default: u64) -> ConfigResult<u64> {
+    let raw = value(values, name, &default.to_string());
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|err| Error::new(ErrorKind::InvalidInput, format!("invalid {name}: {err}")))?;
+    if parsed == 0 {
+        return invalid(format!("{name} must be greater than zero"));
+    }
+    Ok(parsed)
+}
+
+fn parse_usize(
+    values: &BTreeMap<String, String>,
+    name: &str,
+    default: usize,
+) -> ConfigResult<usize> {
+    usize::try_from(parse_u64(values, name, default as u64)?).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("{name} does not fit usize"),
+        )
+        .into()
+    })
+}
+
+fn parse_bool(values: &BTreeMap<String, String>, name: &str, default: bool) -> ConfigResult<bool> {
+    match value(values, name, if default { "true" } else { "false" })
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => invalid(format!("invalid boolean {name}={other}")),
+    }
+}
+
+fn parse_node_addresses(
+    _values: &BTreeMap<String, String>,
+    raw: &str,
+) -> ConfigResult<BTreeMap<String, String>> {
+    let mut addresses = BTreeMap::new();
+    for entry in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (node_id, address) = entry.split_once('=').ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "GRAPH_BOLT_NODE_ADDRESSES entries must use node-id=host:port",
+            )
+        })?;
+        let node_id = node_id.trim();
+        let address = address.trim();
+        if node_id.is_empty()
+            || address.is_empty()
+            || addresses
+                .insert(node_id.to_string(), address.to_string())
+                .is_some()
+        {
+            return invalid(
+                "GRAPH_BOLT_NODE_ADDRESSES contains an empty or duplicate node id/address",
+            );
+        }
+    }
+    if addresses.is_empty() {
+        return invalid("GRAPH_BOLT_NODE_ADDRESSES must contain at least one endpoint");
+    }
+    Ok(addresses)
+}
+
+fn invalid<T>(message: impl Into<String>) -> ConfigResult<T> {
+    Err(Error::new(ErrorKind::InvalidInput, message.into()).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_runtime_requires_tls() {
+        let values = BTreeMap::from([("GRAPH_AUTH_TOKEN_FILE".to_string(), "/token".to_string())]);
+        let error = RuntimeConfig::from_values(values).unwrap_err();
+        assert!(error.to_string().contains("requires GRAPH_TLS_CERTIFICATE"));
+    }
+
+    #[test]
+    fn plaintext_runtime_config_is_explicit_and_bounded() {
+        let values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            (
+                "GRAPH_INTERNAL_ALLOW_PLAINTEXT".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+        let config = RuntimeConfig::from_values(values).unwrap();
+        assert_eq!(config.max_query_runtime_ms, 30_000);
+    }
+
+    #[test]
+    fn graph_node_config_uses_remote_control_endpoint() {
+        let values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            (
+                "GRAPH_INTERNAL_ALLOW_PLAINTEXT".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+        let config = RuntimeConfig::from_values(values).unwrap();
+        assert_eq!(config.control_rpc_endpoint.port(), 9443);
+    }
+}

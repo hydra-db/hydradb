@@ -562,6 +562,11 @@ fn assert_stale_node_a(err: GraphError) {
 #[tokio::test]
 async fn raw_graph_shard_open_is_read_only() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = open_test_shard("graph/read-only-open", Arc::clone(&object_store)).await;
+    writer
+        .write_edge(mutation(1, 2, "seed-reader"))
+        .await
+        .unwrap();
     let shard = GraphShard::open("graph/read-only-open", object_store)
         .await
         .unwrap();
@@ -576,6 +581,29 @@ async fn raw_graph_shard_open_is_read_only() {
             cell_id
         } if cell_id == "reddit-home"
     ));
+    assert!(shard
+        .edge_exists("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 1, 2)
+        .await
+        .unwrap());
+    writer
+        .write_edge(mutation(1, 3, "writer-after-reader-open"))
+        .await
+        .unwrap();
+    shard.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn read_only_shard_requires_writer_initialized_store() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let err = match GraphShard::open("graph/uninitialized-reader", object_store).await {
+        Ok(_) => panic!("read-only shard initialized an empty database"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        GraphError::Slate(_) | GraphError::CorruptValue { .. }
+    ));
 }
 
 #[tokio::test]
@@ -586,6 +614,8 @@ async fn write_authoritative_open_rejects_relaxed_durability() {
         ..Default::default()
     };
 
+    let seed = open_test_shard("graph/relaxed-durability-reader", Arc::clone(&object_store)).await;
+    seed.close().await.unwrap();
     let reader = GraphShard::open_with_options(
         "graph/relaxed-durability-reader",
         Arc::clone(&object_store),
@@ -741,6 +771,10 @@ async fn graph_layer_caches_match_reopened_object_store_truth() {
         cache_policy: GraphCachePolicy {
             prefetch_supernode_chunks: 2,
             ..Default::default()
+        },
+        retention_policy: GraphRetentionPolicy {
+            read_lease_ttl_ms: 0,
+            ..GraphRetentionPolicy::default()
         },
         ..Default::default()
     };
@@ -1066,112 +1100,30 @@ async fn write_edge_commits_canonical_records_and_outbox() {
 }
 
 #[test]
-fn compact_v2_values_decode_alongside_legacy_v1_values() {
+fn canonical_graph_records_reject_obsolete_internal_formats() {
     let edge_key = keys::out_edge("reddit-home", "USER_FOLLOWS_USER", 1, 2);
-    let v1_edge = b"edge1\t7\treddit-home\tUSER_FOLLOWS_USER\t1\t2\n";
-    let decoded_v1 = decode_edge_record(&edge_key, v1_edge).unwrap();
-    assert_eq!(decoded_v1.epoch, 7);
-    assert_eq!(decoded_v1.src, 1);
-    assert_eq!(decoded_v1.dst, 2);
-
-    let v2_edge = decode_edge_record(&edge_key, b"edge2\t8\n").unwrap();
-    assert_eq!(v2_edge.epoch, 8);
-    assert_eq!(v2_edge.edge_type, "USER_FOLLOWS_USER");
-    assert_eq!(v2_edge.src, 1);
-    assert_eq!(v2_edge.dst, 2);
-
-    let v3_edge = decode_edge_record(&edge_key, &encode_edge_epoch(9)).unwrap();
-    assert_eq!(v3_edge.epoch, 9);
-    assert_eq!(v3_edge.edge_type, "USER_FOLLOWS_USER");
-    assert_eq!(v3_edge.src, 1);
-    assert_eq!(v3_edge.dst, 2);
+    let canonical_edge = decode_edge_record(&edge_key, &encode_edge_epoch(9)).unwrap();
+    assert_eq!(canonical_edge.epoch, 9);
+    assert_eq!(canonical_edge.src, 1);
+    assert_eq!(canonical_edge.dst, 2);
+    assert!(decode_edge_record(
+        &edge_key,
+        b"edge1\t7\treddit-home\tUSER_FOLLOWS_USER\t1\t2\n"
+    )
+    .is_err());
+    assert!(decode_edge_record(&edge_key, b"edge2\t8\n").is_err());
 
     let outbox_key = keys::outbox("reddit-home", 9, DeltaKind::Plus, "USER_FOLLOWS_USER", 1, 2);
-    let delta_v2 = decode_delta_record(&outbox_key, b"delta2\n").unwrap();
-    assert_eq!(delta_v2.kind, DeltaKind::Plus);
-    assert_eq!(delta_v2.edge.epoch, 9);
-    assert_eq!(delta_v2.edge.src, 1);
-    assert_eq!(delta_v2.edge.dst, 2);
-
-    let outbox_batch_key = keys::outbox_batch(
-        "reddit-home",
-        11,
-        10,
-        DeltaKind::Plus,
-        "USER_FOLLOWS_USER",
-        "b1",
-    );
-    let outbox_batch_v2 = encode_outbox_delta_batch(
-        "reddit-home",
-        "USER_FOLLOWS_USER",
-        DeltaKind::Plus,
-        10,
-        11,
-        &[(1, 2), (3, 4)],
-    );
-    assert!(outbox_batch_v2.starts_with(b"outbox_batch2\n"));
-    let decoded_batch_v2 = decode_outbox_delta_batch(&outbox_batch_key, &outbox_batch_v2).unwrap();
-    assert_eq!(decoded_batch_v2.edges, vec![(1, 2), (3, 4)]);
-    assert_eq!(decoded_batch_v2.start_epoch, 10);
-    assert_eq!(decoded_batch_v2.end_epoch, 11);
-
-    let outbox_batch_v3 = encode_outbox_delta_batch(
-        "reddit-home",
-        "USER_FOLLOWS_USER",
-        DeltaKind::Plus,
-        10,
-        11,
-        &[(9, 2), (9, 4)],
-    );
-    assert!(outbox_batch_v3.starts_with(b"outbox_batch3\n"));
-    assert!(outbox_batch_v3.len() < outbox_batch_v2.len());
-    let decoded_batch_v3 = decode_outbox_delta_batch(&outbox_batch_key, &outbox_batch_v3).unwrap();
-    assert_eq!(decoded_batch_v3.edges, vec![(9, 2), (9, 4)]);
-    assert_eq!(decoded_batch_v3.start_epoch, 10);
-    assert_eq!(decoded_batch_v3.end_epoch, 11);
-
-    let outbox_batch_v1 =
-        b"outbox_batch1\treddit-home\tUSER_FOLLOWS_USER\t10\t11\tplus\t2\n1\t2\n3\t4\n";
-    let decoded_batch_v1 = decode_outbox_delta_batch(&outbox_batch_key, outbox_batch_v1).unwrap();
-    assert_eq!(decoded_batch_v1.edges, decoded_batch_v2.edges);
-
-    let owner_key = keys::owner_delta(
-        "reddit-home",
-        DeltaKind::Minus,
-        "USER_FOLLOWS_USER",
-        "in",
-        2,
-        10,
-        1,
-    );
-    let owner_delta = decode_delta_record(&owner_key, b"delta2\n").unwrap();
-    assert_eq!(owner_delta.kind, DeltaKind::Minus);
-    assert_eq!(owner_delta.edge.epoch, 10);
-    assert_eq!(owner_delta.edge.src, 1);
-    assert_eq!(owner_delta.edge.dst, 2);
-
-    let pair_key = keys::pair_delta(
-        "reddit-home",
-        DeltaKind::Plus,
-        "USER_FOLLOWS_USER",
-        1,
-        2,
-        12,
-    );
-    let pair_delta = decode_delta_record(&pair_key, b"delta2\n").unwrap();
-    assert_eq!(pair_delta.kind, DeltaKind::Plus);
-    assert_eq!(pair_delta.edge.epoch, 12);
-    assert_eq!(pair_delta.edge.src, 1);
-    assert_eq!(pair_delta.edge.dst, 2);
-
-    let legacy_delta = b"delta1\t+\t11\treddit-home\tUSER_FOLLOWS_USER\t3\t4\n";
-    let decoded_legacy = decode_delta_record(&outbox_key, legacy_delta).unwrap();
-    assert_eq!(decoded_legacy.kind, DeltaKind::Plus);
-    assert_eq!(decoded_legacy.edge.epoch, 11);
-    assert_eq!(decoded_legacy.edge.src, 3);
-    assert_eq!(decoded_legacy.edge.dst, 4);
+    let canonical_delta = decode_delta_record(&outbox_key, b"graph-delta-v1\n").unwrap();
+    assert_eq!(canonical_delta.kind, DeltaKind::Plus);
+    assert_eq!(canonical_delta.edge.epoch, 9);
+    assert!(decode_delta_record(
+        &outbox_key,
+        b"delta1\t+\t9\treddit-home\tUSER_FOLLOWS_USER\t1\t2\n"
+    )
+    .is_err());
+    assert!(decode_delta_record(&outbox_key, b"delta2\n").is_err());
 }
-
 #[tokio::test]
 async fn duplicate_edge_with_new_request_does_not_increment_degree() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1775,37 +1727,25 @@ async fn outbound_only_index_policy_skips_reverse_rows_with_read_fallback() {
         )
         .await
         .unwrap();
-    let legacy_manifest_key = format!(
+    let manifest_key = format!(
         "cell/reddit-home/artifact/posting_manifest/USER_SUBSCRIBED_TO_SUBREDDIT/out/{:020}/{:020}",
         1, result.end_epoch
     );
-    let manifest_value = shard
-        .read_remote(&legacy_manifest_key)
-        .await
-        .unwrap()
-        .unwrap();
+    let manifest_value = shard.read_remote(&manifest_key).await.unwrap().unwrap();
     let manifest_text = std::str::from_utf8(&manifest_value).unwrap();
-    let mut manifest_parts = manifest_text
+    let manifest_parts = manifest_text
         .trim_end_matches('\n')
         .split('\t')
         .collect::<Vec<_>>();
     assert_eq!(manifest_parts.len(), 10);
-    assert_eq!(manifest_parts[0], "posting_manifest2");
-    manifest_parts[0] = "posting_manifest1";
-    let legacy_manifest = format!("{}\n", manifest_parts[..9].join("\t"));
-    let mut batch = GraphWriteBatch::new();
-    batch.put(legacy_manifest_key.as_bytes(), legacy_manifest.as_bytes());
-    shard
-        .write_graph_batch_strict("reddit-home", "test_legacy_posting_manifest", batch)
-        .await
-        .unwrap();
+    assert_eq!(manifest_parts[0], "graph-posting-manifest-v1");
     shard
         .write_edge(typed_mutation(
             "reddit-home",
             "USER_SUBSCRIBED_TO_SUBREDDIT",
             99,
             100,
-            "legacy-posting-after-snapshot",
+            "posting-after-snapshot",
         ))
         .await
         .unwrap();
@@ -2342,7 +2282,7 @@ async fn segment_compaction_merges_segments_and_gcs_tombstones_after_rollup() {
         compacted_values.push(kv.value.to_vec());
     }
     assert_eq!(compacted_values.len(), 1);
-    assert!(compacted_values[0].starts_with(b"out_segment2\n"));
+    assert!(compacted_values[0].starts_with(b"graph-out-segment-v1\n"));
     let mut tombstones = shard
         .scan_remote_prefix(&keys::out_segment_tombstone_src_prefix(
             cell_id, edge_type, 1,
@@ -2409,56 +2349,25 @@ async fn segment_compaction_respects_cell_write_lock_before_scanning() {
 }
 
 #[tokio::test]
-async fn stale_legacy_cell_write_lock_can_be_reclaimed() {
+async fn malformed_cell_write_lock_is_rejected_without_takeover() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard(
-        "graph/stale-legacy-cell-write-lock",
-        Arc::clone(&object_store),
-    )
-    .await;
+    let shard = open_test_shard("graph/malformed-cell-write-lock", Arc::clone(&object_store)).await;
     let cell_id = "reddit-home";
     let path = shard.cell_write_lock_path(cell_id);
-    let stale_created_ms = graph_now_millis()
-        .saturating_sub(GRAPH_CELL_WRITE_LOCK_TTL_MS)
-        .saturating_sub(1);
-    let stale_payload = Bytes::from(format!(
-            "graph-cell-write-lock-v1\ncell={cell_id}\noperation=crashed-writer\ncreated_ms={stale_created_ms}\n"
-        ));
+    let malformed_payload = Bytes::from(format!(
+        "graph-cell-write-lock-v1\ncell={cell_id}\noperation=crashed-writer\n"
+    ));
     object_store
-        .put_opts(&path, stale_payload.into(), PutMode::Create.into())
+        .put_opts(&path, malformed_payload.into(), PutMode::Create.into())
         .await
         .unwrap();
 
-    let lock = shard
-        .acquire_cell_write_lock(cell_id, "new-writer")
-        .await
-        .unwrap();
-    let current = object_store.get(&path).await.unwrap();
-    let current_value = current.bytes().await.unwrap();
-    let current_record = decode_cell_write_lock_record(path.as_ref(), &current_value).unwrap();
-    assert_eq!(current_record.cell_id, cell_id);
-    assert_eq!(current_record.operation, "new-writer");
-    assert_eq!(current_record.owner_token, lock.owner_token);
-    assert_eq!(current_record.state, CellWriteLockState::Active);
-    assert!(current_record.expires_at_ms > graph_now_millis());
-
-    let released_token = lock.owner_token.clone();
-    lock.release().await.unwrap();
-    let released = object_store.get(&path).await.unwrap();
-    let released_value = released.bytes().await.unwrap();
-    let released_record = decode_cell_write_lock_record(path.as_ref(), &released_value).unwrap();
-    assert_eq!(released_record.owner_token, released_token);
-    assert_eq!(released_record.state, CellWriteLockState::Released);
-    assert_eq!(released_record.expires_at_ms, 0);
-
-    let next = shard
-        .acquire_cell_write_lock(cell_id, "next-writer")
-        .await
-        .unwrap();
-    assert_ne!(next.owner_token, released_token);
-    next.release().await.unwrap();
+    let err = match shard.acquire_cell_write_lock(cell_id, "new-writer").await {
+        Ok(_) => panic!("malformed lock unexpectedly acquired"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, GraphError::CorruptValue { .. }));
 }
-
 #[tokio::test]
 async fn stale_owner_release_does_not_remove_reclaimed_cell_write_lock() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -4264,20 +4173,20 @@ async fn delete_edges_batch_publishes_delta_minus_and_replays_idempotently() {
             .collect::<Vec<_>>(),
         vec![(DeltaKind::Minus, 1, 2, 4), (DeltaKind::Minus, 1, 4, 5),]
     );
-    let mut legacy_iter = shard
+    let mut per_edge_iter = shard
         .scan_remote_prefix(&keys::outbox_prefix(cell_id))
         .await
         .unwrap();
-    let mut legacy_minus = Vec::new();
-    while let Some(kv) = legacy_iter.next().await.unwrap() {
+    let mut per_edge_minus = Vec::new();
+    while let Some(kv) = per_edge_iter.next().await.unwrap() {
         let key = String::from_utf8_lossy(&kv.key).into_owned();
         let delta = decode_delta_record(&key, &kv.value).unwrap();
         if delta.kind == DeltaKind::Minus && delta.edge.epoch > 3 {
-            legacy_minus.push((delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch));
+            per_edge_minus.push((delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch));
         }
     }
     assert_eq!(
-        legacy_minus,
+        per_edge_minus,
         vec![(DeltaKind::Minus, 1, 2, 4), (DeltaKind::Minus, 1, 4, 5)]
     );
 
@@ -4620,6 +4529,91 @@ async fn second_writer_open_fences_first_writer_instance() {
     second.close().await.unwrap();
 }
 
+#[test]
+fn db_reader_child_process_entry() {
+    if std::env::var("SLATEDB_GRAPH_READER_CHILD").ok().as_deref() != Some("1") {
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let object_root = std::env::var("SLATEDB_GRAPH_READER_OBJECT_ROOT").unwrap();
+        let ready_path =
+            std::path::PathBuf::from(std::env::var("SLATEDB_GRAPH_READER_READY_FILE").unwrap());
+        let stop_path =
+            std::path::PathBuf::from(std::env::var("SLATEDB_GRAPH_READER_STOP_FILE").unwrap());
+        let object_store = local_object_store(object_root).unwrap();
+        let reader = GraphShard::open("graph/process-reader", object_store)
+            .await
+            .unwrap();
+        assert!(reader
+            .edge_exists("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 1, 2,)
+            .await
+            .unwrap());
+        std::fs::write(&ready_path, b"ready").unwrap();
+        while !stop_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        reader.close().await.unwrap();
+    });
+}
+
+#[tokio::test]
+async fn separate_process_db_reader_does_not_fence_active_writer() {
+    let object_root = tempfile::tempdir().unwrap();
+    let object_store = local_object_store(object_root.path()).unwrap();
+    let writer =
+        GraphShard::open_standalone_writer("graph/process-reader", Arc::clone(&object_store))
+            .await
+            .unwrap();
+    writer
+        .write_edge(mutation(1, 2, "reader-child-seed"))
+        .await
+        .unwrap();
+
+    let ready_file = object_root.path().join("reader.ready");
+    let stop_file = object_root.path().join("reader.stop");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("tests::db_reader_child_process_entry")
+        .arg("--nocapture")
+        .env("SLATEDB_GRAPH_READER_CHILD", "1")
+        .env("SLATEDB_GRAPH_READER_OBJECT_ROOT", object_root.path())
+        .env("SLATEDB_GRAPH_READER_READY_FILE", &ready_file)
+        .env("SLATEDB_GRAPH_READER_STOP_FILE", &stop_file)
+        .spawn()
+        .unwrap();
+
+    for _ in 0..200 {
+        if ready_file.exists() {
+            break;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("reader child exited before ready: {status}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(ready_file.exists(), "reader child did not become ready");
+    writer
+        .write_edge(mutation(1, 3, "writer-after-child-reader"))
+        .await
+        .unwrap();
+
+    std::fs::write(&stop_file, b"stop").unwrap();
+    for _ in 0..200 {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "reader child failed: {status}");
+            writer.close().await.unwrap();
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    child.kill().unwrap();
+    panic!("reader child did not stop");
+}
+
 #[tokio::test]
 async fn leased_writer_requires_installed_data_write_fence() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -4830,6 +4824,15 @@ async fn graph_cluster_runs_multiple_local_shards_on_one_object_store() {
 #[tokio::test]
 async fn graph_cluster_open_cleans_previously_opened_shards_after_later_validation_error() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let seed = open_test_shard(
+        &format!(
+            "{}/cell-a",
+            GraphScope::default().scoped_store_path("graph-cluster-partial-open-cleanup")
+        ),
+        Arc::clone(&object_store),
+    )
+    .await;
+    seed.close().await.unwrap();
     let err = match GraphCluster::open_cells(
         "graph-cluster-partial-open-cleanup",
         ["cell-a", "bad/cell"],
@@ -4889,6 +4892,15 @@ async fn graph_cluster_open_cleans_previously_opened_shards_after_later_validati
 #[tokio::test]
 async fn routed_cluster_rejects_writes_for_non_owned_cells() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let seed = open_test_shard(
+        &format!(
+            "{}/reddit-home",
+            GraphScope::default().scoped_store_path("graph-routed-cluster")
+        ),
+        Arc::clone(&object_store),
+    )
+    .await;
+    seed.close().await.unwrap();
     let placement =
         ShardPlacement::fixed([("reddit-home", "node-a"), ("reddit-search", "node-b")]).unwrap();
     let cluster =
@@ -5521,7 +5533,7 @@ async fn control_plane_drop_cell_control_state_removes_discovery_and_watermarks(
         .unwrap();
     let placement = ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap();
     control
-        .publish_placement_with_catalog(&placement, "reddit", 1)
+        .publish_scoped_placement_with_catalog(&placement, 1)
         .await
         .unwrap();
     let lease = control
@@ -6283,9 +6295,8 @@ async fn managed_graph_node_drop_cell_unregisters_control_state() {
             .unwrap(),
     );
     control
-        .publish_placement_with_catalog(
+        .publish_scoped_placement_with_catalog(
             &ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap(),
-            "reddit",
             1,
         )
         .await
@@ -6371,9 +6382,8 @@ async fn routed_cluster_open_cleans_control_state_for_final_dropped_cell() {
     .await
     .unwrap();
     control
-        .publish_placement_with_catalog(
+        .publish_scoped_placement_with_catalog(
             &ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap(),
-            "reddit",
             1,
         )
         .await
@@ -6440,9 +6450,8 @@ async fn routed_cluster_refresh_cleans_control_state_for_retained_final_dropped_
     .await
     .unwrap();
     control
-        .publish_placement_with_catalog(
+        .publish_scoped_placement_with_catalog(
             &ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap(),
-            "reddit",
             1,
         )
         .await
@@ -7035,12 +7044,12 @@ async fn cluster_controller_discovers_cells_from_control_state() {
     control
         .compare_and_publish_shard_metadata(
             GraphShardCatalogEntry {
-                graph_id: Some("reddit".to_string()),
+                graph_id: "default".to_string(),
                 cell_id: "catalog-only".to_string(),
                 owner_node_id: "node-a".to_string(),
                 lease_token: 0,
-                schema_epoch: Some(1),
-                graph_epoch: Some(0),
+                schema_epoch: 1,
+                graph_epoch: 0,
                 generation: 0,
             },
             None,
@@ -7079,7 +7088,7 @@ async fn cluster_controller_discovers_cells_from_control_state() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(catalog.graph_id.as_deref(), Some("reddit"));
+    assert_eq!(catalog.graph_id, "default");
     assert_eq!(catalog.owner_node_id, "node-b");
     control.close().await.unwrap();
 }
@@ -7133,7 +7142,7 @@ async fn control_plane_catalog_uses_generation_cas() {
         .unwrap();
     let placement = ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap();
     let entries = control
-        .publish_placement_with_catalog(&placement, "reddit", 7)
+        .publish_scoped_placement_with_catalog(&placement, 7)
         .await
         .unwrap();
     assert_eq!(entries.len(), 1);
@@ -7149,15 +7158,15 @@ async fn control_plane_catalog_uses_generation_cas() {
     );
 
     let mut update = entries[0].clone();
-    update.graph_epoch = Some(10);
+    update.graph_epoch = 10;
     let published = control
         .compare_and_publish_shard_metadata(update.clone(), Some(1))
         .await
         .unwrap();
     assert_eq!(published.generation, 2);
-    assert_eq!(published.graph_epoch, Some(10));
+    assert_eq!(published.graph_epoch, 10);
 
-    update.graph_epoch = Some(11);
+    update.graph_epoch = 11;
     let err = control
         .compare_and_publish_shard_metadata(update, Some(1))
         .await
@@ -7185,7 +7194,7 @@ async fn control_plane_catalog_tracks_lease_token_generation() {
         .unwrap();
     let placement = ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap();
     control
-        .publish_placement_with_catalog(&placement, "reddit", 1)
+        .publish_scoped_placement_with_catalog(&placement, 1)
         .await
         .unwrap();
     let lease_a = control
@@ -7218,20 +7227,26 @@ async fn control_plane_catalog_tracks_lease_token_generation() {
 }
 
 #[tokio::test]
-async fn control_plane_legacy_placement_creates_catalog_on_lease() {
+async fn control_plane_placement_publishes_complete_catalog_before_lease() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let control = GraphControlPlane::open("graph-control/catalog-legacy", object_store)
+    let control = GraphControlPlane::open("graph-control/catalog-complete", object_store)
         .await
         .unwrap();
     control
         .publish_placement(&ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap())
         .await
         .unwrap();
-    assert!(control
+    let catalog = control
         .current_shard_metadata("reddit-home")
         .await
         .unwrap()
-        .is_none());
+        .unwrap();
+    assert_eq!(catalog.graph_id, "default");
+    assert_eq!(catalog.schema_epoch, 0);
+    assert_eq!(catalog.graph_epoch, 0);
+    assert_eq!(catalog.owner_node_id, "node-a");
+    assert_eq!(catalog.lease_token, 0);
+    assert_eq!(catalog.generation, 1);
 
     let lease = control
         .acquire_lease("reddit-home", "node-a", std::time::Duration::from_millis(5))
@@ -7242,13 +7257,12 @@ async fn control_plane_legacy_placement_creates_catalog_on_lease() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(catalog.graph_id, None);
-    assert_eq!(catalog.schema_epoch, None);
-    assert_eq!(catalog.graph_epoch, None);
-    assert!(!catalog.has_graph_metadata());
+    assert_eq!(catalog.graph_id, "default");
+    assert_eq!(catalog.schema_epoch, 0);
+    assert_eq!(catalog.graph_epoch, 0);
     assert_eq!(catalog.owner_node_id, "node-a");
     assert_eq!(catalog.lease_token, lease.lease_token);
-    assert_eq!(catalog.generation, 1);
+    assert_eq!(catalog.generation, 2);
 
     tokio::time::sleep(std::time::Duration::from_millis(15)).await;
     let lease = control
@@ -7262,15 +7276,14 @@ async fn control_plane_legacy_placement_creates_catalog_on_lease() {
         .unwrap();
     assert_eq!(catalog.owner_node_id, "node-b");
     assert_eq!(catalog.lease_token, lease.lease_token);
-    assert_eq!(catalog.generation, 2);
-    assert_eq!(catalog.graph_id, None);
-    assert_eq!(catalog.schema_epoch, None);
-    assert_eq!(catalog.graph_epoch, None);
+    assert_eq!(catalog.generation, 3);
+    assert_eq!(catalog.graph_id, "default");
+    assert_eq!(catalog.schema_epoch, 0);
+    assert_eq!(catalog.graph_epoch, 0);
 
     control
-        .publish_placement_with_catalog(
+        .publish_scoped_placement_with_catalog(
             &ShardPlacement::fixed([("reddit-home", "node-b")]).unwrap(),
-            "reddit",
             9,
         )
         .await
@@ -7280,13 +7293,12 @@ async fn control_plane_legacy_placement_creates_catalog_on_lease() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(catalog.graph_id.as_deref(), Some("reddit"));
-    assert_eq!(catalog.schema_epoch, Some(9));
-    assert_eq!(catalog.graph_epoch, Some(0));
-    assert!(catalog.has_graph_metadata());
+    assert_eq!(catalog.graph_id, "default");
+    assert_eq!(catalog.schema_epoch, 9);
+    assert_eq!(catalog.graph_epoch, 0);
     assert_eq!(catalog.owner_node_id, "node-b");
     assert_eq!(catalog.lease_token, lease.lease_token);
-    assert_eq!(catalog.generation, 3);
+    assert_eq!(catalog.generation, 4);
     control.close().await.unwrap();
 }
 
@@ -7523,11 +7535,11 @@ async fn control_plane_empty_compute_node_replacement_reads_object_store_state()
         .unwrap();
     let placement = ShardPlacement::fixed([("reddit-home", "node-a")]).unwrap();
     control
-        .publish_placement_with_catalog(&placement, "reddit", 1)
+        .publish_scoped_placement_with_catalog(&placement, 1)
         .await
         .unwrap();
     let cluster_a = RoutedGraphCluster::open_owned_with_control(
-        "phase1-empty-compute",
+        "empty-compute-replacement",
         "node-a",
         &control,
         Arc::clone(&object_store),
@@ -7562,7 +7574,7 @@ async fn control_plane_empty_compute_node_replacement_reads_object_store_state()
         .await
         .unwrap();
     let cluster_b = RoutedGraphCluster::open_owned_with_control(
-        "phase1-empty-compute",
+        "empty-compute-replacement",
         "node-b",
         &control,
         Arc::clone(&object_store),
@@ -7944,8 +7956,9 @@ async fn posting_chunks_ignore_owner_manifest_without_epoch_manifest() {
         1
     );
     let chunk_value = format!("posting1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t0\t2,3\n");
-    let manifest_value =
-        format!("posting_manifest1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t1\t2\t0\n");
+    let manifest_value = format!(
+        "graph-posting-manifest-v1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t1\t2\t0\t0:2:3\n"
+    );
 
     let mut batch = GraphWriteBatch::new();
     batch.put(chunk_key.as_bytes(), chunk_value.as_bytes());
@@ -7978,8 +7991,9 @@ async fn posting_abort_cleanup_removes_unpublished_chunks_and_owner_manifests() 
         1
     );
     let chunk_value = format!("posting1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t0\t2,3\n");
-    let manifest_value =
-        format!("posting_manifest1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t1\t2\t0\n");
+    let manifest_value = format!(
+        "graph-posting-manifest-v1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t1\t2\t0\t0:2:3\n"
+    );
 
     let mut batch = GraphWriteBatch::new();
     batch.put(chunk_key.as_bytes(), chunk_value.as_bytes());
@@ -8123,8 +8137,9 @@ async fn supernode_groups_ignore_unpublished_orphan_records() {
         1
     );
     let chunk_value = format!("posting1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t0\t2,3\n");
-    let group_value =
-        format!("supernode3\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t2\t1\t2\t0:2:3\n");
+    let group_value = format!(
+        "graph-supernode-v1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t2\t1\t2\t0:2:3\n"
+    );
 
     let mut batch = GraphWriteBatch::new();
     batch.put(chunk_key.as_bytes(), chunk_value.as_bytes());
@@ -9067,8 +9082,9 @@ async fn current_graph_verifier_detects_unpublished_artifacts() {
         1
     );
     let chunk_value = format!("posting1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t0\t2,3\n");
-    let group_value =
-        format!("supernode3\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t2\t1\t2\t0:2:3\n");
+    let group_value = format!(
+        "graph-supernode-v1\t{cell_id}\t{edge_type}\tout\t1\t{base_epoch}\t2\t1\t2\t0:2:3\n"
+    );
 
     let mut batch = GraphWriteBatch::new();
     batch.put(chunk_key.as_bytes(), chunk_value.as_bytes());
@@ -10327,87 +10343,44 @@ fn test_transport_rows_response() -> serde_json::Value {
 
 #[cfg(feature = "query-transport")]
 #[tokio::test]
-async fn tcp_query_transport_v3_client_falls_back_to_v2_server() {
+async fn tcp_query_transport_client_rejects_obsolete_server_version() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let version_two_server = tokio::spawn(async move {
-        for expected_version in [3_u64, 2_u64] {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = tokio::io::BufReader::new(stream);
-            let request = test_read_transport_json(&mut reader).await;
-            assert_eq!(request["version"].as_u64(), Some(expected_version));
-            let response = if expected_version == 3 {
-                serde_json::json!({
-                    "response": {
-                        "kind": "error",
-                        "message": "unsupported query transport version 3; supported versions are 1 and 2",
-                    },
-                    "close_connection": true,
-                })
-            } else {
-                serde_json::json!({
-                    "response": test_transport_rows_response(),
-                    "close_connection": true,
-                })
-            };
-            test_write_transport_json(&mut reader, &response).await;
-        }
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = tokio::io::BufReader::new(stream);
+        let request = test_read_transport_json(&mut reader).await;
+        assert_eq!(request["version"].as_u64(), Some(1));
+        test_write_transport_json(
+            &mut reader,
+            &serde_json::json!({
+                "response": {
+                    "kind": "error",
+                    "message": "unsupported query transport version 1; expected 2",
+                },
+                "close_connection": true,
+            }),
+        )
+        .await;
     });
 
     let client = TcpQueryCellClient::new(addr).with_timeout(std::time::Duration::from_secs(2));
     let result = client
         .execute_cypher_rows(
-            QueryContext::new("reddit-home", "rolling-v3-client-v2-server"),
+            QueryContext::new("reddit-home", "strict-version-client"),
             "MATCH (u {id: 1}) RETURN u.id",
         )
         .await
-        .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(client.metrics().connections_created, 2);
-    assert_eq!(client.metrics().client_retries, 1);
+        .unwrap_err();
+    assert!(matches!(result, GraphError::UnsupportedQuery { .. }));
+    assert_eq!(client.metrics().connections_created, 1);
+    assert_eq!(client.metrics().client_retries, 0);
     version_two_server.await.unwrap();
 }
 
 #[cfg(feature = "query-transport")]
 #[tokio::test]
-async fn tcp_query_transport_new_client_falls_back_to_legacy_server() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let legacy_server = tokio::spawn(async move {
-        for expected_version in [3_u64, 1_u64] {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = tokio::io::BufReader::new(stream);
-            let request = test_read_transport_json(&mut reader).await;
-            assert_eq!(request["version"].as_u64(), Some(expected_version));
-            let response = if expected_version == 3 {
-                serde_json::json!({
-                    "kind": "error",
-                    "message": "unsupported query transport version 3; expected 1",
-                })
-            } else {
-                test_transport_rows_response()
-            };
-            test_write_transport_json(&mut reader, &response).await;
-        }
-    });
-
-    let client = TcpQueryCellClient::new(addr).with_timeout(std::time::Duration::from_secs(2));
-    let result = client
-        .execute_cypher_rows(
-            QueryContext::new("reddit-home", "rolling-new-client-old-server"),
-            "MATCH (u {id: 1}) RETURN u.id",
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(client.metrics().connections_created, 2);
-    assert_eq!(client.metrics().client_retries, 1);
-    legacy_server.await.unwrap();
-}
-
-#[cfg(feature = "query-transport")]
-#[tokio::test]
-async fn tcp_query_transport_new_server_serves_legacy_client_shape() {
+async fn tcp_query_transport_server_rejects_obsolete_client_version() {
     struct StaticQueryClient;
 
     #[async_trait::async_trait]
@@ -10448,26 +10421,18 @@ async fn tcp_query_transport_new_server_serves_legacy_client_shape() {
     let mut reader = tokio::io::BufReader::new(stream);
     let request = serde_json::json!({
         "kind": "rows",
-        "version": 1,
+        "version": 2,
         "auth": { "bearer_token": null },
-        "context": QueryContext::new("reddit-home", "rolling-old-client-new-server"),
+        "context": QueryContext::new("reddit-home", "obsolete-version-client"),
         "query": "MATCH (u {id: 1}) RETURN u.id",
     });
     test_write_transport_json(&mut reader, &request).await;
     let response = test_read_transport_json(&mut reader).await;
-    assert_eq!(response["kind"], "rows");
-    assert!(response.get("response").is_none());
-
-    use tokio::io::AsyncBufReadExt;
-    let mut tail = String::new();
-    let eof = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        reader.read_line(&mut tail),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(eof, 0, "legacy response connection must close");
+    assert_eq!(response["response"]["kind"], "error");
+    assert!(response["response"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("expected 1"));
     server.stop().await.unwrap();
 }
 
@@ -14192,20 +14157,22 @@ async fn cypher_create_set_and_delete_target_individual_relationships() {
         )
         .await
         .unwrap();
-    assert_eq!(
+    assert!(matches!(
         first,
-        QueryOutput::Write(CommitResult {
-            epoch: 1,
-            already_existed: false
+        QueryOutput::Mutation(QueryMutationResult {
+            created_edges: 1,
+            created_relationships: 1,
+            ..
         })
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         second,
-        QueryOutput::Write(CommitResult {
-            epoch: 2,
-            already_existed: false
+        QueryOutput::Mutation(QueryMutationResult {
+            created_edges: 0,
+            created_relationships: 1,
+            ..
         })
-    );
+    ));
     assert_eq!(
         shard.out_degree("reddit-home", "FOLLOWS", 1).await.unwrap(),
         1
@@ -14829,37 +14796,6 @@ async fn tcp_query_transport_runs_against_separate_child_process_and_local_objec
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
-async fn cypher_explain_uses_query_planner() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard("graph/cypher-explain-plan", object_store).await;
-    let plan = shard
-        .explain_cypher(
-            QueryContext::new("reddit-home", "cypher-explain").at_epoch(7),
-            "MATCH (u {id: 10})-[:FOLLOWS]->(v) RETURN count(*)",
-        )
-        .unwrap();
-    assert_eq!(plan.read_epoch, Some(7));
-    assert_eq!(
-        plan.logical,
-        LogicalQueryPlan::MatchOut {
-            edge_type: "FOLLOWS".to_string(),
-            src: 10,
-            return_count: true,
-        }
-    );
-    assert_eq!(
-        plan.physical,
-        PhysicalQueryPlan::OutDegreeCounter {
-            edge_type: "FOLLOWS".to_string(),
-            src: 10,
-        }
-    );
-    assert!(!plan.is_write());
-    shard.close().await.unwrap();
-}
-
-#[cfg(feature = "opencypher")]
-#[tokio::test]
 async fn cypher_create_and_match_use_storage_kernel() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-create-match", object_store).await;
@@ -14871,13 +14807,14 @@ async fn cypher_create_and_match_use_storage_kernel() {
         )
         .await
         .unwrap();
-    assert_eq!(
+    assert!(matches!(
         write,
-        QueryOutput::Write(CommitResult {
-            epoch: 1,
-            already_existed: false
+        QueryOutput::Mutation(QueryMutationResult {
+            created_edges: 1,
+            created_relationships: 1,
+            ..
         })
-    );
+    ));
 
     let neighbors = shard
         .execute_cypher(
@@ -14904,30 +14841,6 @@ async fn cypher_create_labels_properties_are_atomic_and_idempotent() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-create-metadata", object_store).await;
 
-    let plan = shard
-        .explain_cypher(
-            QueryContext::new("reddit-home", "cypher-create-metadata-plan"),
-            "CREATE (u:User {id: 10, name: 'alice', active: true})-[:FOLLOWS]->\
-             (v:User {id: 20, name: 'bob', age: 42})",
-        )
-        .unwrap();
-    assert_eq!(
-        plan.physical,
-        PhysicalQueryPlan::WriteEdgeWithMetadata {
-            edge_type: "FOLLOWS".to_string(),
-            src: 10,
-            dst: 20,
-            src_metadata: VertexMetadata::default()
-                .with_label("User")
-                .with_property("active", VertexPropertyValue::Bool(true))
-                .with_property("name", VertexPropertyValue::String("alice".to_string())),
-            dst_metadata: VertexMetadata::default()
-                .with_label("User")
-                .with_property("age", VertexPropertyValue::Integer(42))
-                .with_property("name", VertexPropertyValue::String("bob".to_string())),
-        }
-    );
-
     let query = "CREATE (u:User {id: 10, name: 'alice', active: true})-[:FOLLOWS]->\
                  (v:User {id: 20, name: 'bob', age: 42})";
     let write = shard
@@ -14937,13 +14850,14 @@ async fn cypher_create_labels_properties_are_atomic_and_idempotent() {
         )
         .await
         .unwrap();
-    assert_eq!(
+    assert!(matches!(
         write,
-        QueryOutput::Write(CommitResult {
-            epoch: 1,
-            already_existed: false
+        QueryOutput::Mutation(QueryMutationResult {
+            created_edges: 1,
+            created_relationships: 1,
+            ..
         })
-    );
+    ));
 
     let rows_at_commit = shard
         .execute_cypher_rows(
@@ -14994,13 +14908,14 @@ async fn cypher_create_labels_properties_are_atomic_and_idempotent() {
         )
         .await
         .unwrap();
-    assert_eq!(
+    assert!(matches!(
         metadata_merge,
-        QueryOutput::Write(CommitResult {
-            epoch: 2,
-            already_existed: false
+        QueryOutput::Mutation(QueryMutationResult {
+            created_edges: 0,
+            created_relationships: 1,
+            ..
         })
-    );
+    ));
     let merged_rows = shard
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "cypher-create-metadata-merged-read"),
@@ -15039,13 +14954,14 @@ async fn cypher_parameters_bind_create_match_where_and_window() {
         )
         .await
         .unwrap();
-    assert_eq!(
+    assert!(matches!(
         write,
-        QueryOutput::Write(CommitResult {
-            epoch: 1,
-            already_existed: false
+        QueryOutput::Mutation(QueryMutationResult {
+            created_edges: 1,
+            created_relationships: 1,
+            ..
         })
-    );
+    ));
 
     let read_context = QueryContext::new("reddit-home", "cypher-params-read")
         .with_parameter("active", VertexPropertyValue::Bool(true))
@@ -15107,20 +15023,6 @@ async fn cypher_limit_skip_uses_query_window() {
             .await
             .unwrap();
     }
-
-    let plan = shard
-        .explain_cypher(
-            QueryContext::new("reddit-home", "cypher-window-plan"),
-            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id SKIP 2 - 1 LIMIT 1 + 1",
-        )
-        .unwrap();
-    assert_eq!(
-        plan.result_window,
-        QueryWindow {
-            skip: 1,
-            limit: Some(2),
-        }
-    );
 
     let windowed = shard
         .execute_cypher(
@@ -16269,8 +16171,9 @@ async fn cypher_relationship_properties_are_indexed_mutable_and_snapshot_safe() 
         .unwrap();
     assert!(matches!(
         create,
-        QueryOutput::Write(CommitResult {
-            already_existed: false,
+        QueryOutput::Mutation(QueryMutationResult {
+            created_edges: 1,
+            created_relationships: 1,
             ..
         })
     ));

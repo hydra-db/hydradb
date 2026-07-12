@@ -336,10 +336,7 @@ impl GraphShard {
                     )
                     .await?;
                 let Some(first) = chunk.vertices.first().copied() else {
-                    return corrupt(
-                        &manifest_key,
-                        "legacy posting manifest references empty chunk",
-                    );
+                    return corrupt(&manifest_key, "posting manifest references empty chunk");
                 };
                 let last = chunk.vertices.last().copied().unwrap_or(first);
                 if dst < first {

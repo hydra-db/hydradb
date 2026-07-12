@@ -21,6 +21,23 @@ client-api = ["query-transport"]
 bolt-server = ["client-api", "query-transport-tls", "dep:boltr"]
 http-api = ["client-api", "query-transport-tls", "dep:axum", "dep:axum-server"]
 public-client-protocols = ["bolt-server", "http-api"]
+server-runtime = [
+    "public-client-protocols",
+    "graphblas",
+    "query-service-discovery",
+    "dep:rustls-pemfile",
+    "dep:tracing-subscriber",
+]
+
+[[bin]]
+name = "graph-node"
+path = "src/bin/graph-node.rs"
+required-features = ["server-runtime"]
+
+[[bin]]
+name = "graph-controller"
+path = "src/bin/graph-controller.rs"
+required-features = ["server-runtime"]
 
 [[example]]
 name = "fence_worker"
@@ -72,6 +89,11 @@ name = "bolt_benchmark"
 path = "examples/bolt_benchmark.rs"
 required-features = ["public-client-protocols"]
 
+[[example]]
+name = "s3_bolt_benchmark_server"
+path = "examples/s3_bolt_benchmark_server.rs"
+required-features = ["server-runtime"]
+
 [dependencies]
 async-trait = "0.1"
 axum = { version = "0.8.9", optional = true }
@@ -82,18 +104,22 @@ base64 = { version = "0.22", optional = true }
 futures = "0.3"
 libcypher-parser-sys = { version = "0.6.1-1", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "a6e169dc1e143fa72a0aa916a9b23cf29b3656b4", default-features = false, features = ["aws", "foyer"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", optional = true }
 sha2 = { version = "0.10", optional = true }
 subtle = { version = "2", optional = true }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"], optional = true }
 
 [dev-dependencies]
 boltr = { version = "0.2.0", features = ["client"] }
+serde = "1"
+serde_yaml = "0.9"
 rcgen = "0.13"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tempfile = "3"

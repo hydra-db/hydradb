@@ -80,7 +80,6 @@ impl QueryBatchOperation {
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryContext {
-    #[cfg_attr(feature = "query-transport", serde(default))]
     pub scope: GraphScope,
     pub cell_id: String,
     pub idempotency_key: String,
@@ -506,6 +505,7 @@ impl QueryResultPage {
 pub struct QueryMutationResult {
     pub matched_rows: u64,
     pub created_edges: u64,
+    pub created_relationships: u64,
     pub deleted_edges: u64,
     pub updated_vertices: u64,
     pub updated_relationships: u64,

@@ -554,7 +554,7 @@ impl GraphShard {
     pub(crate) async fn scan_remote_prefix(&self, prefix: &str) -> Result<slatedb::DbIterator> {
         let iter = self
             .db
-            .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
+            .scan_prefix_with_options(prefix.as_bytes(), None, &remote_scan_options())
             .await?;
         Ok(iter)
     }
@@ -568,7 +568,7 @@ impl GraphShard {
             .db
             .scan_prefix_with_options(
                 prefix.as_bytes(),
-                start_suffix.as_bytes().to_vec()..,
+                Some(start_suffix.as_bytes().to_vec()),
                 &remote_scan_options(),
             )
             .await?;
@@ -581,7 +581,10 @@ impl GraphShard {
             await_durable: true,
             ..Default::default()
         };
-        self.db.write_with_options(batch, &options).await?;
+        self.db
+            .writer()?
+            .write_with_options(batch, &options)
+            .await?;
         Ok(())
     }
 
@@ -696,7 +699,11 @@ impl GraphShard {
         operation: &'static str,
         batch: GraphWriteBatch,
     ) -> Result<()> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, operation)
             .await?;
         for op in batch.ops {
@@ -715,7 +722,11 @@ impl GraphShard {
         guards: &[GraphWriteGuard],
         batch: GraphWriteBatch,
     ) -> Result<()> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
         self.validate_write_fence_txn(&txn, cell_id, operation)
             .await?;
         for guard in guards {

@@ -83,17 +83,9 @@ impl GraphShard {
                     .await?;
                 return Ok(QueryOutput::Mutation(result));
             }
-            let parsed = match self
+            let parsed = self
                 .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters)
-                .await
-            {
-                Ok(parsed) => parsed,
-                Err(err) if is_non_row_opencypher_query(&err) => {
-                    let plan = self.plan_opencypher(context, query)?;
-                    return self.execute_query_plan(plan).await;
-                }
-                Err(err) => return Err(err),
-            };
+                .await?;
             let context = merge_opencypher_window(context, parsed.window)?;
             let result_set = self
                 .execute_parsed_opencypher_rows(context, parsed.clone())
@@ -238,27 +230,6 @@ impl GraphShard {
         statement: QueryStatement,
     ) -> Result<QueryPlan> {
         QueryPlanner::plan(&context, &statement)
-    }
-
-    #[cfg(feature = "opencypher")]
-    pub fn plan_opencypher(&self, context: QueryContext, query: &str) -> Result<QueryPlan> {
-        let parsed = parse_opencypher_with_parameters(query, &context.parameters)?;
-        self.plan_parsed_opencypher(context, parsed)
-    }
-
-    #[cfg(feature = "opencypher")]
-    fn plan_parsed_opencypher(
-        &self,
-        context: QueryContext,
-        parsed: ParsedQuery,
-    ) -> Result<QueryPlan> {
-        let context = merge_opencypher_window(context, parsed.window)?;
-        self.plan_query_statement(context, parsed.statement)
-    }
-
-    #[cfg(feature = "opencypher")]
-    pub fn explain_cypher(&self, context: QueryContext, query: &str) -> Result<QueryPlan> {
-        self.plan_opencypher(context, query)
     }
 
     #[cfg(feature = "opencypher")]
@@ -1069,22 +1040,23 @@ impl GraphShard {
                         context.idempotency_key, edge_type, src, dst
                     ),
                 };
-                let commit = if src_metadata.labels.is_empty()
+                let created = if src_metadata.labels.is_empty()
                     && src_metadata.properties.is_empty()
                     && dst_metadata.labels.is_empty()
                     && dst_metadata.properties.is_empty()
                     && edge_metadata.properties.is_empty()
                 {
-                    self.write_edge(mutation).await?
+                    self.create_relationship(mutation, EdgeMetadata::default())
+                        .await?
                 } else if edge_metadata.properties.is_empty() {
-                    self.write_edge_with_vertex_metadata(
+                    self.create_relationship_with_vertex_metadata(
                         mutation,
                         src_metadata.clone(),
                         dst_metadata.clone(),
                     )
                     .await?
                 } else {
-                    self.write_edge_with_full_metadata(
+                    self.create_relationship_with_full_metadata(
                         mutation,
                         src_metadata.clone(),
                         dst_metadata.clone(),
@@ -1093,8 +1065,9 @@ impl GraphShard {
                     .await?
                 };
                 return Ok(QueryMutationResult {
-                    created_edges: u64::from(!commit.already_existed),
-                    noops: u64::from(commit.already_existed),
+                    created_edges: u64::from(created.structural_edge_inserted),
+                    created_relationships: u64::from(!created.already_created),
+                    noops: u64::from(created.already_created),
                     ..QueryMutationResult::default()
                 });
             }
@@ -7451,16 +7424,6 @@ fn streaming_neighbor_projection_values(
         }
     }
     Ok(values)
-}
-
-#[cfg(feature = "opencypher")]
-fn is_non_row_opencypher_query(err: &GraphError) -> bool {
-    matches!(
-        err,
-        GraphError::UnsupportedQuery { dialect, feature }
-            if *dialect == "OpenCypher"
-                && feature.starts_with("row execution supports MATCH ... RETURN queries")
-    )
 }
 
 #[cfg(feature = "opencypher")]

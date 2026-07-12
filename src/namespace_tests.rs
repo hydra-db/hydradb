@@ -65,7 +65,7 @@ fn namespace_paths_are_validated_hierarchical_and_collision_free() {
 
 #[cfg(feature = "query-transport")]
 #[test]
-fn query_context_scope_round_trips_and_legacy_frames_default_safely() {
+fn query_context_scope_round_trips_and_unscoped_frames_are_rejected() {
     let scoped = QueryContext::new("cell-a", "query-a").in_scope(scope("acme", "search", "social"));
     let encoded = serde_json::to_value(&scoped).unwrap();
     assert_eq!(
@@ -73,16 +73,15 @@ fn query_context_scope_round_trips_and_legacy_frames_default_safely() {
         scoped
     );
 
-    let legacy = serde_json::json!({
+    let unscoped = serde_json::json!({
         "cell_id": "cell-a",
-        "idempotency_key": "legacy-query",
+        "idempotency_key": "unscoped-query",
         "read_epoch": null,
         "result_window": { "skip": 0, "limit": null },
         "parameters": {},
         "max_runtime_ms": null
     });
-    let legacy = serde_json::from_value::<QueryContext>(legacy).unwrap();
-    assert_eq!(legacy.scope, GraphScope::default());
+    assert!(serde_json::from_value::<QueryContext>(unscoped).is_err());
 
     let invalid = serde_json::json!({
         "scope": {
@@ -189,10 +188,10 @@ async fn scoped_graph_clusters_isolate_identical_graph_keys() {
 }
 
 #[tokio::test]
-async fn default_scope_reuses_the_legacy_storage_path() {
+async fn default_scope_convenience_apis_use_the_canonical_scoped_path() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let scoped = GraphCluster::open_cells_standalone_writers_scoped(
-        "legacy-compatible",
+        "default-scope",
         GraphScope::default(),
         ["cell-a"],
         Arc::clone(&object_store),
@@ -213,12 +212,11 @@ async fn default_scope_reuses_the_legacy_storage_path() {
         .unwrap();
     scoped.close().await.unwrap();
 
-    let legacy =
-        GraphCluster::open_cells("legacy-compatible", ["cell-a"], Arc::clone(&object_store))
-            .await
-            .unwrap();
+    let reopened = GraphCluster::open_cells("default-scope", ["cell-a"], Arc::clone(&object_store))
+        .await
+        .unwrap();
     assert_eq!(
-        legacy
+        reopened
             .shard("cell-a")
             .unwrap()
             .out_neighbors("cell-a", "FOLLOWS", 1)
@@ -226,10 +224,10 @@ async fn default_scope_reuses_the_legacy_storage_path() {
             .unwrap(),
         vec![2]
     );
-    legacy.close().await.unwrap();
+    reopened.close().await.unwrap();
 
     let scoped_control = GraphControlPlane::open_scoped(
-        "legacy-control",
+        "default-control",
         Arc::clone(&object_store),
         GraphScope::default(),
     )
@@ -240,11 +238,11 @@ async fn default_scope_reuses_the_legacy_storage_path() {
         .await
         .unwrap();
     scoped_control.close().await.unwrap();
-    let legacy_control = GraphControlPlane::open("legacy-control", object_store)
+    let reopened_control = GraphControlPlane::open("default-control", object_store)
         .await
         .unwrap();
     assert_eq!(
-        legacy_control
+        reopened_control
             .load_placement()
             .await
             .unwrap()
@@ -252,7 +250,7 @@ async fn default_scope_reuses_the_legacy_storage_path() {
             .unwrap(),
         "node-a"
     );
-    legacy_control.close().await.unwrap();
+    reopened_control.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -320,20 +318,9 @@ async fn scoped_control_planes_isolate_placement_lease_and_catalog_state() {
             .await
             .unwrap()
             .unwrap()
-            .graph_id
-            .as_deref(),
-        Some(first_scope.graph_id.as_str())
+            .graph_id,
+        first_scope.graph_id.as_str()
     );
-    let mismatch = first
-        .publish_placement_with_catalog(
-            &ShardPlacement::fixed([("cell-a", "node-search")]).unwrap(),
-            "another-graph",
-            8,
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(mismatch, GraphError::GraphScopeMismatch { .. }));
-
     first.close().await.unwrap();
     second.close().await.unwrap();
 }
@@ -343,6 +330,14 @@ async fn routed_queries_reject_a_context_from_another_graph_scope() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let expected_scope = scope("acme", "search", "social");
     let actual_scope = scope("acme", "billing", "social");
+    let seed_path = format!(
+        "{}/cell-a",
+        expected_scope.scoped_store_path("routed-scope")
+    );
+    let seed = GraphShard::open_standalone_writer(seed_path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    seed.close().await.unwrap();
     let cluster = RoutedGraphCluster::open_owned_scoped(
         "routed-scope",
         expected_scope.clone(),

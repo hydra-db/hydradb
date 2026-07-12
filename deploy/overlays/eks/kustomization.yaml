@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: slatedb-graph
+resources:
+  - ../../base
+  - ../../addons/cert-manager
+  - ../../addons/external-secrets
+patches:
+  - path: service-account-patch.yaml
+  - path: runtime-config-patch.yaml
+  - path: services-patch.yaml
+images:
+  - name: ghcr.io/usecortex/slatedb-graph-kernel
+    newTag: 0.1.0
