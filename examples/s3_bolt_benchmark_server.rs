@@ -111,7 +111,7 @@ async fn seed_graph(cluster: &RoutedGraphCluster, fanout: u64, max_hop: u8) -> B
                 &edge_type,
                 layered_edges(fanout, max_hop),
                 &format!("s3-bolt-seed-{fanout}-{hop}"),
-                10_000,
+                slatedb_graph_kernel::DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
             )
             .await?;
     }

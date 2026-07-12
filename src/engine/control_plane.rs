@@ -48,6 +48,7 @@ impl GraphControlPlane {
                 store_path.clone(),
                 Arc::clone(&object_store),
                 &cache,
+                &crate::GraphStorageMemoryConfig::default(),
                 &GraphDurabilityConfig::default(),
             )
             .await?,

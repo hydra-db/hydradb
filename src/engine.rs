@@ -28,9 +28,9 @@ use crate::{
     parse_out_edge_segment_tombstone_key, parse_u64, release_cell_write_lock, segment_edge_visible,
     sort_deltas, validate_component, CellWriteLock, DeltaKind, DeltaRecord, EdgeRecord,
     GraphCacheConfig, GraphCacheKind, GraphCorrectnessReport, GraphDurabilityConfig, GraphEpoch,
-    GraphError, GraphExportDigest, GraphId, GraphOpenOptions, GraphScope, GraphShard, GraphStore,
-    GraphWriteBatch, GraphWriteGuard, MatrixAdjacency, MatrixCacheKey, PostingChunkCacheKey,
-    RelationshipId, RelationshipRecord, Result, SupernodeCacheKey, VertexId,
+    GraphError, GraphExportDigest, GraphId, GraphMemoryConfig, GraphOpenOptions, GraphScope,
+    GraphShard, GraphStore, GraphWriteBatch, GraphWriteGuard, MatrixAdjacency, MatrixCacheKey,
+    PostingChunkCacheKey, RelationshipId, RelationshipRecord, Result, SupernodeCacheKey, VertexId,
 };
 
 const GRAPH_PREALLOC_LIMIT: usize = 1_000_000;
@@ -285,6 +285,7 @@ pub struct RoutedGraphCluster {
     placement: ShardPlacement,
     object_store: Arc<dyn ObjectStore>,
     options: GraphOpenOptions,
+    memory: GraphMemoryConfig,
     shards: BTreeMap<String, GraphShard>,
     leases: Arc<RwLock<BTreeMap<String, ShardLease>>>,
     shard_db_handles: Arc<RwLock<BTreeMap<String, GraphStore>>>,
@@ -1353,6 +1354,45 @@ fn adjacency_from_edges(edges: &[EdgeRecord]) -> MatrixAdjacency {
 
 fn adjacency_edge_count(adjacency: &MatrixAdjacency) -> u64 {
     adjacency.values().map(|dsts| dsts.len() as u64).sum()
+}
+
+fn adjacency_resident_bytes(adjacency: &MatrixAdjacency) -> usize {
+    const BTREE_ENTRY_OVERHEAD_BYTES: usize = 32;
+    const BTREE_SET_OVERHEAD_BYTES: usize = 48;
+    adjacency
+        .len()
+        .saturating_mul(
+            std::mem::size_of::<VertexId>()
+                .saturating_add(BTREE_ENTRY_OVERHEAD_BYTES)
+                .saturating_add(BTREE_SET_OVERHEAD_BYTES),
+        )
+        .saturating_add(
+            usize::try_from(adjacency_edge_count(adjacency))
+                .unwrap_or(usize::MAX)
+                .saturating_mul(
+                    std::mem::size_of::<VertexId>().saturating_add(BTREE_ENTRY_OVERHEAD_BYTES),
+                ),
+        )
+}
+
+fn posting_chunk_resident_bytes(chunk: &PostingChunk) -> usize {
+    std::mem::size_of::<PostingChunk>()
+        .saturating_add(chunk.cell_id.capacity())
+        .saturating_add(chunk.edge_type.capacity())
+        .saturating_add(
+            chunk
+                .vertices
+                .capacity()
+                .saturating_mul(std::mem::size_of::<VertexId>()),
+        )
+}
+
+fn materialized_supernode_resident_bytes(vertices: &[VertexId]) -> usize {
+    std::mem::size_of::<Vec<VertexId>>().saturating_add(
+        vertices
+            .len()
+            .saturating_mul(std::mem::size_of::<VertexId>()),
+    )
 }
 
 const GRAPH_VERIFY_MISMATCH_SAMPLES: usize = 64;

@@ -42,6 +42,7 @@ pub struct GraphShard {
     pub(crate) cache_metrics: Arc<GraphCacheMetrics>,
     pub(crate) operation_metrics: Arc<GraphOperationalMetrics>,
     pub(crate) hydration_gate: Arc<Semaphore>,
+    pub(crate) matrix_compilation_gate: Arc<Semaphore>,
     pub(crate) graph_write_gate: Arc<Semaphore>,
     pub(crate) artifact_build_gate: Arc<Semaphore>,
     pub(crate) gc_gate: Arc<Semaphore>,
@@ -193,6 +194,23 @@ pub struct GraphCacheEntryCounts {
     pub supernode_groups: usize,
     pub posting_chunks: usize,
     pub materialized_supernodes: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphCacheResidentBytes {
+    pub matrix_adjacencies: usize,
+    pub graphblas_matrices: usize,
+    pub posting_chunks: usize,
+    pub materialized_supernodes: usize,
+}
+
+impl GraphCacheResidentBytes {
+    pub fn total(&self) -> usize {
+        self.matrix_adjacencies
+            .saturating_add(self.graphblas_matrices)
+            .saturating_add(self.posting_chunks)
+            .saturating_add(self.materialized_supernodes)
+    }
 }
 
 #[derive(Clone)]
