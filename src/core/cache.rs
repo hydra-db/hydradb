@@ -184,10 +184,13 @@ struct CacheEntry<V> {
     tenant: String,
     pinned: bool,
     last_access: u64,
+    resident_bytes: usize,
 }
 
 pub(crate) struct BoundedGraphCache<K, V> {
     max_entries: usize,
+    max_resident_bytes: usize,
+    resident_bytes: usize,
     max_entries_per_tenant: Option<usize>,
     clock: u64,
     entries: BTreeMap<K, CacheEntry<V>>,
@@ -200,8 +203,18 @@ where
     V: Clone,
 {
     pub(crate) fn new(max_entries: usize, max_entries_per_tenant: Option<usize>) -> Self {
+        Self::new_with_byte_limit(max_entries, max_entries_per_tenant, usize::MAX)
+    }
+
+    pub(crate) fn new_with_byte_limit(
+        max_entries: usize,
+        max_entries_per_tenant: Option<usize>,
+        max_resident_bytes: usize,
+    ) -> Self {
         Self {
             max_entries,
+            max_resident_bytes,
+            resident_bytes: 0,
             max_entries_per_tenant,
             clock: 0,
             entries: BTreeMap::new(),
@@ -211,6 +224,10 @@ where
 
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.resident_bytes
     }
 
     pub(crate) fn get(&mut self, key: &K) -> Option<V> {
@@ -242,6 +259,18 @@ where
         pinned: bool,
         metrics: &GraphCacheMetrics,
     ) -> Option<V> {
+        self.insert_sized(key, value, tenant, pinned, 0, metrics)
+    }
+
+    pub(crate) fn insert_sized(
+        &mut self,
+        key: K,
+        value: V,
+        tenant: impl Into<String>,
+        pinned: bool,
+        resident_bytes: usize,
+        metrics: &GraphCacheMetrics,
+    ) -> Option<V> {
         if self.max_entries == 0 {
             metrics
                 .tenant_quota_rejections
@@ -258,11 +287,14 @@ where
                 tenant: tenant.clone(),
                 pinned,
                 last_access: self.clock,
+                resident_bytes,
             },
         );
         if let Some(previous) = previous {
+            self.resident_bytes = self.resident_bytes.saturating_sub(previous.resident_bytes);
             self.decrement_tenant(&previous.tenant);
         }
+        self.resident_bytes = self.resident_bytes.saturating_add(resident_bytes);
         *self.tenant_entries.entry(tenant.clone()).or_default() += 1;
         metrics.insertions.fetch_add(1, Ordering::Relaxed);
         if pinned {
@@ -302,7 +334,8 @@ where
     }
 
     fn enforce_total_limit(&mut self, metrics: &GraphCacheMetrics) {
-        while self.entries.len() > self.max_entries {
+        while self.entries.len() > self.max_entries || self.resident_bytes > self.max_resident_bytes
+        {
             if self.evict_one(None, false, metrics).is_none()
                 && self.evict_one(None, true, metrics).is_none()
             {
@@ -335,6 +368,7 @@ where
 
     pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
         let entry = self.entries.remove(key)?;
+        self.resident_bytes = self.resident_bytes.saturating_sub(entry.resident_bytes);
         self.decrement_tenant(&entry.tenant);
         Some(entry.value)
     }
@@ -346,5 +380,40 @@ where
                 self.tenant_entries.remove(tenant);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_limit_evicts_lru_entries() {
+        let metrics = GraphCacheMetrics::default();
+        let mut cache = BoundedGraphCache::new_with_byte_limit(10, None, 100);
+        assert_eq!(
+            cache.insert_sized(1, "first", "cell", false, 60, &metrics),
+            Some("first")
+        );
+        assert_eq!(
+            cache.insert_sized(2, "second", "cell", false, 60, &metrics),
+            Some("second")
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.resident_bytes(), 60);
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&2), Some("second"));
+    }
+
+    #[test]
+    fn oversized_entry_is_not_retained() {
+        let metrics = GraphCacheMetrics::default();
+        let mut cache = BoundedGraphCache::new_with_byte_limit(10, None, 100);
+        assert_eq!(
+            cache.insert_sized(1, "oversized", "cell", true, 101, &metrics),
+            None
+        );
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.resident_bytes(), 0);
     }
 }

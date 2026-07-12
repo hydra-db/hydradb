@@ -577,11 +577,12 @@ impl GraphShard {
             &self.cache_metrics,
         );
         if self.cache_policy.max_matrix_adjacencies > 0 {
-            self.matrix_cache.lock().await.insert(
+            self.matrix_cache.lock().await.insert_sized(
                 cache_key.clone(),
                 Arc::clone(&adjacency),
                 tenant.clone(),
                 pinned,
+                adjacency_resident_bytes(adjacency.as_ref()),
                 &self.cache_metrics,
             );
         }
@@ -612,11 +613,13 @@ impl GraphShard {
                     prewarm.vertices.len() as u64,
                 );
             }
-            self.graphblas_cache.lock().await.insert(
+            let resident_bytes = compiled.estimated_resident_bytes();
+            self.graphblas_cache.lock().await.insert_sized(
                 cache_key,
                 compiled,
                 tenant,
                 pinned,
+                resident_bytes,
                 &self.cache_metrics,
             );
         }
@@ -790,11 +793,12 @@ impl GraphShard {
             None
         };
         if let Some(adjacency) = &adjacency {
-            self.matrix_cache.lock().await.insert(
+            self.matrix_cache.lock().await.insert_sized(
                 cache_key.clone(),
                 Arc::clone(adjacency),
                 tenant.clone(),
                 pinned,
+                adjacency_resident_bytes(adjacency.as_ref()),
                 &self.cache_metrics,
             );
         }
@@ -829,11 +833,13 @@ impl GraphShard {
                     prewarm.vertices.len() as u64,
                 );
             }
-            self.graphblas_cache.lock().await.insert(
+            let resident_bytes = compiled.estimated_resident_bytes();
+            self.graphblas_cache.lock().await.insert_sized(
                 cache_key,
                 compiled,
                 tenant,
                 pinned,
+                resident_bytes,
                 &self.cache_metrics,
             );
         }

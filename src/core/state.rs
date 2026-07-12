@@ -42,6 +42,7 @@ pub struct GraphShard {
     pub(crate) cache_metrics: Arc<GraphCacheMetrics>,
     pub(crate) operation_metrics: Arc<GraphOperationalMetrics>,
     pub(crate) hydration_gate: Arc<Semaphore>,
+    pub(crate) matrix_compilation_gate: Arc<Semaphore>,
     pub(crate) graph_write_gate: Arc<Semaphore>,
     pub(crate) artifact_build_gate: Arc<Semaphore>,
     pub(crate) gc_gate: Arc<Semaphore>,
@@ -181,7 +182,9 @@ impl Drop for QueryStatsRefreshHandle {
 pub struct GraphCacheEntryCounts {
     pub matrix_artifacts: usize,
     pub matrix_adjacencies: usize,
+    pub matrix_adjacency_bytes: usize,
     pub graphblas_matrices: usize,
+    pub graphblas_bytes: usize,
     #[cfg(feature = "opencypher")]
     pub parsed_row_queries: usize,
     #[cfg(feature = "opencypher")]

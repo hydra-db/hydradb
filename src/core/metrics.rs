@@ -5,7 +5,9 @@ use crate::engine;
 pub struct GraphCachePolicy {
     pub max_matrix_artifacts: usize,
     pub max_matrix_adjacencies: usize,
+    pub max_matrix_adjacency_bytes: usize,
     pub max_graphblas_matrices: usize,
+    pub max_graphblas_bytes: usize,
     #[cfg(feature = "opencypher")]
     pub max_parsed_row_queries: usize,
     #[cfg(feature = "opencypher")]
@@ -22,6 +24,7 @@ pub struct GraphCachePolicy {
     pub pin_supernode_min_degree: u64,
     pub prefetch_supernode_chunks: u64,
     pub max_concurrent_hydrations: usize,
+    pub max_concurrent_matrix_compilations: usize,
 }
 
 impl Default for GraphCachePolicy {
@@ -29,7 +32,9 @@ impl Default for GraphCachePolicy {
         Self {
             max_matrix_artifacts: 1_024,
             max_matrix_adjacencies: 128,
+            max_matrix_adjacency_bytes: 64 * 1024 * 1024,
             max_graphblas_matrices: 64,
+            max_graphblas_bytes: 128 * 1024 * 1024,
             #[cfg(feature = "opencypher")]
             max_parsed_row_queries: 4_096,
             #[cfg(feature = "opencypher")]
@@ -46,6 +51,7 @@ impl Default for GraphCachePolicy {
             pin_supernode_min_degree: 10_000,
             prefetch_supernode_chunks: 1,
             max_concurrent_hydrations: 16,
+            max_concurrent_matrix_compilations: 1,
         }
     }
 }
@@ -53,6 +59,10 @@ impl Default for GraphCachePolicy {
 impl GraphCachePolicy {
     pub(crate) fn hydration_permits(&self) -> usize {
         self.max_concurrent_hydrations.max(1)
+    }
+
+    pub(crate) fn matrix_compilation_permits(&self) -> usize {
+        self.max_concurrent_matrix_compilations.max(1)
     }
 
     pub(crate) fn pin_matrix_artifact(&self, artifact: &engine::MatrixArtifact) -> bool {

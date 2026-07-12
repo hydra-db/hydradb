@@ -1663,11 +1663,12 @@ impl GraphShard {
         trim_process_memory_after_hydration();
         let mut cache = self.matrix_cache.lock().await;
         Ok(cache
-            .insert(
+            .insert_sized(
                 cache_key,
                 Arc::clone(&adjacency),
                 cell_id.to_string(),
                 adjacency_edge_count(adjacency.as_ref()) >= self.cache_policy.pin_matrix_min_edges,
+                adjacency_resident_bytes(adjacency.as_ref()),
                 &self.cache_metrics,
             )
             .unwrap_or(adjacency))
@@ -1692,6 +1693,19 @@ impl GraphShard {
         }
 
         self.cache_metrics.record_miss(GraphCacheKind::GraphBlas);
+        let _compile_permit = self
+            .matrix_compilation_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|err| GraphError::CorruptValue {
+                key: "cache/matrix_compilation".to_string(),
+                reason: format!("matrix compilation gate closed: {err}"),
+            })?;
+        if let Some(cached) = self.graphblas_cache.lock().await.get(&cache_key) {
+            self.cache_metrics.record_hit(GraphCacheKind::GraphBlas);
+            return Ok(cached);
+        }
         let started = Instant::now();
         let (compiled, compile_units) = if compact_csc_kernel_enabled() {
             if let Some((compiled, edge_count)) = self
@@ -1734,11 +1748,12 @@ impl GraphShard {
         );
         let mut cache = self.graphblas_cache.lock().await;
         Ok(cache
-            .insert(
+            .insert_sized(
                 cache_key,
                 Arc::clone(&compiled),
                 cell_id.to_string(),
                 compile_units >= self.cache_policy.pin_matrix_min_edges,
+                compiled.estimated_resident_bytes(),
                 &self.cache_metrics,
             )
             .unwrap_or(compiled))

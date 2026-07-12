@@ -15,12 +15,7 @@ impl GraphShard {
             object_store,
             GraphOpenOptions {
                 limits,
-                cache: GraphCacheConfig::default(),
-                durability: GraphDurabilityConfig::default(),
-                cache_policy: GraphCachePolicy::default(),
-                retention_policy: GraphRetentionPolicy::default(),
-                backpressure_policy: GraphBackpressurePolicy::default(),
-                index_policy: GraphIndexPolicy::default(),
+                ..GraphOpenOptions::default()
             },
         )
         .await
@@ -52,12 +47,7 @@ impl GraphShard {
             object_store,
             GraphOpenOptions {
                 limits,
-                cache: GraphCacheConfig::default(),
-                durability: GraphDurabilityConfig::default(),
-                cache_policy: GraphCachePolicy::default(),
-                retention_policy: GraphRetentionPolicy::default(),
-                backpressure_policy: GraphBackpressurePolicy::default(),
-                index_policy: GraphIndexPolicy::default(),
+                ..GraphOpenOptions::default()
             },
         )
         .await
@@ -162,6 +152,7 @@ impl GraphShard {
                         store_path.clone(),
                         Arc::clone(&object_store),
                         &options.cache,
+                        &options.storage_memory,
                         &options.durability,
                     )
                     .await?,
@@ -181,6 +172,8 @@ impl GraphShard {
             Arc::clone(&operation_metrics),
         );
         let hydration_gate = Arc::new(Semaphore::new(cache_policy.hydration_permits()));
+        let matrix_compilation_gate =
+            Arc::new(Semaphore::new(cache_policy.matrix_compilation_permits()));
         let graph_write_gate = Arc::new(Semaphore::new(
             backpressure_policy.max_concurrent_graph_writes.max(1),
         ));
@@ -202,6 +195,7 @@ impl GraphShard {
             cache_metrics,
             operation_metrics,
             hydration_gate,
+            matrix_compilation_gate,
             graph_write_gate,
             artifact_build_gate,
             gc_gate,
@@ -213,13 +207,15 @@ impl GraphShard {
                 cache_policy.max_matrix_artifacts,
                 tenant_quota,
             )),
-            matrix_cache: Mutex::new(BoundedGraphCache::new(
+            matrix_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_matrix_adjacencies,
                 tenant_quota,
+                cache_policy.max_matrix_adjacency_bytes,
             )),
-            graphblas_cache: Mutex::new(BoundedGraphCache::new(
+            graphblas_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_graphblas_matrices,
                 tenant_quota,
+                cache_policy.max_graphblas_bytes,
             )),
             #[cfg(feature = "opencypher")]
             parsed_row_query_cache: Mutex::new(BoundedGraphCache::new(
@@ -402,10 +398,20 @@ impl GraphShard {
     }
 
     pub async fn graph_cache_entry_counts(&self) -> GraphCacheEntryCounts {
+        let (matrix_adjacencies, matrix_adjacency_bytes) = {
+            let cache = self.matrix_cache.lock().await;
+            (cache.len(), cache.resident_bytes())
+        };
+        let (graphblas_matrices, graphblas_bytes) = {
+            let cache = self.graphblas_cache.lock().await;
+            (cache.len(), cache.resident_bytes())
+        };
         GraphCacheEntryCounts {
             matrix_artifacts: self.matrix_artifact_cache.lock().await.len(),
-            matrix_adjacencies: self.matrix_cache.lock().await.len(),
-            graphblas_matrices: self.graphblas_cache.lock().await.len(),
+            matrix_adjacencies,
+            matrix_adjacency_bytes,
+            graphblas_matrices,
+            graphblas_bytes,
             #[cfg(feature = "opencypher")]
             parsed_row_queries: self.parsed_row_query_cache.lock().await.len(),
             #[cfg(feature = "opencypher")]

@@ -43,7 +43,8 @@ pub(crate) use core::cache::{
 pub(crate) use core::config::{open_graph_db, open_graph_reader};
 pub use core::config::{
     GraphBackpressurePolicy, GraphCacheConfig, GraphDurabilityConfig, GraphIndexPolicy,
-    GraphLimits, GraphOpenOptions, GraphRetentionPolicy, DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
+    GraphLimits, GraphOpenOptions, GraphRetentionPolicy, GraphStorageMemoryConfig,
+    DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
 };
 pub use core::error::{GraphError, Result};
 pub use core::metrics::{
