@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use slatedb_graph_kernel::{
-    GraphBackpressurePolicy, GraphCacheConfig, GraphDurabilityConfig, GraphId, GraphIndexPolicy,
-    GraphLimits, GraphOpenOptions, GraphRetentionPolicy, GraphScope, NamespaceId, NamespacePath,
+    GraphBackpressurePolicy, GraphCacheConfig, GraphCachePolicy, GraphDurabilityConfig, GraphId,
+    GraphIndexPolicy, GraphLimits, GraphOpenOptions, GraphRetentionPolicy, GraphScope,
+    GraphStorageMemoryConfig, NamespaceId, NamespacePath,
 };
 
 type ConfigResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -20,6 +21,16 @@ pub struct RuntimeConfig {
     pub data_path: String,
     pub data_cache_dir: PathBuf,
     pub data_cache_bytes: usize,
+    pub l0_sst_size_bytes: usize,
+    pub max_unflushed_bytes: usize,
+    pub max_wal_flushes_before_l0_flush: u64,
+    pub l0_flush_parallelism: usize,
+    pub max_matrix_adjacencies: usize,
+    pub max_matrix_adjacency_bytes: usize,
+    pub max_graphblas_matrices: usize,
+    pub max_graphblas_bytes: usize,
+    pub max_concurrent_hydrations: usize,
+    pub max_concurrent_matrix_compilations: usize,
     pub lease_ttl: Duration,
     pub lease_renew_interval: Duration,
     pub shard_refresh_interval: Duration,
@@ -138,6 +149,44 @@ impl RuntimeConfig {
                 "GRAPH_DATA_CACHE_BYTES",
                 8 * 1024 * 1024 * 1024,
             )?,
+            l0_sst_size_bytes: parse_usize(&values, "GRAPH_L0_SST_SIZE_BYTES", 16 * 1024 * 1024)?,
+            max_unflushed_bytes: parse_usize(
+                &values,
+                "GRAPH_MAX_UNFLUSHED_BYTES",
+                64 * 1024 * 1024,
+            )?,
+            max_wal_flushes_before_l0_flush: parse_u64(
+                &values,
+                "GRAPH_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH",
+                4_096,
+            )?,
+            l0_flush_parallelism: parse_usize(&values, "GRAPH_L0_FLUSH_PARALLELISM", 1)?,
+            max_matrix_adjacencies: parse_usize_allow_zero(
+                &values,
+                "GRAPH_MAX_MATRIX_ADJACENCIES",
+                16,
+            )?,
+            max_matrix_adjacency_bytes: parse_usize_allow_zero(
+                &values,
+                "GRAPH_MAX_MATRIX_ADJACENCY_BYTES",
+                64 * 1024 * 1024,
+            )?,
+            max_graphblas_matrices: parse_usize_allow_zero(
+                &values,
+                "GRAPH_MAX_GRAPHBLAS_MATRICES",
+                16,
+            )?,
+            max_graphblas_bytes: parse_usize_allow_zero(
+                &values,
+                "GRAPH_MAX_GRAPHBLAS_BYTES",
+                128 * 1024 * 1024,
+            )?,
+            max_concurrent_hydrations: parse_usize(&values, "GRAPH_MAX_CONCURRENT_HYDRATIONS", 2)?,
+            max_concurrent_matrix_compilations: parse_usize(
+                &values,
+                "GRAPH_MAX_CONCURRENT_MATRIX_COMPILATIONS",
+                1,
+            )?,
             lease_ttl: parse_duration(&values, "GRAPH_LEASE_TTL_MS", 30_000)?,
             lease_renew_interval: parse_duration(&values, "GRAPH_LEASE_RENEW_INTERVAL_MS", 5_000)?,
             shard_refresh_interval: parse_duration(
@@ -194,8 +243,22 @@ impl RuntimeConfig {
                 &self.data_cache_dir,
                 self.data_cache_bytes,
             ),
+            storage_memory: GraphStorageMemoryConfig {
+                l0_sst_size_bytes: self.l0_sst_size_bytes,
+                max_unflushed_bytes: self.max_unflushed_bytes,
+                max_wal_flushes_before_l0_flush: self.max_wal_flushes_before_l0_flush,
+                l0_flush_parallelism: self.l0_flush_parallelism,
+            },
             durability: GraphDurabilityConfig::default(),
-            cache_policy: Default::default(),
+            cache_policy: GraphCachePolicy {
+                max_matrix_adjacencies: self.max_matrix_adjacencies,
+                max_matrix_adjacency_bytes: self.max_matrix_adjacency_bytes,
+                max_graphblas_matrices: self.max_graphblas_matrices,
+                max_graphblas_bytes: self.max_graphblas_bytes,
+                max_concurrent_hydrations: self.max_concurrent_hydrations,
+                max_concurrent_matrix_compilations: self.max_concurrent_matrix_compilations,
+                ..GraphCachePolicy::default()
+            },
             retention_policy: GraphRetentionPolicy::default(),
             backpressure_policy: GraphBackpressurePolicy::default(),
             index_policy: GraphIndexPolicy::Full,
@@ -364,6 +427,24 @@ fn parse_usize(
     })
 }
 
+fn parse_usize_allow_zero(
+    values: &BTreeMap<String, String>,
+    name: &str,
+    default: usize,
+) -> ConfigResult<usize> {
+    let raw = value(values, name, &default.to_string());
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|err| Error::new(ErrorKind::InvalidInput, format!("invalid {name}: {err}")))?;
+    usize::try_from(parsed).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("{name} does not fit usize"),
+        )
+        .into()
+    })
+}
+
 fn parse_bool(values: &BTreeMap<String, String>, name: &str, default: bool) -> ConfigResult<bool> {
     match value(values, name, if default { "true" } else { "false" })
         .to_ascii_lowercase()
@@ -436,6 +517,11 @@ mod tests {
         ]);
         let config = RuntimeConfig::from_values(values).unwrap();
         assert_eq!(config.max_query_runtime_ms, 30_000);
+        assert_eq!(config.l0_sst_size_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.max_unflushed_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.max_concurrent_hydrations, 2);
+        let options = config.graph_open_options();
+        assert_eq!(options.cache_policy.max_graphblas_bytes, 128 * 1024 * 1024);
     }
 
     #[test]
@@ -449,5 +535,30 @@ mod tests {
         ]);
         let config = RuntimeConfig::from_values(values).unwrap();
         assert_eq!(config.control_rpc_endpoint.port(), 9443);
+    }
+
+    #[test]
+    fn graph_node_config_can_disable_heavy_memory_caches() {
+        let values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            (
+                "GRAPH_INTERNAL_ALLOW_PLAINTEXT".to_string(),
+                "true".to_string(),
+            ),
+            ("GRAPH_MAX_MATRIX_ADJACENCIES".to_string(), "0".to_string()),
+            (
+                "GRAPH_MAX_MATRIX_ADJACENCY_BYTES".to_string(),
+                "0".to_string(),
+            ),
+            ("GRAPH_MAX_GRAPHBLAS_MATRICES".to_string(), "0".to_string()),
+            ("GRAPH_MAX_GRAPHBLAS_BYTES".to_string(), "0".to_string()),
+        ]);
+        let options = RuntimeConfig::from_values(values)
+            .unwrap()
+            .graph_open_options();
+        assert_eq!(options.cache_policy.max_matrix_adjacencies, 0);
+        assert_eq!(options.cache_policy.max_matrix_adjacency_bytes, 0);
+        assert_eq!(options.cache_policy.max_graphblas_matrices, 0);
+        assert_eq!(options.cache_policy.max_graphblas_bytes, 0);
     }
 }

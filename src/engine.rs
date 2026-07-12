@@ -1355,6 +1355,25 @@ fn adjacency_edge_count(adjacency: &MatrixAdjacency) -> u64 {
     adjacency.values().map(|dsts| dsts.len() as u64).sum()
 }
 
+fn adjacency_resident_bytes(adjacency: &MatrixAdjacency) -> usize {
+    const BTREE_ENTRY_OVERHEAD_BYTES: usize = 32;
+    const BTREE_SET_OVERHEAD_BYTES: usize = 48;
+    adjacency
+        .len()
+        .saturating_mul(
+            std::mem::size_of::<VertexId>()
+                .saturating_add(BTREE_ENTRY_OVERHEAD_BYTES)
+                .saturating_add(BTREE_SET_OVERHEAD_BYTES),
+        )
+        .saturating_add(
+            usize::try_from(adjacency_edge_count(adjacency))
+                .unwrap_or(usize::MAX)
+                .saturating_mul(
+                    std::mem::size_of::<VertexId>().saturating_add(BTREE_ENTRY_OVERHEAD_BYTES),
+                ),
+        )
+}
+
 const GRAPH_VERIFY_MISMATCH_SAMPLES: usize = 64;
 
 type RelationshipPropertyIndexEntry = (String, String, VertexId, VertexId, RelationshipId);

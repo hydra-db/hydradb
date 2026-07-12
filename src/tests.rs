@@ -18338,6 +18338,10 @@ async fn graphblas_matrix_kernel_reuses_compiled_base_matrix_cache() {
         .unwrap();
 
     assert_eq!(shard.graphblas_cache.lock().await.len(), 1);
+    let cache_counts = shard.graph_cache_entry_counts().await;
+    assert_eq!(cache_counts.graphblas_matrices, 1);
+    assert!(cache_counts.graphblas_bytes > 0);
+    assert!(cache_counts.graphblas_bytes <= GraphCachePolicy::default().max_graphblas_bytes);
     let first = shard
         .matrix_reachable_with_kernel(
             "reddit-home",

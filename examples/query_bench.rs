@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use slatedb::object_store::ObjectStore;
 use slatedb_graph_kernel::{
     local_object_store, object_store_from_env, ArtifactDirection, GraphCacheConfig,
-    GraphCachePolicy, GraphIndexPolicy, GraphLimits, GraphOpenOptions, GraphShard, QueryContext,
-    RowQueryPlan,
+    GraphCachePolicy, GraphIndexPolicy, GraphLimits, GraphOpenOptions, GraphShard,
+    GraphStorageMemoryConfig, QueryContext, RowQueryPlan,
 };
 
 type BenchResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -355,7 +355,7 @@ async fn async_main() -> BenchResult<()> {
 async fn explain_plan(env: &BenchEnv, query: &str, name: &str) -> BenchResult<String> {
     let cache_dir = env.cache_root.join(format!("fanout-{}-{name}", env.fanout));
     reset_dir(&cache_dir)?;
-    let reader = GraphShard::open_with_options(
+    let reader = GraphShard::open_standalone_writer_with_options(
         env.shard_path.clone(),
         Arc::clone(&env.object_store),
         graph_options(
@@ -386,7 +386,7 @@ async fn bench_rows_workload(
         .cache_root
         .join(format!("fanout-{}-hop-{hop}-rows-warm", env.fanout));
     reset_dir(&cache_dir)?;
-    let seed_reader = GraphShard::open_with_options(
+    let seed_reader = GraphShard::open_standalone_writer_with_options(
         env.shard_path.clone(),
         Arc::clone(&env.object_store),
         graph_options(
@@ -408,7 +408,7 @@ async fn bench_rows_workload(
     seed_reader.close().await?;
 
     let warm_reader = Arc::new(
-        GraphShard::open_with_options(
+        GraphShard::open_standalone_writer_with_options(
             env.shard_path.clone(),
             Arc::clone(&env.object_store),
             graph_options(
@@ -494,7 +494,7 @@ async fn bench_page_workload(
         .cache_root
         .join(format!("fanout-{}-{workload_name}-warm", env.fanout));
     reset_dir(&cache_dir)?;
-    let seed_reader = GraphShard::open_with_options(
+    let seed_reader = GraphShard::open_standalone_writer_with_options(
         env.shard_path.clone(),
         Arc::clone(&env.object_store),
         graph_options(
@@ -522,7 +522,7 @@ async fn bench_page_workload(
     seed_reader.close().await?;
 
     let warm_reader = Arc::new(
-        GraphShard::open_with_options(
+        GraphShard::open_standalone_writer_with_options(
             env.shard_path.clone(),
             Arc::clone(&env.object_store),
             graph_options(
@@ -623,7 +623,7 @@ async fn bench_cold_rows(
         reset_dir(&cache_dir)?;
 
         let open_started = Instant::now();
-        let reader = GraphShard::open_with_options(
+        let reader = GraphShard::open_standalone_writer_with_options(
             env.shard_path.clone(),
             Arc::clone(&env.object_store),
             graph_options(
@@ -690,7 +690,7 @@ async fn bench_cold_page(
         reset_dir(&cache_dir)?;
 
         let open_started = Instant::now();
-        let reader = GraphShard::open_with_options(
+        let reader = GraphShard::open_standalone_writer_with_options(
             env.shard_path.clone(),
             Arc::clone(&env.object_store),
             graph_options(
@@ -878,6 +878,17 @@ fn graph_options(
             .filter(|_| cache_bytes > 0)
             .map(|path| GraphCacheConfig::disk_cache_without_preload(path, cache_bytes))
             .unwrap_or_else(GraphCacheConfig::disabled),
+        storage_memory: GraphStorageMemoryConfig {
+            l0_sst_size_bytes: env_usize(
+                "GRAPH_QUERY_BENCH_L0_SST_BYTES",
+                GraphStorageMemoryConfig::default().l0_sst_size_bytes,
+            ),
+            max_unflushed_bytes: env_usize(
+                "GRAPH_QUERY_BENCH_MAX_UNFLUSHED_BYTES",
+                GraphStorageMemoryConfig::default().max_unflushed_bytes,
+            ),
+            ..GraphStorageMemoryConfig::default()
+        },
         cache_policy: GraphCachePolicy {
             max_matrix_adjacencies,
             max_graphblas_matrices,
