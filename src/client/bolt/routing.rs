@@ -142,6 +142,8 @@ impl BoltRoutingTableProvider for ControllerBoltRoutingTableProvider {
             ttl_secs,
             vec![
                 BoltRoutingServer::new("ROUTE", route_addresses)?,
+                // Only the lease owner opens this cell's shard. Advertising non-owners as
+                // readers would send Bolt clients to nodes that must reject the query.
                 BoltRoutingServer::new("READ", [write_address.clone()])?,
                 BoltRoutingServer::new("WRITE", [write_address])?,
             ],

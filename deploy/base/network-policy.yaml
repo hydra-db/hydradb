@@ -57,6 +57,8 @@ spec:
           port: 8443
         - protocol: TCP
           port: 9090
+        - protocol: TCP
+          port: 9443
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0

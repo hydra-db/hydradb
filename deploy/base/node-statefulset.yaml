@@ -131,6 +131,18 @@ spec:
             secretName: graph-server-tls
             optional: true
         - name: internal-tls
-          secret:
-            secretName: graph-node-mtls
-            optional: false
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: graph-node-mtls
+                  items:
+                    - key: tls.crt
+                      path: tls.crt
+                    - key: tls.key
+                      path: tls.key
+              - secret:
+                  name: graph-internal-ca
+                  items:
+                    - key: tls.crt
+                      path: ca.crt

@@ -26,6 +26,39 @@ spec:
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
+  name: graph-internal-ca
+  namespace: slatedb-graph
+spec:
+  secretName: graph-internal-ca
+  duration: 8760h
+  renewBefore: 720h
+  isCA: true
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+  usages:
+    - cert sign
+    - crl sign
+    - digital signature
+  commonName: slatedb-graph-internal-ca
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: REPLACE_GRAPH_INTERNAL_ROOT_ISSUER
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: graph-internal-ca-issuer
+  namespace: slatedb-graph
+spec:
+  ca:
+    secretName: graph-internal-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
   name: graph-controller-mtls
   namespace: slatedb-graph
 spec:
@@ -43,8 +76,8 @@ spec:
     - graph-controller.slatedb-graph.svc.cluster.local
   issuerRef:
     group: cert-manager.io
-    kind: ClusterIssuer
-    name: REPLACE_GRAPH_INTERNAL_CA_ISSUER
+    kind: Issuer
+    name: graph-internal-ca-issuer
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -64,5 +97,5 @@ spec:
   commonName: graph-node
   issuerRef:
     group: cert-manager.io
-    kind: ClusterIssuer
-    name: REPLACE_GRAPH_INTERNAL_CA_ISSUER
+    kind: Issuer
+    name: graph-internal-ca-issuer

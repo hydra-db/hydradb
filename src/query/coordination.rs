@@ -48,6 +48,8 @@ use crate::{
 use crate::{GraphId, GraphScope, NamespacePath};
 
 #[cfg(feature = "query-transport")]
+// This is the first production wire contract. Pre-production frame versions are
+// intentionally unsupported; future changes must preserve version 1 during rollouts.
 const QUERY_TRANSPORT_VERSION: u16 = 1;
 #[cfg(feature = "query-transport")]
 const DEFAULT_QUERY_TRANSPORT_MAX_FRAME_BYTES: usize = 1 << 20;
