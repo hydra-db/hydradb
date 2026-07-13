@@ -20,10 +20,10 @@ use crate::query::opencypher::{
     OpenCypherQueryAccess, ParsedUnwindBatchKind,
 };
 use crate::{
-    validate_component, GraphEpoch, GraphError, GraphId, GraphScope, NamespaceId, NamespacePath,
-    QueryBatchEdge, QueryBatchOperation, QueryCancellationToken, QueryColumn, QueryContext,
-    QueryCursorToken, QueryParameterValue, QueryResultPage, QueryResultSet, Result,
-    VertexPropertyValue,
+    validate_component, EdgeMetadata, GraphEpoch, GraphError, GraphId, GraphScope, NamespaceId,
+    NamespacePath, QueryBatchEdge, QueryBatchOperation, QueryBatchRelationship, QueryBatchVertex,
+    QueryCancellationToken, QueryColumn, QueryContext, QueryCursorToken, QueryParameterValue,
+    QueryResultPage, QueryResultSet, Result, VertexMetadata, VertexPropertyValue,
 };
 
 const DEFAULT_MAX_QUERY_BYTES: usize = 1024 * 1024;
@@ -1443,6 +1443,65 @@ fn resolve_unwind_batch(
                 values,
             })
         }
+        ParsedUnwindBatchKind::UpsertVertices {
+            label,
+            vertex_field,
+            property_fields,
+        } => Ok(QueryBatchOperation::UpsertVertices {
+            vertices: rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let mut metadata = VertexMetadata::default().with_label(label.clone());
+                    for (property, field) in &property_fields {
+                        metadata
+                            .properties
+                            .insert(property.clone(), unwind_row_scalar(row, index, field)?);
+                    }
+                    Ok(QueryBatchVertex {
+                        vertex: unwind_row_vertex_id(row, index, &vertex_field)?,
+                        metadata,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        }),
+        ParsedUnwindBatchKind::ImportRelationshipsBetweenLabeledVertices {
+            edge_type,
+            source_field,
+            destination_field,
+            relationship_id_field,
+            property_fields,
+            source_label,
+            destination_label,
+        } => Ok(
+            QueryBatchOperation::ImportRelationshipsBetweenLabeledVertices {
+                edge_type,
+                relationships: rows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, row)| {
+                        let mut metadata = EdgeMetadata::default();
+                        for (property, field) in &property_fields {
+                            metadata
+                                .properties
+                                .insert(property.clone(), unwind_row_scalar(row, index, field)?);
+                        }
+                        Ok(QueryBatchRelationship {
+                            src: unwind_row_vertex_id(row, index, &source_field)?,
+                            dst: unwind_row_vertex_id(row, index, &destination_field)?,
+                            relationship_id: unwind_row_vertex_id(
+                                row,
+                                index,
+                                &relationship_id_field,
+                            )?,
+                            metadata,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                source_label,
+                destination_label,
+            },
+        ),
     }
 }
 
@@ -1528,7 +1587,9 @@ fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> 
         | QueryBatchOperation::CreateEdgesBetweenLabeledVertices { .. }
         | QueryBatchOperation::DeleteEdges { .. }
         | QueryBatchOperation::DeleteVertices { .. }
-        | QueryBatchOperation::DeleteRelationshipsByProperty { .. } => Vec::new(),
+        | QueryBatchOperation::DeleteRelationshipsByProperty { .. }
+        | QueryBatchOperation::UpsertVertices { .. }
+        | QueryBatchOperation::ImportRelationshipsBetweenLabeledVertices { .. } => Vec::new(),
     }
 }
 

@@ -454,6 +454,194 @@ async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
         )
         .await
         .unwrap();
+    let vertex_rows = BoltValue::List(vec![
+        BoltValue::Dict(BoltDict::from([
+            ("vertex".to_string(), BoltValue::Integer(70)),
+            (
+                "entity_id".to_string(),
+                BoltValue::String("entity-a".to_string()),
+            ),
+            ("active".to_string(), BoltValue::Boolean(true)),
+            (
+                "tenant_id".to_string(),
+                BoltValue::String("tenant-a".to_string()),
+            ),
+            (
+                "sub_tenant_id".to_string(),
+                BoltValue::String("sub-a".to_string()),
+            ),
+        ])),
+        BoltValue::Dict(BoltDict::from([
+            ("vertex".to_string(), BoltValue::Integer(71)),
+            (
+                "entity_id".to_string(),
+                BoltValue::String("entity-b".to_string()),
+            ),
+            ("active".to_string(), BoltValue::Boolean(true)),
+            (
+                "tenant_id".to_string(),
+                BoltValue::String("tenant-a".to_string()),
+            ),
+            (
+                "sub_tenant_id".to_string(),
+                BoltValue::String("sub-a".to_string()),
+            ),
+        ])),
+    ]);
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MERGE (n:Entity {id: row.vertex, entity_id: row.entity_id, active: row.active, \
+                    tenant_id: row.tenant_id, sub_tenant_id: row.sub_tenant_id})",
+            BoltDict::from([("rows".to_string(), vertex_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    let upserted = session
+        .run("MATCH (n:Entity {entity_id: 'entity-a'}) RETURN n.id AS id, n.active AS active")
+        .await
+        .unwrap();
+    assert_eq!(
+        upserted.records,
+        vec![vec![BoltValue::Integer(70), BoltValue::Boolean(true)]]
+    );
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row MERGE (n:Entity {id: row.vertex, name: row.name})",
+            BoltDict::from([(
+                "rows".to_string(),
+                BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+                    ("vertex".to_string(), BoltValue::Integer(70)),
+                    (
+                        "name".to_string(),
+                        BoltValue::String("Entity A".to_string()),
+                    ),
+                ]))]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    let merged = session
+        .run(
+            "MATCH (n:Entity {entity_id: 'entity-a'}) \
+             RETURN n.active AS active, n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.records,
+        vec![vec![
+            BoltValue::Boolean(true),
+            BoltValue::String("Entity A".to_string()),
+        ]]
+    );
+
+    let relationship_rows = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("source_vertex".to_string(), BoltValue::Integer(70)),
+        ("destination_vertex".to_string(), BoltValue::Integer(71)),
+        ("relationship_vertex".to_string(), BoltValue::Integer(900)),
+        (
+            "relationship_id".to_string(),
+            BoltValue::String("relationship-a".to_string()),
+        ),
+        (
+            "chunk_id".to_string(),
+            BoltValue::String("chunk-a".to_string()),
+        ),
+    ]))]);
+    let relationship_query = "UNWIND $rows AS row \
+         MATCH (s:Entity {id: row.source_vertex}), \
+               (d:Entity {id: row.destination_vertex}) \
+         CREATE (s)-[:RELATES {id: row.relationship_vertex, \
+                 relationship_id: row.relationship_id, chunk_id: row.chunk_id}]->(d)";
+    for _ in 0..2 {
+        let _ = session
+            .run_with_params(
+                relationship_query,
+                BoltDict::from([("rows".to_string(), relationship_rows.clone())]),
+                BoltDict::new(),
+            )
+            .await
+            .unwrap();
+    }
+    let updated_relationship_rows = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("source_vertex".to_string(), BoltValue::Integer(70)),
+        ("destination_vertex".to_string(), BoltValue::Integer(71)),
+        ("relationship_vertex".to_string(), BoltValue::Integer(900)),
+        (
+            "relationship_id".to_string(),
+            BoltValue::String("relationship-a".to_string()),
+        ),
+        (
+            "chunk_id".to_string(),
+            BoltValue::String("chunk-b".to_string()),
+        ),
+    ]))]);
+    let _ = session
+        .run_with_params(
+            relationship_query,
+            BoltDict::from([("rows".to_string(), updated_relationship_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    let relationship = session
+        .run(
+            "MATCH ({id: 70})-[r:RELATES {relationship_id: 'relationship-a'}]->({id: 71}) \
+             RETURN count(*) AS count, r.chunk_id AS chunk_id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        relationship.records,
+        vec![vec![
+            BoltValue::Integer(1),
+            BoltValue::String("chunk-b".to_string()),
+        ]]
+    );
+    let _ = session
+        .run(
+            "MATCH (scope:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+                   -[r:RELATES {relationship_id: 'relationship-a'}]->() \
+             SET r.superseded_by = 'relationship-b', r.valid_to = 42.5",
+        )
+        .await
+        .unwrap();
+    let updated_relationship = session
+        .run(
+            "MATCH ({id: 70})-[r:RELATES {relationship_id: 'relationship-a'}]->({id: 71}) \
+             RETURN r.superseded_by AS superseded_by, r.valid_to AS valid_to",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        updated_relationship.records,
+        vec![vec![
+            BoltValue::String("relationship-b".to_string()),
+            BoltValue::Float(42.5),
+        ]]
+    );
+    let _ = session
+        .run(
+            "MATCH (scope:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+                   -[r:RELATES]->() \
+             WHERE r.chunk_id = 'chunk-b' OR r.chunk_id = 'missing' DELETE r",
+        )
+        .await
+        .unwrap();
+    let deleted_relationship = session
+        .run(
+            "MATCH ({id: 70})-[r:RELATES {relationship_id: 'relationship-a'}]->({id: 71}) \
+             RETURN count(*) AS count",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted_relationship.records,
+        vec![vec![BoltValue::Integer(0)]]
+    );
     let _ = session
         .run("CREATE (:Source {id: 60})-[:SEED]->(:Source {id: 61})")
         .await

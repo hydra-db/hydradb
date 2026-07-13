@@ -106,12 +106,12 @@ pub use placement::{
 };
 pub use query::algebra::{
     LogicalQueryPlan, PhysicalQueryPlan, QueryBatchEdge, QueryBatchOperation,
-    QueryCancellationToken, QueryCardinalityStatsKind, QueryCardinalityStatsRefresh, QueryColumn,
-    QueryContext, QueryCursorToken, QueryMutationResult, QueryOutput, QueryParameterValue,
-    QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet, QueryRow, QueryStatement,
-    QueryStatsHistogramRefresh, QueryStatsRecord, QueryStatsRefreshKind, QueryStatsRefreshResult,
-    QueryStatsRefreshSpec, QueryValue, QueryWindow, RowQueryAccess, RowQueryOptimizerPass,
-    RowQueryPlan, RowQueryPlanGroup, RowQueryPlanPattern,
+    QueryBatchRelationship, QueryBatchVertex, QueryCancellationToken, QueryCardinalityStatsKind,
+    QueryCardinalityStatsRefresh, QueryColumn, QueryContext, QueryCursorToken, QueryMutationResult,
+    QueryOutput, QueryParameterValue, QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet,
+    QueryRow, QueryStatement, QueryStatsHistogramRefresh, QueryStatsRecord, QueryStatsRefreshKind,
+    QueryStatsRefreshResult, QueryStatsRefreshSpec, QueryValue, QueryWindow, RowQueryAccess,
+    RowQueryOptimizerPass, RowQueryPlan, RowQueryPlanGroup, RowQueryPlanPattern,
 };
 #[cfg(feature = "query-service-discovery")]
 pub use query::coordination::{
