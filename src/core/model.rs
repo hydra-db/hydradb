@@ -231,12 +231,20 @@ impl VertexPropertyValue {
     }
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VertexMetadata {
     pub labels: BTreeSet<String>,
     pub properties: BTreeMap<String, VertexPropertyValue>,
 }
 
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EdgeMetadata {
     pub properties: BTreeMap<String, VertexPropertyValue>,

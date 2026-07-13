@@ -40,6 +40,28 @@ pub struct QueryBatchEdge {
     derive(serde::Deserialize, serde::Serialize)
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryBatchVertex {
+    pub vertex: VertexId,
+    pub metadata: VertexMetadata,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryBatchRelationship {
+    pub src: VertexId,
+    pub dst: VertexId,
+    pub relationship_id: u64,
+    pub metadata: EdgeMetadata,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryBatchOperation {
     OutNeighbors {
         edge_type: String,
@@ -70,6 +92,15 @@ pub enum QueryBatchOperation {
         source_label: String,
         destination_label: String,
     },
+    UpsertVertices {
+        vertices: Vec<QueryBatchVertex>,
+    },
+    ImportRelationshipsBetweenLabeledVertices {
+        edge_type: String,
+        relationships: Vec<QueryBatchRelationship>,
+        source_label: String,
+        destination_label: String,
+    },
 }
 
 impl QueryBatchOperation {
@@ -81,6 +112,8 @@ impl QueryBatchOperation {
                 | Self::DeleteEdges { .. }
                 | Self::DeleteVertices { .. }
                 | Self::DeleteRelationshipsByProperty { .. }
+                | Self::UpsertVertices { .. }
+                | Self::ImportRelationshipsBetweenLabeledVertices { .. }
         )
     }
 
@@ -92,6 +125,10 @@ impl QueryBatchOperation {
             | Self::DeleteEdges { edges, .. } => edges.len(),
             Self::DeleteVertices { vertices, .. } => vertices.len(),
             Self::DeleteRelationshipsByProperty { values, .. } => values.len(),
+            Self::UpsertVertices { vertices } => vertices.len(),
+            Self::ImportRelationshipsBetweenLabeledVertices { relationships, .. } => {
+                relationships.len()
+            }
         }
     }
 

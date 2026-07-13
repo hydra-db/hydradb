@@ -74,6 +74,20 @@ pub(crate) enum ParsedUnwindBatchKind {
         property: String,
         value_field: String,
     },
+    UpsertVertices {
+        label: String,
+        vertex_field: String,
+        property_fields: BTreeMap<String, String>,
+    },
+    ImportRelationshipsBetweenLabeledVertices {
+        edge_type: String,
+        source_field: String,
+        destination_field: String,
+        relationship_id_field: String,
+        property_fields: BTreeMap<String, String>,
+        source_label: String,
+        destination_label: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -348,6 +362,8 @@ impl ParsedCypher {
                         | ParsedUnwindBatchKind::DeleteEdges { .. }
                         | ParsedUnwindBatchKind::DeleteVertices { .. }
                         | ParsedUnwindBatchKind::DeleteRelationshipsByProperty { .. }
+                        | ParsedUnwindBatchKind::UpsertVertices { .. }
+                        | ParsedUnwindBatchKind::ImportRelationshipsBetweenLabeledVertices { .. }
                 );
                 if batch_is_write != has_write_clause {
                     return Err(GraphError::CorruptValue {
@@ -401,6 +417,23 @@ impl ParsedCypher {
             let alias = identifier_name(checked_node(sys::cypher_ast_unwind_get_alias(unwind))?)?;
             let second = checked_node(sys::cypher_ast_query_get_clause(query, 1))?;
 
+            if is_instance(second, sys::CYPHER_AST_MERGE) {
+                if clause_count != 2 || sys::cypher_ast_merge_nactions(second) != 0 {
+                    return unsupported(
+                        "UNWIND vertex MERGE must be the final clause without ON CREATE/ON MATCH",
+                    );
+                }
+                let template = unwind_vertex_upsert_template(second, &alias)?;
+                return Ok(Some(ParsedUnwindBatch {
+                    parameter,
+                    kind: ParsedUnwindBatchKind::UpsertVertices {
+                        label: template.label,
+                        vertex_field: template.vertex_field,
+                        property_fields: template.property_fields,
+                    },
+                }));
+            }
+
             if is_instance(second, sys::CYPHER_AST_CREATE) {
                 if clause_count != 2 {
                     return unsupported("UNWIND CREATE cannot be followed by another clause");
@@ -435,6 +468,20 @@ impl ParsedCypher {
             if is_instance(third, sys::CYPHER_AST_CREATE) {
                 let create_pattern = checked_node(sys::cypher_ast_create_get_pattern(third))?;
                 let template = unwind_bound_edge_create_template(pattern, create_pattern, &alias)?;
+                if let Some(relationship_id_field) = template.relationship_id_field {
+                    return Ok(Some(ParsedUnwindBatch {
+                        parameter,
+                        kind: ParsedUnwindBatchKind::ImportRelationshipsBetweenLabeledVertices {
+                            edge_type: template.edge_type,
+                            source_field: template.source_field,
+                            destination_field: template.destination_field,
+                            relationship_id_field,
+                            property_fields: template.property_fields,
+                            source_label: template.source_label,
+                            destination_label: template.destination_label,
+                        },
+                    }));
+                }
                 return Ok(Some(ParsedUnwindBatch {
                     parameter,
                     kind: ParsedUnwindBatchKind::CreateEdgesBetweenLabeledVertices {
@@ -765,6 +812,81 @@ struct UnwindBoundEdgeCreateTemplate {
     destination_field: String,
     source_label: String,
     destination_label: String,
+    relationship_id_field: Option<String>,
+    property_fields: BTreeMap<String, String>,
+}
+
+#[cfg(feature = "client-api")]
+struct UnwindVertexUpsertTemplate {
+    label: String,
+    vertex_field: String,
+    property_fields: BTreeMap<String, String>,
+}
+
+#[cfg(feature = "client-api")]
+fn unwind_vertex_upsert_template(
+    merge_clause: *const AstNode,
+    unwind_alias: &str,
+) -> Result<UnwindVertexUpsertTemplate> {
+    unsafe {
+        let path = checked_node(sys::cypher_ast_merge_get_pattern_path(merge_clause))?;
+        ensure_instance(path, sys::CYPHER_AST_PATTERN_PATH, "UNWIND MERGE vertex")?;
+        if sys::cypher_ast_pattern_path_nelements(path) != 1 {
+            return unsupported("UNWIND vertex MERGE requires exactly one node");
+        }
+        let node = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
+        ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "UNWIND MERGE vertex")?;
+        if sys::cypher_ast_node_pattern_nlabels(node) != 1 {
+            return unsupported("UNWIND vertex MERGE requires exactly one label");
+        }
+        let label = label_name(checked_node(sys::cypher_ast_node_pattern_get_label(
+            node, 0,
+        ))?)?;
+        validate_component("label", &label)?;
+        let properties = checked_node(sys::cypher_ast_node_pattern_get_properties(node))?;
+        let mut fields = unwind_row_property_fields(properties, unwind_alias, "vertex MERGE")?;
+        let vertex_field = fields
+            .remove("id")
+            .ok_or_else(|| unsupported_value("UNWIND vertex MERGE requires id: row.<field>"))?;
+        Ok(UnwindVertexUpsertTemplate {
+            label,
+            vertex_field,
+            property_fields: fields,
+        })
+    }
+}
+
+#[cfg(feature = "client-api")]
+fn unwind_row_property_fields(
+    properties: *const AstNode,
+    unwind_alias: &str,
+    operation: &str,
+) -> Result<BTreeMap<String, String>> {
+    unsafe {
+        ensure_instance(properties, sys::CYPHER_AST_MAP, "UNWIND property map")?;
+        let mut fields = BTreeMap::new();
+        for index in 0..sys::cypher_ast_map_nentries(properties) {
+            let property = prop_name(checked_node(sys::cypher_ast_map_get_key(
+                properties, index,
+            ))?)?;
+            validate_component("property", &property)?;
+            let value = checked_node(sys::cypher_ast_map_get_value(properties, index))?;
+            let Some((binding, field)) = property_expression_binding(value)? else {
+                return unsupported(format!(
+                    "UNWIND {operation} properties must read from the row map"
+                ));
+            };
+            if binding != unwind_alias {
+                return unsupported(format!(
+                    "UNWIND {operation} property references the wrong row alias"
+                ));
+            }
+            if fields.insert(property.clone(), field).is_some() {
+                return unsupported(format!("UNWIND {operation} repeats property {property}"));
+            }
+        }
+        Ok(fields)
+    }
 }
 
 #[cfg(feature = "client-api")]
@@ -841,12 +963,9 @@ fn unwind_bound_edge_create_template(
             return unsupported("UNWIND MATCH CREATE must reference bound endpoint variables");
         }
         if !sys::cypher_ast_rel_pattern_get_varlength(relationship).is_null()
-            || !sys::cypher_ast_rel_pattern_get_properties(relationship).is_null()
             || sys::cypher_ast_rel_pattern_nreltypes(relationship) != 1
         {
-            return unsupported(
-                "UNWIND MATCH CREATE requires one fixed relationship type without properties",
-            );
+            return unsupported("UNWIND MATCH CREATE requires one fixed relationship type");
         }
         let left_binding = node_identifier(left)?.ok_or_else(|| {
             unsupported_value("UNWIND MATCH CREATE source must reference a binding")
@@ -868,6 +987,20 @@ fn unwind_bound_edge_create_template(
             relationship,
             0,
         ))?)?;
+        let relationship_properties = sys::cypher_ast_rel_pattern_get_properties(relationship);
+        let (relationship_id_field, property_fields) = if relationship_properties.is_null() {
+            (None, BTreeMap::new())
+        } else {
+            let mut fields = unwind_row_property_fields(
+                relationship_properties,
+                unwind_alias,
+                "relationship CREATE",
+            )?;
+            let relationship_id_field = fields.remove("id").ok_or_else(|| {
+                unsupported_value("UNWIND relationship CREATE properties require id: row.<field>")
+            })?;
+            (Some(relationship_id_field), fields)
+        };
         match sys::cypher_ast_rel_pattern_get_direction(relationship) {
             sys::cypher_rel_direction::CYPHER_REL_OUTBOUND => Ok(UnwindBoundEdgeCreateTemplate {
                 edge_type,
@@ -875,6 +1008,8 @@ fn unwind_bound_edge_create_template(
                 destination_field: right_endpoint.0.clone(),
                 source_label: left_endpoint.1.clone(),
                 destination_label: right_endpoint.1.clone(),
+                relationship_id_field,
+                property_fields,
             }),
             sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(UnwindBoundEdgeCreateTemplate {
                 edge_type,
@@ -882,6 +1017,8 @@ fn unwind_bound_edge_create_template(
                 destination_field: left_endpoint.0.clone(),
                 source_label: right_endpoint.1.clone(),
                 destination_label: left_endpoint.1.clone(),
+                relationship_id_field,
+                property_fields,
             }),
             sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => {
                 unsupported("UNWIND MATCH CREATE does not support undirected relationships")
@@ -2825,6 +2962,57 @@ mod tests {
                 destination_field: "related_vertex".to_string(),
                 source_label: "Source".to_string(),
                 destination_label: "Source".to_string(),
+            }
+        );
+    }
+
+    #[cfg(feature = "client-api")]
+    #[test]
+    fn lowers_unwind_vertex_upsert_batch() {
+        let parsed = parse_opencypher_unwind_batch(
+            "UNWIND $rows AS row MERGE (n:Source {id: row.vertex, source_id: row.source_id, active: row.active})",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.parameter, "rows");
+        assert_eq!(
+            parsed.kind,
+            ParsedUnwindBatchKind::UpsertVertices {
+                label: "Source".to_string(),
+                vertex_field: "vertex".to_string(),
+                property_fields: BTreeMap::from([
+                    ("active".to_string(), "active".to_string()),
+                    ("source_id".to_string(), "source_id".to_string()),
+                ]),
+            }
+        );
+    }
+
+    #[cfg(feature = "client-api")]
+    #[test]
+    fn lowers_unwind_relationship_import_batch() {
+        let parsed = parse_opencypher_unwind_batch(
+            "UNWIND $rows AS row \
+             MATCH (s:Entity {id: row.source_vertex}), \
+                   (d:Entity {id: row.destination_vertex}) \
+             CREATE (s)-[:RELATES {id: row.relationship_vertex, relationship_id: row.relationship_id, chunk_id: row.chunk_id}]->(d)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.parameter, "rows");
+        assert_eq!(
+            parsed.kind,
+            ParsedUnwindBatchKind::ImportRelationshipsBetweenLabeledVertices {
+                edge_type: "RELATES".to_string(),
+                source_field: "source_vertex".to_string(),
+                destination_field: "destination_vertex".to_string(),
+                relationship_id_field: "relationship_vertex".to_string(),
+                property_fields: BTreeMap::from([
+                    ("chunk_id".to_string(), "chunk_id".to_string()),
+                    ("relationship_id".to_string(), "relationship_id".to_string(),),
+                ]),
+                source_label: "Entity".to_string(),
+                destination_label: "Entity".to_string(),
             }
         );
     }
