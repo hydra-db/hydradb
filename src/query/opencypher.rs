@@ -418,12 +418,18 @@ impl ParsedCypher {
             let second = checked_node(sys::cypher_ast_query_get_clause(query, 1))?;
 
             if is_instance(second, sys::CYPHER_AST_MERGE) {
-                if clause_count != 2 || sys::cypher_ast_merge_nactions(second) != 0 {
+                if clause_count != 3 || sys::cypher_ast_merge_nactions(second) != 0 {
                     return unsupported(
-                        "UNWIND vertex MERGE must be the final clause without ON CREATE/ON MATCH",
+                        "UNWIND vertex upsert requires MERGE by id followed by SET",
                     );
                 }
-                let template = unwind_vertex_upsert_template(second, &alias)?;
+                let set_clause = checked_node(sys::cypher_ast_query_get_clause(query, 2))?;
+                if !is_instance(set_clause, sys::CYPHER_AST_SET) {
+                    return unsupported(
+                        "UNWIND vertex upsert requires MERGE by id followed by SET",
+                    );
+                }
+                let template = unwind_vertex_upsert_template(second, set_clause, &alias)?;
                 return Ok(Some(ParsedUnwindBatch {
                     parameter,
                     kind: ParsedUnwindBatchKind::UpsertVertices {
@@ -826,6 +832,7 @@ struct UnwindVertexUpsertTemplate {
 #[cfg(feature = "client-api")]
 fn unwind_vertex_upsert_template(
     merge_clause: *const AstNode,
+    set_clause: *const AstNode,
     unwind_alias: &str,
 ) -> Result<UnwindVertexUpsertTemplate> {
     unsafe {
@@ -836,22 +843,80 @@ fn unwind_vertex_upsert_template(
         }
         let node = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
         ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "UNWIND MERGE vertex")?;
-        if sys::cypher_ast_node_pattern_nlabels(node) != 1 {
-            return unsupported("UNWIND vertex MERGE requires exactly one label");
+        if sys::cypher_ast_node_pattern_nlabels(node) != 0 {
+            return unsupported(
+                "UNWIND vertex upsert MERGE pattern matches only id; apply labels with SET",
+            );
         }
-        let label = label_name(checked_node(sys::cypher_ast_node_pattern_get_label(
-            node, 0,
-        ))?)?;
-        validate_component("label", &label)?;
+        let node_binding = node_identifier(node)?.ok_or_else(|| {
+            unsupported_value("UNWIND vertex upsert MERGE node requires a binding")
+        })?;
         let properties = checked_node(sys::cypher_ast_node_pattern_get_properties(node))?;
         let mut fields = unwind_row_property_fields(properties, unwind_alias, "vertex MERGE")?;
         let vertex_field = fields
             .remove("id")
             .ok_or_else(|| unsupported_value("UNWIND vertex MERGE requires id: row.<field>"))?;
+        if !fields.is_empty() {
+            return unsupported(
+                "UNWIND vertex upsert MERGE pattern matches only id; apply properties with SET",
+            );
+        }
+
+        ensure_instance(set_clause, sys::CYPHER_AST_SET, "UNWIND vertex SET")?;
+        let mut label = None;
+        let mut property_fields = BTreeMap::new();
+        for index in 0..sys::cypher_ast_set_nitems(set_clause) {
+            let item = checked_node(sys::cypher_ast_set_get_item(set_clause, index))?;
+            if is_instance(item, sys::CYPHER_AST_SET_LABELS) {
+                let binding = identifier_name(checked_node(
+                    sys::cypher_ast_set_labels_get_identifier(item),
+                )?)?;
+                if binding != node_binding {
+                    return unsupported("UNWIND vertex SET label references the wrong node");
+                }
+                if sys::cypher_ast_set_labels_nlabels(item) != 1 || label.is_some() {
+                    return unsupported("UNWIND vertex upsert requires exactly one SET label");
+                }
+                let value =
+                    label_name(checked_node(sys::cypher_ast_set_labels_get_label(item, 0))?)?;
+                validate_component("label", &value)?;
+                label = Some(value);
+                continue;
+            }
+            if is_instance(item, sys::CYPHER_AST_SET_PROPERTY) {
+                let property = checked_node(sys::cypher_ast_set_property_get_property(item))?;
+                let Some((binding, property)) = property_expression_binding(property)? else {
+                    return unsupported("UNWIND vertex SET requires <node>.<property>");
+                };
+                if binding != node_binding {
+                    return unsupported("UNWIND vertex SET property references the wrong node");
+                }
+                if property.eq_ignore_ascii_case("id") {
+                    return unsupported("UNWIND vertex SET cannot update node id");
+                }
+                validate_component("property", &property)?;
+                let expression = checked_node(sys::cypher_ast_set_property_get_expression(item))?;
+                let Some((binding, field)) = property_expression_binding(expression)? else {
+                    return unsupported(
+                        "UNWIND vertex SET values must read fields from the row map",
+                    );
+                };
+                if binding != unwind_alias {
+                    return unsupported("UNWIND vertex SET value references the wrong row alias");
+                }
+                if property_fields.insert(property.clone(), field).is_some() {
+                    return unsupported(format!("UNWIND vertex SET repeats property {property}"));
+                }
+                continue;
+            }
+            return unsupported("UNWIND vertex upsert supports SET labels and properties only");
+        }
         Ok(UnwindVertexUpsertTemplate {
-            label,
+            label: label.ok_or_else(|| {
+                unsupported_value("UNWIND vertex upsert requires exactly one SET label")
+            })?,
             vertex_field,
-            property_fields: fields,
+            property_fields,
         })
     }
 }
@@ -2970,7 +3035,7 @@ mod tests {
     #[test]
     fn lowers_unwind_vertex_upsert_batch() {
         let parsed = parse_opencypher_unwind_batch(
-            "UNWIND $rows AS row MERGE (n:Source {id: row.vertex, source_id: row.source_id, active: row.active})",
+            "UNWIND $rows AS row MERGE (n {id: row.vertex}) SET n:Source, n.source_id = row.source_id, n.active = row.active",
         )
         .unwrap()
         .unwrap();
@@ -2986,6 +3051,18 @@ mod tests {
                 ]),
             }
         );
+    }
+
+    #[cfg(feature = "client-api")]
+    #[test]
+    fn rejects_unwind_merge_that_would_rewrite_pattern_metadata() {
+        let err = parse_opencypher_unwind_batch(
+            "UNWIND $rows AS row MERGE (n:Source {id: row.vertex, source_id: row.source_id})",
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("requires MERGE by id followed by SET"));
     }
 
     #[cfg(feature = "client-api")]
