@@ -1,0 +1,18 @@
+apiVersion: v2
+name: turbolay
+description: Stateless distributed graph database backed by SlateDB and object storage
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/usecortex/slatedb-graph-kernel
+sources:
+  - https://github.com/usecortex/slatedb-graph-kernel
+keywords:
+  - graph
+  - cypher
+  - slatedb
+  - object-storage
+  - graphblas
+annotations:
+  artifacthub.io/license: Apache-2.0
