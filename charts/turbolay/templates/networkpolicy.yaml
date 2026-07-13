@@ -23,15 +23,15 @@ spec:
       {{- include "turbolay.selectorLabels" . | nindent 6 }}
   policyTypes: ["Ingress", "Egress"]
   ingress:
-    - {{- with .Values.networkPolicy.clientIngressFrom }}
-      from:
+    {{- with .Values.networkPolicy.clientIngressFrom }}
+    - from:
         {{- toYaml . | nindent 8 }}
-      {{- end }}
       ports:
         - protocol: TCP
           port: 7687
         - protocol: TCP
           port: 8443
+    {{- end }}
     - from:
         - podSelector:
             matchLabels:
