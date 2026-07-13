@@ -2828,6 +2828,116 @@ impl GraphShard {
         })
     }
 
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn reserve_edge_delete_noops_batch(
+        &self,
+        cell_id: &str,
+        mutations: impl IntoIterator<Item = EdgeMutation>,
+    ) -> Result<()> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_write_authority(cell_id, "reserve_edge_delete_noops_batch")?;
+
+        let mutations: Vec<_> = mutations.into_iter().collect();
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        ensure_limit(
+            "reserve_edge_delete_noops_batch",
+            mutations.len() as u64,
+            self.limits.max_bulk_import_edges as u64,
+        )?;
+        validate_edge_mutations_for_cell(cell_id, &mutations, "reserve_edge_delete_noops_batch")?;
+        validate_unique_delete_mutation_identities(&mutations)?;
+
+        let _permit = self
+            .acquire_graph_write_permit("reserve_edge_delete_noops_batch")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .reserve_edge_delete_noops_batch_txn(cell_id, &mutations)
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(()) => {
+                    self.operation_metrics
+                        .write_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                result => return result,
+            }
+        }
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn reserve_edge_delete_noops_batch_txn(
+        &self,
+        cell_id: &str,
+        mutations: &[EdgeMutation],
+    ) -> Result<()> {
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "reserve_edge_delete_noops_batch")
+            .await?;
+        let result = self
+            .reserve_edge_delete_noops_batch_txn_locked(cell_id, mutations)
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn reserve_edge_delete_noops_batch_txn_locked(
+        &self,
+        cell_id: &str,
+        mutations: &[EdgeMutation],
+    ) -> Result<()> {
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
+        self.validate_write_fence_txn(&txn, cell_id, "reserve_edge_delete_noops_batch")
+            .await?;
+        let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
+
+        for mutation in mutations {
+            let idem_key = keys::idempotency(cell_id, "delete", &mutation.idempotency_key);
+            if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
+                decode_delete_idempotency(&idem_key, mutation, &value)?;
+                continue;
+            }
+            txn.put(
+                idem_key.as_bytes(),
+                encode_delete_idempotency(
+                    mutation,
+                    &DeleteResult {
+                        epoch: current_epoch,
+                        deleted: false,
+                    },
+                ),
+            )?;
+        }
+
+        commit_txn_strict(txn, self.await_durable_writes).await
+    }
+
     async fn delete_edge_mutations_batch_txn(
         &self,
         cell_id: &str,
@@ -3628,10 +3738,44 @@ impl GraphShard {
         cell_id: &str,
         mutations: impl IntoIterator<Item = EdgeMutation>,
     ) -> Result<EdgeMutationBatchResult> {
-        validate_component("cell_id", cell_id)?;
-        self.ensure_write_authority(cell_id, "write_edge_mutations_batch")?;
+        self.write_edge_mutations_batch_with_endpoint_labels(
+            cell_id,
+            mutations.into_iter().collect(),
+            None,
+            "write_edge_mutations_batch",
+        )
+        .await
+    }
 
-        let mutations: Vec<_> = mutations.into_iter().collect();
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn write_edge_mutations_batch_between_labeled_vertices(
+        &self,
+        cell_id: &str,
+        mutations: impl IntoIterator<Item = EdgeMutation>,
+        source_label: &str,
+        destination_label: &str,
+    ) -> Result<EdgeMutationBatchResult> {
+        validate_component("source_label", source_label)?;
+        validate_component("destination_label", destination_label)?;
+        self.write_edge_mutations_batch_with_endpoint_labels(
+            cell_id,
+            mutations.into_iter().collect(),
+            Some((source_label, destination_label)),
+            "write_edge_mutations_batch_between_labeled_vertices",
+        )
+        .await
+    }
+
+    async fn write_edge_mutations_batch_with_endpoint_labels(
+        &self,
+        cell_id: &str,
+        mutations: Vec<EdgeMutation>,
+        endpoint_labels: Option<(&str, &str)>,
+        operation: &'static str,
+    ) -> Result<EdgeMutationBatchResult> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_write_authority(cell_id, operation)?;
+
         if mutations.is_empty() {
             let epoch = self.current_epoch(cell_id).await?;
             return Ok(EdgeMutationBatchResult {
@@ -3643,7 +3787,7 @@ impl GraphShard {
             });
         }
         ensure_limit(
-            "write_edge_mutations_batch",
+            operation,
             mutations.len() as u64,
             self.limits.max_bulk_import_edges as u64,
         )?;
@@ -3662,17 +3806,16 @@ impl GraphShard {
             }
         }
 
-        let _permit = self
-            .acquire_graph_write_permit("write_edge_mutations_batch")
-            .await?;
+        let _permit = self.acquire_graph_write_permit(operation).await?;
         let _writer = self.writer_lane(cell_id).lock().await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
                 .write_edge_mutations_batch_txn(
                     cell_id,
                     &mutations,
-                    "write_edge_mutations_batch",
+                    operation,
                     None,
+                    endpoint_labels,
                 )
                 .await
             {
@@ -4045,6 +4188,7 @@ impl GraphShard {
                     &mutations,
                     "materialize_edge_mutation_log",
                     Some(last_log_epoch),
+                    None,
                 )
                 .await
             {
@@ -4083,6 +4227,7 @@ impl GraphShard {
         mutations: &[EdgeMutation],
         operation: &'static str,
         materialized_log_epoch: Option<GraphEpoch>,
+        endpoint_labels: Option<(&str, &str)>,
     ) -> Result<EdgeMutationBatchResult> {
         let lock = self.acquire_cell_write_lock(cell_id, operation).await?;
         let result = self
@@ -4091,6 +4236,7 @@ impl GraphShard {
                 mutations,
                 operation,
                 materialized_log_epoch,
+                endpoint_labels,
             )
             .await;
         release_cell_write_lock(lock, result).await
@@ -4102,6 +4248,7 @@ impl GraphShard {
         mutations: &[EdgeMutation],
         operation: &'static str,
         materialized_log_epoch: Option<GraphEpoch>,
+        endpoint_labels: Option<(&str, &str)>,
     ) -> Result<EdgeMutationBatchResult> {
         let txn = self
             .db
@@ -4125,6 +4272,7 @@ impl GraphShard {
         let mut next_epoch = current_epoch;
         let mut results = Vec::with_capacity(mutations.len());
         let mut known_edges = BTreeMap::<(String, VertexId, VertexId), GraphEpoch>::new();
+        let mut validated_endpoints = BTreeSet::<(VertexId, String)>::new();
         let mut segment_edges_by_type_src =
             BTreeMap::<(String, VertexId), BTreeMap<VertexId, GraphEpoch>>::new();
         let mut out_increments = BTreeMap::<(String, VertexId), u64>::new();
@@ -4144,6 +4292,35 @@ impl GraphShard {
                 }
                 results.push(result);
                 continue;
+            }
+
+            if let Some((source_label, destination_label)) = endpoint_labels {
+                for (vertex, label) in [
+                    (mutation.src, source_label),
+                    (mutation.dst, destination_label),
+                ] {
+                    if !validated_endpoints.insert((vertex, label.to_string())) {
+                        continue;
+                    }
+                    let key = keys::vertex(cell_id, vertex);
+                    let Some(value) = read_txn_remote(&txn, &key).await? else {
+                        return Err(GraphError::UnsupportedQuery {
+                            dialect: "OpenCypher",
+                            feature: format!(
+                                "MATCH endpoint vertex {vertex} with label {label} does not exist"
+                            ),
+                        });
+                    };
+                    let metadata = decode_vertex_metadata(&key, &value)?;
+                    if !metadata.labels.contains(label) {
+                        return Err(GraphError::UnsupportedQuery {
+                            dialect: "OpenCypher",
+                            feature: format!(
+                                "MATCH endpoint vertex {vertex} does not have label {label}"
+                            ),
+                        });
+                    }
+                }
             }
 
             let identity = (mutation.edge_type.clone(), mutation.src, mutation.dst);

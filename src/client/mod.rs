@@ -8,6 +8,7 @@ pub(crate) mod service;
 pub(crate) struct ClientTestTlsBundle {
     pub server: std::sync::Arc<tokio_rustls::rustls::ServerConfig>,
     pub client: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+    #[cfg(feature = "http-api")]
     pub certificate_der: Vec<u8>,
 }
 
@@ -34,6 +35,7 @@ pub(crate) fn client_test_tls_bundle() -> ClientTestTlsBundle {
     ClientTestTlsBundle {
         server: std::sync::Arc::new(server),
         client: std::sync::Arc::new(client),
+        #[cfg(feature = "http-api")]
         certificate_der: certificate.der().to_vec(),
     }
 }
