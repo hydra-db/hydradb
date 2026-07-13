@@ -5,7 +5,7 @@ use tokio::sync::Notify;
 
 use crate::{
     validate_component, CommitResult, EdgeMetadata, GraphEpoch, GraphError, GraphScope, QueryFloat,
-    Result, VertexId, VertexMetadata, VertexPropertyValue,
+    RelationshipId, Result, VertexId, VertexMetadata, VertexPropertyValue,
 };
 
 #[cfg_attr(
@@ -61,6 +61,18 @@ pub struct QueryBatchRelationship {
     derive(serde::Deserialize, serde::Serialize)
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryBatchRelationshipMerge {
+    pub src: VertexId,
+    pub dst: VertexId,
+    pub relationship_id: RelationshipId,
+    pub metadata: EdgeMetadata,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryBatchOperation {
     OutNeighbors {
         edge_type: String,
@@ -100,6 +112,12 @@ pub enum QueryBatchOperation {
         source_label: String,
         destination_label: String,
     },
+    MergeRelationshipsBetweenLabeledVertices {
+        edge_type: String,
+        relationships: Vec<QueryBatchRelationshipMerge>,
+        source_label: String,
+        destination_label: String,
+    },
 }
 
 impl QueryBatchOperation {
@@ -113,6 +131,7 @@ impl QueryBatchOperation {
                 | Self::DeleteRelationshipsByProperty { .. }
                 | Self::UpsertVertices { .. }
                 | Self::CreateRelationshipsBetweenLabeledVertices { .. }
+                | Self::MergeRelationshipsBetweenLabeledVertices { .. }
         )
     }
 
@@ -126,6 +145,9 @@ impl QueryBatchOperation {
             Self::DeleteRelationshipsByProperty { values, .. } => values.len(),
             Self::UpsertVertices { vertices } => vertices.len(),
             Self::CreateRelationshipsBetweenLabeledVertices { relationships, .. } => {
+                relationships.len()
+            }
+            Self::MergeRelationshipsBetweenLabeledVertices { relationships, .. } => {
                 relationships.len()
             }
         }

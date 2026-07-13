@@ -21,9 +21,10 @@ use crate::query::opencypher::{
 };
 use crate::{
     validate_component, EdgeMetadata, GraphEpoch, GraphError, GraphId, GraphScope, NamespaceId,
-    NamespacePath, QueryBatchEdge, QueryBatchOperation, QueryBatchRelationship, QueryBatchVertex,
-    QueryCancellationToken, QueryColumn, QueryContext, QueryCursorToken, QueryParameterValue,
-    QueryResultPage, QueryResultSet, Result, VertexMetadata, VertexPropertyValue,
+    NamespacePath, QueryBatchEdge, QueryBatchOperation, QueryBatchRelationship,
+    QueryBatchRelationshipMerge, QueryBatchVertex, QueryCancellationToken, QueryColumn,
+    QueryContext, QueryCursorToken, QueryParameterValue, QueryResultPage, QueryResultSet, Result,
+    VertexMetadata, VertexPropertyValue,
 };
 
 const DEFAULT_MAX_QUERY_BYTES: usize = 1024 * 1024;
@@ -1503,6 +1504,43 @@ fn resolve_unwind_batch(
                 destination_label,
             },
         ),
+        ParsedUnwindBatchKind::MergeRelationshipsBetweenLabeledVertices {
+            edge_type,
+            source_field,
+            destination_field,
+            relationship_id_field,
+            property_fields,
+            source_label,
+            destination_label,
+        } => Ok(
+            QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices {
+                edge_type,
+                relationships: rows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, row)| {
+                        let mut metadata = EdgeMetadata::default();
+                        for (property, field) in &property_fields {
+                            metadata
+                                .properties
+                                .insert(property.clone(), unwind_row_scalar(row, index, field)?);
+                        }
+                        Ok(QueryBatchRelationshipMerge {
+                            src: unwind_row_vertex_id(row, index, &source_field)?,
+                            dst: unwind_row_vertex_id(row, index, &destination_field)?,
+                            relationship_id: unwind_row_vertex_id(
+                                row,
+                                index,
+                                &relationship_id_field,
+                            )?,
+                            metadata,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                source_label,
+                destination_label,
+            },
+        ),
     }
 }
 
@@ -1590,7 +1628,8 @@ fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> 
         | QueryBatchOperation::DeleteVertices { .. }
         | QueryBatchOperation::DeleteRelationshipsByProperty { .. }
         | QueryBatchOperation::UpsertVertices { .. }
-        | QueryBatchOperation::CreateRelationshipsBetweenLabeledVertices { .. } => Vec::new(),
+        | QueryBatchOperation::CreateRelationshipsBetweenLabeledVertices { .. }
+        | QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices { .. } => Vec::new(),
     }
 }
 
