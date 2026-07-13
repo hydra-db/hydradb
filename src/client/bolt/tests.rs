@@ -490,9 +490,9 @@ async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
     ]);
     let _ = session
         .run_with_params(
-            "UNWIND $rows AS row \
-             MERGE (n:Entity {id: row.vertex, entity_id: row.entity_id, active: row.active, \
-                    tenant_id: row.tenant_id, sub_tenant_id: row.sub_tenant_id})",
+            "UNWIND $rows AS row MERGE (n {id: row.vertex}) \
+             SET n:Entity, n.entity_id = row.entity_id, n.active = row.active, \
+                 n.tenant_id = row.tenant_id, n.sub_tenant_id = row.sub_tenant_id",
             BoltDict::from([("rows".to_string(), vertex_rows)]),
             BoltDict::new(),
         )
@@ -508,7 +508,8 @@ async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
     );
     let _ = session
         .run_with_params(
-            "UNWIND $rows AS row MERGE (n:Entity {id: row.vertex, name: row.name})",
+            "UNWIND $rows AS row MERGE (n {id: row.vertex}) \
+             SET n:Entity, n.name = row.name",
             BoltDict::from([(
                 "rows".to_string(),
                 BoltValue::List(vec![BoltValue::Dict(BoltDict::from([

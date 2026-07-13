@@ -17,6 +17,13 @@ struct DeleteOutboxRun {
 
 const VERTEX_DELETE_LOCK_RENEW_ITEMS: u64 = 64;
 
+#[derive(Clone, Copy)]
+struct RelationshipImportOptions<'a> {
+    endpoint_labels: Option<(&'a str, &'a str)>,
+    update_existing_metadata: bool,
+    operation: &'static str,
+}
+
 impl GraphShard {
     pub async fn set_vertex_metadata(
         &self,
@@ -1138,9 +1145,11 @@ impl GraphShard {
             edge_type,
             relationships.into_iter().collect(),
             idempotency_key,
-            None,
-            false,
-            "import_relationships_batch",
+            RelationshipImportOptions {
+                endpoint_labels: None,
+                update_existing_metadata: false,
+                operation: "import_relationships_batch",
+            },
         )
         .await
     }
@@ -1162,9 +1171,11 @@ impl GraphShard {
             edge_type,
             relationships.into_iter().collect(),
             idempotency_key,
-            Some((source_label, destination_label)),
-            true,
-            "import_relationships_batch_between_labeled_vertices",
+            RelationshipImportOptions {
+                endpoint_labels: Some((source_label, destination_label)),
+                update_existing_metadata: true,
+                operation: "import_relationships_batch_between_labeled_vertices",
+            },
         )
         .await
     }
@@ -1175,14 +1186,12 @@ impl GraphShard {
         edge_type: &str,
         relationships: Vec<RelationshipMutation>,
         idempotency_key: &str,
-        endpoint_labels: Option<(&str, &str)>,
-        update_existing_metadata: bool,
-        operation: &'static str,
+        options: RelationshipImportOptions<'_>,
     ) -> Result<RelationshipImportResult> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         validate_component("idempotency_key", idempotency_key)?;
-        self.ensure_write_authority(cell_id, operation)?;
+        self.ensure_write_authority(cell_id, options.operation)?;
 
         let mut relationships = coalesce_relationship_imports(cell_id, edge_type, relationships)?;
         if relationships.is_empty() {
@@ -1211,7 +1220,7 @@ impl GraphShard {
         });
         let fingerprint = relationship_import_fingerprint(cell_id, edge_type, &relationships);
 
-        let _permit = self.acquire_graph_write_permit(operation).await?;
+        let _permit = self.acquire_graph_write_permit(options.operation).await?;
         let _writer = self.writer_lane(cell_id).lock().await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
@@ -1221,9 +1230,7 @@ impl GraphShard {
                     &relationships,
                     idempotency_key,
                     fingerprint,
-                    endpoint_labels,
-                    update_existing_metadata,
-                    operation,
+                    options,
                 )
                 .await
             {
@@ -1406,11 +1413,11 @@ impl GraphShard {
         relationships: &[RelationshipMutation],
         idempotency_key: &str,
         fingerprint: u64,
-        endpoint_labels: Option<(&str, &str)>,
-        update_existing_metadata: bool,
-        operation: &'static str,
+        options: RelationshipImportOptions<'_>,
     ) -> Result<RelationshipImportResult> {
-        let lock = self.acquire_cell_write_lock(cell_id, operation).await?;
+        let lock = self
+            .acquire_cell_write_lock(cell_id, options.operation)
+            .await?;
         let result = self
             .import_relationships_batch_txn_locked(
                 cell_id,
@@ -1418,9 +1425,7 @@ impl GraphShard {
                 relationships,
                 idempotency_key,
                 fingerprint,
-                endpoint_labels,
-                update_existing_metadata,
-                operation,
+                options,
             )
             .await;
         release_cell_write_lock(lock, result).await
@@ -1433,18 +1438,16 @@ impl GraphShard {
         relationships: &[RelationshipMutation],
         idempotency_key: &str,
         fingerprint: u64,
-        endpoint_labels: Option<(&str, &str)>,
-        update_existing_metadata: bool,
-        operation: &'static str,
+        options: RelationshipImportOptions<'_>,
     ) -> Result<RelationshipImportResult> {
         let txn = self
             .db
             .writer()?
             .begin(IsolationLevel::SerializableSnapshot)
             .await?;
-        self.validate_write_fence_txn(&txn, cell_id, operation)
+        self.validate_write_fence_txn(&txn, cell_id, options.operation)
             .await?;
-        if let Some((source_label, destination_label)) = endpoint_labels {
+        if let Some((source_label, destination_label)) = options.endpoint_labels {
             let mut validated = BTreeSet::new();
             for relationship in relationships {
                 for (vertex, label) in [
@@ -1567,7 +1570,7 @@ impl GraphShard {
                     });
                 }
                 if existing.metadata != requested.metadata {
-                    if update_existing_metadata {
+                    if options.update_existing_metadata {
                         relationship_metadata_updates
                             .push((existing.clone(), requested.metadata.clone()));
                     } else {
