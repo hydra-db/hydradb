@@ -603,6 +603,35 @@ async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
             vec![BoltValue::String("chunk-b".to_string())],
         ]
     );
+    let merge_created_relationship_rows = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("source_vertex".to_string(), BoltValue::Integer(70)),
+        ("destination_vertex".to_string(), BoltValue::Integer(71)),
+        ("relationship_vertex".to_string(), BoltValue::Integer(900)),
+        ("replayed".to_string(), BoltValue::Boolean(true)),
+    ]))]);
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MATCH (s:Entity {id: row.source_vertex}), \
+                   (d:Entity {id: row.destination_vertex}) \
+             MERGE (s)-[r:RELATES {id: row.relationship_vertex}]->(d) \
+             SET r.replayed = row.replayed",
+            BoltDict::from([("rows".to_string(), merge_created_relationship_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    let merged_created_relationships = session
+        .run(
+            "MATCH ({id: 70})-[r:RELATES {id: 900, replayed: true}]->({id: 71}) \
+             RETURN count(*) AS count",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        merged_created_relationships.records,
+        vec![vec![BoltValue::Integer(3)]]
+    );
     let merge_relationship_query = "UNWIND $rows AS row \
          MATCH (s:Entity {id: row.source_vertex}), \
                (d:Entity {id: row.destination_vertex}) \

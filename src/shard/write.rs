@@ -25,6 +25,17 @@ struct RelationshipImportOptions<'a> {
     operation: &'static str,
 }
 
+#[cfg(feature = "opencypher")]
+struct RelationshipPropertyTxnLookup<'a> {
+    cell_id: &'a str,
+    edge_type: &'a str,
+    src: VertexId,
+    dst: VertexId,
+    property: &'a str,
+    value: &'a VertexPropertyValue,
+    read_epoch: GraphEpoch,
+}
+
 impl GraphShard {
     pub async fn set_vertex_metadata(
         &self,
@@ -1526,25 +1537,72 @@ impl GraphShard {
         let current_relationship_id =
             read_counter_txn(&txn, &keys::last_relationship_id(cell_id)).await?;
         let mut relationships = relationships.to_vec();
+        let mut next_relationship_id = current_relationship_id;
         if options.create_always {
-            let mut relationship_id = current_relationship_id;
             for relationship in &mut relationships {
-                loop {
-                    relationship_id =
-                        relationship_id
-                            .checked_add(1)
-                            .ok_or_else(|| GraphError::CorruptValue {
-                                key: keys::last_relationship_id(cell_id),
-                                reason: "relationship id overflow during CREATE".to_string(),
-                            })?;
-                    if read_txn_remote(&txn, &keys::relationship_id(cell_id, relationship_id))
-                        .await?
-                        .is_none()
-                    {
-                        break;
+                relationship.relationship_id = next_available_relationship_id_txn(
+                    &txn,
+                    cell_id,
+                    &mut next_relationship_id,
+                    "CREATE",
+                )
+                .await?;
+            }
+        } else if options.update_existing_metadata {
+            #[cfg(not(feature = "opencypher"))]
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "relationship MERGE requires the opencypher feature".to_string(),
+            });
+            #[cfg(feature = "opencypher")]
+            {
+                let mut resolved = Vec::new();
+                for relationship in relationships {
+                    let external_id = relationship.relationship_id;
+                    let identity = VertexPropertyValue::Integer(external_id);
+                    if relationship.metadata.properties.get("id") != Some(&identity) {
+                        return Err(GraphError::CorruptValue {
+                            key: format!(
+                                "cell/{cell_id}/relationship-merge/{edge_type}/{}/{external_id}",
+                                relationship.src
+                            ),
+                            reason:
+                                "relationship MERGE identity metadata does not match the parsed id"
+                                    .to_string(),
+                        });
+                    }
+                    let existing_ids = relationship_ids_for_edge_property_txn(
+                        &txn,
+                        RelationshipPropertyTxnLookup {
+                            cell_id,
+                            edge_type,
+                            src: relationship.src,
+                            dst: relationship.dst,
+                            property: "id",
+                            value: &identity,
+                            read_epoch: current_epoch,
+                        },
+                    )
+                    .await?;
+                    if existing_ids.is_empty() {
+                        let mut inserted = relationship;
+                        inserted.relationship_id = next_available_relationship_id_txn(
+                            &txn,
+                            cell_id,
+                            &mut next_relationship_id,
+                            "MERGE",
+                        )
+                        .await?;
+                        resolved.push(inserted);
+                    } else {
+                        for relationship_id in existing_ids {
+                            let mut matched = relationship.clone();
+                            matched.relationship_id = relationship_id;
+                            resolved.push(matched);
+                        }
                     }
                 }
-                relationship.relationship_id = relationship_id;
+                relationships = resolved;
             }
         }
         let max_requested_relationship_id = relationships
@@ -5772,6 +5830,91 @@ fn put_relationship_metadata_delta_txn(
         encode_edge_metadata(metadata).as_slice(),
     )?;
     Ok(())
+}
+
+async fn next_available_relationship_id_txn(
+    txn: &DbTransaction,
+    cell_id: &str,
+    cursor: &mut RelationshipId,
+    operation: &str,
+) -> Result<RelationshipId> {
+    loop {
+        *cursor = cursor
+            .checked_add(1)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: keys::last_relationship_id(cell_id),
+                reason: format!("relationship id overflow during {operation}"),
+            })?;
+        if read_txn_remote(txn, &keys::relationship_id(cell_id, *cursor))
+            .await?
+            .is_none()
+        {
+            return Ok(*cursor);
+        }
+    }
+}
+
+#[cfg(feature = "opencypher")]
+async fn relationship_ids_for_edge_property_txn(
+    txn: &DbTransaction,
+    lookup: RelationshipPropertyTxnLookup<'_>,
+) -> Result<Vec<RelationshipId>> {
+    let RelationshipPropertyTxnLookup {
+        cell_id,
+        edge_type,
+        src,
+        dst,
+        property,
+        value,
+        read_epoch,
+    } = lookup;
+    let encoded = encode_vertex_property_value_key(value);
+    let prefix = keys::relationship_property_index_edge_prefix(
+        cell_id, edge_type, property, &encoded, src, dst,
+    );
+    let mut iter = txn.scan_prefix(prefix.as_bytes(), ..).await?;
+    let mut relationship_ids = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        let key = String::from_utf8_lossy(&kv.key).into_owned();
+        let (
+            parsed_cell_id,
+            parsed_edge_type,
+            parsed_property,
+            parsed_encoded,
+            parsed_src,
+            parsed_dst,
+            relationship_id,
+        ) = parse_relationship_property_index_key(&key)?;
+        if parsed_cell_id != cell_id
+            || parsed_edge_type != edge_type
+            || parsed_property != property
+            || parsed_encoded != encoded
+            || parsed_src != src
+            || parsed_dst != dst
+        {
+            return Err(GraphError::CorruptValue {
+                key,
+                reason: "relationship property index escaped its requested prefix".to_string(),
+            });
+        }
+        let record_key = keys::relationship(cell_id, edge_type, src, dst, relationship_id);
+        let Some(record_value) = read_txn_remote(txn, &record_key).await? else {
+            return Err(GraphError::CorruptValue {
+                key,
+                reason: format!("relationship property index points at missing {record_key}"),
+            });
+        };
+        let record = decode_relationship_record(&record_key, &record_value)?;
+        if record.epoch <= read_epoch
+            && !relationship_deleted_at_txn(txn, &record, read_epoch).await?
+            && record.metadata.properties.get(property) == Some(value)
+        {
+            relationship_ids.push(relationship_id);
+        }
+    }
+    relationship_ids.sort_unstable();
+    relationship_ids.dedup();
+    Ok(relationship_ids)
 }
 
 async fn relationship_tombstone_epoch_txn(
