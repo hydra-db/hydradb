@@ -3205,16 +3205,21 @@ impl QueryCellClient for RoutedGraphCluster {
                     .merge_relationships_batch_between_labeled_vertices(
                         &context.cell_id,
                         &edge_type,
-                        relationships
-                            .into_iter()
-                            .map(|relationship| crate::RelationshipMutation {
+                        relationships.into_iter().map(|relationship| {
+                            let mut metadata = relationship.metadata;
+                            metadata.properties.insert(
+                                "id".to_string(),
+                                crate::VertexPropertyValue::Integer(relationship.relationship_id),
+                            );
+                            crate::RelationshipMutation {
                                 cell_id: context.cell_id.clone(),
                                 edge_type: edge_type.clone(),
                                 src: relationship.src,
                                 dst: relationship.dst,
                                 relationship_id: relationship.relationship_id,
-                                metadata: relationship.metadata,
-                            }),
+                                metadata,
+                            }
+                        }),
                         &format!("{}.unwind-relationship-merge", context.idempotency_key),
                         &source_label,
                         &destination_label,
