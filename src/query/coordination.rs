@@ -3154,6 +3154,79 @@ impl QueryCellClient for RoutedGraphCluster {
                     .await?;
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
+            crate::QueryBatchOperation::UpsertVertices { vertices } => {
+                self.ensure_active_write_lease(&context.cell_id)?;
+                shard
+                    .merge_vertex_metadata_batch(
+                        &context.cell_id,
+                        vertices
+                            .into_iter()
+                            .map(|vertex| (vertex.vertex, vertex.metadata)),
+                    )
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::CreateRelationshipsBetweenLabeledVertices {
+                edge_type,
+                relationships,
+                source_label,
+                destination_label,
+            } => {
+                self.ensure_active_write_lease(&context.cell_id)?;
+                shard
+                    .create_relationships_batch_between_labeled_vertices(
+                        &context.cell_id,
+                        &edge_type,
+                        relationships
+                            .into_iter()
+                            .map(|relationship| crate::RelationshipMutation {
+                                cell_id: context.cell_id.clone(),
+                                edge_type: edge_type.clone(),
+                                src: relationship.src,
+                                dst: relationship.dst,
+                                relationship_id: 0,
+                                metadata: relationship.metadata,
+                            }),
+                        &format!("{}.unwind-relationship-create", context.idempotency_key),
+                        &source_label,
+                        &destination_label,
+                    )
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices {
+                edge_type,
+                relationships,
+                source_label,
+                destination_label,
+            } => {
+                self.ensure_active_write_lease(&context.cell_id)?;
+                shard
+                    .merge_relationships_batch_between_labeled_vertices(
+                        &context.cell_id,
+                        &edge_type,
+                        relationships.into_iter().map(|relationship| {
+                            let mut metadata = relationship.metadata;
+                            metadata.properties.insert(
+                                "id".to_string(),
+                                crate::VertexPropertyValue::Integer(relationship.relationship_id),
+                            );
+                            crate::RelationshipMutation {
+                                cell_id: context.cell_id.clone(),
+                                edge_type: edge_type.clone(),
+                                src: relationship.src,
+                                dst: relationship.dst,
+                                relationship_id: relationship.relationship_id,
+                                metadata,
+                            }
+                        }),
+                        &format!("{}.unwind-relationship-merge", context.idempotency_key),
+                        &source_label,
+                        &destination_label,
+                    )
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
             crate::QueryBatchOperation::DeleteEdges { edge_type, edges } => {
                 self.ensure_active_write_lease(&context.cell_id)?;
                 let mutations =

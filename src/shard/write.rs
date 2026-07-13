@@ -17,6 +17,25 @@ struct DeleteOutboxRun {
 
 const VERTEX_DELETE_LOCK_RENEW_ITEMS: u64 = 64;
 
+#[derive(Clone, Copy)]
+struct RelationshipImportOptions<'a> {
+    endpoint_labels: Option<(&'a str, &'a str)>,
+    create_always: bool,
+    update_existing_metadata: bool,
+    operation: &'static str,
+}
+
+#[cfg(feature = "opencypher")]
+struct RelationshipPropertyTxnLookup<'a> {
+    cell_id: &'a str,
+    edge_type: &'a str,
+    src: VertexId,
+    dst: VertexId,
+    property: &'a str,
+    value: &'a VertexPropertyValue,
+    read_epoch: GraphEpoch,
+}
+
 impl GraphShard {
     pub async fn set_vertex_metadata(
         &self,
@@ -88,6 +107,62 @@ impl GraphShard {
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
                 .set_vertex_metadata_batch_txn(cell_id, updates.clone())
+                .await
+            {
+                Err(err)
+                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                {
+                    self.operation_metrics
+                        .write_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+                Err(err @ GraphError::StaleShardLease { .. }) => {
+                    self.operation_metrics
+                        .stale_write_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
+                Ok(changed) => {
+                    if changed > 0 {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(changed);
+                }
+                result => return result,
+            }
+        }
+        Err(GraphError::RetryExhausted {
+            operation: "graph transaction",
+            attempts: GRAPH_TXN_MAX_RETRIES,
+        })
+    }
+
+    pub async fn merge_vertex_metadata_batch(
+        &self,
+        cell_id: &str,
+        updates: impl IntoIterator<Item = (VertexId, VertexMetadata)>,
+    ) -> Result<usize> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_write_authority(cell_id, "merge_vertex_metadata_batch")?;
+        let updates = coalesce_vertex_metadata_updates(updates)?;
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        ensure_limit(
+            "merge_vertex_metadata_batch",
+            updates.len() as u64,
+            self.limits.max_bulk_import_edges as u64,
+        )?;
+        let _permit = self
+            .acquire_graph_write_permit("merge_vertex_metadata_batch")
+            .await?;
+        let _writer = self.writer_lane(cell_id).lock().await;
+        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+            match self
+                .merge_vertex_metadata_batch_txn(cell_id, updates.clone())
                 .await
             {
                 Err(err)
@@ -233,6 +308,20 @@ impl GraphShard {
         release_cell_write_lock(lock, result).await
     }
 
+    async fn merge_vertex_metadata_batch_txn(
+        &self,
+        cell_id: &str,
+        updates: Vec<(VertexId, VertexMetadata)>,
+    ) -> Result<usize> {
+        let lock = self
+            .acquire_cell_write_lock(cell_id, "merge_vertex_metadata_batch")
+            .await?;
+        let result = self
+            .merge_vertex_metadata_batch_txn_locked(cell_id, updates)
+            .await;
+        release_cell_write_lock(lock, result).await
+    }
+
     async fn set_vertex_metadata_batch_txn_locked(
         &self,
         cell_id: &str,
@@ -254,6 +343,45 @@ impl GraphShard {
             };
             if previous != metadata {
                 changed.push((vertex_id, previous, metadata));
+            }
+        }
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        let epoch = next_epoch_txn(&txn, cell_id).await?;
+        txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(epoch))?;
+        for (vertex_id, previous, metadata) in &changed {
+            apply_vertex_metadata_update_txn(&txn, cell_id, *vertex_id, previous, metadata, epoch)?;
+        }
+        let changed_count = changed.len();
+        commit_txn_strict(txn, self.await_durable_writes).await?;
+        Ok(changed_count)
+    }
+
+    async fn merge_vertex_metadata_batch_txn_locked(
+        &self,
+        cell_id: &str,
+        updates: Vec<(VertexId, VertexMetadata)>,
+    ) -> Result<usize> {
+        let txn = self
+            .db
+            .writer()?
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await?;
+        self.validate_write_fence_txn(&txn, cell_id, "merge_vertex_metadata_batch")
+            .await?;
+        let mut changed = Vec::new();
+        for (vertex_id, patch) in updates {
+            let vertex_key = keys::vertex(cell_id, vertex_id);
+            let previous = match read_txn_remote(&txn, &vertex_key).await? {
+                Some(value) => decode_vertex_metadata(&vertex_key, &value)?,
+                None => VertexMetadata::default(),
+            };
+            let mut merged = previous.clone();
+            merged.labels.extend(patch.labels);
+            merged.properties.extend(patch.properties);
+            if previous != merged {
+                changed.push((vertex_id, previous, merged));
             }
         }
         if changed.is_empty() {
@@ -1024,12 +1152,93 @@ impl GraphShard {
         relationships: impl IntoIterator<Item = RelationshipMutation>,
         idempotency_key: &str,
     ) -> Result<RelationshipImportResult> {
+        self.import_relationships_batch_with_endpoint_labels(
+            cell_id,
+            edge_type,
+            relationships.into_iter().collect(),
+            idempotency_key,
+            RelationshipImportOptions {
+                endpoint_labels: None,
+                create_always: false,
+                update_existing_metadata: false,
+                operation: "import_relationships_batch",
+            },
+        )
+        .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn create_relationships_batch_between_labeled_vertices(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        relationships: impl IntoIterator<Item = RelationshipMutation>,
+        idempotency_key: &str,
+        source_label: &str,
+        destination_label: &str,
+    ) -> Result<RelationshipImportResult> {
+        validate_component("source_label", source_label)?;
+        validate_component("destination_label", destination_label)?;
+        self.import_relationships_batch_with_endpoint_labels(
+            cell_id,
+            edge_type,
+            relationships.into_iter().collect(),
+            idempotency_key,
+            RelationshipImportOptions {
+                endpoint_labels: Some((source_label, destination_label)),
+                create_always: true,
+                update_existing_metadata: false,
+                operation: "create_relationships_batch_between_labeled_vertices",
+            },
+        )
+        .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn merge_relationships_batch_between_labeled_vertices(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        relationships: impl IntoIterator<Item = RelationshipMutation>,
+        idempotency_key: &str,
+        source_label: &str,
+        destination_label: &str,
+    ) -> Result<RelationshipImportResult> {
+        validate_component("source_label", source_label)?;
+        validate_component("destination_label", destination_label)?;
+        self.import_relationships_batch_with_endpoint_labels(
+            cell_id,
+            edge_type,
+            relationships.into_iter().collect(),
+            idempotency_key,
+            RelationshipImportOptions {
+                endpoint_labels: Some((source_label, destination_label)),
+                create_always: false,
+                update_existing_metadata: true,
+                operation: "merge_relationships_batch_between_labeled_vertices",
+            },
+        )
+        .await
+    }
+
+    async fn import_relationships_batch_with_endpoint_labels(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        relationships: Vec<RelationshipMutation>,
+        idempotency_key: &str,
+        options: RelationshipImportOptions<'_>,
+    ) -> Result<RelationshipImportResult> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         validate_component("idempotency_key", idempotency_key)?;
-        self.ensure_write_authority(cell_id, "import_relationships_batch")?;
+        self.ensure_write_authority(cell_id, options.operation)?;
 
-        let mut relationships = coalesce_relationship_imports(cell_id, edge_type, relationships)?;
+        let mut relationships = if options.create_always {
+            validate_relationship_creates(cell_id, edge_type, relationships)?
+        } else {
+            coalesce_relationship_imports(cell_id, edge_type, relationships)?
+        };
         if relationships.is_empty() {
             let epoch = self.current_epoch(cell_id).await?;
             return Ok(RelationshipImportResult {
@@ -1056,9 +1265,7 @@ impl GraphShard {
         });
         let fingerprint = relationship_import_fingerprint(cell_id, edge_type, &relationships);
 
-        let _permit = self
-            .acquire_graph_write_permit("import_relationships_batch")
-            .await?;
+        let _permit = self.acquire_graph_write_permit(options.operation).await?;
         let _writer = self.writer_lane(cell_id).lock().await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
@@ -1068,6 +1275,7 @@ impl GraphShard {
                     &relationships,
                     idempotency_key,
                     fingerprint,
+                    options,
                 )
                 .await
             {
@@ -1250,9 +1458,10 @@ impl GraphShard {
         relationships: &[RelationshipMutation],
         idempotency_key: &str,
         fingerprint: u64,
+        options: RelationshipImportOptions<'_>,
     ) -> Result<RelationshipImportResult> {
         let lock = self
-            .acquire_cell_write_lock(cell_id, "import_relationships_batch")
+            .acquire_cell_write_lock(cell_id, options.operation)
             .await?;
         let result = self
             .import_relationships_batch_txn_locked(
@@ -1261,6 +1470,7 @@ impl GraphShard {
                 relationships,
                 idempotency_key,
                 fingerprint,
+                options,
             )
             .await;
         release_cell_write_lock(lock, result).await
@@ -1273,14 +1483,46 @@ impl GraphShard {
         relationships: &[RelationshipMutation],
         idempotency_key: &str,
         fingerprint: u64,
+        options: RelationshipImportOptions<'_>,
     ) -> Result<RelationshipImportResult> {
         let txn = self
             .db
             .writer()?
             .begin(IsolationLevel::SerializableSnapshot)
             .await?;
-        self.validate_write_fence_txn(&txn, cell_id, "import_relationships_batch")
+        self.validate_write_fence_txn(&txn, cell_id, options.operation)
             .await?;
+        if let Some((source_label, destination_label)) = options.endpoint_labels {
+            let mut validated = BTreeSet::new();
+            for relationship in relationships {
+                for (vertex, label) in [
+                    (relationship.src, source_label),
+                    (relationship.dst, destination_label),
+                ] {
+                    if !validated.insert((vertex, label)) {
+                        continue;
+                    }
+                    let key = keys::vertex(cell_id, vertex);
+                    let Some(value) = read_txn_remote(&txn, &key).await? else {
+                        return Err(GraphError::UnsupportedQuery {
+                            dialect: "OpenCypher",
+                            feature: format!(
+                                "MATCH endpoint vertex {vertex} with label {label} does not exist"
+                            ),
+                        });
+                    };
+                    let metadata = decode_vertex_metadata(&key, &value)?;
+                    if !metadata.labels.contains(label) {
+                        return Err(GraphError::UnsupportedQuery {
+                            dialect: "OpenCypher",
+                            feature: format!(
+                                "MATCH endpoint vertex {vertex} does not have label {label}"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         let idem_key = keys::idempotency(cell_id, "relationship-import", idempotency_key);
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
             return decode_relationship_import_idempotency(
@@ -1294,6 +1536,75 @@ impl GraphShard {
         let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
         let current_relationship_id =
             read_counter_txn(&txn, &keys::last_relationship_id(cell_id)).await?;
+        let mut relationships = relationships.to_vec();
+        let mut next_relationship_id = current_relationship_id;
+        if options.create_always {
+            for relationship in &mut relationships {
+                relationship.relationship_id = next_available_relationship_id_txn(
+                    &txn,
+                    cell_id,
+                    &mut next_relationship_id,
+                    "CREATE",
+                )
+                .await?;
+            }
+        } else if options.update_existing_metadata {
+            #[cfg(not(feature = "opencypher"))]
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "relationship MERGE requires the opencypher feature".to_string(),
+            });
+            #[cfg(feature = "opencypher")]
+            {
+                let mut resolved = Vec::new();
+                for relationship in relationships {
+                    let external_id = relationship.relationship_id;
+                    let identity = VertexPropertyValue::Integer(external_id);
+                    if relationship.metadata.properties.get("id") != Some(&identity) {
+                        return Err(GraphError::CorruptValue {
+                            key: format!(
+                                "cell/{cell_id}/relationship-merge/{edge_type}/{}/{external_id}",
+                                relationship.src
+                            ),
+                            reason:
+                                "relationship MERGE identity metadata does not match the parsed id"
+                                    .to_string(),
+                        });
+                    }
+                    let existing_ids = relationship_ids_for_edge_property_txn(
+                        &txn,
+                        RelationshipPropertyTxnLookup {
+                            cell_id,
+                            edge_type,
+                            src: relationship.src,
+                            dst: relationship.dst,
+                            property: "id",
+                            value: &identity,
+                            read_epoch: current_epoch,
+                        },
+                    )
+                    .await?;
+                    if existing_ids.is_empty() {
+                        let mut inserted = relationship;
+                        inserted.relationship_id = next_available_relationship_id_txn(
+                            &txn,
+                            cell_id,
+                            &mut next_relationship_id,
+                            "MERGE",
+                        )
+                        .await?;
+                        resolved.push(inserted);
+                    } else {
+                        for relationship_id in existing_ids {
+                            let mut matched = relationship.clone();
+                            matched.relationship_id = relationship_id;
+                            resolved.push(matched);
+                        }
+                    }
+                }
+                relationships = resolved;
+            }
+        }
         let max_requested_relationship_id = relationships
             .iter()
             .map(|relationship| relationship.relationship_id)
@@ -1301,8 +1612,9 @@ impl GraphShard {
             .unwrap_or(0);
         let fresh_cell = current_epoch == 0;
         let mut relationships_inserted = Vec::new();
+        let mut relationships_updated = Vec::<(RelationshipRecord, EdgeMetadata)>::new();
         let mut relationships_already_existed = 0_u64;
-        for relationship in relationships {
+        for relationship in &relationships {
             let rel_key = keys::relationship(
                 cell_id,
                 edge_type,
@@ -1360,11 +1672,32 @@ impl GraphShard {
                     epoch: existing.epoch,
                     metadata: relationship.metadata.clone(),
                 };
-                if existing != requested {
+                if existing.cell_id != requested.cell_id
+                    || existing.edge_type != requested.edge_type
+                    || existing.src != requested.src
+                    || existing.dst != requested.dst
+                    || existing.relationship_id != requested.relationship_id
+                {
                     return Err(GraphError::IdempotencyConflict {
                         operation: "relationship-import",
                         idempotency_key: idempotency_key.to_string(),
                     });
+                }
+                if existing.metadata != requested.metadata {
+                    if !options.update_existing_metadata {
+                        return Err(GraphError::IdempotencyConflict {
+                            operation: "relationship-import",
+                            idempotency_key: idempotency_key.to_string(),
+                        });
+                    }
+                    let next_metadata =
+                        merge_edge_metadata(&existing.metadata, &requested.metadata);
+                    if next_metadata != existing.metadata {
+                        let previous_metadata = existing.metadata.clone();
+                        let mut updated = existing;
+                        updated.metadata = next_metadata;
+                        relationships_updated.push((updated, previous_metadata));
+                    }
                 }
                 relationships_already_existed = relationships_already_existed.saturating_add(1);
             } else {
@@ -1426,7 +1759,9 @@ impl GraphShard {
                     reason: format!("too many relationships in one import: {err}"),
                 }
             })?;
-        let changed = relationships_inserted_count > 0 || structural_edges_inserted > 0;
+        let changed = relationships_inserted_count > 0
+            || structural_edges_inserted > 0
+            || !relationships_updated.is_empty();
         let epoch = if changed {
             current_epoch
                 .checked_add(1)
@@ -1549,6 +1884,29 @@ impl GraphShard {
                 &txn,
                 &record,
                 &EdgeMetadata::default(),
+                &record.metadata,
+                epoch,
+            )?;
+        }
+        for (record, previous_metadata) in &relationships_updated {
+            let key = keys::relationship(
+                cell_id,
+                edge_type,
+                record.src,
+                record.dst,
+                record.relationship_id,
+            );
+            txn.put(
+                key.as_bytes(),
+                encode_relationship_record(record).as_slice(),
+            )?;
+            put_relationship_metadata_delta_txn(&txn, record, &record.metadata, epoch)?;
+            delete_relationship_property_indexes_txn(&txn, record, previous_metadata)?;
+            put_relationship_property_indexes_txn(&txn, record)?;
+            put_relationship_property_index_deltas_txn(
+                &txn,
+                record,
+                previous_metadata,
                 &record.metadata,
                 epoch,
             )?;
@@ -5146,6 +5504,49 @@ fn coalesce_edge_metadata_updates(
         .collect())
 }
 
+fn validate_relationship_creates(
+    cell_id: &str,
+    edge_type: &str,
+    relationships: impl IntoIterator<Item = RelationshipMutation>,
+) -> Result<Vec<RelationshipMutation>> {
+    relationships
+        .into_iter()
+        .map(|relationship| {
+            validate_relationship_batch_entry(cell_id, edge_type, &relationship)?;
+            Ok(relationship)
+        })
+        .collect()
+}
+
+fn validate_relationship_batch_entry(
+    cell_id: &str,
+    edge_type: &str,
+    relationship: &RelationshipMutation,
+) -> Result<()> {
+    validate_component("cell_id", &relationship.cell_id)?;
+    validate_component("edge_type", &relationship.edge_type)?;
+    validate_edge_metadata(&relationship.metadata)?;
+    if relationship.cell_id != cell_id {
+        return Err(GraphError::CorruptValue {
+            key: format!("cell/{cell_id}/relationship_import"),
+            reason: format!(
+                "batch contains relationship for different cell {}",
+                relationship.cell_id
+            ),
+        });
+    }
+    if relationship.edge_type != edge_type {
+        return Err(GraphError::CorruptValue {
+            key: format!("cell/{cell_id}/relationship_import/{edge_type}"),
+            reason: format!(
+                "batch contains relationship for different edge type {}",
+                relationship.edge_type
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn coalesce_relationship_imports(
     cell_id: &str,
     edge_type: &str,
@@ -5153,27 +5554,7 @@ fn coalesce_relationship_imports(
 ) -> Result<Vec<RelationshipMutation>> {
     let mut by_id = BTreeMap::<RelationshipId, RelationshipMutation>::new();
     for relationship in relationships {
-        validate_component("cell_id", &relationship.cell_id)?;
-        validate_component("edge_type", &relationship.edge_type)?;
-        validate_edge_metadata(&relationship.metadata)?;
-        if relationship.cell_id != cell_id {
-            return Err(GraphError::CorruptValue {
-                key: format!("cell/{cell_id}/relationship_import"),
-                reason: format!(
-                    "batch contains relationship for different cell {}",
-                    relationship.cell_id
-                ),
-            });
-        }
-        if relationship.edge_type != edge_type {
-            return Err(GraphError::CorruptValue {
-                key: format!("cell/{cell_id}/relationship_import/{edge_type}"),
-                reason: format!(
-                    "batch contains relationship for different edge type {}",
-                    relationship.edge_type
-                ),
-            });
-        }
+        validate_relationship_batch_entry(cell_id, edge_type, &relationship)?;
         match by_id.get(&relationship.relationship_id) {
             Some(existing) if existing != &relationship => {
                 return Err(GraphError::IdempotencyConflict {
@@ -5449,6 +5830,91 @@ fn put_relationship_metadata_delta_txn(
         encode_edge_metadata(metadata).as_slice(),
     )?;
     Ok(())
+}
+
+async fn next_available_relationship_id_txn(
+    txn: &DbTransaction,
+    cell_id: &str,
+    cursor: &mut RelationshipId,
+    operation: &str,
+) -> Result<RelationshipId> {
+    loop {
+        *cursor = cursor
+            .checked_add(1)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: keys::last_relationship_id(cell_id),
+                reason: format!("relationship id overflow during {operation}"),
+            })?;
+        if read_txn_remote(txn, &keys::relationship_id(cell_id, *cursor))
+            .await?
+            .is_none()
+        {
+            return Ok(*cursor);
+        }
+    }
+}
+
+#[cfg(feature = "opencypher")]
+async fn relationship_ids_for_edge_property_txn(
+    txn: &DbTransaction,
+    lookup: RelationshipPropertyTxnLookup<'_>,
+) -> Result<Vec<RelationshipId>> {
+    let RelationshipPropertyTxnLookup {
+        cell_id,
+        edge_type,
+        src,
+        dst,
+        property,
+        value,
+        read_epoch,
+    } = lookup;
+    let encoded = encode_vertex_property_value_key(value);
+    let prefix = keys::relationship_property_index_edge_prefix(
+        cell_id, edge_type, property, &encoded, src, dst,
+    );
+    let mut iter = txn.scan_prefix(prefix.as_bytes(), ..).await?;
+    let mut relationship_ids = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        let key = String::from_utf8_lossy(&kv.key).into_owned();
+        let (
+            parsed_cell_id,
+            parsed_edge_type,
+            parsed_property,
+            parsed_encoded,
+            parsed_src,
+            parsed_dst,
+            relationship_id,
+        ) = parse_relationship_property_index_key(&key)?;
+        if parsed_cell_id != cell_id
+            || parsed_edge_type != edge_type
+            || parsed_property != property
+            || parsed_encoded != encoded
+            || parsed_src != src
+            || parsed_dst != dst
+        {
+            return Err(GraphError::CorruptValue {
+                key,
+                reason: "relationship property index escaped its requested prefix".to_string(),
+            });
+        }
+        let record_key = keys::relationship(cell_id, edge_type, src, dst, relationship_id);
+        let Some(record_value) = read_txn_remote(txn, &record_key).await? else {
+            return Err(GraphError::CorruptValue {
+                key,
+                reason: format!("relationship property index points at missing {record_key}"),
+            });
+        };
+        let record = decode_relationship_record(&record_key, &record_value)?;
+        if record.epoch <= read_epoch
+            && !relationship_deleted_at_txn(txn, &record, read_epoch).await?
+            && record.metadata.properties.get(property) == Some(value)
+        {
+            relationship_ids.push(relationship_id);
+        }
+    }
+    relationship_ids.sort_unstable();
+    relationship_ids.dedup();
+    Ok(relationship_ids)
 }
 
 async fn relationship_tombstone_epoch_txn(

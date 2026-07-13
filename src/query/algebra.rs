@@ -5,7 +5,7 @@ use tokio::sync::Notify;
 
 use crate::{
     validate_component, CommitResult, EdgeMetadata, GraphEpoch, GraphError, GraphScope, QueryFloat,
-    Result, VertexId, VertexMetadata, VertexPropertyValue,
+    RelationshipId, Result, VertexId, VertexMetadata, VertexPropertyValue,
 };
 
 #[cfg_attr(
@@ -33,6 +33,39 @@ impl From<VertexPropertyValue> for QueryParameterValue {
 pub struct QueryBatchEdge {
     pub src: VertexId,
     pub dst: VertexId,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryBatchVertex {
+    pub vertex: VertexId,
+    pub metadata: VertexMetadata,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryBatchRelationship {
+    pub src: VertexId,
+    pub dst: VertexId,
+    pub metadata: EdgeMetadata,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryBatchRelationshipMerge {
+    pub src: VertexId,
+    pub dst: VertexId,
+    pub relationship_id: RelationshipId,
+    pub metadata: EdgeMetadata,
 }
 
 #[cfg_attr(
@@ -70,6 +103,21 @@ pub enum QueryBatchOperation {
         source_label: String,
         destination_label: String,
     },
+    UpsertVertices {
+        vertices: Vec<QueryBatchVertex>,
+    },
+    CreateRelationshipsBetweenLabeledVertices {
+        edge_type: String,
+        relationships: Vec<QueryBatchRelationship>,
+        source_label: String,
+        destination_label: String,
+    },
+    MergeRelationshipsBetweenLabeledVertices {
+        edge_type: String,
+        relationships: Vec<QueryBatchRelationshipMerge>,
+        source_label: String,
+        destination_label: String,
+    },
 }
 
 impl QueryBatchOperation {
@@ -81,6 +129,9 @@ impl QueryBatchOperation {
                 | Self::DeleteEdges { .. }
                 | Self::DeleteVertices { .. }
                 | Self::DeleteRelationshipsByProperty { .. }
+                | Self::UpsertVertices { .. }
+                | Self::CreateRelationshipsBetweenLabeledVertices { .. }
+                | Self::MergeRelationshipsBetweenLabeledVertices { .. }
         )
     }
 
@@ -92,6 +143,13 @@ impl QueryBatchOperation {
             | Self::DeleteEdges { edges, .. } => edges.len(),
             Self::DeleteVertices { vertices, .. } => vertices.len(),
             Self::DeleteRelationshipsByProperty { values, .. } => values.len(),
+            Self::UpsertVertices { vertices } => vertices.len(),
+            Self::CreateRelationshipsBetweenLabeledVertices { relationships, .. } => {
+                relationships.len()
+            }
+            Self::MergeRelationshipsBetweenLabeledVertices { relationships, .. } => {
+                relationships.len()
+            }
         }
     }
 
