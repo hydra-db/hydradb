@@ -53,7 +53,6 @@ pub struct QueryBatchVertex {
 pub struct QueryBatchRelationship {
     pub src: VertexId,
     pub dst: VertexId,
-    pub relationship_id: u64,
     pub metadata: EdgeMetadata,
 }
 
@@ -95,7 +94,7 @@ pub enum QueryBatchOperation {
     UpsertVertices {
         vertices: Vec<QueryBatchVertex>,
     },
-    ImportRelationshipsBetweenLabeledVertices {
+    CreateRelationshipsBetweenLabeledVertices {
         edge_type: String,
         relationships: Vec<QueryBatchRelationship>,
         source_label: String,
@@ -113,7 +112,7 @@ impl QueryBatchOperation {
                 | Self::DeleteVertices { .. }
                 | Self::DeleteRelationshipsByProperty { .. }
                 | Self::UpsertVertices { .. }
-                | Self::ImportRelationshipsBetweenLabeledVertices { .. }
+                | Self::CreateRelationshipsBetweenLabeledVertices { .. }
         )
     }
 
@@ -126,7 +125,7 @@ impl QueryBatchOperation {
             Self::DeleteVertices { vertices, .. } => vertices.len(),
             Self::DeleteRelationshipsByProperty { values, .. } => values.len(),
             Self::UpsertVertices { vertices } => vertices.len(),
-            Self::ImportRelationshipsBetweenLabeledVertices { relationships, .. } => {
+            Self::CreateRelationshipsBetweenLabeledVertices { relationships, .. } => {
                 relationships.len()
             }
         }

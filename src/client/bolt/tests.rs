@@ -591,16 +591,17 @@ async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
     let relationship = session
         .run(
             "MATCH ({id: 70})-[r:RELATES {relationship_id: 'relationship-a'}]->({id: 71}) \
-             RETURN count(*) AS count, r.chunk_id AS chunk_id",
+             RETURN r.chunk_id AS chunk_id ORDER BY chunk_id",
         )
         .await
         .unwrap();
     assert_eq!(
         relationship.records,
-        vec![vec![
-            BoltValue::Integer(1),
-            BoltValue::String("chunk-b".to_string()),
-        ]]
+        vec![
+            vec![BoltValue::String("chunk-a".to_string())],
+            vec![BoltValue::String("chunk-a".to_string())],
+            vec![BoltValue::String("chunk-b".to_string())],
+        ]
     );
     let _ = session
         .run(
@@ -613,22 +614,20 @@ async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
     let updated_relationship = session
         .run(
             "MATCH ({id: 70})-[r:RELATES {relationship_id: 'relationship-a'}]->({id: 71}) \
-             RETURN r.superseded_by AS superseded_by, r.valid_to AS valid_to",
+             WHERE r.superseded_by = 'relationship-b' AND r.valid_to = 42.5 \
+             RETURN count(*) AS count",
         )
         .await
         .unwrap();
     assert_eq!(
         updated_relationship.records,
-        vec![vec![
-            BoltValue::String("relationship-b".to_string()),
-            BoltValue::Float(42.5),
-        ]]
+        vec![vec![BoltValue::Integer(3)]]
     );
     let _ = session
         .run(
             "MATCH (scope:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
                    -[r:RELATES]->() \
-             WHERE r.chunk_id = 'chunk-b' OR r.chunk_id = 'missing' DELETE r",
+             WHERE r.chunk_id = 'chunk-a' OR r.chunk_id = 'chunk-b' DELETE r",
         )
         .await
         .unwrap();

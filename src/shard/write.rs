@@ -20,7 +20,7 @@ const VERTEX_DELETE_LOCK_RENEW_ITEMS: u64 = 64;
 #[derive(Clone, Copy)]
 struct RelationshipImportOptions<'a> {
     endpoint_labels: Option<(&'a str, &'a str)>,
-    update_existing_metadata: bool,
+    create_always: bool,
     operation: &'static str,
 }
 
@@ -1147,7 +1147,7 @@ impl GraphShard {
             idempotency_key,
             RelationshipImportOptions {
                 endpoint_labels: None,
-                update_existing_metadata: false,
+                create_always: false,
                 operation: "import_relationships_batch",
             },
         )
@@ -1155,7 +1155,7 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    pub(crate) async fn import_relationships_batch_between_labeled_vertices(
+    pub(crate) async fn create_relationships_batch_between_labeled_vertices(
         &self,
         cell_id: &str,
         edge_type: &str,
@@ -1173,8 +1173,8 @@ impl GraphShard {
             idempotency_key,
             RelationshipImportOptions {
                 endpoint_labels: Some((source_label, destination_label)),
-                update_existing_metadata: true,
-                operation: "import_relationships_batch_between_labeled_vertices",
+                create_always: true,
+                operation: "create_relationships_batch_between_labeled_vertices",
             },
         )
         .await
@@ -1193,7 +1193,11 @@ impl GraphShard {
         validate_component("idempotency_key", idempotency_key)?;
         self.ensure_write_authority(cell_id, options.operation)?;
 
-        let mut relationships = coalesce_relationship_imports(cell_id, edge_type, relationships)?;
+        let mut relationships = if options.create_always {
+            validate_relationship_creates(cell_id, edge_type, relationships)?
+        } else {
+            coalesce_relationship_imports(cell_id, edge_type, relationships)?
+        };
         if relationships.is_empty() {
             let epoch = self.current_epoch(cell_id).await?;
             return Ok(RelationshipImportResult {
@@ -1491,6 +1495,28 @@ impl GraphShard {
         let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
         let current_relationship_id =
             read_counter_txn(&txn, &keys::last_relationship_id(cell_id)).await?;
+        let mut relationships = relationships.to_vec();
+        if options.create_always {
+            let mut relationship_id = current_relationship_id;
+            for relationship in &mut relationships {
+                loop {
+                    relationship_id =
+                        relationship_id
+                            .checked_add(1)
+                            .ok_or_else(|| GraphError::CorruptValue {
+                                key: keys::last_relationship_id(cell_id),
+                                reason: "relationship id overflow during CREATE".to_string(),
+                            })?;
+                    if read_txn_remote(&txn, &keys::relationship_id(cell_id, relationship_id))
+                        .await?
+                        .is_none()
+                    {
+                        break;
+                    }
+                }
+                relationship.relationship_id = relationship_id;
+            }
+        }
         let max_requested_relationship_id = relationships
             .iter()
             .map(|relationship| relationship.relationship_id)
@@ -1498,9 +1524,8 @@ impl GraphShard {
             .unwrap_or(0);
         let fresh_cell = current_epoch == 0;
         let mut relationships_inserted = Vec::new();
-        let mut relationship_metadata_updates = Vec::new();
         let mut relationships_already_existed = 0_u64;
-        for relationship in relationships {
+        for relationship in &relationships {
             let rel_key = keys::relationship(
                 cell_id,
                 edge_type,
@@ -1570,15 +1595,10 @@ impl GraphShard {
                     });
                 }
                 if existing.metadata != requested.metadata {
-                    if options.update_existing_metadata {
-                        relationship_metadata_updates
-                            .push((existing.clone(), requested.metadata.clone()));
-                    } else {
-                        return Err(GraphError::IdempotencyConflict {
-                            operation: "relationship-import",
-                            idempotency_key: idempotency_key.to_string(),
-                        });
-                    }
+                    return Err(GraphError::IdempotencyConflict {
+                        operation: "relationship-import",
+                        idempotency_key: idempotency_key.to_string(),
+                    });
                 }
                 relationships_already_existed = relationships_already_existed.saturating_add(1);
             } else {
@@ -1640,9 +1660,7 @@ impl GraphShard {
                     reason: format!("too many relationships in one import: {err}"),
                 }
             })?;
-        let changed = relationships_inserted_count > 0
-            || structural_edges_inserted > 0
-            || !relationship_metadata_updates.is_empty();
+        let changed = relationships_inserted_count > 0 || structural_edges_inserted > 0;
         let epoch = if changed {
             current_epoch
                 .checked_add(1)
@@ -1766,31 +1784,6 @@ impl GraphShard {
                 &record,
                 &EdgeMetadata::default(),
                 &record.metadata,
-                epoch,
-            )?;
-        }
-        for (previous_record, metadata) in &relationship_metadata_updates {
-            let mut record = previous_record.clone();
-            record.metadata = metadata.clone();
-            let key = keys::relationship(
-                cell_id,
-                edge_type,
-                record.src,
-                record.dst,
-                record.relationship_id,
-            );
-            txn.put(
-                key.as_bytes(),
-                encode_relationship_record(&record).as_slice(),
-            )?;
-            put_relationship_metadata_delta_txn(&txn, &record, metadata, epoch)?;
-            delete_relationship_property_indexes_txn(&txn, &record, &previous_record.metadata)?;
-            put_relationship_property_indexes_txn(&txn, &record)?;
-            put_relationship_property_index_deltas_txn(
-                &txn,
-                &record,
-                &previous_record.metadata,
-                metadata,
                 epoch,
             )?;
         }
@@ -5387,6 +5380,49 @@ fn coalesce_edge_metadata_updates(
         .collect())
 }
 
+fn validate_relationship_creates(
+    cell_id: &str,
+    edge_type: &str,
+    relationships: impl IntoIterator<Item = RelationshipMutation>,
+) -> Result<Vec<RelationshipMutation>> {
+    relationships
+        .into_iter()
+        .map(|relationship| {
+            validate_relationship_batch_entry(cell_id, edge_type, &relationship)?;
+            Ok(relationship)
+        })
+        .collect()
+}
+
+fn validate_relationship_batch_entry(
+    cell_id: &str,
+    edge_type: &str,
+    relationship: &RelationshipMutation,
+) -> Result<()> {
+    validate_component("cell_id", &relationship.cell_id)?;
+    validate_component("edge_type", &relationship.edge_type)?;
+    validate_edge_metadata(&relationship.metadata)?;
+    if relationship.cell_id != cell_id {
+        return Err(GraphError::CorruptValue {
+            key: format!("cell/{cell_id}/relationship_import"),
+            reason: format!(
+                "batch contains relationship for different cell {}",
+                relationship.cell_id
+            ),
+        });
+    }
+    if relationship.edge_type != edge_type {
+        return Err(GraphError::CorruptValue {
+            key: format!("cell/{cell_id}/relationship_import/{edge_type}"),
+            reason: format!(
+                "batch contains relationship for different edge type {}",
+                relationship.edge_type
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn coalesce_relationship_imports(
     cell_id: &str,
     edge_type: &str,
@@ -5394,27 +5430,7 @@ fn coalesce_relationship_imports(
 ) -> Result<Vec<RelationshipMutation>> {
     let mut by_id = BTreeMap::<RelationshipId, RelationshipMutation>::new();
     for relationship in relationships {
-        validate_component("cell_id", &relationship.cell_id)?;
-        validate_component("edge_type", &relationship.edge_type)?;
-        validate_edge_metadata(&relationship.metadata)?;
-        if relationship.cell_id != cell_id {
-            return Err(GraphError::CorruptValue {
-                key: format!("cell/{cell_id}/relationship_import"),
-                reason: format!(
-                    "batch contains relationship for different cell {}",
-                    relationship.cell_id
-                ),
-            });
-        }
-        if relationship.edge_type != edge_type {
-            return Err(GraphError::CorruptValue {
-                key: format!("cell/{cell_id}/relationship_import/{edge_type}"),
-                reason: format!(
-                    "batch contains relationship for different edge type {}",
-                    relationship.edge_type
-                ),
-            });
-        }
+        validate_relationship_batch_entry(cell_id, edge_type, &relationship)?;
         match by_id.get(&relationship.relationship_id) {
             Some(existing) if existing != &relationship => {
                 return Err(GraphError::IdempotencyConflict {
