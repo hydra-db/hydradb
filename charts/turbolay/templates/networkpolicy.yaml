@@ -40,14 +40,24 @@ spec:
         - protocol: TCP
           port: 9443
     - from:
-        - podSelector: {}
+        - podSelector:
+            matchLabels:
+              {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "turbolay.componentLabels" (dict "root" . "component" "controller") | nindent 14 }}
         - namespaceSelector:
             {{- toYaml .Values.networkPolicy.monitoringNamespaceSelector | nindent 12 }}
       ports:
         - protocol: TCP
           port: 9090
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "turbolay.componentLabels" (dict "root" . "component" "helm-test") | nindent 14 }}
+      ports:
         - protocol: TCP
-          port: 9443
+          port: 7687
   egress:
     - to:
         - namespaceSelector:

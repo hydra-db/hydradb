@@ -41,6 +41,16 @@ controller:
 podDisruptionBudget:
   enabled: false
 
+networkPolicy:
+  additionalEgress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+
 service:
   bolt:
     type: NodePort

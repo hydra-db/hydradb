@@ -46,7 +46,7 @@ data:
   GRAPH_ADMIN_ADDR: 0.0.0.0:9090
   GRAPH_ADVERTISED_BOLT_ADDR: {{ include "turbolay.advertisedBoltAddress" . | quote }}
   GRAPH_BOLT_NODE_ADDRESSES: {{ include "turbolay.nodeAddresses" . | quote }}
-  GRAPH_AUTH_TOKEN_FILE: /var/run/secrets/turbolay/auth-token
+  GRAPH_AUTH_TOKEN_FILE: "/var/run/secrets/turbolay/{{ .Values.auth.secretKey }}"
   GRAPH_TLS_CERTIFICATE: /var/run/secrets/turbolay/public/tls.crt
   GRAPH_TLS_PRIVATE_KEY: /var/run/secrets/turbolay/public/tls.key
   GRAPH_ALLOW_PLAINTEXT: {{ not .Values.tls.public.enabled | quote }}
