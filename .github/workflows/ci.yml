@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
@@ -18,6 +19,16 @@ jobs:
         run: helm template turbolay charts/turbolay --namespace turbolay --values charts/turbolay/examples/values-eks.yaml > /tmp/turbolay-eks.yaml
       - name: Render development example
         run: helm template turbolay charts/turbolay --namespace turbolay --values charts/turbolay/examples/values-development.yaml > /tmp/turbolay-development.yaml
+      - name: Verify chart invariants
+        run: |
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set auth.secretKey=custom-token > /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_AUTH_TOKEN_FILE: "/var/run/secrets/turbolay/custom-token"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'path: custom-token' /tmp/turbolay-custom-auth.yaml
+          grep -q 'port: 9000' /tmp/turbolay-development.yaml
+          grep -q 'app.kubernetes.io/component: helm-test' /tmp/turbolay-development.yaml
       - name: Validate Kubernetes resources
         run: |
           docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary < /tmp/turbolay-development.yaml

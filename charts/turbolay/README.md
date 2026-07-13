@@ -40,6 +40,10 @@ Public TLS and internal mTLS are enabled by default. With cert-manager disabled,
 
 `emptyDir` is the default because S3 is ground truth. Use `persistentVolume` to retain warm SSD cache across pod replacement. Cache loss affects cold-start latency, not durable graph data.
 
+The development example references an existing MinIO Service only to exercise
+the S3-compatible path without AWS. The chart does not install MinIO, and the
+EKS example leaves the custom endpoint unset so production uses AWS S3 directly.
+
 ## Upgrades
 
 Graph nodes default to StatefulSet `OnDelete` updates so operators can drain and replace one node at a time after `helm upgrade`. The controller runtime lease ensures only one controller candidate owns the writable control plane.

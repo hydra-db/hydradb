@@ -166,7 +166,7 @@ spec:
             secretName: {{ include "turbolay.authSecretName" . }}
             items:
               - key: {{ .Values.auth.secretKey }}
-                path: auth-token
+                path: {{ .Values.auth.secretKey }}
         {{- if .Values.tls.public.enabled }}
         - name: public-tls
           secret:

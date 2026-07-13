@@ -50,7 +50,7 @@
       "type": "object",
       "properties": {
         "existingSecret": { "type": "string" },
-        "secretKey": { "type": "string", "minLength": 1 },
+        "secretKey": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
         "create": { "type": "boolean" },
         "token": { "type": "string", "pattern": "^$|^.{32,}$" },
         "preserveGeneratedToken": { "type": "boolean" },
