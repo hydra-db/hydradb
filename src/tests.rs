@@ -477,7 +477,7 @@ async fn edge_mutation_batch_txn_retry_for_test(
 ) -> Result<EdgeMutationBatchResult> {
     for attempt in 0..GRAPH_TXN_MAX_RETRIES {
         match shard
-            .write_edge_mutations_batch_txn(cell_id, &mutations, operation, None)
+            .write_edge_mutations_batch_txn(cell_id, &mutations, operation, None, None)
             .await
         {
             Err(err)

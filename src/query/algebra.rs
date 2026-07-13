@@ -64,6 +64,12 @@ pub enum QueryBatchOperation {
         property: String,
         values: Vec<VertexPropertyValue>,
     },
+    CreateEdgesBetweenLabeledVertices {
+        edge_type: String,
+        edges: Vec<QueryBatchEdge>,
+        source_label: String,
+        destination_label: String,
+    },
 }
 
 impl QueryBatchOperation {
@@ -71,6 +77,7 @@ impl QueryBatchOperation {
         matches!(
             self,
             Self::CreateEdges { .. }
+                | Self::CreateEdgesBetweenLabeledVertices { .. }
                 | Self::DeleteEdges { .. }
                 | Self::DeleteVertices { .. }
                 | Self::DeleteRelationshipsByProperty { .. }
@@ -80,7 +87,9 @@ impl QueryBatchOperation {
     pub fn len(&self) -> usize {
         match self {
             Self::OutNeighbors { sources, .. } => sources.len(),
-            Self::CreateEdges { edges, .. } | Self::DeleteEdges { edges, .. } => edges.len(),
+            Self::CreateEdges { edges, .. }
+            | Self::CreateEdgesBetweenLabeledVertices { edges, .. }
+            | Self::DeleteEdges { edges, .. } => edges.len(),
             Self::DeleteVertices { vertices, .. } => vertices.len(),
             Self::DeleteRelationshipsByProperty { values, .. } => values.len(),
         }

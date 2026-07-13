@@ -454,6 +454,83 @@ async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
         )
         .await
         .unwrap();
+    let _ = session
+        .run("CREATE (:Source {id: 60})-[:SEED]->(:Source {id: 61})")
+        .await
+        .unwrap();
+    let shard = cluster.shard("cell-a").unwrap();
+    shard
+        .write_edge_mutations_batch_between_labeled_vertices(
+            "cell-a",
+            [crate::EdgeMutation {
+                cell_id: "cell-a".to_string(),
+                edge_type: "FORCEFUL_RELATION".to_string(),
+                src: 60,
+                dst: 61,
+                idempotency_key: "bolt-matched-create-direct-check".to_string(),
+            }],
+            "Source",
+            "Source",
+        )
+        .await
+        .unwrap();
+    shard
+        .delete_edge(crate::EdgeMutation {
+            cell_id: "cell-a".to_string(),
+            edge_type: "FORCEFUL_RELATION".to_string(),
+            src: 60,
+            dst: 61,
+            idempotency_key: "bolt-matched-create-direct-cleanup".to_string(),
+        })
+        .await
+        .unwrap();
+    let matched_edge_rows = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("source_vertex".to_string(), BoltValue::Integer(60)),
+        ("related_vertex".to_string(), BoltValue::Integer(61)),
+    ]))]);
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MATCH (s:Source {id: row.source_vertex}), \
+                   (r:Source {id: row.related_vertex}) \
+             CREATE (s)-[:FORCEFUL_RELATION]->(r)",
+            BoltDict::from([("rows".to_string(), matched_edge_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "FORCEFUL_RELATION", 60, 61)
+        .await
+        .unwrap());
+
+    let missing_endpoint = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MATCH (s:Source {id: row.source_vertex}), \
+                   (r:Source {id: row.related_vertex}) \
+             CREATE (s)-[:FORCEFUL_RELATION]->(r)",
+            BoltDict::from([(
+                "rows".to_string(),
+                BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+                    ("source_vertex".to_string(), BoltValue::Integer(60)),
+                    ("related_vertex".to_string(), BoltValue::Integer(62)),
+                ]))]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(missing_endpoint.to_string().contains("does not exist"));
+    session.reset().await.unwrap();
+    assert!(!cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "FORCEFUL_RELATION", 60, 62)
+        .await
+        .unwrap());
     let rows = session
         .run_with_params(
             "UNWIND $sources AS row \
