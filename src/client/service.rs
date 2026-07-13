@@ -1465,7 +1465,7 @@ fn resolve_unwind_batch(
                 })
                 .collect::<Result<Vec<_>>>()?,
         }),
-        ParsedUnwindBatchKind::ImportRelationshipsBetweenLabeledVertices {
+        ParsedUnwindBatchKind::CreateRelationshipsBetweenLabeledVertices {
             edge_type,
             source_field,
             destination_field,
@@ -1474,7 +1474,7 @@ fn resolve_unwind_batch(
             source_label,
             destination_label,
         } => Ok(
-            QueryBatchOperation::ImportRelationshipsBetweenLabeledVertices {
+            QueryBatchOperation::CreateRelationshipsBetweenLabeledVertices {
                 edge_type,
                 relationships: rows
                     .iter()
@@ -1486,14 +1486,15 @@ fn resolve_unwind_batch(
                                 .properties
                                 .insert(property.clone(), unwind_row_scalar(row, index, field)?);
                         }
+                        let relationship_id =
+                            unwind_row_vertex_id(row, index, &relationship_id_field)?;
+                        metadata.properties.insert(
+                            "id".to_string(),
+                            VertexPropertyValue::Integer(relationship_id),
+                        );
                         Ok(QueryBatchRelationship {
                             src: unwind_row_vertex_id(row, index, &source_field)?,
                             dst: unwind_row_vertex_id(row, index, &destination_field)?,
-                            relationship_id: unwind_row_vertex_id(
-                                row,
-                                index,
-                                &relationship_id_field,
-                            )?,
                             metadata,
                         })
                     })
@@ -1589,7 +1590,7 @@ fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> 
         | QueryBatchOperation::DeleteVertices { .. }
         | QueryBatchOperation::DeleteRelationshipsByProperty { .. }
         | QueryBatchOperation::UpsertVertices { .. }
-        | QueryBatchOperation::ImportRelationshipsBetweenLabeledVertices { .. } => Vec::new(),
+        | QueryBatchOperation::CreateRelationshipsBetweenLabeledVertices { .. } => Vec::new(),
     }
 }
 

@@ -3166,7 +3166,7 @@ impl QueryCellClient for RoutedGraphCluster {
                     .await?;
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
-            crate::QueryBatchOperation::ImportRelationshipsBetweenLabeledVertices {
+            crate::QueryBatchOperation::CreateRelationshipsBetweenLabeledVertices {
                 edge_type,
                 relationships,
                 source_label,
@@ -3174,7 +3174,7 @@ impl QueryCellClient for RoutedGraphCluster {
             } => {
                 self.ensure_active_write_lease(&context.cell_id)?;
                 shard
-                    .import_relationships_batch_between_labeled_vertices(
+                    .create_relationships_batch_between_labeled_vertices(
                         &context.cell_id,
                         &edge_type,
                         relationships
@@ -3184,10 +3184,10 @@ impl QueryCellClient for RoutedGraphCluster {
                                 edge_type: edge_type.clone(),
                                 src: relationship.src,
                                 dst: relationship.dst,
-                                relationship_id: relationship.relationship_id,
+                                relationship_id: 0,
                                 metadata: relationship.metadata,
                             }),
-                        &format!("{}.unwind-relationship-import", context.idempotency_key),
+                        &format!("{}.unwind-relationship-create", context.idempotency_key),
                         &source_label,
                         &destination_label,
                     )

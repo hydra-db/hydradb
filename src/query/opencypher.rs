@@ -79,7 +79,7 @@ pub(crate) enum ParsedUnwindBatchKind {
         vertex_field: String,
         property_fields: BTreeMap<String, String>,
     },
-    ImportRelationshipsBetweenLabeledVertices {
+    CreateRelationshipsBetweenLabeledVertices {
         edge_type: String,
         source_field: String,
         destination_field: String,
@@ -363,7 +363,7 @@ impl ParsedCypher {
                         | ParsedUnwindBatchKind::DeleteVertices { .. }
                         | ParsedUnwindBatchKind::DeleteRelationshipsByProperty { .. }
                         | ParsedUnwindBatchKind::UpsertVertices { .. }
-                        | ParsedUnwindBatchKind::ImportRelationshipsBetweenLabeledVertices { .. }
+                        | ParsedUnwindBatchKind::CreateRelationshipsBetweenLabeledVertices { .. }
                 );
                 if batch_is_write != has_write_clause {
                     return Err(GraphError::CorruptValue {
@@ -477,7 +477,7 @@ impl ParsedCypher {
                 if let Some(relationship_id_field) = template.relationship_id_field {
                     return Ok(Some(ParsedUnwindBatch {
                         parameter,
-                        kind: ParsedUnwindBatchKind::ImportRelationshipsBetweenLabeledVertices {
+                        kind: ParsedUnwindBatchKind::CreateRelationshipsBetweenLabeledVertices {
                             edge_type: template.edge_type,
                             source_field: template.source_field,
                             destination_field: template.destination_field,
@@ -3067,7 +3067,7 @@ mod tests {
 
     #[cfg(feature = "client-api")]
     #[test]
-    fn lowers_unwind_relationship_import_batch() {
+    fn lowers_unwind_relationship_create_batch() {
         let parsed = parse_opencypher_unwind_batch(
             "UNWIND $rows AS row \
              MATCH (s:Entity {id: row.source_vertex}), \
@@ -3079,7 +3079,7 @@ mod tests {
         assert_eq!(parsed.parameter, "rows");
         assert_eq!(
             parsed.kind,
-            ParsedUnwindBatchKind::ImportRelationshipsBetweenLabeledVertices {
+            ParsedUnwindBatchKind::CreateRelationshipsBetweenLabeledVertices {
                 edge_type: "RELATES".to_string(),
                 source_field: "source_vertex".to_string(),
                 destination_field: "destination_vertex".to_string(),
