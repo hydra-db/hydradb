@@ -2828,6 +2828,7 @@ impl GraphShard {
         })
     }
 
+    #[cfg(feature = "opencypher")]
     pub(crate) async fn reserve_edge_delete_noops_batch(
         &self,
         cell_id: &str,
@@ -2886,6 +2887,7 @@ impl GraphShard {
         })
     }
 
+    #[cfg(feature = "opencypher")]
     async fn reserve_edge_delete_noops_batch_txn(
         &self,
         cell_id: &str,
@@ -2900,6 +2902,7 @@ impl GraphShard {
         release_cell_write_lock(lock, result).await
     }
 
+    #[cfg(feature = "opencypher")]
     async fn reserve_edge_delete_noops_batch_txn_locked(
         &self,
         cell_id: &str,
@@ -3744,6 +3747,7 @@ impl GraphShard {
         .await
     }
 
+    #[cfg(feature = "opencypher")]
     pub(crate) async fn write_edge_mutations_batch_between_labeled_vertices(
         &self,
         cell_id: &str,
