@@ -454,6 +454,83 @@ async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
         )
         .await
         .unwrap();
+    let _ = session
+        .run("CREATE (:Source {id: 60})-[:SEED]->(:Source {id: 61})")
+        .await
+        .unwrap();
+    let shard = cluster.shard("cell-a").unwrap();
+    shard
+        .write_edge_mutations_batch_between_labeled_vertices(
+            "cell-a",
+            [crate::EdgeMutation {
+                cell_id: "cell-a".to_string(),
+                edge_type: "FORCEFUL_RELATION".to_string(),
+                src: 60,
+                dst: 61,
+                idempotency_key: "bolt-matched-create-direct-check".to_string(),
+            }],
+            "Source",
+            "Source",
+        )
+        .await
+        .unwrap();
+    shard
+        .delete_edge(crate::EdgeMutation {
+            cell_id: "cell-a".to_string(),
+            edge_type: "FORCEFUL_RELATION".to_string(),
+            src: 60,
+            dst: 61,
+            idempotency_key: "bolt-matched-create-direct-cleanup".to_string(),
+        })
+        .await
+        .unwrap();
+    let matched_edge_rows = BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+        ("source_vertex".to_string(), BoltValue::Integer(60)),
+        ("related_vertex".to_string(), BoltValue::Integer(61)),
+    ]))]);
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MATCH (s:Source {id: row.source_vertex}), \
+                   (r:Source {id: row.related_vertex}) \
+             CREATE (s)-[:FORCEFUL_RELATION]->(r)",
+            BoltDict::from([("rows".to_string(), matched_edge_rows)]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "FORCEFUL_RELATION", 60, 61)
+        .await
+        .unwrap());
+
+    let missing_endpoint = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MATCH (s:Source {id: row.source_vertex}), \
+                   (r:Source {id: row.related_vertex}) \
+             CREATE (s)-[:FORCEFUL_RELATION]->(r)",
+            BoltDict::from([(
+                "rows".to_string(),
+                BoltValue::List(vec![BoltValue::Dict(BoltDict::from([
+                    ("source_vertex".to_string(), BoltValue::Integer(60)),
+                    ("related_vertex".to_string(), BoltValue::Integer(62)),
+                ]))]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(missing_endpoint.to_string().contains("does not exist"));
+    session.reset().await.unwrap();
+    assert!(!cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "FORCEFUL_RELATION", 60, 62)
+        .await
+        .unwrap());
     let rows = session
         .run_with_params(
             "UNWIND $sources AS row \
@@ -502,6 +579,77 @@ async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
         .unwrap()
         .iter()
         .all(|entry| !entry.exists));
+
+    let _ = session
+        .run("CREATE ({id: 30})-[:FOLLOWS]->({id: 31})")
+        .await
+        .unwrap();
+    let _ = session
+        .run_with_params(
+            "UNWIND $vertices AS row MATCH (n {id: row.vertex}) DETACH DELETE n",
+            BoltDict::from([(
+                "vertices".to_string(),
+                BoltValue::List(vec![BoltValue::Dict(BoltDict::from([(
+                    "vertex".to_string(),
+                    BoltValue::Integer(30),
+                )]))]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert!(!cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "FOLLOWS", 30, 31)
+        .await
+        .unwrap());
+
+    let _ = session
+        .run("CREATE ({id: 40})-[:RELATES {chunk_id: 'chunk-a'}]->({id: 41})")
+        .await
+        .unwrap();
+    let _ = session
+        .run("CREATE ({id: 40})-[:RELATES {chunk_id: 'chunk-b'}]->({id: 41})")
+        .await
+        .unwrap();
+    let _ = session
+        .run_with_params(
+            "UNWIND $rows AS row \
+             MATCH ()-[r:RELATES {chunk_id: row.chunk_id}]->() DELETE r",
+            BoltDict::from([(
+                "rows".to_string(),
+                BoltValue::List(vec![BoltValue::Dict(BoltDict::from([(
+                    "chunk_id".to_string(),
+                    BoltValue::String("chunk-a".to_string()),
+                )]))]),
+            )]),
+            BoltDict::new(),
+        )
+        .await
+        .unwrap();
+    assert!(cluster
+        .shard("cell-a")
+        .unwrap()
+        .edge_exists("cell-a", "RELATES", 40, 41)
+        .await
+        .unwrap());
+    let chunk_a = session
+        .run(
+            "MATCH ({id: 40})-[r:RELATES {chunk_id: 'chunk-a'}]->({id: 41}) \
+             RETURN count(*) AS count",
+        )
+        .await
+        .unwrap();
+    let chunk_b = session
+        .run(
+            "MATCH ({id: 40})-[r:RELATES {chunk_id: 'chunk-b'}]->({id: 41}) \
+             RETURN count(*) AS count",
+        )
+        .await
+        .unwrap();
+    assert_eq!(chunk_a.records, vec![vec![BoltValue::Integer(0)]]);
+    assert_eq!(chunk_b.records, vec![vec![BoltValue::Integer(1)]]);
 
     let malformed = session
         .run_with_params(

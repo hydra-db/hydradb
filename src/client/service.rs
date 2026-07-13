@@ -1390,6 +1390,18 @@ fn resolve_unwind_batch(
             edge_type,
             edges: unwind_batch_edges(rows, &source_field, &destination_field)?,
         }),
+        ParsedUnwindBatchKind::CreateEdgesBetweenLabeledVertices {
+            edge_type,
+            source_field,
+            destination_field,
+            source_label,
+            destination_label,
+        } => Ok(QueryBatchOperation::CreateEdgesBetweenLabeledVertices {
+            edge_type,
+            edges: unwind_batch_edges(rows, &source_field, &destination_field)?,
+            source_label,
+            destination_label,
+        }),
         ParsedUnwindBatchKind::DeleteEdges {
             edge_type,
             source_field,
@@ -1399,6 +1411,37 @@ fn resolve_unwind_batch(
             let mut seen = std::collections::BTreeSet::new();
             edges.retain(|edge| seen.insert(*edge));
             Ok(QueryBatchOperation::DeleteEdges { edge_type, edges })
+        }
+        ParsedUnwindBatchKind::DeleteVertices {
+            vertex_field,
+            detach,
+        } => {
+            let mut vertices = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| unwind_row_vertex_id(row, index, &vertex_field))
+                .collect::<Result<Vec<_>>>()?;
+            vertices.sort_unstable();
+            vertices.dedup();
+            Ok(QueryBatchOperation::DeleteVertices { vertices, detach })
+        }
+        ParsedUnwindBatchKind::DeleteRelationshipsByProperty {
+            edge_type,
+            property,
+            value_field,
+        } => {
+            let mut values = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| unwind_row_scalar(row, index, &value_field))
+                .collect::<Result<Vec<_>>>()?;
+            values.sort();
+            values.dedup();
+            Ok(QueryBatchOperation::DeleteRelationshipsByProperty {
+                edge_type,
+                property,
+                values,
+            })
         }
     }
 }
@@ -1448,6 +1491,32 @@ fn unwind_row_vertex_id(
     }
 }
 
+fn unwind_row_scalar(
+    row: &QueryParameterValue,
+    index: usize,
+    field: &str,
+) -> Result<VertexPropertyValue> {
+    let QueryParameterValue::Map(row) = row else {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: format!("UNWIND row {index} must be a map"),
+        });
+    };
+    match row.get(field) {
+        Some(QueryParameterValue::Scalar(value)) => Ok(value.clone()),
+        Some(QueryParameterValue::List(_) | QueryParameterValue::Map(_)) => {
+            Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: format!("UNWIND row {index} field {field} must be scalar"),
+            })
+        }
+        None => Err(GraphError::UnsupportedQuery {
+            dialect: "OpenCypher",
+            feature: format!("UNWIND row {index} is missing field {field}"),
+        }),
+    }
+}
+
 fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> {
     match operation {
         QueryBatchOperation::OutNeighbors {
@@ -1455,9 +1524,11 @@ fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> 
             destination_column,
             ..
         } => vec![source_column.clone(), destination_column.clone()],
-        QueryBatchOperation::CreateEdges { .. } | QueryBatchOperation::DeleteEdges { .. } => {
-            Vec::new()
-        }
+        QueryBatchOperation::CreateEdges { .. }
+        | QueryBatchOperation::CreateEdgesBetweenLabeledVertices { .. }
+        | QueryBatchOperation::DeleteEdges { .. }
+        | QueryBatchOperation::DeleteVertices { .. }
+        | QueryBatchOperation::DeleteRelationshipsByProperty { .. } => Vec::new(),
     }
 }
 

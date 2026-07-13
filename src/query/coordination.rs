@@ -3123,6 +3123,37 @@ impl QueryCellClient for RoutedGraphCluster {
                     .await?;
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
+            crate::QueryBatchOperation::CreateEdgesBetweenLabeledVertices {
+                edge_type,
+                edges,
+                source_label,
+                destination_label,
+            } => {
+                self.ensure_active_write_lease(&context.cell_id)?;
+                let mutations =
+                    edges
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, edge)| crate::EdgeMutation {
+                            cell_id: context.cell_id.clone(),
+                            edge_type: edge_type.clone(),
+                            src: edge.src,
+                            dst: edge.dst,
+                            idempotency_key: format!(
+                                "{}.unwind-create-matched.{index:020}",
+                                context.idempotency_key
+                            ),
+                        });
+                shard
+                    .write_edge_mutations_batch_between_labeled_vertices(
+                        &context.cell_id,
+                        mutations,
+                        &source_label,
+                        &destination_label,
+                    )
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
             crate::QueryBatchOperation::DeleteEdges { edge_type, edges } => {
                 self.ensure_active_write_lease(&context.cell_id)?;
                 let mutations =
@@ -3141,6 +3172,49 @@ impl QueryCellClient for RoutedGraphCluster {
                         });
                 shard
                     .delete_edge_mutations_batch(&context.cell_id, mutations)
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::DeleteVertices { vertices, detach } => {
+                self.ensure_active_write_lease(&context.cell_id)?;
+                for (index, vertex) in vertices.into_iter().enumerate() {
+                    if context
+                        .cancellation_token
+                        .as_ref()
+                        .is_some_and(crate::QueryCancellationToken::is_cancelled)
+                    {
+                        return Err(GraphError::QueryTimeout {
+                            operation: "query_cancelled",
+                            elapsed_ms: 0,
+                            limit_ms: 0,
+                        });
+                    }
+                    let idempotency_key = format!(
+                        "{}.unwind-delete-vertex.{index:020}.{vertex}",
+                        context.idempotency_key
+                    );
+                    if detach {
+                        shard
+                            .detach_delete_vertex(&context.cell_id, vertex, &idempotency_key)
+                            .await?;
+                    } else {
+                        shard
+                            .delete_vertex(&context.cell_id, vertex, &idempotency_key)
+                            .await?;
+                    }
+                }
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::DeleteRelationshipsByProperty {
+                edge_type,
+                property,
+                values,
+            } => {
+                self.ensure_active_write_lease(&context.cell_id)?;
+                shard
+                    .delete_relationships_by_property_values_batch(
+                        &context, &edge_type, &property, values,
+                    )
                     .await?;
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
