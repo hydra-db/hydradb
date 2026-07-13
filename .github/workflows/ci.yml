@@ -31,19 +31,33 @@ jobs:
           grep -q 'app.kubernetes.io/component: helm-test' /tmp/turbolay-development.yaml
           helm template turbolay charts/turbolay \
             --namespace turbolay \
-            --values charts/turbolay/ci/ci-values.yaml \
-            --set-string objectStore.aws.endpoint=http://object-store.example:8080 > /tmp/turbolay-custom-endpoint.yaml
+            --values charts/turbolay/ci/custom-endpoint-values.yaml > /tmp/turbolay-custom-endpoint.yaml
           grep -q 'port: 8080' /tmp/turbolay-custom-endpoint.yaml
+          grep -q 'cidr: 10.0.0.0/8' /tmp/turbolay-custom-endpoint.yaml
           if helm template turbolay charts/turbolay \
             --namespace turbolay \
             --values charts/turbolay/ci/ci-values.yaml \
+            --set-string objectStore.aws.endpoint=http://object-store.example:8080 > /tmp/turbolay-unscoped-endpoint.yaml 2>&1; then
+            echo "unscoped custom object-store endpoint was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
+            --set-json 'objectStore.aws.endpointEgressTo=[{}]' > /tmp/turbolay-empty-endpoint-peer.yaml 2>&1; then
+            echo "empty custom object-store endpoint peer was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
             --set-string objectStore.aws.endpoint=ftp://object-store.example > /tmp/turbolay-invalid-endpoint.yaml 2>&1; then
             echo "unsupported object-store endpoint scheme was accepted"
             exit 1
           fi
           if helm template turbolay charts/turbolay \
             --namespace turbolay \
-            --values charts/turbolay/ci/ci-values.yaml \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
             --set-string objectStore.aws.endpoint=http://object-store.example:70000 > /tmp/turbolay-invalid-port.yaml 2>&1; then
             echo "invalid object-store endpoint port was accepted"
             exit 1

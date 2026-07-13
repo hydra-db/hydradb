@@ -44,8 +44,11 @@ The development example references an existing MinIO Service only to exercise
 the S3-compatible path without AWS. The chart does not install MinIO, and the
 EKS example leaves the custom endpoint unset so production uses AWS S3 directly.
 When a custom HTTP or HTTPS endpoint is configured, the chart derives its port
-and creates the matching egress rule. Use `objectStore.aws.endpointEgressTo` to
-scope that rule to the endpoint namespace, Pod selector, or CIDR.
+and creates the matching egress rule. A non-empty
+`objectStore.aws.endpointEgressTo` is required while NetworkPolicy is enabled
+to restrict that rule to the endpoint namespace, Pod selector, or CIDR. Empty
+lists and peers without one of those selectors are rejected before
+installation.
 
 ## Upgrades
 

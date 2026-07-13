@@ -1,0 +1,16 @@
+objectStore:
+  aws:
+    bucketName: graph-ci
+    endpoint: http://object-store.example:8080
+    endpointEgressTo:
+      - ipBlock:
+          cidr: 10.0.0.0/8
+
+auth:
+  token: ci-only-auth-token-with-more-than-32-characters
+
+tls:
+  public:
+    enabled: false
+  internal:
+    enabled: false
