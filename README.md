@@ -48,6 +48,7 @@ src/sparse_kernel.rs
                  Rust sparse traversal and optional SuiteSparse GraphBLAS FFI
 examples/        smoke, stress, correctness, benchmark, and profiling binaries
 scripts/         local, MinIO, query, write, stress, and chaos harnesses
+charts/turbolay/ production Helm chart for graph nodes and controllers
 ```
 
 ## Requirements
@@ -118,6 +119,26 @@ just ci
 CI runs default and native feature checks on Ubuntu. macOS CI validates the
 default and chaos-harness feature sets, so native `opencypher,graphblas` support
 on macOS should be checked locally when those libraries are installed.
+
+## Kubernetes Deployment
+
+The production Helm chart deploys graph nodes, controller candidates, services,
+RBAC, network policies, disruption budgets, object-store configuration, and
+optional cert-manager, External Secrets, and ServiceMonitor resources.
+
+```bash
+helm upgrade --install turbolay charts/turbolay \
+  --namespace turbolay \
+  --create-namespace \
+  --values charts/turbolay/examples/values-eks.yaml \
+  --atomic \
+  --timeout 15m
+```
+
+Copy the EKS example before use and replace its account, IAM role, DNS, issuer,
+bucket, and image values. See `charts/turbolay/README.md` for TLS, authentication,
+cache storage, upgrade, and verification details. The existing `deploy/`
+Kustomize manifests remain available for environments already using them.
 
 ## Feature Flags
 

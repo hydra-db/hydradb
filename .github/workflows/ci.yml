@@ -2,9 +2,105 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+      - name: Lint Helm chart
+        run: helm lint charts/turbolay --values charts/turbolay/ci/ci-values.yaml
+      - name: Render secure EKS example
+        run: helm template turbolay charts/turbolay --namespace turbolay --values charts/turbolay/examples/values-eks.yaml > /tmp/turbolay-eks.yaml
+      - name: Render development example
+        run: helm template turbolay charts/turbolay --namespace turbolay --values charts/turbolay/examples/values-development.yaml > /tmp/turbolay-development.yaml
+      - name: Verify chart invariants
+        run: |
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set auth.secretKey=custom-token > /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_AUTH_TOKEN_FILE: "/var/run/secrets/turbolay/custom-token"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'path: custom-token' /tmp/turbolay-custom-auth.yaml
+          grep -q 'port: 9000' /tmp/turbolay-development.yaml
+          grep -q 'app.kubernetes.io/component: helm-test' /tmp/turbolay-development.yaml
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --show-only templates/networkpolicy.yaml > /tmp/turbolay-default-policy.yaml
+          if awk '/^  ingress:/{ingress=1; next} /^  egress:/{ingress=0} ingress && /port: 8443/{found=1} END{exit found ? 0 : 1}' /tmp/turbolay-default-policy.yaml; then
+            echo "default client ingress unexpectedly permits HTTPS"
+            exit 1
+          fi
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-json 'networkPolicy.clientIngressFrom=[{"ipBlock":{"cidr":"10.20.0.0/16"}}]' > /tmp/turbolay-scoped-client.yaml
+          grep -q 'cidr: 10.20.0.0/16' /tmp/turbolay-scoped-client.yaml
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml > /tmp/turbolay-custom-endpoint.yaml
+          grep -q 'port: 8080' /tmp/turbolay-custom-endpoint.yaml
+          grep -q 'cidr: 10.0.0.0/8' /tmp/turbolay-custom-endpoint.yaml
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-string objectStore.aws.endpoint=http://object-store.example:8080 > /tmp/turbolay-unscoped-endpoint.yaml 2>&1; then
+            echo "unscoped custom object-store endpoint was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
+            --set-json 'objectStore.aws.endpointEgressTo=[{}]' > /tmp/turbolay-empty-endpoint-peer.yaml 2>&1; then
+            echo "empty custom object-store endpoint peer was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
+            --set-json 'objectStore.aws.endpointEgressTo=[{"namespaceSelector":{}}]' > /tmp/turbolay-empty-namespace-selector.yaml 2>&1; then
+            echo "empty custom object-store namespace selector was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
+            --set-json 'objectStore.aws.endpointEgressTo=[{"podSelector":{}}]' > /tmp/turbolay-empty-pod-selector.yaml 2>&1; then
+            echo "empty custom object-store Pod selector was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
+            --set-json 'objectStore.aws.endpointEgressTo=[{"ipBlock":{"cidr":"0.0.0.0/0"}}]' > /tmp/turbolay-universal-endpoint-cidr.yaml 2>&1; then
+            echo "universal custom object-store CIDR was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
+            --set-string objectStore.aws.endpoint=ftp://object-store.example > /tmp/turbolay-invalid-endpoint.yaml 2>&1; then
+            echo "unsupported object-store endpoint scheme was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
+            --set-string objectStore.aws.endpoint=http://object-store.example:70000 > /tmp/turbolay-invalid-port.yaml 2>&1; then
+            echo "invalid object-store endpoint port was accepted"
+            exit 1
+          fi
+      - name: Validate Kubernetes resources
+        run: |
+          docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary < /tmp/turbolay-development.yaml
+          docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary -ignore-missing-schemas < /tmp/turbolay-eks.yaml
+
   test:
     runs-on: ubuntu-latest
     steps:

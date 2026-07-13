@@ -1,0 +1,18 @@
+objectStore:
+  aws:
+    bucketName: graph-ci
+
+auth:
+  token: ci-only-auth-token-with-more-than-32-characters
+
+tls:
+  public:
+    enabled: false
+  internal:
+    enabled: false
+
+node:
+  replicaCount: 3
+
+controller:
+  replicaCount: 2

@@ -1,0 +1,25 @@
+Turbolay has been installed in namespace {{ .Release.Namespace }}.
+
+Bolt service:
+  {{ include "turbolay.fullname" . }}-bolt.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.bolt.port }}
+
+{{- if eq .Values.service.bolt.type "LoadBalancer" }}
+Wait for the load balancer address:
+  kubectl -n {{ .Release.Namespace }} get service {{ include "turbolay.fullname" . }}-bolt --watch
+{{- end }}
+
+Check the runtime:
+  kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "turbolay.fullname" . }}-controller
+  kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "turbolay.fullname" . }}-node
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+{{- if and .Values.auth.create (not .Values.auth.existingSecret) (not .Values.auth.externalSecret.enabled) }}
+Read the generated Bolt password:
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "turbolay.authSecretName" . }} -o jsonpath='{.data.{{ .Values.auth.secretKey }}}' | base64 -d
+{{- end }}
+
+Client configuration:
+  TURBOLAY_URI={{ ternary "bolt+s" "bolt" .Values.tls.public.enabled }}://<bolt-host>:{{ .Values.service.bolt.port }}
+  TURBOLAY_USER=neo4j
+  TURBOLAY_PASSWORD=<client-auth-token>
+  TURBOLAY_DATABASE={{ .Values.graph.database }}
