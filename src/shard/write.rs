@@ -21,6 +21,7 @@ const VERTEX_DELETE_LOCK_RENEW_ITEMS: u64 = 64;
 struct RelationshipImportOptions<'a> {
     endpoint_labels: Option<(&'a str, &'a str)>,
     create_always: bool,
+    update_existing_metadata: bool,
     operation: &'static str,
 }
 
@@ -1148,6 +1149,7 @@ impl GraphShard {
             RelationshipImportOptions {
                 endpoint_labels: None,
                 create_always: false,
+                update_existing_metadata: false,
                 operation: "import_relationships_batch",
             },
         )
@@ -1174,7 +1176,35 @@ impl GraphShard {
             RelationshipImportOptions {
                 endpoint_labels: Some((source_label, destination_label)),
                 create_always: true,
+                update_existing_metadata: false,
                 operation: "create_relationships_batch_between_labeled_vertices",
+            },
+        )
+        .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn merge_relationships_batch_between_labeled_vertices(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        relationships: impl IntoIterator<Item = RelationshipMutation>,
+        idempotency_key: &str,
+        source_label: &str,
+        destination_label: &str,
+    ) -> Result<RelationshipImportResult> {
+        validate_component("source_label", source_label)?;
+        validate_component("destination_label", destination_label)?;
+        self.import_relationships_batch_with_endpoint_labels(
+            cell_id,
+            edge_type,
+            relationships.into_iter().collect(),
+            idempotency_key,
+            RelationshipImportOptions {
+                endpoint_labels: Some((source_label, destination_label)),
+                create_always: false,
+                update_existing_metadata: true,
+                operation: "merge_relationships_batch_between_labeled_vertices",
             },
         )
         .await
@@ -1524,6 +1554,7 @@ impl GraphShard {
             .unwrap_or(0);
         let fresh_cell = current_epoch == 0;
         let mut relationships_inserted = Vec::new();
+        let mut relationships_updated = Vec::<(RelationshipRecord, EdgeMetadata)>::new();
         let mut relationships_already_existed = 0_u64;
         for relationship in &relationships {
             let rel_key = keys::relationship(
@@ -1595,10 +1626,20 @@ impl GraphShard {
                     });
                 }
                 if existing.metadata != requested.metadata {
-                    return Err(GraphError::IdempotencyConflict {
-                        operation: "relationship-import",
-                        idempotency_key: idempotency_key.to_string(),
-                    });
+                    if !options.update_existing_metadata {
+                        return Err(GraphError::IdempotencyConflict {
+                            operation: "relationship-import",
+                            idempotency_key: idempotency_key.to_string(),
+                        });
+                    }
+                    let next_metadata =
+                        merge_edge_metadata(&existing.metadata, &requested.metadata);
+                    if next_metadata != existing.metadata {
+                        let previous_metadata = existing.metadata.clone();
+                        let mut updated = existing;
+                        updated.metadata = next_metadata;
+                        relationships_updated.push((updated, previous_metadata));
+                    }
                 }
                 relationships_already_existed = relationships_already_existed.saturating_add(1);
             } else {
@@ -1660,7 +1701,9 @@ impl GraphShard {
                     reason: format!("too many relationships in one import: {err}"),
                 }
             })?;
-        let changed = relationships_inserted_count > 0 || structural_edges_inserted > 0;
+        let changed = relationships_inserted_count > 0
+            || structural_edges_inserted > 0
+            || !relationships_updated.is_empty();
         let epoch = if changed {
             current_epoch
                 .checked_add(1)
@@ -1783,6 +1826,29 @@ impl GraphShard {
                 &txn,
                 &record,
                 &EdgeMetadata::default(),
+                &record.metadata,
+                epoch,
+            )?;
+        }
+        for (record, previous_metadata) in &relationships_updated {
+            let key = keys::relationship(
+                cell_id,
+                edge_type,
+                record.src,
+                record.dst,
+                record.relationship_id,
+            );
+            txn.put(
+                key.as_bytes(),
+                encode_relationship_record(record).as_slice(),
+            )?;
+            put_relationship_metadata_delta_txn(&txn, record, &record.metadata, epoch)?;
+            delete_relationship_property_indexes_txn(&txn, record, previous_metadata)?;
+            put_relationship_property_indexes_txn(&txn, record)?;
+            put_relationship_property_index_deltas_txn(
+                &txn,
+                record,
+                previous_metadata,
                 &record.metadata,
                 epoch,
             )?;
