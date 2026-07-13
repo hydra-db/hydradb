@@ -101,3 +101,28 @@ app.kubernetes.io/component: {{ .component }}
 {{- define "turbolay.image" -}}
 {{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) -}}
 {{- end -}}
+
+{{- define "turbolay.objectStoreEndpointPort" -}}
+{{- $endpoint := .Values.objectStore.aws.endpoint -}}
+{{- $parsed := urlParse $endpoint -}}
+{{- $scheme := get $parsed "scheme" -}}
+{{- $host := get $parsed "host" -}}
+{{- if or (empty $scheme) (empty $host) -}}
+{{- fail "objectStore.aws.endpoint must be an absolute HTTP or HTTPS URL" -}}
+{{- end -}}
+{{- $explicitPort := regexFind ":[0-9]+$" $host -}}
+{{- $port := 0 -}}
+{{- if $explicitPort -}}
+{{- $port = int (trimPrefix ":" $explicitPort) -}}
+{{- else if eq $scheme "https" -}}
+{{- $port = 443 -}}
+{{- else if eq $scheme "http" -}}
+{{- $port = 80 -}}
+{{- else -}}
+{{- fail "objectStore.aws.endpoint must use the http or https scheme" -}}
+{{- end -}}
+{{- if or (lt $port 1) (gt $port 65535) -}}
+{{- fail "objectStore.aws.endpoint port must be between 1 and 65535" -}}
+{{- end -}}
+{{- $port -}}
+{{- end -}}
