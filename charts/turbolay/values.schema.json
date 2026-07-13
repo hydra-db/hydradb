@@ -1,0 +1,157 @@
+{
+  "$schema": "http://json-schema.org/schema#",
+  "type": "object",
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] },
+        "pullSecrets": { "type": "array" }
+      }
+    },
+    "objectStore": {
+      "type": "object",
+      "required": ["cloudProvider", "aws"],
+      "properties": {
+        "cloudProvider": { "type": "string", "minLength": 1 },
+        "aws": {
+          "type": "object",
+          "required": ["bucketName", "region"],
+          "properties": {
+            "bucketName": { "type": "string", "minLength": 1 },
+            "region": { "type": "string", "minLength": 1 },
+            "allowHttp": { "type": "boolean" },
+            "endpoint": { "type": "string" }
+          }
+        }
+      }
+    },
+    "graph": {
+      "type": "object",
+      "required": ["namespace", "graphId", "database", "cells", "controlPath", "dataPath"],
+      "properties": {
+        "namespace": { "type": "string", "minLength": 1 },
+        "graphId": { "type": "string", "minLength": 1 },
+        "database": { "type": "string", "minLength": 1 },
+        "cells": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "controlPath": { "type": "string", "minLength": 1 },
+        "dataPath": { "type": "string", "minLength": 1 }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "properties": {
+        "existingSecret": { "type": "string" },
+        "secretKey": { "type": "string", "minLength": 1 },
+        "create": { "type": "boolean" },
+        "token": { "type": "string", "pattern": "^$|^.{32,}$" },
+        "preserveGeneratedToken": { "type": "boolean" },
+        "externalSecret": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "targetSecretName": { "type": "string" },
+            "refreshInterval": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "properties": {
+        "public": {
+          "type": "object",
+          "required": ["enabled", "secretName"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "secretName": { "type": "string" },
+            "additionalDnsNames": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "internal": {
+          "type": "object",
+          "required": ["enabled", "caSecretName", "controllerSecretName", "nodeSecretName"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "caSecretName": { "type": "string" },
+            "controllerSecretName": { "type": "string" },
+            "nodeSecretName": { "type": "string" }
+          }
+        },
+        "certManager": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "node": { "$ref": "#/definitions/workload" },
+    "controller": { "$ref": "#/definitions/workload" },
+    "service": {
+      "type": "object",
+      "properties": {
+        "advertisedBoltAddress": { "type": "string" },
+        "bolt": { "$ref": "#/definitions/service" },
+        "https": { "$ref": "#/definitions/service" },
+        "adminPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "controlPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": { "enabled": { "type": "boolean" } }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "properties": { "enabled": { "type": "boolean" } }
+    },
+    "extraObjects": { "type": "array" }
+  },
+  "required": ["image", "objectStore", "graph", "auth", "tls", "node", "controller", "service"],
+  "definitions": {
+    "workload": {
+      "type": "object",
+      "required": ["replicaCount", "cache", "resources"],
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "resources": { "type": "object" },
+        "cache": {
+          "type": "object",
+          "required": ["type", "memoryLimitBytes", "emptyDir", "persistentVolume"],
+          "properties": {
+            "type": { "enum": ["emptyDir", "persistentVolume"] },
+            "memoryLimitBytes": { "type": "integer", "minimum": 0 },
+            "emptyDir": { "type": "object" },
+            "persistentVolume": { "type": "object" }
+          }
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "required": ["type", "port"],
+      "properties": {
+        "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "annotations": { "type": "object" },
+        "loadBalancerSourceRanges": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

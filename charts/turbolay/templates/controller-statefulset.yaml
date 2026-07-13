@@ -1,0 +1,172 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "turbolay.fullname" . }}-controller
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  serviceName: {{ include "turbolay.fullname" . }}-controller-headless
+  replicas: {{ .Values.controller.replicaCount }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "turbolay.componentLabels" (dict "root" . "component" "controller") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "turbolay.componentLabels" (dict "root" . "component" "controller") | nindent 8 }}
+        {{- with .Values.controller.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/runtime-config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.controller.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "turbolay.controllerServiceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.controller.terminationGracePeriodSeconds }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.controller.affinity }}
+      affinity:
+        {{- toYaml .Values.controller.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "turbolay.componentLabels" (dict "root" . "component" "controller") | nindent 20 }}
+      {{- end }}
+      {{- with .Values.controller.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: graph-controller
+          image: {{ include "turbolay.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/graph-controller"]
+          envFrom:
+            - configMapRef:
+                name: {{ include "turbolay.fullname" . }}-runtime
+          {{- with .Values.controller.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: control
+              containerPort: 9443
+            - name: admin
+              containerPort: 9090
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: admin
+            failureThreshold: 60
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/slatedb
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.tls.internal.enabled }}
+            - name: internal-tls
+              mountPath: /var/run/secrets/turbolay/internal
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if eq .Values.controller.cache.type "emptyDir" }}
+        - name: cache
+          emptyDir:
+            {{- with .Values.controller.cache.emptyDir.medium }}
+            medium: {{ . | quote }}
+            {{- end }}
+            sizeLimit: {{ .Values.controller.cache.emptyDir.sizeLimit }}
+        {{- end }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.controller.tmpSizeLimit }}
+        {{- if .Values.tls.internal.enabled }}
+        - name: internal-tls
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: {{ include "turbolay.controllerTlsSecretName" . }}
+                  items:
+                    - key: tls.crt
+                      path: tls.crt
+                    - key: tls.key
+                      path: tls.key
+              - secret:
+                  name: {{ include "turbolay.internalCaSecretName" . }}
+                  items:
+                    - key: tls.crt
+                      path: ca.crt
+        {{- end }}
+  {{- if eq .Values.controller.cache.type "persistentVolume" }}
+  volumeClaimTemplates:
+    - metadata:
+        name: cache
+        {{- with .Values.controller.cache.persistentVolume.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.controller.cache.persistentVolume.accessModes | nindent 10 }}
+        {{- with .Values.controller.cache.persistentVolume.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.controller.cache.persistentVolume.size }}
+  {{- end }}
