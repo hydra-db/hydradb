@@ -14,6 +14,7 @@ objectStore:
     region: us-east-1
     allowHttp: false
     endpoint: ""
+    endpointEgressTo: []
 
 graph:
   namespace: production

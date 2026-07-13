@@ -24,7 +24,8 @@
             "bucketName": { "type": "string", "minLength": 1 },
             "region": { "type": "string", "minLength": 1 },
             "allowHttp": { "type": "boolean" },
-            "endpoint": { "type": "string" }
+            "endpoint": { "type": "string" },
+            "endpointEgressTo": { "type": "array" }
           }
         }
       }

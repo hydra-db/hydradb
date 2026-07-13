@@ -29,6 +29,25 @@ jobs:
           grep -q 'path: custom-token' /tmp/turbolay-custom-auth.yaml
           grep -q 'port: 9000' /tmp/turbolay-development.yaml
           grep -q 'app.kubernetes.io/component: helm-test' /tmp/turbolay-development.yaml
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-string objectStore.aws.endpoint=http://object-store.example:8080 > /tmp/turbolay-custom-endpoint.yaml
+          grep -q 'port: 8080' /tmp/turbolay-custom-endpoint.yaml
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-string objectStore.aws.endpoint=ftp://object-store.example > /tmp/turbolay-invalid-endpoint.yaml 2>&1; then
+            echo "unsupported object-store endpoint scheme was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-string objectStore.aws.endpoint=http://object-store.example:70000 > /tmp/turbolay-invalid-port.yaml 2>&1; then
+            echo "invalid object-store endpoint port was accepted"
+            exit 1
+          fi
       - name: Validate Kubernetes resources
         run: |
           docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary < /tmp/turbolay-development.yaml
