@@ -88,10 +88,8 @@ spec:
         - protocol: TCP
           port: 443
     {{- if .Values.objectStore.aws.endpoint }}
-    - {{- with .Values.objectStore.aws.endpointEgressTo }}
-      to:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+    - to:
+        {{- toYaml .Values.objectStore.aws.endpointEgressTo | nindent 8 }}
       ports:
         - protocol: TCP
           port: {{ include "turbolay.objectStoreEndpointPort" . }}

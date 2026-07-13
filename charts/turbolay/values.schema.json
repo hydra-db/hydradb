@@ -25,7 +25,24 @@
             "region": { "type": "string", "minLength": 1 },
             "allowHttp": { "type": "boolean" },
             "endpoint": { "type": "string" },
-            "endpointEgressTo": { "type": "array" }
+            "endpointEgressTo": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "minProperties": 1,
+                "additionalProperties": false,
+                "properties": {
+                  "ipBlock": { "type": "object" },
+                  "namespaceSelector": { "type": "object" },
+                  "podSelector": { "type": "object" }
+                },
+                "anyOf": [
+                  { "required": ["ipBlock"] },
+                  { "required": ["namespaceSelector"] },
+                  { "required": ["podSelector"] }
+                ]
+              }
+            }
           }
         }
       }

@@ -7,6 +7,16 @@
 {{- if and .Values.tls.certManager.enabled (not .Values.tls.public.enabled) (not .Values.tls.internal.enabled) -}}
 {{- fail "tls.certManager.enabled requires public TLS or internal mTLS" -}}
 {{- end -}}
+{{- if and .Values.networkPolicy.enabled .Values.objectStore.aws.endpoint (empty .Values.objectStore.aws.endpointEgressTo) -}}
+{{- fail "objectStore.aws.endpointEgressTo must restrict every custom object-store endpoint to a namespace, Pod selector, or CIDR" -}}
+{{- end -}}
+{{- if and .Values.networkPolicy.enabled .Values.objectStore.aws.endpoint -}}
+{{- range $index, $peer := .Values.objectStore.aws.endpointEgressTo -}}
+{{- if not (or (hasKey $peer "ipBlock") (hasKey $peer "namespaceSelector") (hasKey $peer "podSelector")) -}}
+{{- fail (printf "objectStore.aws.endpointEgressTo[%d] must define ipBlock, namespaceSelector, or podSelector" $index) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.podDisruptionBudget.node.minAvailable) (int .Values.node.replicaCount)) -}}
 {{- fail "podDisruptionBudget.node.minAvailable cannot exceed node.replicaCount" -}}
 {{- end -}}
