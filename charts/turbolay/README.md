@@ -34,7 +34,10 @@ helm test turbolay -n turbolay
 
 Public TLS and internal mTLS are enabled by default. With cert-manager disabled, provide the release-scoped Secrets shown by `helm template`, or set explicit names through `tls.public.secretName` and `tls.internal.*SecretName`. The chart can generate a client token, use an existing Secret, or materialize one through External Secrets. Production deployments should use an existing or external secret rather than a token in Helm values.
 
-`networkPolicy.clientIngressFrom` should be restricted to HydraDB and ingestion namespaces or pods. Load balancers should be internal unless public access is explicitly required.
+Client ingress is denied by default. Set `networkPolicy.clientIngressFrom` to
+the HydraDB and ingestion namespaces, Pods, or CIDRs that may reach Bolt and
+HTTPS. Load balancers should be internal unless public access is explicitly
+required.
 
 ## Cache Storage
 
@@ -46,9 +49,9 @@ EKS example leaves the custom endpoint unset so production uses AWS S3 directly.
 When a custom HTTP or HTTPS endpoint is configured, the chart derives its port
 and creates the matching egress rule. A non-empty
 `objectStore.aws.endpointEgressTo` is required while NetworkPolicy is enabled
-to restrict that rule to the endpoint namespace, Pod selector, or CIDR. Empty
-lists and peers without one of those selectors are rejected before
-installation.
+to restrict that rule to the endpoint namespace, Pod selector, or a
+non-universal CIDR. Empty lists, empty label selectors, universal CIDRs, and
+peers without a destination selector are rejected before installation.
 
 ## Upgrades
 

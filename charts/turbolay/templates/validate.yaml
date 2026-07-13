@@ -15,6 +15,32 @@
 {{- if not (or (hasKey $peer "ipBlock") (hasKey $peer "namespaceSelector") (hasKey $peer "podSelector")) -}}
 {{- fail (printf "objectStore.aws.endpointEgressTo[%d] must define ipBlock, namespaceSelector, or podSelector" $index) -}}
 {{- end -}}
+{{- if hasKey $peer "ipBlock" -}}
+{{- $cidr := get (get $peer "ipBlock") "cidr" | default "" -}}
+{{- if or (empty $cidr) (eq $cidr "0.0.0.0/0") (eq $cidr "::/0") -}}
+{{- fail (printf "objectStore.aws.endpointEgressTo[%d].ipBlock.cidr must restrict the endpoint to a non-universal CIDR" $index) -}}
+{{- end -}}
+{{- end -}}
+{{- range $selectorName := list "namespaceSelector" "podSelector" -}}
+{{- if hasKey $peer $selectorName -}}
+{{- $selector := get $peer $selectorName -}}
+{{- if and (empty (get $selector "matchLabels")) (empty (get $selector "matchExpressions")) -}}
+{{- fail (printf "objectStore.aws.endpointEgressTo[%d].%s must contain non-empty matchLabels or matchExpressions" $index $selectorName) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.networkPolicy.enabled -}}
+{{- range $index, $peer := .Values.networkPolicy.clientIngressFrom -}}
+{{- range $selectorName := list "namespaceSelector" "podSelector" -}}
+{{- if hasKey $peer $selectorName -}}
+{{- $selector := get $peer $selectorName -}}
+{{- if and (empty (get $selector "matchLabels")) (empty (get $selector "matchExpressions")) -}}
+{{- fail (printf "networkPolicy.clientIngressFrom[%d].%s must contain non-empty matchLabels or matchExpressions" $index $selectorName) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.podDisruptionBudget.node.minAvailable) (int .Values.node.replicaCount)) -}}
