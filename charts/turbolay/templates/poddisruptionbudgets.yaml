@@ -1,0 +1,29 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "turbolay.fullname" . }}-node
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.node.minAvailable }}
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 6 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "turbolay.fullname" . }}-controller
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.controller.minAvailable }}
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "turbolay.componentLabels" (dict "root" . "component" "controller") | nindent 6 }}
+{{- end }}

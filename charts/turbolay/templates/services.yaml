@@ -1,0 +1,121 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "turbolay.fullname" . }}-controller-headless
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "turbolay.componentLabels" (dict "root" . "component" "controller") | nindent 4 }}
+  ports:
+    - name: control
+      port: {{ .Values.service.controlPort }}
+      targetPort: control
+    - name: admin
+      port: {{ .Values.service.adminPort }}
+      targetPort: admin
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "turbolay.fullname" . }}-controller
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  selector:
+    {{- include "turbolay.componentLabels" (dict "root" . "component" "controller") | nindent 4 }}
+  ports:
+    - name: control
+      port: {{ .Values.service.controlPort }}
+      targetPort: control
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "turbolay.fullname" . }}-node-headless
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 4 }}
+  ports:
+    - name: bolt
+      port: 7687
+      targetPort: bolt
+    - name: https
+      port: 8443
+      targetPort: https
+    - name: admin
+      port: {{ .Values.service.adminPort }}
+      targetPort: admin
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "turbolay.fullname" . }}-bolt
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+  {{- with .Values.service.bolt.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.bolt.type }}
+  selector:
+    {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 4 }}
+  ports:
+    - name: bolt
+      port: {{ .Values.service.bolt.port }}
+      targetPort: bolt
+  {{- with .Values.service.bolt.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "turbolay.fullname" . }}-https
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+  {{- with .Values.service.https.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.https.type }}
+  selector:
+    {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 4 }}
+  ports:
+    - name: https
+      port: {{ .Values.service.https.port }}
+      targetPort: https
+  {{- with .Values.service.https.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "turbolay.fullname" . }}-metrics
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+    graph.usecortex.io/metrics: "true"
+spec:
+  selector:
+    {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.service.adminPort }}
+      targetPort: admin

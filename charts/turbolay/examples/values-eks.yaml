@@ -1,0 +1,74 @@
+objectStore:
+  aws:
+    bucketName: graph-benchmark
+    region: us-east-1
+
+image:
+  repository: ghcr.io/usecortex/slatedb-graph-kernel
+  tag: "0.1.0"
+
+auth:
+  create: false
+  externalSecret:
+    enabled: true
+    targetSecretName: graph-client-auth
+    secretStoreRef:
+      kind: ClusterSecretStore
+      name: aws-secrets-manager
+    remoteRef:
+      key: slatedb-graph/client-auth
+      property: token
+
+tls:
+  public:
+    enabled: true
+    secretName: graph-server-tls
+    additionalDnsNames:
+      - graph-bolt.graph.internal.example.com
+  internal:
+    enabled: true
+  certManager:
+    enabled: true
+    publicIssuerRef:
+      kind: ClusterIssuer
+      name: graph-public-issuer
+    internalRootIssuerRef:
+      kind: ClusterIssuer
+      name: graph-internal-root-issuer
+
+node:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/turbolay-data-s3
+  cache:
+    type: persistentVolume
+    memoryLimitBytes: 34359738368
+    persistentVolume:
+      size: 64Gi
+      storageClassName: gp3
+      accessModes:
+        - ReadWriteOnce
+
+controller:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/turbolay-control-s3
+
+service:
+  advertisedBoltAddress: graph-bolt.graph.internal.example.com:7687
+  bolt:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+      service.beta.kubernetes.io/aws-load-balancer-type: external
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+      external-dns.alpha.kubernetes.io/hostname: graph-bolt.graph.internal.example.com
+  https:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+      service.beta.kubernetes.io/aws-load-balancer-type: external
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+
+serviceMonitor:
+  enabled: true

@@ -1,0 +1,223 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/usecortex/slatedb-graph-kernel
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+objectStore:
+  cloudProvider: aws
+  aws:
+    bucketName: ""
+    region: us-east-1
+    allowHttp: false
+    endpoint: ""
+
+graph:
+  namespace: production
+  graphId: default
+  database: default
+  cells:
+    - cell-0
+  controlPath: slatedb-graph/control
+  dataPath: slatedb-graph/data
+
+auth:
+  existingSecret: ""
+  secretKey: auth-token
+  create: true
+  token: ""
+  preserveGeneratedToken: true
+  externalSecret:
+    enabled: false
+    targetSecretName: ""
+    refreshInterval: 1h
+    secretStoreRef:
+      kind: ClusterSecretStore
+      name: ""
+    remoteRef:
+      key: slatedb-graph/client-auth
+      property: token
+
+tls:
+  public:
+    enabled: true
+    secretName: ""
+    additionalDnsNames: []
+  internal:
+    enabled: true
+    caSecretName: ""
+    controllerSecretName: ""
+    nodeSecretName: ""
+  certManager:
+    enabled: false
+    publicIssuerRef:
+      group: cert-manager.io
+      kind: ClusterIssuer
+      name: ""
+    internalRootIssuerRef:
+      group: cert-manager.io
+      kind: ClusterIssuer
+      name: ""
+    publicDuration: 2160h
+    publicRenewBefore: 360h
+    internalCaDuration: 8760h
+    internalCaRenewBefore: 720h
+    internalLeafDuration: 720h
+    internalLeafRenewBefore: 120h
+
+node:
+  replicaCount: 3
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  priorityClassName: ""
+  terminationGracePeriodSeconds: 60
+  updateStrategy: OnDelete
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+      ephemeral-storage: 12Gi
+    limits:
+      cpu: "8"
+      memory: 16Gi
+      ephemeral-storage: 24Gi
+  cache:
+    type: emptyDir
+    memoryLimitBytes: 8589934592
+    emptyDir:
+      sizeLimit: 20Gi
+      medium: ""
+    persistentVolume:
+      size: 40Gi
+      storageClassName: ""
+      accessModes:
+        - ReadWriteOnce
+      annotations: {}
+  tmpSizeLimit: 1Gi
+  affinity: {}
+  topologySpreadConstraints: []
+  tolerations: []
+  nodeSelector: {}
+  extraEnv: []
+
+controller:
+  replicaCount: 2
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  priorityClassName: ""
+  terminationGracePeriodSeconds: 30
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+      ephemeral-storage: 2Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 4Gi
+  cache:
+    type: emptyDir
+    memoryLimitBytes: 536870912
+    emptyDir:
+      sizeLimit: 2Gi
+      medium: ""
+    persistentVolume:
+      size: 4Gi
+      storageClassName: ""
+      accessModes:
+        - ReadWriteOnce
+      annotations: {}
+  tmpSizeLimit: 256Mi
+  affinity: {}
+  topologySpreadConstraints: []
+  tolerations: []
+  nodeSelector: {}
+  extraEnv: []
+
+service:
+  advertisedBoltAddress: ""
+  bolt:
+    type: ClusterIP
+    port: 7687
+    annotations: {}
+    loadBalancerSourceRanges: []
+  https:
+    type: ClusterIP
+    port: 443
+    annotations: {}
+    loadBalancerSourceRanges: []
+  adminPort: 9090
+  controlPort: 9443
+
+runtime:
+  rustLog: info,slatedb_graph_kernel=info
+  maxConcurrentQueries: 256
+  maxQueryRuntimeMs: 30000
+  maxBoltConnections: 4096
+  defaultPageSize: 1024
+  gracefulShutdownMs: 30000
+  l0SstSizeBytes: 16777216
+  maxUnflushedBytes: 67108864
+  maxWalFlushesBeforeL0Flush: 4096
+  l0FlushParallelism: 1
+  maxMatrixAdjacencies: 16
+  maxMatrixAdjacencyBytes: 67108864
+  maxGraphblasMatrices: 16
+  maxGraphblasBytes: 134217728
+  maxPostingChunkBytes: 67108864
+  maxMaterializedSupernodeBytes: 67108864
+  maxConcurrentHydrations: 2
+  maxConcurrentMatrixCompilations: 1
+  trimMemoryAfterHydration: true
+  leaseTtlMs: 30000
+  leaseRenewIntervalMs: 5000
+  shardRefreshIntervalMs: 2000
+  heartbeatTtlMs: 20000
+  controllerIntervalMs: 2000
+  rebalanceMode: stability-first
+  runtimeLeaseTtlMs: 30000
+  runtimeLeaseRenewIntervalMs: 5000
+
+podDisruptionBudget:
+  enabled: true
+  node:
+    minAvailable: 2
+  controller:
+    minAvailable: 1
+
+rbac:
+  create: true
+
+networkPolicy:
+  enabled: true
+  clientIngressFrom: []
+  monitoringNamespaceSelector:
+    matchLabels:
+      graph.usecortex.io/monitoring-access: "true"
+  additionalEgress: []
+
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  scrapeTimeout: 5s
+  labels: {}
+
+tests:
+  enabled: true
+  image:
+    repository: busybox
+    tag: "1.36"
+    pullPolicy: IfNotPresent
+
+extraObjects: []
