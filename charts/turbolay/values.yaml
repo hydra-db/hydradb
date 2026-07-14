@@ -48,6 +48,12 @@ tls:
     enabled: true
     secretName: ""
     additionalDnsNames: []
+    trustBundle:
+      enabled: false
+      name: ""
+      sourceSecretName: ""
+      sourceSecretKey: tls.crt
+      namespaceSelector: {}
   internal:
     enabled: true
     caSecretName: ""
@@ -80,7 +86,7 @@ node:
   podLabels: {}
   priorityClassName: ""
   terminationGracePeriodSeconds: 60
-  updateStrategy: OnDelete
+  updateStrategy: RollingUpdate
   resources:
     requests:
       cpu: "2"
@@ -204,7 +210,6 @@ rbac:
 networkPolicy:
   enabled: true
   clientIngressFrom: []
-  awsStsEgressRequired: true
   httpsEgressTo: []
   monitoringNamespaceSelector:
     matchLabels:
@@ -220,8 +225,8 @@ serviceMonitor:
 tests:
   enabled: true
   image:
-    repository: busybox
-    tag: "1.36"
+    repository: curlimages/curl
+    tag: "8.14.1"
     pullPolicy: IfNotPresent
 
 extraObjects: []

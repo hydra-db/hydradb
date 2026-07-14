@@ -18,6 +18,37 @@ spec:
       command:
         - /bin/sh
         - -ec
-        - >-
-          nc -z -w 10 {{ include "turbolay.fullname" . }}-bolt {{ .Values.service.bolt.port }}
+        - |
+          TOKEN="$(cat /var/run/secrets/turbolay-auth/{{ .Values.auth.secretKey }})"
+          {{- if .Values.tls.public.trustBundle.enabled }}
+          curl --fail --silent --show-error --cacert /var/run/secrets/turbolay-ca/ca.crt \
+          {{- else }}
+          curl --fail --silent --show-error \
+          {{- end }}
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "x-graph-namespace: {{ .Values.graph.namespace }}" \
+            --data '{"cell_id":"{{ first .Values.graph.cells }}","query":"MATCH (n) RETURN count(*)"}' \
+            {{ ternary "https" "http" .Values.tls.public.enabled }}://{{ include "turbolay.fullname" . }}-https:{{ .Values.service.https.port }}/v1/graphs/{{ .Values.graph.graphId }}/query
+      volumeMounts:
+        - name: auth
+          mountPath: /var/run/secrets/turbolay-auth
+          readOnly: true
+        {{- if .Values.tls.public.trustBundle.enabled }}
+        - name: ca
+          mountPath: /var/run/secrets/turbolay-ca
+          readOnly: true
+        {{- end }}
+  volumes:
+    - name: auth
+      secret:
+        secretName: {{ include "turbolay.authSecretName" . }}
+    {{- if .Values.tls.public.trustBundle.enabled }}
+    - name: ca
+      secret:
+        secretName: {{ default (include "turbolay.internalCaSecretName" .) .Values.tls.public.trustBundle.sourceSecretName }}
+        items:
+          - key: {{ .Values.tls.public.trustBundle.sourceSecretKey }}
+            path: ca.crt
+    {{- end }}
 {{- end }}
