@@ -7,8 +7,23 @@
 {{- if and .Values.tls.certManager.enabled (not .Values.tls.public.enabled) (not .Values.tls.internal.enabled) -}}
 {{- fail "tls.certManager.enabled requires public TLS or internal mTLS" -}}
 {{- end -}}
-{{- if and .Values.networkPolicy.enabled (eq .Values.objectStore.cloudProvider "aws") .Values.networkPolicy.awsStsEgressRequired (empty .Values.networkPolicy.httpsEgressTo) -}}
-{{- fail "networkPolicy.httpsEgressTo must restrict AWS S3 and STS HTTPS egress to private endpoint selectors or non-universal CIDRs" -}}
+{{- if ne (len .Values.graph.cells) 1 -}}
+{{- fail "the production runtime currently exposes exactly one cell per graph scope; deploy another release for another independently writable scope" -}}
+{{- end -}}
+{{- if hasKey .Values.node.podLabels "graph.usecortex.io/serving" -}}
+{{- fail "node.podLabels must not set graph.usecortex.io/serving; the runtime owns this role label" -}}
+{{- end -}}
+{{- if hasKey .Values.controller.podLabels "graph.usecortex.io/control-active" -}}
+{{- fail "controller.podLabels must not set graph.usecortex.io/control-active; the runtime owns this role label" -}}
+{{- end -}}
+{{- if and .Values.tls.public.trustBundle.enabled (not .Values.tls.public.enabled) -}}
+{{- fail "tls.public.trustBundle.enabled requires public TLS" -}}
+{{- end -}}
+{{- if and .Values.tls.public.trustBundle.enabled (empty .Values.tls.public.trustBundle.namespaceSelector) -}}
+{{- fail "tls.public.trustBundle.namespaceSelector must explicitly select client namespaces" -}}
+{{- end -}}
+{{- if and .Values.networkPolicy.enabled (empty .Values.networkPolicy.httpsEgressTo) -}}
+{{- fail "networkPolicy.httpsEgressTo must restrict Kubernetes API HTTPS egress and, on AWS, S3 and STS egress to private endpoint selectors or non-universal CIDRs" -}}
 {{- end -}}
 {{- if .Values.networkPolicy.enabled -}}
 {{- range $index, $peer := .Values.networkPolicy.httpsEgressTo -}}

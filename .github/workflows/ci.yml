@@ -27,6 +27,24 @@ jobs:
             --set auth.secretKey=custom-token > /tmp/turbolay-custom-auth.yaml
           grep -q 'GRAPH_AUTH_TOKEN_FILE: "/var/run/secrets/turbolay/custom-token"' /tmp/turbolay-custom-auth.yaml
           grep -q 'path: custom-token' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_KUBERNETES_ROLE_LABELS: "true"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'graph.usecortex.io/serving: "true"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'graph.usecortex.io/control-active: "true"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'Authorization: Bearer' /tmp/turbolay-custom-auth.yaml
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-json 'graph.cells=["cell-0","cell-1"]' > /tmp/turbolay-multiple-cells.yaml 2>&1; then
+            echo "multiple cells in one runtime release were accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-json 'node.podLabels={"graph.usecortex.io/serving":"true"}' > /tmp/turbolay-spoofed-role.yaml 2>&1; then
+            echo "runtime-owned serving role label was accepted in podLabels"
+            exit 1
+          fi
           helm template turbolay charts/turbolay \
             --namespace turbolay \
             --values charts/turbolay/ci/ci-values.yaml \
@@ -38,6 +56,7 @@ jobs:
           helm template turbolay charts/turbolay \
             --namespace turbolay \
             --values charts/turbolay/ci/ci-values.yaml \
+            --set tests.enabled=false \
             --show-only templates/networkpolicy.yaml > /tmp/turbolay-default-policy.yaml
           if grep -q 'cidr: 0.0.0.0/0' /tmp/turbolay-default-policy.yaml; then
             echo "network policy unexpectedly permits universal IPv4 egress"

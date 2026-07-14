@@ -21,8 +21,10 @@ spec:
         {{- with .Values.node.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        graph.usecortex.io/serving: "false"
       annotations:
         checksum/runtime-config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        secret.reloader.stakater.com/reload: {{ printf "%s,%s,%s" (include "turbolay.authSecretName" .) (include "turbolay.publicTlsSecretName" .) (include "turbolay.nodeTlsSecretName" .) | quote }}
         {{- with .Values.node.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -90,6 +92,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             {{- with .Values.node.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
