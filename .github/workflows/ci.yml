@@ -39,6 +39,11 @@ jobs:
             --namespace turbolay \
             --values charts/turbolay/ci/ci-values.yaml \
             --show-only templates/networkpolicy.yaml > /tmp/turbolay-default-policy.yaml
+          if grep -q 'cidr: 0.0.0.0/0' /tmp/turbolay-default-policy.yaml; then
+            echo "network policy unexpectedly permits universal IPv4 egress"
+            exit 1
+          fi
+          grep -q 'cidr: 10.0.0.0/8' /tmp/turbolay-default-policy.yaml
           if awk '/^  ingress:/{ingress=1; next} /^  egress:/{ingress=0} ingress && /port: 8443/{found=1} END{exit found ? 0 : 1}' /tmp/turbolay-default-policy.yaml; then
             echo "default client ingress unexpectedly permits HTTPS"
             exit 1
@@ -48,6 +53,27 @@ jobs:
             --values charts/turbolay/ci/ci-values.yaml \
             --set-json 'networkPolicy.clientIngressFrom=[{"ipBlock":{"cidr":"10.20.0.0/16"}}]' > /tmp/turbolay-scoped-client.yaml
           grep -q 'cidr: 10.20.0.0/16' /tmp/turbolay-scoped-client.yaml
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-json 'networkPolicy.httpsEgressTo=[]' > /tmp/turbolay-unscoped-https.yaml 2>&1; then
+            echo "unscoped AWS HTTPS egress was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-json 'networkPolicy.httpsEgressTo=[{}]' > /tmp/turbolay-empty-https-peer.yaml 2>&1; then
+            echo "empty AWS HTTPS egress peer was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-json 'networkPolicy.httpsEgressTo=[{"ipBlock":{"cidr":"0.0.0.0/0"}}]' > /tmp/turbolay-universal-https.yaml 2>&1; then
+            echo "universal AWS HTTPS egress CIDR was accepted"
+            exit 1
+          fi
           helm template turbolay charts/turbolay \
             --namespace turbolay \
             --values charts/turbolay/ci/custom-endpoint-values.yaml > /tmp/turbolay-custom-endpoint.yaml

@@ -7,6 +7,30 @@
 {{- if and .Values.tls.certManager.enabled (not .Values.tls.public.enabled) (not .Values.tls.internal.enabled) -}}
 {{- fail "tls.certManager.enabled requires public TLS or internal mTLS" -}}
 {{- end -}}
+{{- if and .Values.networkPolicy.enabled (eq .Values.objectStore.cloudProvider "aws") (not .Values.objectStore.aws.endpoint) (empty .Values.networkPolicy.httpsEgressTo) -}}
+{{- fail "networkPolicy.httpsEgressTo must restrict AWS S3 and STS HTTPS egress to private endpoint selectors or non-universal CIDRs" -}}
+{{- end -}}
+{{- if .Values.networkPolicy.enabled -}}
+{{- range $index, $peer := .Values.networkPolicy.httpsEgressTo -}}
+{{- if not (or (hasKey $peer "ipBlock") (hasKey $peer "namespaceSelector") (hasKey $peer "podSelector")) -}}
+{{- fail (printf "networkPolicy.httpsEgressTo[%d] must define ipBlock, namespaceSelector, or podSelector" $index) -}}
+{{- end -}}
+{{- if hasKey $peer "ipBlock" -}}
+{{- $cidr := get (get $peer "ipBlock") "cidr" | default "" -}}
+{{- if or (empty $cidr) (eq $cidr "0.0.0.0/0") (eq $cidr "::/0") -}}
+{{- fail (printf "networkPolicy.httpsEgressTo[%d].ipBlock.cidr must be a non-universal CIDR" $index) -}}
+{{- end -}}
+{{- end -}}
+{{- range $selectorName := list "namespaceSelector" "podSelector" -}}
+{{- if hasKey $peer $selectorName -}}
+{{- $selector := get $peer $selectorName -}}
+{{- if and (empty (get $selector "matchLabels")) (empty (get $selector "matchExpressions")) -}}
+{{- fail (printf "networkPolicy.httpsEgressTo[%d].%s must contain non-empty matchLabels or matchExpressions" $index $selectorName) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.networkPolicy.enabled .Values.objectStore.aws.endpoint (empty .Values.objectStore.aws.endpointEgressTo) -}}
 {{- fail "objectStore.aws.endpointEgressTo must restrict every custom object-store endpoint to a namespace, Pod selector, or CIDR" -}}
 {{- end -}}
