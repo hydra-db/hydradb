@@ -81,12 +81,13 @@ spec:
           port: 9090
         - protocol: TCP
           port: 9443
+    {{- with .Values.networkPolicy.httpsEgressTo }}
     - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
+        {{- toYaml . | nindent 8 }}
       ports:
         - protocol: TCP
           port: 443
+    {{- end }}
     {{- if .Values.objectStore.aws.endpoint }}
     - to:
         {{- toYaml .Values.objectStore.aws.endpointEgressTo | nindent 8 }}

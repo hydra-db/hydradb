@@ -204,6 +204,7 @@ rbac:
 networkPolicy:
   enabled: true
   clientIngressFrom: []
+  httpsEgressTo: []
   monitoringNamespaceSelector:
     matchLabels:
       graph.usecortex.io/monitoring-access: "true"

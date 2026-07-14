@@ -126,6 +126,10 @@
           "type": "array",
           "items": { "$ref": "#/definitions/networkPolicyPeer" }
         },
+        "httpsEgressTo": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/networkPolicyPeer" }
+        },
         "monitoringNamespaceSelector": { "$ref": "#/definitions/labelSelector" },
         "additionalEgress": { "type": "array" }
       }

@@ -68,6 +68,13 @@ the HydraDB and ingestion namespaces, Pods, or CIDRs that may reach Bolt and
 HTTPS. Load balancers should be internal unless public access is explicitly
 required.
 
+Outbound HTTPS is also denied by default. For AWS S3 with IRSA, set
+`networkPolicy.httpsEgressTo` to the private S3 and STS endpoint CIDRs. Prefer
+interface VPC endpoints with private DNS so S3 and STS traffic stays inside the
+VPC. Kubernetes NetworkPolicy cannot restrict traffic by DNS name, so the chart
+rejects empty selectors and universal CIDRs instead of opening TCP/443 to the
+Internet.
+
 ## Cache Storage
 
 `emptyDir` is the default because S3 is ground truth. Use `persistentVolume` to retain warm SSD cache across pod replacement. Cache loss affects cold-start latency, not durable graph data.
