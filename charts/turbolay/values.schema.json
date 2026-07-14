@@ -126,6 +126,7 @@
           "type": "array",
           "items": { "$ref": "#/definitions/networkPolicyPeer" }
         },
+        "awsStsEgressRequired": { "type": "boolean" },
         "httpsEgressTo": {
           "type": "array",
           "items": { "$ref": "#/definitions/networkPolicyPeer" }

@@ -82,6 +82,15 @@ jobs:
           if helm template turbolay charts/turbolay \
             --namespace turbolay \
             --values charts/turbolay/ci/ci-values.yaml \
+            --set-string objectStore.aws.endpoint=https://object-store.example \
+            --set-json 'objectStore.aws.endpointEgressTo=[{"ipBlock":{"cidr":"10.30.0.0/16"}}]' \
+            --set-json 'networkPolicy.httpsEgressTo=[]' > /tmp/turbolay-custom-endpoint-without-sts.yaml 2>&1; then
+            echo "IRSA custom endpoint without scoped STS egress was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
             --set-string objectStore.aws.endpoint=http://object-store.example:8080 > /tmp/turbolay-unscoped-endpoint.yaml 2>&1; then
             echo "unscoped custom object-store endpoint was accepted"
             exit 1

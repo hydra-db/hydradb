@@ -14,3 +14,6 @@ tls:
     enabled: false
   internal:
     enabled: false
+
+networkPolicy:
+  awsStsEgressRequired: false

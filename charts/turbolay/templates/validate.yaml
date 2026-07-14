@@ -7,7 +7,7 @@
 {{- if and .Values.tls.certManager.enabled (not .Values.tls.public.enabled) (not .Values.tls.internal.enabled) -}}
 {{- fail "tls.certManager.enabled requires public TLS or internal mTLS" -}}
 {{- end -}}
-{{- if and .Values.networkPolicy.enabled (eq .Values.objectStore.cloudProvider "aws") (not .Values.objectStore.aws.endpoint) (empty .Values.networkPolicy.httpsEgressTo) -}}
+{{- if and .Values.networkPolicy.enabled (eq .Values.objectStore.cloudProvider "aws") .Values.networkPolicy.awsStsEgressRequired (empty .Values.networkPolicy.httpsEgressTo) -}}
 {{- fail "networkPolicy.httpsEgressTo must restrict AWS S3 and STS HTTPS egress to private endpoint selectors or non-universal CIDRs" -}}
 {{- end -}}
 {{- if .Values.networkPolicy.enabled -}}
