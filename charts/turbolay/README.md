@@ -63,10 +63,27 @@ permissions; no registry password or Kubernetes image-pull Secret is required.
 
 Public TLS and internal mTLS are enabled by default. With cert-manager disabled, provide the release-scoped Secrets shown by `helm template`, or set explicit names through `tls.public.secretName` and `tls.internal.*SecretName`. The chart can generate a client token, use an existing Secret, or materialize one through External Secrets. Production deployments should use an existing or external secret rather than a token in Helm values.
 
+When `tls.public.trustBundle.enabled=true`, install trust-manager first and
+configure its trust source namespace to this release namespace. The chart then
+publishes only the public CA certificate into explicitly selected client
+namespaces; private keys never leave the Turbolay namespace.
+
+Each release currently serves exactly one graph scope and one cell. Deploy a
+separate release, object-store prefix, and controller database for every
+independently writable namespace or subtenant.
+
 Client ingress is denied by default. Set `networkPolicy.clientIngressFrom` to
 the HydraDB and ingestion namespaces, Pods, or CIDRs that may reach Bolt and
 HTTPS. Load balancers should be internal unless public access is explicitly
 required.
+
+Outbound HTTPS is also denied by default. Set `networkPolicy.httpsEgressTo` to
+private peers that cover the Kubernetes API used for active-role publication
+and, on AWS with IRSA, the private S3 and STS endpoint addresses. Prefer
+interface VPC endpoints with private DNS so this traffic stays inside the VPC.
+Kubernetes NetworkPolicy cannot restrict traffic by DNS name, so the chart
+rejects empty selectors and universal CIDRs instead of opening TCP/443 to the
+Internet.
 
 ## Cache Storage
 
@@ -84,4 +101,8 @@ peers without a destination selector are rejected before installation.
 
 ## Upgrades
 
-Graph nodes default to StatefulSet `OnDelete` updates so operators can drain and replace one node at a time after `helm upgrade`. The controller runtime lease ensures only one controller candidate owns the writable control plane.
+Graph nodes use ordered StatefulSet rolling updates with a disruption budget.
+Healthy standbys remain ready, while runtime-owned Pod labels expose only the
+current data writer and active controller through client and control Services.
+SlateDB fencing and the controller runtime lease remain the final correctness
+boundary during failover.

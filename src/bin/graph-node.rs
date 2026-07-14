@@ -4,6 +4,8 @@ mod admin;
 #[allow(dead_code)]
 #[path = "graph_node/config.rs"]
 mod config;
+#[path = "graph_node/kubernetes.rs"]
+mod kubernetes;
 #[allow(dead_code)]
 #[path = "graph_node/tls.rs"]
 mod tls;
@@ -34,6 +36,9 @@ async fn main() -> RuntimeResult<()> {
 }
 
 async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
+    let role_publisher =
+        kubernetes::KubernetesPodRolePublisher::from_env("graph.usecortex.io/serving")?;
+    role_publisher.publish(false).await?;
     std::fs::create_dir_all(&config.data_cache_dir)?;
     let object_store = object_store_from_env(None)?;
     let internal_tls = if config.internal_allow_plaintext {
@@ -163,10 +168,10 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     let http = ClientHttpServer::bind(config.http_addr, service.clone(), http_config).await?;
 
     let ready = Arc::new(AtomicBool::new(false));
-    let (readiness_stop, readiness_task) = start_readiness_monitor(
+    let (serving_stop, serving_task) = start_serving_monitor(
         Arc::clone(&node),
         config.cell_id.clone(),
-        Arc::clone(&ready),
+        role_publisher.clone(),
     );
     let admin = admin::AdminServer::bind(
         config.admin_addr,
@@ -175,6 +180,7 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         Some(service.clone()),
     )
     .await?;
+    ready.store(true, Ordering::Release);
     tracing::info!(
         node_id = %config.node_id,
         bolt_addr = %bolt.local_addr(),
@@ -187,6 +193,9 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         result = shutdown_signal() => result?,
     }
     ready.store(false, Ordering::Release);
+    let _ = serving_stop.send(true);
+    serving_task.await??;
+    role_publisher.publish(false).await?;
     node.set_health_state(GraphNodeHealthState::Draining)
         .await?;
     admin.stop().await?;
@@ -195,8 +204,6 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     if let Some(tls_reloader) = tls_reloader {
         tls_reloader.stop().await;
     }
-    let _ = readiness_stop.send(true);
-    readiness_task.await??;
     drop(service);
     let node =
         Arc::try_unwrap(node).map_err(|_| "graph node still has active runtime references")?;
@@ -208,27 +215,34 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn start_readiness_monitor(
+fn start_serving_monitor(
     node: Arc<slatedb_graph_kernel::ManagedGraphNode>,
     cell_id: String,
-    ready: Arc<AtomicBool>,
+    role_publisher: kubernetes::KubernetesPodRolePublisher,
 ) -> (
     tokio::sync::watch::Sender<bool>,
     tokio::task::JoinHandle<RuntimeResult<()>>,
 ) {
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
+        let mut published = false;
         loop {
             let owns_cell = node
                 .local_cells()
                 .await
                 .map(|cells| cells.iter().any(|candidate| candidate == &cell_id))
                 .unwrap_or(false);
-            ready.store(owns_cell, Ordering::Release);
+            if owns_cell != published {
+                match role_publisher.publish(owns_cell).await {
+                    Ok(()) => published = owns_cell,
+                    Err(error) => {
+                        tracing::warn!(error = %error, owns_cell, "failed to publish graph-node serving role");
+                    }
+                }
+            }
             tokio::select! {
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
-                        ready.store(false, Ordering::Release);
                         return Ok(());
                     }
                 }

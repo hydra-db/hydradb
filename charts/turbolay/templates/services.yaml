@@ -28,6 +28,7 @@ metadata:
 spec:
   selector:
     {{- include "turbolay.componentLabels" (dict "root" . "component" "controller") | nindent 4 }}
+    graph.usecortex.io/control-active: "true"
   ports:
     - name: control
       port: {{ .Values.service.controlPort }}
@@ -71,6 +72,7 @@ spec:
   type: {{ .Values.service.bolt.type }}
   selector:
     {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 4 }}
+    graph.usecortex.io/serving: "true"
   ports:
     - name: bolt
       port: {{ .Values.service.bolt.port }}
@@ -95,6 +97,7 @@ spec:
   type: {{ .Values.service.https.type }}
   selector:
     {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 4 }}
+    graph.usecortex.io/serving: "true"
   ports:
     - name: https
       port: {{ .Values.service.https.port }}
