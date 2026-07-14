@@ -42,6 +42,10 @@ controller:
       cpu: "1"
       memory: 512Mi
 
+networkPolicy:
+  # This local MinIO example does not use AWS web-identity credentials.
+  awsStsEgressRequired: false
+
 podDisruptionBudget:
   enabled: false
 

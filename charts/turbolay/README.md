@@ -75,6 +75,11 @@ VPC. Kubernetes NetworkPolicy cannot restrict traffic by DNS name, so the chart
 rejects empty selectors and universal CIDRs instead of opening TCP/443 to the
 Internet.
 
+`networkPolicy.awsStsEgressRequired` defaults to `true`, including when a
+custom S3-compatible endpoint is configured, because IRSA still refreshes
+credentials through AWS STS. Set it to `false` only when the custom endpoint
+uses credentials that never contact AWS, such as an isolated local MinIO test.
+
 ## Cache Storage
 
 `emptyDir` is the default because S3 is ground truth. Use `persistentVolume` to retain warm SSD cache across pod replacement. Cache loss affects cold-start latency, not durable graph data.

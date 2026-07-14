@@ -204,6 +204,7 @@ rbac:
 networkPolicy:
   enabled: true
   clientIngressFrom: []
+  awsStsEgressRequired: true
   httpsEgressTo: []
   monitoringNamespaceSelector:
     matchLabels:
