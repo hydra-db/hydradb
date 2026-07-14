@@ -27,6 +27,12 @@ jobs:
             --set auth.secretKey=custom-token > /tmp/turbolay-custom-auth.yaml
           grep -q 'GRAPH_AUTH_TOKEN_FILE: "/var/run/secrets/turbolay/custom-token"' /tmp/turbolay-custom-auth.yaml
           grep -q 'path: custom-token' /tmp/turbolay-custom-auth.yaml
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            > /tmp/turbolay-digest-image.yaml
+          grep -q 'image: 525753068359.dkr.ecr.us-east-1.amazonaws.com/staging/turbolay@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' /tmp/turbolay-digest-image.yaml
           grep -q 'port: 9000' /tmp/turbolay-development.yaml
           grep -q 'app.kubernetes.io/component: helm-test' /tmp/turbolay-development.yaml
           helm template turbolay charts/turbolay \

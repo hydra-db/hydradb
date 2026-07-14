@@ -2,8 +2,9 @@ nameOverride: ""
 fullnameOverride: ""
 
 image:
-  repository: ghcr.io/usecortex/slatedb-graph-kernel
+  repository: 525753068359.dkr.ecr.us-east-1.amazonaws.com/staging/turbolay
   tag: ""
+  digest: ""
   pullPolicy: IfNotPresent
   pullSecrets: []
 

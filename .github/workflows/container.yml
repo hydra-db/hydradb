@@ -1,0 +1,222 @@
+name: Deploy Staging
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/container.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - "src/**"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('turbolay-pr-{0}', github.event.pull_request.number) || 'turbolay-staging-release' }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: staging/turbolay
+  IMAGE_TAG: ${{ github.sha }}
+  DEPLOY_ENV: staging
+  ARGOCD_APP_NAME: turbolay-staging
+  INFRA_REPO: usecortex/hydradb-argocd
+
+jobs:
+  pr-build:
+    name: Build PR Docker image
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image without publishing
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          platforms: linux/amd64
+          tags: turbolay-pr:${{ github.sha }}
+          cache-from: |
+            type=gha,scope=turbolay-linux-amd64
+            type=gha,scope=turbolay-pr-${{ github.event.pull_request.number }}
+          cache-to: type=gha,scope=turbolay-pr-${{ github.event.pull_request.number }},mode=max
+          provenance: false
+          sbom: false
+
+  build-and-push:
+    name: Build and push staging image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    outputs:
+      image_tag: ${{ env.IMAGE_TAG }}
+      image_digest: ${{ steps.build.outputs.digest }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.IMAGE_TAG }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha,scope=turbolay-linux-amd64
+          cache-to: type=gha,scope=turbolay-linux-amd64,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest published image
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  update-manifest:
+    name: Update staging Kubernetes manifest
+    if: github.event_name != 'pull_request'
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout infra repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.INFRA_REPO }}
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          ref: main
+
+      - name: Update immutable image identity
+        env:
+          IMAGE_REPOSITORY: ${{ needs.build-and-push.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
+          VALUES_FILE: infra/environments/staging/turbolay/values.yaml
+        uses: mikefarah/yq@v4.45.1
+        with:
+          cmd: >-
+            yq -i
+            '.image.repository = strenv(IMAGE_REPOSITORY) |
+            .image.tag = strenv(IMAGE_TAG) |
+            .image.digest = strenv(IMAGE_DIGEST)'
+            "${VALUES_FILE}"
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: "3.17.0"
+
+      - name: Validate deployment manifest
+        env:
+          IMAGE_REPOSITORY: ${{ needs.build-and-push.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}
+          IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
+          VALUES_FILE: infra/environments/staging/turbolay/values.yaml
+        run: |
+          set -euo pipefail
+          helm lint --strict infra/charts/turbolay --values "${VALUES_FILE}"
+          helm template turbolay-staging infra/charts/turbolay \
+            --namespace turbolay-staging \
+            --values "${VALUES_FILE}" \
+            > /tmp/turbolay-staging.yaml
+          grep -q "image: ${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" /tmp/turbolay-staging.yaml
+
+      - name: Commit and push deployment
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
+          TRIGGER_MESSAGE: ${{ github.event_name == 'workflow_dispatch' && 'Manual staging deploy' || github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git diff
+          if git diff --quiet; then
+            echo "No changes to commit - image is already ${IMAGE_TAG}@${IMAGE_DIGEST}"
+            exit 0
+          fi
+          git add infra/environments/staging/turbolay/values.yaml
+          git commit -m "deploy(turbolay): update staging image to ${IMAGE_TAG}" \
+            -m "Digest: ${IMAGE_DIGEST}" \
+            -m "Triggered by: ${TRIGGER_MESSAGE}" \
+            -m "Commit: ${{ github.repository }}@${IMAGE_TAG}" \
+            -m "Author: ${{ github.actor }}"
+          git push origin main
+
+  sync-argocd:
+    name: Sync staging Argo CD application
+    if: >-
+      github.event_name != 'pull_request' &&
+      vars.TURBOLAY_STAGING_DEPLOY_ENABLED == 'true'
+    needs: [build-and-push, update-manifest]
+    runs-on: ubuntu-latest
+    env:
+      ARGOCD_SERVER: https://argocd.hydradb.com
+    steps:
+      - name: Refresh and sync application
+        env:
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            -X GET "${ARGOCD_SERVER}/api/v1/applications/${ARGOCD_APP_NAME}?refresh=hard" \
+            -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" > /dev/null
+          curl --fail --silent --show-error \
+            -X POST "${ARGOCD_SERVER}/api/v1/applications/${ARGOCD_APP_NAME}/sync" \
+            -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"prune": true}' > /dev/null
+
+      - name: Wait for healthy deployment
+        env:
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..60}; do
+            application=$(curl --fail --silent --show-error \
+              -X GET "${ARGOCD_SERVER}/api/v1/applications/${ARGOCD_APP_NAME}" \
+              -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}")
+            sync_status=$(jq -r '.status.sync.status' <<< "${application}")
+            health_status=$(jq -r '.status.health.status' <<< "${application}")
+            echo "Attempt ${attempt}: sync=${sync_status}, health=${health_status}"
+            if [[ "${sync_status}" == "Synced" && "${health_status}" == "Healthy" ]]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Timed out waiting for ${ARGOCD_APP_NAME} to become healthy" >&2
+          exit 1

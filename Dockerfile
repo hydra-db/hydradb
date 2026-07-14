@@ -3,7 +3,8 @@ FROM ubuntu:24.04 AS builder
 ARG RUST_VERSION=1.91.0
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/usr/local/cargo \
-    RUSTUP_HOME=/usr/local/rustup
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:${PATH}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential ca-certificates clang cmake curl libclang-dev \

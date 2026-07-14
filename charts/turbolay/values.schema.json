@@ -8,6 +8,10 @@
       "properties": {
         "repository": { "type": "string", "minLength": 1 },
         "tag": { "type": "string" },
+        "digest": {
+          "type": "string",
+          "pattern": "^$|^sha256:[0-9a-f]{64}$"
+        },
         "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] },
         "pullSecrets": { "type": "array" }
       }
