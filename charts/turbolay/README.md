@@ -30,6 +30,35 @@ kubectl -n turbolay get pods,services
 helm test turbolay -n turbolay
 ```
 
+## Image Publication
+
+`.github/workflows/container.yml` builds the production Dockerfile on pull
+requests and publishes `linux/amd64` images to the regional
+`staging/turbolay` Amazon ECR repository after a push to `main`. It follows the
+HydraDB deployment convention by publishing the full commit SHA and `latest`
+tags through the shared AWS role. Every published image also has an OCI digest,
+an SBOM, and build-provenance attestation. Argo CD is pinned to the digest and
+never deploys by `latest`.
+
+The publisher uses GitHub OIDC to assume the organization-provided
+`AWS_ROLE_ARN` secret, matching `hydradb-application`. Do not store AWS access
+keys in GitHub. The ECR repository and role access are provisioned through the
+team's existing AWS infrastructure process.
+
+After publishing, the workflow checks out `usecortex/hydradb-argocd` with the
+existing `INFRA_REPO_TOKEN`, updates the staging tag and digest, validates the
+Helm release, and pushes the deployment commit to `main`. This is the same
+promotion path used by HydraDB application and ingestion services.
+
+Set the `TURBOLAY_STAGING_DEPLOY_ENABLED` repository variable to `true` only
+after the staging ECR repository, S3 roles, certificates, and client-auth Secret
+exist. The workflow then uses the shared `ARGOCD_AUTH_TOKEN` to refresh, sync,
+and wait for the `turbolay-staging` application to become healthy.
+
+EKS nodes pull the private image through their IAM node role. Attach
+`AmazonEC2ContainerRegistryPullOnly` or equivalent repository-scoped pull
+permissions; no registry password or Kubernetes image-pull Secret is required.
+
 ## Security
 
 Public TLS and internal mTLS are enabled by default. With cert-manager disabled, provide the release-scoped Secrets shown by `helm template`, or set explicit names through `tls.public.secretName` and `tls.internal.*SecretName`. The chart can generate a client token, use an existing Secret, or materialize one through External Secrets. Production deployments should use an existing or external secret rather than a token in Helm values.

@@ -137,8 +137,8 @@ helm upgrade --install turbolay charts/turbolay \
 
 Copy the EKS example before use and replace its account, IAM role, DNS, issuer,
 bucket, and image values. See `charts/turbolay/README.md` for TLS, authentication,
-cache storage, upgrade, and verification details. The existing `deploy/`
-Kustomize manifests remain available for environments already using them.
+cache storage, upgrade, and verification details. Helm is the single supported
+Kubernetes deployment source; environment values live in `hydradb-argocd`.
 
 ## Feature Flags
 
