@@ -16,3 +16,8 @@ node:
 
 controller:
   replicaCount: 2
+
+networkPolicy:
+  httpsEgressTo:
+    - ipBlock:
+        cidr: 10.0.0.0/8

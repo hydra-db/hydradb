@@ -20,6 +20,8 @@ spec:
     - {{ include "turbolay.fullname" . }}-bolt.{{ .Release.Namespace }}.svc.cluster.local
     - {{ include "turbolay.fullname" . }}-https.{{ .Release.Namespace }}.svc
     - {{ include "turbolay.fullname" . }}-https.{{ .Release.Namespace }}.svc.cluster.local
+    - {{ printf "*.%s-node-headless.%s.svc" (include "turbolay.fullname" .) .Release.Namespace | quote }}
+    - {{ printf "*.%s-node-headless.%s.svc.cluster.local" (include "turbolay.fullname" .) .Release.Namespace | quote }}
     {{- range .Values.tls.public.additionalDnsNames }}
     - {{ . | quote }}
     {{- end }}

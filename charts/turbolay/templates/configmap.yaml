@@ -65,4 +65,5 @@ data:
   GRAPH_INTERNAL_TLS_CA: /var/run/secrets/turbolay/internal/ca.crt
   GRAPH_INTERNAL_ALLOW_PLAINTEXT: {{ not .Values.tls.internal.enabled | quote }}
   GRAPH_TRIM_MEMORY_AFTER_HYDRATION: {{ .Values.runtime.trimMemoryAfterHydration | quote }}
+  GRAPH_KUBERNETES_ROLE_LABELS: "true"
   RUST_LOG: {{ .Values.runtime.rustLog | quote }}

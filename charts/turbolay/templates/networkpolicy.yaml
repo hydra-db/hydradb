@@ -51,6 +51,7 @@ spec:
       ports:
         - protocol: TCP
           port: 9090
+    {{- if .Values.tests.enabled }}
     - from:
         - podSelector:
             matchLabels:
@@ -58,6 +59,9 @@ spec:
       ports:
         - protocol: TCP
           port: 7687
+        - protocol: TCP
+          port: 8443
+    {{- end }}
   egress:
     - to:
         - namespaceSelector:
@@ -81,12 +85,13 @@ spec:
           port: 9090
         - protocol: TCP
           port: 9443
+    {{- with .Values.networkPolicy.httpsEgressTo }}
     - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
+        {{- toYaml . | nindent 8 }}
       ports:
         - protocol: TCP
           port: 443
+    {{- end }}
     {{- if .Values.objectStore.aws.endpoint }}
     - to:
         {{- toYaml .Values.objectStore.aws.endpointEgressTo | nindent 8 }}

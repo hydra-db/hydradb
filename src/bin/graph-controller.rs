@@ -4,6 +4,8 @@ mod admin;
 #[allow(dead_code)]
 #[path = "graph_node/config.rs"]
 mod config;
+#[path = "graph_node/kubernetes.rs"]
+mod kubernetes;
 #[allow(dead_code)]
 #[path = "graph_node/tls.rs"]
 mod tls;
@@ -31,6 +33,10 @@ async fn main() -> RuntimeResult<()> {
     let admin =
         admin::AdminServer::bind_without_control(config.admin_addr, Arc::clone(&ready)).await?;
     let object_store = object_store_from_env(None)?;
+    let role_publisher =
+        kubernetes::KubernetesPodRolePublisher::from_env("graph.usecortex.io/control-active")?;
+    role_publisher.publish(false).await?;
+    ready.store(true, Ordering::Release);
     let mut runtime_lease = tokio::select! {
         lease = acquire_runtime_lease(&config, Arc::clone(&object_store)) => lease,
         result = shutdown_signal() => {
@@ -77,7 +83,7 @@ async fn main() -> RuntimeResult<()> {
     let rpc =
         GraphControlRpcServer::bind(config.control_rpc_addr, Arc::clone(&control), rpc_config)
             .await?;
-    ready.store(true, Ordering::Release);
+    role_publisher.publish(true).await?;
     tracing::info!(
         scope = %config.scope,
         rpc_addr = %rpc.local_addr(),
@@ -90,6 +96,7 @@ async fn main() -> RuntimeResult<()> {
         result = runtime_lease.wait_until_lost() => result.map_err(Into::into),
     };
     ready.store(false, Ordering::Release);
+    role_publisher.publish(false).await?;
     admin.stop().await?;
     rpc.stop().await?;
     if let Some(internal_tls) = internal_tls {
