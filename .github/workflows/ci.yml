@@ -53,6 +53,14 @@ jobs:
           if helm template turbolay charts/turbolay \
             --namespace turbolay \
             --values charts/turbolay/ci/ci-values.yaml \
+            --set-string runtime.maxQueryRuntimeMs=18446744073709551616 \
+            > /tmp/turbolay-u64-overflow.yaml 2>&1; then
+            echo "overflowing unsigned runtime integer was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
             --set-json 'graph.cells=["cell-0","cell-1"]' > /tmp/turbolay-multiple-cells.yaml 2>&1; then
             echo "multiple cells in one runtime release were accepted"
             exit 1
