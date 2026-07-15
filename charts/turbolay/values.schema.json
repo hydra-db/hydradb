@@ -150,6 +150,38 @@
       "type": "object",
       "properties": { "enabled": { "type": "boolean" } }
     },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "rustLog": { "type": "string" },
+        "maxConcurrentQueries": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxQueryRuntimeMs": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxBoltConnections": { "$ref": "#/definitions/unsignedDecimal" },
+        "defaultPageSize": { "$ref": "#/definitions/unsignedDecimal" },
+        "gracefulShutdownMs": { "$ref": "#/definitions/unsignedDecimal" },
+        "l0SstSizeBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxUnflushedBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxWalFlushesBeforeL0Flush": { "$ref": "#/definitions/unsignedDecimal" },
+        "l0FlushParallelism": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxMatrixAdjacencies": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxMatrixAdjacencyBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxGraphblasMatrices": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxGraphblasBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxPostingChunkBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxMaterializedSupernodeBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxConcurrentHydrations": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxConcurrentMatrixCompilations": { "$ref": "#/definitions/unsignedDecimal" },
+        "trimMemoryAfterHydration": { "type": "boolean" },
+        "leaseTtlMs": { "$ref": "#/definitions/unsignedDecimal" },
+        "leaseRenewIntervalMs": { "$ref": "#/definitions/unsignedDecimal" },
+        "shardRefreshIntervalMs": { "$ref": "#/definitions/unsignedDecimal" },
+        "heartbeatTtlMs": { "$ref": "#/definitions/unsignedDecimal" },
+        "controllerIntervalMs": { "$ref": "#/definitions/unsignedDecimal" },
+        "rebalanceMode": { "type": "string" },
+        "runtimeLeaseTtlMs": { "$ref": "#/definitions/unsignedDecimal" },
+        "runtimeLeaseRenewIntervalMs": { "$ref": "#/definitions/unsignedDecimal" }
+      }
+    },
     "extraObjects": { "type": "array" }
   },
   "required": ["image", "objectStore", "graph", "auth", "tls", "node", "controller", "service"],
@@ -165,7 +197,7 @@
           "required": ["type", "memoryLimitBytes", "emptyDir", "persistentVolume"],
           "properties": {
             "type": { "enum": ["emptyDir", "persistentVolume"] },
-            "memoryLimitBytes": { "type": "integer", "minimum": 0 },
+            "memoryLimitBytes": { "$ref": "#/definitions/unsignedDecimal" },
             "emptyDir": { "type": "object" },
             "persistentVolume": { "type": "object" }
           }
@@ -229,6 +261,19 @@
         { "required": ["ipBlock"] },
         { "required": ["namespaceSelector"] },
         { "required": ["podSelector"] }
+      ]
+    },
+    "unsignedDecimal": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        }
       ]
     }
   }
