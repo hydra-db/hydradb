@@ -117,16 +117,8 @@ app.kubernetes.io/component: {{ .component }}
     {{- $normalized = "0" -}}
   {{- end -}}
   {{- $overflow := gt (len $normalized) 20 -}}
-  {{- if eq (len $normalized) 20 -}}
-    {{- $prefix := int (substr 0 2 $normalized) -}}
-    {{- if gt $prefix 18 -}}
-      {{- $overflow = true -}}
-    {{- else if eq $prefix 18 -}}
-      {{- $suffix := int64 (substr 2 20 $normalized) -}}
-      {{- if gt $suffix 446744073709551615 -}}
-        {{- $overflow = true -}}
-      {{- end -}}
-    {{- end -}}
+  {{- if and (eq (len $normalized) 20) (gt $normalized "18446744073709551615") -}}
+    {{- $overflow = true -}}
   {{- end -}}
   {{- if $overflow -}}
     {{- fail (printf "runtime integer %q exceeds the unsigned 64-bit maximum 18446744073709551615" .) -}}
