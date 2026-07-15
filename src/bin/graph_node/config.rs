@@ -50,7 +50,7 @@ pub struct RuntimeConfig {
     pub max_bolt_connections: usize,
     pub default_page_size: usize,
     pub graceful_shutdown_timeout: Duration,
-    pub control_rpc_endpoint: SocketAddr,
+    pub control_rpc_endpoint: String,
     pub control_rpc_server_name: String,
     pub internal_tls_certificate: Option<PathBuf>,
     pub internal_tls_private_key: Option<PathBuf>,
@@ -228,11 +228,7 @@ impl RuntimeConfig {
                 "GRAPH_GRACEFUL_SHUTDOWN_MS",
                 30_000,
             )?,
-            control_rpc_endpoint: parse_socket(
-                &values,
-                "GRAPH_CONTROL_RPC_ENDPOINT",
-                "127.0.0.1:9443",
-            )?,
+            control_rpc_endpoint: value(&values, "GRAPH_CONTROL_RPC_ENDPOINT", "127.0.0.1:9443"),
             control_rpc_server_name: value(
                 &values,
                 "GRAPH_CONTROL_RPC_SERVER_NAME",
@@ -554,7 +550,27 @@ mod tests {
             ),
         ]);
         let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(config.control_rpc_endpoint.port(), 9443);
+        assert_eq!(config.control_rpc_endpoint, "127.0.0.1:9443");
+    }
+
+    #[test]
+    fn graph_node_config_accepts_kubernetes_control_endpoint() {
+        let values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            (
+                "GRAPH_INTERNAL_ALLOW_PLAINTEXT".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "GRAPH_CONTROL_RPC_ENDPOINT".to_string(),
+                "turbolay-controller.turbolay-test.svc.cluster.local:9443".to_string(),
+            ),
+        ]);
+        let config = RuntimeConfig::from_values(values).unwrap();
+        assert_eq!(
+            config.control_rpc_endpoint,
+            "turbolay-controller.turbolay-test.svc.cluster.local:9443"
+        );
     }
 
     #[test]

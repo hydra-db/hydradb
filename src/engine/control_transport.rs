@@ -135,20 +135,22 @@ impl GraphControlRpcServerConfig {
 
 #[derive(Clone)]
 pub struct GraphControlRpcClient {
-    addr: SocketAddr,
+    endpoint: String,
     scope: GraphScope,
     config: GraphControlRpcClientConfig,
 }
 
 impl GraphControlRpcClient {
     pub fn new(
-        addr: SocketAddr,
+        endpoint: impl std::fmt::Display,
         scope: GraphScope,
         config: GraphControlRpcClientConfig,
     ) -> Result<Self> {
         config.validate()?;
+        let endpoint = endpoint.to_string().trim().to_string();
+        validate_control_rpc_endpoint(&endpoint)?;
         Ok(Self {
-            addr,
+            endpoint,
             scope,
             config,
         })
@@ -162,7 +164,7 @@ impl GraphControlRpcClient {
         };
         let future =
             async {
-                let stream = TcpStream::connect(self.addr)
+                let stream = TcpStream::connect(self.endpoint.as_str())
                     .await
                     .map_err(|error| control_rpc_io_error("connect", error))?;
                 stream
@@ -756,6 +758,35 @@ fn control_rpc_config_error<T>(reason: &str) -> Result<T> {
     })
 }
 
+fn validate_control_rpc_endpoint(endpoint: &str) -> Result<()> {
+    let endpoint = endpoint.trim();
+    let Some((host, port)) = endpoint.rsplit_once(':') else {
+        return control_rpc_config_error("control RPC endpoint must use host:port");
+    };
+    if host.is_empty()
+        || host.chars().any(char::is_whitespace)
+        || host.contains('/')
+        || (host.contains(':')
+            && !(host.starts_with('[')
+                && host.ends_with(']')
+                && host[1..host.len() - 1]
+                    .parse::<std::net::Ipv6Addr>()
+                    .is_ok()))
+    {
+        return control_rpc_config_error("control RPC endpoint has an invalid host");
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|error| GraphError::CorruptValue {
+            key: "control/rpc/endpoint".to_string(),
+            reason: format!("invalid port: {error}"),
+        })?;
+    if port == 0 {
+        return control_rpc_config_error("control RPC endpoint port must be nonzero");
+    }
+    Ok(())
+}
+
 fn control_rpc_config_error_value(reason: &str) -> WireError {
     WireError {
         kind: "protocol".to_string(),
@@ -787,6 +818,34 @@ mod tests {
     use super::*;
     use slatedb::object_store::memory::InMemory;
 
+    #[test]
+    fn control_rpc_client_accepts_dns_endpoint_and_rejects_urls() {
+        let client = GraphControlRpcClient::new(
+            "  graph-controller.namespace.svc.cluster.local:9443  ",
+            GraphScope::default(),
+            GraphControlRpcClientConfig::insecure_allow_plaintext(),
+        )
+        .unwrap();
+        assert_eq!(
+            client.endpoint,
+            "graph-controller.namespace.svc.cluster.local:9443"
+        );
+
+        for endpoint in [
+            "https://graph-controller:9443",
+            "graph-controller",
+            "graph-controller:not-a-port",
+            "graph-controller:0",
+        ] {
+            assert!(GraphControlRpcClient::new(
+                endpoint,
+                GraphScope::default(),
+                GraphControlRpcClientConfig::insecure_allow_plaintext(),
+            )
+            .is_err());
+        }
+    }
+
     #[tokio::test]
     async fn remote_control_client_preserves_scope_and_stale_lease_errors() {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -805,7 +864,7 @@ mod tests {
         .await
         .unwrap();
         let client = GraphControlRpcClient::new(
-            server.local_addr(),
+            format!("localhost:{}", server.local_addr().port()),
             GraphScope::default(),
             GraphControlRpcClientConfig::insecure_allow_plaintext(),
         )
