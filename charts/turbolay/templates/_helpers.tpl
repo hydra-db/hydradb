@@ -106,6 +106,44 @@ app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 {{- end -}}
 
+{{- define "turbolay.decimalInteger" -}}
+{{- $kind := kindOf . -}}
+{{- if kindIs "string" . -}}
+  {{- if not (regexMatch "^[0-9]+$" .) -}}
+    {{- fail (printf "runtime integer %q must be an unsigned decimal string" .) -}}
+  {{- end -}}
+  {{- $normalized := regexReplaceAll "^0+" . "" -}}
+  {{- if eq $normalized "" -}}
+    {{- $normalized = "0" -}}
+  {{- end -}}
+  {{- $overflow := gt (len $normalized) 20 -}}
+  {{- if and (eq (len $normalized) 20) (gt $normalized "18446744073709551615") -}}
+    {{- $overflow = true -}}
+  {{- end -}}
+  {{- if $overflow -}}
+    {{- fail (printf "runtime integer %q exceeds the unsigned 64-bit maximum 18446744073709551615" .) -}}
+  {{- end -}}
+  {{- . -}}
+{{- else if or (kindIs "float32" .) (kindIs "float64" .) -}}
+  {{- $value := float64 . -}}
+  {{- if or (lt $value 0.0) (ne $value (floor $value)) -}}
+    {{- fail (printf "runtime integer %v must be a non-negative whole number" .) -}}
+  {{- end -}}
+  {{- if gt $value (float64 "9007199254740991") -}}
+    {{- fail (printf "runtime integer %v exceeds exact YAML numeric precision; provide it as a quoted unsigned decimal string" .) -}}
+  {{- end -}}
+  {{- printf "%.0f" $value -}}
+{{- else if or (kindIs "int" .) (kindIs "int8" .) (kindIs "int16" .) (kindIs "int32" .) (kindIs "int64" .) (kindIs "uint" .) (kindIs "uint8" .) (kindIs "uint16" .) (kindIs "uint32" .) (kindIs "uint64" .) -}}
+  {{- $value := toString . -}}
+  {{- if not (regexMatch "^[0-9]+$" $value) -}}
+    {{- fail (printf "runtime integer %v must be non-negative" .) -}}
+  {{- end -}}
+  {{- $value -}}
+{{- else -}}
+  {{- fail (printf "runtime integer has unsupported value type %s" $kind) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "turbolay.objectStoreEndpointPort" -}}
 {{- $endpoint := .Values.objectStore.aws.endpoint -}}
 {{- $parsed := urlParse $endpoint -}}
