@@ -40,6 +40,19 @@ jobs:
           if helm template turbolay charts/turbolay \
             --namespace turbolay \
             --values charts/turbolay/ci/ci-values.yaml \
+            --set-json runtime.maxConcurrentQueries=1.9 > /tmp/turbolay-fractional-runtime.yaml 2>&1; then
+            echo "fractional runtime integer was accepted"
+            exit 1
+          fi
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-string runtime.maxQueryRuntimeMs=18446744073709551615 \
+            > /tmp/turbolay-u64-runtime.yaml
+          grep -q 'GRAPH_MAX_QUERY_RUNTIME_MS: "18446744073709551615"' /tmp/turbolay-u64-runtime.yaml
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
             --set-json 'graph.cells=["cell-0","cell-1"]' > /tmp/turbolay-multiple-cells.yaml 2>&1; then
             echo "multiple cells in one runtime release were accepted"
             exit 1
