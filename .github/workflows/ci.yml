@@ -13,6 +13,14 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: v3.17.3
+      - name: Validate single-node deployment script
+        env:
+          TURBOLAY_S3_BUCKET: ci-turbolay-bucket
+          TURBOLAY_PUBLIC_HOST: 203.0.113.10
+          TURBOLAY_STATE_DIR: /tmp/turbolay-single-node
+        run: |
+          bash -n scripts/deploy_single_node_k3s.sh
+          bash scripts/deploy_single_node_k3s.sh --render-only
       - name: Lint Helm chart
         run: helm lint charts/turbolay --values charts/turbolay/ci/ci-values.yaml
       - name: Render secure EKS example

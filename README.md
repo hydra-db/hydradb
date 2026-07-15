@@ -126,6 +126,19 @@ The production Helm chart deploys graph nodes, controller candidates, services,
 RBAC, network policies, disruption budgets, object-store configuration, and
 optional cert-manager, External Secrets, and ServiceMonitor resources.
 
+For a public single-node K3s evaluation host with Docker, Helm, `kubectl`, the
+AWS CLI, and OpenSSL already installed, the deployment helper builds the current
+checkout, provisions auth and TLS secrets, imports the image into K3s, and
+installs the chart:
+
+```bash
+TURBOLAY_S3_BUCKET=graph-benchmark ./scripts/deploy_single_node_k3s.sh
+```
+
+On EC2 the public DNS name and IP are discovered automatically. Elsewhere, set
+`TURBOLAY_PUBLIC_HOST`. The script prints the Bolt and HTTPS endpoints and keeps
+the generated client token under `~/.config/turbolay-single-node/`.
+
 ```bash
 helm upgrade --install turbolay charts/turbolay \
   --namespace turbolay \
