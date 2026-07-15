@@ -106,6 +106,10 @@ app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 {{- end -}}
 
+{{- define "turbolay.decimalInteger" -}}
+{{- printf "%d" (int64 .) -}}
+{{- end -}}
+
 {{- define "turbolay.objectStoreEndpointPort" -}}
 {{- $endpoint := .Values.objectStore.aws.endpoint -}}
 {{- $parsed := urlParse $endpoint -}}
