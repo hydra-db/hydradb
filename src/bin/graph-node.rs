@@ -69,7 +69,7 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         GraphControlRpcClientConfig::insecure_allow_plaintext()
     };
     let control = Arc::new(GraphControlRpcClient::new(
-        config.control_rpc_endpoint,
+        config.control_rpc_endpoint.as_str(),
         config.scope.clone(),
         control_config,
     )?);
