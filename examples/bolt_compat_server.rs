@@ -21,7 +21,8 @@ impl QueryCellClient for CompatibilityQueryClient {
         Ok(QueryResultSet::new(
             vec![QueryColumn::new("answer")],
             vec![QueryRow::new(vec![QueryValue::Count(42)])],
-        ))
+        )
+        .with_read_epoch(42))
     }
 
     async fn execute_cypher_rows_page(
