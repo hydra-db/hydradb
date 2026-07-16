@@ -606,7 +606,7 @@ impl QueryResultSet {
         self
     }
 
-    #[cfg(feature = "opencypher")]
+    #[cfg(feature = "public-client-protocols")]
     pub(crate) fn estimated_resident_bytes(&self) -> u64 {
         self.rows.iter().fold(0_u64, |total, row| {
             total.saturating_add(row.estimated_resident_bytes())
