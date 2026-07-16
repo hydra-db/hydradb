@@ -6,15 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use slatedb_graph_kernel::{
-    QueryTransportTlsClientConfigProvider, QueryTransportTlsServerConfigProvider,
-    ReloadableQueryTransportTlsClientConfigProvider,
-    ReloadableQueryTransportTlsServerConfigProvider,
+    QueryTransportTlsServerConfigProvider, ReloadableQueryTransportTlsServerConfigProvider,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tokio_rustls::rustls::{
-    server::WebPkiClientVerifier, ClientConfig, RootCertStore, ServerConfig,
-};
+use tokio_rustls::rustls::ServerConfig;
 
 type TlsResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -22,161 +18,6 @@ pub struct FileTlsReloader {
     provider: Arc<ReloadableQueryTransportTlsServerConfigProvider>,
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
-}
-
-pub struct FileMutualTlsServerReloader {
-    provider: Arc<ReloadableQueryTransportTlsServerConfigProvider>,
-    stop_tx: watch::Sender<bool>,
-    task: JoinHandle<()>,
-}
-
-impl FileMutualTlsServerReloader {
-    pub fn start(
-        certificate_path: &Path,
-        private_key_path: &Path,
-        client_ca_path: &Path,
-        interval: Duration,
-    ) -> TlsResult<Self> {
-        let certificate_path = certificate_path.to_path_buf();
-        let private_key_path = private_key_path.to_path_buf();
-        let client_ca_path = client_ca_path.to_path_buf();
-        let (config, mut fingerprint) =
-            load_mutual_server_config(&certificate_path, &private_key_path, &client_ca_path)?;
-        let provider = Arc::new(ReloadableQueryTransportTlsServerConfigProvider::new(
-            Arc::new(config),
-        ));
-        let task_provider = Arc::clone(&provider);
-        let (stop_tx, mut stop_rx) = watch::channel(false);
-        let task = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                tokio::select! {
-                    changed = stop_rx.changed() => {
-                        if changed.is_err() || *stop_rx.borrow() { return; }
-                    }
-                    _ = ticker.tick() => {
-                        match load_mutual_server_config(&certificate_path, &private_key_path, &client_ca_path) {
-                            Ok((_, next)) if next == fingerprint => {}
-                            Ok((config, next)) => {
-                                if task_provider.rotate(Arc::new(config)).is_ok() {
-                                    fingerprint = next;
-                                }
-                            }
-                            Err(error) => tracing::warn!(error = %error, "internal mTLS server certificate reload failed"),
-                        }
-                    }
-                }
-            }
-        });
-        Ok(Self {
-            provider,
-            stop_tx,
-            task,
-        })
-    }
-
-    pub fn provider(&self) -> Arc<dyn QueryTransportTlsServerConfigProvider> {
-        Arc::clone(&self.provider) as Arc<dyn QueryTransportTlsServerConfigProvider>
-    }
-
-    pub async fn stop(self) {
-        let _ = self.stop_tx.send(true);
-        let _ = self.task.await;
-    }
-}
-
-pub struct FileMutualTlsClientReloader {
-    provider: Arc<ReloadableQueryTransportTlsClientConfigProvider>,
-    stop_tx: watch::Sender<bool>,
-    task: JoinHandle<()>,
-}
-
-impl FileMutualTlsClientReloader {
-    pub fn start(
-        certificate_path: &Path,
-        private_key_path: &Path,
-        server_ca_path: &Path,
-        interval: Duration,
-    ) -> TlsResult<Self> {
-        let certificate_path = certificate_path.to_path_buf();
-        let private_key_path = private_key_path.to_path_buf();
-        let server_ca_path = server_ca_path.to_path_buf();
-        let (config, mut fingerprint) =
-            load_mutual_client_config(&certificate_path, &private_key_path, &server_ca_path)?;
-        let provider = Arc::new(ReloadableQueryTransportTlsClientConfigProvider::new(
-            Arc::new(config),
-        ));
-        let task_provider = Arc::clone(&provider);
-        let (stop_tx, mut stop_rx) = watch::channel(false);
-        let task = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                tokio::select! {
-                    changed = stop_rx.changed() => {
-                        if changed.is_err() || *stop_rx.borrow() { return; }
-                    }
-                    _ = ticker.tick() => {
-                        match load_mutual_client_config(&certificate_path, &private_key_path, &server_ca_path) {
-                            Ok((_, next)) if next == fingerprint => {}
-                            Ok((config, next)) => {
-                                if task_provider.rotate(Arc::new(config)).is_ok() {
-                                    fingerprint = next;
-                                }
-                            }
-                            Err(error) => tracing::warn!(error = %error, "internal mTLS client certificate reload failed"),
-                        }
-                    }
-                }
-            }
-        });
-        Ok(Self {
-            provider,
-            stop_tx,
-            task,
-        })
-    }
-
-    pub fn provider(&self) -> Arc<dyn QueryTransportTlsClientConfigProvider> {
-        Arc::clone(&self.provider) as Arc<dyn QueryTransportTlsClientConfigProvider>
-    }
-
-    pub async fn stop(self) {
-        let _ = self.stop_tx.send(true);
-        let _ = self.task.await;
-    }
-}
-
-fn load_mutual_server_config(
-    certificate_path: &Path,
-    private_key_path: &Path,
-    client_ca_path: &Path,
-) -> TlsResult<(ServerConfig, u64)> {
-    let (certificates, private_key, mut fingerprint) =
-        load_certificate_material(certificate_path, private_key_path)?;
-    let ca_bytes = std::fs::read(client_ca_path)?;
-    ca_bytes.hash(&mut fingerprint);
-    let roots = load_root_store(&ca_bytes)?;
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
-    let config = ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(certificates, private_key)?;
-    Ok((config, fingerprint.finish()))
-}
-
-fn load_mutual_client_config(
-    certificate_path: &Path,
-    private_key_path: &Path,
-    server_ca_path: &Path,
-) -> TlsResult<(ClientConfig, u64)> {
-    let (certificates, private_key, mut fingerprint) =
-        load_certificate_material(certificate_path, private_key_path)?;
-    let ca_bytes = std::fs::read(server_ca_path)?;
-    ca_bytes.hash(&mut fingerprint);
-    let roots = load_root_store(&ca_bytes)?;
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_client_auth_cert(certificates, private_key)?;
-    Ok((config, fingerprint.finish()))
 }
 
 fn load_certificate_material(
@@ -206,20 +47,6 @@ fn load_certificate_material(
     certificate_bytes.hash(&mut fingerprint);
     private_key_bytes.hash(&mut fingerprint);
     Ok((certificates, private_key, fingerprint))
-}
-
-fn load_root_store(bytes: &[u8]) -> TlsResult<RootCertStore> {
-    let mut reader = Cursor::new(bytes);
-    let certificates =
-        rustls_pemfile::certs(&mut reader).collect::<std::result::Result<Vec<_>, _>>()?;
-    if certificates.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidData, "TLS CA file is empty").into());
-    }
-    let mut roots = RootCertStore::empty();
-    for certificate in certificates {
-        roots.add(certificate)?;
-    }
-    Ok(roots)
 }
 
 impl FileTlsReloader {
@@ -315,10 +142,7 @@ fn load_server_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::{
-        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-        KeyUsagePurpose,
-    };
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
 
     fn write_certificate_pair(certificate_path: &Path, private_key_path: &Path) {
         let key = KeyPair::generate().unwrap();
@@ -353,68 +177,5 @@ mod tests {
         .unwrap();
         provider.current_server_config().unwrap();
         reloader.stop().await;
-    }
-
-    #[tokio::test]
-    async fn internal_mutual_tls_requires_and_accepts_a_trusted_client_certificate() {
-        let root = tempfile::tempdir().unwrap();
-        let certificate_path = root.path().join("tls.crt");
-        let private_key_path = root.path().join("tls.key");
-        let ca_path = root.path().join("ca.crt");
-
-        let ca_key = KeyPair::generate().unwrap();
-        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca_params.key_usages = vec![
-            KeyUsagePurpose::DigitalSignature,
-            KeyUsagePurpose::KeyCertSign,
-        ];
-        let ca = ca_params.self_signed(&ca_key).unwrap();
-        let leaf_key = KeyPair::generate().unwrap();
-        let mut leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        leaf_params.extended_key_usages = vec![
-            ExtendedKeyUsagePurpose::ServerAuth,
-            ExtendedKeyUsagePurpose::ClientAuth,
-        ];
-        let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
-        std::fs::write(&certificate_path, leaf.pem()).unwrap();
-        std::fs::write(&private_key_path, leaf_key.serialize_pem()).unwrap();
-        std::fs::write(&ca_path, ca.pem()).unwrap();
-
-        let server = FileMutualTlsServerReloader::start(
-            &certificate_path,
-            &private_key_path,
-            &ca_path,
-            Duration::from_secs(60),
-        )
-        .unwrap();
-        let client = FileMutualTlsClientReloader::start(
-            &certificate_path,
-            &private_key_path,
-            &ca_path,
-            Duration::from_secs(60),
-        )
-        .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_config = server.provider().current_server_config().unwrap();
-        let accept = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            tokio_rustls::TlsAcceptor::from(server_config)
-                .accept(stream)
-                .await
-                .unwrap();
-        });
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost")
-            .unwrap()
-            .to_owned();
-        tokio_rustls::TlsConnector::from(client.provider().current_client_config().unwrap())
-            .connect(server_name, stream)
-            .await
-            .unwrap();
-        accept.await.unwrap();
-        client.stop().await;
-        server.stop().await;
     }
 }

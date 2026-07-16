@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use slatedb_graph_kernel::{
     GraphBackpressurePolicy, GraphCacheConfig, GraphCachePolicy, GraphDurabilityConfig, GraphId,
-    GraphIndexPolicy, GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphRetentionPolicy,
-    GraphScope, GraphStorageMemoryConfig, NamespaceId, NamespacePath,
+    GraphIndexPolicy, GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphScope,
+    GraphStorageMemoryConfig, NamespaceId, NamespacePath,
 };
 
 type ConfigResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -17,6 +17,7 @@ pub struct RuntimeConfig {
     pub node_id: String,
     pub scope: GraphScope,
     pub cell_id: String,
+    pub cells: Vec<String>,
     pub database: String,
     pub data_path: String,
     pub data_cache_dir: PathBuf,
@@ -29,14 +30,17 @@ pub struct RuntimeConfig {
     pub max_matrix_adjacency_bytes: usize,
     pub max_graphblas_matrices: usize,
     pub max_graphblas_bytes: usize,
-    pub max_posting_chunk_bytes: usize,
-    pub max_materialized_supernode_bytes: usize,
+    pub max_relationship_rows_bytes: usize,
+    pub max_source_relationship_rows_bytes: usize,
+    pub max_relationship_property_rows_bytes: usize,
     pub max_concurrent_hydrations: usize,
     pub max_concurrent_matrix_compilations: usize,
-    pub lease_ttl: Duration,
-    pub lease_renew_interval: Duration,
-    pub shard_refresh_interval: Duration,
-    pub heartbeat_ttl: Duration,
+    pub matrix_auto_refresh_enabled: bool,
+    pub matrix_refresh_interval: Duration,
+    pub matrix_refresh_max_dirty_age: Duration,
+    pub matrix_refresh_min_epoch_lag: u64,
+    pub matrix_refresh_tile_size: u64,
+    pub matrix_refresh_max_edge_types_per_cycle: usize,
     pub bolt_addr: SocketAddr,
     pub http_addr: SocketAddr,
     pub admin_addr: SocketAddr,
@@ -47,39 +51,13 @@ pub struct RuntimeConfig {
     pub allow_plaintext: bool,
     pub max_concurrent_queries: usize,
     pub max_query_runtime_ms: u64,
+    pub max_server_cursors: usize,
+    pub max_cursor_buffer_bytes: u64,
+    pub cursor_ttl: Duration,
     pub max_bolt_connections: usize,
     pub default_page_size: usize,
     pub graceful_shutdown_timeout: Duration,
-    pub control_rpc_endpoint: String,
-    pub control_rpc_server_name: String,
-    pub internal_tls_certificate: Option<PathBuf>,
-    pub internal_tls_private_key: Option<PathBuf>,
-    pub internal_tls_ca: Option<PathBuf>,
-    pub internal_allow_plaintext: bool,
 }
-
-#[derive(Clone, Debug)]
-pub struct ControllerRuntimeConfig {
-    pub scope: GraphScope,
-    pub cells: Vec<String>,
-    pub control_path: String,
-    pub control_cache_dir: PathBuf,
-    pub control_cache_bytes: usize,
-    pub lease_ttl: Duration,
-    pub heartbeat_ttl: Duration,
-    pub controller_interval: Duration,
-    pub rebalance_mode: GraphClusterRebalanceMode,
-    pub control_rpc_addr: SocketAddr,
-    pub admin_addr: SocketAddr,
-    pub internal_tls_certificate: Option<PathBuf>,
-    pub internal_tls_private_key: Option<PathBuf>,
-    pub internal_tls_ca: Option<PathBuf>,
-    pub internal_allow_plaintext: bool,
-    pub runtime_lease_ttl: Duration,
-    pub runtime_lease_renew_interval: Duration,
-}
-
-use slatedb_graph_kernel::GraphClusterRebalanceMode;
 
 impl RuntimeConfig {
     pub fn from_env() -> ConfigResult<Self> {
@@ -99,6 +77,15 @@ impl RuntimeConfig {
             GraphId::new(value(&values, "GRAPH_ID", "default"))?,
         );
         let cell_id = value(&values, "GRAPH_CELL_ID", "cell-0");
+        let cells = value(&values, "GRAPH_CELLS", &cell_id)
+            .split(',')
+            .map(str::trim)
+            .filter(|cell| !cell.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if cells.is_empty() || !cells.iter().any(|cell| cell == &cell_id) {
+            return invalid("GRAPH_CELLS must contain GRAPH_CELL_ID");
+        }
         let allow_plaintext = parse_bool(&values, "GRAPH_ALLOW_PLAINTEXT", false)?;
         let tls_certificate = optional_path(&values, "GRAPH_TLS_CERTIFICATE");
         let tls_private_key = optional_path(&values, "GRAPH_TLS_PRIVATE_KEY");
@@ -124,21 +111,11 @@ impl RuntimeConfig {
                 ),
             ),
         )?;
-        let internal_allow_plaintext =
-            parse_bool(&values, "GRAPH_INTERNAL_ALLOW_PLAINTEXT", false)?;
-        let internal_tls_certificate = optional_path(&values, "GRAPH_INTERNAL_TLS_CERTIFICATE");
-        let internal_tls_private_key = optional_path(&values, "GRAPH_INTERNAL_TLS_PRIVATE_KEY");
-        let internal_tls_ca = optional_path(&values, "GRAPH_INTERNAL_TLS_CA");
-        validate_internal_tls(
-            internal_allow_plaintext,
-            &internal_tls_certificate,
-            &internal_tls_private_key,
-            &internal_tls_ca,
-        )?;
         Ok(Self {
             node_id: value(&values, "GRAPH_NODE_ID", "graph-node-0"),
             scope,
             cell_id,
+            cells,
             database: value(&values, "GRAPH_DATABASE", "default"),
             data_path: value(&values, "GRAPH_DATA_PATH", "graph/data"),
             data_cache_dir: PathBuf::from(value(
@@ -166,12 +143,12 @@ impl RuntimeConfig {
             max_matrix_adjacencies: parse_usize_allow_zero(
                 &values,
                 "GRAPH_MAX_MATRIX_ADJACENCIES",
-                16,
+                0,
             )?,
             max_matrix_adjacency_bytes: parse_usize_allow_zero(
                 &values,
                 "GRAPH_MAX_MATRIX_ADJACENCY_BYTES",
-                64 * 1024 * 1024,
+                0,
             )?,
             max_graphblas_matrices: parse_usize_allow_zero(
                 &values,
@@ -183,15 +160,20 @@ impl RuntimeConfig {
                 "GRAPH_MAX_GRAPHBLAS_BYTES",
                 128 * 1024 * 1024,
             )?,
-            max_posting_chunk_bytes: parse_usize_allow_zero(
+            max_relationship_rows_bytes: parse_usize_allow_zero(
                 &values,
-                "GRAPH_MAX_POSTING_CHUNK_BYTES",
-                64 * 1024 * 1024,
+                "GRAPH_MAX_RELATIONSHIP_ROWS_BYTES",
+                8 * 1024 * 1024,
             )?,
-            max_materialized_supernode_bytes: parse_usize_allow_zero(
+            max_source_relationship_rows_bytes: parse_usize_allow_zero(
                 &values,
-                "GRAPH_MAX_MATERIALIZED_SUPERNODE_BYTES",
-                64 * 1024 * 1024,
+                "GRAPH_MAX_SOURCE_RELATIONSHIP_ROWS_BYTES",
+                8 * 1024 * 1024,
+            )?,
+            max_relationship_property_rows_bytes: parse_usize_allow_zero(
+                &values,
+                "GRAPH_MAX_RELATIONSHIP_PROPERTY_ROWS_BYTES",
+                16 * 1024 * 1024,
             )?,
             max_concurrent_hydrations: parse_usize(&values, "GRAPH_MAX_CONCURRENT_HYDRATIONS", 2)?,
             max_concurrent_matrix_compilations: parse_usize(
@@ -199,14 +181,32 @@ impl RuntimeConfig {
                 "GRAPH_MAX_CONCURRENT_MATRIX_COMPILATIONS",
                 1,
             )?,
-            lease_ttl: parse_duration(&values, "GRAPH_LEASE_TTL_MS", 30_000)?,
-            lease_renew_interval: parse_duration(&values, "GRAPH_LEASE_RENEW_INTERVAL_MS", 5_000)?,
-            shard_refresh_interval: parse_duration(
+            matrix_auto_refresh_enabled: parse_bool(
                 &values,
-                "GRAPH_SHARD_REFRESH_INTERVAL_MS",
-                2_000,
+                "GRAPH_MATRIX_AUTO_REFRESH_ENABLED",
+                true,
             )?,
-            heartbeat_ttl: parse_duration(&values, "GRAPH_HEARTBEAT_TTL_MS", 20_000)?,
+            matrix_refresh_interval: parse_duration(
+                &values,
+                "GRAPH_MATRIX_REFRESH_INTERVAL_MS",
+                5_000,
+            )?,
+            matrix_refresh_max_dirty_age: parse_duration(
+                &values,
+                "GRAPH_MATRIX_REFRESH_MAX_DIRTY_MS",
+                30_000,
+            )?,
+            matrix_refresh_min_epoch_lag: parse_u64(
+                &values,
+                "GRAPH_MATRIX_REFRESH_MIN_EPOCH_LAG",
+                1_000,
+            )?,
+            matrix_refresh_tile_size: parse_u64(&values, "GRAPH_MATRIX_REFRESH_TILE_SIZE", 4_096)?,
+            matrix_refresh_max_edge_types_per_cycle: parse_usize(
+                &values,
+                "GRAPH_MATRIX_REFRESH_MAX_EDGE_TYPES_PER_CYCLE",
+                4,
+            )?,
             bolt_addr: parse_socket(&values, "GRAPH_BOLT_ADDR", "0.0.0.0:7687")?,
             http_addr: parse_socket(&values, "GRAPH_HTTP_ADDR", "0.0.0.0:8443")?,
             admin_addr: parse_socket(&values, "GRAPH_ADMIN_ADDR", "0.0.0.0:9090")?,
@@ -221,6 +221,13 @@ impl RuntimeConfig {
             allow_plaintext,
             max_concurrent_queries: parse_usize(&values, "GRAPH_MAX_CONCURRENT_QUERIES", 256)?,
             max_query_runtime_ms: parse_u64(&values, "GRAPH_MAX_QUERY_RUNTIME_MS", 30_000)?,
+            max_server_cursors: parse_usize(&values, "GRAPH_MAX_SERVER_CURSORS", 1_024)?,
+            max_cursor_buffer_bytes: parse_u64(
+                &values,
+                "GRAPH_MAX_CURSOR_BUFFER_BYTES",
+                64 * 1024 * 1024,
+            )?,
+            cursor_ttl: parse_duration(&values, "GRAPH_CURSOR_TTL_MS", 60_000)?,
             max_bolt_connections: parse_usize(&values, "GRAPH_MAX_BOLT_CONNECTIONS", 4_096)?,
             default_page_size: parse_usize(&values, "GRAPH_DEFAULT_PAGE_SIZE", 1_024)?,
             graceful_shutdown_timeout: parse_duration(
@@ -228,16 +235,6 @@ impl RuntimeConfig {
                 "GRAPH_GRACEFUL_SHUTDOWN_MS",
                 30_000,
             )?,
-            control_rpc_endpoint: value(&values, "GRAPH_CONTROL_RPC_ENDPOINT", "127.0.0.1:9443"),
-            control_rpc_server_name: value(
-                &values,
-                "GRAPH_CONTROL_RPC_SERVER_NAME",
-                "graph-controller.slatedb-graph.svc.cluster.local",
-            ),
-            internal_tls_certificate,
-            internal_tls_private_key,
-            internal_tls_ca,
-            internal_allow_plaintext,
         })
     }
 
@@ -258,7 +255,6 @@ impl RuntimeConfig {
                 max_concurrent_hydrations: self.max_concurrent_hydrations,
                 ..GraphCachePolicy::default()
             },
-            retention_policy: GraphRetentionPolicy::default(),
             backpressure_policy: GraphBackpressurePolicy::default(),
             index_policy: GraphIndexPolicy::Full,
         }
@@ -274,8 +270,9 @@ impl RuntimeConfig {
             },
             max_matrix_adjacency_bytes: self.max_matrix_adjacency_bytes,
             max_graphblas_bytes: self.max_graphblas_bytes,
-            max_posting_chunk_bytes: self.max_posting_chunk_bytes,
-            max_materialized_supernode_bytes: self.max_materialized_supernode_bytes,
+            max_relationship_rows_bytes: self.max_relationship_rows_bytes,
+            max_source_relationship_rows_bytes: self.max_source_relationship_rows_bytes,
+            max_relationship_property_rows_bytes: self.max_relationship_property_rows_bytes,
             max_concurrent_matrix_compilations: self.max_concurrent_matrix_compilations,
         }
     }
@@ -289,93 +286,6 @@ impl RuntimeConfig {
         }
         Ok(token)
     }
-}
-
-impl ControllerRuntimeConfig {
-    pub fn from_env() -> ConfigResult<Self> {
-        let values: BTreeMap<_, _> = std::env::vars().collect();
-        let namespace = value(&values, "GRAPH_NAMESPACE", "default");
-        let namespace = NamespacePath::new(
-            namespace
-                .split('/')
-                .map(|segment| NamespaceId::new(segment.to_string()))
-                .collect::<slatedb_graph_kernel::Result<Vec<_>>>()?,
-        )?;
-        let scope = GraphScope::new(
-            namespace,
-            GraphId::new(value(&values, "GRAPH_ID", "default"))?,
-        );
-        let cells = value(&values, "GRAPH_CELLS", "cell-0")
-            .split(',')
-            .map(str::trim)
-            .filter(|cell| !cell.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        if cells.is_empty() {
-            return invalid("GRAPH_CELLS must contain at least one cell");
-        }
-        let internal_allow_plaintext =
-            parse_bool(&values, "GRAPH_INTERNAL_ALLOW_PLAINTEXT", false)?;
-        let internal_tls_certificate = optional_path(&values, "GRAPH_INTERNAL_TLS_CERTIFICATE");
-        let internal_tls_private_key = optional_path(&values, "GRAPH_INTERNAL_TLS_PRIVATE_KEY");
-        let internal_tls_ca = optional_path(&values, "GRAPH_INTERNAL_TLS_CA");
-        validate_internal_tls(
-            internal_allow_plaintext,
-            &internal_tls_certificate,
-            &internal_tls_private_key,
-            &internal_tls_ca,
-        )?;
-        Ok(Self {
-            scope,
-            cells,
-            control_path: value(&values, "GRAPH_CONTROL_PATH", "graph/control"),
-            control_cache_dir: PathBuf::from(value(
-                &values,
-                "GRAPH_CONTROL_CACHE_DIR",
-                "/var/cache/slatedb/control",
-            )),
-            control_cache_bytes: parse_usize(
-                &values,
-                "GRAPH_CONTROL_CACHE_BYTES",
-                512 * 1024 * 1024,
-            )?,
-            lease_ttl: parse_duration(&values, "GRAPH_LEASE_TTL_MS", 30_000)?,
-            heartbeat_ttl: parse_duration(&values, "GRAPH_HEARTBEAT_TTL_MS", 20_000)?,
-            controller_interval: parse_duration(&values, "GRAPH_CONTROLLER_INTERVAL_MS", 2_000)?,
-            rebalance_mode: match value(&values, "GRAPH_REBALANCE_MODE", "stability-first").as_str()
-            {
-                "stability-first" => GraphClusterRebalanceMode::StabilityFirst,
-                "rendezvous" => GraphClusterRebalanceMode::Rendezvous,
-                other => return invalid(format!("unsupported GRAPH_REBALANCE_MODE {other}")),
-            },
-            control_rpc_addr: parse_socket(&values, "GRAPH_CONTROL_RPC_ADDR", "0.0.0.0:9443")?,
-            admin_addr: parse_socket(&values, "GRAPH_ADMIN_ADDR", "0.0.0.0:9090")?,
-            internal_tls_certificate,
-            internal_tls_private_key,
-            internal_tls_ca,
-            internal_allow_plaintext,
-            runtime_lease_ttl: parse_duration(&values, "GRAPH_RUNTIME_LEASE_TTL_MS", 30_000)?,
-            runtime_lease_renew_interval: parse_duration(
-                &values,
-                "GRAPH_RUNTIME_LEASE_RENEW_INTERVAL_MS",
-                5_000,
-            )?,
-        })
-    }
-}
-
-fn validate_internal_tls(
-    allow_plaintext: bool,
-    certificate: &Option<PathBuf>,
-    private_key: &Option<PathBuf>,
-    ca: &Option<PathBuf>,
-) -> ConfigResult<()> {
-    if !allow_plaintext && (certificate.is_none() || private_key.is_none() || ca.is_none()) {
-        return invalid(
-            "internal control RPC requires GRAPH_INTERNAL_TLS_CERTIFICATE, GRAPH_INTERNAL_TLS_PRIVATE_KEY, and GRAPH_INTERNAL_TLS_CA unless GRAPH_INTERNAL_ALLOW_PLAINTEXT=true",
-        );
-    }
-    Ok(())
 }
 
 fn value(values: &BTreeMap<String, String>, name: &str, default: &str) -> String {
@@ -523,53 +433,29 @@ mod tests {
 
     #[test]
     fn plaintext_runtime_config_is_explicit_and_bounded() {
-        let values = BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            (
-                "GRAPH_INTERNAL_ALLOW_PLAINTEXT".to_string(),
-                "true".to_string(),
-            ),
-        ]);
+        let values = BTreeMap::from([("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string())]);
         let config = RuntimeConfig::from_values(values).unwrap();
         assert_eq!(config.max_query_runtime_ms, 30_000);
+        assert_eq!(config.max_server_cursors, 1_024);
+        assert_eq!(config.max_cursor_buffer_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.cursor_ttl, Duration::from_secs(60));
         assert_eq!(config.l0_sst_size_bytes, 16 * 1024 * 1024);
         assert_eq!(config.max_unflushed_bytes, 64 * 1024 * 1024);
         assert_eq!(config.max_concurrent_hydrations, 2);
+        assert!(config.matrix_auto_refresh_enabled);
+        assert_eq!(config.matrix_refresh_interval, Duration::from_secs(5));
+        assert_eq!(config.matrix_refresh_max_dirty_age, Duration::from_secs(30));
+        assert_eq!(config.matrix_refresh_min_epoch_lag, 1_000);
+        assert_eq!(config.matrix_refresh_tile_size, 4_096);
+        assert_eq!(config.matrix_refresh_max_edge_types_per_cycle, 4);
         let memory = config.graph_memory_config();
         assert_eq!(memory.max_graphblas_bytes, 128 * 1024 * 1024);
-        assert_eq!(memory.max_posting_chunk_bytes, 64 * 1024 * 1024);
-    }
-
-    #[test]
-    fn graph_node_config_uses_remote_control_endpoint() {
-        let values = BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            (
-                "GRAPH_INTERNAL_ALLOW_PLAINTEXT".to_string(),
-                "true".to_string(),
-            ),
-        ]);
-        let config = RuntimeConfig::from_values(values).unwrap();
-        assert_eq!(config.control_rpc_endpoint, "127.0.0.1:9443");
-    }
-
-    #[test]
-    fn graph_node_config_accepts_kubernetes_control_endpoint() {
-        let values = BTreeMap::from([
-            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            (
-                "GRAPH_INTERNAL_ALLOW_PLAINTEXT".to_string(),
-                "true".to_string(),
-            ),
-            (
-                "GRAPH_CONTROL_RPC_ENDPOINT".to_string(),
-                "turbolay-controller.turbolay-test.svc.cluster.local:9443".to_string(),
-            ),
-        ]);
-        let config = RuntimeConfig::from_values(values).unwrap();
+        assert_eq!(memory.max_matrix_adjacency_bytes, 0);
+        assert_eq!(memory.max_relationship_rows_bytes, 8 * 1024 * 1024);
+        assert_eq!(memory.max_source_relationship_rows_bytes, 8 * 1024 * 1024);
         assert_eq!(
-            config.control_rpc_endpoint,
-            "turbolay-controller.turbolay-test.svc.cluster.local:9443"
+            memory.max_relationship_property_rows_bytes,
+            16 * 1024 * 1024
         );
     }
 
@@ -577,10 +463,6 @@ mod tests {
     fn graph_node_config_can_disable_heavy_memory_caches() {
         let values = BTreeMap::from([
             ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
-            (
-                "GRAPH_INTERNAL_ALLOW_PLAINTEXT".to_string(),
-                "true".to_string(),
-            ),
             ("GRAPH_MAX_MATRIX_ADJACENCIES".to_string(), "0".to_string()),
             (
                 "GRAPH_MAX_MATRIX_ADJACENCY_BYTES".to_string(),
@@ -588,9 +470,16 @@ mod tests {
             ),
             ("GRAPH_MAX_GRAPHBLAS_MATRICES".to_string(), "0".to_string()),
             ("GRAPH_MAX_GRAPHBLAS_BYTES".to_string(), "0".to_string()),
-            ("GRAPH_MAX_POSTING_CHUNK_BYTES".to_string(), "0".to_string()),
             (
-                "GRAPH_MAX_MATERIALIZED_SUPERNODE_BYTES".to_string(),
+                "GRAPH_MAX_RELATIONSHIP_ROWS_BYTES".to_string(),
+                "0".to_string(),
+            ),
+            (
+                "GRAPH_MAX_SOURCE_RELATIONSHIP_ROWS_BYTES".to_string(),
+                "0".to_string(),
+            ),
+            (
+                "GRAPH_MAX_RELATIONSHIP_PROPERTY_ROWS_BYTES".to_string(),
                 "0".to_string(),
             ),
         ]);
@@ -601,7 +490,8 @@ mod tests {
         assert_eq!(memory.max_matrix_adjacency_bytes, 0);
         assert_eq!(options.cache_policy.max_graphblas_matrices, 0);
         assert_eq!(memory.max_graphblas_bytes, 0);
-        assert_eq!(memory.max_posting_chunk_bytes, 0);
-        assert_eq!(memory.max_materialized_supernode_bytes, 0);
+        assert_eq!(memory.max_relationship_rows_bytes, 0);
+        assert_eq!(memory.max_source_relationship_rows_bytes, 0);
+        assert_eq!(memory.max_relationship_property_rows_bytes, 0);
     }
 }

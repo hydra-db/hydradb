@@ -1,6 +1,6 @@
 # Turbolay Helm Chart
 
-This chart deploys Turbolay graph nodes and controller candidates. SlateDB stores durable state in object storage; node and controller cache volumes are disposable by default.
+This chart deploys Turbolay graph nodes. SlateDB stores durable state in object storage and fences stale writers; node cache volumes are disposable.
 
 ## Requirements
 
@@ -61,7 +61,7 @@ permissions; no registry password or Kubernetes image-pull Secret is required.
 
 ## Security
 
-Public TLS and internal mTLS are enabled by default. With cert-manager disabled, provide the release-scoped Secrets shown by `helm template`, or set explicit names through `tls.public.secretName` and `tls.internal.*SecretName`. The chart can generate a client token, use an existing Secret, or materialize one through External Secrets. Production deployments should use an existing or external secret rather than a token in Helm values.
+Public TLS is enabled by default. With cert-manager disabled, provide the release-scoped Secret shown by `helm template`, or set `tls.public.secretName`. The chart can generate a client token, use an existing Secret, or materialize one through External Secrets. Production deployments should use an existing or external secret rather than a token in Helm values.
 
 When `tls.public.trustBundle.enabled=true`, install trust-manager first and
 configure its trust source namespace to this release namespace. The chart then
@@ -69,7 +69,7 @@ publishes only the public CA certificate into explicitly selected client
 namespaces; private keys never leave the Turbolay namespace.
 
 Each release currently serves exactly one graph scope and one cell. Deploy a
-separate release, object-store prefix, and controller database for every
+separate release and object-store prefix for every
 independently writable namespace or subtenant.
 
 Client ingress is denied by default. Set `networkPolicy.clientIngressFrom` to
@@ -102,7 +102,10 @@ peers without a destination selector are rejected before installation.
 ## Upgrades
 
 Graph nodes use ordered StatefulSet rolling updates with a disruption budget.
-Healthy standbys remain ready, while runtime-owned Pod labels expose only the
-current data writer and active controller through client and control Services.
-SlateDB fencing and the controller runtime lease remain the final correctness
-boundary during failover.
+Rendezvous placement chooses one locality owner per cell. The owner opens that
+cell as a SlateDB writer, and SlateDB's writer epoch plus WAL barrier is the
+authoritative stale-writer fence. Kubernetes replaces failed StatefulSet Pods
+under the same stable node identity; no writable controller database is part of
+the data path. Because one chart release currently exposes one cell, the
+production default is one node replica; scale independently writable graph
+scopes with separate releases rather than paying for idle replicas.

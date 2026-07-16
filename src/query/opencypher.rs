@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::ptr::null_mut;
 
@@ -10,6 +11,13 @@ use crate::{
 };
 
 type AstNode = sys::cypher_astnode_t;
+
+const PARSED_CYPHER_THREAD_CACHE_CAPACITY: usize = 32;
+
+thread_local! {
+    static PARSED_CYPHER_THREAD_CACHE: RefCell<ParsedCypherThreadCache> =
+        RefCell::new(ParsedCypherThreadCache::default());
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedRowQuery {
@@ -260,25 +268,79 @@ pub fn parse_opencypher_row_query_with_parameters(
     query: &str,
     parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<ParsedRowQuery> {
-    let parsed = ParsedCypher::parse(query)?;
-    parsed.lower_row_query(parameters)
+    with_parsed_cypher(query, |parsed| parsed.lower_row_query(parameters))
 }
 
 pub fn parse_opencypher_mutation_query_with_parameters(
     query: &str,
     parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<Option<ParsedMutationQuery>> {
-    let parsed = ParsedCypher::parse(query)?;
-    parsed.lower_mutation_query(parameters)
+    with_parsed_cypher(query, |parsed| parsed.lower_mutation_query(parameters))
 }
 
 #[cfg(feature = "client-api")]
 pub(crate) fn parse_opencypher_unwind_batch(query: &str) -> Result<Option<ParsedUnwindBatch>> {
-    ParsedCypher::parse(query)?.lower_unwind_batch()
+    if starts_with_non_unwind_clause(query) {
+        return Ok(None);
+    }
+    with_parsed_cypher(query, ParsedCypher::lower_unwind_batch)
+}
+
+#[cfg(feature = "client-api")]
+fn starts_with_non_unwind_clause(query: &str) -> bool {
+    const NON_UNWIND_CLAUSES: &[&str] = &[
+        "CREATE", "MATCH", "MERGE", "OPTIONAL", "REMOVE", "RETURN", "SET", "WITH",
+    ];
+    let query = query.trim_start();
+    NON_UNWIND_CLAUSES.iter().any(|keyword| {
+        query
+            .get(..keyword.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+            && query[keyword.len()..]
+                .chars()
+                .next()
+                .is_none_or(|next| next.is_ascii_whitespace() || matches!(next, '(' | '[' | '{'))
+    })
 }
 
 pub(crate) fn classify_opencypher_query_access(query: &str) -> Result<OpenCypherQueryAccess> {
-    ParsedCypher::parse(query)?.query_access()
+    with_parsed_cypher(query, ParsedCypher::query_access)
+}
+
+#[derive(Default)]
+struct ParsedCypherThreadCache {
+    entries: VecDeque<(String, ParsedCypher)>,
+}
+
+fn with_parsed_cypher<T>(
+    query: &str,
+    operation: impl FnOnce(&ParsedCypher) -> Result<T>,
+) -> Result<T> {
+    PARSED_CYPHER_THREAD_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(index) = cache
+            .entries
+            .iter()
+            .position(|(cached_query, _)| cached_query == query)
+        {
+            let entry = cache
+                .entries
+                .remove(index)
+                .expect("cached Cypher entry exists at the located index");
+            cache.entries.push_front(entry);
+        } else {
+            let parsed = ParsedCypher::parse(query)?;
+            cache.entries.push_front((query.to_string(), parsed));
+            cache.entries.truncate(PARSED_CYPHER_THREAD_CACHE_CAPACITY);
+        }
+        operation(
+            &cache
+                .entries
+                .front()
+                .expect("parsed Cypher cache contains the requested query")
+                .1,
+        )
+    })
 }
 
 struct ParsedCypher {
@@ -3134,6 +3196,22 @@ mod tests {
                 ref prefix,
             }) if binding == "s" && property == "thread_id" && prefix == "thread-"
         ));
+    }
+
+    #[test]
+    fn cached_cypher_ast_lowers_each_requests_parameters() {
+        let query = "MATCH (s:Source) WHERE s.thread_id STARTS WITH $prefix RETURN s.id";
+        for expected in ["first-", "second-"] {
+            let parameters = BTreeMap::from([(
+                "prefix".to_string(),
+                VertexPropertyValue::String(expected.to_string()),
+            )]);
+            let parsed = parse_opencypher_row_query_with_parameters(query, &parameters).unwrap();
+            assert!(matches!(
+                parsed.predicate,
+                Some(RowPredicate::StartsWith { ref prefix, .. }) if prefix == expected
+            ));
+        }
     }
 
     #[cfg(feature = "client-api")]

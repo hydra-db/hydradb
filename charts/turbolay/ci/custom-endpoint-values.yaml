@@ -12,8 +12,6 @@ auth:
 tls:
   public:
     enabled: false
-  internal:
-    enabled: false
 
 networkPolicy:
   httpsEgressTo:

@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::GraphEpoch;
+use crate::TopologySequence;
 #[derive(Debug, Error)]
 pub enum GraphError {
     #[error("slatedb error: {0}")]
@@ -53,16 +53,16 @@ pub enum GraphError {
     ControlWatermarkRegression {
         cell_id: String,
         field: &'static str,
-        requested_epoch: GraphEpoch,
-        current_epoch: GraphEpoch,
+        requested_epoch: TopologySequence,
+        current_epoch: TopologySequence,
     },
     #[error(
         "snapshot epoch {read_epoch} is ahead of current epoch {current_epoch} for cell {cell_id}"
     )]
     SnapshotAhead {
         cell_id: String,
-        read_epoch: GraphEpoch,
-        current_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
+        current_epoch: TopologySequence,
     },
     #[error("no shard placement exists for cell {cell_id}")]
     UnknownShard { cell_id: String },
@@ -80,39 +80,17 @@ pub enum GraphError {
         owner_node_id: String,
         local_node_id: String,
     },
-    #[error("cell {cell_id} is currently leased by node {owner_node_id} until {expires_at_ms}")]
-    ShardLeaseHeld {
-        cell_id: String,
-        owner_node_id: String,
-        expires_at_ms: u64,
-    },
-    #[error("node {node_id} does not hold current lease token {lease_token} for cell {cell_id}")]
-    StaleShardLease {
-        cell_id: String,
-        node_id: String,
-        lease_token: u64,
-    },
-    #[error("{operation} requires an active graph control-plane lease for cell {cell_id}")]
-    WriteRequiresLease {
+    #[error("{operation} requires the fenced SlateDB writer for cell {cell_id}")]
+    WriteRequiresWriter {
         operation: &'static str,
         cell_id: String,
     },
     #[error("operation requires writable SlateDB shard storage")]
     ReadOnlyShardStorage,
-    #[error("read snapshot retention for cell {cell_id} requires a writer-side lease coordinator")]
-    ReadLeaseCoordinatorUnavailable { cell_id: String },
     #[error("cell {cell_id} has been dropped; {operation} is rejected")]
     CellDropped {
         operation: &'static str,
         cell_id: String,
-    },
-    #[error(
-        "{operation} for cell {cell_id} is waiting for active readers at epoch {read_epoch} to drain"
-    )]
-    ActiveReadLease {
-        operation: &'static str,
-        cell_id: String,
-        read_epoch: GraphEpoch,
     },
     #[error(
         "snapshot epoch {read_epoch} for cell {cell_id} edge {edge_type} is below compacted watermark {min_epoch}"
@@ -120,8 +98,8 @@ pub enum GraphError {
     SnapshotExpired {
         cell_id: String,
         edge_type: String,
-        read_epoch: GraphEpoch,
-        min_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
+        min_epoch: TopologySequence,
     },
     #[error(
         "{operation} snapshot epoch {read_epoch} for cell {cell_id} edge {edge_type} changed while building; current epoch is {current_epoch}"
@@ -130,8 +108,8 @@ pub enum GraphError {
         operation: &'static str,
         cell_id: String,
         edge_type: String,
-        read_epoch: GraphEpoch,
-        current_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
+        current_epoch: TopologySequence,
     },
     #[error(
         "{operation} stats snapshot epoch {read_epoch} for cell {cell_id} changed while refreshing; current epoch is {current_epoch}"
@@ -139,8 +117,8 @@ pub enum GraphError {
     QueryStatsSnapshotChanged {
         operation: &'static str,
         cell_id: String,
-        read_epoch: GraphEpoch,
-        current_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
+        current_epoch: TopologySequence,
     },
     #[error("{operation} rejected by admission control: actual {actual} exceeds limit {limit}")]
     AdmissionRejected {
@@ -170,13 +148,6 @@ pub enum GraphError {
     UnsupportedQuery {
         dialect: &'static str,
         feature: String,
-    },
-    #[error("{operation} would violate retention for cell {cell_id}: requested epoch {requested_epoch}, safe epoch {safe_epoch}")]
-    RetentionViolation {
-        operation: &'static str,
-        cell_id: String,
-        requested_epoch: GraphEpoch,
-        safe_epoch: GraphEpoch,
     },
 }
 

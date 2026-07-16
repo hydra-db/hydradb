@@ -3,70 +3,9 @@ use std::sync::atomic::Ordering;
 #[cfg(feature = "opencypher")]
 use std::sync::Arc;
 
-use crate::{engine, GraphCacheMetrics, GraphEpoch, VertexId};
 #[cfg(feature = "opencypher")]
-use crate::{EdgeMetadata, RelationshipId};
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct SupernodeCacheKey {
-    pub(crate) cell_id: String,
-    pub(crate) edge_type: String,
-    pub(crate) direction: engine::ArtifactDirection,
-    pub(crate) vertex_id: VertexId,
-    pub(crate) base_epoch: GraphEpoch,
-}
-
-impl SupernodeCacheKey {
-    pub(crate) fn new(
-        cell_id: &str,
-        edge_type: &str,
-        direction: engine::ArtifactDirection,
-        vertex_id: VertexId,
-        base_epoch: GraphEpoch,
-    ) -> Self {
-        Self {
-            cell_id: cell_id.to_string(),
-            edge_type: edge_type.to_string(),
-            direction,
-            vertex_id,
-            base_epoch,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct PostingChunkCacheKey {
-    pub(crate) cell_id: String,
-    pub(crate) edge_type: String,
-    pub(crate) direction: engine::ArtifactDirection,
-    pub(crate) vertex_id: VertexId,
-    pub(crate) base_epoch: GraphEpoch,
-    pub(crate) chunk_id: u64,
-}
-
-impl PostingChunkCacheKey {
-    pub(crate) fn new(group: &engine::SupernodeGroup, chunk_id: u64) -> Self {
-        Self {
-            cell_id: group.cell_id.clone(),
-            edge_type: group.edge_type.clone(),
-            direction: group.direction,
-            vertex_id: group.vertex_id,
-            base_epoch: group.base_epoch,
-            chunk_id,
-        }
-    }
-
-    pub(crate) fn from_chunk(chunk: &engine::PostingChunk) -> Self {
-        Self {
-            cell_id: chunk.cell_id.clone(),
-            edge_type: chunk.edge_type.clone(),
-            direction: chunk.direction,
-            vertex_id: chunk.owner,
-            base_epoch: chunk.base_epoch,
-            chunk_id: chunk.chunk_id,
-        }
-    }
-}
-
+use crate::{EdgeMetadata, RelationshipId, VertexId, VertexPropertyValue};
+use crate::{GraphCacheMetrics, TopologySequence};
 #[cfg(feature = "opencypher")]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RelationshipRowsCacheKey {
@@ -74,7 +13,7 @@ pub(crate) struct RelationshipRowsCacheKey {
     pub(crate) edge_type: String,
     pub(crate) src: VertexId,
     pub(crate) dst: VertexId,
-    pub(crate) read_epoch: GraphEpoch,
+    pub(crate) read_epoch: TopologySequence,
 }
 
 #[cfg(feature = "opencypher")]
@@ -84,7 +23,7 @@ impl RelationshipRowsCacheKey {
         edge_type: &str,
         src: VertexId,
         dst: VertexId,
-        read_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
     ) -> Self {
         Self {
             cell_id: cell_id.to_string(),
@@ -94,6 +33,12 @@ impl RelationshipRowsCacheKey {
             read_epoch,
         }
     }
+
+    pub(crate) fn estimated_resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.cell_id.capacity())
+            .saturating_add(self.edge_type.capacity())
+    }
 }
 
 #[cfg(feature = "opencypher")]
@@ -102,7 +47,7 @@ pub(crate) struct SourceRelationshipRowsCacheKey {
     pub(crate) cell_id: String,
     pub(crate) edge_type: String,
     pub(crate) src: VertexId,
-    pub(crate) read_epoch: GraphEpoch,
+    pub(crate) read_epoch: TopologySequence,
 }
 
 #[cfg(feature = "opencypher")]
@@ -111,7 +56,7 @@ impl SourceRelationshipRowsCacheKey {
         cell_id: &str,
         edge_type: &str,
         src: VertexId,
-        read_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
     ) -> Self {
         Self {
             cell_id: cell_id.to_string(),
@@ -119,6 +64,12 @@ impl SourceRelationshipRowsCacheKey {
             src,
             read_epoch,
         }
+    }
+
+    pub(crate) fn estimated_resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.cell_id.capacity())
+            .saturating_add(self.edge_type.capacity())
     }
 }
 
@@ -131,7 +82,7 @@ pub(crate) struct RelationshipPropertyRowsCacheKey {
     pub(crate) dst: VertexId,
     pub(crate) property: String,
     pub(crate) encoded_value: String,
-    pub(crate) read_epoch: GraphEpoch,
+    pub(crate) read_epoch: TopologySequence,
 }
 
 #[cfg(feature = "opencypher")]
@@ -143,7 +94,7 @@ impl RelationshipPropertyRowsCacheKey {
         dst: VertexId,
         property: &str,
         encoded_value: &str,
-        read_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
     ) -> Self {
         Self {
             cell_id: cell_id.to_string(),
@@ -154,6 +105,14 @@ impl RelationshipPropertyRowsCacheKey {
             encoded_value: encoded_value.to_string(),
             read_epoch,
         }
+    }
+
+    pub(crate) fn estimated_resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.cell_id.capacity())
+            .saturating_add(self.edge_type.capacity())
+            .saturating_add(self.property.capacity())
+            .saturating_add(self.encoded_value.capacity())
     }
 }
 
@@ -177,6 +136,55 @@ impl RelationshipRowsCacheValue {
             rows: Arc::new(rows),
         }
     }
+
+    pub(crate) fn estimated_resident_bytes(&self) -> usize {
+        let allocation = std::mem::size_of::<Vec<RelationshipRowsCacheEntry>>()
+            .saturating_add(
+                self.rows
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<RelationshipRowsCacheEntry>()),
+            )
+            .saturating_add(2 * std::mem::size_of::<usize>());
+        self.rows.iter().fold(
+            std::mem::size_of::<Self>().saturating_add(allocation),
+            |bytes, row| bytes.saturating_add(edge_metadata_heap_bytes(&row.metadata)),
+        )
+    }
+}
+
+#[cfg(feature = "opencypher")]
+pub(crate) fn source_relationship_rows_resident_bytes(
+    key: &SourceRelationshipRowsCacheKey,
+    rows: &Arc<Vec<VertexId>>,
+) -> usize {
+    key.estimated_resident_bytes()
+        .saturating_add(std::mem::size_of::<Arc<Vec<VertexId>>>())
+        .saturating_add(2 * std::mem::size_of::<usize>())
+        .saturating_add(std::mem::size_of::<Vec<VertexId>>())
+        .saturating_add(
+            rows.capacity()
+                .saturating_mul(std::mem::size_of::<VertexId>()),
+        )
+}
+
+#[cfg(feature = "opencypher")]
+fn edge_metadata_heap_bytes(metadata: &EdgeMetadata) -> usize {
+    const BTREE_ENTRY_OVERHEAD_WORDS: usize = 4;
+    metadata.properties.iter().fold(0, |bytes, (name, value)| {
+        let value_heap_bytes = match value {
+            VertexPropertyValue::String(value) => value.capacity(),
+            VertexPropertyValue::Integer(_)
+            | VertexPropertyValue::SignedInteger(_)
+            | VertexPropertyValue::Bool(_)
+            | VertexPropertyValue::Float(_) => 0,
+        };
+        bytes
+            .saturating_add(std::mem::size_of::<String>())
+            .saturating_add(std::mem::size_of::<VertexPropertyValue>())
+            .saturating_add(BTREE_ENTRY_OVERHEAD_WORDS * std::mem::size_of::<usize>())
+            .saturating_add(name.capacity())
+            .saturating_add(value_heap_bytes)
+    })
 }
 
 struct CacheEntry<V> {
@@ -240,7 +248,7 @@ where
     pub(crate) fn get_latest_by(
         &mut self,
         mut predicate: impl FnMut(&K, &V) -> bool,
-        mut score: impl FnMut(&K, &V) -> GraphEpoch,
+        mut score: impl FnMut(&K, &V) -> TopologySequence,
     ) -> Option<V> {
         let key = self
             .entries

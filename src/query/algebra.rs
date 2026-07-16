@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 use crate::{
-    validate_component, CommitResult, EdgeMetadata, GraphEpoch, GraphError, GraphScope, QueryFloat,
-    RelationshipId, Result, VertexId, VertexMetadata, VertexPropertyValue,
+    validate_component, CommitResult, EdgeMetadata, GraphError, GraphScope, QueryFloat,
+    RelationshipId, Result, TopologySequence, VertexId, VertexMetadata, VertexPropertyValue,
 };
 
 #[cfg_attr(
@@ -167,10 +167,11 @@ pub struct QueryContext {
     pub scope: GraphScope,
     pub cell_id: String,
     pub idempotency_key: String,
-    pub read_epoch: Option<GraphEpoch>,
+    pub read_epoch: Option<TopologySequence>,
     pub result_window: QueryWindow,
     pub parameters: BTreeMap<String, VertexPropertyValue>,
     pub max_runtime_ms: Option<u64>,
+    pub max_result_bytes: Option<u64>,
     #[cfg_attr(feature = "query-transport", serde(skip, default))]
     pub cancellation_token: Option<QueryCancellationToken>,
     #[cfg(feature = "opencypher")]
@@ -188,6 +189,7 @@ impl QueryContext {
             result_window: QueryWindow::default(),
             parameters: BTreeMap::new(),
             max_runtime_ms: None,
+            max_result_bytes: None,
             cancellation_token: None,
             #[cfg(feature = "opencypher")]
             validated_read: None,
@@ -199,7 +201,7 @@ impl QueryContext {
         self
     }
 
-    pub fn at_epoch(mut self, read_epoch: GraphEpoch) -> Self {
+    pub fn at_epoch(mut self, read_epoch: TopologySequence) -> Self {
         self.read_epoch = Some(read_epoch);
         self
     }
@@ -227,28 +229,33 @@ impl QueryContext {
         self
     }
 
+    pub fn with_max_result_bytes(mut self, max_result_bytes: u64) -> Self {
+        self.max_result_bytes = Some(max_result_bytes);
+        self
+    }
+
     pub fn with_cancellation_token(mut self, token: QueryCancellationToken) -> Self {
         self.cancellation_token = Some(token);
         self
     }
 
     #[cfg(feature = "opencypher")]
-    pub(crate) fn with_validated_read_epoch(
+    pub(crate) fn with_validated_storage_read_epoch(
         mut self,
-        read_epoch: GraphEpoch,
-        retention: Arc<crate::QueryReadLeaseRegistration>,
+        read_epoch: TopologySequence,
+        storage_sequence: crate::StorageSequence,
     ) -> Self {
         self.read_epoch = Some(read_epoch);
         self.validated_read = Some(ValidatedQueryRead {
             cell_id: self.cell_id.clone(),
             read_epoch,
-            retention,
+            retention: ValidatedQueryReadRetention::StorageSnapshot(storage_sequence),
         });
         self
     }
 
     #[cfg(feature = "opencypher")]
-    pub(crate) fn validated_read_epoch(&self) -> Option<GraphEpoch> {
+    pub(crate) fn validated_read_epoch(&self) -> Option<TopologySequence> {
         self.validated_read.as_ref().and_then(|validated| {
             let _retention = &validated.retention;
             (validated.cell_id == self.cell_id && self.read_epoch == Some(validated.read_epoch))
@@ -261,8 +268,14 @@ impl QueryContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ValidatedQueryRead {
     cell_id: String,
-    read_epoch: GraphEpoch,
-    retention: Arc<crate::QueryReadLeaseRegistration>,
+    read_epoch: TopologySequence,
+    retention: ValidatedQueryReadRetention,
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ValidatedQueryReadRetention {
+    StorageSnapshot(crate::StorageSequence),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -343,7 +356,7 @@ pub enum QueryCardinalityStatsKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryCardinalityStatsRefresh {
     pub cell_id: String,
-    pub read_epoch: GraphEpoch,
+    pub read_epoch: TopologySequence,
     pub kind: QueryCardinalityStatsKind,
     pub count: u64,
     pub stats: QueryStatsRecord,
@@ -352,7 +365,7 @@ pub struct QueryCardinalityStatsRefresh {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryStatsRecord {
     pub count: u64,
-    pub read_epoch: GraphEpoch,
+    pub read_epoch: TopologySequence,
     pub refreshed_at_ms: u64,
     pub distinct_values: u64,
     pub total_values: u64,
@@ -360,7 +373,7 @@ pub struct QueryStatsRecord {
 }
 
 impl QueryStatsRecord {
-    pub fn point_count(count: u64, read_epoch: GraphEpoch, refreshed_at_ms: u64) -> Self {
+    pub fn point_count(count: u64, read_epoch: TopologySequence, refreshed_at_ms: u64) -> Self {
         Self {
             count,
             read_epoch,
@@ -373,7 +386,7 @@ impl QueryStatsRecord {
 
     pub fn histogram(
         count: u64,
-        read_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
         refreshed_at_ms: u64,
         distinct_values: u64,
         most_common_count: u64,
@@ -388,7 +401,7 @@ impl QueryStatsRecord {
         }
     }
 
-    pub fn is_stale_at(&self, current_epoch: GraphEpoch, now_ms: u64) -> bool {
+    pub fn is_stale_at(&self, current_epoch: TopologySequence, now_ms: u64) -> bool {
         self.read_epoch < current_epoch || self.refreshed_at_ms > now_ms
     }
 
@@ -407,7 +420,7 @@ impl QueryStatsRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryStatsHistogramRefresh {
     pub cell_id: String,
-    pub read_epoch: GraphEpoch,
+    pub read_epoch: TopologySequence,
     pub property: String,
     pub edge_type: Option<String>,
     pub stats: QueryStatsRecord,
@@ -527,21 +540,77 @@ impl QueryRow {
     pub fn new(values: Vec<QueryValue>) -> Self {
         Self { values }
     }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn estimated_resident_bytes(&self) -> u64 {
+        self.values
+            .iter()
+            .fold(std::mem::size_of::<Self>() as u64, |total, value| {
+                total.saturating_add(value.estimated_resident_bytes())
+            })
+    }
+}
+
+impl QueryValue {
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn estimated_resident_bytes(&self) -> u64 {
+        let inline = std::mem::size_of::<Self>() as u64;
+        match self {
+            Self::Property(VertexPropertyValue::String(value)) => {
+                inline.saturating_add(value.len() as u64)
+            }
+            Self::List(values) => values.iter().fold(inline, |total, value| {
+                total.saturating_add(value.estimated_resident_bytes())
+            }),
+            Self::Null
+            | Self::VertexId(_)
+            | Self::Count(_)
+            | Self::Bool(_)
+            | Self::Float(_)
+            | Self::Property(_) => inline,
+        }
+    }
 }
 
 #[cfg_attr(
     feature = "query-transport",
     derive(serde::Deserialize, serde::Serialize)
 )]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct QueryResultSet {
     pub columns: Vec<QueryColumn>,
     pub rows: Vec<QueryRow>,
+    pub read_epoch: Option<TopologySequence>,
 }
+
+impl PartialEq for QueryResultSet {
+    fn eq(&self, other: &Self) -> bool {
+        // A snapshot watermark describes execution, not the logical row set.
+        self.columns == other.columns && self.rows == other.rows
+    }
+}
+
+impl Eq for QueryResultSet {}
 
 impl QueryResultSet {
     pub fn new(columns: Vec<QueryColumn>, rows: Vec<QueryRow>) -> Self {
-        Self { columns, rows }
+        Self {
+            columns,
+            rows,
+            read_epoch: None,
+        }
+    }
+
+    pub fn with_read_epoch(mut self, read_epoch: TopologySequence) -> Self {
+        self.read_epoch = Some(read_epoch);
+        self
+    }
+
+    #[cfg(any(feature = "bolt-server", feature = "http-api"))]
+    pub(crate) fn estimated_resident_bytes(&self) -> u64 {
+        self.rows.iter().fold(0_u64, |total, row| {
+            total.saturating_add(row.estimated_resident_bytes())
+        })
     }
 }
 
@@ -659,7 +728,7 @@ impl QueryStatement {
 pub struct QueryPlan {
     pub cell_id: String,
     pub idempotency_key: String,
-    pub read_epoch: Option<GraphEpoch>,
+    pub read_epoch: Option<TopologySequence>,
     pub result_window: QueryWindow,
     pub max_runtime_ms: Option<u64>,
     pub logical: LogicalQueryPlan,
@@ -673,7 +742,7 @@ pub struct QueryPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowQueryPlan {
     pub cell_id: String,
-    pub read_epoch: GraphEpoch,
+    pub read_epoch: TopologySequence,
     pub columns: Vec<QueryColumn>,
     pub groups: Vec<RowQueryPlanGroup>,
     pub union_all: bool,

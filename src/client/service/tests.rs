@@ -25,23 +25,24 @@ struct TestClient {
     epoch: AtomicU64,
 }
 
+struct CursorTestClient {
+    executions: Arc<AtomicU64>,
+}
+
+struct SnapshotEpochClient;
+
 #[async_trait]
-impl QueryCellClient for TestClient {
+impl QueryCellClient for SnapshotEpochClient {
     async fn execute_cypher_rows(
         &self,
-        context: QueryContext,
+        _context: QueryContext,
         _query: &str,
     ) -> Result<QueryResultSet> {
-        if let Some(token) = context.cancellation_token {
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
-                _ = token.cancelled() => return Err(client_query_cancelled()),
-            }
-        }
         Ok(QueryResultSet::new(
             vec![QueryColumn::new("value")],
             vec![QueryRow::new(vec![QueryValue::Count(1)])],
-        ))
+        )
+        .with_read_epoch(9))
     }
 
     async fn execute_cypher_rows_page(
@@ -59,7 +60,95 @@ impl QueryCellClient for TestClient {
         &self,
         _scope: &GraphScope,
         _cell_id: &str,
-    ) -> Result<Option<GraphEpoch>> {
+    ) -> Result<Option<TopologySequence>> {
+        Ok(Some(7))
+    }
+}
+
+#[async_trait]
+impl QueryCellClient for CursorTestClient {
+    async fn execute_cypher_rows(
+        &self,
+        context: QueryContext,
+        _query: &str,
+    ) -> Result<QueryResultSet> {
+        self.executions.fetch_add(1, Ordering::Relaxed);
+        let result = QueryResultSet::new(
+            vec![QueryColumn::new("value")],
+            (1..=4)
+                .map(|value| QueryRow::new(vec![QueryValue::Count(value)]))
+                .collect(),
+        )
+        .with_read_epoch(7);
+        if let Some(limit) = context.max_result_bytes {
+            crate::codec::ensure_limit(
+                "client_cursor_buffer_bytes",
+                result.estimated_resident_bytes(),
+                limit,
+            )?;
+        }
+        Ok(result)
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let result = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(result.columns, result.rows, None))
+    }
+
+    async fn current_graph_epoch(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<TopologySequence>> {
+        Ok(Some(7))
+    }
+}
+
+#[async_trait]
+impl QueryCellClient for TestClient {
+    async fn execute_cypher_rows(
+        &self,
+        context: QueryContext,
+        _query: &str,
+    ) -> Result<QueryResultSet> {
+        let read_epoch = context
+            .read_epoch
+            .unwrap_or_else(|| self.epoch.load(Ordering::Relaxed));
+        if let Some(token) = context.cancellation_token {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+                _ = token.cancelled() => return Err(client_query_cancelled()),
+            }
+        }
+        Ok(QueryResultSet::new(
+            vec![QueryColumn::new("value")],
+            vec![QueryRow::new(vec![QueryValue::Count(1)])],
+        )
+        .with_read_epoch(read_epoch))
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let result = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(result.columns, result.rows, None))
+    }
+
+    async fn current_graph_epoch(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<TopologySequence>> {
         Ok(Some(self.epoch.load(Ordering::Relaxed)))
     }
 }
@@ -84,6 +173,37 @@ fn service() -> ClientQueryService {
             .with_scope_authorizer(Arc::new(authorizer)),
     )
     .unwrap()
+}
+
+fn cursor_service(
+    executions: Arc<AtomicU64>,
+    max_cursors: usize,
+    max_buffer_bytes: u64,
+    ttl_ms: u64,
+) -> ClientQueryService {
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::read_graph(GraphScope::default()),
+        )
+        .unwrap();
+    ClientQueryService::new(
+        Arc::new(CursorTestClient { executions }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_server_cursor_limits(max_cursors, max_buffer_bytes, ttl_ms),
+    )
+    .unwrap()
+}
+
+fn authenticated_session(service: &ClientQueryService) -> ClientQuerySession {
+    service
+        .authenticate(
+            &ClientQueryCredentials::Bearer("secret".to_string()),
+            &QueryTransportConnectionIdentity::default(),
+        )
+        .unwrap()
 }
 
 #[test]
@@ -118,6 +238,34 @@ async fn service_authenticates_authorizes_and_returns_epoch_bookmark() {
         .unwrap();
     assert_eq!(response.result.rows.len(), 1);
     assert_eq!(response.bookmark.unwrap().epoch, 7);
+}
+
+#[tokio::test]
+async fn service_bookmark_uses_the_epoch_of_the_storage_snapshot_read() {
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::read_graph(GraphScope::default()),
+        )
+        .unwrap();
+    let service = ClientQueryService::new(
+        Arc::new(SnapshotEpochClient),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(authorizer)),
+    )
+    .unwrap();
+    let session = authenticated_session(&service);
+    let response = service
+        .execute_rows(
+            &session,
+            ClientQueryRequest::new(target(), "query-snapshot", "MATCH (n {id: 1}) RETURN n.id"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.read_epoch, Some(9));
+    assert_eq!(response.bookmark.unwrap().epoch, 9);
 }
 
 #[tokio::test]
@@ -160,6 +308,152 @@ async fn prepared_pages_reauthorize_after_scope_grant_revocation() {
         .unwrap_err();
     assert!(matches!(error, GraphError::GraphScopeAccessDenied { .. }));
     assert_eq!(service.active_query_count().await, 0);
+}
+
+#[tokio::test]
+async fn server_cursor_executes_once_and_release_invalidates_it() {
+    let executions = Arc::new(AtomicU64::new(0));
+    let service = cursor_service(Arc::clone(&executions), 4, 1 << 20, 1_000);
+    let session = authenticated_session(&service);
+    let request = ClientQueryRequest::new(
+        target(),
+        "query-server-cursor",
+        "MATCH (n {id: 1}) RETURN n.id AS value",
+    );
+
+    let first = service
+        .execute_page(&session, request.clone(), None, 1)
+        .await
+        .unwrap();
+    let cursor = first.page.next_cursor.expect("remaining rows use a cursor");
+    assert_eq!(executions.load(Ordering::Relaxed), 1);
+
+    let second = service
+        .execute_page(&session, request.clone(), Some(cursor), 1)
+        .await
+        .unwrap();
+    assert_eq!(second.page.rows.len(), 1);
+    assert_eq!(executions.load(Ordering::Relaxed), 1);
+    assert!(
+        service
+            .release_server_cursor(&session, &request, cursor)
+            .await
+    );
+
+    let error = service
+        .execute_page(&session, request, Some(cursor), 1)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown or expired"));
+    assert_eq!(executions.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn server_cursor_enforces_count_and_buffer_admission() {
+    let executions = Arc::new(AtomicU64::new(0));
+    let service = cursor_service(Arc::clone(&executions), 1, 1 << 20, 1_000);
+    let session = authenticated_session(&service);
+    service
+        .execute_page(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "query-cursor-first",
+                "MATCH (n {id: 1}) RETURN n.id AS value",
+            ),
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    let count_error = service
+        .execute_page(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "query-cursor-second",
+                "MATCH (n {id: 1}) RETURN n.id AS value",
+            ),
+            None,
+            1,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        count_error,
+        GraphError::AdmissionRejected {
+            operation: "client_server_cursors",
+            ..
+        }
+    ));
+
+    let tiny_service = cursor_service(Arc::new(AtomicU64::new(0)), 1, 1, 1_000);
+    let tiny_session = authenticated_session(&tiny_service);
+    let buffer_error = tiny_service
+        .execute_page(
+            &tiny_session,
+            ClientQueryRequest::new(
+                target(),
+                "query-cursor-buffer",
+                "MATCH (n {id: 1}) RETURN n.id AS value",
+            ),
+            None,
+            1,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        buffer_error,
+        GraphError::AdmissionRejected {
+            operation: "client_cursor_buffer_bytes",
+            ..
+        }
+    ));
+
+    let first_page_error = tiny_service
+        .execute_page(
+            &tiny_session,
+            ClientQueryRequest::new(
+                target(),
+                "query-cursor-buffer-first-page",
+                "MATCH (n {id: 1}) RETURN n.id AS value",
+            ),
+            None,
+            4,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        first_page_error,
+        GraphError::AdmissionRejected {
+            operation: "client_cursor_buffer_bytes",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn expired_server_cursor_releases_its_buffer() {
+    let service = cursor_service(Arc::new(AtomicU64::new(0)), 1, 1 << 20, 1);
+    let session = authenticated_session(&service);
+    let request = ClientQueryRequest::new(
+        target(),
+        "query-cursor-expiry",
+        "MATCH (n {id: 1}) RETURN n.id AS value",
+    );
+    let first = service
+        .execute_page(&session, request.clone(), None, 1)
+        .await
+        .unwrap();
+    let cursor = first.page.next_cursor.expect("remaining rows use a cursor");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let error = service
+        .execute_page(&session, request, Some(cursor), 1)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown or expired"));
+    assert_eq!(service.inner.cursor_buffer_bytes.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -371,7 +665,7 @@ impl QueryCellClient for CancellationIgnoringClient {
         &self,
         _scope: &GraphScope,
         _cell_id: &str,
-    ) -> Result<Option<GraphEpoch>> {
+    ) -> Result<Option<TopologySequence>> {
         Ok(Some(7))
     }
 }

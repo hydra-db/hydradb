@@ -10,8 +10,8 @@ struct IncidentEdge {
 #[derive(Clone, Debug)]
 struct DeleteOutboxRun {
     edge_type: String,
-    start_epoch: GraphEpoch,
-    end_epoch: GraphEpoch,
+    start_epoch: TopologySequence,
+    end_epoch: TopologySequence,
     edges: Vec<(VertexId, VertexId)>,
 }
 
@@ -33,7 +33,7 @@ struct RelationshipPropertyTxnLookup<'a> {
     dst: VertexId,
     property: &'a str,
     value: &'a VertexPropertyValue,
-    read_epoch: GraphEpoch,
+    read_epoch: TopologySequence,
 }
 
 impl GraphShard {
@@ -62,12 +62,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(()) => {
                     self.operation_metrics
@@ -116,12 +110,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(changed) => {
                     if changed > 0 {
@@ -173,12 +161,6 @@ impl GraphShard {
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
-                }
                 Ok(changed) => {
                     if changed > 0 {
                         self.operation_metrics
@@ -228,12 +210,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(changed) => {
                     if changed > 0 {
@@ -515,12 +491,6 @@ impl GraphShard {
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
-                }
                 Ok(result) => {
                     self.operation_metrics
                         .write_commits
@@ -730,7 +700,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         vertex_id: VertexId,
-        read_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
         lock: &CellWriteLock,
     ) -> Result<BTreeSet<IncidentEdge>> {
         let mut edges = BTreeSet::new();
@@ -773,19 +743,6 @@ impl GraphShard {
             let record = decode_relationship_record(&key, &kv.value)?;
             if record.epoch > read_epoch {
                 continue;
-            }
-            let tombstone_key = keys::relationship_tombstone(
-                cell_id,
-                &record.edge_type,
-                record.src,
-                record.dst,
-                record.relationship_id,
-            );
-            if let Some(value) = self.read_remote(&tombstone_key).await? {
-                let tombstone_epoch = decode_u64(&tombstone_key, &value)?;
-                if record.epoch <= tombstone_epoch && tombstone_epoch <= read_epoch {
-                    continue;
-                }
             }
             if record.src == vertex_id || record.dst == vertex_id {
                 edges.insert(IncidentEdge {
@@ -866,12 +823,6 @@ impl GraphShard {
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
-                }
                 Ok(result) => {
                     self.operation_metrics
                         .write_commits
@@ -896,7 +847,6 @@ impl GraphShard {
         let idem_key = keys::cell_drop_idempotency(cell_id, idempotency_key);
         let marker_key = keys::cell_drop_marker(cell_id);
         let pending_marker_key = keys::cell_drop_pending_marker(cell_id);
-        let write_fence_key = keys::write_fence(cell_id);
         let txn = self
             .db
             .writer()?
@@ -933,16 +883,13 @@ impl GraphShard {
         };
         commit_txn_strict(txn, self.await_durable_writes).await?;
 
-        self.wait_for_drop_read_leases(cell_id, lock).await?;
-        lock.renew().await?;
-
         let mut deleted_keys = 0_u64;
         let mut batches = 0_u64;
         let mut pending = Vec::new();
         let mut iter = self.scan_remote_prefix(&keys::cell_prefix(cell_id)).await?;
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            if key == write_fence_key || key == pending_marker_key {
+            if key == pending_marker_key {
                 continue;
             }
             pending.push(key);
@@ -980,7 +927,6 @@ impl GraphShard {
         }
         txn.put(marker_key.as_bytes(), encode_u64(marker_epoch))?;
         txn.delete(pending_marker_key.as_bytes())?;
-        txn.delete(write_fence_key.as_bytes())?;
         txn.put(
             idem_key.as_bytes(),
             encode_cell_drop_idempotency(cell_id, idempotency_key, &result),
@@ -1013,32 +959,6 @@ impl GraphShard {
         Ok(deleted)
     }
 
-    async fn wait_for_drop_read_leases(&self, cell_id: &str, lock: &CellWriteLock) -> Result<()> {
-        if self.retention_policy.read_lease_ttl_ms == 0 {
-            return Ok(());
-        }
-        let started_ms = graph_now_millis();
-        let timeout_ms = self
-            .retention_policy
-            .read_lease_ttl_ms
-            .saturating_add(1_000);
-        loop {
-            let Some(read_epoch) = self.min_active_read_epoch(cell_id).await? else {
-                return Ok(());
-            };
-            if graph_now_millis().saturating_sub(started_ms) >= timeout_ms {
-                return Err(GraphError::ActiveReadLease {
-                    operation: "drop_cell",
-                    cell_id: cell_id.to_string(),
-                    read_epoch,
-                });
-            }
-            lock.renew().await?;
-            let sleep_ms = self.retention_policy.read_lease_ttl_ms.clamp(1, 50);
-            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-        }
-    }
-
     pub async fn set_edge_metadata(
         &self,
         cell_id: &str,
@@ -1065,12 +985,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(result) => {
                     self.operation_metrics
@@ -1121,12 +1035,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(changed) => {
                     if changed > 0 {
@@ -1286,12 +1194,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(result) => {
                     self.operation_metrics
@@ -1633,12 +1535,7 @@ impl GraphShard {
                     match read_txn_remote(&txn, target_key).await? {
                         Some(value) => {
                             let record = decode_relationship_record(target_key, &value)?;
-                            if relationship_deleted_at_txn(&txn, &record, current_epoch).await? {
-                                txn.delete(id_key.as_bytes())?;
-                                None
-                            } else {
-                                Some(record)
-                            }
+                            Some(record)
                         }
                         None => {
                             return Err(GraphError::CorruptValue {
@@ -1653,11 +1550,7 @@ impl GraphShard {
                 None => match read_txn_remote(&txn, &rel_key).await? {
                     Some(value) => {
                         let record = decode_relationship_record(&rel_key, &value)?;
-                        if relationship_deleted_at_txn(&txn, &record, current_epoch).await? {
-                            None
-                        } else {
-                            Some(record)
-                        }
+                        Some(record)
                     }
                     None => None,
                 },
@@ -1878,15 +1771,7 @@ impl GraphShard {
                 )
                 .as_bytes(),
             )?;
-            put_relationship_metadata_delta_txn(&txn, &record, &record.metadata, epoch)?;
             put_relationship_property_indexes_txn(&txn, &record)?;
-            put_relationship_property_index_deltas_txn(
-                &txn,
-                &record,
-                &EdgeMetadata::default(),
-                &record.metadata,
-                epoch,
-            )?;
         }
         for (record, previous_metadata) in &relationships_updated {
             let key = keys::relationship(
@@ -1900,16 +1785,8 @@ impl GraphShard {
                 key.as_bytes(),
                 encode_relationship_record(record).as_slice(),
             )?;
-            put_relationship_metadata_delta_txn(&txn, record, &record.metadata, epoch)?;
             delete_relationship_property_indexes_txn(&txn, record, previous_metadata)?;
             put_relationship_property_indexes_txn(&txn, record)?;
-            put_relationship_property_index_deltas_txn(
-                &txn,
-                record,
-                previous_metadata,
-                &record.metadata,
-                epoch,
-            )?;
         }
         let mut relationship_count_increments = BTreeMap::<(VertexId, VertexId), u64>::new();
         for relationship in &relationships_inserted {
@@ -2009,12 +1886,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(result) => {
                     self.operation_metrics
@@ -2253,15 +2124,7 @@ impl GraphShard {
             relationship_count_key.as_bytes(),
             encode_u64(relationship_count),
         )?;
-        put_relationship_metadata_delta_txn(&txn, &record, edge_metadata, epoch)?;
         put_relationship_property_indexes_txn(&txn, &record)?;
-        put_relationship_property_index_deltas_txn(
-            &txn,
-            &record,
-            &EdgeMetadata::default(),
-            edge_metadata,
-            epoch,
-        )?;
 
         let result = RelationshipCreateResult {
             epoch,
@@ -2313,12 +2176,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(changed) => {
                     if changed {
@@ -2387,9 +2244,7 @@ impl GraphShard {
             });
         };
         let mut record = decode_relationship_record(&key, &value)?;
-        if record.epoch > current_epoch
-            || relationship_deleted_at_txn(&txn, &record, current_epoch).await?
-        {
+        if record.epoch > current_epoch {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "GraphQuery",
                 feature: "cannot set metadata for a deleted relationship".to_string(),
@@ -2405,10 +2260,8 @@ impl GraphShard {
             key.as_bytes(),
             encode_relationship_record(&record).as_slice(),
         )?;
-        put_relationship_metadata_delta_txn(&txn, &record, &metadata, epoch)?;
         delete_relationship_property_indexes_txn(&txn, &record, &previous)?;
         put_relationship_property_indexes_txn(&txn, &record)?;
-        put_relationship_property_index_deltas_txn(&txn, &record, &previous, &metadata, epoch)?;
         txn.put(keys::last_epoch(cell_id).as_bytes(), encode_u64(epoch))?;
         commit_txn_strict(txn, self.await_durable_writes).await?;
         Ok(true)
@@ -2440,12 +2293,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(result) => {
                     self.operation_metrics
@@ -2523,19 +2370,6 @@ impl GraphShard {
             return Ok(result);
         };
         let record = decode_relationship_record(&key, &value)?;
-        if relationship_deleted_at_txn(&txn, &record, current_epoch).await? {
-            let result = DeleteResult {
-                epoch: current_epoch,
-                deleted: false,
-            };
-            txn.put(
-                idem_key.as_bytes(),
-                encode_relationship_delete_idempotency(mutation, relationship_id, &result),
-            )?;
-            commit_txn_strict(txn, self.await_durable_writes).await?;
-            return Ok(result);
-        }
-
         let epoch = current_epoch
             .checked_add(1)
             .ok_or_else(|| GraphError::CorruptValue {
@@ -2558,17 +2392,7 @@ impl GraphShard {
             keys::last_epoch(&mutation.cell_id).as_bytes(),
             encode_u64(epoch),
         )?;
-        txn.put(
-            keys::relationship_tombstone(
-                &mutation.cell_id,
-                &mutation.edge_type,
-                mutation.src,
-                mutation.dst,
-                relationship_id,
-            )
-            .as_bytes(),
-            encode_u64(epoch),
-        )?;
+        txn.delete(key.as_bytes())?;
         txn.delete(keys::relationship_id(&mutation.cell_id, relationship_id).as_bytes())?;
         let relationship_count_key = keys::relationship_count(
             &mutation.cell_id,
@@ -2588,13 +2412,6 @@ impl GraphShard {
             )?;
         }
         delete_relationship_property_indexes_txn(&txn, &record, &record.metadata)?;
-        put_relationship_property_index_deltas_txn(
-            &txn,
-            &record,
-            &record.metadata,
-            &EdgeMetadata::default(),
-            epoch,
-        )?;
 
         if !other_live_relationships {
             delete_structural_edge_txn(self, &txn, mutation, epoch).await?;
@@ -2629,12 +2446,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(result) => {
                     self.operation_metrics
@@ -2702,12 +2513,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(result) => {
                     self.operation_metrics
@@ -2778,12 +2583,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(result) => {
                     self.operation_metrics
@@ -3061,7 +2860,7 @@ impl GraphShard {
             self.limits.max_bulk_import_edges as u64,
         )?;
 
-        let mut start_epoch: Option<GraphEpoch> = None;
+        let mut start_epoch: Option<TopologySequence> = None;
         let mut end_epoch = self.current_epoch(cell_id).await?;
         let mut deleted = 0_u64;
         let mut already_deleted = 0_u64;
@@ -3165,12 +2964,6 @@ impl GraphShard {
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
-                }
                 Ok(result) => {
                     self.operation_metrics
                         .write_commits
@@ -3223,12 +3016,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(()) => {
                     self.operation_metrics
@@ -3331,7 +3118,7 @@ impl GraphShard {
         let mut out_decrements = BTreeMap::<(String, VertexId), u64>::new();
         let mut in_decrements = BTreeMap::<(String, VertexId), u64>::new();
         let mut segment_edges_by_type_src =
-            BTreeMap::<(String, VertexId), BTreeMap<VertexId, GraphEpoch>>::new();
+            BTreeMap::<(String, VertexId), BTreeMap<VertexId, TopologySequence>>::new();
         let mut outbox_runs = Vec::<DeleteOutboxRun>::new();
         let mut current_run = None::<DeleteOutboxRun>;
         let write_reverse_index = self.writes_reverse_index();
@@ -3406,13 +3193,7 @@ impl GraphShard {
                 Some(value) => decode_edge_metadata(&edge_metadata_key, &value)?,
                 None => EdgeMetadata::default(),
             };
-            tombstone_relationships_for_structural_edge_delete_txn(
-                &txn,
-                mutation,
-                next_epoch,
-                current_epoch,
-            )
-            .await?;
+            delete_relationships_for_structural_edge_txn(&txn, mutation, current_epoch).await?;
             if !previous_edge_metadata.properties.is_empty() {
                 apply_edge_metadata_update_txn(
                     &txn,
@@ -3572,12 +3353,6 @@ impl GraphShard {
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
-                }
                 Ok(result) => {
                     self.operation_metrics
                         .write_commits
@@ -3715,13 +3490,7 @@ impl GraphShard {
                 None => EdgeMetadata::default(),
             };
 
-            tombstone_relationships_for_structural_edge_delete_txn(
-                &txn,
-                mutation,
-                epoch,
-                current_epoch,
-            )
-            .await?;
+            delete_relationships_for_structural_edge_txn(&txn, mutation, current_epoch).await?;
             txn.put(
                 keys::last_epoch(&mutation.cell_id).as_bytes(),
                 encode_u64(epoch),
@@ -3807,13 +3576,8 @@ impl GraphShard {
             None => EdgeMetadata::default(),
         };
 
-        tombstone_relationships_for_structural_edge_delete_txn(
-            &txn,
-            mutation,
-            epoch,
-            epoch.saturating_sub(1),
-        )
-        .await?;
+        delete_relationships_for_structural_edge_txn(&txn, mutation, epoch.saturating_sub(1))
+            .await?;
         txn.put(
             keys::last_epoch(&mutation.cell_id).as_bytes(),
             encode_u64(epoch),
@@ -3950,7 +3714,7 @@ impl GraphShard {
         .await
     }
 
-    pub async fn bulk_append_supernode_segment_trusted(
+    pub async fn bulk_append_out_adjacency_segment_trusted(
         &self,
         cell_id: &str,
         edge_type: &str,
@@ -3967,11 +3731,11 @@ impl GraphShard {
                 feature: "segment trusted append requires outbound-only index policy".to_string(),
             });
         }
-        self.ensure_write_authority(cell_id, "bulk_append_supernode_segment_trusted")?;
+        self.ensure_write_authority(cell_id, "bulk_append_out_adjacency_segment_trusted")?;
 
         let mut dsts: Vec<_> = dsts.into_iter().collect();
         ensure_limit(
-            "bulk_append_supernode_segment_trusted",
+            "bulk_append_out_adjacency_segment_trusted",
             dsts.len() as u64,
             self.limits.max_bulk_import_edges as u64,
         )?;
@@ -3981,12 +3745,12 @@ impl GraphShard {
         let fingerprint = bulk_import_fingerprint(cell_id, edge_type, &edges);
 
         let _permit = self
-            .acquire_graph_write_permit("bulk_append_supernode_segment_trusted")
+            .acquire_graph_write_permit("bulk_append_out_adjacency_segment_trusted")
             .await?;
         let _writer = self.writer_lane(cell_id).lock().await;
         for attempt in 0..GRAPH_TXN_MAX_RETRIES {
             match self
-                .bulk_append_supernode_segment_trusted_txn(
+                .bulk_append_out_adjacency_segment_trusted_txn(
                     cell_id,
                     edge_type,
                     src,
@@ -4003,12 +3767,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(result) => {
                     self.operation_metrics
@@ -4069,12 +3827,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(result) => {
                     self.operation_metrics
@@ -4184,12 +3936,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(result) => {
                     self.operation_metrics
@@ -4321,12 +4067,6 @@ impl GraphShard {
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
-                }
                 Ok(result) => {
                     self.operation_metrics
                         .write_commits
@@ -4444,7 +4184,7 @@ impl GraphShard {
                 .materialized_log_epoch
                 .checked_add(1)
                 .map(|epoch| format!("{epoch:020}/"))
-                .unwrap_or_else(|| format!("{:020}/", GraphEpoch::MAX));
+                .unwrap_or_else(|| format!("{:020}/", TopologySequence::MAX));
             let mut iter = self
                 .scan_remote_prefix_from(&keys::mutation_log_prefix(cell_id), &start_suffix)
                 .await?;
@@ -4519,8 +4259,8 @@ impl GraphShard {
     async fn materialize_edge_mutation_log_batches(
         &self,
         cell_id: &str,
-        last_log_epoch: GraphEpoch,
-        batches: Vec<(GraphEpoch, Vec<EdgeMutation>)>,
+        last_log_epoch: TopologySequence,
+        batches: Vec<(TopologySequence, Vec<EdgeMutation>)>,
     ) -> Result<EdgeMutationBatchResult> {
         let mutation_count = batches
             .iter()
@@ -4558,12 +4298,6 @@ impl GraphShard {
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
-                }
                 Ok(result) => {
                     self.operation_metrics
                         .write_commits
@@ -4584,7 +4318,7 @@ impl GraphShard {
         cell_id: &str,
         mutations: &[EdgeMutation],
         operation: &'static str,
-        materialized_log_epoch: Option<GraphEpoch>,
+        materialized_log_epoch: Option<TopologySequence>,
         endpoint_labels: Option<(&str, &str)>,
     ) -> Result<EdgeMutationBatchResult> {
         let lock = self.acquire_cell_write_lock(cell_id, operation).await?;
@@ -4605,7 +4339,7 @@ impl GraphShard {
         cell_id: &str,
         mutations: &[EdgeMutation],
         operation: &'static str,
-        materialized_log_epoch: Option<GraphEpoch>,
+        materialized_log_epoch: Option<TopologySequence>,
         endpoint_labels: Option<(&str, &str)>,
     ) -> Result<EdgeMutationBatchResult> {
         let txn = self
@@ -4629,10 +4363,10 @@ impl GraphShard {
         let current_epoch = read_counter_txn(&txn, &keys::last_epoch(cell_id)).await?;
         let mut next_epoch = current_epoch;
         let mut results = Vec::with_capacity(mutations.len());
-        let mut known_edges = BTreeMap::<(String, VertexId, VertexId), GraphEpoch>::new();
+        let mut known_edges = BTreeMap::<(String, VertexId, VertexId), TopologySequence>::new();
         let mut validated_endpoints = BTreeSet::<(VertexId, String)>::new();
         let mut segment_edges_by_type_src =
-            BTreeMap::<(String, VertexId), BTreeMap<VertexId, GraphEpoch>>::new();
+            BTreeMap::<(String, VertexId), BTreeMap<VertexId, TopologySequence>>::new();
         let mut out_increments = BTreeMap::<(String, VertexId), u64>::new();
         let mut in_increments = BTreeMap::<(String, VertexId), u64>::new();
         let write_reverse_index = self.writes_reverse_index();
@@ -4986,7 +4720,7 @@ impl GraphShard {
         })
     }
 
-    pub(crate) async fn bulk_append_supernode_segment_trusted_txn(
+    pub(crate) async fn bulk_append_out_adjacency_segment_trusted_txn(
         &self,
         cell_id: &str,
         edge_type: &str,
@@ -4996,10 +4730,10 @@ impl GraphShard {
         fingerprint: u64,
     ) -> Result<BulkImportResult> {
         let lock = self
-            .acquire_cell_write_lock(cell_id, "bulk_append_supernode_segment_trusted")
+            .acquire_cell_write_lock(cell_id, "bulk_append_out_adjacency_segment_trusted")
             .await?;
         let result = self
-            .bulk_append_supernode_segment_trusted_txn_locked(
+            .bulk_append_out_adjacency_segment_trusted_txn_locked(
                 cell_id,
                 edge_type,
                 src,
@@ -5011,7 +4745,7 @@ impl GraphShard {
         release_cell_write_lock(lock, result).await
     }
 
-    async fn bulk_append_supernode_segment_trusted_txn_locked(
+    async fn bulk_append_out_adjacency_segment_trusted_txn_locked(
         &self,
         cell_id: &str,
         edge_type: &str,
@@ -5025,7 +4759,7 @@ impl GraphShard {
             .writer()?
             .begin(IsolationLevel::SerializableSnapshot)
             .await?;
-        self.validate_write_fence_txn(&txn, cell_id, "bulk_append_supernode_segment_trusted")
+        self.validate_write_fence_txn(&txn, cell_id, "bulk_append_out_adjacency_segment_trusted")
             .await?;
         let idem_key = keys::idempotency(cell_id, "segment-import", idempotency_key);
         if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
@@ -5380,7 +5114,7 @@ fn push_delete_outbox_run(
     runs: &mut Vec<DeleteOutboxRun>,
     current: &mut Option<DeleteOutboxRun>,
     edge_type: &str,
-    epoch: GraphEpoch,
+    epoch: TopologySequence,
     src: VertexId,
     dst: VertexId,
 ) -> Result<()> {
@@ -5600,14 +5334,10 @@ fn apply_vertex_metadata_update_txn(
     vertex_id: VertexId,
     previous: &VertexMetadata,
     next: &VertexMetadata,
-    epoch: GraphEpoch,
+    _epoch: TopologySequence,
 ) -> Result<()> {
     validate_vertex_metadata(next)?;
     let vertex_key = keys::vertex(cell_id, vertex_id);
-    txn.put(
-        keys::vertex_delta(cell_id, vertex_id, epoch).as_bytes(),
-        encode_vertex_metadata(next).as_slice(),
-    )?;
     delete_vertex_metadata_indexes_txn(txn, cell_id, vertex_id, previous)?;
     if next.labels.is_empty() && next.properties.is_empty() {
         txn.delete(vertex_key.as_bytes())?;
@@ -5618,7 +5348,7 @@ fn apply_vertex_metadata_update_txn(
         )?;
         put_vertex_metadata_indexes_txn(txn, cell_id, vertex_id, next)?;
     }
-    put_vertex_metadata_index_deltas_txn(txn, cell_id, vertex_id, previous, next, epoch)
+    Ok(())
 }
 
 fn put_vertex_metadata_indexes_txn(
@@ -5671,80 +5401,16 @@ fn delete_vertex_metadata_indexes_txn(
     Ok(())
 }
 
-fn put_vertex_metadata_index_deltas_txn(
-    txn: &DbTransaction,
-    cell_id: &str,
-    vertex_id: VertexId,
-    previous: &VertexMetadata,
-    next: &VertexMetadata,
-    epoch: GraphEpoch,
-) -> Result<()> {
-    for label in previous.labels.difference(&next.labels) {
-        txn.put(
-            keys::vertex_label_delta(cell_id, label, epoch, vertex_id).as_bytes(),
-            encode_vertex_index_delta(false).as_slice(),
-        )?;
-    }
-    for label in next.labels.difference(&previous.labels) {
-        txn.put(
-            keys::vertex_label_delta(cell_id, label, epoch, vertex_id).as_bytes(),
-            encode_vertex_index_delta(true).as_slice(),
-        )?;
-    }
-    for (property, value) in &previous.properties {
-        if next.properties.get(property) != Some(value) {
-            txn.put(
-                keys::vertex_property_index_delta(
-                    cell_id,
-                    property,
-                    &encode_vertex_property_value_key(value),
-                    epoch,
-                    vertex_id,
-                )
-                .as_bytes(),
-                encode_vertex_index_delta(false).as_slice(),
-            )?;
-        }
-    }
-    for (property, value) in &next.properties {
-        if previous.properties.get(property) != Some(value) {
-            txn.put(
-                keys::vertex_property_index_delta(
-                    cell_id,
-                    property,
-                    &encode_vertex_property_value_key(value),
-                    epoch,
-                    vertex_id,
-                )
-                .as_bytes(),
-                encode_vertex_index_delta(true).as_slice(),
-            )?;
-        }
-    }
-    Ok(())
-}
-
 fn apply_edge_metadata_update_txn(
     txn: &DbTransaction,
     target: EdgeMetadataTarget<'_>,
     previous: &EdgeMetadata,
     next: &EdgeMetadata,
-    epoch: GraphEpoch,
+    _epoch: TopologySequence,
 ) -> Result<()> {
     validate_edge_metadata(next)?;
     let edge_metadata_key =
         keys::edge_metadata(target.cell_id, target.edge_type, target.src, target.dst);
-    txn.put(
-        keys::edge_metadata_delta(
-            target.cell_id,
-            target.edge_type,
-            target.src,
-            target.dst,
-            epoch,
-        )
-        .as_bytes(),
-        encode_edge_metadata(next).as_slice(),
-    )?;
     delete_edge_metadata_indexes_txn(txn, target, previous)?;
     if next.properties.is_empty() {
         txn.delete(edge_metadata_key.as_bytes())?;
@@ -5755,7 +5421,7 @@ fn apply_edge_metadata_update_txn(
         )?;
         put_edge_metadata_indexes_txn(txn, target, next)?;
     }
-    put_edge_metadata_index_deltas_txn(txn, target, previous, next, epoch)
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -5807,28 +5473,6 @@ fn put_relationship_property_indexes_txn(
             encode_u64(record.relationship_id).as_slice(),
         )?;
     }
-    Ok(())
-}
-
-fn put_relationship_metadata_delta_txn(
-    txn: &DbTransaction,
-    record: &RelationshipRecord,
-    metadata: &EdgeMetadata,
-    epoch: GraphEpoch,
-) -> Result<()> {
-    validate_edge_metadata(metadata)?;
-    txn.put(
-        keys::relationship_metadata_delta(
-            &record.cell_id,
-            &record.edge_type,
-            record.src,
-            record.dst,
-            record.relationship_id,
-            epoch,
-        )
-        .as_bytes(),
-        encode_edge_metadata(metadata).as_slice(),
-    )?;
     Ok(())
 }
 
@@ -5905,10 +5549,7 @@ async fn relationship_ids_for_edge_property_txn(
             });
         };
         let record = decode_relationship_record(&record_key, &record_value)?;
-        if record.epoch <= read_epoch
-            && !relationship_deleted_at_txn(txn, &record, read_epoch).await?
-            && record.metadata.properties.get(property) == Some(value)
-        {
+        if record.epoch <= read_epoch && record.metadata.properties.get(property) == Some(value) {
             relationship_ids.push(relationship_id);
         }
     }
@@ -5917,41 +5558,13 @@ async fn relationship_ids_for_edge_property_txn(
     Ok(relationship_ids)
 }
 
-async fn relationship_tombstone_epoch_txn(
-    txn: &DbTransaction,
-    record: &RelationshipRecord,
-) -> Result<Option<GraphEpoch>> {
-    let key = keys::relationship_tombstone(
-        &record.cell_id,
-        &record.edge_type,
-        record.src,
-        record.dst,
-        record.relationship_id,
-    );
-    match read_txn_remote(txn, &key).await? {
-        Some(value) => Ok(Some(decode_u64(&key, &value)?)),
-        None => Ok(None),
-    }
-}
-
-async fn relationship_deleted_at_txn(
-    txn: &DbTransaction,
-    record: &RelationshipRecord,
-    read_epoch: GraphEpoch,
-) -> Result<bool> {
-    Ok(match relationship_tombstone_epoch_txn(txn, record).await? {
-        Some(tombstone_epoch) => record.epoch <= tombstone_epoch && tombstone_epoch <= read_epoch,
-        None => false,
-    })
-}
-
 async fn live_relationships_for_edge_txn(
     txn: &DbTransaction,
     cell_id: &str,
     edge_type: &str,
     src: VertexId,
     dst: VertexId,
-    read_epoch: GraphEpoch,
+    read_epoch: TopologySequence,
 ) -> Result<Vec<RelationshipRecord>> {
     let prefix = keys::relationship_edge_prefix(cell_id, edge_type, src, dst);
     let mut iter = txn.scan_prefix(prefix.as_bytes(), ..).await?;
@@ -5960,9 +5573,6 @@ async fn live_relationships_for_edge_txn(
         let key = String::from_utf8_lossy(&kv.key).into_owned();
         let record = decode_relationship_record(&key, &kv.value)?;
         if record.epoch > read_epoch {
-            continue;
-        }
-        if relationship_deleted_at_txn(txn, &record, read_epoch).await? {
             continue;
         }
         records.push(record);
@@ -5974,7 +5584,7 @@ async fn delete_structural_edge_txn(
     shard: &GraphShard,
     txn: &DbTransaction,
     mutation: &EdgeMutation,
-    epoch: GraphEpoch,
+    epoch: TopologySequence,
 ) -> Result<()> {
     let edge_key = keys::out_edge(
         &mutation.cell_id,
@@ -6116,14 +5726,21 @@ fn put_scoped_delta_indexes_txn(txn: &DbTransaction, delta: &DeltaRecord) -> Res
         .as_bytes(),
         value,
     )?;
+    txn.put(
+        keys::matrix_dirty(&delta.edge.cell_id, &delta.edge.edge_type).as_bytes(),
+        encode_u64(delta.edge.epoch),
+    )?;
+    txn.put(
+        keys::adjacency_generation(&delta.edge.cell_id, &delta.edge.edge_type).as_bytes(),
+        encode_u64(delta.edge.epoch),
+    )?;
     Ok(())
 }
 
-async fn tombstone_relationships_for_structural_edge_delete_txn(
+async fn delete_relationships_for_structural_edge_txn(
     txn: &DbTransaction,
     mutation: &EdgeMutation,
-    delete_epoch: GraphEpoch,
-    read_epoch: GraphEpoch,
+    read_epoch: TopologySequence,
 ) -> Result<u64> {
     let relationships = live_relationships_for_edge_txn(
         txn,
@@ -6135,8 +5752,8 @@ async fn tombstone_relationships_for_structural_edge_delete_txn(
     )
     .await?;
     for record in &relationships {
-        txn.put(
-            keys::relationship_tombstone(
+        txn.delete(
+            keys::relationship(
                 &record.cell_id,
                 &record.edge_type,
                 record.src,
@@ -6144,17 +5761,9 @@ async fn tombstone_relationships_for_structural_edge_delete_txn(
                 record.relationship_id,
             )
             .as_bytes(),
-            encode_u64(delete_epoch),
         )?;
         txn.delete(keys::relationship_id(&record.cell_id, record.relationship_id).as_bytes())?;
         delete_relationship_property_indexes_txn(txn, record, &record.metadata)?;
-        put_relationship_property_index_deltas_txn(
-            txn,
-            record,
-            &record.metadata,
-            &EdgeMetadata::default(),
-            delete_epoch,
-        )?;
     }
     txn.delete(
         keys::relationship_count(
@@ -6172,7 +5781,7 @@ async fn tombstone_relationships_for_structural_edge_delete_txn(
             mutation.src,
             mutation.dst,
         ),
-        reason: format!("too many relationships to tombstone during edge delete: {err}"),
+        reason: format!("too many relationships to delete with structural edge: {err}"),
     })
 }
 
@@ -6198,52 +5807,6 @@ fn delete_relationship_property_indexes_txn(
     Ok(())
 }
 
-fn put_relationship_property_index_deltas_txn(
-    txn: &DbTransaction,
-    record: &RelationshipRecord,
-    previous: &EdgeMetadata,
-    next: &EdgeMetadata,
-    epoch: GraphEpoch,
-) -> Result<()> {
-    for (property, value) in &previous.properties {
-        if next.properties.get(property) != Some(value) {
-            txn.put(
-                keys::relationship_property_index_delta(keys::RelationshipPropertyIndexDeltaKey {
-                    cell_id: &record.cell_id,
-                    edge_type: &record.edge_type,
-                    property,
-                    encoded_value: &encode_vertex_property_value_key(value),
-                    epoch,
-                    src: record.src,
-                    dst: record.dst,
-                    relationship_id: record.relationship_id,
-                })
-                .as_bytes(),
-                encode_vertex_index_delta(false).as_slice(),
-            )?;
-        }
-    }
-    for (property, value) in &next.properties {
-        if previous.properties.get(property) != Some(value) {
-            txn.put(
-                keys::relationship_property_index_delta(keys::RelationshipPropertyIndexDeltaKey {
-                    cell_id: &record.cell_id,
-                    edge_type: &record.edge_type,
-                    property,
-                    encoded_value: &encode_vertex_property_value_key(value),
-                    epoch,
-                    src: record.src,
-                    dst: record.dst,
-                    relationship_id: record.relationship_id,
-                })
-                .as_bytes(),
-                encode_vertex_index_delta(true).as_slice(),
-            )?;
-        }
-    }
-    Ok(())
-}
-
 fn delete_edge_metadata_indexes_txn(
     txn: &DbTransaction,
     target: EdgeMetadataTarget<'_>,
@@ -6261,50 +5824,6 @@ fn delete_edge_metadata_indexes_txn(
             )
             .as_bytes(),
         )?;
-    }
-    Ok(())
-}
-
-fn put_edge_metadata_index_deltas_txn(
-    txn: &DbTransaction,
-    target: EdgeMetadataTarget<'_>,
-    previous: &EdgeMetadata,
-    next: &EdgeMetadata,
-    epoch: GraphEpoch,
-) -> Result<()> {
-    for (property, value) in &previous.properties {
-        if next.properties.get(property) != Some(value) {
-            txn.put(
-                keys::edge_property_index_delta(
-                    target.cell_id,
-                    target.edge_type,
-                    property,
-                    &encode_vertex_property_value_key(value),
-                    epoch,
-                    target.src,
-                    target.dst,
-                )
-                .as_bytes(),
-                encode_vertex_index_delta(false).as_slice(),
-            )?;
-        }
-    }
-    for (property, value) in &next.properties {
-        if previous.properties.get(property) != Some(value) {
-            txn.put(
-                keys::edge_property_index_delta(
-                    target.cell_id,
-                    target.edge_type,
-                    property,
-                    &encode_vertex_property_value_key(value),
-                    epoch,
-                    target.src,
-                    target.dst,
-                )
-                .as_bytes(),
-                encode_vertex_index_delta(true).as_slice(),
-            )?;
-        }
     }
     Ok(())
 }

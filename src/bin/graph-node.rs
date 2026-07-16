@@ -17,11 +17,10 @@ use std::time::Duration;
 use config::RuntimeConfig;
 use slatedb_graph_kernel::{
     object_store_from_env, BoltServerConfig, ClientBoltServer, ClientHttpServer,
-    ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget,
-    ControllerBoltRoutingTableProvider, GraphControlClient, GraphControlRpcClient,
-    GraphControlRpcClientConfig, GraphError, GraphNode, GraphNodeHealthState,
-    GraphNodeRuntimeConfig, HttpQueryServerConfig, QueryTransportAction, QueryTransportScopeGrant,
-    StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer,
+    ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget, HttpQueryServerConfig,
+    QueryTransportAction, QueryTransportScopeGrant, RendezvousBoltRoutingTableProvider,
+    RoutedGraphCluster, ShardPlacement, StaticClientDatabaseResolver,
+    StaticQueryTransportScopeAuthorizer,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -41,57 +40,37 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     role_publisher.publish(false).await?;
     std::fs::create_dir_all(&config.data_cache_dir)?;
     let object_store = object_store_from_env(None)?;
-    let internal_tls = if config.internal_allow_plaintext {
-        None
-    } else {
-        Some(tls::FileMutualTlsClientReloader::start(
-            config
-                .internal_tls_certificate
-                .as_deref()
-                .expect("validated internal certificate"),
-            config
-                .internal_tls_private_key
-                .as_deref()
-                .expect("validated internal private key"),
-            config
-                .internal_tls_ca
-                .as_deref()
-                .expect("validated internal CA"),
-            Duration::from_secs(1),
-        )?)
-    };
-    let control_config = if let Some(reloader) = &internal_tls {
-        GraphControlRpcClientConfig::new(
-            config.control_rpc_server_name.clone(),
-            reloader.provider(),
-        )
-    } else {
-        GraphControlRpcClientConfig::insecure_allow_plaintext()
-    };
-    let control = Arc::new(GraphControlRpcClient::new(
-        config.control_rpc_endpoint.as_str(),
-        config.scope.clone(),
-        control_config,
-    )?);
     let open_options = config.graph_open_options();
     let memory_config = config.graph_memory_config();
-    wait_for_initial_placement(&config, control.as_ref()).await?;
+    let placement = ShardPlacement::rendezvous(
+        config.cells.iter().cloned(),
+        config.bolt_node_addresses.keys().cloned(),
+    )?;
     let node = Arc::new(
-        GraphNode::open_managed_with_memory_config(
+        RoutedGraphCluster::open_fenced_owned_scoped_with_memory_options(
             config.data_path.clone(),
+            config.scope.clone(),
             config.node_id.clone(),
-            Arc::clone(&control),
+            placement.clone(),
             object_store,
-            GraphNodeRuntimeConfig::new(
-                config.lease_ttl,
-                config.lease_renew_interval,
-                config.shard_refresh_interval,
-            )
-            .with_options(open_options),
+            open_options,
             memory_config,
         )
         .await?,
     );
+    let matrix_refresh = if config.matrix_auto_refresh_enabled {
+        Some(node.start_matrix_artifact_refresh_job(
+            slatedb_graph_kernel::MatrixArtifactRefreshPolicy {
+                interval: config.matrix_refresh_interval,
+                max_dirty_age: config.matrix_refresh_max_dirty_age,
+                min_epoch_lag: config.matrix_refresh_min_epoch_lag,
+                tile_size: config.matrix_refresh_tile_size,
+                max_edge_types_per_cycle: config.matrix_refresh_max_edge_types_per_cycle,
+            },
+        )?)
+    } else {
+        None
+    };
 
     let token = config.read_auth_token()?;
     let authorizer = StaticQueryTransportScopeAuthorizer::new().with_bearer_grant(
@@ -112,7 +91,12 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
             .with_required_bearer_token(token)
             .with_scope_authorizer(Arc::new(authorizer))
             .with_max_concurrent_queries(config.max_concurrent_queries)
-            .with_max_query_runtime_ms(config.max_query_runtime_ms),
+            .with_max_query_runtime_ms(config.max_query_runtime_ms)
+            .with_server_cursor_limits(
+                config.max_server_cursors,
+                config.max_cursor_buffer_bytes,
+                config.cursor_ttl.as_millis().try_into()?,
+            ),
     )?;
     let target = ClientQueryTarget::new(config.scope.clone(), config.cell_id.clone())?;
     let resolver = Arc::new(StaticClientDatabaseResolver::single(
@@ -140,12 +124,8 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         .with_default_database(config.database.clone())
         .with_max_connections(config.max_bolt_connections)
         .with_graceful_shutdown_timeout(config.graceful_shutdown_timeout);
-    let routing = ControllerBoltRoutingTableProvider::new(
-        Arc::clone(&control),
-        config.bolt_node_addresses.clone(),
-        config.heartbeat_ttl,
-        30,
-    )?;
+    let routing =
+        RendezvousBoltRoutingTableProvider::new(placement, config.bolt_node_addresses.clone(), 30)?;
     bolt_config = bolt_config.with_routing_table_provider(Arc::new(routing));
     if let Some(provider) = &tls_provider {
         bolt_config = bolt_config.with_tls_provider(Arc::clone(provider));
@@ -173,11 +153,11 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         config.cell_id.clone(),
         role_publisher.clone(),
     );
-    let admin = admin::AdminServer::bind(
+    let admin = admin::AdminServer::bind_routed(
         config.admin_addr,
         Arc::clone(&ready),
-        Arc::clone(&control),
-        Some(service.clone()),
+        service.clone(),
+        Arc::clone(&node),
     )
     .await?;
     ready.store(true, Ordering::Release);
@@ -196,27 +176,25 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     let _ = serving_stop.send(true);
     serving_task.await??;
     role_publisher.publish(false).await?;
-    node.set_health_state(GraphNodeHealthState::Draining)
-        .await?;
     admin.stop().await?;
     http.stop().await?;
     bolt.stop().await?;
     if let Some(tls_reloader) = tls_reloader {
         tls_reloader.stop().await;
     }
+    if let Some(matrix_refresh) = matrix_refresh {
+        matrix_refresh.stop().await?;
+    }
     drop(service);
     let node =
         Arc::try_unwrap(node).map_err(|_| "graph node still has active runtime references")?;
     node.close().await?;
-    if let Some(internal_tls) = internal_tls {
-        internal_tls.stop().await;
-    }
     tracing::info!(node_id = %config.node_id, "graph node stopped");
     Ok(())
 }
 
 fn start_serving_monitor(
-    node: Arc<slatedb_graph_kernel::ManagedGraphNode>,
+    node: Arc<RoutedGraphCluster>,
     cell_id: String,
     role_publisher: kubernetes::KubernetesPodRolePublisher,
 ) -> (
@@ -229,9 +207,8 @@ fn start_serving_monitor(
         loop {
             let owns_cell = node
                 .local_cells()
-                .await
-                .map(|cells| cells.iter().any(|candidate| candidate == &cell_id))
-                .unwrap_or(false);
+                .iter()
+                .any(|candidate| *candidate == cell_id);
             if owns_cell != published {
                 match role_publisher.publish(owns_cell).await {
                     Ok(()) => published = owns_cell,
@@ -251,31 +228,6 @@ fn start_serving_monitor(
         }
     });
     (stop_tx, task)
-}
-
-async fn wait_for_initial_placement(
-    config: &RuntimeConfig,
-    control: &dyn GraphControlClient,
-) -> RuntimeResult<()> {
-    const MAX_ATTEMPTS: usize = 120;
-    for attempt in 1..=MAX_ATTEMPTS {
-        control
-            .publish_node_heartbeat(&config.node_id, GraphNodeHealthState::Active)
-            .await?;
-        match control.load_placement().await {
-            Ok(placement) if placement.cells().next().is_some() => return Ok(()),
-            Ok(_) => {}
-            Err(GraphError::CorruptValue { key, .. }) if key == "placement" => {}
-            Err(error) => return Err(error.into()),
-        }
-        tracing::info!(attempt, node_id = %config.node_id, "waiting for initial shard placement");
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    Err(format!(
-        "controller did not publish initial placement for node {} within 60 seconds",
-        config.node_id
-    )
-    .into())
 }
 
 fn init_tracing() {

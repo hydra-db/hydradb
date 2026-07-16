@@ -36,16 +36,6 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 14 }}
-      ports:
-        - protocol: TCP
-          port: 9443
-    - from:
-        - podSelector:
-            matchLabels:
-              {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 14 }}
-        - podSelector:
-            matchLabels:
-              {{- include "turbolay.componentLabels" (dict "root" . "component" "controller") | nindent 14 }}
         - namespaceSelector:
             {{- toYaml .Values.networkPolicy.monitoringNamespaceSelector | nindent 12 }}
       ports:
@@ -83,8 +73,6 @@ spec:
           port: 8443
         - protocol: TCP
           port: 9090
-        - protocol: TCP
-          port: 9443
     {{- with .Values.networkPolicy.httpsEgressTo }}
     - to:
         {{- toYaml . | nindent 8 }}
