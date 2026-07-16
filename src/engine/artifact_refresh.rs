@@ -44,7 +44,8 @@ impl RoutedGraphCluster {
         let metrics = Arc::clone(&self.maintenance_metrics);
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
-            let mut first_observed_dirty = BTreeMap::<(String, String), Instant>::new();
+            let mut first_observed_dirty =
+                BTreeMap::<(String, String), DirtyGenerationObservation>::new();
             let mut next_candidate_offset = 0_usize;
             loop {
                 metrics
@@ -106,7 +107,7 @@ impl RoutedGraphCluster {
 async fn refresh_matrix_artifacts_once_for_shards(
     shards: Vec<(String, Arc<GraphShard>)>,
     policy: &MatrixArtifactRefreshPolicy,
-    first_observed_dirty: &mut BTreeMap<(String, String), Instant>,
+    first_observed_dirty: &mut BTreeMap<(String, String), DirtyGenerationObservation>,
     next_candidate_offset: &mut usize,
 ) -> Result<MatrixArtifactRefreshReport> {
     let mut report = MatrixArtifactRefreshReport::default();
@@ -148,9 +149,8 @@ async fn refresh_matrix_artifacts_once_for_shards(
 
     for (cell_id, shard, edge_type, dirty_epoch) in candidates.into_iter().take(process_count) {
         let observation_key = (cell_id.clone(), edge_type.clone());
-        let observed_at = *first_observed_dirty
-            .entry(observation_key.clone())
-            .or_insert_with(Instant::now);
+        let observed_at =
+            observe_dirty_generation(first_observed_dirty, observation_key.clone(), dirty_epoch);
         let latest = match shard
             .latest_matrix_artifact(&cell_id, &edge_type, dirty_epoch)
             .await
@@ -239,6 +239,10 @@ async fn refresh_matrix_artifacts_once_for_shards(
                 );
             }
             Err(GraphError::SnapshotChanged { .. }) => {
+                // The build raced a newer topology generation. Let that
+                // generation age from the next observation instead of
+                // inheriting the elapsed debounce time of this attempt.
+                first_observed_dirty.remove(&observation_key);
                 report.artifacts_deferred = report.artifacts_deferred.saturating_add(1);
             }
             Err(err) => {
@@ -255,6 +259,33 @@ async fn refresh_matrix_artifacts_once_for_shards(
         }
     }
     Ok(report)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DirtyGenerationObservation {
+    dirty_epoch: TopologySequence,
+    observed_at: Instant,
+}
+
+fn observe_dirty_generation(
+    observations: &mut BTreeMap<(String, String), DirtyGenerationObservation>,
+    key: (String, String),
+    dirty_epoch: TopologySequence,
+) -> Instant {
+    let now = Instant::now();
+    let observation = observations
+        .entry(key)
+        .or_insert(DirtyGenerationObservation {
+            dirty_epoch,
+            observed_at: now,
+        });
+    if observation.dirty_epoch != dirty_epoch {
+        *observation = DirtyGenerationObservation {
+            dirty_epoch,
+            observed_at: now,
+        };
+    }
+    observation.observed_at
 }
 
 impl GraphShard {
@@ -319,4 +350,28 @@ fn invalid_refresh_policy(reason: &str) -> Result<()> {
         key: "artifact/matrix_refresh_policy".to_string(),
         reason: reason.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dirty_observation_restarts_when_the_generation_advances() {
+        let key = ("cell-a".to_string(), "FOLLOWS".to_string());
+        let first = Instant::now() - std::time::Duration::from_secs(1);
+        let mut observations = BTreeMap::from([(
+            key.clone(),
+            DirtyGenerationObservation {
+                dirty_epoch: 7,
+                observed_at: first,
+            },
+        )]);
+
+        assert_eq!(
+            observe_dirty_generation(&mut observations, key.clone(), 7),
+            first
+        );
+        assert!(observe_dirty_generation(&mut observations, key, 8) > first);
+    }
 }

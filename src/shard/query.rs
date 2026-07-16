@@ -505,29 +505,31 @@ impl GraphShard {
         let budget = QueryBudget::new(
             context.max_runtime_ms.or(self.limits.max_query_runtime_ms),
             context.cancellation_token.clone(),
-        );
+        )
+        .with_max_result_bytes(context.max_result_bytes);
         budget.check("cypher_rows")?;
         let read_epoch = self.query_read_epoch(&context).await?;
 
-        if !query.union_arms.is_empty() {
-            return self
-                .execute_union_opencypher_rows(
-                    &context.cell_id,
-                    read_epoch,
-                    query,
-                    context.result_window,
-                    &budget,
-                )
-                .await;
-        }
-        self.execute_single_opencypher_rows(
-            &context.cell_id,
-            read_epoch,
-            query,
-            context.result_window,
-            &budget,
-        )
-        .await
+        let result = if !query.union_arms.is_empty() {
+            self.execute_union_opencypher_rows(
+                &context.cell_id,
+                read_epoch,
+                query,
+                context.result_window,
+                &budget,
+            )
+            .await
+        } else {
+            self.execute_single_opencypher_rows(
+                &context.cell_id,
+                read_epoch,
+                query,
+                context.result_window,
+                &budget,
+            )
+            .await
+        }?;
+        Ok(result.with_read_epoch(read_epoch))
     }
 
     #[cfg(feature = "opencypher")]
@@ -660,7 +662,7 @@ impl GraphShard {
             budget.check("cypher_project")?;
             let row = project_binding_row(binding, &query.projections)?;
             let sort_keys = sort_keys_for_row(binding, &row, &query.columns, &query.order_by)?;
-            projected.push(ProjectedQueryRow { row, sort_keys });
+            push_projected_query_row(&mut projected, row, sort_keys, budget)?;
         }
         self.finish_projected_rows(
             query.columns,
@@ -696,7 +698,9 @@ impl GraphShard {
                 )
                 .await?;
             self.ensure_query_scan_edges("cypher_graph_kernel_count_edge_visits", edge_visits)?;
-            let rows = vec![QueryRow::new(vec![QueryValue::Count(count)])];
+            let row = QueryRow::new(vec![QueryValue::Count(count)]);
+            budget.account_result_row(&row)?;
+            let rows = vec![row];
             return Ok(Some(QueryResultSet::new(
                 query.columns.clone(),
                 self.apply_query_row_window(rows, window)?,
@@ -751,8 +755,10 @@ impl GraphShard {
                 })
                 .collect(),
             GraphKernelProjection::CountAll => {
+                let row = QueryRow::new(vec![QueryValue::Count(vertices.len() as u64)]);
+                budget.account_result_row(&row)?;
                 vec![ProjectedQueryRow {
-                    row: QueryRow::new(vec![QueryValue::Count(vertices.len() as u64)]),
+                    row,
                     sort_keys: Vec::new(),
                 }]
             }
@@ -817,7 +823,7 @@ impl GraphShard {
             let row = project_relationship_row(edge, &relationship, &metadata, &query.projections)?;
             let sort_keys =
                 sort_keys_for_relationship_row(edge, &relationship, &metadata, &row, query)?;
-            projected.push(ProjectedQueryRow { row, sort_keys });
+            push_projected_query_row(&mut projected, row, sort_keys, budget)?;
             self.ensure_query_intermediate_rows(
                 "cypher_relationship_rows_fast_path",
                 projected.len(),
@@ -858,7 +864,7 @@ impl GraphShard {
             budget.check("cypher_source_relationship_id_project")?;
             let row = project_binding_row(&binding, &query.projections)?;
             let sort_keys = sort_keys_for_row(&binding, &row, &query.columns, &query.order_by)?;
-            projected.push(ProjectedQueryRow { row, sort_keys });
+            push_projected_query_row(&mut projected, row, sort_keys, budget)?;
         }
         Ok(Some(self.finish_projected_rows(
             query.columns.clone(),
@@ -888,7 +894,9 @@ impl GraphShard {
         let count = self
             .relationship_count_for_edge_at(cell_id, &edge.edge_type, src, dst, read_epoch, budget)
             .await?;
-        let rows = vec![QueryRow::new(vec![QueryValue::Count(count)])];
+        let row = QueryRow::new(vec![QueryValue::Count(count)]);
+        budget.account_result_row(&row)?;
+        let rows = vec![row];
         Ok(Some(QueryResultSet::new(
             query.columns.clone(),
             self.apply_query_row_window(rows, window)?,
@@ -6753,6 +6761,10 @@ struct QueryBudget {
     started_at: std::time::Instant,
     max_runtime_ms: Option<u64>,
     cancellation_token: Option<QueryCancellationToken>,
+    #[cfg(feature = "opencypher")]
+    max_result_bytes: Option<u64>,
+    #[cfg(feature = "opencypher")]
+    result_bytes: Arc<AtomicU64>,
 }
 
 impl QueryBudget {
@@ -6764,7 +6776,40 @@ impl QueryBudget {
             started_at: std::time::Instant::now(),
             max_runtime_ms,
             cancellation_token,
+            #[cfg(feature = "opencypher")]
+            max_result_bytes: None,
+            #[cfg(feature = "opencypher")]
+            result_bytes: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn with_max_result_bytes(mut self, max_result_bytes: Option<u64>) -> Self {
+        self.max_result_bytes = max_result_bytes;
+        self
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn account_result_row(&self, row: &QueryRow) -> Result<()> {
+        let Some(limit) = self.max_result_bytes else {
+            return Ok(());
+        };
+        let bytes = row.estimated_resident_bytes();
+        let previous = self
+            .result_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(bytes))
+            })
+            .unwrap_or_else(|current| current);
+        let actual = previous.saturating_add(bytes);
+        if actual > limit {
+            return Err(GraphError::AdmissionRejected {
+                operation: "client_cursor_buffer_bytes",
+                actual,
+                limit,
+            });
+        }
+        Ok(())
     }
 
     fn check(&self, operation: &'static str) -> Result<()> {
@@ -6982,7 +7027,9 @@ fn graph_kernel_node_id_rows(
     let mut rows = Vec::with_capacity(vertices.len());
     for vertex in vertices {
         budget.check("cypher_graph_kernel_project")?;
-        rows.push(QueryRow::new(vec![QueryValue::VertexId(vertex)]));
+        let row = QueryRow::new(vec![QueryValue::VertexId(vertex)]);
+        budget.account_result_row(&row)?;
+        rows.push(row);
     }
     Ok(rows)
 }
@@ -7875,6 +7922,18 @@ struct ProjectedQueryRow {
 }
 
 #[cfg(feature = "opencypher")]
+fn push_projected_query_row(
+    projected: &mut Vec<ProjectedQueryRow>,
+    row: QueryRow,
+    sort_keys: Vec<QueryValue>,
+    budget: &QueryBudget,
+) -> Result<()> {
+    budget.account_result_row(&row)?;
+    projected.push(ProjectedQueryRow { row, sort_keys });
+    Ok(())
+}
+
+#[cfg(feature = "opencypher")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RowScalarValue {
     Value(VertexPropertyValue),
@@ -8474,7 +8533,7 @@ fn aggregate_projected_rows(
         }
         let row = QueryRow::new(values);
         let sort_keys = sort_keys_for_projected_only(&row, columns, order_by)?;
-        projected.push(ProjectedQueryRow { row, sort_keys });
+        push_projected_query_row(&mut projected, row, sort_keys, budget)?;
     }
     Ok(projected)
 }

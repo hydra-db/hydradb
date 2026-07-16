@@ -23,8 +23,8 @@ use crate::{
     validate_component, EdgeMetadata, GraphError, GraphId, GraphScope, NamespaceId, NamespacePath,
     QueryBatchEdge, QueryBatchOperation, QueryBatchRelationship, QueryBatchRelationshipMerge,
     QueryBatchVertex, QueryCancellationToken, QueryColumn, QueryContext, QueryCursorToken,
-    QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow, QueryValue, Result,
-    TopologySequence, VertexMetadata, VertexPropertyValue,
+    QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow, Result, TopologySequence,
+    VertexMetadata, VertexPropertyValue,
 };
 
 const DEFAULT_MAX_QUERY_BYTES: usize = 1024 * 1024;
@@ -794,7 +794,6 @@ impl ClientQueryService {
                 runtime_limit_ms,
                 async {
                     self.validate_bookmark(&request).await?;
-                    self.pin_read_epoch(action, &mut request).await?;
                     let mut context = query_context(
                         &request,
                         scalar_parameters.clone(),
@@ -802,6 +801,7 @@ impl ClientQueryService {
                     );
                     if action == QueryTransportAction::Read {
                         context.read_epoch = None;
+                        context.max_result_bytes = Some(self.inner.config.max_cursor_buffer_bytes);
                     }
                     let result = match batch_operation {
                         Some(operation) => {
@@ -814,11 +814,12 @@ impl ClientQueryService {
                                 .await?
                         }
                     };
-                    let bookmark = self.bookmark_after(&request, action).await?;
+                    let read_epoch = result_read_epoch(&result, action)?;
+                    let bookmark = self.bookmark_after(&request, action, read_epoch).await?;
                     Ok(ClientQueryResult {
                         query_id: request.query_id.clone(),
                         result,
-                        read_epoch: request.read_epoch,
+                        read_epoch,
                         bookmark,
                     })
                 },
@@ -909,6 +910,7 @@ impl ClientQueryService {
                         // storage snapshot selector. Shard execution creates
                         // one SlateDB DbSnapshot for this complete result.
                         context.read_epoch = None;
+                        context.max_result_bytes = Some(self.inner.config.max_cursor_buffer_bytes);
                         let result = match batch_operation {
                             Some(operation) => {
                                 self.inner.client.execute_batch(context, operation).await?
@@ -920,9 +922,12 @@ impl ClientQueryService {
                                     .await?
                             }
                         };
-                        let bookmark = self.bookmark_after(&request, action).await?;
+                        let read_epoch = result_read_epoch(&result, action)?;
+                        let bookmark = self.bookmark_after(&request, action, read_epoch).await?;
                         return self
-                            .start_server_cursor(session, &request, result, bookmark, page_size)
+                            .start_server_cursor(
+                                session, &request, result, read_epoch, bookmark, page_size,
+                            )
                             .await;
                     }
                     let page = match batch_operation {
@@ -939,7 +944,7 @@ impl ClientQueryService {
                                 .await?
                         }
                     };
-                    let bookmark = self.bookmark_after(&request, action).await?;
+                    let bookmark = self.bookmark_after(&request, action, None).await?;
                     Ok(ClientQueryPage {
                         query_id: request.query_id.clone(),
                         page,
@@ -983,7 +988,6 @@ impl ClientQueryService {
         self.normalize_runtime_limit(&mut request)?;
         let action = self.authorize_query(session, &request)?;
         self.validate_bookmark(&request).await?;
-        self.pin_read_epoch(action, &mut request).await?;
 
         let parsed_unwind = parse_opencypher_unwind_batch(&request.query)?;
         let (batch_operation, scalar_parameters) = match parsed_unwind {
@@ -1061,24 +1065,39 @@ impl ClientQueryService {
         session: &ClientQuerySession,
         request: &ClientQueryRequest,
         result: QueryResultSet,
+        read_epoch: Option<TopologySequence>,
         bookmark: Option<ClientBookmark>,
         page_size: usize,
     ) -> Result<ClientQueryPage> {
-        let QueryResultSet { columns, rows } = result;
+        let materialized_bytes = result.estimated_resident_bytes();
+        let mut cursors = self.inner.cursors.lock().await;
+        self.purge_expired_cursors(&mut cursors);
+        let current_bytes = self.inner.cursor_buffer_bytes.load(Ordering::Relaxed);
+        let materialized_total = current_bytes.saturating_add(materialized_bytes);
+        if materialized_total > self.inner.config.max_cursor_buffer_bytes {
+            return Err(GraphError::AdmissionRejected {
+                operation: "client_cursor_buffer_bytes",
+                actual: materialized_total,
+                limit: self.inner.config.max_cursor_buffer_bytes,
+            });
+        }
+        let QueryResultSet {
+            columns,
+            rows,
+            read_epoch: _,
+        } = result;
         let mut remaining = VecDeque::from(rows);
         let page_rows = take_cursor_rows(&mut remaining, page_size);
         if remaining.is_empty() {
             return Ok(ClientQueryPage {
                 query_id: request.query_id.clone(),
                 page: QueryResultPage::new(columns, page_rows, None),
-                read_epoch: request.read_epoch,
+                read_epoch,
                 bookmark,
             });
         }
 
         let resident_bytes = query_rows_resident_bytes(&remaining);
-        let mut cursors = self.inner.cursors.lock().await;
-        self.purge_expired_cursors(&mut cursors);
         if cursors.len() >= self.inner.config.max_server_cursors {
             return Err(GraphError::AdmissionRejected {
                 operation: "client_server_cursors",
@@ -1086,15 +1105,7 @@ impl ClientQueryService {
                 limit: self.inner.config.max_server_cursors as u64,
             });
         }
-        let current_bytes = self.inner.cursor_buffer_bytes.load(Ordering::Relaxed);
         let next_bytes = current_bytes.saturating_add(resident_bytes);
-        if next_bytes > self.inner.config.max_cursor_buffer_bytes {
-            return Err(GraphError::AdmissionRejected {
-                operation: "client_cursor_buffer_bytes",
-                actual: next_bytes,
-                limit: self.inner.config.max_cursor_buffer_bytes,
-            });
-        }
         let cursor_id = next_cursor_id(&self.inner.next_cursor_id, &cursors)?;
         let cursor = ServerQueryCursor {
             owner: client_query_key(session, request),
@@ -1103,7 +1114,7 @@ impl ClientQueryService {
             parameters: request.parameters.clone(),
             columns: columns.clone(),
             rows: remaining,
-            read_epoch: request.read_epoch,
+            read_epoch,
             bookmark: bookmark.clone(),
             expires_at: Instant::now() + Duration::from_millis(self.inner.config.cursor_ttl_ms),
             resident_bytes,
@@ -1115,7 +1126,7 @@ impl ClientQueryService {
         Ok(ClientQueryPage {
             query_id: request.query_id.clone(),
             page: QueryResultPage::new(columns, page_rows, Some(QueryCursorToken::new(cursor_id))),
-            read_epoch: request.read_epoch,
+            read_epoch,
             bookmark,
         })
     }
@@ -1329,29 +1340,14 @@ impl ClientQueryService {
         self.ensure_bookmark(bookmark).await
     }
 
-    async fn pin_read_epoch(
-        &self,
-        action: QueryTransportAction,
-        request: &mut ClientQueryRequest,
-    ) -> Result<()> {
-        if action != QueryTransportAction::Read || request.read_epoch.is_some() {
-            return Ok(());
-        }
-        request.read_epoch = self
-            .inner
-            .client
-            .current_graph_epoch(&request.target.scope, &request.target.cell_id)
-            .await?;
-        Ok(())
-    }
-
     async fn bookmark_after(
         &self,
         request: &ClientQueryRequest,
         action: QueryTransportAction,
+        read_epoch: Option<TopologySequence>,
     ) -> Result<Option<ClientBookmark>> {
         let epoch = if action == QueryTransportAction::Read {
-            request.read_epoch
+            read_epoch
         } else {
             self.inner
                 .client
@@ -1562,34 +1558,24 @@ fn take_cursor_rows(rows: &mut VecDeque<QueryRow>, page_size: usize) -> Vec<Quer
 
 fn query_rows_resident_bytes(rows: &VecDeque<QueryRow>) -> u64 {
     rows.iter().fold(0_u64, |total, row| {
-        total.saturating_add(query_row_resident_bytes(row))
+        total.saturating_add(row.estimated_resident_bytes())
     })
 }
 
-fn query_row_resident_bytes(row: &QueryRow) -> u64 {
-    row.values
-        .iter()
-        .fold(std::mem::size_of::<QueryRow>() as u64, |total, value| {
-            total.saturating_add(query_value_resident_bytes(value))
-        })
-}
-
-fn query_value_resident_bytes(value: &QueryValue) -> u64 {
-    let inline = std::mem::size_of::<QueryValue>() as u64;
-    match value {
-        QueryValue::Property(VertexPropertyValue::String(value)) => {
-            inline.saturating_add(value.len() as u64)
-        }
-        QueryValue::List(values) => values.iter().fold(inline, |total, value| {
-            total.saturating_add(query_value_resident_bytes(value))
-        }),
-        QueryValue::Null
-        | QueryValue::VertexId(_)
-        | QueryValue::Count(_)
-        | QueryValue::Bool(_)
-        | QueryValue::Float(_)
-        | QueryValue::Property(_) => inline,
+fn result_read_epoch(
+    result: &QueryResultSet,
+    action: QueryTransportAction,
+) -> Result<Option<TopologySequence>> {
+    if action != QueryTransportAction::Read {
+        return Ok(None);
     }
+    result
+        .read_epoch
+        .map(Some)
+        .ok_or_else(|| GraphError::CorruptValue {
+            key: "client/query/read_epoch".to_string(),
+            reason: "read query result did not report its storage snapshot epoch".to_string(),
+        })
 }
 
 fn query_context(

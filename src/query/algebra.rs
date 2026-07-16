@@ -171,6 +171,7 @@ pub struct QueryContext {
     pub result_window: QueryWindow,
     pub parameters: BTreeMap<String, VertexPropertyValue>,
     pub max_runtime_ms: Option<u64>,
+    pub max_result_bytes: Option<u64>,
     #[cfg_attr(feature = "query-transport", serde(skip, default))]
     pub cancellation_token: Option<QueryCancellationToken>,
     #[cfg(feature = "opencypher")]
@@ -188,6 +189,7 @@ impl QueryContext {
             result_window: QueryWindow::default(),
             parameters: BTreeMap::new(),
             max_runtime_ms: None,
+            max_result_bytes: None,
             cancellation_token: None,
             #[cfg(feature = "opencypher")]
             validated_read: None,
@@ -224,6 +226,11 @@ impl QueryContext {
 
     pub fn with_timeout_ms(mut self, max_runtime_ms: u64) -> Self {
         self.max_runtime_ms = Some(max_runtime_ms);
+        self
+    }
+
+    pub fn with_max_result_bytes(mut self, max_result_bytes: u64) -> Self {
+        self.max_result_bytes = Some(max_result_bytes);
         self
     }
 
@@ -533,21 +540,77 @@ impl QueryRow {
     pub fn new(values: Vec<QueryValue>) -> Self {
         Self { values }
     }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn estimated_resident_bytes(&self) -> u64 {
+        self.values
+            .iter()
+            .fold(std::mem::size_of::<Self>() as u64, |total, value| {
+                total.saturating_add(value.estimated_resident_bytes())
+            })
+    }
+}
+
+impl QueryValue {
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn estimated_resident_bytes(&self) -> u64 {
+        let inline = std::mem::size_of::<Self>() as u64;
+        match self {
+            Self::Property(VertexPropertyValue::String(value)) => {
+                inline.saturating_add(value.len() as u64)
+            }
+            Self::List(values) => values.iter().fold(inline, |total, value| {
+                total.saturating_add(value.estimated_resident_bytes())
+            }),
+            Self::Null
+            | Self::VertexId(_)
+            | Self::Count(_)
+            | Self::Bool(_)
+            | Self::Float(_)
+            | Self::Property(_) => inline,
+        }
+    }
 }
 
 #[cfg_attr(
     feature = "query-transport",
     derive(serde::Deserialize, serde::Serialize)
 )]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct QueryResultSet {
     pub columns: Vec<QueryColumn>,
     pub rows: Vec<QueryRow>,
+    pub read_epoch: Option<TopologySequence>,
 }
+
+impl PartialEq for QueryResultSet {
+    fn eq(&self, other: &Self) -> bool {
+        // A snapshot watermark describes execution, not the logical row set.
+        self.columns == other.columns && self.rows == other.rows
+    }
+}
+
+impl Eq for QueryResultSet {}
 
 impl QueryResultSet {
     pub fn new(columns: Vec<QueryColumn>, rows: Vec<QueryRow>) -> Self {
-        Self { columns, rows }
+        Self {
+            columns,
+            rows,
+            read_epoch: None,
+        }
+    }
+
+    pub fn with_read_epoch(mut self, read_epoch: TopologySequence) -> Self {
+        self.read_epoch = Some(read_epoch);
+        self
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn estimated_resident_bytes(&self) -> u64 {
+        self.rows.iter().fold(0_u64, |total, row| {
+            total.saturating_add(row.estimated_resident_bytes())
+        })
     }
 }
 

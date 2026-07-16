@@ -24,7 +24,8 @@ impl QueryCellClient for HttpTestClient {
             (1..=3)
                 .map(|value| QueryRow::new(vec![QueryValue::Count(value)]))
                 .collect(),
-        ))
+        )
+        .with_read_epoch(11))
     }
 
     async fn execute_cypher_rows_page(
