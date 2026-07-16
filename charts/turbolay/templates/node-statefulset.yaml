@@ -24,7 +24,7 @@ spec:
         graph.usecortex.io/serving: "false"
       annotations:
         checksum/runtime-config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        secret.reloader.stakater.com/reload: {{ printf "%s,%s,%s" (include "turbolay.authSecretName" .) (include "turbolay.publicTlsSecretName" .) (include "turbolay.nodeTlsSecretName" .) | quote }}
+        secret.reloader.stakater.com/reload: {{ printf "%s,%s" (include "turbolay.authSecretName" .) (include "turbolay.publicTlsSecretName" .) | quote }}
         {{- with .Values.node.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -154,11 +154,6 @@ spec:
               mountPath: /var/run/secrets/turbolay/public
               readOnly: true
             {{- end }}
-            {{- if .Values.tls.internal.enabled }}
-            - name: internal-tls
-              mountPath: /var/run/secrets/turbolay/internal
-              readOnly: true
-            {{- end }}
       volumes:
         {{- if eq .Values.node.cache.type "emptyDir" }}
         - name: cache
@@ -181,24 +176,6 @@ spec:
         - name: public-tls
           secret:
             secretName: {{ include "turbolay.publicTlsSecretName" . }}
-        {{- end }}
-        {{- if .Values.tls.internal.enabled }}
-        - name: internal-tls
-          projected:
-            defaultMode: 0440
-            sources:
-              - secret:
-                  name: {{ include "turbolay.nodeTlsSecretName" . }}
-                  items:
-                    - key: tls.crt
-                      path: tls.crt
-                    - key: tls.key
-                      path: tls.key
-              - secret:
-                  name: {{ include "turbolay.internalCaSecretName" . }}
-                  items:
-                    - key: tls.crt
-                      path: ca.crt
         {{- end }}
   {{- if eq .Values.node.cache.type "persistentVolume" }}
   volumeClaimTemplates:

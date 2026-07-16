@@ -106,14 +106,11 @@ kill_mode_then_recover reddit-kill-batch 9 batch batch 900000
 run_worker_for reddit-kill-matrix 10 batch "$STORE_ARG" "$DB_BASE/reddit-kill-matrix" seed-matrix "$KILL_OPS" 1000000
 kill_mode_then_recover reddit-kill-matrix 10 matrix matrix 1000000
 
-run_worker_for reddit-kill-supernode 11 batch "$STORE_ARG" "$DB_BASE/reddit-kill-supernode" seed-supernode "$KILL_OPS" 1100000
-kill_mode_then_recover reddit-kill-supernode 11 supernode supernode 1100000
-
-run_worker_for reddit-kill-rollup 12 batch "$STORE_ARG" "$DB_BASE/reddit-kill-rollup" seed-rollup "$KILL_OPS" 1200000
-kill_mode_then_recover reddit-kill-rollup 12 rollup rollup 1200000
+run_worker_for reddit-kill-artifact 12 batch "$STORE_ARG" "$DB_BASE/reddit-kill-artifact" seed-artifact "$KILL_OPS" 1200000
+kill_mode_then_recover reddit-kill-artifact 12 artifact artifact 1200000
 
 run_worker_for reddit-kill-delta-gc 13 batch "$STORE_ARG" "$DB_BASE/reddit-kill-delta-gc" seed-delta-gc "$KILL_OPS" 1300000
-run_worker_for reddit-kill-delta-gc 13 rollup "$STORE_ARG" "$DB_BASE/reddit-kill-delta-gc" seed-delta-gc-rollup 1 1
+run_worker_for reddit-kill-delta-gc 13 artifact "$STORE_ARG" "$DB_BASE/reddit-kill-delta-gc" seed-delta-gc-artifact 1 1
 kill_mode_then_recover reddit-kill-delta-gc 13 delta-gc delta-gc 1300000
 
 GRAPH_INDEX_POLICY=outbound-only kill_mode_then_recover reddit-kill-segment 15 segment segment 1500000

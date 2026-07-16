@@ -12,12 +12,17 @@ MC_IMAGE="${GRAPH_MC_IMAGE:-minio/mc:RELEASE.2025-04-16T18-13-26Z}"
 BUCKET="${GRAPH_MINIO_BUCKET:-graph-fence-$(date +%s)-$$}"
 DB_BASE="${GRAPH_DB_BASE:-graph-minio-fence-$BUCKET}"
 TIMEOUT_SECONDS="${GRAPH_WORKER_TIMEOUT:-300}"
-LEASE_TTL_MS="${GRAPH_LEASE_TTL_MS:-5000}"
 ENV_FILE="$(mktemp)"
+SIGNAL_DIR="$(mktemp -d)"
+INCUMBENT_PID=""
 FEATURE_ARGS=(--features chaos-harness)
 
 cleanup() {
   rm -f "$ENV_FILE"
+  rm -rf "$SIGNAL_DIR"
+  if [[ -n "$INCUMBENT_PID" ]]; then
+    kill "$INCUMBENT_PID" >/dev/null 2>&1 || true
+  fi
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
 }
@@ -29,8 +34,6 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/dgraph-target}"
-export GRAPH_LEASE_TTL_MS="$LEASE_TTL_MS"
-
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker network rm "$NETWORK" >/dev/null 2>&1 || true
 docker network create "$NETWORK" >/dev/null
@@ -71,15 +74,15 @@ run_worker() {
 
 cd "$ROOT"
 DATA_PATH="$DB_BASE/data"
-CONTROL_PATH="$DB_BASE/control"
 
-echo "graph MinIO fence takeover: bucket=$BUCKET data=$DATA_PATH control=$CONTROL_PATH ttl_ms=$LEASE_TTL_MS"
-run_worker init "$ENV_FILE" "$DATA_PATH" "$CONTROL_PATH"
-sleep "$(awk "BEGIN { printf \"%.3f\", (($LEASE_TTL_MS + 150) / 1000) }")"
-run_worker takeover "$ENV_FILE" "$DATA_PATH" "$CONTROL_PATH"
+echo "graph MinIO SlateDB fence takeover: bucket=$BUCKET data=$DATA_PATH"
+run_worker incumbent "$ENV_FILE" "$DATA_PATH" "$SIGNAL_DIR" &
+INCUMBENT_PID=$!
+run_worker takeover "$ENV_FILE" "$DATA_PATH" "$SIGNAL_DIR"
+wait "$INCUMBENT_PID"
+INCUMBENT_PID=""
 docker restart "$NAME" >/dev/null
-run_worker stale-probe "$ENV_FILE" "$DATA_PATH" "$CONTROL_PATH"
-run_worker reader "$ENV_FILE" "$DATA_PATH" "$CONTROL_PATH"
+run_worker reader "$ENV_FILE" "$DATA_PATH" "$SIGNAL_DIR"
 
 docker run --rm --network "$NETWORK" --entrypoint /bin/sh "$MC_IMAGE" \
   -c "mc alias set local 'http://$NAME:9000' '$ACCESS_KEY' '$SECRET_KEY' >/dev/null && mc find 'local/$BUCKET' --name '*' --maxdepth 4" | sed -n '1,80p'

@@ -6,22 +6,25 @@ and memory are cache layers controlled through SlateDB settings and graph-layer
 cache policy.
 
 The crate is intentionally kept outside the SlateDB repository. SlateDB stays an
-upstream dependency pinned in `Cargo.toml`/`Cargo.lock`, and this crate owns the
-graph model, write fencing, artifact layout, traversal kernels, query planner,
-and operational harnesses.
+upstream dependency pinned in `Cargo.toml`/`Cargo.lock`. SlateDB owns writer
+fencing, WAL durability, storage snapshots, compaction, and object-store
+coordination; this crate owns the graph model, topology artifacts, traversal
+kernels, query planner, and operational harnesses.
 
 ## What Is Implemented
 
 - Durable edge writes, deletes, bulk import, trusted segment append, mutation
   logs, idempotency records, and degree/index maintenance.
-- Per-cell hard write fencing with object-store lock records, lease generation
-  checks, and SlateDB transactional retries.
-- Routed multi-cell clusters, graph nodes with lease renewal, placement metadata,
-  control-plane watermarks, failover helpers, and repair paths.
-- Snapshot reads, read leases, retention checks, rollup, delta GC, artifact GC,
-  and full graph export/verifier digests.
-- Posting chunks, matrix tiles, supernode chunk indexes, paginated supernode
-  scans, supernode membership checks, and intersection helpers.
+- Per-cell hard write fencing through SlateDB writer epochs and WAL barriers,
+  plus transactional retries for graph mutations.
+- Controllerless routed multi-cell nodes with deterministic rendezvous
+  placement. Kubernetes supplies stable membership and restarts; SlateDB is the
+  final stale-writer correctness boundary.
+- SlateDB snapshot reads for current one-shot queries, retained historical/cursor
+  reads, matrix publication, topology delta GC, matrix artifact GC, and full
+  graph export/verifier digests.
+- Canonical outbound adjacency segments for high-throughput ingestion and one
+  persisted matrix artifact format for sparse traversal.
 - Sparse traversal through the Rust kernel by default, with optional SuiteSparse
   GraphBLAS FFI for compiled CSC traversal.
 - OpenCypher row query execution behind the `opencypher` feature, including
@@ -41,14 +44,14 @@ and operational harnesses.
 ```text
 src/core/        configuration, error types, public model types, cache policy
 src/shard/       GraphShard lifecycle, writes, reads, query execution, maintenance
-src/engine/      artifacts, supernodes, rollup/GC, cluster/control-plane helpers
+src/engine/      matrix artifacts and GC, routed cluster and placement runtime
 src/query/       OpenCypher lowering, algebra, optimizer, transport, TCK parser
 src/client/      shared public query service plus Bolt/TLS and HTTPS adapters
 src/sparse_kernel.rs
                  Rust sparse traversal and optional SuiteSparse GraphBLAS FFI
 examples/        smoke, stress, correctness, benchmark, and profiling binaries
 scripts/         local, MinIO, query, write, stress, and chaos harnesses
-charts/turbolay/ production Helm chart for graph nodes and controllers
+charts/turbolay/ production Helm chart for graph nodes
 ```
 
 ## Requirements
@@ -122,9 +125,23 @@ on macOS should be checked locally when those libraries are installed.
 
 ## Kubernetes Deployment
 
-The production Helm chart deploys graph nodes, controller candidates, services,
-RBAC, network policies, disruption budgets, object-store configuration, and
-optional cert-manager, External Secrets, and ServiceMonitor resources.
+The production Helm chart deploys graph nodes, services, RBAC, network policies,
+disruption budgets, object-store configuration, and optional cert-manager,
+External Secrets, and ServiceMonitor resources. It does not deploy a writable
+separate graph controller database.
+
+For a public single-node K3s evaluation host with Docker, Helm, `kubectl`, the
+AWS CLI, and OpenSSL already installed, the deployment helper builds the current
+checkout, provisions auth and TLS secrets, imports the image into K3s, and
+installs the chart:
+
+```bash
+TURBOLAY_S3_BUCKET=graph-benchmark ./scripts/deploy_single_node_k3s.sh
+```
+
+On EC2 the public DNS name and IP are discovered automatically. Elsewhere, set
+`TURBOLAY_PUBLIC_HOST`. The script prints the Bolt and HTTPS endpoints and keeps
+the generated client token under `~/.config/turbolay-single-node/`.
 
 ```bash
 helm upgrade --install turbolay charts/turbolay \
@@ -183,9 +200,10 @@ Caching is two-layer:
 - SlateDB object-store cache: configured through `GraphCacheConfig`, including
   disk cache directory, cache size, cache-on-put, and SST preload.
 - Graph-layer memory cache: configured through `GraphCachePolicy`, including
-  matrix artifacts, matrix adjacencies, compiled GraphBLAS matrices, parsed
-  row queries, reachability results, supernode groups, posting chunks, and
-  hydration concurrency.
+  matrix adjacencies, compiled GraphBLAS matrices, parsed row queries, and
+  hydration concurrency. `GraphMemoryConfig` independently caps compiled
+  matrices and all relationship-result cache payloads by resident bytes;
+  oversized query results remain correct but are not retained.
 
 ## Falkor S3 Import
 
@@ -263,18 +281,15 @@ Common write paths:
 - `append_edge_mutation_log`
 - `bulk_import_edges`, `bulk_import_edges_chunked`
 - `bulk_append_edges_trusted_chunked`
-- `bulk_append_supernode_segment_trusted`
+- `bulk_append_out_adjacency_segment_trusted`
 
-Common read/artifact paths:
+Common read and matrix paths:
 
 - `edge_exists`, `out_neighbors`, `out_degree`
 - `snapshot`, `snapshot_at`
-- `build_posting_chunks`, `build_matrix_tiles`, `build_supernode_groups`
-- `matrix_reachable`, `matrix_reachable_with_kernel`, `posting_reachable`
-- `supernode_page`, `supernode_degree`, `supernode_edge_exists`,
-  `supernode_intersection`
-- `rollup_artifacts`, `delete_deltas_through_rollup`,
-  `delete_graph_artifacts_before`
+- `build_adjacency_image`, `build_matrix_tiles`
+- `matrix_reachable`, `matrix_reachable_with_kernel`, `direct_snapshot_reachable`
+- `delete_deltas_through_matrix`, `delete_graph_artifacts_before`
 - `export_live_graph_digest`, `verify_current_graph`
 
 Minimal local example:
@@ -372,16 +387,16 @@ service to `ClientBoltServer` and `ClientHttpServer`. The shared service:
 - enforces graph and hierarchical namespace grants;
 - applies global and namespace concurrency limits;
 - caps query size, parameter count, page size, and total stream runtime;
-- pins paged reads to one graph epoch and emits scoped graph bookmarks;
+- pins paged reads to one topology cursor and emits scoped graph bookmarks;
 - supports cancellation without letting query ids cross principals or scopes.
 
 Bolt supports `HELLO`, `LOGON`, `LOGOFF`, auto-commit `RUN`, bounded or complete
 `PULL`/`DISCARD`, `RESET`, `GOODBYE`, `ROUTE`, and telemetry acknowledgement.
 Explicit `BEGIN`, `COMMIT`, and `ROLLBACK` are rejected until cross-query
 transaction semantics exist. TLS is required by default. Configure
-`ControllerBoltRoutingTableProvider` with public Bolt addresses to derive read
-and route endpoints from live controller heartbeats and the write endpoint from
-the current unexpired cell lease. If no routing provider or complete static
+`RendezvousBoltRoutingTableProvider` with the same cell and node membership used
+to open `RoutedGraphCluster`; Bolt routing and local ownership then use one
+deterministic placement calculation. If no routing provider or complete static
 routing table is configured, `ROUTE` fails closed; direct `bolt://` sessions
 continue to work.
 
@@ -426,15 +441,12 @@ just smoke                    # local object-store smoke
 just smoke-graphblas          # local smoke with GraphBLAS traversal
 just stress                   # local multiprocess stress and recovery checks
 just fence                    # local stale-writer/fence takeover proof
-just bench                    # path/supernode benchmark
-just bench-rust               # same benchmark with Rust sparse traversal
 just query-bench              # OpenCypher hot/warm/cold query benchmark
 just query-correctness        # exact query correctness checks
 just query-memory-profile     # low-memory query/build/concurrency profile
 just minio-smoke              # Docker MinIO smoke
 just minio-chaos              # Docker MinIO chaos
 just minio-fence              # MinIO fence takeover proof
-just minio-bench              # MinIO path/supernode benchmark
 just minio-query-bench        # MinIO query benchmark
 just minio-query-correctness  # MinIO query correctness checks
 ```
@@ -449,24 +461,41 @@ GRAPH_QUERY_BENCH_MAX_GRAPHBLAS_MATRICES=1 \
 just query-bench
 ```
 
+## Storage And Ownership Model
+
+The production data path follows a single-writer-per-cell object-store design:
+
+1. Kubernetes supplies the configured node identities and restarts failed
+   StatefulSet members.
+2. Rendezvous placement maps each cell to one node without a writable placement
+   database.
+3. The selected node opens that cell's SlateDB writer. SlateDB's writer epoch and
+   WAL barrier fence any stale process that still believes it is the owner.
+4. Current one-shot reads use `DbSnapshot`, so all canonical records and indexes
+   come from one SlateDB sequence without publishing graph coordination records.
+5. A compact graph topology cursor remains for asynchronous GraphBLAS matrices:
+   a query evaluates matrix base `B` plus topology changes `(B, S]`. It is not a
+   second storage MVCC authority.
+6. Public pagination uses bounded server-held result cursors, so continuation
+   pages never replay a query or publish graph-owned retention records.
+
+This keeps S3 as the durable source of truth, local SSD/NVMe as SlateDB's block
+cache, and memory for bounded query plans and compiled GraphBLAS matrices.
+
 ## Production Boundary
 
-This crate is a kernel/library, not a complete hosted database service. It now
-contains the major storage, query, routing, fencing, controller, artifact,
-stress, and verification pieces needed for an object-store graph database, but
-production use still requires an embedding service and operational validation
-around it:
+The repository contains the deployable graph-node service, storage/query engine,
+public protocols, chart, stress tools, and verification paths. Production
+promotion still requires environment-specific evidence rather than more storage
+coordination code:
 
-- deployment-specific rollout policy and service lifecycle integration around
-  `GraphControlPlane`, `GraphClusterControllerHandle`, and `ManagedGraphNode`;
-- production metrics export, dashboards, alerts, tenant quotas, and
-  backpressure policy choices;
-- long-running multi-process and real S3 soak tests under throttling, latency,
-  timeout, and restart faults;
-- complete compatibility policy for the OpenCypher subset, including larger TCK
-  reports and documented skip reasons;
-- security integration for the TCP transport, including real certificate
-  rotation and secret management.
+- long-running multi-node and real-S3 soak tests under throttling, latency,
+  timeout, restart, and membership-change faults;
+- dashboards and alerts for SlateDB fencing, object-store errors, query latency,
+  memory budgets, matrix lag, and rejected work;
+- an explicit OpenCypher compatibility policy backed by larger TCK reports;
+- deployment certificate rotation, secret management, backup/restore drills,
+  and tested rollback procedures.
 
 The safest way to evaluate a new environment is: run default tests, native
 feature tests, local smoke, MinIO smoke, query correctness, stress, and then a

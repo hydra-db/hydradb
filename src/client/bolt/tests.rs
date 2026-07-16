@@ -2,12 +2,11 @@ use super::values::bolt_parameter_to_property;
 use super::wire::strict_decode_client_message;
 use super::*;
 use crate::{
-    ClientQueryServiceConfig, GraphControlPlane, GraphNodeHealthState, QueryCellClient,
-    QueryColumn, QueryContext, QueryCursorToken, QueryFloat, QueryParameterValue, QueryResultPage,
-    QueryResultSet, QueryRow, QueryTransportAction, QueryTransportScopeGrant, QueryValue,
-    RoutedGraphCluster, ShardPlacement, StaticClientDatabaseResolver,
-    StaticQueryTransportScopeAuthorizer, StaticQueryTransportTlsServerConfigProvider,
-    VertexPropertyValue,
+    ClientQueryServiceConfig, QueryCellClient, QueryColumn, QueryContext, QueryCursorToken,
+    QueryFloat, QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow,
+    QueryTransportAction, QueryTransportScopeGrant, QueryValue, RoutedGraphCluster, ShardPlacement,
+    StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer,
+    StaticQueryTransportTlsServerConfigProvider, VertexPropertyValue,
 };
 use boltr::chunk::{ChunkReader, ChunkWriter};
 use boltr::client::BoltSession;
@@ -31,7 +30,8 @@ impl QueryCellClient for BoltTestClient {
         Ok(QueryResultSet::new(
             vec![QueryColumn::new("answer")],
             vec![QueryRow::new(vec![QueryValue::Count(42)])],
-        ))
+        )
+        .with_read_epoch(9))
     }
 
     async fn execute_cypher_rows_page(
@@ -68,7 +68,8 @@ impl QueryCellClient for PagedBoltTestClient {
             (1..=5)
                 .map(|value| QueryRow::new(vec![QueryValue::Count(value)]))
                 .collect(),
-        ))
+        )
+        .with_read_epoch(9))
     }
 
     async fn execute_cypher_rows_page(
@@ -333,20 +334,13 @@ async fn bolt_server_runs_autocommit_queries_and_rejects_fake_transactions() {
 #[tokio::test]
 async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let control = GraphControlPlane::open("bolt-create/control", Arc::clone(&object_store))
-        .await
-        .unwrap();
-    control
-        .publish_placement(&ShardPlacement::fixed([("cell-a", "node-a")]).unwrap())
-        .await
-        .unwrap();
+    let placement = ShardPlacement::fixed([("cell-a", "node-a")]).unwrap();
     let cluster = Arc::new(
-        RoutedGraphCluster::open_owned_with_control(
+        RoutedGraphCluster::open_fenced_owned(
             "bolt-create/data",
             "node-a",
-            &control,
+            placement,
             object_store,
-            Duration::from_secs(60),
         )
         .await
         .unwrap(),
@@ -953,11 +947,10 @@ async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
     session.close().await.unwrap();
     server.stop().await.unwrap();
     cluster.close().await.unwrap();
-    control.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn bolt_pull_streams_backend_cursor_pages_without_full_materialization() {
+async fn bolt_pull_uses_snapshot_backed_server_cursor_pages() {
     let server = ClientBoltServer::bind(
         "127.0.0.1:0".parse().unwrap(),
         bolt_service_for(Arc::new(PagedBoltTestClient)),
@@ -1299,36 +1292,13 @@ async fn bolt_server_closes_idle_post_handshake_connections() {
 }
 
 #[tokio::test]
-async fn controller_routing_uses_live_nodes_and_current_lease_owner() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let control = Arc::new(
-        GraphControlPlane::open("client/bolt/controller-routing", object_store)
-            .await
-            .unwrap(),
-    );
-    control
-        .publish_placement(&ShardPlacement::fixed([("cell-a", "node-a")]).unwrap())
-        .await
-        .unwrap();
-    control
-        .publish_node_heartbeat("node-a", GraphNodeHealthState::Active)
-        .await
-        .unwrap();
-    control
-        .publish_node_heartbeat("node-b", GraphNodeHealthState::Active)
-        .await
-        .unwrap();
-    control
-        .acquire_lease("cell-a", "node-a", Duration::from_secs(60))
-        .await
-        .unwrap();
-    let provider = ControllerBoltRoutingTableProvider::new(
-        Arc::clone(&control),
+async fn rendezvous_routing_uses_the_deterministic_cell_owner() {
+    let provider = RendezvousBoltRoutingTableProvider::new(
+        ShardPlacement::fixed([("cell-a", "node-a")]).unwrap(),
         [
             ("node-a".to_string(), "node-a.example:7687".to_string()),
             ("node-b".to_string(), "node-b.example:7687".to_string()),
         ],
-        Duration::from_secs(60),
         30,
     )
     .unwrap();
@@ -1352,7 +1322,6 @@ async fn controller_routing_uses_live_nodes_and_current_lease_owner() {
         .find(|server| server.role == "READ")
         .unwrap();
     assert_eq!(read.addresses, vec!["node-a.example:7687"]);
-    control.close().await.unwrap();
 }
 
 async fn send_test_bolt_client_message<W>(writer: &mut ChunkWriter<W>, message: &ClientMessage)

@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use slatedb_graph_kernel::{ClientQueryService, GraphControlClient, Result};
+use slatedb_graph_kernel::{ClientQueryService, Result, RoutedGraphCluster};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -15,8 +15,8 @@ use tokio::task::JoinHandle;
 #[derive(Clone)]
 struct AdminState {
     ready: Arc<AtomicBool>,
-    control: Option<Arc<dyn GraphControlClient>>,
-    query: Option<ClientQueryService>,
+    query: ClientQueryService,
+    routed_node: Arc<RoutedGraphCluster>,
 }
 
 pub struct AdminServer {
@@ -26,36 +26,23 @@ pub struct AdminServer {
 }
 
 impl AdminServer {
-    pub async fn bind<C>(
+    pub async fn bind_routed(
         addr: SocketAddr,
         ready: Arc<AtomicBool>,
-        control: Arc<C>,
-        query: Option<ClientQueryService>,
-    ) -> Result<Self>
-    where
-        C: GraphControlClient + 'static,
-    {
-        let control: Arc<dyn GraphControlClient> = control;
-        Self::bind_inner(addr, ready, Some(control), query).await
-    }
-
-    pub async fn bind_without_control(addr: SocketAddr, ready: Arc<AtomicBool>) -> Result<Self> {
-        Self::bind_inner(addr, ready, None, None).await
-    }
-
-    async fn bind_inner(
-        addr: SocketAddr,
-        ready: Arc<AtomicBool>,
-        control: Option<Arc<dyn GraphControlClient>>,
-        query: Option<ClientQueryService>,
+        query: ClientQueryService,
+        node: Arc<RoutedGraphCluster>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr).await.map_err(admin_io_error)?;
         let local_addr = listener.local_addr().map_err(admin_io_error)?;
         let state = AdminState {
             ready,
-            control,
             query,
+            routed_node: node,
         };
+        Self::serve(listener, local_addr, state)
+    }
+
+    fn serve(listener: TcpListener, local_addr: SocketAddr, state: AdminState) -> Result<Self> {
         let router = Router::new()
             .route("/livez", get(live))
             .route("/readyz", get(readiness))
@@ -113,57 +100,31 @@ async fn metrics(State(state): State<AdminState>) -> Response {
         "# TYPE graph_runtime_ready gauge\ngraph_runtime_ready {}\n",
         u8::from(state.ready.load(Ordering::Acquire)),
     );
-    if let Some(control) = state.control {
-        let control = match control.metrics().await {
-            Ok(metrics) => metrics,
-            Err(error) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("control metrics unavailable: {error}\n"),
-                )
-                    .into_response();
-            }
-        };
-        output.push_str(&format!(
-            concat!(
-                "# TYPE graph_control_controller_runs counter\n",
-                "graph_control_controller_runs {}\n",
-                "# TYPE graph_control_controller_failures counter\n",
-                "graph_control_controller_failures {}\n",
-                "# TYPE graph_control_lease_renew_failures counter\n",
-                "graph_control_lease_renew_failures {}\n",
-                "# TYPE graph_control_lease_renew_lost counter\n",
-                "graph_control_lease_renew_lost {}\n",
-                ""
-            ),
-            control.controller_runs,
-            control.controller_failures,
-            control.lease_renew_failures,
-            control.lease_renew_lost,
-        ));
-    }
-    if let Some(query) = state.query {
-        let query = query.metrics();
-        output.push_str(&format!(
-            concat!(
-                "# TYPE graph_query_started counter\n",
-                "graph_query_started {}\n",
-                "# TYPE graph_query_completed counter\n",
-                "graph_query_completed {}\n",
-                "# TYPE graph_query_failed counter\n",
-                "graph_query_failed {}\n",
-                "# TYPE graph_query_auth_failures counter\n",
-                "graph_query_auth_failures {}\n",
-                "# TYPE graph_query_scope_denials counter\n",
-                "graph_query_scope_denials {}\n"
-            ),
-            query.queries_started,
-            query.queries_completed,
-            query.queries_failed,
-            query.auth_failures,
-            query.scope_denials,
-        ));
-    }
+    let query = state.query.metrics();
+    output.push_str(&format!(
+        concat!(
+            "# TYPE graph_query_started counter\n",
+            "graph_query_started {}\n",
+            "# TYPE graph_query_completed counter\n",
+            "graph_query_completed {}\n",
+            "# TYPE graph_query_failed counter\n",
+            "graph_query_failed {}\n",
+            "# TYPE graph_query_auth_failures counter\n",
+            "graph_query_auth_failures {}\n",
+            "# TYPE graph_query_scope_denials counter\n",
+            "graph_query_scope_denials {}\n"
+        ),
+        query.queries_started,
+        query.queries_completed,
+        query.queries_failed,
+        query.auth_failures,
+        query.scope_denials,
+    ));
+    append_node_metrics(
+        &mut output,
+        state.routed_node.maintenance_metrics(),
+        state.routed_node.local_shard_runtime_metrics().await,
+    );
     (
         [
             ("content-type", "text/plain; version=0.0.4; charset=utf-8"),
@@ -172,6 +133,109 @@ async fn metrics(State(state): State<AdminState>) -> Response {
         output,
     )
         .into_response()
+}
+
+fn append_node_metrics(
+    output: &mut String,
+    maintenance: slatedb_graph_kernel::GraphNodeMaintenanceMetricsSnapshot,
+    shard_metrics: Vec<slatedb_graph_kernel::GraphShardRuntimeMetrics>,
+) {
+    output.push_str(&format!(
+        concat!(
+            "# TYPE graph_matrix_refresh_cycles counter\n",
+            "graph_matrix_refresh_cycles {}\n",
+            "# TYPE graph_matrix_refresh_dirty_edge_types counter\n",
+            "graph_matrix_refresh_dirty_edge_types {}\n",
+            "# TYPE graph_matrix_refresh_artifacts_built counter\n",
+            "graph_matrix_refresh_artifacts_built {}\n",
+            "# TYPE graph_matrix_refresh_artifacts_deferred counter\n",
+            "graph_matrix_refresh_artifacts_deferred {}\n",
+            "# TYPE graph_matrix_refresh_failures counter\n",
+            "graph_matrix_refresh_failures {}\n"
+        ),
+        maintenance.matrix_refresh_cycles,
+        maintenance.matrix_refresh_dirty_edge_types,
+        maintenance.matrix_refresh_artifacts_built,
+        maintenance.matrix_refresh_artifacts_deferred,
+        maintenance.matrix_refresh_failures,
+    ));
+    output.push_str(concat!(
+        "# TYPE graph_query_graphblas_exact_snapshots counter\n",
+        "# TYPE graph_query_graphblas_delta_snapshots counter\n",
+        "# TYPE graph_query_rust_sparse_fallbacks counter\n",
+        "# TYPE graph_cache_entries gauge\n",
+        "# TYPE graph_cache_resident_bytes gauge\n"
+    ));
+    for metrics in shard_metrics {
+        output.push_str(&format!(
+            concat!(
+                "graph_query_graphblas_exact_snapshots{{cell_id=\"{}\"}} {}\n",
+                "graph_query_graphblas_delta_snapshots{{cell_id=\"{}\"}} {}\n",
+                "graph_query_rust_sparse_fallbacks{{cell_id=\"{}\"}} {}\n"
+            ),
+            metrics.cell_id,
+            metrics.operational.query_graphblas_exact_snapshots,
+            metrics.cell_id,
+            metrics.operational.query_graphblas_delta_snapshots,
+            metrics.cell_id,
+            metrics.operational.query_rust_sparse_fallbacks,
+        ));
+        for (cache, entries) in [
+            ("matrix_artifacts", metrics.cache_entries.matrix_artifacts),
+            (
+                "matrix_adjacencies",
+                metrics.cache_entries.matrix_adjacencies,
+            ),
+            (
+                "graphblas_matrices",
+                metrics.cache_entries.graphblas_matrices,
+            ),
+            (
+                "parsed_row_queries",
+                metrics.cache_entries.parsed_row_queries,
+            ),
+            (
+                "relationship_rows",
+                metrics.cache_entries.relationship_row_sets,
+            ),
+            (
+                "relationship_property_rows",
+                metrics.cache_entries.relationship_property_row_sets,
+            ),
+        ] {
+            output.push_str(&format!(
+                "graph_cache_entries{{cell_id=\"{}\",cache=\"{cache}\"}} {entries}\n",
+                metrics.cell_id
+            ));
+        }
+        for (cache, bytes) in [
+            (
+                "matrix_adjacencies",
+                metrics.cache_resident_bytes.matrix_adjacencies,
+            ),
+            (
+                "graphblas_matrices",
+                metrics.cache_resident_bytes.graphblas_matrices,
+            ),
+            (
+                "relationship_rows",
+                metrics.cache_resident_bytes.relationship_rows,
+            ),
+            (
+                "source_relationship_rows",
+                metrics.cache_resident_bytes.source_relationship_rows,
+            ),
+            (
+                "relationship_property_rows",
+                metrics.cache_resident_bytes.relationship_property_rows,
+            ),
+        ] {
+            output.push_str(&format!(
+                "graph_cache_resident_bytes{{cell_id=\"{}\",cache=\"{cache}\"}} {bytes}\n",
+                metrics.cell_id
+            ));
+        }
+    }
 }
 
 fn admin_io_error(error: std::io::Error) -> slatedb_graph_kernel::GraphError {

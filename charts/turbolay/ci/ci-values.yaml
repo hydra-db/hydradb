@@ -8,14 +8,9 @@ auth:
 tls:
   public:
     enabled: false
-  internal:
-    enabled: false
 
 node:
   replicaCount: 3
-
-controller:
-  replicaCount: 2
 
 networkPolicy:
   httpsEgressTo:

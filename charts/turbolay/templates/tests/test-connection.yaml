@@ -46,7 +46,7 @@ spec:
     {{- if .Values.tls.public.trustBundle.enabled }}
     - name: ca
       secret:
-        secretName: {{ default (include "turbolay.internalCaSecretName" .) .Values.tls.public.trustBundle.sourceSecretName }}
+        secretName: {{ default (include "turbolay.publicTlsSecretName" .) .Values.tls.public.trustBundle.sourceSecretName }}
         items:
           - key: {{ .Values.tls.public.trustBundle.sourceSecretKey }}
             path: ca.crt

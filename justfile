@@ -80,14 +80,6 @@ smoke:
 smoke-graphblas:
     GRAPH_MATRIX_KERNEL=graphblas cargo run --features graphblas --example object_store_smoke
 
-# Run the path/supernode benchmark harness.
-bench:
-    bash scripts/path_bench.sh
-
-# Run the path/supernode benchmark with the Rust sparse kernel.
-bench-rust:
-    GRAPH_BENCH_GRAPHBLAS=0 GRAPH_MATRIX_KERNEL=rust bash scripts/path_bench.sh
-
 # Run local multiprocess stress against the local filesystem object store.
 stress:
     bash scripts/multiprocess_stress.sh
@@ -99,10 +91,6 @@ fence:
 # Run MinIO smoke test. Requires Docker.
 minio-smoke:
     bash scripts/minio_smoke.sh
-
-# Run path/supernode benchmarks against MinIO. Requires Docker.
-minio-bench:
-    bash scripts/minio_path_bench.sh
 
 # Run Query engine Cypher query benchmarks.
 query-bench:

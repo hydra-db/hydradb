@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use slatedb::bytes::Bytes;
@@ -24,7 +24,7 @@ mod sparse_kernel;
 #[cfg(feature = "bolt-server")]
 pub use client::bolt::{
     BoltRoutingServer, BoltRoutingTable, BoltRoutingTableProvider, BoltServerConfig,
-    BoltServerHandle, ClientBoltServer, ControllerBoltRoutingTableProvider,
+    BoltServerHandle, ClientBoltServer, RendezvousBoltRoutingTableProvider,
 };
 #[cfg(feature = "http-api")]
 pub use client::http::{ClientHttpServer, HttpQueryServerConfig, HttpQueryServerHandle};
@@ -34,17 +34,18 @@ pub use client::service::{
     ClientQueryPage, ClientQueryRequest, ClientQueryResult, ClientQueryService,
     ClientQueryServiceConfig, ClientQuerySession, ClientQueryTarget, StaticClientDatabaseResolver,
 };
-pub(crate) use core::cache::{BoundedGraphCache, PostingChunkCacheKey, SupernodeCacheKey};
+pub(crate) use core::cache::BoundedGraphCache;
 #[cfg(feature = "opencypher")]
 pub(crate) use core::cache::{
-    RelationshipPropertyRowsCacheKey, RelationshipRowsCacheEntry, RelationshipRowsCacheKey,
-    RelationshipRowsCacheValue, SourceRelationshipRowsCacheKey,
+    source_relationship_rows_resident_bytes, RelationshipPropertyRowsCacheKey,
+    RelationshipRowsCacheEntry, RelationshipRowsCacheKey, RelationshipRowsCacheValue,
+    SourceRelationshipRowsCacheKey,
 };
 pub(crate) use core::config::{open_graph_db, open_graph_reader};
 pub use core::config::{
     GraphBackpressurePolicy, GraphCacheConfig, GraphDurabilityConfig, GraphIndexPolicy,
-    GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphRetentionPolicy,
-    GraphStorageMemoryConfig, DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
+    GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphStorageMemoryConfig,
+    DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
 };
 pub use core::error::{GraphError, Result};
 pub use core::metrics::{
@@ -71,34 +72,19 @@ pub use core::snapshot::GraphSnapshot;
 pub use core::state::QueryStatsRefreshHandle;
 pub(crate) use core::state::{
     acquire_distributed_write_lock, is_retryable_write_conflict, release_cell_write_lock,
-    CellWriteLock, GraphReadLease, GraphStore, GraphWriteAuthority, GraphWriteFence, GraphWriteOp,
+    CellWriteLock, GraphStore, GraphWriteAuthority, GraphWriteOp,
 };
 #[cfg(test)]
 pub(crate) use core::state::{
     decode_cell_write_lock_record, encode_cell_write_lock_record, CellWriteLockState,
 };
 pub use core::state::{GraphCacheEntryCounts, GraphCacheResidentBytes, GraphShard};
-#[cfg(feature = "opencypher")]
-pub(crate) use core::state::{QueryReadLeaseManager, QueryReadLeaseRegistration};
 pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
 pub use engine::{
-    local_object_store, object_store_from_env, ArtifactDirection, ArtifactGcResult,
-    BenchmarkResult, DeltaGcResult, GraphCluster, GraphClusterControllerConfig,
-    GraphClusterControllerHandle, GraphClusterControllerReport, GraphClusterRebalanceMode,
-    GraphControlCellDropReport, GraphControlClient, GraphControlEdgeWatermark,
-    GraphControlIdempotencyRecord, GraphControlMetricsSnapshot, GraphControlPlane,
-    GraphControlRepairReport, GraphControlWatermark, GraphNode, GraphNodeHealthState,
-    GraphNodeHeartbeat, GraphNodeMaintenanceMetricsSnapshot, GraphNodeRuntimeConfig,
-    GraphPendingFailover, GraphRollup, GraphRuntimeLease, GraphShardCatalogEntry,
-    GraphShardReassignment, GraphShardRefreshReport, LeaseRenewalHandle, ManagedGraphNode,
-    MatrixArtifact, MatrixTraversalResult, NodeHeartbeatHandle, PostingChunk, RoutedGraphCluster,
-    ShardLease, ShardPlacement, ShardRefreshHandle, SupernodeGroup, SupernodePage,
-    TraversalBackend,
-};
-#[cfg(feature = "query-transport-tls")]
-pub use engine::{
-    GraphControlRpcClient, GraphControlRpcClientConfig, GraphControlRpcServer,
-    GraphControlRpcServerConfig,
+    local_object_store, object_store_from_env, ArtifactGcResult, BenchmarkResult, DeltaGcResult,
+    GraphCluster, GraphNodeMaintenanceMetricsSnapshot, GraphShardRuntimeMetrics, MatrixArtifact,
+    MatrixArtifactRefreshHandle, MatrixArtifactRefreshPolicy, MatrixArtifactRefreshReport,
+    MatrixTraversalResult, RoutedGraphCluster, ShardPlacement, TraversalBackend,
 };
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
@@ -155,18 +141,25 @@ pub use query::opencypher::{
 pub use sparse_kernel::SparseKernelBackend;
 
 pub type VertexId = u64;
-pub type GraphEpoch = u64;
+/// SlateDB's sequence number for a committed storage snapshot.
+pub type StorageSequence = u64;
+
+/// Monotonic cursor for topology changes consumed by asynchronous matrix builds.
+/// This is not a second storage MVCC system; canonical record visibility belongs
+/// to SlateDB snapshots.
+pub type TopologySequence = u64;
+
 pub(crate) type MatrixAdjacency = BTreeMap<VertexId, BTreeSet<VertexId>>;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct MatrixCacheKey {
     pub(crate) cell_id: String,
     pub(crate) edge_type: String,
-    pub(crate) base_epoch: GraphEpoch,
+    pub(crate) base_epoch: TopologySequence,
 }
 
 impl MatrixCacheKey {
-    pub(crate) fn new(cell_id: &str, edge_type: &str, base_epoch: GraphEpoch) -> Self {
+    pub(crate) fn new(cell_id: &str, edge_type: &str, base_epoch: TopologySequence) -> Self {
         Self {
             cell_id: cell_id.to_string(),
             edge_type: edge_type.to_string(),
@@ -190,115 +183,6 @@ impl ParsedRowQueryCacheKey {
     }
 }
 
-#[cfg(feature = "opencypher")]
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ReachabilityCacheKey {
-    cell_id: String,
-    edge_type: String,
-    src: VertexId,
-    min_hops: u8,
-    max_hops: u8,
-    read_epoch: GraphEpoch,
-    window: Option<ReachabilityCacheWindow>,
-}
-
-#[cfg(feature = "opencypher")]
-impl ReachabilityCacheKey {
-    pub(crate) fn new(
-        cell_id: &str,
-        edge_type: &str,
-        src: VertexId,
-        hop_range: (u8, u8),
-        read_epoch: GraphEpoch,
-    ) -> Self {
-        Self {
-            cell_id: cell_id.to_string(),
-            edge_type: edge_type.to_string(),
-            src,
-            min_hops: hop_range.0,
-            max_hops: hop_range.1,
-            read_epoch,
-            window: None,
-        }
-    }
-
-    pub(crate) fn new_window(
-        cell_id: &str,
-        edge_type: &str,
-        src: VertexId,
-        hop_range: (u8, u8),
-        read_epoch: GraphEpoch,
-        window: QueryWindow,
-        ascending: bool,
-    ) -> Self {
-        Self {
-            cell_id: cell_id.to_string(),
-            edge_type: edge_type.to_string(),
-            src,
-            min_hops: hop_range.0,
-            max_hops: hop_range.1,
-            read_epoch,
-            window: Some(ReachabilityCacheWindow {
-                skip: window.skip,
-                limit: window.limit,
-                ascending,
-            }),
-        }
-    }
-
-    pub(crate) fn cell_id(&self) -> &str {
-        &self.cell_id
-    }
-}
-
-#[cfg(feature = "opencypher")]
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ReachabilityCacheWindow {
-    skip: u64,
-    limit: Option<usize>,
-    ascending: bool,
-}
-
-#[cfg(feature = "opencypher")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ReachabilityCacheValue {
-    vertices: Option<Arc<Vec<VertexId>>>,
-    count: u64,
-    edge_visits: u64,
-}
-
-#[cfg(feature = "opencypher")]
-impl ReachabilityCacheValue {
-    pub(crate) fn from_vertices(vertices: Vec<VertexId>, edge_visits: u64) -> Self {
-        let count = vertices.len() as u64;
-        Self {
-            vertices: Some(Arc::new(vertices)),
-            count,
-            edge_visits,
-        }
-    }
-
-    pub(crate) fn count_only(count: u64, edge_visits: u64) -> Self {
-        Self {
-            vertices: None,
-            count,
-            edge_visits,
-        }
-    }
-
-    pub(crate) fn vertices(&self) -> Option<Arc<Vec<VertexId>>> {
-        self.vertices.clone()
-    }
-
-    pub(crate) fn count(&self) -> u64 {
-        self.count
-    }
-
-    pub(crate) fn edge_visits(&self) -> u64 {
-        self.edge_visits
-    }
-}
-
 pub(crate) const GRAPH_TXN_MAX_RETRIES: usize = 32;
 pub(crate) const GRAPH_DELTA_GC_BATCH_KEYS: usize = 512;
 pub(crate) const GRAPH_WRITE_LANES: usize = 64;
@@ -311,7 +195,6 @@ pub(crate) const GRAPH_CELL_WRITE_LOCK_TTL_MS: u64 = 5 * 60 * 1000;
 pub(crate) const GRAPH_MUTATION_LOG_MATERIALIZE_TXN_EDGES: usize = 512;
 pub(crate) const GRAPH_STORE_FORMAT_KEY: &str = "graph/meta/format_version";
 pub(crate) const GRAPH_STORE_FORMAT_VERSION: u64 = 1;
-static GRAPH_READ_LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static GRAPH_CELL_WRITE_LOCK_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 mod codec;

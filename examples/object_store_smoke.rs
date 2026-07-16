@@ -1,5 +1,5 @@
 use slatedb_graph_kernel::{
-    object_store_from_env, ArtifactDirection, EdgeMutation, GraphShard, Result, SparseKernelBackend,
+    object_store_from_env, EdgeMutation, GraphShard, Result, SparseKernelBackend,
 };
 
 #[tokio::main]
@@ -28,13 +28,7 @@ async fn main() -> Result<()> {
 
         let base_epoch = shard.current_epoch(cell_id).await?;
         shard
-            .build_posting_chunks(cell_id, edge_type, base_epoch, 2)
-            .await?;
-        shard
             .build_matrix_tiles(cell_id, edge_type, base_epoch, 4)
-            .await?;
-        shard
-            .build_supernode_groups(cell_id, edge_type, base_epoch, 4, 2)
             .await?;
 
         shard
@@ -74,28 +68,13 @@ async fn main() -> Result<()> {
     let object_store = object_store_from_env(env_file)?;
     let reopened = GraphShard::open(db_path, object_store).await?;
     let read_epoch = reopened.current_epoch(cell_id).await?;
-    assert!(
-        !reopened
-            .supernode_edge_exists(cell_id, edge_type, 100, 11, read_epoch)
-            .await?
+    let snapshot = reopened.snapshot_at(cell_id, read_epoch).await?;
+    assert!(!snapshot.edge_exists(edge_type, 100, 11).await?);
+    assert!(snapshot.edge_exists(edge_type, 100, 16).await?);
+    assert_eq!(
+        snapshot.out_neighbors(edge_type, 100).await?,
+        vec![10, 12, 13, 14, 15, 16]
     );
-    assert!(
-        reopened
-            .supernode_edge_exists(cell_id, edge_type, 100, 16, read_epoch)
-            .await?
-    );
-    let page = reopened
-        .supernode_page(
-            cell_id,
-            edge_type,
-            ArtifactDirection::Out,
-            100,
-            read_epoch,
-            0,
-        )
-        .await?
-        .expect("supernode page should exist after reopen");
-    assert_eq!(page.vertices, vec![10, 12]);
     reopened.close().await?;
 
     println!("graph object-store smoke passed at epoch {read_epoch}");

@@ -39,7 +39,7 @@
     },
     "graph": {
       "type": "object",
-      "required": ["namespace", "graphId", "database", "cells", "controlPath", "dataPath"],
+      "required": ["namespace", "graphId", "database", "cells", "dataPath"],
       "properties": {
         "namespace": { "type": "string", "minLength": 1 },
         "graphId": { "type": "string", "minLength": 1 },
@@ -51,7 +51,6 @@
           "uniqueItems": true,
           "items": { "type": "string", "minLength": 1 }
         },
-        "controlPath": { "type": "string", "minLength": 1 },
         "dataPath": { "type": "string", "minLength": 1 }
       }
     },
@@ -100,16 +99,6 @@
             }
           }
         },
-        "internal": {
-          "type": "object",
-          "required": ["enabled", "caSecretName", "controllerSecretName", "nodeSecretName"],
-          "properties": {
-            "enabled": { "type": "boolean" },
-            "caSecretName": { "type": "string" },
-            "controllerSecretName": { "type": "string" },
-            "nodeSecretName": { "type": "string" }
-          }
-        },
         "certManager": {
           "type": "object",
           "properties": {
@@ -119,15 +108,13 @@
       }
     },
     "node": { "$ref": "#/definitions/workload" },
-    "controller": { "$ref": "#/definitions/workload" },
     "service": {
       "type": "object",
       "properties": {
         "advertisedBoltAddress": { "type": "string" },
         "bolt": { "$ref": "#/definitions/service" },
         "https": { "$ref": "#/definitions/service" },
-        "adminPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
-        "controlPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+        "adminPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
       }
     },
     "networkPolicy": {
@@ -156,6 +143,9 @@
         "rustLog": { "type": "string" },
         "maxConcurrentQueries": { "$ref": "#/definitions/unsignedDecimal" },
         "maxQueryRuntimeMs": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxServerCursors": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "maxCursorBufferBytes": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "cursorTtlMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "maxBoltConnections": { "$ref": "#/definitions/unsignedDecimal" },
         "defaultPageSize": { "$ref": "#/definitions/unsignedDecimal" },
         "gracefulShutdownMs": { "$ref": "#/definitions/unsignedDecimal" },
@@ -167,24 +157,23 @@
         "maxMatrixAdjacencyBytes": { "$ref": "#/definitions/unsignedDecimal" },
         "maxGraphblasMatrices": { "$ref": "#/definitions/unsignedDecimal" },
         "maxGraphblasBytes": { "$ref": "#/definitions/unsignedDecimal" },
-        "maxPostingChunkBytes": { "$ref": "#/definitions/unsignedDecimal" },
-        "maxMaterializedSupernodeBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxRelationshipRowsBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxSourceRelationshipRowsBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxRelationshipPropertyRowsBytes": { "$ref": "#/definitions/unsignedDecimal" },
         "maxConcurrentHydrations": { "$ref": "#/definitions/unsignedDecimal" },
         "maxConcurrentMatrixCompilations": { "$ref": "#/definitions/unsignedDecimal" },
-        "trimMemoryAfterHydration": { "type": "boolean" },
-        "leaseTtlMs": { "$ref": "#/definitions/unsignedDecimal" },
-        "leaseRenewIntervalMs": { "$ref": "#/definitions/unsignedDecimal" },
-        "shardRefreshIntervalMs": { "$ref": "#/definitions/unsignedDecimal" },
-        "heartbeatTtlMs": { "$ref": "#/definitions/unsignedDecimal" },
-        "controllerIntervalMs": { "$ref": "#/definitions/unsignedDecimal" },
-        "rebalanceMode": { "type": "string" },
-        "runtimeLeaseTtlMs": { "$ref": "#/definitions/unsignedDecimal" },
-        "runtimeLeaseRenewIntervalMs": { "$ref": "#/definitions/unsignedDecimal" }
+        "matrixAutoRefreshEnabled": { "type": "boolean" },
+        "matrixRefreshIntervalMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "matrixRefreshMaxDirtyMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "matrixRefreshMinEpochLag": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "matrixRefreshTileSize": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "matrixRefreshMaxEdgeTypesPerCycle": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "trimMemoryAfterHydration": { "type": "boolean" }
       }
     },
     "extraObjects": { "type": "array" }
   },
-  "required": ["image", "objectStore", "graph", "auth", "tls", "node", "controller", "service"],
+  "required": ["image", "objectStore", "graph", "auth", "tls", "node", "service"],
   "definitions": {
     "workload": {
       "type": "object",
@@ -273,6 +262,19 @@
         {
           "type": "string",
           "pattern": "^[0-9]+$"
+        }
+      ]
+    },
+    "positiveUnsignedDecimal": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        {
+          "type": "string",
+          "pattern": "^0*[1-9][0-9]*$"
         }
       ]
     }

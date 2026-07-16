@@ -9,18 +9,11 @@ pub struct GraphCachePolicy {
     #[cfg(feature = "opencypher")]
     pub max_parsed_row_queries: usize,
     #[cfg(feature = "opencypher")]
-    pub max_reachability_results: usize,
-    #[cfg(feature = "opencypher")]
     pub max_relationship_row_sets: usize,
     #[cfg(feature = "opencypher")]
     pub max_relationship_property_row_sets: usize,
-    pub max_supernode_groups: usize,
-    pub max_posting_chunks: usize,
-    pub max_materialized_supernodes: usize,
     pub max_entries_per_cell: Option<usize>,
     pub pin_matrix_min_edges: u64,
-    pub pin_supernode_min_degree: u64,
-    pub prefetch_supernode_chunks: u64,
     pub max_concurrent_hydrations: usize,
 }
 
@@ -28,23 +21,16 @@ impl Default for GraphCachePolicy {
     fn default() -> Self {
         Self {
             max_matrix_artifacts: 1_024,
-            max_matrix_adjacencies: 128,
+            max_matrix_adjacencies: 0,
             max_graphblas_matrices: 64,
             #[cfg(feature = "opencypher")]
             max_parsed_row_queries: 4_096,
             #[cfg(feature = "opencypher")]
-            max_reachability_results: 512,
-            #[cfg(feature = "opencypher")]
             max_relationship_row_sets: 1_024,
             #[cfg(feature = "opencypher")]
             max_relationship_property_row_sets: 4_096,
-            max_supernode_groups: 4_096,
-            max_posting_chunks: 16_384,
-            max_materialized_supernodes: 512,
             max_entries_per_cell: Some(8_192),
             pin_matrix_min_edges: 1_000_000,
-            pin_supernode_min_degree: 10_000,
-            prefetch_supernode_chunks: 1,
             max_concurrent_hydrations: 16,
         }
     }
@@ -58,10 +44,6 @@ impl GraphCachePolicy {
     pub(crate) fn pin_matrix_artifact(&self, artifact: &engine::MatrixArtifact) -> bool {
         artifact.edge_count >= self.pin_matrix_min_edges
     }
-
-    pub(crate) fn pin_supernode_group(&self, group: &engine::SupernodeGroup) -> bool {
-        group.degree >= self.pin_supernode_min_degree
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,12 +52,8 @@ pub enum GraphCacheKind {
     MatrixAdjacency,
     GraphBlas,
     ParsedRowQuery,
-    ReachabilityResult,
     RelationshipRows,
     RelationshipPropertyRows,
-    SupernodeGroup,
-    PostingChunk,
-    MaterializedSupernode,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -88,18 +66,10 @@ pub struct GraphCacheMetricsSnapshot {
     pub graphblas_misses: u64,
     pub parsed_row_query_hits: u64,
     pub parsed_row_query_misses: u64,
-    pub reachability_result_hits: u64,
-    pub reachability_result_misses: u64,
     pub relationship_rows_hits: u64,
     pub relationship_rows_misses: u64,
     pub relationship_property_rows_hits: u64,
     pub relationship_property_rows_misses: u64,
-    pub supernode_group_hits: u64,
-    pub supernode_group_misses: u64,
-    pub posting_chunk_hits: u64,
-    pub posting_chunk_misses: u64,
-    pub materialized_supernode_hits: u64,
-    pub materialized_supernode_misses: u64,
     pub insertions: u64,
     pub evictions: u64,
     pub pinned_insertions: u64,
@@ -107,8 +77,6 @@ pub struct GraphCacheMetricsSnapshot {
     pub hydration_started: u64,
     pub hydration_waited: u64,
     pub hydration_completed: u64,
-    pub prefetch_requests: u64,
-    pub prefetch_skipped: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -116,8 +84,6 @@ pub struct GraphOperationalMetricsSnapshot {
     pub write_attempts: u64,
     pub write_commits: u64,
     pub write_retries: u64,
-    pub stale_write_rejects: u64,
-    pub retention_rejects: u64,
     pub bulk_import_batches_profiled: u64,
     pub bulk_import_preflight_us: u64,
     pub bulk_import_batch_build_us: u64,
@@ -133,7 +99,6 @@ pub struct GraphOperationalMetricsSnapshot {
     pub gc_jobs_completed: u64,
     pub gc_keys_deleted: u64,
     pub gc_duration_us: u64,
-    pub read_leases_created: u64,
     pub verifier_runs: u64,
     pub verifier_failures: u64,
     pub verifier_duration_us: u64,
@@ -144,6 +109,9 @@ pub struct GraphOperationalMetricsSnapshot {
     pub query_rows_duration_us: u64,
     pub query_artifact_lookup_us: u64,
     pub query_graphblas_cache_us: u64,
+    pub query_graphblas_exact_snapshots: u64,
+    pub query_graphblas_delta_snapshots: u64,
+    pub query_rust_sparse_fallbacks: u64,
     pub graph_compute_tasks: u64,
     pub graph_compute_queue_us: u64,
     pub graph_compute_duration_us: u64,
@@ -155,8 +123,6 @@ pub(crate) struct GraphOperationalMetrics {
     pub(crate) write_attempts: AtomicU64,
     pub(crate) write_commits: AtomicU64,
     pub(crate) write_retries: AtomicU64,
-    pub(crate) stale_write_rejects: AtomicU64,
-    pub(crate) retention_rejects: AtomicU64,
     pub(crate) bulk_import_batches_profiled: AtomicU64,
     pub(crate) bulk_import_preflight_us: AtomicU64,
     pub(crate) bulk_import_batch_build_us: AtomicU64,
@@ -172,7 +138,6 @@ pub(crate) struct GraphOperationalMetrics {
     pub(crate) gc_jobs_completed: AtomicU64,
     pub(crate) gc_keys_deleted: AtomicU64,
     pub(crate) gc_duration_us: AtomicU64,
-    pub(crate) read_leases_created: AtomicU64,
     pub(crate) verifier_runs: AtomicU64,
     pub(crate) verifier_failures: AtomicU64,
     pub(crate) verifier_duration_us: AtomicU64,
@@ -183,6 +148,9 @@ pub(crate) struct GraphOperationalMetrics {
     pub(crate) query_rows_duration_us: AtomicU64,
     pub(crate) query_artifact_lookup_us: AtomicU64,
     pub(crate) query_graphblas_cache_us: AtomicU64,
+    pub(crate) query_graphblas_exact_snapshots: AtomicU64,
+    pub(crate) query_graphblas_delta_snapshots: AtomicU64,
+    pub(crate) query_rust_sparse_fallbacks: AtomicU64,
     pub(crate) graph_compute_tasks: AtomicU64,
     pub(crate) graph_compute_queue_us: AtomicU64,
     pub(crate) graph_compute_duration_us: AtomicU64,
@@ -195,8 +163,6 @@ impl GraphOperationalMetrics {
             write_attempts: self.write_attempts.load(Ordering::Relaxed),
             write_commits: self.write_commits.load(Ordering::Relaxed),
             write_retries: self.write_retries.load(Ordering::Relaxed),
-            stale_write_rejects: self.stale_write_rejects.load(Ordering::Relaxed),
-            retention_rejects: self.retention_rejects.load(Ordering::Relaxed),
             bulk_import_batches_profiled: self.bulk_import_batches_profiled.load(Ordering::Relaxed),
             bulk_import_preflight_us: self.bulk_import_preflight_us.load(Ordering::Relaxed),
             bulk_import_batch_build_us: self.bulk_import_batch_build_us.load(Ordering::Relaxed),
@@ -212,7 +178,6 @@ impl GraphOperationalMetrics {
             gc_jobs_completed: self.gc_jobs_completed.load(Ordering::Relaxed),
             gc_keys_deleted: self.gc_keys_deleted.load(Ordering::Relaxed),
             gc_duration_us: self.gc_duration_us.load(Ordering::Relaxed),
-            read_leases_created: self.read_leases_created.load(Ordering::Relaxed),
             verifier_runs: self.verifier_runs.load(Ordering::Relaxed),
             verifier_failures: self.verifier_failures.load(Ordering::Relaxed),
             verifier_duration_us: self.verifier_duration_us.load(Ordering::Relaxed),
@@ -223,6 +188,13 @@ impl GraphOperationalMetrics {
             query_rows_duration_us: self.query_rows_duration_us.load(Ordering::Relaxed),
             query_artifact_lookup_us: self.query_artifact_lookup_us.load(Ordering::Relaxed),
             query_graphblas_cache_us: self.query_graphblas_cache_us.load(Ordering::Relaxed),
+            query_graphblas_exact_snapshots: self
+                .query_graphblas_exact_snapshots
+                .load(Ordering::Relaxed),
+            query_graphblas_delta_snapshots: self
+                .query_graphblas_delta_snapshots
+                .load(Ordering::Relaxed),
+            query_rust_sparse_fallbacks: self.query_rust_sparse_fallbacks.load(Ordering::Relaxed),
             graph_compute_tasks: self.graph_compute_tasks.load(Ordering::Relaxed),
             graph_compute_queue_us: self.graph_compute_queue_us.load(Ordering::Relaxed),
             graph_compute_duration_us: self.graph_compute_duration_us.load(Ordering::Relaxed),
@@ -241,18 +213,10 @@ pub(crate) struct GraphCacheMetrics {
     pub(crate) graphblas_misses: AtomicU64,
     pub(crate) parsed_row_query_hits: AtomicU64,
     pub(crate) parsed_row_query_misses: AtomicU64,
-    pub(crate) reachability_result_hits: AtomicU64,
-    pub(crate) reachability_result_misses: AtomicU64,
     pub(crate) relationship_rows_hits: AtomicU64,
     pub(crate) relationship_rows_misses: AtomicU64,
     pub(crate) relationship_property_rows_hits: AtomicU64,
     pub(crate) relationship_property_rows_misses: AtomicU64,
-    pub(crate) supernode_group_hits: AtomicU64,
-    pub(crate) supernode_group_misses: AtomicU64,
-    pub(crate) posting_chunk_hits: AtomicU64,
-    pub(crate) posting_chunk_misses: AtomicU64,
-    pub(crate) materialized_supernode_hits: AtomicU64,
-    pub(crate) materialized_supernode_misses: AtomicU64,
     pub(crate) insertions: AtomicU64,
     pub(crate) evictions: AtomicU64,
     pub(crate) pinned_insertions: AtomicU64,
@@ -260,8 +224,6 @@ pub(crate) struct GraphCacheMetrics {
     pub(crate) hydration_started: AtomicU64,
     pub(crate) hydration_waited: AtomicU64,
     pub(crate) hydration_completed: AtomicU64,
-    pub(crate) prefetch_requests: AtomicU64,
-    pub(crate) prefetch_skipped: AtomicU64,
 }
 
 impl GraphCacheMetrics {
@@ -283,8 +245,6 @@ impl GraphCacheMetrics {
             (GraphCacheKind::GraphBlas, false) => &self.graphblas_misses,
             (GraphCacheKind::ParsedRowQuery, true) => &self.parsed_row_query_hits,
             (GraphCacheKind::ParsedRowQuery, false) => &self.parsed_row_query_misses,
-            (GraphCacheKind::ReachabilityResult, true) => &self.reachability_result_hits,
-            (GraphCacheKind::ReachabilityResult, false) => &self.reachability_result_misses,
             (GraphCacheKind::RelationshipRows, true) => &self.relationship_rows_hits,
             (GraphCacheKind::RelationshipRows, false) => &self.relationship_rows_misses,
             (GraphCacheKind::RelationshipPropertyRows, true) => {
@@ -293,12 +253,6 @@ impl GraphCacheMetrics {
             (GraphCacheKind::RelationshipPropertyRows, false) => {
                 &self.relationship_property_rows_misses
             }
-            (GraphCacheKind::SupernodeGroup, true) => &self.supernode_group_hits,
-            (GraphCacheKind::SupernodeGroup, false) => &self.supernode_group_misses,
-            (GraphCacheKind::PostingChunk, true) => &self.posting_chunk_hits,
-            (GraphCacheKind::PostingChunk, false) => &self.posting_chunk_misses,
-            (GraphCacheKind::MaterializedSupernode, true) => &self.materialized_supernode_hits,
-            (GraphCacheKind::MaterializedSupernode, false) => &self.materialized_supernode_misses,
         }
     }
 
@@ -312,8 +266,6 @@ impl GraphCacheMetrics {
             graphblas_misses: self.graphblas_misses.load(Ordering::Relaxed),
             parsed_row_query_hits: self.parsed_row_query_hits.load(Ordering::Relaxed),
             parsed_row_query_misses: self.parsed_row_query_misses.load(Ordering::Relaxed),
-            reachability_result_hits: self.reachability_result_hits.load(Ordering::Relaxed),
-            reachability_result_misses: self.reachability_result_misses.load(Ordering::Relaxed),
             relationship_rows_hits: self.relationship_rows_hits.load(Ordering::Relaxed),
             relationship_rows_misses: self.relationship_rows_misses.load(Ordering::Relaxed),
             relationship_property_rows_hits: self
@@ -322,14 +274,6 @@ impl GraphCacheMetrics {
             relationship_property_rows_misses: self
                 .relationship_property_rows_misses
                 .load(Ordering::Relaxed),
-            supernode_group_hits: self.supernode_group_hits.load(Ordering::Relaxed),
-            supernode_group_misses: self.supernode_group_misses.load(Ordering::Relaxed),
-            posting_chunk_hits: self.posting_chunk_hits.load(Ordering::Relaxed),
-            posting_chunk_misses: self.posting_chunk_misses.load(Ordering::Relaxed),
-            materialized_supernode_hits: self.materialized_supernode_hits.load(Ordering::Relaxed),
-            materialized_supernode_misses: self
-                .materialized_supernode_misses
-                .load(Ordering::Relaxed),
             insertions: self.insertions.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             pinned_insertions: self.pinned_insertions.load(Ordering::Relaxed),
@@ -337,8 +281,6 @@ impl GraphCacheMetrics {
             hydration_started: self.hydration_started.load(Ordering::Relaxed),
             hydration_waited: self.hydration_waited.load(Ordering::Relaxed),
             hydration_completed: self.hydration_completed.load(Ordering::Relaxed),
-            prefetch_requests: self.prefetch_requests.load(Ordering::Relaxed),
-            prefetch_skipped: self.prefetch_skipped.load(Ordering::Relaxed),
         }
     }
 }

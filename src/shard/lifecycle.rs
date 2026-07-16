@@ -95,88 +95,7 @@ impl GraphShard {
             object_store,
             options,
             memory,
-            GraphWriteAuthority::Standalone,
-        )
-        .await
-    }
-
-    #[cfg(any(test, feature = "chaos-harness"))]
-    pub(crate) async fn open_leased_writer(
-        path: impl Into<Path>,
-        object_store: Arc<dyn ObjectStore>,
-        options: GraphOpenOptions,
-        local_node_id: String,
-        leases: Arc<RwLock<BTreeMap<String, engine::ShardLease>>>,
-    ) -> Result<Self> {
-        Self::open_leased_writer_with_memory_options(
-            path,
-            object_store,
-            options,
-            GraphMemoryConfig::default(),
-            local_node_id,
-            leases,
-        )
-        .await
-    }
-
-    pub(crate) async fn open_leased_writer_with_memory_options(
-        path: impl Into<Path>,
-        object_store: Arc<dyn ObjectStore>,
-        options: GraphOpenOptions,
-        memory: GraphMemoryConfig,
-        local_node_id: String,
-        leases: Arc<RwLock<BTreeMap<String, engine::ShardLease>>>,
-    ) -> Result<Self> {
-        Self::open_internal(
-            path,
-            object_store,
-            options,
-            memory,
-            GraphWriteAuthority::Leased {
-                local_node_id,
-                leases,
-            },
-        )
-        .await
-    }
-
-    #[cfg(feature = "chaos-harness")]
-    pub async fn open_chaos_leased_writer_with_options(
-        path: impl Into<Path>,
-        object_store: Arc<dyn ObjectStore>,
-        options: GraphOpenOptions,
-        local_node_id: impl Into<String>,
-        lease: engine::ShardLease,
-    ) -> Result<Self> {
-        let local_node_id = local_node_id.into();
-        validate_component("node_id", &local_node_id)?;
-        if lease.owner_node_id != local_node_id {
-            return Err(GraphError::StaleShardLease {
-                cell_id: lease.cell_id.clone(),
-                node_id: local_node_id,
-                lease_token: lease.lease_token,
-            });
-        }
-        let leases = Arc::new(RwLock::new(BTreeMap::from([(
-            lease.cell_id.clone(),
-            lease,
-        )])));
-        Self::open_leased_writer(path, object_store, options, local_node_id, leases).await
-    }
-
-    #[cfg(feature = "chaos-harness")]
-    pub async fn open_chaos_leased_writer(
-        path: impl Into<Path>,
-        object_store: Arc<dyn ObjectStore>,
-        local_node_id: impl Into<String>,
-        lease: engine::ShardLease,
-    ) -> Result<Self> {
-        Self::open_chaos_leased_writer_with_options(
-            path,
-            object_store,
-            GraphOpenOptions::default(),
-            local_node_id,
-            lease,
+            GraphWriteAuthority::Writer,
         )
         .await
     }
@@ -207,18 +126,16 @@ impl GraphShard {
                 )
                 .await?,
             )),
-            GraphWriteAuthority::Standalone | GraphWriteAuthority::Leased { .. } => {
-                GraphStore::Writer(
-                    open_graph_db(
-                        store_path.clone(),
-                        Arc::clone(&object_store),
-                        &options.cache,
-                        &memory.storage,
-                        &options.durability,
-                    )
-                    .await?,
+            GraphWriteAuthority::Writer => GraphStore::Writer(
+                open_graph_db(
+                    store_path.clone(),
+                    Arc::clone(&object_store),
+                    &options.cache,
+                    &memory.storage,
+                    &options.durability,
                 )
-            }
+                .await?,
+            ),
         };
         ensure_store_format(&db, &write_authority).await?;
         let cache_policy = options.cache_policy;
@@ -226,12 +143,6 @@ impl GraphShard {
         let tenant_quota = cache_policy.max_entries_per_cell;
         let cache_metrics = Arc::new(GraphCacheMetrics::default());
         let operation_metrics = Arc::new(GraphOperationalMetrics::default());
-        #[cfg(feature = "opencypher")]
-        let query_read_leases = QueryReadLeaseManager::new(
-            db.writer_clone().ok(),
-            options.retention_policy.read_lease_ttl_ms,
-            Arc::clone(&operation_metrics),
-        );
         let hydration_gate = Arc::new(Semaphore::new(cache_policy.hydration_permits()));
         let matrix_compilation_gate = Arc::new(Semaphore::new(memory.matrix_compilation_permits()));
         let graph_write_gate = Arc::new(Semaphore::new(
@@ -249,9 +160,6 @@ impl GraphShard {
             store_path,
             limits: options.limits,
             cache_policy: cache_policy.clone(),
-            retention_policy: options.retention_policy,
-            #[cfg(feature = "opencypher")]
-            query_read_leases,
             cache_metrics,
             operation_metrics,
             hydration_gate,
@@ -283,38 +191,22 @@ impl GraphShard {
                 tenant_quota,
             )),
             #[cfg(feature = "opencypher")]
-            reachability_cache: Mutex::new(BoundedGraphCache::new(
-                cache_policy.max_reachability_results,
-                tenant_quota,
-            )),
-            #[cfg(feature = "opencypher")]
-            relationship_rows_cache: Mutex::new(BoundedGraphCache::new(
+            relationship_rows_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_relationship_row_sets,
                 tenant_quota,
+                memory.max_relationship_rows_bytes,
             )),
             #[cfg(feature = "opencypher")]
-            source_relationship_rows_cache: Mutex::new(BoundedGraphCache::new(
+            source_relationship_rows_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_relationship_row_sets,
                 tenant_quota,
+                memory.max_source_relationship_rows_bytes,
             )),
             #[cfg(feature = "opencypher")]
-            relationship_property_rows_cache: Mutex::new(BoundedGraphCache::new(
+            relationship_property_rows_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_relationship_property_row_sets,
                 tenant_quota,
-            )),
-            supernode_group_cache: Mutex::new(BoundedGraphCache::new(
-                cache_policy.max_supernode_groups,
-                tenant_quota,
-            )),
-            posting_chunk_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
-                cache_policy.max_posting_chunks,
-                tenant_quota,
-                memory.max_posting_chunk_bytes,
-            )),
-            materialized_supernode_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
-                cache_policy.max_materialized_supernodes,
-                tenant_quota,
-                memory.max_materialized_supernode_bytes,
+                memory.max_relationship_property_rows_bytes,
             )),
         })
     }
@@ -358,7 +250,7 @@ impl GraphShard {
         artifact_kind: &'static str,
         cell_id: &str,
         edge_type: &str,
-        base_epoch: GraphEpoch,
+        base_epoch: TopologySequence,
     ) -> Path {
         let db_path = if self.store_path.as_ref().is_empty() {
             "__root__"
@@ -368,8 +260,6 @@ impl GraphShard {
         let base_epoch = format!("{base_epoch:020}");
         let lock_namespace = match artifact_kind {
             "matrix" => "matrix_artifact_locks",
-            "posting" => "posting_artifact_locks",
-            "supernode" => "supernode_artifact_locks",
             _ => "artifact_locks",
         };
         Path::from_iter([
@@ -386,7 +276,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge_type: &str,
-        base_epoch: GraphEpoch,
+        base_epoch: TopologySequence,
     ) -> Path {
         self.graph_artifact_write_lock_path("matrix", cell_id, edge_type, base_epoch)
     }
@@ -405,40 +295,12 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge_type: &str,
-        base_epoch: GraphEpoch,
+        base_epoch: TopologySequence,
         operation: &'static str,
     ) -> Result<CellWriteLock> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         let path = self.matrix_artifact_write_lock_path(cell_id, edge_type, base_epoch);
-        self.acquire_write_lock_at_path(path, cell_id, operation)
-            .await
-    }
-
-    pub(crate) async fn acquire_posting_artifact_write_lock(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        base_epoch: GraphEpoch,
-        operation: &'static str,
-    ) -> Result<CellWriteLock> {
-        validate_component("cell_id", cell_id)?;
-        validate_component("edge_type", edge_type)?;
-        let path = self.graph_artifact_write_lock_path("posting", cell_id, edge_type, base_epoch);
-        self.acquire_write_lock_at_path(path, cell_id, operation)
-            .await
-    }
-
-    pub(crate) async fn acquire_supernode_artifact_write_lock(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        base_epoch: GraphEpoch,
-        operation: &'static str,
-    ) -> Result<CellWriteLock> {
-        validate_component("cell_id", cell_id)?;
-        validate_component("edge_type", edge_type)?;
-        let path = self.graph_artifact_write_lock_path("supernode", cell_id, edge_type, base_epoch);
         self.acquire_write_lock_at_path(path, cell_id, operation)
             .await
     }
@@ -467,8 +329,6 @@ impl GraphShard {
             #[cfg(feature = "opencypher")]
             parsed_row_queries: self.parsed_row_query_cache.lock().await.len(),
             #[cfg(feature = "opencypher")]
-            reachability_results: self.reachability_cache.lock().await.len(),
-            #[cfg(feature = "opencypher")]
             relationship_row_sets: self.relationship_rows_cache.lock().await.len()
                 + self.source_relationship_rows_cache.lock().await.len(),
             #[cfg(feature = "opencypher")]
@@ -477,9 +337,6 @@ impl GraphShard {
                 .lock()
                 .await
                 .len(),
-            supernode_groups: self.supernode_group_cache.lock().await.len(),
-            posting_chunks: self.posting_chunk_cache.lock().await.len(),
-            materialized_supernodes: self.materialized_supernode_cache.lock().await.len(),
         }
     }
 
@@ -487,9 +344,17 @@ impl GraphShard {
         GraphCacheResidentBytes {
             matrix_adjacencies: self.matrix_cache.lock().await.resident_bytes(),
             graphblas_matrices: self.graphblas_cache.lock().await.resident_bytes(),
-            posting_chunks: self.posting_chunk_cache.lock().await.resident_bytes(),
-            materialized_supernodes: self
-                .materialized_supernode_cache
+            #[cfg(feature = "opencypher")]
+            relationship_rows: self.relationship_rows_cache.lock().await.resident_bytes(),
+            #[cfg(feature = "opencypher")]
+            source_relationship_rows: self
+                .source_relationship_rows_cache
+                .lock()
+                .await
+                .resident_bytes(),
+            #[cfg(feature = "opencypher")]
+            relationship_property_rows: self
+                .relationship_property_rows_cache
                 .lock()
                 .await
                 .resident_bytes(),
@@ -581,115 +446,13 @@ impl GraphShard {
         cell_id: &str,
         operation: &'static str,
     ) -> Result<()> {
-        self.active_write_lease(cell_id, operation).map(|_| ())
-    }
-
-    pub(crate) fn active_write_lease(
-        &self,
-        cell_id: &str,
-        operation: &'static str,
-    ) -> Result<Option<engine::ShardLease>> {
         match &self.write_authority {
-            GraphWriteAuthority::ReadOnly => Err(GraphError::WriteRequiresLease {
+            GraphWriteAuthority::ReadOnly => Err(GraphError::WriteRequiresWriter {
                 operation,
                 cell_id: cell_id.to_string(),
             }),
-            GraphWriteAuthority::Standalone => Ok(None),
-            GraphWriteAuthority::Leased {
-                local_node_id,
-                leases,
-            } => {
-                let Some(lease) = leases.read().map_err(lock_error)?.get(cell_id).cloned() else {
-                    return Err(GraphError::WriteRequiresLease {
-                        operation,
-                        cell_id: cell_id.to_string(),
-                    });
-                };
-                if lease.owner_node_id == *local_node_id && lease.expires_at_ms > graph_now_millis()
-                {
-                    Ok(Some(lease))
-                } else {
-                    Err(GraphError::StaleShardLease {
-                        cell_id: cell_id.to_string(),
-                        node_id: local_node_id.clone(),
-                        lease_token: lease.lease_token,
-                    })
-                }
-            }
+            GraphWriteAuthority::Writer => self.db.writer().map(|_| ()),
         }
-    }
-
-    pub(crate) async fn install_write_fence(
-        &self,
-        cell_id: &str,
-        lease: &engine::ShardLease,
-    ) -> Result<()> {
-        validate_component("cell_id", cell_id)?;
-        validate_component("node_id", &lease.owner_node_id)?;
-        if lease.cell_id != cell_id {
-            return Err(GraphError::StaleShardLease {
-                cell_id: cell_id.to_string(),
-                node_id: lease.owner_node_id.clone(),
-                lease_token: lease.lease_token,
-            });
-        }
-        let Some(active) = self.active_write_lease(cell_id, "install_write_fence")? else {
-            return Ok(());
-        };
-        if active.owner_node_id != lease.owner_node_id || active.lease_token != lease.lease_token {
-            return Err(GraphError::StaleShardLease {
-                cell_id: cell_id.to_string(),
-                node_id: lease.owner_node_id.clone(),
-                lease_token: lease.lease_token,
-            });
-        }
-
-        let _writer = self.writer_lane(cell_id).lock().await;
-        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
-            match self.install_write_fence_txn(cell_id, lease).await {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    tokio::task::yield_now().await;
-                }
-                result => return result,
-            }
-        }
-        Err(GraphError::RetryExhausted {
-            operation: "graph transaction",
-            attempts: GRAPH_TXN_MAX_RETRIES,
-        })
-    }
-
-    async fn install_write_fence_txn(
-        &self,
-        cell_id: &str,
-        lease: &engine::ShardLease,
-    ) -> Result<()> {
-        let txn = self
-            .db
-            .writer()?
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await?;
-        let key = keys::write_fence(cell_id);
-        if let Some(value) = read_txn_remote(&txn, &key).await? {
-            let current = decode_write_fence(&key, &value)?;
-            if current.lease_token > lease.lease_token
-                || (current.lease_token == lease.lease_token
-                    && current.owner_node_id != lease.owner_node_id)
-            {
-                return Err(GraphError::StaleShardLease {
-                    cell_id: cell_id.to_string(),
-                    node_id: lease.owner_node_id.clone(),
-                    lease_token: lease.lease_token,
-                });
-            }
-        }
-        txn.put(
-            key.as_bytes(),
-            encode_write_fence(&GraphWriteFence::from(lease)),
-        )?;
-        commit_txn_strict(txn, self.await_durable_writes).await
     }
 
     pub(crate) async fn validate_write_fence_txn(
@@ -698,7 +461,7 @@ impl GraphShard {
         cell_id: &str,
         operation: &'static str,
     ) -> Result<()> {
-        if operation != "drop_cell" && operation != "prune_read_leases" {
+        if operation != "drop_cell" {
             let drop_marker = keys::cell_drop_marker(cell_id);
             let pending_drop_marker = keys::cell_drop_pending_marker(cell_id);
             if read_txn_remote(txn, &drop_marker).await?.is_some()
@@ -710,29 +473,7 @@ impl GraphShard {
                 });
             }
         }
-        let Some(lease) = self.active_write_lease(cell_id, operation)? else {
-            return Ok(());
-        };
-        let key = keys::write_fence(cell_id);
-        let Some(value) = read_txn_remote(txn, &key).await? else {
-            return Err(GraphError::WriteRequiresLease {
-                operation,
-                cell_id: cell_id.to_string(),
-            });
-        };
-        let fence = decode_write_fence(&key, &value)?;
-        if fence.cell_id == cell_id
-            && fence.owner_node_id == lease.owner_node_id
-            && fence.lease_token == lease.lease_token
-        {
-            Ok(())
-        } else {
-            Err(GraphError::StaleShardLease {
-                cell_id: cell_id.to_string(),
-                node_id: lease.owner_node_id,
-                lease_token: lease.lease_token,
-            })
-        }
+        self.ensure_write_authority(cell_id, operation)
     }
 
     pub(crate) async fn validate_write_fence(
@@ -747,170 +488,6 @@ impl GraphShard {
             .await?;
         self.validate_write_fence_txn(&txn, cell_id, operation)
             .await
-    }
-
-    pub(crate) async fn publish_read_lease(
-        &self,
-        cell_id: &str,
-        read_epoch: GraphEpoch,
-    ) -> Result<()> {
-        if self.retention_policy.read_lease_ttl_ms == 0 {
-            return Ok(());
-        }
-        let now_ms = graph_now_millis();
-        let lease_id = format!(
-            "{now_ms:020}-{:020}",
-            GRAPH_READ_LEASE_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
-        let lease = GraphReadLease {
-            cell_id: cell_id.to_string(),
-            lease_id: lease_id.clone(),
-            read_epoch,
-            expires_at_ms: now_ms.saturating_add(self.retention_policy.read_lease_ttl_ms),
-        };
-        let mut batch = WriteBatch::new();
-        batch.put(
-            keys::read_lease(cell_id, &lease_id).as_bytes(),
-            encode_read_lease(&lease),
-        );
-        let options = WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        };
-        self.db
-            .writer()?
-            .write_with_options(batch, &options)
-            .await?;
-        self.operation_metrics
-            .read_leases_created
-            .fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub(crate) async fn min_active_read_epoch(&self, cell_id: &str) -> Result<Option<GraphEpoch>> {
-        if self.retention_policy.read_lease_ttl_ms == 0 {
-            return Ok(None);
-        }
-        let now_ms = graph_now_millis();
-        let prefix = keys::read_lease_prefix(cell_id);
-        let mut iter = self.scan_remote_prefix(&prefix).await?;
-        let mut scanned = 0_u64;
-        let mut min_epoch = None;
-        let mut expired_batch = GraphWriteBatch::new();
-        let mut pending_deletes = 0_usize;
-        while let Some(kv) = iter.next().await? {
-            scanned = scanned.saturating_add(1);
-            if scanned > self.retention_policy.max_read_leases_to_scan {
-                self.operation_metrics
-                    .retention_rejects
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(GraphError::AdmissionRejected {
-                    operation: "read_lease_scan",
-                    actual: scanned,
-                    limit: self.retention_policy.max_read_leases_to_scan,
-                });
-            }
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let lease = decode_read_lease(&key, &kv.value)?;
-            if lease.cell_id != cell_id {
-                return Err(GraphError::CorruptValue {
-                    key,
-                    reason: "read lease cell id does not match key prefix".to_string(),
-                });
-            }
-            if lease.expires_at_ms <= now_ms {
-                expired_batch.delete(key.as_bytes());
-                pending_deletes += 1;
-                if pending_deletes >= GRAPH_DELTA_GC_BATCH_KEYS {
-                    self.flush_read_lease_gc_batch(
-                        cell_id,
-                        &mut expired_batch,
-                        &mut pending_deletes,
-                    )
-                    .await?;
-                }
-            } else {
-                min_epoch = Some(min_epoch.map_or(lease.read_epoch, |epoch: GraphEpoch| {
-                    epoch.min(lease.read_epoch)
-                }));
-            }
-        }
-        self.flush_read_lease_gc_batch(cell_id, &mut expired_batch, &mut pending_deletes)
-            .await?;
-        Ok(min_epoch)
-    }
-
-    async fn flush_read_lease_gc_batch(
-        &self,
-        cell_id: &str,
-        batch: &mut GraphWriteBatch,
-        pending_deletes: &mut usize,
-    ) -> Result<()> {
-        if *pending_deletes == 0 {
-            return Ok(());
-        }
-        let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
-        self.write_graph_batch_strict(cell_id, "prune_read_leases", batch_to_write)
-            .await?;
-        *pending_deletes = 0;
-        Ok(())
-    }
-
-    pub(crate) async fn delta_gc_safe_epoch(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-    ) -> Result<GraphEpoch> {
-        let current_epoch = self.current_epoch(cell_id).await?;
-        let retained_safe_epoch =
-            current_epoch.saturating_sub(self.retention_policy.min_retained_epochs);
-        if self.min_active_read_epoch(cell_id).await?.is_some() {
-            let watermark = self.delta_gc_watermark(cell_id, edge_type).await?;
-            Ok(retained_safe_epoch.min(watermark))
-        } else {
-            Ok(retained_safe_epoch)
-        }
-    }
-
-    pub(crate) async fn artifact_gc_safe_keep_epoch(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-    ) -> Result<GraphEpoch> {
-        if self.min_active_read_epoch(cell_id).await?.is_some() {
-            return Ok(1);
-        }
-        if self.retention_policy.min_retained_epochs == 0 {
-            return Ok(GraphEpoch::MAX);
-        }
-        let current_epoch = self.current_epoch(cell_id).await?;
-        let oldest_retained_epoch =
-            current_epoch.saturating_sub(self.retention_policy.min_retained_epochs);
-        if oldest_retained_epoch == 0 {
-            return Ok(1);
-        }
-        Ok(self
-            .latest_matrix_artifact(cell_id, edge_type, oldest_retained_epoch)
-            .await?
-            .map_or(1, |artifact| artifact.base_epoch))
-    }
-
-    pub(crate) fn record_retention_reject(
-        &self,
-        operation: &'static str,
-        cell_id: &str,
-        requested_epoch: GraphEpoch,
-        safe_epoch: GraphEpoch,
-    ) -> GraphError {
-        self.operation_metrics
-            .retention_rejects
-            .fetch_add(1, Ordering::Relaxed);
-        GraphError::RetentionViolation {
-            operation,
-            cell_id: cell_id.to_string(),
-            requested_epoch,
-            safe_epoch,
-        }
     }
 
     pub(crate) fn record_artifact_build_completed(&self, duration: std::time::Duration) {
@@ -958,13 +535,7 @@ impl GraphShard {
         record_count: usize,
         duration: std::time::Duration,
     ) {
-        if matches!(
-            operation,
-            "build_posting_chunks"
-                | "build_matrix_tiles"
-                | "build_supernode_groups"
-                | "rollup_artifacts"
-        ) {
+        if operation == "build_matrix_tiles" {
             self.operation_metrics
                 .artifact_publish_batches
                 .fetch_add(1, Ordering::Relaxed);
@@ -1003,18 +574,33 @@ impl GraphShard {
 
     pub async fn snapshot(&self, cell_id: &str) -> Result<GraphSnapshot<'_>> {
         validate_component("cell_id", cell_id)?;
-        let read_epoch = self.pin_current_read_epoch(cell_id, "snapshot").await?;
+        let storage_snapshot = self.db.snapshot().await?;
+        let read_epoch = if let Some(snapshot) = storage_snapshot.as_ref() {
+            let key = keys::last_epoch(cell_id);
+            match snapshot
+                .get_with_options(key.as_bytes(), &remote_read_options())
+                .await?
+            {
+                Some(value) => decode_u64(&key, &value)?,
+                None => 0,
+            }
+        } else {
+            // DbReader pins a checkpoint/manifest even though this SlateDB
+            // revision does not expose a DbSnapshot handle for it.
+            self.current_epoch(cell_id).await?
+        };
         Ok(GraphSnapshot {
             shard: self,
             cell_id: cell_id.to_string(),
             read_epoch,
+            storage_snapshot,
         })
     }
 
     pub async fn snapshot_at(
         &self,
         cell_id: &str,
-        read_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
     ) -> Result<GraphSnapshot<'_>> {
         validate_component("cell_id", cell_id)?;
         let current_epoch = self.current_epoch(cell_id).await?;
@@ -1025,12 +611,17 @@ impl GraphShard {
                 current_epoch,
             });
         }
-        self.pin_read_epoch(cell_id, "snapshot_at", read_epoch)
-            .await?;
+        if read_epoch != current_epoch {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "GraphSnapshot",
+                feature: "historical graph epochs are not SlateDB snapshots".to_string(),
+            });
+        }
         Ok(GraphSnapshot {
             shard: self,
             cell_id: cell_id.to_string(),
             read_epoch,
+            storage_snapshot: self.db.snapshot().await?,
         })
     }
 }
