@@ -142,7 +142,7 @@ cargo build "${FEATURE_ARGS[@]}" --example stress_worker >/dev/null
 echo "graph MinIO chaos: bucket=$BUCKET db=$DB_PATH ops=$OPS"
 
 pause_mode_then_recover reddit-home 1 writer writer 100000
-run_worker_for reddit-home 1 rollup "$ENV_FILE" "$DB_PATH" node-a 1 1
+run_worker_for reddit-home 1 artifact "$ENV_FILE" "$DB_PATH" node-a 1 1
 verify_cell reddit-home 1
 
 kill_mode_then_recover reddit-kill-batch 9 batch batch 900000
@@ -150,14 +150,11 @@ kill_mode_then_recover reddit-kill-batch 9 batch batch 900000
 run_worker_for reddit-kill-matrix 10 batch "$ENV_FILE" "$DB_PATH" seed-matrix "$KILL_OPS" 1000000
 kill_mode_then_recover reddit-kill-matrix 10 matrix matrix 1000000
 
-run_worker_for reddit-kill-supernode 11 batch "$ENV_FILE" "$DB_PATH" seed-supernode "$KILL_OPS" 1100000
-kill_mode_then_recover reddit-kill-supernode 11 supernode supernode 1100000
-
-run_worker_for reddit-kill-rollup 12 batch "$ENV_FILE" "$DB_PATH" seed-rollup "$KILL_OPS" 1200000
-kill_mode_then_recover reddit-kill-rollup 12 rollup rollup 1200000
+run_worker_for reddit-kill-artifact 12 batch "$ENV_FILE" "$DB_PATH" seed-artifact "$KILL_OPS" 1200000
+kill_mode_then_recover reddit-kill-artifact 12 artifact artifact 1200000
 
 run_worker_for reddit-kill-delta-gc 13 batch "$ENV_FILE" "$DB_PATH" seed-delta-gc "$KILL_OPS" 1300000
-run_worker_for reddit-kill-delta-gc 13 rollup "$ENV_FILE" "$DB_PATH" seed-delta-gc-rollup 1 1
+run_worker_for reddit-kill-delta-gc 13 artifact "$ENV_FILE" "$DB_PATH" seed-delta-gc-artifact 1 1
 kill_mode_then_recover reddit-kill-delta-gc 13 delta-gc delta-gc 1300000
 
 GRAPH_INDEX_POLICY=outbound-only kill_mode_then_recover reddit-kill-segment 15 segment segment 1500000
@@ -167,20 +164,19 @@ GRAPH_INDEX_POLICY=outbound-only kill_mode_then_recover reddit-kill-segment-gc 1
 GRAPH_INDEX_POLICY=outbound-only run_worker_for reddit-kill-segment-gc 16 segment-delete "$ENV_FILE" "$DB_PATH" seed-segment-gc-delete "$KILL_OPS" 1600000
 GRAPH_INDEX_POLICY=outbound-only kill_mode_then_recover reddit-kill-segment-gc 16 segment-gc segment-gc 1600000
 
-run_worker_for reddit-pause-rollup 14 batch "$ENV_FILE" "$DB_PATH" seed-pause-rollup "$KILL_OPS" 1400000
-pause_mode_then_recover reddit-pause-rollup 14 rollup rollup 1400000
+run_worker_for reddit-pause-artifact 14 batch "$ENV_FILE" "$DB_PATH" seed-pause-artifact "$KILL_OPS" 1400000
+pause_mode_then_recover reddit-pause-artifact 14 artifact artifact 1400000
 
 docker restart "$NAME" >/dev/null
 run_worker_for reddit-home 1 reader "$ENV_FILE" "$DB_PATH" reader-empty-cache 1 1
 verify_cell reddit-home 1
 verify_cell reddit-kill-batch 9
 verify_cell reddit-kill-matrix 10
-verify_cell reddit-kill-supernode 11
-verify_cell reddit-kill-rollup 12
+verify_cell reddit-kill-artifact 12
 verify_cell reddit-kill-delta-gc 13
 GRAPH_INDEX_POLICY=outbound-only verify_cell reddit-kill-segment 15
 GRAPH_INDEX_POLICY=outbound-only verify_cell reddit-kill-segment-gc 16
-verify_cell reddit-pause-rollup 14
+verify_cell reddit-pause-artifact 14
 
 scripts/minio_fence_takeover.sh
 

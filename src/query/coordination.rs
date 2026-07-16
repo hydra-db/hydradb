@@ -1607,17 +1607,8 @@ pub trait QueryCellClient: Send + Sync {
         &self,
         _scope: &crate::GraphScope,
         _cell_id: &str,
-    ) -> Result<Option<crate::GraphEpoch>> {
+    ) -> Result<Option<crate::TopologySequence>> {
         Ok(None)
-    }
-
-    async fn pin_query_read_context(&self, mut context: QueryContext) -> Result<QueryContext> {
-        if context.read_epoch.is_none() {
-            context.read_epoch = self
-                .current_graph_epoch(&context.scope, &context.cell_id)
-                .await?;
-        }
-        Ok(context)
     }
 }
 
@@ -3103,7 +3094,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 ))
             }
             crate::QueryBatchOperation::CreateEdges { edge_type, edges } => {
-                self.ensure_active_write_lease(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id)?;
                 let mutations =
                     edges
                         .into_iter()
@@ -3129,7 +3120,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 source_label,
                 destination_label,
             } => {
-                self.ensure_active_write_lease(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id)?;
                 let mutations =
                     edges
                         .into_iter()
@@ -3155,7 +3146,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
             crate::QueryBatchOperation::UpsertVertices { vertices } => {
-                self.ensure_active_write_lease(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id)?;
                 shard
                     .merge_vertex_metadata_batch(
                         &context.cell_id,
@@ -3172,7 +3163,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 source_label,
                 destination_label,
             } => {
-                self.ensure_active_write_lease(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id)?;
                 shard
                     .create_relationships_batch_between_labeled_vertices(
                         &context.cell_id,
@@ -3200,7 +3191,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 source_label,
                 destination_label,
             } => {
-                self.ensure_active_write_lease(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id)?;
                 shard
                     .merge_relationships_batch_between_labeled_vertices(
                         &context.cell_id,
@@ -3228,7 +3219,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
             crate::QueryBatchOperation::DeleteEdges { edge_type, edges } => {
-                self.ensure_active_write_lease(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id)?;
                 let mutations =
                     edges
                         .into_iter()
@@ -3249,7 +3240,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
             crate::QueryBatchOperation::DeleteVertices { vertices, detach } => {
-                self.ensure_active_write_lease(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id)?;
                 for (index, vertex) in vertices.into_iter().enumerate() {
                     if context
                         .cancellation_token
@@ -3283,7 +3274,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 property,
                 values,
             } => {
-                self.ensure_active_write_lease(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id)?;
                 shard
                     .delete_relationships_by_property_values_batch(
                         &context, &edge_type, &property, values,
@@ -3298,7 +3289,7 @@ impl QueryCellClient for RoutedGraphCluster {
         &self,
         scope: &crate::GraphScope,
         cell_id: &str,
-    ) -> Result<Option<crate::GraphEpoch>> {
+    ) -> Result<Option<crate::TopologySequence>> {
         if scope != self.scope() {
             return Err(GraphError::GraphScopeMismatch {
                 expected: self.scope().to_string(),
@@ -3306,38 +3297,6 @@ impl QueryCellClient for RoutedGraphCluster {
             });
         }
         Ok(Some(self.shard(cell_id)?.current_epoch(cell_id).await?))
-    }
-
-    async fn pin_query_read_context(&self, context: QueryContext) -> Result<QueryContext> {
-        if &context.scope != self.scope() {
-            return Err(GraphError::GraphScopeMismatch {
-                expected: self.scope().to_string(),
-                actual: context.scope.to_string(),
-            });
-        }
-        let shard = self.shard(&context.cell_id)?;
-        let read_epoch = match context.read_epoch {
-            Some(read_epoch) => {
-                let current_epoch = shard.current_epoch(&context.cell_id).await?;
-                if read_epoch > current_epoch {
-                    return Err(GraphError::SnapshotAhead {
-                        cell_id: context.cell_id.clone(),
-                        read_epoch,
-                        current_epoch,
-                    });
-                }
-                read_epoch
-            }
-            None => shard.current_epoch(&context.cell_id).await?,
-        };
-        if shard.retention_policy.read_lease_ttl_ms == 0 {
-            return Ok(context.at_epoch(read_epoch));
-        }
-        let retention = shard
-            .query_read_leases
-            .acquire(&context.cell_id, read_epoch, context.max_runtime_ms)
-            .await?;
-        Ok(context.with_validated_read_epoch(read_epoch, retention))
     }
 }
 

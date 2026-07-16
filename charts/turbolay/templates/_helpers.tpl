@@ -42,10 +42,6 @@ app.kubernetes.io/component: {{ .component }}
 {{- default (printf "%s-node" (include "turbolay.fullname" .)) .Values.node.serviceAccount.name -}}
 {{- end -}}
 
-{{- define "turbolay.controllerServiceAccountName" -}}
-{{- default (printf "%s-controller" (include "turbolay.fullname" .)) .Values.controller.serviceAccount.name -}}
-{{- end -}}
-
 {{- define "turbolay.authSecretName" -}}
 {{- if .Values.auth.existingSecret -}}
 {{- .Values.auth.existingSecret -}}
@@ -58,18 +54,6 @@ app.kubernetes.io/component: {{ .component }}
 
 {{- define "turbolay.publicTlsSecretName" -}}
 {{- default (printf "%s-server-tls" (include "turbolay.fullname" .)) .Values.tls.public.secretName -}}
-{{- end -}}
-
-{{- define "turbolay.internalCaSecretName" -}}
-{{- default (printf "%s-internal-ca" (include "turbolay.fullname" .)) .Values.tls.internal.caSecretName -}}
-{{- end -}}
-
-{{- define "turbolay.controllerTlsSecretName" -}}
-{{- default (printf "%s-controller-mtls" (include "turbolay.fullname" .)) .Values.tls.internal.controllerSecretName -}}
-{{- end -}}
-
-{{- define "turbolay.nodeTlsSecretName" -}}
-{{- default (printf "%s-node-mtls" (include "turbolay.fullname" .)) .Values.tls.internal.nodeSecretName -}}
 {{- end -}}
 
 {{- define "turbolay.nodeAddresses" -}}
@@ -88,14 +72,6 @@ app.kubernetes.io/component: {{ .component }}
 {{- else -}}
 {{- printf "%s-bolt.%s.svc.cluster.local:%v" (include "turbolay.fullname" .) .Release.Namespace .Values.service.bolt.port -}}
 {{- end -}}
-{{- end -}}
-
-{{- define "turbolay.controlEndpoint" -}}
-{{- printf "%s-controller.%s.svc.cluster.local:%v" (include "turbolay.fullname" .) .Release.Namespace .Values.service.controlPort -}}
-{{- end -}}
-
-{{- define "turbolay.controlServerName" -}}
-{{- printf "%s-controller.%s.svc.cluster.local" (include "turbolay.fullname" .) .Release.Namespace -}}
 {{- end -}}
 
 {{- define "turbolay.image" -}}

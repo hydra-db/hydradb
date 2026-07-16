@@ -13,12 +13,11 @@ use boltr::types::{BoltDict, BoltValue};
 use bytes::BytesMut;
 use slatedb::object_store::ObjectStore;
 use slatedb_graph_kernel::{
-    local_object_store, ArtifactDirection, BoltServerConfig, BoltServerHandle, ClientBoltServer,
-    ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget, GraphBackpressurePolicy,
-    GraphCacheConfig, GraphCachePolicy, GraphControlPlane, GraphIndexPolicy, GraphLimits,
-    GraphOpenOptions, GraphRetentionPolicy, GraphScope, QueryTransportAction,
-    QueryTransportScopeGrant, RoutedGraphCluster, ShardPlacement, StaticClientDatabaseResolver,
-    StaticQueryTransportScopeAuthorizer,
+    local_object_store, BoltServerConfig, BoltServerHandle, ClientBoltServer, ClientQueryService,
+    ClientQueryServiceConfig, ClientQueryTarget, GraphBackpressurePolicy, GraphCacheConfig,
+    GraphCachePolicy, GraphIndexPolicy, GraphLimits, GraphOpenOptions, GraphScope,
+    QueryTransportAction, QueryTransportScopeGrant, RoutedGraphCluster, ShardPlacement,
+    StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer,
 };
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
@@ -72,7 +71,7 @@ async fn main() -> BenchResult<()> {
     let object_store = local_object_store(&object_root)?;
 
     eprintln!(
-        "Bolt benchmark: fanouts={fanouts:?} hops={hops:?} read_latency_iters={read_latency_iters} read_concurrency={read_concurrency} read_queries_per_worker={read_queries_per_worker} write_latency_iters={write_latency_iters} write_concurrency={write_concurrency} write_queries_per_worker={write_queries_per_worker} backend=local-object-store transport=tcp-loopback kernel={} reachability_cache=disabled",
+        "Bolt benchmark: fanouts={fanouts:?} hops={hops:?} read_latency_iters={read_latency_iters} read_concurrency={read_concurrency} read_queries_per_worker={read_queries_per_worker} write_latency_iters={write_latency_iters} write_concurrency={write_concurrency} write_queries_per_worker={write_queries_per_worker} backend=local-object-store transport=tcp-loopback kernel={}",
         if cfg!(feature = "graphblas") { "graphblas" } else { "rust" }
     );
     println!(
@@ -82,7 +81,6 @@ async fn main() -> BenchResult<()> {
 
     for fanout in fanouts {
         let paths = BenchPaths {
-            control: format!("bolt-benchmark/fanout-{fanout}/control"),
             graph: format!("bolt-benchmark/fanout-{fanout}/graph"),
             cache: cache_root.join(format!("fanout-{fanout}")),
         };
@@ -434,7 +432,6 @@ async fn prepare_external_dataset(
 }
 
 struct BenchPaths {
-    control: String,
     graph: String,
     cache: std::path::PathBuf,
 }
@@ -443,14 +440,12 @@ struct BenchEnvironment {
     server: BoltServerHandle,
     service: ClientQueryService,
     cluster: Arc<RoutedGraphCluster>,
-    control: GraphControlPlane,
 }
 
 impl BenchEnvironment {
     async fn stop(self) -> BenchResult<()> {
         self.server.stop().await?;
         self.cluster.close().await?;
-        self.control.close().await?;
         Ok(())
     }
 }
@@ -462,17 +457,12 @@ async fn open_environment(
     object_store: Arc<dyn ObjectStore>,
     bulk_chunk_size: usize,
 ) -> BenchResult<BenchEnvironment> {
-    let control = GraphControlPlane::open(paths.control, Arc::clone(&object_store)).await?;
-    control
-        .publish_placement(&ShardPlacement::fixed([(CELL_ID, "benchmark-node")])?)
-        .await?;
     let cluster = Arc::new(
-        RoutedGraphCluster::open_owned_with_control_and_options(
+        RoutedGraphCluster::open_fenced_owned_with_options(
             paths.graph,
             "benchmark-node",
-            &control,
+            ShardPlacement::fixed([(CELL_ID, "benchmark-node")])?,
             object_store,
-            Duration::from_secs(300),
             graph_options(fanout, max_hop, paths.cache),
         )
         .await?,
@@ -491,16 +481,6 @@ async fn open_environment(
     let epoch = shard.current_epoch(CELL_ID).await?;
     shard
         .build_matrix_tiles(CELL_ID, EDGE_TYPE, epoch, 4_096)
-        .await?;
-    shard
-        .build_supernode_groups_for_directions(
-            CELL_ID,
-            EDGE_TYPE,
-            epoch,
-            10,
-            512,
-            &[ArtifactDirection::Out],
-        )
         .await?;
     shard
         .refresh_edge_type_query_stats(CELL_ID, EDGE_TYPE)
@@ -545,7 +525,6 @@ async fn open_environment(
         server,
         service,
         cluster,
-        control,
     })
 }
 
@@ -571,7 +550,6 @@ fn graph_options(fanout: u64, max_hop: u8, cache_dir: std::path::PathBuf) -> Gra
         cache_policy: GraphCachePolicy {
             max_matrix_adjacencies: 0,
             max_graphblas_matrices: 1,
-            max_reachability_results: 0,
             max_entries_per_cell: None,
             pin_matrix_min_edges: 0,
             max_concurrent_hydrations: 32,
@@ -582,10 +560,6 @@ fn graph_options(fanout: u64, max_hop: u8, cache_dir: std::path::PathBuf) -> Gra
             ..Default::default()
         },
         index_policy: GraphIndexPolicy::Full,
-        retention_policy: GraphRetentionPolicy {
-            read_lease_ttl_ms: env_u64("GRAPH_BOLT_BENCH_READ_LEASE_TTL_MS", 60_000),
-            ..Default::default()
-        },
         ..Default::default()
     }
 }
@@ -961,13 +935,6 @@ fn parse_u8_list(name: &str, default: &[u8]) -> Vec<u8> {
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())

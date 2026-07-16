@@ -9,7 +9,6 @@ Wait for the load balancer address:
 {{- end }}
 
 Check the runtime:
-  kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "turbolay.fullname" . }}-controller
   kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "turbolay.fullname" . }}-node
   helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
 

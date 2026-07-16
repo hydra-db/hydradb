@@ -7,7 +7,7 @@ impl GraphShard {
         edge_type: &str,
         starts: &[VertexId],
         hops: u8,
-        read_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
     ) -> Result<MatrixTraversalResult> {
         self.matrix_reachable_with_kernel(
             cell_id,
@@ -26,7 +26,7 @@ impl GraphShard {
         edge_type: &str,
         starts: &[VertexId],
         hops: u8,
-        read_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
         sparse_kernel: SparseKernelBackend,
     ) -> Result<MatrixTraversalResult> {
         validate_component("cell_id", cell_id)?;
@@ -36,14 +36,6 @@ impl GraphShard {
             u64::from(hops),
             u64::from(self.limits.max_traversal_hops),
         )?;
-        if hops == 1 {
-            if let Some(result) = self
-                .supernode_one_hop_reachable(cell_id, edge_type, starts, read_epoch, sparse_kernel)
-                .await?
-            {
-                return Ok(result);
-            }
-        }
         let profile = matrix_profile_enabled();
         let total_started = Instant::now();
 
@@ -143,18 +135,18 @@ impl GraphShard {
         })
     }
 
-    pub async fn posting_reachable(
+    pub async fn direct_snapshot_reachable(
         &self,
         cell_id: &str,
         edge_type: &str,
         starts: &[VertexId],
         hops: u8,
-        read_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
     ) -> Result<MatrixTraversalResult> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         ensure_limit(
-            "posting_reachable",
+            "direct_snapshot_reachable",
             u64::from(hops),
             u64::from(self.limits.max_traversal_hops),
         )?;
@@ -172,7 +164,7 @@ impl GraphShard {
         };
         let traversal = expand_sparse(&adjacency, starts, hops, SparseKernelBackend::RustSparse)?;
         Ok(MatrixTraversalResult {
-            backend: TraversalBackend::PostingExpansion,
+            backend: TraversalBackend::DirectSnapshot,
             vertices: traversal.vertices,
             hops,
             base_epoch: 0,
@@ -188,19 +180,19 @@ impl GraphShard {
         edge_type: &str,
         starts: &[VertexId],
         hops: u8,
-        read_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
     ) -> Result<BenchmarkResult> {
-        let posting = self
-            .posting_reachable(cell_id, edge_type, starts, hops, read_epoch)
+        let direct = self
+            .direct_snapshot_reachable(cell_id, edge_type, starts, hops, read_epoch)
             .await?;
         let matrix = self
             .matrix_reachable(cell_id, edge_type, starts, hops, read_epoch)
             .await?;
         Ok(BenchmarkResult {
-            matrix_wins: matrix.vertices == posting.vertices
-                && (matrix.edge_visits < posting.edge_visits
-                    || matrix.delta_records_applied < posting.delta_records_applied),
-            posting,
+            matrix_wins: matrix.vertices == direct.vertices
+                && (matrix.edge_visits < direct.edge_visits
+                    || matrix.delta_records_applied < direct.delta_records_applied),
+            direct,
             matrix,
         })
     }

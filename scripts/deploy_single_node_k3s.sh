@@ -174,9 +174,6 @@ DEPLOYMENT_NONCE="${TURBOLAY_DEPLOYMENT_NONCE:-$(date +%s)}"
 AWS_SECRET_NAME="${TURBOLAY_AWS_SECRET_NAME:-$RELEASE-aws-credentials}"
 AUTH_SECRET_NAME="${TURBOLAY_AUTH_SECRET_NAME:-$RELEASE-auth}"
 PUBLIC_TLS_SECRET_NAME="${TURBOLAY_PUBLIC_TLS_SECRET_NAME:-$RELEASE-public-tls}"
-INTERNAL_CA_SECRET_NAME="${TURBOLAY_INTERNAL_CA_SECRET_NAME:-$RELEASE-internal-ca}"
-CONTROLLER_TLS_SECRET_NAME="${TURBOLAY_CONTROLLER_TLS_SECRET_NAME:-$RELEASE-controller-mtls}"
-NODE_TLS_SECRET_NAME="${TURBOLAY_NODE_TLS_SECRET_NAME:-$RELEASE-node-mtls}"
 
 [[ -n "$S3_BUCKET" ]] || die "TURBOLAY_S3_BUCKET is required"
 [[ "$S3_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "invalid S3 bucket name"
@@ -267,7 +264,6 @@ graph:
   graphId: "$GRAPH_ID"
   database: "$DATABASE"
   cells: ["cell-0"]
-  controlPath: "$S3_PREFIX/control"
   dataPath: "$S3_PREFIX/data"
 
 auth:
@@ -279,11 +275,6 @@ tls:
   public:
     enabled: true
     secretName: "$PUBLIC_TLS_SECRET_NAME"
-  internal:
-    enabled: true
-    caSecretName: "$INTERNAL_CA_SECRET_NAME"
-    controllerSecretName: "$CONTROLLER_TLS_SECRET_NAME"
-    nodeSecretName: "$NODE_TLS_SECRET_NAME"
   certManager:
     enabled: false
 
@@ -312,34 +303,6 @@ node:
       accessModes: [ReadWriteOnce]
       annotations: {}
   tmpSizeLimit: 1Gi
-  extraEnv:
-$AWS_EXTRA_ENV
-
-controller:
-  replicaCount: 1
-  podAnnotations:
-    graph.usecortex.io/deployment-nonce: "$DEPLOYMENT_NONCE"
-  resources:
-    requests:
-      cpu: "100m"
-      memory: 256Mi
-      ephemeral-storage: 1Gi
-    limits:
-      cpu: "1"
-      memory: 1Gi
-      ephemeral-storage: 2Gi
-  cache:
-    type: emptyDir
-    memoryLimitBytes: 268435456
-    emptyDir:
-      sizeLimit: 1Gi
-      medium: ""
-    persistentVolume:
-      size: 2Gi
-      storageClassName: ""
-      accessModes: [ReadWriteOnce]
-      annotations: {}
-  tmpSizeLimit: 256Mi
   extraEnv:
 $AWS_EXTRA_ENV
 
@@ -504,67 +467,6 @@ else
     -keyout "$PKI_DIR/public.key" \
     -out "$PKI_DIR/public.crt" >/dev/null 2>&1
   apply_secret_tls "$PUBLIC_TLS_SECRET_NAME" "$PKI_DIR/public.crt" "$PKI_DIR/public.key"
-fi
-
-CONTROLLER_DNS="$RELEASE-controller.$K8S_NAMESPACE.svc.cluster.local"
-if secret_exists "$INTERNAL_CA_SECRET_NAME" \
-  && secret_exists "$CONTROLLER_TLS_SECRET_NAME" \
-  && secret_exists "$NODE_TLS_SECRET_NAME" \
-  && [[ "$ROTATE_SECRETS" != "1" ]]; then
-  kubectl -n "$K8S_NAMESPACE" get secret "$CONTROLLER_TLS_SECRET_NAME" \
-    -o jsonpath='{.data.tls\.crt}' | base64 --decode >"$PKI_DIR/controller-existing.crt"
-  certificate_matches_host "$PKI_DIR/controller-existing.crt" "$CONTROLLER_DNS" || \
-    die "existing internal certificate does not cover $CONTROLLER_DNS; set TURBOLAY_ROTATE_SECRETS=1"
-else
-  openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
-    -subj "/CN=$RELEASE-internal-ca" \
-    -addext 'basicConstraints=critical,CA:TRUE' \
-    -addext 'keyUsage=critical,keyCertSign,cRLSign' \
-    -keyout "$PKI_DIR/ca.key" \
-    -out "$PKI_DIR/ca.crt" >/dev/null 2>&1
-
-  openssl req -new -newkey rsa:2048 -nodes \
-    -subj "/CN=$CONTROLLER_DNS" \
-    -keyout "$PKI_DIR/controller.key" \
-    -out "$PKI_DIR/controller.csr" >/dev/null 2>&1
-  cat >"$PKI_DIR/controller.ext" <<EOF
-basicConstraints=critical,CA:FALSE
-keyUsage=critical,digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth
-subjectAltName=DNS:$CONTROLLER_DNS
-EOF
-  openssl x509 -req -sha256 -days 825 \
-    -in "$PKI_DIR/controller.csr" \
-    -CA "$PKI_DIR/ca.crt" \
-    -CAkey "$PKI_DIR/ca.key" \
-    -CAcreateserial \
-    -extfile "$PKI_DIR/controller.ext" \
-    -out "$PKI_DIR/controller.crt" >/dev/null 2>&1
-
-  openssl req -new -newkey rsa:2048 -nodes \
-    -subj "/CN=$RELEASE-node" \
-    -keyout "$PKI_DIR/node.key" \
-    -out "$PKI_DIR/node.csr" >/dev/null 2>&1
-  cat >"$PKI_DIR/node.ext" <<EOF
-basicConstraints=critical,CA:FALSE
-keyUsage=critical,digitalSignature,keyEncipherment
-extendedKeyUsage=clientAuth
-subjectAltName=DNS:$RELEASE-node
-EOF
-  openssl x509 -req -sha256 -days 825 \
-    -in "$PKI_DIR/node.csr" \
-    -CA "$PKI_DIR/ca.crt" \
-    -CAkey "$PKI_DIR/ca.key" \
-    -CAcreateserial \
-    -extfile "$PKI_DIR/node.ext" \
-    -out "$PKI_DIR/node.crt" >/dev/null 2>&1
-
-  kubectl -n "$K8S_NAMESPACE" create secret generic "$INTERNAL_CA_SECRET_NAME" \
-    --from-file="tls.crt=$PKI_DIR/ca.crt" \
-    --dry-run=client \
-    -o yaml | kubectl apply -f - >/dev/null
-  apply_secret_tls "$CONTROLLER_TLS_SECRET_NAME" "$PKI_DIR/controller.crt" "$PKI_DIR/controller.key"
-  apply_secret_tls "$NODE_TLS_SECRET_NAME" "$PKI_DIR/node.crt" "$PKI_DIR/node.key"
 fi
 
 if [[ "$SKIP_BUILD" != "1" ]]; then

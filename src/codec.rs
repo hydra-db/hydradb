@@ -62,7 +62,7 @@ pub(crate) async fn out_neighbors_for_src_txn(
     cell_id: &str,
     edge_type: &str,
     src: VertexId,
-    read_epoch: GraphEpoch,
+    read_epoch: TopologySequence,
 ) -> Result<BTreeSet<VertexId>> {
     let mut neighbors = BTreeSet::new();
 
@@ -89,8 +89,8 @@ pub(crate) async fn edge_epoch_at_txn(
     edge_type: &str,
     src: VertexId,
     dst: VertexId,
-    read_epoch: GraphEpoch,
-) -> Result<Option<GraphEpoch>> {
+    read_epoch: TopologySequence,
+) -> Result<Option<TopologySequence>> {
     let edge_key = keys::out_edge(cell_id, edge_type, src, dst);
     if let Some(value) = read_txn_remote(txn, &edge_key).await? {
         let record = decode_edge_record(&edge_key, &value)?;
@@ -111,7 +111,7 @@ pub(crate) async fn out_segment_neighbors_for_src_txn(
     cell_id: &str,
     edge_type: &str,
     src: VertexId,
-    read_epoch: GraphEpoch,
+    read_epoch: TopologySequence,
 ) -> Result<BTreeSet<VertexId>> {
     Ok(
         out_segment_edges_for_src_txn(txn, cell_id, edge_type, src, read_epoch)
@@ -126,10 +126,10 @@ pub(crate) async fn out_segment_edges_for_src_txn(
     cell_id: &str,
     edge_type: &str,
     src: VertexId,
-    read_epoch: GraphEpoch,
-) -> Result<BTreeMap<VertexId, GraphEpoch>> {
-    let mut edges = BTreeMap::<VertexId, GraphEpoch>::new();
-    let mut tombstones = BTreeMap::<VertexId, GraphEpoch>::new();
+    read_epoch: TopologySequence,
+) -> Result<BTreeMap<VertexId, TopologySequence>> {
+    let mut edges = BTreeMap::<VertexId, TopologySequence>::new();
+    let mut tombstones = BTreeMap::<VertexId, TopologySequence>::new();
     {
         let prefix = keys::out_segment_tombstone_src_prefix(cell_id, edge_type, src);
         let mut iter = txn.scan_prefix(prefix.as_bytes(), ..).await?;
@@ -182,7 +182,7 @@ pub(crate) async fn read_counter_txn(txn: &DbTransaction, key: &str) -> Result<u
     }
 }
 
-pub(crate) async fn next_epoch_txn(txn: &DbTransaction, cell_id: &str) -> Result<GraphEpoch> {
+pub(crate) async fn next_epoch_txn(txn: &DbTransaction, cell_id: &str) -> Result<TopologySequence> {
     let current = read_counter_txn(txn, &keys::last_epoch(cell_id)).await?;
     current
         .checked_add(1)
@@ -193,12 +193,21 @@ pub(crate) async fn next_epoch_txn(txn: &DbTransaction, cell_id: &str) -> Result
 }
 
 pub(crate) async fn commit_txn_strict(txn: DbTransaction, await_durable: bool) -> Result<()> {
+    commit_txn_strict_with_sequence(txn, await_durable)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn commit_txn_strict_with_sequence(
+    txn: DbTransaction,
+    await_durable: bool,
+) -> Result<Option<crate::StorageSequence>> {
     let options = WriteOptions {
         await_durable,
         ..Default::default()
     };
-    txn.commit_with_options(&options).await?;
-    Ok(())
+    let handle = txn.commit_with_options(&options).await?;
+    Ok(handle.map(|handle| handle.seqnum()))
 }
 
 pub(crate) fn remote_read_options() -> ReadOptions {
@@ -549,22 +558,6 @@ pub(crate) fn encode_vertex_property_value_key(value: &VertexPropertyValue) -> S
     }
 }
 
-pub(crate) fn encode_vertex_index_delta(present: bool) -> Vec<u8> {
-    vec![u8::from(present)]
-}
-
-#[cfg(feature = "opencypher")]
-pub(crate) fn decode_vertex_index_delta(key: &str, value: &[u8]) -> Result<bool> {
-    match value {
-        [0] => Ok(false),
-        [1] => Ok(true),
-        _ => Err(GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: "expected one-byte vertex index delta".to_string(),
-        }),
-    }
-}
-
 fn encode_vertex_property_value_record(value: &VertexPropertyValue) -> String {
     match value {
         VertexPropertyValue::Integer(value) => format!("i:{value}"),
@@ -682,7 +675,7 @@ pub(crate) fn encode_edge_record(record: &EdgeRecord) -> Vec<u8> {
     encode_edge_epoch(record.epoch)
 }
 
-pub(crate) fn encode_edge_epoch(epoch: GraphEpoch) -> Vec<u8> {
+pub(crate) fn encode_edge_epoch(epoch: TopologySequence) -> Vec<u8> {
     let mut value = Vec::with_capacity(b"graph-edge-v1".len() + 8);
     value.extend_from_slice(b"graph-edge-v1");
     value.extend_from_slice(&epoch.to_be_bytes());
@@ -701,7 +694,7 @@ pub(crate) fn decode_edge_record(key: &str, value: &[u8]) -> Result<EdgeRecord> 
     Ok(record)
 }
 
-pub(crate) fn encode_out_edge_segment_records(edges: &[(GraphEpoch, VertexId)]) -> Vec<u8> {
+pub(crate) fn encode_out_edge_segment_records(edges: &[(TopologySequence, VertexId)]) -> Vec<u8> {
     let mut value = Vec::with_capacity(b"graph-out-segment-v1\n".len() + 8 + edges.len() * 16);
     value.extend_from_slice(b"graph-out-segment-v1\n");
     value.extend_from_slice(&(edges.len() as u64).to_be_bytes());
@@ -732,7 +725,7 @@ pub(crate) fn encode_segment_compaction_idempotency(
 pub(crate) fn decode_segment_compaction_idempotency(
     key: &str,
     idempotency_key: &str,
-    compacted_through_epoch: GraphEpoch,
+    compacted_through_epoch: TopologySequence,
     value: &[u8],
 ) -> Result<SegmentCompactionResult> {
     let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
@@ -1604,7 +1597,7 @@ pub(crate) fn edge_mutation_log_fingerprint(
     hash
 }
 
-pub(crate) fn parse_mutation_log_epoch(key: &str) -> Result<GraphEpoch> {
+pub(crate) fn parse_mutation_log_epoch(key: &str) -> Result<TopologySequence> {
     let parts: Vec<&str> = key.split('/').collect();
     if parts.len() < 5 || parts[0] != "cell" || parts[2] != "mutation_log" {
         return Err(GraphError::CorruptValue {
@@ -1648,13 +1641,6 @@ pub(crate) fn writer_lane_index(cell_id: &str) -> usize {
     (hash as usize) % GRAPH_WRITE_LANES
 }
 
-pub(crate) fn lock_error<T>(_: std::sync::PoisonError<T>) -> GraphError {
-    GraphError::CorruptValue {
-        key: "graph/write_authority_lock".to_string(),
-        reason: "write authority lock poisoned".to_string(),
-    }
-}
-
 pub(crate) fn graph_now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1673,8 +1659,8 @@ pub(crate) fn duration_micros_u64(duration: std::time::Duration) -> u64 {
 
 pub(crate) fn merge_ingest_batch(
     batch: &EdgeMutationBatchResult,
-    start_epoch: &mut Option<GraphEpoch>,
-    end_epoch: &mut GraphEpoch,
+    start_epoch: &mut Option<TopologySequence>,
+    end_epoch: &mut TopologySequence,
     inserted: &mut u64,
     already_existed: &mut u64,
     batches: &mut u64,
@@ -1698,8 +1684,8 @@ pub(crate) fn encode_outbox_delta_batch(
     cell_id: &str,
     edge_type: &str,
     kind: DeltaKind,
-    start_epoch: GraphEpoch,
-    end_epoch: GraphEpoch,
+    start_epoch: TopologySequence,
+    end_epoch: TopologySequence,
     edges: &[(VertexId, VertexId)],
 ) -> Vec<u8> {
     if let Some((src, _)) = edges.first() {
@@ -1731,8 +1717,8 @@ pub(crate) fn encode_outbox_delta_batch_same_src(
     cell_id: &str,
     edge_type: &str,
     kind: DeltaKind,
-    start_epoch: GraphEpoch,
-    end_epoch: GraphEpoch,
+    start_epoch: TopologySequence,
+    end_epoch: TopologySequence,
     src: VertexId,
     dsts: &[VertexId],
 ) -> Vec<u8> {
@@ -1785,8 +1771,8 @@ fn decode_outbox_delta_batch_general(
     cell_id: String,
     edge_type: String,
     kind: DeltaKind,
-    start_epoch: GraphEpoch,
-    end_epoch: GraphEpoch,
+    start_epoch: TopologySequence,
+    end_epoch: TopologySequence,
 ) -> Result<OutboxDeltaBatch> {
     if start_epoch > end_epoch {
         return Err(GraphError::CorruptValue {
@@ -1876,8 +1862,8 @@ fn decode_outbox_delta_batch_same_src(
     cell_id: String,
     edge_type: String,
     kind: DeltaKind,
-    start_epoch: GraphEpoch,
-    end_epoch: GraphEpoch,
+    start_epoch: TopologySequence,
+    end_epoch: TopologySequence,
 ) -> Result<OutboxDeltaBatch> {
     if start_epoch > end_epoch {
         return Err(GraphError::CorruptValue {
@@ -1957,7 +1943,13 @@ fn decode_outbox_delta_batch_same_src(
 
 pub(crate) fn parse_outbox_batch_key(
     key: &str,
-) -> Result<(String, GraphEpoch, GraphEpoch, DeltaKind, String)> {
+) -> Result<(
+    String,
+    TopologySequence,
+    TopologySequence,
+    DeltaKind,
+    String,
+)> {
     let parts: Vec<&str> = key.split('/').collect();
     match parts.as_slice() {
         ["cell", cell_id, "outbox_batch", end_epoch, start_epoch, kind, edge_type, batch_id] => {
@@ -2109,7 +2101,7 @@ pub(crate) fn parse_relationship_property_index_key(
 
 pub(crate) fn parse_out_edge_segment_key(
     key: &str,
-) -> Result<(String, String, VertexId, GraphEpoch, GraphEpoch)> {
+) -> Result<(String, String, VertexId, TopologySequence, TopologySequence)> {
     let parts: Vec<&str> = key.split('/').collect();
     match parts.as_slice() {
         [
@@ -2166,8 +2158,8 @@ pub(crate) fn parse_out_edge_segment_tombstone_key(
 }
 
 pub(crate) fn segment_edge_visible(
-    edge_epoch: GraphEpoch,
-    tombstone_epoch: Option<GraphEpoch>,
+    edge_epoch: TopologySequence,
+    tombstone_epoch: Option<TopologySequence>,
 ) -> bool {
     match tombstone_epoch {
         Some(epoch) => edge_epoch > epoch,
@@ -2274,66 +2266,6 @@ pub(crate) fn sort_and_dedup_deltas(records: &mut Vec<DeltaRecord>) {
             && left.edge.dst == right.edge.dst
             && left.edge.epoch == right.edge.epoch
     });
-}
-
-pub(crate) fn encode_write_fence(fence: &GraphWriteFence) -> Vec<u8> {
-    format!(
-        "write_fence1\t{}\t{}\t{}\t{}\n",
-        fence.cell_id, fence.owner_node_id, fence.lease_token, fence.expires_at_ms
-    )
-    .into_bytes()
-}
-
-pub(crate) fn decode_write_fence(key: &str, value: &[u8]) -> Result<GraphWriteFence> {
-    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
-        key: key.to_string(),
-        reason: err.to_string(),
-    })?;
-    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 5 || parts[0] != "write_fence1" {
-        return Err(GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: "expected write_fence1 record with 5 fields".to_string(),
-        });
-    }
-    validate_component("cell_id", parts[1])?;
-    validate_component("node_id", parts[2])?;
-    Ok(GraphWriteFence {
-        cell_id: parts[1].to_string(),
-        owner_node_id: parts[2].to_string(),
-        lease_token: parse_u64(key, parts[3], "lease_token")?,
-        expires_at_ms: parse_u64(key, parts[4], "expires_at_ms")?,
-    })
-}
-
-pub(crate) fn encode_read_lease(lease: &GraphReadLease) -> Vec<u8> {
-    format!(
-        "read_lease1\t{}\t{}\t{}\t{}\n",
-        lease.cell_id, lease.lease_id, lease.read_epoch, lease.expires_at_ms
-    )
-    .into_bytes()
-}
-
-pub(crate) fn decode_read_lease(key: &str, value: &[u8]) -> Result<GraphReadLease> {
-    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
-        key: key.to_string(),
-        reason: err.to_string(),
-    })?;
-    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 5 || parts[0] != "read_lease1" {
-        return Err(GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: "expected read_lease1 record with 5 fields".to_string(),
-        });
-    }
-    validate_component("cell_id", parts[1])?;
-    validate_component("read_lease_id", parts[2])?;
-    Ok(GraphReadLease {
-        cell_id: parts[1].to_string(),
-        lease_id: parts[2].to_string(),
-        read_epoch: parse_u64(key, parts[3], "read_epoch")?,
-        expires_at_ms: parse_u64(key, parts[4], "expires_at_ms")?,
-    })
 }
 
 pub(crate) fn parse_u64(key: &str, value: &str, field: &str) -> Result<u64> {

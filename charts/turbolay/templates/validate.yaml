@@ -4,17 +4,14 @@
 {{- if and .Values.auth.existingSecret .Values.auth.externalSecret.enabled -}}
 {{- fail "auth.existingSecret and auth.externalSecret.enabled are mutually exclusive" -}}
 {{- end -}}
-{{- if and .Values.tls.certManager.enabled (not .Values.tls.public.enabled) (not .Values.tls.internal.enabled) -}}
-{{- fail "tls.certManager.enabled requires public TLS or internal mTLS" -}}
+{{- if and .Values.tls.certManager.enabled (not .Values.tls.public.enabled) -}}
+{{- fail "tls.certManager.enabled requires public TLS" -}}
 {{- end -}}
 {{- if ne (len .Values.graph.cells) 1 -}}
 {{- fail "the production runtime currently exposes exactly one cell per graph scope; deploy another release for another independently writable scope" -}}
 {{- end -}}
 {{- if hasKey .Values.node.podLabels "graph.usecortex.io/serving" -}}
 {{- fail "node.podLabels must not set graph.usecortex.io/serving; the runtime owns this role label" -}}
-{{- end -}}
-{{- if hasKey .Values.controller.podLabels "graph.usecortex.io/control-active" -}}
-{{- fail "controller.podLabels must not set graph.usecortex.io/control-active; the runtime owns this role label" -}}
 {{- end -}}
 {{- if and .Values.tls.public.trustBundle.enabled (not .Values.tls.public.enabled) -}}
 {{- fail "tls.public.trustBundle.enabled requires public TLS" -}}
@@ -84,7 +81,4 @@
 {{- end -}}
 {{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.podDisruptionBudget.node.minAvailable) (int .Values.node.replicaCount)) -}}
 {{- fail "podDisruptionBudget.node.minAvailable cannot exceed node.replicaCount" -}}
-{{- end -}}
-{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.podDisruptionBudget.controller.minAvailable) (int .Values.controller.replicaCount)) -}}
-{{- fail "podDisruptionBudget.controller.minAvailable cannot exceed controller.replicaCount" -}}
 {{- end -}}

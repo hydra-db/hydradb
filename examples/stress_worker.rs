@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
         eprintln!(
-            "usage: stress_worker <writer|batch|chunked-batch|deleter|segment|segment-delete|segment-compact|segment-gc|matrix|supernode|rollup|artifact|delta-gc|reader|verify|digest> <env-file|local:PATH|-> <db-path> [node-id] [ops] [start]"
+            "usage: stress_worker <writer|batch|chunked-batch|deleter|segment|segment-delete|segment-compact|segment-gc|matrix|artifact|delta-gc|reader|verify|digest> <env-file|local:PATH|-> <db-path> [node-id] [ops] [start]"
         );
         std::process::exit(2);
     }
@@ -32,8 +32,7 @@ async fn main() -> Result<()> {
     let open_options = graph_open_options();
     let shard = match mode {
         "writer" | "batch" | "chunked-batch" | "deleter" | "segment" | "segment-delete"
-        | "segment-compact" | "segment-gc" | "matrix" | "supernode" | "rollup" | "artifact"
-        | "delta-gc" => {
+        | "segment-compact" | "segment-gc" | "matrix" | "artifact" | "delta-gc" => {
             GraphShard::open_standalone_writer_with_options(
                 db_path.to_string(),
                 object_store,
@@ -189,7 +188,7 @@ async fn main() -> Result<()> {
                 let chunk_end = (chunk_start + chunk_size).min(ops);
                 let dsts = (chunk_start..chunk_end).map(|offset| start + offset);
                 let result = shard
-                    .bulk_append_supernode_segment_trusted(
+                    .bulk_append_out_adjacency_segment_trusted(
                         &cell_id,
                         &edge_type,
                         src,
@@ -237,18 +236,15 @@ async fn main() -> Result<()> {
             let epoch = shard.current_epoch(&cell_id).await?;
             if epoch > 0 {
                 shard
-                    .rollup_artifacts(
+                    .build_adjacency_image(
                         &cell_id,
                         &edge_type,
                         epoch,
-                        env_usize("GRAPH_POSTING_CHUNK", 256),
                         parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096),
-                        parse_env_u64("GRAPH_SUPERNODE_THRESHOLD").unwrap_or(10),
-                        env_usize("GRAPH_SUPERNODE_CHUNK", 256),
                     )
                     .await?;
                 let compact = shard
-                    .compact_supernode_segments(
+                    .compact_out_adjacency_segments(
                         &cell_id,
                         &edge_type,
                         src,
@@ -276,18 +272,15 @@ async fn main() -> Result<()> {
             let epoch = shard.current_epoch(&cell_id).await?;
             if epoch > 0 {
                 shard
-                    .rollup_artifacts(
+                    .build_adjacency_image(
                         &cell_id,
                         &edge_type,
                         epoch,
-                        env_usize("GRAPH_POSTING_CHUNK", 256),
                         parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096),
-                        parse_env_u64("GRAPH_SUPERNODE_THRESHOLD").unwrap_or(10),
-                        env_usize("GRAPH_SUPERNODE_CHUNK", 256),
                     )
                     .await?;
                 let compact = shard
-                    .compact_supernode_segments(
+                    .compact_out_adjacency_segments(
                         &cell_id,
                         &edge_type,
                         src,
@@ -296,7 +289,7 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 let delta_gc = shard
-                    .delete_deltas_through_rollup(&cell_id, &edge_type, epoch)
+                    .delete_deltas_through_matrix(&cell_id, &edge_type, epoch)
                     .await?;
                 println!(
                     "graph worker segment-gc node={node_id} cell={cell_id} src={src} epoch={} segments_deleted={} tombstones_deleted={} deltas_deleted={} deltas_retained={}",
@@ -332,46 +325,20 @@ async fn main() -> Result<()> {
                 println!("graph worker matrix node={node_id} cell={cell_id} epoch=0 skipped");
             }
         }
-        "supernode" => {
+        "artifact" => {
             let epoch = shard.current_epoch(&cell_id).await?;
             if epoch > 0 {
-                let groups = shard
-                    .build_supernode_groups(
+                let artifact = shard
+                    .build_adjacency_image(
                         &cell_id,
                         &edge_type,
                         epoch,
-                        parse_env_u64("GRAPH_SUPERNODE_THRESHOLD").unwrap_or(10),
-                        env_usize("GRAPH_SUPERNODE_CHUNK", 256),
-                    )
-                    .await?;
-                println!(
-                    "graph worker supernode node={node_id} cell={cell_id} epoch={epoch} groups={}",
-                    groups.len()
-                );
-            } else {
-                println!("graph worker supernode node={node_id} cell={cell_id} epoch=0 skipped");
-            }
-        }
-        "artifact" | "rollup" => {
-            let epoch = shard.current_epoch(&cell_id).await?;
-            if epoch > 0 {
-                let rollup = shard
-                    .rollup_artifacts(
-                        &cell_id,
-                        &edge_type,
-                        epoch,
-                        env_usize("GRAPH_POSTING_CHUNK", 256),
                         parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096),
-                        parse_env_u64("GRAPH_SUPERNODE_THRESHOLD").unwrap_or(10),
-                        env_usize("GRAPH_SUPERNODE_CHUNK", 256),
                     )
                     .await?;
                 println!(
-                    "graph worker artifact node={node_id} cell={cell_id} epoch={} posting_chunks={} matrix_edges={} supernodes={}",
-                    rollup.base_epoch,
-                    rollup.posting_chunks,
-                    rollup.matrix_edge_count,
-                    rollup.supernode_groups
+                    "graph worker artifact node={node_id} cell={cell_id} epoch={} matrix_edges={}",
+                    artifact.base_epoch, artifact.edge_count,
                 );
             } else {
                 println!("graph worker artifact node={node_id} cell={cell_id} epoch=0 skipped");
@@ -381,18 +348,15 @@ async fn main() -> Result<()> {
             let epoch = shard.current_epoch(&cell_id).await?;
             if epoch > 0 {
                 shard
-                    .rollup_artifacts(
+                    .build_adjacency_image(
                         &cell_id,
                         &edge_type,
                         epoch,
-                        env_usize("GRAPH_POSTING_CHUNK", 256),
                         parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096),
-                        parse_env_u64("GRAPH_SUPERNODE_THRESHOLD").unwrap_or(10),
-                        env_usize("GRAPH_SUPERNODE_CHUNK", 256),
                     )
                     .await?;
                 let gc = shard
-                    .delete_deltas_through_rollup(&cell_id, &edge_type, epoch)
+                    .delete_deltas_through_matrix(&cell_id, &edge_type, epoch)
                     .await?;
                 println!(
                     "graph worker delta-gc node={node_id} cell={cell_id} compacted={} deleted={} retained={}",
@@ -409,8 +373,8 @@ async fn main() -> Result<()> {
             if epoch > 0 {
                 let src = parse_env_u64("GRAPH_SRC_ID").unwrap_or(start);
                 let hops = parse_env_u8("GRAPH_HOPS").unwrap_or(1);
-                let posting = shard
-                    .posting_reachable(&cell_id, &edge_type, &[src], hops, epoch)
+                let direct = shard
+                    .direct_snapshot_reachable(&cell_id, &edge_type, &[src], hops, epoch)
                     .await?;
                 let matrix = shard
                     .matrix_reachable_with_kernel(
@@ -422,7 +386,7 @@ async fn main() -> Result<()> {
                         selected_matrix_kernel(),
                     )
                     .await?;
-                assert_eq!(posting.vertices, matrix.vertices);
+                assert_eq!(direct.vertices, matrix.vertices);
                 println!(
                     "graph worker reader node={node_id} cell={cell_id} epoch={epoch} hops={hops} vertices={} deltas={}",
                     matrix.vertices.len(),
@@ -442,7 +406,7 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             println!(
-                "graph worker verify node={node_id} cell={cell_id} epoch={} edges={} checksum={} canonical={} out_index={} in_index={} matrix_edges={} posting_chunks={} supernodes={} traversal_checks={} mismatches={}",
+                "graph worker verify node={node_id} cell={cell_id} epoch={} edges={} checksum={} canonical={} out_index={} in_index={} matrix_edges={} traversal_checks={} mismatches={}",
                 report.read_epoch,
                 report.digest.live_edges,
                 report.digest.edge_checksum,
@@ -450,8 +414,6 @@ async fn main() -> Result<()> {
                 report.out_index_edges,
                 report.in_index_edges,
                 report.matrix_edges_checked,
-                report.posting_chunks_checked,
-                report.supernode_groups_checked,
                 report.traversal_roots_checked,
                 report.mismatch_count
             );

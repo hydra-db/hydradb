@@ -34,11 +34,6 @@ name = "graph-node"
 path = "src/bin/graph-node.rs"
 required-features = ["server-runtime"]
 
-[[bin]]
-name = "graph-controller"
-path = "src/bin/graph-controller.rs"
-required-features = ["server-runtime"]
-
 [[example]]
 name = "fence_worker"
 path = "examples/fence_worker.rs"

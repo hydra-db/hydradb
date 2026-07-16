@@ -77,28 +77,11 @@ async fn main() -> Result<()> {
         let epoch = shard.current_epoch(&config.cell_id).await?;
         for edge_type in edge_import.type_counts.keys() {
             shard
-                .build_posting_chunks(
-                    &config.cell_id,
-                    edge_type,
-                    epoch,
-                    config.artifact_chunk_size,
-                )
-                .await?;
-            shard
-                .build_matrix_tiles(
+                .build_adjacency_image(
                     &config.cell_id,
                     edge_type,
                     epoch,
                     config.artifact_chunk_size as u64,
-                )
-                .await?;
-            shard
-                .build_supernode_groups(
-                    &config.cell_id,
-                    edge_type,
-                    epoch,
-                    config.supernode_threshold as u64,
-                    config.artifact_chunk_size,
                 )
                 .await?;
         }
@@ -143,7 +126,6 @@ struct ImportConfig {
     duplicate_policy: DuplicatePolicy,
     build_artifacts: bool,
     artifact_chunk_size: usize,
-    supernode_threshold: usize,
     cache_dir: Option<String>,
     cache_bytes: usize,
 }
@@ -185,10 +167,6 @@ impl ImportConfig {
             .optional_usize("--artifact-chunk-size")?
             .unwrap_or(32_768)
             .max(1);
-        let supernode_threshold = parser
-            .optional_usize("--supernode-threshold")?
-            .unwrap_or(1_024)
-            .max(1);
         let cache_bytes = parser
             .optional_usize("--cache-bytes")?
             .unwrap_or_else(default_cache_bytes);
@@ -202,7 +180,6 @@ impl ImportConfig {
             duplicate_policy,
             build_artifacts: parser.flag("--build-artifacts"),
             artifact_chunk_size,
-            supernode_threshold,
             cache_dir: parser.optional("--cache-dir")?,
             cache_bytes,
         };

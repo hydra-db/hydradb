@@ -4,8 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PYTHON="${PYTHON:-python3}"
-
-cargo build --locked --features server-runtime --bin graph-controller --bin graph-node
+cargo build --locked --features server-runtime --bin graph-node
 
 ROOT="${GRAPH_RUNTIME_SMOKE_ROOT:-/tmp/sgk-runtime-smoke}"
 if [[ "$ROOT" != /tmp/sgk-runtime-smoke ]]; then
@@ -13,7 +12,7 @@ if [[ "$ROOT" != /tmp/sgk-runtime-smoke ]]; then
   exit 2
 fi
 rm -rf -- "$ROOT"
-mkdir -p "$ROOT/store" "$ROOT/controller-cache-a" "$ROOT/controller-cache-b" "$ROOT/node-data-cache"
+mkdir -p "$ROOT/store" "$ROOT/node-data-cache"
 
 TOKEN="runtime-smoke-auth-token-32-characters-long"
 printf '%s\n' "$TOKEN" >"$ROOT/auth-token"
@@ -24,84 +23,41 @@ export GRAPH_NAMESPACE=smoke
 export GRAPH_ID=default
 export GRAPH_CELL_ID=cell-0
 export GRAPH_CELLS=cell-0
-export GRAPH_CONTROL_PATH=control
 export GRAPH_DATA_PATH=data
 export GRAPH_ALLOW_PLAINTEXT=true
-export GRAPH_INTERNAL_ALLOW_PLAINTEXT=true
 export GRAPH_AUTH_TOKEN_FILE="$ROOT/auth-token"
-export GRAPH_LEASE_TTL_MS=10000
-export GRAPH_LEASE_RENEW_INTERVAL_MS=1000
-export GRAPH_SHARD_REFRESH_INTERVAL_MS=500
-export GRAPH_HEARTBEAT_TTL_MS=5000
-export GRAPH_CONTROLLER_INTERVAL_MS=250
-export GRAPH_CONTROL_CACHE_BYTES=16777216
 export GRAPH_DATA_CACHE_BYTES=67108864
-export GRAPH_RUNTIME_LEASE_TTL_MS=2000
-export GRAPH_RUNTIME_LEASE_RENEW_INTERVAL_MS=250
-export GRAPH_CONTROL_RPC_ENDPOINT=127.0.0.1:19443
-export GRAPH_CONTROL_RPC_SERVER_NAME=localhost
 export GRAPH_BOLT_NODE_ADDRESSES=node-0=127.0.0.1:17687
+export GRAPH_NODE_ID=node-0
+export GRAPH_BOLT_ADDR=127.0.0.1:17687
+export GRAPH_HTTP_ADDR=127.0.0.1:18443
+export GRAPH_ADMIN_ADDR=127.0.0.1:19091
+export GRAPH_ADVERTISED_BOLT_ADDR=127.0.0.1:17687
+export GRAPH_DATA_CACHE_DIR="$ROOT/node-data-cache"
+export GRAPH_KUBERNETES_ROLE_LABELS=false
 export RUST_LOG=warn
 
-start_controller() {
-  local cache_dir="$1"
-  local log_file="$2"
-  GRAPH_CONTROL_RPC_ADDR=127.0.0.1:19443 \
-  GRAPH_ADMIN_ADDR=127.0.0.1:19090 \
-  GRAPH_CONTROL_CACHE_DIR="$cache_dir" \
-  target/debug/graph-controller >"$log_file" 2>&1 &
-  controller_pid=$!
-}
-
-wait_ready() {
-  local url="$1"
-  local pid="$2"
-  local log_file="$3"
-  for _ in $(seq 1 160); do
-    if curl -fsS "$url" >/dev/null 2>&1; then
-      return 0
-    fi
-    if ! kill -0 "$pid" 2>/dev/null; then
-      cat "$log_file" >&2
-      return 1
-    fi
-    sleep 0.25
-  done
-  cat "$log_file" >&2
-  return 1
-}
-
-controller_pid=""
 node_pid=""
 cleanup() {
-  for pid in "${node_pid:-}" "${controller_pid:-}"; do
-    if [[ -n "$pid" ]]; then
-      kill -TERM "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-    fi
-  done
+  if [[ -n "${node_pid:-}" ]]; then
+    kill -TERM "$node_pid" 2>/dev/null || true
+    wait "$node_pid" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
-start_controller "$ROOT/controller-cache-a" "$ROOT/controller-a.log"
-wait_ready http://127.0.0.1:19090/readyz "$controller_pid" "$ROOT/controller-a.log"
-
-GRAPH_NODE_ID=node-0 \
-GRAPH_BOLT_ADDR=127.0.0.1:17687 \
-GRAPH_HTTP_ADDR=127.0.0.1:18443 \
-GRAPH_ADMIN_ADDR=127.0.0.1:19091 \
-GRAPH_ADVERTISED_BOLT_ADDR=127.0.0.1:17687 \
-GRAPH_DATA_CACHE_DIR="$ROOT/node-data-cache" \
 target/debug/graph-node >"$ROOT/node.log" 2>&1 &
 node_pid=$!
-wait_ready http://127.0.0.1:19091/readyz "$node_pid" "$ROOT/node.log"
-
-kill -TERM "$controller_pid"
-wait "$controller_pid"
-controller_pid=""
-start_controller "$ROOT/controller-cache-b" "$ROOT/controller-b.log"
-wait_ready http://127.0.0.1:19090/readyz "$controller_pid" "$ROOT/controller-b.log"
-sleep 1.5
+for _ in $(seq 1 160); do
+  if curl -fsS http://127.0.0.1:19091/readyz >/dev/null 2>&1; then
+    break
+  fi
+  if ! kill -0 "$node_pid" 2>/dev/null; then
+    cat "$ROOT/node.log" >&2
+    exit 1
+  fi
+  sleep 0.25
+done
 curl -fsS http://127.0.0.1:19091/readyz >/dev/null
 curl -fsS http://127.0.0.1:19091/metrics | grep -q graph_runtime_ready
 
@@ -137,7 +93,4 @@ grep -q '"value":2' <<<"$http_result"
 kill -TERM "$node_pid"
 wait "$node_pid"
 node_pid=""
-kill -TERM "$controller_pid"
-wait "$controller_pid"
-controller_pid=""
 echo runtime-smoke-ok

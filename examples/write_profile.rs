@@ -374,7 +374,7 @@ async fn run_batch(
         }
         "segment-trusted" => {
             let result = shard
-                .bulk_append_supernode_segment_trusted(
+                .bulk_append_out_adjacency_segment_trusted(
                     CELL_ID,
                     EDGE_TYPE,
                     src,

@@ -4,42 +4,33 @@ struct SegmentCompactionRequest<'a> {
     cell_id: &'a str,
     edge_type: &'a str,
     src: VertexId,
-    compacted_through_epoch: GraphEpoch,
+    compacted_through_epoch: TopologySequence,
     idempotency_key: &'a str,
     started: std::time::Instant,
     lock: &'a CellWriteLock,
 }
 
 impl GraphShard {
-    pub async fn delete_deltas_through_rollup(
+    pub async fn delete_deltas_through_matrix(
         &self,
         cell_id: &str,
         edge_type: &str,
-        compact_through_epoch: GraphEpoch,
+        compact_through_epoch: TopologySequence,
     ) -> Result<DeltaGcResult> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        self.ensure_write_authority(cell_id, "delete_deltas_through_rollup")?;
+        self.ensure_write_authority(cell_id, "delete_deltas_through_matrix")?;
         let _permit = self
-            .acquire_gc_permit("delete_deltas_through_rollup")
+            .acquire_gc_permit("delete_deltas_through_matrix")
             .await?;
         let started = std::time::Instant::now();
-        let safe_epoch = self.delta_gc_safe_epoch(cell_id, edge_type).await?;
-        if compact_through_epoch > safe_epoch {
-            return Err(self.record_retention_reject(
-                "delete_deltas_through_rollup",
-                cell_id,
-                compact_through_epoch,
-                safe_epoch,
-            ));
-        }
         let Some(artifact) = self
             .latest_matrix_artifact(cell_id, edge_type, compact_through_epoch)
             .await?
         else {
             return Err(GraphError::CorruptValue {
                 key: keys::delta_gc_watermark(cell_id, edge_type),
-                reason: "cannot compact deltas without a matrix rollup artifact".to_string(),
+                reason: "cannot compact deltas without a matrix artifact".to_string(),
             });
         };
         if artifact.base_epoch != compact_through_epoch {
@@ -59,7 +50,7 @@ impl GraphShard {
         );
         self.write_graph_batch_strict_with_cell_lock(
             cell_id,
-            "delete_deltas_through_rollup",
+            "delete_deltas_through_matrix",
             watermark_batch,
         )
         .await?;
@@ -126,7 +117,7 @@ impl GraphShard {
             compact_through_epoch,
             deleted_delta_keys = result.deleted_delta_keys,
             retained_delta_keys = result.retained_delta_keys,
-            "deleted graph deltas through rollup"
+            "deleted graph deltas through published matrix"
         );
         self.record_gc_completed(result.deleted_delta_keys, started.elapsed());
         Ok(result)
@@ -136,7 +127,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge_type: &str,
-    ) -> Result<GraphEpoch> {
+    ) -> Result<TopologySequence> {
         self.read_counter(&keys::delta_gc_watermark(cell_id, edge_type))
             .await
     }
@@ -145,7 +136,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         prefix: &str,
-        compact_through_epoch: GraphEpoch,
+        compact_through_epoch: TopologySequence,
         result: &mut DeltaGcResult,
     ) -> Result<()> {
         let mut iter = self.scan_remote_prefix(prefix).await?;
@@ -174,7 +165,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge_type: &str,
-        compact_through_epoch: GraphEpoch,
+        compact_through_epoch: TopologySequence,
         result: &mut DeltaGcResult,
     ) -> Result<()> {
         let mut iter = self
@@ -207,7 +198,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge_type: &str,
-        compact_through_epoch: GraphEpoch,
+        compact_through_epoch: TopologySequence,
         result: &mut DeltaGcResult,
     ) -> Result<()> {
         let mut iter = self
@@ -240,7 +231,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         prefix: &str,
-        compact_through_epoch: GraphEpoch,
+        compact_through_epoch: TopologySequence,
         result: &mut DeltaGcResult,
     ) -> Result<()> {
         let mut iter = self.scan_remote_prefix(prefix).await?;
@@ -277,7 +268,7 @@ impl GraphShard {
         let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
         self.write_graph_batch_strict_with_cell_lock(
             cell_id,
-            "delete_deltas_through_rollup",
+            "delete_deltas_through_matrix",
             batch_to_write,
         )
         .await?;
@@ -291,7 +282,7 @@ impl GraphShard {
         edge_type: &str,
         src: VertexId,
         dst: VertexId,
-        read_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
     ) -> Result<bool> {
         Ok(self
             .edges_at(cell_id, edge_type, read_epoch)
@@ -305,7 +296,7 @@ impl GraphShard {
         cell_id: &str,
         edge_type: &str,
         src: VertexId,
-        read_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
     ) -> Result<Vec<VertexId>> {
         let mut neighbors: Vec<_> = self
             .edges_at(cell_id, edge_type, read_epoch)
@@ -322,7 +313,7 @@ impl GraphShard {
         cell_id: &str,
         edge_type: &str,
         src: VertexId,
-        read_epoch: GraphEpoch,
+        read_epoch: TopologySequence,
     ) -> Result<u64> {
         Ok(self
             .out_neighbors_at(cell_id, edge_type, src, read_epoch)
@@ -330,27 +321,29 @@ impl GraphShard {
             .len() as u64)
     }
 
-    pub async fn compact_supernode_segments(
+    pub async fn compact_out_adjacency_segments(
         &self,
         cell_id: &str,
         edge_type: &str,
         src: VertexId,
-        compacted_through_epoch: GraphEpoch,
+        compacted_through_epoch: TopologySequence,
         idempotency_key: &str,
     ) -> Result<SegmentCompactionResult> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         validate_component("idempotency_key", idempotency_key)?;
-        self.ensure_write_authority(cell_id, "compact_supernode_segments")?;
+        self.ensure_write_authority(cell_id, "compact_out_adjacency_segments")?;
 
         let started = std::time::Instant::now();
-        let _permit = self.acquire_gc_permit("compact_supernode_segments").await?;
+        let _permit = self
+            .acquire_gc_permit("compact_out_adjacency_segments")
+            .await?;
         let _writer = self.writer_lane(cell_id).lock().await;
         let lock = self
-            .acquire_cell_write_lock(cell_id, "compact_supernode_segments")
+            .acquire_cell_write_lock(cell_id, "compact_out_adjacency_segments")
             .await?;
         let result = self
-            .compact_supernode_segments_locked(SegmentCompactionRequest {
+            .compact_out_adjacency_segments_locked(SegmentCompactionRequest {
                 cell_id,
                 edge_type,
                 src,
@@ -363,7 +356,7 @@ impl GraphShard {
         release_cell_write_lock(lock, result).await
     }
 
-    async fn compact_supernode_segments_locked(
+    async fn compact_out_adjacency_segments_locked(
         &self,
         request: SegmentCompactionRequest<'_>,
     ) -> Result<SegmentCompactionResult> {
@@ -401,7 +394,7 @@ impl GraphShard {
         else {
             return Err(GraphError::CorruptValue {
                 key: keys::out_segment_src_prefix(cell_id, edge_type, src),
-                reason: "cannot compact segments without a matrix rollup artifact".to_string(),
+                reason: "cannot compact adjacency segments without a matrix artifact".to_string(),
             });
         };
         if artifact.base_epoch != compacted_through_epoch {
@@ -441,7 +434,7 @@ impl GraphShard {
                 cell_id, edge_type, src,
             ))
             .await?;
-        let mut tombstones = BTreeMap::<VertexId, (GraphEpoch, String)>::new();
+        let mut tombstones = BTreeMap::<VertexId, (TopologySequence, String)>::new();
         while let Some(kv) = tombstone_iter.next().await? {
             if should_renew_cell_lock_after_items(tombstones.len()) {
                 lock.renew().await?;
@@ -461,7 +454,7 @@ impl GraphShard {
             }
         }
 
-        let mut live = BTreeMap::<VertexId, GraphEpoch>::new();
+        let mut live = BTreeMap::<VertexId, TopologySequence>::new();
         for (_, segment) in &source_segments {
             for (epoch, dst) in &segment.edges {
                 if *epoch > compacted_through_epoch {
@@ -525,7 +518,7 @@ impl GraphShard {
             encode_segment_compaction_idempotency(idempotency_key, &result),
         );
         lock.renew().await?;
-        self.write_graph_batch_strict(cell_id, "compact_supernode_segments", batch)
+        self.write_graph_batch_strict(cell_id, "compact_out_adjacency_segments", batch)
             .await?;
         self.record_gc_completed(
             result
@@ -613,12 +606,6 @@ impl GraphShard {
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
-                }
                 Ok(()) => {
                     self.record_graph_batch_commit(operation, record_count, started.elapsed());
                     return Ok(());
@@ -657,12 +644,6 @@ impl GraphShard {
                         .write_retries
                         .fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
-                }
-                Err(err @ GraphError::StaleShardLease { .. }) => {
-                    self.operation_metrics
-                        .stale_write_rejects
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
                 }
                 Ok(()) => {
                     self.record_graph_batch_commit(operation, record_count, started.elapsed());
