@@ -25,16 +25,11 @@ tls:
     secretName: graph-server-tls
     additionalDnsNames:
       - graph-bolt.graph.internal.example.com
-  internal:
-    enabled: true
   certManager:
     enabled: true
     publicIssuerRef:
       kind: ClusterIssuer
       name: graph-public-issuer
-    internalRootIssuerRef:
-      kind: ClusterIssuer
-      name: graph-internal-root-issuer
 
 node:
   serviceAccount:
@@ -48,11 +43,6 @@ node:
       storageClassName: gp3
       accessModes:
         - ReadWriteOnce
-
-controller:
-  serviceAccount:
-    annotations:
-      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/turbolay-control-s3
 
 service:
   advertisedBoltAddress: graph-bolt.graph.internal.example.com:7687

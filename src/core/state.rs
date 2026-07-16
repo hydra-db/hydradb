@@ -1,12 +1,10 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use slatedb::bytes::Bytes;
 use slatedb::config::{ReadOptions, ScanOptions};
 use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
 use slatedb::ErrorKind;
-#[cfg(feature = "opencypher")]
-use slatedb::IsolationLevel;
 use slatedb::{Db, DbReader};
 #[cfg(feature = "opencypher")]
 use tokio::sync::watch;
@@ -18,16 +16,18 @@ use tokio::task::JoinHandle;
 use crate::query::opencypher::ParsedRowQuery;
 use crate::{
     engine, graph_now_millis, new_cell_write_lock_owner_token, parse_u64, sparse_kernel,
-    validate_component, BoundedGraphCache, GraphCacheMetrics, GraphCachePolicy, GraphEpoch,
-    GraphError, GraphIndexPolicy, GraphLimits, GraphOperationalMetrics, GraphRetentionPolicy,
-    MatrixAdjacency, MatrixCacheKey, PostingChunkCacheKey, Result, SupernodeCacheKey, VertexId,
-    GRAPH_CELL_WRITE_LOCK_BACKOFF_MS, GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS,
+    validate_component, BoundedGraphCache, GraphCacheMetrics, GraphCachePolicy, GraphError,
+    GraphIndexPolicy, GraphLimits, GraphOperationalMetrics, MatrixAdjacency, MatrixCacheKey,
+    Result, GRAPH_CELL_WRITE_LOCK_BACKOFF_MS, GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS,
 };
+
+tokio::task_local! {
+    static ACTIVE_STORAGE_SNAPSHOT: Arc<slatedb::DbSnapshot>;
+}
 #[cfg(feature = "opencypher")]
 use crate::{
-    ParsedRowQueryCacheKey, ReachabilityCacheKey, ReachabilityCacheValue,
-    RelationshipPropertyRowsCacheKey, RelationshipRowsCacheKey, RelationshipRowsCacheValue,
-    SourceRelationshipRowsCacheKey,
+    ParsedRowQueryCacheKey, RelationshipPropertyRowsCacheKey, RelationshipRowsCacheKey,
+    RelationshipRowsCacheValue, SourceRelationshipRowsCacheKey, VertexId,
 };
 
 pub struct GraphShard {
@@ -36,9 +36,6 @@ pub struct GraphShard {
     pub(crate) store_path: Path,
     pub(crate) limits: GraphLimits,
     pub(crate) cache_policy: GraphCachePolicy,
-    pub(crate) retention_policy: GraphRetentionPolicy,
-    #[cfg(feature = "opencypher")]
-    pub(crate) query_read_leases: Arc<QueryReadLeaseManager>,
     pub(crate) cache_metrics: Arc<GraphCacheMetrics>,
     pub(crate) operation_metrics: Arc<GraphOperationalMetrics>,
     pub(crate) hydration_gate: Arc<Semaphore>,
@@ -59,9 +56,6 @@ pub struct GraphShard {
     pub(crate) parsed_row_query_cache:
         Mutex<BoundedGraphCache<ParsedRowQueryCacheKey, ParsedRowQuery>>,
     #[cfg(feature = "opencypher")]
-    pub(crate) reachability_cache:
-        Mutex<BoundedGraphCache<ReachabilityCacheKey, ReachabilityCacheValue>>,
-    #[cfg(feature = "opencypher")]
     pub(crate) relationship_rows_cache:
         Mutex<BoundedGraphCache<RelationshipRowsCacheKey, RelationshipRowsCacheValue>>,
     #[cfg(feature = "opencypher")]
@@ -70,12 +64,6 @@ pub struct GraphShard {
     #[cfg(feature = "opencypher")]
     pub(crate) relationship_property_rows_cache:
         Mutex<BoundedGraphCache<RelationshipPropertyRowsCacheKey, RelationshipRowsCacheValue>>,
-    pub(crate) supernode_group_cache:
-        Mutex<BoundedGraphCache<SupernodeCacheKey, engine::SupernodeGroup>>,
-    pub(crate) posting_chunk_cache:
-        Mutex<BoundedGraphCache<PostingChunkCacheKey, engine::PostingChunk>>,
-    pub(crate) materialized_supernode_cache:
-        Mutex<BoundedGraphCache<SupernodeCacheKey, Arc<Vec<VertexId>>>>,
 }
 
 #[derive(Clone)]
@@ -92,16 +80,14 @@ impl GraphStore {
         }
     }
 
-    #[cfg(feature = "opencypher")]
-    pub(crate) fn writer_clone(&self) -> Result<Db> {
-        self.writer().cloned()
-    }
-
     pub(crate) async fn get_with_options(
         &self,
         key: &[u8],
         options: &ReadOptions,
     ) -> std::result::Result<Option<Bytes>, slatedb::Error> {
+        if let Ok(snapshot) = ACTIVE_STORAGE_SNAPSHOT.try_with(Arc::clone) {
+            return snapshot.get_with_options(key, options).await;
+        }
         match self {
             Self::Writer(db) => db.get_with_options(key, options).await,
             Self::Reader(reader) => reader.get_with_options(key, options).await,
@@ -114,6 +100,16 @@ impl GraphStore {
         start_suffix: Option<Vec<u8>>,
         options: &ScanOptions,
     ) -> std::result::Result<slatedb::DbIterator, slatedb::Error> {
+        if let Ok(snapshot) = ACTIVE_STORAGE_SNAPSHOT.try_with(Arc::clone) {
+            return match start_suffix {
+                Some(start) => {
+                    snapshot
+                        .scan_prefix_with_options(prefix, start.., options)
+                        .await
+                }
+                None => snapshot.scan_prefix_with_options(prefix, .., options).await,
+            };
+        }
         match (self, start_suffix) {
             (Self::Writer(db), Some(start)) => {
                 db.scan_prefix_with_options(prefix, start.., options).await
@@ -135,6 +131,27 @@ impl GraphStore {
             Self::Writer(db) => db.close().await,
             Self::Reader(reader) => reader.close().await,
         }
+    }
+
+    pub(crate) async fn snapshot(
+        &self,
+    ) -> std::result::Result<Option<Arc<slatedb::DbSnapshot>>, slatedb::Error> {
+        match self {
+            Self::Writer(db) => db.snapshot().await.map(Some),
+            // DbReader already pins its manifest through a checkpoint. It does
+            // not expose DbSnapshot in the SlateDB revision used here.
+            Self::Reader(_) => Ok(None),
+        }
+    }
+
+    pub(crate) async fn scope_snapshot<F>(
+        snapshot: Arc<slatedb::DbSnapshot>,
+        future: F,
+    ) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        ACTIVE_STORAGE_SNAPSHOT.scope(snapshot, future).await
     }
 }
 
@@ -186,259 +203,46 @@ pub struct GraphCacheEntryCounts {
     #[cfg(feature = "opencypher")]
     pub parsed_row_queries: usize,
     #[cfg(feature = "opencypher")]
-    pub reachability_results: usize,
-    #[cfg(feature = "opencypher")]
     pub relationship_row_sets: usize,
     #[cfg(feature = "opencypher")]
     pub relationship_property_row_sets: usize,
-    pub supernode_groups: usize,
-    pub posting_chunks: usize,
-    pub materialized_supernodes: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GraphCacheResidentBytes {
     pub matrix_adjacencies: usize,
     pub graphblas_matrices: usize,
-    pub posting_chunks: usize,
-    pub materialized_supernodes: usize,
+    #[cfg(feature = "opencypher")]
+    pub relationship_rows: usize,
+    #[cfg(feature = "opencypher")]
+    pub source_relationship_rows: usize,
+    #[cfg(feature = "opencypher")]
+    pub relationship_property_rows: usize,
 }
 
 impl GraphCacheResidentBytes {
     pub fn total(&self) -> usize {
         self.matrix_adjacencies
             .saturating_add(self.graphblas_matrices)
-            .saturating_add(self.posting_chunks)
-            .saturating_add(self.materialized_supernodes)
+            .saturating_add({
+                #[cfg(feature = "opencypher")]
+                {
+                    self.relationship_rows
+                        .saturating_add(self.source_relationship_rows)
+                        .saturating_add(self.relationship_property_rows)
+                }
+                #[cfg(not(feature = "opencypher"))]
+                {
+                    0
+                }
+            })
     }
 }
 
 #[derive(Clone)]
 pub(crate) enum GraphWriteAuthority {
     ReadOnly,
-    Standalone,
-    Leased {
-        local_node_id: String,
-        leases: Arc<RwLock<BTreeMap<String, engine::ShardLease>>>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GraphWriteFence {
-    pub(crate) cell_id: String,
-    pub(crate) owner_node_id: String,
-    pub(crate) lease_token: u64,
-    pub(crate) expires_at_ms: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GraphReadLease {
-    pub(crate) cell_id: String,
-    pub(crate) lease_id: String,
-    pub(crate) read_epoch: GraphEpoch,
-    pub(crate) expires_at_ms: u64,
-}
-
-#[cfg(feature = "opencypher")]
-#[derive(Default)]
-struct QueryReadLeaseCellState {
-    active_epochs: BTreeMap<GraphEpoch, u64>,
-    persisted_epoch: Option<GraphEpoch>,
-    persisted_expires_at_ms: u64,
-}
-
-#[cfg(feature = "opencypher")]
-pub(crate) struct QueryReadLeaseManager {
-    db: Option<Db>,
-    lease_id: String,
-    ttl_ms: u64,
-    cells: Mutex<BTreeMap<String, QueryReadLeaseCellState>>,
-    metrics: Arc<GraphOperationalMetrics>,
-}
-
-#[cfg(feature = "opencypher")]
-impl QueryReadLeaseManager {
-    pub(crate) fn new(
-        db: Option<Db>,
-        ttl_ms: u64,
-        metrics: Arc<GraphOperationalMetrics>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            db,
-            lease_id: format!(
-                "query-{:020}",
-                crate::GRAPH_READ_LEASE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ),
-            ttl_ms,
-            cells: Mutex::new(BTreeMap::new()),
-            metrics,
-        })
-    }
-
-    pub(crate) async fn acquire(
-        self: &Arc<Self>,
-        cell_id: &str,
-        read_epoch: GraphEpoch,
-        max_runtime_ms: Option<u64>,
-    ) -> Result<Arc<QueryReadLeaseRegistration>> {
-        if self.ttl_ms == 0 {
-            return Ok(Arc::new(QueryReadLeaseRegistration {
-                manager: None,
-                cell_id: cell_id.to_string(),
-                read_epoch,
-            }));
-        }
-
-        let Some(db) = &self.db else {
-            return Err(GraphError::ReadLeaseCoordinatorUnavailable {
-                cell_id: cell_id.to_string(),
-            });
-        };
-
-        let now_ms = graph_now_millis();
-        let hold_ms = self
-            .ttl_ms
-            .max(max_runtime_ms.unwrap_or(0).saturating_add(5_000));
-        let required_expiry = now_ms.saturating_add(hold_ms);
-        let published_expiry = required_expiry.saturating_add(self.ttl_ms);
-        let mut cells = self.cells.lock().await;
-        let state = cells.entry(cell_id.to_string()).or_default();
-        *state.active_epochs.entry(read_epoch).or_default() += 1;
-        let min_epoch = state
-            .active_epochs
-            .keys()
-            .next()
-            .copied()
-            .expect("the acquired epoch is active");
-        let lease_covers_query = state
-            .persisted_epoch
-            .is_some_and(|persisted| persisted <= min_epoch)
-            && state.persisted_expires_at_ms >= required_expiry;
-        if !lease_covers_query {
-            let lease = GraphReadLease {
-                cell_id: cell_id.to_string(),
-                lease_id: self.lease_id.clone(),
-                read_epoch: min_epoch,
-                expires_at_ms: published_expiry,
-            };
-            let publish = async {
-                let txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
-                let drop_marker = crate::keys::cell_drop_marker(cell_id);
-                let pending_drop_marker = crate::keys::cell_drop_pending_marker(cell_id);
-                if crate::read_txn_remote(&txn, &drop_marker).await?.is_some()
-                    || crate::read_txn_remote(&txn, &pending_drop_marker)
-                        .await?
-                        .is_some()
-                {
-                    return Err(GraphError::CellDropped {
-                        operation: "pin_query_read",
-                        cell_id: cell_id.to_string(),
-                    });
-                }
-                txn.put(
-                    crate::keys::read_lease(cell_id, &self.lease_id).as_bytes(),
-                    crate::encode_read_lease(&lease),
-                )?;
-                crate::commit_txn_strict(txn, true).await
-            }
-            .await;
-            if let Err(err) = publish {
-                decrement_active_read_epoch(state, read_epoch);
-                return Err(err);
-            }
-            state.persisted_epoch = Some(min_epoch);
-            state.persisted_expires_at_ms = published_expiry;
-            self.metrics
-                .read_leases_created
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        drop(cells);
-
-        Ok(Arc::new(QueryReadLeaseRegistration {
-            manager: Some(Arc::clone(self)),
-            cell_id: cell_id.to_string(),
-            read_epoch,
-        }))
-    }
-
-    async fn release(&self, cell_id: &str, read_epoch: GraphEpoch) {
-        let mut cells = self.cells.lock().await;
-        if let Some(state) = cells.get_mut(cell_id) {
-            decrement_active_read_epoch(state, read_epoch);
-        }
-    }
-}
-
-#[cfg(feature = "opencypher")]
-fn decrement_active_read_epoch(state: &mut QueryReadLeaseCellState, read_epoch: GraphEpoch) {
-    let Some(count) = state.active_epochs.get_mut(&read_epoch) else {
-        return;
-    };
-    *count = count.saturating_sub(1);
-    if *count == 0 {
-        state.active_epochs.remove(&read_epoch);
-    }
-}
-
-#[cfg(feature = "opencypher")]
-pub(crate) struct QueryReadLeaseRegistration {
-    manager: Option<Arc<QueryReadLeaseManager>>,
-    cell_id: String,
-    read_epoch: GraphEpoch,
-}
-
-#[cfg(feature = "opencypher")]
-impl std::fmt::Debug for QueryReadLeaseRegistration {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("QueryReadLeaseRegistration")
-            .field("cell_id", &self.cell_id)
-            .field("read_epoch", &self.read_epoch)
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "opencypher")]
-impl PartialEq for QueryReadLeaseRegistration {
-    fn eq(&self, other: &Self) -> bool {
-        self.cell_id == other.cell_id
-            && self.read_epoch == other.read_epoch
-            && match (&self.manager, &other.manager) {
-                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-                (None, None) => true,
-                _ => false,
-            }
-    }
-}
-
-#[cfg(feature = "opencypher")]
-impl Eq for QueryReadLeaseRegistration {}
-
-#[cfg(feature = "opencypher")]
-impl Drop for QueryReadLeaseRegistration {
-    fn drop(&mut self) {
-        let Some(manager) = self.manager.take() else {
-            return;
-        };
-        let cell_id = self.cell_id.clone();
-        let read_epoch = self.read_epoch;
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                manager.release(&cell_id, read_epoch).await;
-            });
-        }
-    }
-}
-
-impl From<&engine::ShardLease> for GraphWriteFence {
-    fn from(lease: &engine::ShardLease) -> Self {
-        Self {
-            cell_id: lease.cell_id.clone(),
-            owner_node_id: lease.owner_node_id.clone(),
-            lease_token: lease.lease_token,
-            expires_at_ms: lease.expires_at_ms,
-        }
-    }
+    Writer,
 }
 
 #[derive(Clone, Debug)]

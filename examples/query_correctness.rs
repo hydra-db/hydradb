@@ -7,9 +7,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use slatedb::object_store::ObjectStore;
 use slatedb_graph_kernel::{
-    local_object_store, object_store_from_env, ArtifactDirection, EdgeMutation, GraphCacheConfig,
-    GraphCachePolicy, GraphLimits, GraphOpenOptions, GraphShard, QueryContext, QueryResultPage,
-    QueryResultSet, QueryValue,
+    local_object_store, object_store_from_env, EdgeMutation, GraphCacheConfig, GraphCachePolicy,
+    GraphLimits, GraphOpenOptions, GraphShard, QueryContext, QueryResultPage, QueryResultSet,
+    QueryValue,
 };
 
 type CheckResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -82,16 +82,6 @@ async fn main() -> CheckResult<()> {
             .build_matrix_tiles(CELL_ID, EDGE_TYPE, base_epoch, tile_size)
             .await?;
         writer
-            .build_supernode_groups_for_directions(
-                CELL_ID,
-                EDGE_TYPE,
-                base_epoch,
-                10,
-                512,
-                &[ArtifactDirection::Out],
-            )
-            .await?;
-        writer
             .refresh_edge_type_query_stats(CELL_ID, EDGE_TYPE)
             .await?;
         writer.close().await?;
@@ -105,7 +95,7 @@ async fn main() -> CheckResult<()> {
         )
         .await?;
 
-        verify_supernode_page(&reader, object_backend, fanout, page_size, repeats).await?;
+        verify_one_hop_page(&reader, object_backend, fanout, page_size, repeats).await?;
         for hop in &hops {
             verify_full_rows(&reader, object_backend, fanout, *hop, repeats).await?;
             verify_count(&reader, object_backend, fanout, *hop, repeats).await?;
@@ -118,7 +108,7 @@ async fn main() -> CheckResult<()> {
     Ok(())
 }
 
-async fn verify_supernode_page(
+async fn verify_one_hop_page(
     shard: &GraphShard,
     object_backend: &str,
     fanout: u64,
@@ -132,7 +122,7 @@ async fn verify_supernode_page(
     for repeat in 0..repeats {
         let page = shard
             .execute_cypher_rows_page(
-                QueryContext::new(CELL_ID, format!("correct-supernode-page-{fanout}-{repeat}")),
+                QueryContext::new(CELL_ID, format!("correct-one-hop-page-{fanout}-{repeat}")),
                 &query,
                 None,
                 page_size,
@@ -140,7 +130,7 @@ async fn verify_supernode_page(
             .await?;
         actual = page_vertices(&page)?;
         assert_exact(
-            "supernode_page",
+            "one_hop_page",
             fanout,
             1,
             &expected,
@@ -152,7 +142,7 @@ async fn verify_supernode_page(
         object_backend,
         fanout,
         hops: 1,
-        check: "supernode_page",
+        check: "one_hop_page",
         repeats,
         expected_rows: expected.len(),
         actual_rows: actual.len(),
@@ -509,9 +499,7 @@ fn graph_options(cache_dir: Option<&Path>, fanout: u64, max_hop: u8) -> GraphOpe
         cache_policy: GraphCachePolicy {
             max_matrix_adjacencies: 8,
             max_graphblas_matrices: 8,
-            max_posting_chunks: 262_144,
             max_entries_per_cell: None,
-            prefetch_supernode_chunks: 2,
             max_concurrent_hydrations: 16,
             ..Default::default()
         },

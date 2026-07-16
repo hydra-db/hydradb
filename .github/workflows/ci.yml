@@ -20,6 +20,8 @@ jobs:
           TURBOLAY_STATE_DIR: /tmp/turbolay-single-node
         run: |
           bash -n scripts/deploy_single_node_k3s.sh
+          bash -n scripts/ec2_graphblas_benchmark.sh
+          python3 -m py_compile scripts/bolt_graphblas_client.py
           bash scripts/deploy_single_node_k3s.sh --render-only
       - name: Lint Helm chart
         run: helm lint charts/turbolay --values charts/turbolay/ci/ci-values.yaml
@@ -34,13 +36,17 @@ jobs:
             --values charts/turbolay/ci/ci-values.yaml \
             --set auth.secretKey=custom-token > /tmp/turbolay-custom-auth.yaml
           grep -q 'GRAPH_AUTH_TOKEN_FILE: "/var/run/secrets/turbolay/custom-token"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_MAX_RELATIONSHIP_ROWS_BYTES: "8388608"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_MAX_SOURCE_RELATIONSHIP_ROWS_BYTES: "8388608"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_MAX_RELATIONSHIP_PROPERTY_ROWS_BYTES: "16777216"' /tmp/turbolay-custom-auth.yaml
           grep -q 'path: custom-token' /tmp/turbolay-custom-auth.yaml
           grep -q 'GRAPH_KUBERNETES_ROLE_LABELS: "true"' /tmp/turbolay-custom-auth.yaml
           grep -q 'graph.usecortex.io/serving: "true"' /tmp/turbolay-custom-auth.yaml
-          grep -q 'graph.usecortex.io/control-active: "true"' /tmp/turbolay-custom-auth.yaml
+          test "$(grep -c '^kind: RoleBinding$' /tmp/turbolay-custom-auth.yaml)" -eq 2
+          grep -q 'name: turbolay-node-role-publisher' /tmp/turbolay-custom-auth.yaml
+          grep -q 'name: turbolay-service-discovery' /tmp/turbolay-custom-auth.yaml
           grep -q 'Authorization: Bearer' /tmp/turbolay-custom-auth.yaml
           grep -q 'GRAPH_DATA_CACHE_BYTES: "8589934592"' /tmp/turbolay-custom-auth.yaml
-          grep -q 'GRAPH_CONTROL_CACHE_BYTES: "536870912"' /tmp/turbolay-custom-auth.yaml
           if grep -Eq 'GRAPH_[A-Z0-9_]+: "[0-9]+(\.[0-9]+)?e[+-][0-9]+"' /tmp/turbolay-custom-auth.yaml; then
             echo "runtime integer was rendered in scientific notation"
             exit 1
@@ -240,7 +246,7 @@ jobs:
       - name: Test public client protocols
         run: cargo test --locked --all-targets --features public-client-protocols
       - name: Test production runtime configuration
-        run: cargo test --locked --features server-runtime --bin graph-node --bin graph-controller
+        run: cargo test --locked --features server-runtime --bin graph-node
       - name: Test official Neo4j driver compatibility
         run: |
           python3 -m pip install 'neo4j>=6,<7'

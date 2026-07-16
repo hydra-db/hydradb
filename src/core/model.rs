@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{GraphEpoch, VertexId};
+use crate::{TopologySequence, VertexId};
 
 pub type RelationshipId = u64;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GraphRepairReport {
     pub cell_id: String,
     pub edge_type: String,
-    pub read_epoch: GraphEpoch,
+    pub read_epoch: TopologySequence,
     pub live_edges: u64,
     pub delta_records: u64,
     pub degree_mismatches: Vec<String>,
@@ -17,7 +17,7 @@ pub struct GraphRepairReport {
 pub struct GraphExportDigest {
     pub cell_id: String,
     pub edge_type: String,
-    pub read_epoch: GraphEpoch,
+    pub read_epoch: TopologySequence,
     pub live_edges: u64,
     pub edge_checksum: u64,
     pub out_degree_checksum: u64,
@@ -28,8 +28,8 @@ pub struct GraphExportDigest {
 pub struct GraphCorrectnessReport {
     pub cell_id: String,
     pub edge_type: String,
-    pub read_epoch: GraphEpoch,
-    pub delta_gc_watermark: GraphEpoch,
+    pub read_epoch: TopologySequence,
+    pub delta_gc_watermark: TopologySequence,
     pub digest: GraphExportDigest,
     pub canonical_edges: u64,
     pub out_index_edges: u64,
@@ -38,9 +38,7 @@ pub struct GraphCorrectnessReport {
     pub relationship_records: u64,
     pub relationship_count_counters: u64,
     pub relationship_property_indexes: u64,
-    pub posting_chunks_checked: u64,
     pub matrix_edges_checked: u64,
-    pub supernode_groups_checked: u64,
     pub traversal_roots_checked: u64,
     pub mismatch_count: u64,
     pub mismatch_samples: Vec<String>,
@@ -67,7 +65,7 @@ pub struct EdgeRecord {
     pub edge_type: String,
     pub src: VertexId,
     pub dst: VertexId,
-    pub epoch: GraphEpoch,
+    pub epoch: TopologySequence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,13 +98,13 @@ pub struct RelationshipRecord {
     pub src: VertexId,
     pub dst: VertexId,
     pub relationship_id: RelationshipId,
-    pub epoch: GraphEpoch,
+    pub epoch: TopologySequence,
     pub metadata: EdgeMetadata,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelationshipCreateResult {
-    pub epoch: GraphEpoch,
+    pub epoch: TopologySequence,
     pub relationship_id: RelationshipId,
     pub structural_edge_inserted: bool,
     pub already_created: bool,
@@ -274,27 +272,27 @@ pub(crate) struct OutEdgeSegment {
     pub(crate) cell_id: String,
     pub(crate) edge_type: String,
     pub(crate) src: VertexId,
-    pub(crate) start_epoch: GraphEpoch,
-    pub(crate) end_epoch: GraphEpoch,
-    pub(crate) edges: Vec<(GraphEpoch, VertexId)>,
+    pub(crate) start_epoch: TopologySequence,
+    pub(crate) end_epoch: TopologySequence,
+    pub(crate) edges: Vec<(TopologySequence, VertexId)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitResult {
-    pub epoch: GraphEpoch,
+    pub epoch: TopologySequence,
     pub already_existed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeleteResult {
-    pub epoch: GraphEpoch,
+    pub epoch: TopologySequence,
     pub deleted: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EdgeDeleteBatchResult {
-    pub start_epoch: GraphEpoch,
-    pub end_epoch: GraphEpoch,
+    pub start_epoch: TopologySequence,
+    pub end_epoch: TopologySequence,
     pub deleted: u64,
     pub already_deleted: u64,
     pub results: Vec<DeleteResult>,
@@ -302,7 +300,7 @@ pub struct EdgeDeleteBatchResult {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VertexDeleteResult {
-    pub epoch: GraphEpoch,
+    pub epoch: TopologySequence,
     pub vertex_deleted: bool,
     pub incident_edges_deleted: u64,
     pub relationships_deleted: u64,
@@ -310,7 +308,7 @@ pub struct VertexDeleteResult {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GraphCellDropResult {
-    pub marker_epoch: GraphEpoch,
+    pub marker_epoch: TopologySequence,
     pub deleted_keys: u64,
     pub batches: u64,
     pub already_dropped: bool,
@@ -318,7 +316,7 @@ pub struct GraphCellDropResult {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SegmentCompactionResult {
-    pub compacted_through_epoch: GraphEpoch,
+    pub compacted_through_epoch: TopologySequence,
     pub source_segments: u64,
     pub deleted_segment_keys: u64,
     pub deleted_tombstone_keys: u64,
@@ -328,16 +326,16 @@ pub struct SegmentCompactionResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BulkImportResult {
-    pub start_epoch: GraphEpoch,
-    pub end_epoch: GraphEpoch,
+    pub start_epoch: TopologySequence,
+    pub end_epoch: TopologySequence,
     pub inserted: u64,
     pub already_existed: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelationshipImportResult {
-    pub start_epoch: GraphEpoch,
-    pub end_epoch: GraphEpoch,
+    pub start_epoch: TopologySequence,
+    pub end_epoch: TopologySequence,
     pub relationships_inserted: u64,
     pub relationships_already_existed: u64,
     pub structural_edges_inserted: u64,
@@ -398,8 +396,8 @@ impl BulkImportDeltaLogPolicy {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EdgeMutationBatchResult {
-    pub start_epoch: GraphEpoch,
-    pub end_epoch: GraphEpoch,
+    pub start_epoch: TopologySequence,
+    pub end_epoch: TopologySequence,
     pub inserted: u64,
     pub already_existed: u64,
     pub results: Vec<CommitResult>,
@@ -418,8 +416,8 @@ impl Default for EdgeIngestOptions {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EdgeIngestResult {
-    pub start_epoch: GraphEpoch,
-    pub end_epoch: GraphEpoch,
+    pub start_epoch: TopologySequence,
+    pub end_epoch: TopologySequence,
     pub inserted: u64,
     pub already_existed: u64,
     pub batches: u64,
@@ -428,7 +426,7 @@ pub struct EdgeIngestResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EdgeMutationLogAppendResult {
-    pub log_epoch: GraphEpoch,
+    pub log_epoch: TopologySequence,
     pub mutations: u64,
     pub already_appended: bool,
 }
@@ -440,9 +438,9 @@ pub struct EdgeMutationLogMaterializeResult {
     pub mutations: u64,
     pub inserted: u64,
     pub already_existed: u64,
-    pub last_log_epoch: GraphEpoch,
-    pub materialized_log_epoch: GraphEpoch,
-    pub current_epoch: GraphEpoch,
+    pub last_log_epoch: TopologySequence,
+    pub materialized_log_epoch: TopologySequence,
+    pub current_epoch: TopologySequence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -470,7 +468,7 @@ pub(crate) struct OutboxDeltaBatch {
     pub(crate) cell_id: String,
     pub(crate) edge_type: String,
     pub(crate) kind: DeltaKind,
-    pub(crate) start_epoch: GraphEpoch,
-    pub(crate) end_epoch: GraphEpoch,
+    pub(crate) start_epoch: TopologySequence,
+    pub(crate) end_epoch: TopologySequence,
     pub(crate) edges: Vec<(VertexId, VertexId)>,
 }

@@ -1,16 +1,12 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use futures::future::join_all;
-use slatedb::bytes::Bytes;
-use slatedb::config::{DurabilityLevel, ReadOptions, ScanOptions, WriteOptions};
-use slatedb::object_store::{local::LocalFileSystem, path::Path, ObjectStore};
-use slatedb::{Db, DbTransaction, ErrorKind, IsolationLevel};
-use tokio::sync::{watch, RwLock as TokioRwLock};
+use slatedb::object_store::{local::LocalFileSystem, ObjectStore};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 #[cfg(feature = "graphblas")]
@@ -22,66 +18,27 @@ use crate::sparse_kernel::{
     SparseKernelBackend,
 };
 use crate::{
-    acquire_distributed_write_lock, decode_delta_record, decode_edge_record,
-    decode_out_edge_segment, decode_relationship_record, decode_u64,
-    encode_vertex_property_value_key, ensure_limit, open_graph_db,
-    parse_out_edge_segment_tombstone_key, parse_u64, release_cell_write_lock, segment_edge_visible,
-    sort_deltas, validate_component, CellWriteLock, DeltaKind, DeltaRecord, EdgeRecord,
-    GraphCacheConfig, GraphCacheKind, GraphCorrectnessReport, GraphDurabilityConfig, GraphEpoch,
-    GraphError, GraphExportDigest, GraphId, GraphMemoryConfig, GraphOpenOptions, GraphScope,
-    GraphShard, GraphStore, GraphWriteBatch, GraphWriteGuard, MatrixAdjacency, MatrixCacheKey,
-    PostingChunkCacheKey, RelationshipId, RelationshipRecord, Result, SupernodeCacheKey, VertexId,
+    decode_edge_record, decode_out_edge_segment, decode_relationship_record, decode_u64,
+    encode_vertex_property_value_key, ensure_limit, parse_out_edge_segment_tombstone_key,
+    parse_u64, segment_edge_visible, validate_component, CellWriteLock, DeltaKind, DeltaRecord,
+    EdgeRecord, GraphCacheEntryCounts, GraphCacheKind, GraphCacheMetricsSnapshot,
+    GraphCacheResidentBytes, GraphCorrectnessReport, GraphError, GraphExportDigest,
+    GraphMemoryConfig, GraphOpenOptions, GraphOperationalMetricsSnapshot, GraphScope, GraphShard,
+    GraphWriteBatch, GraphWriteGuard, MatrixAdjacency, MatrixCacheKey, RelationshipId,
+    RelationshipRecord, Result, TopologySequence, VertexId,
 };
 
-const GRAPH_PREALLOC_LIMIT: usize = 1_000_000;
-const GRAPH_CHUNK_PREALLOC_LIMIT: usize = 65_536;
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum ArtifactDirection {
+enum MatrixDirection {
     Out,
     In,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PostingChunk {
-    pub cell_id: String,
-    pub edge_type: String,
-    pub direction: ArtifactDirection,
-    pub owner: VertexId,
-    pub base_epoch: GraphEpoch,
-    pub chunk_id: u64,
-    pub vertices: Vec<VertexId>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PostingChunkManifest {
-    cell_id: String,
-    edge_type: String,
-    direction: ArtifactDirection,
-    owner: VertexId,
-    base_epoch: GraphEpoch,
-    chunk_count: u64,
-    vertex_count: u64,
-    chunk_checksums: Vec<u64>,
-    chunk_bounds: Vec<SupernodeChunkBound>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PostingArtifactManifest {
-    cell_id: String,
-    edge_type: String,
-    base_epoch: GraphEpoch,
-    owner_manifest_count: u64,
-    chunk_count: u64,
-    vertex_count: u64,
-    checksum: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MatrixArtifact {
     pub cell_id: String,
     pub edge_type: String,
-    pub base_epoch: GraphEpoch,
+    pub base_epoch: TopologySequence,
     pub tile_size: u64,
     pub out_tiles: u64,
     pub transpose_tiles: u64,
@@ -90,7 +47,7 @@ pub struct MatrixArtifact {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TraversalBackend {
-    PostingExpansion,
+    DirectSnapshot,
     MatrixOverlay,
 }
 
@@ -99,7 +56,7 @@ pub struct MatrixTraversalResult {
     pub backend: TraversalBackend,
     pub vertices: Vec<VertexId>,
     pub hops: u8,
-    pub base_epoch: GraphEpoch,
+    pub base_epoch: TopologySequence,
     pub edge_visits: u64,
     pub delta_records_applied: u64,
     pub sparse_kernel: SparseKernelBackend,
@@ -107,166 +64,14 @@ pub struct MatrixTraversalResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BenchmarkResult {
-    pub posting: MatrixTraversalResult,
+    pub direct: MatrixTraversalResult,
     pub matrix: MatrixTraversalResult,
     pub matrix_wins: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SupernodeGroup {
-    pub cell_id: String,
-    pub edge_type: String,
-    pub direction: ArtifactDirection,
-    pub vertex_id: VertexId,
-    pub base_epoch: GraphEpoch,
-    pub degree: u64,
-    pub chunk_count: u64,
-    pub page_size: u64,
-    pub chunk_bounds: Vec<SupernodeChunkBound>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SupernodeChunkBound {
-    pub chunk_id: u64,
-    pub first: VertexId,
-    pub last: VertexId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SupernodeArtifactManifest {
-    cell_id: String,
-    edge_type: String,
-    base_epoch: GraphEpoch,
-    group_count: u64,
-    chunk_count: u64,
-    degree: u64,
-    checksum: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SupernodePage {
-    pub vertex_id: VertexId,
-    pub edge_type: String,
-    pub direction: ArtifactDirection,
-    pub page_id: u64,
-    pub vertices: Vec<VertexId>,
-    pub has_next: bool,
 }
 
 pub struct GraphCluster {
     scope: GraphScope,
     shards: BTreeMap<String, GraphShard>,
-}
-
-pub struct GraphControlPlane {
-    db: Db,
-    object_store: Arc<dyn ObjectStore>,
-    store_path: Path,
-    scope: GraphScope,
-    metrics: Arc<GraphControlMetrics>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct GraphControlMetricsSnapshot {
-    pub lease_acquire_attempts: u64,
-    pub lease_acquire_successes: u64,
-    pub lease_acquire_failures: u64,
-    pub lease_renew_attempts: u64,
-    pub lease_renew_successes: u64,
-    pub lease_renew_failures: u64,
-    pub lease_renew_lost: u64,
-    pub lease_renew_retries: u64,
-    pub lease_release_attempts: u64,
-    pub lease_release_successes: u64,
-    pub lease_release_failures: u64,
-    pub metadata_cas_attempts: u64,
-    pub metadata_cas_successes: u64,
-    pub metadata_cas_conflicts: u64,
-    pub watermark_advances: u64,
-    pub watermark_rejects: u64,
-    pub control_idempotency_commits: u64,
-    pub control_idempotency_replays: u64,
-    pub repair_runs: u64,
-    pub repair_actions: u64,
-    pub node_heartbeat_writes: u64,
-    pub node_heartbeat_prunes: u64,
-    pub controller_runs: u64,
-    pub controller_successes: u64,
-    pub controller_failures: u64,
-    pub controller_reassignments: u64,
-    pub controller_failovers: u64,
-    pub controller_pending_failovers: u64,
-}
-
-#[derive(Default)]
-struct GraphControlMetrics {
-    lease_acquire_attempts: AtomicU64,
-    lease_acquire_successes: AtomicU64,
-    lease_acquire_failures: AtomicU64,
-    lease_renew_attempts: AtomicU64,
-    lease_renew_successes: AtomicU64,
-    lease_renew_failures: AtomicU64,
-    lease_renew_lost: AtomicU64,
-    lease_renew_retries: AtomicU64,
-    lease_release_attempts: AtomicU64,
-    lease_release_successes: AtomicU64,
-    lease_release_failures: AtomicU64,
-    metadata_cas_attempts: AtomicU64,
-    metadata_cas_successes: AtomicU64,
-    metadata_cas_conflicts: AtomicU64,
-    watermark_advances: AtomicU64,
-    watermark_rejects: AtomicU64,
-    control_idempotency_commits: AtomicU64,
-    control_idempotency_replays: AtomicU64,
-    repair_runs: AtomicU64,
-    repair_actions: AtomicU64,
-    node_heartbeat_writes: AtomicU64,
-    node_heartbeat_prunes: AtomicU64,
-    controller_runs: AtomicU64,
-    controller_successes: AtomicU64,
-    controller_failures: AtomicU64,
-    controller_reassignments: AtomicU64,
-    controller_failovers: AtomicU64,
-    controller_pending_failovers: AtomicU64,
-}
-
-impl GraphControlMetrics {
-    fn snapshot(&self) -> GraphControlMetricsSnapshot {
-        GraphControlMetricsSnapshot {
-            lease_acquire_attempts: self.lease_acquire_attempts.load(Ordering::Relaxed),
-            lease_acquire_successes: self.lease_acquire_successes.load(Ordering::Relaxed),
-            lease_acquire_failures: self.lease_acquire_failures.load(Ordering::Relaxed),
-            lease_renew_attempts: self.lease_renew_attempts.load(Ordering::Relaxed),
-            lease_renew_successes: self.lease_renew_successes.load(Ordering::Relaxed),
-            lease_renew_failures: self.lease_renew_failures.load(Ordering::Relaxed),
-            lease_renew_lost: self.lease_renew_lost.load(Ordering::Relaxed),
-            lease_renew_retries: self.lease_renew_retries.load(Ordering::Relaxed),
-            lease_release_attempts: self.lease_release_attempts.load(Ordering::Relaxed),
-            lease_release_successes: self.lease_release_successes.load(Ordering::Relaxed),
-            lease_release_failures: self.lease_release_failures.load(Ordering::Relaxed),
-            metadata_cas_attempts: self.metadata_cas_attempts.load(Ordering::Relaxed),
-            metadata_cas_successes: self.metadata_cas_successes.load(Ordering::Relaxed),
-            metadata_cas_conflicts: self.metadata_cas_conflicts.load(Ordering::Relaxed),
-            watermark_advances: self.watermark_advances.load(Ordering::Relaxed),
-            watermark_rejects: self.watermark_rejects.load(Ordering::Relaxed),
-            control_idempotency_commits: self.control_idempotency_commits.load(Ordering::Relaxed),
-            control_idempotency_replays: self.control_idempotency_replays.load(Ordering::Relaxed),
-            repair_runs: self.repair_runs.load(Ordering::Relaxed),
-            repair_actions: self.repair_actions.load(Ordering::Relaxed),
-            node_heartbeat_writes: self.node_heartbeat_writes.load(Ordering::Relaxed),
-            node_heartbeat_prunes: self.node_heartbeat_prunes.load(Ordering::Relaxed),
-            controller_runs: self.controller_runs.load(Ordering::Relaxed),
-            controller_successes: self.controller_successes.load(Ordering::Relaxed),
-            controller_failures: self.controller_failures.load(Ordering::Relaxed),
-            controller_reassignments: self.controller_reassignments.load(Ordering::Relaxed),
-            controller_failovers: self.controller_failovers.load(Ordering::Relaxed),
-            controller_pending_failovers: self.controller_pending_failovers.load(Ordering::Relaxed),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -280,284 +85,91 @@ pub struct ShardPlacement {
 
 pub struct RoutedGraphCluster {
     scope: GraphScope,
-    base_path: String,
     local_node_id: String,
     placement: ShardPlacement,
-    object_store: Arc<dyn ObjectStore>,
-    options: GraphOpenOptions,
-    memory: GraphMemoryConfig,
-    shards: BTreeMap<String, GraphShard>,
-    leases: Arc<RwLock<BTreeMap<String, ShardLease>>>,
-    shard_db_handles: Arc<RwLock<BTreeMap<String, GraphStore>>>,
-    revoked_cells: Arc<RwLock<BTreeSet<String>>>,
-}
-
-pub struct GraphNode {
-    cluster: RoutedGraphCluster,
-    control: Arc<dyn GraphControlClient>,
-    lease_renewer: LeaseRenewalHandle,
-    heartbeat: NodeHeartbeatHandle,
-}
-
-pub struct ManagedGraphNode {
-    node: Arc<TokioRwLock<Option<GraphNode>>>,
-    shard_refresher: ShardRefreshHandle,
-    metrics: Arc<GraphNodeMaintenanceMetrics>,
-}
-
-#[derive(Clone, Debug)]
-pub struct GraphNodeRuntimeConfig {
-    pub lease_ttl: Duration,
-    pub lease_renew_interval: Duration,
-    pub shard_refresh_interval: Duration,
-    pub options: GraphOpenOptions,
+    shards: BTreeMap<String, Arc<GraphShard>>,
+    writable: bool,
+    maintenance_metrics: Arc<GraphNodeMaintenanceMetrics>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct ShardLease {
-    pub cell_id: String,
-    pub owner_node_id: String,
-    pub lease_token: u64,
-    pub expires_at_ms: u64,
+pub struct MatrixArtifactRefreshPolicy {
+    pub interval: Duration,
+    pub max_dirty_age: Duration,
+    pub min_epoch_lag: TopologySequence,
+    pub tile_size: u64,
+    pub max_edge_types_per_cycle: usize,
 }
 
-pub struct LeaseRenewalHandle {
-    stop_tx: watch::Sender<bool>,
-    task: JoinHandle<Result<()>>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub enum GraphNodeHealthState {
-    Active,
-    Draining,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    feature = "query-transport",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct GraphNodeHeartbeat {
-    pub node_id: String,
-    pub state: GraphNodeHealthState,
-    pub started_at_ms: u64,
-    pub last_seen_ms: u64,
-    pub generation: u64,
-}
-
-pub struct NodeHeartbeatHandle {
-    stop_tx: watch::Sender<bool>,
-    state_tx: watch::Sender<GraphNodeHealthState>,
-    task: JoinHandle<Result<()>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GraphClusterControllerConfig {
-    pub cell_ids: Vec<String>,
-    pub heartbeat_ttl: Duration,
-    pub lease_ttl: Duration,
-    pub rebalance_mode: GraphClusterRebalanceMode,
-    pub discover_existing_cells: bool,
-    pub max_expired_heartbeats_to_prune: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GraphClusterRebalanceMode {
-    StabilityFirst,
-    Rendezvous,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GraphShardReassignment {
-    pub cell_id: String,
-    pub previous_owner_node_id: Option<String>,
-    pub new_owner_node_id: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GraphPendingFailover {
-    pub cell_id: String,
-    pub current_owner_node_id: String,
-    pub target_owner_node_id: String,
-    pub lease_expires_at_ms: u64,
+impl Default for MatrixArtifactRefreshPolicy {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(5),
+            max_dirty_age: Duration::from_secs(30),
+            min_epoch_lag: 1_000,
+            tile_size: 4_096,
+            max_edge_types_per_cycle: 4,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct GraphClusterControllerReport {
-    pub now_ms: u64,
-    pub controlled_cells: Vec<String>,
-    pub active_nodes: Vec<String>,
-    pub draining_nodes: Vec<String>,
-    pub expired_nodes: Vec<String>,
-    pub pruned_expired_nodes: Vec<String>,
-    pub unassigned_cells: Vec<String>,
-    pub reassignments: Vec<GraphShardReassignment>,
-    pub failed_over_leases: Vec<ShardLease>,
-    pub pending_failovers: Vec<GraphPendingFailover>,
+pub struct MatrixArtifactRefreshReport {
+    pub dirty_edge_types: u64,
+    pub artifacts_built: u64,
+    pub artifacts_current: u64,
+    pub artifacts_deferred: u64,
+    pub artifact_failures: u64,
 }
 
-pub struct GraphClusterControllerHandle {
+pub struct MatrixArtifactRefreshHandle {
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<Result<()>>,
 }
 
-mod control_client;
-pub use control_client::GraphControlClient;
-#[cfg(feature = "query-transport-tls")]
-mod control_transport;
-#[cfg(feature = "query-transport-tls")]
-pub use control_transport::{
-    GraphControlRpcClient, GraphControlRpcClientConfig, GraphControlRpcServer,
-    GraphControlRpcServerConfig,
-};
-
-pub struct GraphRuntimeLease {
-    stop_tx: watch::Sender<bool>,
-    lost_rx: watch::Receiver<Option<String>>,
-    task: JoinHandle<Result<()>>,
-}
-
-impl GraphRuntimeLease {
-    pub async fn acquire(
-        base_path: &str,
-        scope: &GraphScope,
-        object_store: Arc<dyn ObjectStore>,
-        ttl: Duration,
-        renew_interval: Duration,
-    ) -> Result<Self> {
-        let ttl_ms = u64::try_from(ttl.as_millis()).map_err(|_| GraphError::CorruptValue {
-            key: "runtime/lease_ttl".to_string(),
-            reason: "runtime lease TTL does not fit u64 milliseconds".to_string(),
-        })?;
-        if ttl_ms == 0 || renew_interval.is_zero() || renew_interval >= ttl {
-            return Err(GraphError::CorruptValue {
-                key: "runtime/lease_config".to_string(),
-                reason: "runtime lease requires 0 < renew interval < TTL".to_string(),
-            });
-        }
-        let lock_path = scope.scoped_store_path(&format!(
-            "{}/runtime/single-writer.lock",
-            base_path.trim_end_matches('/')
-        ));
-        let lock = acquire_distributed_write_lock(
-            object_store,
-            Path::from(lock_path),
-            "graph-runtime",
-            "hold_graph_runtime_lease",
-            ttl_ms,
-        )
-        .await?;
-        let (stop_tx, mut stop_rx) = watch::channel(false);
-        let (lost_tx, lost_rx) = watch::channel(None);
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    changed = stop_rx.changed() => {
-                        if changed.is_err() || *stop_rx.borrow() {
-                            return lock.release().await;
-                        }
-                    }
-                    _ = tokio::time::sleep(renew_interval) => {
-                        if let Err(error) = lock.renew().await {
-                            let _ = lost_tx.send(Some(error.to_string()));
-                            return Err(error);
-                        }
-                    }
-                }
-            }
-        });
-        Ok(Self {
-            stop_tx,
-            lost_rx,
-            task,
-        })
-    }
-
-    pub async fn wait_until_lost(&mut self) -> Result<()> {
-        loop {
-            if let Some(reason) = self.lost_rx.borrow().clone() {
-                return Err(GraphError::CorruptValue {
-                    key: "runtime/lease".to_string(),
-                    reason,
-                });
-            }
-            self.lost_rx
-                .changed()
-                .await
-                .map_err(|_| GraphError::CorruptValue {
-                    key: "runtime/lease".to_string(),
-                    reason: "runtime lease renewal task stopped unexpectedly".to_string(),
-                })?;
-        }
-    }
-
-    pub async fn stop(self) -> Result<()> {
-        let _ = self.stop_tx.send(true);
-        self.task.await.map_err(|error| GraphError::CorruptValue {
-            key: "runtime/lease".to_string(),
-            reason: format!("runtime lease task failed: {error}"),
-        })?
-    }
-}
-
-pub struct ShardRefreshHandle {
-    stop_tx: watch::Sender<bool>,
-    task: JoinHandle<Result<()>>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct GraphShardRefreshReport {
-    pub opened_cells: Vec<String>,
-    pub closed_cells: Vec<String>,
-    pub retained_cells: Vec<String>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphShardRuntimeMetrics {
+    pub cell_id: String,
+    pub operational: GraphOperationalMetricsSnapshot,
+    pub cache: GraphCacheMetricsSnapshot,
+    pub cache_entries: GraphCacheEntryCounts,
+    pub cache_resident_bytes: GraphCacheResidentBytes,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GraphNodeMaintenanceMetricsSnapshot {
-    pub shard_refresh_attempts: u64,
-    pub shard_refresh_successes: u64,
-    pub shard_refresh_failures: u64,
-    pub shard_refresh_opened_cells: u64,
-    pub shard_refresh_closed_cells: u64,
+    pub matrix_refresh_cycles: u64,
+    pub matrix_refresh_dirty_edge_types: u64,
+    pub matrix_refresh_artifacts_built: u64,
+    pub matrix_refresh_artifacts_deferred: u64,
+    pub matrix_refresh_failures: u64,
 }
 
 #[derive(Default)]
 struct GraphNodeMaintenanceMetrics {
-    shard_refresh_attempts: AtomicU64,
-    shard_refresh_successes: AtomicU64,
-    shard_refresh_failures: AtomicU64,
-    shard_refresh_opened_cells: AtomicU64,
-    shard_refresh_closed_cells: AtomicU64,
+    matrix_refresh_cycles: AtomicU64,
+    matrix_refresh_dirty_edge_types: AtomicU64,
+    matrix_refresh_artifacts_built: AtomicU64,
+    matrix_refresh_artifacts_deferred: AtomicU64,
+    matrix_refresh_failures: AtomicU64,
 }
 
 impl GraphNodeMaintenanceMetrics {
     fn snapshot(&self) -> GraphNodeMaintenanceMetricsSnapshot {
         GraphNodeMaintenanceMetricsSnapshot {
-            shard_refresh_attempts: self.shard_refresh_attempts.load(Ordering::Relaxed),
-            shard_refresh_successes: self.shard_refresh_successes.load(Ordering::Relaxed),
-            shard_refresh_failures: self.shard_refresh_failures.load(Ordering::Relaxed),
-            shard_refresh_opened_cells: self.shard_refresh_opened_cells.load(Ordering::Relaxed),
-            shard_refresh_closed_cells: self.shard_refresh_closed_cells.load(Ordering::Relaxed),
+            matrix_refresh_cycles: self.matrix_refresh_cycles.load(Ordering::Relaxed),
+            matrix_refresh_dirty_edge_types: self
+                .matrix_refresh_dirty_edge_types
+                .load(Ordering::Relaxed),
+            matrix_refresh_artifacts_built: self
+                .matrix_refresh_artifacts_built
+                .load(Ordering::Relaxed),
+            matrix_refresh_artifacts_deferred: self
+                .matrix_refresh_artifacts_deferred
+                .load(Ordering::Relaxed),
+            matrix_refresh_failures: self.matrix_refresh_failures.load(Ordering::Relaxed),
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GraphRollup {
-    pub cell_id: String,
-    pub edge_type: String,
-    pub base_epoch: GraphEpoch,
-    pub posting_chunks: u64,
-    pub matrix_edge_count: u64,
-    pub supernode_groups: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -570,37 +182,25 @@ pub struct ArtifactGcResult {
 pub struct DeltaGcResult {
     pub deleted_delta_keys: u64,
     pub retained_delta_keys: u64,
-    pub compacted_through_epoch: GraphEpoch,
+    pub compacted_through_epoch: TopologySequence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MatrixTile {
     cell_id: String,
     edge_type: String,
-    base_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
     tile_size: u64,
-    direction: ArtifactDirection,
+    direction: MatrixDirection,
     tile_row: u64,
     tile_col: u64,
     rows: BTreeMap<VertexId, Vec<VertexId>>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct SupernodeDeltaOverlay {
-    plus: BTreeSet<VertexId>,
-    minus: BTreeSet<VertexId>,
-}
-
-impl SupernodeDeltaOverlay {
-    fn is_empty(&self) -> bool {
-        self.plus.is_empty() && self.minus.is_empty()
-    }
-}
-
 struct TraversalVerifyRequest<'a> {
     cell_id: &'a str,
     edge_type: &'a str,
-    read_epoch: GraphEpoch,
+    read_epoch: TopologySequence,
     max_hops: u8,
     root_limit: usize,
     edges: &'a [EdgeRecord],
@@ -610,7 +210,7 @@ struct TraversalVerifyRequest<'a> {
 struct GraphBlasCscManifest {
     cell_id: String,
     edge_type: String,
-    base_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
     chunk_size: u64,
     vertices_len: u64,
     pointers_len: u64,
@@ -636,19 +236,19 @@ impl MatrixRows {
 
     fn normalize(&mut self) {
         let mut live_edges = 0_u64;
-        self.rows.retain(|_, dsts| {
-            dsts.sort_unstable();
-            dsts.dedup();
-            live_edges = live_edges.saturating_add(dsts.len() as u64);
-            !dsts.is_empty()
+        self.rows.retain(|_, destinations| {
+            destinations.sort_unstable();
+            destinations.dedup();
+            live_edges = live_edges.saturating_add(destinations.len() as u64);
+            !destinations.is_empty()
         });
         self.live_edges = live_edges;
     }
 
-    fn reversed(&self) -> MatrixRows {
-        let mut reversed = MatrixRows::default();
-        for (src, dsts) in &self.rows {
-            for dst in dsts {
+    fn reversed(&self) -> Self {
+        let mut reversed = Self::default();
+        for (src, destinations) in &self.rows {
+            for dst in destinations {
                 reversed.push(*dst, *src);
             }
         }
@@ -659,24 +259,18 @@ impl MatrixRows {
     fn to_adjacency(&self) -> MatrixAdjacency {
         self.rows
             .iter()
-            .map(|(src, dsts)| (*src, dsts.iter().copied().collect()))
+            .map(|(src, destinations)| (*src, destinations.iter().copied().collect()))
             .collect()
     }
 }
 
 mod artifact_build;
+mod artifact_gc;
+mod artifact_refresh;
 mod cluster;
-mod control_metadata;
-mod control_plane;
-mod controller;
-mod supernode;
+mod matrix_cache;
 mod traversal;
 mod verify;
-
-pub use control_metadata::{
-    GraphControlCellDropReport, GraphControlEdgeWatermark, GraphControlIdempotencyRecord,
-    GraphControlRepairReport, GraphControlWatermark, GraphShardCatalogEntry,
-};
 
 pub fn local_object_store(path: impl AsRef<std::path::Path>) -> Result<Arc<dyn ObjectStore>> {
     Ok(Arc::new(LocalFileSystem::new_with_prefix(path.as_ref())?) as Arc<dyn ObjectStore>)
@@ -684,425 +278,6 @@ pub fn local_object_store(path: impl AsRef<std::path::Path>) -> Result<Arc<dyn O
 
 pub fn object_store_from_env(env_file: Option<String>) -> Result<Arc<dyn ObjectStore>> {
     Ok(slatedb::admin::load_object_store_from_env(env_file)?)
-}
-
-const GRAPH_CONTROL_TXN_MAX_RETRIES: usize = 32;
-const GRAPH_CONTROLLER_EXPIRED_HEARTBEAT_PRUNE_LIMIT: usize = 1024;
-const GRAPH_CONTROLLER_LOCK_TTL_MS: u64 = 30_000;
-const CONTROL_PLACEMENT_PREFIX: &str = "control/placement/";
-const CONTROL_NODE_PREFIX: &str = "control/node/";
-
-fn control_placement_key(cell_id: &str) -> String {
-    format!("{CONTROL_PLACEMENT_PREFIX}{cell_id}")
-}
-
-fn control_node_key(node_id: &str) -> String {
-    format!("{CONTROL_NODE_PREFIX}{node_id}")
-}
-
-fn control_lease_key(cell_id: &str) -> String {
-    format!("control/lease/{cell_id}")
-}
-
-fn control_lease_token_key(cell_id: &str) -> String {
-    format!("control/lease_token/{cell_id}")
-}
-
-fn encode_control_placement(cell_id: &str, owner_node_id: &str) -> Vec<u8> {
-    format!("placement1\t{cell_id}\t{owner_node_id}\n").into_bytes()
-}
-
-fn decode_control_placement(key: &str, value: &[u8]) -> Result<(String, String)> {
-    let text = text_value(key, value)?;
-    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 3 || parts[0] != "placement1" {
-        return corrupt(key, "expected placement1 record with 3 fields");
-    }
-    validate_component("cell_id", parts[1])?;
-    validate_component("node_id", parts[2])?;
-    Ok((parts[1].to_string(), parts[2].to_string()))
-}
-
-fn encode_node_health_state(state: GraphNodeHealthState) -> &'static str {
-    match state {
-        GraphNodeHealthState::Active => "active",
-        GraphNodeHealthState::Draining => "draining",
-    }
-}
-
-fn decode_node_health_state(key: &str, value: &str) -> Result<GraphNodeHealthState> {
-    match value {
-        "active" => Ok(GraphNodeHealthState::Active),
-        "draining" => Ok(GraphNodeHealthState::Draining),
-        _ => corrupt(key, format!("unknown node health state {value}")),
-    }
-}
-
-fn encode_node_heartbeat(heartbeat: &GraphNodeHeartbeat) -> Vec<u8> {
-    format!(
-        "node1\t{}\t{}\t{}\t{}\t{}\n",
-        heartbeat.node_id,
-        encode_node_health_state(heartbeat.state),
-        heartbeat.started_at_ms,
-        heartbeat.last_seen_ms,
-        heartbeat.generation
-    )
-    .into_bytes()
-}
-
-fn decode_node_heartbeat(key: &str, value: &[u8]) -> Result<GraphNodeHeartbeat> {
-    let text = text_value(key, value)?;
-    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 6 || parts[0] != "node1" {
-        return corrupt(key, "expected node1 record with 6 fields");
-    }
-    validate_component("node_id", parts[1])?;
-    Ok(GraphNodeHeartbeat {
-        node_id: parts[1].to_string(),
-        state: decode_node_health_state(key, parts[2])?,
-        started_at_ms: parse_u64(key, parts[3], "started_at_ms")?,
-        last_seen_ms: parse_u64(key, parts[4], "last_seen_ms")?,
-        generation: parse_u64(key, parts[5], "generation")?,
-    })
-}
-
-fn encode_shard_lease(lease: &ShardLease) -> Vec<u8> {
-    format!(
-        "lease1\t{}\t{}\t{}\t{}\n",
-        lease.cell_id, lease.owner_node_id, lease.lease_token, lease.expires_at_ms
-    )
-    .into_bytes()
-}
-
-fn decode_shard_lease(key: &str, value: &[u8]) -> Result<ShardLease> {
-    let text = text_value(key, value)?;
-    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 5 || parts[0] != "lease1" {
-        return corrupt(key, "expected lease1 record with 5 fields");
-    }
-    validate_component("cell_id", parts[1])?;
-    validate_component("node_id", parts[2])?;
-    Ok(ShardLease {
-        cell_id: parts[1].to_string(),
-        owner_node_id: parts[2].to_string(),
-        lease_token: parse_u64(key, parts[3], "lease_token")?,
-        expires_at_ms: parse_u64(key, parts[4], "expires_at_ms")?,
-    })
-}
-
-async fn read_control_txn(txn: &DbTransaction, key: &str) -> Result<Option<Bytes>> {
-    txn.mark_read([key.as_bytes()])?;
-    Ok(txn
-        .get_with_options(key.as_bytes(), &control_read_options())
-        .await?)
-}
-
-async fn read_control_counter_txn(txn: &DbTransaction, key: &str) -> Result<u64> {
-    match read_control_txn(txn, key).await? {
-        Some(value) => decode_u64_be(key, &value),
-        None => Ok(0),
-    }
-}
-
-async fn commit_control_txn(txn: DbTransaction) -> Result<()> {
-    let options = WriteOptions {
-        await_durable: true,
-        ..Default::default()
-    };
-    txn.commit_with_options(&options).await?;
-    Ok(())
-}
-
-fn control_read_options() -> ReadOptions {
-    ReadOptions {
-        durability_filter: DurabilityLevel::Remote,
-        ..Default::default()
-    }
-}
-
-fn control_scan_options() -> ScanOptions {
-    ScanOptions::default()
-        .with_durability_filter(DurabilityLevel::Remote)
-        .with_cache_blocks(false)
-}
-
-fn encode_u64_be(value: u64) -> Vec<u8> {
-    value.to_be_bytes().to_vec()
-}
-
-fn decode_u64_be(key: &str, value: &[u8]) -> Result<u64> {
-    let bytes: [u8; 8] = value.try_into().map_err(|_| GraphError::CorruptValue {
-        key: key.to_string(),
-        reason: format!("expected 8 bytes, got {}", value.len()),
-    })?;
-    Ok(u64::from_be_bytes(bytes))
-}
-
-fn lease_ttl_ms(ttl: Duration) -> Result<u64> {
-    u64::try_from(ttl.as_millis()).map_err(|err| GraphError::CorruptValue {
-        key: "control/lease_ttl".to_string(),
-        reason: format!("lease ttl is too large: {err}"),
-    })
-}
-
-fn now_millis() -> u64 {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-}
-
-fn lock_error<T>(_: std::sync::PoisonError<T>) -> GraphError {
-    GraphError::CorruptValue {
-        key: "control/lease_lock".to_string(),
-        reason: "lease state lock poisoned".to_string(),
-    }
-}
-
-fn append_posting_chunks(
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: GraphEpoch,
-    direction: ArtifactDirection,
-    chunk_size: usize,
-    mut adjacency: BTreeMap<VertexId, Vec<VertexId>>,
-    chunks: &mut Vec<PostingChunk>,
-) {
-    for (owner, vertices) in adjacency.iter_mut() {
-        vertices.sort_unstable();
-        vertices.dedup();
-        for (chunk_id, chunk) in vertices.chunks(chunk_size).enumerate() {
-            chunks.push(PostingChunk {
-                cell_id: cell_id.to_string(),
-                edge_type: edge_type.to_string(),
-                direction,
-                owner: *owner,
-                base_epoch,
-                chunk_id: chunk_id as u64,
-                vertices: chunk.to_vec(),
-            });
-        }
-    }
-}
-
-fn posting_manifests_from_chunks(chunks: &[PostingChunk]) -> Result<Vec<PostingChunkManifest>> {
-    let mut grouped = BTreeMap::<
-        (String, String, ArtifactDirection, VertexId, GraphEpoch),
-        Vec<&PostingChunk>,
-    >::new();
-    for chunk in chunks {
-        grouped
-            .entry((
-                chunk.cell_id.clone(),
-                chunk.edge_type.clone(),
-                chunk.direction,
-                chunk.owner,
-                chunk.base_epoch,
-            ))
-            .or_default()
-            .push(chunk);
-    }
-
-    let mut manifests = Vec::with_capacity(grouped.len());
-    for ((cell_id, edge_type, direction, owner, base_epoch), mut owner_chunks) in grouped {
-        owner_chunks.sort_by_key(|chunk| chunk.chunk_id);
-        let mut vertex_count = 0_u64;
-        let mut chunk_checksums = Vec::with_capacity(owner_chunks.len());
-        for (expected_id, chunk) in owner_chunks.iter().enumerate() {
-            let expected_id = expected_id as u64;
-            if chunk.chunk_id != expected_id {
-                return Err(GraphError::CorruptValue {
-                    key: posting_key(chunk),
-                    reason: format!(
-                        "posting chunk ids must be contiguous before publish: expected {expected_id}, got {}",
-                        chunk.chunk_id
-                    ),
-                });
-            }
-            vertex_count = vertex_count.saturating_add(chunk.vertices.len() as u64);
-            chunk_checksums.push(posting_chunk_checksum(chunk));
-        }
-        manifests.push(PostingChunkManifest {
-            cell_id,
-            edge_type,
-            direction,
-            owner,
-            base_epoch,
-            chunk_count: owner_chunks.len() as u64,
-            vertex_count,
-            chunk_checksums,
-            chunk_bounds: supernode_chunk_bounds(&owner_chunks),
-        });
-    }
-    Ok(manifests)
-}
-
-fn posting_artifact_manifest_from_owner_manifests(
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: GraphEpoch,
-    manifests: &[PostingChunkManifest],
-) -> Result<Option<PostingArtifactManifest>> {
-    if manifests.is_empty() {
-        return Ok(None);
-    }
-    let mut checksum = 0xcbf2_9ce4_8422_2325_u64;
-    checksum_u64(&mut checksum, base_epoch);
-    let mut chunk_count = 0_u64;
-    let mut vertex_count = 0_u64;
-    for manifest in manifests {
-        if manifest.cell_id != cell_id
-            || manifest.edge_type != edge_type
-            || manifest.base_epoch != base_epoch
-        {
-            return Err(GraphError::CorruptValue {
-                key: posting_manifest_key(
-                    &manifest.cell_id,
-                    &manifest.edge_type,
-                    manifest.direction,
-                    manifest.owner,
-                    manifest.base_epoch,
-                ),
-                reason: "posting owner manifest does not belong to artifact epoch".to_string(),
-            });
-        }
-        checksum_u64(
-            &mut checksum,
-            match manifest.direction {
-                ArtifactDirection::Out => 1,
-                ArtifactDirection::In => 2,
-            },
-        );
-        checksum_u64(&mut checksum, manifest.owner);
-        checksum_u64(&mut checksum, manifest.chunk_count);
-        checksum_u64(&mut checksum, manifest.vertex_count);
-        for chunk_checksum in &manifest.chunk_checksums {
-            checksum_u64(&mut checksum, *chunk_checksum);
-        }
-        chunk_count = chunk_count.saturating_add(manifest.chunk_count);
-        vertex_count = vertex_count.saturating_add(manifest.vertex_count);
-    }
-    Ok(Some(PostingArtifactManifest {
-        cell_id: cell_id.to_string(),
-        edge_type: edge_type.to_string(),
-        base_epoch,
-        owner_manifest_count: manifests.len() as u64,
-        chunk_count,
-        vertex_count,
-        checksum,
-    }))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_current_supernode_chunk(
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: GraphEpoch,
-    direction: ArtifactDirection,
-    owner: VertexId,
-    chunks: &mut Vec<PostingChunk>,
-    chunk_bounds: &mut Vec<SupernodeChunkBound>,
-    vertices: &mut Vec<VertexId>,
-) {
-    let chunk_id = chunk_bounds.len() as u64;
-    if let (Some(first), Some(last)) = (vertices.first().copied(), vertices.last().copied()) {
-        chunk_bounds.push(SupernodeChunkBound {
-            chunk_id,
-            first,
-            last,
-        });
-    }
-    chunks.push(PostingChunk {
-        cell_id: cell_id.to_string(),
-        edge_type: edge_type.to_string(),
-        direction,
-        owner,
-        base_epoch,
-        chunk_id,
-        vertices: std::mem::take(vertices),
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_supernode_chunks(
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: GraphEpoch,
-    direction: ArtifactDirection,
-    degree_threshold: u64,
-    chunk_size: usize,
-    mut adjacency: BTreeMap<VertexId, Vec<VertexId>>,
-    chunks: &mut Vec<PostingChunk>,
-    groups: &mut Vec<SupernodeGroup>,
-) {
-    for (owner, vertices) in adjacency.iter_mut() {
-        vertices.sort_unstable();
-        vertices.dedup();
-        let degree = vertices.len() as u64;
-        if degree < degree_threshold {
-            continue;
-        }
-        let first_chunk_id = chunks.len() as u64;
-        let mut chunk_bounds = Vec::new();
-        for (offset, chunk) in vertices.chunks(chunk_size).enumerate() {
-            let chunk_id = offset as u64;
-            if let (Some(first), Some(last)) = (chunk.first(), chunk.last()) {
-                chunk_bounds.push(SupernodeChunkBound {
-                    chunk_id,
-                    first: *first,
-                    last: *last,
-                });
-            }
-            chunks.push(PostingChunk {
-                cell_id: cell_id.to_string(),
-                edge_type: edge_type.to_string(),
-                direction,
-                owner: *owner,
-                base_epoch,
-                chunk_id,
-                vertices: chunk.to_vec(),
-            });
-        }
-        groups.push(SupernodeGroup {
-            cell_id: cell_id.to_string(),
-            edge_type: edge_type.to_string(),
-            direction,
-            vertex_id: *owner,
-            base_epoch,
-            degree,
-            chunk_count: (chunks.len() as u64).saturating_sub(first_chunk_id),
-            page_size: chunk_size as u64,
-            chunk_bounds,
-        });
-    }
-}
-
-fn supernode_chunk_bounds(chunks: &[&PostingChunk]) -> Vec<SupernodeChunkBound> {
-    let mut bounds: Vec<_> = chunks
-        .iter()
-        .filter_map(|chunk| {
-            let first = chunk.vertices.first().copied()?;
-            let last = chunk.vertices.last().copied()?;
-            Some(SupernodeChunkBound {
-                chunk_id: chunk.chunk_id,
-                first,
-                last,
-            })
-        })
-        .collect();
-    bounds.sort_by_key(|bound| (bound.first, bound.last, bound.chunk_id));
-    bounds
-}
-
-fn supernode_bound_for_vertex(
-    group: &SupernodeGroup,
-    vertex: VertexId,
-) -> Option<&SupernodeChunkBound> {
-    let idx = group
-        .chunk_bounds
-        .partition_point(|bound| bound.last < vertex);
-    let bound = group.chunk_bounds.get(idx)?;
-    (bound.first <= vertex && vertex <= bound.last).then_some(bound)
 }
 
 fn rendezvous_score(cell_id: &str, node_id: &str) -> u64 {
@@ -1115,16 +290,16 @@ fn rendezvous_score(cell_id: &str, node_id: &str) -> u64 {
 fn matrix_tiles_from_edges(
     cell_id: &str,
     edge_type: &str,
-    base_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
     tile_size: u64,
-    direction: ArtifactDirection,
+    direction: MatrixDirection,
     edges: &[EdgeRecord],
 ) -> Vec<MatrixTile> {
     let mut tiles: BTreeMap<(u64, u64), BTreeMap<VertexId, Vec<VertexId>>> = BTreeMap::new();
     for edge in edges {
         let (row, col) = match direction {
-            ArtifactDirection::Out => (edge.src, edge.dst),
-            ArtifactDirection::In => (edge.dst, edge.src),
+            MatrixDirection::Out => (edge.src, edge.dst),
+            MatrixDirection::In => (edge.dst, edge.src),
         };
         let key = (row / tile_size, col / tile_size);
         tiles
@@ -1163,9 +338,9 @@ async fn append_matrix_tiles_from_rows(
     pending_writes: &mut usize,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
     tile_size: u64,
-    direction: ArtifactDirection,
+    direction: MatrixDirection,
     rows: &BTreeMap<VertexId, Vec<VertexId>>,
 ) -> Result<u64> {
     let mut current_tile_row = None;
@@ -1232,9 +407,9 @@ async fn flush_matrix_tile_row(
     pending_writes: &mut usize,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
     tile_size: u64,
-    direction: ArtifactDirection,
+    direction: MatrixDirection,
     tile_row: u64,
     tile_columns: &mut BTreeMap<u64, BTreeMap<VertexId, Vec<VertexId>>>,
 ) -> Result<u64> {
@@ -1375,26 +550,6 @@ fn adjacency_resident_bytes(adjacency: &MatrixAdjacency) -> usize {
         )
 }
 
-fn posting_chunk_resident_bytes(chunk: &PostingChunk) -> usize {
-    std::mem::size_of::<PostingChunk>()
-        .saturating_add(chunk.cell_id.capacity())
-        .saturating_add(chunk.edge_type.capacity())
-        .saturating_add(
-            chunk
-                .vertices
-                .capacity()
-                .saturating_mul(std::mem::size_of::<VertexId>()),
-        )
-}
-
-fn materialized_supernode_resident_bytes(vertices: &[VertexId]) -> usize {
-    std::mem::size_of::<Vec<VertexId>>().saturating_add(
-        vertices
-            .len()
-            .saturating_mul(std::mem::size_of::<VertexId>()),
-    )
-}
-
 const GRAPH_VERIFY_MISMATCH_SAMPLES: usize = 64;
 
 type RelationshipPropertyIndexEntry = (String, String, VertexId, VertexId, RelationshipId);
@@ -1402,7 +557,7 @@ type RelationshipPropertyIndexEntry = (String, String, VertexId, VertexId, Relat
 fn graph_export_digest(
     cell_id: &str,
     edge_type: &str,
-    read_epoch: GraphEpoch,
+    read_epoch: TopologySequence,
     edges: &[EdgeRecord],
 ) -> GraphExportDigest {
     let (out_degrees, in_degrees) = degree_maps(edges);
@@ -1640,17 +795,17 @@ fn naive_reachable(adjacency: &MatrixAdjacency, root: VertexId, hops: u8) -> Vec
 }
 
 pub(crate) fn apply_delta_overlay(
-    adjacency: &mut BTreeMap<VertexId, BTreeSet<VertexId>>,
+    adjacency: &mut MatrixAdjacency,
     deltas: Vec<DeltaRecord>,
-    base_epoch: GraphEpoch,
-    read_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
+    read_epoch: TopologySequence,
 ) -> u64 {
     let mut applied = 0_u64;
     for delta in deltas {
         if delta.edge.epoch <= base_epoch || delta.edge.epoch > read_epoch {
             continue;
         }
-        applied += 1;
+        applied = applied.saturating_add(1);
         match delta.kind {
             DeltaKind::Plus => {
                 adjacency
@@ -1659,8 +814,11 @@ pub(crate) fn apply_delta_overlay(
                     .insert(delta.edge.dst);
             }
             DeltaKind::Minus => {
-                if let Some(row) = adjacency.get_mut(&delta.edge.src) {
-                    row.remove(&delta.edge.dst);
+                if let Some(destinations) = adjacency.get_mut(&delta.edge.src) {
+                    destinations.remove(&delta.edge.dst);
+                    if destinations.is_empty() {
+                        adjacency.remove(&delta.edge.src);
+                    }
                 }
             }
         }
@@ -1668,43 +826,20 @@ pub(crate) fn apply_delta_overlay(
     applied
 }
 
-fn next_live_base_vertex(
-    vertices: &[VertexId],
-    index: &mut usize,
-    overlay: &SupernodeDeltaOverlay,
-) -> Option<VertexId> {
-    while let Some(vertex) = vertices.get(*index).copied() {
-        *index += 1;
-        if !overlay.minus.contains(&vertex) {
-            return Some(vertex);
-        }
-    }
-    None
-}
-
-fn merge_next_vertex(base: Option<VertexId>, plus: Option<VertexId>) -> Option<VertexId> {
-    match (base, plus) {
-        (Some(base), Some(plus)) => Some(base.min(plus)),
-        (Some(base), None) => Some(base),
-        (None, Some(plus)) => Some(plus),
-        (None, None) => None,
-    }
-}
-
-fn direction_str(direction: ArtifactDirection) -> &'static str {
+fn direction_str(direction: MatrixDirection) -> &'static str {
     match direction {
-        ArtifactDirection::Out => "out",
-        ArtifactDirection::In => "in",
+        MatrixDirection::Out => "out",
+        MatrixDirection::In => "in",
     }
 }
 
-fn parse_direction(value: &str) -> Result<ArtifactDirection> {
+fn parse_direction(value: &str) -> Result<MatrixDirection> {
     match value {
-        "out" => Ok(ArtifactDirection::Out),
-        "in" => Ok(ArtifactDirection::In),
-        other => Err(GraphError::CorruptValue {
-            key: "direction".to_string(),
-            reason: format!("invalid artifact direction {other}"),
+        "out" => Ok(MatrixDirection::Out),
+        "in" => Ok(MatrixDirection::In),
+        _ => Err(GraphError::CorruptValue {
+            key: "matrix/direction".to_string(),
+            reason: format!("unknown matrix direction {value}"),
         }),
     }
 }
@@ -1716,287 +851,14 @@ fn parse_last_key_component(key: &str, field: &str) -> Result<u64> {
     parse_u64(key, value, field)
 }
 
-fn posting_key(chunk: &PostingChunk) -> String {
-    posting_chunk_key(
-        &chunk.cell_id,
-        &chunk.edge_type,
-        chunk.direction,
-        chunk.owner,
-        chunk.base_epoch,
-        chunk.chunk_id,
-    )
-}
-
-fn posting_chunk_key(
-    cell_id: &str,
-    edge_type: &str,
-    direction: ArtifactDirection,
-    owner: VertexId,
-    base_epoch: GraphEpoch,
-    chunk_id: u64,
-) -> String {
-    format!(
-        "cell/{cell_id}/artifact/posting/{edge_type}/{}/{owner:020}/{base_epoch:020}/{chunk_id:020}",
-        direction_str(direction)
-    )
-}
-
-fn posting_prefix(
-    cell_id: &str,
-    edge_type: &str,
-    direction: ArtifactDirection,
-    owner: VertexId,
-    base_epoch: GraphEpoch,
-) -> String {
-    format!(
-        "cell/{cell_id}/artifact/posting/{edge_type}/{}/{owner:020}/{base_epoch:020}/",
-        direction_str(direction)
-    )
-}
-
-fn posting_manifest_key(
-    cell_id: &str,
-    edge_type: &str,
-    direction: ArtifactDirection,
-    owner: VertexId,
-    base_epoch: GraphEpoch,
-) -> String {
-    format!(
-        "cell/{cell_id}/artifact/posting_manifest/{edge_type}/{}/{owner:020}/{base_epoch:020}",
-        direction_str(direction)
-    )
-}
-
-fn posting_manifest_prefix(cell_id: &str, edge_type: &str) -> String {
-    format!("cell/{cell_id}/artifact/posting_manifest/{edge_type}/")
-}
-
-fn posting_artifact_manifest_key(cell_id: &str, edge_type: &str, base_epoch: GraphEpoch) -> String {
-    format!("cell/{cell_id}/artifact/posting_epoch_manifest/{edge_type}/{base_epoch:020}")
-}
-
-pub(crate) fn posting_cleanup_marker_key(
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: GraphEpoch,
-) -> String {
-    format!("cell/{cell_id}/meta/posting_cleanup/{edge_type}/{base_epoch:020}")
-}
-
-fn posting_artifact_manifest_prefix(cell_id: &str, edge_type: &str) -> String {
-    format!("cell/{cell_id}/artifact/posting_epoch_manifest/{edge_type}/")
-}
-
-fn encode_posting_chunk(chunk: &PostingChunk) -> Vec<u8> {
-    format!(
-        "posting1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        chunk.cell_id,
-        chunk.edge_type,
-        direction_str(chunk.direction),
-        chunk.owner,
-        chunk.base_epoch,
-        chunk.chunk_id,
-        encode_vertices(&chunk.vertices)
-    )
-    .into_bytes()
-}
-
-fn decode_posting_chunk(key: &str, value: &[u8]) -> Result<PostingChunk> {
-    let text = text_value(key, value)?;
-    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 8 || parts[0] != "posting1" {
-        return corrupt(key, "expected posting1 record with 8 fields");
-    }
-    Ok(PostingChunk {
-        cell_id: parts[1].to_string(),
-        edge_type: parts[2].to_string(),
-        direction: parse_direction(parts[3])?,
-        owner: parse_u64(key, parts[4], "owner")?,
-        base_epoch: parse_u64(key, parts[5], "base_epoch")?,
-        chunk_id: parse_u64(key, parts[6], "chunk_id")?,
-        vertices: decode_vertices(key, parts[7])?,
-    })
-}
-
-fn posting_chunk_checksum(chunk: &PostingChunk) -> u64 {
-    let mut checksum = 0xcbf2_9ce4_8422_2325_u64;
-    checksum_u64(
-        &mut checksum,
-        match chunk.direction {
-            ArtifactDirection::Out => 1,
-            ArtifactDirection::In => 2,
-        },
-    );
-    checksum_u64(&mut checksum, chunk.owner);
-    checksum_u64(&mut checksum, chunk.base_epoch);
-    checksum_u64(&mut checksum, chunk.chunk_id);
-    checksum_u64(&mut checksum, chunk.vertices.len() as u64);
-    for vertex in &chunk.vertices {
-        checksum_u64(&mut checksum, *vertex);
-    }
-    checksum
-}
-
-fn encode_posting_manifest(manifest: &PostingChunkManifest) -> Vec<u8> {
-    format!(
-        "graph-posting-manifest-v1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        manifest.cell_id,
-        manifest.edge_type,
-        direction_str(manifest.direction),
-        manifest.owner,
-        manifest.base_epoch,
-        manifest.chunk_count,
-        manifest.vertex_count,
-        encode_u64_list(&manifest.chunk_checksums),
-        encode_supernode_chunk_bounds(&manifest.chunk_bounds)
-    )
-    .into_bytes()
-}
-
-fn decode_posting_manifest(key: &str, value: &[u8]) -> Result<PostingChunkManifest> {
-    let text = text_value(key, value)?;
-    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 10 || parts[0] != "graph-posting-manifest-v1" {
-        return corrupt(key, "expected graph-posting-manifest-v1 record");
-    }
-    let chunk_count = parse_u64(key, parts[6], "chunk_count")?;
-    let chunk_checksums = decode_u64_list(key, parts[8])?;
-    let expected_checksums =
-        usize::try_from(chunk_count).map_err(|err| GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: format!("posting manifest chunk count does not fit usize: {err}"),
-        })?;
-    if chunk_checksums.len() != expected_checksums {
-        return corrupt(
-            key,
-            "posting manifest checksum count does not match chunk count",
-        );
-    }
-    validate_posting_manifest(
-        key,
-        PostingChunkManifest {
-            cell_id: parts[1].to_string(),
-            edge_type: parts[2].to_string(),
-            direction: parse_direction(parts[3])?,
-            owner: parse_u64(key, parts[4], "owner")?,
-            base_epoch: parse_u64(key, parts[5], "base_epoch")?,
-            chunk_count,
-            vertex_count: parse_u64(key, parts[7], "vertex_count")?,
-            chunk_checksums,
-            chunk_bounds: decode_supernode_chunk_bounds(key, parts[9])?,
-        },
-    )
-}
-
-fn validate_posting_manifest(
-    key: &str,
-    manifest: PostingChunkManifest,
-) -> Result<PostingChunkManifest> {
-    if manifest.vertex_count > 0 && manifest.chunk_count == 0 {
-        return corrupt(key, "posting manifest vertex count requires chunks");
-    }
-    if !manifest.chunk_bounds.is_empty() {
-        if manifest.chunk_bounds.len() as u64 != manifest.chunk_count {
-            return corrupt(key, "posting manifest bounds must cover every chunk");
-        }
-        let mut previous_last = None;
-        for (expected_id, bound) in manifest.chunk_bounds.iter().enumerate() {
-            if bound.chunk_id != expected_id as u64 || bound.first > bound.last {
-                return corrupt(key, "posting manifest contains invalid chunk bounds");
-            }
-            if previous_last.is_some_and(|last| bound.first <= last) {
-                return corrupt(key, "posting manifest chunk bounds overlap or are unsorted");
-            }
-            previous_last = Some(bound.last);
-        }
-    }
-    let parts: Vec<_> = key.split('/').collect();
-    let ["cell", cell_id, "artifact", "posting_manifest", edge_type, direction, owner, base_epoch] =
-        parts.as_slice()
-    else {
-        return corrupt(key, "invalid posting manifest key");
-    };
-    if manifest.cell_id != *cell_id
-        || manifest.edge_type != *edge_type
-        || direction_str(manifest.direction) != *direction
-        || manifest.owner != parse_u64(key, owner, "owner")?
-        || manifest.base_epoch != parse_u64(key, base_epoch, "base_epoch")?
-    {
-        return corrupt(key, "posting manifest key does not match value");
-    }
-    Ok(manifest)
-}
-
-fn encode_posting_artifact_manifest(manifest: &PostingArtifactManifest) -> Vec<u8> {
-    format!(
-        "posting_epoch_manifest1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        manifest.cell_id,
-        manifest.edge_type,
-        manifest.base_epoch,
-        manifest.owner_manifest_count,
-        manifest.chunk_count,
-        manifest.vertex_count,
-        manifest.checksum
-    )
-    .into_bytes()
-}
-
-fn decode_posting_artifact_manifest(key: &str, value: &[u8]) -> Result<PostingArtifactManifest> {
-    let text = text_value(key, value)?;
-    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 8 || parts[0] != "posting_epoch_manifest1" {
-        return corrupt(key, "expected posting_epoch_manifest1 record with 8 fields");
-    }
-    validate_posting_artifact_manifest(
-        key,
-        PostingArtifactManifest {
-            cell_id: parts[1].to_string(),
-            edge_type: parts[2].to_string(),
-            base_epoch: parse_u64(key, parts[3], "base_epoch")?,
-            owner_manifest_count: parse_u64(key, parts[4], "owner_manifest_count")?,
-            chunk_count: parse_u64(key, parts[5], "chunk_count")?,
-            vertex_count: parse_u64(key, parts[6], "vertex_count")?,
-            checksum: parse_u64(key, parts[7], "checksum")?,
-        },
-    )
-}
-
-fn validate_posting_artifact_manifest(
-    key: &str,
-    manifest: PostingArtifactManifest,
-) -> Result<PostingArtifactManifest> {
-    if manifest.vertex_count > 0 && manifest.chunk_count == 0 {
-        return corrupt(key, "posting epoch manifest vertex count requires chunks");
-    }
-    if manifest.chunk_count > 0 && manifest.owner_manifest_count == 0 {
-        return corrupt(
-            key,
-            "posting epoch manifest chunk count requires owner manifests",
-        );
-    }
-    let parts: Vec<_> = key.split('/').collect();
-    let ["cell", cell_id, "artifact", "posting_epoch_manifest", edge_type, base_epoch] =
-        parts.as_slice()
-    else {
-        return corrupt(key, "invalid posting epoch manifest key");
-    };
-    if manifest.cell_id != *cell_id
-        || manifest.edge_type != *edge_type
-        || manifest.base_epoch != parse_u64(key, base_epoch, "base_epoch")?
-    {
-        return corrupt(key, "posting epoch manifest key does not match value");
-    }
-    Ok(manifest)
-}
-
-fn matrix_manifest_key(cell_id: &str, edge_type: &str, base_epoch: GraphEpoch) -> String {
+fn matrix_manifest_key(cell_id: &str, edge_type: &str, base_epoch: TopologySequence) -> String {
     format!("cell/{cell_id}/artifact/matrix_manifest/{edge_type}/{base_epoch:020}")
 }
 
 pub(crate) fn matrix_cleanup_marker_key(
     cell_id: &str,
     edge_type: &str,
-    base_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
 ) -> String {
     format!("cell/{cell_id}/meta/matrix_cleanup/{edge_type}/{base_epoch:020}")
 }
@@ -2072,8 +934,8 @@ fn matrix_tile_key(tile: &MatrixTile) -> String {
 fn matrix_tile_prefix(
     cell_id: &str,
     edge_type: &str,
-    base_epoch: GraphEpoch,
-    direction: ArtifactDirection,
+    base_epoch: TopologySequence,
+    direction: MatrixDirection,
 ) -> String {
     format!(
         "cell/{cell_id}/artifact/matrix/{edge_type}/{base_epoch:020}/{}/",
@@ -2081,7 +943,7 @@ fn matrix_tile_prefix(
     )
 }
 
-fn graphblas_csc_key(cell_id: &str, edge_type: &str, base_epoch: GraphEpoch) -> String {
+fn graphblas_csc_key(cell_id: &str, edge_type: &str, base_epoch: TopologySequence) -> String {
     format!("cell/{cell_id}/artifact/graphblas_csc/{edge_type}/{base_epoch:020}")
 }
 
@@ -2096,7 +958,7 @@ fn graphblas_csc_chunk_prefix(cell_id: &str, edge_type: &str) -> String {
 fn graphblas_csc_chunk_epoch_prefix(
     cell_id: &str,
     edge_type: &str,
-    base_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
 ) -> String {
     format!("cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/{base_epoch:020}/")
 }
@@ -2104,7 +966,7 @@ fn graphblas_csc_chunk_epoch_prefix(
 fn graphblas_csc_chunk_key(
     cell_id: &str,
     edge_type: &str,
-    base_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
     field: &str,
     chunk_id: u64,
 ) -> String {
@@ -2113,42 +975,22 @@ fn graphblas_csc_chunk_key(
     )
 }
 
-fn rollup_key(cell_id: &str, edge_type: &str, base_epoch: GraphEpoch) -> String {
-    format!("cell/{cell_id}/rollup/{edge_type}/{base_epoch:020}")
-}
-
-fn rollup_prefix(cell_id: &str, edge_type: &str) -> String {
-    format!("cell/{cell_id}/rollup/{edge_type}/")
-}
-
 fn graph_artifact_gc_prefixes(cell_id: &str, edge_type: &str) -> Vec<String> {
     vec![
-        format!("cell/{cell_id}/artifact/posting/{edge_type}/"),
-        posting_manifest_prefix(cell_id, edge_type),
-        posting_artifact_manifest_prefix(cell_id, edge_type),
         matrix_manifest_prefix(cell_id, edge_type),
         format!("cell/{cell_id}/artifact/matrix/{edge_type}/"),
         graphblas_csc_prefix(cell_id, edge_type),
         graphblas_csc_chunk_prefix(cell_id, edge_type),
-        format!("cell/{cell_id}/artifact/supernode/{edge_type}/"),
-        supernode_artifact_manifest_prefix(cell_id, edge_type),
-        rollup_prefix(cell_id, edge_type),
     ]
 }
 
-fn graph_artifact_epoch_from_key(key: &str) -> Result<Option<GraphEpoch>> {
+fn graph_artifact_epoch_from_key(key: &str) -> Result<Option<TopologySequence>> {
     let parts: Vec<_> = key.split('/').collect();
     let epoch = match parts.as_slice() {
-        ["cell", _, "artifact", "posting", _, _, _, base_epoch, ..] => Some(*base_epoch),
-        ["cell", _, "artifact", "posting_manifest", _, _, _, base_epoch] => Some(*base_epoch),
-        ["cell", _, "artifact", "posting_epoch_manifest", _, base_epoch] => Some(*base_epoch),
         ["cell", _, "artifact", "matrix_manifest", _, base_epoch] => Some(*base_epoch),
         ["cell", _, "artifact", "matrix", _, base_epoch, ..] => Some(*base_epoch),
         ["cell", _, "artifact", "graphblas_csc", _, base_epoch] => Some(*base_epoch),
         ["cell", _, "artifact", "graphblas_csc_chunk", _, base_epoch, ..] => Some(*base_epoch),
-        ["cell", _, "artifact", "supernode", _, _, _, base_epoch] => Some(*base_epoch),
-        ["cell", _, "artifact", "supernode_epoch_manifest", _, base_epoch] => Some(*base_epoch),
-        ["cell", _, "rollup", _, base_epoch] => Some(*base_epoch),
         _ => None,
     };
     epoch
@@ -2212,747 +1054,6 @@ async fn flush_artifact_put_batch(
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct PostingArtifactCleanupResult {
-    pub(crate) deleted_keys: u64,
-    pub(crate) cleanup_errors: u64,
-    pub(crate) skipped_published_manifest: bool,
-}
-
-impl PostingArtifactCleanupResult {
-    fn record_error<E>(
-        &mut self,
-        cell_id: &str,
-        edge_type: &str,
-        base_epoch: GraphEpoch,
-        operation: &'static str,
-        cleanup_step: &'static str,
-        err: &E,
-    ) where
-        E: std::fmt::Display + ?Sized,
-    {
-        self.cleanup_errors = self.cleanup_errors.saturating_add(1);
-        tracing::warn!(
-            target: "slatedb_graph_kernel",
-            cell_id,
-            edge_type,
-            base_epoch,
-            operation,
-            cleanup_step,
-            error = %err,
-            "posting artifact abort cleanup step failed"
-        );
-    }
-}
-
-pub(crate) async fn cleanup_unpublished_posting_artifact_epoch(
-    shard: &GraphShard,
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: GraphEpoch,
-    operation: &'static str,
-) -> PostingArtifactCleanupResult {
-    let mut result = PostingArtifactCleanupResult::default();
-    let manifest_key = posting_artifact_manifest_key(cell_id, edge_type, base_epoch);
-    match shard.read_remote(&manifest_key).await {
-        Ok(Some(_)) => {
-            result.skipped_published_manifest = true;
-            return result;
-        }
-        Ok(None) => {}
-        Err(err) => {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "read_posting_epoch_manifest",
-                &err,
-            );
-            return result;
-        }
-    }
-
-    let artifact_lock = match shard
-        .acquire_posting_artifact_write_lock(cell_id, edge_type, base_epoch, operation)
-        .await
-    {
-        Ok(lock) => lock,
-        Err(err) => {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "acquire_posting_artifact_lock",
-                &err,
-            );
-            return result;
-        }
-    };
-
-    let cleanup_marker_key = posting_cleanup_marker_key(cell_id, edge_type, base_epoch);
-    let cleanup_token = artifact_lock.owner_token.as_bytes().to_vec();
-    let supernode_manifest_key = supernode_artifact_manifest_key(cell_id, edge_type, base_epoch);
-    let mut cleanup_claimed = false;
-
-    let cleanup_run = async {
-        for (cleanup_step, protected_manifest_key) in [
-            ("recheck_posting_epoch_manifest", manifest_key.as_str()),
-            (
-                "recheck_supernode_epoch_manifest_before_posting_cleanup",
-                supernode_manifest_key.as_str(),
-            ),
-        ] {
-            match shard.read_remote(protected_manifest_key).await {
-                Ok(Some(_)) => {
-                    result.skipped_published_manifest = true;
-                    return Ok(());
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    result.record_error(
-                        cell_id,
-                        edge_type,
-                        base_epoch,
-                        operation,
-                        cleanup_step,
-                        &err,
-                    );
-                    return Ok(());
-                }
-            }
-        }
-
-        let mut claim_batch = GraphWriteBatch::new();
-        claim_batch.put(&cleanup_marker_key, &cleanup_token);
-        match shard
-            .write_graph_batch_strict_guarded(
-                cell_id,
-                operation,
-                vec![
-                    GraphWriteGuard::absent(&manifest_key),
-                    GraphWriteGuard::absent(&supernode_manifest_key),
-                ],
-                claim_batch,
-            )
-            .await
-        {
-            Ok(()) => cleanup_claimed = true,
-            Err(GraphError::ConditionalWriteConflict { key, .. })
-                if key == manifest_key || key == supernode_manifest_key =>
-            {
-                result.skipped_published_manifest = true;
-                return Ok(());
-            }
-            Err(err) => {
-                result.record_error(
-                    cell_id,
-                    edge_type,
-                    base_epoch,
-                    operation,
-                    "claim_posting_cleanup_generation",
-                    &err,
-                );
-                return Ok(());
-            }
-        }
-
-        let mut batch = GraphWriteBatch::new();
-        let mut pending_deletes = 0_usize;
-        for (cleanup_step, prefix) in [
-            (
-                "scan_posting_chunks",
-                format!("cell/{cell_id}/artifact/posting/{edge_type}/"),
-            ),
-            (
-                "scan_posting_owner_manifests",
-                posting_manifest_prefix(cell_id, edge_type),
-            ),
-        ] {
-            let mut iter = match shard.scan_remote_prefix(&prefix).await {
-                Ok(iter) => iter,
-                Err(err) => {
-                    result.record_error(
-                        cell_id,
-                        edge_type,
-                        base_epoch,
-                        operation,
-                        cleanup_step,
-                        &err,
-                    );
-                    continue;
-                }
-            };
-            loop {
-                let kv = match iter.next().await {
-                    Ok(Some(kv)) => kv,
-                    Ok(None) => break,
-                    Err(err) => {
-                        result.record_error(
-                            cell_id,
-                            edge_type,
-                            base_epoch,
-                            operation,
-                            cleanup_step,
-                            &err,
-                        );
-                        break;
-                    }
-                };
-                let key = String::from_utf8_lossy(&kv.key).into_owned();
-                match graph_artifact_epoch_from_key(&key) {
-                    Ok(Some(epoch)) if epoch == base_epoch => {
-                        batch.delete(key.as_bytes());
-                        pending_deletes += 1;
-                    }
-                    Ok(_) => {}
-                    Err(err) => result.record_error(
-                        cell_id,
-                        edge_type,
-                        base_epoch,
-                        operation,
-                        cleanup_step,
-                        &err,
-                    ),
-                }
-                if pending_deletes >= GRAPH_ARTIFACT_GC_BATCH_KEYS
-                    && !flush_unpublished_posting_artifact_gc_batch_best_effort(
-                        shard,
-                        cell_id,
-                        edge_type,
-                        base_epoch,
-                        operation,
-                        &manifest_key,
-                        &supernode_manifest_key,
-                        &cleanup_marker_key,
-                        &cleanup_token,
-                        &artifact_lock,
-                        &mut batch,
-                        &mut pending_deletes,
-                        &mut result,
-                    )
-                    .await
-                {
-                    return Ok(());
-                }
-            }
-        }
-
-        if flush_unpublished_posting_artifact_gc_batch_best_effort(
-            shard,
-            cell_id,
-            edge_type,
-            base_epoch,
-            operation,
-            &manifest_key,
-            &supernode_manifest_key,
-            &cleanup_marker_key,
-            &cleanup_token,
-            &artifact_lock,
-            &mut batch,
-            &mut pending_deletes,
-            &mut result,
-        )
-        .await
-        {
-            shard.posting_chunk_cache.lock().await.retain(|key, _| {
-                key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch
-            });
-        }
-
-        Ok(())
-    }
-    .await;
-    if cleanup_claimed {
-        let mut release_batch = GraphWriteBatch::new();
-        release_batch.delete(&cleanup_marker_key);
-        if let Err(err) = shard
-            .write_graph_batch_strict_guarded(
-                cell_id,
-                operation,
-                vec![GraphWriteGuard::equals(&cleanup_marker_key, &cleanup_token)],
-                release_batch,
-            )
-            .await
-        {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "release_posting_cleanup_generation",
-                &err,
-            );
-        }
-    }
-    if let Err(err) = crate::release_cell_write_lock(artifact_lock, cleanup_run).await {
-        result.record_error(
-            cell_id,
-            edge_type,
-            base_epoch,
-            operation,
-            "release_posting_artifact_lock",
-            &err,
-        );
-    }
-
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn flush_unpublished_posting_artifact_gc_batch_best_effort(
-    shard: &GraphShard,
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: GraphEpoch,
-    operation: &'static str,
-    manifest_key: &str,
-    supernode_manifest_key: &str,
-    cleanup_marker_key: &str,
-    cleanup_token: &[u8],
-    artifact_lock: &CellWriteLock,
-    batch: &mut GraphWriteBatch,
-    pending_deletes: &mut usize,
-    result: &mut PostingArtifactCleanupResult,
-) -> bool {
-    if *pending_deletes == 0 {
-        return true;
-    }
-    if let Err(err) = artifact_lock.renew().await {
-        result.record_error(
-            cell_id,
-            edge_type,
-            base_epoch,
-            operation,
-            "renew_posting_artifact_lock",
-            &err,
-        );
-        return false;
-    }
-    let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
-    let delete_count = *pending_deletes as u64;
-    match shard
-        .write_graph_batch_strict_guarded(
-            cell_id,
-            operation,
-            vec![
-                GraphWriteGuard::absent(manifest_key),
-                GraphWriteGuard::absent(supernode_manifest_key),
-                GraphWriteGuard::equals(cleanup_marker_key, cleanup_token),
-            ],
-            batch_to_write,
-        )
-        .await
-    {
-        Ok(()) => {
-            result.deleted_keys = result.deleted_keys.saturating_add(delete_count);
-            *pending_deletes = 0;
-            true
-        }
-        Err(GraphError::ConditionalWriteConflict { key, .. })
-            if key == manifest_key || key == supernode_manifest_key =>
-        {
-            result.skipped_published_manifest = true;
-            false
-        }
-        Err(GraphError::ConditionalWriteConflict {
-            operation: conflict_operation,
-            key,
-        }) if key == cleanup_marker_key => {
-            let err = GraphError::ConditionalWriteConflict {
-                operation: conflict_operation,
-                key,
-            };
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "lost_posting_cleanup_generation",
-                &err,
-            );
-            false
-        }
-        Err(err) => {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "delete_unpublished_posting_artifacts",
-                &err,
-            );
-            *pending_deletes = 0;
-            true
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct SupernodeArtifactCleanupResult {
-    pub(crate) deleted_keys: u64,
-    pub(crate) cleanup_errors: u64,
-    pub(crate) skipped_published_manifest: bool,
-}
-
-impl SupernodeArtifactCleanupResult {
-    fn record_error<E>(
-        &mut self,
-        cell_id: &str,
-        edge_type: &str,
-        base_epoch: GraphEpoch,
-        operation: &'static str,
-        cleanup_step: &'static str,
-        err: &E,
-    ) where
-        E: std::fmt::Display + ?Sized,
-    {
-        self.cleanup_errors = self.cleanup_errors.saturating_add(1);
-        tracing::warn!(
-            target: "slatedb_graph_kernel",
-            cell_id,
-            edge_type,
-            base_epoch,
-            operation,
-            cleanup_step,
-            error = %err,
-            "supernode artifact abort cleanup step failed"
-        );
-    }
-}
-
-pub(crate) async fn cleanup_unpublished_supernode_artifact_epoch(
-    shard: &GraphShard,
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: GraphEpoch,
-    operation: &'static str,
-) -> SupernodeArtifactCleanupResult {
-    let mut result = SupernodeArtifactCleanupResult::default();
-    let manifest_key = supernode_artifact_manifest_key(cell_id, edge_type, base_epoch);
-    match shard.read_remote(&manifest_key).await {
-        Ok(Some(_)) => {
-            result.skipped_published_manifest = true;
-            return result;
-        }
-        Ok(None) => {}
-        Err(err) => {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "read_supernode_epoch_manifest",
-                &err,
-            );
-            return result;
-        }
-    }
-
-    let artifact_lock = match shard
-        .acquire_supernode_artifact_write_lock(cell_id, edge_type, base_epoch, operation)
-        .await
-    {
-        Ok(lock) => lock,
-        Err(err) => {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "acquire_supernode_artifact_lock",
-                &err,
-            );
-            return result;
-        }
-    };
-
-    let cleanup_marker_key = supernode_cleanup_marker_key(cell_id, edge_type, base_epoch);
-    let cleanup_token = artifact_lock.owner_token.as_bytes().to_vec();
-    let mut cleanup_claimed = false;
-
-    let cleanup_run = async {
-        match shard.read_remote(&manifest_key).await {
-            Ok(Some(_)) => {
-                result.skipped_published_manifest = true;
-                return Ok(());
-            }
-            Ok(None) => {}
-            Err(err) => {
-                result.record_error(
-                    cell_id,
-                    edge_type,
-                    base_epoch,
-                    operation,
-                    "recheck_supernode_epoch_manifest",
-                    &err,
-                );
-                return Ok(());
-            }
-        }
-
-        let mut claim_batch = GraphWriteBatch::new();
-        claim_batch.put(&cleanup_marker_key, &cleanup_token);
-        match shard
-            .write_graph_batch_strict_guarded(
-                cell_id,
-                operation,
-                vec![GraphWriteGuard::absent(&manifest_key)],
-                claim_batch,
-            )
-            .await
-        {
-            Ok(()) => cleanup_claimed = true,
-            Err(GraphError::ConditionalWriteConflict { key, .. }) if key == manifest_key => {
-                result.skipped_published_manifest = true;
-                return Ok(());
-            }
-            Err(err) => {
-                result.record_error(
-                    cell_id,
-                    edge_type,
-                    base_epoch,
-                    operation,
-                    "claim_supernode_cleanup_generation",
-                    &err,
-                );
-                return Ok(());
-            }
-        }
-
-        let mut batch = GraphWriteBatch::new();
-        let mut pending_deletes = 0_usize;
-        let prefixes = [(
-            "scan_supernode_groups",
-            format!("cell/{cell_id}/artifact/supernode/{edge_type}/"),
-        )];
-        for (cleanup_step, prefix) in prefixes {
-            let mut iter = match shard.scan_remote_prefix(&prefix).await {
-                Ok(iter) => iter,
-                Err(err) => {
-                    result.record_error(
-                        cell_id,
-                        edge_type,
-                        base_epoch,
-                        operation,
-                        cleanup_step,
-                        &err,
-                    );
-                    continue;
-                }
-            };
-            loop {
-                let kv = match iter.next().await {
-                    Ok(Some(kv)) => kv,
-                    Ok(None) => break,
-                    Err(err) => {
-                        result.record_error(
-                            cell_id,
-                            edge_type,
-                            base_epoch,
-                            operation,
-                            cleanup_step,
-                            &err,
-                        );
-                        break;
-                    }
-                };
-                let key = String::from_utf8_lossy(&kv.key).into_owned();
-                match graph_artifact_epoch_from_key(&key) {
-                    Ok(Some(epoch)) if epoch == base_epoch => {
-                        batch.delete(key.as_bytes());
-                        pending_deletes += 1;
-                    }
-                    Ok(_) => {}
-                    Err(err) => result.record_error(
-                        cell_id,
-                        edge_type,
-                        base_epoch,
-                        operation,
-                        cleanup_step,
-                        &err,
-                    ),
-                }
-                if pending_deletes >= GRAPH_ARTIFACT_GC_BATCH_KEYS
-                    && !flush_unpublished_supernode_artifact_gc_batch_best_effort(
-                        shard,
-                        cell_id,
-                        edge_type,
-                        base_epoch,
-                        operation,
-                        &manifest_key,
-                        &cleanup_marker_key,
-                        &cleanup_token,
-                        &artifact_lock,
-                        &mut batch,
-                        &mut pending_deletes,
-                        &mut result,
-                    )
-                    .await
-                {
-                    return Ok(());
-                }
-            }
-        }
-
-        if flush_unpublished_supernode_artifact_gc_batch_best_effort(
-            shard,
-            cell_id,
-            edge_type,
-            base_epoch,
-            operation,
-            &manifest_key,
-            &cleanup_marker_key,
-            &cleanup_token,
-            &artifact_lock,
-            &mut batch,
-            &mut pending_deletes,
-            &mut result,
-        )
-        .await
-        {
-            shard.supernode_group_cache.lock().await.retain(|key, _| {
-                key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch != base_epoch
-            });
-            shard
-                .materialized_supernode_cache
-                .lock()
-                .await
-                .retain(|key, _| {
-                    key.cell_id != cell_id
-                        || key.edge_type != edge_type
-                        || key.base_epoch != base_epoch
-                });
-        }
-
-        Ok(())
-    }
-    .await;
-    if cleanup_claimed {
-        let mut release_batch = GraphWriteBatch::new();
-        release_batch.delete(&cleanup_marker_key);
-        if let Err(err) = shard
-            .write_graph_batch_strict_guarded(
-                cell_id,
-                operation,
-                vec![GraphWriteGuard::equals(&cleanup_marker_key, &cleanup_token)],
-                release_batch,
-            )
-            .await
-        {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "release_supernode_cleanup_generation",
-                &err,
-            );
-        }
-    }
-    if let Err(err) = crate::release_cell_write_lock(artifact_lock, cleanup_run).await {
-        result.record_error(
-            cell_id,
-            edge_type,
-            base_epoch,
-            operation,
-            "release_supernode_artifact_lock",
-            &err,
-        );
-    }
-
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn flush_unpublished_supernode_artifact_gc_batch_best_effort(
-    shard: &GraphShard,
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: GraphEpoch,
-    operation: &'static str,
-    manifest_key: &str,
-    cleanup_marker_key: &str,
-    cleanup_token: &[u8],
-    artifact_lock: &CellWriteLock,
-    batch: &mut GraphWriteBatch,
-    pending_deletes: &mut usize,
-    result: &mut SupernodeArtifactCleanupResult,
-) -> bool {
-    if *pending_deletes == 0 {
-        return true;
-    }
-    let attempted_deletes = *pending_deletes as u64;
-    let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
-    *pending_deletes = 0;
-    let locked_delete = async {
-        artifact_lock.renew().await?;
-        shard
-            .write_graph_batch_strict_guarded(
-                cell_id,
-                operation,
-                vec![
-                    GraphWriteGuard::absent(manifest_key),
-                    GraphWriteGuard::equals(cleanup_marker_key, cleanup_token),
-                ],
-                batch_to_write,
-            )
-            .await?;
-        artifact_lock.renew().await
-    }
-    .await;
-    match locked_delete {
-        Ok(()) => {
-            result.deleted_keys = result.deleted_keys.saturating_add(attempted_deletes);
-        }
-        Err(GraphError::ConditionalWriteConflict { key, .. }) if key == manifest_key => {
-            result.skipped_published_manifest = true;
-            return false;
-        }
-        Err(GraphError::ConditionalWriteConflict {
-            operation: conflict_operation,
-            key,
-        }) if key == cleanup_marker_key => {
-            let err = GraphError::ConditionalWriteConflict {
-                operation: conflict_operation,
-                key,
-            };
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "lost_supernode_cleanup_generation",
-                &err,
-            );
-            return false;
-        }
-        Err(err @ GraphError::CellWriteConflict { .. }) => {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "delete_unpublished_supernode_artifacts",
-                &err,
-            );
-            return false;
-        }
-        Err(err) => {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "delete_unpublished_supernode_artifacts",
-                &err,
-            );
-        }
-    }
-    true
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MatrixArtifactCleanupResult {
     pub(crate) deleted_keys: u64,
     pub(crate) cleanup_errors: u64,
@@ -2964,7 +1065,7 @@ impl MatrixArtifactCleanupResult {
         &mut self,
         cell_id: &str,
         edge_type: &str,
-        base_epoch: GraphEpoch,
+        base_epoch: TopologySequence,
         operation: &'static str,
         cleanup_step: &'static str,
         err: &E,
@@ -2989,7 +1090,7 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
     shard: &GraphShard,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
     operation: &'static str,
 ) -> MatrixArtifactCleanupResult {
     let mut result = MatrixArtifactCleanupResult::default();
@@ -3125,11 +1226,11 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
         for (cleanup_step, prefix) in [
             (
                 "scan_matrix_out_tiles",
-                matrix_tile_prefix(cell_id, edge_type, base_epoch, ArtifactDirection::Out),
+                matrix_tile_prefix(cell_id, edge_type, base_epoch, MatrixDirection::Out),
             ),
             (
                 "scan_matrix_in_tiles",
-                matrix_tile_prefix(cell_id, edge_type, base_epoch, ArtifactDirection::In),
+                matrix_tile_prefix(cell_id, edge_type, base_epoch, MatrixDirection::In),
             ),
             (
                 "scan_graphblas_chunks",
@@ -3262,7 +1363,7 @@ async fn flush_unpublished_artifact_gc_batch_best_effort(
     shard: &GraphShard,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
     operation: &'static str,
     manifest_key: &str,
     cleanup_marker_key: &str,
@@ -3402,35 +1503,6 @@ fn decode_matrix_artifact(key: &str, value: &[u8]) -> Result<MatrixArtifact> {
     })
 }
 
-fn encode_graph_rollup(rollup: &GraphRollup) -> Vec<u8> {
-    format!(
-        "graph_rollup1\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        rollup.cell_id,
-        rollup.edge_type,
-        rollup.base_epoch,
-        rollup.posting_chunks,
-        rollup.matrix_edge_count,
-        rollup.supernode_groups
-    )
-    .into_bytes()
-}
-
-fn decode_graph_rollup(key: &str, value: &[u8]) -> Result<GraphRollup> {
-    let text = text_value(key, value)?;
-    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 7 || parts[0] != "graph_rollup1" {
-        return corrupt(key, "expected graph_rollup1 record with 7 fields");
-    }
-    Ok(GraphRollup {
-        cell_id: parts[1].to_string(),
-        edge_type: parts[2].to_string(),
-        base_epoch: parse_u64(key, parts[3], "base_epoch")?,
-        posting_chunks: parse_u64(key, parts[4], "posting_chunks")?,
-        matrix_edge_count: parse_u64(key, parts[5], "matrix_edge_count")?,
-        supernode_groups: parse_u64(key, parts[6], "supernode_groups")?,
-    })
-}
-
 const GRAPHBLAS_CSC_MAGIC: &[u8] = b"graphblas_csc1\n";
 const GRAPHBLAS_CSC_MANIFEST_MAGIC: &str = "graph-graphblas-csc-manifest-v1";
 const GRAPHBLAS_CSC_CHUNK_MAGIC: &[u8] = b"graphblas_csc_chunk1\n";
@@ -3444,7 +1516,7 @@ async fn append_graphblas_csc_chunks(
     pending_writes: &mut usize,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
     csc: &GraphBlasCsc,
 ) -> Result<GraphBlasCscManifest> {
     let vertex_chunks = append_graphblas_csc_field_chunks(
@@ -3506,7 +1578,7 @@ async fn append_graphblas_csc_chunks_from_rows(
     pending_writes: &mut usize,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
     rows: &MatrixRows,
 ) -> Result<GraphBlasCscManifest> {
     let vertices = matrix_rows_vertices(rows);
@@ -3620,7 +1692,7 @@ async fn append_graphblas_csc_field_chunks(
     pending_writes: &mut usize,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: GraphEpoch,
+    base_epoch: TopologySequence,
     field: &'static str,
     values: &[u64],
 ) -> Result<u64> {
@@ -3707,7 +1779,7 @@ fn decode_graphblas_csc(
     value: &[u8],
     expected_cell_id: &str,
     expected_edge_type: &str,
-    expected_base_epoch: GraphEpoch,
+    expected_base_epoch: TopologySequence,
 ) -> Result<GraphBlasCsc> {
     if !value.starts_with(GRAPHBLAS_CSC_MAGIC) {
         return corrupt(key, "expected graphblas_csc1 binary artifact");
@@ -3913,297 +1985,6 @@ fn decode_matrix_tile(key: &str, value: &[u8]) -> Result<MatrixTile> {
     })
 }
 
-fn supernode_group_key(group: &SupernodeGroup) -> String {
-    format!(
-        "cell/{}/artifact/supernode/{}/{}/{:020}/{:020}",
-        group.cell_id,
-        group.edge_type,
-        direction_str(group.direction),
-        group.vertex_id,
-        group.base_epoch
-    )
-}
-
-fn supernode_group_prefix(
-    cell_id: &str,
-    edge_type: &str,
-    direction: ArtifactDirection,
-    vertex_id: VertexId,
-) -> String {
-    format!(
-        "cell/{cell_id}/artifact/supernode/{edge_type}/{}/{vertex_id:020}/",
-        direction_str(direction)
-    )
-}
-
-fn supernode_artifact_manifest_key(
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: GraphEpoch,
-) -> String {
-    format!("cell/{cell_id}/artifact/supernode_epoch_manifest/{edge_type}/{base_epoch:020}")
-}
-
-pub(crate) fn supernode_cleanup_marker_key(
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: GraphEpoch,
-) -> String {
-    format!("cell/{cell_id}/meta/supernode_cleanup/{edge_type}/{base_epoch:020}")
-}
-
-fn supernode_artifact_manifest_prefix(cell_id: &str, edge_type: &str) -> String {
-    format!("cell/{cell_id}/artifact/supernode_epoch_manifest/{edge_type}/")
-}
-
-fn supernode_artifact_manifest_from_groups(
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: GraphEpoch,
-    groups: &[SupernodeGroup],
-) -> Result<Option<SupernodeArtifactManifest>> {
-    if groups.is_empty() {
-        return Ok(None);
-    }
-    let mut checksum = 0xcbf2_9ce4_8422_2325_u64;
-    checksum_u64(&mut checksum, base_epoch);
-    let mut chunk_count = 0_u64;
-    let mut degree = 0_u64;
-    let mut ordered_groups: Vec<_> = groups.iter().collect();
-    ordered_groups.sort_by_key(|group| (group.direction, group.vertex_id));
-    for group in ordered_groups {
-        if group.cell_id != cell_id
-            || group.edge_type != edge_type
-            || group.base_epoch != base_epoch
-        {
-            return Err(GraphError::CorruptValue {
-                key: supernode_group_key(group),
-                reason: "supernode group does not belong to artifact epoch".to_string(),
-            });
-        }
-        checksum_u64(
-            &mut checksum,
-            match group.direction {
-                ArtifactDirection::Out => 1,
-                ArtifactDirection::In => 2,
-            },
-        );
-        checksum_u64(&mut checksum, group.vertex_id);
-        checksum_u64(&mut checksum, group.degree);
-        checksum_u64(&mut checksum, group.chunk_count);
-        checksum_u64(&mut checksum, group.page_size);
-        for bound in &group.chunk_bounds {
-            checksum_u64(&mut checksum, bound.chunk_id);
-            checksum_u64(&mut checksum, bound.first);
-            checksum_u64(&mut checksum, bound.last);
-        }
-        chunk_count = chunk_count.saturating_add(group.chunk_count);
-        degree = degree.saturating_add(group.degree);
-    }
-    Ok(Some(SupernodeArtifactManifest {
-        cell_id: cell_id.to_string(),
-        edge_type: edge_type.to_string(),
-        base_epoch,
-        group_count: groups.len() as u64,
-        chunk_count,
-        degree,
-        checksum,
-    }))
-}
-
-async fn ensure_supernode_artifact_publish_compatible(
-    shard: &GraphShard,
-    cell_id: &str,
-    edge_type: &str,
-    base_epoch: GraphEpoch,
-    manifest: Option<&SupernodeArtifactManifest>,
-) -> Result<()> {
-    let key = supernode_artifact_manifest_key(cell_id, edge_type, base_epoch);
-    let Some(value) = shard.read_remote(&key).await? else {
-        return Ok(());
-    };
-    let existing = decode_supernode_artifact_manifest(&key, &value)?;
-    match manifest {
-        Some(manifest) if existing == *manifest => Ok(()),
-        Some(_) => Err(GraphError::CorruptValue {
-            key,
-            reason: "existing supernode artifact manifest is incompatible with rebuild".to_string(),
-        }),
-        None => Err(GraphError::CorruptValue {
-            key,
-            reason: "existing supernode artifact manifest exists for empty rebuild".to_string(),
-        }),
-    }
-}
-
-fn encode_supernode_group(group: &SupernodeGroup) -> Vec<u8> {
-    format!(
-        "graph-supernode-v1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        group.cell_id,
-        group.edge_type,
-        direction_str(group.direction),
-        group.vertex_id,
-        group.base_epoch,
-        group.degree,
-        group.chunk_count,
-        group.page_size,
-        encode_supernode_chunk_bounds(&group.chunk_bounds)
-    )
-    .into_bytes()
-}
-
-fn decode_supernode_group(key: &str, value: &[u8]) -> Result<SupernodeGroup> {
-    let text = text_value(key, value)?;
-    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 10 || parts[0] != "graph-supernode-v1" {
-        return corrupt(key, "expected graph-supernode-v1 record with 10 fields");
-    }
-    validate_supernode_group(
-        key,
-        SupernodeGroup {
-            cell_id: parts[1].to_string(),
-            edge_type: parts[2].to_string(),
-            direction: parse_direction(parts[3])?,
-            vertex_id: parse_u64(key, parts[4], "vertex_id")?,
-            base_epoch: parse_u64(key, parts[5], "base_epoch")?,
-            degree: parse_u64(key, parts[6], "degree")?,
-            chunk_count: parse_u64(key, parts[7], "chunk_count")?,
-            page_size: parse_u64(key, parts[8], "page_size")?,
-            chunk_bounds: decode_supernode_chunk_bounds(key, parts[9])?,
-        },
-    )
-}
-
-fn encode_supernode_artifact_manifest(manifest: &SupernodeArtifactManifest) -> Vec<u8> {
-    format!(
-        "supernode_epoch_manifest1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        manifest.cell_id,
-        manifest.edge_type,
-        manifest.base_epoch,
-        manifest.group_count,
-        manifest.chunk_count,
-        manifest.degree,
-        manifest.checksum
-    )
-    .into_bytes()
-}
-
-fn decode_supernode_artifact_manifest(
-    key: &str,
-    value: &[u8],
-) -> Result<SupernodeArtifactManifest> {
-    let text = text_value(key, value)?;
-    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 8 || parts[0] != "supernode_epoch_manifest1" {
-        return corrupt(
-            key,
-            "expected supernode_epoch_manifest1 record with 8 fields",
-        );
-    }
-    validate_supernode_artifact_manifest(
-        key,
-        SupernodeArtifactManifest {
-            cell_id: parts[1].to_string(),
-            edge_type: parts[2].to_string(),
-            base_epoch: parse_u64(key, parts[3], "base_epoch")?,
-            group_count: parse_u64(key, parts[4], "group_count")?,
-            chunk_count: parse_u64(key, parts[5], "chunk_count")?,
-            degree: parse_u64(key, parts[6], "degree")?,
-            checksum: parse_u64(key, parts[7], "checksum")?,
-        },
-    )
-}
-
-fn validate_supernode_artifact_manifest(
-    key: &str,
-    manifest: SupernodeArtifactManifest,
-) -> Result<SupernodeArtifactManifest> {
-    if manifest.degree > 0 && manifest.chunk_count == 0 {
-        return corrupt(key, "supernode epoch manifest degree requires chunks");
-    }
-    if manifest.chunk_count > 0 && manifest.group_count == 0 {
-        return corrupt(key, "supernode epoch manifest chunks require groups");
-    }
-    let parts: Vec<_> = key.split('/').collect();
-    let ["cell", cell_id, "artifact", "supernode_epoch_manifest", edge_type, base_epoch] =
-        parts.as_slice()
-    else {
-        return corrupt(key, "invalid supernode epoch manifest key");
-    };
-    if manifest.cell_id != *cell_id
-        || manifest.edge_type != *edge_type
-        || manifest.base_epoch != parse_u64(key, base_epoch, "base_epoch")?
-    {
-        return corrupt(key, "supernode epoch manifest key does not match value");
-    }
-    Ok(manifest)
-}
-
-fn validate_supernode_group(key: &str, group: SupernodeGroup) -> Result<SupernodeGroup> {
-    if group.degree > 0 && group.chunk_count == 0 {
-        return corrupt(key, "supernode degree requires at least one chunk");
-    }
-    if group.page_size > 0 {
-        let capacity = group
-            .chunk_count
-            .checked_mul(group.page_size)
-            .ok_or_else(|| GraphError::CorruptValue {
-                key: key.to_string(),
-                reason: "supernode chunk capacity overflow".to_string(),
-            })?;
-        if group.degree > capacity {
-            return corrupt(key, "supernode degree exceeds chunk capacity");
-        }
-    }
-    if group.chunk_bounds.len() as u64 > group.chunk_count {
-        return corrupt(key, "supernode chunk bounds exceed chunk count");
-    }
-    let mut previous = None;
-    for bound in &group.chunk_bounds {
-        if bound.chunk_id >= group.chunk_count {
-            return corrupt(key, "supernode chunk bound id exceeds chunk count");
-        }
-        if bound.first > bound.last {
-            return corrupt(key, "supernode chunk bound range is inverted");
-        }
-        if let Some((prev_first, prev_last, prev_id)) = previous {
-            if (bound.first, bound.last, bound.chunk_id) <= (prev_first, prev_last, prev_id) {
-                return corrupt(key, "supernode chunk bounds must be sorted and unique");
-            }
-        }
-        previous = Some((bound.first, bound.last, bound.chunk_id));
-    }
-    Ok(group)
-}
-
-fn encode_supernode_chunk_bounds(bounds: &[SupernodeChunkBound]) -> String {
-    bounds
-        .iter()
-        .map(|bound| format!("{}:{}:{}", bound.chunk_id, bound.first, bound.last))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn decode_supernode_chunk_bounds(key: &str, value: &str) -> Result<Vec<SupernodeChunkBound>> {
-    if value.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut bounds = Vec::new();
-    for item in value.split(',') {
-        let parts: Vec<_> = item.split(':').collect();
-        if parts.len() != 3 {
-            return corrupt(key, "invalid supernode chunk bound encoding");
-        }
-        bounds.push(SupernodeChunkBound {
-            chunk_id: parse_u64(key, parts[0], "chunk_id")?,
-            first: parse_u64(key, parts[1], "chunk_first")?,
-            last: parse_u64(key, parts[2], "chunk_last")?,
-        });
-    }
-    bounds.sort_by_key(|bound| (bound.first, bound.last, bound.chunk_id));
-    Ok(bounds)
-}
-
 fn encode_vertices(vertices: &[VertexId]) -> String {
     vertices
         .iter()
@@ -4219,24 +2000,6 @@ fn decode_vertices(key: &str, value: &str) -> Result<Vec<VertexId>> {
     value
         .split(',')
         .map(|part| parse_u64(key, part, "vertex"))
-        .collect()
-}
-
-fn encode_u64_list(values: &[u64]) -> String {
-    values
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn decode_u64_list(key: &str, value: &str) -> Result<Vec<u64>> {
-    if value.is_empty() {
-        return Ok(Vec::new());
-    }
-    value
-        .split(',')
-        .map(|part| parse_u64(key, part, "u64_list_value"))
         .collect()
 }
 
@@ -4421,69 +2184,3 @@ fn trim_process_memory() {
 
 #[cfg(not(target_os = "linux"))]
 fn trim_process_memory() {}
-
-#[cfg(test)]
-mod artifact_publish_tests {
-    use super::*;
-    use crate::graph_now_millis;
-    use slatedb::object_store::{memory::InMemory, ObjectStoreExt};
-
-    #[tokio::test]
-    async fn artifact_batch_flush_renews_held_lock() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let shard = GraphShard::open_standalone_writer(
-            "graph/artifact-lock-renew",
-            Arc::clone(&object_store),
-        )
-        .await
-        .unwrap();
-        let cell_id = "reddit-home";
-        let edge_type = "LOCK_RENEW_EDGE";
-        let lock = shard
-            .acquire_posting_artifact_write_lock(
-                cell_id,
-                edge_type,
-                1,
-                "artifact_batch_flush_renews_held_lock",
-            )
-            .await
-            .unwrap();
-        let stale_payload = crate::encode_cell_write_lock_record(
-            cell_id,
-            "artifact_batch_flush_renews_held_lock",
-            &lock.owner_token,
-            0,
-            1,
-            crate::CellWriteLockState::Active,
-        );
-        lock.object_store
-            .put(&lock.path, stale_payload.into())
-            .await
-            .unwrap();
-
-        let mut batch = GraphWriteBatch::new();
-        let mut pending_writes = 0_usize;
-        for idx in 0..GRAPH_ARTIFACT_WRITE_BATCH_KEYS {
-            put_artifact_record(
-                &shard,
-                &[&lock],
-                cell_id,
-                "artifact_batch_flush_renews_held_lock",
-                &mut batch,
-                &mut pending_writes,
-                format!("cell/{cell_id}/artifact/test/{edge_type}/{idx:020}"),
-                b"artifact-test".to_vec(),
-            )
-            .await
-            .unwrap();
-        }
-        assert_eq!(pending_writes, 0);
-
-        let current = lock.object_store.get(&lock.path).await.unwrap();
-        let value = current.bytes().await.unwrap();
-        let record = crate::decode_cell_write_lock_record(lock.path.as_ref(), &value).unwrap();
-        assert_eq!(record.owner_token, lock.owner_token);
-        assert!(record.expires_at_ms > graph_now_millis());
-        lock.release().await.unwrap();
-    }
-}

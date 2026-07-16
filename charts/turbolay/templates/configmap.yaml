@@ -17,11 +17,8 @@ data:
   GRAPH_DATABASE: {{ .Values.graph.database | quote }}
   GRAPH_CELL_ID: {{ first .Values.graph.cells | quote }}
   GRAPH_CELLS: {{ join "," .Values.graph.cells | quote }}
-  GRAPH_CONTROL_PATH: {{ .Values.graph.controlPath | quote }}
   GRAPH_DATA_PATH: {{ .Values.graph.dataPath | quote }}
-  GRAPH_CONTROL_CACHE_DIR: /var/cache/slatedb/control
   GRAPH_DATA_CACHE_DIR: /var/cache/slatedb/data
-  GRAPH_CONTROL_CACHE_BYTES: {{ include "turbolay.decimalInteger" .Values.controller.cache.memoryLimitBytes | quote }}
   GRAPH_DATA_CACHE_BYTES: {{ include "turbolay.decimalInteger" .Values.node.cache.memoryLimitBytes | quote }}
   GRAPH_L0_SST_SIZE_BYTES: {{ include "turbolay.decimalInteger" .Values.runtime.l0SstSizeBytes | quote }}
   GRAPH_MAX_UNFLUSHED_BYTES: {{ include "turbolay.decimalInteger" .Values.runtime.maxUnflushedBytes | quote }}
@@ -31,16 +28,17 @@ data:
   GRAPH_MAX_MATRIX_ADJACENCY_BYTES: {{ include "turbolay.decimalInteger" .Values.runtime.maxMatrixAdjacencyBytes | quote }}
   GRAPH_MAX_GRAPHBLAS_MATRICES: {{ include "turbolay.decimalInteger" .Values.runtime.maxGraphblasMatrices | quote }}
   GRAPH_MAX_GRAPHBLAS_BYTES: {{ include "turbolay.decimalInteger" .Values.runtime.maxGraphblasBytes | quote }}
-  GRAPH_MAX_POSTING_CHUNK_BYTES: {{ include "turbolay.decimalInteger" .Values.runtime.maxPostingChunkBytes | quote }}
-  GRAPH_MAX_MATERIALIZED_SUPERNODE_BYTES: {{ include "turbolay.decimalInteger" .Values.runtime.maxMaterializedSupernodeBytes | quote }}
+  GRAPH_MAX_RELATIONSHIP_ROWS_BYTES: {{ include "turbolay.decimalInteger" .Values.runtime.maxRelationshipRowsBytes | quote }}
+  GRAPH_MAX_SOURCE_RELATIONSHIP_ROWS_BYTES: {{ include "turbolay.decimalInteger" .Values.runtime.maxSourceRelationshipRowsBytes | quote }}
+  GRAPH_MAX_RELATIONSHIP_PROPERTY_ROWS_BYTES: {{ include "turbolay.decimalInteger" .Values.runtime.maxRelationshipPropertyRowsBytes | quote }}
   GRAPH_MAX_CONCURRENT_HYDRATIONS: {{ include "turbolay.decimalInteger" .Values.runtime.maxConcurrentHydrations | quote }}
   GRAPH_MAX_CONCURRENT_MATRIX_COMPILATIONS: {{ include "turbolay.decimalInteger" .Values.runtime.maxConcurrentMatrixCompilations | quote }}
-  GRAPH_LEASE_TTL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.leaseTtlMs | quote }}
-  GRAPH_LEASE_RENEW_INTERVAL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.leaseRenewIntervalMs | quote }}
-  GRAPH_SHARD_REFRESH_INTERVAL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.shardRefreshIntervalMs | quote }}
-  GRAPH_HEARTBEAT_TTL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.heartbeatTtlMs | quote }}
-  GRAPH_CONTROLLER_INTERVAL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.controllerIntervalMs | quote }}
-  GRAPH_REBALANCE_MODE: {{ .Values.runtime.rebalanceMode | quote }}
+  GRAPH_MATRIX_AUTO_REFRESH_ENABLED: {{ .Values.runtime.matrixAutoRefreshEnabled | quote }}
+  GRAPH_MATRIX_REFRESH_INTERVAL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.matrixRefreshIntervalMs | quote }}
+  GRAPH_MATRIX_REFRESH_MAX_DIRTY_MS: {{ include "turbolay.decimalInteger" .Values.runtime.matrixRefreshMaxDirtyMs | quote }}
+  GRAPH_MATRIX_REFRESH_MIN_EPOCH_LAG: {{ include "turbolay.decimalInteger" .Values.runtime.matrixRefreshMinEpochLag | quote }}
+  GRAPH_MATRIX_REFRESH_TILE_SIZE: {{ include "turbolay.decimalInteger" .Values.runtime.matrixRefreshTileSize | quote }}
+  GRAPH_MATRIX_REFRESH_MAX_EDGE_TYPES_PER_CYCLE: {{ include "turbolay.decimalInteger" .Values.runtime.matrixRefreshMaxEdgeTypesPerCycle | quote }}
   GRAPH_BOLT_ADDR: 0.0.0.0:7687
   GRAPH_HTTP_ADDR: 0.0.0.0:8443
   GRAPH_ADMIN_ADDR: 0.0.0.0:9090
@@ -52,18 +50,12 @@ data:
   GRAPH_ALLOW_PLAINTEXT: {{ not .Values.tls.public.enabled | quote }}
   GRAPH_MAX_CONCURRENT_QUERIES: {{ include "turbolay.decimalInteger" .Values.runtime.maxConcurrentQueries | quote }}
   GRAPH_MAX_QUERY_RUNTIME_MS: {{ include "turbolay.decimalInteger" .Values.runtime.maxQueryRuntimeMs | quote }}
+  GRAPH_MAX_SERVER_CURSORS: {{ include "turbolay.decimalInteger" .Values.runtime.maxServerCursors | quote }}
+  GRAPH_MAX_CURSOR_BUFFER_BYTES: {{ include "turbolay.decimalInteger" .Values.runtime.maxCursorBufferBytes | quote }}
+  GRAPH_CURSOR_TTL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.cursorTtlMs | quote }}
   GRAPH_MAX_BOLT_CONNECTIONS: {{ include "turbolay.decimalInteger" .Values.runtime.maxBoltConnections | quote }}
   GRAPH_DEFAULT_PAGE_SIZE: {{ include "turbolay.decimalInteger" .Values.runtime.defaultPageSize | quote }}
   GRAPH_GRACEFUL_SHUTDOWN_MS: {{ include "turbolay.decimalInteger" .Values.runtime.gracefulShutdownMs | quote }}
-  GRAPH_RUNTIME_LEASE_TTL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.runtimeLeaseTtlMs | quote }}
-  GRAPH_RUNTIME_LEASE_RENEW_INTERVAL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.runtimeLeaseRenewIntervalMs | quote }}
-  GRAPH_CONTROL_RPC_ADDR: 0.0.0.0:9443
-  GRAPH_CONTROL_RPC_ENDPOINT: {{ include "turbolay.controlEndpoint" . | quote }}
-  GRAPH_CONTROL_RPC_SERVER_NAME: {{ include "turbolay.controlServerName" . | quote }}
-  GRAPH_INTERNAL_TLS_CERTIFICATE: /var/run/secrets/turbolay/internal/tls.crt
-  GRAPH_INTERNAL_TLS_PRIVATE_KEY: /var/run/secrets/turbolay/internal/tls.key
-  GRAPH_INTERNAL_TLS_CA: /var/run/secrets/turbolay/internal/ca.crt
-  GRAPH_INTERNAL_ALLOW_PLAINTEXT: {{ not .Values.tls.internal.enabled | quote }}
   GRAPH_TRIM_MEMORY_AFTER_HYDRATION: {{ .Values.runtime.trimMemoryAfterHydration | quote }}
   GRAPH_KUBERNETES_ROLE_LABELS: "true"
   RUST_LOG: {{ .Values.runtime.rustLog | quote }}

@@ -142,7 +142,7 @@ async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["query_id"], "http-json-query");
     assert_eq!(body["read_epoch"], 11);
-    assert_eq!(body["next_cursor"], 2);
+    assert!(body["next_cursor"].as_u64().is_some());
     assert_eq!(body["rows"][0][0]["type"], "integer");
     assert_eq!(body["rows"][0][0]["value"], 1);
     assert!(body["bookmark"].as_str().unwrap().starts_with("sgk:1:"));
@@ -150,7 +150,7 @@ async fn http_api_enforces_auth_scope_and_returns_typed_json() {
 }
 
 #[tokio::test]
-async fn ndjson_stream_pages_at_one_pinned_epoch() {
+async fn ndjson_stream_uses_one_snapshot_backed_server_cursor() {
     let backend = Arc::new(HttpTestClient {
         observed_epochs: Mutex::new(Vec::new()),
     });
@@ -198,10 +198,7 @@ async fn ndjson_stream_pages_at_one_pinned_epoch() {
     assert_eq!(lines[0]["type"], "header");
     assert_eq!(lines.iter().filter(|line| line["type"] == "row").count(), 3);
     assert_eq!(lines.last().unwrap()["type"], "summary");
-    assert_eq!(
-        backend.observed_epochs.lock().await.as_slice(),
-        &[Some(11), Some(11), Some(11)]
-    );
+    assert_eq!(backend.observed_epochs.lock().await.as_slice(), &[None]);
     server.stop().await.unwrap();
 }
 

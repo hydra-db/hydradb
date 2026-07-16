@@ -6,13 +6,13 @@ use slatedb::config::{DbReaderOptions, PreloadLevel, Settings};
 use slatedb::object_store::{path::Path, ObjectStore};
 use slatedb::{Db, DbReader};
 
-use crate::{GraphCachePolicy, GraphEpoch, Result};
+use crate::{GraphCachePolicy, Result, TopologySequence};
 
 pub const DEFAULT_TRUSTED_APPEND_CHUNK_EDGES: usize = 4_096;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphLimits {
     pub max_bulk_import_edges: usize,
-    pub max_artifact_source_epochs: GraphEpoch,
+    pub max_artifact_source_epochs: TopologySequence,
     pub max_traversal_hops: u8,
     pub max_artifact_build_edges: u64,
     pub max_query_result_vertices: usize,
@@ -34,23 +34,6 @@ impl Default for GraphLimits {
             max_query_index_candidates: 250_000,
             max_query_scan_edges: 1_000_000,
             max_query_runtime_ms: Some(30_000),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GraphRetentionPolicy {
-    pub min_retained_epochs: GraphEpoch,
-    pub read_lease_ttl_ms: u64,
-    pub max_read_leases_to_scan: u64,
-}
-
-impl Default for GraphRetentionPolicy {
-    fn default() -> Self {
-        Self {
-            min_retained_epochs: 0,
-            read_lease_ttl_ms: 60_000,
-            max_read_leases_to_scan: 10_000,
         }
     }
 }
@@ -146,7 +129,6 @@ pub struct GraphOpenOptions {
     pub cache: GraphCacheConfig,
     pub durability: GraphDurabilityConfig,
     pub cache_policy: GraphCachePolicy,
-    pub retention_policy: GraphRetentionPolicy,
     pub backpressure_policy: GraphBackpressurePolicy,
     pub index_policy: GraphIndexPolicy,
 }
@@ -156,8 +138,12 @@ pub struct GraphMemoryConfig {
     pub storage: GraphStorageMemoryConfig,
     pub max_matrix_adjacency_bytes: usize,
     pub max_graphblas_bytes: usize,
-    pub max_posting_chunk_bytes: usize,
-    pub max_materialized_supernode_bytes: usize,
+    #[cfg(feature = "opencypher")]
+    pub max_relationship_rows_bytes: usize,
+    #[cfg(feature = "opencypher")]
+    pub max_source_relationship_rows_bytes: usize,
+    #[cfg(feature = "opencypher")]
+    pub max_relationship_property_rows_bytes: usize,
     pub max_concurrent_matrix_compilations: usize,
 }
 
@@ -165,10 +151,14 @@ impl Default for GraphMemoryConfig {
     fn default() -> Self {
         Self {
             storage: GraphStorageMemoryConfig::default(),
-            max_matrix_adjacency_bytes: 64 * 1024 * 1024,
+            max_matrix_adjacency_bytes: 0,
             max_graphblas_bytes: 128 * 1024 * 1024,
-            max_posting_chunk_bytes: 64 * 1024 * 1024,
-            max_materialized_supernode_bytes: 64 * 1024 * 1024,
+            #[cfg(feature = "opencypher")]
+            max_relationship_rows_bytes: 8 * 1024 * 1024,
+            #[cfg(feature = "opencypher")]
+            max_source_relationship_rows_bytes: 8 * 1024 * 1024,
+            #[cfg(feature = "opencypher")]
+            max_relationship_property_rows_bytes: 16 * 1024 * 1024,
             max_concurrent_matrix_compilations: 1,
         }
     }
@@ -178,10 +168,14 @@ impl GraphMemoryConfig {
     pub fn low_memory() -> Self {
         Self {
             storage: GraphStorageMemoryConfig::low_memory(),
-            max_matrix_adjacency_bytes: 16 * 1024 * 1024,
+            max_matrix_adjacency_bytes: 0,
             max_graphblas_bytes: 32 * 1024 * 1024,
-            max_posting_chunk_bytes: 16 * 1024 * 1024,
-            max_materialized_supernode_bytes: 16 * 1024 * 1024,
+            #[cfg(feature = "opencypher")]
+            max_relationship_rows_bytes: 2 * 1024 * 1024,
+            #[cfg(feature = "opencypher")]
+            max_source_relationship_rows_bytes: 2 * 1024 * 1024,
+            #[cfg(feature = "opencypher")]
+            max_relationship_property_rows_bytes: 4 * 1024 * 1024,
             ..Self::default()
         }
     }
@@ -360,8 +354,14 @@ mod tests {
         assert_eq!(low_memory.max_unflushed_bytes, 16 * 1024 * 1024);
 
         let memory = GraphMemoryConfig::low_memory();
-        assert_eq!(memory.max_posting_chunk_bytes, 16 * 1024 * 1024);
-        assert_eq!(memory.max_materialized_supernode_bytes, 16 * 1024 * 1024);
+        assert_eq!(memory.max_matrix_adjacency_bytes, 0);
+        assert_eq!(memory.max_graphblas_bytes, 32 * 1024 * 1024);
+        #[cfg(feature = "opencypher")]
+        {
+            assert_eq!(memory.max_relationship_rows_bytes, 2 * 1024 * 1024);
+            assert_eq!(memory.max_source_relationship_rows_bytes, 2 * 1024 * 1024);
+            assert_eq!(memory.max_relationship_property_rows_bytes, 4 * 1024 * 1024);
+        }
     }
 
     #[test]
@@ -392,18 +392,12 @@ mod tests {
             #[cfg(feature = "opencypher")]
             max_parsed_row_queries: 1,
             #[cfg(feature = "opencypher")]
-            max_reachability_results: 1,
             #[cfg(feature = "opencypher")]
             max_relationship_row_sets: 1,
             #[cfg(feature = "opencypher")]
             max_relationship_property_row_sets: 1,
-            max_supernode_groups: 1,
-            max_posting_chunks: 1,
-            max_materialized_supernodes: 1,
             max_entries_per_cell: Some(1),
             pin_matrix_min_edges: 1,
-            pin_supernode_min_degree: 1,
-            prefetch_supernode_chunks: 1,
             max_concurrent_hydrations: 1,
         };
         let _options = GraphOpenOptions {
@@ -411,7 +405,6 @@ mod tests {
             cache: GraphCacheConfig::default(),
             durability: GraphDurabilityConfig::default(),
             cache_policy,
-            retention_policy: GraphRetentionPolicy::default(),
             backpressure_policy: GraphBackpressurePolicy::default(),
             index_policy: GraphIndexPolicy::default(),
         };

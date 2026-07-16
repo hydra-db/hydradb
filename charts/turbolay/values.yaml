@@ -23,7 +23,6 @@ graph:
   database: default
   cells:
     - cell-0
-  controlPath: slatedb-graph/control
   dataPath: slatedb-graph/data
 
 auth:
@@ -54,30 +53,17 @@ tls:
       sourceSecretName: ""
       sourceSecretKey: tls.crt
       namespaceSelector: {}
-  internal:
-    enabled: true
-    caSecretName: ""
-    controllerSecretName: ""
-    nodeSecretName: ""
   certManager:
     enabled: false
     publicIssuerRef:
       group: cert-manager.io
       kind: ClusterIssuer
       name: ""
-    internalRootIssuerRef:
-      group: cert-manager.io
-      kind: ClusterIssuer
-      name: ""
     publicDuration: 2160h
     publicRenewBefore: 360h
-    internalCaDuration: 8760h
-    internalCaRenewBefore: 720h
-    internalLeafDuration: 720h
-    internalLeafRenewBefore: 120h
 
 node:
-  replicaCount: 3
+  replicaCount: 1
   serviceAccount:
     create: true
     name: ""
@@ -115,44 +101,6 @@ node:
   nodeSelector: {}
   extraEnv: []
 
-controller:
-  replicaCount: 2
-  serviceAccount:
-    create: true
-    name: ""
-    annotations: {}
-  podAnnotations: {}
-  podLabels: {}
-  priorityClassName: ""
-  terminationGracePeriodSeconds: 30
-  resources:
-    requests:
-      cpu: 250m
-      memory: 512Mi
-      ephemeral-storage: 2Gi
-    limits:
-      cpu: "2"
-      memory: 2Gi
-      ephemeral-storage: 4Gi
-  cache:
-    type: emptyDir
-    memoryLimitBytes: 536870912
-    emptyDir:
-      sizeLimit: 2Gi
-      medium: ""
-    persistentVolume:
-      size: 4Gi
-      storageClassName: ""
-      accessModes:
-        - ReadWriteOnce
-      annotations: {}
-  tmpSizeLimit: 256Mi
-  affinity: {}
-  topologySpreadConstraints: []
-  tolerations: []
-  nodeSelector: {}
-  extraEnv: []
-
 service:
   advertisedBoltAddress: ""
   bolt:
@@ -166,12 +114,14 @@ service:
     annotations: {}
     loadBalancerSourceRanges: []
   adminPort: 9090
-  controlPort: 9443
 
 runtime:
   rustLog: info,slatedb_graph_kernel=info
   maxConcurrentQueries: 256
   maxQueryRuntimeMs: 30000
+  maxServerCursors: 1024
+  maxCursorBufferBytes: 67108864
+  cursorTtlMs: 60000
   maxBoltConnections: 4096
   defaultPageSize: 1024
   gracefulShutdownMs: 30000
@@ -179,29 +129,26 @@ runtime:
   maxUnflushedBytes: 67108864
   maxWalFlushesBeforeL0Flush: 4096
   l0FlushParallelism: 1
-  maxMatrixAdjacencies: 16
-  maxMatrixAdjacencyBytes: 67108864
+  maxMatrixAdjacencies: 0
+  maxMatrixAdjacencyBytes: 0
   maxGraphblasMatrices: 16
   maxGraphblasBytes: 134217728
-  maxPostingChunkBytes: 67108864
-  maxMaterializedSupernodeBytes: 67108864
+  maxRelationshipRowsBytes: 8388608
+  maxSourceRelationshipRowsBytes: 8388608
+  maxRelationshipPropertyRowsBytes: 16777216
   maxConcurrentHydrations: 2
   maxConcurrentMatrixCompilations: 1
+  matrixAutoRefreshEnabled: true
+  matrixRefreshIntervalMs: 5000
+  matrixRefreshMaxDirtyMs: 30000
+  matrixRefreshMinEpochLag: 1000
+  matrixRefreshTileSize: 4096
+  matrixRefreshMaxEdgeTypesPerCycle: 4
   trimMemoryAfterHydration: true
-  leaseTtlMs: 30000
-  leaseRenewIntervalMs: 5000
-  shardRefreshIntervalMs: 2000
-  heartbeatTtlMs: 20000
-  controllerIntervalMs: 2000
-  rebalanceMode: stability-first
-  runtimeLeaseTtlMs: 30000
-  runtimeLeaseRenewIntervalMs: 5000
 
 podDisruptionBudget:
   enabled: true
   node:
-    minAvailable: 2
-  controller:
     minAvailable: 1
 
 rbac:

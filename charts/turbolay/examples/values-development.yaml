@@ -15,8 +15,6 @@ auth:
 tls:
   public:
     enabled: false
-  internal:
-    enabled: false
 
 node:
   replicaCount: 1
@@ -31,16 +29,6 @@ node:
     memoryLimitBytes: 268435456
     emptyDir:
       sizeLimit: 2Gi
-
-controller:
-  replicaCount: 1
-  resources:
-    requests:
-      cpu: 100m
-      memory: 128Mi
-    limits:
-      cpu: "1"
-      memory: 512Mi
 
 networkPolicy:
   # Adjust this to the private CIDR used by the cluster's Kubernetes API endpoint.

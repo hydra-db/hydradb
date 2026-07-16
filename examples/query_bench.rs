@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use slatedb::object_store::ObjectStore;
 use slatedb_graph_kernel::{
-    local_object_store, object_store_from_env, ArtifactDirection, GraphCacheConfig,
-    GraphCachePolicy, GraphIndexPolicy, GraphLimits, GraphMemoryConfig, GraphOpenOptions,
-    GraphShard, GraphStorageMemoryConfig, QueryContext, RowQueryPlan,
+    local_object_store, object_store_from_env, GraphCacheConfig, GraphCachePolicy,
+    GraphIndexPolicy, GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphShard,
+    GraphStorageMemoryConfig, QueryContext, RowQueryPlan,
 };
 
 type BenchResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -56,7 +56,7 @@ impl BenchMode {
 
 #[derive(Clone, Copy, Debug)]
 struct WorkloadFilter {
-    supernode_page: bool,
+    one_hop_page: bool,
     rows: bool,
     count: bool,
     page: bool,
@@ -65,7 +65,7 @@ struct WorkloadFilter {
 impl WorkloadFilter {
     fn all() -> Self {
         Self {
-            supernode_page: true,
+            one_hop_page: true,
             rows: true,
             count: true,
             page: true,
@@ -214,17 +214,6 @@ async fn async_main() -> BenchResult<()> {
                 .await?;
             log_stage_rss(fanout, "matrix-build");
             writer
-                .build_supernode_groups_for_directions(
-                    CELL_ID,
-                    EDGE_TYPE,
-                    base_epoch,
-                    10,
-                    512,
-                    &[ArtifactDirection::Out],
-                )
-                .await?;
-            log_stage_rss(fanout, "supernode-build");
-            writer
                 .refresh_edge_type_query_stats(CELL_ID, EDGE_TYPE)
                 .await?;
             log_stage_rss(fanout, "stats-refresh");
@@ -257,12 +246,11 @@ async fn async_main() -> BenchResult<()> {
 
         let page_query =
             format!("MATCH (u {{id: 1}})-[:{EDGE_TYPE}]->(v) RETURN v.id ORDER BY v.id");
-        if workload_filter.supernode_page {
-            let page =
-                bench_page_workload(&env, &run_config, "supernode-page", &page_query).await?;
-            let page_plan = explain_plan(&env, &page_query, "supernode-page-plan").await?;
+        if workload_filter.one_hop_page {
+            let page = bench_page_workload(&env, &run_config, "one-hop-page", &page_query).await?;
+            let page_plan = explain_plan(&env, &page_query, "one-hop-page-plan").await?;
             print_result(PrintRecord {
-                kind: "supernode_page",
+                kind: "one_hop_page",
                 object_backend,
                 fanout,
                 hops: 1,
@@ -869,7 +857,6 @@ fn graph_options(
     let query_rows = edges.saturating_add(fanout).saturating_add(1_024);
     let max_matrix_adjacencies = env_usize("GRAPH_QUERY_BENCH_MAX_MATRIX_ADJACENCIES", 0);
     let max_graphblas_matrices = env_usize("GRAPH_QUERY_BENCH_MAX_GRAPHBLAS_MATRICES", 1);
-    let max_reachability_results = env_usize("GRAPH_QUERY_BENCH_MAX_REACHABILITY_RESULTS", 0);
     GraphOpenOptions {
         limits: GraphLimits {
             max_bulk_import_edges: usize::try_from(edges).unwrap_or(usize::MAX).max(1),
@@ -889,12 +876,8 @@ fn graph_options(
         cache_policy: GraphCachePolicy {
             max_matrix_adjacencies,
             max_graphblas_matrices,
-            max_posting_chunks: 262_144,
-            max_reachability_results,
             max_entries_per_cell: None,
             pin_matrix_min_edges: 50_000,
-            pin_supernode_min_degree: 10_000,
-            prefetch_supernode_chunks: 2,
             max_concurrent_hydrations: 32,
             ..Default::default()
         },
@@ -997,10 +980,6 @@ fn cache_hits(metrics: &slatedb_graph_kernel::GraphCacheMetricsSnapshot) -> u64 
         + metrics.matrix_adjacency_hits
         + metrics.graphblas_hits
         + metrics.parsed_row_query_hits
-        + metrics.reachability_result_hits
-        + metrics.supernode_group_hits
-        + metrics.posting_chunk_hits
-        + metrics.materialized_supernode_hits
 }
 
 fn cache_misses(metrics: &slatedb_graph_kernel::GraphCacheMetricsSnapshot) -> u64 {
@@ -1008,10 +987,6 @@ fn cache_misses(metrics: &slatedb_graph_kernel::GraphCacheMetricsSnapshot) -> u6
         + metrics.matrix_adjacency_misses
         + metrics.graphblas_misses
         + metrics.parsed_row_query_misses
-        + metrics.reachability_result_misses
-        + metrics.supernode_group_misses
-        + metrics.posting_chunk_misses
-        + metrics.materialized_supernode_misses
 }
 
 fn layered_edges(fanout: u64, max_hop: u8) -> impl Iterator<Item = (u64, u64)> {
@@ -1188,7 +1163,7 @@ fn parse_workload_filter(value: &str) -> BenchResult<WorkloadFilter> {
         return Ok(WorkloadFilter::all());
     }
     let mut filter = WorkloadFilter {
-        supernode_page: false,
+        one_hop_page: false,
         rows: false,
         count: false,
         page: false,
@@ -1199,7 +1174,7 @@ fn parse_workload_filter(value: &str) -> BenchResult<WorkloadFilter> {
         .filter(|item| !item.is_empty())
     {
         match item.to_ascii_lowercase().as_str() {
-            "supernode" | "supernode-page" | "supernode_page" => filter.supernode_page = true,
+            "one-hop" | "one-hop-page" | "one_hop_page" => filter.one_hop_page = true,
             "rows" | "multi-hop-rows" | "multi_hop_rows" => filter.rows = true,
             "count" | "multi-hop-count" | "multi_hop_count" => filter.count = true,
             "page" | "multi-hop-page" | "multi_hop_page" => filter.page = true,
@@ -1208,7 +1183,7 @@ fn parse_workload_filter(value: &str) -> BenchResult<WorkloadFilter> {
             }
         }
     }
-    if !(filter.supernode_page || filter.rows || filter.count || filter.page) {
+    if !(filter.one_hop_page || filter.rows || filter.count || filter.page) {
         return Err("GRAPH_QUERY_BENCH_WORKLOADS selected no workloads".into());
     }
     Ok(filter)

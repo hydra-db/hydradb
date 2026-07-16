@@ -461,8 +461,12 @@ async fn execute_query_inner(
         .collect::<std::result::Result<BTreeMap<_, _>, HttpApiError>>()?;
     let mut request =
         ClientQueryRequest::new(target, query_id, body.query).with_query_parameters(parameters);
-    if let Some(read_epoch) = body.read_epoch {
-        request = request.at_epoch(read_epoch);
+    if body.read_epoch.is_some() {
+        return Err(HttpApiError::from_graph(GraphError::UnsupportedQuery {
+            dialect: "HTTP",
+            feature: "read_epoch is not a storage snapshot selector; use bookmark for causal reads"
+                .to_string(),
+        }));
     }
     if let Some(timeout_ms) = body.timeout_ms {
         request = request.with_timeout_ms(timeout_ms);

@@ -8,7 +8,7 @@ metadata:
 spec:
   sources:
     - secret:
-        name: {{ default (include "turbolay.internalCaSecretName" .) .Values.tls.public.trustBundle.sourceSecretName }}
+        name: {{ default (include "turbolay.publicTlsSecretName" .) .Values.tls.public.trustBundle.sourceSecretName }}
         key: {{ .Values.tls.public.trustBundle.sourceSecretKey }}
   target:
     configMap:

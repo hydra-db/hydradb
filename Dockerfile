@@ -1,4 +1,4 @@
-FROM ubuntu:24.04 AS builder
+FROM ubuntu:24.04 AS build-base
 
 ARG RUST_VERSION=1.91.0
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -15,11 +15,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace
 COPY . .
-RUN cargo build --locked --release --features server-runtime \
-      --bin graph-node --bin graph-controller && \
-    strip target/release/graph-node target/release/graph-controller
 
-FROM ubuntu:24.04
+FROM build-base AS builder
+
+RUN cargo build --locked --release --features server-runtime \
+      --bin graph-node && \
+    strip target/release/graph-node
+
+FROM build-base AS benchmark-builder
+
+RUN cargo build --locked --release --features server-runtime \
+      --example s3_bolt_benchmark_server && \
+    strip target/release/examples/s3_bolt_benchmark_server
+
+FROM ubuntu:24.04 AS runtime-base
 
 ENV DEBIAN_FRONTEND=noninteractive \
     RUST_LOG=info
@@ -32,8 +41,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mkdir -p /var/cache/slatedb /tmp/graph && \
     chown -R graph:graph /var/cache/slatedb /tmp/graph
 
+FROM runtime-base AS graphblas-benchmark
+
+COPY --from=benchmark-builder \
+  /workspace/target/release/examples/s3_bolt_benchmark_server \
+  /usr/local/bin/s3-bolt-benchmark-server
+
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/s3-bolt-benchmark-server"]
+
+FROM runtime-base AS runtime
+
 COPY --from=builder /workspace/target/release/graph-node /usr/local/bin/graph-node
-COPY --from=builder /workspace/target/release/graph-controller /usr/local/bin/graph-controller
 
 USER 10001:10001
 EXPOSE 7687 8443 9090 9443

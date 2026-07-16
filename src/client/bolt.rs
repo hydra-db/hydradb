@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -34,7 +35,7 @@ mod wire;
 use routing::validate_bolt_routing_table;
 pub use routing::{
     BoltRoutingServer, BoltRoutingTable, BoltRoutingTableProvider,
-    ControllerBoltRoutingTableProvider,
+    RendezvousBoltRoutingTableProvider,
 };
 use values::{
     bolt_parameter_to_query_value, explicit_transactions_unsupported, graph_error_to_bolt,
@@ -693,11 +694,14 @@ async fn run_bolt_protocol(
         if state == BoltState::Failed {
             match message {
                 ClientMessage::Reset => {
-                    session.pending = None;
+                    clear_pending_result(&context, &mut session).await;
                     send_bolt_success(&mut writer, BoltDict::new()).await?;
                     state = BoltState::Ready;
                 }
-                ClientMessage::Goodbye => break,
+                ClientMessage::Goodbye => {
+                    clear_pending_result(&context, &mut session).await;
+                    break;
+                }
                 _ => send_bolt_message(&mut writer, &ServerMessage::Ignored).await?,
             }
             continue;
@@ -752,15 +756,18 @@ async fn run_bolt_protocol(
                     }
                 }
             }
-            (_, ClientMessage::Goodbye) => break,
+            (_, ClientMessage::Goodbye) => {
+                clear_pending_result(&context, &mut session).await;
+                break;
+            }
             (BoltState::Ready, ClientMessage::Reset)
             | (BoltState::Streaming, ClientMessage::Reset) => {
-                session.pending = None;
+                clear_pending_result(&context, &mut session).await;
                 send_bolt_success(&mut writer, BoltDict::new()).await?;
                 state = BoltState::Ready;
             }
             (BoltState::Ready, ClientMessage::Logoff) => {
-                session.pending = None;
+                clear_pending_result(&context, &mut session).await;
                 session.authenticated = None;
                 session.database = None;
                 send_bolt_success(&mut writer, BoltDict::new()).await?;
@@ -872,7 +879,7 @@ async fn run_bolt_protocol(
                 match pull_result {
                     Err(error) => {
                         send_bolt_failure(&mut writer, &error).await?;
-                        session.pending = None;
+                        clear_pending_result(&context, &mut session).await;
                         state = BoltState::Failed;
                     }
                     Ok(PageAwaitResult::Complete(Ok(_))) => {
@@ -884,17 +891,17 @@ async fn run_bolt_protocol(
                         let metadata = bolt_result_summary_metadata(pending, has_more);
                         send_bolt_success(&mut writer, metadata).await?;
                         if !has_more {
-                            session.pending = None;
+                            clear_pending_result(&context, &mut session).await;
                             state = BoltState::Ready;
                         }
                     }
                     Ok(PageAwaitResult::Complete(Err(error))) => {
                         send_bolt_failure(&mut writer, &graph_error_to_bolt(error)).await?;
-                        session.pending = None;
+                        clear_pending_result(&context, &mut session).await;
                         state = BoltState::Failed;
                     }
                     Ok(PageAwaitResult::Reset) => {
-                        session.pending = None;
+                        clear_pending_result(&context, &mut session).await;
                         state = BoltState::Ready;
                     }
                     Ok(PageAwaitResult::Goodbye) => break,
@@ -944,7 +951,7 @@ async fn run_bolt_protocol(
                 match discard_result {
                     Err(error) => {
                         send_bolt_failure(&mut writer, &error).await?;
-                        session.pending = None;
+                        clear_pending_result(&context, &mut session).await;
                         state = BoltState::Failed;
                     }
                     Ok(PageAwaitResult::Complete(Ok(_))) => {
@@ -959,17 +966,17 @@ async fn run_bolt_protocol(
                         )
                         .await?;
                         if !has_more {
-                            session.pending = None;
+                            clear_pending_result(&context, &mut session).await;
                             state = BoltState::Ready;
                         }
                     }
                     Ok(PageAwaitResult::Complete(Err(error))) => {
                         send_bolt_failure(&mut writer, &graph_error_to_bolt(error)).await?;
-                        session.pending = None;
+                        clear_pending_result(&context, &mut session).await;
                         state = BoltState::Failed;
                     }
                     Ok(PageAwaitResult::Reset) => {
-                        session.pending = None;
+                        clear_pending_result(&context, &mut session).await;
                         state = BoltState::Ready;
                     }
                     Ok(PageAwaitResult::Goodbye) => break,
@@ -1016,9 +1023,24 @@ async fn run_bolt_protocol(
         }
     }
 
+    clear_pending_result(&context, &mut session).await;
     reader_task.stop().await;
     tracing::debug!(target: "slatedb_graph_kernel", %peer_addr, "Bolt session closed");
     Ok(())
+}
+
+async fn clear_pending_result(context: &BoltConnectionContext, session: &mut BoltProtocolSession) {
+    let Some(pending) = session.pending.take() else {
+        return;
+    };
+    let (Some(authenticated), Some(cursor)) = (session.authenticated.as_ref(), pending.next_cursor)
+    else {
+        return;
+    };
+    context
+        .service
+        .release_server_cursor(authenticated, &pending.prepared.request, cursor)
+        .await;
 }
 
 fn bolt_client_credentials(
@@ -1164,22 +1186,8 @@ fn bolt_bookmarks_from_extra(extra: &BoltDict) -> std::result::Result<Vec<String
     }
 }
 
-fn spawn_bolt_page(
-    service: ClientQueryService,
-    authenticated: ClientQuerySession,
-    prepared: PreparedClientQuery,
-    cursor: Option<QueryCursorToken>,
-    page_size: usize,
-) -> JoinHandle<Result<ClientQueryPage>> {
-    tokio::spawn(async move {
-        service
-            .execute_prepared_page(&authenticated, prepared, cursor, page_size)
-            .await
-    })
-}
-
-async fn await_bolt_page<W>(
-    mut task: JoinHandle<Result<ClientQueryPage>>,
+async fn await_bolt_page<W, F>(
+    task: F,
     service: &ClientQueryService,
     authenticated: &ClientQuerySession,
     scope: &GraphScope,
@@ -1188,25 +1196,18 @@ async fn await_bolt_page<W>(
 ) -> std::result::Result<PageAwaitResult, BoltError>
 where
     W: AsyncWrite + Unpin,
+    F: Future<Output = Result<ClientQueryPage>>,
 {
+    tokio::pin!(task);
     loop {
         tokio::select! {
             result = &mut task => {
-                let result = match result {
-                    Ok(result) => result,
-                    Err(error) => Err(GraphError::CorruptValue {
-                        key: "client/bolt/query_task".to_string(),
-                        reason: error.to_string(),
-                    }),
-                };
                 return Ok(PageAwaitResult::Complete(result));
             }
             incoming = channels.message_rx.recv() => {
                 match incoming {
                     Some(Ok(ClientMessage::Reset)) => {
                         let _ = service.cancel(authenticated, scope, query_id).await;
-                        task.abort();
-                        let _ = task.await;
                         let queued_before_reset = channels.queued.len();
                         send_bolt_message(channels.writer, &ServerMessage::Ignored).await?;
                         for _ in 0..queued_before_reset {
@@ -1218,14 +1219,10 @@ where
                     }
                     Some(Ok(ClientMessage::Goodbye)) | None => {
                         let _ = service.cancel(authenticated, scope, query_id).await;
-                        task.abort();
-                        let _ = task.await;
                         return Ok(PageAwaitResult::Goodbye);
                     }
                     Some(Ok(message)) => {
                         if channels.queued.len() >= channels.max_queued_messages {
-                            task.abort();
-                            let _ = task.await;
                             return Err(BoltError::ResourceExhausted(
                                 "Bolt pipelined message queue is full".to_string(),
                             ));
@@ -1233,8 +1230,6 @@ where
                         channels.queued.push_back(message);
                     }
                     Some(Err(error)) => {
-                        task.abort();
-                        let _ = task.await;
                         return Err(error);
                     }
                 }
@@ -1283,9 +1278,8 @@ where
         let fetch_size = count.map_or(prefetch_rows, |count| prefetch_rows.min(count.max(1)));
         let query_id = pending.prepared.request.query_id.clone();
         let scope = pending.prepared.request.target.scope.clone();
-        let task = spawn_bolt_page(
-            context.service.clone(),
-            authenticated.clone(),
+        let task = context.service.execute_prepared_page(
+            authenticated,
             pending.prepared.clone(),
             cursor,
             fetch_size,
