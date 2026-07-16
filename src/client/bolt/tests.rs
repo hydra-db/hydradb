@@ -30,7 +30,8 @@ impl QueryCellClient for BoltTestClient {
         Ok(QueryResultSet::new(
             vec![QueryColumn::new("answer")],
             vec![QueryRow::new(vec![QueryValue::Count(42)])],
-        ))
+        )
+        .with_read_epoch(9))
     }
 
     async fn execute_cypher_rows_page(
@@ -67,7 +68,8 @@ impl QueryCellClient for PagedBoltTestClient {
             (1..=5)
                 .map(|value| QueryRow::new(vec![QueryValue::Count(value)]))
                 .collect(),
-        ))
+        )
+        .with_read_epoch(9))
     }
 
     async fn execute_cypher_rows_page(

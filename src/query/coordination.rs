@@ -3069,6 +3069,7 @@ impl QueryCellClient for RoutedGraphCluster {
                     shard.limits.max_query_result_vertices as u64,
                 )?;
                 let mut rows = Vec::with_capacity(row_count);
+                let mut result_bytes = 0_u64;
                 for entry in entries {
                     if context
                         .cancellation_token
@@ -3081,17 +3082,26 @@ impl QueryCellClient for RoutedGraphCluster {
                             limit_ms: 0,
                         });
                     }
-                    rows.extend(entry.neighbors.into_iter().map(|destination| {
-                        QueryRow::new(vec![
+                    for destination in entry.neighbors {
+                        let row = QueryRow::new(vec![
                             QueryValue::VertexId(entry.vertex),
                             QueryValue::VertexId(destination),
-                        ])
-                    }));
+                        ]);
+                        result_bytes = result_bytes.saturating_add(row.estimated_resident_bytes());
+                        if let Some(limit) = context.max_result_bytes {
+                            crate::codec::ensure_limit(
+                                "client_cursor_buffer_bytes",
+                                result_bytes,
+                                limit,
+                            )?;
+                        }
+                        rows.push(row);
+                    }
                 }
-                Ok(QueryResultSet::new(
-                    vec![source_column, destination_column],
-                    rows,
-                ))
+                Ok(
+                    QueryResultSet::new(vec![source_column, destination_column], rows)
+                        .with_read_epoch(read_epoch),
+                )
             }
             crate::QueryBatchOperation::CreateEdges { edge_type, edges } => {
                 self.ensure_local_writer(&context.cell_id)?;
