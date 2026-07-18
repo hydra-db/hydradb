@@ -269,6 +269,49 @@ impl GraphShard {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<QueryResultPage> {
+        // Page fast paths must have the same snapshot contract as the complete
+        // row path. In particular, a graph/topology epoch is not a storage
+        // snapshot unless this shard validated it from a DbSnapshot.
+        #[cfg(feature = "opencypher")]
+        {
+            if context.read_epoch.is_some() && context.validated_read_epoch().is_none() {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "historical graph epochs are not storage snapshots; execute against a current SlateDB snapshot".to_string(),
+                });
+            }
+
+            if context.read_epoch.is_none() {
+                match self.db.snapshot().await {
+                    Ok(Some(snapshot)) => {
+                        let key = keys::last_epoch(&context.cell_id);
+                        let read_epoch = match snapshot
+                            .get_with_options(key.as_bytes(), &remote_read_options())
+                            .await
+                        {
+                            Ok(Some(value)) => decode_u64(&key, &value),
+                            Ok(None) => Ok(0),
+                            Err(err) => Err(err.into()),
+                        };
+                        let read_epoch = read_epoch?;
+                        let context =
+                            context.with_validated_storage_read_epoch(read_epoch, snapshot.seq());
+                        return GraphStore::scope_snapshot(
+                            snapshot,
+                            Box::pin(
+                                self.execute_opencypher_rows_page(
+                                    context, query, cursor, page_size,
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                    Ok(None) => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+
         #[cfg(feature = "opencypher")]
         {
             let parsed = self

@@ -9,6 +9,37 @@ async fn open_test_shard(path: &str, object_store: Arc<dyn ObjectStore>) -> Grap
         .unwrap()
 }
 
+// BFG-002: a direct paged fast path must not reinterpret a caller-supplied
+// topology epoch as a current storage snapshot.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn paged_query_rejects_unvalidated_historical_epoch_before_fast_path_dispatch() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/bfg-002-reject-page-epoch", object_store).await;
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "bfg-002-seed".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let error = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("reddit-home", "bfg-002-reject-page-epoch").at_epoch(0),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id",
+            None,
+            1,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, GraphError::UnsupportedQuery { .. }));
+}
+
 #[cfg(all(feature = "opencypher", feature = "graphblas"))]
 #[tokio::test]
 async fn cypher_graphblas_snapshot_applies_plus_and_minus_deltas() {
