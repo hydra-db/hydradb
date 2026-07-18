@@ -4,12 +4,11 @@
 //
 // It intentionally does not parse Cypher. Each action is the normalized
 // behavior of one supported command class that an MBT adapter will invoke.
-// Relationship-ID scope is approved endpoint-scoped (BFG-003, 2026-07-18), but
-// the current source still keys identity on the external ID alone and rejects a
-// same-ID/different-endpoint import. `rejectAmbiguousRelationshipId` below
-// deliberately still encodes that pre-fix rejection so this model stays faithful
-// to unmodified source; it flips to endpoint-scoped in the same PR as the kernel
-// fix. See docs/bugs-found-fixed/BFG-003-relationship-merge-identity-scope.md.
+// The external relationship_id is a client-supplied per-cell idempotency/dedup
+// key on the bulk/direct import path (BFG-003, not-a-bug 2026-07-18): reusing it
+// at a different endpoint is a genuine dedup-key collision and is rejected.
+// `rejectAmbiguousRelationshipId` below encodes that approved contract. See
+// docs/bugs-found-fixed/BFG-003-relationship-merge-identity-scope.md.
 module m5_public_commands {
   var edgePresent: bool
   var vertexPresent: bool
@@ -114,10 +113,10 @@ module m5_public_commands {
     lastAction' = "mergeSameRelationshipCommand",
   }
 
-  // Same external ID at another endpoint. Approved contract is endpoint-scoped
-  // (both records should coexist, BFG-003), but current source rejects this with
-  // IdempotencyConflict; this action encodes that pre-fix rejection until the
-  // kernel fix lands. Silently merging it is never an allowed action.
+  // Same external ID at another endpoint. The external ID is a per-cell
+  // idempotency/dedup key (BFG-003, not-a-bug), so reusing it for a different
+  // edge is a legitimate IdempotencyConflict — the approved contract. Silently
+  // aliasing or merging it onto the first edge is never an allowed action.
   action rejectAmbiguousRelationshipId: bool = all {
     relationshipPresent,
     relationshipId == 7,
