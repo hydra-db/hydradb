@@ -22,11 +22,11 @@ Apalache then bounded-checked every main model through six transitions using
 |---|---|---:|---:|---|
 | M1 | atomic edge projection, idempotency, writer fencing | 4 | 6 | 24 seeded public-API traces pass |
 | M1b | chunked bulk import, durable prefix, retry | 3 | 6 | focused public-API conformance test |
-| M2 | page snapshot scope, historical epoch rejection, bookmarks | 4 | 6 | direct-page conformance test; driver pending |
+| M2 | page snapshot scope, historical epoch rejection, bookmarks | 4 | 6 | 24 seeded public-API traces pass |
 | M2b | current-only `snapshot_at`, typed rejection, cancelled page | 3 | 6 | 24 seeded OpenCypher public-API traces pass |
 | M3 | artifact generation fence, matrix equivalence, reader retention | 4 | 6 | 10k simulation + bounded check; driver pending |
 | M4 | placement disagreement and durable writer fence | 3 | 6 | 10k simulation + bounded check; driver pending |
-| M5 | command normalization, relationship identity, batch semantics | 7 | 6 | P0/P1 command conformance tests; driver pending |
+| M5 | command normalization, relationship identity, batch semantics | 7 | 6 | 24 seeded public-API traces pass |
 | M5b | `DELETE`, `DETACH DELETE`, cell-drop fence | 3 | 6 | 24 seeded public-API traces pass |
 
 The generated M1/M2 Informal Trace Format files are under `target/formal/` and
@@ -53,9 +53,10 @@ The focused kernel conformance tests are:
 | 3 | `formal_p0_direct_offset_pagination_is_best_effort_across_requests` | insertion before an offset may repeat a row on the later direct request |
 | 4 | `formal_p0_edge_metadata_set_and_clear_preserve_structural_adjacency` | property visibility changes while edge existence and degree remain stable |
 
-These are public-kernel conformance tests, not a claim that M2/M5 already
-have full Quint Connect action adapters. M1 is the current complete adapter;
-M2 and M5 are the next bindings.
+`formal_mbt_m2.rs` and `formal_mbt_m5.rs` now replay 24 seeded simulation
+traces for each model against public kernel APIs. They compare the entire
+normalized Quint state after every action, including error outcomes and cursor
+or relationship lifecycle projections.
 
 ### P1 artifact and reader-safety evidence (2026-07-18)
 
@@ -121,18 +122,17 @@ SlateDB keys as its oracle.
 | Family | Rust action binding | Public normalization after each action |
 |---|---|---|
 | M1 | **implemented:** `GraphShard::open_standalone_writer`, `write_edge`, `delete_edge`, retry, close/reopen | edge existence, degree, current epoch, recorded idempotency outcome |
-| M2 | `snapshot`, `edge_exists_at`, `out_neighbors_at`, `out_degree_at`, `execute_cypher_rows_page` | one snapshot's edge/neighbor/degree projection; typed historical error; page rows |
+| M2 | **implemented:** `snapshot`, `snapshot_at`, neighbor reads, direct-page projection, bookmark | one snapshot's edge/neighbor projection; typed historical error; page state |
 | M3 | artifact build/refresh, direct and matrix reachability, maintenance GC | direct traversal equals matrix-plus-delta traversal; publication generation; retained read succeeds |
 | M4 | fenced owned shard/routed cluster open and replacement writer | one accepted writer, monotone epoch, fresh reader sees committed prefix |
-| M5 | Cypher `CREATE`/`MERGE`/`DELETE`/batch plus service cursor calls | normalized rows, relationship identity, batch outcome, materialized cursor rows |
+| M5 | **implemented:** relationship import/delete, vertex batch, metadata, cursor projection | relationship identity, batch outcome, metadata, parallel-edge lifecycle |
 | M2b | **implemented:** `snapshot_at`, OpenCypher page/cancellation | snapshot epoch/error class; a cancelled request yields no page |
 | M5b | **implemented:** vertex deletion and `drop_cell` | incident-edge degree projection; post-drop `CellDropped` |
 
-The next implementation order is the broader M2, then M5 P0 semantics. Every
-driver runs first against a local in-memory object store, retains the input
-trace plus observed projection on failure, and later replays the same corpus
-against MinIO. M3–M5 remain subject to their required public semantic
-decisions.
+Every driver runs first against a local in-memory object store, retains the
+input trace plus observed projection on failure, and later replays the same
+corpus against MinIO. M3/M4 async and ownership adapters remain the next MBT
+expansion; their current source-level conformance evidence is unchanged.
 
 ## Jepsen handoff
 
@@ -170,6 +170,8 @@ mise exec -- quint run quint-models/turbolay/m1_cell_write.qnt \
 
 # Rust replay of action-labelled Quint simulation traces.
 mise exec -- cargo test --locked --test formal_mbt -- --test-threads=1
+mise exec -- cargo test --locked --test formal_mbt_m2 -- --test-threads=1
+mise exec -- cargo test --locked --test formal_mbt_m5 -- --test-threads=1
 mise exec -- cargo test --locked --test formal_mbt_p2 -- --test-threads=1
 ```
 
@@ -179,5 +181,5 @@ mise exec -- cargo test --locked --test formal_mbt_p2 -- --test-threads=1
 2. Approve whether BFG-004's conflict rejection is the public batch contract.
 3. Choose BFG-008: stable direct pagination or explicitly best-effort offset
    pagination.
-4. Confirm that the broader M2 then M5 P0 adapters are the desired next Rust
-   MBT implementation order after M1/M2b/M5b.
+4. Confirm whether M3 artifact publication or M4 ownership fencing is the
+   desired next Rust MBT adapter after M1/M2/M5/M2b/M5b.
