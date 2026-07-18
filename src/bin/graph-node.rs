@@ -111,7 +111,8 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         .with_default_database(config.database.clone())
         .with_max_connections(config.max_bolt_connections)
         .with_graceful_shutdown_timeout(config.graceful_shutdown_timeout);
-    let routing = ObjectStoreBoltRoutingTableProvider::new(config.bolt_node_addresses.clone(), 30)?;
+    let routing = ObjectStoreBoltRoutingTableProvider::new(config.bolt_node_addresses.clone(), 30)?
+        .with_readiness_port(config.admin_addr.port())?;
     bolt_config = bolt_config.with_routing_table_provider(Arc::new(routing));
     if let Some(provider) = &tls_provider {
         bolt_config = bolt_config.with_tls_provider(Arc::clone(provider));

@@ -28,9 +28,13 @@ impl GraphShard {
     pub(crate) async fn topology_tail_since(
         &self,
         generation: &crate::GraphIndexGeneration,
+        snapshot: &GraphStorageSnapshot,
         read_sequence: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<GraphTopologyTail> {
+        if snapshot.seq() != read_sequence {
+            return Ok(GraphTopologyTail::Unavailable);
+        }
         if generation.base_sequence >= read_sequence {
             return Ok(GraphTopologyTail::Complete(GraphTopologyOverlay::default()));
         }
@@ -74,13 +78,12 @@ impl GraphShard {
             }
         }
 
-        let snapshot = self.db.snapshot().await?;
         let mut overlay = GraphTopologyOverlay::default();
         for (src, dst) in affected {
             budget.check("graph_index_wal_resolve_edge")?;
             let exists = self
                 .edge_exists_in_storage_snapshot(
-                    &snapshot,
+                    snapshot,
                     &generation.cell_id,
                     &generation.edge_type,
                     src,

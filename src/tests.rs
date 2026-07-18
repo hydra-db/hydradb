@@ -154,6 +154,56 @@ async fn graph_index_gc_keeps_current_and_bounded_previous_generations() {
     assert_eq!(generations.len(), 2);
 }
 
+#[cfg(feature = "graphblas")]
+#[tokio::test]
+async fn graph_index_query_recovers_when_gc_removes_its_selected_generation() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/index-generation-gc-query-race";
+    let shard = open_test_shard(path, object_store).await;
+    shard
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "gc-race-base"))
+        .await
+        .unwrap();
+    let selected = shard.build_graph_index("cell-a", "CHAIN").await.unwrap();
+
+    shard
+        .write_edge(typed_mutation("cell-a", "CHAIN", 2, 3, "gc-race-next"))
+        .await
+        .unwrap();
+    let current = shard.build_graph_index("cell-a", "CHAIN").await.unwrap();
+    assert!(current.base_sequence > selected.base_sequence);
+    assert_eq!(
+        shard
+            .gc_graph_index_generations("cell-a", "CHAIN", 0)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(shard.graph_index_csc(&selected).await.unwrap().is_none());
+
+    let snapshot = shard.snapshot("cell-a").await.unwrap();
+    let read_sequence = snapshot.read_epoch();
+    let compiled = crate::GraphStore::scope_snapshot(
+        Arc::clone(&snapshot.storage_snapshot),
+        shard.compiled_graphblas_query_snapshot(
+            "cell-a",
+            "CHAIN",
+            selected.base_sequence,
+            read_sequence,
+            &crate::shard::QueryBudget::new(None, None),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(compiled.is_some());
+
+    let traversal = snapshot
+        .matrix_reachable_with_kernel("CHAIN", &[1], 2, SparseKernelBackend::SuiteSparseGraphBlas)
+        .await
+        .unwrap();
+    assert_eq!(traversal.vertices, vec![2, 3]);
+}
+
 #[tokio::test]
 async fn concurrent_indexers_publish_and_gc_without_regressing_current_generation() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -438,6 +488,34 @@ async fn cypher_graphblas_applies_wal_tail_after_edge_changes() {
     reader.close().await.unwrap();
     indexer.close().await.unwrap();
     writer.close().await.unwrap();
+}
+
+#[cfg(feature = "graphblas")]
+#[tokio::test]
+async fn graphblas_wal_tail_resolves_edges_at_the_pinned_snapshot() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/index-pinned-tail", object_store).await;
+    shard
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "pinned-base"))
+        .await
+        .unwrap();
+    shard.build_graph_index("cell-a", "CHAIN").await.unwrap();
+    shard
+        .delete_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "pinned-delete"))
+        .await
+        .unwrap();
+    let pinned = shard.snapshot("cell-a").await.unwrap();
+
+    shard
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "pinned-readd"))
+        .await
+        .unwrap();
+
+    let traversal = pinned
+        .matrix_reachable_with_kernel("CHAIN", &[1], 1, SparseKernelBackend::SuiteSparseGraphBlas)
+        .await
+        .unwrap();
+    assert!(traversal.vertices.is_empty());
 }
 
 #[cfg(all(feature = "opencypher", feature = "graphblas"))]
