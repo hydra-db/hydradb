@@ -92,6 +92,23 @@ Jepsen/MinIO campaign item.
 | 9 | `snapshot_at`, future epoch, and cursor cancellation | Current-only snapshot success, typed future/historical rejection, and cancelled cursor no-result behavior. |
 | 10 | `DELETE`, `DETACH DELETE`, and cell drop | Vertex delete rejection/behavior, detach removal of all incident relationships, and no post-drop writes. |
 
+#### P2 completion evidence
+
+M2b and M5b make both lower-frequency contracts executable. M2b admits a
+snapshot only at the current epoch, represents future and historical epochs as
+typed no-page rejections, and makes cancellation terminal for a cursor
+request. M5b requires ordinary `DELETE` with incident edges to preserve the
+vertex, `DETACH DELETE` to remove the vertex and all incident edges, and a
+cell-drop marker to fence all later writes.
+
+Each model's three deterministic scenarios, 10,000 twelve-step simulation,
+and six-step Apalache run pass. The focused kernel conformance tests are
+`formal_p2_snapshot_at_is_current_only`,
+`formal_p2_cancelled_cursor_page_returns_no_rows` (OpenCypher), and
+`formal_p2_delete_detach_delete_and_drop_are_fenced`. P2 action adapters are
+part of the remaining Rust MBT completion gate; the tests establish the public
+contract before those randomized trace bindings are added.
+
 ## Completion gates
 
 1. Extend M1–M5 with the named action, state projection, safety invariant, and

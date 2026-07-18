@@ -305,6 +305,178 @@ async fn formal_p1_chunked_bulk_import_is_idempotent_by_durable_chunk() {
     shard.close().await.unwrap();
 }
 
+// P2/M2b: `snapshot_at` is deliberately a current-storage-snapshot API, not
+// a historical graph-time-travel API. Both invalid epoch classes must fail
+// before a caller can observe rows from an unintended view.
+#[tokio::test]
+async fn formal_p2_snapshot_at_is_current_only() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/formal-p2-snapshot-at", object_store).await;
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "formal-cell".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "formal-p2-snapshot-seed".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let current_epoch = shard.current_epoch("formal-cell").await.unwrap();
+    let current = shard
+        .snapshot_at("formal-cell", current_epoch)
+        .await
+        .unwrap();
+    assert_eq!(current.read_epoch(), current_epoch);
+    assert_eq!(current.out_neighbors("FOLLOWS", 1).await.unwrap(), vec![2]);
+
+    let future = match shard.snapshot_at("formal-cell", current_epoch + 1).await {
+        Ok(_) => panic!("a future graph epoch must not open a storage snapshot"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        future,
+        GraphError::SnapshotAhead {
+            ref cell_id,
+            read_epoch,
+            current_epoch: observed_current,
+        } if cell_id == "formal-cell"
+            && read_epoch == current_epoch + 1
+            && observed_current == current_epoch
+    ));
+
+    let historical = shard.snapshot_at("formal-cell", current_epoch - 1).await;
+    assert!(matches!(
+        historical,
+        Err(GraphError::UnsupportedQuery {
+            dialect: "GraphSnapshot",
+            ..
+        })
+    ));
+    shard.close().await.unwrap();
+}
+
+// P2/M5b: plain DELETE must leave an attached vertex untouched; DETACH DELETE
+// clears every incident relationship, and the later cell-drop marker prevents
+// the same namespace being resurrected by another write.
+#[tokio::test]
+async fn formal_p2_delete_detach_delete_and_drop_are_fenced() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/formal-p2-destructive", object_store).await;
+    shard
+        .set_vertex_metadata(
+            "formal-cell",
+            1,
+            VertexMetadata::default().with_label("User"),
+        )
+        .await
+        .unwrap();
+    for (edge_type, src, dst, key) in [
+        ("FOLLOWS", 1, 2, "formal-p2-delete-out"),
+        ("LIKES", 3, 1, "formal-p2-delete-in"),
+    ] {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "formal-cell".to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: key.to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let rejected = shard
+        .delete_vertex("formal-cell", 1, "formal-p2-delete")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        rejected,
+        GraphError::UnsupportedQuery {
+            dialect: "Graph",
+            ref feature,
+        } if feature.contains("requires DETACH")
+    ));
+    assert!(shard
+        .edge_exists("formal-cell", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+
+    let detached = shard
+        .detach_delete_vertex("formal-cell", 1, "formal-p2-detach-delete")
+        .await
+        .unwrap();
+    assert!(detached.vertex_deleted);
+    assert_eq!(detached.incident_edges_deleted, 2);
+    assert!(!shard
+        .edge_exists("formal-cell", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+    assert!(!shard
+        .edge_exists("formal-cell", "LIKES", 3, 1)
+        .await
+        .unwrap());
+
+    let dropped = shard
+        .drop_cell("formal-cell", "formal-p2-drop-cell")
+        .await
+        .unwrap();
+    assert!(!dropped.already_dropped);
+    let post_drop = shard
+        .write_edge(EdgeMutation {
+            cell_id: "formal-cell".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 4,
+            idempotency_key: "formal-p2-post-drop-write".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        post_drop,
+        GraphError::CellDropped {
+            operation: "write_edge",
+            ref cell_id,
+        } if cell_id == "formal-cell"
+    ));
+    shard.close().await.unwrap();
+}
+
+// P2/M2b: a cancelled paged request is a typed no-result outcome. In
+// particular, the cancellation check happens before row-page construction.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn formal_p2_cancelled_cursor_page_returns_no_rows() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/formal-p2-cancelled-page", object_store).await;
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "formal-cell".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "formal-p2-cancelled-page-seed".to_string(),
+        })
+        .await
+        .unwrap();
+    let token = QueryCancellationToken::new();
+    token.cancel();
+    let cancelled = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("formal-cell", "formal-p2-cancelled-page")
+                .with_cancellation_token(token),
+            "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id",
+            None,
+            1,
+        )
+        .await
+        .unwrap_err();
+    assert!(cancelled.to_string().contains("query_cancelled"));
+    shard.close().await.unwrap();
+}
+
 #[cfg(all(feature = "opencypher", feature = "graphblas"))]
 #[tokio::test]
 async fn cypher_graphblas_snapshot_applies_plus_and_minus_deltas() {
