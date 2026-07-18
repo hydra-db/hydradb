@@ -1,4 +1,4 @@
-use super::{RelationshipId, TopologySequence, VertexId};
+use super::{RelationshipId, StorageSequence, VertexId};
 
 pub fn cell_prefix(cell_id: &str) -> String {
     format!("cell/{cell_id}/")
@@ -16,20 +16,8 @@ pub fn cell_drop_idempotency(cell_id: &str, idempotency_key: &str) -> String {
     format!("graph/drop/idem/{cell_id}/{idempotency_key}")
 }
 
-pub fn last_epoch(cell_id: &str) -> String {
-    format!("cell/{cell_id}/meta/last_epoch")
-}
-
 pub fn last_relationship_id(cell_id: &str) -> String {
     format!("cell/{cell_id}/meta/last_relationship_id")
-}
-
-pub fn mutation_log_epoch(cell_id: &str) -> String {
-    format!("cell/{cell_id}/meta/mutation_log_epoch")
-}
-
-pub fn mutation_log_materialized_epoch(cell_id: &str) -> String {
-    format!("cell/{cell_id}/meta/mutation_log_materialized_epoch")
 }
 
 pub fn matrix_dirty_prefix(cell_id: &str) -> String {
@@ -80,13 +68,10 @@ pub fn out_segment(
     cell_id: &str,
     edge_type: &str,
     src: VertexId,
-    end_epoch: TopologySequence,
-    start_epoch: TopologySequence,
+    storage_sequence: StorageSequence,
     segment_id: &str,
 ) -> String {
-    format!(
-            "cell/{cell_id}/seg/out/{edge_type}/{src:020}/{end_epoch:020}/{start_epoch:020}/{segment_id}"
-        )
+    format!("cell/{cell_id}/seg/out/{edge_type}/{src:020}/{storage_sequence:020}/{segment_id}")
 }
 
 pub fn out_segment_edge_type_prefix(cell_id: &str, edge_type: &str) -> String {
@@ -176,62 +161,6 @@ pub fn degree_out(cell_id: &str, edge_type: &str, src: VertexId) -> String {
 
 pub fn degree_in(cell_id: &str, edge_type: &str, dst: VertexId) -> String {
     format!("cell/{cell_id}/cnt/in/{edge_type}/{dst:020}")
-}
-
-pub fn outbox(
-    cell_id: &str,
-    epoch: TopologySequence,
-    kind: super::DeltaKind,
-    edge_type: &str,
-    src: VertexId,
-    dst: VertexId,
-) -> String {
-    let kind = match kind {
-        super::DeltaKind::Plus => "plus",
-        super::DeltaKind::Minus => "minus",
-    };
-    format!("cell/{cell_id}/outbox/{epoch:020}/{kind}/{edge_type}/{src:020}/{dst:020}")
-}
-
-pub fn outbox_prefix(cell_id: &str) -> String {
-    format!("cell/{cell_id}/outbox/")
-}
-
-pub fn outbox_batch(
-    cell_id: &str,
-    end_epoch: TopologySequence,
-    start_epoch: TopologySequence,
-    kind: super::DeltaKind,
-    edge_type: &str,
-    batch_id: &str,
-) -> String {
-    let kind = match kind {
-        super::DeltaKind::Plus => "plus",
-        super::DeltaKind::Minus => "minus",
-    };
-    format!(
-            "cell/{cell_id}/outbox_batch/{end_epoch:020}/{start_epoch:020}/{kind}/{edge_type}/{batch_id}"
-        )
-}
-
-pub fn outbox_batch_prefix(cell_id: &str) -> String {
-    format!("cell/{cell_id}/outbox_batch/")
-}
-
-pub fn mutation_batch(
-    cell_id: &str,
-    start_epoch: TopologySequence,
-    idempotency_key: &str,
-) -> String {
-    format!("cell/{cell_id}/mutation_batch/{start_epoch:020}/{idempotency_key}")
-}
-
-pub fn mutation_log_prefix(cell_id: &str) -> String {
-    format!("cell/{cell_id}/mutation_log/")
-}
-
-pub fn mutation_log_entry(cell_id: &str, log_epoch: TopologySequence, batch_id: &str) -> String {
-    format!("{}{log_epoch:020}/{batch_id}", mutation_log_prefix(cell_id))
 }
 
 pub fn vertex(cell_id: &str, vertex_id: VertexId) -> String {
@@ -384,88 +313,4 @@ pub fn query_stats_edge_property_histogram(
 #[cfg(feature = "opencypher")]
 pub fn query_stats_record_key(count_key: &str) -> String {
     format!("{count_key}/record")
-}
-
-pub fn delta_plus_prefix(cell_id: &str, edge_type: &str) -> String {
-    format!("cell/{cell_id}/delta/plus/{edge_type}/")
-}
-
-pub fn delta_minus_prefix(cell_id: &str, edge_type: &str) -> String {
-    format!("cell/{cell_id}/delta/minus/{edge_type}/")
-}
-
-pub fn owner_delta_prefix(
-    cell_id: &str,
-    kind: super::DeltaKind,
-    edge_type: &str,
-    direction: &str,
-    owner: VertexId,
-) -> String {
-    let kind = match kind {
-        super::DeltaKind::Plus => "plus",
-        super::DeltaKind::Minus => "minus",
-    };
-    format!("cell/{cell_id}/delta_owner/{kind}/{edge_type}/{direction}/{owner:020}/")
-}
-
-pub fn owner_delta_kind_prefix(cell_id: &str, edge_type: &str, kind: super::DeltaKind) -> String {
-    let kind = match kind {
-        super::DeltaKind::Plus => "plus",
-        super::DeltaKind::Minus => "minus",
-    };
-    format!("cell/{cell_id}/delta_owner/{kind}/{edge_type}/")
-}
-
-pub fn owner_delta(
-    cell_id: &str,
-    kind: super::DeltaKind,
-    edge_type: &str,
-    direction: &str,
-    owner: VertexId,
-    epoch: TopologySequence,
-    neighbor: VertexId,
-) -> String {
-    format!(
-        "{}{epoch:020}/{neighbor:020}",
-        owner_delta_prefix(cell_id, kind, edge_type, direction, owner)
-    )
-}
-
-pub fn pair_delta_kind_prefix(cell_id: &str, edge_type: &str, kind: super::DeltaKind) -> String {
-    let kind = match kind {
-        super::DeltaKind::Plus => "plus",
-        super::DeltaKind::Minus => "minus",
-    };
-    format!("cell/{cell_id}/delta_pair/{kind}/{edge_type}/")
-}
-
-pub fn pair_delta_prefix(
-    cell_id: &str,
-    kind: super::DeltaKind,
-    edge_type: &str,
-    src: VertexId,
-    dst: VertexId,
-) -> String {
-    format!(
-        "{}{src:020}/{dst:020}/",
-        pair_delta_kind_prefix(cell_id, edge_type, kind)
-    )
-}
-
-pub fn pair_delta(
-    cell_id: &str,
-    kind: super::DeltaKind,
-    edge_type: &str,
-    src: VertexId,
-    dst: VertexId,
-    epoch: TopologySequence,
-) -> String {
-    format!(
-        "{}{epoch:020}",
-        pair_delta_prefix(cell_id, kind, edge_type, src, dst)
-    )
-}
-
-pub fn delta_gc_watermark(cell_id: &str, edge_type: &str) -> String {
-    format!("cell/{cell_id}/meta/delta_gc/{edge_type}")
 }

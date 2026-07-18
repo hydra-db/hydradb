@@ -5,7 +5,7 @@ use tokio::sync::Notify;
 
 use crate::{
     validate_component, CommitResult, EdgeMetadata, GraphError, GraphScope, QueryFloat,
-    RelationshipId, Result, TopologySequence, VertexId, VertexMetadata, VertexPropertyValue,
+    RelationshipId, Result, StorageSequence, VertexId, VertexMetadata, VertexPropertyValue,
 };
 
 #[cfg_attr(
@@ -167,11 +167,13 @@ pub struct QueryContext {
     pub scope: GraphScope,
     pub cell_id: String,
     pub idempotency_key: String,
-    pub read_epoch: Option<TopologySequence>,
+    pub read_epoch: Option<StorageSequence>,
     pub result_window: QueryWindow,
     pub parameters: BTreeMap<String, VertexPropertyValue>,
     pub max_runtime_ms: Option<u64>,
     pub max_result_bytes: Option<u64>,
+    #[cfg_attr(feature = "query-transport", serde(default))]
+    refreshed_reader: bool,
     #[cfg_attr(feature = "query-transport", serde(skip, default))]
     pub cancellation_token: Option<QueryCancellationToken>,
     #[cfg(feature = "opencypher")]
@@ -190,6 +192,7 @@ impl QueryContext {
             parameters: BTreeMap::new(),
             max_runtime_ms: None,
             max_result_bytes: None,
+            refreshed_reader: false,
             cancellation_token: None,
             #[cfg(feature = "opencypher")]
             validated_read: None,
@@ -201,7 +204,7 @@ impl QueryContext {
         self
     }
 
-    pub fn at_epoch(mut self, read_epoch: TopologySequence) -> Self {
+    pub fn at_epoch(mut self, read_epoch: StorageSequence) -> Self {
         self.read_epoch = Some(read_epoch);
         self
     }
@@ -234,6 +237,18 @@ impl QueryContext {
         self
     }
 
+    #[cfg(any(feature = "client-api", test))]
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn with_refreshed_reader(mut self) -> Self {
+        self.refreshed_reader = true;
+        self
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn uses_refreshed_reader(&self) -> bool {
+        self.refreshed_reader
+    }
+
     pub fn with_cancellation_token(mut self, token: QueryCancellationToken) -> Self {
         self.cancellation_token = Some(token);
         self
@@ -242,7 +257,7 @@ impl QueryContext {
     #[cfg(feature = "opencypher")]
     pub(crate) fn with_validated_storage_read_epoch(
         mut self,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
         storage_sequence: crate::StorageSequence,
     ) -> Self {
         self.read_epoch = Some(read_epoch);
@@ -255,11 +270,23 @@ impl QueryContext {
     }
 
     #[cfg(feature = "opencypher")]
-    pub(crate) fn validated_read_epoch(&self) -> Option<TopologySequence> {
+    pub(crate) fn validated_read_epoch(&self) -> Option<StorageSequence> {
         self.validated_read.as_ref().and_then(|validated| {
             let _retention = &validated.retention;
             (validated.cell_id == self.cell_id && self.read_epoch == Some(validated.read_epoch))
                 .then_some(validated.read_epoch)
+        })
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn validated_storage_sequence(&self) -> Option<crate::StorageSequence> {
+        self.validated_read.as_ref().and_then(|validated| {
+            if validated.cell_id != self.cell_id || self.read_epoch != Some(validated.read_epoch) {
+                return None;
+            }
+            match &validated.retention {
+                ValidatedQueryReadRetention::StorageSnapshot(sequence) => Some(*sequence),
+            }
         })
     }
 }
@@ -268,7 +295,7 @@ impl QueryContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ValidatedQueryRead {
     cell_id: String,
-    read_epoch: TopologySequence,
+    read_epoch: StorageSequence,
     retention: ValidatedQueryReadRetention,
 }
 
@@ -356,7 +383,7 @@ pub enum QueryCardinalityStatsKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryCardinalityStatsRefresh {
     pub cell_id: String,
-    pub read_epoch: TopologySequence,
+    pub read_epoch: StorageSequence,
     pub kind: QueryCardinalityStatsKind,
     pub count: u64,
     pub stats: QueryStatsRecord,
@@ -365,7 +392,7 @@ pub struct QueryCardinalityStatsRefresh {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryStatsRecord {
     pub count: u64,
-    pub read_epoch: TopologySequence,
+    pub read_epoch: StorageSequence,
     pub refreshed_at_ms: u64,
     pub distinct_values: u64,
     pub total_values: u64,
@@ -373,7 +400,7 @@ pub struct QueryStatsRecord {
 }
 
 impl QueryStatsRecord {
-    pub fn point_count(count: u64, read_epoch: TopologySequence, refreshed_at_ms: u64) -> Self {
+    pub fn point_count(count: u64, read_epoch: StorageSequence, refreshed_at_ms: u64) -> Self {
         Self {
             count,
             read_epoch,
@@ -386,7 +413,7 @@ impl QueryStatsRecord {
 
     pub fn histogram(
         count: u64,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
         refreshed_at_ms: u64,
         distinct_values: u64,
         most_common_count: u64,
@@ -401,8 +428,10 @@ impl QueryStatsRecord {
         }
     }
 
-    pub fn is_stale_at(&self, current_epoch: TopologySequence, now_ms: u64) -> bool {
-        self.read_epoch < current_epoch || self.refreshed_at_ms > now_ms
+    /// Older optimizer stats remain useful estimates. Publishing stats itself
+    /// advances SlateDB's sequence, so only future records are unusable.
+    pub fn is_unusable_at(&self, current_epoch: StorageSequence, now_ms: u64) -> bool {
+        self.read_epoch > current_epoch || self.refreshed_at_ms > now_ms
     }
 
     pub fn equality_estimate(&self) -> u64 {
@@ -420,7 +449,7 @@ impl QueryStatsRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryStatsHistogramRefresh {
     pub cell_id: String,
-    pub read_epoch: TopologySequence,
+    pub read_epoch: StorageSequence,
     pub property: String,
     pub edge_type: Option<String>,
     pub stats: QueryStatsRecord,
@@ -580,7 +609,8 @@ impl QueryValue {
 pub struct QueryResultSet {
     pub columns: Vec<QueryColumn>,
     pub rows: Vec<QueryRow>,
-    pub read_epoch: Option<TopologySequence>,
+    pub read_epoch: Option<StorageSequence>,
+    pub storage_sequence: Option<crate::StorageSequence>,
 }
 
 impl PartialEq for QueryResultSet {
@@ -598,11 +628,17 @@ impl QueryResultSet {
             columns,
             rows,
             read_epoch: None,
+            storage_sequence: None,
         }
     }
 
-    pub fn with_read_epoch(mut self, read_epoch: TopologySequence) -> Self {
+    pub fn with_read_epoch(mut self, read_epoch: StorageSequence) -> Self {
         self.read_epoch = Some(read_epoch);
+        self
+    }
+
+    pub fn with_storage_sequence(mut self, storage_sequence: crate::StorageSequence) -> Self {
+        self.storage_sequence = Some(storage_sequence);
         self
     }
 
@@ -728,7 +764,7 @@ impl QueryStatement {
 pub struct QueryPlan {
     pub cell_id: String,
     pub idempotency_key: String,
-    pub read_epoch: Option<TopologySequence>,
+    pub read_epoch: Option<StorageSequence>,
     pub result_window: QueryWindow,
     pub max_runtime_ms: Option<u64>,
     pub logical: LogicalQueryPlan,
@@ -742,7 +778,7 @@ pub struct QueryPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowQueryPlan {
     pub cell_id: String,
-    pub read_epoch: TopologySequence,
+    pub read_epoch: StorageSequence,
     pub columns: Vec<QueryColumn>,
     pub groups: Vec<RowQueryPlanGroup>,
     pub union_all: bool,

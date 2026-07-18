@@ -5,7 +5,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge_type: &str,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Result<GraphExportDigest> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
@@ -31,7 +31,6 @@ impl GraphShard {
             cell_id: cell_id.to_string(),
             edge_type: edge_type.to_string(),
             read_epoch,
-            delta_gc_watermark: self.delta_gc_watermark(cell_id, edge_type).await?,
             digest: graph_export_digest(cell_id, edge_type, read_epoch, &edges),
             ..GraphCorrectnessReport::default()
         };
@@ -129,12 +128,12 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge_type: &str,
-        read_epoch: TopologySequence,
+        _read_epoch: StorageSequence,
         expected_edges: &BTreeSet<(VertexId, VertexId)>,
         report: &mut GraphCorrectnessReport,
     ) -> Result<()> {
         let relationships = self
-            .scan_live_relationship_records(cell_id, edge_type, read_epoch, report)
+            .scan_live_relationship_records(cell_id, edge_type, report)
             .await?;
         report.relationship_records = relationships.len() as u64;
 
@@ -190,7 +189,6 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge_type: &str,
-        read_epoch: TopologySequence,
         report: &mut GraphCorrectnessReport,
     ) -> Result<Vec<RelationshipRecord>> {
         let mut iter = self
@@ -211,16 +209,6 @@ impl GraphShard {
                         record.cell_id, record.edge_type
                     ),
                 );
-            }
-            if record.epoch > read_epoch {
-                record_mismatch(
-                    report,
-                    format!(
-                        "relationship:future-record key={key} relationship_epoch={} read_epoch={read_epoch}",
-                        record.epoch
-                    ),
-                );
-                continue;
             }
             records.push(record);
         }
@@ -270,7 +258,7 @@ impl GraphShard {
         prefix: &str,
         cell_id: &str,
         edge_type: &str,
-        read_epoch: TopologySequence,
+        _read_epoch: StorageSequence,
         index_name: &'static str,
         report: &mut GraphCorrectnessReport,
     ) -> Result<BTreeSet<(VertexId, VertexId)>> {
@@ -285,15 +273,6 @@ impl GraphShard {
                     format!(
                         "{index_name}:record-identity key={key} got={}/{}",
                         edge.cell_id, edge.edge_type
-                    ),
-                );
-            }
-            if edge.epoch > read_epoch {
-                record_mismatch(
-                    report,
-                    format!(
-                        "{index_name}:future-edge key={key} edge_epoch={} read_epoch={read_epoch}",
-                        edge.epoch
                     ),
                 );
             }
@@ -318,7 +297,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge_type: &str,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
         report: &mut GraphCorrectnessReport,
     ) -> Result<()> {
         if let Some(artifact) = self

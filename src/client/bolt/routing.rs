@@ -1,7 +1,13 @@
 use async_trait::async_trait;
+use futures::future::join_all;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::time::timeout;
 
 use super::*;
-use crate::{validate_component, ShardPlacement};
+use crate::validate_component;
+
+const DEFAULT_ROUTING_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoltRoutingServer {
@@ -31,24 +37,25 @@ pub trait BoltRoutingTableProvider: Send + Sync {
     ) -> Result<BoltRoutingTable>;
 }
 
-/// Bolt routing backed by the same deterministic placement used to open data
-/// shards. Membership is supplied by service discovery (or a static deployment
-/// directory); it is not persisted in a separate consensus/control database.
+/// Bolt routing for object-store-native nodes. Every advertised node can read
+/// any configured cell. The first reachable node in stable preference order is
+/// advertised for writes to preserve a warm writer cache. Reachability is only
+/// routing affinity because SlateDB remains the authoritative writer fence.
 #[derive(Clone)]
-pub struct RendezvousBoltRoutingTableProvider {
-    placement: ShardPlacement,
+pub struct ObjectStoreBoltRoutingTableProvider {
     node_addresses: BTreeMap<String, String>,
+    preferred_writer_node: String,
     routing_ttl_secs: i64,
+    health_probe_timeout: Duration,
 }
 
-impl RendezvousBoltRoutingTableProvider {
+impl ObjectStoreBoltRoutingTableProvider {
     pub fn new(
-        placement: ShardPlacement,
         node_addresses: impl IntoIterator<Item = (String, String)>,
         routing_ttl_secs: i64,
     ) -> Result<Self> {
         if routing_ttl_secs <= 0 {
-            return bolt_config_error("rendezvous routing TTL must be greater than zero");
+            return bolt_config_error("object-store routing TTL must be greater than zero");
         }
         let mut addresses = BTreeMap::new();
         for (node_id, address) in node_addresses {
@@ -56,49 +63,87 @@ impl RendezvousBoltRoutingTableProvider {
             let address = address.trim().to_string();
             if address.is_empty() || addresses.insert(node_id, address).is_some() {
                 return bolt_config_error(
-                    "rendezvous routing node ids must be unique and addresses cannot be empty",
+                    "object-store routing node ids must be unique and addresses cannot be empty",
                 );
             }
         }
         if addresses.is_empty() {
-            return bolt_config_error("rendezvous routing requires at least one node address");
+            return bolt_config_error("object-store routing requires at least one node address");
         }
-        for node_id in placement.node_ids() {
-            if !addresses.contains_key(node_id) {
-                return bolt_config_error(
-                    "every rendezvous placement node must have a Bolt address",
-                );
-            }
-        }
+        let preferred_writer_node = addresses
+            .keys()
+            .next()
+            .expect("non-empty address map")
+            .clone();
         Ok(Self {
-            placement,
             node_addresses: addresses,
+            preferred_writer_node,
             routing_ttl_secs,
+            health_probe_timeout: DEFAULT_ROUTING_HEALTH_PROBE_TIMEOUT,
         })
+    }
+
+    pub fn with_preferred_writer_node(mut self, node_id: impl Into<String>) -> Result<Self> {
+        let node_id = node_id.into();
+        validate_component("node_id", &node_id)?;
+        if !self.node_addresses.contains_key(&node_id) {
+            return bolt_config_error("preferred writer node must be present in routing addresses");
+        }
+        self.preferred_writer_node = node_id;
+        Ok(self)
+    }
+
+    pub fn with_health_probe_timeout(mut self, probe_timeout: Duration) -> Result<Self> {
+        if probe_timeout.is_zero() {
+            return bolt_config_error("routing health probe timeout must be greater than zero");
+        }
+        self.health_probe_timeout = probe_timeout;
+        Ok(self)
+    }
+
+    async fn reachable_nodes(&self) -> Vec<(String, String)> {
+        let probes = self.node_addresses.iter().map(|(node_id, address)| {
+            let node_id = node_id.clone();
+            let address = address.clone();
+            async move {
+                let reachable = timeout(self.health_probe_timeout, TcpStream::connect(&address))
+                    .await
+                    .is_ok_and(|result| result.is_ok());
+                reachable.then_some((node_id, address))
+            }
+        });
+        join_all(probes).await.into_iter().flatten().collect()
     }
 }
 
 #[async_trait]
-impl BoltRoutingTableProvider for RendezvousBoltRoutingTableProvider {
+impl BoltRoutingTableProvider for ObjectStoreBoltRoutingTableProvider {
     async fn routing_table(
         &self,
         _database: &str,
-        target: &ClientQueryTarget,
+        _target: &ClientQueryTarget,
     ) -> Result<BoltRoutingTable> {
-        let owner = self.placement.owner(&target.cell_id)?;
-        let owner_address =
-            self.node_addresses
-                .get(owner)
-                .cloned()
-                .ok_or_else(|| GraphError::UnknownShard {
-                    cell_id: target.cell_id.clone(),
-                })?;
+        let reachable = self.reachable_nodes().await;
+        if reachable.is_empty() {
+            return bolt_config_error("object-store routing found no reachable graph nodes");
+        }
+        let addresses = reachable
+            .iter()
+            .map(|(_, address)| address.clone())
+            .collect::<Vec<_>>();
+        let writer = reachable
+            .iter()
+            .find(|(node_id, _)| node_id == &self.preferred_writer_node)
+            .or_else(|| reachable.first())
+            .expect("reachable node list was checked")
+            .1
+            .clone();
         BoltRoutingTable::new(
             self.routing_ttl_secs,
             vec![
-                BoltRoutingServer::new("ROUTE", self.node_addresses.values().cloned())?,
-                BoltRoutingServer::new("READ", [owner_address.clone()])?,
-                BoltRoutingServer::new("WRITE", [owner_address])?,
+                BoltRoutingServer::new("ROUTE", addresses.clone())?,
+                BoltRoutingServer::new("READ", addresses)?,
+                BoltRoutingServer::new("WRITE", [writer])?,
             ],
         )
     }

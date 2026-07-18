@@ -4,8 +4,6 @@ mod admin;
 #[allow(dead_code)]
 #[path = "graph_node/config.rs"]
 mod config;
-#[path = "graph_node/kubernetes.rs"]
-mod kubernetes;
 #[allow(dead_code)]
 #[path = "graph_node/tls.rs"]
 mod tls;
@@ -18,8 +16,8 @@ use config::RuntimeConfig;
 use slatedb_graph_kernel::{
     object_store_from_env, BoltServerConfig, ClientBoltServer, ClientHttpServer,
     ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget, HttpQueryServerConfig,
-    QueryTransportAction, QueryTransportScopeGrant, RendezvousBoltRoutingTableProvider,
-    RoutedGraphCluster, ShardPlacement, StaticClientDatabaseResolver,
+    ObjectStoreBoltRoutingTableProvider, ObjectStoreNodeDirectory, QueryTransportAction,
+    QueryTransportScopeGrant, RoutedGraphCluster, StaticClientDatabaseResolver,
     StaticQueryTransportScopeAuthorizer,
 };
 use tracing_subscriber::EnvFilter;
@@ -35,42 +33,31 @@ async fn main() -> RuntimeResult<()> {
 }
 
 async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
-    let role_publisher =
-        kubernetes::KubernetesPodRolePublisher::from_env("graph.usecortex.io/serving")?;
-    role_publisher.publish(false).await?;
     std::fs::create_dir_all(&config.data_cache_dir)?;
     let object_store = object_store_from_env(None)?;
     let open_options = config.graph_open_options();
     let memory_config = config.graph_memory_config();
-    let placement = ShardPlacement::rendezvous(
+    let directory = ObjectStoreNodeDirectory::new(
         config.cells.iter().cloned(),
         config.bolt_node_addresses.keys().cloned(),
     )?;
     let node = Arc::new(
-        RoutedGraphCluster::open_fenced_owned_scoped_with_memory_options(
+        RoutedGraphCluster::open_promotable_scoped_with_memory_options(
             config.data_path.clone(),
             config.scope.clone(),
             config.node_id.clone(),
-            placement.clone(),
+            directory.clone(),
             object_store,
             open_options,
             memory_config,
         )
         .await?,
     );
-    let matrix_refresh = if config.matrix_auto_refresh_enabled {
-        Some(node.start_matrix_artifact_refresh_job(
-            slatedb_graph_kernel::MatrixArtifactRefreshPolicy {
-                interval: config.matrix_refresh_interval,
-                max_dirty_age: config.matrix_refresh_max_dirty_age,
-                min_epoch_lag: config.matrix_refresh_min_epoch_lag,
-                tile_size: config.matrix_refresh_tile_size,
-                max_edge_types_per_cycle: config.matrix_refresh_max_edge_types_per_cycle,
-            },
-        )?)
-    } else {
-        None
-    };
+    let (index_discovery_stop, index_discovery_task) = start_index_discovery(
+        Arc::clone(&node),
+        config.cells.clone(),
+        config.index_discovery_interval,
+    );
 
     let token = config.read_auth_token()?;
     let authorizer = StaticQueryTransportScopeAuthorizer::new().with_bearer_grant(
@@ -124,8 +111,7 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         .with_default_database(config.database.clone())
         .with_max_connections(config.max_bolt_connections)
         .with_graceful_shutdown_timeout(config.graceful_shutdown_timeout);
-    let routing =
-        RendezvousBoltRoutingTableProvider::new(placement, config.bolt_node_addresses.clone(), 30)?;
+    let routing = ObjectStoreBoltRoutingTableProvider::new(config.bolt_node_addresses.clone(), 30)?;
     bolt_config = bolt_config.with_routing_table_provider(Arc::new(routing));
     if let Some(provider) = &tls_provider {
         bolt_config = bolt_config.with_tls_provider(Arc::clone(provider));
@@ -148,11 +134,6 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     let http = ClientHttpServer::bind(config.http_addr, service.clone(), http_config).await?;
 
     let ready = Arc::new(AtomicBool::new(false));
-    let (serving_stop, serving_task) = start_serving_monitor(
-        Arc::clone(&node),
-        config.cell_id.clone(),
-        role_publisher.clone(),
-    );
     let admin = admin::AdminServer::bind_routed(
         config.admin_addr,
         Arc::clone(&ready),
@@ -173,18 +154,14 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         result = shutdown_signal() => result?,
     }
     ready.store(false, Ordering::Release);
-    let _ = serving_stop.send(true);
-    serving_task.await??;
-    role_publisher.publish(false).await?;
     admin.stop().await?;
     http.stop().await?;
     bolt.stop().await?;
     if let Some(tls_reloader) = tls_reloader {
         tls_reloader.stop().await;
     }
-    if let Some(matrix_refresh) = matrix_refresh {
-        matrix_refresh.stop().await?;
-    }
+    let _ = index_discovery_stop.send(true);
+    index_discovery_task.await??;
     drop(service);
     let node =
         Arc::try_unwrap(node).map_err(|_| "graph node still has active runtime references")?;
@@ -193,28 +170,39 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn start_serving_monitor(
+fn start_index_discovery(
     node: Arc<RoutedGraphCluster>,
-    cell_id: String,
-    role_publisher: kubernetes::KubernetesPodRolePublisher,
+    cells: Vec<String>,
+    interval: Duration,
 ) -> (
     tokio::sync::watch::Sender<bool>,
     tokio::task::JoinHandle<RuntimeResult<()>>,
 ) {
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
-        let mut published = false;
         loop {
-            let owns_cell = node
-                .local_cells()
-                .iter()
-                .any(|candidate| *candidate == cell_id);
-            if owns_cell != published {
-                match role_publisher.publish(owns_cell).await {
-                    Ok(()) => published = owns_cell,
-                    Err(error) => {
-                        tracing::warn!(error = %error, owns_cell, "failed to publish graph-node serving role");
+            for cell_id in &cells {
+                let shard = node.shard(cell_id)?;
+                match shard.dirty_graph_index_edge_types(cell_id).await {
+                    Ok(edge_types) => {
+                        for (edge_type, _) in edge_types {
+                            if let Err(error) =
+                                shard.discover_graph_index(cell_id, &edge_type).await
+                            {
+                                tracing::warn!(
+                                    cell_id,
+                                    edge_type,
+                                    error = %error,
+                                    "failed to discover graph index generation"
+                                );
+                            }
+                        }
                     }
+                    Err(error) => tracing::warn!(
+                        cell_id,
+                        error = %error,
+                        "failed to discover dirty graph index edge types"
+                    ),
                 }
             }
             tokio::select! {
@@ -223,7 +211,7 @@ fn start_serving_monitor(
                         return Ok(());
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                _ = tokio::time::sleep(interval.max(Duration::from_millis(100))) => {}
             }
         }
     });

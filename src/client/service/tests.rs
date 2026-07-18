@@ -31,18 +31,25 @@ struct CursorTestClient {
 
 struct SnapshotEpochClient;
 
+struct ConsistencyTestClient {
+    refreshes: Arc<AtomicU64>,
+}
+
 #[async_trait]
-impl QueryCellClient for SnapshotEpochClient {
+impl QueryCellClient for ConsistencyTestClient {
     async fn execute_cypher_rows(
         &self,
         _context: QueryContext,
         _query: &str,
     ) -> Result<QueryResultSet> {
         Ok(QueryResultSet::new(
-            vec![QueryColumn::new("value")],
-            vec![QueryRow::new(vec![QueryValue::Count(1)])],
+            vec![QueryColumn::new("refreshes")],
+            vec![QueryRow::new(vec![QueryValue::Count(
+                self.refreshes.load(Ordering::SeqCst),
+            )])],
         )
-        .with_read_epoch(9))
+        .with_read_epoch(7)
+        .with_storage_sequence(7))
     }
 
     async fn execute_cypher_rows_page(
@@ -56,11 +63,55 @@ impl QueryCellClient for SnapshotEpochClient {
         Ok(QueryResultPage::new(result.columns, result.rows, None))
     }
 
-    async fn current_graph_epoch(
+    async fn current_storage_sequence(
         &self,
         _scope: &GraphScope,
         _cell_id: &str,
-    ) -> Result<Option<TopologySequence>> {
+    ) -> Result<Option<StorageSequence>> {
+        Ok(Some(7))
+    }
+
+    async fn refresh_storage_sequence(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<StorageSequence>> {
+        self.refreshes.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(7))
+    }
+}
+
+#[async_trait]
+impl QueryCellClient for SnapshotEpochClient {
+    async fn execute_cypher_rows(
+        &self,
+        _context: QueryContext,
+        _query: &str,
+    ) -> Result<QueryResultSet> {
+        Ok(QueryResultSet::new(
+            vec![QueryColumn::new("value")],
+            vec![QueryRow::new(vec![QueryValue::Count(1)])],
+        )
+        .with_read_epoch(9)
+        .with_storage_sequence(13))
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let result = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(result.columns, result.rows, None))
+    }
+
+    async fn current_storage_sequence(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<StorageSequence>> {
         Ok(Some(7))
     }
 }
@@ -79,7 +130,8 @@ impl QueryCellClient for CursorTestClient {
                 .map(|value| QueryRow::new(vec![QueryValue::Count(value)]))
                 .collect(),
         )
-        .with_read_epoch(7);
+        .with_read_epoch(7)
+        .with_storage_sequence(7);
         if let Some(limit) = context.max_result_bytes {
             crate::codec::ensure_limit(
                 "client_cursor_buffer_bytes",
@@ -101,11 +153,11 @@ impl QueryCellClient for CursorTestClient {
         Ok(QueryResultPage::new(result.columns, result.rows, None))
     }
 
-    async fn current_graph_epoch(
+    async fn current_storage_sequence(
         &self,
         _scope: &GraphScope,
         _cell_id: &str,
-    ) -> Result<Option<TopologySequence>> {
+    ) -> Result<Option<StorageSequence>> {
         Ok(Some(7))
     }
 }
@@ -130,7 +182,8 @@ impl QueryCellClient for TestClient {
             vec![QueryColumn::new("value")],
             vec![QueryRow::new(vec![QueryValue::Count(1)])],
         )
-        .with_read_epoch(read_epoch))
+        .with_read_epoch(read_epoch)
+        .with_storage_sequence(read_epoch))
     }
 
     async fn execute_cypher_rows_page(
@@ -144,11 +197,11 @@ impl QueryCellClient for TestClient {
         Ok(QueryResultPage::new(result.columns, result.rows, None))
     }
 
-    async fn current_graph_epoch(
+    async fn current_storage_sequence(
         &self,
         _scope: &GraphScope,
         _cell_id: &str,
-    ) -> Result<Option<TopologySequence>> {
+    ) -> Result<Option<StorageSequence>> {
         Ok(Some(self.epoch.load(Ordering::Relaxed)))
     }
 }
@@ -241,7 +294,7 @@ async fn service_authenticates_authorizes_and_returns_epoch_bookmark() {
 }
 
 #[tokio::test]
-async fn service_bookmark_uses_the_epoch_of_the_storage_snapshot_read() {
+async fn service_bookmark_uses_the_slatedb_sequence_of_the_snapshot_read() {
     let authorizer = StaticQueryTransportScopeAuthorizer::new()
         .with_bearer_grant(
             "secret",
@@ -265,7 +318,56 @@ async fn service_bookmark_uses_the_epoch_of_the_storage_snapshot_read() {
         .unwrap();
 
     assert_eq!(response.read_epoch, Some(9));
-    assert_eq!(response.bookmark.unwrap().epoch, 9);
+    assert_eq!(response.bookmark.unwrap().epoch, 13);
+}
+
+#[tokio::test]
+async fn strong_reads_refresh_storage_while_causal_reads_stay_cache_local() {
+    let refreshes = Arc::new(AtomicU64::new(0));
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::read_graph(GraphScope::default()),
+        )
+        .unwrap();
+    let service = ClientQueryService::new(
+        Arc::new(ConsistencyTestClient {
+            refreshes: Arc::clone(&refreshes),
+        }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(authorizer)),
+    )
+    .unwrap();
+    let session = authenticated_session(&service);
+
+    let causal = service
+        .execute_rows(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "query-causal-consistency",
+                "MATCH (n {id: 1}) RETURN n.id",
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(causal.result.rows[0].values, vec![QueryValue::Count(0)]);
+
+    let strong = service
+        .execute_rows(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "query-strong-consistency",
+                "MATCH (n {id: 1}) RETURN n.id",
+            )
+            .strong(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(strong.result.rows[0].values, vec![QueryValue::Count(1)]);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -661,11 +763,11 @@ impl QueryCellClient for CancellationIgnoringClient {
         Ok(QueryResultPage::new(result.columns, result.rows, None))
     }
 
-    async fn current_graph_epoch(
+    async fn current_storage_sequence(
         &self,
         _scope: &GraphScope,
         _cell_id: &str,
-    ) -> Result<Option<TopologySequence>> {
+    ) -> Result<Option<StorageSequence>> {
         Ok(Some(7))
     }
 }

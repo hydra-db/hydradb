@@ -36,7 +36,6 @@ spec:
   type: {{ .Values.service.bolt.type }}
   selector:
     {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 4 }}
-    graph.usecortex.io/serving: "true"
   ports:
     - name: bolt
       port: {{ .Values.service.bolt.port }}
@@ -61,7 +60,6 @@ spec:
   type: {{ .Values.service.https.type }}
   selector:
     {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 4 }}
-    graph.usecortex.io/serving: "true"
   ports:
     - name: https
       port: {{ .Values.service.https.port }}
@@ -86,3 +84,21 @@ spec:
     - name: metrics
       port: {{ .Values.service.adminPort }}
       targetPort: admin
+{{- if .Values.indexer.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "turbolay.fullname" . }}-indexer-metrics
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: indexer
+    graph.usecortex.io/metrics: "true"
+spec:
+  selector:
+    {{- include "turbolay.componentLabels" (dict "root" . "component" "indexer") | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9091
+      targetPort: admin
+{{- end }}

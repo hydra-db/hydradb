@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,10 +7,10 @@ use slatedb::bytes::Bytes;
 use slatedb::config::{DurabilityLevel, ReadOptions, ScanOptions, WriteOptions};
 use slatedb::object_store::{path::Path, ObjectStore};
 #[cfg(test)]
-use slatedb::object_store::{ObjectStoreExt, PutMode};
-#[cfg(test)]
 use slatedb::ErrorKind;
-use slatedb::{DbTransaction, IsolationLevel, WriteBatch};
+#[cfg(test)]
+use slatedb::WriteBatch;
+use slatedb::{DbTransaction, IsolationLevel};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 #[cfg(feature = "client-api")]
@@ -24,7 +24,7 @@ mod sparse_kernel;
 #[cfg(feature = "bolt-server")]
 pub use client::bolt::{
     BoltRoutingServer, BoltRoutingTable, BoltRoutingTableProvider, BoltServerConfig,
-    BoltServerHandle, ClientBoltServer, RendezvousBoltRoutingTableProvider,
+    BoltServerHandle, ClientBoltServer, ObjectStoreBoltRoutingTableProvider,
 };
 #[cfg(feature = "http-api")]
 pub use client::http::{ClientHttpServer, HttpQueryServerConfig, HttpQueryServerHandle};
@@ -32,7 +32,8 @@ pub use client::http::{ClientHttpServer, HttpQueryServerConfig, HttpQueryServerH
 pub use client::service::{
     ClientBookmark, ClientDatabaseResolver, ClientQueryCredentials, ClientQueryMetricsSnapshot,
     ClientQueryPage, ClientQueryRequest, ClientQueryResult, ClientQueryService,
-    ClientQueryServiceConfig, ClientQuerySession, ClientQueryTarget, StaticClientDatabaseResolver,
+    ClientQueryServiceConfig, ClientQuerySession, ClientQueryTarget, ClientReadConsistency,
+    StaticClientDatabaseResolver,
 };
 pub(crate) use core::cache::BoundedGraphCache;
 #[cfg(feature = "opencypher")]
@@ -52,17 +53,16 @@ pub use core::metrics::{
     GraphCacheKind, GraphCacheMetricsSnapshot, GraphCachePolicy, GraphOperationalMetricsSnapshot,
 };
 pub(crate) use core::metrics::{GraphCacheMetrics, GraphOperationalMetrics};
+pub(crate) use core::model::OutEdgeSegment;
 pub use core::model::{
-    BulkImportDeltaLogPolicy, BulkImportDuplicatePolicy, BulkImportOptions, BulkImportResult,
-    CommitResult, DeleteResult, DeltaKind, DeltaRecord, EdgeDeleteBatchResult,
-    EdgeExistenceBatchEntry, EdgeIngestOptions, EdgeIngestResult, EdgeMetadata, EdgeMutation,
-    EdgeMutationBatchResult, EdgeMutationLogAppendResult, EdgeMutationLogMaterializeResult,
-    EdgeRecord, GraphCellDropResult, GraphCorrectnessReport, GraphExportDigest, GraphRepairReport,
-    NeighborBatchEntry, QueryFloat, RelationshipCreateResult, RelationshipId,
-    RelationshipImportResult, RelationshipMutation, RelationshipRecord, SegmentCompactionResult,
-    VertexDeleteResult, VertexMetadata, VertexPropertyValue,
+    BulkImportDuplicatePolicy, BulkImportOptions, BulkImportResult, CommitResult, DeleteResult,
+    EdgeDeleteBatchResult, EdgeExistenceBatchEntry, EdgeIngestOptions, EdgeIngestResult,
+    EdgeMetadata, EdgeMutation, EdgeMutationBatchResult, EdgeRecord, GraphCellDropResult,
+    GraphCorrectnessReport, GraphExportDigest, GraphRepairReport, NeighborBatchEntry, QueryFloat,
+    RelationshipCreateResult, RelationshipId, RelationshipImportResult, RelationshipMutation,
+    RelationshipRecord, SegmentCompactionResult, VertexDeleteResult, VertexMetadata,
+    VertexPropertyValue,
 };
-pub(crate) use core::model::{EdgeMutationLogBatch, OutEdgeSegment, OutboxDeltaBatch};
 pub use core::namespace::{
     GraphId, GraphScope, NamespaceId, NamespacePath, DEFAULT_GRAPH_ID, DEFAULT_NAMESPACE_ID,
     MAX_NAMESPACE_DEPTH,
@@ -71,20 +71,15 @@ pub use core::snapshot::GraphSnapshot;
 #[cfg(feature = "opencypher")]
 pub use core::state::QueryStatsRefreshHandle;
 pub(crate) use core::state::{
-    acquire_distributed_write_lock, is_retryable_write_conflict, release_cell_write_lock,
-    CellWriteLock, GraphStore, GraphWriteAuthority, GraphWriteOp,
-};
-#[cfg(test)]
-pub(crate) use core::state::{
-    decode_cell_write_lock_record, encode_cell_write_lock_record, CellWriteLockState,
+    finish_local_write, is_retryable_write_conflict, GraphStorageSnapshot, GraphStore,
+    GraphWriteAuthority, GraphWriteOp, LocalWriteGuard,
 };
 pub use core::state::{GraphCacheEntryCounts, GraphCacheResidentBytes, GraphShard};
 pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
 pub use engine::{
-    local_object_store, object_store_from_env, ArtifactGcResult, BenchmarkResult, DeltaGcResult,
-    GraphCluster, GraphNodeMaintenanceMetricsSnapshot, GraphShardRuntimeMetrics, MatrixArtifact,
-    MatrixArtifactRefreshHandle, MatrixArtifactRefreshPolicy, MatrixArtifactRefreshReport,
-    MatrixTraversalResult, RoutedGraphCluster, ShardPlacement, TraversalBackend,
+    local_object_store, object_store_from_env, ArtifactGcResult, BenchmarkResult, GraphCluster,
+    GraphIndexGeneration, GraphShardRuntimeMetrics, MatrixArtifact, MatrixTraversalResult,
+    ObjectStoreNodeDirectory, RoutedGraphCluster, TraversalBackend,
 };
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
@@ -144,22 +139,17 @@ pub type VertexId = u64;
 /// SlateDB's sequence number for a committed storage snapshot.
 pub type StorageSequence = u64;
 
-/// Monotonic cursor for topology changes consumed by asynchronous matrix builds.
-/// This is not a second storage MVCC system; canonical record visibility belongs
-/// to SlateDB snapshots.
-pub type TopologySequence = u64;
-
 pub(crate) type MatrixAdjacency = BTreeMap<VertexId, BTreeSet<VertexId>>;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct MatrixCacheKey {
     pub(crate) cell_id: String,
     pub(crate) edge_type: String,
-    pub(crate) base_epoch: TopologySequence,
+    pub(crate) base_epoch: StorageSequence,
 }
 
 impl MatrixCacheKey {
-    pub(crate) fn new(cell_id: &str, edge_type: &str, base_epoch: TopologySequence) -> Self {
+    pub(crate) fn new(cell_id: &str, edge_type: &str, base_epoch: StorageSequence) -> Self {
         Self {
             cell_id: cell_id.to_string(),
             edge_type: edge_type.to_string(),
@@ -184,18 +174,8 @@ impl ParsedRowQueryCacheKey {
 }
 
 pub(crate) const GRAPH_TXN_MAX_RETRIES: usize = 32;
-pub(crate) const GRAPH_DELTA_GC_BATCH_KEYS: usize = 512;
+pub(crate) const GRAPH_MAINTENANCE_BATCH_KEYS: usize = 512;
 pub(crate) const GRAPH_WRITE_LANES: usize = 64;
-pub(crate) const GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS: usize = 256;
-pub(crate) const GRAPH_CELL_WRITE_LOCK_BACKOFF_MS: u64 = 2;
-pub(crate) const GRAPH_CELL_WRITE_LOCK_TTL_MS: u64 = 5 * 60 * 1000;
-// Release profiling showed larger materialization transactions regress from SlateDB
-// write-batch and conflict-tracking overhead; keep async drains in the same
-// microbatch range as foreground indexed writes.
-pub(crate) const GRAPH_MUTATION_LOG_MATERIALIZE_TXN_EDGES: usize = 512;
-pub(crate) const GRAPH_STORE_FORMAT_KEY: &str = "graph/meta/format_version";
-pub(crate) const GRAPH_STORE_FORMAT_VERSION: u64 = 1;
-static GRAPH_CELL_WRITE_LOCK_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 mod codec;
 pub(crate) use codec::*;

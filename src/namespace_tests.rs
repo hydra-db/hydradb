@@ -240,11 +240,11 @@ async fn routed_queries_reject_a_context_from_another_graph_scope() {
         .await
         .unwrap();
     seed.close().await.unwrap();
-    let cluster = RoutedGraphCluster::open_owned_scoped(
+    let cluster = RoutedGraphCluster::open_readers_scoped(
         "routed-scope",
         expected_scope.clone(),
         "node-a",
-        ShardPlacement::fixed([("cell-a", "node-a")]).unwrap(),
+        ObjectStoreNodeDirectory::new(["cell-a"], ["node-a"]).unwrap(),
         object_store,
     )
     .await

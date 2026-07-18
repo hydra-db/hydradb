@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "graphblas")]
+use crate::shard::QueryBudget;
 
 impl GraphShard {
     pub async fn matrix_reachable(
@@ -7,7 +9,7 @@ impl GraphShard {
         edge_type: &str,
         starts: &[VertexId],
         hops: u8,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Result<MatrixTraversalResult> {
         self.matrix_reachable_with_kernel(
             cell_id,
@@ -26,7 +28,7 @@ impl GraphShard {
         edge_type: &str,
         starts: &[VertexId],
         hops: u8,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
         sparse_kernel: SparseKernelBackend,
     ) -> Result<MatrixTraversalResult> {
         validate_component("cell_id", cell_id)?;
@@ -51,33 +53,56 @@ impl GraphShard {
         );
 
         let base_epoch = artifact.as_ref().map_or(0, |artifact| artifact.base_epoch);
-        let started = Instant::now();
-        let deltas = if read_epoch <= base_epoch {
-            Vec::new()
-        } else {
-            self.deltas_between(cell_id, edge_type, base_epoch, read_epoch)
-                .await?
-        };
-        record_matrix_profile(
-            profile,
-            "deltas_since",
-            started.elapsed(),
-            deltas.len() as u64,
-        );
 
-        if sparse_kernel == SparseKernelBackend::SuiteSparseGraphBlas
-            && deltas.is_empty()
-            && artifact.is_some()
-        {
+        #[cfg(feature = "graphblas")]
+        if sparse_kernel == SparseKernelBackend::SuiteSparseGraphBlas && artifact.is_some() {
             let started = Instant::now();
-            let compiled = self
-                .cached_graphblas_matrix(cell_id, edge_type, base_epoch)
-                .await?;
+            let Some((compiled, overlay, _)) = self
+                .compiled_graphblas_query_snapshot(
+                    cell_id,
+                    edge_type,
+                    base_epoch,
+                    read_epoch,
+                    &QueryBudget::new(self.limits.max_query_runtime_ms, None),
+                )
+                .await?
+            else {
+                let traversal = if let [start] = starts {
+                    self.reachable_from_storage_frontier(
+                        cell_id,
+                        edge_type,
+                        *start,
+                        (1, hops),
+                        read_epoch,
+                        &QueryBudget::new(self.limits.max_query_runtime_ms, None),
+                    )
+                    .await?
+                } else {
+                    let adjacency = self
+                        .canonical_adjacency_at(cell_id, edge_type, read_epoch)
+                        .await?;
+                    expand_sparse(&adjacency, starts, hops, sparse_kernel)?
+                };
+                return Ok(MatrixTraversalResult {
+                    backend: TraversalBackend::DirectSnapshot,
+                    vertices: traversal.vertices,
+                    hops,
+                    base_epoch,
+                    edge_visits: traversal.edge_visits,
+                    sparse_kernel: traversal.backend,
+                });
+            };
             record_matrix_profile(profile, "cached_graphblas_matrix", started.elapsed(), 0);
 
             let started = Instant::now();
             let empty_adjacency = BTreeMap::new();
-            let traversal = expand_compiled_graphblas(&compiled, &empty_adjacency, starts, hops)?;
+            let traversal = if let Some(overlay) = overlay {
+                crate::shard::topology_tail::expand_range_with_overlay(
+                    &compiled, &overlay, starts, 1, hops,
+                )?
+            } else {
+                expand_compiled_graphblas(&compiled, &empty_adjacency, starts, hops)?
+            };
             record_matrix_profile(
                 profile,
                 "expand_compiled_graphblas",
@@ -91,32 +116,26 @@ impl GraphShard {
                 0,
             );
             return Ok(MatrixTraversalResult {
-                backend: TraversalBackend::MatrixOverlay,
+                backend: TraversalBackend::MatrixSnapshot,
                 vertices: traversal.vertices,
                 hops,
                 base_epoch,
                 edge_visits: traversal.edge_visits,
-                delta_records_applied: 0,
                 sparse_kernel: traversal.backend,
             });
         }
 
         let started = Instant::now();
-        let base_adjacency = if let Some(artifact) = artifact.as_ref() {
-            self.cached_matrix_adjacency(cell_id, edge_type, artifact.base_epoch)
-                .await?
-        } else {
-            Arc::new(BTreeMap::new())
-        };
+        let adjacency = self
+            .canonical_adjacency_at(cell_id, edge_type, read_epoch)
+            .await?;
         record_matrix_profile(
             profile,
-            "cached_matrix_adjacency",
+            "canonical_adjacency",
             started.elapsed(),
-            base_adjacency.len() as u64,
+            adjacency.len() as u64,
         );
 
-        let mut adjacency = base_adjacency.as_ref().clone();
-        let applied = apply_delta_overlay(&mut adjacency, deltas, base_epoch, read_epoch);
         let traversal = expand_sparse(&adjacency, starts, hops, sparse_kernel)?;
         record_matrix_profile(
             profile,
@@ -125,12 +144,11 @@ impl GraphShard {
             0,
         );
         Ok(MatrixTraversalResult {
-            backend: TraversalBackend::MatrixOverlay,
+            backend: TraversalBackend::MatrixSnapshot,
             vertices: traversal.vertices,
             hops,
             base_epoch,
             edge_visits: traversal.edge_visits,
-            delta_records_applied: applied,
             sparse_kernel: traversal.backend,
         })
     }
@@ -141,7 +159,7 @@ impl GraphShard {
         edge_type: &str,
         starts: &[VertexId],
         hops: u8,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Result<MatrixTraversalResult> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
@@ -150,18 +168,9 @@ impl GraphShard {
             u64::from(hops),
             u64::from(self.limits.max_traversal_hops),
         )?;
-        let watermark = self.delta_gc_watermark(cell_id, edge_type).await?;
-        let (adjacency, applied) = if watermark == 0 {
-            let deltas = self
-                .deltas_between(cell_id, edge_type, 0, read_epoch)
-                .await?;
-            let mut adjacency = BTreeMap::new();
-            let applied = apply_delta_overlay(&mut adjacency, deltas, 0, read_epoch);
-            (adjacency, applied)
-        } else {
-            let edges = self.edges_at(cell_id, edge_type, read_epoch).await?;
-            (adjacency_from_edges(&edges), 0)
-        };
+        let adjacency = self
+            .canonical_adjacency_at(cell_id, edge_type, read_epoch)
+            .await?;
         let traversal = expand_sparse(&adjacency, starts, hops, SparseKernelBackend::RustSparse)?;
         Ok(MatrixTraversalResult {
             backend: TraversalBackend::DirectSnapshot,
@@ -169,7 +178,6 @@ impl GraphShard {
             hops,
             base_epoch: 0,
             edge_visits: traversal.edge_visits,
-            delta_records_applied: applied,
             sparse_kernel: traversal.backend,
         })
     }
@@ -180,7 +188,7 @@ impl GraphShard {
         edge_type: &str,
         starts: &[VertexId],
         hops: u8,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Result<BenchmarkResult> {
         let direct = self
             .direct_snapshot_reachable(cell_id, edge_type, starts, hops, read_epoch)
@@ -190,8 +198,7 @@ impl GraphShard {
             .await?;
         Ok(BenchmarkResult {
             matrix_wins: matrix.vertices == direct.vertices
-                && (matrix.edge_visits < direct.edge_visits
-                    || matrix.delta_records_applied < direct.delta_records_applied),
+                && matrix.edge_visits < direct.edge_visits,
             direct,
             matrix,
         })

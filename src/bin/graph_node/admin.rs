@@ -122,7 +122,6 @@ async fn metrics(State(state): State<AdminState>) -> Response {
     ));
     append_node_metrics(
         &mut output,
-        state.routed_node.maintenance_metrics(),
         state.routed_node.local_shard_runtime_metrics().await,
     );
     (
@@ -137,31 +136,11 @@ async fn metrics(State(state): State<AdminState>) -> Response {
 
 fn append_node_metrics(
     output: &mut String,
-    maintenance: slatedb_graph_kernel::GraphNodeMaintenanceMetricsSnapshot,
     shard_metrics: Vec<slatedb_graph_kernel::GraphShardRuntimeMetrics>,
 ) {
-    output.push_str(&format!(
-        concat!(
-            "# TYPE graph_matrix_refresh_cycles counter\n",
-            "graph_matrix_refresh_cycles {}\n",
-            "# TYPE graph_matrix_refresh_dirty_edge_types counter\n",
-            "graph_matrix_refresh_dirty_edge_types {}\n",
-            "# TYPE graph_matrix_refresh_artifacts_built counter\n",
-            "graph_matrix_refresh_artifacts_built {}\n",
-            "# TYPE graph_matrix_refresh_artifacts_deferred counter\n",
-            "graph_matrix_refresh_artifacts_deferred {}\n",
-            "# TYPE graph_matrix_refresh_failures counter\n",
-            "graph_matrix_refresh_failures {}\n"
-        ),
-        maintenance.matrix_refresh_cycles,
-        maintenance.matrix_refresh_dirty_edge_types,
-        maintenance.matrix_refresh_artifacts_built,
-        maintenance.matrix_refresh_artifacts_deferred,
-        maintenance.matrix_refresh_failures,
-    ));
     output.push_str(concat!(
-        "# TYPE graph_query_graphblas_exact_snapshots counter\n",
-        "# TYPE graph_query_graphblas_delta_snapshots counter\n",
+        "# TYPE graph_query_graphblas_artifact_snapshots counter\n",
+        "# TYPE graph_query_graphblas_rebuilt_snapshots counter\n",
         "# TYPE graph_query_rust_sparse_fallbacks counter\n",
         "# TYPE graph_cache_entries gauge\n",
         "# TYPE graph_cache_resident_bytes gauge\n"
@@ -169,14 +148,14 @@ fn append_node_metrics(
     for metrics in shard_metrics {
         output.push_str(&format!(
             concat!(
-                "graph_query_graphblas_exact_snapshots{{cell_id=\"{}\"}} {}\n",
-                "graph_query_graphblas_delta_snapshots{{cell_id=\"{}\"}} {}\n",
+                "graph_query_graphblas_artifact_snapshots{{cell_id=\"{}\"}} {}\n",
+                "graph_query_graphblas_rebuilt_snapshots{{cell_id=\"{}\"}} {}\n",
                 "graph_query_rust_sparse_fallbacks{{cell_id=\"{}\"}} {}\n"
             ),
             metrics.cell_id,
-            metrics.operational.query_graphblas_exact_snapshots,
+            metrics.operational.query_graphblas_artifact_snapshots,
             metrics.cell_id,
-            metrics.operational.query_graphblas_delta_snapshots,
+            metrics.operational.query_graphblas_rebuilt_snapshots,
             metrics.cell_id,
             metrics.operational.query_rust_sparse_fallbacks,
         ));
