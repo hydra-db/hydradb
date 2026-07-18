@@ -31,10 +31,25 @@ turbolay `.qnt` models by the middle → understand MBT by the end. Scope is
 - Build: `cd book && typst compile --input mode=dark quint.typ quint.pdf`
   (also test `--input mode=light`; PDFs are gitignored).
 
+## Requirements (apply to every chapter, Act II and III included)
+- **Every chapter must carry at least one clear diagram that illustrates what
+  that chapter is testing** — the state machine, invariant, counterexample, or
+  test flow the prose is about, drawn as a picture, not just described. A chapter
+  with no such figure is not done. The gold-standard reference is Ch.3 §3.6
+  `<fig-state-space>` (`quint-02-first-model-m1.typ`): the whole model as one
+  picture — a bold causal spine (one behavior a test walks), faded forks (the
+  other interleavings the checker walks), a shaded region where `allSafety`
+  holds, and the forbidden state _outside_ it reached only by a crossed-out "no
+  such transition" arrow (the missing edge that _is_ the safety property).
+  Reuse that visual grammar so diagrams compound across chapters: nodes = states,
+  bold = the sampled path, faded = the unexplored branches, shaded region = the
+  invariant, a red frontier-crossing edge = a bug (Act II's buggy twin), a proven
+  wall = Apalache, a re-walked bold thread = Rust MBT.
+
 ## Next steps
-- **Pending (paused before insertion):** add a `step = any { … }` nondeterministic
-  fan-out diagram in Ch.3 **immediately before** the storyline state-transition
-  figure (`quint-02-first-model-m1.typ`, ~line 685).
+- **Ch.3 diagrams — done** (`71ae358`, `f13f84d`): the §3.6 state-space concept
+  figure opens the section; the `step` fan-out and the storyline are reframed in
+  prose as zoom-ins of it. `make quint` builds the standalone PDF (dark default).
 - **Act II:** invariants, witnesses & the buggy-twin method (`*_buggy.qnt`);
   deterministic scenarios (`run`/`then`/`expect`); the model gallery reading all
   eight `.qnt` families. Scaffold with `formatting-chapters`, then fill with
