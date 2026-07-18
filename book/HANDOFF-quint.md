@@ -8,22 +8,41 @@ turbolay `.qnt` models by the middle → understand MBT by the end. Scope is
 **Quint → Apalache → Rust MBT**; Jepsen is named as a future layer but deferred.
 
 ## What is done
-- **Act I written, on the real Bookly theme, contrast-fixed, committed** (`5aac8cf`):
-  Ch.1 The correctness problem · Ch.2 Quint from zero · Ch.3 Reading the first
-  real model (`m1_cell_write`).
-- Entry `book/quint.typ` mirrors `main.typ` (reader theme, its own PDF); chapters
-  are `book/chapters/quint-0{0,1,2}-*.typ` (the `quint-*` prefix keeps them out
-  of `gen-index.sh`). Compiles clean in dark + light.
+- **All three Acts written, committed, compiling clean in dark + light — the book
+  is complete (9 chapters, ~81pp).** Every chapter carries at least one diagram in
+  the shared visual grammar; all figures were rendered and eyeballed in both modes
+  in the full-book context before committing.
+  - **Act I** (`5aac8cf`, `71ae358`, `f13f84d`): Ch.1 The correctness problem ·
+    Ch.2 Quint from zero · Ch.3 Reading the first real model (`m1_cell_write`),
+    incl. the §3.6 `<fig-state-space>` concept figure.
+  - **Act II** (`170fa3f`, `e5c4c07`, `c562394`): Ch.4 Invariants, witnesses & the
+    buggy twin (`fig-ch4-counterexample` — the red bug edge crossing out of the
+    safe region) · Ch.5 Deterministic scenarios `run`/`then`/`expect`
+    (`fig-ch5-scenario-path`) · Ch.6 The model gallery / coverage map of all eight
+    families (`fig-ch6-coverage-map`).
+  - **Act III** (`f78fc4d`, `3cba77b`, `62d44bf`): Ch.7 Bounded proof —
+    `quint verify` / Apalache (`fig-ch7-three-regimes`: sampling vs bounded-
+    exhaustive vs unbounded) · Ch.8 Rust MBT — ITF replay against the real
+    `GraphShard` (`fig-ch8-refinement-loop`) · Ch.9 Epilogue — the assurance stack,
+    Jepsen deferred (`fig-ch9-stack`).
+- Entry `book/quint.typ` includes `quint-0{0..8}-*.typ` in order (the `quint-*`
+  prefix keeps them out of `gen-index.sh`). `make quint` builds the standalone PDF
+  (dark by default; `make MODE=light quint` for light). PDFs are gitignored.
 - Two authoring skills capture the workflow: `book/skills/formatting-chapters`
   (Phase 1: Bookly scaffolding, standardized Term/Why boxes, **theme-aware
   diagram colors**, visualize-don't-tell) and `book/skills/writing-content`
-  (Phase 2: the Socratic method, ground every claim in a real file).
+  (Phase 2: the Socratic method, ground every claim in a real file). The winning
+  authoring pattern was one subagent per chapter, each self-verifying compile +
+  contrast via a throwaway `_preview-chN.typ` (quint.typ preamble + one include),
+  with the orchestrator owning `quint.typ` wiring, label-collision checks, and the
+  per-chapter commits.
 
 ## What to read to gain context
 - This file, then `book/skills/formatting-chapters` + `book/skills/writing-content`.
-- The three existing chapters as the voice/format reference; `book/quint.typ`
-  for the entry pattern; `book/chapters/intro-00-replaceable-compute.typ` for
-  native Bookly usage.
+- The nine chapters (`quint-0{0..8}-*.typ`) as the voice/format reference —
+  especially `quint-02` for the `<fig-state-space>` visual grammar every later
+  figure reuses; `book/quint.typ` for the entry pattern;
+  `book/chapters/intro-00-replaceable-compute.typ` for native Bookly usage.
 - Content source of truth: `docs/formal-methods/0001-...md` (objective, contract,
   properties) and `0003-...md` (evidence, boundaries); the models in
   `quint-models/turbolay/*.qnt`; the real code in `src/shard/write.rs` and
@@ -47,15 +66,17 @@ turbolay `.qnt` models by the middle → understand MBT by the end. Scope is
   wall = Apalache, a re-walked bold thread = Rust MBT.
 
 ## Next steps
-- **Ch.3 diagrams — done** (`71ae358`, `f13f84d`): the §3.6 state-space concept
-  figure opens the section; the `step` fan-out and the storyline are reframed in
-  prose as zoom-ins of it. `make quint` builds the standalone PDF (dark default).
-- **Act II:** invariants, witnesses & the buggy-twin method (`*_buggy.qnt`);
-  deterministic scenarios (`run`/`then`/`expect`); the model gallery reading all
-  eight `.qnt` families. Scaffold with `formatting-chapters`, then fill with
-  `writing-content`.
-- **Act III:** Apalache (`quint verify`) and Rust MBT (`tests/formal_mbt*.rs`,
-  `just minio-mbt`).
+The three-Act arc is complete. What remains is optional polish and future layers:
+- **Jepsen chapter (future):** the epilogue names Jepsen as the deferred real-
+  cluster fault-injection layer. When Jepsen is actually run and evidence exists,
+  it warrants its own chapter (real-process histories, fault schedules) — grounded
+  in `docs/formal-methods/0001` §Jepsen and whatever run artifacts land.
+- **Polish pass (optional):** a full read-through for cross-chapter voice
+  consistency and forward/back references; re-verify quoted `file:line` numbers if
+  the models/tests drift; consider a short front-matter preface framing the arc.
+- **When editing any chapter,** keep the per-chapter self-verify loop (throwaway
+  `_preview-chN.typ`, compile + eyeball both modes) and re-run the label-collision
+  check (`grep` figure/table labels across all chapters) before committing.
 
 ## Anything else
 - Always compile **both** modes and eyeball diagram contrast before committing;
