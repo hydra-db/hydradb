@@ -67,10 +67,11 @@ just minio-fence
    - **BFG-004** (reject conflicts atomically) and **BFG-008** (best-effort
      direct pages, stable service cursor) match current behavior → `not-a-bug`;
      records, model comments, and inventory updated; Quint stays green.
-   - **BFG-003** approved **endpoint-scoped** — current source violates it
-     (rejects same-ID/different-endpoint) → `reproducing`, medium kernel fix
-     scoped in the record for a reviewed PR (model/witness/adapter flip in the
-     same PR).
+   - **BFG-003** reviewed: the external `relationship_id` is a client-supplied
+     per-cell idempotency/dedup key on the bulk/direct import path, so a
+     same-ID/different-endpoint `IdempotencyConflict` is intended → `not-a-bug`;
+     matches the implementation, no source/model/adapter change. (Reverses an
+     earlier provisional endpoint-scoped note.)
    - **BFG-007** approved **read-your-writes after bookmark** — local path met
      and typed proof-unavailable error exists; remote proof + reader refresh
      scoped in the record, stays `blocked` (reader refresh may need a SlateDB
