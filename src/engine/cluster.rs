@@ -98,36 +98,28 @@ impl GraphCluster {
     }
 }
 
-impl ShardPlacement {
-    pub fn fixed(
-        assignments: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
-    ) -> Result<Self> {
-        let mut owners = BTreeMap::new();
-        for (cell_id, node_id) in assignments {
-            let cell_id = cell_id.into();
-            let node_id = node_id.into();
-            validate_component("cell_id", &cell_id)?;
-            validate_component("node_id", &node_id)?;
-            if owners.insert(cell_id.clone(), node_id).is_some() {
-                return Err(GraphError::CorruptValue {
-                    key: format!("placement/{cell_id}"),
-                    reason: "duplicate cell placement".to_string(),
-                });
-            }
-        }
-        if owners.is_empty() {
-            return Err(GraphError::CorruptValue {
-                key: "placement".to_string(),
-                reason: "at least one cell placement is required".to_string(),
-            });
-        }
-        Ok(Self { owners })
-    }
-
-    pub fn rendezvous(
+impl ObjectStoreNodeDirectory {
+    pub fn new(
         cell_ids: impl IntoIterator<Item = impl Into<String>>,
         node_ids: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<Self> {
+        let mut cells = BTreeSet::new();
+        for cell_id in cell_ids {
+            let cell_id = cell_id.into();
+            validate_component("cell_id", &cell_id)?;
+            if !cells.insert(cell_id.clone()) {
+                return Err(GraphError::CorruptValue {
+                    key: format!("directory/cell/{cell_id}"),
+                    reason: "duplicate cell id".to_string(),
+                });
+            }
+        }
+        if cells.is_empty() {
+            return Err(GraphError::CorruptValue {
+                key: "directory/cells".to_string(),
+                reason: "at least one cell id is required".to_string(),
+            });
+        }
         let mut nodes = Vec::new();
         for node_id in node_ids {
             let node_id = node_id.into();
@@ -138,83 +130,32 @@ impl ShardPlacement {
         nodes.dedup();
         if nodes.is_empty() {
             return Err(GraphError::CorruptValue {
-                key: "placement".to_string(),
-                reason: "at least one owner node is required".to_string(),
+                key: "directory/nodes".to_string(),
+                reason: "at least one node id is required".to_string(),
             });
         }
-
-        let mut owners = BTreeMap::new();
-        for cell_id in cell_ids {
-            let cell_id = cell_id.into();
-            validate_component("cell_id", &cell_id)?;
-            let Some(owner) = nodes
-                .iter()
-                .max_by_key(|node_id| rendezvous_score(&cell_id, node_id))
-                .cloned()
-            else {
-                return Err(GraphError::CorruptValue {
-                    key: "placement".to_string(),
-                    reason: "at least one owner node is required".to_string(),
-                });
-            };
-            if owners.insert(cell_id.clone(), owner).is_some() {
-                return Err(GraphError::CorruptValue {
-                    key: format!("placement/{cell_id}"),
-                    reason: "duplicate cell placement".to_string(),
-                });
-            }
-        }
-        if owners.is_empty() {
-            return Err(GraphError::CorruptValue {
-                key: "placement".to_string(),
-                reason: "at least one cell placement is required".to_string(),
-            });
-        }
-        Ok(Self { owners })
-    }
-
-    pub fn owner(&self, cell_id: &str) -> Result<&str> {
-        validate_component("cell_id", cell_id)?;
-        self.owners
-            .get(cell_id)
-            .map(String::as_str)
-            .ok_or_else(|| GraphError::UnknownShard {
-                cell_id: cell_id.to_string(),
-            })
-    }
-
-    pub fn ensure_local_owner(&self, local_node_id: &str, cell_id: &str) -> Result<()> {
-        validate_component("node_id", local_node_id)?;
-        let owner = self.owner(cell_id)?;
-        if owner == local_node_id {
-            Ok(())
-        } else {
-            Err(GraphError::ShardNotOwned {
-                cell_id: cell_id.to_string(),
-                owner_node_id: owner.to_string(),
-                local_node_id: local_node_id.to_string(),
-            })
-        }
-    }
-
-    pub fn cells_for_node(&self, node_id: &str) -> Result<Vec<String>> {
-        validate_component("node_id", node_id)?;
-        Ok(self
-            .owners
-            .iter()
-            .filter_map(|(cell_id, owner)| (owner == node_id).then_some(cell_id.clone()))
-            .collect())
+        Ok(Self {
+            cells,
+            nodes: nodes.into_iter().collect(),
+        })
     }
 
     pub fn cells(&self) -> impl Iterator<Item = &str> {
-        self.owners.keys().map(String::as_str)
+        self.cells.iter().map(String::as_str)
     }
 
     pub fn node_ids(&self) -> impl Iterator<Item = &str> {
-        let mut nodes = self.owners.values().map(String::as_str).collect::<Vec<_>>();
-        nodes.sort_unstable();
-        nodes.dedup();
-        nodes.into_iter()
+        self.nodes.iter().map(String::as_str)
+    }
+
+    pub fn contains_cell(&self, cell_id: &str) -> Result<bool> {
+        validate_component("cell_id", cell_id)?;
+        Ok(self.cells.contains(cell_id))
+    }
+
+    pub fn contains_node(&self, node_id: &str) -> Result<bool> {
+        validate_component("node_id", node_id)?;
+        Ok(self.nodes.contains(node_id))
     }
 }
 
@@ -222,41 +163,41 @@ struct RoutedClusterOpenConfig {
     base_path: String,
     scope: GraphScope,
     local_node_id: String,
-    placement: ShardPlacement,
+    directory: ObjectStoreNodeDirectory,
     object_store: Arc<dyn ObjectStore>,
-    writable: bool,
+    promotable: bool,
     options: GraphOpenOptions,
     memory: GraphMemoryConfig,
 }
 
 impl RoutedGraphCluster {
-    pub async fn open_owned(
+    pub async fn open_readers(
         base_path: impl Into<String>,
         local_node_id: impl Into<String>,
-        placement: ShardPlacement,
+        directory: ObjectStoreNodeDirectory,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
-        Self::open_owned_scoped(
+        Self::open_readers_scoped(
             base_path,
             GraphScope::default(),
             local_node_id,
-            placement,
+            directory,
             object_store,
         )
         .await
     }
 
-    pub async fn open_fenced_owned(
+    pub async fn open_promotable(
         base_path: impl Into<String>,
         local_node_id: impl Into<String>,
-        placement: ShardPlacement,
+        directory: ObjectStoreNodeDirectory,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
-        Self::open_fenced_owned_scoped_with_memory_options(
+        Self::open_promotable_scoped_with_memory_options(
             base_path,
             GraphScope::default(),
             local_node_id,
-            placement,
+            directory,
             object_store,
             GraphOpenOptions::default(),
             GraphMemoryConfig::default(),
@@ -264,18 +205,18 @@ impl RoutedGraphCluster {
         .await
     }
 
-    pub async fn open_fenced_owned_with_options(
+    pub async fn open_promotable_with_options(
         base_path: impl Into<String>,
         local_node_id: impl Into<String>,
-        placement: ShardPlacement,
+        directory: ObjectStoreNodeDirectory,
         object_store: Arc<dyn ObjectStore>,
         options: GraphOpenOptions,
     ) -> Result<Self> {
-        Self::open_fenced_owned_scoped_with_memory_options(
+        Self::open_promotable_scoped_with_memory_options(
             base_path,
             GraphScope::default(),
             local_node_id,
-            placement,
+            directory,
             object_store,
             options,
             GraphMemoryConfig::default(),
@@ -283,11 +224,11 @@ impl RoutedGraphCluster {
         .await
     }
 
-    pub async fn open_owned_scoped(
+    pub async fn open_readers_scoped(
         base_path: impl Into<String>,
         scope: GraphScope,
         local_node_id: impl Into<String>,
-        placement: ShardPlacement,
+        directory: ObjectStoreNodeDirectory,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
         let base_path = scope.scoped_store_path(&base_path.into());
@@ -295,20 +236,20 @@ impl RoutedGraphCluster {
             base_path,
             scope,
             local_node_id: local_node_id.into(),
-            placement,
+            directory,
             object_store,
-            writable: false,
+            promotable: false,
             options: GraphOpenOptions::default(),
             memory: GraphMemoryConfig::default(),
         })
         .await
     }
 
-    pub async fn open_fenced_owned_scoped_with_memory_options(
+    pub async fn open_promotable_scoped_with_memory_options(
         base_path: impl Into<String>,
         scope: GraphScope,
         local_node_id: impl Into<String>,
-        placement: ShardPlacement,
+        directory: ObjectStoreNodeDirectory,
         object_store: Arc<dyn ObjectStore>,
         options: GraphOpenOptions,
         memory: GraphMemoryConfig,
@@ -318,9 +259,9 @@ impl RoutedGraphCluster {
             base_path,
             scope,
             local_node_id: local_node_id.into(),
-            placement,
+            directory,
             object_store,
-            writable: true,
+            promotable: true,
             options,
             memory,
         })
@@ -332,21 +273,27 @@ impl RoutedGraphCluster {
             base_path,
             scope,
             local_node_id,
-            placement,
+            directory,
             object_store,
-            writable,
+            promotable,
             options,
             memory,
         } = config;
         validate_component("node_id", &local_node_id)?;
-        for cell_id in placement.cells() {
+        if !directory.contains_node(&local_node_id)? {
+            return Err(GraphError::CorruptValue {
+                key: format!("directory/node/{local_node_id}"),
+                reason: "local node is not present in the object-store node directory".to_string(),
+            });
+        }
+        for cell_id in directory.cells() {
             validate_component("cell_id", cell_id)?;
         }
         let mut shards = BTreeMap::new();
-        for cell_id in placement.cells_for_node(&local_node_id)? {
+        for cell_id in directory.cells().map(str::to_string) {
             let path = format!("{base_path}/{cell_id}");
-            let opened = if writable {
-                GraphShard::open_standalone_writer_with_memory_options(
+            let opened = if promotable {
+                GraphShard::open_promotable_with_memory_options(
                     path,
                     Arc::clone(&object_store),
                     options.clone(),
@@ -369,10 +316,11 @@ impl RoutedGraphCluster {
                     return Err(err);
                 }
             };
-            if shard
-                .read_remote(&keys::cell_drop_marker(&cell_id))
-                .await?
-                .is_some()
+            if !promotable
+                && shard
+                    .read_remote(&keys::cell_drop_marker(&cell_id))
+                    .await?
+                    .is_some()
             {
                 shard.close().await?;
                 continue;
@@ -382,10 +330,9 @@ impl RoutedGraphCluster {
         Ok(Self {
             scope,
             local_node_id,
-            placement,
+            directory,
             shards,
-            writable,
-            maintenance_metrics: Arc::new(GraphNodeMaintenanceMetrics::default()),
+            promotable,
         })
     }
 
@@ -395,14 +342,11 @@ impl RoutedGraphCluster {
     pub fn scope(&self) -> &GraphScope {
         &self.scope
     }
-    pub fn placement(&self) -> &ShardPlacement {
-        &self.placement
+    pub fn directory(&self) -> &ObjectStoreNodeDirectory {
+        &self.directory
     }
     pub fn local_cells(&self) -> Vec<&str> {
         self.shards.keys().map(String::as_str).collect()
-    }
-    pub fn maintenance_metrics(&self) -> GraphNodeMaintenanceMetricsSnapshot {
-        self.maintenance_metrics.snapshot()
     }
     pub async fn local_shard_runtime_metrics(&self) -> Vec<GraphShardRuntimeMetrics> {
         let mut metrics = Vec::with_capacity(self.shards.len());
@@ -419,8 +363,7 @@ impl RoutedGraphCluster {
     }
 
     pub fn shard(&self, cell_id: &str) -> Result<&GraphShard> {
-        self.placement
-            .ensure_local_owner(&self.local_node_id, cell_id)?;
+        validate_component("cell_id", cell_id)?;
         self.shards
             .get(cell_id)
             .map(Arc::as_ref)
@@ -429,34 +372,32 @@ impl RoutedGraphCluster {
             })
     }
 
-    pub(crate) fn ensure_local_writer(&self, cell_id: &str) -> Result<()> {
-        self.placement
-            .ensure_local_owner(&self.local_node_id, cell_id)?;
-        if !self.writable {
+    pub(crate) async fn ensure_local_writer(&self, cell_id: &str) -> Result<()> {
+        validate_component("cell_id", cell_id)?;
+        if !self.promotable {
             return Err(GraphError::WriteRequiresWriter {
                 operation: "routed_write",
                 cell_id: cell_id.to_string(),
             });
         }
-        self.shards
+        let shard = self
+            .shards
             .get(cell_id)
             .ok_or_else(|| GraphError::UnknownShard {
                 cell_id: cell_id.to_string(),
-            })?
-            .db
-            .writer()?;
-        Ok(())
+            })?;
+        shard.promote_to_writer(cell_id, "routed_write").await
     }
 
     pub async fn write_edge(&self, mutation: crate::EdgeMutation) -> Result<crate::CommitResult> {
         let shard = self.shard(&mutation.cell_id)?;
-        self.ensure_local_writer(&mutation.cell_id)?;
+        self.ensure_local_writer(&mutation.cell_id).await?;
         shard.write_edge(mutation).await
     }
 
     pub async fn delete_edge(&self, mutation: crate::EdgeMutation) -> Result<crate::DeleteResult> {
         let shard = self.shard(&mutation.cell_id)?;
-        self.ensure_local_writer(&mutation.cell_id)?;
+        self.ensure_local_writer(&mutation.cell_id).await?;
         shard.delete_edge(mutation).await
     }
 
@@ -468,7 +409,7 @@ impl RoutedGraphCluster {
         idempotency_key: &str,
     ) -> Result<crate::EdgeDeleteBatchResult> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard
             .delete_edges_batch(cell_id, edge_type, edges, idempotency_key)
             .await
@@ -483,7 +424,7 @@ impl RoutedGraphCluster {
         chunk_size: usize,
     ) -> Result<crate::EdgeDeleteBatchResult> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard
             .delete_edges_batch_chunked(cell_id, edge_type, edges, idempotency_key, chunk_size)
             .await
@@ -495,7 +436,7 @@ impl RoutedGraphCluster {
         mutations: impl IntoIterator<Item = crate::EdgeMutation>,
     ) -> Result<crate::EdgeDeleteBatchResult> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard.delete_edge_mutations_batch(cell_id, mutations).await
     }
 
@@ -506,7 +447,7 @@ impl RoutedGraphCluster {
         idempotency_key: &str,
     ) -> Result<crate::VertexDeleteResult> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard
             .delete_vertex(cell_id, vertex_id, idempotency_key)
             .await
@@ -519,7 +460,7 @@ impl RoutedGraphCluster {
         idempotency_key: &str,
     ) -> Result<crate::VertexDeleteResult> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard
             .detach_delete_vertex(cell_id, vertex_id, idempotency_key)
             .await
@@ -531,7 +472,7 @@ impl RoutedGraphCluster {
         idempotency_key: &str,
     ) -> Result<crate::GraphCellDropResult> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard.drop_cell(cell_id, idempotency_key).await
     }
 
@@ -542,7 +483,7 @@ impl RoutedGraphCluster {
         options: crate::EdgeIngestOptions,
     ) -> Result<crate::EdgeIngestResult> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard
             .ingest_edge_mutations(cell_id, mutations, options)
             .await
@@ -556,7 +497,7 @@ impl RoutedGraphCluster {
         idempotency_key: &str,
     ) -> Result<crate::BulkImportResult> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard
             .bulk_import_edges(cell_id, edge_type, edges, idempotency_key)
             .await
@@ -570,7 +511,7 @@ impl RoutedGraphCluster {
         idempotency_key: &str,
     ) -> Result<crate::BulkImportResult> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard
             .write_edges_batch(cell_id, edge_type, edges, idempotency_key)
             .await
@@ -585,7 +526,7 @@ impl RoutedGraphCluster {
         chunk_size: usize,
     ) -> Result<crate::BulkImportResult> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard
             .write_edges_batch_chunked(cell_id, edge_type, edges, idempotency_key, chunk_size)
             .await
@@ -598,7 +539,7 @@ impl RoutedGraphCluster {
         metadata: crate::VertexMetadata,
     ) -> Result<()> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard
             .set_vertex_metadata(cell_id, vertex_id, metadata)
             .await
@@ -610,7 +551,7 @@ impl RoutedGraphCluster {
         updates: impl IntoIterator<Item = (crate::VertexId, crate::VertexMetadata)>,
     ) -> Result<usize> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard.set_vertex_metadata_batch(cell_id, updates).await
     }
 
@@ -620,7 +561,7 @@ impl RoutedGraphCluster {
         updates: impl IntoIterator<Item = (crate::VertexId, crate::VertexMetadata)>,
     ) -> Result<usize> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard.import_vertex_metadata_batch(cell_id, updates).await
     }
 
@@ -633,7 +574,7 @@ impl RoutedGraphCluster {
         metadata: crate::EdgeMetadata,
     ) -> Result<bool> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard
             .set_edge_metadata(cell_id, edge_type, src, dst, metadata)
             .await
@@ -646,7 +587,7 @@ impl RoutedGraphCluster {
         updates: impl IntoIterator<Item = (crate::VertexId, crate::VertexId, crate::EdgeMetadata)>,
     ) -> Result<usize> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard
             .set_edge_metadata_batch(cell_id, edge_type, updates)
             .await
@@ -660,7 +601,7 @@ impl RoutedGraphCluster {
         idempotency_key: &str,
     ) -> Result<crate::RelationshipImportResult> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard
             .import_relationships_batch(cell_id, edge_type, relationships, idempotency_key)
             .await
@@ -672,7 +613,7 @@ impl RoutedGraphCluster {
         mutations: impl IntoIterator<Item = crate::EdgeMutation>,
     ) -> Result<crate::EdgeMutationBatchResult> {
         let shard = self.shard(cell_id)?;
-        self.ensure_local_writer(cell_id)?;
+        self.ensure_local_writer(cell_id).await?;
         shard.write_edge_mutations_batch(cell_id, mutations).await
     }
 
@@ -718,7 +659,7 @@ impl RoutedGraphCluster {
         let shard = self.shard(&context.cell_id)?;
         let plan = shard.plan_query_statement(context, statement)?;
         if plan.is_write() {
-            self.ensure_local_writer(&plan.cell_id)?;
+            self.ensure_local_writer(&plan.cell_id).await?;
         }
         shard.execute_query_plan(plan).await
     }
@@ -726,7 +667,7 @@ impl RoutedGraphCluster {
     pub async fn execute_query_plan(&self, plan: crate::QueryPlan) -> Result<crate::QueryOutput> {
         let shard = self.shard(&plan.cell_id)?;
         if plan.is_write() {
-            self.ensure_local_writer(&plan.cell_id)?;
+            self.ensure_local_writer(&plan.cell_id).await?;
         }
         shard.execute_query_plan(plan).await
     }
@@ -744,7 +685,7 @@ impl RoutedGraphCluster {
             crate::query::opencypher::OpenCypherQueryAccess::Write
         );
         if requires_writer {
-            self.ensure_local_writer(&context.cell_id)?;
+            self.ensure_local_writer(&context.cell_id).await?;
         }
         shard.execute_cypher(context, query).await
     }

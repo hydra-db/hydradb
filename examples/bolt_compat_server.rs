@@ -22,7 +22,8 @@ impl QueryCellClient for CompatibilityQueryClient {
             vec![QueryColumn::new("answer")],
             vec![QueryRow::new(vec![QueryValue::Count(42)])],
         )
-        .with_read_epoch(42))
+        .with_read_epoch(42)
+        .with_storage_sequence(42))
     }
 
     async fn execute_cypher_rows_page(
@@ -36,7 +37,7 @@ impl QueryCellClient for CompatibilityQueryClient {
         Ok(QueryResultPage::new(rows.columns, rows.rows, None))
     }
 
-    async fn current_graph_epoch(
+    async fn current_storage_sequence(
         &self,
         _scope: &GraphScope,
         _cell_id: &str,

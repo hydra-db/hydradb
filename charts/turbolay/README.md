@@ -1,6 +1,8 @@
 # Turbolay Helm Chart
 
-This chart deploys Turbolay graph nodes. SlateDB stores durable state in object storage and fences stale writers; node cache volumes are disposable.
+This chart deploys Turbolay query nodes and independent graph-indexer workers.
+SlateDB stores durable state in object storage and fences stale writers; every
+Pod and cache volume is disposable.
 
 ## Requirements
 
@@ -26,9 +28,16 @@ helm upgrade --install turbolay charts/turbolay \
 Verify the deployment:
 
 ```bash
-kubectl -n turbolay get pods,services
+kubectl -n turbolay get pods,deployments,statefulsets,services
 helm test turbolay -n turbolay
 ```
+
+Query nodes serve Bolt/HTTPS reads and canonical writes. Indexer workers have no
+client listener: they open SlateDB as durable readers, build immutable CSC graph
+index generations, and publish a compare-and-swap `current` pointer in object
+storage. Query nodes discover generations asynchronously and never perform a
+full topology build on a request thread. Scale `node.replicaCount` for query
+capacity and `indexer.replicaCount` for background indexing capacity.
 
 ## Image Publication
 
@@ -78,8 +87,8 @@ HTTPS. Load balancers should be internal unless public access is explicitly
 required.
 
 Outbound HTTPS is also denied by default. Set `networkPolicy.httpsEgressTo` to
-private peers that cover the Kubernetes API used for active-role publication
-and, on AWS with IRSA, the private S3 and STS endpoint addresses. Prefer
+private peers that cover, on AWS with IRSA, the private S3 and STS endpoint
+addresses. Prefer
 interface VPC endpoints with private DNS so this traffic stays inside the VPC.
 Kubernetes NetworkPolicy cannot restrict traffic by DNS name, so the chart
 rejects empty selectors and universal CIDRs instead of opening TCP/443 to the
@@ -88,6 +97,13 @@ Internet.
 ## Cache Storage
 
 `emptyDir` is the default because S3 is ground truth. Use `persistentVolume` to retain warm SSD cache across pod replacement. Cache loss affects cold-start latency, not durable graph data.
+
+Indexer Pods intentionally use disposable temporary storage. Published CSC
+generations live in object storage, while query-node NVMe and memory hold only
+reconstructible hydrated/compiled copies. The indexer retains
+`indexer.retainPreviousGenerations` older generations after each successful
+publish; generation keys carry their durable sequence so cleanup uses object
+listing rather than downloading large artifacts.
 
 The development example references an existing MinIO Service only to exercise
 the S3-compatible path without AWS. The chart does not install MinIO, and the
@@ -102,10 +118,13 @@ peers without a destination selector are rejected before installation.
 ## Upgrades
 
 Graph nodes use ordered StatefulSet rolling updates with a disruption budget.
-Rendezvous placement chooses one locality owner per cell. The owner opens that
-cell as a SlateDB writer, and SlateDB's writer epoch plus WAL barrier is the
-authoritative stale-writer fence. Kubernetes replaces failed StatefulSet Pods
-under the same stable node identity; no writable controller database is part of
-the data path. Because one chart release currently exposes one cell, the
-production default is one node replica; scale independently writable graph
-scopes with separate releases rather than paying for idle replicas.
+Every ready Pod can serve reads through a SlateDB `DbReader`; the Bolt routing
+table advertises one stable Pod as the preferred writer to preserve cache
+locality. This preference is disposable: SlateDB's writer epoch and WAL barrier
+remain the authoritative fence. No writable controller or placement database is
+part of the data path. Indexer Deployments can roll, fail, or scale independently
+without blocking canonical reads or writes. While an index generation lags,
+query nodes combine its CSC base with the committed SlateDB WAL tail; if no
+usable generation exists, correctness falls back to bounded canonical reads.
+Deploy independently writable graph scopes as separate releases and
+object-store prefixes.

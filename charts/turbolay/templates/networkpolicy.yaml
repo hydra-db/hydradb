@@ -41,6 +41,8 @@ spec:
       ports:
         - protocol: TCP
           port: 9090
+        - protocol: TCP
+          port: 9091
     {{- if .Values.tests.enabled }}
     - from:
         - podSelector:
@@ -73,6 +75,8 @@ spec:
           port: 8443
         - protocol: TCP
           port: 9090
+        - protocol: TCP
+          port: 9091
     {{- with .Values.networkPolicy.httpsEgressTo }}
     - to:
         {{- toYaml . | nindent 8 }}

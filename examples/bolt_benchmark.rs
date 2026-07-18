@@ -16,7 +16,7 @@ use slatedb_graph_kernel::{
     local_object_store, BoltServerConfig, BoltServerHandle, ClientBoltServer, ClientQueryService,
     ClientQueryServiceConfig, ClientQueryTarget, GraphBackpressurePolicy, GraphCacheConfig,
     GraphCachePolicy, GraphIndexPolicy, GraphLimits, GraphOpenOptions, GraphScope,
-    QueryTransportAction, QueryTransportScopeGrant, RoutedGraphCluster, ShardPlacement,
+    ObjectStoreNodeDirectory, QueryTransportAction, QueryTransportScopeGrant, RoutedGraphCluster,
     StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer,
 };
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -458,10 +458,10 @@ async fn open_environment(
     bulk_chunk_size: usize,
 ) -> BenchResult<BenchEnvironment> {
     let cluster = Arc::new(
-        RoutedGraphCluster::open_fenced_owned_with_options(
+        RoutedGraphCluster::open_promotable_with_options(
             paths.graph,
             "benchmark-node",
-            ShardPlacement::fixed([(CELL_ID, "benchmark-node")])?,
+            ObjectStoreNodeDirectory::new([CELL_ID], ["benchmark-node"])?,
             object_store,
             graph_options(fanout, max_hop, paths.cache),
         )

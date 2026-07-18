@@ -1,28 +1,28 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use slatedb::bytes::Bytes;
 use slatedb::config::{ReadOptions, ScanOptions};
-use slatedb::object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
+use slatedb::object_store::{path::Path, ObjectStore};
 use slatedb::ErrorKind;
-use slatedb::{Db, DbReader};
+use slatedb::{Db, DbReader, DbReaderSnapshot, DbSnapshot};
 #[cfg(feature = "opencypher")]
 use tokio::sync::watch;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock as AsyncRwLock, Semaphore};
 #[cfg(feature = "opencypher")]
 use tokio::task::JoinHandle;
 
 #[cfg(feature = "opencypher")]
 use crate::query::opencypher::ParsedRowQuery;
 use crate::{
-    engine, graph_now_millis, new_cell_write_lock_owner_token, parse_u64, sparse_kernel,
-    validate_component, BoundedGraphCache, GraphCacheMetrics, GraphCachePolicy, GraphError,
-    GraphIndexPolicy, GraphLimits, GraphOperationalMetrics, MatrixAdjacency, MatrixCacheKey,
-    Result, GRAPH_CELL_WRITE_LOCK_BACKOFF_MS, GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS,
+    engine, graph_now_millis, open_graph_db, open_graph_reader, sparse_kernel, BoundedGraphCache,
+    GraphCacheConfig, GraphCacheMetrics, GraphCachePolicy, GraphDurabilityConfig, GraphError,
+    GraphIndexPolicy, GraphLimits, GraphOperationalMetrics, GraphStorageMemoryConfig,
+    MatrixAdjacency, MatrixCacheKey, Result,
 };
 
 tokio::task_local! {
-    static ACTIVE_STORAGE_SNAPSHOT: Arc<slatedb::DbSnapshot>;
+    static ACTIVE_STORAGE_SNAPSHOT: Arc<GraphStorageSnapshot>;
 }
 #[cfg(feature = "opencypher")]
 use crate::{
@@ -32,13 +32,12 @@ use crate::{
 
 pub struct GraphShard {
     pub(crate) db: GraphStore,
-    pub(crate) object_store: Arc<dyn ObjectStore>,
-    pub(crate) store_path: Path,
     pub(crate) limits: GraphLimits,
     pub(crate) cache_policy: GraphCachePolicy,
     pub(crate) cache_metrics: Arc<GraphCacheMetrics>,
     pub(crate) operation_metrics: Arc<GraphOperationalMetrics>,
     pub(crate) hydration_gate: Arc<Semaphore>,
+    #[cfg(feature = "graphblas")]
     pub(crate) matrix_compilation_gate: Arc<Semaphore>,
     pub(crate) graph_write_gate: Arc<Semaphore>,
     pub(crate) artifact_build_gate: Arc<Semaphore>,
@@ -46,9 +45,13 @@ pub struct GraphShard {
     pub(crate) index_policy: GraphIndexPolicy,
     pub(crate) await_durable_writes: bool,
     pub(crate) write_authority: GraphWriteAuthority,
+    pub(crate) local_write_guard: Arc<Mutex<()>>,
+    pub(crate) local_artifact_guard: Arc<Mutex<()>>,
     pub(crate) writer_lanes: Vec<Mutex<()>>,
     pub(crate) matrix_artifact_cache:
         Mutex<BoundedGraphCache<MatrixCacheKey, engine::MatrixArtifact>>,
+    pub(crate) graph_index_generations:
+        Mutex<std::collections::BTreeMap<MatrixCacheKey, engine::GraphIndexGeneration>>,
     pub(crate) matrix_cache: Mutex<BoundedGraphCache<MatrixCacheKey, Arc<MatrixAdjacency>>>,
     pub(crate) graphblas_cache:
         Mutex<BoundedGraphCache<MatrixCacheKey, Arc<sparse_kernel::CompiledGraphBlasMatrix>>>,
@@ -67,16 +70,39 @@ pub struct GraphShard {
 }
 
 #[derive(Clone)]
-pub(crate) enum GraphStore {
-    Writer(Db),
-    Reader(Arc<DbReader>),
+pub(crate) struct GraphStore {
+    inner: Arc<GraphStoreInner>,
 }
 
-impl GraphStore {
-    pub(crate) fn writer(&self) -> Result<&Db> {
+struct GraphStoreInner {
+    path: Path,
+    object_store: Arc<dyn ObjectStore>,
+    cache: GraphCacheConfig,
+    storage_memory: GraphStorageMemoryConfig,
+    durability: GraphDurabilityConfig,
+    writer: StdRwLock<Option<Db>>,
+    reader: AsyncRwLock<Option<Arc<DbReader>>>,
+    writer_open_gate: Mutex<()>,
+    reader_open_gate: Mutex<()>,
+}
+
+pub(crate) enum GraphStorageSnapshot {
+    Writer(Arc<DbSnapshot>),
+    Reader(Arc<DbReaderSnapshot>),
+}
+
+impl GraphStorageSnapshot {
+    pub(crate) fn seq(&self) -> u64 {
         match self {
-            Self::Writer(db) => Ok(db),
-            Self::Reader(_) => Err(GraphError::ReadOnlyShardStorage),
+            Self::Writer(snapshot) => snapshot.seq(),
+            Self::Reader(snapshot) => snapshot.seq(),
+        }
+    }
+
+    pub(crate) fn last_wal_id(&self) -> Option<u64> {
+        match self {
+            Self::Writer(_) => None,
+            Self::Reader(snapshot) => Some(snapshot.last_wal_id()),
         }
     }
 
@@ -85,13 +111,156 @@ impl GraphStore {
         key: &[u8],
         options: &ReadOptions,
     ) -> std::result::Result<Option<Bytes>, slatedb::Error> {
-        if let Ok(snapshot) = ACTIVE_STORAGE_SNAPSHOT.try_with(Arc::clone) {
-            return snapshot.get_with_options(key, options).await;
-        }
         match self {
-            Self::Writer(db) => db.get_with_options(key, options).await,
-            Self::Reader(reader) => reader.get_with_options(key, options).await,
+            Self::Writer(snapshot) => snapshot.get_with_options(key, options).await,
+            Self::Reader(snapshot) => snapshot.get_with_options(key, options).await,
         }
+    }
+
+    pub(crate) async fn scan_prefix_with_options<T>(
+        &self,
+        prefix: &[u8],
+        subrange: T,
+        options: &ScanOptions,
+    ) -> std::result::Result<slatedb::DbIterator, slatedb::Error>
+    where
+        T: slatedb::ByteRangeBounds + Send,
+    {
+        match self {
+            Self::Writer(snapshot) => {
+                snapshot
+                    .scan_prefix_with_options(prefix, subrange, options)
+                    .await
+            }
+            Self::Reader(snapshot) => {
+                snapshot
+                    .scan_prefix_with_options(prefix, subrange, options)
+                    .await
+            }
+        }
+    }
+}
+
+impl GraphStore {
+    pub(crate) fn lazy(
+        path: Path,
+        object_store: Arc<dyn ObjectStore>,
+        cache: GraphCacheConfig,
+        storage_memory: GraphStorageMemoryConfig,
+        durability: GraphDurabilityConfig,
+    ) -> Self {
+        Self {
+            inner: Arc::new(GraphStoreInner {
+                path,
+                object_store,
+                cache,
+                storage_memory,
+                durability,
+                writer: StdRwLock::new(None),
+                reader: AsyncRwLock::new(None),
+                writer_open_gate: Mutex::new(()),
+                reader_open_gate: Mutex::new(()),
+            }),
+        }
+    }
+
+    fn open_writer(&self) -> Option<Db> {
+        self.inner
+            .writer
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn store_path(&self) -> &Path {
+        &self.inner.path
+    }
+
+    pub(crate) fn object_store(&self) -> &Arc<dyn ObjectStore> {
+        &self.inner.object_store
+    }
+
+    pub(crate) fn writer(&self) -> Result<Db> {
+        self.open_writer().ok_or(GraphError::ReadOnlyShardStorage)
+    }
+
+    pub(crate) async fn refresh_writer_fence(&self) -> Result<()> {
+        let _open_guard = self.inner.writer_open_gate.lock().await;
+        let writer = self.open_writer().ok_or(GraphError::ReadOnlyShardStorage)?;
+        match writer.refresh_manifest().await {
+            Ok(()) => Ok(()),
+            Err(err) if matches!(err.kind(), ErrorKind::Closed(slatedb::CloseReason::Fenced)) => {
+                *self
+                    .inner
+                    .writer
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                Err(err.into())
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    pub(crate) async fn promote_writer(&self) -> Result<bool> {
+        if self.open_writer().is_some() {
+            return Ok(false);
+        }
+        let _open_guard = self.inner.writer_open_gate.lock().await;
+        if self.open_writer().is_some() {
+            return Ok(false);
+        }
+        let writer = open_graph_db(
+            self.inner.path.clone(),
+            Arc::clone(&self.inner.object_store),
+            &self.inner.cache,
+            &self.inner.storage_memory,
+            &self.inner.durability,
+        )
+        .await?;
+        *self
+            .inner
+            .writer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(writer);
+        Ok(true)
+    }
+
+    pub(crate) async fn open_reader(&self) -> Result<Arc<DbReader>> {
+        if let Some(reader) = self.inner.reader.read().await.as_ref().cloned() {
+            return Ok(reader);
+        }
+        let _open_guard = self.inner.reader_open_gate.lock().await;
+        if let Some(reader) = self.inner.reader.read().await.as_ref().cloned() {
+            return Ok(reader);
+        }
+        let reader = Arc::new(
+            open_graph_reader(
+                self.inner.path.clone(),
+                Arc::clone(&self.inner.object_store),
+                &self.inner.cache,
+            )
+            .await?,
+        );
+        *self.inner.reader.write().await = Some(Arc::clone(&reader));
+        Ok(reader)
+    }
+
+    pub(crate) async fn get_with_options(
+        &self,
+        key: &[u8],
+        options: &ReadOptions,
+    ) -> Result<Option<Bytes>> {
+        if let Ok(snapshot) = ACTIVE_STORAGE_SNAPSHOT.try_with(Arc::clone) {
+            return Ok(snapshot.get_with_options(key, options).await?);
+        }
+        if let Some(writer) = self.open_writer() {
+            return Ok(writer.get_with_options(key, options).await?);
+        }
+        Ok(self
+            .open_reader()
+            .await?
+            .get_with_options(key, options)
+            .await?)
     }
 
     pub(crate) async fn scan_prefix_with_options(
@@ -99,53 +268,113 @@ impl GraphStore {
         prefix: &[u8],
         start_suffix: Option<Vec<u8>>,
         options: &ScanOptions,
-    ) -> std::result::Result<slatedb::DbIterator, slatedb::Error> {
+    ) -> Result<slatedb::DbIterator> {
         if let Ok(snapshot) = ACTIVE_STORAGE_SNAPSHOT.try_with(Arc::clone) {
-            return match start_suffix {
+            return Ok(match start_suffix {
                 Some(start) => {
                     snapshot
                         .scan_prefix_with_options(prefix, start.., options)
-                        .await
+                        .await?
                 }
-                None => snapshot.scan_prefix_with_options(prefix, .., options).await,
-            };
+                None => {
+                    snapshot
+                        .scan_prefix_with_options(prefix, .., options)
+                        .await?
+                }
+            });
         }
-        match (self, start_suffix) {
-            (Self::Writer(db), Some(start)) => {
-                db.scan_prefix_with_options(prefix, start.., options).await
-            }
-            (Self::Writer(db), None) => db.scan_prefix_with_options(prefix, .., options).await,
-            (Self::Reader(reader), Some(start)) => {
+        if let Some(writer) = self.open_writer() {
+            return Ok(match start_suffix {
+                Some(start) => {
+                    writer
+                        .scan_prefix_with_options(prefix, start.., options)
+                        .await?
+                }
+                None => writer.scan_prefix_with_options(prefix, .., options).await?,
+            });
+        }
+        let reader = self.open_reader().await?;
+        Ok(match start_suffix {
+            Some(start) => {
                 reader
                     .scan_prefix_with_options(prefix, start.., options)
-                    .await
+                    .await?
             }
-            (Self::Reader(reader), None) => {
-                reader.scan_prefix_with_options(prefix, .., options).await
-            }
-        }
+            None => reader.scan_prefix_with_options(prefix, .., options).await?,
+        })
     }
 
-    pub(crate) async fn close(&self) -> std::result::Result<(), slatedb::Error> {
-        match self {
-            Self::Writer(db) => db.close().await,
-            Self::Reader(reader) => reader.close().await,
+    pub(crate) async fn close(&self) -> Result<()> {
+        let reader = self.inner.reader.read().await.as_ref().cloned();
+        if let Some(reader) = reader {
+            reader.close().await?;
         }
+        if let Some(writer) = self.open_writer() {
+            writer.close().await?;
+        }
+        Ok(())
     }
 
-    pub(crate) async fn snapshot(
-        &self,
-    ) -> std::result::Result<Option<Arc<slatedb::DbSnapshot>>, slatedb::Error> {
-        match self {
-            Self::Writer(db) => db.snapshot().await.map(Some),
-            // DbReader already pins its manifest through a checkpoint. It does
-            // not expose DbSnapshot in the SlateDB revision used here.
-            Self::Reader(_) => Ok(None),
+    pub(crate) async fn snapshot(&self) -> Result<Arc<GraphStorageSnapshot>> {
+        if let Ok(snapshot) = ACTIVE_STORAGE_SNAPSHOT.try_with(Arc::clone) {
+            return Ok(snapshot);
         }
+        if let Some(writer) = self.open_writer() {
+            return writer
+                .snapshot()
+                .await
+                .map(|snapshot| Arc::new(GraphStorageSnapshot::Writer(snapshot)))
+                .map_err(Into::into);
+        }
+        self.open_reader()
+            .await?
+            .snapshot()
+            .await
+            .map(|snapshot| Arc::new(GraphStorageSnapshot::Reader(snapshot)))
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn reader_snapshot(&self) -> Result<Arc<GraphStorageSnapshot>> {
+        self.open_reader()
+            .await?
+            .snapshot()
+            .await
+            .map(|snapshot| Arc::new(GraphStorageSnapshot::Reader(snapshot)))
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn durable_sequence(&self) -> Result<u64> {
+        if let Some(writer) = self.open_writer() {
+            return Ok(writer.status().durable_seq);
+        }
+        Ok(self.open_reader().await?.status().durable_seq)
+    }
+
+    pub(crate) async fn refresh_durable_reader(&self) -> Result<u64> {
+        let reader = self.open_reader().await?;
+        reader.refresh().await?;
+        Ok(reader.status().durable_seq)
+    }
+
+    #[cfg(feature = "graphblas")]
+    pub(crate) async fn last_durable_wal_id(&self) -> Result<u64> {
+        let snapshot = self.snapshot().await?;
+        if let Some(last_wal_id) = snapshot.last_wal_id() {
+            return Ok(last_wal_id);
+        }
+        Ok(self.writer()?.last_flushed_wal_id())
+    }
+
+    #[cfg(feature = "graphblas")]
+    pub(crate) fn wal_reader(&self) -> slatedb::WalReader {
+        slatedb::WalReader::new(
+            self.inner.path.clone(),
+            Arc::clone(&self.inner.object_store),
+        )
     }
 
     pub(crate) async fn scope_snapshot<F>(
-        snapshot: Arc<slatedb::DbSnapshot>,
+        snapshot: Arc<GraphStorageSnapshot>,
         future: F,
     ) -> F::Output
     where
@@ -242,6 +471,7 @@ impl GraphCacheResidentBytes {
 #[derive(Clone)]
 pub(crate) enum GraphWriteAuthority {
     ReadOnly,
+    Promotable,
     Writer,
 }
 
@@ -251,353 +481,36 @@ pub(crate) enum GraphWriteOp {
     Delete(Bytes),
 }
 
-pub(crate) struct CellWriteLock {
-    pub(crate) object_store: Arc<dyn ObjectStore>,
-    pub(crate) path: Path,
-    pub(crate) owner_token: String,
-    pub(crate) ttl_ms: u64,
+static LOCAL_WRITE_GUARD_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) struct LocalWriteGuard {
+    pub(crate) token: String,
+    _guard: OwnedMutexGuard<()>,
 }
 
-impl CellWriteLock {
+impl LocalWriteGuard {
+    pub(crate) fn new(guard: OwnedMutexGuard<()>) -> Self {
+        let counter = LOCAL_WRITE_GUARD_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self {
+            token: format!("{}-{}-{counter}", graph_now_millis(), std::process::id()),
+            _guard: guard,
+        }
+    }
+
     pub(crate) async fn renew(&self) -> Result<()> {
-        let current = self.object_store.get(&self.path).await?;
-        let version = UpdateVersion {
-            e_tag: current.meta.e_tag.clone(),
-            version: current.meta.version.clone(),
-        };
-        let value = current.bytes().await?;
-        let record = decode_cell_write_lock_record(self.path.as_ref(), &value)?;
-        if record.owner_token != self.owner_token || record.state != CellWriteLockState::Active {
-            return Err(GraphError::CellWriteConflict {
-                operation: "renew_cell_write_lock",
-                cell_id: record.cell_id,
-            });
-        }
-        let now_ms = graph_now_millis();
-        let payload = encode_cell_write_lock_record(
-            &record.cell_id,
-            &record.operation,
-            &self.owner_token,
-            record.created_ms,
-            now_ms.saturating_add(self.ttl_ms),
-            CellWriteLockState::Active,
-        );
-        match self
-            .object_store
-            .put_opts(&self.path, payload.into(), PutMode::Update(version).into())
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(slatedb::object_store::Error::Precondition { .. })
-            | Err(slatedb::object_store::Error::NotFound { .. }) => {
-                Err(GraphError::CellWriteConflict {
-                    operation: "renew_cell_write_lock",
-                    cell_id: record.cell_id,
-                })
-            }
-            Err(slatedb::object_store::Error::NotImplemented { .. })
-            | Err(slatedb::object_store::Error::NotSupported { .. }) => {
-                // Some local object-store backends do not support conditional update. We already
-                // verified that this owner still holds an active lock; those backends also cannot
-                // safely CAS-reclaim the lock, so accepting the renewal preserves exclusivity.
-                Ok(())
-            }
-            Err(err) => Err(err.into()),
-        }
+        Ok(())
     }
 
     pub(crate) async fn release(self) -> Result<()> {
-        let current = match self.object_store.get(&self.path).await {
-            Ok(current) => current,
-            Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(()),
-            Err(err) => return Err(err.into()),
-        };
-        let version = UpdateVersion {
-            e_tag: current.meta.e_tag.clone(),
-            version: current.meta.version.clone(),
-        };
-        let value = current.bytes().await?;
-        let record = decode_cell_write_lock_record(self.path.as_ref(), &value)?;
-        if record.owner_token != self.owner_token {
-            return Ok(());
-        }
-        let payload = encode_cell_write_lock_record(
-            &record.cell_id,
-            &record.operation,
-            &self.owner_token,
-            record.created_ms,
-            0,
-            CellWriteLockState::Released,
-        );
-        match self
-            .object_store
-            .put_opts(&self.path, payload.into(), PutMode::Update(version).into())
-            .await
-        {
-            Ok(_) | Err(slatedb::object_store::Error::Precondition { .. }) => Ok(()),
-            Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
-            Err(slatedb::object_store::Error::NotImplemented { .. })
-            | Err(slatedb::object_store::Error::NotSupported { .. }) => {
-                match self.object_store.delete(&self.path).await {
-                    Ok(()) | Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
-                    Err(err) => Err(err.into()),
-                }
-            }
-            Err(err) => Err(err.into()),
-        }
+        Ok(())
     }
 }
 
-pub(crate) async fn acquire_distributed_write_lock(
-    object_store: Arc<dyn ObjectStore>,
-    path: Path,
-    scope_id: &str,
-    operation: &'static str,
-    ttl_ms: u64,
-) -> Result<CellWriteLock> {
-    validate_component("lock_scope", scope_id)?;
-    if ttl_ms == 0 {
-        return Err(GraphError::CorruptValue {
-            key: path.to_string(),
-            reason: "distributed write lock TTL must be greater than zero".to_string(),
-        });
-    }
-    let owner_token = new_cell_write_lock_owner_token();
-    for attempt in 0..GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS {
-        let now_ms = graph_now_millis();
-        let payload = encode_cell_write_lock_record(
-            scope_id,
-            operation,
-            &owner_token,
-            now_ms,
-            now_ms.saturating_add(ttl_ms),
-            CellWriteLockState::Active,
-        );
-        match object_store
-            .put_opts(&path, payload.clone().into(), PutMode::Create.into())
-            .await
-        {
-            Ok(_) => {
-                return Ok(CellWriteLock {
-                    object_store,
-                    path,
-                    owner_token,
-                    ttl_ms,
-                });
-            }
-            Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
-                if let Some(lock) = try_reclaim_distributed_write_lock(
-                    Arc::clone(&object_store),
-                    &path,
-                    scope_id,
-                    operation,
-                    &owner_token,
-                    ttl_ms,
-                )
-                .await?
-                {
-                    return Ok(lock);
-                }
-                if attempt + 1 < GRAPH_CELL_WRITE_LOCK_MAX_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        GRAPH_CELL_WRITE_LOCK_BACKOFF_MS,
-                    ))
-                    .await;
-                    continue;
-                }
-                return Err(GraphError::CellWriteConflict {
-                    operation,
-                    cell_id: scope_id.to_string(),
-                });
-            }
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Err(GraphError::CellWriteConflict {
-        operation,
-        cell_id: scope_id.to_string(),
-    })
-}
-
-async fn try_reclaim_distributed_write_lock(
-    object_store: Arc<dyn ObjectStore>,
-    path: &Path,
-    scope_id: &str,
-    operation: &'static str,
-    owner_token: &str,
-    ttl_ms: u64,
-) -> Result<Option<CellWriteLock>> {
-    let current = match object_store.get(path).await {
-        Ok(current) => current,
-        Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let version = UpdateVersion {
-        e_tag: current.meta.e_tag.clone(),
-        version: current.meta.version.clone(),
-    };
-    let value = current.bytes().await?;
-    let record = decode_cell_write_lock_record(path.as_ref(), &value)?;
-    if record.cell_id != scope_id {
-        return Err(GraphError::CorruptValue {
-            key: path.to_string(),
-            reason: format!(
-                "distributed write lock belongs to scope {}, expected {scope_id}",
-                record.cell_id
-            ),
-        });
-    }
-    let now_ms = graph_now_millis();
-    if !record.is_expired(now_ms) {
-        return Ok(None);
-    }
-    let payload = encode_cell_write_lock_record(
-        scope_id,
-        operation,
-        owner_token,
-        now_ms,
-        now_ms.saturating_add(ttl_ms),
-        CellWriteLockState::Active,
-    );
-    match object_store
-        .put_opts(path, payload.into(), PutMode::Update(version).into())
-        .await
-    {
-        Ok(_) => Ok(Some(CellWriteLock {
-            object_store,
-            path: path.clone(),
-            owner_token: owner_token.to_string(),
-            ttl_ms,
-        })),
-        Err(slatedb::object_store::Error::Precondition { .. })
-        | Err(slatedb::object_store::Error::NotFound { .. })
-        | Err(slatedb::object_store::Error::NotImplemented { .. })
-        | Err(slatedb::object_store::Error::NotSupported { .. }) => Ok(None),
-        Err(err) => Err(err.into()),
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum CellWriteLockState {
-    Active,
-    Released,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CellWriteLockRecord {
-    pub(crate) cell_id: String,
-    pub(crate) operation: String,
-    pub(crate) owner_token: String,
-    pub(crate) created_ms: u64,
-    pub(crate) expires_at_ms: u64,
-    pub(crate) state: CellWriteLockState,
-}
-
-impl CellWriteLockRecord {
-    pub(crate) fn is_expired(&self, now_ms: u64) -> bool {
-        self.state == CellWriteLockState::Released || self.expires_at_ms <= now_ms
-    }
-}
-
-pub(crate) fn encode_cell_write_lock_record(
-    cell_id: &str,
-    operation: &str,
-    owner_token: &str,
-    created_ms: u64,
-    expires_at_ms: u64,
-    state: CellWriteLockState,
-) -> Bytes {
-    let state = match state {
-        CellWriteLockState::Active => "active",
-        CellWriteLockState::Released => "released",
-    };
-    Bytes::from(format!(
-        "graph-cell-write-lock-v1\ncell={cell_id}\noperation={operation}\nowner_token={owner_token}\ncreated_ms={created_ms}\nexpires_at_ms={expires_at_ms}\nstate={state}\n"
-    ))
-}
-
-pub(crate) fn decode_cell_write_lock_record(
-    key: &str,
-    value: &[u8],
-) -> Result<CellWriteLockRecord> {
-    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
-        key: key.to_string(),
-        reason: err.to_string(),
-    })?;
-    let mut lines = text.trim_end_matches('\n').lines();
-    let Some(header) = lines.next() else {
-        return Err(GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: "empty cell write lock record".to_string(),
-        });
-    };
-    let mut fields = BTreeMap::new();
-    for line in lines {
-        let Some((name, value)) = line.split_once('=') else {
-            return Err(GraphError::CorruptValue {
-                key: key.to_string(),
-                reason: format!("invalid cell write lock field {line}"),
-            });
-        };
-        fields.insert(name, value);
-    }
-    let field = |name: &'static str| -> Result<&str> {
-        fields
-            .get(name)
-            .copied()
-            .ok_or_else(|| GraphError::CorruptValue {
-                key: key.to_string(),
-                reason: format!("missing cell write lock field {name}"),
-            })
-    };
-    let cell_id = field("cell")?;
-    validate_component("cell_id", cell_id)?;
-    let operation = field("operation")?;
-    validate_component("operation", operation)?;
-
-    match header {
-        "graph-cell-write-lock-v1" => {
-            let owner_token = field("owner_token")?;
-            let created_ms = parse_u64(key, field("created_ms")?, "created_ms")?;
-            let expires_at_ms = parse_u64(key, field("expires_at_ms")?, "expires_at_ms")?;
-            let state = match field("state")? {
-                "active" => CellWriteLockState::Active,
-                "released" => CellWriteLockState::Released,
-                other => {
-                    return Err(GraphError::CorruptValue {
-                        key: key.to_string(),
-                        reason: format!("invalid cell write lock state {other}"),
-                    });
-                }
-            };
-            Ok(CellWriteLockRecord {
-                cell_id: cell_id.to_string(),
-                operation: operation.to_string(),
-                owner_token: owner_token.to_string(),
-                created_ms,
-                expires_at_ms,
-                state,
-            })
-        }
-        other => Err(GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: format!("unsupported cell write lock record {other}"),
-        }),
-    }
-}
-
-pub(crate) async fn release_cell_write_lock<T>(
-    lock: CellWriteLock,
-    result: Result<T>,
-) -> Result<T> {
-    match (result, lock.release().await) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(err)) => Err(err),
-        (Err(err), _) => Err(err),
-    }
+pub(crate) async fn finish_local_write<T>(guard: LocalWriteGuard, result: Result<T>) -> Result<T> {
+    guard.release().await?;
+    result
 }
 
 pub(crate) fn is_retryable_write_conflict(err: &GraphError) -> bool {
-    matches!(err, GraphError::Slate(err) if err.kind() == ErrorKind::Transaction)
-        || matches!(err, GraphError::CellWriteConflict { .. })
+    matches!(err, GraphError::Slate(err) if matches!(err.kind(), ErrorKind::Transaction | ErrorKind::Invalid))
 }

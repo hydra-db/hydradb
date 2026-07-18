@@ -1,17 +1,12 @@
 use thiserror::Error;
 
-use crate::TopologySequence;
+use crate::StorageSequence;
 #[derive(Debug, Error)]
 pub enum GraphError {
     #[error("slatedb error: {0}")]
     Slate(#[from] slatedb::Error),
     #[error("object store error: {0}")]
     ObjectStore(#[from] slatedb::object_store::Error),
-    #[error("cell write conflict for {operation} on {cell_id}")]
-    CellWriteConflict {
-        operation: &'static str,
-        cell_id: String,
-    },
     #[error("conditional graph write conflict for {operation} at {key}")]
     ConditionalWriteConflict {
         operation: &'static str,
@@ -53,18 +48,18 @@ pub enum GraphError {
     ControlWatermarkRegression {
         cell_id: String,
         field: &'static str,
-        requested_epoch: TopologySequence,
-        current_epoch: TopologySequence,
+        requested_epoch: StorageSequence,
+        current_epoch: StorageSequence,
     },
     #[error(
         "snapshot epoch {read_epoch} is ahead of current epoch {current_epoch} for cell {cell_id}"
     )]
     SnapshotAhead {
         cell_id: String,
-        read_epoch: TopologySequence,
-        current_epoch: TopologySequence,
+        read_epoch: StorageSequence,
+        current_epoch: StorageSequence,
     },
-    #[error("no shard placement exists for cell {cell_id}")]
+    #[error("cell {cell_id} is not present in the node directory")]
     UnknownShard { cell_id: String },
     #[error("graph scope mismatch: expected {expected}, received {actual}")]
     GraphScopeMismatch { expected: String, actual: String },
@@ -73,12 +68,6 @@ pub enum GraphError {
         principal: String,
         action: &'static str,
         scope: String,
-    },
-    #[error("cell {cell_id} is owned by node {owner_node_id}, not local node {local_node_id}")]
-    ShardNotOwned {
-        cell_id: String,
-        owner_node_id: String,
-        local_node_id: String,
     },
     #[error("{operation} requires the fenced SlateDB writer for cell {cell_id}")]
     WriteRequiresWriter {
@@ -98,8 +87,8 @@ pub enum GraphError {
     SnapshotExpired {
         cell_id: String,
         edge_type: String,
-        read_epoch: TopologySequence,
-        min_epoch: TopologySequence,
+        read_epoch: StorageSequence,
+        min_epoch: StorageSequence,
     },
     #[error(
         "{operation} snapshot epoch {read_epoch} for cell {cell_id} edge {edge_type} changed while building; current epoch is {current_epoch}"
@@ -108,8 +97,8 @@ pub enum GraphError {
         operation: &'static str,
         cell_id: String,
         edge_type: String,
-        read_epoch: TopologySequence,
-        current_epoch: TopologySequence,
+        read_epoch: StorageSequence,
+        current_epoch: StorageSequence,
     },
     #[error(
         "{operation} stats snapshot epoch {read_epoch} for cell {cell_id} changed while refreshing; current epoch is {current_epoch}"
@@ -117,8 +106,8 @@ pub enum GraphError {
     QueryStatsSnapshotChanged {
         operation: &'static str,
         cell_id: String,
-        read_epoch: TopologySequence,
-        current_epoch: TopologySequence,
+        read_epoch: StorageSequence,
+        current_epoch: StorageSequence,
     },
     #[error("{operation} rejected by admission control: actual {actual} exceeds limit {limit}")]
     AdmissionRejected {

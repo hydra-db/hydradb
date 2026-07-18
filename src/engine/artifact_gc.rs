@@ -5,7 +5,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge_type: &str,
-        keep_epoch: TopologySequence,
+        keep_epoch: StorageSequence,
     ) -> Result<ArtifactGcResult> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
