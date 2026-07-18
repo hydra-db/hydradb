@@ -18,17 +18,21 @@ violation while reaching its named actions. Apalache then bounded-checked every
 main model through six transitions using `quint verify` and
 `mise exec java@21.0.2`; all five runs returned `NoError`.
 
-| Family | Safety boundary | Deterministic scenarios | Apalache bound | MBT trace |
+| Family | Safety boundary | Deterministic scenarios | Apalache bound | Rust MBT status |
 |---|---|---:|---:|---|
-| M1 | atomic edge projection, idempotency, writer fencing | 4 | 6 | generated |
+| M1 | atomic edge projection, idempotency, writer fencing | 4 | 6 | 24 seeded public-API traces pass |
 | M2 | page snapshot scope, historical epoch rejection, bookmarks | 3 | 6 | generated |
 | M3 | artifact generation fence, matrix equivalence, reader retention | 4 | 6 | pending |
 | M4 | placement disagreement and durable writer fence | 3 | 6 | pending |
 | M5 | command normalization, relationship identity, batch semantics | 5 | 6 | pending |
 
 The generated M1/M2 Informal Trace Format files are under `target/formal/` and
-are ignored by Git. They include `mbt::actionTaken`; this proves trace
-generation, not a replay against Rust.
+are ignored by Git. M1 is additionally replayed against Rust by
+`tests/formal_mbt.rs`: `quint-connect` generates 24 deterministic-seed
+simulation traces, calls only public `GraphShard` APIs, and compares the
+normalized state after every step. The four named `quint test` witnesses remain
+Quint-only because `quint test` ITF output omits `mbt::actionTaken`, which the
+current adapter requires for action dispatch.
 
 ## Evidence boundary
 
@@ -44,30 +48,30 @@ The bug records make this distinction explicit:
 |---|---|---|
 | BFG-001 | fault model counterexample; current page-entry scope fix; M2 bounded check | force a writer commit inside historical/current graph-kernel and streaming page operators, then replay in Rust MBT |
 | BFG-002 | fault model counterexample; historical `e875387` test returns current row; current regression rejects; M2 bounded check | Rust MBT replay and review |
-| BFG-003/BFG-004 | M1/M5 model makes the identity/batch choice explicit | approve relationship-ID scope and duplicate-row public contract before calling either a defect or fixed |
+| BFG-003/BFG-004 | M1/M5 model makes the identity/batch choice explicit; M1 Rust MBT verifies structural-edge retries | implement the approved relationship-ID and duplicate-row contract in the M5 driver |
 | BFG-005/BFG-006 | M1/M3 check normalized write and stale-build safety | implementation trace adapter plus concurrent artifact test |
 | BFG-007 | M2/M4 model safety only | decide remote bookmark/read-only freshness guarantee |
 | BFG-008 | deliberately open direct-page contract | approve best-effort behavior or add a snapshot-bearing/materialized direct cursor |
 
 ## Rust MBT adapter scope
 
-Add a test-only `quint-connect`/ITF driver only after resolving its version
-against this repository's Rust toolchain. The driver must invoke public kernel
-APIs and compare a normalized projection after every trace action; it must not
-read private SlateDB keys as its oracle.
+The test-only `quint-connect` 0.1.2 driver is resolved in the workspace's
+locked development dependencies. It invokes public kernel APIs and compares a
+normalized projection after every trace action; it does not read private
+SlateDB keys as its oracle.
 
 | Family | Rust action binding | Public normalization after each action |
 |---|---|---|
-| M1 | `GraphShard::open_standalone_writer`, `write_edge`, `delete_edge`, retry, writer reopen | edge existence, neighbors, degree, current epoch, idempotency outcome |
+| M1 | **implemented:** `GraphShard::open_standalone_writer`, `write_edge`, `delete_edge`, retry, close/reopen | edge existence, degree, current epoch, recorded idempotency outcome |
 | M2 | `snapshot`, `edge_exists_at`, `out_neighbors_at`, `out_degree_at`, `execute_cypher_rows_page` | one snapshot's edge/neighbor/degree projection; typed historical error; page rows |
 | M3 | artifact build/refresh, direct and matrix reachability, maintenance GC | direct traversal equals matrix-plus-delta traversal; publication generation; retained read succeeds |
 | M4 | fenced owned shard/routed cluster open and replacement writer | one accepted writer, monotone epoch, fresh reader sees committed prefix |
 | M5 | Cypher `CREATE`/`MERGE`/`DELETE`/batch plus service cursor calls | normalized rows, relationship identity, batch outcome, materialized cursor rows |
 
-The first implementation order is M1, then M2. It should run a local
-in-memory/object-store trace first, retain the input ITF plus observed
-projection on failure, and rerun the same corpus against MinIO. M3–M5 follow
-only after their required public semantic decisions are approved.
+The next implementation order is M2, then M5 P0 semantics. Every driver runs
+first against a local in-memory object store, retains the input trace plus
+observed projection on failure, and later replays the same corpus against
+MinIO. M3–M5 remain subject to their required public semantic decisions.
 
 ## Jepsen handoff
 
@@ -104,6 +108,9 @@ deleteIdempotencyExact,oneEffectiveWriter,zombieWriteRejected --max-steps 6
 mise exec -- quint run quint-models/turbolay/m1_cell_write.qnt \
   --main m1_cell_write --mbt --max-steps 8 \
   --out-itf target/formal/m1-cell-write-mbt.itf.json
+
+# Rust replay of action-labelled Quint simulation traces.
+mise exec -- cargo test --locked --test formal_mbt -- --test-threads=1
 ```
 
 ## Review requested
