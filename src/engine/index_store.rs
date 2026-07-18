@@ -148,7 +148,7 @@ impl GraphShard {
     pub(crate) async fn graph_index_csc(
         &self,
         generation: &GraphIndexGeneration,
-    ) -> Result<GraphBlasCsc> {
+    ) -> Result<Option<GraphBlasCsc>> {
         let path = graph_index_generation_path(
             self.db.store_path(),
             &generation.cell_id,
@@ -156,7 +156,16 @@ impl GraphShard {
             generation.base_sequence,
             &generation.generation,
         );
-        let value = self.db.object_store().get(&path).await?.bytes().await?;
+        let result = match self.db.object_store().get(&path).await {
+            Ok(result) => result,
+            Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let value = match result.bytes().await {
+            Ok(value) => value,
+            Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
         let csc = decode_graph_index_csc(
             path.as_ref(),
             &value,
@@ -167,7 +176,18 @@ impl GraphShard {
         if csc.indices.len() as u64 != generation.edge_count {
             return corrupt(path.as_ref(), "index edge count does not match manifest");
         }
-        Ok(csc)
+        Ok(Some(csc))
+    }
+
+    #[cfg(feature = "graphblas")]
+    pub(crate) async fn forget_graph_index_generation(&self, generation: &GraphIndexGeneration) {
+        let key = MatrixCacheKey::new(
+            &generation.cell_id,
+            &generation.edge_type,
+            generation.base_sequence,
+        );
+        self.graph_index_generations.lock().await.remove(&key);
+        self.graphblas_cache.lock().await.remove(&key);
     }
 
     #[cfg(feature = "graphblas")]

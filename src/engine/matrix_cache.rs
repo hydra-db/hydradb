@@ -49,7 +49,7 @@ impl GraphShard {
         cell_id: &str,
         edge_type: &str,
         base_epoch: StorageSequence,
-    ) -> Result<Arc<CompiledGraphBlasMatrix>> {
+    ) -> Result<Option<Arc<CompiledGraphBlasMatrix>>> {
         let cache_key = MatrixCacheKey::new(cell_id, edge_type, base_epoch);
         if let Some(cached) = self.graphblas_cache.lock().await.get(&cache_key) {
             self.cache_metrics.record_hit(GraphCacheKind::GraphBlas);
@@ -59,7 +59,7 @@ impl GraphShard {
                 Duration::ZERO,
                 base_epoch,
             );
-            return Ok(cached);
+            return Ok(Some(cached));
         }
 
         self.cache_metrics.record_miss(GraphCacheKind::GraphBlas);
@@ -74,14 +74,17 @@ impl GraphShard {
             })?;
         if let Some(cached) = self.graphblas_cache.lock().await.get(&cache_key) {
             self.cache_metrics.record_hit(GraphCacheKind::GraphBlas);
-            return Ok(cached);
+            return Ok(Some(cached));
         }
         let started = Instant::now();
         let external = self
             .graph_index_generation_at(cell_id, edge_type, base_epoch)
             .await?;
         let (compiled, compile_units) = if let Some(generation) = external {
-            let csc = self.graph_index_csc(&generation).await?;
+            let Some(csc) = self.graph_index_csc(&generation).await? else {
+                self.forget_graph_index_generation(&generation).await;
+                return Ok(None);
+            };
             let edge_count = csc.indices.len() as u64;
             (Arc::new(compile_graphblas_csc_owned(csc)?), edge_count)
         } else if compact_csc_kernel_enabled() {
@@ -124,16 +127,18 @@ impl GraphShard {
             compile_units,
         );
         let mut cache = self.graphblas_cache.lock().await;
-        Ok(cache
-            .insert_sized(
-                cache_key,
-                Arc::clone(&compiled),
-                cell_id.to_string(),
-                compile_units >= self.cache_policy.pin_matrix_min_edges,
-                compiled.estimated_resident_bytes(),
-                &self.cache_metrics,
-            )
-            .unwrap_or(compiled))
+        Ok(Some(
+            cache
+                .insert_sized(
+                    cache_key,
+                    Arc::clone(&compiled),
+                    cell_id.to_string(),
+                    compile_units >= self.cache_policy.pin_matrix_min_edges,
+                    compiled.estimated_resident_bytes(),
+                    &self.cache_metrics,
+                )
+                .unwrap_or(compiled),
+        ))
     }
 
     #[cfg(feature = "graphblas")]

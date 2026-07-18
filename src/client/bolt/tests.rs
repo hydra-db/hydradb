@@ -1322,13 +1322,25 @@ async fn object_store_routing_advertises_all_readers_and_one_soft_affinity_write
     let preferred_address = preferred_listener.local_addr().unwrap().to_string();
     let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let fallback_address = fallback_listener.local_addr().unwrap().to_string();
+    let unready_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unready_address = unready_listener.local_addr().unwrap().to_string();
+    let (preferred_readiness, preferred_readiness_task) = start_test_readiness_endpoint(true).await;
+    let (fallback_readiness, fallback_readiness_task) = start_test_readiness_endpoint(true).await;
+    let (unready_readiness, unready_readiness_task) = start_test_readiness_endpoint(false).await;
     let provider = ObjectStoreBoltRoutingTableProvider::new(
         [
             ("node-a".to_string(), preferred_address.clone()),
             ("node-b".to_string(), fallback_address.clone()),
+            ("node-c".to_string(), unready_address),
         ],
         30,
     )
+    .unwrap()
+    .with_readiness_addresses([
+        ("node-a".to_string(), preferred_readiness),
+        ("node-b".to_string(), fallback_readiness),
+        ("node-c".to_string(), unready_readiness),
+    ])
     .unwrap()
     .with_health_probe_timeout(Duration::from_secs(1))
     .unwrap();
@@ -1377,6 +1389,8 @@ async fn object_store_routing_advertises_all_readers_and_one_soft_affinity_write
     );
 
     drop(preferred_listener);
+    preferred_readiness_task.abort();
+    let _ = preferred_readiness_task.await;
     let failed_over = provider
         .routing_table(
             "default",
@@ -1402,6 +1416,28 @@ async fn object_store_routing_advertises_all_readers_and_one_soft_affinity_write
             .addresses,
         vec![fallback_address]
     );
+
+    fallback_readiness_task.abort();
+    unready_readiness_task.abort();
+}
+
+async fn start_test_readiness_endpoint(ready: bool) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0_u8; 256];
+            let _ = stream.read(&mut request).await;
+            let status = if ready {
+                "HTTP/1.1 200 OK"
+            } else {
+                "HTTP/1.1 503 Service Unavailable"
+            };
+            let response = format!("{status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    (address, task)
 }
 
 async fn send_test_bolt_client_message<W>(writer: &mut ChunkWriter<W>, message: &ClientMessage)

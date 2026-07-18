@@ -5264,16 +5264,33 @@ impl GraphShard {
             .graph_index_generation_at(cell_id, edge_type, base_epoch)
             .await?
         {
+            let storage_snapshot = self.db.snapshot().await?;
+            if storage_snapshot.seq() != read_epoch {
+                return Ok(None);
+            }
             let mut generation = generation;
             for refresh_attempt in 0..=1 {
-                let compiled = self
+                let Some(compiled) = self
                     .cached_graphblas_matrix(cell_id, edge_type, generation.base_sequence)
-                    .await?;
+                    .await?
+                else {
+                    if refresh_attempt == 0 {
+                        if let Some(latest) = self.discover_graph_index(cell_id, edge_type).await? {
+                            if latest.base_sequence > generation.base_sequence
+                                && latest.base_sequence <= read_epoch
+                            {
+                                generation = latest;
+                                continue;
+                            }
+                        }
+                    }
+                    return Ok(None);
+                };
                 if generation.base_sequence >= read_epoch {
                     return Ok(Some((compiled, None, false)));
                 }
                 match self
-                    .topology_tail_since(&generation, read_epoch, budget)
+                    .topology_tail_since(&generation, storage_snapshot.as_ref(), read_epoch, budget)
                     .await
                 {
                     Ok(GraphTopologyTail::Complete(overlay)) => {
@@ -5315,12 +5332,10 @@ impl GraphShard {
                 return Ok(None);
             }
         }
-        Ok(Some((
-            self.cached_graphblas_matrix(cell_id, edge_type, base_epoch)
-                .await?,
-            None,
-            false,
-        )))
+        Ok(self
+            .cached_graphblas_matrix(cell_id, edge_type, base_epoch)
+            .await?
+            .map(|compiled| (compiled, None, false)))
     }
 
     #[cfg(feature = "graphblas")]
