@@ -46,3 +46,6 @@
 #include "chapters/quint-00-correctness-problem.typ"
 #include "chapters/quint-01-quint-from-zero.typ"
 #include "chapters/quint-02-first-model-m1.typ"
+#include "chapters/quint-03-invariants-and-buggy-twin.typ"
+#include "chapters/quint-04-deterministic-scenarios.typ"
+#include "chapters/quint-05-model-gallery.typ"
