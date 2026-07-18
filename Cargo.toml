@@ -112,9 +112,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"], optional = true }
 
 [dev-dependencies]
+anyhow = "1"
 boltr = { version = "0.2.0", features = ["client"] }
 falkordb = "0.10.3"
-serde = "1"
+quint-connect = "0.1.2"
+serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 rcgen = "0.13"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

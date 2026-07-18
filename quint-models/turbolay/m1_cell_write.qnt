@@ -105,6 +105,7 @@ module m1_cell_write {
   // A matching create retry returns its recorded outcome and does not write.
   action retryCreate: bool = all {
     createRecorded,
+    activeWriter != 0,
     epoch' = epoch,
     previousEpoch' = epoch,
     edgePresent' = edgePresent,
@@ -124,6 +125,7 @@ module m1_cell_write {
   // A reused idempotency key with a different mutation is rejected.
   action rejectConflictingRetry: bool = all {
     createRecorded,
+    activeWriter != 0,
     epoch' = epoch,
     previousEpoch' = epoch,
     edgePresent' = edgePresent,
@@ -163,6 +165,7 @@ module m1_cell_write {
 
   action retryDelete: bool = all {
     deleteRecorded,
+    activeWriter != 0,
     epoch' = epoch,
     previousEpoch' = epoch,
     edgePresent' = edgePresent,
@@ -201,6 +204,7 @@ module m1_cell_write {
   action takeOverWriter2: bool = all {
     activeWriter == 0,
     not(writer1Live),
+    lastAction == "crashWriter1",
     epoch' = epoch,
     previousEpoch' = epoch,
     edgePresent' = edgePresent,

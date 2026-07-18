@@ -57,7 +57,13 @@ mise exec java@21.0.2 -- mise exec -- quint verify \
   --invariant cursorPinnedToSnapshot,returnedPageMatchesCursor,\
 invalidHistoricalNeverReturns,bookmarkMonotone --max-steps 6
 
-# Produces action names (`mbt::actionTaken`) for a future Rust driver.
+# The M1 Rust driver replays these action-labelled simulation traces through
+# the public GraphShard API and compares its state projection after every step.
+mise exec -- cargo test --locked --test formal_mbt -- --test-threads=1
+
+# Produces action names (`mbt::actionTaken`) for inspecting the generated
+# simulation trace. `quint test` witnesses are deterministic model checks, but
+# their ITF output lacks the action labels required by quint-connect 0.1.2.
 mise exec -- quint run quint-models/turbolay/m1_cell_write.qnt \
   --main m1_cell_write --mbt --max-steps 8 \
   --out-itf target/formal/m1-cell-write-mbt.itf.json
