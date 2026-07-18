@@ -9007,7 +9007,7 @@ async fn cypher_row_engine_supports_bindings_where_order_and_windows() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
-async fn cypher_variable_hops_use_matrix_artifact_adjacency() {
+async fn cypher_variable_hops_use_the_configured_graph_kernel_backend() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-varhop-matrix-artifact", object_store).await;
 
@@ -9039,7 +9039,10 @@ async fn cypher_variable_hops_use_matrix_artifact_adjacency() {
         .optimizer_passes
         .contains(&RowQueryOptimizerPass::GraphKernel));
 
+    #[cfg(feature = "graphblas")]
     let before_metrics = shard.graph_cache_metrics();
+    #[cfg(not(feature = "graphblas"))]
+    let before_operations = shard.graph_operational_metrics();
 
     let rows = shard
         .execute_cypher_rows(
@@ -9111,14 +9114,20 @@ async fn cypher_variable_hops_use_matrix_artifact_adjacency() {
             vec![QueryRow::new(vec![QueryValue::Count(2)])],
         )
     );
-    let first_metrics = shard.graph_cache_metrics();
     #[cfg(feature = "graphblas")]
-    assert!(first_metrics.graphblas_hits > before_metrics.graphblas_hits);
+    let first_metrics = {
+        let metrics = shard.graph_cache_metrics();
+        assert!(metrics.graphblas_hits > before_metrics.graphblas_hits);
+        metrics
+    };
     #[cfg(not(feature = "graphblas"))]
-    assert!(
-        first_metrics.matrix_adjacency_hits > before_metrics.matrix_adjacency_hits
-            || first_metrics.matrix_adjacency_misses > before_metrics.matrix_adjacency_misses
-    );
+    let first_operations = {
+        let metrics = shard.graph_operational_metrics();
+        assert!(
+            metrics.query_rust_sparse_fallbacks > before_operations.query_rust_sparse_fallbacks
+        );
+        metrics
+    };
 
     shard
         .execute_cypher_rows(
@@ -9127,11 +9136,15 @@ async fn cypher_variable_hops_use_matrix_artifact_adjacency() {
         )
         .await
         .unwrap();
-    let hot_metrics = shard.graph_cache_metrics();
     #[cfg(feature = "graphblas")]
-    assert!(hot_metrics.graphblas_hits > first_metrics.graphblas_hits);
+    assert!(shard.graph_cache_metrics().graphblas_hits > first_metrics.graphblas_hits);
     #[cfg(not(feature = "graphblas"))]
-    assert!(hot_metrics.matrix_artifact_hits > first_metrics.matrix_artifact_hits);
+    assert!(
+        shard
+            .graph_operational_metrics()
+            .query_rust_sparse_fallbacks
+            > first_operations.query_rust_sparse_fallbacks
+    );
 
     shard.close().await.unwrap();
 }
