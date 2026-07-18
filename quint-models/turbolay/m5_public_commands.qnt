@@ -4,8 +4,12 @@
 //
 // It intentionally does not parse Cypher. Each action is the normalized
 // behavior of one supported command class that an MBT adapter will invoke.
-// The relationship-ID behavior is a provisional safety contract: an ambiguous
-// duplicate external ID is rejected until the product approves its scope.
+// Relationship-ID scope is approved endpoint-scoped (BFG-003, 2026-07-18), but
+// the current source still keys identity on the external ID alone and rejects a
+// same-ID/different-endpoint import. `rejectAmbiguousRelationshipId` below
+// deliberately still encodes that pre-fix rejection so this model stays faithful
+// to unmodified source; it flips to endpoint-scoped in the same PR as the kernel
+// fix. See docs/bugs-found-fixed/BFG-003-relationship-merge-identity-scope.md.
 module m5_public_commands {
   var edgePresent: bool
   var vertexPresent: bool
@@ -110,9 +114,10 @@ module m5_public_commands {
     lastAction' = "mergeSameRelationshipCommand",
   }
 
-  // Same external ID at another endpoint is not silently aliased. Whether the
-  // eventual public contract rejects or scopes it by endpoint is a review
-  // decision; silently merging it is never an allowed action.
+  // Same external ID at another endpoint. Approved contract is endpoint-scoped
+  // (both records should coexist, BFG-003), but current source rejects this with
+  // IdempotencyConflict; this action encodes that pre-fix rejection until the
+  // kernel fix lands. Silently merging it is never an allowed action.
   action rejectAmbiguousRelationshipId: bool = all {
     relationshipPresent,
     relationshipId == 7,
@@ -134,8 +139,9 @@ module m5_public_commands {
     lastAction' = "rejectAmbiguousRelationshipId",
   }
 
-  // The currently observed batch behavior is explicit: conflicting values for
-  // one vertex row reject the batch rather than applying an arbitrary winner.
+  // Approved contract (BFG-004, not-a-bug 2026-07-18): conflicting values for
+  // one vertex row reject the whole batch atomically rather than applying an
+  // arbitrary winner. Equal duplicate values coalesce.
   action rejectConflictingDuplicateVertex: bool = all {
     vertexPresent,
     edgePresent' = edgePresent,
@@ -157,8 +163,9 @@ module m5_public_commands {
   }
 
   // The client-service cursor is materialized: later graph writes cannot alter
-  // its stored rows. Direct low-level page tokens are BFG-008 and intentionally
-  // outside this cursor action until their contract is approved.
+  // its stored rows. Direct low-level page tokens are approved best-effort
+  // (BFG-008, not-a-bug 2026-07-18): each page is an independent current read
+  // and is intentionally outside this stable cursor action.
   action openMaterializedCursor: bool = all {
     not(cursorOpen),
     edgePresent' = edgePresent,

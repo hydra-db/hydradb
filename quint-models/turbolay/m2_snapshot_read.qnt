@@ -274,7 +274,9 @@ module m2_snapshot_read {
   val bookmarkMonotone: bool = sessionBookmark >= previousBookmark
 
   // A direct offset page can only have observed a committed view, but it is
-  // deliberately not required to equal the view of a later request.
+  // deliberately not required to equal the view of a later request. This is the
+  // approved best-effort direct-pagination contract (BFG-008, not-a-bug
+  // 2026-07-18); only the materialized service cursor is stable.
   val directPageUsesOneRequestView: bool =
     not(directPageReturned) or all {
       directPageEpoch > 0,

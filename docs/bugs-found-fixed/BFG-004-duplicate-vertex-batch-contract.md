@@ -1,7 +1,7 @@
 ---
 id: BFG-004
 title: Duplicate vertex batch rows have an undocumented conflict policy
-status: blocked
+status: not-a-bug
 severity: P2
 classification: batch-semantics-contract-gap
 introduced_or_first_bad_commit: ea7ec2c
@@ -11,7 +11,7 @@ model:
   - quint-models/turbolay/m5_public_commands.qnt
 current_verified_commit: f45662c
 date_opened: 2026-07-18
-date_verified: null
+date_verified: 2026-07-18
 tags: [bugs, batch, vertices, semantics, quint]
 ---
 
@@ -19,7 +19,10 @@ tags: [bugs, batch, vertices, semantics, quint]
 
 ## Status
 
-Blocked on API-contract review. V2 coalesces duplicate vertex IDs, but rejects a batch when their mutable property values conflict. That is a valid possible contract, not automatically a defect.
+Resolved as `not-a-bug`: the observed behavior is the approved public contract.
+V2 coalesces duplicate vertex IDs with equal values and rejects the whole batch
+atomically when their mutable property values conflict. This was reviewed and
+confirmed as intentional rather than a defect.
 
 ## Intended behavior
 
@@ -35,8 +38,16 @@ Without a documented rule, clients can accidentally depend on input ordering or 
 
 ## Formal coverage and next step
 
-M5's `rejectConflictingDuplicateVertex` is an explicit provisional model of the observed behavior. Its scenario and six-step bounded check pass. Rust MBT must change with the approved contract rather than treating this provisional rejection as an implementation proof.
+M5's `rejectConflictingDuplicateVertex` is now the approved contract, not a
+provisional model. Its deterministic scenario and six-step bounded check pass,
+and the M5 Rust adapter (`reject_duplicate`) replays the atomic rejection
+against both InMemory and MinIO. No further model, adapter, or source change is
+required; the contract and implementation agree.
 
 ## Review decision
 
-Required: approve the conflict-rejection rule or choose a different merge rule.
+Reviewed 2026-07-18 (vyom@hydradb.com). **Decision: reject conflicts
+atomically** — duplicate vertex rows with equal values coalesce; any conflicting
+mutable property value rejects the whole batch atomically (no arbitrary winner,
+no last-row-wins). This matches the current implementation. Status transition:
+`blocked` → `not-a-bug`.
