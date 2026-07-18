@@ -113,6 +113,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 
 [dev-dependencies]
 boltr = { version = "0.2.0", features = ["client"] }
+falkordb = "0.10.3"
 serde = "1"
 serde_yaml = "0.9"
 rcgen = "0.13"

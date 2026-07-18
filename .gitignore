@@ -25,3 +25,5 @@ Thumbs.db
 # Local environment files
 .env
 *.env
+docs/formal-methods-docs/
+book/*.pdf
