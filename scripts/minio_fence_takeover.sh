@@ -68,8 +68,32 @@ AWS_ALLOW_HTTP=true
 AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false
 ENV
 
+run_with_timeout() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$TIMEOUT_SECONDS" "$@"
+    return
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$TIMEOUT_SECONDS" "$@"
+    return
+  fi
+
+  "$@" &
+  local worker_pid=$!
+  (
+    sleep "$TIMEOUT_SECONDS"
+    kill -TERM "$worker_pid" >/dev/null 2>&1 || true
+  ) &
+  local watchdog_pid=$!
+  local status=0
+  wait "$worker_pid" || status=$?
+  kill "$watchdog_pid" >/dev/null 2>&1 || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  return "$status"
+}
+
 run_worker() {
-  timeout "$TIMEOUT_SECONDS" cargo run "${FEATURE_ARGS[@]}" --example fence_worker -- "$@"
+  run_with_timeout cargo run "${FEATURE_ARGS[@]}" --example fence_worker -- "$@"
 }
 
 cd "$ROOT"
