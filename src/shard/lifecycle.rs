@@ -603,15 +603,45 @@ impl GraphShard {
         read_epoch: TopologySequence,
     ) -> Result<GraphSnapshot<'_>> {
         validate_component("cell_id", cell_id)?;
-        let current_epoch = self.current_epoch(cell_id).await?;
-        if read_epoch > current_epoch {
+        let storage_snapshot = self.db.snapshot().await?;
+        let snapshot_epoch = if let Some(snapshot) = storage_snapshot.as_ref() {
+            let drop_marker = keys::cell_drop_marker(cell_id);
+            let pending_drop_marker = keys::cell_drop_pending_marker(cell_id);
+            if snapshot
+                .get_with_options(drop_marker.as_bytes(), &remote_read_options())
+                .await?
+                .is_some()
+                || snapshot
+                    .get_with_options(pending_drop_marker.as_bytes(), &remote_read_options())
+                    .await?
+                    .is_some()
+            {
+                return Err(GraphError::CellDropped {
+                    operation: "snapshot_at",
+                    cell_id: cell_id.to_string(),
+                });
+            }
+            let key = keys::last_epoch(cell_id);
+            match snapshot
+                .get_with_options(key.as_bytes(), &remote_read_options())
+                .await?
+            {
+                Some(value) => decode_u64(&key, &value)?,
+                None => 0,
+            }
+        } else {
+            // DbReader pins a checkpoint/manifest even though this SlateDB
+            // revision does not expose a DbSnapshot handle for it.
+            self.current_epoch(cell_id).await?
+        };
+        if read_epoch > snapshot_epoch {
             return Err(GraphError::SnapshotAhead {
                 cell_id: cell_id.to_string(),
                 read_epoch,
-                current_epoch,
+                current_epoch: snapshot_epoch,
             });
         }
-        if read_epoch != current_epoch {
+        if read_epoch != snapshot_epoch {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "GraphSnapshot",
                 feature: "historical graph epochs are not SlateDB snapshots".to_string(),
@@ -621,7 +651,7 @@ impl GraphShard {
             shard: self,
             cell_id: cell_id.to_string(),
             read_epoch,
-            storage_snapshot: self.db.snapshot().await?,
+            storage_snapshot,
         })
     }
 }

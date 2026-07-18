@@ -24,18 +24,21 @@ Apalache then bounded-checked every main model through six transitions using
 | M1b | chunked bulk import, durable prefix, retry | 3 | 6 | focused public-API conformance test |
 | M2 | page snapshot scope, historical epoch rejection, bookmarks | 4 | 6 | 24 seeded public-API traces pass |
 | M2b | current-only `snapshot_at`, typed rejection, cancelled page | 3 | 6 | 24 seeded OpenCypher public-API traces pass |
-| M3 | artifact generation fence, matrix equivalence, reader retention | 4 | 6 | 10k simulation + bounded check; driver pending |
-| M4 | placement disagreement and durable writer fence | 3 | 6 | 10k simulation + bounded check; driver pending |
+| M3 | artifact generation fence, matrix equivalence, reader retention | 4 | 6 | 24 seeded public-API traces pass against `InMemory` |
+| M4 | placement disagreement and durable writer fence | 3 | 6 | 24 seeded public-API traces pass against `InMemory` |
 | M5 | command normalization, relationship identity, batch semantics | 7 | 6 | 24 seeded public-API traces pass |
 | M5b | `DELETE`, `DETACH DELETE`, cell-drop fence | 3 | 6 | 24 seeded public-API traces pass |
 
-The generated M1/M2 Informal Trace Format files are under `target/formal/` and
-are ignored by Git. M1 is replayed by `tests/formal_mbt.rs`; M2b and M5b are
-replayed by `tests/formal_mbt_p2.rs`. `quint-connect` generates 24
-deterministic-seed simulation traces per driver, calls only public APIs, and
-compares normalized state after every step. The named `quint test` witnesses
-remain Quint-only because their ITF output omits `mbt::actionTaken`, which the
-current adapter requires for action dispatch.
+The generated Informal Trace Format files are under `target/formal/` and are
+ignored by Git. Rust MBT replay now has six default-feature adapter binaries:
+`tests/formal_mbt.rs`, `tests/formal_mbt_m2.rs`, `tests/formal_mbt_m3.rs`,
+`tests/formal_mbt_m4.rs`, `tests/formal_mbt_m5.rs`, and
+`tests/formal_mbt_p2.rs`. The P2 binary replays M5b by default and adds the
+M2b cancelled-page driver when built with OpenCypher. `quint-connect`
+generates 24 deterministic-seed simulation traces per driver, calls only
+public APIs, and compares normalized state after every step. The named
+`quint test` witnesses remain Quint-only because their ITF output omits
+`mbt::actionTaken`, which the current adapter requires for action dispatch.
 
 ### P0 completion evidence (2026-07-18)
 
@@ -62,11 +65,19 @@ or relationship lifecycle projections.
 
 M3's aggregate predicate covers stale publication rejection, active-read
 retention, and matrix/direct equivalence. M4's covers the durable writer fence,
-monotone committed prefix, and zombie-writer rejection. Both passed their
-deterministic suites, 10,000 twelve-step simulation traces, and six-step
-Apalache checks. This proves the stated finite abstractions, not a read-only
-freshness SLA: the documented BFG-007 contract remains safety/proof-or-error
-only.
+monotone committed prefix, and zombie-writer rejection only after node-2 fences
+a previously opened node-1 writer. Both passed their deterministic suites,
+10,000 twelve-step simulation traces, and six-step Apalache checks. Their Rust
+MBT adapters now replay 24 seeded traces each against public APIs on a local
+`InMemory` object store. M3 exercises
+`GraphShard::build_matrix_tiles_checked_current`, `latest_matrix_artifact`,
+`owned_snapshot`, `delete_deltas_through_matrix`, `direct_snapshot_reachable`,
+and `matrix_reachable`. M4 exercises `ShardPlacement::fixed`, routed owned
+open, `RoutedGraphCluster::open_fenced_owned`, writes across takeover, and
+typed stale-writer rejection on the old node-1 writer handle. This proves the
+stated finite abstractions and local adapter refinement only, not S3/MinIO
+behavior, Jepsen behavior, or a read-only freshness SLA: the documented BFG-007
+contract remains safety/proof-or-error only.
 
 ### P1 bulk import evidence (2026-07-18)
 
@@ -108,8 +119,8 @@ The bug records make this distinction explicit:
 | BFG-001 | fault model counterexample; current page-entry scope fix; M2 bounded check | force a writer commit inside historical/current graph-kernel and streaming page operators, then replay in Rust MBT |
 | BFG-002 | fault model counterexample; historical `e875387` test returns current row; current regression rejects; M2 bounded check | Rust MBT replay and review |
 | BFG-003/BFG-004 | M1/M5 model makes the identity/batch choice explicit; M1 Rust MBT verifies structural-edge retries | implement the approved relationship-ID and duplicate-row contract in the M5 driver |
-| BFG-005/BFG-006 | M1/M3 check normalized write and stale-build safety | implementation trace adapter plus concurrent artifact test |
-| BFG-007 | M2/M4 model safety only | decide remote bookmark/read-only freshness guarantee |
+| BFG-005/BFG-006 | M1/M3 check normalized write and stale-build safety; M3 Rust MBT replays finite `InMemory` artifact/GC traces | MinIO/S3 replay, Jepsen artifacts/GC campaign, and broader concurrent artifact tests |
+| BFG-007 | M2/M4 model safety; M4 Rust MBT replays finite `InMemory` routed-fence traces | decide remote bookmark/read-only freshness guarantee; MinIO/S3 and Jepsen ownership campaigns |
 | BFG-008 | deliberately open direct-page contract | approve best-effort behavior or add a snapshot-bearing/materialized direct cursor |
 
 ## Rust MBT adapter scope
@@ -123,16 +134,17 @@ SlateDB keys as its oracle.
 |---|---|---|
 | M1 | **implemented:** `GraphShard::open_standalone_writer`, `write_edge`, `delete_edge`, retry, close/reopen | edge existence, degree, current epoch, recorded idempotency outcome |
 | M2 | **implemented:** `snapshot`, `snapshot_at`, neighbor reads, direct-page projection, bookmark | one snapshot's edge/neighbor projection; typed historical error; page state |
-| M3 | artifact build/refresh, direct and matrix reachability, maintenance GC | direct traversal equals matrix-plus-delta traversal; publication generation; retained read succeeds |
-| M4 | fenced owned shard/routed cluster open and replacement writer | one accepted writer, monotone epoch, fresh reader sees committed prefix |
+| M3 | **implemented:** topology writes, checked-current artifact publication/rejection, owned snapshot retention, GC, direct/matrix query | direct traversal equals matrix traversal at the current epoch; artifact base epoch and edge count; retained owned snapshot succeeds |
+| M4 | **implemented:** local placement disagreement, fenced routed cluster open, takeover, stale writer rejection on the previously opened node-1 writer | one accepted writer generation, monotone committed prefix, replacement sees prior commits, zombie write is rejected by the fenced old handle |
 | M5 | **implemented:** relationship import/delete, vertex batch, metadata, cursor projection | relationship identity, batch outcome, metadata, parallel-edge lifecycle |
 | M2b | **implemented:** `snapshot_at`, OpenCypher page/cancellation | snapshot epoch/error class; a cancelled request yields no page |
 | M5b | **implemented:** vertex deletion and `drop_cell` | incident-edge degree projection; post-drop `CellDropped` |
 
-Every driver runs first against a local in-memory object store, retains the
-input trace plus observed projection on failure, and later replays the same
-corpus against MinIO. M3/M4 async and ownership adapters remain the next MBT
-expansion; their current source-level conformance evidence is unchanged.
+Every driver currently runs against a local in-memory object store and retains
+the input trace plus observed projection on failure. No MinIO/S3 MBT replay and
+no Jepsen campaign is claimed in this evidence record. The next expansion is to
+replay the same seeded corpus against S3-compatible storage and then run the
+Jepsen campaigns described below.
 
 ## Jepsen handoff
 
@@ -171,6 +183,8 @@ mise exec -- quint run quint-models/turbolay/m1_cell_write.qnt \
 # Rust replay of action-labelled Quint simulation traces.
 mise exec -- cargo test --locked --test formal_mbt -- --test-threads=1
 mise exec -- cargo test --locked --test formal_mbt_m2 -- --test-threads=1
+mise exec -- cargo test --locked --test formal_mbt_m3 -- --test-threads=1
+mise exec -- cargo test --locked --test formal_mbt_m4 -- --test-threads=1
 mise exec -- cargo test --locked --test formal_mbt_m5 -- --test-threads=1
 mise exec -- cargo test --locked --test formal_mbt_p2 -- --test-threads=1
 ```
@@ -181,5 +195,5 @@ mise exec -- cargo test --locked --test formal_mbt_p2 -- --test-threads=1
 2. Approve whether BFG-004's conflict rejection is the public batch contract.
 3. Choose BFG-008: stable direct pagination or explicitly best-effort offset
    pagination.
-4. Confirm whether M3 artifact publication or M4 ownership fencing is the
-   desired next Rust MBT adapter after M1/M2/M5/M2b/M5b.
+4. Confirm the schedule for MinIO/S3 MBT replay and Jepsen campaigns; the M3
+   and M4 Rust MBT adapters are now wired for finite `InMemory` replay.

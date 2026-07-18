@@ -12,6 +12,7 @@ module m4_placement_fence {
   var node2Active: bool
   var node1Reachable: bool
   var node2Reachable: bool
+  var node1FencedByNode2: bool
   var committedPrefix: int
   var previousPrefix: int
   var lastAction: str
@@ -25,6 +26,7 @@ module m4_placement_fence {
     node2Active' = false,
     node1Reachable' = true,
     node2Reachable' = true,
+    node1FencedByNode2' = false,
     committedPrefix' = 0,
     previousPrefix' = 0,
     lastAction' = "init",
@@ -39,6 +41,7 @@ module m4_placement_fence {
     node2Active' = node2Active,
     node1Reachable' = node1Reachable,
     node2Reachable' = node2Reachable,
+    node1FencedByNode2' = node1FencedByNode2,
     committedPrefix' = committedPrefix,
     previousPrefix' = committedPrefix,
     lastAction' = "chooseNode1",
@@ -53,6 +56,7 @@ module m4_placement_fence {
     node2Active' = node2Active,
     node1Reachable' = node1Reachable,
     node2Reachable' = node2Reachable,
+    node1FencedByNode2' = node1FencedByNode2,
     committedPrefix' = committedPrefix,
     previousPrefix' = committedPrefix,
     lastAction' = "chooseNode2",
@@ -60,6 +64,8 @@ module m4_placement_fence {
 
   action acquireFenceNode1: bool = all {
     node1Candidate,
+    node1Reachable,
+    not(node1Active),
     not(node2Active),
     durableFence' = 1,
     previousFence' = durableFence,
@@ -69,6 +75,7 @@ module m4_placement_fence {
     node2Active' = false,
     node1Reachable' = node1Reachable,
     node2Reachable' = node2Reachable,
+    node1FencedByNode2' = node1FencedByNode2,
     committedPrefix' = committedPrefix,
     previousPrefix' = committedPrefix,
     lastAction' = "acquireFenceNode1",
@@ -86,6 +93,7 @@ module m4_placement_fence {
     node2Active' = node2Active,
     node1Reachable' = node1Reachable,
     node2Reachable' = node2Reachable,
+    node1FencedByNode2' = node1FencedByNode2,
     committedPrefix' = committedPrefix + 1,
     previousPrefix' = committedPrefix,
     lastAction' = "commitNode1",
@@ -95,6 +103,8 @@ module m4_placement_fence {
   // fence. A later takeover atomically fences this old writer before enabling
   // its replacement.
   action partitionNode1: bool = all {
+    node1Active,
+    durableFence == 1,
     durableFence' = durableFence,
     previousFence' = durableFence,
     node1Candidate' = node1Candidate,
@@ -103,6 +113,7 @@ module m4_placement_fence {
     node2Active' = node2Active,
     node1Reachable' = false,
     node2Reachable' = node2Reachable,
+    node1FencedByNode2' = node1FencedByNode2,
     committedPrefix' = committedPrefix,
     previousPrefix' = committedPrefix,
     lastAction' = "partitionNode1",
@@ -111,6 +122,8 @@ module m4_placement_fence {
   action takeOverFenceNode2: bool = all {
     node2Candidate,
     not(node1Reachable),
+    node1Active,
+    durableFence == 1,
     durableFence' = 2,
     previousFence' = durableFence,
     node1Candidate' = node1Candidate,
@@ -119,6 +132,7 @@ module m4_placement_fence {
     node2Active' = true,
     node1Reachable' = node1Reachable,
     node2Reachable' = node2Reachable,
+    node1FencedByNode2' = true,
     committedPrefix' = committedPrefix,
     previousPrefix' = committedPrefix,
     lastAction' = "takeOverFenceNode2",
@@ -136,6 +150,7 @@ module m4_placement_fence {
     node2Active' = node2Active,
     node1Reachable' = node1Reachable,
     node2Reachable' = node2Reachable,
+    node1FencedByNode2' = node1FencedByNode2,
     committedPrefix' = committedPrefix + 1,
     previousPrefix' = committedPrefix,
     lastAction' = "commitNode2",
@@ -144,6 +159,7 @@ module m4_placement_fence {
   action rejectZombieNode1Commit: bool = all {
     durableFence == 2,
     not(node1Active),
+    node1FencedByNode2,
     durableFence' = durableFence,
     previousFence' = durableFence,
     node1Candidate' = node1Candidate,
@@ -152,6 +168,7 @@ module m4_placement_fence {
     node2Active' = node2Active,
     node1Reachable' = node1Reachable,
     node2Reachable' = node2Reachable,
+    node1FencedByNode2' = node1FencedByNode2,
     committedPrefix' = committedPrefix,
     previousPrefix' = committedPrefix,
     lastAction' = "rejectZombieNode1Commit",

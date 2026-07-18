@@ -78,12 +78,13 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         let key = keys::out_edge(cell_id, edge_type, src, dst);
-        if snapshot
+        if let Some(value) = snapshot
             .get_with_options(key.as_bytes(), &remote_read_options())
             .await?
-            .is_some()
         {
-            return Ok(true);
+            if decode_edge_record(&key, &value)?.epoch <= topology_sequence {
+                return Ok(true);
+            }
         }
 
         let tombstone_key = keys::out_segment_tombstone(cell_id, edge_type, src, dst);
@@ -136,7 +137,10 @@ impl GraphShard {
             .await?;
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
-            neighbors.insert(decode_edge_record(&key, &kv.value)?.dst);
+            let record = decode_edge_record(&key, &kv.value)?;
+            if record.epoch <= topology_sequence {
+                neighbors.insert(record.dst);
+            }
         }
 
         let tombstone_prefix = keys::out_segment_tombstone_src_prefix(cell_id, edge_type, src);

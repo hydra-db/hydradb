@@ -16,8 +16,11 @@ tags: [quint, apalache, mbt, jepsen, minio, ci]
 
 The top-ten API contracts have Quint models, deterministic witnesses, bounded
 Apalache checks, and focused Rust conformance tests. Rust MBT replay is wired
-for M1, M2, M5, M2b, and M5b. These checks currently use an in-memory object
-store for fast deterministic feedback.
+for the six default adapter binaries: M1, M2, M3, M4, M5, and P2. The P2
+binary covers M5b by default and covers M2b cancellation when built with
+OpenCypher. These checks currently use an in-memory object store for fast
+deterministic feedback; this document does not claim MinIO/S3 or Jepsen
+completion.
 
 All formal-methods and test work described here remains on `Turbolay-V3`.
 
@@ -37,15 +40,20 @@ Review and approve the explicit defaults before expanding distributed tests:
 If a decision changes, update the corresponding Quint action, witness, Rust
 adapter, and bug record together.
 
-### 2. Complete M3 and M4 Rust MBT adapters
+### 2. M3 and M4 Rust MBT adapters — complete for finite `InMemory` replay
 
-Add public-API Quint Connect drivers for:
+Public-API Quint Connect drivers are now wired for:
 
-- M3 artifact publication, retained readers, GC, and direct/matrix equivalence.
-- M4 placement disagreement, durable writer fencing, takeover, and committed-prefix monotonicity.
+- M3 artifact publication, stale-publication rejection, retained owned readers,
+  GC gated by a published artifact, and direct/matrix equivalence.
+- M4 placement disagreement, durable writer fencing, takeover, committed-prefix
+  monotonicity, and zombie-writer rejection through the previously opened old
+  writer handle.
 
-Each driver must compare a normalized public projection after every action and
-retain the failing seed, action trace, and observed state.
+Each driver compares a normalized public projection after every action and
+retains the failing seed, action trace, and observed state. The observable
+scope is still finite seeded replay on `InMemory`; S3-compatible storage and
+Jepsen remain later gates.
 
 ### 3. Replay against S3-compatible storage
 
@@ -110,7 +118,7 @@ backend. A passing in-memory check must not be treated as an S3/Jepsen pass.
 This workstream is complete when:
 
 - the contract decisions above are approved;
-- M3 and M4 have Rust MBT adapters;
+- M3 and M4 have Rust MBT adapters (satisfied for finite `InMemory` replay);
 - all adapters pass against both `InMemory` and MinIO/S3;
 - each Jepsen campaign has a passing baseline and documented failure policy;
 - every discovered bug has a minimized witness and a regression record; and
