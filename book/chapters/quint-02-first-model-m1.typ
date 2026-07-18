@@ -684,29 +684,59 @@ It helps to see the shape `step` traces out. The create-and-fence storyline look
 
 #figure(
   diagram(
-    node-stroke: 0.6pt,
-    node-fill: rgb("#eef4ff"),
+    node-stroke: 0.6pt + reader-colors.border,
+    node-fill: reader-colors.info_soft,
+    node-outset: 0pt,
     spacing: (1.9cm, 1.0cm),
-    node((0, 0), [`init`\ no writer], width: 2.5cm),
-    node((1, 0), [writer 1\ owns cell], fill: rgb("#eef4ff"), width: 2.5cm),
-    node((2, 0), [edge present\ epoch += 1], fill: rgb("#e9fce9"), width: 2.5cm),
-    node((2, 1), [committed,\ reply lost], fill: rgb("#fff8e6"), width: 2.5cm),
-    node((1, 1), [writer 1\ crashed], width: 2.5cm),
-    node((2, 2), [writer 2\ took over], fill: rgb("#eef4ff"), width: 2.5cm),
-    node((0, 2), [zombie write\ rejected], fill: rgb("#ffecec"), width: 2.5cm),
-    edge((0, 0), (1, 0), "->", [`openWriter1`]),
-    edge((1, 0), (2, 0), "->", [`createEdge`]),
-    edge((1, 0), (2, 1), "->", [`commitThenLoseReply`], stroke: 0.5pt + luma(60%)),
-    edge((2, 1), (2, 0), "->", [`retryCreate`], stroke: 0.5pt + luma(60%)),
-    edge((2, 0), (1, 1), "->", [`crashWriter1`]),
-    edge((1, 1), (2, 2), "->", [`takeOverWriter2`]),
-    edge((2, 2), (0, 2), "->", [`rejectZombieWrite`], stroke: 0.5pt + rgb("#1d90d0")),
+    node((0, 0), text(fill: reader-colors.text)[`init`\ no writer], fill: reader-colors.surface_soft, width: 2.5cm),
+    node((1, 0), text(fill: reader-colors.text)[writer 1\ owns cell], fill: reader-colors.info_soft, width: 2.5cm),
+    node((2, 0), text(fill: reader-colors.text)[edge present\ epoch += 1], fill: reader-colors.ok_soft, width: 2.5cm),
+    node((2, 1), text(fill: reader-colors.text)[committed,\ reply lost], fill: reader-colors.warn_soft, width: 2.5cm),
+    node((1, 1), text(fill: reader-colors.text)[writer 1\ crashed], fill: reader-colors.surface_soft, width: 2.5cm),
+    node((2, 2), text(fill: reader-colors.text)[writer 2\ took over], fill: reader-colors.info_soft, width: 2.5cm),
+    node((0, 2), text(fill: reader-colors.text)[zombie write\ rejected], fill: reader-colors.bad_soft, width: 2.5cm),
+    edge((0, 0), (1, 0), "->", text(fill: reader-colors.muted)[`openWriter1`], stroke: reader-colors.muted),
+    edge((1, 0), (2, 0), "->", text(fill: reader-colors.muted)[`createEdge`], stroke: reader-colors.muted),
+    edge((1, 0), (2, 1), "->", text(fill: reader-colors.muted)[`commitThenLoseReply`], stroke: 0.5pt + reader-colors.muted),
+    edge((2, 1), (2, 0), "->", text(fill: reader-colors.muted)[`retryCreate`], stroke: 0.5pt + reader-colors.muted),
+    edge((2, 0), (1, 1), "->", text(fill: reader-colors.muted)[`crashWriter1`], stroke: reader-colors.muted),
+    edge((1, 1), (2, 2), "->", text(fill: reader-colors.muted)[`takeOverWriter2`], stroke: reader-colors.muted),
+    edge((2, 2), (0, 2), "->", text(fill: reader-colors.info)[`rejectZombieWrite`], stroke: 0.5pt + reader-colors.info),
   ),
   caption: [One storyline through `step`: acquire, create (or commit-then-lose-reply and retry), crash, take over, and reject the zombie. Every arrow is one action firing because its guards held; the graph projections carry across crash and takeover untouched.],
 )
 
 The diagram is one path; the checker explores all of them. Delete, retry-delete, and
 conflicting-retry rejections branch off the same states wherever their guards permit.
+
+It helps to hold the whole model as a single map: each abstract action stands for a real call
+on `GraphShard`, and each pins one claim. The model-based-testing chapter later drives exactly
+these bindings against the running kernel; for now the table is a reading aid.
+
+#figure(
+  table(
+    columns: (1.15fr, 1.15fr, 1.7fr),
+    align: (left, left, left),
+    stroke: 0.5pt + reader-colors.border,
+    fill: (_, row) => if row == 0 { reader-colors.surface_soft },
+    inset: 7pt,
+    table.header(
+      text(fill: reader-colors.text)[*Quint action*],
+      text(fill: reader-colors.text)[*Real turbolay call*],
+      text(fill: reader-colors.text)[*What it pins*],
+    ),
+    [`openWriter1`], [`open_standalone_writer`], [one effective writer acquires the cell],
+    [`createEdge`], [`write_edge`], [edge, adjacency, degree, delta, and outcome commit atomically; epoch += 1],
+    [`commitThenLoseReply`], [`write_edge`, reply dropped], [the commit is durable even when the acknowledgement is not],
+    [`retryCreate`], [`write_edge`, same key], [a matching retry returns the recorded outcome and writes nothing; epoch unchanged],
+    [`rejectConflictingRetry`], [`write_edge`, reused key], [a reused idempotency key with a different mutation is rejected],
+    [`deleteEdge` / `retryDelete`], [`delete_edge`], [removal is atomic and its replay is idempotent],
+    [`crashWriter1` / `takeOverWriter2`], [writer loss, then `open_fenced_owned`], [ownership moves to a replacement without losing durable commits],
+    [`rejectZombieWrite`], [fenced former-writer handle], [a fenced former writer can never commit a second time],
+  ),
+  caption: [Every action in `m1_cell_write.qnt` and the real `GraphShard` call it abstracts. The middle column is the binding the model-based-testing chapter makes executable; the right column is the safety claim the next chapter turns into a checked invariant.],
+) <tab-m1-action-api>
+
 
 == What comes next: the predicates that judge these transitions
 

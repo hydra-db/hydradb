@@ -6,7 +6,9 @@
 The previous chapter argued that turbolay's hardest guarantees, single-writer fencing,
 snapshot isolation, exactly-once retries, are the kind of thing an English sentence can
 describe but cannot enforce. This chapter introduces the tool the rest of this part uses to
-turn those sentences into something a machine can check: #custom-box(title: [Term — Quint], icon: "info", color: purple)[
+turn those sentences into something a machine can check.
+
+#custom-box(title: [Term — Quint], icon: "info", color: purple)[
   An executable specification language for state machines. You write down the states a system
   can be in and the steps it may take between them, and Quint can then run the specification
   like a program, generate example executions, and, with a backend checker, prove that a
@@ -44,7 +46,7 @@ because there is no mechanical link between the words and the behavior.
 ]
 
 An executable specification fixes the rot by making the specification a program. You describe
-the system as a #custom-box(title: [Term — state machine], icon: "info", color: purple)[see above] and hand it to Quint. Now the sentence
+the system as a state machine and hand it to Quint. Now the sentence
 above is not prose; it is a property you can evaluate against actual executions of the model.
 If the model can reach a state where a retry wrote twice, Quint hands you the exact sequence
 of steps that got there.
@@ -64,6 +66,18 @@ chapter is those three parts and nothing more:
 - an *`init`*: the one starting state;
 - a *`step`*: the rule for how the state is allowed to change.
 
+#figure(
+  diagram(
+    node-stroke: 0.6pt + reader-colors.border,
+    spacing: (1.6cm, 1.25cm),
+    node((0, 0), text(fill: reader-colors.muted, size: 8pt)[start], stroke: none),
+    node((0, 1), text(fill: reader-colors.text)[*State*\ the `var`s — everything\ the machine remembers], fill: reader-colors.info_soft, width: 4.6cm),
+    edge((0, 0), (0, 1), "->", text(fill: reader-colors.muted, size: 8pt)[`init` sets the first values], stroke: reader-colors.muted),
+    edge((0, 1), (0, 1), "->", text(fill: reader-colors.muted, size: 8pt)[`step`: fire any one enabled action], bend: 135deg, stroke: reader-colors.muted),
+  ),
+  caption: [The three moving parts, and how they relate. The *state* is the variables; `init` sets their first values; `step` is a self-transition that carries the state to a next state by firing any one enabled action. Everything in this chapter is one of these three.],
+)
+
 Let us build all three for the turnstile.
 
 == The system: a coin turnstile
@@ -75,14 +89,14 @@ it is a genuine two-state gate, the same shape as many real protocols.
 
 #figure(
   diagram(
-    node-stroke: 0.6pt,
-    node-fill: rgb("#eef4ff"),
+    node-stroke: 0.6pt + reader-colors.border,
+    node-fill: reader-colors.info_soft,
     spacing: (3.2cm, 1.4cm),
-    node((0, 0), [locked], width: 2.4cm, shape: fletcher.shapes.pill),
-    node((1, 0), [unlocked], width: 2.4cm, shape: fletcher.shapes.pill),
-    edge((0, 0), (1, 0), "->", [`insertCoin`], bend: 30deg),
-    edge((1, 0), (0, 0), "->", [`push`], bend: 30deg),
-    edge((0, 0), (0, 0), "->", [`push` (no-op)], bend: 130deg),
+    node((0, 0), text(fill: reader-colors.text)[locked], width: 2.4cm, shape: fletcher.shapes.pill),
+    node((1, 0), text(fill: reader-colors.text)[unlocked], width: 2.4cm, shape: fletcher.shapes.pill, fill: reader-colors.ok_soft),
+    edge((0, 0), (1, 0), "->", text(fill: reader-colors.text)[`insertCoin`], bend: 30deg, stroke: reader-colors.muted),
+    edge((1, 0), (0, 0), "->", text(fill: reader-colors.text)[`push`], bend: 30deg, stroke: reader-colors.muted),
+    edge((0, 0), (0, 0), "->", text(fill: reader-colors.muted)[`push` (no-op)], bend: 130deg, stroke: reader-colors.muted),
   ),
   caption: [The turnstile as a state machine. Two states, and three kinds of step. A coin unlocks; a push through an unlocked gate re-locks it; a push against a locked gate changes nothing.],
 )
@@ -147,7 +161,9 @@ value that `init` then installs. Keep the distinction sharp in your head:
 
 == `init`: the starting state
 
-The machine needs somewhere to begin. That is `init`, and it is our first #custom-box(title: [Term — action], icon: "info", color: purple)[
+The machine needs somewhere to begin. That is `init`, and it is our first action.
+
+#custom-box(title: [Term — action], icon: "info", color: purple)[
   A named rule describing a state transition, declared `action name: bool = all { ... }`. It
   evaluates to a boolean: `true` means "this transition is allowed and here is the resulting
   next state," `false` means "this transition is not possible right now." `init` is the special
@@ -212,7 +228,9 @@ it takes a coin and unlocks. Here it is.
 
 The first line, `locked`, is different in kind from the other three. It has no prime and no
 assignment. It is just a boolean expression over the current state, and because `all { ... }`
-requires every line to hold, it acts as a #custom-box(title: [Term — guard / precondition], icon: "info", color: purple)[
+requires every line to hold, it acts as a guard.
+
+#custom-box(title: [Term — guard / precondition], icon: "info", color: purple)[
   A plain boolean line inside an action's `all { ... }` block, with no primed variable. It is a
   condition on the current state that must be true for the action to be enabled. If the guard is
   false, the whole `all { ... }` is false, so the action simply cannot happen from this state.

@@ -114,10 +114,54 @@ Line numbers are signposts; keep the quoted definition accurate.
 
 ### Figures and diagrams
 
-Use fletcher exactly as `chapters/00-foundations.typ` and other chapters do, but
-put the caption inside the figure: `#figure(diagram(...), caption: [ … ]) <fig-id>`.
-Do not use a separate caption helper. For diagram stroke/fill greys use
-`luma(60%)`; do not reference `accent`/`muted` (those were custom-template globals).
+Use fletcher, put the caption inside the figure, and label it:
+`#figure(diagram(...), caption: [ … ]) <fig-id>`. Do not use a separate caption
+helper. Available viz libraries (all cached offline): `@preview/fletcher`
+(box-and-arrow, state, sequence diagrams), `@preview/cetz` (freeform drawing),
+and Typst `table`. Never reference `accent`/`muted` (old custom-template globals).
+
+### Theme-aware diagram colors (MANDATORY — this was gotten wrong once)
+
+The book renders in dark, light, and sepia via `--input mode=…`. **Never
+hardcode a fill or text color in a diagram** (e.g. `rgb("#eef4ff")`, `luma(60%)`).
+A hardcoded light fill plus the theme's light label text is invisible in dark
+mode. Always pull colors from the mode-adaptive `reader-colors` palette (exported
+by `bookly.typ`), and set an explicit label text fill so contrast holds in every
+mode:
+
+| Role | Fill | Text / stroke |
+|---|---|---|
+| neutral / structural node | `reader-colors.surface_soft` | text `reader-colors.text` |
+| normal / in-progress node | `reader-colors.info_soft` | text `reader-colors.text` |
+| success / committed node | `reader-colors.ok_soft` | text `reader-colors.text` |
+| warning / ambiguous node | `reader-colors.warn_soft` | text `reader-colors.text` |
+| error / rejected node | `reader-colors.bad_soft` | text `reader-colors.text` |
+| node border / faint lifeline | — | `reader-colors.border` |
+| edge line + arrowhead + label | — | `reader-colors.muted` (NEVER default/black — arrowheads default to black and vanish in dark mode; `border` is too faint for a marker) |
+| accent edge (highlight) | — | `reader-colors.info` / `reader-colors.primary` |
+
+Pattern: `node((x,y), text(fill: reader-colors.text)[label], fill: reader-colors.ok_soft, ...)`
+and `edge(a, b, "->", text(fill: reader-colors.muted)[label], stroke: reader-colors.border)`.
+Table headers: `fill: (_, row) => if row == 0 { reader-colors.surface_soft }` with
+`stroke: 0.5pt + reader-colors.border`. Always compile BOTH `--input mode=dark`
+and `--input mode=light` and eyeball contrast before declaring done.
+
+### Visualize, don't just tell
+
+Long stretches of prose are a smell. When a point is a flow, a state machine, an
+exchange over time, a mapping, or a comparison, prefer a figure or table over a
+paragraph. Good defaults per shape:
+
+- **sequence of events / a protocol exchange** → fletcher two-lifeline sequence
+  diagram (see `<fig-lost-reply>` in `quint-00`).
+- **states and transitions** → fletcher state diagram (see the turnstile in
+  `quint-01`, the M1 storyline in `quint-02`).
+- **a concept's parts and how they relate** → a small labeled schematic.
+- **a mapping (model ↔ code, action ↔ API) or a comparison** → a `table`
+  (see `<tab-m1-action-api>` in `quint-02`).
+
+Scaffold the empty `#figure(...)` with a `// TODO(content): …` caption where a
+visual belongs, so Phase 2 fills the illustration, not another wall of text.
 
 ## Placeholders to hand off to Phase 2
 
