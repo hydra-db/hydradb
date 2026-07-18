@@ -105,9 +105,10 @@ Each model's three deterministic scenarios, 10,000 twelve-step simulation,
 and six-step Apalache run pass. The focused kernel conformance tests are
 `formal_p2_snapshot_at_is_current_only`,
 `formal_p2_cancelled_cursor_page_returns_no_rows` (OpenCypher), and
-`formal_p2_delete_detach_delete_and_drop_are_fenced`. P2 action adapters are
-part of the remaining Rust MBT completion gate; the tests establish the public
-contract before those randomized trace bindings are added.
+`formal_p2_delete_detach_delete_and_drop_are_fenced`. `formal_mbt_p2.rs`
+replays 24 seeded M5b traces with default features and 24 seeded M2b traces
+with OpenCypher; each action compares its normalized public result/error and
+structural projection. The broader M2/M5 P0 adapters remain separate work.
 
 ## Completion gates
 

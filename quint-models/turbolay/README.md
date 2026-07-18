@@ -68,6 +68,14 @@ mise exec java@21.0.2 -- mise exec -- quint verify \
 # the public GraphShard API and compares its state projection after every step.
 mise exec -- cargo test --locked --test formal_mbt -- --test-threads=1
 
+# P2 has two additional public-API trace replayers. M5b is feature-independent;
+# M2b also exercises the OpenCypher cancelled-page entry point.
+mise exec -- cargo test --locked --test formal_mbt_p2 -- --test-threads=1
+TURBOLAY_PKG_PREFIX="$(brew --prefix libcypher-parser)" \
+PKG_CONFIG_PATH="$(brew --prefix libcypher-parser)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+BINDGEN_EXTRA_CLANG_ARGS="-I$(brew --prefix libcypher-parser)/include" \
+mise exec -- cargo test --locked --features opencypher --test formal_mbt_p2 -- --test-threads=1
+
 # Produces action names (`mbt::actionTaken`) for inspecting the generated
 # simulation trace. `quint test` witnesses are deterministic model checks, but
 # their ITF output lacks the action labels required by quint-connect 0.1.2.

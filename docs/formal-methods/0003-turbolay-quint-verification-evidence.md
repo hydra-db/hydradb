@@ -23,18 +23,18 @@ Apalache then bounded-checked every main model through six transitions using
 | M1 | atomic edge projection, idempotency, writer fencing | 4 | 6 | 24 seeded public-API traces pass |
 | M1b | chunked bulk import, durable prefix, retry | 3 | 6 | focused public-API conformance test |
 | M2 | page snapshot scope, historical epoch rejection, bookmarks | 4 | 6 | direct-page conformance test; driver pending |
-| M2b | current-only `snapshot_at`, typed rejection, cancelled page | 3 | 6 | P2 public-API conformance tests; driver pending |
+| M2b | current-only `snapshot_at`, typed rejection, cancelled page | 3 | 6 | 24 seeded OpenCypher public-API traces pass |
 | M3 | artifact generation fence, matrix equivalence, reader retention | 4 | 6 | 10k simulation + bounded check; driver pending |
 | M4 | placement disagreement and durable writer fence | 3 | 6 | 10k simulation + bounded check; driver pending |
 | M5 | command normalization, relationship identity, batch semantics | 7 | 6 | P0/P1 command conformance tests; driver pending |
-| M5b | `DELETE`, `DETACH DELETE`, cell-drop fence | 3 | 6 | P2 public-API conformance test; driver pending |
+| M5b | `DELETE`, `DETACH DELETE`, cell-drop fence | 3 | 6 | 24 seeded public-API traces pass |
 
 The generated M1/M2 Informal Trace Format files are under `target/formal/` and
-are ignored by Git. M1 is additionally replayed against Rust by
-`tests/formal_mbt.rs`: `quint-connect` generates 24 deterministic-seed
-simulation traces, calls only public `GraphShard` APIs, and compares the
-normalized state after every step. The four named `quint test` witnesses remain
-Quint-only because `quint test` ITF output omits `mbt::actionTaken`, which the
+are ignored by Git. M1 is replayed by `tests/formal_mbt.rs`; M2b and M5b are
+replayed by `tests/formal_mbt_p2.rs`. `quint-connect` generates 24
+deterministic-seed simulation traces per driver, calls only public APIs, and
+compares normalized state after every step. The named `quint test` witnesses
+remain Quint-only because their ITF output omits `mbt::actionTaken`, which the
 current adapter requires for action dispatch.
 
 ### P0 completion evidence (2026-07-18)
@@ -87,7 +87,10 @@ Quint simulation, and six-step Apalache check. The default-feature tests
 `formal_p2_cancelled_cursor_page_returns_no_rows` also passes. Together these
 check current-only storage snapshot admission, future/historical typed errors,
 cancelled page no-result behavior, detach cascade, and the post-drop write
-fence.
+fence. `formal_mbt_p2.rs` then replays 24 seeded M5b destructive-operation
+traces under default features and 24 seeded M2b snapshot/cancellation traces
+with OpenCypher. Each driver normalizes only public outcomes, snapshots, and
+degree projections after every Quint action.
 
 ## Evidence boundary
 
@@ -122,12 +125,14 @@ SlateDB keys as its oracle.
 | M3 | artifact build/refresh, direct and matrix reachability, maintenance GC | direct traversal equals matrix-plus-delta traversal; publication generation; retained read succeeds |
 | M4 | fenced owned shard/routed cluster open and replacement writer | one accepted writer, monotone epoch, fresh reader sees committed prefix |
 | M5 | Cypher `CREATE`/`MERGE`/`DELETE`/batch plus service cursor calls | normalized rows, relationship identity, batch outcome, materialized cursor rows |
-| M2b/M5b | `snapshot_at`, paged cancellation, vertex deletion, `drop_cell` | snapshot epoch/error class, no cancelled page, incident-edge projection, post-drop `CellDropped` |
+| M2b | **implemented:** `snapshot_at`, OpenCypher page/cancellation | snapshot epoch/error class; a cancelled request yields no page |
+| M5b | **implemented:** vertex deletion and `drop_cell` | incident-edge degree projection; post-drop `CellDropped` |
 
-The next implementation order is M2, then M5 P0 semantics. Every driver runs
-first against a local in-memory object store, retains the input trace plus
-observed projection on failure, and later replays the same corpus against
-MinIO. M3–M5 remain subject to their required public semantic decisions.
+The next implementation order is the broader M2, then M5 P0 semantics. Every
+driver runs first against a local in-memory object store, retains the input
+trace plus observed projection on failure, and later replays the same corpus
+against MinIO. M3–M5 remain subject to their required public semantic
+decisions.
 
 ## Jepsen handoff
 
@@ -165,6 +170,7 @@ mise exec -- quint run quint-models/turbolay/m1_cell_write.qnt \
 
 # Rust replay of action-labelled Quint simulation traces.
 mise exec -- cargo test --locked --test formal_mbt -- --test-threads=1
+mise exec -- cargo test --locked --test formal_mbt_p2 -- --test-threads=1
 ```
 
 ## Review requested
@@ -173,4 +179,5 @@ mise exec -- cargo test --locked --test formal_mbt -- --test-threads=1
 2. Approve whether BFG-004's conflict rejection is the public batch contract.
 3. Choose BFG-008: stable direct pagination or explicitly best-effort offset
    pagination.
-4. Confirm that M1 then M2 is the desired Rust MBT implementation order.
+4. Confirm that the broader M2 then M5 P0 adapters are the desired next Rust
+   MBT implementation order after M1/M2b/M5b.
