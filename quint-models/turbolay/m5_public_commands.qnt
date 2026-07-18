@@ -14,6 +14,7 @@ module m5_public_commands {
   var relationshipSrc: int
   var relationshipDst: int
   var createdRelationshipCount: int
+  var liveRelationshipCount: int
   var edgeMetadata: str
   var duplicateVertexRejected: bool
   var ambiguousRelationshipRejected: bool
@@ -31,6 +32,7 @@ module m5_public_commands {
     relationshipSrc' = 0,
     relationshipDst' = 0,
     createdRelationshipCount' = 0,
+    liveRelationshipCount' = 0,
     edgeMetadata' = "none",
     duplicateVertexRejected' = false,
     ambiguousRelationshipRejected' = false,
@@ -50,6 +52,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    liveRelationshipCount' = liveRelationshipCount,
     edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
@@ -63,6 +66,8 @@ module m5_public_commands {
   // CREATE allocates a relationship identity. The finite model uses ID 7.
   action createRelationshipCommand: bool = all {
     not(relationshipPresent),
+    not(edgePresent),
+    createdRelationshipCount == 0,
     edgePresent' = true,
     vertexPresent' = vertexPresent,
     relationshipPresent' = true,
@@ -70,6 +75,7 @@ module m5_public_commands {
     relationshipSrc' = 1,
     relationshipDst' = 2,
     createdRelationshipCount' = createdRelationshipCount + 1,
+    liveRelationshipCount' = 1,
     edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
@@ -93,6 +99,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    liveRelationshipCount' = liveRelationshipCount,
     edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
@@ -116,6 +123,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    liveRelationshipCount' = liveRelationshipCount,
     edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = true,
@@ -137,6 +145,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    liveRelationshipCount' = liveRelationshipCount,
     edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = true,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
@@ -159,6 +168,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    liveRelationshipCount' = liveRelationshipCount,
     edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
@@ -179,6 +189,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    liveRelationshipCount' = liveRelationshipCount,
     edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
@@ -201,6 +212,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    liveRelationshipCount' = liveRelationshipCount,
     edgeMetadata' = "set",
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
@@ -221,6 +233,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    liveRelationshipCount' = liveRelationshipCount,
     edgeMetadata' = "none",
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
@@ -231,6 +244,71 @@ module m5_public_commands {
     lastAction' = "removeEdgeMetadataCommand",
   }
 
+  // Two relationship records may share one structural edge. Removing either
+  // record must preserve adjacency until the final record is removed.
+  action createParallelRelationshipCommand: bool = all {
+    relationshipPresent,
+    liveRelationshipCount == 1,
+    edgePresent' = true,
+    vertexPresent' = vertexPresent,
+    relationshipPresent' = true,
+    relationshipId' = relationshipId,
+    relationshipSrc' = relationshipSrc,
+    relationshipDst' = relationshipDst,
+    createdRelationshipCount' = createdRelationshipCount,
+    liveRelationshipCount' = 2,
+    edgeMetadata' = edgeMetadata,
+    duplicateVertexRejected' = duplicateVertexRejected,
+    ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
+    materializedRows' = materializedRows,
+    cursorOffset' = cursorOffset,
+    cursorOpen' = cursorOpen,
+    lastResponse' = "created",
+    lastAction' = "createParallelRelationshipCommand",
+  }
+
+  action deleteOneParallelRelationshipCommand: bool = all {
+    relationshipPresent,
+    liveRelationshipCount == 2,
+    edgePresent' = true,
+    vertexPresent' = vertexPresent,
+    relationshipPresent' = true,
+    relationshipId' = relationshipId,
+    relationshipSrc' = relationshipSrc,
+    relationshipDst' = relationshipDst,
+    createdRelationshipCount' = createdRelationshipCount,
+    liveRelationshipCount' = 1,
+    edgeMetadata' = edgeMetadata,
+    duplicateVertexRejected' = duplicateVertexRejected,
+    ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
+    materializedRows' = materializedRows,
+    cursorOffset' = cursorOffset,
+    cursorOpen' = cursorOpen,
+    lastResponse' = "deleted",
+    lastAction' = "deleteOneParallelRelationshipCommand",
+  }
+
+  action deleteFinalRelationshipCommand: bool = all {
+    relationshipPresent,
+    liveRelationshipCount == 1,
+    edgePresent' = false,
+    vertexPresent' = vertexPresent,
+    relationshipPresent' = false,
+    relationshipId' = 0,
+    relationshipSrc' = 0,
+    relationshipDst' = 0,
+    createdRelationshipCount' = createdRelationshipCount,
+    liveRelationshipCount' = 0,
+    edgeMetadata' = "none",
+    duplicateVertexRejected' = duplicateVertexRejected,
+    ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
+    materializedRows' = materializedRows,
+    cursorOffset' = cursorOffset,
+    cursorOpen' = cursorOpen,
+    lastResponse' = "deleted",
+    lastAction' = "deleteFinalRelationshipCommand",
+  }
+
   action step: bool = any {
     createEdgeCommand,
     createRelationshipCommand,
@@ -239,6 +317,9 @@ module m5_public_commands {
     rejectConflictingDuplicateVertex,
     setEdgeMetadataCommand,
     removeEdgeMetadataCommand,
+    createParallelRelationshipCommand,
+    deleteOneParallelRelationshipCommand,
+    deleteFinalRelationshipCommand,
     openMaterializedCursor,
     fetchMaterializedCursorPage,
   }
@@ -249,6 +330,7 @@ module m5_public_commands {
       relationshipSrc == 1,
       relationshipDst == 2,
       createdRelationshipCount == 1,
+      liveRelationshipCount >= 1,
     }
   val conflictingVertexBatchHasNoMutation: bool =
     not(duplicateVertexRejected) or vertexPresent
@@ -257,20 +339,23 @@ module m5_public_commands {
   val cursorRowsRemainMaterialized: bool =
     not(cursorOpen) or materializedRows == 2
   val ambiguousRelationshipNeverAliases: bool =
-    not(ambiguousRelationshipRejected) or all {
+    not(ambiguousRelationshipRejected) or not(relationshipPresent) or all {
       relationshipSrc == 1,
       relationshipDst == 2,
       createdRelationshipCount == 1,
     }
   val metadataRequiresStructuralEdge: bool =
     edgeMetadata == "none" or edgePresent
+  val liveRelationshipsRequireStructuralEdge: bool =
+    liveRelationshipCount == 0 or edgePresent
   val allSafety: bool =
     relationshipIdentityIsStable and
       conflictingVertexBatchHasNoMutation and
       materializedCursorBounds and
       cursorRowsRemainMaterialized and
       ambiguousRelationshipNeverAliases and
-      metadataRequiresStructuralEdge
+      metadataRequiresStructuralEdge and
+      liveRelationshipsRequireStructuralEdge
 
   val ambiguousRelationshipRejectionReached: bool =
     lastAction == "rejectAmbiguousRelationshipId"
@@ -284,4 +369,10 @@ module m5_public_commands {
     lastAction == "fetchMaterializedCursorPage"
   val edgeMetadataSetReached: bool = lastAction == "setEdgeMetadataCommand"
   val edgeMetadataRemovedReached: bool = lastAction == "removeEdgeMetadataCommand"
+  val parallelRelationshipCreatedReached: bool =
+    lastAction == "createParallelRelationshipCommand"
+  val oneParallelRelationshipDeletedReached: bool =
+    lastAction == "deleteOneParallelRelationshipCommand"
+  val finalRelationshipDeletedReached: bool =
+    lastAction == "deleteFinalRelationshipCommand"
 }

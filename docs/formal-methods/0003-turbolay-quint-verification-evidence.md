@@ -24,7 +24,7 @@ main model through six transitions using `quint verify` and
 | M2 | page snapshot scope, historical epoch rejection, bookmarks | 4 | 6 | direct-page conformance test; driver pending |
 | M3 | artifact generation fence, matrix equivalence, reader retention | 4 | 6 | pending |
 | M4 | placement disagreement and durable writer fence | 3 | 6 | pending |
-| M5 | command normalization, relationship identity, batch semantics | 6 | 6 | P0 command conformance tests; driver pending |
+| M5 | command normalization, relationship identity, batch semantics | 7 | 6 | P0/P1 command conformance tests; driver pending |
 
 The generated M1/M2 Informal Trace Format files are under `target/formal/` and
 are ignored by Git. M1 is additionally replayed against Rust by
