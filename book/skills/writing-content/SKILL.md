@@ -50,6 +50,12 @@ phases — respect that boundary.
 5. **Make it runnable where you can.** Prefer a small snippet the reader could
    actually type and run (e.g. a toy Quint model, a `mise exec -- quint run …`
    command) over an abstract description. Keep runnable examples correct.
+5b. **Show it, don't just tell it.** If a paragraph is describing a sequence of
+   events, a set of states and transitions, a concept's parts, or a mapping
+   between two things, replace or accompany it with a figure or table. A page
+   that is wall-to-wall prose is a defect — break it up with visuals. Use the
+   Bookly/fletcher/cetz/table conventions and theme-aware colors from the
+   `formatting-chapters` skill; never hardcode diagram colors.
 6. **State the learning goal's payoff.** By the end of the chapter the reader
    should be able to do the thing the `LEARNING GOAL` promises. Close by naming
    what the next chapter does, by descriptive name.

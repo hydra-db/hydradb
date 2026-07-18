@@ -44,6 +44,24 @@ correct behavior is that the retry, carrying the same idempotency key, returns t
 and applies nothing further, so that the ambiguous outcome collapses back to exactly one edge no
 matter how many times the anxious client asks again.
 
+#figure(
+  diagram(
+    spacing: (3.0cm, 0.85cm),
+    node-stroke: none,
+    node((0, 0), text(weight: "bold", fill: reader-colors.text)[Client]),
+    node((1, 0), text(weight: "bold", fill: reader-colors.text)[turbolay]),
+    edge((0, 0), (0, 6), stroke: (dash: "dotted", paint: reader-colors.border)),
+    edge((1, 0), (1, 6), stroke: (dash: "dotted", paint: reader-colors.border)),
+    edge((0, 1), (1, 1), "->", text(fill: reader-colors.muted, size: 8pt)[create edge, key `K`], stroke: reader-colors.muted),
+    node((1, 2), text(fill: reader-colors.text, size: 8pt)[commit durable · epoch += 1], fill: reader-colors.ok_soft, stroke: 0.5pt + reader-colors.border, inset: 5pt),
+    edge((1, 3), (0, 3), "-->", text(fill: reader-colors.bad, size: 8pt)[acknowledgement lost], stroke: (dash: "dashed", paint: reader-colors.bad)),
+    edge((0, 4), (1, 4), "->", text(fill: reader-colors.muted, size: 8pt)[retry, same key `K`], stroke: reader-colors.muted),
+    node((1, 5), text(fill: reader-colors.text, size: 8pt)[recognise `K` · write nothing], fill: reader-colors.warn_soft, stroke: 0.5pt + reader-colors.border, inset: 5pt),
+    edge((1, 6), (0, 6), "->", text(fill: reader-colors.muted, size: 8pt)[original result — one edge], stroke: 0.7pt + reader-colors.ok),
+  ),
+  caption: [The unlucky exchange. The write is durable, but its acknowledgement never reaches the client. A correct retry, carrying the same idempotency key `K`, returns the recorded outcome and writes nothing, so the ambiguous result collapses to exactly one edge. The task of this part is to gain confidence that turbolay behaves like this in every ordering, not just this one.],
+) <fig-lost-reply>
+
 #custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
   This exact hazard is a first-class property in the models, listed as "ambiguous-result recovery
   and idempotency": if a transaction commits but its response is lost, retrying the same idempotency
@@ -151,16 +169,16 @@ error the layer below cannot.
 
 #figure(
   diagram(
-    node-stroke: 0.6pt,
-    node-fill: rgb("#eef4ff"),
+    node-stroke: 0.6pt + reader-colors.border,
+    node-fill: reader-colors.info_soft,
     spacing: (0pt, 0.7cm),
-    node((0, 0), [*Quint model*\ small, explicit, executable state machine and its safety properties], width: 12.5cm),
-    edge((0, 0), (0, 1), "->", [debugged by simulation]),
-    node((0, 1), [*Apalache, via `quint verify`*\ bounded exhaustive check of the highest-value properties], width: 12.5cm),
-    edge((0, 1), (0, 2), "->", [action traces (ITF)]),
-    node((0, 2), [*Rust model-based testing*\ replay traces against turbolay's public API; the real code must refine the model], fill: rgb("#e9fce9"), width: 12.5cm),
-    edge((0, 2), (0, 3), "-->", stroke: (dash: "dashed", paint: luma(60%)), [deferred, out of scope here]),
-    node((0, 3), text(fill: luma(60%))[_Jepsen_\ real processes and an S3-compatible store under injected faults], stroke: (dash: "dashed", paint: luma(60%)), fill: none, width: 12.5cm),
+    node((0, 0), text(fill: reader-colors.text)[*Quint model*\ small, explicit, executable state machine and its safety properties], width: 12.5cm),
+    edge((0, 0), (0, 1), "->", text(fill: reader-colors.muted)[debugged by simulation], stroke: reader-colors.muted),
+    node((0, 1), text(fill: reader-colors.text)[*Apalache, via `quint verify`*\ bounded exhaustive check of the highest-value properties], width: 12.5cm),
+    edge((0, 1), (0, 2), "->", text(fill: reader-colors.muted)[action traces (ITF)], stroke: reader-colors.muted),
+    node((0, 2), text(fill: reader-colors.text)[*Rust model-based testing*\ replay traces against turbolay's public API; the real code must refine the model], fill: reader-colors.ok_soft, width: 12.5cm),
+    edge((0, 2), (0, 3), "-->", stroke: (dash: "dashed", paint: reader-colors.muted), text(fill: reader-colors.muted)[deferred, out of scope here]),
+    node((0, 3), text(fill: reader-colors.muted)[_Jepsen_\ real processes and an S3-compatible store under injected faults], stroke: (dash: "dashed", paint: reader-colors.muted), fill: none, width: 12.5cm),
   ),
   caption: [The layered-evidence design from the testing objective. Each layer establishes something the layer above it cannot. This part of the book pursues the first three; Jepsen is named here as the intended fourth layer and is out of scope for these chapters.],
 ) <fig-layers-of-evidence>
