@@ -64,6 +64,16 @@ explicit remaining completion-gate item rather than an unrecorded gap.
 | 7 | Remote bookmark proof and reader freshness | Typed proof-or-error result, monotonic bookmark, and an explicit safety-only lagging-reader model. |
 | 8 | Bulk/trusted import unit and retry | Model stated atomic batch units, failure between units, and trusted-input precondition rejection. |
 
+#### P1 rank 5 completion evidence
+
+M5 now models two relationship records sharing one structural edge and the
+two required deletion transitions. Its parallel-relationship witness, 10,000
+sample simulation, and six-step Apalache run pass. The default-feature Rust
+test `formal_p1_parallel_relationship_delete_preserves_edge_until_final_relationship`
+verifies that the first delete leaves the edge and its degree intact, while the
+second removes both. P1 ranks 6–8 remain pending their adapter and fault-model
+work.
+
 ### P2 — lower-frequency destructive or unsupported operations
 
 | Rank | Surface | Quint/MBT completion target |

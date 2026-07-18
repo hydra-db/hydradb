@@ -48,4 +48,16 @@ module m5_public_commands_test {
       .then(removeEdgeMetadataCommand)
       .expect(edgePresent)
       .expect(edgeMetadata == "none")
+
+  run parallelRelationshipDeletePreservesEdgeUntilFinalDeleteTest =
+    init
+      .then(createRelationshipCommand)
+      .then(createParallelRelationshipCommand)
+      .expect(liveRelationshipCount == 2)
+      .then(deleteOneParallelRelationshipCommand)
+      .expect(liveRelationshipCount == 1)
+      .expect(edgePresent)
+      .then(deleteFinalRelationshipCommand)
+      .expect(liveRelationshipCount == 0)
+      .expect(not(edgePresent))
 }

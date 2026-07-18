@@ -144,6 +144,98 @@ async fn formal_p0_relationship_identity_and_duplicate_vertex_batch_are_atomic()
     shard.close().await.unwrap();
 }
 
+// P1/M5: relationship records are a multigraph layer over one structural
+// adjacency. Deleting one record cannot remove the shared edge; the last one
+// must remove it and decrement the degree exactly once.
+#[tokio::test]
+async fn formal_p1_parallel_relationship_delete_preserves_edge_until_final_relationship() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/formal-p1-parallel-relationship-delete", object_store).await;
+    let imported = shard
+        .import_relationships_batch(
+            "formal-cell",
+            "FOLLOWS",
+            [
+                RelationshipMutation {
+                    cell_id: "formal-cell".to_string(),
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 1,
+                    dst: 2,
+                    relationship_id: 7,
+                    metadata: EdgeMetadata::default(),
+                },
+                RelationshipMutation {
+                    cell_id: "formal-cell".to_string(),
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 1,
+                    dst: 2,
+                    relationship_id: 8,
+                    metadata: EdgeMetadata::default(),
+                },
+            ],
+            "formal-p1-parallel-relationships",
+        )
+        .await
+        .unwrap();
+    assert_eq!(imported.relationships_inserted, 2);
+    assert_eq!(
+        shard.out_degree("formal-cell", "FOLLOWS", 1).await.unwrap(),
+        1
+    );
+
+    assert!(
+        shard
+            .delete_relationship(
+                EdgeMutation {
+                    cell_id: "formal-cell".to_string(),
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 1,
+                    dst: 2,
+                    idempotency_key: "formal-p1-delete-relationship-7".to_string(),
+                },
+                7,
+            )
+            .await
+            .unwrap()
+            .deleted
+    );
+    assert!(shard
+        .edge_exists("formal-cell", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+    assert_eq!(
+        shard.out_degree("formal-cell", "FOLLOWS", 1).await.unwrap(),
+        1
+    );
+
+    assert!(
+        shard
+            .delete_relationship(
+                EdgeMutation {
+                    cell_id: "formal-cell".to_string(),
+                    edge_type: "FOLLOWS".to_string(),
+                    src: 1,
+                    dst: 2,
+                    idempotency_key: "formal-p1-delete-relationship-8".to_string(),
+                },
+                8,
+            )
+            .await
+            .unwrap()
+            .deleted
+    );
+    assert!(!shard
+        .edge_exists("formal-cell", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+    assert_eq!(
+        shard.out_degree("formal-cell", "FOLLOWS", 1).await.unwrap(),
+        0
+    );
+
+    shard.close().await.unwrap();
+}
+
 #[cfg(all(feature = "opencypher", feature = "graphblas"))]
 #[tokio::test]
 async fn cypher_graphblas_snapshot_applies_plus_and_minus_deltas() {
