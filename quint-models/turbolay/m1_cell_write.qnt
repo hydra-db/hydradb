@@ -268,6 +268,14 @@ module m1_cell_write {
       ((activeWriter == 1) implies writer1Live) and
       ((activeWriter == 2) implies writer2Live)
   val zombieWriteRejected: bool = not(lastAction == "zombieWrite")
+  val allSafety: bool =
+    epochNeverRegresses and
+      edgeProjectionConsistent and
+      deltaMatchesLatestTopologyChange and
+      createIdempotencyExact and
+      deleteIdempotencyExact and
+      oneEffectiveWriter and
+      zombieWriteRejected
 
   val lostReplyReached: bool = lastAction == "commitThenLoseReply"
   val takeoverReached: bool = lastAction == "takeOverWriter2"

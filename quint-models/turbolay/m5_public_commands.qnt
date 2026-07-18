@@ -14,6 +14,7 @@ module m5_public_commands {
   var relationshipSrc: int
   var relationshipDst: int
   var createdRelationshipCount: int
+  var edgeMetadata: str
   var duplicateVertexRejected: bool
   var ambiguousRelationshipRejected: bool
   var materializedRows: int
@@ -30,6 +31,7 @@ module m5_public_commands {
     relationshipSrc' = 0,
     relationshipDst' = 0,
     createdRelationshipCount' = 0,
+    edgeMetadata' = "none",
     duplicateVertexRejected' = false,
     ambiguousRelationshipRejected' = false,
     materializedRows' = 0,
@@ -48,6 +50,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
     materializedRows' = materializedRows,
@@ -67,6 +70,7 @@ module m5_public_commands {
     relationshipSrc' = 1,
     relationshipDst' = 2,
     createdRelationshipCount' = createdRelationshipCount + 1,
+    edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
     materializedRows' = materializedRows,
@@ -89,6 +93,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
     materializedRows' = materializedRows,
@@ -111,6 +116,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = true,
     materializedRows' = materializedRows,
@@ -131,6 +137,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = true,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
     materializedRows' = materializedRows,
@@ -152,6 +159,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
     materializedRows' = 2,
@@ -171,6 +179,7 @@ module m5_public_commands {
     relationshipSrc' = relationshipSrc,
     relationshipDst' = relationshipDst,
     createdRelationshipCount' = createdRelationshipCount,
+    edgeMetadata' = edgeMetadata,
     duplicateVertexRejected' = duplicateVertexRejected,
     ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
     materializedRows' = materializedRows,
@@ -180,12 +189,56 @@ module m5_public_commands {
     lastAction' = "fetchMaterializedCursorPage",
   }
 
+  // Property changes are one atomic metadata/index projection. They do not
+  // create or remove the structural adjacency that owns the relationship.
+  action setEdgeMetadataCommand: bool = all {
+    edgePresent,
+    edgeMetadata != "set",
+    edgePresent' = edgePresent,
+    vertexPresent' = vertexPresent,
+    relationshipPresent' = relationshipPresent,
+    relationshipId' = relationshipId,
+    relationshipSrc' = relationshipSrc,
+    relationshipDst' = relationshipDst,
+    createdRelationshipCount' = createdRelationshipCount,
+    edgeMetadata' = "set",
+    duplicateVertexRejected' = duplicateVertexRejected,
+    ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
+    materializedRows' = materializedRows,
+    cursorOffset' = cursorOffset,
+    cursorOpen' = cursorOpen,
+    lastResponse' = "updated",
+    lastAction' = "setEdgeMetadataCommand",
+  }
+
+  action removeEdgeMetadataCommand: bool = all {
+    edgePresent,
+    edgeMetadata == "set",
+    edgePresent' = edgePresent,
+    vertexPresent' = vertexPresent,
+    relationshipPresent' = relationshipPresent,
+    relationshipId' = relationshipId,
+    relationshipSrc' = relationshipSrc,
+    relationshipDst' = relationshipDst,
+    createdRelationshipCount' = createdRelationshipCount,
+    edgeMetadata' = "none",
+    duplicateVertexRejected' = duplicateVertexRejected,
+    ambiguousRelationshipRejected' = ambiguousRelationshipRejected,
+    materializedRows' = materializedRows,
+    cursorOffset' = cursorOffset,
+    cursorOpen' = cursorOpen,
+    lastResponse' = "updated",
+    lastAction' = "removeEdgeMetadataCommand",
+  }
+
   action step: bool = any {
     createEdgeCommand,
     createRelationshipCommand,
     mergeSameRelationshipCommand,
     rejectAmbiguousRelationshipId,
     rejectConflictingDuplicateVertex,
+    setEdgeMetadataCommand,
+    removeEdgeMetadataCommand,
     openMaterializedCursor,
     fetchMaterializedCursorPage,
   }
@@ -209,6 +262,15 @@ module m5_public_commands {
       relationshipDst == 2,
       createdRelationshipCount == 1,
     }
+  val metadataRequiresStructuralEdge: bool =
+    edgeMetadata == "none" or edgePresent
+  val allSafety: bool =
+    relationshipIdentityIsStable and
+      conflictingVertexBatchHasNoMutation and
+      materializedCursorBounds and
+      cursorRowsRemainMaterialized and
+      ambiguousRelationshipNeverAliases and
+      metadataRequiresStructuralEdge
 
   val ambiguousRelationshipRejectionReached: bool =
     lastAction == "rejectAmbiguousRelationshipId"
@@ -220,4 +282,6 @@ module m5_public_commands {
   val materializedCursorOpenedReached: bool = lastAction == "openMaterializedCursor"
   val materializedCursorPageFetchedReached: bool =
     lastAction == "fetchMaterializedCursorPage"
+  val edgeMetadataSetReached: bool = lastAction == "setEdgeMetadataCommand"
+  val edgeMetadataRemovedReached: bool = lastAction == "removeEdgeMetadataCommand"
 }

@@ -54,8 +54,7 @@ done
 # Bounded Apalache check; Java must be selected through Mise on this host.
 mise exec java@21.0.2 -- mise exec -- quint verify \
   quint-models/turbolay/m2_snapshot_read.qnt --main m2_snapshot_read \
-  --invariant cursorPinnedToSnapshot,returnedPageMatchesCursor,\
-invalidHistoricalNeverReturns,bookmarkMonotone --max-steps 6
+  --invariant allSafety --max-steps 6
 
 # The M1 Rust driver replays these action-labelled simulation traces through
 # the public GraphShard API and compares its state projection after every step.

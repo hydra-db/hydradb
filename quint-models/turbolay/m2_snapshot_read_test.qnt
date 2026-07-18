@@ -29,4 +29,16 @@ module m2_snapshot_read_test {
       .then(advanceBookmark)
       .expect(sessionBookmark == 2)
       .expect(previousBookmark == 1)
+
+  run directOffsetPaginationUsesItsOwnRequestViewTest =
+    init
+      .then(fetchDirectPage)
+      .expect(directPageEpoch == 1)
+      .expect(directPageIndex == 0)
+      .expect(directPageRow == 1)
+      .then(commitAppend)
+      .then(fetchDirectPage)
+      .expect(directPageEpoch == 2)
+      .expect(directPageIndex == 1)
+      .expect(directPageRow == 2)
 }
