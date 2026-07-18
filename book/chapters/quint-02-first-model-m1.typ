@@ -680,11 +680,65 @@ here; only note that those scenarios exercise exactly the actions you have just 
 
 == A picture of the reachable states
 
-Before the storyline, look at a single step in isolation, because that is where the
-nondeterminism lives. From one state, `step` does not pick _the_ next action; it may fire
-_any_ action whose guards currently hold. Standing in the state where writer 1 owns the cell
-and no edge exists yet, four different actions are enabled at once, and the checker follows
-every one of them:
+A Quint model is a state machine, and the honest way to picture it is not a single storyline
+but a _branching tree_. `init` fixes the root. Every time `step` fires, its `any { ... }`
+offers several enabled actions at once, so the future _forks_: one state has many possible
+successors, and the model _is_ the whole tree of states reachable from `init` by repeating
+`step`. Two facts about that tree are the entire reason this abstraction is worth the
+discipline, and one picture holds both.
+
+#note[
+  Two ways to read the same tree. Follow the *bold* line only and you are _testing_ — one
+  path, one verdict, and no idea what the untaken forks would have done. Fill in the _whole_
+  tree and you are _model checking_ — every interleaving judged at once. That difference is
+  the whole subject of the final chapters.
+]
+
+#figure(
+  diagram(
+    node-stroke: 0.6pt + reader-colors.border,
+    node-outset: 0pt,
+    spacing: (2.3cm, 1.25cm),
+    // Shaded reachable region (declared first so it sits behind the states).
+    node(
+      enclose: ((0, 0), (0, 1), (-1.45, 2), (0, 2), (1.45, 2), (0, 3), (0, 4), (0, 5)),
+      inset: 13pt,
+      corner-radius: 7pt,
+      stroke: (dash: "dashed", paint: reader-colors.ok, thickness: 0.8pt),
+      fill: reader-colors.ok_soft.transparentize(60%),
+    ),
+    // The bold spine: one behavior — what a single test exercises.
+    node((0, 0), text(fill: reader-colors.text)[`init`\ no writer], fill: reader-colors.surface_soft, width: 2.55cm),
+    node((0, 1), text(fill: reader-colors.text)[writer 1\ owns cell], fill: reader-colors.info_soft, width: 2.55cm),
+    node((0, 2), text(fill: reader-colors.text, hyphenate: false)[edge present\ epoch += 1], fill: reader-colors.ok_soft, width: 2.55cm),
+    node((0, 3), text(fill: reader-colors.text)[writer 1\ crashed], fill: reader-colors.surface_soft, width: 2.55cm),
+    node((0, 4), text(fill: reader-colors.text)[writer 2\ took over], fill: reader-colors.info_soft, width: 2.55cm),
+    node((0, 5), text(fill: reader-colors.text)[zombie write\ rejected], fill: reader-colors.ok_soft, width: 2.55cm),
+    // Faded forks: the other interleavings the checker also walks.
+    node((-1.45, 2), text(fill: reader-colors.muted)[reply\ lost], fill: reader-colors.warn_soft.transparentize(25%), width: 2.0cm),
+    node((1.45, 2), text(fill: reader-colors.muted)[conflict\ rejected], fill: reader-colors.bad_soft.transparentize(25%), width: 2.0cm),
+    // The forbidden state: outside the region, no arrow reaches it.
+    node((2.95, 4), text(fill: reader-colors.text)[*zombie COMMITS*\ 2nd durable write], fill: reader-colors.bad_soft, width: 2.5cm, stroke: (dash: "dashed", paint: reader-colors.bad, thickness: 1pt)),
+    // Bold spine edges.
+    edge((0, 0), (0, 1), "->", text(fill: reader-colors.info, size: 7.5pt)[`openWriter1`], stroke: 1.3pt + reader-colors.info, label-side: right),
+    edge((0, 1), (0, 2), "->", text(fill: reader-colors.info, size: 7.5pt)[`createEdge`], stroke: 1.3pt + reader-colors.info, label-side: right),
+    edge((0, 2), (0, 3), "->", text(fill: reader-colors.info, size: 7.5pt)[`crashWriter1`], stroke: 1.3pt + reader-colors.info, label-side: right),
+    edge((0, 3), (0, 4), "->", text(fill: reader-colors.info, size: 7.5pt)[`takeOverWriter2`], stroke: 1.3pt + reader-colors.info, label-side: right),
+    edge((0, 4), (0, 5), "->", text(fill: reader-colors.info, size: 7.5pt)[`rejectZombieWrite`], stroke: 1.3pt + reader-colors.info, label-side: right),
+    // Faded fork edges.
+    edge((0, 1), (-1.45, 2), "->", text(fill: reader-colors.muted, size: 6.5pt)[`commitThenLoseReply`], stroke: (thickness: 0.6pt, paint: reader-colors.muted, dash: "dotted"), label-side: left, label-pos: 0.82),
+    edge((0, 1), (1.45, 2), "->", text(fill: reader-colors.muted, size: 6.5pt)[`rejectConflictingRetry`], stroke: (thickness: 0.6pt, paint: reader-colors.muted, dash: "dotted"), label-side: right, label-pos: 0.82),
+    // The transition that does not exist.
+    edge((0, 4), (2.95, 4), "-->", text(fill: reader-colors.bad, size: 7pt)[✗ no such\ transition], stroke: (thickness: 0.8pt, paint: reader-colors.bad, dash: "dashed"), label-pos: 0.78),
+  ),
+  caption: [The write-path model as the tree of states reachable from `init`. The *bold* path is one behavior — what a single test exercises. The faded forks are the _other_ interleavings `step`'s `any { ... }` allows, and `quint run` walks them all. Everything the model can reach lies inside the shaded region, where `allSafety` holds. The dashed state outside has _no incoming arrow_: the model contains no transition that lets a fenced writer commit a second time — and that missing edge is exactly what the fence guarantee means.],
+) <fig-state-space>
+
+Hold onto that shape; the two figures below are both zoomed-in views of it. First zoom into a
+single fork, because that is where the nondeterminism lives. From one state, `step` does not
+pick _the_ next action; it may fire _any_ action whose guards currently hold. Standing in the
+state where writer 1 owns the cell and no edge exists yet, four different actions are enabled
+at once, and the checker follows every one of them:
 
 #figure(
   diagram(
