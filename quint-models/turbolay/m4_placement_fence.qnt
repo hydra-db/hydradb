@@ -179,4 +179,10 @@ module m4_placement_fence {
   val candidateDisagreementReached: bool = node1Candidate and node2Candidate
   val takeoverReached: bool = lastAction == "takeOverFenceNode2"
   val zombieRejectionReached: bool = lastAction == "rejectZombieNode1Commit"
+  val node1ChosenReached: bool = lastAction == "chooseNode1"
+  val node2ChosenReached: bool = lastAction == "chooseNode2"
+  val node1FenceAcquiredReached: bool = lastAction == "acquireFenceNode1"
+  val node1CommitReached: bool = lastAction == "commitNode1"
+  val node1PartitionedReached: bool = lastAction == "partitionNode1"
+  val node2CommitReached: bool = lastAction == "commitNode2"
 }

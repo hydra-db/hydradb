@@ -34,4 +34,13 @@ module m1_cell_write_test {
       .expect(activeWriter == 2)
       .expect(edgePresent)
       .expect(epoch == 1)
+
+  run conflictingRetryIsRejectedWithoutMutationTest =
+    init
+      .then(openWriter1)
+      .then(createEdge)
+      .then(rejectConflictingRetry)
+      .expect(edgePresent)
+      .expect(epoch == 1)
+      .expect(lastAction == "rejectConflictingRetry")
 }

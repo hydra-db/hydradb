@@ -214,4 +214,10 @@ module m5_public_commands {
     lastAction == "rejectAmbiguousRelationshipId"
   val duplicateVertexRejectionReached: bool =
     lastAction == "rejectConflictingDuplicateVertex"
+  val edgeCreateReached: bool = lastAction == "createEdgeCommand"
+  val relationshipCreateReached: bool = lastAction == "createRelationshipCommand"
+  val relationshipMergeReached: bool = lastAction == "mergeSameRelationshipCommand"
+  val materializedCursorOpenedReached: bool = lastAction == "openMaterializedCursor"
+  val materializedCursorPageFetchedReached: bool =
+    lastAction == "fetchMaterializedCursorPage"
 }

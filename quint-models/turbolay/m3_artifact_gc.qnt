@@ -270,4 +270,10 @@ module m3_artifact_gc {
   val stalePublishRejectedReached: bool = lastAction == "rejectStalePublish"
   val matrixQueryReached: bool = lastAction == "queryMatrix"
   val activeReadReached: bool = lastAction == "beginRead"
+  val writeCreateReached: bool = lastAction == "writeCreate"
+  val writeDeleteReached: bool = lastAction == "writeDelete"
+  val artifactBuildStartedReached: bool = lastAction == "startArtifactBuild"
+  val artifactPublishedReached: bool = lastAction == "publishCurrentBuild"
+  val readEndedReached: bool = lastAction == "endRead"
+  val historyGcReached: bool = lastAction == "gcHistory"
 }

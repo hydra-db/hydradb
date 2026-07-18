@@ -268,4 +268,11 @@ module m1_cell_write {
   val lostReplyReached: bool = lastAction == "commitThenLoseReply"
   val takeoverReached: bool = lastAction == "takeOverWriter2"
   val zombieRejectionReached: bool = lastAction == "rejectZombieWrite"
+  val openWriter1Reached: bool = lastAction == "openWriter1"
+  val createEdgeReached: bool = lastAction == "createEdge"
+  val retryCreateReached: bool = lastAction == "retryCreate"
+  val conflictingRetryRejectionReached: bool = lastAction == "rejectConflictingRetry"
+  val deleteEdgeReached: bool = lastAction == "deleteEdge"
+  val retryDeleteReached: bool = lastAction == "retryDelete"
+  val crashWriter1Reached: bool = lastAction == "crashWriter1"
 }
