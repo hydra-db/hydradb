@@ -41,8 +41,8 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 #[cfg(feature = "query-transport")]
 use crate::QueryCancellationToken;
 use crate::{
-    validate_component, GraphError, QueryContext, QueryCursorToken, QueryResultPage,
-    QueryResultSet, QueryRow, QueryValue, Result, RoutedGraphCluster, ShardPlacement,
+    validate_component, GraphError, ObjectStoreNodeDirectory, QueryContext, QueryCursorToken,
+    QueryResultPage, QueryResultSet, QueryRow, QueryValue, Result, RoutedGraphCluster,
 };
 #[cfg(feature = "query-transport")]
 use crate::{GraphId, GraphScope, NamespacePath};
@@ -1603,12 +1603,29 @@ pub trait QueryCellClient: Send + Sync {
         )
     }
 
-    async fn current_graph_epoch(
+    async fn current_storage_sequence(
         &self,
         _scope: &crate::GraphScope,
         _cell_id: &str,
-    ) -> Result<Option<crate::TopologySequence>> {
+    ) -> Result<Option<crate::StorageSequence>> {
         Ok(None)
+    }
+
+    async fn wait_for_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+        _minimum: crate::StorageSequence,
+    ) -> Result<Option<crate::StorageSequence>> {
+        self.current_storage_sequence(scope, cell_id).await
+    }
+
+    async fn refresh_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+    ) -> Result<Option<crate::StorageSequence>> {
+        self.current_storage_sequence(scope, cell_id).await
     }
 }
 
@@ -2656,14 +2673,14 @@ pub struct DistributedQueryPlanResult {
 }
 
 pub struct DistributedQueryCoordinator {
-    placement: ShardPlacement,
+    directory: ObjectStoreNodeDirectory,
     clients: BTreeMap<String, Arc<dyn QueryCellClient>>,
 }
 
 impl DistributedQueryCoordinator {
-    pub fn new(placement: ShardPlacement) -> Self {
+    pub fn new(directory: ObjectStoreNodeDirectory) -> Self {
         Self {
-            placement,
+            directory,
             clients: BTreeMap::new(),
         }
     }
@@ -2690,12 +2707,12 @@ impl DistributedQueryCoordinator {
 
     #[cfg(feature = "query-transport")]
     pub fn from_service_directory(
-        placement: ShardPlacement,
-        directory: &QueryServiceDirectory,
+        nodes: ObjectStoreNodeDirectory,
+        services: &QueryServiceDirectory,
     ) -> Result<Self> {
-        let mut coordinator = Self::new(placement.clone());
-        for node_id in placement.node_ids() {
-            let endpoint = directory
+        let mut coordinator = Self::new(nodes.clone());
+        for node_id in nodes.node_ids() {
+            let endpoint = services
                 .endpoint(node_id)
                 .ok_or_else(|| GraphError::CorruptValue {
                     key: format!("query/service/{node_id}"),
@@ -2714,11 +2731,11 @@ impl DistributedQueryCoordinator {
 
     #[cfg(feature = "query-transport")]
     pub async fn from_service_discovery(
-        placement: ShardPlacement,
+        nodes: ObjectStoreNodeDirectory,
         discovery: &dyn QueryServiceDiscovery,
     ) -> Result<Self> {
-        let directory = discovery.resolve_query_services().await?;
-        Self::from_service_directory(placement, &directory)
+        let services = discovery.resolve_query_services().await?;
+        Self::from_service_directory(nodes, &services)
     }
 
     pub async fn execute_cypher_rows_many(
@@ -2837,13 +2854,24 @@ impl DistributedQueryCoordinator {
     }
 
     fn client_for_cell(&self, cell_id: &str) -> Result<Arc<dyn QueryCellClient>> {
-        let owner = self.placement.owner(cell_id)?;
+        if !self.directory.contains_cell(cell_id)? {
+            return Err(GraphError::UnknownShard {
+                cell_id: cell_id.to_string(),
+            });
+        }
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in cell_id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let index = usize::try_from(hash % self.clients.len().max(1) as u64).unwrap_or(0);
         self.clients
-            .get(owner)
+            .values()
+            .nth(index)
             .cloned()
             .ok_or_else(|| GraphError::CorruptValue {
-                key: format!("query/node/{owner}"),
-                reason: format!("missing query client for owner node {owner}"),
+                key: format!("query/cell/{cell_id}"),
+                reason: "no query nodes are registered".to_string(),
             })
     }
 }
@@ -3047,18 +3075,29 @@ impl QueryCellClient for RoutedGraphCluster {
                 source_column,
                 destination_column,
             } => {
-                let read_epoch = context
-                    .read_epoch
-                    .unwrap_or(shard.current_epoch(&context.cell_id).await?);
-                let entries = shard
-                    .out_neighbors_batch_at_with_cancellation(
+                let snapshot = match context.read_epoch {
+                    Some(read_epoch) => shard.snapshot_at(&context.cell_id, read_epoch).await?,
+                    None => {
+                        shard
+                            .snapshot_for_query(&context.cell_id, context.uses_refreshed_reader())
+                            .await?
+                    }
+                };
+                let read_epoch = snapshot.read_epoch();
+                let storage_sequence = snapshot
+                    .storage_sequence()
+                    .expect("all graph snapshots pin a SlateDB sequence");
+                let entries = crate::GraphStore::scope_snapshot(
+                    Arc::clone(&snapshot.storage_snapshot),
+                    shard.out_neighbors_batch_at_with_cancellation(
                         &context.cell_id,
                         &edge_type,
                         sources,
                         read_epoch,
                         context.cancellation_token.clone(),
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 let row_count = entries
                     .iter()
                     .map(|entry| entry.neighbors.len())
@@ -3100,11 +3139,12 @@ impl QueryCellClient for RoutedGraphCluster {
                 }
                 Ok(
                     QueryResultSet::new(vec![source_column, destination_column], rows)
-                        .with_read_epoch(read_epoch),
+                        .with_read_epoch(read_epoch)
+                        .with_storage_sequence(storage_sequence),
                 )
             }
             crate::QueryBatchOperation::CreateEdges { edge_type, edges } => {
-                self.ensure_local_writer(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id).await?;
                 let mutations =
                     edges
                         .into_iter()
@@ -3130,7 +3170,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 source_label,
                 destination_label,
             } => {
-                self.ensure_local_writer(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id).await?;
                 let mutations =
                     edges
                         .into_iter()
@@ -3156,7 +3196,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
             crate::QueryBatchOperation::UpsertVertices { vertices } => {
-                self.ensure_local_writer(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id).await?;
                 shard
                     .merge_vertex_metadata_batch(
                         &context.cell_id,
@@ -3173,7 +3213,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 source_label,
                 destination_label,
             } => {
-                self.ensure_local_writer(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id).await?;
                 shard
                     .create_relationships_batch_between_labeled_vertices(
                         &context.cell_id,
@@ -3201,7 +3241,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 source_label,
                 destination_label,
             } => {
-                self.ensure_local_writer(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id).await?;
                 shard
                     .merge_relationships_batch_between_labeled_vertices(
                         &context.cell_id,
@@ -3229,7 +3269,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
             crate::QueryBatchOperation::DeleteEdges { edge_type, edges } => {
-                self.ensure_local_writer(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id).await?;
                 let mutations =
                     edges
                         .into_iter()
@@ -3250,7 +3290,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
             crate::QueryBatchOperation::DeleteVertices { vertices, detach } => {
-                self.ensure_local_writer(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id).await?;
                 for (index, vertex) in vertices.into_iter().enumerate() {
                     if context
                         .cancellation_token
@@ -3284,7 +3324,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 property,
                 values,
             } => {
-                self.ensure_local_writer(&context.cell_id)?;
+                self.ensure_local_writer(&context.cell_id).await?;
                 shard
                     .delete_relationships_by_property_values_batch(
                         &context, &edge_type, &property, values,
@@ -3295,18 +3335,59 @@ impl QueryCellClient for RoutedGraphCluster {
         }
     }
 
-    async fn current_graph_epoch(
+    async fn current_storage_sequence(
         &self,
         scope: &crate::GraphScope,
         cell_id: &str,
-    ) -> Result<Option<crate::TopologySequence>> {
+    ) -> Result<Option<crate::StorageSequence>> {
         if scope != self.scope() {
             return Err(GraphError::GraphScopeMismatch {
                 expected: self.scope().to_string(),
                 actual: scope.to_string(),
             });
         }
-        Ok(Some(self.shard(cell_id)?.current_epoch(cell_id).await?))
+        Ok(Some(
+            self.shard(cell_id)?
+                .current_storage_sequence(cell_id)
+                .await?,
+        ))
+    }
+
+    async fn wait_for_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+        minimum: crate::StorageSequence,
+    ) -> Result<Option<crate::StorageSequence>> {
+        if scope != self.scope() {
+            return Err(GraphError::GraphScopeMismatch {
+                expected: self.scope().to_string(),
+                actual: scope.to_string(),
+            });
+        }
+        Ok(Some(
+            self.shard(cell_id)?
+                .wait_for_storage_sequence(cell_id, minimum)
+                .await?,
+        ))
+    }
+
+    async fn refresh_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+    ) -> Result<Option<crate::StorageSequence>> {
+        if scope != self.scope() {
+            return Err(GraphError::GraphScopeMismatch {
+                expected: self.scope().to_string(),
+                actual: scope.to_string(),
+            });
+        }
+        Ok(Some(
+            self.shard(cell_id)?
+                .refresh_storage_sequence(cell_id)
+                .await?,
+        ))
     }
 }
 

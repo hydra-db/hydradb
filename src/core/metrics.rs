@@ -109,8 +109,8 @@ pub struct GraphOperationalMetricsSnapshot {
     pub query_rows_duration_us: u64,
     pub query_artifact_lookup_us: u64,
     pub query_graphblas_cache_us: u64,
-    pub query_graphblas_exact_snapshots: u64,
-    pub query_graphblas_delta_snapshots: u64,
+    pub query_graphblas_artifact_snapshots: u64,
+    pub query_graphblas_rebuilt_snapshots: u64,
     pub query_rust_sparse_fallbacks: u64,
     pub graph_compute_tasks: u64,
     pub graph_compute_queue_us: u64,
@@ -148,8 +148,8 @@ pub(crate) struct GraphOperationalMetrics {
     pub(crate) query_rows_duration_us: AtomicU64,
     pub(crate) query_artifact_lookup_us: AtomicU64,
     pub(crate) query_graphblas_cache_us: AtomicU64,
-    pub(crate) query_graphblas_exact_snapshots: AtomicU64,
-    pub(crate) query_graphblas_delta_snapshots: AtomicU64,
+    pub(crate) query_graphblas_artifact_snapshots: AtomicU64,
+    pub(crate) query_graphblas_rebuilt_snapshots: AtomicU64,
     pub(crate) query_rust_sparse_fallbacks: AtomicU64,
     pub(crate) graph_compute_tasks: AtomicU64,
     pub(crate) graph_compute_queue_us: AtomicU64,
@@ -188,11 +188,11 @@ impl GraphOperationalMetrics {
             query_rows_duration_us: self.query_rows_duration_us.load(Ordering::Relaxed),
             query_artifact_lookup_us: self.query_artifact_lookup_us.load(Ordering::Relaxed),
             query_graphblas_cache_us: self.query_graphblas_cache_us.load(Ordering::Relaxed),
-            query_graphblas_exact_snapshots: self
-                .query_graphblas_exact_snapshots
+            query_graphblas_artifact_snapshots: self
+                .query_graphblas_artifact_snapshots
                 .load(Ordering::Relaxed),
-            query_graphblas_delta_snapshots: self
-                .query_graphblas_delta_snapshots
+            query_graphblas_rebuilt_snapshots: self
+                .query_graphblas_rebuilt_snapshots
                 .load(Ordering::Relaxed),
             query_rust_sparse_fallbacks: self.query_rust_sparse_fallbacks.load(Ordering::Relaxed),
             graph_compute_tasks: self.graph_compute_tasks.load(Ordering::Relaxed),

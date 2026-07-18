@@ -20,7 +20,7 @@ use tokio::time::Instant;
 
 use super::service::{
     ClientBookmark, ClientQueryCredentials, ClientQueryPage, ClientQueryRequest,
-    ClientQueryService, ClientQuerySession, ClientQueryTarget,
+    ClientQueryService, ClientQuerySession, ClientQueryTarget, ClientReadConsistency,
 };
 use crate::{
     GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryCursorToken, QueryFloat,
@@ -297,6 +297,8 @@ struct HttpQueryRequestBody {
     page_size: Option<usize>,
     #[serde(default)]
     cursor: Option<u64>,
+    #[serde(default)]
+    consistency: Option<ClientReadConsistency>,
 }
 
 #[derive(Serialize)]
@@ -461,6 +463,9 @@ async fn execute_query_inner(
         .collect::<std::result::Result<BTreeMap<_, _>, HttpApiError>>()?;
     let mut request =
         ClientQueryRequest::new(target, query_id, body.query).with_query_parameters(parameters);
+    if let Some(consistency) = body.consistency {
+        request = request.with_consistency(consistency);
+    }
     if body.read_epoch.is_some() {
         return Err(HttpApiError::from_graph(GraphError::UnsupportedQuery {
             dialect: "HTTP",

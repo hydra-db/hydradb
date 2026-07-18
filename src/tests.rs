@@ -1,5 +1,5 @@
 use super::*;
-use slatedb::bytes::Bytes;
+use futures::StreamExt;
 use slatedb::object_store::local::LocalFileSystem;
 use slatedb::object_store::memory::InMemory;
 
@@ -9,14 +9,385 @@ async fn open_test_shard(path: &str, object_store: Arc<dyn ObjectStore>) -> Grap
         .unwrap()
 }
 
+#[tokio::test]
+async fn durable_reader_refreshes_to_writer_sequence_without_a_controller() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/slatedb-native-reader-refresh";
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+    writer
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "reader-base"))
+        .await
+        .unwrap();
+
+    let reader = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    reader.refresh_storage_sequence("cell-a").await.unwrap();
+    assert!(reader.edge_exists("cell-a", "CHAIN", 1, 2).await.unwrap());
+
+    let committed = writer
+        .write_edge(typed_mutation("cell-a", "CHAIN", 2, 3, "reader-tail"))
+        .await
+        .unwrap();
+    let refreshed = reader.refresh_storage_sequence("cell-a").await.unwrap();
+    assert!(refreshed >= committed.epoch);
+    assert!(reader.edge_exists("cell-a", "CHAIN", 2, 3).await.unwrap());
+
+    reader.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn refreshed_reader_query_ignores_a_stale_local_writer_view() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/strong-reader-after-writer-handoff";
+    let first_writer = open_test_shard(path, Arc::clone(&object_store)).await;
+    first_writer
+        .write_edge(typed_mutation(
+            "cell-a",
+            "CHAIN",
+            1,
+            2,
+            "writer-handoff-base",
+        ))
+        .await
+        .unwrap();
+
+    let second_writer = open_test_shard(path, object_store).await;
+    second_writer
+        .write_edge(typed_mutation(
+            "cell-a",
+            "CHAIN",
+            2,
+            3,
+            "writer-handoff-tail",
+        ))
+        .await
+        .unwrap();
+
+    first_writer
+        .refresh_storage_sequence("cell-a")
+        .await
+        .unwrap();
+    let rows = first_writer
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "strong-reader-after-writer-handoff")
+                .with_refreshed_reader(),
+            "MATCH (u {id: 2})-[:CHAIN]->(v) RETURN v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(3)])],
+        )
+    );
+
+    second_writer.close().await.unwrap();
+    let _ = first_writer.close().await;
+}
+
+#[tokio::test]
+async fn graph_index_generations_are_isolated_by_cell() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/index-cell-isolation", object_store).await;
+    shard
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "cell-a-edge"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation("cell-b", "CHAIN", 10, 20, "cell-b-edge"))
+        .await
+        .unwrap();
+
+    let cell_a = shard.build_graph_index("cell-a", "CHAIN").await.unwrap();
+    let cell_b = shard.build_graph_index("cell-b", "CHAIN").await.unwrap();
+    assert_ne!(cell_a.generation, cell_b.generation);
+    assert_eq!(
+        shard.current_graph_index("cell-a", "CHAIN").await.unwrap(),
+        Some(cell_a)
+    );
+    assert_eq!(
+        shard.current_graph_index("cell-b", "CHAIN").await.unwrap(),
+        Some(cell_b)
+    );
+}
+
+#[tokio::test]
+async fn graph_index_gc_keeps_current_and_bounded_previous_generations() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/index-generation-gc";
+    let shard = open_test_shard(path, Arc::clone(&object_store)).await;
+    for (index, (src, dst)) in [(1, 2), (2, 3), (3, 4)].into_iter().enumerate() {
+        shard
+            .write_edge(typed_mutation(
+                "cell-a",
+                "CHAIN",
+                src,
+                dst,
+                &format!("index-gc-{index}"),
+            ))
+            .await
+            .unwrap();
+        shard.build_graph_index("cell-a", "CHAIN").await.unwrap();
+    }
+
+    assert_eq!(
+        shard
+            .gc_graph_index_generations("cell-a", "CHAIN", 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let prefix: slatedb::object_store::path::Path =
+        format!("{path}/_graph_index/cell-a/CHAIN/generations").into();
+    let generations = object_store
+        .list(Some(&prefix))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(generations.len(), 2);
+}
+
+#[cfg(feature = "graphblas")]
+#[tokio::test]
+async fn graph_index_query_recovers_when_gc_removes_its_selected_generation() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/index-generation-gc-query-race";
+    let shard = open_test_shard(path, object_store).await;
+    shard
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "gc-race-base"))
+        .await
+        .unwrap();
+    let selected = shard.build_graph_index("cell-a", "CHAIN").await.unwrap();
+
+    shard
+        .write_edge(typed_mutation("cell-a", "CHAIN", 2, 3, "gc-race-next"))
+        .await
+        .unwrap();
+    let current = shard.build_graph_index("cell-a", "CHAIN").await.unwrap();
+    assert!(current.base_sequence > selected.base_sequence);
+    assert_eq!(
+        shard
+            .gc_graph_index_generations("cell-a", "CHAIN", 0)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(shard.graph_index_csc(&selected).await.unwrap().is_none());
+
+    let snapshot = shard.snapshot("cell-a").await.unwrap();
+    let read_sequence = snapshot.read_epoch();
+    let compiled = crate::GraphStore::scope_snapshot(
+        Arc::clone(&snapshot.storage_snapshot),
+        shard.compiled_graphblas_query_snapshot(
+            "cell-a",
+            "CHAIN",
+            selected.base_sequence,
+            read_sequence,
+            &crate::shard::QueryBudget::new(None, None),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(compiled.is_some());
+
+    let traversal = snapshot
+        .matrix_reachable_with_kernel("CHAIN", &[1], 2, SparseKernelBackend::SuiteSparseGraphBlas)
+        .await
+        .unwrap();
+    assert_eq!(traversal.vertices, vec![2, 3]);
+}
+
+#[tokio::test]
+async fn concurrent_indexers_publish_and_gc_without_regressing_current_generation() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/concurrent-index-publish-gc";
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+    writer
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "index-base"))
+        .await
+        .unwrap();
+
+    let indexer_a = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let indexer_b = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let indexer_c = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+
+    let mut last_sequence = 0;
+    for round in 0..4_u64 {
+        if round > 0 {
+            writer
+                .write_edge(typed_mutation(
+                    "cell-a",
+                    "CHAIN",
+                    round + 1,
+                    round + 2,
+                    &format!("index-round-{round}"),
+                ))
+                .await
+                .unwrap();
+        }
+        for indexer in [&indexer_a, &indexer_b, &indexer_c] {
+            indexer.refresh_storage_sequence("cell-a").await.unwrap();
+        }
+
+        let (a, b, c) = tokio::join!(
+            indexer_a.build_graph_index("cell-a", "CHAIN"),
+            indexer_b.build_graph_index("cell-a", "CHAIN"),
+            indexer_c.build_graph_index("cell-a", "CHAIN"),
+        );
+        let generations = [a.unwrap(), b.unwrap(), c.unwrap()];
+        let current = indexer_a
+            .current_graph_index("cell-a", "CHAIN")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(current.base_sequence > last_sequence);
+        assert!(generations
+            .iter()
+            .all(|generation| generation.base_sequence == current.base_sequence));
+        last_sequence = current.base_sequence;
+
+        let (a, b, c) = tokio::join!(
+            indexer_a.gc_graph_index_generations("cell-a", "CHAIN", 1),
+            indexer_b.gc_graph_index_generations("cell-a", "CHAIN", 1),
+            indexer_c.gc_graph_index_generations("cell-a", "CHAIN", 1),
+        );
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
+        assert_eq!(
+            indexer_b
+                .current_graph_index("cell-a", "CHAIN")
+                .await
+                .unwrap(),
+            Some(current)
+        );
+    }
+
+    let prefix: slatedb::object_store::path::Path =
+        format!("{path}/_graph_index/cell-a/CHAIN/generations").into();
+    let generations = object_store
+        .list(Some(&prefix))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!generations.is_empty());
+    assert!(generations.len() <= 2);
+
+    indexer_a.close().await.unwrap();
+    indexer_b.close().await.unwrap();
+    indexer_c.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
 #[cfg(all(feature = "opencypher", feature = "graphblas"))]
 #[tokio::test]
-async fn cypher_graphblas_snapshot_applies_plus_and_minus_deltas() {
+async fn graph_index_wal_tail_fails_at_its_bound_and_recovers_after_reindexing() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard("graph/cypher-graphblas-snapshot-deltas", object_store).await;
+    let path = "graph/index-wal-tail-bound";
+    let limits = GraphLimits {
+        max_query_scan_edges: 2,
+        ..GraphLimits::default()
+    };
+    let writer = GraphShard::open_standalone_writer_with_limits(
+        path,
+        Arc::clone(&object_store),
+        limits.clone(),
+    )
+    .await
+    .unwrap();
+    writer
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "tail-base"))
+        .await
+        .unwrap();
+
+    let indexer = GraphShard::open_with_options(
+        path,
+        Arc::clone(&object_store),
+        GraphOpenOptions {
+            limits,
+            ..GraphOpenOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    indexer.refresh_storage_sequence("cell-a").await.unwrap();
+    indexer.build_graph_index("cell-a", "CHAIN").await.unwrap();
+
+    for (src, dst, key) in [(10, 11, "tail-1"), (20, 21, "tail-2")] {
+        writer
+            .write_edge(typed_mutation("cell-a", "CHAIN", src, dst, key))
+            .await
+            .unwrap();
+    }
+    indexer.refresh_storage_sequence("cell-a").await.unwrap();
+    let within_limit = indexer
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "tail-within-limit"),
+            "MATCH ({id: 1})-[:CHAIN*1..1]->(v) RETURN count(*) AS total",
+        )
+        .await
+        .unwrap();
+    assert_eq!(within_limit.rows[0].values, vec![QueryValue::Count(1)]);
+
+    writer
+        .write_edge(typed_mutation("cell-a", "CHAIN", 30, 31, "tail-overflow"))
+        .await
+        .unwrap();
+    indexer.refresh_storage_sequence("cell-a").await.unwrap();
+    let overflow = indexer
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "tail-overflow"),
+            "MATCH ({id: 1})-[:CHAIN*1..1]->(v) RETURN count(*) AS total",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        overflow,
+        GraphError::AdmissionRejected {
+            operation: "graph_index_wal_affected_edges",
+            actual: 3,
+            limit: 2,
+        }
+    ));
+
+    indexer.build_graph_index("cell-a", "CHAIN").await.unwrap();
+    let recovered = indexer
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "tail-reindexed"),
+            "MATCH ({id: 1})-[:CHAIN*1..1]->(v) RETURN count(*) AS total",
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.rows[0].values, vec![QueryValue::Count(1)]);
+
+    indexer.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+#[cfg(all(feature = "opencypher", feature = "graphblas"))]
+#[tokio::test]
+async fn cypher_graphblas_applies_wal_tail_after_edge_changes() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/cypher-graphblas-snapshot-rebuild";
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
 
     for (index, (src, dst)) in [(1, 2), (2, 3), (1, 4)].into_iter().enumerate() {
-        shard
+        writer
             .write_edge(typed_mutation(
                 "reddit-home",
                 "CHAIN",
@@ -27,12 +398,20 @@ async fn cypher_graphblas_snapshot_applies_plus_and_minus_deltas() {
             .await
             .unwrap();
     }
-    let base_epoch = shard.current_epoch("reddit-home").await.unwrap();
-    shard
-        .build_matrix_tiles("reddit-home", "CHAIN", base_epoch, 4)
+    let base_epoch = writer.current_epoch("reddit-home").await.unwrap();
+    let indexer = GraphShard::open(path, Arc::clone(&object_store))
         .await
         .unwrap();
-    shard
+    indexer
+        .refresh_storage_sequence("reddit-home")
+        .await
+        .unwrap();
+    let index = indexer
+        .build_graph_index("reddit-home", "CHAIN")
+        .await
+        .unwrap();
+    assert_eq!(index.base_sequence, base_epoch);
+    writer
         .write_edge(typed_mutation(
             "reddit-home",
             "CHAIN",
@@ -42,7 +421,7 @@ async fn cypher_graphblas_snapshot_applies_plus_and_minus_deltas() {
         ))
         .await
         .unwrap();
-    shard
+    writer
         .delete_edge(typed_mutation(
             "reddit-home",
             "CHAIN",
@@ -53,9 +432,14 @@ async fn cypher_graphblas_snapshot_applies_plus_and_minus_deltas() {
         .await
         .unwrap();
 
-    let rows = shard
+    let reader = GraphShard::open(path, object_store).await.unwrap();
+    reader
+        .refresh_storage_sequence("reddit-home")
+        .await
+        .unwrap();
+    let rows = reader
         .execute_cypher_rows(
-            QueryContext::new("reddit-home", "snapshot-delta-read"),
+            QueryContext::new("reddit-home", "snapshot-rebuild-read"),
             "MATCH (u {id: 1})-[:CHAIN*1..3]->(v) RETURN v.id ORDER BY v.id",
         )
         .await
@@ -71,21 +455,67 @@ async fn cypher_graphblas_snapshot_applies_plus_and_minus_deltas() {
             ],
         )
     );
-    let metrics = shard.graph_operational_metrics();
-    assert_eq!(metrics.query_graphblas_delta_snapshots, 1);
+    let metrics = reader.graph_operational_metrics();
+    assert_eq!(metrics.query_graphblas_artifact_snapshots, 1);
+    assert_eq!(metrics.query_graphblas_rebuilt_snapshots, 0);
     assert_eq!(metrics.query_rust_sparse_fallbacks, 0);
 
-    let cached_rows = shard
+    let cached_rows = reader
         .execute_cypher_rows(
-            QueryContext::new("reddit-home", "snapshot-delta-cached-read"),
+            QueryContext::new("reddit-home", "snapshot-rebuild-cached-read"),
             "MATCH (u {id: 1})-[:CHAIN*1..3]->(v) RETURN v.id ORDER BY v.id",
         )
         .await
         .unwrap();
     assert_eq!(cached_rows, rows);
-    let cached_metrics = shard.graph_operational_metrics();
-    assert_eq!(cached_metrics.query_graphblas_delta_snapshots, 2);
-    assert_eq!(cached_metrics.query_graphblas_exact_snapshots, 0);
+    let cached_metrics = reader.graph_operational_metrics();
+    assert_eq!(cached_metrics.query_graphblas_rebuilt_snapshots, 0);
+    assert_eq!(cached_metrics.query_graphblas_artifact_snapshots, 2);
+
+    let writer_rows = writer
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "snapshot-writer-local-read"),
+            "MATCH (u {id: 1})-[:CHAIN*1..3]->(v) RETURN v.id ORDER BY v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(writer_rows, rows);
+    let writer_metrics = writer.graph_operational_metrics();
+    assert_eq!(writer_metrics.query_graphblas_artifact_snapshots, 1);
+    assert_eq!(writer_metrics.query_graphblas_rebuilt_snapshots, 0);
+    assert_eq!(writer_metrics.query_rust_sparse_fallbacks, 0);
+
+    reader.close().await.unwrap();
+    indexer.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+#[cfg(feature = "graphblas")]
+#[tokio::test]
+async fn graphblas_wal_tail_resolves_edges_at_the_pinned_snapshot() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/index-pinned-tail", object_store).await;
+    shard
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "pinned-base"))
+        .await
+        .unwrap();
+    shard.build_graph_index("cell-a", "CHAIN").await.unwrap();
+    shard
+        .delete_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "pinned-delete"))
+        .await
+        .unwrap();
+    let pinned = shard.snapshot("cell-a").await.unwrap();
+
+    shard
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "pinned-readd"))
+        .await
+        .unwrap();
+
+    let traversal = pinned
+        .matrix_reachable_with_kernel("CHAIN", &[1], 1, SparseKernelBackend::SuiteSparseGraphBlas)
+        .await
+        .unwrap();
+    assert!(traversal.vertices.is_empty());
 }
 
 #[cfg(all(feature = "opencypher", feature = "graphblas"))]
@@ -103,10 +533,11 @@ async fn cypher_cold_graphblas_snapshot_does_not_reacquire_compilation_gate() {
         .await
         .unwrap();
     let base_epoch = writer.current_epoch("reddit-home").await.unwrap();
-    writer
-        .build_matrix_tiles("reddit-home", "CHAIN", base_epoch, 4)
+    let index = writer
+        .build_graph_index("reddit-home", "CHAIN")
         .await
         .unwrap();
+    assert_eq!(index.base_sequence, base_epoch);
 
     // Advance the topology sequence without changing this edge type. After a
     // reopen, the query must hydrate the cold base matrix and compile the
@@ -122,7 +553,7 @@ async fn cypher_cold_graphblas_snapshot_does_not_reacquire_compilation_gate() {
     assert!(writer.current_epoch("reddit-home").await.unwrap() > base_epoch);
     writer.close().await.unwrap();
 
-    let reopened = open_test_shard(path, object_store).await;
+    let reopened = GraphShard::open(path, object_store).await.unwrap();
     assert_eq!(reopened.graphblas_cache.lock().await.len(), 0);
     let rows = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -142,8 +573,8 @@ async fn cypher_cold_graphblas_snapshot_does_not_reacquire_compilation_gate() {
         )
     );
     let metrics = reopened.graph_operational_metrics();
-    assert_eq!(metrics.query_graphblas_exact_snapshots, 1);
-    assert_eq!(metrics.query_graphblas_delta_snapshots, 0);
+    assert_eq!(metrics.query_graphblas_artifact_snapshots, 1);
+    assert_eq!(metrics.query_graphblas_rebuilt_snapshots, 0);
     assert_eq!(reopened.graphblas_cache.lock().await.len(), 1);
     reopened.close().await.unwrap();
 }
@@ -162,10 +593,11 @@ async fn cypher_graphblas_matrix_survives_interleaved_unrelated_writes() {
         .await
         .unwrap();
     let base_epoch = shard.current_epoch("reddit-home").await.unwrap();
-    shard
-        .build_matrix_tiles("reddit-home", "CHAIN", base_epoch, 4)
+    let index = shard
+        .build_graph_index("reddit-home", "CHAIN")
         .await
         .unwrap();
+    assert_eq!(index.base_sequence, base_epoch);
 
     for marker in 0..3 {
         shard
@@ -198,8 +630,8 @@ async fn cypher_graphblas_matrix_survives_interleaved_unrelated_writes() {
         base_epoch
     );
     let metrics = shard.graph_operational_metrics();
-    assert_eq!(metrics.query_graphblas_exact_snapshots, 3);
-    assert_eq!(metrics.query_graphblas_delta_snapshots, 0);
+    assert_eq!(metrics.query_graphblas_artifact_snapshots, 3);
+    assert_eq!(metrics.query_graphblas_rebuilt_snapshots, 0);
     assert_eq!(shard.graphblas_cache.lock().await.len(), 1);
 }
 
@@ -290,7 +722,7 @@ async fn batch_reads_share_one_snapshot_and_preserve_input_order() {
         )
         .await
         .unwrap();
-    let snapshot_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    let snapshot = shard.snapshot("reddit-home").await.unwrap();
 
     assert_eq!(
         shard
@@ -379,13 +811,7 @@ async fn batch_reads_share_one_snapshot_and_preserve_input_order() {
         ))
         .await
         .unwrap();
-    assert!(
-        shard
-            .edge_exists_batch_at("reddit-home", "FOLLOWS", [(1, 10)], snapshot_epoch,)
-            .await
-            .unwrap()[0]
-            .exists
-    );
+    assert!(snapshot.edge_exists("FOLLOWS", 1, 10).await.unwrap());
     assert!(
         !shard
             .edge_exists_batch("reddit-home", "FOLLOWS", [(1, 10)])
@@ -552,10 +978,10 @@ async fn batch_neighbor_reads_honor_cancellation_before_storage_scans() {
 }
 
 #[tokio::test]
-async fn historical_batch_reads_scan_only_requested_owner_and_pair_deltas() {
+async fn batch_reads_scope_work_to_requested_vertices() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_limits(
-        "graph/batch-read-scoped-deltas",
+        "graph/batch-read-scoped-vertices",
         object_store,
         GraphLimits {
             max_query_scan_edges: 2,
@@ -661,30 +1087,7 @@ async fn edge_mutation_batch_txn_retry_for_test(
 ) -> Result<EdgeMutationBatchResult> {
     for attempt in 0..GRAPH_TXN_MAX_RETRIES {
         match shard
-            .write_edge_mutations_batch_txn(cell_id, &mutations, operation, None, None)
-            .await
-        {
-            Err(err)
-                if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-            {
-                tokio::task::yield_now().await;
-            }
-            result => return result,
-        }
-    }
-    unreachable!("transaction retry loop always returns on final attempt")
-}
-
-async fn append_edge_mutation_log_txn_retry_for_test(
-    shard: Arc<GraphShard>,
-    cell_id: &str,
-    batch_id: &str,
-    mutations: Vec<EdgeMutation>,
-) -> Result<EdgeMutationLogAppendResult> {
-    let fingerprint = edge_mutation_log_fingerprint(cell_id, batch_id, &mutations);
-    for attempt in 0..GRAPH_TXN_MAX_RETRIES {
-        match shard
-            .append_edge_mutation_log_txn(cell_id, batch_id, &mutations, fingerprint)
+            .write_edge_mutations_batch_txn(cell_id, &mutations, operation, None)
             .await
         {
             Err(err)
@@ -813,7 +1216,7 @@ async fn write_authoritative_open_rejects_relaxed_durability() {
         GraphError::UnsafeDurabilityConfig {
             operation: "open_write_authoritative_shard",
             ref reason
-        } if reason.contains("remote-visible metadata")
+        } if reason.contains("remotely durable SlateDB sequences")
     ));
 }
 
@@ -932,7 +1335,7 @@ async fn graph_cache_policy_bounds_entries_and_reports_hits_misses() {
         assert_eq!(metrics.matrix_adjacency_misses, 0);
         assert_eq!(metrics.matrix_adjacency_hits, 0);
     } else {
-        assert!(metrics.matrix_adjacency_misses >= 1);
+        assert_eq!(metrics.matrix_adjacency_misses, 0);
         assert_eq!(metrics.matrix_adjacency_hits, 0);
     }
     assert!(metrics.hydration_started >= 2);
@@ -941,7 +1344,7 @@ async fn graph_cache_policy_bounds_entries_and_reports_hits_misses() {
 }
 
 #[tokio::test]
-async fn write_edge_commits_canonical_records_and_outbox() {
+async fn write_edge_commits_canonical_records() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/write-edge", object_store).await;
 
@@ -981,19 +1384,12 @@ async fn write_edge_commits_canonical_records_and_outbox() {
 
     let retry = shard.write_edge(mutation(1, 2, "req-1")).await.unwrap();
     assert_eq!(retry, first);
-
-    let outbox = shard.outbox_since("reddit-home", 0).await.unwrap();
-    assert_eq!(outbox.len(), 1);
-    assert_eq!(outbox[0].kind, DeltaKind::Plus);
-    assert_eq!(outbox[0].edge.src, 1);
-    assert_eq!(outbox[0].edge.dst, 2);
 }
 
 #[test]
-fn canonical_graph_records_reject_obsolete_internal_formats() {
+fn canonical_graph_records_derive_identity_from_keys() {
     let edge_key = keys::out_edge("reddit-home", "USER_FOLLOWS_USER", 1, 2);
-    let canonical_edge = decode_edge_record(&edge_key, &encode_edge_epoch(9)).unwrap();
-    assert_eq!(canonical_edge.epoch, 9);
+    let canonical_edge = decode_edge_record(&edge_key, b"graph-edge\n").unwrap();
     assert_eq!(canonical_edge.src, 1);
     assert_eq!(canonical_edge.dst, 2);
     assert!(decode_edge_record(
@@ -1002,17 +1398,6 @@ fn canonical_graph_records_reject_obsolete_internal_formats() {
     )
     .is_err());
     assert!(decode_edge_record(&edge_key, b"edge2\t8\n").is_err());
-
-    let outbox_key = keys::outbox("reddit-home", 9, DeltaKind::Plus, "USER_FOLLOWS_USER", 1, 2);
-    let canonical_delta = decode_delta_record(&outbox_key, b"graph-delta-v1\n").unwrap();
-    assert_eq!(canonical_delta.kind, DeltaKind::Plus);
-    assert_eq!(canonical_delta.edge.epoch, 9);
-    assert!(decode_delta_record(
-        &outbox_key,
-        b"delta1\t+\t9\treddit-home\tUSER_FOLLOWS_USER\t1\t2\n"
-    )
-    .is_err());
-    assert!(decode_delta_record(&outbox_key, b"delta2\n").is_err());
 }
 #[tokio::test]
 async fn duplicate_edge_with_new_request_does_not_increment_degree() {
@@ -1032,7 +1417,6 @@ async fn duplicate_edge_with_new_request_does_not_increment_degree() {
             .unwrap(),
         1
     );
-    assert_eq!(shard.outbox_since("reddit-home", 0).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1220,13 +1604,13 @@ async fn bulk_import_transactions_retry_without_epoch_overlap() {
         vec![
             BulkImportResult {
                 start_epoch: 1,
-                end_epoch: 2,
+                end_epoch: 1,
                 inserted: 2,
                 already_existed: 0,
             },
             BulkImportResult {
-                start_epoch: 3,
-                end_epoch: 4,
+                start_epoch: 2,
+                end_epoch: 2,
                 inserted: 2,
                 already_existed: 0,
             },
@@ -1276,7 +1660,15 @@ async fn concurrent_duplicate_edge_writes_converge_to_one_record() {
             .count(),
         1
     );
-    assert!(results.iter().all(|result| result.epoch == 1));
+    assert_eq!(
+        results
+            .iter()
+            .find(|result| !result.already_existed)
+            .unwrap()
+            .epoch,
+        1
+    );
+    assert!(results.iter().all(|result| result.epoch >= 1));
     assert_eq!(
         shard
             .out_degree("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 7)
@@ -1284,11 +1676,10 @@ async fn concurrent_duplicate_edge_writes_converge_to_one_record() {
             .unwrap(),
         1
     );
-    assert_eq!(shard.outbox_since("reddit-home", 0).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
-async fn bulk_import_edges_writes_normal_indexes_deltas_and_idempotency() {
+async fn bulk_import_edges_writes_normal_indexes_and_idempotency() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/bulk-import", object_store).await;
 
@@ -1315,7 +1706,7 @@ async fn bulk_import_edges_writes_normal_indexes_deltas_and_idempotency() {
         result,
         BulkImportResult {
             start_epoch: 1,
-            end_epoch: 2,
+            end_epoch: 1,
             inserted: 2,
             already_existed: 0
         }
@@ -1334,16 +1725,6 @@ async fn bulk_import_edges_writes_normal_indexes_deltas_and_idempotency() {
             .await
             .unwrap(),
         2
-    );
-    assert_eq!(
-        shard
-            .deltas_since("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 0)
-            .await
-            .unwrap()
-            .iter()
-            .map(|delta| (delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch))
-            .collect::<Vec<_>>(),
-        vec![(DeltaKind::Plus, 1, 2, 1), (DeltaKind::Plus, 1, 3, 2)]
     );
 
     let conflict = shard
@@ -1375,13 +1756,13 @@ async fn bulk_import_edges_writes_normal_indexes_deltas_and_idempotency() {
     assert_eq!(
         second,
         BulkImportResult {
-            start_epoch: 3,
-            end_epoch: 3,
+            start_epoch: 2,
+            end_epoch: 2,
             inserted: 1,
             already_existed: 1
         }
     );
-    assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 3);
+    assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 2);
 }
 
 #[tokio::test]
@@ -1430,7 +1811,7 @@ async fn chunked_bulk_import_respects_batch_limits_and_keeps_idempotency() {
         result,
         BulkImportResult {
             start_epoch: 1,
-            end_epoch: 5,
+            end_epoch: 3,
             inserted: 5,
             already_existed: 0
         }
@@ -1457,7 +1838,7 @@ async fn chunked_bulk_import_respects_batch_limits_and_keeps_idempotency() {
 }
 
 #[tokio::test]
-async fn trusted_chunked_bulk_append_uses_bounded_batch_delta_logs() {
+async fn trusted_chunked_bulk_append_uses_bounded_canonical_batches() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_limits(
         "graph/trusted-bulk-import-chunked",
@@ -1506,30 +1887,13 @@ async fn trusted_chunked_bulk_append_uses_bounded_batch_delta_logs() {
         result,
         BulkImportResult {
             start_epoch: 1,
-            end_epoch: 5,
+            end_epoch: 3,
             inserted: 5,
             already_existed: 0
         }
     );
     assert_eq!(retry, result);
-    assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 5);
-    assert_eq!(shard.outbox_since(cell_id, 0).await.unwrap().len(), 5);
-
-    let mut per_edge_outbox = shard
-        .scan_remote_prefix(&keys::outbox_prefix(cell_id))
-        .await
-        .unwrap();
-    assert!(per_edge_outbox.next().await.unwrap().is_none());
-
-    let mut batch_outbox = shard
-        .scan_remote_prefix(&keys::outbox_batch_prefix(cell_id))
-        .await
-        .unwrap();
-    let mut batch_records = 0;
-    while batch_outbox.next().await.unwrap().is_some() {
-        batch_records += 1;
-    }
-    assert_eq!(batch_records, 3);
+    assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 3);
 
     let overlap = shard
         .bulk_append_edges_trusted_bounded(
@@ -1544,13 +1908,13 @@ async fn trusted_chunked_bulk_append_uses_bounded_batch_delta_logs() {
     assert_eq!(
         overlap,
         BulkImportResult {
-            start_epoch: 6,
-            end_epoch: 6,
+            start_epoch: 4,
+            end_epoch: 4,
             inserted: 1,
             already_existed: 1
         }
     );
-    assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 6);
+    assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 4);
     assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 6);
     assert_eq!(
         shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
@@ -1569,8 +1933,8 @@ async fn trusted_chunked_bulk_append_uses_bounded_batch_delta_logs() {
         .unwrap();
     assert_eq!(chunked_overlap.inserted, 1);
     assert_eq!(chunked_overlap.already_existed, 1);
-    assert_eq!(chunked_overlap.end_epoch, 7);
-    assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 7);
+    assert_eq!(chunked_overlap.end_epoch, 5);
+    assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 5);
     assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 7);
     assert_eq!(
         shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
@@ -1579,226 +1943,47 @@ async fn trusted_chunked_bulk_append_uses_bounded_batch_delta_logs() {
 }
 
 #[tokio::test]
-async fn malformed_cell_write_lock_is_rejected_without_takeover() {
+async fn segmented_adjacency_delete_then_reinsert_clears_the_old_tombstone() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard("graph/malformed-cell-write-lock", Arc::clone(&object_store)).await;
-    let cell_id = "reddit-home";
-    let path = shard.cell_write_lock_path(cell_id);
-    let malformed_payload = Bytes::from(format!(
-        "graph-cell-write-lock-v1\ncell={cell_id}\noperation=crashed-writer\n"
-    ));
-    object_store
-        .put_opts(&path, malformed_payload.into(), PutMode::Create.into())
-        .await
-        .unwrap();
-
-    let err = match shard.acquire_cell_write_lock(cell_id, "new-writer").await {
-        Ok(_) => panic!("malformed lock unexpectedly acquired"),
-        Err(err) => err,
-    };
-    assert!(matches!(err, GraphError::CorruptValue { .. }));
-}
-#[tokio::test]
-async fn stale_owner_release_does_not_remove_reclaimed_cell_write_lock() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard(
-        "graph/stale-owner-release-cell-write-lock",
-        Arc::clone(&object_store),
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/segment-delete-reinsert",
+        object_store,
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..Default::default()
+        },
     )
-    .await;
-    let cell_id = "reddit-home";
-    let path = shard.cell_write_lock_path(cell_id);
-    let stale_owner = shard
-        .acquire_cell_write_lock(cell_id, "slow-writer")
-        .await
-        .unwrap();
-    let stale_created_ms = graph_now_millis()
-        .saturating_sub(GRAPH_CELL_WRITE_LOCK_TTL_MS)
-        .saturating_sub(1);
-    let stale_payload = encode_cell_write_lock_record(
-        cell_id,
-        "slow-writer",
-        &stale_owner.owner_token,
-        stale_created_ms,
-        stale_created_ms,
-        CellWriteLockState::Active,
-    );
-    object_store
-        .put_opts(&path, stale_payload.into(), PutMode::Overwrite.into())
-        .await
-        .unwrap();
-
-    let reclaimed = shard
-        .acquire_cell_write_lock(cell_id, "new-writer")
-        .await
-        .unwrap();
-    assert_ne!(reclaimed.owner_token, stale_owner.owner_token);
-    stale_owner.release().await.unwrap();
-
-    let current = object_store.get(&path).await.unwrap();
-    let current_value = current.bytes().await.unwrap();
-    let current_record = decode_cell_write_lock_record(path.as_ref(), &current_value).unwrap();
-    assert_eq!(current_record.owner_token, reclaimed.owner_token);
-    assert_eq!(current_record.state, CellWriteLockState::Active);
-    reclaimed.release().await.unwrap();
-}
-
-#[tokio::test]
-async fn cell_write_lock_renew_extends_owner_expiry() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard(
-        "graph/cell-write-lock-renew-extends-expiry",
-        Arc::clone(&object_store),
-    )
-    .await;
-    let cell_id = "reddit-home";
-    let path = shard.cell_write_lock_path(cell_id);
-    let lock = shard
-        .acquire_cell_write_lock(cell_id, "long-maintenance")
-        .await
-        .unwrap();
-    let stale_created_ms = graph_now_millis()
-        .saturating_sub(GRAPH_CELL_WRITE_LOCK_TTL_MS)
-        .saturating_sub(1);
-    let stale_payload = encode_cell_write_lock_record(
-        cell_id,
-        "long-maintenance",
-        &lock.owner_token,
-        stale_created_ms,
-        stale_created_ms,
-        CellWriteLockState::Active,
-    );
-    object_store
-        .put_opts(&path, stale_payload.into(), PutMode::Overwrite.into())
-        .await
-        .unwrap();
-
-    lock.renew().await.unwrap();
-    let current = object_store.get(&path).await.unwrap();
-    let current_value = current.bytes().await.unwrap();
-    let current_record = decode_cell_write_lock_record(path.as_ref(), &current_value).unwrap();
-    assert_eq!(current_record.owner_token, lock.owner_token);
-    assert_eq!(current_record.state, CellWriteLockState::Active);
-    assert!(current_record.expires_at_ms > graph_now_millis());
-
-    let err = match shard
-        .acquire_cell_write_lock(cell_id, "contending-writer")
-        .await
-    {
-        Ok(_) => panic!("contending writer acquired renewed cell write lock"),
-        Err(err) => err,
-    };
-    assert!(matches!(
-        err,
-        GraphError::CellWriteConflict {
-            operation: "contending-writer",
-            ref cell_id
-        } if cell_id == "reddit-home"
-    ));
-    lock.release().await.unwrap();
-}
-
-#[tokio::test]
-async fn stale_owner_cannot_renew_reclaimed_cell_write_lock() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard(
-        "graph/stale-owner-renew-cell-write-lock",
-        Arc::clone(&object_store),
-    )
-    .await;
-    let cell_id = "reddit-home";
-    let path = shard.cell_write_lock_path(cell_id);
-    let stale_owner = shard
-        .acquire_cell_write_lock(cell_id, "slow-writer")
-        .await
-        .unwrap();
-    let replacement_payload = encode_cell_write_lock_record(
-        cell_id,
-        "new-writer",
-        "replacement-owner-token",
-        graph_now_millis(),
-        graph_now_millis().saturating_add(GRAPH_CELL_WRITE_LOCK_TTL_MS),
-        CellWriteLockState::Active,
-    );
-    object_store
-        .put_opts(&path, replacement_payload.into(), PutMode::Overwrite.into())
-        .await
-        .unwrap();
-
-    let err = stale_owner.renew().await.unwrap_err();
-    assert!(matches!(
-        err,
-        GraphError::CellWriteConflict {
-            operation: "renew_cell_write_lock",
-            ref cell_id
-        } if cell_id == "reddit-home"
-    ));
-    stale_owner.release().await.unwrap();
-    let current = object_store.get(&path).await.unwrap();
-    let current_value = current.bytes().await.unwrap();
-    let current_record = decode_cell_write_lock_record(path.as_ref(), &current_value).unwrap();
-    assert_eq!(current_record.owner_token, "replacement-owner-token");
-    assert_eq!(current_record.state, CellWriteLockState::Active);
-}
-
-#[tokio::test]
-async fn matrix_artifact_write_lock_is_epoch_scoped_and_cell_lock_independent() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard(
-        "graph/matrix-artifact-write-lock-scope",
-        Arc::clone(&object_store),
-    )
-    .await;
+    .await
+    .unwrap();
     let cell_id = "reddit-home";
     let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
-    let base_epoch = 7;
 
-    let artifact_lock = shard
-        .acquire_matrix_artifact_write_lock(cell_id, edge_type, base_epoch, "build_matrix_tiles")
+    let inserted = shard
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "segment-insert")
         .await
         .unwrap();
-    let same_epoch_err = match shard
-        .acquire_matrix_artifact_write_lock(cell_id, edge_type, base_epoch, "contending-builder")
-        .await
-    {
-        Ok(_) => panic!("contending builder acquired matrix artifact write lock"),
-        Err(err) => err,
-    };
-    assert!(matches!(
-        same_epoch_err,
-        GraphError::CellWriteConflict {
-            operation: "contending-builder",
-            ref cell_id
-        } if cell_id == "reddit-home"
-    ));
+    assert_eq!(inserted.end_epoch, 1);
 
-    let next_epoch_lock = shard
-        .acquire_matrix_artifact_write_lock(
-            cell_id,
-            edge_type,
-            base_epoch + 1,
-            "different-epoch-builder",
-        )
+    let deleted = shard
+        .delete_edge(typed_mutation(cell_id, edge_type, 1, 2, "segment-delete"))
         .await
         .unwrap();
-    let different_edge_type_lock = shard
-        .acquire_matrix_artifact_write_lock(
-            cell_id,
-            "OTHER_EDGE_TYPE",
-            base_epoch,
-            "different-edge-builder",
-        )
-        .await
-        .unwrap();
-    let cell_lock = shard
-        .acquire_cell_write_lock(cell_id, "ordinary-cell-writer")
-        .await
-        .unwrap();
+    assert_eq!(deleted.epoch, 2);
+    assert!(deleted.deleted);
+    assert!(!shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap());
 
-    cell_lock.release().await.unwrap();
-    different_edge_type_lock.release().await.unwrap();
-    next_epoch_lock.release().await.unwrap();
-    artifact_lock.release().await.unwrap();
+    let reinserted = shard
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "segment-reinsert")
+        .await
+        .unwrap();
+    assert_eq!(reinserted.end_epoch, 3);
+    assert_eq!(reinserted.inserted, 1);
+    assert!(shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap());
+    assert_eq!(
+        shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+        vec![2]
+    );
+    assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -1856,13 +2041,13 @@ async fn segment_append_transactions_retry_without_epoch_overlap() {
         vec![
             BulkImportResult {
                 start_epoch: 1,
-                end_epoch: 2,
+                end_epoch: 1,
                 inserted: 2,
                 already_existed: 0,
             },
             BulkImportResult {
-                start_epoch: 3,
-                end_epoch: 4,
+                start_epoch: 2,
+                end_epoch: 2,
                 inserted: 2,
                 already_existed: 0,
             },
@@ -1890,7 +2075,7 @@ fn writer_lanes_partition_different_cells() {
 }
 
 #[tokio::test]
-async fn write_edges_batch_uses_one_batch_idempotency_and_logs_batch_boundary() {
+async fn write_edges_batch_uses_one_atomic_idempotent_transaction() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/write-edges-batch", object_store).await;
 
@@ -1907,7 +2092,7 @@ async fn write_edges_batch_uses_one_batch_idempotency_and_logs_batch_boundary() 
         result,
         BulkImportResult {
             start_epoch: 1,
-            end_epoch: 3,
+            end_epoch: 1,
             inserted: 3,
             already_existed: 0
         }
@@ -1925,22 +2110,7 @@ async fn write_edges_batch_uses_one_batch_idempotency_and_logs_batch_boundary() 
         result
     );
 
-    let mut iter = shard
-        .scan_remote_prefix("cell/reddit-home/mutation_batch/")
-        .await
-        .unwrap();
-    let mut logs = Vec::new();
-    while let Some(kv) = iter.next().await.unwrap() {
-        logs.push((
-            String::from_utf8_lossy(&kv.key).into_owned(),
-            String::from_utf8_lossy(&kv.value).into_owned(),
-        ));
-    }
-    assert_eq!(logs.len(), 1);
-    assert!(logs[0].0.ends_with("/batch-create-1"));
-    assert!(logs[0]
-        .1
-        .starts_with("mutation_batch1\tUSER_SUBSCRIBED_TO_SUBREDDIT\t1\t3\t3\t0\t"));
+    assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -1961,7 +2131,7 @@ async fn write_edge_mutations_batch_keeps_per_edge_idempotency_and_indexes() {
         .unwrap();
 
     assert_eq!(result.start_epoch, 1);
-    assert_eq!(result.end_epoch, 2);
+    assert_eq!(result.end_epoch, 1);
     assert_eq!(result.inserted, 2);
     assert_eq!(result.already_existed, 1);
     assert_eq!(
@@ -1972,7 +2142,7 @@ async fn write_edge_mutations_batch_keeps_per_edge_idempotency_and_indexes() {
                 already_existed: false
             },
             CommitResult {
-                epoch: 2,
+                epoch: 1,
                 already_existed: false
             },
             CommitResult {
@@ -1995,16 +2165,6 @@ async fn write_edge_mutations_batch_keeps_per_edge_idempotency_and_indexes() {
             .unwrap(),
         2
     );
-    assert_eq!(
-        shard
-            .deltas_since("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 0)
-            .await
-            .unwrap()
-            .iter()
-            .map(|delta| (delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch))
-            .collect::<Vec<_>>(),
-        vec![(DeltaKind::Plus, 7, 10, 1), (DeltaKind::Plus, 7, 11, 2)]
-    );
 
     let retry = shard
         .write_edge_mutations_batch(
@@ -2018,7 +2178,7 @@ async fn write_edge_mutations_batch_keeps_per_edge_idempotency_and_indexes() {
         .await
         .unwrap();
     assert_eq!(retry, result);
-    assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 2);
+    assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -2067,7 +2227,7 @@ async fn edge_mutation_batch_transactions_retry_without_epoch_overlap() {
         vec![
             EdgeMutationBatchResult {
                 start_epoch: 1,
-                end_epoch: 2,
+                end_epoch: 1,
                 inserted: 2,
                 already_existed: 0,
                 results: vec![
@@ -2076,23 +2236,23 @@ async fn edge_mutation_batch_transactions_retry_without_epoch_overlap() {
                         already_existed: false,
                     },
                     CommitResult {
-                        epoch: 2,
+                        epoch: 1,
                         already_existed: false,
                     },
                 ],
             },
             EdgeMutationBatchResult {
-                start_epoch: 3,
-                end_epoch: 4,
+                start_epoch: 2,
+                end_epoch: 2,
                 inserted: 2,
                 already_existed: 0,
                 results: vec![
                     CommitResult {
-                        epoch: 3,
+                        epoch: 2,
                         already_existed: false,
                     },
                     CommitResult {
-                        epoch: 4,
+                        epoch: 2,
                         already_existed: false,
                     },
                 ],
@@ -2189,7 +2349,7 @@ async fn ingest_edge_mutations_chunks_and_replays_idempotently() {
         result,
         EdgeIngestResult {
             start_epoch: 1,
-            end_epoch: 5,
+            end_epoch: 3,
             inserted: 5,
             already_existed: 0,
             batches: 3,
@@ -2213,7 +2373,7 @@ async fn ingest_edge_mutations_chunks_and_replays_idempotently() {
         .await
         .unwrap();
     assert_eq!(replay, result);
-    assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 5);
+    assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 3);
 
     let duplicate = shard
         .ingest_edge_mutations(
@@ -2225,7 +2385,7 @@ async fn ingest_edge_mutations_chunks_and_replays_idempotently() {
         .unwrap();
     assert_eq!(duplicate.inserted, 0);
     assert_eq!(duplicate.already_existed, 1);
-    assert_eq!(duplicate.end_epoch, 5);
+    assert_eq!(duplicate.end_epoch, 3);
 }
 
 #[tokio::test]
@@ -2246,438 +2406,6 @@ async fn ingest_edge_mutations_rejects_zero_batch_size() {
         GraphError::CorruptValue { ref key, .. } if key == "edge_ingest_batch_size"
     ));
     assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 0);
-}
-
-#[tokio::test]
-async fn mutation_log_append_is_durable_and_replayed_after_reopen() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let path = "graph/mutation-log-reopen";
-    {
-        let writer = open_test_shard(path, Arc::clone(&object_store)).await;
-        let result = writer
-            .append_edge_mutation_log(
-                "reddit-home",
-                "log-batch-1",
-                [
-                    mutation(20, 30, "log-edge-1"),
-                    mutation(20, 31, "log-edge-2"),
-                ],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            result,
-            EdgeMutationLogAppendResult {
-                log_epoch: 1,
-                mutations: 2,
-                already_appended: false
-            }
-        );
-        assert_eq!(writer.current_epoch("reddit-home").await.unwrap(), 0);
-        assert!(!writer
-            .edge_exists("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 20, 30)
-            .await
-            .unwrap());
-        writer.close().await.unwrap();
-    }
-
-    let reopened = open_test_shard(path, Arc::clone(&object_store)).await;
-    let materialized = reopened
-        .materialize_edge_mutation_log("reddit-home", 16)
-        .await
-        .unwrap();
-    assert_eq!(materialized.scanned_batches, 1);
-    assert_eq!(materialized.materialized_batches, 1);
-    assert_eq!(materialized.mutations, 2);
-    assert_eq!(materialized.inserted, 2);
-    assert_eq!(materialized.materialized_log_epoch, 1);
-    assert_eq!(materialized.current_epoch, 2);
-    assert_eq!(
-        reopened
-            .out_neighbors("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 20)
-            .await
-            .unwrap(),
-        vec![30, 31]
-    );
-}
-
-#[tokio::test]
-async fn graph_mutation_log_and_outbox_payloads_match_replayed_graph() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let path = "graph/mutation-log-payload-accuracy";
-    let cell_id = "reddit-home";
-    let edge_type = "WAL_EDGE";
-    let first_batch = vec![
-        typed_mutation(cell_id, edge_type, 1, 10, "wal-payload-1"),
-        typed_mutation(cell_id, edge_type, 1, 11, "wal-payload-2"),
-    ];
-    let second_batch = vec![
-        typed_mutation(cell_id, edge_type, 2, 20, "wal-payload-3"),
-        typed_mutation(cell_id, edge_type, 2, 21, "wal-payload-4"),
-    ];
-
-    {
-        let writer = open_test_shard(path, Arc::clone(&object_store)).await;
-        assert_eq!(
-            writer
-                .append_edge_mutation_log(cell_id, "wal-batch-1", first_batch.clone())
-                .await
-                .unwrap(),
-            EdgeMutationLogAppendResult {
-                log_epoch: 1,
-                mutations: 2,
-                already_appended: false,
-            }
-        );
-        assert_eq!(
-            writer
-                .append_edge_mutation_log(cell_id, "wal-batch-2", second_batch.clone())
-                .await
-                .unwrap(),
-            EdgeMutationLogAppendResult {
-                log_epoch: 2,
-                mutations: 2,
-                already_appended: false,
-            }
-        );
-
-        let mut iter = writer
-            .scan_remote_prefix(&keys::mutation_log_prefix(cell_id))
-            .await
-            .unwrap();
-        let mut decoded = Vec::new();
-        while let Some(kv) = iter.next().await.unwrap() {
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            decoded.push((
-                parse_mutation_log_epoch(&key).unwrap(),
-                decode_edge_mutation_log_batch(&key, &kv.value).unwrap(),
-            ));
-        }
-        decoded.sort_by_key(|(log_epoch, _)| *log_epoch);
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].0, 1);
-        assert_eq!(decoded[0].1.cell_id, cell_id);
-        assert_eq!(decoded[0].1.batch_id, "wal-batch-1");
-        assert_eq!(
-            decoded[0].1.fingerprint,
-            edge_mutation_log_fingerprint(cell_id, "wal-batch-1", &first_batch)
-        );
-        assert_eq!(decoded[0].1.mutations, first_batch);
-        assert_eq!(decoded[1].0, 2);
-        assert_eq!(decoded[1].1.cell_id, cell_id);
-        assert_eq!(decoded[1].1.batch_id, "wal-batch-2");
-        assert_eq!(
-            decoded[1].1.fingerprint,
-            edge_mutation_log_fingerprint(cell_id, "wal-batch-2", &second_batch)
-        );
-        assert_eq!(decoded[1].1.mutations, second_batch);
-        assert_eq!(
-            writer
-                .read_counter(&keys::mutation_log_epoch(cell_id))
-                .await
-                .unwrap(),
-            2
-        );
-        assert_eq!(writer.current_epoch(cell_id).await.unwrap(), 0);
-        assert!(writer.outbox_since(cell_id, 0).await.unwrap().is_empty());
-        writer.close().await.unwrap();
-    }
-
-    let reopened = open_test_shard(path, Arc::clone(&object_store)).await;
-    let replay = reopened
-        .materialize_edge_mutation_log(cell_id, 16)
-        .await
-        .unwrap();
-    assert_eq!(
-        replay,
-        EdgeMutationLogMaterializeResult {
-            scanned_batches: 2,
-            materialized_batches: 2,
-            mutations: 4,
-            inserted: 4,
-            already_existed: 0,
-            last_log_epoch: 2,
-            materialized_log_epoch: 2,
-            current_epoch: 4,
-        }
-    );
-
-    let expected_pairs = [(1, 10), (1, 11), (2, 20), (2, 21)];
-    let outbox = reopened.outbox_since(cell_id, 0).await.unwrap();
-    assert_eq!(outbox.len(), expected_pairs.len());
-    for (idx, record) in outbox.iter().enumerate() {
-        assert_eq!(record.kind, DeltaKind::Plus);
-        assert_eq!(record.edge.cell_id, cell_id);
-        assert_eq!(record.edge.edge_type, edge_type);
-        assert_eq!(record.edge.epoch, (idx + 1) as u64);
-        assert_eq!((record.edge.src, record.edge.dst), expected_pairs[idx]);
-    }
-    assert_eq!(
-        reopened
-            .read_counter(&keys::mutation_log_materialized_epoch(cell_id))
-            .await
-            .unwrap(),
-        2
-    );
-
-    let live_edges = reopened.edges_at(cell_id, edge_type, 4).await.unwrap();
-    assert_eq!(
-        live_edges
-            .iter()
-            .map(|edge| (edge.epoch, edge.src, edge.dst))
-            .collect::<Vec<_>>(),
-        vec![(1, 1, 10), (2, 1, 11), (3, 2, 20), (4, 2, 21)]
-    );
-    assert_eq!(
-        reopened.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
-        vec![10, 11]
-    );
-    assert_eq!(
-        reopened.out_neighbors(cell_id, edge_type, 2).await.unwrap(),
-        vec![20, 21]
-    );
-    assert_eq!(reopened.out_degree(cell_id, edge_type, 1).await.unwrap(), 2);
-    assert_eq!(reopened.out_degree(cell_id, edge_type, 2).await.unwrap(), 2);
-
-    let replay_again = reopened
-        .materialize_edge_mutation_log(cell_id, 16)
-        .await
-        .unwrap();
-    assert_eq!(replay_again.scanned_batches, 0);
-    assert_eq!(replay_again.materialized_batches, 0);
-    assert_eq!(replay_again.current_epoch, 4);
-}
-
-#[tokio::test]
-async fn mutation_log_append_is_batch_idempotent_and_detects_conflict() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard("graph/mutation-log-idempotency", object_store).await;
-
-    let first = shard
-        .append_edge_mutation_log(
-            "reddit-home",
-            "log-batch-idem",
-            [
-                mutation(30, 40, "log-idem-1"),
-                mutation(30, 41, "log-idem-2"),
-            ],
-        )
-        .await
-        .unwrap();
-    let retry = shard
-        .append_edge_mutation_log(
-            "reddit-home",
-            "log-batch-idem",
-            [
-                mutation(30, 40, "log-idem-1"),
-                mutation(30, 41, "log-idem-2"),
-            ],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        retry,
-        EdgeMutationLogAppendResult {
-            already_appended: true,
-            ..first
-        }
-    );
-
-    let conflict = shard
-        .append_edge_mutation_log(
-            "reddit-home",
-            "log-batch-idem",
-            [mutation(30, 42, "log-idem-different")],
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        conflict,
-        GraphError::IdempotencyConflict {
-            operation: "mutation-log",
-            ref idempotency_key
-        } if idempotency_key == "log-batch-idem"
-    ));
-
-    let mut iter = shard
-        .scan_remote_prefix("cell/reddit-home/mutation_log/")
-        .await
-        .unwrap();
-    let mut logs = 0;
-    while iter.next().await.unwrap().is_some() {
-        logs += 1;
-    }
-    assert_eq!(logs, 1);
-}
-
-#[tokio::test]
-async fn mutation_log_appends_retry_without_log_epoch_overlap() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard =
-        Arc::new(open_test_shard("graph/mutation-log-transaction-race", object_store).await);
-    let cell_id = "reddit-home";
-
-    let left = {
-        let shard = Arc::clone(&shard);
-        tokio::spawn(async move {
-            append_edge_mutation_log_txn_retry_for_test(
-                shard,
-                cell_id,
-                "log-race-a",
-                vec![mutation(60, 70, "log-race-edge-a")],
-            )
-            .await
-        })
-    };
-    let right = {
-        let shard = Arc::clone(&shard);
-        tokio::spawn(async move {
-            append_edge_mutation_log_txn_retry_for_test(
-                shard,
-                cell_id,
-                "log-race-b",
-                vec![mutation(61, 71, "log-race-edge-b")],
-            )
-            .await
-        })
-    };
-
-    let mut results = vec![left.await.unwrap().unwrap(), right.await.unwrap().unwrap()];
-    results.sort_by_key(|result| result.log_epoch);
-    assert_eq!(
-        results,
-        vec![
-            EdgeMutationLogAppendResult {
-                log_epoch: 1,
-                mutations: 1,
-                already_appended: false,
-            },
-            EdgeMutationLogAppendResult {
-                log_epoch: 2,
-                mutations: 1,
-                already_appended: false,
-            },
-        ]
-    );
-    assert_eq!(
-        shard
-            .read_counter(&keys::mutation_log_epoch(cell_id))
-            .await
-            .unwrap(),
-        2
-    );
-
-    let materialized = shard
-        .materialize_edge_mutation_log(cell_id, 16)
-        .await
-        .unwrap();
-    assert_eq!(materialized.scanned_batches, 2);
-    assert_eq!(materialized.materialized_batches, 2);
-    assert_eq!(materialized.mutations, 2);
-    assert_eq!(materialized.materialized_log_epoch, 2);
-    assert_eq!(materialized.current_epoch, 2);
-    assert!(shard
-        .edge_exists(cell_id, "USER_SUBSCRIBED_TO_SUBREDDIT", 60, 70)
-        .await
-        .unwrap());
-    assert!(shard
-        .edge_exists(cell_id, "USER_SUBSCRIBED_TO_SUBREDDIT", 61, 71)
-        .await
-        .unwrap());
-}
-
-#[tokio::test]
-async fn mutation_log_materializer_replay_is_idempotent_if_watermark_is_lost() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard("graph/mutation-log-replay-idempotent", object_store).await;
-
-    shard
-        .append_edge_mutation_log(
-            "reddit-home",
-            "log-batch-watermark",
-            [
-                mutation(40, 50, "log-watermark-1"),
-                mutation(40, 51, "log-watermark-2"),
-            ],
-        )
-        .await
-        .unwrap();
-    let first = shard
-        .materialize_edge_mutation_log("reddit-home", 16)
-        .await
-        .unwrap();
-    assert_eq!(first.inserted, 2);
-    assert_eq!(first.current_epoch, 2);
-
-    let mut batch = WriteBatch::new();
-    batch.put(
-        keys::mutation_log_materialized_epoch("reddit-home"),
-        encode_u64(0),
-    );
-    shard.write_strict_for_test(batch).await.unwrap();
-
-    let replay = shard
-        .materialize_edge_mutation_log("reddit-home", 16)
-        .await
-        .unwrap();
-    assert_eq!(replay.materialized_batches, 1);
-    assert_eq!(replay.current_epoch, 2);
-    assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 2);
-    assert_eq!(
-        shard
-            .out_degree("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 40)
-            .await
-            .unwrap(),
-        2
-    );
-}
-
-#[tokio::test]
-async fn mutation_log_materializer_uses_bounded_microdrains() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard("graph/mutation-log-bounded-drain", object_store).await;
-
-    for batch in 0..2_u64 {
-        let mutations = (0..400_u64)
-            .map(|index| {
-                mutation(
-                    50 + batch,
-                    10_000 + (batch * 1_000) + index,
-                    &format!("log-bounded-{batch}-{index}"),
-                )
-            })
-            .collect::<Vec<_>>();
-        shard
-            .append_edge_mutation_log(
-                "reddit-home",
-                &format!("log-bounded-batch-{batch}"),
-                mutations,
-            )
-            .await
-            .unwrap();
-    }
-
-    let first = shard
-        .materialize_edge_mutation_log("reddit-home", 2)
-        .await
-        .unwrap();
-    assert_eq!(first.scanned_batches, 2);
-    assert_eq!(first.materialized_batches, 2);
-    assert_eq!(first.mutations, 800);
-    assert_eq!(first.materialized_log_epoch, 2);
-    assert_eq!(first.last_log_epoch, 2);
-    assert_eq!(first.current_epoch, 800);
-
-    let second = shard
-        .materialize_edge_mutation_log("reddit-home", 2)
-        .await
-        .unwrap();
-    assert_eq!(second.scanned_batches, 0);
-    assert_eq!(second.materialized_batches, 0);
-    assert_eq!(second.mutations, 0);
-    assert_eq!(second.materialized_log_epoch, 2);
-    assert_eq!(second.current_epoch, 800);
-    assert_eq!(shard.current_epoch("reddit-home").await.unwrap(), 800);
 }
 
 #[tokio::test]
@@ -2719,7 +2447,7 @@ async fn idempotency_keys_are_bound_to_the_original_edge() {
 }
 
 #[tokio::test]
-async fn delete_edge_publishes_delta_minus_and_snapshot_reads_stay_correct() {
+async fn delete_edge_updates_canonical_snapshot_idempotently() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/delete-edge", object_store).await;
 
@@ -2763,41 +2491,15 @@ async fn delete_edge_publishes_delta_minus_and_snapshot_reads_stay_correct() {
     );
     assert_eq!(
         shard
-            .out_neighbors_at("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 1, 2)
-            .await
-            .unwrap(),
-        vec![2, 3]
-    );
-    assert_eq!(
-        shard
             .out_neighbors_at("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 1, 3)
             .await
             .unwrap(),
         vec![3]
     );
-
-    let deltas = shard
-        .deltas_since("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 0)
-        .await
-        .unwrap();
-    assert_eq!(
-        deltas.iter().map(|delta| delta.kind).collect::<Vec<_>>(),
-        vec![DeltaKind::Plus, DeltaKind::Plus, DeltaKind::Minus]
-    );
-    assert_eq!(
-        shard
-            .outbox_since("reddit-home", 0)
-            .await
-            .unwrap()
-            .iter()
-            .map(|delta| delta.kind)
-            .collect::<Vec<_>>(),
-        vec![DeltaKind::Plus, DeltaKind::Plus, DeltaKind::Minus]
-    );
 }
 
 #[tokio::test]
-async fn delete_edges_batch_publishes_delta_minus_and_replays_idempotently() {
+async fn delete_edges_batch_updates_canonical_state_and_replays_idempotently() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/delete-edges-batch", object_store).await;
     let cell_id = "reddit-home";
@@ -2822,23 +2524,23 @@ async fn delete_edges_batch_publishes_delta_minus_and_replays_idempotently() {
         )
         .await
         .unwrap();
-    assert_eq!(result.start_epoch, 4);
-    assert_eq!(result.end_epoch, 5);
+    assert_eq!(result.start_epoch, 2);
+    assert_eq!(result.end_epoch, 2);
     assert_eq!(result.deleted, 2);
     assert_eq!(result.already_deleted, 1);
     assert_eq!(
         result.results,
         vec![
             DeleteResult {
-                epoch: 4,
+                epoch: 2,
                 deleted: true,
             },
             DeleteResult {
-                epoch: 5,
+                epoch: 2,
                 deleted: true,
             },
             DeleteResult {
-                epoch: 3,
+                epoch: 1,
                 deleted: false,
             },
         ]
@@ -2851,58 +2553,6 @@ async fn delete_edges_batch_publishes_delta_minus_and_replays_idempotently() {
     assert!(!shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap());
     assert!(shard.edge_exists(cell_id, edge_type, 1, 3).await.unwrap());
     assert!(!shard.edge_exists(cell_id, edge_type, 1, 4).await.unwrap());
-    assert_eq!(
-        shard
-            .out_neighbors_at(cell_id, edge_type, 1, 3)
-            .await
-            .unwrap(),
-        vec![2, 3, 4]
-    );
-
-    let deltas = shard
-        .deltas_since(cell_id, edge_type, 0)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|delta| (delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        deltas,
-        vec![
-            (DeltaKind::Plus, 1, 2, 1),
-            (DeltaKind::Plus, 1, 3, 2),
-            (DeltaKind::Plus, 1, 4, 3),
-            (DeltaKind::Minus, 1, 2, 4),
-            (DeltaKind::Minus, 1, 4, 5),
-        ]
-    );
-    assert_eq!(
-        shard
-            .outbox_since(cell_id, 3)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|delta| (delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch))
-            .collect::<Vec<_>>(),
-        vec![(DeltaKind::Minus, 1, 2, 4), (DeltaKind::Minus, 1, 4, 5),]
-    );
-    let mut per_edge_iter = shard
-        .scan_remote_prefix(&keys::outbox_prefix(cell_id))
-        .await
-        .unwrap();
-    let mut per_edge_minus = Vec::new();
-    while let Some(kv) = per_edge_iter.next().await.unwrap() {
-        let key = String::from_utf8_lossy(&kv.key).into_owned();
-        let delta = decode_delta_record(&key, &kv.value).unwrap();
-        if delta.kind == DeltaKind::Minus && delta.edge.epoch > 3 {
-            per_edge_minus.push((delta.kind, delta.edge.src, delta.edge.dst, delta.edge.epoch));
-        }
-    }
-    assert_eq!(
-        per_edge_minus,
-        vec![(DeltaKind::Minus, 1, 2, 4), (DeltaKind::Minus, 1, 4, 5)]
-    );
-
     let retry = shard
         .delete_edges_batch(
             cell_id,
@@ -2913,7 +2563,7 @@ async fn delete_edges_batch_publishes_delta_minus_and_replays_idempotently() {
         .await
         .unwrap();
     assert_eq!(retry, result);
-    assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 5);
+    assert_eq!(shard.current_epoch(cell_id).await.unwrap(), 2);
 
     shard
         .bulk_import_edges(
@@ -3094,10 +2744,6 @@ async fn reopened_reader_sees_data_from_object_store() {
             .out_degree("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 100)
             .await
             .unwrap(),
-        1
-    );
-    assert_eq!(
-        reopened.outbox_since("reddit-home", 0).await.unwrap().len(),
         1
     );
 }
@@ -3355,7 +3001,7 @@ async fn graph_cluster_open_cleans_previously_opened_shards_after_later_validati
 }
 
 #[tokio::test]
-async fn routed_cluster_rejects_writes_for_non_owned_cells() {
+async fn routed_cluster_readers_open_every_configured_cell() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let seed = open_test_shard(
         &format!(
@@ -3366,13 +3012,23 @@ async fn routed_cluster_rejects_writes_for_non_owned_cells() {
     )
     .await;
     seed.close().await.unwrap();
+    let seed = open_test_shard(
+        &format!(
+            "{}/reddit-search",
+            GraphScope::default().scoped_store_path("graph-routed-cluster")
+        ),
+        Arc::clone(&object_store),
+    )
+    .await;
+    seed.close().await.unwrap();
     let placement =
-        ShardPlacement::fixed([("reddit-home", "node-a"), ("reddit-search", "node-b")]).unwrap();
+        ObjectStoreNodeDirectory::new(["reddit-home", "reddit-search"], ["node-a", "node-b"])
+            .unwrap();
     let cluster =
-        RoutedGraphCluster::open_owned("graph-routed-cluster", "node-a", placement, object_store)
+        RoutedGraphCluster::open_readers("graph-routed-cluster", "node-a", placement, object_store)
             .await
             .unwrap();
-    assert_eq!(cluster.local_cells(), vec!["reddit-home"]);
+    assert_eq!(cluster.local_cells(), vec!["reddit-home", "reddit-search"]);
 
     let read_only_error = cluster
         .write_edge(EdgeMutation {
@@ -3392,25 +3048,22 @@ async fn routed_cluster_rejects_writes_for_non_owned_cells() {
         } if cell_id == "reddit-home"
     ));
 
-    let err = cluster
+    let second_read_only_error = cluster
         .write_edge(EdgeMutation {
             cell_id: "reddit-search".to_string(),
             edge_type: "FOLLOWS".to_string(),
             src: 1,
             dst: 2,
-            idempotency_key: "wrong-owner".to_string(),
+            idempotency_key: "second-read-only".to_string(),
         })
         .await
         .unwrap_err();
     assert!(matches!(
-        err,
-        GraphError::ShardNotOwned {
-            ref cell_id,
-            ref owner_node_id,
-            ref local_node_id
+        second_read_only_error,
+        GraphError::WriteRequiresWriter {
+            operation: "routed_write",
+            ref cell_id
         } if cell_id == "reddit-search"
-            && owner_node_id == "node-b"
-            && local_node_id == "node-a"
     ));
     cluster.close().await.unwrap();
 }
@@ -3418,11 +3071,11 @@ async fn routed_cluster_rejects_writes_for_non_owned_cells() {
 #[tokio::test]
 async fn routed_cluster_uses_slatedb_writer_fencing() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let placement = ShardPlacement::fixed([("cell-a", "node-a")]).unwrap();
-    let first = RoutedGraphCluster::open_fenced_owned_scoped_with_memory_options(
+    let placement = ObjectStoreNodeDirectory::new(["cell-a"], ["node-a", "node-b"]).unwrap();
+    let first = RoutedGraphCluster::open_promotable_scoped_with_memory_options(
         "graph-slate-writer-fencing",
         GraphScope::default(),
-        "node-a",
+        "node-b",
         placement.clone(),
         Arc::clone(&object_store),
         GraphOpenOptions::default(),
@@ -3435,7 +3088,7 @@ async fn routed_cluster_uses_slatedb_writer_fencing() {
         .await
         .unwrap();
 
-    let replacement = RoutedGraphCluster::open_fenced_owned_scoped_with_memory_options(
+    let replacement = RoutedGraphCluster::open_promotable_scoped_with_memory_options(
         "graph-slate-writer-fencing",
         GraphScope::default(),
         "node-a",
@@ -3464,8 +3117,99 @@ async fn routed_cluster_uses_slatedb_writer_fencing() {
             )
     ));
 
-    replacement.close().await.unwrap();
+    first
+        .write_edge(typed_mutation("cell-a", "FOLLOWS", 3, 4, "recovered"))
+        .await
+        .unwrap();
+    let replacement_stale = replacement
+        .write_edge(typed_mutation(
+            "cell-a",
+            "FOLLOWS",
+            4,
+            5,
+            "replacement-stale",
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        replacement_stale,
+        GraphError::Slate(ref error)
+            if matches!(
+                error.kind(),
+                slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced)
+            )
+    ));
+
+    let _ = replacement.close().await;
     let _ = first.close().await;
+}
+
+#[tokio::test]
+async fn routed_reader_catches_up_to_a_remote_writer_storage_sequence() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let placement = ObjectStoreNodeDirectory::new(["cell-a"], ["node-a", "node-b"]).unwrap();
+    let writer = RoutedGraphCluster::open_promotable_scoped_with_memory_options(
+        "graph-slate-multi-reader",
+        GraphScope::default(),
+        "node-a",
+        placement.clone(),
+        Arc::clone(&object_store),
+        GraphOpenOptions::default(),
+        GraphMemoryConfig::default(),
+    )
+    .await
+    .unwrap();
+    writer
+        .write_edge(typed_mutation("cell-a", "FOLLOWS", 1, 2, "seed"))
+        .await
+        .unwrap();
+
+    let reader = RoutedGraphCluster::open_readers(
+        "graph-slate-multi-reader",
+        "node-b",
+        placement,
+        object_store,
+    )
+    .await
+    .unwrap();
+    assert!(reader
+        .shard("cell-a")
+        .unwrap()
+        .snapshot("cell-a")
+        .await
+        .unwrap()
+        .edge_exists("FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+
+    writer
+        .write_edge(typed_mutation("cell-a", "FOLLOWS", 2, 3, "later"))
+        .await
+        .unwrap();
+    let sequence = writer
+        .shard("cell-a")
+        .unwrap()
+        .current_storage_sequence("cell-a")
+        .await
+        .unwrap();
+    let reader_shard = reader.shard("cell-a").unwrap();
+    assert!(
+        reader_shard
+            .wait_for_storage_sequence("cell-a", sequence)
+            .await
+            .unwrap()
+            >= sequence
+    );
+    assert!(reader_shard
+        .snapshot("cell-a")
+        .await
+        .unwrap()
+        .edge_exists("FOLLOWS", 2, 3)
+        .await
+        .unwrap());
+
+    reader.close().await.unwrap();
+    writer.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -3599,7 +3343,7 @@ async fn matrix_snapshot_abort_cleanup_respects_inflight_artifact_builder_lock()
         .unwrap();
 
     let builder_lock = shard
-        .acquire_matrix_artifact_write_lock(cell_id, edge_type, base_epoch, "held-by-test-builder")
+        .acquire_local_artifact_guard(cell_id, edge_type, base_epoch, "held-by-test-builder")
         .await
         .unwrap();
     let cleanup = engine::cleanup_unpublished_matrix_artifact_epoch(
@@ -3809,7 +3553,7 @@ async fn artifact_build_edge_limit_rejects_loaded_builds() {
 }
 
 #[tokio::test]
-async fn repair_report_validates_degrees_and_delta_counts() {
+async fn repair_report_validates_canonical_edges_and_degrees() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/repair-report", object_store).await;
     shard.write_edge(mutation(1, 2, "repair-1")).await.unwrap();
@@ -3819,7 +3563,6 @@ async fn repair_report_validates_degrees_and_delta_counts() {
         .await
         .unwrap();
     assert_eq!(report.live_edges, 2);
-    assert_eq!(report.delta_records, 2);
     assert!(report.degree_mismatches.is_empty());
     shard.close().await.unwrap();
 }
@@ -3848,7 +3591,7 @@ async fn current_graph_verifier_detects_index_corruption() {
         report
             .mismatch_samples
             .iter()
-            .any(|sample| sample.contains("out_index:missing")),
+            .any(|sample| sample.contains("in_index:extra")),
         "{:?}",
         report.mismatch_samples
     );
@@ -4031,7 +3774,7 @@ async fn query_planner_selects_physical_operators() {
 }
 
 #[tokio::test]
-async fn query_plan_snapshot_reads_pin_epoch() {
+async fn stale_query_plans_require_a_live_pinned_slatedb_snapshot() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/query-plan-snapshot", object_store).await;
     shard
@@ -4066,11 +3809,11 @@ async fn query_plan_snapshot_reads_pin_epoch() {
         .await
         .unwrap();
 
-    assert_eq!(
-        shard.execute_query_plan(plan).await.unwrap(),
-        QueryOutput::Vertices(vec![2])
-    );
-    assert_eq!(
+    assert!(matches!(
+        shard.execute_query_plan(plan).await.unwrap_err(),
+        GraphError::UnsupportedQuery { .. }
+    ));
+    assert!(matches!(
         shard
             .execute_query_statement(
                 QueryContext::new("reddit-home", "query-snapshot-count").at_epoch(read_epoch),
@@ -4081,10 +3824,10 @@ async fn query_plan_snapshot_reads_pin_epoch() {
                 },
             )
             .await
-            .unwrap(),
-        QueryOutput::Count(1)
-    );
-    assert_eq!(
+            .unwrap_err(),
+        GraphError::UnsupportedQuery { .. }
+    ));
+    assert!(matches!(
         shard
             .execute_query_statement(
                 QueryContext::new("reddit-home", "query-snapshot-exists").at_epoch(read_epoch),
@@ -4096,9 +3839,9 @@ async fn query_plan_snapshot_reads_pin_epoch() {
                 },
             )
             .await
-            .unwrap(),
-        QueryOutput::Bool(false)
-    );
+            .unwrap_err(),
+        GraphError::UnsupportedQuery { .. }
+    ));
     shard.close().await.unwrap();
 }
 
@@ -6202,8 +5945,25 @@ async fn query_property_histogram_stats_refresh_persists_selectivity_records() {
 }
 
 #[cfg(feature = "opencypher")]
-#[tokio::test]
-async fn cypher_float_properties_roundtrip_index_compare_and_order() {
+#[test]
+fn cypher_float_properties_roundtrip_index_compare_and_order() {
+    std::thread::Builder::new()
+        .name("cypher-float-properties".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(cypher_float_properties_roundtrip_index_compare_and_order_inner());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+async fn cypher_float_properties_roundtrip_index_compare_and_order_inner() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-float-properties", object_store).await;
 
@@ -8409,20 +8169,23 @@ async fn distributed_query_plan_orders_legs_by_cost_estimate() {
 #[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn distributed_union_all_preserves_declared_leg_order() {
-    struct StaticRowsClient {
-        value: VertexId,
-    }
+    struct StaticRowsClient;
 
     #[async_trait::async_trait]
     impl QueryCellClient for StaticRowsClient {
         async fn execute_cypher_rows(
             &self,
-            _context: QueryContext,
+            context: QueryContext,
             _query: &str,
         ) -> Result<QueryResultSet> {
+            let value = match context.cell_id.as_str() {
+                "cell-z" => 2,
+                "cell-a" => 1,
+                other => panic!("unexpected test cell {other}"),
+            };
             Ok(QueryResultSet::new(
                 vec![QueryColumn::new("id")],
-                vec![QueryRow::new(vec![QueryValue::VertexId(self.value)])],
+                vec![QueryRow::new(vec![QueryValue::VertexId(value)])],
             ))
         }
 
@@ -8438,11 +8201,12 @@ async fn distributed_union_all_preserves_declared_leg_order() {
         }
     }
 
-    let placement = ShardPlacement::fixed([("cell-z", "node-z"), ("cell-a", "node-a")]).unwrap();
+    let placement =
+        ObjectStoreNodeDirectory::new(["cell-z", "cell-a"], ["node-z", "node-a"]).unwrap();
     let coordinator = DistributedQueryCoordinator::new(placement)
-        .with_client("node-z", Arc::new(StaticRowsClient { value: 2 }))
+        .with_client("node-z", Arc::new(StaticRowsClient))
         .unwrap()
-        .with_client("node-a", Arc::new(StaticRowsClient { value: 1 }))
+        .with_client("node-a", Arc::new(StaticRowsClient))
         .unwrap();
     let plan = DistributedQueryPlan::union_all(vec![
         DistributedQueryLeg::new(
@@ -8502,9 +8266,9 @@ fn query_transport_child_process_entry() {
         let token = std::env::var("SLATEDB_GRAPH_QUERY_TOKEN").unwrap();
 
         let object_store = local_object_store(&object_root).unwrap();
-        let placement = ShardPlacement::fixed([("reddit-home", "node-child")]).unwrap();
+        let placement = ObjectStoreNodeDirectory::new(["reddit-home"], ["node-child"]).unwrap();
         let cluster = Arc::new(
-            RoutedGraphCluster::open_fenced_owned(
+            RoutedGraphCluster::open_promotable(
                 "query-child-process",
                 "node-child",
                 placement,
@@ -9243,7 +9007,7 @@ async fn cypher_row_engine_supports_bindings_where_order_and_windows() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
-async fn cypher_variable_hops_use_matrix_artifact_adjacency() {
+async fn cypher_variable_hops_use_the_configured_graph_kernel_backend() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-varhop-matrix-artifact", object_store).await;
 
@@ -9275,7 +9039,10 @@ async fn cypher_variable_hops_use_matrix_artifact_adjacency() {
         .optimizer_passes
         .contains(&RowQueryOptimizerPass::GraphKernel));
 
+    #[cfg(feature = "graphblas")]
     let before_metrics = shard.graph_cache_metrics();
+    #[cfg(not(feature = "graphblas"))]
+    let before_operations = shard.graph_operational_metrics();
 
     let rows = shard
         .execute_cypher_rows(
@@ -9347,14 +9114,20 @@ async fn cypher_variable_hops_use_matrix_artifact_adjacency() {
             vec![QueryRow::new(vec![QueryValue::Count(2)])],
         )
     );
-    let first_metrics = shard.graph_cache_metrics();
     #[cfg(feature = "graphblas")]
-    assert!(first_metrics.graphblas_hits > before_metrics.graphblas_hits);
+    let first_metrics = {
+        let metrics = shard.graph_cache_metrics();
+        assert!(metrics.graphblas_hits > before_metrics.graphblas_hits);
+        metrics
+    };
     #[cfg(not(feature = "graphblas"))]
-    assert!(
-        first_metrics.matrix_adjacency_hits > before_metrics.matrix_adjacency_hits
-            || first_metrics.matrix_adjacency_misses > before_metrics.matrix_adjacency_misses
-    );
+    let first_operations = {
+        let metrics = shard.graph_operational_metrics();
+        assert!(
+            metrics.query_rust_sparse_fallbacks > before_operations.query_rust_sparse_fallbacks
+        );
+        metrics
+    };
 
     shard
         .execute_cypher_rows(
@@ -9363,11 +9136,15 @@ async fn cypher_variable_hops_use_matrix_artifact_adjacency() {
         )
         .await
         .unwrap();
-    let hot_metrics = shard.graph_cache_metrics();
     #[cfg(feature = "graphblas")]
-    assert!(hot_metrics.graphblas_hits > first_metrics.graphblas_hits);
+    assert!(shard.graph_cache_metrics().graphblas_hits > first_metrics.graphblas_hits);
     #[cfg(not(feature = "graphblas"))]
-    assert!(hot_metrics.matrix_artifact_hits > first_metrics.matrix_artifact_hits);
+    assert!(
+        shard
+            .graph_operational_metrics()
+            .query_rust_sparse_fallbacks
+            > first_operations.query_rust_sparse_fallbacks
+    );
 
     shard.close().await.unwrap();
 }
@@ -10862,14 +10639,17 @@ async fn cypher_row_engine_rejects_large_full_edge_scans() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(
-        err,
-        GraphError::AdmissionRejected {
-            operation: "cypher_edge_full_scan" | "query_outbox_delta_records",
-            actual: 2,
-            limit: 1
-        }
-    ));
+    assert!(
+        matches!(
+            err,
+            GraphError::AdmissionRejected {
+                operation: "query_edges_at_canonical",
+                actual: 2,
+                limit: 1
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 #[cfg(feature = "opencypher")]
@@ -11875,49 +11655,12 @@ async fn cypher_where_and_variable_hops_use_storage_kernel() {
 }
 
 #[tokio::test]
-async fn edge_writes_publish_delta_plus_records_for_builders() {
+async fn edge_writes_advance_canonical_adjacency_generation() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard("graph/delta-plus", object_store).await;
+    let shard = open_test_shard("graph/adjacency-generation", object_store).await;
 
     shard.write_edge(mutation(1, 10, "req-1")).await.unwrap();
     shard.write_edge(mutation(1, 11, "req-2")).await.unwrap();
-
-    let deltas = shard
-        .deltas_since("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 0)
-        .await
-        .unwrap();
-    assert_eq!(
-        deltas,
-        vec![
-            DeltaRecord {
-                kind: DeltaKind::Plus,
-                edge: EdgeRecord {
-                    cell_id: "reddit-home".to_string(),
-                    edge_type: "USER_SUBSCRIBED_TO_SUBREDDIT".to_string(),
-                    src: 1,
-                    dst: 10,
-                    epoch: 1
-                }
-            },
-            DeltaRecord {
-                kind: DeltaKind::Plus,
-                edge: EdgeRecord {
-                    cell_id: "reddit-home".to_string(),
-                    edge_type: "USER_SUBSCRIBED_TO_SUBREDDIT".to_string(),
-                    src: 1,
-                    dst: 11,
-                    epoch: 2
-                }
-            }
-        ]
-    );
-
-    let after_first = shard
-        .deltas_since("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 1)
-        .await
-        .unwrap();
-    assert_eq!(after_first.len(), 1);
-    assert_eq!(after_first[0].edge.dst, 11);
 
     let dirty_key = keys::matrix_dirty("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT");
     let dirty_epoch = shard
@@ -11932,9 +11675,9 @@ async fn edge_writes_publish_delta_plus_records_for_builders() {
 }
 
 #[tokio::test]
-async fn reopened_reader_sees_delta_plus_records() {
+async fn reopened_reader_sees_canonical_edge_records() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let path = "graph/reopen-deltas";
+    let path = "graph/reopen-canonical-records";
 
     {
         let shard = open_test_shard(path, Arc::clone(&object_store)).await;
@@ -11943,19 +11686,15 @@ async fn reopened_reader_sees_delta_plus_records() {
     }
 
     let reopened = open_test_shard(path, object_store).await;
-    let deltas = reopened
-        .deltas_since("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 0)
+    assert!(reopened
+        .edge_exists("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 42, 84)
         .await
-        .unwrap();
-    assert_eq!(deltas.len(), 1);
-    assert_eq!(deltas[0].kind, DeltaKind::Plus);
-    assert_eq!(deltas[0].edge.src, 42);
-    assert_eq!(deltas[0].edge.dst, 84);
+        .unwrap());
 }
 
 #[cfg(feature = "graphblas")]
 #[tokio::test]
-async fn graphblas_matrix_kernel_matches_rust_kernel_after_delta_overlay() {
+async fn graphblas_matrix_kernel_matches_rust_kernel_after_canonical_snapshot_rebuild() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/matrix-graphblas", object_store).await;
 
@@ -11984,11 +11723,11 @@ async fn graphblas_matrix_kernel_matches_rust_kernel_after_delta_overlay() {
         .unwrap();
 
     shard
-        .write_edge(mutation(4, 6, "graphblas-delta-plus"))
+        .write_edge(mutation(4, 6, "graphblas-snapshot-plus"))
         .await
         .unwrap();
     shard
-        .delete_edge(mutation(3, 4, "graphblas-delta-minus"))
+        .delete_edge(mutation(3, 4, "graphblas-snapshot-minus"))
         .await
         .unwrap();
     let read_epoch = shard.current_epoch("reddit-home").await.unwrap();
@@ -12022,7 +11761,6 @@ async fn graphblas_matrix_kernel_matches_rust_kernel_after_delta_overlay() {
     );
     assert_eq!(graphblas.vertices, rust.vertices);
     assert_eq!(graphblas.edge_visits, rust.edge_visits);
-    assert_eq!(graphblas.delta_records_applied, rust.delta_records_applied);
 }
 
 #[cfg(feature = "graphblas")]
@@ -12086,14 +11824,13 @@ async fn graphblas_matrix_kernel_reuses_compiled_base_matrix_cache() {
         .unwrap();
     assert_eq!(shard.graphblas_cache.lock().await.len(), 1);
     assert_eq!(second.vertices, first.vertices);
-    assert_eq!(second.delta_records_applied, 0);
 
     shard
-        .write_edge(mutation(4, 6, "graphblas-cache-delta-plus"))
+        .write_edge(mutation(4, 6, "graphblas-cache-snapshot-plus"))
         .await
         .unwrap();
     let read_epoch = shard.current_epoch("reddit-home").await.unwrap();
-    let with_delta = shard
+    let rebuilt = shard
         .matrix_reachable_with_kernel(
             "reddit-home",
             "USER_SUBSCRIBED_TO_SUBREDDIT",
@@ -12104,7 +11841,7 @@ async fn graphblas_matrix_kernel_reuses_compiled_base_matrix_cache() {
         )
         .await
         .unwrap();
-    assert_eq!(with_delta.delta_records_applied, 1);
+    assert!(rebuilt.vertices.contains(&6));
     assert_eq!(shard.graphblas_cache.lock().await.len(), 1);
 }
 
@@ -12172,7 +11909,6 @@ async fn graphblas_empty_cache_reader_uses_persisted_csc_artifact() {
         .unwrap();
     assert_eq!(actual.vertices, expected.vertices);
     assert_eq!(actual.edge_visits, expected.edge_visits);
-    assert_eq!(actual.delta_records_applied, 0);
     assert_eq!(reader.graphblas_cache.lock().await.len(), 1);
     assert_eq!(reader.matrix_cache.lock().await.len(), 0);
 }

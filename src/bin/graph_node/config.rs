@@ -35,12 +35,7 @@ pub struct RuntimeConfig {
     pub max_relationship_property_rows_bytes: usize,
     pub max_concurrent_hydrations: usize,
     pub max_concurrent_matrix_compilations: usize,
-    pub matrix_auto_refresh_enabled: bool,
-    pub matrix_refresh_interval: Duration,
-    pub matrix_refresh_max_dirty_age: Duration,
-    pub matrix_refresh_min_epoch_lag: u64,
-    pub matrix_refresh_tile_size: u64,
-    pub matrix_refresh_max_edge_types_per_cycle: usize,
+    pub index_discovery_interval: Duration,
     pub bolt_addr: SocketAddr,
     pub http_addr: SocketAddr,
     pub admin_addr: SocketAddr,
@@ -50,6 +45,7 @@ pub struct RuntimeConfig {
     pub tls_private_key: Option<PathBuf>,
     pub allow_plaintext: bool,
     pub max_concurrent_queries: usize,
+    pub max_query_scan_edges: u64,
     pub max_query_runtime_ms: u64,
     pub max_server_cursors: usize,
     pub max_cursor_buffer_bytes: u64,
@@ -181,31 +177,10 @@ impl RuntimeConfig {
                 "GRAPH_MAX_CONCURRENT_MATRIX_COMPILATIONS",
                 1,
             )?,
-            matrix_auto_refresh_enabled: parse_bool(
+            index_discovery_interval: parse_duration(
                 &values,
-                "GRAPH_MATRIX_AUTO_REFRESH_ENABLED",
-                true,
-            )?,
-            matrix_refresh_interval: parse_duration(
-                &values,
-                "GRAPH_MATRIX_REFRESH_INTERVAL_MS",
+                "GRAPH_INDEX_DISCOVERY_INTERVAL_MS",
                 5_000,
-            )?,
-            matrix_refresh_max_dirty_age: parse_duration(
-                &values,
-                "GRAPH_MATRIX_REFRESH_MAX_DIRTY_MS",
-                30_000,
-            )?,
-            matrix_refresh_min_epoch_lag: parse_u64(
-                &values,
-                "GRAPH_MATRIX_REFRESH_MIN_EPOCH_LAG",
-                1_000,
-            )?,
-            matrix_refresh_tile_size: parse_u64(&values, "GRAPH_MATRIX_REFRESH_TILE_SIZE", 4_096)?,
-            matrix_refresh_max_edge_types_per_cycle: parse_usize(
-                &values,
-                "GRAPH_MATRIX_REFRESH_MAX_EDGE_TYPES_PER_CYCLE",
-                4,
             )?,
             bolt_addr: parse_socket(&values, "GRAPH_BOLT_ADDR", "0.0.0.0:7687")?,
             http_addr: parse_socket(&values, "GRAPH_HTTP_ADDR", "0.0.0.0:8443")?,
@@ -220,6 +195,7 @@ impl RuntimeConfig {
             tls_private_key,
             allow_plaintext,
             max_concurrent_queries: parse_usize(&values, "GRAPH_MAX_CONCURRENT_QUERIES", 256)?,
+            max_query_scan_edges: parse_u64(&values, "GRAPH_MAX_QUERY_SCAN_EDGES", 1_000_000)?,
             max_query_runtime_ms: parse_u64(&values, "GRAPH_MAX_QUERY_RUNTIME_MS", 30_000)?,
             max_server_cursors: parse_usize(&values, "GRAPH_MAX_SERVER_CURSORS", 1_024)?,
             max_cursor_buffer_bytes: parse_u64(
@@ -241,6 +217,7 @@ impl RuntimeConfig {
     pub fn graph_open_options(&self) -> GraphOpenOptions {
         GraphOpenOptions {
             limits: GraphLimits {
+                max_query_scan_edges: self.max_query_scan_edges,
                 max_query_runtime_ms: Some(self.max_query_runtime_ms),
                 ..GraphLimits::default()
             },
@@ -435,6 +412,7 @@ mod tests {
     fn plaintext_runtime_config_is_explicit_and_bounded() {
         let values = BTreeMap::from([("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string())]);
         let config = RuntimeConfig::from_values(values).unwrap();
+        assert_eq!(config.max_query_scan_edges, 1_000_000);
         assert_eq!(config.max_query_runtime_ms, 30_000);
         assert_eq!(config.max_server_cursors, 1_024);
         assert_eq!(config.max_cursor_buffer_bytes, 64 * 1024 * 1024);
@@ -442,12 +420,7 @@ mod tests {
         assert_eq!(config.l0_sst_size_bytes, 16 * 1024 * 1024);
         assert_eq!(config.max_unflushed_bytes, 64 * 1024 * 1024);
         assert_eq!(config.max_concurrent_hydrations, 2);
-        assert!(config.matrix_auto_refresh_enabled);
-        assert_eq!(config.matrix_refresh_interval, Duration::from_secs(5));
-        assert_eq!(config.matrix_refresh_max_dirty_age, Duration::from_secs(30));
-        assert_eq!(config.matrix_refresh_min_epoch_lag, 1_000);
-        assert_eq!(config.matrix_refresh_tile_size, 4_096);
-        assert_eq!(config.matrix_refresh_max_edge_types_per_cycle, 4);
+        assert_eq!(config.index_discovery_interval, Duration::from_secs(5));
         let memory = config.graph_memory_config();
         assert_eq!(memory.max_graphblas_bytes, 128 * 1024 * 1024);
         assert_eq!(memory.max_matrix_adjacency_bytes, 0);
@@ -457,6 +430,17 @@ mod tests {
             memory.max_relationship_property_rows_bytes,
             16 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn graph_node_config_applies_query_scan_edge_limit() {
+        let values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            ("GRAPH_MAX_QUERY_SCAN_EDGES".to_string(), "64".to_string()),
+        ]);
+        let config = RuntimeConfig::from_values(values).unwrap();
+        assert_eq!(config.max_query_scan_edges, 64);
+        assert_eq!(config.graph_open_options().limits.max_query_scan_edges, 64);
     }
 
     #[test]

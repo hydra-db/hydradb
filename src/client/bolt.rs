@@ -22,7 +22,7 @@ use tokio_rustls::TlsAcceptor;
 use super::service::{
     ClientBookmark, ClientDatabaseResolver, ClientQueryCredentials, ClientQueryPage,
     ClientQueryRequest, ClientQueryService, ClientQuerySession, ClientQueryTarget,
-    PreparedClientQuery,
+    ClientReadConsistency, PreparedClientQuery,
 };
 use crate::{
     GraphError, GraphScope, QueryColumn, QueryCursorToken, QueryRow, QueryTransportAction,
@@ -35,7 +35,7 @@ mod wire;
 use routing::validate_bolt_routing_table;
 pub use routing::{
     BoltRoutingServer, BoltRoutingTable, BoltRoutingTableProvider,
-    RendezvousBoltRoutingTableProvider,
+    ObjectStoreBoltRoutingTableProvider,
 };
 use values::{
     bolt_parameter_to_query_value, explicit_transactions_unsupported, graph_error_to_bolt,
@@ -1147,7 +1147,49 @@ fn bolt_query_request(
         }
         None => {}
     }
+    if let Some(consistency) = bolt_read_consistency(extra)? {
+        request = request.with_consistency(consistency);
+    }
     Ok(request)
+}
+
+fn bolt_read_consistency(
+    extra: &BoltDict,
+) -> std::result::Result<Option<ClientReadConsistency>, BoltError> {
+    let direct = extra.get("consistency");
+    let metadata = match extra.get("tx_metadata") {
+        None => None,
+        Some(BoltValue::Dict(metadata)) => metadata.get("turbolay.consistency"),
+        Some(_) => {
+            return Err(BoltError::Protocol(
+                "tx_metadata must be a dictionary".to_string(),
+            ));
+        }
+    };
+    let value = match (direct, metadata) {
+        (Some(left), Some(right)) if left != right => {
+            return Err(BoltError::Protocol(
+                "conflicting Bolt consistency metadata".to_string(),
+            ));
+        }
+        (Some(value), _) | (_, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+    match value {
+        None => Ok(None),
+        Some(BoltValue::String(value)) if value == "causal" => {
+            Ok(Some(ClientReadConsistency::Causal))
+        }
+        Some(BoltValue::String(value)) if value == "strong" => {
+            Ok(Some(ClientReadConsistency::Strong))
+        }
+        Some(BoltValue::String(_)) => Err(BoltError::Protocol(
+            "consistency metadata must be causal or strong".to_string(),
+        )),
+        Some(_) => Err(BoltError::Protocol(
+            "consistency metadata must be a string".to_string(),
+        )),
+    }
 }
 
 fn validate_bolt_run_extra(extra: &BoltDict) -> std::result::Result<(), BoltError> {
