@@ -27,4 +27,6 @@ Thumbs.db
 .env
 *.env
 docs/formal-methods-docs/
-book/*.pdf
+
+# Generated PDFs (book builds, exports)
+*.pdf
