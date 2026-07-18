@@ -1,6 +1,6 @@
 ---
 title: "Formal Methods 0002: Turbolay Quint Specification and MBT Plan"
-status: proposed
+status: implementation-in-progress
 date: 2026-07-18
 related:
   - 0001-quint-jepsen-testing-objective.md
@@ -11,11 +11,12 @@ related:
 
 ## Decision requested
 
-Approve the model shapes, abstraction boundary, action names, properties,
-deterministic scenarios, and verification gates below. Once approved, these
-become the source-of-truth plan for the Quint files and the Rust MBT adapter.
-An invariant will never be weakened merely to make an implementation test pass;
-a semantic change requires a proposed spec change and renewed approval.
+The model shapes, abstraction boundary, action names, properties, deterministic
+scenarios, and verification gates below are now implemented in
+`quint-models/turbolay/`. Their first execution evidence is in
+[0003](0003-turbolay-quint-verification-evidence.md). An invariant will never
+be weakened merely to make an implementation test pass; a semantic change
+requires a proposed spec change and renewed approval.
 
 ## Modeling decisions
 
@@ -48,7 +49,8 @@ every Apalache run records its bound.
 
 ### Model structure and source correspondence
 
-The files below are created only after approval.
+The following files are implemented. Fault-shaped modules are added only when
+they distinguish a documented historical bug from the intended contract.
 
 ```text
 quint-models/

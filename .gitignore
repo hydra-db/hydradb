@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+/_apalache-out/
 
 # Generated benchmark and stress outputs
 /bench-results/

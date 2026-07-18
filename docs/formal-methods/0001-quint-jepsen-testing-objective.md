@@ -1,6 +1,6 @@
 ---
 title: "Formal Methods 0001: Turbolay Quint and Jepsen Testing Objective"
-status: proposed
+status: implementation-in-progress
 date: 2026-07-18
 owners:
   - Turbolay storage and query maintainers
@@ -12,11 +12,12 @@ depends_on:
 
 ## Decision requested
 
-Approve the system contract, API scope, and verification sequence in this document
-and in [0002](0002-turbolay-quint-specification-plan.md). Approval authorizes
-creation of the Quint models, deterministic Quint tests, ITF traces, and the
-local Rust model-based-test (MBT) harness. It does **not** silently authorize a
-change to production semantics.
+Review the implemented model boundary, API scope, and verification sequence in
+this document and in [0002](0002-turbolay-quint-specification-plan.md). The
+five Quint model families and deterministic scenarios now exist; the remaining
+approval points are the public contracts deliberately left open in BFG-003,
+BFG-004, BFG-007, and BFG-008, plus the scope of the Rust MBT adapter. This
+does **not** silently authorize a change to production semantics.
 
 ## Objective
 
@@ -157,10 +158,12 @@ listed in the implementation plan. Every bounded-proof report records the model
 version, module instance, constants, invariant list, max steps, tool versions,
 and result.
 
-Quint is available through Mise (`quint 0.32.0`). The current Apalache launcher
-cannot start because the host lacks a Java runtime. Installing or exposing a
-supported JRE is a prerequisite for this stage; it is not a reason to skip the
-earlier Quint, ITF, MBT, or Jepsen stages.
+Use the explicitly provisioned runtime in the requested tmux pane:
+`mise exec java@21.0.2 -- mise exec -- quint verify ...`. This resolves the
+macOS Java launcher stub and runs the Apalache bundled by Quint. The first
+bounded results are recorded in
+[0003](0003-turbolay-quint-verification-evidence.md); they are bounded checks,
+not unbounded proofs.
 
 ### 3. Rust model-based testing
 
