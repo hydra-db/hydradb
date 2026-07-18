@@ -25,15 +25,20 @@ must be pinned to one snapshot and an unvalidated historical request must be
 rejected. Its cursor state is the intended contract for the materialized client
 cursor. Direct `QueryResultPage` pagination remains BFG-008: its token carries
 only an offset, so its across-request contract is intentionally still open.
+M2b makes the separate `snapshot_at` admission and cancellation boundary
+executable. M5b captures destructive API behavior without overloading the
+relationship-identity command model.
 
 | Family | Main module | Deterministic tests | Primary findings |
 |---|---|---|---|
 | M1 | `m1_cell_write.qnt` | `m1_cell_write_test.qnt` | BFG-003, BFG-004, BFG-005, BFG-006 |
 | M1b | `m1_bulk_import.qnt` | `m1_bulk_import_test.qnt` | P1 bulk unit/retry contract |
 | M2 | `m2_snapshot_read.qnt` | `m2_snapshot_read_test.qnt` | BFG-001, BFG-002, BFG-007, BFG-008 |
+| M2b | `m2_snapshot_lifecycle.qnt` | `m2_snapshot_lifecycle_test.qnt` | P2 current-only `snapshot_at`, typed rejection, cancellation |
 | M3 | `m3_artifact_gc.qnt` | `m3_artifact_gc_test.qnt` | BFG-005, BFG-006 |
 | M4 | `m4_placement_fence.qnt` | `m4_placement_fence_test.qnt` | BFG-007 |
 | M5 | `m5_public_commands.qnt` | `m5_public_commands_test.qnt` | BFG-003, BFG-004, BFG-008 |
+| M5b | `m5_destructive_lifecycle.qnt` | `m5_destructive_lifecycle_test.qnt` | P2 `DELETE`, `DETACH DELETE`, cell-drop fence |
 
 ## Local commands
 
@@ -41,13 +46,15 @@ Run Quint and other long-running formal-methods commands in tmux pane
 `pson:10.2`:
 
 ```bash
-for model in m1_cell_write m1_bulk_import m2_snapshot_read m3_artifact_gc \
-             m4_placement_fence m5_public_commands; do
+for model in m1_cell_write m1_bulk_import m2_snapshot_read \
+             m2_snapshot_lifecycle m3_artifact_gc m4_placement_fence \
+             m5_public_commands m5_destructive_lifecycle; do
   mise exec -- quint typecheck "quint-models/turbolay/${model}.qnt"
 done
 
-for test in m1_cell_write m1_bulk_import m2_snapshot_read m3_artifact_gc \
-            m4_placement_fence m5_public_commands; do
+for test in m1_cell_write m1_bulk_import m2_snapshot_read \
+            m2_snapshot_lifecycle m3_artifact_gc m4_placement_fence \
+            m5_public_commands m5_destructive_lifecycle; do
   mise exec -- quint test "quint-models/turbolay/${test}_test.qnt" \
     --main "${test}_test" --match '.*Test$'
 done

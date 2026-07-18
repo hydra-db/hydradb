@@ -12,20 +12,22 @@ tags: [quint, apalache, mbt, jepsen, verification]
 
 ## What is now executable
 
-All five planned model families typecheck. Their 19 deterministic scenarios
-pass, and each main model's randomized Quint simulation found no invariant
-violation while reaching its named actions. Apalache then bounded-checked every
-main model through six transitions using `quint verify` and
-`mise exec java@21.0.2`; all five runs returned `NoError`.
+All five planned model families and their three focused submodels typecheck.
+Their 31 deterministic scenarios pass, and each main model's randomized Quint
+simulation found no invariant violation while reaching its named actions.
+Apalache then bounded-checked every main model through six transitions using
+`quint verify` and `mise exec java@21.0.2`; all runs returned `NoError`.
 
 | Family | Safety boundary | Deterministic scenarios | Apalache bound | Rust MBT status |
 |---|---|---:|---:|---|
 | M1 | atomic edge projection, idempotency, writer fencing | 4 | 6 | 24 seeded public-API traces pass |
 | M1b | chunked bulk import, durable prefix, retry | 3 | 6 | focused public-API conformance test |
 | M2 | page snapshot scope, historical epoch rejection, bookmarks | 4 | 6 | direct-page conformance test; driver pending |
+| M2b | current-only `snapshot_at`, typed rejection, cancelled page | 3 | 6 | P2 public-API conformance tests; driver pending |
 | M3 | artifact generation fence, matrix equivalence, reader retention | 4 | 6 | 10k simulation + bounded check; driver pending |
 | M4 | placement disagreement and durable writer fence | 3 | 6 | 10k simulation + bounded check; driver pending |
 | M5 | command normalization, relationship identity, batch semantics | 7 | 6 | P0/P1 command conformance tests; driver pending |
+| M5b | `DELETE`, `DETACH DELETE`, cell-drop fence | 3 | 6 | P2 public-API conformance test; driver pending |
 
 The generated M1/M2 Informal Trace Format files are under `target/formal/` and
 are ignored by Git. M1 is additionally replayed against Rust by
@@ -76,6 +78,17 @@ default-feature Rust test
 real chunked import, invalid chunk rejection, reordered retry, stable epoch,
 and final public neighbors.
 
+### P2 snapshot and destructive-operation evidence (2026-07-18)
+
+M2b and M5b each passed their three deterministic scenarios, 10,000 twelve-step
+Quint simulation, and six-step Apalache check. The default-feature tests
+`formal_p2_snapshot_at_is_current_only` and
+`formal_p2_delete_detach_delete_and_drop_are_fenced` pass. With OpenCypher,
+`formal_p2_cancelled_cursor_page_returns_no_rows` also passes. Together these
+check current-only storage snapshot admission, future/historical typed errors,
+cancelled page no-result behavior, detach cascade, and the post-drop write
+fence.
+
 ## Evidence boundary
 
 These checks are intentionally finite. A six-step Apalache result means that
@@ -109,6 +122,7 @@ SlateDB keys as its oracle.
 | M3 | artifact build/refresh, direct and matrix reachability, maintenance GC | direct traversal equals matrix-plus-delta traversal; publication generation; retained read succeeds |
 | M4 | fenced owned shard/routed cluster open and replacement writer | one accepted writer, monotone epoch, fresh reader sees committed prefix |
 | M5 | Cypher `CREATE`/`MERGE`/`DELETE`/batch plus service cursor calls | normalized rows, relationship identity, batch outcome, materialized cursor rows |
+| M2b/M5b | `snapshot_at`, paged cancellation, vertex deletion, `drop_cell` | snapshot epoch/error class, no cancelled page, incident-edge projection, post-drop `CellDropped` |
 
 The next implementation order is M2, then M5 P0 semantics. Every driver runs
 first against a local in-memory object store, retains the input trace plus
