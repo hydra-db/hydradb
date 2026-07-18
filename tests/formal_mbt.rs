@@ -5,15 +5,16 @@
 //! executing its public API call; a crash preserves the last observed durable
 //! projection until its successor opens the same S3-compatible store.
 
+mod support;
+
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use quint_connect::{quint_run, switch, Driver, Result, State, Step};
 use serde::Deserialize;
-use slatedb::object_store::{memory::InMemory, ObjectStore};
+use slatedb::object_store::ObjectStore;
 use slatedb_graph_kernel::{CommitResult, EdgeMutation, GraphError, GraphShard};
-
-const GRAPH_PATH: &str = "graph/formal-mbt-m1";
+use support::mbt_backend::MbtBackend;
 const CELL: &str = "formal-cell";
 const EDGE_TYPE: &str = "FOLLOWS";
 
@@ -60,6 +61,7 @@ impl State<M1Driver> for M1State {
 struct M1Driver {
     runtime: tokio::runtime::Runtime,
     store: Option<Arc<dyn ObjectStore>>,
+    graph_path: String,
     writer: Option<GraphShard>,
     // The closed shard is retained solely to prove that its next write is
     // rejected after a replacement writer has acquired the storage.
@@ -85,6 +87,7 @@ impl Default for M1Driver {
         Self {
             runtime: tokio::runtime::Runtime::new().expect("model-based test runtime"),
             store: None,
+            graph_path: String::new(),
             writer: None,
             zombie_writer: None,
             last_epoch: 0,
@@ -134,7 +137,9 @@ impl M1Driver {
             let _ = self.runtime.block_on(writer.close());
         }
 
-        self.store = Some(Arc::new(InMemory::new()));
+        let replay = MbtBackend::from_env()?.new_replay("m1")?;
+        self.store = Some(replay.object_store);
+        self.graph_path = replay.graph_path;
         self.last_epoch = 0;
         self.previous_epoch = 0;
         self.last_edge_present = false;
@@ -280,10 +285,10 @@ impl M1Driver {
 
     fn open_writer(&mut self) -> Result {
         let store = Arc::clone(self.store.as_ref().context("M1 store is not initialized")?);
-        self.writer = Some(
-            self.runtime
-                .block_on(GraphShard::open_standalone_writer(GRAPH_PATH, store))?,
-        );
+        self.writer = Some(self.runtime.block_on(GraphShard::open_standalone_writer(
+            self.graph_path.as_str(),
+            store,
+        ))?);
         Ok(())
     }
 

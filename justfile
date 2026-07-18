@@ -120,6 +120,10 @@ minio-chaos:
 minio-fence:
     bash scripts/minio_fence_takeover.sh
 
+# Replay all six Quint Connect adapters against isolated MinIO paths. Requires Docker.
+minio-mbt:
+    bash scripts/minio_mbt.sh
+
 # Refresh the pinned SlateDB Git dependency in Cargo.lock.
 update-slatedb:
     cargo update -p slatedb

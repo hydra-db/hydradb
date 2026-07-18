@@ -36,9 +36,11 @@ ignored by Git. Rust MBT replay now has six default-feature adapter binaries:
 `tests/formal_mbt_p2.rs`. The P2 binary replays M5b by default and adds the
 M2b cancelled-page driver when built with OpenCypher. `quint-connect`
 generates 24 deterministic-seed simulation traces per driver, calls only
-public APIs, and compares normalized state after every step. The named
-`quint test` witnesses remain Quint-only because their ITF output omits
-`mbt::actionTaken`, which the current adapter requires for action dispatch.
+public APIs, and compares normalized state after every step. The shared
+backend defaults to `InMemory` and `just minio-mbt` replays all six against
+local MinIO with the same seeds. The named `quint test` witnesses remain
+Quint-only because their ITF output omits `mbt::actionTaken`, which the current
+adapter requires for action dispatch.
 
 ### P0 completion evidence (2026-07-18)
 
@@ -140,11 +142,12 @@ SlateDB keys as its oracle.
 | M2b | **implemented:** `snapshot_at`, OpenCypher page/cancellation | snapshot epoch/error class; a cancelled request yields no page |
 | M5b | **implemented:** vertex deletion and `drop_cell` | incident-edge degree projection; post-drop `CellDropped` |
 
-Every driver currently runs against a local in-memory object store and retains
-the input trace plus observed projection on failure. No MinIO/S3 MBT replay and
-no Jepsen campaign is claimed in this evidence record. The next expansion is to
-replay the same seeded corpus against S3-compatible storage and then run the
-Jepsen campaigns described below.
+Every driver defaults to a local in-memory object store and retains the input
+trace plus observed projection on failure. The shared backend factory also
+replays the same seeds against local MinIO through `just minio-mbt`, with a
+unique safe prefix per replay and retained config/log/object artifacts on
+failure. No Jepsen campaign or general S3 soak result is claimed in this
+evidence record.
 
 ## Jepsen handoff
 

@@ -30,13 +30,16 @@ executable. M5b captures destructive API behavior without overloading the
 relationship-identity command model.
 
 The Rust Quint Connect adapters are finite public-API refinement checks. They
-run seeded traces against a local `InMemory` object store, not MinIO/S3, and do
-not constitute Jepsen evidence. M3's adapter observes checked-current matrix
-artifact publication/rejection, retained owned snapshots, GC through a
-published artifact, and direct/matrix reachability equivalence. M4's adapter
-observes local placement disagreement, fenced routed-cluster takeover,
-committed-prefix monotonicity, and stale-writer rejection through the previously
-opened node-1 writer handle.
+default to a fresh local `InMemory` store for every replay. Set
+`GRAPH_MBT_BACKEND=minio` with `GRAPH_MBT_S3_ENV_FILE` only to opt into an
+S3-compatible backend; the factory requires `CLOUD_PROVIDER=aws`, endpoint,
+bucket, access key, and secret, and allocates a unique safe graph prefix for
+each replay. Neither backend is Jepsen evidence. M3's adapter observes
+checked-current matrix artifact publication/rejection, retained owned snapshots,
+GC through a published artifact, and direct/matrix reachability equivalence.
+M4's adapter observes local placement disagreement, fenced routed-cluster
+takeover, committed-prefix monotonicity, and stale-writer rejection through the
+previously opened node-1 writer handle.
 
 | Family | Main module | Deterministic tests | Primary findings |
 |---|---|---|---|
@@ -85,6 +88,19 @@ mise exec -- cargo test --locked --test formal_mbt_m5 -- --test-threads=1
 # P2 has two additional public-API trace replayers. M5b is feature-independent;
 # M2b also exercises the OpenCypher cancelled-page entry point.
 mise exec -- cargo test --locked --test formal_mbt_p2 -- --test-threads=1
+
+# Starts pinned MinIO/mc containers, creates a bucket, and replays all six
+# default adapters serially. On failure it retains config, logs, data, and the
+# bucket/prefix under target/minio-mbt/; on success it removes them.
+just minio-mbt
+
+# To use another S3-compatible service directly, provide a SlateDB AWS env file
+# (including CLOUD_PROVIDER=aws, AWS_ENDPOINT, AWS_BUCKET, credentials) and a
+# safe shared prefix. Each adapter replay receives a distinct child path.
+GRAPH_MBT_BACKEND=minio GRAPH_MBT_S3_ENV_FILE=/path/to/minio.env \
+  GRAPH_MBT_PREFIX=formal-mbt/manual-$(date +%s) \
+  mise exec -- cargo test --locked --test formal_mbt -- --test-threads=1
+
 TURBOLAY_PKG_PREFIX="$(brew --prefix libcypher-parser)" \
 PKG_CONFIG_PATH="$(brew --prefix libcypher-parser)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
 BINDGEN_EXTRA_CLANG_ARGS="-I$(brew --prefix libcypher-parser)/include" \

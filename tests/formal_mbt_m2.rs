@@ -1,12 +1,12 @@
 //! Quint Connect refinement adapter for the M2 read/snapshot contract.
 
-use std::sync::Arc;
+mod support;
 
 use anyhow::{bail, Context};
 use quint_connect::{quint_run, switch, Driver, Result, State, Step};
 use serde::Deserialize;
-use slatedb::object_store::{memory::InMemory, ObjectStore};
 use slatedb_graph_kernel::{EdgeMutation, GraphError, GraphShard};
+use support::mbt_backend::MbtBackend;
 
 const CELL: &str = "formal-cell";
 const EDGE: &str = "FOLLOWS";
@@ -141,10 +141,10 @@ impl M2Driver {
         if let Some(s) = self.shard.take() {
             self.runtime.block_on(s.close())?;
         }
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let replay = MbtBackend::from_env()?.new_replay("m2")?;
         let s = self.runtime.block_on(GraphShard::open_standalone_writer(
-            "graph/formal-mbt-m2",
-            store,
+            replay.graph_path,
+            replay.object_store,
         ))?;
         self.runtime.block_on(s.write_edge(EdgeMutation {
             cell_id: CELL.into(),
