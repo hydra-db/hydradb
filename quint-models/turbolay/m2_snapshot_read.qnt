@@ -206,4 +206,8 @@ module m2_snapshot_read {
   val unvalidatedHistoricalRejected: bool =
     lastAction == "rejectUnvalidatedHistoricalPage" and historicalRejected
   val cursorOpenedReached: bool = lastAction == "openCursor"
+  val snapshotOpenedReached: bool = lastAction == "openSnapshot"
+  val commitAppendReached: bool = lastAction == "commitAppend"
+  val cursorPageFetchedReached: bool = lastAction == "fetchCursorPage"
+  val bookmarkAdvancedReached: bool = lastAction == "advanceBookmark"
 }

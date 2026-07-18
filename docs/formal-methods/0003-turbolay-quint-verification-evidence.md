@@ -12,7 +12,7 @@ tags: [quint, apalache, mbt, jepsen, verification]
 
 ## What is now executable
 
-All five planned model families typecheck. Their 15 deterministic scenarios
+All five planned model families typecheck. Their 19 deterministic scenarios
 pass, and each main model's randomized Quint simulation found no invariant
 violation while reaching its named actions. Apalache then bounded-checked every
 main model through six transitions using `quint verify` and
@@ -20,11 +20,11 @@ main model through six transitions using `quint verify` and
 
 | Family | Safety boundary | Deterministic scenarios | Apalache bound | MBT trace |
 |---|---|---:|---:|---|
-| M1 | atomic edge projection, idempotency, writer fencing | 3 | 6 | generated |
+| M1 | atomic edge projection, idempotency, writer fencing | 4 | 6 | generated |
 | M2 | page snapshot scope, historical epoch rejection, bookmarks | 3 | 6 | generated |
-| M3 | artifact generation fence, matrix equivalence, reader retention | 3 | 6 | pending |
+| M3 | artifact generation fence, matrix equivalence, reader retention | 4 | 6 | pending |
 | M4 | placement disagreement and durable writer fence | 3 | 6 | pending |
-| M5 | command normalization, relationship identity, batch semantics | 4 | 6 | pending |
+| M5 | command normalization, relationship identity, batch semantics | 5 | 6 | pending |
 
 The generated M1/M2 Informal Trace Format files are under `target/formal/` and
 are ignored by Git. They include `mbt::actionTaken`; this proves trace

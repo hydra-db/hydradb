@@ -32,4 +32,10 @@ module m5_public_commands_test {
       .then(fetchMaterializedCursorPage)
       .expect(cursorOffset == 2)
       .expect(not(cursorOpen))
+
+  run createEdgeCommandHasPublicCreatedOutcomeTest =
+    init
+      .then(createEdgeCommand)
+      .expect(edgePresent)
+      .expect(lastResponse == "created")
 }

@@ -28,4 +28,12 @@ module m3_artifact_gc_test {
       .expect(readerActive)
       .then(queryMatrix)
       .expect(queryResult == canonicalReachable)
+
+  run completedReadPermitsHistoryCollectionTest =
+    init
+      .then(beginRead)
+      .then(endRead)
+      .then(gcHistory)
+      .expect(not(readerActive))
+      .expect(not(historyRetained))
 }
