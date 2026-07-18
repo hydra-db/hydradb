@@ -87,12 +87,13 @@ cargo test --locked --features opencypher --lib \
 The intended model disables the forbidden transition. Its deterministic
 scenario `unvalidatedHistoricalPageIsRejectedTest` passes, and bounded Quint
 simulation reports no violation of `invalidHistoricalNeverReturns` while
-reaching the rejection witness. These are model checks over the stated finite
-model, not a claim of an unbounded proof; Apalache and Rust MBT replay remain
-required gates in the approved plan.
+reaching the rejection witness. Apalache also completed the stated six-step
+bounded check. These are checks over the stated finite model, not a claim of
+an unbounded proof; Rust MBT replay remains a required gate in the approved
+plan.
 
 ## Review decision
 
-Pending review of the behavior and evidence. Promote to `fixed` only after
-the M2 Apalache/MBT gate is recorded and the public historical-epoch error
-contract is accepted.
+Pending review of the behavior and evidence. Promote to `fixed` only after the
+Rust MBT gate is recorded and the public historical-epoch error contract is
+accepted.

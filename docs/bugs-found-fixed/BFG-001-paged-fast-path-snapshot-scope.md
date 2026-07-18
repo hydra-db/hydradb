@@ -74,11 +74,11 @@ results during a concurrent write.
 3. mark the context as a validated storage read; and
 4. run the recursive page execution inside `GraphStore::scope_snapshot`.
 
-The intended M2 model has passed its deterministic tests and bounded Quint
-simulation with `cursorPinnedToSnapshot` and `returnedPageMatchesCursor`.
-The remaining validation is a controlled write/read interleaving for both the
-graph-kernel and streaming page shapes at `e875387` and `b1709ea`, followed by
-an Apalache bounded check and an MBT replay.
+The intended M2 model has passed its deterministic tests, bounded Quint
+simulation, and the six-step Apalache check with `cursorPinnedToSnapshot` and
+`returnedPageMatchesCursor`. The remaining validation is a controlled
+write/read interleaving for both the graph-kernel and streaming page shapes at
+`e875387` and `b1709ea`, followed by Rust MBT replay.
 
 ## Review decision
 
