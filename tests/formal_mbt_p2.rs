@@ -4,13 +4,13 @@
 //! do not inspect private object-store keys: the API result/error, snapshot
 //! rows, and structural degrees are the refinement oracle after each action.
 
-use std::sync::Arc;
+mod support;
 
 use anyhow::{bail, Context};
 use quint_connect::{quint_run, switch, Driver, Result, State, Step};
 use serde::Deserialize;
-use slatedb::object_store::{memory::InMemory, ObjectStore};
 use slatedb_graph_kernel::{EdgeMutation, GraphError, GraphShard, VertexMetadata};
+use support::mbt_backend::MbtBackend;
 
 const CELL: &str = "formal-cell";
 const EDGE_TYPE: &str = "FOLLOWS";
@@ -102,10 +102,10 @@ impl M5bDriver {
         if let Some(shard) = self.shard.take() {
             self.runtime.block_on(shard.close())?;
         }
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let replay = MbtBackend::from_env()?.new_replay("p2-m5b")?;
         let shard = self.runtime.block_on(GraphShard::open_standalone_writer(
-            "graph/formal-mbt-m5b",
-            store,
+            replay.graph_path,
+            replay.object_store,
         ))?;
         self.runtime.block_on(async {
             shard
@@ -315,10 +315,10 @@ mod snapshot_lifecycle {
             if let Some(shard) = self.shard.take() {
                 self.runtime.block_on(shard.close())?;
             }
-            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let replay = MbtBackend::from_env()?.new_replay("p2-m2b")?;
             let shard = self.runtime.block_on(GraphShard::open_standalone_writer(
-                "graph/formal-mbt-m2b",
-                store,
+                replay.graph_path,
+                replay.object_store,
             ))?;
             self.runtime
                 .block_on(shard.write_edge(edge(EDGE_TYPE, 1, 2, "m2b-seed")))?;

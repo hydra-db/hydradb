@@ -24,6 +24,12 @@ completion.
 
 All formal-methods and test work described here remains on `Turbolay-V3`.
 
+The six adapters default to isolated `InMemory` replays. `just minio-mbt` now
+starts pinned local MinIO/mc containers and replays the same six seeded corpora
+serially through the explicit S3-compatible backend. It retains the generated
+config, MinIO log, object listing, data volume, and bucket/prefix under
+`target/minio-mbt/` on failure, and removes them on success.
+
 ## Ordered work
 
 ### 1. Contract review
@@ -52,25 +58,24 @@ Public-API Quint Connect drivers are now wired for:
 
 Each driver compares a normalized public projection after every action and
 retains the failing seed, action trace, and observed state. The observable
-scope is still finite seeded replay on `InMemory`; S3-compatible storage and
-Jepsen remain later gates.
+scope is still finite seeded replay with the default `InMemory` backend; local
+S3-compatible MinIO replay is now available, while Jepsen remains a later gate.
 
-### 3. Replay against S3-compatible storage
+### 3. Replay against S3-compatible storage — local MinIO implemented
 
-Run the complete MBT corpus against MinIO or the configured S3-compatible
-backend after the in-memory runs pass. Preserve the same seeds so failures can
-be compared across storage backends.
+The shared test-only backend factory keeps `InMemory` as the default. Setting
+`GRAPH_MBT_BACKEND=minio` and `GRAPH_MBT_S3_ENV_FILE` selects SlateDB's AWS
+object-store configuration after validating the endpoint, bucket, and
+credentials. Every adapter replay gets a unique safe path below
+`GRAPH_MBT_PREFIX`, while retaining the existing Quint seeds, actions, and
+normalized oracles.
 
-Required evidence:
-
-- object-store endpoint and configuration;
-- Quint seed and action trace;
-- Rust observed projection and error;
-- relevant object prefix and service logs;
-- whether the failure reproduces with `InMemory`.
-
-Long-running Quint, Apalache, and Cargo commands must run in tmux pane
-`pson:10.2`.
+Run `just minio-mbt` after the in-memory corpus. The runner records the
+endpoint config, per-adapter Cargo output, bucket/prefix, objects, and MinIO
+logs on failure; compare a failure with the default backend using the same
+seed. A configured external S3-compatible service can use the same environment
+selection. Long-running Quint, Apalache, and Cargo commands must run in tmux
+pane `pson:10.2`.
 
 ### 4. Run Jepsen campaigns
 

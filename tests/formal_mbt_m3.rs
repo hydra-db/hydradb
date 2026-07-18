@@ -7,15 +7,16 @@
 //! gated by a published artifact, and matrix queries are compared with the
 //! direct current oracle.
 
+mod support;
+
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use quint_connect::{quint_run, switch, Driver, Result, State, Step};
 use serde::Deserialize;
-use slatedb::object_store::{memory::InMemory, ObjectStore};
 use slatedb_graph_kernel::{EdgeMutation, GraphError, GraphShard, OwnedGraphSnapshot};
+use support::mbt_backend::MbtBackend;
 
-const GRAPH_PATH: &str = "graph/formal-mbt-m3";
 const CELL: &str = "formal-cell";
 const EDGE_TYPE: &str = "FOLLOWS";
 const SRC: u64 = 1;
@@ -152,11 +153,11 @@ impl M3Driver {
             self.runtime.block_on(shard.close())?;
         }
 
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let shard = Arc::new(
-            self.runtime
-                .block_on(GraphShard::open_standalone_writer(GRAPH_PATH, store))?,
-        );
+        let replay = MbtBackend::from_env()?.new_replay("m3")?;
+        let shard = Arc::new(self.runtime.block_on(GraphShard::open_standalone_writer(
+            replay.graph_path,
+            replay.object_store,
+        ))?);
         self.shard = Some(shard);
         let (epoch, reachable) = self.observe_current()?;
         if epoch != 0 || reachable {

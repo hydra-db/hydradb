@@ -1,14 +1,15 @@
 //! Quint Connect refinement adapter for the M5 public-command contract.
 
+mod support;
+
 use anyhow::{bail, Context};
 use quint_connect::{quint_run, switch, Driver, Result, State, Step};
 use serde::Deserialize;
-use slatedb::object_store::{memory::InMemory, ObjectStore};
 use slatedb_graph_kernel::{
     EdgeMetadata, EdgeMutation, GraphError, GraphShard, RelationshipMutation, VertexMetadata,
     VertexPropertyValue,
 };
-use std::sync::Arc;
+use support::mbt_backend::MbtBackend;
 
 const CELL: &str = "formal-cell";
 const EDGE: &str = "FOLLOWS";
@@ -98,10 +99,10 @@ impl M5Driver {
         if let Some(s) = self.shard.take() {
             self.runtime.block_on(s.close())?;
         }
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let replay = MbtBackend::from_env()?.new_replay("m5")?;
         let s = self.runtime.block_on(GraphShard::open_standalone_writer(
-            "graph/formal-mbt-m5",
-            store,
+            replay.graph_path,
+            replay.object_store,
         ))?;
         self.runtime.block_on(s.set_vertex_metadata(
             CELL,

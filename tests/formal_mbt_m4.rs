@@ -6,16 +6,17 @@
 //! a reachability-only partition, replacement takeover on the same object-store
 //! path, prefix extension by the replacement, and typed rejection of stale writes.
 
+mod support;
+
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use quint_connect::{quint_run, switch, Driver, Result, State, Step};
 use serde::Deserialize;
-use slatedb::object_store::{memory::InMemory, ObjectStore};
+use slatedb::object_store::ObjectStore;
 use slatedb::ErrorKind;
 use slatedb_graph_kernel::{EdgeMutation, GraphError, RoutedGraphCluster, ShardPlacement};
-
-const GRAPH_PATH: &str = "graph/formal-mbt-m4";
+use support::mbt_backend::MbtBackend;
 const CELL: &str = "formal-cell";
 const EDGE_TYPE: &str = "FOLLOWS";
 const NODE1: &str = "node-1";
@@ -41,6 +42,7 @@ struct M4State {
 struct M4Driver {
     runtime: tokio::runtime::Runtime,
     store: Option<Arc<dyn ObjectStore>>,
+    graph_path: String,
     node1_placement: Option<ShardPlacement>,
     node2_placement: Option<ShardPlacement>,
     node1_cluster: Option<RoutedGraphCluster>,
@@ -53,6 +55,7 @@ impl Default for M4Driver {
         Self {
             runtime: tokio::runtime::Runtime::new().expect("M4 MBT runtime"),
             store: None,
+            graph_path: String::new(),
             node1_placement: None,
             node2_placement: None,
             node1_cluster: None,
@@ -107,7 +110,9 @@ impl M4Driver {
         if let Some(cluster) = self.node2_cluster.take() {
             let _ = self.runtime.block_on(cluster.close());
         }
-        self.store = Some(Arc::new(InMemory::new()));
+        let replay = MbtBackend::from_env()?.new_replay("m4")?;
+        self.store = Some(replay.object_store);
+        self.graph_path = replay.graph_path;
         self.node1_placement = None;
         self.node2_placement = None;
         self.p = M4State {
@@ -328,7 +333,7 @@ impl M4Driver {
         Ok(self
             .runtime
             .block_on(RoutedGraphCluster::open_fenced_owned(
-                GRAPH_PATH,
+                self.graph_path.as_str(),
                 local_node_id,
                 placement,
                 store,
