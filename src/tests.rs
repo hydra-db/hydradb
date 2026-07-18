@@ -236,6 +236,75 @@ async fn formal_p1_parallel_relationship_delete_preserves_edge_until_final_relat
     shard.close().await.unwrap();
 }
 
+// P1/M1b: chunks are the admitted durable units. Retrying the complete
+// request in another input order must return the recorded aggregate outcome
+// without advancing the epoch or duplicating structural edges.
+#[tokio::test]
+async fn formal_p1_chunked_bulk_import_is_idempotent_by_durable_chunk() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_limits(
+        "graph/formal-p1-chunked-bulk-import",
+        object_store,
+        GraphLimits {
+            max_bulk_import_edges: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let invalid_chunk = shard
+        .bulk_import_edges_chunked("formal-cell", "FOLLOWS", [(1, 2)], "formal-p1-zero", 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(invalid_chunk, GraphError::CorruptValue { .. }));
+
+    let result = shard
+        .bulk_import_edges_chunked(
+            "formal-cell",
+            "FOLLOWS",
+            [(1, 2), (1, 3), (1, 4), (1, 5), (1, 6)],
+            "formal-p1-chunked",
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        BulkImportResult {
+            start_epoch: 1,
+            end_epoch: 5,
+            inserted: 5,
+            already_existed: 0,
+        }
+    );
+    let completed_epoch = shard.current_epoch("formal-cell").await.unwrap();
+
+    let retry = shard
+        .bulk_import_edges_chunked(
+            "formal-cell",
+            "FOLLOWS",
+            [(1, 6), (1, 5), (1, 4), (1, 3), (1, 2)],
+            "formal-p1-chunked",
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry, result);
+    assert_eq!(
+        shard.current_epoch("formal-cell").await.unwrap(),
+        completed_epoch
+    );
+    assert_eq!(
+        shard
+            .out_neighbors("formal-cell", "FOLLOWS", 1)
+            .await
+            .unwrap(),
+        vec![2, 3, 4, 5, 6]
+    );
+
+    shard.close().await.unwrap();
+}
+
 #[cfg(all(feature = "opencypher", feature = "graphblas"))]
 #[tokio::test]
 async fn cypher_graphblas_snapshot_applies_plus_and_minus_deltas() {

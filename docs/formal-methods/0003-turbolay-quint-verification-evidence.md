@@ -21,6 +21,7 @@ main model through six transitions using `quint verify` and
 | Family | Safety boundary | Deterministic scenarios | Apalache bound | Rust MBT status |
 |---|---|---:|---:|---|
 | M1 | atomic edge projection, idempotency, writer fencing | 4 | 6 | 24 seeded public-API traces pass |
+| M1b | chunked bulk import, durable prefix, retry | 3 | 6 | focused public-API conformance test |
 | M2 | page snapshot scope, historical epoch rejection, bookmarks | 4 | 6 | direct-page conformance test; driver pending |
 | M3 | artifact generation fence, matrix equivalence, reader retention | 4 | 6 | 10k simulation + bounded check; driver pending |
 | M4 | placement disagreement and durable writer fence | 3 | 6 | 10k simulation + bounded check; driver pending |
@@ -63,6 +64,17 @@ deterministic suites, 10,000 twelve-step simulation traces, and six-step
 Apalache checks. This proves the stated finite abstractions, not a read-only
 freshness SLA: the documented BFG-007 contract remains safety/proof-or-error
 only.
+
+### P1 bulk import evidence (2026-07-18)
+
+The M1b submodel represents the documented 2+2+1 chunk boundaries for a
+five-edge import. It makes an interruption after the first durable chunk
+explicit and requires retry to preserve the committed prefix. Its three
+witnesses, 10,000-sample simulation, and six-step Apalache check pass. The
+default-feature Rust test
+`formal_p1_chunked_bulk_import_is_idempotent_by_durable_chunk` validates a
+real chunked import, invalid chunk rejection, reordered retry, stable epoch,
+and final public neighbors.
 
 ## Evidence boundary
 
