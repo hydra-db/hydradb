@@ -680,7 +680,33 @@ here; only note that those scenarios exercise exactly the actions you have just 
 
 == A picture of the reachable states
 
-It helps to see the shape `step` traces out. The create-and-fence storyline looks like this:
+Before the storyline, look at a single step in isolation, because that is where the
+nondeterminism lives. From one state, `step` does not pick _the_ next action; it may fire
+_any_ action whose guards currently hold. Standing in the state where writer 1 owns the cell
+and no edge exists yet, four different actions are enabled at once, and the checker follows
+every one of them:
+
+#figure(
+  diagram(
+    node-stroke: 0.6pt + reader-colors.border,
+    node-fill: reader-colors.surface_soft,
+    node-outset: 0pt,
+    spacing: (2.6cm, 0.72cm),
+    node((0, 1.5), text(fill: reader-colors.text)[writer 1 owns cell,\ no edge yet], fill: reader-colors.info_soft, width: 2.9cm),
+    node((1, 0), text(fill: reader-colors.text)[edge present\ epoch += 1], fill: reader-colors.ok_soft, width: 2.9cm),
+    node((1, 1), text(fill: reader-colors.text)[committed,\ reply lost], fill: reader-colors.warn_soft, width: 2.9cm),
+    node((1, 2), text(fill: reader-colors.text)[writer 1\ crashed], fill: reader-colors.surface_soft, width: 2.9cm),
+    node((1, 3), text(fill: reader-colors.text)[still no edge,\ conflict rejected], fill: reader-colors.bad_soft, width: 2.9cm),
+    edge((0, 1.5), (1, 0), "->", text(fill: reader-colors.muted, size: 8pt)[`createEdge`], stroke: reader-colors.muted),
+    edge((0, 1.5), (1, 1), "->", text(fill: reader-colors.muted, size: 8pt)[`commitThenLoseReply`], stroke: reader-colors.muted),
+    edge((0, 1.5), (1, 2), "->", text(fill: reader-colors.muted, size: 8pt)[`crashWriter1`], stroke: reader-colors.muted),
+    edge((0, 1.5), (1, 3), "->", text(fill: reader-colors.muted, size: 8pt)[`rejectConflictingRetry`], stroke: reader-colors.muted),
+  ),
+  caption: [One state, four enabled actions. `step` is `any { ... }`, so every branch whose guards hold is a legal next state, and the checker takes all of them. The storyline below is just _one_ walk through a tree that branches like this at every step.],
+) <fig-step-fanout>
+
+With that in mind, it helps to see the shape a whole run of `step` traces out. The
+create-and-fence storyline is one path down that branching tree:
 
 #figure(
   diagram(
