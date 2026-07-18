@@ -5,7 +5,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge_type: &str,
-        base_epoch: TopologySequence,
+        base_epoch: StorageSequence,
     ) -> Result<Arc<MatrixAdjacency>> {
         let cache_key = MatrixCacheKey::new(cell_id, edge_type, base_epoch);
         if let Some(cached) = self.matrix_cache.lock().await.get(&cache_key) {
@@ -43,11 +43,12 @@ impl GraphShard {
             .unwrap_or(adjacency))
     }
 
+    #[cfg(feature = "graphblas")]
     pub(crate) async fn cached_graphblas_matrix(
         &self,
         cell_id: &str,
         edge_type: &str,
-        base_epoch: TopologySequence,
+        base_epoch: StorageSequence,
     ) -> Result<Arc<CompiledGraphBlasMatrix>> {
         let cache_key = MatrixCacheKey::new(cell_id, edge_type, base_epoch);
         if let Some(cached) = self.graphblas_cache.lock().await.get(&cache_key) {
@@ -76,7 +77,14 @@ impl GraphShard {
             return Ok(cached);
         }
         let started = Instant::now();
-        let (compiled, compile_units) = if compact_csc_kernel_enabled() {
+        let external = self
+            .graph_index_generation_at(cell_id, edge_type, base_epoch)
+            .await?;
+        let (compiled, compile_units) = if let Some(generation) = external {
+            let csc = self.graph_index_csc(&generation).await?;
+            let edge_count = csc.indices.len() as u64;
+            (Arc::new(compile_graphblas_csc_owned(csc)?), edge_count)
+        } else if compact_csc_kernel_enabled() {
             if let Some((compiled, edge_count)) = self
                 .compact_graphblas_csc_matrix(cell_id, edge_type, base_epoch)
                 .await?
@@ -128,11 +136,12 @@ impl GraphShard {
             .unwrap_or(compiled))
     }
 
+    #[cfg(feature = "graphblas")]
     async fn compact_graphblas_csc_matrix(
         &self,
         cell_id: &str,
         edge_type: &str,
-        base_epoch: TopologySequence,
+        base_epoch: StorageSequence,
     ) -> Result<Option<(CompiledGraphBlasMatrix, u64)>> {
         let key = graphblas_csc_key(cell_id, edge_type, base_epoch);
         let _permit = self
@@ -198,7 +207,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge_type: &str,
-        base_epoch: TopologySequence,
+        base_epoch: StorageSequence,
     ) -> Result<Option<GraphBlasCsc>> {
         let key = graphblas_csc_key(cell_id, edge_type, base_epoch);
         let _permit = self.acquire_hydration_permit("graphblas_csc").await?;
@@ -267,7 +276,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge_type: &str,
-        base_epoch: TopologySequence,
+        base_epoch: StorageSequence,
         field: &'static str,
         chunk_count: u64,
         expected_len: u64,
@@ -292,11 +301,12 @@ impl GraphShard {
         Ok(values)
     }
 
+    #[cfg(feature = "graphblas")]
     async fn load_graphblas_csc_chunks_u32(
         &self,
         cell_id: &str,
         edge_type: &str,
-        base_epoch: TopologySequence,
+        base_epoch: StorageSequence,
         field: &'static str,
         chunk_count: u64,
         expected_len: u64,

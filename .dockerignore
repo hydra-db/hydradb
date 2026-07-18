@@ -1,4 +1,5 @@
 .git
+.cargo/config.toml
 .github
 .idea
 .vscode

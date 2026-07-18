@@ -2,9 +2,9 @@ use super::values::bolt_parameter_to_property;
 use super::wire::strict_decode_client_message;
 use super::*;
 use crate::{
-    ClientQueryServiceConfig, QueryCellClient, QueryColumn, QueryContext, QueryCursorToken,
-    QueryFloat, QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow,
-    QueryTransportAction, QueryTransportScopeGrant, QueryValue, RoutedGraphCluster, ShardPlacement,
+    ClientQueryServiceConfig, ObjectStoreNodeDirectory, QueryCellClient, QueryColumn, QueryContext,
+    QueryCursorToken, QueryFloat, QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow,
+    QueryTransportAction, QueryTransportScopeGrant, QueryValue, RoutedGraphCluster,
     StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer,
     StaticQueryTransportTlsServerConfigProvider, VertexPropertyValue,
 };
@@ -20,6 +20,34 @@ use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 struct BoltTestClient;
 
+#[test]
+fn bolt_consistency_metadata_accepts_only_causal_or_strong() {
+    assert_eq!(
+        bolt_read_consistency(&BoltDict::from([(
+            "consistency".to_string(),
+            BoltValue::String("strong".to_string()),
+        )]))
+        .unwrap(),
+        Some(ClientReadConsistency::Strong)
+    );
+    assert_eq!(
+        bolt_read_consistency(&BoltDict::from([(
+            "tx_metadata".to_string(),
+            BoltValue::Dict(BoltDict::from([(
+                "turbolay.consistency".to_string(),
+                BoltValue::String("causal".to_string()),
+            )])),
+        )]))
+        .unwrap(),
+        Some(ClientReadConsistency::Causal)
+    );
+    assert!(bolt_read_consistency(&BoltDict::from([(
+        "consistency".to_string(),
+        BoltValue::String("eventual".to_string()),
+    )]))
+    .is_err());
+}
+
 #[async_trait::async_trait]
 impl QueryCellClient for BoltTestClient {
     async fn execute_cypher_rows(
@@ -31,7 +59,8 @@ impl QueryCellClient for BoltTestClient {
             vec![QueryColumn::new("answer")],
             vec![QueryRow::new(vec![QueryValue::Count(42)])],
         )
-        .with_read_epoch(9))
+        .with_read_epoch(9)
+        .with_storage_sequence(9))
     }
 
     async fn execute_cypher_rows_page(
@@ -45,7 +74,7 @@ impl QueryCellClient for BoltTestClient {
         Ok(QueryResultPage::new(result.columns, result.rows, None))
     }
 
-    async fn current_graph_epoch(
+    async fn current_storage_sequence(
         &self,
         _scope: &GraphScope,
         _cell_id: &str,
@@ -69,7 +98,8 @@ impl QueryCellClient for PagedBoltTestClient {
                 .map(|value| QueryRow::new(vec![QueryValue::Count(value)]))
                 .collect(),
         )
-        .with_read_epoch(9))
+        .with_read_epoch(9)
+        .with_storage_sequence(9))
     }
 
     async fn execute_cypher_rows_page(
@@ -91,7 +121,7 @@ impl QueryCellClient for PagedBoltTestClient {
         ))
     }
 
-    async fn current_graph_epoch(
+    async fn current_storage_sequence(
         &self,
         _scope: &GraphScope,
         _cell_id: &str,
@@ -138,7 +168,7 @@ impl QueryCellClient for BlockingBoltTestClient {
         Ok(QueryResultPage::new(result.columns, result.rows, None))
     }
 
-    async fn current_graph_epoch(
+    async fn current_storage_sequence(
         &self,
         _scope: &GraphScope,
         _cell_id: &str,
@@ -334,16 +364,11 @@ async fn bolt_server_runs_autocommit_queries_and_rejects_fake_transactions() {
 #[tokio::test]
 async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let placement = ShardPlacement::fixed([("cell-a", "node-a")]).unwrap();
+    let placement = ObjectStoreNodeDirectory::new(["cell-a"], ["node-a"]).unwrap();
     let cluster = Arc::new(
-        RoutedGraphCluster::open_fenced_owned(
-            "bolt-create/data",
-            "node-a",
-            placement,
-            object_store,
-        )
-        .await
-        .unwrap(),
+        RoutedGraphCluster::open_promotable("bolt-create/data", "node-a", placement, object_store)
+            .await
+            .unwrap(),
     );
     let scope = GraphScope::default();
     let authorizer = StaticQueryTransportScopeAuthorizer::new()
@@ -1292,15 +1317,20 @@ async fn bolt_server_closes_idle_post_handshake_connections() {
 }
 
 #[tokio::test]
-async fn rendezvous_routing_uses_the_deterministic_cell_owner() {
-    let provider = RendezvousBoltRoutingTableProvider::new(
-        ShardPlacement::fixed([("cell-a", "node-a")]).unwrap(),
+async fn object_store_routing_advertises_all_readers_and_one_soft_affinity_writer() {
+    let preferred_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let preferred_address = preferred_listener.local_addr().unwrap().to_string();
+    let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fallback_address = fallback_listener.local_addr().unwrap().to_string();
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
         [
-            ("node-a".to_string(), "node-a.example:7687".to_string()),
-            ("node-b".to_string(), "node-b.example:7687".to_string()),
+            ("node-a".to_string(), preferred_address.clone()),
+            ("node-b".to_string(), fallback_address.clone()),
         ],
         30,
     )
+    .unwrap()
+    .with_health_probe_timeout(Duration::from_secs(1))
     .unwrap();
     let table = provider
         .routing_table(
@@ -1315,13 +1345,63 @@ async fn rendezvous_routing_uses_the_deterministic_cell_owner() {
         .iter()
         .find(|server| server.role == "WRITE")
         .unwrap();
-    assert_eq!(write.addresses, vec!["node-a.example:7687"]);
+    assert_eq!(write.addresses, vec![preferred_address.clone()]);
     let read = table
         .servers
         .iter()
         .find(|server| server.role == "READ")
         .unwrap();
-    assert_eq!(read.addresses, vec!["node-a.example:7687"]);
+    assert_eq!(
+        read.addresses,
+        vec![preferred_address.clone(), fallback_address.clone()]
+    );
+
+    let preferred = provider
+        .clone()
+        .with_preferred_writer_node("node-b")
+        .unwrap()
+        .routing_table(
+            "default",
+            &ClientQueryTarget::new(GraphScope::default(), "cell-a").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        preferred
+            .servers
+            .iter()
+            .find(|server| server.role == "WRITE")
+            .unwrap()
+            .addresses,
+        vec![fallback_address.clone()]
+    );
+
+    drop(preferred_listener);
+    let failed_over = provider
+        .routing_table(
+            "default",
+            &ClientQueryTarget::new(GraphScope::default(), "cell-a").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        failed_over
+            .servers
+            .iter()
+            .find(|server| server.role == "WRITE")
+            .unwrap()
+            .addresses,
+        vec![fallback_address.clone()]
+    );
+    assert_eq!(
+        failed_over
+            .servers
+            .iter()
+            .find(|server| server.role == "READ")
+            .unwrap()
+            .addresses,
+        vec![fallback_address]
+    );
 }
 
 async fn send_test_bolt_client_message<W>(writer: &mut ChunkWriter<W>, message: &ClientMessage)

@@ -5,8 +5,8 @@ use slatedb_graph_kernel::{
     object_store_from_env, BoltServerConfig, ClientBoltServer, ClientQueryService,
     ClientQueryServiceConfig, ClientQueryTarget, GraphBackpressurePolicy, GraphCacheConfig,
     GraphCachePolicy, GraphIndexPolicy, GraphLimits, GraphOpenOptions, GraphScope,
-    QueryTransportAction, QueryTransportScopeGrant, RoutedGraphCluster, ShardPlacement,
-    StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer, TopologySequence,
+    ObjectStoreNodeDirectory, QueryTransportAction, QueryTransportScopeGrant, RoutedGraphCluster,
+    StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer, StorageSequence,
 };
 
 type BenchResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -33,10 +33,10 @@ async fn main() -> BenchResult<()> {
     let addr = required_env("GRAPH_BOLT_ADDR")?.parse()?;
     let object_store = object_store_from_env(None)?;
     let cluster = Arc::new(
-        RoutedGraphCluster::open_fenced_owned_with_options(
+        RoutedGraphCluster::open_promotable_with_options(
             format!("{prefix}/data"),
             "benchmark-node",
-            ShardPlacement::fixed([(CELL_ID, "benchmark-node")])?,
+            ObjectStoreNodeDirectory::new([CELL_ID], ["benchmark-node"])?,
             object_store,
             graph_options(fanout, max_hop, cache_dir.into()),
         )
@@ -187,7 +187,7 @@ async fn seed_graph(cluster: &RoutedGraphCluster, fanout: u64, max_hop: u8) -> B
 
 async fn verify_graphblas_artifacts(
     cluster: &RoutedGraphCluster,
-    read_epoch: TopologySequence,
+    read_epoch: StorageSequence,
 ) -> BenchResult<()> {
     let shard = cluster.shard(CELL_ID)?;
     let artifact = shard

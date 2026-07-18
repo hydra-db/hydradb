@@ -108,6 +108,7 @@
       }
     },
     "node": { "$ref": "#/definitions/workload" },
+    "indexer": { "$ref": "#/definitions/indexerWorkload" },
     "service": {
       "type": "object",
       "properties": {
@@ -142,6 +143,7 @@
       "properties": {
         "rustLog": { "type": "string" },
         "maxConcurrentQueries": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxQueryScanEdges": { "$ref": "#/definitions/unsignedDecimal" },
         "maxQueryRuntimeMs": { "$ref": "#/definitions/unsignedDecimal" },
         "maxServerCursors": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "maxCursorBufferBytes": { "$ref": "#/definitions/positiveUnsignedDecimal" },
@@ -162,18 +164,13 @@
         "maxRelationshipPropertyRowsBytes": { "$ref": "#/definitions/unsignedDecimal" },
         "maxConcurrentHydrations": { "$ref": "#/definitions/unsignedDecimal" },
         "maxConcurrentMatrixCompilations": { "$ref": "#/definitions/unsignedDecimal" },
-        "matrixAutoRefreshEnabled": { "type": "boolean" },
-        "matrixRefreshIntervalMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
-        "matrixRefreshMaxDirtyMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
-        "matrixRefreshMinEpochLag": { "$ref": "#/definitions/positiveUnsignedDecimal" },
-        "matrixRefreshTileSize": { "$ref": "#/definitions/positiveUnsignedDecimal" },
-        "matrixRefreshMaxEdgeTypesPerCycle": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "indexDiscoveryIntervalMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "trimMemoryAfterHydration": { "type": "boolean" }
       }
     },
     "extraObjects": { "type": "array" }
   },
-  "required": ["image", "objectStore", "graph", "auth", "tls", "node", "service"],
+  "required": ["image", "objectStore", "graph", "auth", "tls", "node", "indexer", "service"],
   "definitions": {
     "workload": {
       "type": "object",
@@ -191,6 +188,27 @@
             "persistentVolume": { "type": "object" }
           }
         }
+      }
+    },
+    "indexerWorkload": {
+      "type": "object",
+      "required": ["enabled", "replicaCount", "intervalMs", "retainPreviousGenerations", "resources", "serviceAccount"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "replicaCount": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "intervalMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "retainPreviousGenerations": { "$ref": "#/definitions/unsignedDecimal" },
+        "resources": { "type": "object" },
+        "serviceAccount": { "type": "object" },
+        "podAnnotations": { "type": "object" },
+        "podLabels": { "type": "object" },
+        "priorityClassName": { "type": "string" },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
+        "affinity": { "type": "object" },
+        "topologySpreadConstraints": { "type": "array" },
+        "tolerations": { "type": "array" },
+        "nodeSelector": { "type": "object" },
+        "extraEnv": { "type": "array" }
       }
     },
     "service": {
