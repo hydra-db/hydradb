@@ -22,8 +22,8 @@ main model through six transitions using `quint verify` and
 |---|---|---:|---:|---|
 | M1 | atomic edge projection, idempotency, writer fencing | 4 | 6 | 24 seeded public-API traces pass |
 | M2 | page snapshot scope, historical epoch rejection, bookmarks | 4 | 6 | direct-page conformance test; driver pending |
-| M3 | artifact generation fence, matrix equivalence, reader retention | 4 | 6 | pending |
-| M4 | placement disagreement and durable writer fence | 3 | 6 | pending |
+| M3 | artifact generation fence, matrix equivalence, reader retention | 4 | 6 | 10k simulation + bounded check; driver pending |
+| M4 | placement disagreement and durable writer fence | 3 | 6 | 10k simulation + bounded check; driver pending |
 | M5 | command normalization, relationship identity, batch semantics | 7 | 6 | P0/P1 command conformance tests; driver pending |
 
 The generated M1/M2 Informal Trace Format files are under `target/formal/` and
@@ -53,6 +53,16 @@ The focused kernel conformance tests are:
 These are public-kernel conformance tests, not a claim that M2/M5 already
 have full Quint Connect action adapters. M1 is the current complete adapter;
 M2 and M5 are the next bindings.
+
+### P1 artifact and reader-safety evidence (2026-07-18)
+
+M3's aggregate predicate covers stale publication rejection, active-read
+retention, and matrix/direct equivalence. M4's covers the durable writer fence,
+monotone committed prefix, and zombie-writer rejection. Both passed their
+deterministic suites, 10,000 twelve-step simulation traces, and six-step
+Apalache checks. This proves the stated finite abstractions, not a read-only
+freshness SLA: the documented BFG-007 contract remains safety/proof-or-error
+only.
 
 ## Evidence boundary
 
