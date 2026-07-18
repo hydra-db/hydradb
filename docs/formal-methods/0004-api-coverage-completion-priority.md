@@ -74,6 +74,12 @@ verifies that the first delete leaves the edge and its degree intact, while the
 second removes both. P1 ranks 6–8 remain pending their adapter and fault-model
 work.
 
+P1 rank 6 is covered by M3's stale-publication, retained-reader, and
+matrix/direct-equivalence actions. P1 rank 7 is covered by M2's monotone
+bookmark model and M4's durable-fence safety model; it intentionally does not
+promise reader freshness. Both models passed their deterministic, simulation,
+and bounded checks on this branch. Their Rust MBT adapters remain pending.
+
 ### P2 — lower-frequency destructive or unsupported operations
 
 | Rank | Surface | Quint/MBT completion target |

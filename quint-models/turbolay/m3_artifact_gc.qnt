@@ -266,6 +266,13 @@ module m3_artifact_gc {
     not(lastAction == "queryMatrix") or queryResult == canonicalReachable
   val artifactGenerationNeverExceedsCurrent: bool =
     not(artifactPublished) or artifactEpoch <= epoch
+  val allSafety: bool =
+    epochNeverRegresses and
+      publishedArtifactIsCurrentAtPublication and
+      staleBuilderCannotPublish and
+      activeReadRetainsHistory and
+      matrixEqualsCanonical and
+      artifactGenerationNeverExceedsCurrent
 
   val stalePublishRejectedReached: bool = lastAction == "rejectStalePublish"
   val matrixQueryReached: bool = lastAction == "queryMatrix"

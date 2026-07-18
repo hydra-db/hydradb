@@ -175,6 +175,12 @@ module m4_placement_fence {
     ((durableFence == 1) implies not(node2Active)) and
       ((durableFence == 2) implies not(node1Active))
   val staleWriterCannotCommit: bool = not(lastAction == "commitNode1" and durableFence == 2)
+  val allSafety: bool =
+    atMostOneEffectiveWriter and
+      durableFenceMonotone and
+      committedPrefixNeverRegresses and
+      activeWriterMatchesFence and
+      staleWriterCannotCommit
 
   val candidateDisagreementReached: bool = node1Candidate and node2Candidate
   val takeoverReached: bool = lastAction == "takeOverFenceNode2"
