@@ -20,6 +20,7 @@ module m4_placement_fence_test {
       .then(partitionNode1)
       .then(takeOverFenceNode2)
       .then(rejectZombieNode1Commit)
+      .expect(node1FencedByNode2)
       .expect(durableFence == 2)
       .expect(node2Active)
       .expect(not(node1Active))

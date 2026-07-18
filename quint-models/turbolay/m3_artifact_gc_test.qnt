@@ -31,6 +31,9 @@ module m3_artifact_gc_test {
 
   run completedReadPermitsHistoryCollectionTest =
     init
+      .then(writeCreate)
+      .then(startArtifactBuild)
+      .then(publishCurrentBuild)
       .then(beginRead)
       .then(endRead)
       .then(gcHistory)

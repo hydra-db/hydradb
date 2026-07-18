@@ -3535,6 +3535,231 @@ async fn current_snapshot_uses_one_slatedb_storage_sequence() {
 }
 
 #[tokio::test]
+async fn borrowed_and_owned_snapshot_at_retain_epoch_n_direct_results_after_epoch_n_plus_one() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = Arc::new(open_test_shard("graph/snapshot-at-epoch-visibility", object_store).await);
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+    shard
+        .write_edge(mutation(1, 2, "snapshot-at-epoch-1"))
+        .await
+        .unwrap();
+    let read_epoch = shard.current_epoch(cell_id).await.unwrap();
+    let borrowed = shard.snapshot_at(cell_id, read_epoch).await.unwrap();
+    let owned = shard.owned_snapshot_at(cell_id, read_epoch).await.unwrap();
+
+    shard
+        .write_edge(mutation(1, 3, "snapshot-at-epoch-2"))
+        .await
+        .unwrap();
+
+    assert!(borrowed.edge_exists(edge_type, 1, 2).await.unwrap());
+    assert!(!borrowed.edge_exists(edge_type, 1, 3).await.unwrap());
+    assert_eq!(borrowed.out_neighbors(edge_type, 1).await.unwrap(), vec![2]);
+    assert_eq!(borrowed.out_degree(edge_type, 1).await.unwrap(), 1);
+    assert!(owned.edge_exists(edge_type, 1, 2).await.unwrap());
+    assert!(!owned.edge_exists(edge_type, 1, 3).await.unwrap());
+    assert_eq!(owned.out_neighbors(edge_type, 1).await.unwrap(), vec![2]);
+    assert_eq!(owned.out_degree(edge_type, 1).await.unwrap(), 1);
+
+    drop(borrowed);
+    drop(owned);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn owned_snapshot_survives_current_writes_drop_cell_and_external_handle_drop() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = Arc::new(open_test_shard("graph/owned-snapshot-lifecycle", object_store).await);
+
+    shard
+        .write_edge(mutation(1, 2, "owned-snapshot-seed"))
+        .await
+        .unwrap();
+    let snapshot = shard.owned_snapshot("reddit-home").await.unwrap();
+    assert_eq!(snapshot.cell_id(), "reddit-home");
+    assert_eq!(snapshot.read_epoch(), 1);
+    assert!(snapshot.storage_sequence().is_some());
+
+    shard
+        .write_edge(mutation(1, 3, "owned-snapshot-current-advance"))
+        .await
+        .unwrap();
+    let dropped = shard
+        .drop_cell("reddit-home", "owned-snapshot-drop")
+        .await
+        .unwrap();
+    assert_eq!(dropped.marker_epoch, 3);
+    drop(shard);
+
+    assert_eq!(
+        snapshot
+            .out_neighbors("USER_SUBSCRIBED_TO_SUBREDDIT", 1)
+            .await
+            .unwrap(),
+        vec![2]
+    );
+    assert!(snapshot
+        .edge_exists("USER_SUBSCRIBED_TO_SUBREDDIT", 1, 2)
+        .await
+        .unwrap());
+    assert!(!snapshot
+        .edge_exists("USER_SUBSCRIBED_TO_SUBREDDIT", 1, 3)
+        .await
+        .unwrap());
+    assert_eq!(
+        snapshot
+            .out_degree("USER_SUBSCRIBED_TO_SUBREDDIT", 1)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        snapshot
+            .matrix_reachable("USER_SUBSCRIBED_TO_SUBREDDIT", &[1], 1)
+            .await
+            .unwrap()
+            .vertices,
+        vec![2]
+    );
+}
+
+#[tokio::test]
+async fn owned_snapshot_at_matches_current_snapshot_epoch_checks() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = Arc::new(open_test_shard("graph/owned-snapshot-at", object_store).await);
+
+    shard
+        .write_edge(mutation(10, 20, "owned-snapshot-at-seed"))
+        .await
+        .unwrap();
+    let current_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    let current = shard
+        .owned_snapshot_at("reddit-home", current_epoch)
+        .await
+        .unwrap();
+    assert_eq!(current.read_epoch(), current_epoch);
+    assert_eq!(
+        current
+            .out_neighbors("USER_SUBSCRIBED_TO_SUBREDDIT", 10)
+            .await
+            .unwrap(),
+        vec![20]
+    );
+
+    let future = match shard
+        .owned_snapshot_at("reddit-home", current_epoch + 1)
+        .await
+    {
+        Ok(_) => panic!("future owned snapshot should be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        future,
+        GraphError::SnapshotAhead {
+            ref cell_id,
+            read_epoch,
+            current_epoch: observed_current,
+        } if cell_id == "reddit-home"
+            && read_epoch == current_epoch + 1
+            && observed_current == current_epoch
+    ));
+
+    let historical = shard
+        .owned_snapshot_at("reddit-home", current_epoch - 1)
+        .await;
+    assert!(matches!(
+        historical,
+        Err(GraphError::UnsupportedQuery {
+            dialect: "GraphSnapshot",
+            ..
+        })
+    ));
+
+    shard
+        .write_edge(mutation(10, 30, "owned-snapshot-at-current-advance"))
+        .await
+        .unwrap();
+    assert_eq!(
+        current
+            .out_neighbors("USER_SUBSCRIBED_TO_SUBREDDIT", 10)
+            .await
+            .unwrap(),
+        vec![20]
+    );
+    assert_eq!(
+        shard
+            .out_neighbors("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 10)
+            .await
+            .unwrap(),
+        vec![20, 30]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_snapshot_at_does_not_label_later_storage_snapshot_as_requested_epoch() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = Arc::new(
+        open_test_shard(
+            "graph/owned-snapshot-at-concurrent-current-only",
+            object_store,
+        )
+        .await,
+    );
+
+    shard
+        .write_edge(mutation(77, 10_001, "owned-snapshot-at-race-1"))
+        .await
+        .unwrap();
+
+    let writer = {
+        let shard = Arc::clone(&shard);
+        tokio::spawn(async move {
+            for epoch in 2..=40_u64 {
+                tokio::task::yield_now().await;
+                shard
+                    .write_edge(mutation(
+                        77,
+                        10_000 + epoch,
+                        &format!("owned-snapshot-at-race-{epoch}"),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+
+    for _ in 0..80 {
+        let requested_epoch = shard.current_epoch("reddit-home").await.unwrap();
+        match shard
+            .owned_snapshot_at("reddit-home", requested_epoch)
+            .await
+        {
+            Ok(snapshot) => {
+                assert_eq!(snapshot.read_epoch(), requested_epoch);
+                let neighbors = snapshot
+                    .out_neighbors("USER_SUBSCRIBED_TO_SUBREDDIT", 77)
+                    .await
+                    .unwrap();
+                let expected = (1..=requested_epoch)
+                    .map(|epoch| 10_000 + epoch)
+                    .collect::<Vec<_>>();
+                assert_eq!(neighbors, expected);
+            }
+            Err(GraphError::UnsupportedQuery {
+                dialect: "GraphSnapshot",
+                ..
+            }) => {}
+            Err(error) => panic!("unexpected owned_snapshot_at error: {error}"),
+        }
+        tokio::task::yield_now().await;
+    }
+
+    writer.await.unwrap();
+}
+
+#[tokio::test]
 async fn reopened_reader_sees_data_from_object_store() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let path = "graph/reopen";
@@ -4140,6 +4365,72 @@ async fn matrix_publish_is_fenced_by_cleanup_generation_and_reclaims_stale_marke
     assert_eq!(artifact.base_epoch, base_epoch);
     assert!(shard.read_remote(&cleanup_marker).await.unwrap().is_none());
     assert!(shard.read_remote(&manifest_key).await.unwrap().is_some());
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn checked_current_matrix_build_rejects_stale_expected_epoch() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/checked-current-matrix-build", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "CHECKED_CURRENT_EDGE";
+
+    shard
+        .write_edge(typed_mutation(
+            cell_id,
+            edge_type,
+            1,
+            2,
+            "checked-current-seed",
+        ))
+        .await
+        .unwrap();
+    let stale_epoch = shard.current_epoch(cell_id).await.unwrap();
+    shard
+        .write_edge(typed_mutation(
+            cell_id,
+            edge_type,
+            2,
+            3,
+            "checked-current-advance",
+        ))
+        .await
+        .unwrap();
+    let current_epoch = shard.current_epoch(cell_id).await.unwrap();
+    assert!(current_epoch > stale_epoch);
+
+    let stale = shard
+        .build_matrix_tiles_checked_current(cell_id, edge_type, stale_epoch, 64)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        GraphError::SnapshotChanged {
+            operation: "build_matrix_tiles",
+            ref cell_id,
+            ref edge_type,
+            read_epoch,
+            current_epoch: observed_current,
+        } if cell_id == "reddit-home"
+            && edge_type == "CHECKED_CURRENT_EDGE"
+            && read_epoch == stale_epoch
+            && observed_current == current_epoch
+    ));
+    assert!(
+        shard
+            .latest_matrix_artifact(cell_id, edge_type, current_epoch)
+            .await
+            .unwrap()
+            .is_none(),
+        "a stale checked-current build must not publish a historical artifact"
+    );
+
+    let artifact = shard
+        .build_matrix_tiles_checked_current(cell_id, edge_type, current_epoch, 64)
+        .await
+        .unwrap();
+    assert_eq!(artifact.base_epoch, current_epoch);
+    assert_eq!(artifact.edge_count, 2);
     shard.close().await.unwrap();
 }
 

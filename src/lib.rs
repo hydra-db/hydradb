@@ -67,7 +67,7 @@ pub use core::namespace::{
     GraphId, GraphScope, NamespaceId, NamespacePath, DEFAULT_GRAPH_ID, DEFAULT_NAMESPACE_ID,
     MAX_NAMESPACE_DEPTH,
 };
-pub use core::snapshot::GraphSnapshot;
+pub use core::snapshot::{GraphSnapshot, OwnedGraphSnapshot};
 #[cfg(feature = "opencypher")]
 pub use core::state::QueryStatsRefreshHandle;
 pub(crate) use core::state::{

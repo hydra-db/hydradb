@@ -21,6 +21,29 @@ impl GraphShard {
         base_epoch: TopologySequence,
         tile_size: u64,
     ) -> Result<MatrixArtifact> {
+        self.build_matrix_tiles_inner(cell_id, edge_type, base_epoch, tile_size, false)
+            .await
+    }
+
+    pub async fn build_matrix_tiles_checked_current(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        expected_current_epoch: TopologySequence,
+        tile_size: u64,
+    ) -> Result<MatrixArtifact> {
+        self.build_matrix_tiles_inner(cell_id, edge_type, expected_current_epoch, tile_size, true)
+            .await
+    }
+
+    async fn build_matrix_tiles_inner(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        base_epoch: TopologySequence,
+        tile_size: u64,
+        require_current_epoch: bool,
+    ) -> Result<MatrixArtifact> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         self.validate_write_fence(cell_id, "build_matrix_tiles")
@@ -41,12 +64,22 @@ impl GraphShard {
             .acquire_artifact_build_permit("build_matrix_tiles")
             .await?;
         let started = Instant::now();
-        if base_epoch == self.current_epoch(cell_id).await? {
+        let current_epoch = self.current_epoch(cell_id).await?;
+        if base_epoch == current_epoch {
             return self
                 .build_current_matrix_tiles_streaming(
                     cell_id, edge_type, base_epoch, tile_size, started,
                 )
                 .await;
+        }
+        if require_current_epoch {
+            return Err(GraphError::SnapshotChanged {
+                operation: "build_matrix_tiles",
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch: base_epoch,
+                current_epoch,
+            });
         }
         let edges = self.edges_at(cell_id, edge_type, base_epoch).await?;
         ensure_limit(

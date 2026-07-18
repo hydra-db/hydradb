@@ -29,6 +29,15 @@ M2b makes the separate `snapshot_at` admission and cancellation boundary
 executable. M5b captures destructive API behavior without overloading the
 relationship-identity command model.
 
+The Rust Quint Connect adapters are finite public-API refinement checks. They
+run seeded traces against a local `InMemory` object store, not MinIO/S3, and do
+not constitute Jepsen evidence. M3's adapter observes checked-current matrix
+artifact publication/rejection, retained owned snapshots, GC through a
+published artifact, and direct/matrix reachability equivalence. M4's adapter
+observes local placement disagreement, fenced routed-cluster takeover,
+committed-prefix monotonicity, and stale-writer rejection through the previously
+opened node-1 writer handle.
+
 | Family | Main module | Deterministic tests | Primary findings |
 |---|---|---|---|
 | M1 | `m1_cell_write.qnt` | `m1_cell_write_test.qnt` | BFG-003, BFG-004, BFG-005, BFG-006 |
@@ -64,10 +73,13 @@ mise exec java@21.0.2 -- mise exec -- quint verify \
   quint-models/turbolay/m2_snapshot_read.qnt --main m2_snapshot_read \
   --invariant allSafety --max-steps 6
 
-# The M1 Rust driver replays these action-labelled simulation traces through
-# the public GraphShard API and compares its state projection after every step.
+# The Rust drivers replay action-labelled simulation traces through public APIs
+# and compare a normalized state projection after every step. M3 and M4 are the
+# newly wired adapters for artifact/GC and placement/fencing respectively.
 mise exec -- cargo test --locked --test formal_mbt -- --test-threads=1
 mise exec -- cargo test --locked --test formal_mbt_m2 -- --test-threads=1
+mise exec -- cargo test --locked --test formal_mbt_m3 -- --test-threads=1
+mise exec -- cargo test --locked --test formal_mbt_m4 -- --test-threads=1
 mise exec -- cargo test --locked --test formal_mbt_m5 -- --test-threads=1
 
 # P2 has two additional public-API trace replayers. M5b is feature-independent;

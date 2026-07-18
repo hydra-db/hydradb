@@ -199,6 +199,7 @@ module m3_artifact_gc {
   // Collection cannot remove history while a read has pinned it.
   action gcHistory: bool = all {
     not(readerActive),
+    artifactPublished,
     epoch' = epoch,
     previousEpoch' = epoch,
     canonicalReachable' = canonicalReachable,
