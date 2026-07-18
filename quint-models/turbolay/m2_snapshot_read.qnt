@@ -18,6 +18,13 @@ module m2_snapshot_read {
   var pageReturned: bool
   var pageIndex: int
   var pageRow: int
+  // Direct low-level page tokens are offsets. Each request captures the
+  // current view independently, so its observed epoch is not a cursor lease.
+  var directCursorOffset: int
+  var directPageReturned: bool
+  var directPageEpoch: int
+  var directPageIndex: int
+  var directPageRow: int
   var historicalRejected: bool
   var sessionBookmark: int
   var previousBookmark: int
@@ -36,6 +43,11 @@ module m2_snapshot_read {
     pageReturned' = false,
     pageIndex' = -1,
     pageRow' = 0,
+    directCursorOffset' = 0,
+    directPageReturned' = false,
+    directPageEpoch' = 0,
+    directPageIndex' = -1,
+    directPageRow' = 0,
     historicalRejected' = false,
     sessionBookmark' = 0,
     previousBookmark' = 0,
@@ -54,6 +66,11 @@ module m2_snapshot_read {
     pageReturned' = pageReturned,
     pageIndex' = pageIndex,
     pageRow' = pageRow,
+    directCursorOffset' = directCursorOffset,
+    directPageReturned' = directPageReturned,
+    directPageEpoch' = directPageEpoch,
+    directPageIndex' = directPageIndex,
+    directPageRow' = directPageRow,
     historicalRejected' = historicalRejected,
     sessionBookmark' = sessionBookmark,
     previousBookmark' = previousBookmark,
@@ -73,6 +90,11 @@ module m2_snapshot_read {
     pageReturned' = pageReturned,
     pageIndex' = pageIndex,
     pageRow' = pageRow,
+    directCursorOffset' = directCursorOffset,
+    directPageReturned' = directPageReturned,
+    directPageEpoch' = directPageEpoch,
+    directPageIndex' = directPageIndex,
+    directPageRow' = directPageRow,
     historicalRejected' = historicalRejected,
     sessionBookmark' = sessionBookmark,
     previousBookmark' = previousBookmark,
@@ -90,6 +112,11 @@ module m2_snapshot_read {
     pageReturned' = false,
     pageIndex' = -1,
     pageRow' = 0,
+    directCursorOffset' = directCursorOffset,
+    directPageReturned' = directPageReturned,
+    directPageEpoch' = directPageEpoch,
+    directPageIndex' = directPageIndex,
+    directPageRow' = directPageRow,
     historicalRejected' = historicalRejected,
     sessionBookmark' = sessionBookmark,
     previousBookmark' = previousBookmark,
@@ -109,6 +136,11 @@ module m2_snapshot_read {
     pageReturned' = true,
     pageIndex' = cursorOffset,
     pageRow' = cursor.rows.nth(cursorOffset),
+    directCursorOffset' = directCursorOffset,
+    directPageReturned' = directPageReturned,
+    directPageEpoch' = directPageEpoch,
+    directPageIndex' = directPageIndex,
+    directPageRow' = directPageRow,
     historicalRejected' = historicalRejected,
     sessionBookmark' = sessionBookmark,
     previousBookmark' = previousBookmark,
@@ -128,6 +160,11 @@ module m2_snapshot_read {
     pageReturned' = false,
     pageIndex' = -1,
     pageRow' = 0,
+    directCursorOffset' = directCursorOffset,
+    directPageReturned' = directPageReturned,
+    directPageEpoch' = directPageEpoch,
+    directPageIndex' = directPageIndex,
+    directPageRow' = directPageRow,
     historicalRejected' = true,
     sessionBookmark' = sessionBookmark,
     previousBookmark' = previousBookmark,
@@ -146,6 +183,11 @@ module m2_snapshot_read {
     pageReturned' = pageReturned,
     pageIndex' = pageIndex,
     pageRow' = pageRow,
+    directCursorOffset' = directCursorOffset,
+    directPageReturned' = directPageReturned,
+    directPageEpoch' = directPageEpoch,
+    directPageIndex' = directPageIndex,
+    directPageRow' = directPageRow,
     historicalRejected' = historicalRejected,
     sessionBookmark' = sessionBookmark,
     previousBookmark' = previousBookmark,
@@ -164,10 +206,39 @@ module m2_snapshot_read {
     pageReturned' = pageReturned,
     pageIndex' = pageIndex,
     pageRow' = pageRow,
+    directCursorOffset' = directCursorOffset,
+    directPageReturned' = directPageReturned,
+    directPageEpoch' = directPageEpoch,
+    directPageIndex' = directPageIndex,
+    directPageRow' = directPageRow,
     historicalRejected' = historicalRejected,
     sessionBookmark' = current.epoch,
     previousBookmark' = sessionBookmark,
     lastAction' = "advanceBookmark",
+  }
+
+  // A direct page is a new request. It reads the then-current view at its
+  // offset; the token does not pin that view for a later request.
+  action fetchDirectPage: bool = all {
+    directCursorOffset < current.rows.length(),
+    current' = current,
+    snapshot' = snapshot,
+    snapshotOpen' = snapshotOpen,
+    cursor' = cursor,
+    cursorOpen' = cursorOpen,
+    cursorOffset' = cursorOffset,
+    pageReturned' = pageReturned,
+    pageIndex' = pageIndex,
+    pageRow' = pageRow,
+    directCursorOffset' = directCursorOffset + 1,
+    directPageReturned' = true,
+    directPageEpoch' = current.epoch,
+    directPageIndex' = directCursorOffset,
+    directPageRow' = current.rows.nth(directCursorOffset),
+    historicalRejected' = historicalRejected,
+    sessionBookmark' = sessionBookmark,
+    previousBookmark' = previousBookmark,
+    lastAction' = "fetchDirectPage",
   }
 
   action step: bool = any {
@@ -175,6 +246,7 @@ module m2_snapshot_read {
     commitAppend,
     openCursor,
     fetchCursorPage,
+    fetchDirectPage,
     rejectUnvalidatedHistoricalPage,
     advanceBookmark,
   }
@@ -201,6 +273,21 @@ module m2_snapshot_read {
   // move forward, never backward.
   val bookmarkMonotone: bool = sessionBookmark >= previousBookmark
 
+  // A direct offset page can only have observed a committed view, but it is
+  // deliberately not required to equal the view of a later request.
+  val directPageUsesOneRequestView: bool =
+    not(directPageReturned) or all {
+      directPageEpoch > 0,
+      directPageEpoch <= current.epoch,
+      directPageIndex >= 0,
+    }
+  val allSafety: bool =
+    cursorPinnedToSnapshot and
+      returnedPageMatchesCursor and
+      invalidHistoricalNeverReturns and
+      bookmarkMonotone and
+      directPageUsesOneRequestView
+
   val pageAfterConcurrentCommitReached: bool =
     pageReturned and current.epoch > cursor.epoch
   val unvalidatedHistoricalRejected: bool =
@@ -209,5 +296,6 @@ module m2_snapshot_read {
   val snapshotOpenedReached: bool = lastAction == "openSnapshot"
   val commitAppendReached: bool = lastAction == "commitAppend"
   val cursorPageFetchedReached: bool = lastAction == "fetchCursorPage"
+  val directPageFetchedReached: bool = lastAction == "fetchDirectPage"
   val bookmarkAdvancedReached: bool = lastAction == "advanceBookmark"
 }

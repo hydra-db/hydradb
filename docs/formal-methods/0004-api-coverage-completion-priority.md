@@ -42,6 +42,19 @@ implementation rather than leaving an accidental contract.
 | 3 | Direct paged query contract | Model a per-request snapshot and explicit mutation-between-pages best-effort behavior; separately prove materialized cursor stability. |
 | 4 | Metadata `SET` / `REMOVE` | Model metadata update/removal as an atomic record/index projection that does not change structural adjacency. |
 
+#### P0 completion evidence
+
+The first kernel-contract pass is implemented on `Turbolay-V3`: M2/M5 contain
+the actions and deterministic witnesses; each has passed a 10,000-sample,
+12-step Quint simulation and a six-step Apalache check. The focused Rust tests
+are named `formal_p0_*` in `src/tests.rs`; relationship/duplicate testing runs
+with default features, and direct pagination/metadata testing runs with
+`--features opencypher`.
+
+M1 is the first complete Quint Connect driver. M2 and M5 still need their
+full action adapters before this group can be called MBT-complete; this is an
+explicit remaining completion-gate item rather than an unrecorded gap.
+
 ### P1 — severe but less frequent or asynchronous paths
 
 | Rank | Surface | Quint/MBT completion target |

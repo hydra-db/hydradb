@@ -40,6 +40,110 @@ async fn paged_query_rejects_unvalidated_historical_epoch_before_fast_path_dispa
     assert!(matches!(error, GraphError::UnsupportedQuery { .. }));
 }
 
+// P0/M5: an imported external relationship identity is scoped to its cell,
+// and batch validation must fail before it changes the isolated vertex state.
+#[tokio::test]
+async fn formal_p0_relationship_identity_and_duplicate_vertex_batch_are_atomic() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/formal-p0-identity-batch", object_store).await;
+
+    let first = shard
+        .import_relationships_batch(
+            "formal-cell",
+            "FOLLOWS",
+            [RelationshipMutation {
+                cell_id: "formal-cell".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                relationship_id: 7,
+                metadata: EdgeMetadata::default(),
+            }],
+            "formal-p0-relationship-7",
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.relationships_inserted, 1);
+    let relationship_epoch = shard.current_epoch("formal-cell").await.unwrap();
+
+    let identity_conflict = shard
+        .import_relationships_batch(
+            "formal-cell",
+            "FOLLOWS",
+            [RelationshipMutation {
+                cell_id: "formal-cell".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 3,
+                relationship_id: 7,
+                metadata: EdgeMetadata::default(),
+            }],
+            "formal-p0-relationship-7-conflict",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        identity_conflict,
+        GraphError::IdempotencyConflict { .. }
+    ));
+    assert!(shard
+        .edge_exists("formal-cell", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+    assert!(!shard
+        .edge_exists("formal-cell", "FOLLOWS", 1, 3)
+        .await
+        .unwrap());
+    assert_eq!(
+        shard.out_degree("formal-cell", "FOLLOWS", 1).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        shard.current_epoch("formal-cell").await.unwrap(),
+        relationship_epoch
+    );
+
+    let same_vertex = VertexMetadata::default()
+        .with_property("name", VertexPropertyValue::String("stable".to_string()));
+    assert_eq!(
+        shard
+            .set_vertex_metadata_batch("formal-cell", [(9, same_vertex.clone()), (9, same_vertex)],)
+            .await
+            .unwrap(),
+        1
+    );
+    let vertex_epoch = shard.current_epoch("formal-cell").await.unwrap();
+    let duplicate_conflict = shard
+        .set_vertex_metadata_batch(
+            "formal-cell",
+            [
+                (
+                    9,
+                    VertexMetadata::default()
+                        .with_property("rank", VertexPropertyValue::Integer(1)),
+                ),
+                (
+                    9,
+                    VertexMetadata::default()
+                        .with_property("rank", VertexPropertyValue::Integer(2)),
+                ),
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        duplicate_conflict,
+        GraphError::UnsupportedQuery { .. }
+    ));
+    assert_eq!(
+        shard.current_epoch("formal-cell").await.unwrap(),
+        vertex_epoch,
+        "a conflicting duplicate is rejected before the batch changes the graph"
+    );
+
+    shard.close().await.unwrap();
+}
+
 #[cfg(all(feature = "opencypher", feature = "graphblas"))]
 #[tokio::test]
 async fn cypher_graphblas_snapshot_applies_plus_and_minus_deltas() {
@@ -9146,6 +9250,141 @@ async fn cypher_rows_page_returns_bounded_cursor_pages() {
             ..
         }
     ));
+}
+
+// P0/M2: an offset token is not a snapshot lease. A write that sorts before
+// the next offset can make a later direct page repeat a row; callers needing
+// stability must use the materialized service cursor instead.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn formal_p0_direct_offset_pagination_is_best_effort_across_requests() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/formal-p0-direct-offset", object_store).await;
+    for (index, dst) in [10, 20].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "formal-cell".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst,
+                idempotency_key: format!("formal-p0-direct-offset-seed-{index}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let query = "MATCH (u {id: 1})-[:FOLLOWS]->(v) RETURN v.id ORDER BY v.id";
+    let first = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("formal-cell", "formal-p0-direct-offset-first"),
+            query,
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first.rows,
+        vec![QueryRow::new(vec![QueryValue::VertexId(10)])]
+    );
+    let cursor = first
+        .next_cursor
+        .expect("a second direct page is available");
+
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "formal-cell".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 5,
+            idempotency_key: "formal-p0-direct-offset-between-pages".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let second = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("formal-cell", "formal-p0-direct-offset-second"),
+            query,
+            Some(cursor),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.rows,
+        vec![QueryRow::new(vec![QueryValue::VertexId(10)])],
+        "the second request observed the new sorted view at its old offset"
+    );
+
+    shard.close().await.unwrap();
+}
+
+// P0/M5: setting and clearing an edge's metadata projection changes its
+// property visibility but never changes the structural edge or degree.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn formal_p0_edge_metadata_set_and_clear_preserve_structural_adjacency() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/formal-p0-edge-metadata", object_store).await;
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "formal-cell".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "formal-p0-edge-metadata-seed".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(shard
+        .set_edge_metadata(
+            "formal-cell",
+            "FOLLOWS",
+            1,
+            2,
+            EdgeMetadata::default().with_property("weight", VertexPropertyValue::Integer(7)),
+        )
+        .await
+        .unwrap());
+
+    let weighted_query =
+        "MATCH (u {id: 1})-[r:FOLLOWS {weight: 7}]->(v {id: 2}) RETURN v.id AS dst";
+    let weighted = shard
+        .execute_cypher_rows(
+            QueryContext::new("formal-cell", "formal-p0-edge-metadata-set"),
+            weighted_query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        weighted.rows,
+        vec![QueryRow::new(vec![QueryValue::VertexId(2)])]
+    );
+
+    assert!(shard
+        .set_edge_metadata("formal-cell", "FOLLOWS", 1, 2, EdgeMetadata::default())
+        .await
+        .unwrap());
+    assert!(shard
+        .edge_exists("formal-cell", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+    assert_eq!(
+        shard.out_degree("formal-cell", "FOLLOWS", 1).await.unwrap(),
+        1
+    );
+    assert!(shard
+        .execute_cypher_rows(
+            QueryContext::new("formal-cell", "formal-p0-edge-metadata-cleared"),
+            weighted_query,
+        )
+        .await
+        .unwrap()
+        .rows
+        .is_empty());
+
+    shard.close().await.unwrap();
 }
 
 #[cfg(feature = "opencypher")]

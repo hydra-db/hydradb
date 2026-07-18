@@ -21,10 +21,10 @@ main model through six transitions using `quint verify` and
 | Family | Safety boundary | Deterministic scenarios | Apalache bound | Rust MBT status |
 |---|---|---:|---:|---|
 | M1 | atomic edge projection, idempotency, writer fencing | 4 | 6 | 24 seeded public-API traces pass |
-| M2 | page snapshot scope, historical epoch rejection, bookmarks | 3 | 6 | generated |
+| M2 | page snapshot scope, historical epoch rejection, bookmarks | 4 | 6 | direct-page conformance test; driver pending |
 | M3 | artifact generation fence, matrix equivalence, reader retention | 4 | 6 | pending |
 | M4 | placement disagreement and durable writer fence | 3 | 6 | pending |
-| M5 | command normalization, relationship identity, batch semantics | 5 | 6 | pending |
+| M5 | command normalization, relationship identity, batch semantics | 6 | 6 | P0 command conformance tests; driver pending |
 
 The generated M1/M2 Informal Trace Format files are under `target/formal/` and
 are ignored by Git. M1 is additionally replayed against Rust by
@@ -33,6 +33,26 @@ simulation traces, calls only public `GraphShard` APIs, and compares the
 normalized state after every step. The four named `quint test` witnesses remain
 Quint-only because `quint test` ITF output omits `mbt::actionTaken`, which the
 current adapter requires for action dispatch.
+
+### P0 completion evidence (2026-07-18)
+
+M2 now states BFG-008 precisely: a low-level offset page captures one request
+view, while a materialized cursor remains stable. M5 now states metadata set
+and removal as an atomic projection that cannot remove structural adjacency.
+Both model families passed 10,000 twelve-step simulation traces and a
+six-transition Apalache check using their `allSafety` predicates.
+
+The focused kernel conformance tests are:
+
+| Rank | Rust test | Contract checked |
+|---:|---|---|
+| 1–2 | `formal_p0_relationship_identity_and_duplicate_vertex_batch_are_atomic` | cell-global external relationship ID; equal duplicate coalescing; conflict has no epoch change |
+| 3 | `formal_p0_direct_offset_pagination_is_best_effort_across_requests` | insertion before an offset may repeat a row on the later direct request |
+| 4 | `formal_p0_edge_metadata_set_and_clear_preserve_structural_adjacency` | property visibility changes while edge existence and degree remain stable |
+
+These are public-kernel conformance tests, not a claim that M2/M5 already
+have full Quint Connect action adapters. M1 is the current complete adapter;
+M2 and M5 are the next bindings.
 
 ## Evidence boundary
 
@@ -101,9 +121,7 @@ mise exec -- quint test quint-models/turbolay/m1_cell_write_test.qnt \
 
 mise exec java@21.0.2 -- mise exec -- quint verify \
   quint-models/turbolay/m1_cell_write.qnt --main m1_cell_write \
-  --invariant epochNeverRegresses,edgeProjectionConsistent,\
-deltaMatchesLatestTopologyChange,createIdempotencyExact,\
-deleteIdempotencyExact,oneEffectiveWriter,zombieWriteRejected --max-steps 6
+  --invariant allSafety --max-steps 6
 
 mise exec -- quint run quint-models/turbolay/m1_cell_write.qnt \
   --main m1_cell_write --mbt --max-steps 8 \

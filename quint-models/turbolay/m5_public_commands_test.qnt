@@ -38,4 +38,14 @@ module m5_public_commands_test {
       .then(createEdgeCommand)
       .expect(edgePresent)
       .expect(lastResponse == "created")
+
+  run edgeMetadataDoesNotChangeStructuralAdjacencyTest =
+    init
+      .then(createEdgeCommand)
+      .then(setEdgeMetadataCommand)
+      .expect(edgePresent)
+      .expect(edgeMetadata == "set")
+      .then(removeEdgeMetadataCommand)
+      .expect(edgePresent)
+      .expect(edgeMetadata == "none")
 }
