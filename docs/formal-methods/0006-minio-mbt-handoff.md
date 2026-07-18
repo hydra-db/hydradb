@@ -61,9 +61,20 @@ just minio-fence
 
 ## Pending, in order
 
-1. Record product approval (or intentional changes) for BFG-003, BFG-004,
-   BFG-007, and BFG-008; revise model, witness, adapter, and bug record
-   together for any changed decision.
+1. ~~Record product approval (or intentional changes) for BFG-003, BFG-004,
+   BFG-007, and BFG-008~~ **Done 2026-07-18.** All four reviewed by
+   vyom@hydradb.com:
+   - **BFG-004** (reject conflicts atomically) and **BFG-008** (best-effort
+     direct pages, stable service cursor) match current behavior → `not-a-bug`;
+     records, model comments, and inventory updated; Quint stays green.
+   - **BFG-003** approved **endpoint-scoped** — current source violates it
+     (rejects same-ID/different-endpoint) → `reproducing`, medium kernel fix
+     scoped in the record for a reviewed PR (model/witness/adapter flip in the
+     same PR).
+   - **BFG-007** approved **read-your-writes after bookmark** — local path met
+     and typed proof-unavailable error exists; remote proof + reader refresh
+     scoped in the record, stays `blocked` (reader refresh may need a SlateDB
+     bump). Per-bug implementation plans live under `docs/bugs-found-fixed/`.
 2. Add the bounded `just minio-mbt` corpus to CI after the existing
    InMemory MBT gate. Upload retained MinIO failure artifacts and report the
    backend, seed, trace, commit, bucket/prefix, and logs.
