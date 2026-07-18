@@ -67,6 +67,8 @@ mise exec java@21.0.2 -- mise exec -- quint verify \
 # The M1 Rust driver replays these action-labelled simulation traces through
 # the public GraphShard API and compares its state projection after every step.
 mise exec -- cargo test --locked --test formal_mbt -- --test-threads=1
+mise exec -- cargo test --locked --test formal_mbt_m2 -- --test-threads=1
+mise exec -- cargo test --locked --test formal_mbt_m5 -- --test-threads=1
 
 # P2 has two additional public-API trace replayers. M5b is feature-independent;
 # M2b also exercises the OpenCypher cancelled-page entry point.

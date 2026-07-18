@@ -51,9 +51,11 @@ are named `formal_p0_*` in `src/tests.rs`; relationship/duplicate testing runs
 with default features, and direct pagination/metadata testing runs with
 `--features opencypher`.
 
-M1 is the first complete Quint Connect driver. M2 and M5 still need their
-full action adapters before this group can be called MBT-complete; this is an
-explicit remaining completion-gate item rather than an unrecorded gap.
+M1, M2, and M5 now each have a complete seeded Quint Connect driver. M2 replays
+snapshot, cursor, historical-rejection, bookmark, and direct-page actions;
+M5 replays identity, duplicate-batch, metadata, parallel-delete, and cursor
+actions. Together with the focused P0 conformance tests, this group is
+MBT-complete for the stated finite contracts.
 
 ### P1 — severe but less frequent or asynchronous paths
 
