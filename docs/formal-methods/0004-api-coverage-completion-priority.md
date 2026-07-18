@@ -71,14 +71,19 @@ two required deletion transitions. Its parallel-relationship witness, 10,000
 sample simulation, and six-step Apalache run pass. The default-feature Rust
 test `formal_p1_parallel_relationship_delete_preserves_edge_until_final_relationship`
 verifies that the first delete leaves the edge and its degree intact, while the
-second removes both. P1 ranks 6–8 remain pending their adapter and fault-model
-work.
+second removes both.
 
 P1 rank 6 is covered by M3's stale-publication, retained-reader, and
 matrix/direct-equivalence actions. P1 rank 7 is covered by M2's monotone
 bookmark model and M4's durable-fence safety model; it intentionally does not
 promise reader freshness. Both models passed their deterministic, simulation,
 and bounded checks on this branch. Their Rust MBT adapters remain pending.
+
+P1 rank 8 is covered by the M1b chunk-import model and
+`formal_p1_chunked_bulk_import_is_idempotent_by_durable_chunk`. The evidence
+asserts atomic admitted chunks, invalid chunk-size rejection, and idempotent
+whole-request retry; fault injection between actual chunk RPCs remains a
+Jepsen/MinIO campaign item.
 
 ### P2 — lower-frequency destructive or unsupported operations
 

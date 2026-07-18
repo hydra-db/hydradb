@@ -29,6 +29,7 @@ only an offset, so its across-request contract is intentionally still open.
 | Family | Main module | Deterministic tests | Primary findings |
 |---|---|---|---|
 | M1 | `m1_cell_write.qnt` | `m1_cell_write_test.qnt` | BFG-003, BFG-004, BFG-005, BFG-006 |
+| M1b | `m1_bulk_import.qnt` | `m1_bulk_import_test.qnt` | P1 bulk unit/retry contract |
 | M2 | `m2_snapshot_read.qnt` | `m2_snapshot_read_test.qnt` | BFG-001, BFG-002, BFG-007, BFG-008 |
 | M3 | `m3_artifact_gc.qnt` | `m3_artifact_gc_test.qnt` | BFG-005, BFG-006 |
 | M4 | `m4_placement_fence.qnt` | `m4_placement_fence_test.qnt` | BFG-007 |
@@ -40,12 +41,12 @@ Run Quint and other long-running formal-methods commands in tmux pane
 `pson:10.2`:
 
 ```bash
-for model in m1_cell_write m2_snapshot_read m3_artifact_gc \
+for model in m1_cell_write m1_bulk_import m2_snapshot_read m3_artifact_gc \
              m4_placement_fence m5_public_commands; do
   mise exec -- quint typecheck "quint-models/turbolay/${model}.qnt"
 done
 
-for test in m1_cell_write m2_snapshot_read m3_artifact_gc \
+for test in m1_cell_write m1_bulk_import m2_snapshot_read m3_artifact_gc \
             m4_placement_fence m5_public_commands; do
   mise exec -- quint test "quint-models/turbolay/${test}_test.qnt" \
     --main "${test}_test" --match '.*Test$'
