@@ -393,27 +393,53 @@ SlateDB snapshot and bind it to the cell's current topology cursor; writes advan
 as they mutate topology; and deletes rely on the cursor to decide which topology deltas are
 old enough to physically remove.
 
+#let seq-tag(body) = text(size: 7.5pt, fill: reader-colors.muted, weight: "bold", body)
 #figure(
   diagram(
     spacing: (7mm, 9mm),
-    node-stroke: 0.5pt,
-    node((0, 0), text(size: 8pt)[StorageSequence\ SlateDB snapshot seq], width: 4.6cm, fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 3pt),
-    edge((0, 0), (1, 0), "->", stroke: reader-colors.muted, label: text(size: 7.5pt, fill: reader-colors.muted)[read pins `DbSnapshot` @ seq N]),
-    node((1, 0), text(size: 8pt)[controls what a\ read can see (MVCC)], width: 4.6cm, fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 3pt),
-    node((0, 1), text(size: 8pt)[TopologySequence\ topology cursor], width: 4.6cm, fill: reader-colors.purple_soft, stroke: reader-colors.purple, corner-radius: 3pt),
-    edge((0, 1), (1, 1), "->", stroke: reader-colors.muted, label: text(size: 7.5pt, fill: reader-colors.muted)[write advances `last_epoch`]),
-    node((1, 1), text(size: 8pt)[consumed later by\ async matrix build], width: 4.6cm, fill: reader-colors.purple_soft, stroke: reader-colors.purple, corner-radius: 3pt),
-    node((0.5, 0.5), text(size: 7.5pt, fill: reader-colors.muted, style: "italic")[two different numbers,\ two different jobs], stroke: none, fill: none),
+    node-stroke: 0.6pt,
+    node-inset: 7pt,
+    node-corner-radius: 3pt,
+    // Lane A — SlateDB owns record visibility
+    node((0, 0), seq-tag[SlateDB\ owns this], stroke: none, fill: none),
+    node((2, 0), align(center)[
+      #text(size: 9pt, weight: "bold")[`db.snapshot()` → StorageSequence *S*] \
+      #text(size: 8pt)[one consistent view of *every* key · MVCC record visibility]
+    ], fill: reader-colors.info_soft, stroke: reader-colors.info, width: 88mm),
+    // the seam — the app cursor is read from inside the SlateDB snapshot
+    edge((2, 0), (2, 1), "->", stroke: reader-colors.primary_active + 0.8pt, label-side: right,
+      label: text(size: 7.5pt, fill: reader-colors.primary_active)[read `meta/last_epoch` from #emph[inside] snapshot #emph[S]]),
+    node((2, 1), align(center)[
+      #text(size: 8.5pt)[`read_epoch` *E* = `meta/last_epoch` (TopologySequence)] \
+      #text(size: 7.5pt, fill: reader-colors.muted)[bound by `with_validated_storage_read_epoch(E, S)`]
+    ], fill: reader-colors.info_soft, stroke: reader-colors.info, width: 88mm),
+    // Lane B — TurboLay owns the topology / acceleration axis
+    node((0, 3), seq-tag[TurboLay\ owns this], stroke: none, fill: none),
+    node((1, 3), align(center)[#text(size: 8pt)[`delta_gc_watermark` *W*] \ #text(size: 7pt, fill: reader-colors.muted)[reads below → `SnapshotExpired`]],
+      fill: reader-colors.warn_soft, stroke: (paint: reader-colors.warn, dash: "dashed")),
+    node((2, 3), align(center)[#text(size: 8pt)[matrix artifact] \ #text(size: 8pt, weight: "bold")[`base_epoch` *B*]],
+      fill: reader-colors.purple_soft, stroke: reader-colors.purple),
+    node((3, 3), align(center)[#text(size: 8pt)[read view] \ #text(size: 8pt, weight: "bold")[@ epoch *E*]],
+      fill: reader-colors.ok_soft, stroke: reader-colors.ok),
+    edge((1, 3), (2, 3), "--", stroke: reader-colors.muted),
+    edge((2, 3), (3, 3), "->", stroke: reader-colors.muted, label-fill: none, label-side: center,
+      label: text(size: 7.5pt, fill: reader-colors.muted)[replay deltas after #emph[B] up to #emph[E]]),
+    // the SAME E from lane A anchors the topology axis
+    edge((2, 1), (3, 3), "-->", stroke: (paint: reader-colors.primary_active, dash: "dotted"), bend: -20deg, label-fill: none, label-side: left,
+      label: text(size: 7pt, fill: reader-colors.primary_active)[same #emph[E]]),
   ),
   caption: none,
-)
-#figcap[The two-sequence split. The top lane is SlateDB's read-visibility clock; the bottom lane is the topology cursor that async matrix builds trail behind.]
+) <fig-two-sequences>
+#figcap[The two sequences, and the seam that binds them. A read pins a SlateDB snapshot (top lane, record visibility) and, from inside it, reads the topology cursor E (bottom lane) that the matrix accelerator is measured against.]
 
-Read it as two independent lanes: the top lane is the `StorageSequence`, which answers
-"what is visible to this read" by pinning a `DbSnapshot` at a snapshot number; the bottom lane
-is the `TopologySequence`, which answers "how far the matrix artifact lags the latest topology"
-as writes advance `last_epoch` and async builds consume it later. They are two different numbers
-with two different jobs, and conflating them is the classic confusion this book keeps warning about.
+Read it as two lanes joined by one seam. The top lane is the `StorageSequence`: opening a
+`DbSnapshot` fixes what every key looks like — this, and only this, is what a read can see.
+The bottom lane is the `TopologySequence`: the matrix artifact is allowed to sit at an older
+`base_epoch B`, because the exact interval of deltas after `B` up to `E` is replayed at read
+time, and any read below `delta_gc_watermark W` is refused with `SnapshotExpired`. The seam is
+the whole point — the read epoch `E` is a value read *from inside* the SlateDB snapshot, so the
+topology cursor never becomes a second, competing notion of visibility. Two different numbers,
+two different jobs, bound once per read.
 
 == The identity hierarchy: namespaces, graphs, and scopes
 
