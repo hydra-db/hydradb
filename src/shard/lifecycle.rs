@@ -593,6 +593,10 @@ impl GraphShard {
         minimum: StorageSequence,
     ) -> Result<StorageSequence> {
         validate_component("cell_id", cell_id)?;
+        let current = self.db.durable_sequence().await?;
+        if current >= minimum {
+            return Ok(current);
+        }
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(
                 self.limits.max_query_runtime_ms.unwrap_or(30_000).max(1),
