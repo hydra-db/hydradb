@@ -101,6 +101,53 @@ then trusts the caller's epoch, so a read that asks for an epoch below the
 watermark is refused with `SnapshotExpired` rather than being silently served
 partial history.
 
+#let seq-tag(body) = text(size: 7.5pt, fill: reader-colors.muted, weight: "bold", body)
+#figure(
+  diagram(
+    spacing: (7mm, 9mm),
+    node-stroke: 0.6pt,
+    node-inset: 7pt,
+    node-corner-radius: 3pt,
+    // Lane A — SlateDB owns record visibility
+    node((0, 0), seq-tag[SlateDB\ owns this], stroke: none, fill: none),
+    node((2, 0), align(center)[
+      #text(size: 9pt, weight: "bold")[`db.snapshot()` → StorageSequence *S*] \
+      #text(size: 8pt)[one consistent view of *every* key · MVCC record visibility]
+    ], fill: reader-colors.info_soft, stroke: reader-colors.info, width: 88mm),
+    // the seam — the app cursor is read from inside the SlateDB snapshot
+    edge((2, 0), (2, 1), "->", stroke: reader-colors.primary_active + 0.8pt, label-side: right,
+      label: text(size: 7.5pt, fill: reader-colors.primary_active)[read `meta/last_epoch` from #emph[inside] snapshot #emph[S]]),
+    node((2, 1), align(center)[
+      #text(size: 8.5pt)[`read_epoch` *E* = `meta/last_epoch` (TopologySequence)] \
+      #text(size: 7.5pt, fill: reader-colors.muted)[bound by `with_validated_storage_read_epoch(E, S)`]
+    ], fill: reader-colors.info_soft, stroke: reader-colors.info, width: 88mm),
+    // Lane B — TurboLay owns the topology / acceleration axis
+    node((0, 3), seq-tag[TurboLay\ owns this], stroke: none, fill: none),
+    node((1, 3), align(center)[#text(size: 8pt)[`delta_gc_watermark` *W*] \ #text(size: 7pt, fill: reader-colors.muted)[reads below → `SnapshotExpired`]],
+      fill: reader-colors.warn_soft, stroke: (paint: reader-colors.warn, dash: "dashed")),
+    node((2, 3), align(center)[#text(size: 8pt)[matrix artifact] \ #text(size: 8pt, weight: "bold")[`base_epoch` *B*]],
+      fill: reader-colors.purple_soft, stroke: reader-colors.purple),
+    node((3, 3), align(center)[#text(size: 8pt)[read view] \ #text(size: 8pt, weight: "bold")[@ epoch *E*]],
+      fill: reader-colors.ok_soft, stroke: reader-colors.ok),
+    edge((1, 3), (2, 3), "--", stroke: reader-colors.muted),
+    edge((2, 3), (3, 3), "->", stroke: reader-colors.muted, label-fill: none, label-side: center,
+      label: text(size: 7.5pt, fill: reader-colors.muted)[replay deltas after #emph[B] up to #emph[E]]),
+    // the SAME E from lane A anchors the topology axis
+    edge((2, 1), (3, 3), "-->", stroke: (paint: reader-colors.primary_active, dash: "dotted"), bend: -20deg, label-fill: none, label-side: left,
+      label: text(size: 7pt, fill: reader-colors.primary_active)[same #emph[E]]),
+  ),
+  caption: [The two sequences, and the seam that binds them: a read pins a SlateDB snapshot
+    (record visibility), and from inside it reads the topology cursor E that the matrix
+    accelerator is measured against.],
+) <fig-intro03-two-sequences>
+
+How to read it: the top lane is SlateDB's job — opening a `DbSnapshot` fixes what every key
+looks like, which is the only thing that makes a long read coherent. The bottom lane is
+TurboLay's job — the artifact may lag at `base_epoch B`, the missing interval up to `E` is
+replayed, and reads below `delta_gc_watermark W` are refused. The dotted seam is the punchline:
+`E` is read #emph[from inside] the snapshot, so the topology cursor never becomes a second
+visibility clock.
+
 #note[
   Epoch consistency is cell-local. A distributed query can give each cell leg
   an explicit epoch, but the coordinator does not negotiate one global epoch
