@@ -1,4 +1,5 @@
 #import "../vendor/bookly/src/bookly.typ": *
+#import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
 
 = Reads Name the World They See
 
@@ -47,6 +48,35 @@ than the requested read epoch. The shard hydrates it, then
   ),
   caption: [The artifact is allowed to lag because the exact missing interval is replayed.],
 ) <tab-artifact-overlay>
+
+#figure(
+  diagram(
+    spacing: (6mm, 9mm),
+    node-stroke: 0.5pt,
+    // async refresh job — dashed edge over the base artifact
+    edge((0.1, -1), (2.4, -1), "->", stroke: (paint: reader-colors.warn, dash: "dashed"), label: text(size: 8pt, fill: reader-colors.warn)[async refresh job rebuilds the base], label-side: center),
+    // base matrix artifact (wide, durable)
+    node(enclose: ((0, 0), (2.4, 0)), [matrix artifact — `base_epoch 100`], fill: reader-colors.purple_soft, stroke: reader-colors.purple, corner-radius: 3pt, inset: 8pt),
+    // delta ticks
+    node((3.2, 0), text(size: 8pt)[Δ101], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 2pt, inset: 4pt),
+    node((3.9, 0), text(size: 8pt)[Δ102], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 2pt, inset: 4pt),
+    node((4.6, 0), text(size: 8pt)[…], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 2pt, inset: 4pt),
+    node((5.3, 0), text(size: 8pt)[Δ107], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 2pt, inset: 4pt),
+    // read epoch marker
+    node((6.4, 0), text(size: 8pt)[`read_epoch 107`], stroke: reader-colors.primary_active, corner-radius: 2pt, inset: 5pt),
+    // epoch axis
+    edge((-0.4, 0.9), (6.9, 0.9), "->", stroke: reader-colors.muted, label: text(size: 8pt, fill: reader-colors.muted)[epoch], label-side: center),
+    // summary bracket node
+    node((3.0, 1.8), text(size: 8pt)[`artifact(100) + deltas(101..107] = answer @ 107`], fill: reader-colors.ok_soft, stroke: reader-colors.ok, corner-radius: 3pt, inset: 7pt),
+  ),
+  caption: [The artifact is allowed to lag because the exact missing interval of deltas is
+    replayed on top; a background job rebuilds the base asynchronously.],
+) <fig-intro03-overlay>
+
+Read it left to right along the epoch axis. The durable artifact only knows the
+world up to its base epoch (100), so a read at epoch 107 replays exactly the deltas
+in `(100, 107]` on top of it. The dashed arrow is the background job that will later
+fold those deltas into a fresher artifact — which is why the base is allowed to lag.
 
 #info-box(title: [Status: planned, not in the current tree])[The Roaring
 compression described next is future work. It is not on this branch: the

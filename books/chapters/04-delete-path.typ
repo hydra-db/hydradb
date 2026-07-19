@@ -1,5 +1,6 @@
 #import "../template.typ": term, why, srcblock, figcap, accent, muted
 #import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
+#import "../vendor/bookly/src/themes/reader.typ": reader-colors
 
 = The Delete Path
 
@@ -131,6 +132,46 @@ its id record, its property indexes, and the relationship count, so a relationsh
 the edge that carries it. Note the asymmetry. The structural edge itself is still soft-deleted --
 a `Minus` delta or a segment tombstone at a new epoch, exactly as above -- but the relationships
 riding on it are hard-removed, not tombstoned. Not every delete in TurboLay is a soft delete.
+
+#figure(
+  stack(
+    dir: ttb,
+    spacing: 8mm,
+    align(left)[#text(size: 9pt, weight: "bold", fill: reader-colors.ink)[Part 1 -- one delete txn @ epoch E]],
+    diagram(
+      node-stroke: 0.6pt,
+      spacing: (11mm, 9mm),
+      node((1, 0), text(size: 8pt)[delete txn @ epoch `E`], fill: reader-colors.surface_soft, stroke: reader-colors.border, corner-radius: 3pt, width: 4cm),
+      edge((1, 0), (0, 1), "->", stroke: reader-colors.muted, label: text(size: 7pt, fill: reader-colors.muted)[structural edge]),
+      edge((1, 0), (2, 1), "->", stroke: reader-colors.muted, label: text(size: 7pt, fill: reader-colors.muted)[relationships on it]),
+      node((0, 1), text(size: 8pt)[edge: `Minus` delta / tombstone\ *soft* -- readable at old epochs], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 3pt, width: 5.2cm),
+      node((2, 1), text(size: 8pt)[`txn.delete` id + indexes + count\ *hard* -- gone now], fill: reader-colors.bad_soft, stroke: reader-colors.bad, corner-radius: 3pt, width: 5.2cm),
+    ),
+    align(left)[#text(size: 9pt, weight: "bold", fill: reader-colors.ink)[Part 2 -- GC contract]],
+    diagram(
+      node-stroke: 0.6pt,
+      spacing: (9mm, 8mm),
+      node((0, 0), text(size: 7pt, fill: reader-colors.muted)[epoch 0], stroke: none, fill: none),
+      node((4, 0), text(size: 7pt, fill: reader-colors.muted)[now], stroke: none, fill: none),
+      edge((0, 0), (4, 0), "->", stroke: reader-colors.muted),
+      node((2, -0.55), text(size: 7pt, fill: reader-colors.primary_active)[`delta_gc_watermark`], stroke: none, fill: none),
+      edge((2, -0.18), (2, 0.18), "-", stroke: 1.6pt + reader-colors.primary_active),
+      node((1, 1.2), text(size: 8pt)[raise watermark], fill: reader-colors.ok_soft, stroke: reader-colors.ok, corner-radius: 3pt, width: 3.2cm),
+      node((3, 1.2), text(size: 8pt)[delete deltas below it], fill: reader-colors.surface_soft, stroke: reader-colors.border, corner-radius: 3pt, width: 3.8cm),
+      edge((1, 1.2), (3, 1.2), "->", stroke: reader-colors.muted, label: text(size: 7pt, fill: reader-colors.muted)[then]),
+      node((0.7, 2.5), text(size: 8pt)[read @ epoch < watermark], fill: reader-colors.surface_soft, stroke: reader-colors.border, corner-radius: 3pt, width: 4cm),
+      node((3, 2.5), text(size: 8pt)[`SnapshotExpired`], fill: reader-colors.warn_soft, stroke: reader-colors.warn, corner-radius: 3pt, width: 3.4cm),
+      edge((0.7, 2.5), (3, 2.5), "->", stroke: reader-colors.muted),
+    ),
+  ),
+  caption: none,
+) <fig-ch04-delete-watermark>
+#figcap[The delete asymmetry and the GC/read watermark contract. Read Part 1 left-to-right: one delete txn splits in two -- the structural edge is soft-deleted (a `Minus` delta or tombstone at a new epoch, still readable at old epochs), while the relationships riding on it are hard-deleted in the same txn. Part 2 is the epoch axis: GC raises `delta_gc_watermark` *before* deleting the deltas beneath it, so a read that starts below the watermark is refused with `SnapshotExpired` rather than served a half-collected history.]
+
+Not every delete is soft, then, and GC never deletes the only route to a still-permitted read
+epoch. The edge is versioned but the relationships it carries are physically removed; and because
+GC advances the watermark first, anything older than the watermark is refused outright rather than
+silently reconstructed wrong.
 
 #figure(
   diagram(

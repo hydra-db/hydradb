@@ -1,4 +1,5 @@
 #import "../template.typ": term, why, srcblock, figcap, accent, muted
+#import "../vendor/bookly/src/themes/reader.typ": reader-colors
 #import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
 
 = The Write Path
@@ -80,6 +81,37 @@ Chapter 0 said only one writer per cell may exist. TurboLay does not rest that p
 single mechanism. Three independent things line up behind every commit — a static writer role,
 the object-store cell write lock, and the serializable transaction the write runs in — and a
 write that satisfies all three cannot race another writer.
+
+#let tier-title(t) = text(size: 8pt, weight: "bold", fill: reader-colors.ink)[#t]
+#let defend(t) = text(size: 7pt, fill: reader-colors.muted, style: "italic")[#t]
+#figure(
+  diagram(
+    node-stroke: 0.6pt,
+    node-shape: fletcher.shapes.rect,
+    spacing: (1.0cm, 1.8cm),
+    // Three concentric tiers, all centered on (0,0): outer -> inner.
+    node((0, 0), box(width: 9.6cm, height: 6.6cm, inset: 6pt, align(top + center,
+      tier-title[Tier 1 · writer role — sole SlateDB writer handle])),
+      fill: reader-colors.surface_soft, stroke: reader-colors.border, corner-radius: 4pt, name: <t1>),
+    node((0, 0), box(width: 7.6cm, height: 4.6cm, inset: 6pt, align(top + center, stack(spacing: 4pt,
+      tier-title[Tier 2 · cell write lock],
+      tier-title[cross-process · owner token + TTL]))),
+      fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 4pt, name: <t2>),
+    node((0, 0), box(width: 5.9cm, height: 2.4cm, inset: 6pt, align(top + center, stack(spacing: 5pt,
+      tier-title[Tier 3 · serializable txn — drop-guard + authority, fan-out],
+      text(size: 8pt, weight: "bold", fill: reader-colors.ok)[commit \@ new epoch]))),
+      fill: reader-colors.ok_soft, stroke: reader-colors.ok, corner-radius: 4pt, name: <t3>),
+    // "defends against" side labels, one per tier.
+    node((1, -1), defend[defends against:\ read-only /\ non-owner process], stroke: none, name: <d1>),
+    node((1, 0), defend[defends against:\ two processes,\ same cell], stroke: none, name: <d2>),
+    node((1, 1), defend[defends against:\ partial fan-out /\ conflicting epochs], stroke: none, name: <d3>),
+    edge(<t1>, <d1>, "-", stroke: (paint: reader-colors.muted, dash: "dashed")),
+    edge(<t2>, <d2>, "-", stroke: (paint: reader-colors.muted, dash: "dashed")),
+    edge(<t3>, <d3>, "-", stroke: (paint: reader-colors.muted, dash: "dashed")),
+  ),
+  caption: none,
+) <fig-ch03-tiers>
+#figcap[The three tiers behind single-writer atomicity, nested from the outermost check to the innermost commit. There is no lease or write-fence record any more: correctness rests on these three overlapping mechanisms, and the innermost serializable commit — where the epoch advances and every index key is written — is what makes the multi-record edge write atomic within the cell.]
 
 === Tier 1: the writer role
 

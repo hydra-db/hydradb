@@ -1,5 +1,6 @@
 #import "../template.typ": term, why, srcblock, figcap, accent, muted
 #import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
+#import "../vendor/bookly/src/themes/reader.typ": reader-colors
 
 = The Read Path
 
@@ -233,6 +234,45 @@ the topology state that this storage snapshot froze. `GraphStore::scope_snapshot
 storage access underneath sees the same frozen bytes; the borrowed and owned forms are
 `GraphSnapshot` / `OwnedGraphSnapshot` (`src/core/snapshot.rs:9,16`). This is where the "one
 epoch everywhere" thread becomes concrete.
+
+The whole model fits in one picture: the epoch is not chosen by the caller. The shard derives
+it from one SlateDB snapshot, and every read inside the query sees exactly that world. The
+answer itself comes in two layers --- the compacted matrix artifact may lag the read epoch, so
+the missing delta interval is replayed on top of it.
+
+#figure(
+  diagram(
+    node-stroke: 0.6pt,
+    spacing: (14mm, 11mm),
+    node((0.5, 0), text(size: 8.5pt)[client request\ (bookmark, no epoch)],
+      fill: reader-colors.surface_soft, stroke: reader-colors.border, corner-radius: 3pt, width: 4.6cm),
+    edge((0.5, 0), (0.5, 1), "->", stroke: reader-colors.muted),
+    node((0.5, 1), text(size: 8.5pt)[service: `read_epoch = None`],
+      fill: reader-colors.surface_soft, stroke: reader-colors.border, corner-radius: 3pt, width: 4.6cm),
+    edge((0.5, 1), (0.5, 2), "->", stroke: reader-colors.muted),
+    node((0.5, 2), text(size: 8.5pt)[shard opens `DbSnapshot`;\ reads `last_epoch` inside it\ (pins storage seq + read epoch)],
+      fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 3pt, width: 5.6cm),
+
+    node((0, 3), text(size: 8.5pt)[matrix artifact\ (`base_epoch`)],
+      fill: reader-colors.purple_soft, stroke: reader-colors.purple, corner-radius: 3pt, width: 4cm),
+    node((1, 3), text(size: 8.5pt)[deltas\ `(base, read]`],
+      fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 3pt, width: 4cm),
+    edge((0.5, 2), (0, 3), "->", stroke: reader-colors.muted),
+    edge((0.5, 2), (1, 3), "->", stroke: reader-colors.muted),
+    edge((0, 3), (0.5, 4), "->", stroke: reader-colors.muted, label: text(size: 10pt, fill: reader-colors.muted)[⊕]),
+    edge((1, 3), (0.5, 4), "->", stroke: reader-colors.muted, label: text(size: 10pt, fill: reader-colors.muted)[=]),
+    node((0.5, 4), text(size: 8.5pt)[rows],
+      fill: reader-colors.ok_soft, stroke: reader-colors.ok, corner-radius: 3pt, width: 3.4cm),
+
+    node((-0.62, 2.05), text(size: 8pt, style: "italic", fill: reader-colors.muted)[scoped under\ one snapshot],
+      stroke: none, fill: none),
+    node(enclose: ((-0.62, 2.05), (0.5, 2), (0, 3), (1, 3), (0.5, 4)),
+      stroke: (paint: reader-colors.muted, dash: "dotted"), fill: none,
+      inset: 11pt, corner-radius: 5pt),
+  ),
+  caption: none,
+) <fig-ch02-snapshot-merge>
+#figcap[One read, one snapshot, two layers. The service refuses a client epoch and passes `None`; the shard opens a single `DbSnapshot`, reads `last_epoch` from inside it (pinning both the storage sequence and the read epoch), and answers under that one snapshot as the matrix artifact at `base_epoch` merged with the deltas in `(base, read]`.]
 
 == Parsing Cypher into the engine's plan
 

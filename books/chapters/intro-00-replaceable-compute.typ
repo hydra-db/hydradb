@@ -1,4 +1,5 @@
 #import "../vendor/bookly/src/bookly.typ": *
+#import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
 
 = The Compute Node Can Disappear
 
@@ -13,6 +14,33 @@ the compute node holds ways to reach it quickly.
   *The graph survives the machine. Memory and local disk make it faster, but
   they do not make it true.*
 ]
+
+#figure(
+  diagram(
+    spacing: (10mm, 14mm),
+    node-stroke: 0.5pt,
+    node((0, 0), text(size: 8pt)[graph-node A — heap · caches · writer role],
+      fill: reader-colors.bad_soft, stroke: (paint: reader-colors.bad, dash: "dashed"),
+      shape: fletcher.shapes.rect, corner-radius: 3pt),
+    node((1, 0), text(size: 8pt)[graph-node A′ (replacement) — empty heap · cold cache],
+      fill: reader-colors.surface_soft, stroke: reader-colors.border,
+      shape: fletcher.shapes.rect, corner-radius: 3pt),
+    node((0.5, 1), text(size: 8pt)[Object store (SlateDB): edges · epochs · artifacts · deltas · write locks],
+      fill: reader-colors.purple_soft, stroke: reader-colors.purple,
+      shape: fletcher.shapes.rect, corner-radius: 3pt),
+    edge((0, 0), (0.5, 1), "--}>", stroke: (paint: reader-colors.bad, dash: "dashed"),
+      label: text(size: 8pt, fill: reader-colors.muted)[gone]),
+    edge((0.5, 1), (1, 0), "->", stroke: reader-colors.muted,
+      label: text(size: 8pt, fill: reader-colors.muted)[re-hydrate same path]),
+  ),
+  caption: [Memory and local disk make the graph faster, not true: a replacement node
+    rebuilds the same logical state from the same object-store path.],
+) <fig-intro00-boundary>
+
+Read the picture top-down. The two compute nodes are interchangeable: when node A
+dies, node A′ starts with a cold heap and re-opens the *same* object-store path, so
+the graph it serves is identical. The crash costs cache warmth and in-flight work,
+never a fact.
 
 == The one-sentence architecture
 
