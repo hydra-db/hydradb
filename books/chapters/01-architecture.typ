@@ -1,5 +1,6 @@
 #import "../template.typ": term, why, srcblock, figcap, accent, muted
 #import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
+#import "../vendor/bookly/src/themes/reader.typ": reader-colors
 
 = Architecture
 
@@ -396,6 +397,26 @@ Three per-node modules move artifacts through their life cycle, all under `src/e
   (`cached_matrix_adjacency`, `cached_graphblas_matrix`).
 - *Collect* — `artifact_gc.rs` deletes artifact keys whose `base_epoch` falls below a caller-
   supplied `keep_epoch` and prunes the matrix caches with `retain`.
+
+#figure(
+  diagram(
+    node-stroke: 0.5pt,
+    spacing: (4mm, 9mm),
+    node((0, 0), text(size: 7.5pt)[writes →\ dirty markers], fill: reader-colors.surface_soft, stroke: reader-colors.border, corner-radius: 3pt, width: 2.4cm),
+    edge((0, 0), (1, 0), "->", stroke: reader-colors.muted),
+    node((1, 0), text(size: 7.5pt)[refresh job\ (per node,\ policy-driven)], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 3pt, width: 2.6cm),
+    edge((1, 0), (2, 0), "->", stroke: reader-colors.muted),
+    node((2, 0), text(size: 7.5pt)[`build_adjacency_image`], fill: reader-colors.surface_soft, stroke: reader-colors.border, corner-radius: 3pt, width: 2.6cm),
+    edge((2, 0), (3, 0), "->", stroke: reader-colors.muted),
+    node((3, 0), text(size: 7.5pt)[durable matrix artifact:\ tiles + GraphBLAS CSC\ (object store)], fill: reader-colors.purple_soft, stroke: reader-colors.purple, corner-radius: 3pt, width: 3cm),
+    edge((3, 0), (4, 0), "->", stroke: reader-colors.muted, label: text(size: 7pt, fill: reader-colors.muted)[read]),
+    node((4, 0), text(size: 7.5pt)[`matrix_cache`\ hydration (read)], fill: reader-colors.ok_soft, stroke: reader-colors.ok, corner-radius: 3pt, width: 2.6cm),
+    edge((3, 0), (3, 1), "->", stroke: (dash: "dashed", paint: reader-colors.muted)),
+    node((3, 1), text(size: 7.5pt)[`artifact_gc` prunes\ old base epochs], fill: reader-colors.warn_soft, stroke: reader-colors.warn, corner-radius: 3pt, width: 3cm),
+  ),
+  caption: none,
+)<fig-ch01-artifact-lifecycle>
+#figcap[The matrix-artifact life cycle. Acceleration is now precomputed matrix artifacts rebuilt asynchronously by each node, not a control plane or supernodes. Writes only mark edge-types dirty; a per-node, policy-driven refresh job rebuilds the durable artifact, and a read hydrates the current artifact and overlays newer deltas — so the object store stays the single source of truth, with `artifact_gc` pruning superseded base epochs off to the side.]
 
 The matrix caches are keyed by `(cell_id, edge_type, base_epoch)` and, unlike the per-read
 result caches, are *not* invalidated by a write. Their `base_epoch` deliberately lags the

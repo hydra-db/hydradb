@@ -1,5 +1,6 @@
 #import "../template.typ": term, why, srcblock, figcap, accent, muted
 #import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
+#import "../vendor/bookly/src/themes/reader.typ": reader-colors
 
 = Caching
 
@@ -313,6 +314,39 @@ achieve it in two different ways, and the difference matters. There is a common 
 invalidation code because there is nothing to invalidate." That story is true, but only for one
 family of caches. The matrix caches work differently and *are* explicitly pruned. Separating the
 two regimes is the point of this section.
+
+#figure(
+  diagram(
+    node-stroke: 0.55pt,
+    spacing: (0.7cm, 0.7cm),
+    // LEFT: per-read caches — self-invalidating.
+    node((0, 0), text(size: 8pt)[*per-read caches* \ keyed by `read_epoch`], fill: reader-colors.info_soft, stroke: reader-colors.info, width: 4.7cm),
+    edge((0, 0), (0, 1), "->", stroke: reader-colors.muted),
+    node((0, 1), text(size: 8pt)[write advances epoch], fill: reader-colors.info_soft, stroke: reader-colors.info, width: 4.7cm),
+    edge((0, 1), (0, 2), "->", stroke: reader-colors.muted),
+    node((0, 2), text(size: 8pt)[new key → miss], fill: reader-colors.info_soft, stroke: reader-colors.info, width: 4.7cm),
+    edge((0, 2), (0, 3), "->", stroke: reader-colors.muted),
+    node((0, 3), text(size: 8pt)[old entry ages out (LRU)], fill: reader-colors.info_soft, stroke: reader-colors.info, width: 4.7cm),
+    node((0, 4), text(size: 7.5pt, fill: reader-colors.muted)[self-invalidating; no invalidation code], stroke: none, width: 4.7cm),
+
+    // RIGHT: matrix caches — explicitly GC'd.
+    node((1, 0), text(size: 8pt)[*matrix caches* \ keyed by lagging `base_epoch`], fill: reader-colors.purple_soft, stroke: reader-colors.purple, width: 4.7cm),
+    edge((1, 0), (1, 1), "->", stroke: reader-colors.muted),
+    node((1, 1), text(size: 8pt)[read picks `base_epoch <= read_epoch`], fill: reader-colors.purple_soft, stroke: reader-colors.purple, width: 4.7cm),
+    edge((1, 1), (1, 2), "->", stroke: reader-colors.muted),
+    node((1, 2), text(size: 8pt)[overlay deltas; write does not invalidate], fill: reader-colors.purple_soft, stroke: reader-colors.purple, width: 4.7cm),
+    edge((1, 2), (1, 3), "->", stroke: reader-colors.muted),
+    node((1, 3), text(size: 8pt)[`artifact_gc` prunes via `retain`], fill: reader-colors.purple_soft, stroke: reader-colors.purple, width: 4.7cm),
+    node((1, 4), text(size: 7.5pt, fill: reader-colors.muted)[explicitly invalidated by GC], stroke: none, width: 4.7cm),
+
+    // BOTTOM: read-through hydration fed by the background refresh job.
+    node((0, 5), text(size: 8pt)[background refresh job], fill: reader-colors.surface_soft, stroke: reader-colors.border, width: 4.7cm),
+    edge((0, 5), (1, 5), "->", stroke: reader-colors.muted, label: text(size: 7.5pt, fill: reader-colors.muted)[feeds]),
+    node((1, 5), text(size: 8pt)[read-through hydration \ permit → load artifact → insert pinned], fill: reader-colors.ok_soft, stroke: reader-colors.ok, width: 4.7cm),
+  ),
+  caption: none,
+) <fig-ch05-two-regimes>
+#figcap[The two cache-correctness regimes. On the left, per-read caches embed `read_epoch`, so a write just mints new keys and the stale entries age out under LRU — the "no invalidation code" thesis holds exactly here. On the right, the matrix caches reuse a deliberately lagging `base_epoch` across many read epochs (a read overlays deltas on it), so a write does *not* self-invalidate them; they need real, GC-driven eviction via `artifact_gc`'s `retain`, with entries hydrated read-through and fed by the background refresh job.]
 
 === Regime one: per-read caches, epoch-keyed, self-invalidating
 

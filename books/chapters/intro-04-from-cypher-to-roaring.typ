@@ -1,4 +1,5 @@
 #import "../vendor/bookly/src/bookly.typ": *
+#import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
 
 = From Cypher to Roaring Rows
 
@@ -28,6 +29,71 @@ With the `opencypher` feature enabled, a cell-local query moves through:
   ),
   caption: [Parsing describes the question; optimization chooses how the cell answers it.],
 ) <tab-query-pipeline>
+
+#figure(
+  diagram(
+    spacing: (9mm, 12mm),
+    node-stroke: 0.5pt,
+    {
+      // pipeline (left to right)
+      let pipe = (
+        ((0, 0), [Cypher text]),
+        ((1, 0), [parse\ (`ParsedCypher`)]),
+        ((2, 0), [row plan +\ optimizer]),
+        ((3, 0), [GraphShard\ executor]),
+        ((4, 0), [rows / page /\ count]),
+      )
+      for (pos, body) in pipe {
+        node(pos, text(size: 8pt)[#body], fill: reader-colors.surface_soft,
+          stroke: reader-colors.border, shape: fletcher.shapes.rect,
+          corner-radius: 3pt, width: 2.4cm)
+      }
+      edge((0, 0), (1, 0), "->", stroke: reader-colors.muted)
+      edge((1, 0), (2, 0), "->", stroke: reader-colors.muted)
+      edge((2, 0), (3, 0), "->", stroke: reader-colors.muted)
+      edge((3, 0), (4, 0), "->", stroke: reader-colors.muted)
+
+      // access-path fan-out below the executor
+      let access = (
+        ((0.5, 1), [point reads]),
+        ((1.5, 1), [label/property\ index]),
+        ((2.5, 1), [neighbor\ expansion]),
+        ((3.5, 1), [matrix\ artifacts]),
+      )
+      for (pos, body) in access {
+        node(pos, text(size: 8pt)[#body], fill: reader-colors.info_soft,
+          stroke: reader-colors.info, shape: fletcher.shapes.rect,
+          corner-radius: 3pt, width: 2.3cm)
+        edge((3, 0), pos, "->", stroke: reader-colors.muted)
+      }
+
+      // sparse-kernel seam and its two backends
+      node((2, 2), text(size: 8pt)[sparse kernel], fill: reader-colors.surface_soft,
+        stroke: reader-colors.border, shape: fletcher.shapes.rect,
+        corner-radius: 3pt, width: 2.4cm)
+      edge((2.5, 1), (2, 2), "->", stroke: reader-colors.muted)
+      edge((3.5, 1), (2, 2), "->", stroke: reader-colors.muted)
+
+      node((1, 3), text(size: 8pt)[Rust sparse\ (default)], fill: reader-colors.surface_soft,
+        stroke: reader-colors.border, shape: fletcher.shapes.rect,
+        corner-radius: 3pt, width: 2.4cm)
+      node((3, 3), text(size: 8pt)[GraphBLAS\ (optional)], fill: reader-colors.surface_soft,
+        stroke: reader-colors.border, shape: fletcher.shapes.rect,
+        corner-radius: 3pt, width: 2.4cm)
+      edge((2, 2), (1, 3), "->", stroke: reader-colors.muted)
+      edge((2, 2), (3, 3), "->", stroke: reader-colors.muted)
+
+      // PLANNED node at the hydration seam
+      node((4.5, 2), text(size: 8pt)[Roaring rows\ (planned)], fill: reader-colors.warn_soft,
+        stroke: (paint: reader-colors.warn, dash: "dashed"),
+        shape: fletcher.shapes.rect, corner-radius: 3pt, width: 2.4cm)
+      edge((3.5, 1), (4.5, 2), "-->", stroke: (paint: reader-colors.warn, dash: "dashed"))
+    },
+  ),
+  caption: [Parsing describes the question; the optimizer chooses a physical
+    access path. Roaring row compression is a planned optimization at the
+    hydration seam.],
+) <fig-intro04-pipeline>
 
 The executor can use point reads, label or property indexes, neighbor expansion,
 edge-exists checks, matrix artifacts, and specialized streaming paths.

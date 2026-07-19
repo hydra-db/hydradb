@@ -1,4 +1,5 @@
 #import "../template.typ": term, why, srcblock, figcap, accent, muted
+#import "../vendor/bookly/src/themes/reader.typ": reader-colors
 #import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
 
 = Foundations
@@ -391,6 +392,28 @@ The two sequences are the backbone of the read, write, and delete chapters. Read
 SlateDB snapshot and bind it to the cell's current topology cursor; writes advance the cursor
 as they mutate topology; and deletes rely on the cursor to decide which topology deltas are
 old enough to physically remove.
+
+#figure(
+  diagram(
+    spacing: (7mm, 9mm),
+    node-stroke: 0.5pt,
+    node((0, 0), text(size: 8pt)[StorageSequence\ SlateDB snapshot seq], width: 4.6cm, fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 3pt),
+    edge((0, 0), (1, 0), "->", stroke: reader-colors.muted, label: text(size: 7.5pt, fill: reader-colors.muted)[read pins `DbSnapshot` @ seq N]),
+    node((1, 0), text(size: 8pt)[controls what a\ read can see (MVCC)], width: 4.6cm, fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 3pt),
+    node((0, 1), text(size: 8pt)[TopologySequence\ topology cursor], width: 4.6cm, fill: reader-colors.purple_soft, stroke: reader-colors.purple, corner-radius: 3pt),
+    edge((0, 1), (1, 1), "->", stroke: reader-colors.muted, label: text(size: 7.5pt, fill: reader-colors.muted)[write advances `last_epoch`]),
+    node((1, 1), text(size: 8pt)[consumed later by\ async matrix build], width: 4.6cm, fill: reader-colors.purple_soft, stroke: reader-colors.purple, corner-radius: 3pt),
+    node((0.5, 0.5), text(size: 7.5pt, fill: reader-colors.muted, style: "italic")[two different numbers,\ two different jobs], stroke: none, fill: none),
+  ),
+  caption: none,
+)
+#figcap[The two-sequence split. The top lane is SlateDB's read-visibility clock; the bottom lane is the topology cursor that async matrix builds trail behind.]
+
+Read it as two independent lanes: the top lane is the `StorageSequence`, which answers
+"what is visible to this read" by pinning a `DbSnapshot` at a snapshot number; the bottom lane
+is the `TopologySequence`, which answers "how far the matrix artifact lags the latest topology"
+as writes advance `last_epoch` and async builds consume it later. They are two different numbers
+with two different jobs, and conflating them is the classic confusion this book keeps warning about.
 
 == The identity hierarchy: namespaces, graphs, and scopes
 

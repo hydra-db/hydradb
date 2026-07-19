@@ -1,4 +1,5 @@
 #import "../vendor/bookly/src/bookly.typ": *
+#import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
 
 = Roaring Matrix Rows
 
@@ -26,6 +27,55 @@ BTreeMap<VertexId, RoaringTreemap>
 Design note: `VertexId` is `u64`, so the plan calls for `RoaringTreemap` rather
 than the 32-bit `RoaringBitmap`. Tests for the change would deliberately include
 IDs above `u32::MAX` to pin that requirement.
+
+#figure(
+  diagram(
+    spacing: (16mm, 9mm),
+    node-stroke: 0.5pt,
+    // column headers
+    node((0, -0.7), text(size: 8pt, fill: reader-colors.muted)[*Durable — unchanged*], stroke: none),
+    node((2, -0.7), text(size: 8pt, fill: reader-colors.muted)[*Hydrated in compute*], stroke: none),
+
+    // durable column (left)
+    node((0, 0), text(size: 8pt)[SlateDB records],
+      fill: reader-colors.purple_soft, stroke: reader-colors.purple,
+      shape: fletcher.shapes.rect, corner-radius: 3pt),
+    node((0, 1), text(size: 8pt)[matrix tiles `Vec<u64>`],
+      fill: reader-colors.purple_soft, stroke: reader-colors.purple,
+      shape: fletcher.shapes.rect, corner-radius: 3pt),
+    node((0, 2), text(size: 8pt)[persisted CSC chunks],
+      fill: reader-colors.purple_soft, stroke: reader-colors.purple,
+      shape: fletcher.shapes.rect, corner-radius: 3pt),
+
+    // hydrated column (right)
+    node((2, 0.4), text(size: 8pt)[row: `BTreeSet<VertexId>` (today)],
+      fill: reader-colors.surface_soft, stroke: reader-colors.border,
+      shape: fletcher.shapes.rect, corner-radius: 3pt),
+    node((2, 1.6), text(size: 8pt)[row: `RoaringTreemap` (planned)],
+      fill: reader-colors.warn_soft, stroke: (paint: reader-colors.warn, dash: "dashed"),
+      shape: fletcher.shapes.rect, corner-radius: 3pt),
+
+    // planned dashed edge
+    edge((2, 0.4), (2, 1.6), "-->", stroke: (paint: reader-colors.warn, dash: "dashed"),
+      label: text(size: 7pt, fill: reader-colors.warn)[planned]),
+
+    // outer wrapper annotation enclosing the hydrated rows
+    node(enclose: ((2, 0.4), (2, 1.6)), inset: 10pt,
+      fill: none, stroke: (paint: reader-colors.border, dash: "dotted"), corner-radius: 4pt),
+    node((2, 2.35), text(size: 7pt, fill: reader-colors.muted)[`BTreeMap<VertexId, …>` (unchanged)], stroke: none),
+
+    // hydrate seam edge
+    edge((0, 1), (2, 0.4), "->", stroke: reader-colors.muted,
+      label: text(size: 7pt, fill: reader-colors.muted)[hydrate (`matrix_cache.rs`)]),
+  ),
+  caption: [The durable artifact format stays byte-for-byte stable; the planned
+    change compresses only the hydrated row at the matrix-cache hydration seam.],
+) <fig-detail01-seam>
+
+Read it as a wall between durable and hydrated. Everything on the object store
+(left) would stay exactly as it is on disk; the only proposed change (right, dashed)
+is to compress the in-memory row *after* it is hydrated. Because nothing durable
+changes, no artifact would need rewriting and old artifacts stay readable.
 
 == What stays byte-for-byte compatible
 

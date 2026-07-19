@@ -1,4 +1,5 @@
 #import "../vendor/bookly/src/bookly.typ": *
+#import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
 
 = The `write_edge` Path
 
@@ -54,6 +55,38 @@ The transaction then performs the logical work:
   ),
   caption: [One logical edge mutation fans out inside one serializable transaction.],
 ) <tab-write-fanout>
+
+#figure(
+  diagram(
+    spacing: (5mm, 7mm),
+    node-stroke: 0.5pt,
+    node-corner-radius: 3pt,
+    // Phase flow, left to right
+    node((0, 0), text(size: 8pt)[*Phase 1*\ reject wrong writer\ authority · semaphore · lane],
+      fill: reader-colors.surface_soft, stroke: reader-colors.border, width: 34mm),
+    edge((0, 0), (1, 0), "->", stroke: reader-colors.muted),
+    node((1, 0), text(size: 8pt)[*Phase 2*\ acquire cell\ write lock\ (cross-process)],
+      fill: reader-colors.surface_soft, stroke: reader-colors.border, width: 30mm),
+    edge((1, 0), (2, 0), "->", stroke: reader-colors.muted),
+    node((2, 0), text(size: 8pt)[*Phase 3 — serializable txn*\ drop-guard + authority · idempotency\ · epoch · edge state · indexes\ · degree · delta/outbox · idem result],
+      fill: reader-colors.info_soft, stroke: reader-colors.info, width: 58mm, height: 26mm),
+    edge((2, 0), (3, 0), "->", stroke: reader-colors.muted),
+    node((3, 0), text(size: 8pt)[*Phase 4*\ retry on\ conflict / report],
+      fill: reader-colors.surface_soft, stroke: reader-colors.border, width: 28mm),
+    edge((3, 0), (4, 0), "->", stroke: reader-colors.muted),
+    node((4, 0), text(size: 8pt)[release lock],
+      fill: reader-colors.surface_soft, stroke: reader-colors.border, width: 24mm),
+    // commit divider between before / after states
+    edge((2.55, -0.55), (2.55, 1.35), stroke: reader-colors.ok + 1.4pt,
+      label: text(size: 7.5pt, fill: reader-colors.ok)[commit], label-side: left),
+    node((2, 0.95), text(size: 7.5pt)[before: nothing visible],
+      fill: reader-colors.ok_soft, stroke: none),
+    node((3.4, 0.95), text(size: 7.5pt)[after: edge + epoch + indexes\ + delta + idem visible together],
+      fill: reader-colors.ok_soft, stroke: none),
+  ),
+  caption: [One logical edge mutation fans out inside one serializable transaction;
+    nothing is visible before commit, everything after.],
+) <fig-detail02-phases>
 
 `commit_txn_strict` uses durable write options. Write-authoritative shards reject
 configuration that would acknowledge before remote-visible metadata is durable.

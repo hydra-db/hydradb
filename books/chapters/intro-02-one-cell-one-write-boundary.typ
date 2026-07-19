@@ -1,4 +1,5 @@
 #import "../vendor/bookly/src/bookly.typ": *
+#import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
 
 = One Cell, One Write Boundary
 
@@ -32,6 +33,64 @@ The public `write_edge` path in `src/shard/write.rs` crosses several gates:
   ),
   caption: [The write path narrows authority before it changes durable state.],
 ) <tab-write-guards>
+
+#figure(
+  diagram(
+    spacing: (12mm, 7mm),
+    node-stroke: 0.5pt,
+    {
+      let guard(pos, w, body) = node(
+        pos, text(size: 8pt, fill: reader-colors.text, body),
+        fill: reader-colors.surface_soft, stroke: reader-colors.border,
+        shape: fletcher.shapes.rect, corner-radius: 3pt, width: w,
+      )
+      guard((0, 0), 62mm, [writer authority])
+      guard((0, 1), 56mm, [backpressure permit])
+      guard((0, 2), 50mm, [writer lane])
+      guard((0, 3), 44mm, [cell write lock])
+      guard((0, 4), 38mm, [drop-guard + authority])
+      guard((0, 5), 32mm, [serializable transaction])
+      edge((0, 0), (0, 1), "->", stroke: reader-colors.muted)
+      edge((0, 1), (0, 2), "->", stroke: reader-colors.muted)
+      edge((0, 2), (0, 3), "->", stroke: reader-colors.muted)
+      edge((0, 3), (0, 4), "->", stroke: reader-colors.muted)
+      edge((0, 4), (0, 5), "->", stroke: reader-colors.muted)
+      edge((0, 5), (0, 6), "->", stroke: reader-colors.muted)
+      node(
+        (0, 6), text(size: 8pt, fill: reader-colors.text, [durable commit \@ new epoch]),
+        fill: reader-colors.ok_soft, stroke: reader-colors.ok,
+        shape: fletcher.shapes.rect, corner-radius: 3pt, width: 46mm,
+      )
+      node(
+        (2, 5), text(size: 8pt, fill: reader-colors.text, [insert edge 1#sym.arrow.r 2]),
+        fill: reader-colors.info_soft, stroke: reader-colors.info,
+        shape: fletcher.shapes.rect, corner-radius: 3pt, width: 30mm,
+      )
+      let rec(pos, body) = node(
+        pos, text(size: 8pt, fill: reader-colors.text, body),
+        fill: reader-colors.info_soft, stroke: reader-colors.info,
+        shape: fletcher.shapes.rect, corner-radius: 3pt, width: 30mm,
+      )
+      rec((4, 2), [canonical edge])
+      rec((4, 3), [reverse])
+      rec((4, 4), [degree])
+      rec((4, 5), [index])
+      rec((4, 6), [epoch])
+      rec((4, 7), [delta / outbox])
+      rec((4, 8), [idempotency])
+      edge((2, 5), (4, 2), "->", stroke: reader-colors.muted)
+      edge((2, 5), (4, 3), "->", stroke: reader-colors.muted)
+      edge((2, 5), (4, 4), "->", stroke: reader-colors.muted)
+      edge((2, 5), (4, 5), "->", stroke: reader-colors.muted)
+      edge((2, 5), (4, 6), "->", stroke: reader-colors.muted)
+      edge((2, 5), (4, 7), "->", stroke: reader-colors.muted)
+      edge((2, 5), (4, 8), "->", stroke: reader-colors.muted)
+      node((4, 1), text(size: 8pt, fill: reader-colors.muted, [one txn, one epoch]), stroke: none)
+    },
+  ),
+  caption: [Each guard narrows authority; one logical mutation fans out into many
+  records inside a single serializable transaction at one new epoch.],
+) <fig-intro02-funnel>
 
 The layers overlap deliberately. The local lane is cheap. The object-store cell
 write lock coordinates processes. The sole SlateDB writer handle and the cell
