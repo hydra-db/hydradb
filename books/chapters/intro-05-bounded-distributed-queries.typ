@@ -37,6 +37,7 @@ coordinator looks up the cell's owner in `ShardPlacement`, selects a registered
   diagram(
     spacing: (16mm, 10mm),
     node-stroke: 0.5pt,
+    crossing-fill: reader-colors.paper,
     node((0, 1), text(size: 8pt)[coordinator],
       fill: reader-colors.surface_soft, stroke: reader-colors.border,
       shape: fletcher.shapes.rect, corner-radius: 3pt),
@@ -62,6 +63,11 @@ coordinator looks up the cell's owner in `ShardPlacement`, selects a registered
   caption: [The coordinator routes explicit cell legs to their owners, runs them
     concurrently, and merges the returned rows — no global planner or global snapshot.],
 ) <fig-intro05-scatter>
+
+Read it left to right. The coordinator does not plan the split — the caller already
+named the legs — so all it does is look up each leg's owner, run the legs
+concurrently, and merge what comes back. There is no global planner and no global
+snapshot anywhere in the picture, which is also why writes stay with the local owner.
 
 Clients may be in-process implementations — `RoutedGraphCluster` itself
 implements `QueryCellClient` — or, with the `query-transport` feature, TCP

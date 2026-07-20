@@ -34,7 +34,7 @@ building toward — _where does the guarantee stop_? The honest answer is not a 
 proof. It is a stack of layers, each catching a different class of error at a different
 cost, and each with an edge past which it says nothing at all.
 
-#custom-box(title: [Term — Assurance stack], icon: "info", color: purple)[
+#custom-box(title: [Term — Assurance stack], icon: "info")[
   A deliberately layered set of independent techniques, ordered so that each one covers
   the blind spot of the one below it. Lower layers are cheaper and reason exhaustively
   over a small abstract model of the protocol; higher layers are costlier and exercise
@@ -69,6 +69,7 @@ stack and the shape of the whole effort appears at once.
 #figure(
   stack(dir: ttb, spacing: 10pt,
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.7pt + reader-colors.border,
     node-outset: 0pt,
     spacing: (1cm, 0.55cm),
@@ -126,7 +127,7 @@ stack and the shape of the whole effort appears at once.
   caption: [The assurance stack, bottom to top. The base layer checks the concerns the Quint models deliberately exclude, each with its own tool. Above it, three layers reason about turbolay's protocol: simulation _samples_ interleavings, Apalache proves them _exhaustive to a small bound_, and model-based testing shows the _real kernel_ refines the checked model over a bounded corpus. The top band, Jepsen, is dashed because it is future work — no operational histories exist yet. Moving up the stack means moving closer to reality at higher cost and broader fault coverage; moving down means cheaper, more exhaustive reasoning over a smaller abstraction. The dashed enclosure is the edge of what is checked at all; the caption beneath it names what lies outside every layer.],
 ) <fig-ch9-stack>
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   Why layer at all, instead of pushing one technique as far as it will go? Because each
   technique's strength is exactly another's blind spot, and the trade is unavoidable.
   Exhaustive checking is only possible over a _small abstract_ state space — the moment
@@ -166,7 +167,7 @@ The Rust model-based-testing layer changes the subject from the model to the cod
 does not check the model against itself; it checks the _implementation_ against the
 model.
 
-#custom-box(title: [Term — Refinement], icon: "info", color: purple)[
+#custom-box(title: [Term — Refinement], icon: "info")[
   The relation that makes a model-based test meaningful. The real implementation
   _refines_ a model when every behavior the implementation exhibits corresponds to some
   behavior the model allows — the implementation may do more (richer records, real
@@ -235,6 +236,7 @@ any state the model can express.
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.6pt + reader-colors.border,
     node-outset: 0pt,
     spacing: (2.3cm, 1.35cm),

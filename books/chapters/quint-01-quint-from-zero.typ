@@ -8,7 +8,7 @@ snapshot isolation, exactly-once retries, are the kind of thing an English sente
 describe but cannot enforce. This chapter introduces the tool the rest of this part uses to
 turn those sentences into something a machine can check.
 
-#custom-box(title: [Term — Quint], icon: "info", color: purple)[
+#custom-box(title: [Term — Quint], icon: "info")[
   An executable specification language for state machines. You write down the states a system
   can be in and the steps it may take between them, and Quint can then run the specification
   like a program, generate example executions, and, with a backend checker, prove that a
@@ -38,7 +38,7 @@ future refactor makes a retry advance the epoch a second time, the sentence stil
 document, still reads correctly, and is now a lie. English prose specifications rot silently
 because there is no mechanical link between the words and the behavior.
 
-#custom-box(title: [Term — State machine], icon: "info", color: purple)[
+#custom-box(title: [Term — State machine], icon: "info")[
   A description of a system as a set of possible states plus the rules for moving between
   them. It has a starting state and a transition rule that says, given the current state, which
   next states are allowed. Almost any stateful system, a protocol, a database, a UI, can be
@@ -51,7 +51,7 @@ above is not prose; it is a property you can evaluate against actual executions 
 If the model can reach a state where a retry wrote twice, Quint hands you the exact sequence
 of steps that got there.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   An English spec is read by people and enforced by nobody. An executable spec is read by
   people #emph[and] run by a machine. The moment the model and the claimed property disagree,
   the tool produces a concrete counterexample, a specific trace of steps, rather than leaving
@@ -68,6 +68,7 @@ chapter is those three parts and nothing more:
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.6pt + reader-colors.border,
     spacing: (1.6cm, 1.25cm),
     node((0, 0), text(fill: reader-colors.muted, size: 8pt)[start], stroke: none),
@@ -76,7 +77,7 @@ chapter is those three parts and nothing more:
     edge((0, 1), (0, 1), "->", text(fill: reader-colors.muted, size: 8pt)[`step`: fire any one enabled action], bend: 135deg, stroke: reader-colors.muted),
   ),
   caption: [The three moving parts, and how they relate. The *state* is the variables; `init` sets their first values; `step` is a self-transition that carries the state to a next state by firing any one enabled action. Everything in this chapter is one of these three.],
-)
+) <fig-quint01-three-parts>
 
 Let us build all three for the turnstile.
 
@@ -89,6 +90,7 @@ it is a genuine two-state gate, the same shape as many real protocols.
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.6pt + reader-colors.border,
     node-fill: reader-colors.info_soft,
     spacing: (3.2cm, 1.4cm),
@@ -99,7 +101,7 @@ it is a genuine two-state gate, the same shape as many real protocols.
     edge((0, 0), (0, 0), "->", text(fill: reader-colors.muted)[`push` (no-op)], bend: 130deg, stroke: reader-colors.muted),
   ),
   caption: [The turnstile as a state machine. Two states, and three kinds of step. A coin unlocks; a push through an unlocked gate re-locks it; a push against a locked gate changes nothing.],
-)
+) <fig-quint01-turnstile>
 
 We will also make the turnstile count, so that the model has some data in it and not just a
 single flag. It keeps a running tally of coins taken and passes made. That gives us a real
@@ -110,7 +112,7 @@ passes than you paid coins for").
 
 Every Quint file is a `module`. Inside it, the state of the machine is declared with `var`.
 
-#custom-box(title: [Term — State variable], icon: "info", color: purple)[
+#custom-box(title: [Term — State variable], icon: "info")[
   A named piece of the system's memory, declared with `var`. The values of all the state
   variables together are the current state of the machine. Nothing outside the state variables
   persists between steps; if the machine needs to remember something, it must live in a `var`.
@@ -163,7 +165,7 @@ value that `init` then installs. Keep the distinction sharp in your head:
 
 The machine needs somewhere to begin. That is `init`, and it is our first action.
 
-#custom-box(title: [Term — action], icon: "info", color: purple)[
+#custom-box(title: [Term — action], icon: "info")[
   A named rule describing a state transition, declared `action name: bool = all { ... }`. It
   evaluates to a boolean: `true` means "this transition is allowed and here is the resulting
   next state," `false` means "this transition is not possible right now." `init` is the special
@@ -188,7 +190,7 @@ which Quint does not permit.
 
 The odd part is the apostrophe. `locked'`, not `locked`.
 
-#custom-box(title: [Term — Primed variable], icon: "info", color: purple)[
+#custom-box(title: [Term — Primed variable], icon: "info")[
   Inside an action, `x` means the value of state variable `x` in the #emph[current] state, and
   `x'` (pronounced "x prime") means its value in the #emph[next] state, after the transition.
   An assignment `x' = e` says "in the next state, `x` takes the value `e`." An action defines a
@@ -230,7 +232,7 @@ The first line, `locked`, is different in kind from the other three. It has no p
 assignment. It is just a boolean expression over the current state, and because `all { ... }`
 requires every line to hold, it acts as a guard.
 
-#custom-box(title: [Term — guard / precondition], icon: "info", color: purple)[
+#custom-box(title: [Term — guard / precondition], icon: "info")[
   A plain boolean line inside an action's `all { ... }` block, with no primed variable. It is a
   condition on the current state that must be true for the action to be enabled. If the guard is
   false, the whole `all { ... }` is false, so the action simply cannot happen from this state.
@@ -276,7 +278,7 @@ opens a writer still carries every unrelated variable forward with lines like `e
 and `edgePresent' = edgePresent`. It looks verbose, and it is, but it makes every transition
 total and unambiguous: reading one action tells you the fate of the entire state.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   Forcing every action to assign every variable removes a whole class of specification bug: the
   variable you "forgot" to think about. In an imperative program, an omitted update just leaves
   the old value silently. In a state machine used for verification, silence is dangerous, an
@@ -303,7 +305,7 @@ is a logical #emph[or]: the machine takes a step if #emph[any] one of the listed
 fire. From a given state, Quint looks at which of the three actions have a satisfied guard,
 and the step is a nondeterministic choice among exactly those.
 
-#custom-box(title: [Term — Nondeterminism], icon: "info", color: purple)[
+#custom-box(title: [Term — Nondeterminism], icon: "info")[
   A model is nondeterministic when, from one state, more than one next step is allowed and the
   model does not say which is taken. `any { a, b, c }` expresses this directly: whichever of the
   enabled actions could happen, may happen. Nondeterminism is not vagueness; it is coverage. One
@@ -319,7 +321,7 @@ Take the coin, and now the gate is unlocked: `insertCoin` and `pushWhenLocked` f
 what shape the nondeterminism: at every state the set of enabled actions is exactly those
 whose guards hold.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   Nondeterminism is the reason a single tiny model can say something about a whole messy
   reality. A real turnstile is used by thousands of people in an order nobody controls, coins
   and pushes interleaved every possible way. We do not want to write one model per possible
@@ -336,7 +338,7 @@ We have a complete, runnable machine. But a machine that merely runs tells us no
 to state and check things that should always be true of it. The first taste of that is a named
 predicate written with `val`.
 
-#custom-box(title: [Term — State predicate (`val ... : bool`)], icon: "info", color: purple)[
+#custom-box(title: [Term — State predicate (`val ... : bool`)], icon: "info")[
   A named boolean expression over the current state. `val p: bool = ...` gives a name to a
   claim about any state the machine can be in. Evaluated in a given state it is simply true or
   false. Used as a property to check, it asserts that the claim holds in every reachable state.

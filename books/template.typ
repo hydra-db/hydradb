@@ -18,6 +18,45 @@
 // --------------------------------------------------------------------------
 // Shared palette shortcuts (chapters import `accent` / `muted` from here).
 // --------------------------------------------------------------------------
+// Chapter numbering offset by one so the first chapter renders as 0 (see the
+// note in `book` below). Levels below the chapter are passed through unchanged.
+// Defensive: the reader theme's chapter title page and the `part` page both call
+// this through `counter.display`, sometimes before any chapter has incremented
+// the counter, so an empty or already-zero first level must not panic.
+#let zero-based-numbering = (..n) => {
+  let p = n.pos()
+  if p.len() == 0 {
+    ""
+  } else {
+    // "1.1." keeps bookly's trailing period (bookly-environments.typ:21).
+    numbering("1.1.", calc.max(p.at(0) - 1, 0), ..p.slice(1))
+  }
+}
+
+// Figure numbers embed the chapter number, so they need the same offset. This
+// mirrors bookly's own `numbering-fig` (bookly.typ:87-94) with h1 - 1.
+#let zero-based-figure-numbering = n => {
+  let h1 = counter(heading).get().first()
+  numbering(states.num-pattern-fig.get(), calc.max(h1 - 1, 0), n)
+}
+
+// The chapter opener page prints the number alone after the word "Chapter", so
+// it wants a bare "1" pattern — the ToC's trailing period would render as
+// "Chapter 1.".
+#let zero-based-chapter-label = (..n) => {
+  let p = n.pos()
+  if p.len() == 0 {
+    ""
+  } else {
+    numbering("1", calc.max(p.at(0) - 1, 0))
+  }
+}
+
+#let zero-based-equation-numbering = (..n) => {
+  let h1 = counter(heading).get().first()
+  numbering(states.num-pattern-eq.get(), calc.max(h1 - 1, 0), ..n)
+}
+
 #let accent = reader-colors.primary_active
 #let muted = reader-colors.muted
 #let term-bg = reader-colors.purple_soft
@@ -67,6 +106,35 @@
 
   show: front-matter
   show: main-matter
+
+  // --- Zero-based chapter numbering -------------------------------------
+  // The chapter files are named 00-, 01-, ... and every cross-reference in the
+  // prose says "Chapter 0" / "Section 1.8". Bookly (and Typst) number from 1,
+  // which rendered Foundations as "Chapter 1" and left every reference off by
+  // one against the page. Typst counters cannot go negative, so rather than
+  // seeding the counter we subtract one at display time, in four places: the
+  // headings themselves, figures, tables, and the chapter opener label.
+  //
+  // These must come AFTER `main-matter`: it applies its own
+  // `set heading(numbering: "1.1.")` (bookly-environments.typ:21), which would
+  // otherwise win. Figures carry the chapter number too (bookly.typ:87-94 reads
+  // the raw heading counter), so they need the same offset or "Figure 1.1"
+  // would appear inside "Chapter 0".
+  set heading(numbering: zero-based-numbering)
+  // Figures and tables need `show ... : set` rules, not a bare `set figure`:
+  // bookly installs its own `show figure.where(kind: ...)` rules
+  // (bookly.typ:91, 118) and a show rule always beats a set rule.
+  show figure.where(kind: image): set figure(numbering: zero-based-figure-numbering)
+  show figure.where(kind: table): set figure(numbering: zero-based-figure-numbering)
+  set math.equation(numbering: zero-based-equation-numbering)
+  // The reader theme's chapter opener page renders
+  // `counter(heading).display(states.num-heading.get())` (reader.typ:243), so it
+  // needs the offset too or the opener says "Chapter 5" above a chapter the ToC
+  // and running head both call 4. This update MUST come after `main-matter`,
+  // which resets the state to the plain "1" pattern
+  // (bookly-environments.typ:27). Wrapped in `_ => ...` because
+  // `state.update(f)` treats a bare function as an updater (new = f(old)).
+  states.num-heading.update(_ => zero-based-chapter-label)
 
   tableofcontents
   listoffigures

@@ -16,8 +16,8 @@ larger machine.
 
 The book assumes you can read Rust but does not assume you know graph databases,
 log-structured storage, or object stores. Chapter 0 defines every term the later
-chapters use. When a term first appears it is called out in a purple box. Design
-decisions are called out in yellow boxes.
+chapters use. When a term first appears it is called out in a blue box. Design
+decisions are called out in green boxes.
 
 Code shown in the book is quoted from the tree at the commit noted in the build
 file (`README.md`). Line numbers drift as the code changes, so treat them as

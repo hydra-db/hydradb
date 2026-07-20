@@ -34,7 +34,7 @@ that reproduced all of them would be as hard to trust as the code.
 So the model does not reproduce them. It collapses the entire durable transaction into a
 single atomic state update.
 
-#custom-box(title: [Term — Shared-state abstraction], icon: "info", color: purple)[
+#custom-box(title: [Term — Shared-state abstraction], icon: "info")[
   A modeling style in which the whole system is one shared collection of variables, and
   every operation is an atomic transition that reads some of them and writes some of them
   in one indivisible step. There are no threads, no messages in flight, no partial writes.
@@ -52,7 +52,7 @@ atomic state update. They do not model byte encoding, LSM compaction, S3's
 implementation, Rust scheduling, TLS, parsing, or Kubernetes internals.
 ```
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   Why throw away so much? Because each discarded layer has a _better_ test technique than a
   state-machine model, and mixing them in would only dilute the one thing this model is
   good at. The same document pairs every excluded concern with its proper tool: key
@@ -95,7 +95,7 @@ single edge, not a graph. "The normalized projections which must commit together
 handful of variables below are not the graph, they are the _consequences_ a successful
 mutation must produce, reduced to their essence.
 
-#custom-box(title: [Term — Projection], icon: "info", color: purple)[
+#custom-box(title: [Term — Projection], icon: "info")[
   A single derived view of a mutation's effect, reduced to the one fact this model needs to
   check. A real `write_edge` writes an out-adjacency key, an in-adjacency key, two degree
   counters, an outbox delta, owner and pair delta indexes, an idempotency record, and the
@@ -347,7 +347,7 @@ hazard. The durable effect is the same — the edge is present, the degree is 1,
 advanced, the idempotency record is written. What differs is only the caller's knowledge.
 The write happened; the reply did not.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   Why model the lost reply as a separate action rather than a flag on `createEdge`? Because
   it makes the checker enumerate _both_ worlds. In some behaviors the caller learns the
   outcome (`createEdge`); in some it does not (`commitThenLoseReply`). By splitting them into
@@ -519,7 +519,7 @@ The last three actions are the reason the objective document uses the word "fenc
 often, and they are best read as a single three-step story: the owner dies, a replacement
 takes over, and the dead owner — should it wake up — is refused.
 
-#custom-box(title: [Term — Write fence and the zombie writer], icon: "info", color: purple)[
+#custom-box(title: [Term — Write fence and the zombie writer], icon: "info")[
   A write fence is the durable record that names the one legitimate writer of a cell and a
   token that increases each time ownership changes. A _zombie writer_ is a former owner that
   believes it is still the writer — it was paused, or partitioned, and never learned it was
@@ -626,7 +626,7 @@ property 2, "Epoch and fence safety": "A writer whose epoch is no longer current
 a durable mutation or issue a successful outcome," and property 8, "Placement is not
 authority ... the durable writer fence determines the one effective writer."
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   Notice there is no action in this model that lets a fenced writer actually commit. That is
   deliberate: a successful zombie commit would be a _bug_, and this model encodes the correct
   system, in which such a transition does not exist. The safety predicate below even names a
@@ -661,7 +661,7 @@ guards are currently satisfied). This one keyword is what turns a pile of action
 state machine. At every state, Quint asks which of the ten listed actions are enabled (their
 guards hold), and the next state may be the result of any one of them.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   This is why the abstraction is worth the discipline. Because `step` is a nondeterministic
   choice and each action is small, a model checker can explore _every reachable interleaving_
   of these operations: create then crash then takeover then zombie; open, lose a reply, retry,
@@ -696,6 +696,7 @@ discipline, and one picture holds both.
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.6pt + reader-colors.border,
     node-outset: 0pt,
     spacing: (2.3cm, 1.25cm),
@@ -742,6 +743,7 @@ at once, and the checker follows every one of them:
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.6pt + reader-colors.border,
     node-fill: reader-colors.surface_soft,
     node-outset: 0pt,
@@ -764,6 +766,7 @@ create-and-fence storyline is one path down that branching tree:
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.6pt + reader-colors.border,
     node-fill: reader-colors.info_soft,
     node-outset: 0pt,
@@ -784,7 +787,7 @@ create-and-fence storyline is one path down that branching tree:
     edge((2, 2), (0, 2), "->", text(fill: reader-colors.info)[`rejectZombieWrite`], stroke: 0.5pt + reader-colors.info),
   ),
   caption: [One storyline through `step`: acquire, create (or commit-then-lose-reply and retry), crash, take over, and reject the zombie. Every arrow is one action firing because its guards held; the graph projections carry across crash and takeover untouched.],
-)
+) <fig-quint02-storyline>
 
 The diagram is one path; the checker explores all of them. Delete, retry-delete, and
 conflicting-retry rejections branch off the same states wherever their guards permit.

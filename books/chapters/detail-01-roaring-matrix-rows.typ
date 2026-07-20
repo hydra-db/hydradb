@@ -32,6 +32,7 @@ IDs above `u32::MAX` to pin that requirement.
   diagram(
     spacing: (16mm, 9mm),
     node-stroke: 0.5pt,
+    crossing-fill: reader-colors.paper,
     // column headers
     node((0, -0.7), text(size: 8pt, fill: reader-colors.muted)[*Durable — unchanged*], stroke: none),
     node((2, -0.7), text(size: 8pt, fill: reader-colors.muted)[*Hydrated in compute*], stroke: none),

@@ -76,7 +76,7 @@ both live, and whichever writer is named as active is in fact the live one. None
 mentions a sequence of steps or a history; each is a yes-or-no question you could ask about a
 photograph of the fourteen variables. That is what makes them _invariants_.
 
-#custom-box(title: [Term — Invariant (safety predicate)], icon: "info", color: purple)[
+#custom-box(title: [Term — Invariant (safety predicate)], icon: "info")[
   A predicate over a single state — a boolean expression of the model's variables — that must
   evaluate to true in _every state the model can reach_ from `init` by any sequence of
   `step`s. It says "nothing bad is ever the case." An invariant is violated the moment the
@@ -111,7 +111,7 @@ rejected a zombie would be absurd. We want it to be true _somewhere_: there must
 least one reachable state in which it holds, which proves the model can actually get a zombie
 rejected. That is a _witness_.
 
-#custom-box(title: [Term — Reachability witness], icon: "info", color: purple)[
+#custom-box(title: [Term — Reachability witness], icon: "info")[
   A predicate that must be true in _at least one_ reachable state. It witnesses that some
   interesting situation is actually achievable — that a particular action can fire, that a
   particular corner of the state space is not dead code. Where an invariant is a claim of the
@@ -187,7 +187,7 @@ Ten thousand random walks through the write path, each up to twelve `step`s long
 single state along every single walk, all seven safety predicates held at once. That is real
 evidence. It is also, and this matters, _not a proof_.
 
-#custom-box(title: [Term — Bounded simulation], icon: "info", color: purple)[
+#custom-box(title: [Term — Bounded simulation], icon: "info")[
   `quint run` is a _randomized, bounded simulator_. It samples a finite number of behaviors, each
   of finite length, and checks the invariant at each state it happens to visit. It does not
   enumerate every reachable state; it draws a large but incomplete sample of them. A clean
@@ -216,7 +216,7 @@ system never does the bad thing." But there is a second, poisonous explanation f
 check: the bad thing was never _possible_ in your model to begin with, so of course no state
 violated the invariant, and the check told you nothing.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   A predicate is _vacuously true_ when it holds only because its dangerous case never arises.
   `zombieWriteRejected` in `m1_cell_write.qnt:270` reads `not(lastAction == "zombieWrite")` — it
   is false exactly when the last action was a successful zombie write. But look back at the
@@ -246,7 +246,7 @@ action that reaches the forbidden state. Then run the checker on the copy. If th
 teeth, the checker must now _fail_, and hand you a concrete trace of the violation. If instead
 the buggy copy still passes, your invariant was vacuous all along, and you have just caught it.
 
-#custom-box(title: [Term — Buggy twin], icon: "info", color: purple)[
+#custom-box(title: [Term — Buggy twin], icon: "info")[
   A deliberately-broken copy of a model, identical to the intended one except that it adds (or
   un-forbids) a transition the correct model refuses to make — the specific defect an invariant
   is meant to rule out. Its purpose is _negative_: a correct model must pass its invariants, and
@@ -265,7 +265,7 @@ read model, `m2_snapshot_read.qnt`, and only one.
 The read model is about serving _pages_ of query results to a client without lying to it while
 the graph changes underneath. Its central object is a snapshot.
 
-#custom-box(title: [Term — Snapshot], icon: "info", color: purple)[
+#custom-box(title: [Term — Snapshot], icon: "info")[
   One immutable view of the graph, captured at a single committed epoch. Once a snapshot is
   taken, later writes advance the _current_ graph but must not alter what the snapshot shows.
   A reader that pins a snapshot and then reads pages from it sees a stable, self-consistent
@@ -392,7 +392,7 @@ the experiment succeeded: the invariant that sat there looking harmless in the c
 turned out to have real teeth, because the moment we added a transition that could reach the
 forbidden state, it caught it and produced a trace naming the exact culprit.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   A counterexample trace is the most useful thing a checker produces, and it is worth seeing why
   the buggy twin earns one where prose review cannot. A human reading `pageMatchesSnapshot` can
   agree it _looks_ right and still not know whether any reachable state can falsify it. The twin
@@ -414,6 +414,7 @@ _transition_ that makes that state reachable, the edge that crosses out of the s
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.6pt + reader-colors.border,
     node-outset: 0pt,
     spacing: (2.7cm, 1.2cm),
@@ -464,6 +465,7 @@ actually reached" — a place the model must be able to stand, marked below with
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.6pt + reader-colors.border,
     node-outset: 0pt,
     spacing: (2.5cm, 1.15cm),

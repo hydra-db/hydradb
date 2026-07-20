@@ -51,21 +51,22 @@ than the requested read epoch. The shard hydrates it, then
 
 #figure(
   diagram(
-    spacing: (6mm, 9mm),
+    spacing: (4mm, 9mm),
     node-stroke: 0.5pt,
+    crossing-fill: reader-colors.paper,
     // async refresh job — dashed edge over the base artifact
-    edge((0.1, -1), (2.4, -1), "->", stroke: (paint: reader-colors.warn, dash: "dashed"), label: text(size: 8pt, fill: reader-colors.warn)[async refresh job rebuilds the base], label-side: center),
+    edge((0, -1), (5, -1), "->", stroke: (paint: reader-colors.warn, dash: "dashed"), label: text(size: 8pt, fill: reader-colors.warn)[async refresh job rebuilds the base], label-side: center),
     // base matrix artifact (wide, durable)
-    node(enclose: ((0, 0), (2.4, 0)), [matrix artifact — `base_epoch 100`], fill: reader-colors.purple_soft, stroke: reader-colors.purple, corner-radius: 3pt, inset: 8pt),
+    node(enclose: ((0, 0), (1, 0)), [matrix artifact — `base_epoch 100`], fill: reader-colors.purple_soft, stroke: reader-colors.purple, corner-radius: 3pt, inset: 8pt),
     // delta ticks
-    node((3.2, 0), text(size: 8pt)[Δ101], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 2pt, inset: 4pt),
-    node((3.9, 0), text(size: 8pt)[Δ102], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 2pt, inset: 4pt),
-    node((4.6, 0), text(size: 8pt)[…], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 2pt, inset: 4pt),
-    node((5.3, 0), text(size: 8pt)[Δ107], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 2pt, inset: 4pt),
+    node((2, 0), text(size: 8pt)[Δ101], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 2pt, inset: 4pt),
+    node((3, 0), text(size: 8pt)[Δ102], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 2pt, inset: 4pt),
+    node((4, 0), text(size: 8pt)[…], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 2pt, inset: 4pt),
+    node((5, 0), text(size: 8pt)[Δ107], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 2pt, inset: 4pt),
     // read epoch marker
-    node((6.4, 0), text(size: 8pt)[`read_epoch 107`], stroke: reader-colors.primary_active, corner-radius: 2pt, inset: 5pt),
+    node((6, 0), text(size: 8pt)[`read_epoch 107`], fill: reader-colors.warn_soft, stroke: reader-colors.primary_active, corner-radius: 2pt, inset: 5pt),
     // epoch axis
-    edge((-0.4, 0.9), (6.9, 0.9), "->", stroke: reader-colors.muted, label: text(size: 8pt, fill: reader-colors.muted)[epoch], label-side: center),
+    edge((-0.3, 0.9), (6.4, 0.9), "->", stroke: reader-colors.muted, label: text(size: 8pt, fill: reader-colors.muted)[epoch], label-side: center),
     // summary bracket node
     node((3.0, 1.8), text(size: 8pt)[`artifact(100) + deltas(101..107] = answer @ 107`], fill: reader-colors.ok_soft, stroke: reader-colors.ok, corner-radius: 3pt, inset: 7pt),
   ),
@@ -106,6 +107,7 @@ partial history.
   diagram(
     spacing: (7mm, 9mm),
     node-stroke: 0.6pt,
+    crossing-fill: reader-colors.paper,
     node-inset: 7pt,
     node-corner-radius: 3pt,
     // Lane A — SlateDB owns record visibility

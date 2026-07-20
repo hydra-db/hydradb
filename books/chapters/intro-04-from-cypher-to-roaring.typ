@@ -34,6 +34,7 @@ With the `opencypher` feature enabled, a cell-local query moves through:
   diagram(
     spacing: (9mm, 12mm),
     node-stroke: 0.5pt,
+    crossing-fill: reader-colors.paper,
     {
       // pipeline (left to right)
       let pipe = (
@@ -94,6 +95,12 @@ With the `opencypher` feature enabled, a cell-local query moves through:
     access path. Roaring row compression is a planned optimization at the
     hydration seam.],
 ) <fig-intro04-pipeline>
+
+Read the top row left to right: parsing describes the question, and the optimizer
+chooses how to answer it. The row below is the choice itself — the physical access
+paths the executor may pick — and two of them descend into the sparse kernel and
+its two backends. The dashed node is the planned Roaring row compression, which
+attaches at the hydration seam and nowhere else.
 
 The executor can use point reads, label or property indexes, neighbor expansion,
 edge-exists checks, matrix artifacts, and specialized streaming paths.

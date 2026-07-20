@@ -60,6 +60,7 @@ The transaction then performs the logical work:
   diagram(
     spacing: (5mm, 7mm),
     node-stroke: 0.5pt,
+    crossing-fill: reader-colors.paper,
     node-corner-radius: 3pt,
     // Phase flow, left to right
     node((0, 0), text(size: 8pt)[*Phase 1*\ reject wrong writer\ authority · semaphore · lane],

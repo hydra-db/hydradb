@@ -1,16 +1,31 @@
-# Diagram style — both books (conceptual.typ AND inside.typ)
+# Diagram style — all three books (conceptual.typ, inside.typ, quint.typ)
+
+> See also `skills/diagrams/SKILL.md` — the worked technique behind these rules,
+> extracted from the quint book: copy-pasteable snippets per semantic role, the
+> dark-mode failure modes (including the fletcher `crossing-fill: white` bug),
+> and a pre-flight checklist.
 
 ## Intuition-first rule (read this first)
 
 The goal of every diagram is to build a mental model. So:
 
-- **Each diagram must be accompanied by a short 1–3 sentence "how to read it" explanation
-  in prose**, right before or after the figure — in addition to the caption. The caption
-  names the picture; the explanation tells the reader what to take away. Do not leave a
-  diagram to speak for itself.
+- **The caption IS the "how to read it" explanation.** Write a full sentence (sometimes
+  two) stating what the reader should conclude from the picture — not a noun-phrase title
+  naming it. Do not leave a diagram to speak for itself, and do not split the takeaway
+  into a separate block: it goes in `caption:` so it also lands in the List of Figures.
+  There is no `#figcap` in current chapters; if you find one, fold it into the caption.
+  Canonical example — `chapters/intro-00-replaceable-compute.typ:36`:
+
+  ```typ
+  #figure(
+    diagram( ... ),
+    caption: [Memory and local disk make the graph faster, not true: a replacement node
+      rebuilds the same logical state from the same object-store path.],
+  ) <fig-intro00-boundary>
+  ```
 - Prefer a diagram + short explanation over a dense paragraph whenever a concept is
   structural (a boundary, a pipeline, a lifecycle, a merge, a set of tiers).
-- One diagram per chapter minimum. Both books get this treatment. The `inside.typ`
+- One diagram per chapter minimum. All three books get this treatment. The `inside.typ`
   chapters (00–05) already import fletcher and already have some diagrams; ADD or UPGRADE
   so the chapter's **key implementation concept** has an intuition diagram, and make sure
   every diagram has its short explanation. Do not delete correct existing diagrams.
@@ -48,6 +63,9 @@ strokes — the conceptual book's `reader-colors` palette switches with the buil
 
 - Wrap every diagram in a `#figure(...)` with a `caption:` and a `<label>` so it lands
   in the List of Figures. Use one clear label per chapter, e.g. `<fig-intro00-boundary>`.
+  Never `caption: none` — that produces a blank List-of-Figures entry. The label goes
+  immediately after the figure's closing paren. This applies to table and code-listing
+  figures too.
 - Keep node text short (a few words); put the explanation in prose, not the diagram.
 - Prefer a readable grid: `diagram(spacing: (10mm, 8mm), node-stroke: 0.5pt, ...)`.
 - Node helper pattern:

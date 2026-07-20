@@ -46,6 +46,7 @@ matter how many times the anxious client asks again.
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     spacing: (3.0cm, 0.85cm),
     node-stroke: none,
     node((0, 0), text(weight: "bold", fill: reader-colors.text)[Client]),
@@ -62,7 +63,7 @@ matter how many times the anxious client asks again.
   caption: [The unlucky exchange. The write is durable, but its acknowledgement never reaches the client. A correct retry, carrying the same idempotency key `K`, returns the recorded outcome and writes nothing, so the ambiguous result collapses to exactly one edge. The task of this part is to gain confidence that turbolay behaves like this in every ordering, not just this one.],
 ) <fig-lost-reply>
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   This exact hazard is a first-class property in the models, listed as "ambiguous-result recovery
   and idempotency": if a transaction commits but its response is lost, retrying the same idempotency
   key must yield the same logical result without a duplicate edge, degree increment, or delta. It is
@@ -109,7 +110,7 @@ enumerate the scenarios, you write down, once and precisely, what the system is 
 a form small enough that a tool can explore the scenarios for you. This is the domain of formal
 methods.
 
-#custom-box(title: [Term — Formal methods], icon: "info", color: purple)[
+#custom-box(title: [Term — Formal methods], icon: "info")[
   The practice of describing a system, and the properties it must satisfy, in a precise mathematical
   language, so that the description can be analyzed by a tool rather than only read by a human.
   Because the description is exact and executable, a machine can search through system behaviors
@@ -120,7 +121,7 @@ methods.
 The heart of the technique is to stop thinking about the code and start thinking about a _model_ of
 it.
 
-#custom-box(title: [Term — Model], icon: "info", color: purple)[
+#custom-box(title: [Term — Model], icon: "info")[
   A small, deliberately simplified description of a system as a state machine: a notion of what
   counts as the system's state, a set of named actions that carry it from one state to the next, and
   a starting state. The model is not the code. It keeps the behavior that matters for the property
@@ -133,7 +134,7 @@ it.
 A model on its own only describes behavior. To catch bugs you also have to state, separately and
 just as precisely, what must never go wrong.
 
-#custom-box(title: [Term — Safety property], icon: "info", color: purple)[
+#custom-box(title: [Term — Safety property], icon: "info")[
   A claim that something bad never happens: at every reachable state, some condition holds. "The
   graph never contains two edges from one committed create," "a fenced writer never commits," "a
   historical read never mixes state from two storage sequences." A safety property is violated the
@@ -141,7 +142,7 @@ just as precisely, what must never go wrong.
   kind of witness a tool can hunt for.
 ]
 
-#custom-box(title: [Term — Invariant], icon: "info", color: purple)[
+#custom-box(title: [Term — Invariant], icon: "info")[
   A safety property phrased as a predicate on a single state that must hold for _every_ state the
   model can reach. Checking a model reduces to a mechanical question: starting from the initial
   state and applying actions in every possible order, can the model ever reach a state where the
@@ -169,6 +170,7 @@ error the layer below cannot.
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.6pt + reader-colors.border,
     node-fill: reader-colors.info_soft,
     spacing: (0pt, 0.7cm),
@@ -197,7 +199,7 @@ evidence the model is not obviously broken; it is not a proof that no violation 
 
 For that you climb to the second layer, _bounded model checking_.
 
-#custom-box(title: [Term — Bounded model checking], icon: "info", color: purple)[
+#custom-box(title: [Term — Bounded model checking], icon: "info")[
   Exhaustively checking every behavior of a model up to a fixed limit, typically a maximum number of
   actions, or steps. Unlike simulation, which samples paths at random, bounded checking examines all
   of them within the bound. If a safety property can be violated in that many steps, the checker is
@@ -215,7 +217,7 @@ The first two layers reason only about the model. They can prove the intended pr
 self-consistent, and they cannot detect that the real Rust code does something the model never
 described. Closing that gap is the third layer, _model-based testing_.
 
-#custom-box(title: [Term — Model-based testing (MBT)], icon: "info", color: purple)[
+#custom-box(title: [Term — Model-based testing (MBT)], icon: "info")[
   Using the model as an oracle for the real implementation. The checked model generates sequences of
   actions; each action is mapped to a genuine call against the real system; and after every step the
   implementation's observable state is compared against the model's. When they disagree, either the
@@ -269,7 +271,7 @@ published artifact and no active read still needs. And underneath all of it, _pl
 authority_, restated because it is the crux of correct takeover: divergent views of cluster membership
 may produce competing writer candidates, but only the durable fence decides which one is real.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   These claims are scoped to _one cell_ on purpose. turbolay's public surface offers no cross-query,
   cross-cell transaction: an explicit multi-statement Bolt transaction is rejected outright. Write
   throughput is meant to scale by adding cells, not by admitting concurrent writers to a single hot
@@ -315,7 +317,7 @@ operations, not an unbounded graph. "Six transitions checked" is emphatically no
 all graphs of all sizes under all failures." It is a strong statement about a deliberately small
 world.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   Why bounded, then, if it is not a full proof? Because bugs in concurrent, failure-prone protocols
   are overwhelmingly _shallow_: they show up in short sequences of a few operations and a
   well-placed fault, exactly the sequences a small bounded check enumerates exhaustively. A bounded
