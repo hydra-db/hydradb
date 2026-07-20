@@ -13,18 +13,22 @@ kernels, query planner, and operational harnesses.
 
 ## What Is Implemented
 
-- Durable edge writes, deletes, bulk import, trusted segment append, mutation
-  logs, idempotency records, and degree/index maintenance.
-- Per-cell hard write fencing through SlateDB writer epochs and WAL barriers,
-  plus transactional retries for graph mutations.
-- Controllerless routed multi-cell nodes with deterministic rendezvous
-  placement. Kubernetes supplies stable membership and restarts; SlateDB is the
-  final stale-writer correctness boundary.
-- SlateDB snapshot reads for current one-shot queries, retained historical/cursor
-  reads, matrix publication, topology delta GC, matrix artifact GC, and full
-  graph export/verifier digests.
+- Durable edge writes, deletes, bulk import, trusted segment append,
+  idempotency records, and degree/index maintenance.
+- One SlateDB writer and any number of `DbReader` processes per graph store.
+  SlateDB writer epochs, WAL barriers, and serializable transactions provide
+  fencing and commit ordering.
+- Controllerless stateless nodes: every node can read every configured cell;
+  write requests lazily open a cached writer and rely on SlateDB for safety.
+- Query-scoped `DbSnapshot`/`DbReaderSnapshot` reads, immutable graph-index
+  publication, bounded generation GC, and full graph export/verifier digests.
 - Canonical outbound adjacency segments for high-throughput ingestion and one
-  persisted matrix artifact format for sparse traversal.
+  content-addressed CSC graph-index format for sparse traversal.
+- Compute-compute separation: graph nodes serve reads and canonical writes;
+  independent `graph-indexer` workers build CSC generations asynchronously.
+- Causal reads stay entirely on the local reader/cache path. Strong reads first
+  refresh SlateDB from object storage, then pin one snapshot. Both modes combine
+  an indexed base with the committed WAL tail when indexing lags.
 - Sparse traversal through the Rust kernel by default, with optional SuiteSparse
   GraphBLAS FFI for compiled CSC traversal.
 - OpenCypher row query execution behind the `opencypher` feature, including
@@ -44,14 +48,14 @@ kernels, query planner, and operational harnesses.
 ```text
 src/core/        configuration, error types, public model types, cache policy
 src/shard/       GraphShard lifecycle, writes, reads, query execution, maintenance
-src/engine/      matrix artifacts and GC, routed cluster and placement runtime
+src/engine/      immutable graph indexes, GC, routed multi-reader runtime
 src/query/       OpenCypher lowering, algebra, optimizer, transport, TCK parser
 src/client/      shared public query service plus Bolt/TLS and HTTPS adapters
 src/sparse_kernel.rs
                  Rust sparse traversal and optional SuiteSparse GraphBLAS FFI
 examples/        smoke, stress, correctness, benchmark, and profiling binaries
 scripts/         local, MinIO, query, write, stress, and chaos harnesses
-charts/turbolay/ production Helm chart for graph nodes
+charts/turbolay/ production Helm chart for graph nodes and indexer workers
 ```
 
 ## Requirements
@@ -125,7 +129,7 @@ on macOS should be checked locally when those libraries are installed.
 
 ## Kubernetes Deployment
 
-The production Helm chart deploys graph nodes, services, RBAC, network policies,
+The production Helm chart deploys graph nodes, services, network policies,
 disruption budgets, object-store configuration, and optional cert-manager,
 External Secrets, and ServiceMonitor resources. It does not deploy a writable
 separate graph controller database.
@@ -172,6 +176,8 @@ Kubernetes deployment source; environment values live in `hydradb-argocd`.
 | `bolt-server` | Adds the Bolt 5.1-5.4 server and requires TLS unless plaintext is explicitly enabled |
 | `http-api` | Adds the HTTPS typed JSON and NDJSON query API |
 | `public-client-protocols` | Enables both Bolt and HTTPS public adapters |
+| `server-runtime` | Builds the production graph-node service and native query stack |
+| `indexer-runtime` | Builds the independent graph-indexer worker and admin server |
 
 The GraphBLAS path does not depend on a Rust GraphBLAS crate. It links directly
 to the system library with `#[link(name = "graphblas")]`.
@@ -204,6 +210,14 @@ Caching is two-layer:
   hydration concurrency. `GraphMemoryConfig` independently caps compiled
   matrices and all relationship-result cache payloads by resident bytes;
   oversized query results remain correct but are not retained.
+
+Derived topology is not written back into SlateDB. Indexer workers publish
+immutable CSC objects under `_graph_index/<cell>/<edge-type>/generations/` and
+atomically advance a small `current` pointer. Query nodes discover that pointer,
+hydrate the selected generation through the normal object-store/NVMe cache, and
+retain only bounded compiled matrices in memory. Generation GC retains the
+configured number of previous objects and never downloads CSC payloads merely
+to identify their sequence.
 
 ## Falkor S3 Import
 
@@ -278,7 +292,6 @@ Common write paths:
 - `delete_edge`
 - `write_edge_mutations_batch`
 - `ingest_edge_mutations`
-- `append_edge_mutation_log`
 - `bulk_import_edges`, `bulk_import_edges_chunked`
 - `bulk_append_edges_trusted_chunked`
 - `bulk_append_out_adjacency_segment_trusted`
@@ -286,10 +299,10 @@ Common write paths:
 Common read and matrix paths:
 
 - `edge_exists`, `out_neighbors`, `out_degree`
-- `snapshot`, `snapshot_at`
+- `snapshot` (a stable current SlateDB snapshot); `snapshot_at` validates current bookmarks and rejects detached historical replay
 - `build_adjacency_image`, `build_matrix_tiles`
 - `matrix_reachable`, `matrix_reachable_with_kernel`, `direct_snapshot_reachable`
-- `delete_deltas_through_matrix`, `delete_graph_artifacts_before`
+- `delete_graph_artifacts_before`
 - `export_live_graph_digest`, `verify_current_graph`
 
 Minimal local example:
@@ -387,18 +400,31 @@ service to `ClientBoltServer` and `ClientHttpServer`. The shared service:
 - enforces graph and hierarchical namespace grants;
 - applies global and namespace concurrency limits;
 - caps query size, parameter count, page size, and total stream runtime;
-- pins paged reads to one topology cursor and emits scoped graph bookmarks;
+- pins paged reads to one SlateDB storage sequence and emits scoped bookmarks;
 - supports cancellation without letting query ids cross principals or scopes.
+
+There are exactly two read-consistency modes:
+
+- `causal` is the default hot path. It uses the node's current durable reader
+  view and refreshes only when a supplied bookmark requires a newer sequence.
+- `strong` refreshes the SlateDB reader from object storage before pinning the
+  query snapshot, so it observes every durable write committed before that
+  refresh completed. It intentionally pays the object-store freshness check.
+
+HTTPS accepts `"consistency": "causal"` or `"strong"` in the query body. Bolt
+accepts the same value in RUN metadata as `consistency`, or as
+`tx_metadata["turbolay.consistency"]`. Mutation queries reject `strong` because
+write acknowledgement already defines their durable commit point.
 
 Bolt supports `HELLO`, `LOGON`, `LOGOFF`, auto-commit `RUN`, bounded or complete
 `PULL`/`DISCARD`, `RESET`, `GOODBYE`, `ROUTE`, and telemetry acknowledgement.
 Explicit `BEGIN`, `COMMIT`, and `ROLLBACK` are rejected until cross-query
 transaction semantics exist. TLS is required by default. Configure
-`RendezvousBoltRoutingTableProvider` with the same cell and node membership used
-to open `RoutedGraphCluster`; Bolt routing and local ownership then use one
-deterministic placement calculation. If no routing provider or complete static
-routing table is configured, `ROUTE` fails closed; direct `bolt://` sessions
-continue to work.
+`ObjectStoreBoltRoutingTableProvider` advertises every node for reads and one
+stable preferred node for writes. This preserves writer/cache locality only;
+direct writes to another promotable node remain safe because SlateDB owns the
+writer fence. If no routing provider or complete static routing table is
+configured, `ROUTE` fails closed; direct `bolt://` sessions continue to work.
 
 The HTTPS API exposes:
 
@@ -461,22 +487,28 @@ GRAPH_QUERY_BENCH_MAX_GRAPHBLAS_MATRICES=1 \
 just query-bench
 ```
 
-## Storage And Ownership Model
+## Storage And Concurrency Model
 
-The production data path follows a single-writer-per-cell object-store design:
+The production data path follows SlateDB's single-writer, multi-reader model:
 
-1. Kubernetes supplies the configured node identities and restarts failed
-   StatefulSet members.
-2. Rendezvous placement maps each cell to one node without a writable placement
-   database.
-3. The selected node opens that cell's SlateDB writer. SlateDB's writer epoch and
-   WAL barrier fence any stale process that still believes it is the owner.
-4. Current one-shot reads use `DbSnapshot`, so all canonical records and indexes
-   come from one SlateDB sequence without publishing graph coordination records.
-5. A compact graph topology cursor remains for asynchronous GraphBLAS matrices:
-   a query evaluates matrix base `B` plus topology changes `(B, S]`. It is not a
-   second storage MVCC authority.
-6. Public pagination uses bounded server-held result cursors, so continuation
+1. Every node lazily opens a `DbReader` for every configured cell and keeps only
+   disposable memory/NVMe caches locally.
+2. A write-routed node lazily opens and caches the SlateDB writer. SlateDB's
+   writer epoch and WAL barrier fence any competing or stale writer.
+3. Every query pins one `DbSnapshot` or `DbReaderSnapshot`, so canonical records
+   and indexes come from exactly one durable SlateDB storage sequence.
+4. Bookmarks are SlateDB commit sequences. A reader explicitly refreshes and
+   waits until its durable sequence reaches the bookmark before serving data.
+5. Indexer workers pin a durable SlateDB reader snapshot, build one immutable
+   CSC generation, and publish its base sequence plus exact WAL cursor through
+   an object-store compare-and-swap pointer.
+6. Query nodes never rebuild a full topology index. They run GraphBLAS over the
+   discovered base and overlay committed topology changes from the SlateDB WAL
+   through the pinned query sequence. If the required WAL has already been
+   compacted away, the query uses bounded source-scoped canonical reads.
+7. Bolt routing uses one preferred writer address as soft cache affinity and all
+   nodes as readers. It is not a correctness or ownership database.
+8. Public pagination uses bounded server-held result cursors, so continuation
    pages never replay a query or publish graph-owned retention records.
 
 This keeps S3 as the durable source of truth, local SSD/NVMe as SlateDB's block
@@ -492,7 +524,7 @@ coordination code:
 - long-running multi-node and real-S3 soak tests under throttling, latency,
   timeout, restart, and membership-change faults;
 - dashboards and alerts for SlateDB fencing, object-store errors, query latency,
-  memory budgets, matrix lag, and rejected work;
+  memory budgets, graph-index lag, WAL-tail size, and rejected work;
 - an explicit OpenCypher compatibility policy backed by larger TCK reports;
 - deployment certificate rotation, secret management, backup/restore drills,
   and tested rollback procedures.

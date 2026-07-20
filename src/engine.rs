@@ -1,31 +1,28 @@
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use slatedb::object_store::{local::LocalFileSystem, ObjectStore};
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
 
 #[cfg(feature = "graphblas")]
-use crate::sparse_kernel::compile_graphblas_csc;
 use crate::sparse_kernel::{
-    compact_csc_kernel_enabled, compile_graphblas_compact_csc_u32, compile_graphblas_csc_owned,
-    compile_graphblas_matrix, default_matrix_kernel, expand as expand_sparse,
-    expand_compiled_graphblas, graphblas_csc_from_adjacency, CompiledGraphBlasMatrix, GraphBlasCsc,
+    compact_csc_kernel_enabled, compile_graphblas_compact_csc_u32, compile_graphblas_csc,
+    compile_graphblas_csc_owned, compile_graphblas_matrix, expand_compiled_graphblas,
+    CompiledGraphBlasMatrix,
+};
+use crate::sparse_kernel::{
+    default_matrix_kernel, expand as expand_sparse, graphblas_csc_from_adjacency, GraphBlasCsc,
     SparseKernelBackend,
 };
 use crate::{
     decode_edge_record, decode_out_edge_segment, decode_relationship_record, decode_u64,
     encode_vertex_property_value_key, ensure_limit, parse_out_edge_segment_tombstone_key,
-    parse_u64, segment_edge_visible, validate_component, CellWriteLock, DeltaKind, DeltaRecord,
-    EdgeRecord, GraphCacheEntryCounts, GraphCacheKind, GraphCacheMetricsSnapshot,
-    GraphCacheResidentBytes, GraphCorrectnessReport, GraphError, GraphExportDigest,
-    GraphMemoryConfig, GraphOpenOptions, GraphOperationalMetricsSnapshot, GraphScope, GraphShard,
-    GraphWriteBatch, GraphWriteGuard, MatrixAdjacency, MatrixCacheKey, RelationshipId,
-    RelationshipRecord, Result, TopologySequence, VertexId,
+    parse_u64, segment_edge_visible, validate_component, EdgeRecord, GraphCacheEntryCounts,
+    GraphCacheKind, GraphCacheMetricsSnapshot, GraphCacheResidentBytes, GraphCorrectnessReport,
+    GraphError, GraphExportDigest, GraphMemoryConfig, GraphOpenOptions,
+    GraphOperationalMetricsSnapshot, GraphScope, GraphShard, GraphStore, GraphWriteBatch,
+    GraphWriteGuard, LocalWriteGuard, MatrixAdjacency, MatrixCacheKey, RelationshipId,
+    RelationshipRecord, Result, StorageSequence, VertexId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -38,7 +35,7 @@ enum MatrixDirection {
 pub struct MatrixArtifact {
     pub cell_id: String,
     pub edge_type: String,
-    pub base_epoch: TopologySequence,
+    pub base_epoch: StorageSequence,
     pub tile_size: u64,
     pub out_tiles: u64,
     pub transpose_tiles: u64,
@@ -48,7 +45,7 @@ pub struct MatrixArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TraversalBackend {
     DirectSnapshot,
-    MatrixOverlay,
+    MatrixSnapshot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,9 +53,8 @@ pub struct MatrixTraversalResult {
     pub backend: TraversalBackend,
     pub vertices: Vec<VertexId>,
     pub hops: u8,
-    pub base_epoch: TopologySequence,
+    pub base_epoch: StorageSequence,
     pub edge_visits: u64,
-    pub delta_records_applied: u64,
     pub sparse_kernel: SparseKernelBackend,
 }
 
@@ -79,52 +75,17 @@ pub struct GraphCluster {
     feature = "query-transport",
     derive(serde::Serialize, serde::Deserialize)
 )]
-pub struct ShardPlacement {
-    owners: BTreeMap<String, String>,
+pub struct ObjectStoreNodeDirectory {
+    cells: BTreeSet<String>,
+    nodes: BTreeSet<String>,
 }
 
 pub struct RoutedGraphCluster {
     scope: GraphScope,
     local_node_id: String,
-    placement: ShardPlacement,
+    directory: ObjectStoreNodeDirectory,
     shards: BTreeMap<String, Arc<GraphShard>>,
-    writable: bool,
-    maintenance_metrics: Arc<GraphNodeMaintenanceMetrics>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MatrixArtifactRefreshPolicy {
-    pub interval: Duration,
-    pub max_dirty_age: Duration,
-    pub min_epoch_lag: TopologySequence,
-    pub tile_size: u64,
-    pub max_edge_types_per_cycle: usize,
-}
-
-impl Default for MatrixArtifactRefreshPolicy {
-    fn default() -> Self {
-        Self {
-            interval: Duration::from_secs(5),
-            max_dirty_age: Duration::from_secs(30),
-            min_epoch_lag: 1_000,
-            tile_size: 4_096,
-            max_edge_types_per_cycle: 4,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MatrixArtifactRefreshReport {
-    pub dirty_edge_types: u64,
-    pub artifacts_built: u64,
-    pub artifacts_current: u64,
-    pub artifacts_deferred: u64,
-    pub artifact_failures: u64,
-}
-
-pub struct MatrixArtifactRefreshHandle {
-    stop_tx: watch::Sender<bool>,
-    task: JoinHandle<Result<()>>,
+    promotable: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,59 +98,16 @@ pub struct GraphShardRuntimeMetrics {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct GraphNodeMaintenanceMetricsSnapshot {
-    pub matrix_refresh_cycles: u64,
-    pub matrix_refresh_dirty_edge_types: u64,
-    pub matrix_refresh_artifacts_built: u64,
-    pub matrix_refresh_artifacts_deferred: u64,
-    pub matrix_refresh_failures: u64,
-}
-
-#[derive(Default)]
-struct GraphNodeMaintenanceMetrics {
-    matrix_refresh_cycles: AtomicU64,
-    matrix_refresh_dirty_edge_types: AtomicU64,
-    matrix_refresh_artifacts_built: AtomicU64,
-    matrix_refresh_artifacts_deferred: AtomicU64,
-    matrix_refresh_failures: AtomicU64,
-}
-
-impl GraphNodeMaintenanceMetrics {
-    fn snapshot(&self) -> GraphNodeMaintenanceMetricsSnapshot {
-        GraphNodeMaintenanceMetricsSnapshot {
-            matrix_refresh_cycles: self.matrix_refresh_cycles.load(Ordering::Relaxed),
-            matrix_refresh_dirty_edge_types: self
-                .matrix_refresh_dirty_edge_types
-                .load(Ordering::Relaxed),
-            matrix_refresh_artifacts_built: self
-                .matrix_refresh_artifacts_built
-                .load(Ordering::Relaxed),
-            matrix_refresh_artifacts_deferred: self
-                .matrix_refresh_artifacts_deferred
-                .load(Ordering::Relaxed),
-            matrix_refresh_failures: self.matrix_refresh_failures.load(Ordering::Relaxed),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ArtifactGcResult {
     pub deleted_keys: u64,
     pub retained_keys: u64,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DeltaGcResult {
-    pub deleted_delta_keys: u64,
-    pub retained_delta_keys: u64,
-    pub compacted_through_epoch: TopologySequence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MatrixTile {
     cell_id: String,
     edge_type: String,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
     tile_size: u64,
     direction: MatrixDirection,
     tile_row: u64,
@@ -200,7 +118,7 @@ struct MatrixTile {
 struct TraversalVerifyRequest<'a> {
     cell_id: &'a str,
     edge_type: &'a str,
-    read_epoch: TopologySequence,
+    read_epoch: StorageSequence,
     max_hops: u8,
     root_limit: usize,
     edges: &'a [EdgeRecord],
@@ -210,7 +128,7 @@ struct TraversalVerifyRequest<'a> {
 struct GraphBlasCscManifest {
     cell_id: String,
     edge_type: String,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
     chunk_size: u64,
     vertices_len: u64,
     pointers_len: u64,
@@ -266,11 +184,13 @@ impl MatrixRows {
 
 mod artifact_build;
 mod artifact_gc;
-mod artifact_refresh;
 mod cluster;
+mod index_store;
 mod matrix_cache;
 mod traversal;
 mod verify;
+
+pub use index_store::GraphIndexGeneration;
 
 pub fn local_object_store(path: impl AsRef<std::path::Path>) -> Result<Arc<dyn ObjectStore>> {
     Ok(Arc::new(LocalFileSystem::new_with_prefix(path.as_ref())?) as Arc<dyn ObjectStore>)
@@ -280,17 +200,10 @@ pub fn object_store_from_env(env_file: Option<String>) -> Result<Arc<dyn ObjectS
     Ok(slatedb::admin::load_object_store_from_env(env_file)?)
 }
 
-fn rendezvous_score(cell_id: &str, node_id: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    cell_id.hash(&mut hasher);
-    node_id.hash(&mut hasher);
-    hasher.finish()
-}
-
 fn matrix_tiles_from_edges(
     cell_id: &str,
     edge_type: &str,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
     tile_size: u64,
     direction: MatrixDirection,
     edges: &[EdgeRecord],
@@ -333,12 +246,12 @@ fn matrix_tiles_from_edges(
 #[allow(clippy::too_many_arguments)]
 async fn append_matrix_tiles_from_rows(
     shard: &GraphShard,
-    artifact_lock: &CellWriteLock,
+    artifact_lock: &LocalWriteGuard,
     batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
     tile_size: u64,
     direction: MatrixDirection,
     rows: &BTreeMap<VertexId, Vec<VertexId>>,
@@ -402,12 +315,12 @@ async fn append_matrix_tiles_from_rows(
 #[allow(clippy::too_many_arguments)]
 async fn flush_matrix_tile_row(
     shard: &GraphShard,
-    artifact_lock: &CellWriteLock,
+    artifact_lock: &LocalWriteGuard,
     batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
     tile_size: u64,
     direction: MatrixDirection,
     tile_row: u64,
@@ -557,7 +470,7 @@ type RelationshipPropertyIndexEntry = (String, String, VertexId, VertexId, Relat
 fn graph_export_digest(
     cell_id: &str,
     edge_type: &str,
-    read_epoch: TopologySequence,
+    read_epoch: StorageSequence,
     edges: &[EdgeRecord],
 ) -> GraphExportDigest {
     let (out_degrees, in_degrees) = degree_maps(edges);
@@ -575,11 +488,10 @@ fn graph_export_digest(
 fn edge_checksum(edges: &[EdgeRecord]) -> u64 {
     let mut hash = 0xcbf29ce484222325;
     let mut sorted = edges.to_vec();
-    sorted.sort_by_key(|edge| (edge.src, edge.dst, edge.epoch));
+    sorted.sort_by_key(|edge| (edge.src, edge.dst));
     for edge in sorted {
         checksum_u64(&mut hash, edge.src);
         checksum_u64(&mut hash, edge.dst);
-        checksum_u64(&mut hash, edge.epoch);
     }
     hash
 }
@@ -794,38 +706,6 @@ fn naive_reachable(adjacency: &MatrixAdjacency, root: VertexId, hops: u8) -> Vec
     reachable.into_iter().collect()
 }
 
-pub(crate) fn apply_delta_overlay(
-    adjacency: &mut MatrixAdjacency,
-    deltas: Vec<DeltaRecord>,
-    base_epoch: TopologySequence,
-    read_epoch: TopologySequence,
-) -> u64 {
-    let mut applied = 0_u64;
-    for delta in deltas {
-        if delta.edge.epoch <= base_epoch || delta.edge.epoch > read_epoch {
-            continue;
-        }
-        applied = applied.saturating_add(1);
-        match delta.kind {
-            DeltaKind::Plus => {
-                adjacency
-                    .entry(delta.edge.src)
-                    .or_default()
-                    .insert(delta.edge.dst);
-            }
-            DeltaKind::Minus => {
-                if let Some(destinations) = adjacency.get_mut(&delta.edge.src) {
-                    destinations.remove(&delta.edge.dst);
-                    if destinations.is_empty() {
-                        adjacency.remove(&delta.edge.src);
-                    }
-                }
-            }
-        }
-    }
-    applied
-}
-
 fn direction_str(direction: MatrixDirection) -> &'static str {
     match direction {
         MatrixDirection::Out => "out",
@@ -851,14 +731,14 @@ fn parse_last_key_component(key: &str, field: &str) -> Result<u64> {
     parse_u64(key, value, field)
 }
 
-fn matrix_manifest_key(cell_id: &str, edge_type: &str, base_epoch: TopologySequence) -> String {
+fn matrix_manifest_key(cell_id: &str, edge_type: &str, base_epoch: StorageSequence) -> String {
     format!("cell/{cell_id}/artifact/matrix_manifest/{edge_type}/{base_epoch:020}")
 }
 
 pub(crate) fn matrix_cleanup_marker_key(
     cell_id: &str,
     edge_type: &str,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
 ) -> String {
     format!("cell/{cell_id}/meta/matrix_cleanup/{edge_type}/{base_epoch:020}")
 }
@@ -880,9 +760,11 @@ async fn prepare_artifact_build(
     if batch.is_empty() {
         return Ok(());
     }
-    shard
+    let lock = shard.acquire_local_write_guard(cell_id, operation).await?;
+    let result = shard
         .write_graph_batch_strict_guarded(cell_id, operation, guards, batch)
-        .await
+        .await;
+    crate::finish_local_write(lock, result).await
 }
 
 async fn publish_artifact_records_guarded(
@@ -908,11 +790,11 @@ async fn publish_artifact_records_guarded_with_cell_lock(
     cleanup_marker_keys: &[String],
     batch: GraphWriteBatch,
 ) -> Result<()> {
-    let lock = shard.acquire_cell_write_lock(cell_id, operation).await?;
+    let lock = shard.acquire_local_write_guard(cell_id, operation).await?;
     let result =
         publish_artifact_records_guarded(shard, cell_id, operation, cleanup_marker_keys, batch)
             .await;
-    crate::release_cell_write_lock(lock, result).await
+    crate::finish_local_write(lock, result).await
 }
 
 fn matrix_manifest_prefix(cell_id: &str, edge_type: &str) -> String {
@@ -934,7 +816,7 @@ fn matrix_tile_key(tile: &MatrixTile) -> String {
 fn matrix_tile_prefix(
     cell_id: &str,
     edge_type: &str,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
     direction: MatrixDirection,
 ) -> String {
     format!(
@@ -943,7 +825,7 @@ fn matrix_tile_prefix(
     )
 }
 
-fn graphblas_csc_key(cell_id: &str, edge_type: &str, base_epoch: TopologySequence) -> String {
+fn graphblas_csc_key(cell_id: &str, edge_type: &str, base_epoch: StorageSequence) -> String {
     format!("cell/{cell_id}/artifact/graphblas_csc/{edge_type}/{base_epoch:020}")
 }
 
@@ -958,7 +840,7 @@ fn graphblas_csc_chunk_prefix(cell_id: &str, edge_type: &str) -> String {
 fn graphblas_csc_chunk_epoch_prefix(
     cell_id: &str,
     edge_type: &str,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
 ) -> String {
     format!("cell/{cell_id}/artifact/graphblas_csc_chunk/{edge_type}/{base_epoch:020}/")
 }
@@ -966,7 +848,7 @@ fn graphblas_csc_chunk_epoch_prefix(
 fn graphblas_csc_chunk_key(
     cell_id: &str,
     edge_type: &str,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
     field: &str,
     chunk_id: u64,
 ) -> String {
@@ -984,7 +866,7 @@ fn graph_artifact_gc_prefixes(cell_id: &str, edge_type: &str) -> Vec<String> {
     ]
 }
 
-fn graph_artifact_epoch_from_key(key: &str) -> Result<Option<TopologySequence>> {
+fn graph_artifact_epoch_from_key(key: &str) -> Result<Option<StorageSequence>> {
     let parts: Vec<_> = key.split('/').collect();
     let epoch = match parts.as_slice() {
         ["cell", _, "artifact", "matrix_manifest", _, base_epoch] => Some(*base_epoch),
@@ -1004,7 +886,7 @@ const GRAPH_ARTIFACT_GC_BATCH_KEYS: usize = 512;
 #[allow(clippy::too_many_arguments)]
 async fn put_artifact_record(
     shard: &GraphShard,
-    artifact_locks: &[&CellWriteLock],
+    artifact_locks: &[&LocalWriteGuard],
     cell_id: &str,
     operation: &'static str,
     batch: &mut GraphWriteBatch,
@@ -1030,7 +912,7 @@ async fn put_artifact_record(
 
 async fn flush_artifact_put_batch(
     shard: &GraphShard,
-    artifact_locks: &[&CellWriteLock],
+    artifact_locks: &[&LocalWriteGuard],
     cell_id: &str,
     operation: &'static str,
     batch: &mut GraphWriteBatch,
@@ -1044,7 +926,7 @@ async fn flush_artifact_put_batch(
     }
     let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
     shard
-        .write_graph_batch_strict(cell_id, operation, batch_to_write)
+        .write_graph_batch_strict_with_cell_lock(cell_id, operation, batch_to_write)
         .await?;
     for lock in artifact_locks {
         lock.renew().await?;
@@ -1065,7 +947,7 @@ impl MatrixArtifactCleanupResult {
         &mut self,
         cell_id: &str,
         edge_type: &str,
-        base_epoch: TopologySequence,
+        base_epoch: StorageSequence,
         operation: &'static str,
         cleanup_step: &'static str,
         err: &E,
@@ -1090,7 +972,7 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
     shard: &GraphShard,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
     operation: &'static str,
 ) -> MatrixArtifactCleanupResult {
     let mut result = MatrixArtifactCleanupResult::default();
@@ -1115,7 +997,7 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
     }
 
     let artifact_lock = match shard
-        .acquire_matrix_artifact_write_lock(cell_id, edge_type, base_epoch, operation)
+        .acquire_local_artifact_guard(cell_id, edge_type, base_epoch, operation)
         .await
     {
         Ok(lock) => lock,
@@ -1133,7 +1015,7 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
     };
 
     let cleanup_marker_key = matrix_cleanup_marker_key(cell_id, edge_type, base_epoch);
-    let cleanup_token = artifact_lock.owner_token.as_bytes().to_vec();
+    let cleanup_token = artifact_lock.token.as_bytes().to_vec();
     let mut cleanup_claimed = false;
 
     let cleanup_run = async {
@@ -1344,7 +1226,7 @@ pub(crate) async fn cleanup_unpublished_matrix_artifact_epoch(
             );
         }
     }
-    if let Err(err) = crate::release_cell_write_lock(artifact_lock, cleanup_run).await {
+    if let Err(err) = crate::finish_local_write(artifact_lock, cleanup_run).await {
         result.record_error(
             cell_id,
             edge_type,
@@ -1363,12 +1245,12 @@ async fn flush_unpublished_artifact_gc_batch_best_effort(
     shard: &GraphShard,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
     operation: &'static str,
     manifest_key: &str,
     cleanup_marker_key: &str,
     cleanup_token: &[u8],
-    artifact_lock: &crate::CellWriteLock,
+    artifact_lock: &crate::LocalWriteGuard,
     batch: &mut GraphWriteBatch,
     pending_deletes: &mut usize,
     result: &mut MatrixArtifactCleanupResult,
@@ -1425,17 +1307,6 @@ async fn flush_unpublished_artifact_gc_batch_best_effort(
                 base_epoch,
                 operation,
                 "lost_matrix_cleanup_generation",
-                &err,
-            );
-            return false;
-        }
-        Err(err @ GraphError::CellWriteConflict { .. }) => {
-            result.record_error(
-                cell_id,
-                edge_type,
-                base_epoch,
-                operation,
-                "delete_artifact_batch",
                 &err,
             );
             return false;
@@ -1511,12 +1382,12 @@ const GRAPHBLAS_CSC_CHUNK_U64S: usize = 64 * 1024;
 #[allow(clippy::too_many_arguments)]
 async fn append_graphblas_csc_chunks(
     shard: &GraphShard,
-    artifact_lock: &CellWriteLock,
+    artifact_lock: &LocalWriteGuard,
     batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
     csc: &GraphBlasCsc,
 ) -> Result<GraphBlasCscManifest> {
     let vertex_chunks = append_graphblas_csc_field_chunks(
@@ -1573,12 +1444,12 @@ async fn append_graphblas_csc_chunks(
 #[allow(clippy::too_many_arguments)]
 async fn append_graphblas_csc_chunks_from_rows(
     shard: &GraphShard,
-    artifact_lock: &CellWriteLock,
+    artifact_lock: &LocalWriteGuard,
     batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
     rows: &MatrixRows,
 ) -> Result<GraphBlasCscManifest> {
     let vertices = matrix_rows_vertices(rows);
@@ -1687,12 +1558,12 @@ async fn append_graphblas_csc_chunks_from_rows(
 #[allow(clippy::too_many_arguments)]
 async fn append_graphblas_csc_field_chunks(
     shard: &GraphShard,
-    artifact_lock: &CellWriteLock,
+    artifact_lock: &LocalWriteGuard,
     batch: &mut GraphWriteBatch,
     pending_writes: &mut usize,
     cell_id: &str,
     edge_type: &str,
-    base_epoch: TopologySequence,
+    base_epoch: StorageSequence,
     field: &'static str,
     values: &[u64],
 ) -> Result<u64> {
@@ -1779,7 +1650,7 @@ fn decode_graphblas_csc(
     value: &[u8],
     expected_cell_id: &str,
     expected_edge_type: &str,
-    expected_base_epoch: TopologySequence,
+    expected_base_epoch: StorageSequence,
 ) -> Result<GraphBlasCsc> {
     if !value.starts_with(GRAPHBLAS_CSC_MAGIC) {
         return corrupt(key, "expected graphblas_csc1 binary artifact");
@@ -1840,6 +1711,7 @@ fn decode_graphblas_csc_chunk(
     Ok(values)
 }
 
+#[cfg(feature = "graphblas")]
 fn decode_graphblas_csc_chunk_u32(
     key: &str,
     value: &[u8],
@@ -1910,6 +1782,7 @@ fn graphblas_csc_checksum(csc: &GraphBlasCsc) -> u64 {
     hash
 }
 
+#[cfg(feature = "graphblas")]
 fn graphblas_csc_checksum_compact(vertices: &[VertexId], pointers: &[u32], indices: &[u32]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     checksum_u64(&mut hash, 0x01);
@@ -2057,6 +1930,7 @@ fn decode_binary_u64s(
         .collect()
 }
 
+#[cfg(feature = "graphblas")]
 fn decode_binary_u32s_from_u64s(
     key: &str,
     value: &[u8],

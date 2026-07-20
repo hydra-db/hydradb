@@ -4,15 +4,15 @@ use std::time::Duration;
 
 use slatedb::config::{DbReaderOptions, PreloadLevel, Settings};
 use slatedb::object_store::{path::Path, ObjectStore};
-use slatedb::{Db, DbReader};
+use slatedb::{Db, DbReader, DbReaderMode};
 
-use crate::{GraphCachePolicy, Result, TopologySequence};
+use crate::{GraphCachePolicy, Result, StorageSequence};
 
 pub const DEFAULT_TRUSTED_APPEND_CHUNK_EDGES: usize = 4_096;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphLimits {
     pub max_bulk_import_edges: usize,
-    pub max_artifact_source_epochs: TopologySequence,
+    pub max_artifact_source_epochs: StorageSequence,
     pub max_traversal_hops: u8,
     pub max_artifact_build_edges: u64,
     pub max_query_result_vertices: usize,
@@ -99,7 +99,8 @@ impl GraphCacheConfig {
         if let Some(max_cache_size_bytes) = self.object_store_cache_bytes {
             settings.object_store_cache_options.max_cache_size_bytes = Some(max_cache_size_bytes);
         }
-        settings.object_store_cache_options.cache_puts = self.object_store_cache_puts;
+        settings.object_store_cache_options.cache_on_flush = self.object_store_cache_puts;
+        settings.object_store_cache_options.cache_on_compaction = self.object_store_cache_puts;
         if self.preload_sst_on_startup {
             settings
                 .object_store_cache_options
@@ -114,7 +115,8 @@ impl GraphCacheConfig {
         if let Some(max_cache_size_bytes) = self.object_store_cache_bytes {
             options.object_store_cache_options.max_cache_size_bytes = Some(max_cache_size_bytes);
         }
-        options.object_store_cache_options.cache_puts = false;
+        options.object_store_cache_options.cache_on_flush = false;
+        options.object_store_cache_options.cache_on_compaction = false;
         if self.preload_sst_on_startup {
             options
                 .object_store_cache_options
@@ -180,6 +182,7 @@ impl GraphMemoryConfig {
         }
     }
 
+    #[cfg(feature = "graphblas")]
     pub(crate) fn matrix_compilation_permits(&self) -> usize {
         self.max_concurrent_matrix_compilations.max(1)
     }
@@ -333,6 +336,7 @@ pub(crate) async fn open_graph_reader(
     cache.apply_to_reader_options(&mut options);
     Ok(DbReader::builder(path, object_store)
         .with_options(options)
+        .with_reader_mode(DbReaderMode::ManagedCheckpoint)
         .build()
         .await?)
 }

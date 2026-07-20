@@ -288,16 +288,11 @@ async fn main() -> Result<()> {
                         &format!("{node_id}-segment-gc-compact-{src}-{epoch}"),
                     )
                     .await?;
-                let delta_gc = shard
-                    .delete_deltas_through_matrix(&cell_id, &edge_type, epoch)
-                    .await?;
                 println!(
-                    "graph worker segment-gc node={node_id} cell={cell_id} src={src} epoch={} segments_deleted={} tombstones_deleted={} deltas_deleted={} deltas_retained={}",
+                    "graph worker segment-gc node={node_id} cell={cell_id} src={src} epoch={} segments_deleted={} tombstones_deleted={}",
                     compact.compacted_through_epoch,
                     compact.deleted_segment_keys,
-                    compact.deleted_tombstone_keys,
-                    delta_gc.deleted_delta_keys,
-                    delta_gc.retained_delta_keys
+                    compact.deleted_tombstone_keys
                 );
             } else {
                 println!("graph worker segment-gc node={node_id} cell={cell_id} epoch=0 skipped");
@@ -355,14 +350,8 @@ async fn main() -> Result<()> {
                         parse_env_u64("GRAPH_MATRIX_TILE").unwrap_or(4_096),
                     )
                     .await?;
-                let gc = shard
-                    .delete_deltas_through_matrix(&cell_id, &edge_type, epoch)
-                    .await?;
                 println!(
-                    "graph worker delta-gc node={node_id} cell={cell_id} compacted={} deleted={} retained={}",
-                    gc.compacted_through_epoch,
-                    gc.deleted_delta_keys,
-                    gc.retained_delta_keys
+                    "graph worker delta-gc node={node_id} cell={cell_id} epoch={epoch} skipped=no-graph-delta-log"
                 );
             } else {
                 println!("graph worker delta-gc node={node_id} cell={cell_id} epoch=0 skipped");
@@ -388,9 +377,8 @@ async fn main() -> Result<()> {
                     .await?;
                 assert_eq!(direct.vertices, matrix.vertices);
                 println!(
-                    "graph worker reader node={node_id} cell={cell_id} epoch={epoch} hops={hops} vertices={} deltas={}",
-                    matrix.vertices.len(),
-                    matrix.delta_records_applied
+                    "graph worker reader node={node_id} cell={cell_id} epoch={epoch} hops={hops} vertices={}",
+                    matrix.vertices.len()
                 );
             } else {
                 println!("graph worker reader node={node_id} cell={cell_id} epoch=0 skipped");

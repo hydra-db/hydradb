@@ -21,7 +21,6 @@ spec:
         {{- with .Values.node.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-        graph.usecortex.io/serving: "false"
       annotations:
         checksum/runtime-config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
         secret.reloader.stakater.com/reload: {{ printf "%s,%s" (include "turbolay.authSecretName" .) (include "turbolay.publicTlsSecretName" .) | quote }}
