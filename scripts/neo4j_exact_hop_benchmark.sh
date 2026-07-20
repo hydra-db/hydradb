@@ -7,7 +7,7 @@ PORT="${NEO4J_BENCH_PORT:-17688}"
 PASSWORD="${NEO4J_BENCH_PASSWORD:-benchmark-secret}"
 DEGREE="${NEO4J_BENCH_DEGREE:-1000}"
 HOPS="${NEO4J_BENCH_HOPS:-1,3,5,10}"
-MAX_HOP="${NEO4J_BENCH_MAX_HOP:-10}"
+MAX_HOP_INPUT="${NEO4J_BENCH_MAX_HOP:-}"
 REPEATS="${NEO4J_BENCH_REPEATS:-3}"
 WARMUP="${NEO4J_BENCH_WARMUP:-10}"
 SAMPLES="${NEO4J_BENCH_SAMPLES:-100}"
@@ -17,6 +17,83 @@ HEAP="${NEO4J_BENCH_HEAP:-512m}"
 PAGE_CACHE="${NEO4J_BENCH_PAGE_CACHE:-512m}"
 OUTPUT_ROOT="${NEO4J_BENCH_OUTPUT_ROOT:-$HOME/neo4j-exact-hop-degree-${DEGREE}}"
 VENV="${NEO4J_BENCH_VENV:-$HOME/.cache/turbolay-graphblas-benchmark-venv}"
+
+if ! validated_dimensions="$(
+  python3 - \
+    "$PORT" "$DEGREE" "$HOPS" "$MAX_HOP_INPUT" "$REPEATS" "$WARMUP" \
+    "$SAMPLES" "$CONCURRENCY" "$OPERATIONS_PER_WORKER" 2>&1 <<'PY'
+import sys
+
+(
+    port_raw,
+    degree_raw,
+    hops_raw,
+    max_hop_raw,
+    repeats_raw,
+    warmup_raw,
+    samples_raw,
+    concurrency_raw,
+    operations_raw,
+) = sys.argv[1:]
+
+
+def decimal(name: str, raw: str, *, allow_zero: bool = False) -> int:
+    if not raw.isascii() or not raw.isdecimal():
+        raise SystemExit(f"{name} must be an unsigned decimal integer")
+    value = int(raw)
+    if value < (0 if allow_zero else 1):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise SystemExit(f"{name} must be {qualifier}")
+    return value
+
+
+port = decimal("NEO4J_BENCH_PORT", port_raw)
+if port > 65535:
+    raise SystemExit("NEO4J_BENCH_PORT must not exceed 65535")
+degree = decimal("NEO4J_BENCH_DEGREE", degree_raw)
+requested_hops = [
+    decimal("NEO4J_BENCH_HOPS", value.strip())
+    for value in hops_raw.split(",")
+    if value.strip()
+]
+if not requested_hops:
+    raise SystemExit("NEO4J_BENCH_HOPS must contain at least one hop")
+if any(hop > 32 for hop in requested_hops):
+    raise SystemExit("NEO4J_BENCH_HOPS values must not exceed 32")
+
+max_hop = max(requested_hops)
+if max_hop_raw:
+    max_hop = decimal("NEO4J_BENCH_MAX_HOP", max_hop_raw)
+    if max_hop > 32:
+        raise SystemExit("NEO4J_BENCH_MAX_HOP must not exceed 32")
+    if max(requested_hops) > max_hop:
+        raise SystemExit(
+            "NEO4J_BENCH_MAX_HOP must be at least the deepest requested hop"
+        )
+
+decimal("NEO4J_BENCH_REPEATS", repeats_raw)
+decimal("NEO4J_BENCH_WARMUP", warmup_raw, allow_zero=True)
+decimal("NEO4J_BENCH_SAMPLES", samples_raw)
+decimal("NEO4J_BENCH_CONCURRENCY", concurrency_raw)
+decimal("NEO4J_BENCH_OPERATIONS_PER_WORKER", operations_raw)
+
+stride = degree + 1
+largest_vertex_id = max_hop * stride + degree
+if largest_vertex_id > (1 << 63) - 1:
+    raise SystemExit("configured degree and hop depth exceed Neo4j's signed integer IDs")
+
+print(max_hop, stride)
+PY
+)"; then
+  printf '%s\n' "$validated_dimensions" >&2
+  exit 2
+fi
+read -r MAX_HOP ID_STRIDE <<<"$validated_dimensions"
+
+if [[ "${NEO4J_BENCH_VALIDATE_ONLY:-0}" == "1" ]]; then
+  printf 'validated max_hop=%s id_stride=%s\n' "$MAX_HOP" "$ID_STRIDE"
+  exit 0
+fi
 
 container=""
 cleanup() {
@@ -35,7 +112,7 @@ seed_graph() {
   local path="(root)"
   local hop offset
   for ((hop = 1; hop <= MAX_HOP; hop++)); do
-    offset=$((hop * 1000000))
+    offset=$((hop * ID_STRIDE))
     path+="-[:BENCH]->(:BenchNode {id: ${offset} + branch + 1})"
   done
 
