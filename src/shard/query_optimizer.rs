@@ -19,7 +19,7 @@ impl GraphShard {
     pub(crate) async fn explain_row_query_plan_with_stats(
         &self,
         cell_id: &str,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
         query: &ParsedRowQuery,
     ) -> Result<RowQueryPlan> {
         let groups = self
@@ -45,7 +45,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         groups: &[RowMatchGroup],
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Result<Vec<RowMatchGroup>> {
         Ok(self
             .optimize_row_match_group_plans_with_stats(cell_id, groups, read_epoch)
@@ -59,7 +59,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         patterns: &[RowPattern],
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
         initial_bindings: &BTreeSet<String>,
     ) -> Result<Vec<RowPattern>> {
         Ok(self
@@ -75,7 +75,7 @@ impl GraphShard {
         cell_id: &str,
         patterns: &[RowPattern],
         groups: &[RowMatchGroup],
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Result<Vec<OptimizedRowMatchGroup>> {
         if groups.is_empty() {
             let group = RowMatchGroup {
@@ -95,7 +95,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         groups: &[RowMatchGroup],
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Result<Vec<OptimizedRowMatchGroup>> {
         let mut output = Vec::with_capacity(groups.len());
         let mut required_segment = Vec::<(usize, RowMatchGroup)>::new();
@@ -154,7 +154,7 @@ impl GraphShard {
     async fn flush_required_row_groups(
         &self,
         cell_id: &str,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
         required_segment: &mut Vec<(usize, RowMatchGroup)>,
         available_bindings: &mut BTreeSet<String>,
         output: &mut Vec<OptimizedRowMatchGroup>,
@@ -214,7 +214,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         patterns: &[RowPattern],
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
         initial_bindings: &BTreeSet<String>,
     ) -> Result<Vec<OptimizedRowPattern>> {
         let current_epoch = self.current_epoch(cell_id).await?;
@@ -370,7 +370,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         edge: &RowEdgePattern,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
         bound: &BTreeSet<String>,
     ) -> Result<RowQueryAccess> {
         let current_epoch = self.current_epoch(cell_id).await?;
@@ -622,11 +622,11 @@ impl GraphShard {
 #[cfg(feature = "opencypher")]
 fn stats_record_cost_estimate(
     record: &QueryStatsRecord,
-    current_epoch: TopologySequence,
+    current_epoch: StorageSequence,
     fallback: u64,
 ) -> u64 {
     let base = record.count.max(1);
-    if record.is_stale_at(current_epoch, graph_now_millis()) {
+    if record.is_unusable_at(current_epoch, graph_now_millis()) {
         return base.saturating_mul(4).max(fallback);
     }
     base

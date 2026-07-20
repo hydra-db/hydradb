@@ -42,6 +42,10 @@ app.kubernetes.io/component: {{ .component }}
 {{- default (printf "%s-node" (include "turbolay.fullname" .)) .Values.node.serviceAccount.name -}}
 {{- end -}}
 
+{{- define "turbolay.indexerServiceAccountName" -}}
+{{- default (printf "%s-indexer" (include "turbolay.fullname" .)) .Values.indexer.serviceAccount.name -}}
+{{- end -}}
+
 {{- define "turbolay.authSecretName" -}}
 {{- if .Values.auth.existingSecret -}}
 {{- .Values.auth.existingSecret -}}

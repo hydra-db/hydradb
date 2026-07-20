@@ -10,9 +10,6 @@
 {{- if ne (len .Values.graph.cells) 1 -}}
 {{- fail "the production runtime currently exposes exactly one cell per graph scope; deploy another release for another independently writable scope" -}}
 {{- end -}}
-{{- if hasKey .Values.node.podLabels "graph.usecortex.io/serving" -}}
-{{- fail "node.podLabels must not set graph.usecortex.io/serving; the runtime owns this role label" -}}
-{{- end -}}
 {{- if and .Values.tls.public.trustBundle.enabled (not .Values.tls.public.enabled) -}}
 {{- fail "tls.public.trustBundle.enabled requires public TLS" -}}
 {{- end -}}
@@ -20,7 +17,7 @@
 {{- fail "tls.public.trustBundle.namespaceSelector must explicitly select client namespaces" -}}
 {{- end -}}
 {{- if and .Values.networkPolicy.enabled (empty .Values.networkPolicy.httpsEgressTo) -}}
-{{- fail "networkPolicy.httpsEgressTo must restrict Kubernetes API HTTPS egress and, on AWS, S3 and STS egress to private endpoint selectors or non-universal CIDRs" -}}
+{{- fail "networkPolicy.httpsEgressTo must restrict AWS S3 and STS HTTPS egress to private endpoint selectors or non-universal CIDRs" -}}
 {{- end -}}
 {{- if .Values.networkPolicy.enabled -}}
 {{- range $index, $peer := .Values.networkPolicy.httpsEgressTo -}}
@@ -81,4 +78,7 @@
 {{- end -}}
 {{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.podDisruptionBudget.node.minAvailable) (int .Values.node.replicaCount)) -}}
 {{- fail "podDisruptionBudget.node.minAvailable cannot exceed node.replicaCount" -}}
+{{- end -}}
+{{- if and .Values.podDisruptionBudget.enabled .Values.indexer.enabled (gt (int .Values.podDisruptionBudget.indexer.minAvailable) (int .Values.indexer.replicaCount)) -}}
+{{- fail "podDisruptionBudget.indexer.minAvailable cannot exceed indexer.replicaCount" -}}
 {{- end -}}

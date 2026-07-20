@@ -5,10 +5,12 @@ use crate::{
     StaticQueryTransportTlsServerConfigProvider,
 };
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 struct HttpTestClient {
     observed_epochs: Mutex<Vec<Option<u64>>>,
+    refreshes: AtomicU64,
 }
 
 #[async_trait]
@@ -25,7 +27,8 @@ impl QueryCellClient for HttpTestClient {
                 .map(|value| QueryRow::new(vec![QueryValue::Count(value)]))
                 .collect(),
         )
-        .with_read_epoch(11))
+        .with_read_epoch(11)
+        .with_storage_sequence(11))
     }
 
     async fn execute_cypher_rows_page(
@@ -49,11 +52,20 @@ impl QueryCellClient for HttpTestClient {
         ))
     }
 
-    async fn current_graph_epoch(
+    async fn current_storage_sequence(
         &self,
         _scope: &GraphScope,
         _cell_id: &str,
     ) -> Result<Option<u64>> {
+        Ok(Some(11))
+    }
+
+    async fn refresh_storage_sequence(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<u64>> {
+        self.refreshes.fetch_add(1, Ordering::SeqCst);
         Ok(Some(11))
     }
 }
@@ -102,6 +114,7 @@ fn http_parameters_preserve_integer_sign_and_precision() {
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {
         observed_epochs: Mutex::new(Vec::new()),
+        refreshes: AtomicU64::new(0),
     });
     let server = ClientHttpServer::bind(
         "127.0.0.1:0".parse().unwrap(),
@@ -151,9 +164,46 @@ async fn http_api_enforces_auth_scope_and_returns_typed_json() {
 }
 
 #[tokio::test]
+async fn http_strong_consistency_refreshes_the_slatedb_reader() {
+    let backend = Arc::new(HttpTestClient {
+        observed_epochs: Mutex::new(Vec::new()),
+        refreshes: AtomicU64::new(0),
+    });
+    let server = ClientHttpServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        http_service(Arc::clone(&backend)),
+        HttpQueryServerConfig::default()
+            .with_default_page_size(2)
+            .insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}/v1/graphs/social/query",
+            server.local_addr()
+        ))
+        .bearer_auth("http-secret")
+        .header(GRAPH_NAMESPACE_HEADER, "acme")
+        .json(&serde_json::json!({
+            "cell_id": "cell-a",
+            "query_id": "http-strong-query",
+            "query": "MATCH (n {id: 1}) RETURN n.id",
+            "consistency": "strong"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(backend.refreshes.load(Ordering::SeqCst), 1);
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn ndjson_stream_uses_one_snapshot_backed_server_cursor() {
     let backend = Arc::new(HttpTestClient {
         observed_epochs: Mutex::new(Vec::new()),
+        refreshes: AtomicU64::new(0),
     });
     let server = ClientHttpServer::bind(
         "127.0.0.1:0".parse().unwrap(),
@@ -210,6 +260,7 @@ async fn http_api_serves_authenticated_queries_over_https() {
         "127.0.0.1:0".parse().unwrap(),
         http_service(Arc::new(HttpTestClient {
             observed_epochs: Mutex::new(Vec::new()),
+            refreshes: AtomicU64::new(0),
         })),
         HttpQueryServerConfig::default()
             .with_default_page_size(2)

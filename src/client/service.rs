@@ -23,7 +23,7 @@ use crate::{
     validate_component, EdgeMetadata, GraphError, GraphId, GraphScope, NamespaceId, NamespacePath,
     QueryBatchEdge, QueryBatchOperation, QueryBatchRelationship, QueryBatchRelationshipMerge,
     QueryBatchVertex, QueryCancellationToken, QueryColumn, QueryContext, QueryCursorToken,
-    QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow, Result, TopologySequence,
+    QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow, Result, StorageSequence,
     VertexMetadata, VertexPropertyValue,
 };
 
@@ -129,11 +129,11 @@ fn validate_database_name(database: String) -> Result<String> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientBookmark {
     pub target: ClientQueryTarget,
-    pub epoch: TopologySequence,
+    pub epoch: StorageSequence,
 }
 
 impl ClientBookmark {
-    pub fn new(target: ClientQueryTarget, epoch: TopologySequence) -> Self {
+    pub fn new(target: ClientQueryTarget, epoch: StorageSequence) -> Self {
         Self { target, epoch }
     }
 
@@ -173,7 +173,7 @@ impl FromStr for ClientBookmark {
         let cell_id = String::from_utf8(hex_decode(parts[4])?)
             .map_err(|_| invalid_bookmark("cell id is not UTF-8"))?;
         let epoch = parts[5]
-            .parse::<TopologySequence>()
+            .parse::<StorageSequence>()
             .map_err(|_| invalid_bookmark("epoch is not an unsigned integer"))?;
         let namespace = NamespacePath::new(
             namespace
@@ -254,9 +254,22 @@ pub struct ClientQueryRequest {
     pub query_id: String,
     pub query: String,
     pub parameters: BTreeMap<String, QueryParameterValue>,
-    pub read_epoch: Option<TopologySequence>,
+    pub read_epoch: Option<StorageSequence>,
     pub max_runtime_ms: Option<u64>,
     pub bookmark: Option<ClientBookmark>,
+    pub consistency: ClientReadConsistency,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(feature = "query-transport", serde(rename_all = "snake_case"))]
+pub enum ClientReadConsistency {
+    #[default]
+    Causal,
+    Strong,
 }
 
 impl ClientQueryRequest {
@@ -273,6 +286,7 @@ impl ClientQueryRequest {
             read_epoch: None,
             max_runtime_ms: None,
             bookmark: None,
+            consistency: ClientReadConsistency::Causal,
         }
     }
 
@@ -296,7 +310,7 @@ impl ClientQueryRequest {
         self
     }
 
-    pub fn at_epoch(mut self, read_epoch: TopologySequence) -> Self {
+    pub fn at_epoch(mut self, read_epoch: StorageSequence) -> Self {
         self.read_epoch = Some(read_epoch);
         self
     }
@@ -310,13 +324,23 @@ impl ClientQueryRequest {
         self.bookmark = Some(bookmark);
         self
     }
+
+    pub fn with_consistency(mut self, consistency: ClientReadConsistency) -> Self {
+        self.consistency = consistency;
+        self
+    }
+
+    pub fn strong(mut self) -> Self {
+        self.consistency = ClientReadConsistency::Strong;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientQueryResult {
     pub query_id: String,
     pub result: QueryResultSet,
-    pub read_epoch: Option<TopologySequence>,
+    pub read_epoch: Option<StorageSequence>,
     pub bookmark: Option<ClientBookmark>,
 }
 
@@ -324,7 +348,7 @@ pub struct ClientQueryResult {
 pub struct ClientQueryPage {
     pub query_id: String,
     pub page: QueryResultPage,
-    pub read_epoch: Option<TopologySequence>,
+    pub read_epoch: Option<StorageSequence>,
     pub bookmark: Option<ClientBookmark>,
 }
 
@@ -590,7 +614,7 @@ struct ServerQueryCursor {
     parameters: BTreeMap<String, QueryParameterValue>,
     columns: Vec<QueryColumn>,
     rows: VecDeque<QueryRow>,
-    read_epoch: Option<TopologySequence>,
+    read_epoch: Option<StorageSequence>,
     bookmark: Option<ClientBookmark>,
     expires_at: Instant,
     resident_bytes: u64,
@@ -693,20 +717,24 @@ impl ClientQueryService {
     }
 
     pub async fn ensure_bookmark(&self, bookmark: &ClientBookmark) -> Result<()> {
-        let current_epoch = self
+        let current_sequence = self
             .inner
             .client
-            .current_graph_epoch(&bookmark.target.scope, &bookmark.target.cell_id)
+            .wait_for_storage_sequence(
+                &bookmark.target.scope,
+                &bookmark.target.cell_id,
+                bookmark.epoch,
+            )
             .await?
             .ok_or_else(|| GraphError::UnsupportedQuery {
                 dialect: "ClientProtocol",
                 feature: "backend cannot prove bookmark durability".to_string(),
             })?;
-        if current_epoch < bookmark.epoch {
+        if current_sequence < bookmark.epoch {
             return Err(GraphError::SnapshotAhead {
                 cell_id: bookmark.target.cell_id.clone(),
                 read_epoch: bookmark.epoch,
-                current_epoch,
+                current_epoch: current_sequence,
             });
         }
         Ok(())
@@ -794,6 +822,7 @@ impl ClientQueryService {
                 runtime_limit_ms,
                 async {
                     self.validate_bookmark(&request).await?;
+                    self.refresh_strong_read(&request, action).await?;
                     let mut context = query_context(
                         &request,
                         scalar_parameters.clone(),
@@ -815,7 +844,10 @@ impl ClientQueryService {
                         }
                     };
                     let read_epoch = result_read_epoch(&result, action)?;
-                    let bookmark = self.bookmark_after(&request, action, read_epoch).await?;
+                    let storage_sequence = result_storage_sequence(&result, action)?;
+                    let bookmark = self
+                        .bookmark_after(&request, action, storage_sequence)
+                        .await?;
                     Ok(ClientQueryResult {
                         query_id: request.query_id.clone(),
                         result,
@@ -911,6 +943,7 @@ impl ClientQueryService {
                         // one SlateDB DbSnapshot for this complete result.
                         context.read_epoch = None;
                         context.max_result_bytes = Some(self.inner.config.max_cursor_buffer_bytes);
+                        self.refresh_strong_read(&request, action).await?;
                         let result = match batch_operation {
                             Some(operation) => {
                                 self.inner.client.execute_batch(context, operation).await?
@@ -923,7 +956,10 @@ impl ClientQueryService {
                             }
                         };
                         let read_epoch = result_read_epoch(&result, action)?;
-                        let bookmark = self.bookmark_after(&request, action, read_epoch).await?;
+                        let storage_sequence = result_storage_sequence(&result, action)?;
+                        let bookmark = self
+                            .bookmark_after(&request, action, storage_sequence)
+                            .await?;
                         return self
                             .start_server_cursor(
                                 session, &request, result, read_epoch, bookmark, page_size,
@@ -1065,7 +1101,7 @@ impl ClientQueryService {
         session: &ClientQuerySession,
         request: &ClientQueryRequest,
         result: QueryResultSet,
-        read_epoch: Option<TopologySequence>,
+        read_epoch: Option<StorageSequence>,
         bookmark: Option<ClientBookmark>,
         page_size: usize,
     ) -> Result<ClientQueryPage> {
@@ -1085,6 +1121,7 @@ impl ClientQueryService {
             columns,
             rows,
             read_epoch: _,
+            storage_sequence: _,
         } = result;
         let mut remaining = VecDeque::from(rows);
         let page_rows = take_cursor_rows(&mut remaining, page_size);
@@ -1340,21 +1377,46 @@ impl ClientQueryService {
         self.ensure_bookmark(bookmark).await
     }
 
+    async fn refresh_strong_read(
+        &self,
+        request: &ClientQueryRequest,
+        action: QueryTransportAction,
+    ) -> Result<()> {
+        if request.consistency != ClientReadConsistency::Strong {
+            return Ok(());
+        }
+        if action != QueryTransportAction::Read {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "ClientProtocol",
+                feature: "strong consistency applies only to read queries".to_string(),
+            });
+        }
+        self.inner
+            .client
+            .refresh_storage_sequence(&request.target.scope, &request.target.cell_id)
+            .await?
+            .ok_or_else(|| GraphError::UnsupportedQuery {
+                dialect: "ClientProtocol",
+                feature: "backend cannot refresh the latest durable SlateDB frontier".to_string(),
+            })?;
+        Ok(())
+    }
+
     async fn bookmark_after(
         &self,
         request: &ClientQueryRequest,
         action: QueryTransportAction,
-        read_epoch: Option<TopologySequence>,
+        read_storage_sequence: Option<StorageSequence>,
     ) -> Result<Option<ClientBookmark>> {
-        let epoch = if action == QueryTransportAction::Read {
-            read_epoch
+        let sequence = if action == QueryTransportAction::Read {
+            read_storage_sequence
         } else {
             self.inner
                 .client
-                .current_graph_epoch(&request.target.scope, &request.target.cell_id)
+                .current_storage_sequence(&request.target.scope, &request.target.cell_id)
                 .await?
         };
-        Ok(epoch.map(|epoch| ClientBookmark::new(request.target.clone(), epoch)))
+        Ok(sequence.map(|sequence| ClientBookmark::new(request.target.clone(), sequence)))
     }
 
     async fn begin_query(&self, key: ClientQueryKey) -> Result<(u64, QueryCancellationToken)> {
@@ -1565,7 +1627,7 @@ fn query_rows_resident_bytes(rows: &VecDeque<QueryRow>) -> u64 {
 fn result_read_epoch(
     result: &QueryResultSet,
     action: QueryTransportAction,
-) -> Result<Option<TopologySequence>> {
+) -> Result<Option<StorageSequence>> {
     if action != QueryTransportAction::Read {
         return Ok(None);
     }
@@ -1575,6 +1637,22 @@ fn result_read_epoch(
         .ok_or_else(|| GraphError::CorruptValue {
             key: "client/query/read_epoch".to_string(),
             reason: "read query result did not report its storage snapshot epoch".to_string(),
+        })
+}
+
+fn result_storage_sequence(
+    result: &QueryResultSet,
+    action: QueryTransportAction,
+) -> Result<Option<StorageSequence>> {
+    if action != QueryTransportAction::Read {
+        return Ok(None);
+    }
+    result
+        .storage_sequence
+        .map(Some)
+        .ok_or_else(|| GraphError::CorruptValue {
+            key: "client/query/storage_sequence".to_string(),
+            reason: "read query result did not report its SlateDB snapshot sequence".to_string(),
         })
 }
 
@@ -1592,6 +1670,9 @@ fn query_context(
     }
     if let Some(max_runtime_ms) = request.max_runtime_ms {
         context = context.with_timeout_ms(max_runtime_ms);
+    }
+    if request.consistency == ClientReadConsistency::Strong {
+        context = context.with_refreshed_reader();
     }
     context
 }

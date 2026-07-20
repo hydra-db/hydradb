@@ -100,6 +100,22 @@ impl GraphShard {
         .await
     }
 
+    pub(crate) async fn open_promotable_with_memory_options(
+        path: impl Into<Path>,
+        object_store: Arc<dyn ObjectStore>,
+        options: GraphOpenOptions,
+        memory: GraphMemoryConfig,
+    ) -> Result<Self> {
+        Self::open_internal(
+            path,
+            object_store,
+            options,
+            memory,
+            GraphWriteAuthority::Promotable,
+        )
+        .await
+    }
+
     async fn open_internal(
         path: impl Into<Path>,
         object_store: Arc<dyn ObjectStore>,
@@ -112,38 +128,34 @@ impl GraphShard {
         {
             return Err(GraphError::UnsafeDurabilityConfig {
                 operation: "open_write_authoritative_shard",
-                reason: "graph writers allocate epochs from remote-visible metadata; relaxed durability can release cross-process fences before last_epoch, degree counters, and idempotency keys are visible".to_string(),
+                reason: "graph writes rely on remotely durable SlateDB sequences, degree counters, and idempotency records".to_string(),
             });
         }
 
         let store_path = path.into();
-        let db = match &write_authority {
-            GraphWriteAuthority::ReadOnly => GraphStore::Reader(Arc::new(
-                open_graph_reader(
-                    store_path.clone(),
-                    Arc::clone(&object_store),
-                    &options.cache,
-                )
-                .await?,
-            )),
-            GraphWriteAuthority::Writer => GraphStore::Writer(
-                open_graph_db(
-                    store_path.clone(),
-                    Arc::clone(&object_store),
-                    &options.cache,
-                    &memory.storage,
-                    &options.durability,
-                )
-                .await?,
-            ),
-        };
-        ensure_store_format(&db, &write_authority).await?;
+        let db = GraphStore::lazy(
+            store_path.clone(),
+            Arc::clone(&object_store),
+            options.cache.clone(),
+            memory.storage.clone(),
+            options.durability.clone(),
+        );
+        match &write_authority {
+            GraphWriteAuthority::ReadOnly => {
+                db.open_reader().await?;
+            }
+            GraphWriteAuthority::Promotable => {}
+            GraphWriteAuthority::Writer => {
+                db.promote_writer().await?;
+            }
+        }
         let cache_policy = options.cache_policy;
         let backpressure_policy = options.backpressure_policy;
         let tenant_quota = cache_policy.max_entries_per_cell;
         let cache_metrics = Arc::new(GraphCacheMetrics::default());
         let operation_metrics = Arc::new(GraphOperationalMetrics::default());
         let hydration_gate = Arc::new(Semaphore::new(cache_policy.hydration_permits()));
+        #[cfg(feature = "graphblas")]
         let matrix_compilation_gate = Arc::new(Semaphore::new(memory.matrix_compilation_permits()));
         let graph_write_gate = Arc::new(Semaphore::new(
             backpressure_policy.max_concurrent_graph_writes.max(1),
@@ -156,13 +168,12 @@ impl GraphShard {
         ));
         Ok(Self {
             db,
-            object_store,
-            store_path,
             limits: options.limits,
             cache_policy: cache_policy.clone(),
             cache_metrics,
             operation_metrics,
             hydration_gate,
+            #[cfg(feature = "graphblas")]
             matrix_compilation_gate,
             graph_write_gate,
             artifact_build_gate,
@@ -170,11 +181,14 @@ impl GraphShard {
             index_policy: options.index_policy,
             await_durable_writes: options.durability.await_durable_writes,
             write_authority,
+            local_write_guard: Arc::new(Mutex::new(())),
+            local_artifact_guard: Arc::new(Mutex::new(())),
             writer_lanes: (0..GRAPH_WRITE_LANES).map(|_| Mutex::new(())).collect(),
             matrix_artifact_cache: Mutex::new(BoundedGraphCache::new(
                 cache_policy.max_matrix_artifacts,
                 tenant_quota,
             )),
+            graph_index_generations: Mutex::new(BTreeMap::new()),
             matrix_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_matrix_adjacencies,
                 tenant_quota,
@@ -236,89 +250,35 @@ impl GraphShard {
         &self.writer_lanes[writer_lane_index(cell_id)]
     }
 
-    pub(crate) fn cell_write_lock_path(&self, cell_id: &str) -> Path {
-        let db_path = if self.store_path.as_ref().is_empty() {
-            "__root__"
-        } else {
-            self.store_path.as_ref()
-        };
-        Path::from_iter(["__slatedb_graph_kernel", "write_locks", db_path, cell_id])
-    }
-
-    pub(crate) fn graph_artifact_write_lock_path(
-        &self,
-        artifact_kind: &'static str,
-        cell_id: &str,
-        edge_type: &str,
-        base_epoch: TopologySequence,
-    ) -> Path {
-        let db_path = if self.store_path.as_ref().is_empty() {
-            "__root__"
-        } else {
-            self.store_path.as_ref()
-        };
-        let base_epoch = format!("{base_epoch:020}");
-        let lock_namespace = match artifact_kind {
-            "matrix" => "matrix_artifact_locks",
-            _ => "artifact_locks",
-        };
-        Path::from_iter([
-            "__slatedb_graph_kernel",
-            lock_namespace,
-            db_path,
-            cell_id,
-            edge_type,
-            &base_epoch,
-        ])
-    }
-
-    pub(crate) fn matrix_artifact_write_lock_path(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        base_epoch: TopologySequence,
-    ) -> Path {
-        self.graph_artifact_write_lock_path("matrix", cell_id, edge_type, base_epoch)
-    }
-
-    pub(crate) async fn acquire_cell_write_lock(
+    pub(crate) async fn acquire_local_write_guard(
         &self,
         cell_id: &str,
         operation: &'static str,
-    ) -> Result<CellWriteLock> {
-        let path = self.cell_write_lock_path(cell_id);
-        self.acquire_write_lock_at_path(path, cell_id, operation)
-            .await
+    ) -> Result<LocalWriteGuard> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("operation", operation)?;
+        let guard = LocalWriteGuard::new(Arc::clone(&self.local_write_guard).lock_owned().await);
+        self.db.refresh_writer_fence().await?;
+        Ok(guard)
     }
 
-    pub(crate) async fn acquire_matrix_artifact_write_lock(
+    pub(crate) async fn acquire_local_artifact_guard(
         &self,
         cell_id: &str,
         edge_type: &str,
-        base_epoch: TopologySequence,
+        _base_epoch: StorageSequence,
         operation: &'static str,
-    ) -> Result<CellWriteLock> {
+    ) -> Result<LocalWriteGuard> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        let path = self.matrix_artifact_write_lock_path(cell_id, edge_type, base_epoch);
-        self.acquire_write_lock_at_path(path, cell_id, operation)
-            .await
-    }
-
-    async fn acquire_write_lock_at_path(
-        &self,
-        path: Path,
-        cell_id: &str,
-        operation: &'static str,
-    ) -> Result<CellWriteLock> {
-        acquire_distributed_write_lock(
-            Arc::clone(&self.object_store),
-            path,
-            cell_id,
-            operation,
-            GRAPH_CELL_WRITE_LOCK_TTL_MS,
-        )
-        .await
+        validate_component("operation", operation)?;
+        let guard = Arc::clone(&self.local_artifact_guard)
+            .try_lock_owned()
+            .map_err(|_| GraphError::ConditionalWriteConflict {
+                operation,
+                key: format!("local-artifact/{cell_id}/{edge_type}"),
+            })?;
+        Ok(LocalWriteGuard::new(guard))
     }
 
     pub async fn graph_cache_entry_counts(&self) -> GraphCacheEntryCounts {
@@ -451,8 +411,26 @@ impl GraphShard {
                 operation,
                 cell_id: cell_id.to_string(),
             }),
-            GraphWriteAuthority::Writer => self.db.writer().map(|_| ()),
+            GraphWriteAuthority::Promotable | GraphWriteAuthority::Writer => {
+                self.db.writer().map(|_| ())
+            }
         }
+    }
+
+    pub(crate) async fn promote_to_writer(
+        &self,
+        cell_id: &str,
+        operation: &'static str,
+    ) -> Result<()> {
+        validate_component("cell_id", cell_id)?;
+        if matches!(&self.write_authority, GraphWriteAuthority::ReadOnly) {
+            return Err(GraphError::WriteRequiresWriter {
+                operation,
+                cell_id: cell_id.to_string(),
+            });
+        }
+        self.db.promote_writer().await?;
+        Ok(())
     }
 
     pub(crate) async fn validate_write_fence_txn(
@@ -481,6 +459,7 @@ impl GraphShard {
         cell_id: &str,
         operation: &'static str,
     ) -> Result<()> {
+        self.db.refresh_writer_fence().await?;
         let txn = self
             .db
             .writer()?
@@ -573,22 +552,21 @@ impl GraphShard {
     }
 
     pub async fn snapshot(&self, cell_id: &str) -> Result<GraphSnapshot<'_>> {
+        self.snapshot_for_query(cell_id, false).await
+    }
+
+    pub(crate) async fn snapshot_for_query(
+        &self,
+        cell_id: &str,
+        refreshed_reader: bool,
+    ) -> Result<GraphSnapshot<'_>> {
         validate_component("cell_id", cell_id)?;
-        let storage_snapshot = self.db.snapshot().await?;
-        let read_epoch = if let Some(snapshot) = storage_snapshot.as_ref() {
-            let key = keys::last_epoch(cell_id);
-            match snapshot
-                .get_with_options(key.as_bytes(), &remote_read_options())
-                .await?
-            {
-                Some(value) => decode_u64(&key, &value)?,
-                None => 0,
-            }
+        let storage_snapshot = if refreshed_reader {
+            self.db.reader_snapshot().await?
         } else {
-            // DbReader pins a checkpoint/manifest even though this SlateDB
-            // revision does not expose a DbSnapshot handle for it.
-            self.current_epoch(cell_id).await?
+            self.db.snapshot().await?
         };
+        let read_epoch = storage_snapshot.seq();
         Ok(GraphSnapshot {
             shard: self,
             cell_id: cell_id.to_string(),
@@ -597,10 +575,52 @@ impl GraphShard {
         })
     }
 
+    pub async fn current_storage_sequence(&self, cell_id: &str) -> Result<StorageSequence> {
+        validate_component("cell_id", cell_id)?;
+        self.db.durable_sequence().await
+    }
+
+    pub async fn refresh_storage_sequence(&self, cell_id: &str) -> Result<StorageSequence> {
+        validate_component("cell_id", cell_id)?;
+        self.ensure_cell_readable(cell_id, "refresh_storage_sequence")
+            .await?;
+        self.db.refresh_durable_reader().await
+    }
+
+    pub async fn wait_for_storage_sequence(
+        &self,
+        cell_id: &str,
+        minimum: StorageSequence,
+    ) -> Result<StorageSequence> {
+        validate_component("cell_id", cell_id)?;
+        let current = self.db.durable_sequence().await?;
+        if current >= minimum {
+            return Ok(current);
+        }
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(
+                self.limits.max_query_runtime_ms.unwrap_or(30_000).max(1),
+            );
+        loop {
+            let current = self.db.refresh_durable_reader().await?;
+            if current >= minimum {
+                return Ok(current);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(GraphError::SnapshotAhead {
+                    cell_id: cell_id.to_string(),
+                    read_epoch: minimum,
+                    current_epoch: current,
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     pub async fn snapshot_at(
         &self,
         cell_id: &str,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Result<GraphSnapshot<'_>> {
         validate_component("cell_id", cell_id)?;
         let current_epoch = self.current_epoch(cell_id).await?;
