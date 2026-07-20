@@ -101,6 +101,34 @@ node:
   nodeSelector: {}
   extraEnv: []
 
+indexer:
+  enabled: true
+  replicaCount: 1
+  intervalMs: 5000
+  retainPreviousGenerations: 1
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  priorityClassName: ""
+  terminationGracePeriodSeconds: 60
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+      ephemeral-storage: 2Gi
+    limits:
+      cpu: "8"
+      memory: 16Gi
+      ephemeral-storage: 8Gi
+  affinity: {}
+  topologySpreadConstraints: []
+  tolerations: []
+  nodeSelector: {}
+  extraEnv: []
+
 service:
   advertisedBoltAddress: ""
   bolt:
@@ -118,6 +146,7 @@ service:
 runtime:
   rustLog: info,slatedb_graph_kernel=info
   maxConcurrentQueries: 256
+  maxQueryScanEdges: 1000000
   maxQueryRuntimeMs: 30000
   maxServerCursors: 1024
   maxCursorBufferBytes: 67108864
@@ -138,21 +167,15 @@ runtime:
   maxRelationshipPropertyRowsBytes: 16777216
   maxConcurrentHydrations: 2
   maxConcurrentMatrixCompilations: 1
-  matrixAutoRefreshEnabled: true
-  matrixRefreshIntervalMs: 5000
-  matrixRefreshMaxDirtyMs: 30000
-  matrixRefreshMinEpochLag: 1000
-  matrixRefreshTileSize: 4096
-  matrixRefreshMaxEdgeTypesPerCycle: 4
+  indexDiscoveryIntervalMs: 5000
   trimMemoryAfterHydration: true
 
 podDisruptionBudget:
   enabled: true
   node:
     minAvailable: 1
-
-rbac:
-  create: true
+  indexer:
+    minAvailable: 1
 
 networkPolicy:
   enabled: true

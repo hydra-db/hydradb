@@ -106,6 +106,7 @@ pub(crate) fn expand(
     }
 }
 
+#[cfg(all(test, feature = "graphblas"))]
 pub(crate) fn expand_range(
     adjacency: &Adjacency,
     starts: &[VertexId],
@@ -129,22 +130,17 @@ pub(crate) use graphblas::CompiledGraphBlasMatrix;
 #[cfg(not(feature = "graphblas"))]
 pub(crate) struct CompiledGraphBlasMatrix;
 
-#[cfg(not(feature = "graphblas"))]
-impl CompiledGraphBlasMatrix {
-    pub(crate) fn estimated_resident_bytes(&self) -> usize {
-        0
-    }
-}
-
+#[cfg(feature = "graphblas")]
 pub(crate) fn compile_graphblas_matrix(adjacency: &Adjacency) -> Result<CompiledGraphBlasMatrix> {
     compile_graphblas(adjacency)
 }
 
-#[cfg_attr(not(feature = "graphblas"), allow(dead_code))]
+#[cfg(feature = "graphblas")]
 pub(crate) fn compile_graphblas_csc(csc: &GraphBlasCsc) -> Result<CompiledGraphBlasMatrix> {
     compile_graphblas_from_csc(csc)
 }
 
+#[cfg(feature = "graphblas")]
 pub(crate) fn compile_graphblas_csc_owned(csc: GraphBlasCsc) -> Result<CompiledGraphBlasMatrix> {
     compile_graphblas_from_csc_owned(csc)
 }
@@ -154,11 +150,6 @@ pub(crate) fn compact_csc_kernel_enabled() -> bool {
     graphblas::use_compact_csc_kernel()
 }
 
-#[cfg(not(feature = "graphblas"))]
-pub(crate) fn compact_csc_kernel_enabled() -> bool {
-    false
-}
-
 #[cfg(feature = "graphblas")]
 pub(crate) fn compile_graphblas_compact_csc_u32(
     vertices: Vec<VertexId>,
@@ -166,18 +157,6 @@ pub(crate) fn compile_graphblas_compact_csc_u32(
     indices: Vec<u32>,
 ) -> Result<CompiledGraphBlasMatrix> {
     graphblas::CompiledGraphBlasMatrix::new_from_compact_u32(vertices, pointers, indices)
-}
-
-#[cfg(not(feature = "graphblas"))]
-pub(crate) fn compile_graphblas_compact_csc_u32(
-    _vertices: Vec<VertexId>,
-    _pointers: Vec<u32>,
-    _indices: Vec<u32>,
-) -> Result<CompiledGraphBlasMatrix> {
-    Err(crate::GraphError::SparseKernel {
-        backend: "SuiteSparseGraphBlas",
-        reason: "crate was built without the graphblas feature".to_string(),
-    })
 }
 
 pub(crate) fn graphblas_csc_from_adjacency(adjacency: &Adjacency) -> Result<GraphBlasCsc> {
@@ -221,6 +200,7 @@ fn csc_vertex_ordinal(vertices: &[VertexId], vertex: VertexId, role: &str) -> Re
         })
 }
 
+#[cfg(feature = "graphblas")]
 pub(crate) fn expand_compiled_graphblas(
     compiled: &CompiledGraphBlasMatrix,
     adjacency: &Adjacency,
@@ -228,6 +208,15 @@ pub(crate) fn expand_compiled_graphblas(
     hops: u8,
 ) -> Result<SparseTraversal> {
     expand_graphblas_compiled(compiled, adjacency, starts, hops)
+}
+
+#[cfg(feature = "graphblas")]
+pub(crate) fn compiled_graphblas_contains_edge(
+    compiled: &CompiledGraphBlasMatrix,
+    src: VertexId,
+    dst: VertexId,
+) -> bool {
+    compiled.contains_edge(src, dst)
 }
 
 #[cfg(feature = "graphblas")]
@@ -304,6 +293,7 @@ fn expand_rust(adjacency: &Adjacency, starts: &[VertexId], hops: u8) -> SparseTr
     }
 }
 
+#[cfg(all(test, feature = "graphblas"))]
 fn expand_range_rust(
     adjacency: &Adjacency,
     starts: &[VertexId],
@@ -379,50 +369,8 @@ fn expand_graphblas(
 }
 
 #[cfg(not(feature = "graphblas"))]
-fn expand_range_graphblas(
-    _adjacency: &Adjacency,
-    _starts: &[VertexId],
-    _min_hops: u8,
-    _max_hops: u8,
-) -> Result<SparseTraversal> {
-    Err(crate::GraphError::SparseKernel {
-        backend: "SuiteSparseGraphBlas",
-        reason: "crate was built without the graphblas feature".to_string(),
-    })
-}
-
-#[cfg(not(feature = "graphblas"))]
-fn compile_graphblas(_adjacency: &Adjacency) -> Result<CompiledGraphBlasMatrix> {
-    Err(crate::GraphError::SparseKernel {
-        backend: "SuiteSparseGraphBlas",
-        reason: "crate was built without the graphblas feature".to_string(),
-    })
-}
-
-#[cfg(not(feature = "graphblas"))]
 #[allow(dead_code)]
 fn compile_graphblas_from_csc(_csc: &GraphBlasCsc) -> Result<CompiledGraphBlasMatrix> {
-    Err(crate::GraphError::SparseKernel {
-        backend: "SuiteSparseGraphBlas",
-        reason: "crate was built without the graphblas feature".to_string(),
-    })
-}
-
-#[cfg(not(feature = "graphblas"))]
-fn compile_graphblas_from_csc_owned(_csc: GraphBlasCsc) -> Result<CompiledGraphBlasMatrix> {
-    Err(crate::GraphError::SparseKernel {
-        backend: "SuiteSparseGraphBlas",
-        reason: "crate was built without the graphblas feature".to_string(),
-    })
-}
-
-#[cfg(not(feature = "graphblas"))]
-fn expand_graphblas_compiled(
-    _compiled: &CompiledGraphBlasMatrix,
-    _adjacency: &Adjacency,
-    _starts: &[VertexId],
-    _hops: u8,
-) -> Result<SparseTraversal> {
     Err(crate::GraphError::SparseKernel {
         backend: "SuiteSparseGraphBlas",
         reason: "crate was built without the graphblas feature".to_string(),
@@ -438,7 +386,7 @@ fn expand_graphblas(
     graphblas::expand(adjacency, starts, hops)
 }
 
-#[cfg(feature = "graphblas")]
+#[cfg(all(test, feature = "graphblas"))]
 fn expand_range_graphblas(
     adjacency: &Adjacency,
     starts: &[VertexId],
@@ -647,7 +595,6 @@ mod graphblas {
 
     pub(crate) struct CompiledGraphBlasMatrix {
         canonical_out: CompiledCompactCscMatrix,
-        canonical_in: OnceLock<CompiledCompactCscMatrix>,
         use_compact_kernel: bool,
         replicas: Vec<Mutex<CompiledGraphBlasMatrixInner>>,
         next_replica: AtomicUsize,
@@ -760,85 +707,13 @@ mod graphblas {
             self.indices.get(index)
         }
 
-        fn out_neighbors(&self, source: VertexId) -> Result<Vec<VertexId>> {
-            let Some(ordinal) = self.ordinal(source) else {
-                return Ok(Vec::new());
-            };
-            let range = self.neighbor_range(ordinal);
-            let mut neighbors = Vec::with_capacity(range.len());
-            for index in range {
-                let destination = self.neighbor(index);
-                let vertex = self.vertices.get(destination).copied().ok_or_else(|| {
-                    GraphError::SparseKernel {
-                        backend: "CanonicalAdjacency",
-                        reason: format!(
-                            "destination ordinal {destination} exceeds dimension {}",
-                            self.vertices.len()
-                        ),
-                    }
-                })?;
-                neighbors.push(vertex);
-            }
-            Ok(neighbors)
-        }
-
-        fn contains_edge(&self, source: VertexId, destination: VertexId) -> bool {
-            let (Some(source), Some(destination)) =
-                (self.ordinal(source), self.ordinal(destination))
+        fn contains_edge(&self, src: VertexId, dst: VertexId) -> bool {
+            let (Some(src_ordinal), Some(dst_ordinal)) = (self.ordinal(src), self.ordinal(dst))
             else {
                 return false;
             };
-            let range = self.neighbor_range(source);
-            let mut low = range.start;
-            let mut high = range.end;
-            while low < high {
-                let middle = low + (high - low) / 2;
-                match self.neighbor(middle).cmp(&destination) {
-                    std::cmp::Ordering::Less => low = middle + 1,
-                    std::cmp::Ordering::Greater => high = middle,
-                    std::cmp::Ordering::Equal => return true,
-                }
-            }
-            false
-        }
-
-        fn to_adjacency(&self) -> Result<Adjacency> {
-            let mut adjacency = Adjacency::new();
-            for source in self.vertices.iter().copied() {
-                let neighbors = self.out_neighbors(source)?;
-                if !neighbors.is_empty() {
-                    adjacency.insert(source, neighbors.into_iter().collect());
-                }
-            }
-            Ok(adjacency)
-        }
-
-        fn reversed(&self) -> Self {
-            let dimension = self.vertices.len();
-            let mut pointers = vec![0_u64; dimension + 1];
-            for index in 0..self.indices.len() {
-                let destination = self.neighbor(index);
-                let pointer = &mut pointers[destination + 1];
-                *pointer = pointer.saturating_add(1);
-            }
-            for ordinal in 1..pointers.len() {
-                pointers[ordinal] = pointers[ordinal].saturating_add(pointers[ordinal - 1]);
-            }
-            let mut offsets = pointers[..dimension].to_vec();
-            let mut indices = vec![0_u64; self.indices.len()];
-            for source in 0..dimension {
-                for index in self.neighbor_range(source) {
-                    let destination = self.neighbor(index);
-                    let offset = &mut offsets[destination];
-                    indices[*offset as usize] = source as u64;
-                    *offset = offset.saturating_add(1);
-                }
-            }
-            Self {
-                vertices: self.vertices.clone(),
-                pointers: CompactOrdinalVec::from_u64(pointers),
-                indices: CompactOrdinalVec::from_u64(indices),
-            }
+            self.neighbor_range(src_ordinal)
+                .any(|index| self.neighbor(index) == dst_ordinal)
         }
 
         fn start_ordinals(&self, starts: &[VertexId]) -> Vec<usize> {
@@ -1110,12 +985,11 @@ mod graphblas {
             if use_compact_csc_kernel() {
                 return Ok(Self {
                     canonical_out,
-                    canonical_in: OnceLock::new(),
                     use_compact_kernel: true,
                     replicas: Vec::new(),
                     next_replica: AtomicUsize::new(0),
                     edge_count: csc.indices.len(),
-                    estimated_resident_bytes: compact_csc_resident_bytes(csc).saturating_mul(2),
+                    estimated_resident_bytes: compact_csc_resident_bytes(csc),
                 });
             }
             init()?;
@@ -1130,13 +1004,12 @@ mod graphblas {
             }
             Ok(Self {
                 canonical_out,
-                canonical_in: OnceLock::new(),
                 use_compact_kernel: false,
                 replicas,
                 next_replica: AtomicUsize::new(0),
                 edge_count: csc.indices.len(),
                 estimated_resident_bytes: native_graphblas_resident_bytes(csc, replica_count)
-                    .saturating_add(compact_csc_resident_bytes(csc).saturating_mul(2)),
+                    .saturating_add(compact_csc_resident_bytes(csc)),
             })
         }
 
@@ -1148,12 +1021,11 @@ mod graphblas {
                 let edge_count = canonical_out.indices.len();
                 return Ok(Self {
                     canonical_out,
-                    canonical_in: OnceLock::new(),
                     use_compact_kernel: true,
                     replicas: Vec::new(),
                     next_replica: AtomicUsize::new(0),
                     edge_count,
-                    estimated_resident_bytes: compact_bytes.saturating_mul(2),
+                    estimated_resident_bytes: compact_bytes,
                 });
             }
             Self::new_from_csc(&csc)
@@ -1184,12 +1056,11 @@ mod graphblas {
                 let edge_count = canonical_out.indices.len();
                 return Ok(Self {
                     canonical_out,
-                    canonical_in: OnceLock::new(),
                     use_compact_kernel: true,
                     replicas: Vec::new(),
                     next_replica: AtomicUsize::new(0),
                     edge_count,
-                    estimated_resident_bytes: one_orientation_bytes.saturating_mul(2),
+                    estimated_resident_bytes: one_orientation_bytes,
                 });
             }
             let csc = GraphBlasCsc {
@@ -1217,29 +1088,8 @@ mod graphblas {
             self.estimated_resident_bytes
         }
 
-        pub(crate) fn canonical_out_neighbors(&self, source: VertexId) -> Result<Vec<VertexId>> {
-            self.canonical_out.out_neighbors(source)
-        }
-
-        pub(crate) fn canonical_in_neighbors(
-            &self,
-            destination: VertexId,
-        ) -> Result<Vec<VertexId>> {
-            self.canonical_in
-                .get_or_init(|| self.canonical_out.reversed())
-                .out_neighbors(destination)
-        }
-
-        pub(crate) fn canonical_contains_edge(
-            &self,
-            source: VertexId,
-            destination: VertexId,
-        ) -> bool {
-            self.canonical_out.contains_edge(source, destination)
-        }
-
-        pub(crate) fn canonical_adjacency(&self) -> Result<Adjacency> {
-            self.canonical_out.to_adjacency()
+        pub(crate) fn contains_edge(&self, src: VertexId, dst: VertexId) -> bool {
+            self.canonical_out.contains_edge(src, dst)
         }
 
         pub(crate) fn expand_range(
@@ -1386,6 +1236,7 @@ mod graphblas {
         expand_with_compiled(adjacency, starts, hops, &compiled)
     }
 
+    #[cfg(test)]
     pub(super) fn expand_range(
         adjacency: &Adjacency,
         starts: &[VertexId],
@@ -2379,43 +2230,6 @@ mod tests {
         assert_eq!(graphblas.backend, SparseKernelBackend::SuiteSparseGraphBlas);
         assert_eq!(graphblas.vertices, rust.vertices);
         assert_eq!(graphblas.edge_visits, rust.edge_visits);
-    }
-
-    #[cfg(feature = "graphblas")]
-    #[test]
-    fn compiled_matrix_exposes_its_canonical_adjacency_rows() {
-        let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
-        let previous = std::env::var("GRAPH_COMPILED_KERNEL").ok();
-        std::env::remove_var("GRAPH_COMPILED_KERNEL");
-
-        let adjacency = test_adjacency();
-        let compiled = compile_graphblas_matrix(&adjacency).expect("matrix should compile");
-
-        match previous {
-            Some(value) => std::env::set_var("GRAPH_COMPILED_KERNEL", value),
-            None => std::env::remove_var("GRAPH_COMPILED_KERNEL"),
-        }
-
-        assert_eq!(
-            compiled
-                .canonical_out_neighbors(42)
-                .expect("canonical row should decode"),
-            vec![10, 11, 12, 13, 14, 15, 16]
-        );
-        assert_eq!(
-            compiled
-                .canonical_in_neighbors(4)
-                .expect("canonical reverse row should decode"),
-            vec![2, 3]
-        );
-        assert!(compiled.canonical_contains_edge(42, 13));
-        assert!(!compiled.canonical_contains_edge(42, 99));
-        assert_eq!(
-            compiled
-                .canonical_adjacency()
-                .expect("canonical adjacency should decode"),
-            adjacency
-        );
     }
 
     #[cfg(all(feature = "graphblas", feature = "opencypher"))]

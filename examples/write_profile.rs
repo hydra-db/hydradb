@@ -88,35 +88,27 @@ async fn main() -> ProfileResult<()> {
     eprintln!(
         "graph write profile mode={mode} object_store={object_label} db_path={shard_path} batch_size={batch_size} batches={batches} warmup_batches={warmup_batches} seed_degree={seed_degree} wal_flush_interval_ms={wal_flush_interval_ms} await_durable={await_durable_writes} index_policy={index_policy:?} trusted_chunk_size={trusted_chunk_size}"
     );
-    let (stats, metrics_before, metrics_after) = if mode == "log-drain" {
-        let metrics_before = shard.graph_operational_metrics();
-        let stats = run_log_drain_profile(&shard, src, batch_size, warmup_batches, batches).await?;
-        let metrics_after = shard.graph_operational_metrics();
-        (stats, metrics_before, metrics_after)
-    } else {
-        run_warmup(
-            &shard,
-            &mode,
-            src,
-            batch_size,
-            warmup_batches,
-            trusted_chunk_size,
-        )
-        .await?;
-        let metrics_before = shard.graph_operational_metrics();
-        let stats = run_measured(
-            &shard,
-            &mode,
-            src,
-            batch_size,
-            warmup_batches,
-            batches,
-            trusted_chunk_size,
-        )
-        .await?;
-        let metrics_after = shard.graph_operational_metrics();
-        (stats, metrics_before, metrics_after)
-    };
+    run_warmup(
+        &shard,
+        &mode,
+        src,
+        batch_size,
+        warmup_batches,
+        trusted_chunk_size,
+    )
+    .await?;
+    let metrics_before = shard.graph_operational_metrics();
+    let stats = run_measured(
+        &shard,
+        &mode,
+        src,
+        batch_size,
+        warmup_batches,
+        batches,
+        trusted_chunk_size,
+    )
+    .await?;
+    let metrics_after = shard.graph_operational_metrics();
     let breakdown =
         WriteProfileBreakdown::from_metrics(&metrics_before, &metrics_after, stats.total_edges);
     let epoch = shard.current_epoch(CELL_ID).await?;
@@ -145,62 +137,6 @@ async fn main() -> ProfileResult<()> {
         breakdown.commit_pct,
     );
     Ok(())
-}
-
-async fn run_log_drain_profile(
-    shard: &GraphShard,
-    src: u64,
-    batch_size: usize,
-    warmup_batches: usize,
-    batches: usize,
-) -> ProfileResult<WriteProfileStats> {
-    for batch in 0..warmup_batches {
-        run_batch(
-            shard,
-            "log",
-            src,
-            batch_size,
-            batch,
-            "warmup",
-            DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
-        )
-        .await?;
-    }
-    if warmup_batches > 0 {
-        shard
-            .materialize_edge_mutation_log(CELL_ID, warmup_batches)
-            .await?;
-    }
-
-    let total_started = Instant::now();
-    let mut total_edges = 0_u64;
-    for offset in 0..batches {
-        total_edges = total_edges.saturating_add(
-            run_batch(
-                shard,
-                "log",
-                src,
-                batch_size,
-                warmup_batches + offset,
-                "measure",
-                DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
-            )
-            .await?,
-        );
-    }
-    let materialized = shard
-        .materialize_edge_mutation_log(CELL_ID, batches)
-        .await?;
-    let elapsed = total_started.elapsed();
-    let visible_edges = materialized.mutations.max(total_edges);
-    Ok(WriteProfileStats {
-        total_edges: visible_edges,
-        total_elapsed: elapsed,
-        latency_per_edge: LatencyStats::from_durations(&[duration_div(
-            elapsed,
-            visible_edges.max(1),
-        )]),
-    })
 }
 
 async fn run_warmup(
@@ -404,47 +340,6 @@ async fn run_batch(
                 )
                 .await?;
             Ok(result.inserted)
-        }
-        "log" => {
-            let result = shard
-                .append_edge_mutation_log(
-                    CELL_ID,
-                    &format!("write-profile-log-{phase}-{batch}"),
-                    (0..batch_size).map(|index| {
-                        let dst = base + index as u64;
-                        EdgeMutation {
-                            cell_id: CELL_ID.to_string(),
-                            edge_type: EDGE_TYPE.to_string(),
-                            src,
-                            dst,
-                            idempotency_key: format!("write-profile-log-{phase}-{batch}-{index}"),
-                        }
-                    }),
-                )
-                .await?;
-            Ok(result.mutations)
-        }
-        "log-materialize" => {
-            let result = shard
-                .append_edge_mutation_log(
-                    CELL_ID,
-                    &format!("write-profile-log-materialize-{phase}-{batch}"),
-                    (0..batch_size).map(|index| {
-                        let dst = base + index as u64;
-                        EdgeMutation {
-                            cell_id: CELL_ID.to_string(),
-                            edge_type: EDGE_TYPE.to_string(),
-                            src,
-                            dst,
-                            idempotency_key: format!(
-                                "write-profile-log-materialize-{phase}-{batch}-{index}"
-                            ),
-                        }
-                    }),
-                )
-                .await?;
-            let materialized = shard.materialize_edge_mutation_log(CELL_ID, 1).await?;
-            Ok(materialized.mutations.max(result.mutations))
         }
         other => Err(format!("unsupported GRAPH_WRITE_PROFILE_MODE={other}").into()),
     }

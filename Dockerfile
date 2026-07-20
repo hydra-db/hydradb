@@ -18,9 +18,9 @@ COPY . .
 
 FROM build-base AS builder
 
-RUN cargo build --locked --release --features server-runtime \
-      --bin graph-node && \
-    strip target/release/graph-node
+RUN cargo build --locked --release --features server-runtime,indexer-runtime \
+      --bin graph-node --bin graph-indexer && \
+    strip target/release/graph-node target/release/graph-indexer
 
 FROM build-base AS benchmark-builder
 
@@ -53,6 +53,7 @@ ENTRYPOINT ["/usr/local/bin/s3-bolt-benchmark-server"]
 FROM runtime-base AS runtime
 
 COPY --from=builder /workspace/target/release/graph-node /usr/local/bin/graph-node
+COPY --from=builder /workspace/target/release/graph-indexer /usr/local/bin/graph-indexer
 
 USER 10001:10001
 EXPOSE 7687 8443 9090 9443

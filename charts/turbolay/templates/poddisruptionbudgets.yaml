@@ -13,3 +13,19 @@ spec:
     matchLabels:
       {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 6 }}
 {{- end }}
+{{- if and .Values.podDisruptionBudget.enabled .Values.indexer.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "turbolay.fullname" . }}-indexer
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: indexer
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.indexer.minAvailable }}
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "turbolay.componentLabels" (dict "root" . "component" "indexer") | nindent 6 }}
+{{- end }}

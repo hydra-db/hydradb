@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "opencypher")]
 use crate::{EdgeMetadata, RelationshipId, VertexId, VertexPropertyValue};
-use crate::{GraphCacheMetrics, TopologySequence};
+use crate::{GraphCacheMetrics, StorageSequence};
 #[cfg(feature = "opencypher")]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RelationshipRowsCacheKey {
@@ -13,7 +13,7 @@ pub(crate) struct RelationshipRowsCacheKey {
     pub(crate) edge_type: String,
     pub(crate) src: VertexId,
     pub(crate) dst: VertexId,
-    pub(crate) read_epoch: TopologySequence,
+    pub(crate) read_epoch: StorageSequence,
 }
 
 #[cfg(feature = "opencypher")]
@@ -23,7 +23,7 @@ impl RelationshipRowsCacheKey {
         edge_type: &str,
         src: VertexId,
         dst: VertexId,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Self {
         Self {
             cell_id: cell_id.to_string(),
@@ -47,7 +47,7 @@ pub(crate) struct SourceRelationshipRowsCacheKey {
     pub(crate) cell_id: String,
     pub(crate) edge_type: String,
     pub(crate) src: VertexId,
-    pub(crate) read_epoch: TopologySequence,
+    pub(crate) read_epoch: StorageSequence,
 }
 
 #[cfg(feature = "opencypher")]
@@ -56,7 +56,7 @@ impl SourceRelationshipRowsCacheKey {
         cell_id: &str,
         edge_type: &str,
         src: VertexId,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Self {
         Self {
             cell_id: cell_id.to_string(),
@@ -82,7 +82,7 @@ pub(crate) struct RelationshipPropertyRowsCacheKey {
     pub(crate) dst: VertexId,
     pub(crate) property: String,
     pub(crate) encoded_value: String,
-    pub(crate) read_epoch: TopologySequence,
+    pub(crate) read_epoch: StorageSequence,
 }
 
 #[cfg(feature = "opencypher")]
@@ -94,7 +94,7 @@ impl RelationshipPropertyRowsCacheKey {
         dst: VertexId,
         property: &str,
         encoded_value: &str,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Self {
         Self {
             cell_id: cell_id.to_string(),
@@ -248,7 +248,7 @@ where
     pub(crate) fn get_latest_by(
         &mut self,
         mut predicate: impl FnMut(&K, &V) -> bool,
-        mut score: impl FnMut(&K, &V) -> TopologySequence,
+        mut score: impl FnMut(&K, &V) -> StorageSequence,
     ) -> Option<V> {
         let key = self
             .entries
