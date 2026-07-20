@@ -56,6 +56,7 @@ src/sparse_kernel.rs
 examples/        smoke, stress, correctness, benchmark, and profiling binaries
 scripts/         local, MinIO, query, write, stress, and chaos harnesses
 charts/turbolay/ production Helm chart for graph nodes and indexer workers
+architecture.md  high-level system design and low-level component flows
 ```
 
 ## Requirements
