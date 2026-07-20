@@ -33,12 +33,10 @@ data:
   GRAPH_MAX_RELATIONSHIP_PROPERTY_ROWS_BYTES: {{ include "turbolay.decimalInteger" .Values.runtime.maxRelationshipPropertyRowsBytes | quote }}
   GRAPH_MAX_CONCURRENT_HYDRATIONS: {{ include "turbolay.decimalInteger" .Values.runtime.maxConcurrentHydrations | quote }}
   GRAPH_MAX_CONCURRENT_MATRIX_COMPILATIONS: {{ include "turbolay.decimalInteger" .Values.runtime.maxConcurrentMatrixCompilations | quote }}
-  GRAPH_MATRIX_AUTO_REFRESH_ENABLED: {{ .Values.runtime.matrixAutoRefreshEnabled | quote }}
-  GRAPH_MATRIX_REFRESH_INTERVAL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.matrixRefreshIntervalMs | quote }}
-  GRAPH_MATRIX_REFRESH_MAX_DIRTY_MS: {{ include "turbolay.decimalInteger" .Values.runtime.matrixRefreshMaxDirtyMs | quote }}
-  GRAPH_MATRIX_REFRESH_MIN_EPOCH_LAG: {{ include "turbolay.decimalInteger" .Values.runtime.matrixRefreshMinEpochLag | quote }}
-  GRAPH_MATRIX_REFRESH_TILE_SIZE: {{ include "turbolay.decimalInteger" .Values.runtime.matrixRefreshTileSize | quote }}
-  GRAPH_MATRIX_REFRESH_MAX_EDGE_TYPES_PER_CYCLE: {{ include "turbolay.decimalInteger" .Values.runtime.matrixRefreshMaxEdgeTypesPerCycle | quote }}
+  GRAPH_INDEX_DISCOVERY_INTERVAL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.indexDiscoveryIntervalMs | quote }}
+  GRAPH_INDEXER_INTERVAL_MS: {{ include "turbolay.decimalInteger" .Values.indexer.intervalMs | quote }}
+  GRAPH_INDEXER_RETAIN_PREVIOUS: {{ include "turbolay.decimalInteger" .Values.indexer.retainPreviousGenerations | quote }}
+  GRAPH_INDEXER_ADMIN_ADDR: "0.0.0.0:9091"
   GRAPH_BOLT_ADDR: 0.0.0.0:7687
   GRAPH_HTTP_ADDR: 0.0.0.0:8443
   GRAPH_ADMIN_ADDR: 0.0.0.0:9090
@@ -49,6 +47,7 @@ data:
   GRAPH_TLS_PRIVATE_KEY: /var/run/secrets/turbolay/public/tls.key
   GRAPH_ALLOW_PLAINTEXT: {{ not .Values.tls.public.enabled | quote }}
   GRAPH_MAX_CONCURRENT_QUERIES: {{ include "turbolay.decimalInteger" .Values.runtime.maxConcurrentQueries | quote }}
+  GRAPH_MAX_QUERY_SCAN_EDGES: {{ include "turbolay.decimalInteger" .Values.runtime.maxQueryScanEdges | quote }}
   GRAPH_MAX_QUERY_RUNTIME_MS: {{ include "turbolay.decimalInteger" .Values.runtime.maxQueryRuntimeMs | quote }}
   GRAPH_MAX_SERVER_CURSORS: {{ include "turbolay.decimalInteger" .Values.runtime.maxServerCursors | quote }}
   GRAPH_MAX_CURSOR_BUFFER_BYTES: {{ include "turbolay.decimalInteger" .Values.runtime.maxCursorBufferBytes | quote }}
@@ -57,5 +56,4 @@ data:
   GRAPH_DEFAULT_PAGE_SIZE: {{ include "turbolay.decimalInteger" .Values.runtime.defaultPageSize | quote }}
   GRAPH_GRACEFUL_SHUTDOWN_MS: {{ include "turbolay.decimalInteger" .Values.runtime.gracefulShutdownMs | quote }}
   GRAPH_TRIM_MEMORY_AFTER_HYDRATION: {{ .Values.runtime.trimMemoryAfterHydration | quote }}
-  GRAPH_KUBERNETES_ROLE_LABELS: "true"
   RUST_LOG: {{ .Values.runtime.rustLog | quote }}

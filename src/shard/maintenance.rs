@@ -4,285 +4,20 @@ struct SegmentCompactionRequest<'a> {
     cell_id: &'a str,
     edge_type: &'a str,
     src: VertexId,
-    compacted_through_epoch: TopologySequence,
+    compacted_through_epoch: StorageSequence,
     idempotency_key: &'a str,
     started: std::time::Instant,
-    lock: &'a CellWriteLock,
+    lock: &'a LocalWriteGuard,
 }
 
 impl GraphShard {
-    pub async fn delete_deltas_through_matrix(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        compact_through_epoch: TopologySequence,
-    ) -> Result<DeltaGcResult> {
-        validate_component("cell_id", cell_id)?;
-        validate_component("edge_type", edge_type)?;
-        self.ensure_write_authority(cell_id, "delete_deltas_through_matrix")?;
-        let _permit = self
-            .acquire_gc_permit("delete_deltas_through_matrix")
-            .await?;
-        let started = std::time::Instant::now();
-        let Some(artifact) = self
-            .latest_matrix_artifact(cell_id, edge_type, compact_through_epoch)
-            .await?
-        else {
-            return Err(GraphError::CorruptValue {
-                key: keys::delta_gc_watermark(cell_id, edge_type),
-                reason: "cannot compact deltas without a matrix artifact".to_string(),
-            });
-        };
-        if artifact.base_epoch != compact_through_epoch {
-            return Err(GraphError::CorruptValue {
-                key: keys::delta_gc_watermark(cell_id, edge_type),
-                reason: format!(
-                    "latest matrix artifact is at epoch {}, expected {compact_through_epoch}",
-                    artifact.base_epoch
-                ),
-            });
-        }
-
-        let mut watermark_batch = GraphWriteBatch::new();
-        watermark_batch.put(
-            keys::delta_gc_watermark(cell_id, edge_type),
-            encode_u64(compact_through_epoch),
-        );
-        self.write_graph_batch_strict_with_cell_lock(
-            cell_id,
-            "delete_deltas_through_matrix",
-            watermark_batch,
-        )
-        .await?;
-
-        let mut result = DeltaGcResult {
-            compacted_through_epoch: compact_through_epoch,
-            ..DeltaGcResult::default()
-        };
-        self.delete_outbox_deltas_through(cell_id, edge_type, compact_through_epoch, &mut result)
-            .await?;
-        self.delete_outbox_delta_batches_through(
-            cell_id,
-            edge_type,
-            compact_through_epoch,
-            &mut result,
-        )
-        .await?;
-        self.delete_delta_prefix_through(
-            cell_id,
-            &keys::delta_plus_prefix(cell_id, edge_type),
-            compact_through_epoch,
-            &mut result,
-        )
-        .await?;
-        self.delete_delta_prefix_through(
-            cell_id,
-            &keys::delta_minus_prefix(cell_id, edge_type),
-            compact_through_epoch,
-            &mut result,
-        )
-        .await?;
-        self.delete_owner_delta_prefix_through(
-            cell_id,
-            &keys::owner_delta_kind_prefix(cell_id, edge_type, DeltaKind::Plus),
-            compact_through_epoch,
-            &mut result,
-        )
-        .await?;
-        self.delete_owner_delta_prefix_through(
-            cell_id,
-            &keys::owner_delta_kind_prefix(cell_id, edge_type, DeltaKind::Minus),
-            compact_through_epoch,
-            &mut result,
-        )
-        .await?;
-        self.delete_owner_delta_prefix_through(
-            cell_id,
-            &keys::pair_delta_kind_prefix(cell_id, edge_type, DeltaKind::Plus),
-            compact_through_epoch,
-            &mut result,
-        )
-        .await?;
-        self.delete_owner_delta_prefix_through(
-            cell_id,
-            &keys::pair_delta_kind_prefix(cell_id, edge_type, DeltaKind::Minus),
-            compact_through_epoch,
-            &mut result,
-        )
-        .await?;
-        tracing::info!(
-            target: "slatedb_graph_kernel",
-            cell_id,
-            edge_type,
-            compact_through_epoch,
-            deleted_delta_keys = result.deleted_delta_keys,
-            retained_delta_keys = result.retained_delta_keys,
-            "deleted graph deltas through published matrix"
-        );
-        self.record_gc_completed(result.deleted_delta_keys, started.elapsed());
-        Ok(result)
-    }
-
-    pub(crate) async fn delta_gc_watermark(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-    ) -> Result<TopologySequence> {
-        self.read_counter(&keys::delta_gc_watermark(cell_id, edge_type))
-            .await
-    }
-
-    async fn delete_delta_prefix_through(
-        &self,
-        cell_id: &str,
-        prefix: &str,
-        compact_through_epoch: TopologySequence,
-        result: &mut DeltaGcResult,
-    ) -> Result<()> {
-        let mut iter = self.scan_remote_prefix(prefix).await?;
-        let mut batch = GraphWriteBatch::new();
-        let mut pending_deletes = 0_usize;
-        while let Some(kv) = iter.next().await? {
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let edge = decode_edge_record(&key, &kv.value)?;
-            if edge.epoch <= compact_through_epoch {
-                batch.delete(key.as_bytes());
-                result.deleted_delta_keys += 1;
-                pending_deletes += 1;
-                if pending_deletes >= GRAPH_DELTA_GC_BATCH_KEYS {
-                    self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
-                        .await?;
-                }
-            } else {
-                result.retained_delta_keys += 1;
-            }
-        }
-        self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
-            .await
-    }
-
-    async fn delete_outbox_deltas_through(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        compact_through_epoch: TopologySequence,
-        result: &mut DeltaGcResult,
-    ) -> Result<()> {
-        let mut iter = self
-            .scan_remote_prefix(&keys::outbox_prefix(cell_id))
-            .await?;
-        let mut batch = GraphWriteBatch::new();
-        let mut pending_deletes = 0_usize;
-        while let Some(kv) = iter.next().await? {
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let delta = decode_delta_record(&key, &kv.value)?;
-            if delta.edge.epoch > compact_through_epoch {
-                break;
-            }
-            if delta.edge.edge_type != edge_type {
-                continue;
-            }
-            batch.delete(key.as_bytes());
-            result.deleted_delta_keys += 1;
-            pending_deletes += 1;
-            if pending_deletes >= GRAPH_DELTA_GC_BATCH_KEYS {
-                self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
-                    .await?;
-            }
-        }
-        self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
-            .await
-    }
-
-    async fn delete_outbox_delta_batches_through(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        compact_through_epoch: TopologySequence,
-        result: &mut DeltaGcResult,
-    ) -> Result<()> {
-        let mut iter = self
-            .scan_remote_prefix(&keys::outbox_batch_prefix(cell_id))
-            .await?;
-        let mut batch = GraphWriteBatch::new();
-        let mut pending_deletes = 0_usize;
-        while let Some(kv) = iter.next().await? {
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let delta_batch = decode_outbox_delta_batch(&key, &kv.value)?;
-            if delta_batch.end_epoch > compact_through_epoch {
-                break;
-            }
-            if delta_batch.edge_type != edge_type {
-                continue;
-            }
-            batch.delete(key.as_bytes());
-            result.deleted_delta_keys += 1;
-            pending_deletes += 1;
-            if pending_deletes >= GRAPH_DELTA_GC_BATCH_KEYS {
-                self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
-                    .await?;
-            }
-        }
-        self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
-            .await
-    }
-
-    async fn delete_owner_delta_prefix_through(
-        &self,
-        cell_id: &str,
-        prefix: &str,
-        compact_through_epoch: TopologySequence,
-        result: &mut DeltaGcResult,
-    ) -> Result<()> {
-        let mut iter = self.scan_remote_prefix(prefix).await?;
-        let mut batch = GraphWriteBatch::new();
-        let mut pending_deletes = 0_usize;
-        while let Some(kv) = iter.next().await? {
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let delta = decode_delta_record(&key, &kv.value)?;
-            if delta.edge.epoch <= compact_through_epoch {
-                batch.delete(key.as_bytes());
-                result.deleted_delta_keys += 1;
-                pending_deletes += 1;
-                if pending_deletes >= GRAPH_DELTA_GC_BATCH_KEYS {
-                    self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
-                        .await?;
-                }
-            } else {
-                result.retained_delta_keys += 1;
-            }
-        }
-        self.flush_delta_gc_batch(cell_id, &mut batch, &mut pending_deletes)
-            .await
-    }
-
-    async fn flush_delta_gc_batch(
-        &self,
-        cell_id: &str,
-        batch: &mut GraphWriteBatch,
-        pending_deletes: &mut usize,
-    ) -> Result<()> {
-        if *pending_deletes == 0 {
-            return Ok(());
-        }
-        let batch_to_write = std::mem::replace(batch, GraphWriteBatch::new());
-        self.write_graph_batch_strict_with_cell_lock(
-            cell_id,
-            "delete_deltas_through_matrix",
-            batch_to_write,
-        )
-        .await?;
-        *pending_deletes = 0;
-        Ok(())
-    }
-
     pub async fn edge_exists_at(
         &self,
         cell_id: &str,
         edge_type: &str,
         src: VertexId,
         dst: VertexId,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Result<bool> {
         Ok(self
             .edges_at(cell_id, edge_type, read_epoch)
@@ -296,7 +31,7 @@ impl GraphShard {
         cell_id: &str,
         edge_type: &str,
         src: VertexId,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Result<Vec<VertexId>> {
         let mut neighbors: Vec<_> = self
             .edges_at(cell_id, edge_type, read_epoch)
@@ -313,7 +48,7 @@ impl GraphShard {
         cell_id: &str,
         edge_type: &str,
         src: VertexId,
-        read_epoch: TopologySequence,
+        read_epoch: StorageSequence,
     ) -> Result<u64> {
         Ok(self
             .out_neighbors_at(cell_id, edge_type, src, read_epoch)
@@ -326,7 +61,7 @@ impl GraphShard {
         cell_id: &str,
         edge_type: &str,
         src: VertexId,
-        compacted_through_epoch: TopologySequence,
+        compacted_through_epoch: StorageSequence,
         idempotency_key: &str,
     ) -> Result<SegmentCompactionResult> {
         validate_component("cell_id", cell_id)?;
@@ -340,7 +75,7 @@ impl GraphShard {
             .await?;
         let _writer = self.writer_lane(cell_id).lock().await;
         let lock = self
-            .acquire_cell_write_lock(cell_id, "compact_out_adjacency_segments")
+            .acquire_local_write_guard(cell_id, "compact_out_adjacency_segments")
             .await?;
         let result = self
             .compact_out_adjacency_segments_locked(SegmentCompactionRequest {
@@ -353,7 +88,7 @@ impl GraphShard {
                 lock: &lock,
             })
             .await;
-        release_cell_write_lock(lock, result).await
+        finish_local_write(lock, result).await
     }
 
     async fn compact_out_adjacency_segments_locked(
@@ -419,13 +154,10 @@ impl GraphShard {
             }
             let key = String::from_utf8_lossy(&kv.key).into_owned();
             let segment = decode_out_edge_segment(&key, &kv.value)?;
-            if segment.start_epoch > compacted_through_epoch {
+            if segment.storage_sequence > compacted_through_epoch {
                 break;
             }
-            if segment.end_epoch > compacted_through_epoch {
-                continue;
-            }
-            input_edges = input_edges.saturating_add(segment.edges.len() as u64);
+            input_edges = input_edges.saturating_add(segment.destinations.len() as u64);
             source_segments.push((key, segment));
         }
 
@@ -434,7 +166,7 @@ impl GraphShard {
                 cell_id, edge_type, src,
             ))
             .await?;
-        let mut tombstones = BTreeMap::<VertexId, (TopologySequence, String)>::new();
+        let mut tombstones = BTreeMap::<VertexId, (StorageSequence, String)>::new();
         while let Some(kv) = tombstone_iter.next().await? {
             if should_renew_cell_lock_after_items(tombstones.len()) {
                 lock.renew().await?;
@@ -454,26 +186,23 @@ impl GraphShard {
             }
         }
 
-        let mut live = BTreeMap::<VertexId, TopologySequence>::new();
+        let mut live = BTreeMap::<VertexId, StorageSequence>::new();
         for (_, segment) in &source_segments {
-            for (epoch, dst) in &segment.edges {
-                if *epoch > compacted_through_epoch {
-                    continue;
-                }
+            for dst in &segment.destinations {
                 let tombstone_epoch = tombstones
                     .get(dst)
                     .map(|(epoch, _)| *epoch)
                     .filter(|epoch| *epoch <= compacted_through_epoch);
-                if segment_edge_visible(*epoch, tombstone_epoch) {
+                if segment_edge_visible(segment.storage_sequence, tombstone_epoch) {
                     live.entry(*dst)
-                        .and_modify(|existing| *existing = (*existing).max(*epoch))
-                        .or_insert(*epoch);
+                        .and_modify(|existing| {
+                            *existing = (*existing).max(segment.storage_sequence)
+                        })
+                        .or_insert(segment.storage_sequence);
                 }
             }
         }
-        let mut compacted_edges: Vec<_> =
-            live.into_iter().map(|(dst, epoch)| (epoch, dst)).collect();
-        compacted_edges.sort_unstable();
+        let compacted_destinations: Vec<_> = live.into_keys().collect();
 
         let mut batch = GraphWriteBatch::new();
         for (key, _) in &source_segments {
@@ -486,19 +215,16 @@ impl GraphShard {
                 deleted_tombstone_keys = deleted_tombstone_keys.saturating_add(1);
             }
         }
-        if let (Some((start_epoch, _)), Some((end_epoch, _))) =
-            (compacted_edges.first(), compacted_edges.last())
-        {
+        if !compacted_destinations.is_empty() {
             batch.put(
                 keys::out_segment(
                     cell_id,
                     edge_type,
                     src,
-                    *end_epoch,
-                    *start_epoch,
+                    compacted_through_epoch,
                     &format!("compact-{idempotency_key}"),
                 ),
-                encode_out_edge_segment_records(&compacted_edges),
+                encode_out_edge_segment_records(&compacted_destinations),
             );
         }
         batch.put(
@@ -511,7 +237,7 @@ impl GraphShard {
             deleted_segment_keys: source_segments.len() as u64,
             deleted_tombstone_keys,
             input_edges,
-            output_edges: compacted_edges.len() as u64,
+            output_edges: compacted_destinations.len() as u64,
         };
         batch.put(
             idem_key.as_bytes(),
@@ -548,22 +274,6 @@ impl GraphShard {
         let iter = self
             .db
             .scan_prefix_with_options(prefix.as_bytes(), None, &remote_scan_options())
-            .await?;
-        Ok(iter)
-    }
-
-    pub(crate) async fn scan_remote_prefix_from(
-        &self,
-        prefix: &str,
-        start_suffix: &str,
-    ) -> Result<slatedb::DbIterator> {
-        let iter = self
-            .db
-            .scan_prefix_with_options(
-                prefix.as_bytes(),
-                Some(start_suffix.as_bytes().to_vec()),
-                &remote_scan_options(),
-            )
             .await?;
         Ok(iter)
     }
@@ -667,11 +377,11 @@ impl GraphShard {
         if batch.is_empty() {
             return Ok(());
         }
-        let lock = self.acquire_cell_write_lock(cell_id, operation).await?;
+        let lock = self.acquire_local_write_guard(cell_id, operation).await?;
         let result = self
             .write_graph_batch_strict(cell_id, operation, batch)
             .await;
-        release_cell_write_lock(lock, result).await
+        finish_local_write(lock, result).await
     }
 
     async fn write_graph_batch_txn(
@@ -742,6 +452,6 @@ impl GraphShard {
 
 fn should_renew_cell_lock_after_items(items: usize) -> bool {
     items == 0
-        || (items >= GRAPH_DELTA_GC_BATCH_KEYS
-            && items / GRAPH_DELTA_GC_BATCH_KEYS * GRAPH_DELTA_GC_BATCH_KEYS == items)
+        || (items >= GRAPH_MAINTENANCE_BATCH_KEYS
+            && items / GRAPH_MAINTENANCE_BATCH_KEYS * GRAPH_MAINTENANCE_BATCH_KEYS == items)
 }

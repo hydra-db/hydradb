@@ -342,7 +342,6 @@ extraObjects:
         app.kubernetes.io/name: '{{ include "turbolay.name" . }}'
         app.kubernetes.io/instance: '{{ .Release.Name }}'
         app.kubernetes.io/component: node
-        graph.usecortex.io/serving: "true"
       ports:
         - name: bolt
           port: 7687
@@ -362,7 +361,6 @@ extraObjects:
         app.kubernetes.io/name: '{{ include "turbolay.name" . }}'
         app.kubernetes.io/instance: '{{ .Release.Name }}'
         app.kubernetes.io/component: node
-        graph.usecortex.io/serving: "true"
       ports:
         - name: https
           port: 443
