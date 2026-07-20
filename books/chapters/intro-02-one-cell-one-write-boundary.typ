@@ -38,6 +38,7 @@ The public `write_edge` path in `src/shard/write.rs` crosses several gates:
   diagram(
     spacing: (12mm, 7mm),
     node-stroke: 0.5pt,
+    crossing-fill: reader-colors.paper,
     {
       let guard(pos, w, body) = node(
         pos, text(size: 8pt, fill: reader-colors.text, body),
@@ -47,9 +48,9 @@ The public `write_edge` path in `src/shard/write.rs` crosses several gates:
       guard((0, 0), 62mm, [writer authority])
       guard((0, 1), 56mm, [backpressure permit])
       guard((0, 2), 50mm, [writer lane])
-      guard((0, 3), 44mm, [cell write lock])
-      guard((0, 4), 38mm, [drop-guard + authority])
-      guard((0, 5), 32mm, [serializable transaction])
+      guard((0, 3), 46mm, [cell write lock])
+      guard((0, 4), 42mm, [drop-guard + authority])
+      guard((0, 5), 38mm, [serializable transaction])
       edge((0, 0), (0, 1), "->", stroke: reader-colors.muted)
       edge((0, 1), (0, 2), "->", stroke: reader-colors.muted)
       edge((0, 2), (0, 3), "->", stroke: reader-colors.muted)
@@ -91,6 +92,12 @@ The public `write_edge` path in `src/shard/write.rs` crosses several gates:
   caption: [Each guard narrows authority; one logical mutation fans out into many
   records inside a single serializable transaction at one new epoch.],
 ) <fig-intro02-funnel>
+
+Read the left column downward: each guard is narrower than the one above it, so
+authority is progressively reduced until a single serializable transaction is all
+that remains. The right column is what that one transaction actually writes —
+one logical mutation fanning out into many records, all published together at one
+new epoch.
 
 The layers overlap deliberately. The local lane is cheap. The object-store cell
 write lock coordinates processes. The sole SlateDB writer handle and the cell

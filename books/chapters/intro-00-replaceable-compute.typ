@@ -19,6 +19,7 @@ the compute node holds ways to reach it quickly.
   diagram(
     spacing: (10mm, 14mm),
     node-stroke: 0.5pt,
+    crossing-fill: reader-colors.paper,
     node((0, 0), text(size: 8pt)[graph-node A — heap · caches · writer role],
       fill: reader-colors.bad_soft, stroke: (paint: reader-colors.bad, dash: "dashed"),
       shape: fletcher.shapes.rect, corner-radius: 3pt),
@@ -83,7 +84,7 @@ as `reopened_reader_sees_data_from_object_store` (`src/tests.rs`) exercise that
 replacement boundary: a fresh shard opens the same object-store path and serves
 the same edges from an empty heap and cache.
 
-#note[
+#custom-box(title: [Term — Replaceable compute], icon: "info")[
   “Replaceable compute” is more accurate than “stateless compute.” An active
   process holds a writer role, a cell write lock, semaphores, parsed plans, and
   hydrated matrices. Those are runtime state, but none is the sole durable copy

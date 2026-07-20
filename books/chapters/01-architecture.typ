@@ -1,4 +1,4 @@
-#import "../template.typ": term, why, srcblock, figcap, accent, muted
+#import "../template.typ": custom-box, srcblock, accent, muted
 #import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
 #import "../vendor/bookly/src/themes/reader.typ": reader-colors
 
@@ -19,7 +19,7 @@ TurboLay is a single Rust crate. It is not a workspace of many crates. Instead i
 features to include or exclude large slices of itself, so the same source can build as a
 small embedded library or as a full network server.
 
-#term("Cargo feature")[
+#custom-box(title: [Term — Cargo feature], icon: "info")[
   A named, optional slice of a crate. Code guarded by `#[cfg(feature = "x")]` only compiles
   when feature `x` is turned on. Features can depend on other features, so turning one on can
   pull in a whole stack. This lets one crate ship many configurations.
@@ -63,21 +63,25 @@ Read from the bottom up:
 
 #figure(
   diagram(
-    node-stroke: 0.6pt,
+    crossing-fill: reader-colors.paper,
+    node-stroke: 0.6pt + reader-colors.border,
     spacing: (0pt, 0.72cm),
-    node((0, 0), [`server-runtime` → `graph-node` (full data node: both front doors, GraphBLAS, discovery)], fill: rgb("#e9fce9"), width: 11.5cm),
-    node((0, 1), [`public-client-protocols` = `bolt-server` + `http-api`], fill: rgb("#eef4ff"), width: 11.5cm),
-    node((0, 2), [`client-api` (shared `ClientQueryService`)], fill: rgb("#eef4ff"), width: 11.5cm),
-    node((0, 3), [`query-transport` (query wire protocol, auth, quotas)], fill: rgb("#eef4ff"), width: 11.5cm),
-    node((0, 4), [`opencypher` (Cypher parser and planner)], fill: rgb("#fff8e6"), width: 11.5cm),
-    node((0, 5), [default (embedded engine: model, keys, codec, shard, storage)], fill: rgb("#f6f8fa"), width: 11.5cm),
-    node((0, 6), [`indexer-runtime` → `graph-indexer` (lean, separate: admin HTTP + engine, no front doors)], fill: rgb("#f3e9fc"), width: 11.5cm),
+    node((0, 0), [`server-runtime` → `graph-node` (full data node: both front doors, GraphBLAS, discovery)], fill: reader-colors.ok_soft, stroke: 0.6pt + reader-colors.ok, width: 11.5cm),
+    node((0, 1), [`public-client-protocols` = `bolt-server` + `http-api`], fill: reader-colors.info_soft, stroke: 0.6pt + reader-colors.info, width: 11.5cm),
+    node((0, 2), [`client-api` (shared `ClientQueryService`)], fill: reader-colors.info_soft, stroke: 0.6pt + reader-colors.info, width: 11.5cm),
+    node((0, 3), [`query-transport` (query wire protocol, auth, quotas)], fill: reader-colors.info_soft, stroke: 0.6pt + reader-colors.info, width: 11.5cm),
+    node((0, 4), [`opencypher` (Cypher parser and planner)], fill: reader-colors.warn_soft, stroke: 0.6pt + reader-colors.warn, width: 11.5cm),
+    node((0, 5), [default (embedded engine: model, keys, codec, shard, storage)], fill: reader-colors.surface_soft, stroke: 0.6pt + reader-colors.border, width: 11.5cm),
+    node((0, 6), [`indexer-runtime` → `graph-indexer` (lean, separate: admin HTTP + engine, no front doors)], fill: reader-colors.purple_soft, stroke: 0.6pt + reader-colors.purple, width: 11.5cm),
   ),
-  caption: none,
-)
-#figcap[The feature tower. A build is a horizontal slice: everything from some level down. The deployable *data node* (`graph-node`) builds with `server-runtime`; the two example servers in `examples/` build with `bolt-server`. `indexer-runtime` (bottom, shaded) is not part of the tower — it is a separate lean slice over the embedded engine that produces the `graph-indexer` binary.]
+  caption: [The feature tower: a build is a horizontal slice, everything from some level
+    down. The deployable *data node* (`graph-node`) builds with `server-runtime`; the two
+    example servers in `examples/` build with `bolt-server`. `indexer-runtime` (bottom,
+    shaded) is not part of the tower — it is a separate lean slice over the embedded
+    engine that produces the `graph-indexer` binary.],
+) <fig-arch-feature-tower>
 
-#why[
+#custom-box(title: [Why], icon: "tip")[
   A single crate with features, rather than many small crates, keeps the internal types
   shared without a web of crate boundaries and version bumps. The cost is that you must read
   the `#[cfg(...)]` attributes to know whether a given item exists in your build. When you
@@ -93,7 +97,7 @@ module lives under `src/`. Grouped by job:
   columns: (auto, 1fr),
   inset: 5pt,
   align: (left + top, left + top),
-  stroke: 0.4pt + rgb("#d0d7de"),
+  stroke: 0.4pt + reader-colors.border,
   [*Area*], [*What lives there*],
   [`core/`], [The foundations: `state.rs` (the `GraphShard` type and write authority), `model.rs` (vertex, edge, relationship, property types), `config.rs` (open options and the SlateDB open functions), `namespace.rs` (namespaces, graph ids, scopes), `snapshot.rs`, `cache.rs`, `metrics.rs`, `error.rs`, `write_batch.rs`.],
   [`keys.rs`], [Every storage key builder. One function per key shape. 316 lines of pure key formatting.],
@@ -113,7 +117,7 @@ write chapters.
 
 == GraphShard: the type that ties it together
 
-#term("GraphShard")[
+#custom-box(title: [Term — GraphShard], icon: "info")[
   The central type of the engine. One `GraphShard` is one open handle to one cell's data on
   the object store, plus everything needed to read and write it: the SlateDB storage handle,
   the configured limits and policies, the concurrency controls, and all the in-memory caches.
@@ -138,7 +142,7 @@ pub struct GraphShard {
 
 `db` is the `GraphStore` from Chapter 0. Where the durable data lives (`object_store`,
 `store_path`) now lives *inside* `GraphStore` rather than on the shard. `write_authority` and
-`writer_lanes` are the write-authority and lane machinery from Section 0.10 and 0.11;
+`writer_lanes` are the write-authority and lane machinery from Section 0.10;
 `write_authority` is one of `ReadOnly`, `Promotable`, or `Writer` (Section 1.6).
 
 Second, the concurrency gates. Each is a semaphore that bounds how many of one kind of
@@ -153,7 +157,7 @@ expensive operation can run at once:
     pub(crate) gc_gate: Arc<Semaphore>,
 ```]
 
-#term("Semaphore (as used here)")[
+#custom-box(title: [Term — Semaphore (as used here)], icon: "info")[
   A counter that hands out a fixed number of permits. A task must take a permit before doing
   the guarded work and returns it when done. If no permit is free the task waits. TurboLay
   uses one semaphore per class of heavy work (loading data into memory, compiling a matrix,
@@ -261,7 +265,7 @@ focused. When you look for a method, pick the file by concern.
 A client does not know about cells or epochs. It connects and names a database. The server
 turns that name into a concrete target, and the target carries the `cell_id` that every
 storage key needs. This resolution is worth following closely because it connects the
-outward identity (Chapter 0, Section 0.9) to the storage keys (Section 0.7).
+outward identity (Chapter 0, Section 0.9) to the storage keys (Section 0.6).
 
 The target is a scope plus a cell id:
 
@@ -311,22 +315,25 @@ So the full journey of a request name is a chain of translations:
 
 #figure(
   diagram(
-    node-stroke: 0.6pt,
-    node-fill: rgb("#eef4ff"),
+    crossing-fill: reader-colors.paper,
+    node-stroke: 0.6pt + reader-colors.info,
+    node-fill: reader-colors.info_soft,
+    edge-stroke: reader-colors.muted,
     spacing: (0pt, 0.7cm),
     node((0, 0), [Bolt `db` field / HTTPS `x-graph-namespace` (a name like `"default"`)], width: 12cm),
-    edge((0, 0), (0, 1), "->", [`ClientDatabaseResolver::resolve_database`]),
+    edge((0, 0), (0, 1), "->", text(size: 8pt, fill: reader-colors.muted)[`ClientDatabaseResolver::resolve_database`]),
     node((0, 1), [`ClientQueryTarget { scope: GraphScope, cell_id }`], width: 12cm),
-    edge((0, 1), (0, 2), "->", [`cell_id`]),
+    edge((0, 1), (0, 2), "->", text(size: 8pt, fill: reader-colors.muted)[`cell_id`]),
     node((0, 2), [`cell_prefix(cell_id)` = `cell/<cell_id>/`], width: 12cm),
-    edge((0, 2), (0, 3), "->", [key builders in `keys.rs`]),
-    node((0, 3), [concrete storage keys read from / written to SlateDB], fill: rgb("#e9fce9"), width: 12cm),
+    edge((0, 2), (0, 3), "->", text(size: 8pt, fill: reader-colors.muted)[key builders in `keys.rs`]),
+    node((0, 3), [concrete storage keys read from / written to SlateDB], fill: reader-colors.ok_soft, stroke: 0.6pt + reader-colors.ok, width: 12cm),
   ),
-  caption: none,
-)
-#figcap[Name resolution. The client picks a database name; the resolver maps it to a scope and a cell id; the cell id becomes the storage-key prefix. The client never sees cell ids or epochs.]
+  caption: [Name resolution: the client picks a database name, the resolver maps it to a
+    scope and a cell id, and the cell id becomes the storage-key prefix. The client never
+    sees cell ids or epochs.],
+) <fig-arch-name-resolution>
 
-#why[
+#custom-box(title: [Why], icon: "tip")[
   Keeping the name-to-cell mapping behind a trait means the same engine serves a single local
   graph in a test and a multi-tenant fleet in production without changing the query path. In
   the deployable binary the resolver is built from environment variables that name one cell;
@@ -372,7 +379,7 @@ pub struct RoutedGraphCluster {
 }
 ```]
 
-#term("ObjectStoreNodeDirectory")[
+#custom-box(title: [Term — ObjectStoreNodeDirectory], icon: "info")[
   A serializable directory of the fleet: the set of `cells` that exist and the set of `nodes`
   that participate. It replaced `ShardPlacement`. Crucially it does *not* map a cell to an
   owner — it just lists what exists. At open time a node validates that it is in `nodes`, then
@@ -402,27 +409,33 @@ pub async fn write_edge(&self, mutation: EdgeMutation) -> Result<CommitResult> {
 ```]
 
 Single-writer safety does not come from a placement table; it rests on the sole SlateDB writer
-handle plus the object-store cell write lock (Chapter 0). A second node that tries to promote
+handle plus SlateDB's own manifest fencing. A second node that tries to promote
 the same cell is fenced at the storage layer, so `promotable` can be true on more than one
 node without corrupting a cell — at most one promotion wins. The old `graph-controller` binary
 and its controller loop no longer exist.
 
 #figure(
   diagram(
-    node-stroke: 0.6pt,
-    spacing: (1.5cm, 1.0cm),
-    node((0, 0), [`graph-node` A\ reads all cells\ (writer for cell 1)], fill: rgb("#eef4ff"), width: 3.6cm),
-    node((1, 0), [`graph-node` B\ reads all cells\ (writer for cell 3)], fill: rgb("#eef4ff"), width: 3.6cm),
-    node((2, 0), [`graph-indexer`\ builds index\ generations], fill: rgb("#f3e9fc"), width: 3.6cm),
-    node((1, 1.6), [Object store (durable graph data + CSC index generations)], fill: rgb("#e9fce9"), width: 11cm),
+    crossing-fill: reader-colors.paper,
+    node-stroke: 0.6pt + reader-colors.border,
+    edge-stroke: reader-colors.muted,
+    spacing: (0.7cm, 1.0cm),
+    node((0, 0), text(size: 8pt)[`graph-node` A\ reads all cells\ (writer for cell 1)], fill: reader-colors.info_soft, stroke: 0.6pt + reader-colors.info, width: 3.1cm),
+    node((1, 0), text(size: 8pt)[`graph-node` B\ reads all cells\ (writer for cell 3)], fill: reader-colors.info_soft, stroke: 0.6pt + reader-colors.info, width: 3.1cm),
+    node((2, 0), text(size: 8pt)[`graph-indexer`\ builds index\ generations], fill: reader-colors.purple_soft, stroke: 0.6pt + reader-colors.purple, width: 3.1cm),
+    node((1, 1.6), text(size: 8pt)[Object store (durable graph data + CSC index generations)], fill: reader-colors.ok_soft, stroke: 0.6pt + reader-colors.ok, width: 9.4cm),
     edge((0, 0), (1, 1.6), "<->"),
     edge((1, 0), (1, 1.6), "<->"),
     edge((2, 0), (1, 1.6), "<->"),
-    edge((0, 0), (1, 0), "<->", [same `ObjectStoreNodeDirectory`], stroke: 0.5pt + muted),
+    edge((0, 0), (1, 0), "<->", text(size: 7.5pt, fill: reader-colors.muted)[same directory], stroke: 0.5pt + muted),
   ),
-  caption: none,
-)
-#figcap[Cluster topology after the resync. Data nodes are identical `graph-node` processes that all read every cell over the shared object store; a write lazily promotes that node to the cell's single writer. A separate, stateless `graph-indexer` builds the durable CSC index generations off to the side (Section 1.8). All parties share one `ObjectStoreNodeDirectory`; there is no controller and no static per-cell owner.]
+  caption: [Cluster topology after the resync: data nodes are identical `graph-node`
+    processes that all read every cell over the shared object store, and a write lazily
+    promotes that node to the cell's single writer. A separate, stateless `graph-indexer`
+    builds the durable CSC index generations off to the side (Section 1.8). All parties
+    share one `ObjectStoreNodeDirectory`; there is no controller and no static per-cell
+    owner.],
+) <fig-arch-topology>
 
 == Traversal acceleration: index generations
 
@@ -435,7 +448,7 @@ reachability caches; this is the whole of it. What changed with the resync is *w
 (a separate process, Section 1.8) and that it is now an immutable generation rather than a
 mutable, per-node-refreshed artifact.
 
-#term("Index generation")[
+#custom-box(title: [Term — Index generation], icon: "info")[
   A durable snapshot of one cell's adjacency for one edge type, built at a fixed storage
   sequence (`base_sequence`) and identified by the SHA-256 of its CSC payload (`generation`).
   It is a cache of structure, not a source of truth: canonical edges still live in the
@@ -476,23 +489,28 @@ Four steps move a generation through its life cycle. All the durable logic lives
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.5pt,
-    spacing: (4mm, 9mm),
-    node((0, 0), text(size: 7.5pt)[writes →\ dirty markers], fill: reader-colors.surface_soft, stroke: reader-colors.border, corner-radius: 3pt, width: 2.4cm),
+    spacing: (6mm, 9mm),
+    node((0, 0), text(size: 7.5pt, hyphenate: false)[writes →\ dirty markers], fill: reader-colors.surface_soft, stroke: reader-colors.border, corner-radius: 3pt, width: 2.5cm),
     edge((0, 0), (1, 0), "->", stroke: reader-colors.muted),
-    node((1, 0), text(size: 7.5pt)[`graph-indexer`\ (separate process,\ Section 1.8)], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 3pt, width: 2.7cm),
+    node((1, 0), text(size: 7.5pt, hyphenate: false)[`graph-indexer`\ (separate process,\ Section 1.8)], fill: reader-colors.info_soft, stroke: reader-colors.info, corner-radius: 3pt, width: 2.8cm),
     edge((1, 0), (2, 0), "->", stroke: reader-colors.muted),
-    node((2, 0), text(size: 7.5pt)[`build_graph_index`\ → publish manifest], fill: reader-colors.surface_soft, stroke: reader-colors.border, corner-radius: 3pt, width: 2.7cm),
+    node((2, 0), text(size: 7.5pt, hyphenate: false)[`build_graph_index`\ → publish manifest], fill: reader-colors.surface_soft, stroke: reader-colors.border, corner-radius: 3pt, width: 2.8cm),
     edge((2, 0), (3, 0), "->", stroke: reader-colors.muted),
-    node((3, 0), text(size: 7.5pt)[immutable generation:\ GraphBLAS CSC + manifest\ (object store)], fill: reader-colors.purple_soft, stroke: reader-colors.purple, corner-radius: 3pt, width: 3cm),
+    node((3, 0), text(size: 7.5pt, hyphenate: false)[immutable generation:\ GraphBLAS CSC + manifest\ (object store)], fill: reader-colors.purple_soft, stroke: reader-colors.purple, corner-radius: 3pt, width: 3.2cm),
     edge((3, 0), (4, 0), "->", stroke: reader-colors.muted, label: text(size: 7pt, fill: reader-colors.muted)[read]),
-    node((4, 0), text(size: 7.5pt)[hydrate + WAL-tail\ overlay (read)], fill: reader-colors.ok_soft, stroke: reader-colors.ok, corner-radius: 3pt, width: 2.7cm),
+    node((4, 0), text(size: 7.5pt, hyphenate: false)[hydrate + WAL-tail\ overlay (read)], fill: reader-colors.ok_soft, stroke: reader-colors.ok, corner-radius: 3pt, width: 2.8cm),
     edge((3, 0), (3, 1), "->", stroke: (dash: "dashed", paint: reader-colors.muted)),
-    node((3, 1), text(size: 7.5pt)[`gc_graph_index_generations`\ prunes old base sequences], fill: reader-colors.warn_soft, stroke: reader-colors.warn, corner-radius: 3pt, width: 3.2cm),
+    node((3, 1), text(size: 7.5pt, hyphenate: false)[`gc_graph_index_generations`\ prunes old base sequences], fill: reader-colors.warn_soft, stroke: reader-colors.warn, corner-radius: 3pt, width: 3.2cm),
   ),
-  caption: none,
-)<fig-ch01-artifact-lifecycle>
-#figcap[The index-generation life cycle. Writes only mark edge-types dirty. A separate `graph-indexer` process (Section 1.8) builds and publishes an immutable, content-addressed CSC generation; a read hydrates the current generation and overlays the WAL tail written since it — so the object store stays the single source of truth, with `gc_graph_index_generations` pruning superseded base sequences off to the side.]
+  caption: [The index-generation life cycle: writes only mark edge-types dirty, a separate
+    `graph-indexer` process (Section 1.8) builds and publishes an immutable,
+    content-addressed CSC generation, and a read hydrates the current generation and
+    overlays the WAL tail written since it — so the object store stays the single source
+    of truth, with `gc_graph_index_generations` pruning superseded base sequences off to
+    the side.],
+) <fig-ch01-artifact-lifecycle>
 
 The matrix caches are keyed by `(cell_id, edge_type, base_sequence)` and, unlike the per-read
 result caches, are *not* invalidated by a write. Their `base_sequence` deliberately lags the
@@ -502,7 +520,7 @@ overlay edges — and stale generations are removed only by a newer generation s
 by GC pruning them. By default the hydrated-adjacency cache is off (`max_matrix_adjacencies =
 0`); only the compiled GraphBLAS matrix is cached.
 
-#why[
+#custom-box(title: [Why], icon: "tip")[
   Decoupling the durable generation's sequence from the read sequence is what lets acceleration
   stay cheap under a steady write load. If the matrix cache were keyed by the exact read
   sequence, every write would invalidate it and force a rebuild. Instead the generation is
@@ -532,7 +550,7 @@ a Prometheus `/metrics` endpoint. Each cycle, for every cell:
   sequence and, if the generation is stale, `build_graph_index` to publish a fresh one;
 + `gc_graph_index_generations` to prune superseded generations beyond the retained count.
 
-#why[
+#custom-box(title: [Why], icon: "tip")[
   Separating the builder from the data node is compute–compute separation: index building can
   be scaled, scheduled, and rate-limited independently of query serving, and a runaway build
   cannot starve reads on a data node. Because a generation is immutable and published
@@ -579,7 +597,7 @@ each step is covered in depth:
   into the engine's plan (`query/opencypher.rs`), and runs it against the local `GraphShard`
   (`shard/query.rs`). This is the whole read chapter.
 + For a write, the node must be `promotable`: it *lazily opens (and caches) a SlateDB writer*
-  for the cell, takes the *cell write lock*, then commits through a *write batch* that advances
+  for the cell, refreshes its *SlateDB manifest fence*, then commits through a *write batch* that advances
   the storage sequence and updates the edge, adjacency, index, and degree keys. This is the
   write chapter.
 + A delete *hard-removes* the relationship rows and *soft-deletes* the structural edge at a

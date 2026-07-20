@@ -41,7 +41,7 @@ calls — behaves the way the checked model promises?
 
 That is the question this chapter answers, and the answer has a name.
 
-#custom-box(title: [Term — Model-based testing (MBT)], icon: "info", color: purple)[
+#custom-box(title: [Term — Model-based testing (MBT)], icon: "info")[
   A testing technique in which the _test cases are generated from a model_
   rather than written by hand. The model produces sequences of actions; a
   harness executes each action against the real system; after each step the
@@ -74,7 +74,7 @@ delta, the idempotency record, and the epoch counter, and commits. Two very
 different machines. The claim the whole verification effort rests on is that the
 second _refines_ the first.
 
-#custom-box(title: [Term — Refinement], icon: "info", color: purple)[
+#custom-box(title: [Term — Refinement], icon: "info")[
   One system _refines_ another when everything the first does is permitted by the
   second — the concrete implementation is an allowed behavior of the abstract
   model. For turbolay this means: reduce the real durable state to the same
@@ -93,7 +93,7 @@ check that runs. The model says what the projection must be; the harness reads
 what the real projection _is_; refinement holds when, step after step, they
 match.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   Why generate the traces from the model instead of writing test cases by hand?
   Because the model has already been proven to explore states a human would never
   think to enumerate — reply lost then retried then crashed then fenced, in every
@@ -116,9 +116,10 @@ generated corpus is then run a second time against a different storage backend.
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.6pt + reader-colors.border,
     node-outset: 0pt,
-    spacing: (2.5cm, 1.15cm),
+    spacing: (1.7cm, 1.15cm),
     // The abstract / model side.
     node((0, 0), text(fill: reader-colors.text, hyphenate: false)[Quint model\ `m1_cell_write.qnt`], fill: reader-colors.info_soft, width: 3.4cm),
     node((0, 1), text(fill: reader-colors.text, hyphenate: false)[ITF action trace\ `init` → `openWriter1` → `createEdge` → …], fill: reader-colors.info_soft, width: 4.0cm),
@@ -152,7 +153,7 @@ The green node is the real kernel, the code that ships. The whole point of the
 loop is to make those two agree at the verdict node, over and over, on traces the
 model itself invented.
 
-#custom-box(title: [Term — Informal Trace Format (ITF)], icon: "info", color: purple)[
+#custom-box(title: [Term — Informal Trace Format (ITF)], icon: "info")[
   A JSON file format for _traces_ — sequences of states and the actions between
   them — emitted by Quint (and other Apalache-family tools). When `quint run` is
   asked for model-based testing output it writes each generated behavior as an
@@ -422,7 +423,7 @@ backend-specific failure can be reproduced (`0006-minio-mbt-handoff.md:34-36`).
 The recorded result is that all six adapters pass against both the default
 `InMemory` store and local MinIO (`0006-minio-mbt-handoff.md:37-40`).
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   Why bother running the identical corpus twice? Because `InMemory` and MinIO test
   different things through the same lens. The in-memory store makes the kernel's
   _protocol logic_ fast to check on every commit — the atomic projection, the

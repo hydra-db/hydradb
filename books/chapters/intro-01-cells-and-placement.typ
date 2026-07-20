@@ -46,6 +46,7 @@ placement is static configuration, not a coordinated, renewing grant.
   diagram(
     spacing: (13mm, 14mm),
     node-stroke: 0.5pt,
+    crossing-fill: reader-colors.paper,
     node-corner-radius: 3pt,
     // compute nodes (top row)
     node((0.5, 0), text(size: 8pt)[`node-a`], fill: reader-colors.surface_soft, stroke: reader-colors.border),

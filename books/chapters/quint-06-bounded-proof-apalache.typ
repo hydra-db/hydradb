@@ -66,7 +66,7 @@ state where the invariant is false?_ If the answer is a rigorous "no," then no s
 counterexample exists — not "was not sampled," but does not exist — among every behavior of
 length N or shorter. That is a bounded exhaustive check.
 
-#custom-box(title: [Term — Bounded exhaustive model checking], icon: "info", color: purple)[
+#custom-box(title: [Term — Bounded exhaustive model checking], icon: "info")[
   A check that examines _every_ behavior of a model up to a fixed number of transitions, N,
   and reports whether any of them violates a stated invariant. Unlike simulation, it does not
   sample: within the bound N it leaves no behavior unexamined, so a clean result means "no
@@ -79,7 +79,7 @@ The tool that does this for Quint is Apalache, reached through the `quint verify
 Crucially, it does not do the enumeration by brute force — walking a tree with millions of
 leaves would be as hopeless as sampling is incomplete. It works _symbolically_.
 
-#custom-box(title: [Term — Symbolic model checking], icon: "info", color: purple)[
+#custom-box(title: [Term — Symbolic model checking], icon: "info")[
   Instead of executing behaviors one concrete state at a time, a symbolic checker encodes
   "some behavior of length N reaches a bad state" as a single logical formula over all the
   model's variables at every step, and hands that formula to an SMT solver — a decision engine
@@ -108,6 +108,7 @@ And beyond that frontier the tree keeps going, into a depth no tool in this book
     text(fill: reader-colors.text, size: 8.5pt)[*beyond the bound*\ #text(fill: reader-colors.muted, size: 7pt)[unbounded, unknown]],
     // ===================== PANEL A: sampling =====================
     diagram(
+      crossing-fill: reader-colors.paper,
       node-outset: 0pt,
       spacing: (0.62cm, 0.66cm),
       // faint nodes (unsampled)
@@ -138,6 +139,7 @@ And beyond that frontier the tree keeps going, into a depth no tool in this book
     ),
     // ===================== PANEL B: bounded exhaustive =====================
     diagram(
+      crossing-fill: reader-colors.paper,
       node-outset: 0pt,
       spacing: (0.62cm, 0.66cm),
       // shaded proven-safe region, behind the nodes
@@ -179,6 +181,7 @@ And beyond that frontier the tree keeps going, into a depth no tool in this book
     ),
     // ===================== PANEL C: unbounded / unknown =====================
     diagram(
+      crossing-fill: reader-colors.paper,
       node-outset: 0pt,
       spacing: (0.62cm, 0.66cm),
       // small proven cap, shaded
@@ -291,7 +294,7 @@ mise exec java@21.0.2 -- mise exec -- quint verify \
   --invariant allSafety --max-steps 6
 ```
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   Why the doubled `mise exec` and the pinned `java@21.0.2`? Apalache is a JVM tool that Quint
   bundles and shells out to. The outer `mise exec java@21.0.2 --` provisions a real Java 21
   runtime and puts it on the path; the inner `mise exec -- quint verify ...` then runs Quint,
@@ -306,7 +309,7 @@ A check this powerful is not free, and it does not accept just any model. A symb
 to turn the whole model into a finite logical formula, which means the model must be finite and
 tame in specific ways.
 
-#custom-box(title: [Term — Apalache-friendly model], icon: "info", color: purple)[
+#custom-box(title: [Term — Apalache-friendly model], icon: "info")[
   A model an SMT-backed checker can encode as a finite formula: finite enumerations, no
   recursion, no unbounded containers, and explicit bounds on every domain. The specification
   plan requires turbolay's Apalache targets to be exactly this — "finite enumerations, no
@@ -402,7 +405,7 @@ committed to:
   encoding, LSM compaction, S3's implementation, Rust scheduling, or Kubernetes internals. Those
   are real, and they are simply not what a symbolic check of this model can reach.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   Why keep saying "still bounded" when the result is genuinely strong? Because the most
   dangerous thing a green check can do is invite a claim larger than it earned. A reader who
   hears "Apalache proved it" and drops the qualifier will believe turbolay is proven correct for

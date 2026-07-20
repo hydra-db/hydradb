@@ -47,7 +47,7 @@ spelled out at each step — is a deterministic scenario. It is the second half 
 how turbolay is verified, and it complements the exhaustive check rather than
 replacing it.
 
-#custom-box(title: [Term — Deterministic scenario], icon: "info", color: purple)[
+#custom-box(title: [Term — Deterministic scenario], icon: "info")[
   A single, named walk through a model: a fixed sequence of actions,
   `init.then(actionA).then(actionB)...`, that pins exactly one path through the
   otherwise-nondeterministic `step`, together with checkpoints that assert what
@@ -98,7 +98,7 @@ That `import ... .*` is what lets the scenarios below say `openWriter1` and
 `epoch` directly, as if they were writing inside the model. Now the first
 operator.
 
-#custom-box(title: [Term — `run`], icon: "info", color: purple)[
+#custom-box(title: [Term — `run`], icon: "info")[
   A named, executable scenario. `run <name> = <expr>` binds a name to a fixed
   sequence built from `init`, `then`, and `expect`. Unlike a `val` (a value) or
   an `action` (a single transition), a `run` is a whole _behavior_: a starting
@@ -119,7 +119,7 @@ refuses to proceed, and it has just told you your story is impossible.
 
 The third operator, `expect`, is how a scenario checks its work without moving.
 
-#custom-box(title: [Term — `expect` (a checkpoint)], icon: "info", color: purple)[
+#custom-box(title: [Term — `expect` (a checkpoint)], icon: "info")[
   `b.expect(pred)` runs the behavior `b`, then evaluates the boolean `pred` in
   the resulting state. If `pred` is true the state is passed along unchanged and
   the scenario continues; if it is false the run fails at that line. An `expect`
@@ -133,7 +133,7 @@ that changes the world, `expect` is a question that reads it. A scenario is an
 alternation of the two — do something, check something, do the next thing, check
 again.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   Why have `expect` at all, when the previous chapter's invariants already assert
   facts about state? Because they assert them _everywhere_, unconditionally. An
   invariant like `epochNeverRegresses` must hold in every reachable state, so it
@@ -190,6 +190,7 @@ it passes through.
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.6pt + reader-colors.border,
     node-outset: 0pt,
     spacing: (3.0cm, 1.25cm),
@@ -342,7 +343,7 @@ run means the story is possible _and_ every checkpoint held. Because there is no
 nondeterminism — every action is named — the result is completely reproducible:
 `quint test` does not sample or search, it replays.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   Why keep these fast, deterministic scenarios when the exhaustive invariant
   check already covers strictly more paths? Two reasons. First, they are the
   documentation that cannot rot: `lostReplyRetryIsExactlyOnceTest` says, in

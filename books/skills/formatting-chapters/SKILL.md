@@ -78,7 +78,7 @@ All defined in `vendor/bookly/src/bookly-themes.typ`; available after the
 |---|---|
 | Key one-line statement | `#boxeq[ *…* ]` |
 | Margin aside / sidenote | `#note[…]` |
-| Generic callout box | `#custom-box(title: <content>, icon: <str>, color: <color>)[…]` |
+| Generic callout box | `#custom-box(title: <content>, icon: <str>)[…]` |
 | Stock note / tip / warning / important / question | `#info-box(title:[…])[…]`, `#tip-box[…]`, `#warning-box[…]`, `#important-box[…]`, `#question-box[…]` |
 | Figure (diagram or table) | `#figure(<diagram|table>, caption: [<caption>]) <label>` |
 | Code | a plain fenced block ` ```rust … ``` ` — Bookly styles raw automatically |
@@ -86,15 +86,24 @@ All defined in `vendor/bookly/src/bookly-themes.typ`; available after the
 Available `custom-box` icons: `"info"`, `"tip"`, `"alert"`, `"stop"`,
 `"report"`, `"question"`.
 
-### Standardized semantic boxes for this book
+`custom-box` accepts a `color:` argument, but **do not pass it.** The accent is
+derived from the icon name: `reader-box` calls
+`_accent-for(c, icon, color)` (`vendor/bookly/src/themes/reader.typ:421`) and
+`_accent-for` (`reader.typ:149-165`) resolves all six icons above from a lookup
+on `icon`, using `color` only as a fallback for an unrecognized one. A `color:`
+on these boxes is silently ignored.
 
-To keep meaning consistent across chapters, map the two recurring teaching
-callouts to these exact `custom-box` forms:
+### Standardized semantic boxes for these books
+
+All three books (`inside`, `conceptual`, `quint`) converge on `custom-box`; the
+`template.typ` helpers `#term`/`#why`/`#srcblock` are being retired. Map the two
+recurring teaching callouts to these exact forms:
 
 - **Term / definition** (first appearance of jargon):
-  `#custom-box(title: [Term — <Name>], icon: "info", color: purple)[ … ]`
+  `#custom-box(title: [Term — <Name>], icon: "info")[ … ]`
 - **Why / design rationale**:
-  `#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[ … ]`
+  `#custom-box(title: [Why], icon: "tip")[ … ]` — renders green (`c.ok`), which
+  is the accepted colour.
 
 ### Code excerpts with a source location
 
@@ -173,7 +182,7 @@ writing skill will replace. Example skeleton body:
 == The problem
 // TODO(content): Socratic opener — pose the concrete failure, then motivate.
 
-#custom-box(title: [Term — Snapshot], icon: "info", color: purple)[
+#custom-box(title: [Term — Snapshot], icon: "info")[
   // TODO(content): first-principles definition.
 ]
 

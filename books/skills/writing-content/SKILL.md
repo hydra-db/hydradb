@@ -26,6 +26,13 @@ phases — respect that boundary.
   names. Never write a claim you have not grounded in a real file.
 - `chapters/00-foundations.typ` and `chapters/intro-00-replaceable-compute.typ`
   — the canonical voice. Match their register.
+- `skills/chapter-framing/SKILL.md` — the chapter's *argument shape* (the
+  declarative-claim title, the opening scenario, the `Problem N` ladder, the
+  synthesis / honest-boundary / revision-notes sections) and the prose rhythm
+  that carries it, extracted from the v1 book. This skill covers voice and
+  grounding; that one covers the skeleton those sentences hang on. If a chapter
+  reads like a summary rather than a lesson, the defect is framing, not prose.
+- `skills/diagrams/SKILL.md` — before adding or editing any figure.
 
 ## The method (this is the whole point)
 
@@ -74,20 +81,54 @@ phases — respect that boundary.
 ## Filling the scaffold
 
 - Replace each `TODO(content)` with prose; keep the surrounding component.
-- Fill Term boxes (`#custom-box(title: [Term — …], icon: "info", color: purple)`)
-  with first-principles definitions; fill Why boxes
-  (`#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))`) with design
-  rationale.
+- Fill Term boxes (`#custom-box(title: [Term — …], icon: "info")`) with
+  first-principles definitions; fill Why boxes
+  (`#custom-box(title: [Why], icon: "tip")`) with design rationale.
+- **Do not pass a `color:` argument.** The accent is derived from `icon:`, not
+  from `color:` — see "The callout vocabulary" below.
 - Put code inside the existing fenced blocks / figures; add the inline
   `file:line` reference in the introducing sentence.
 - Give figures real captions. If a diagram or Term box the skeleton lacks is
   genuinely needed, add it using the SAME Bookly components (see
   `formatting-chapters`) — but do not convert existing ones to anything else.
 
+## The callout vocabulary (settled decision — read before writing a box)
+
+**All three books converge on Bookly's `custom-box`.** This is a decision by the
+book owner, not a preference. The `books/template.typ` helpers — `term`, `why`,
+`srcblock`, `figcap`, `accent`, `muted` — are being **retired**. A separate
+conversion pass is rewriting the `inside` book's remaining `#term` / `#why`
+calls into `custom-box`. Do not add new calls to any of them, in any book,
+including files that still contain them; if you are revising a section that
+already uses `#term`/`#why`, write the replacement prose in `custom-box` form.
+
+The two standardized forms, and the only ones you should write:
+
+```typ
+#custom-box(title: [Term — <Name>], icon: "info")[ … ]
+#custom-box(title: [Why], icon: "tip")[ … ]
+```
+
+**No `color:` argument.** It is dead code. `reader-box`
+(`vendor/bookly/src/themes/reader.typ:419-421`) computes its accent with
+`let accent = _accent-for(c, icon, color)`, and `_accent-for`
+(`reader.typ:149-165`) branches on the *icon name* — `"tip"` → `c.ok`,
+`"alert"`/`"stop"` → `c.bad`, `"question"`/`"report"` → `c.purple`, `"info"` →
+`c.info` — falling through to `color` only for an icon it does not recognize.
+The companion `_soft-for` (`reader.typ:167`) picks the fill the same way. Every
+one of the six documented icons is recognized, so `color:` has never had any
+effect on these boxes: Why boxes have always rendered **green** (`c.ok`), never
+the gold that was written into the old snippets. Green is accepted; the argument
+is dropped. Do not reintroduce it — passing a colour that the render silently
+ignores is how the last round of drift started.
+
+To change a box's accent, change the `icon:`. That is the only lever.
+
 ## What NOT to do
 
 - Do not import `template.typ` or use `term`/`why`/`srcblock`/`figcap`/`accent`/
-  `muted` — those are the wrong (old) helpers.
+  `muted` — all three books are converging on `custom-box` (see above).
+- Do not pass `color:` to `custom-box`. The accent comes from `icon:`.
 - Do not change headings' structure or order, or rename the file.
 - Do not compile Typst as part of writing (the format phase / a final check owns
   that); just make sure your Typst is well-formed.

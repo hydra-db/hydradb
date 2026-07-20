@@ -41,7 +41,7 @@ and check everything at once? One model, one `allSafety`, one verdict.
 
 The answer is the reason this is a gallery and not a single canvas.
 
-#custom-box(title: [Term — Model family], icon: "info", color: purple)[
+#custom-box(title: [Term — Model family], icon: "info")[
   A model family is one self-contained Quint module that fixes a single abstraction boundary:
   one subsystem, its own small set of state variables, its own named actions, and its own
   `allSafety` conjunction and reachability witnesses. It is deliberately not the whole system.
@@ -57,7 +57,7 @@ placement would be too large to walk exhaustively, which throws away the one adv
 had over integration testing. Second, and more important, it would be unreadable — and an
 unreadable model is just a second program to get wrong, not a check on the first.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   The specification plan makes the separation an explicit design rule, and pairs every family
   with the reason it stands alone
   (`0002-turbolay-quint-specification-plan.md:77-83`): the atomic durable mutation is "the
@@ -93,6 +93,7 @@ system; the store band at the bottom is shaded neutral because no Quint model re
 #figure(
   block(width: 100%)[
     #diagram(
+      crossing-fill: reader-colors.paper,
       node-outset: 0pt,
       node-stroke: none,
       spacing: (1.0cm, 1.0cm),
@@ -275,7 +276,7 @@ Finally, the surface a client actually talks to. `m5_public_commands.qnt` is a s
 model: it does not parse Cypher, but treats each action as the normalized behavior of one
 supported command class that a model-based-testing adapter invokes (`m5_public_commands.qnt:3-11`).
 
-#custom-box(title: [Term — Refinement model], icon: "info", color: purple)[
+#custom-box(title: [Term — Refinement model], icon: "info")[
   A refinement model does not re-derive a subsystem from scratch; it maps a higher-level
   interface down onto semantics an existing model already checks. M5 takes public commands —
   `CREATE`, `MERGE`, `SET`, pagination, relationship delete — and expresses each as the M1/M2
@@ -333,7 +334,7 @@ commits to a shared-state abstraction and then lists what it throws away: byte e
 compaction, S3's implementation, Rust scheduling, TLS, parsing, and Kubernetes internals. Those
 are not oversights. They are concerns with _better_ tools than a state machine.
 
-#custom-box(title: [Term — Protocol-logic core], icon: "info", color: purple)[
+#custom-box(title: [Term — Protocol-logic core], icon: "info")[
   The protocol-logic core is the part of turbolay's correctness that is about the _shape_ of its
   transitions — which operations are enabled, what they commit atomically, what they refuse, how
   epochs and fences order them — rather than about bytes, timing, or syntax. It is exactly the
@@ -350,7 +351,7 @@ does not pretend to be a parser. And Kubernetes scheduling is below M4's abstrac
 takes "membership can disagree" as a given and checks that disagreement cannot create two
 writers, without modeling how the disagreement arose.
 
-#custom-box(title: [Why], icon: "tip", color: rgb("#c99700"))[
+#custom-box(title: [Why], icon: "tip")[
   The suite is also honest about where its coverage is intentionally _shallow_. Read-only handles
   carry no freshness or read-your-writes promise — the bookmark contract is monotonic-or-error
   and nothing more, and a real freshness guarantee would need a separate change-log protocol that

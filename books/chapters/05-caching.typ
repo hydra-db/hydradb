@@ -1,4 +1,4 @@
-#import "../template.typ": term, why, srcblock, figcap, accent, muted
+#import "../template.typ": custom-box, srcblock, accent, muted
 #import "@preview/fletcher:0.5.7" as fletcher: diagram, node, edge
 #import "../vendor/bookly/src/themes/reader.typ": reader-colors
 
@@ -21,24 +21,27 @@ their configuration, and `src/shard/lifecycle.rs` for where they are built.
 
 #figure(
   diagram(
-    node-stroke: 0.6pt,
+    crossing-fill: reader-colors.paper,
+    node-stroke: 0.6pt + reader-colors.border,
+    edge-stroke: reader-colors.muted,
     spacing: (0pt, 0.7cm),
-    node((0, 0), [engine result caches (this chapter, `BoundedGraphCache`)\ parsed queries, relationship rows, matrix artifacts / GraphBLAS, ...], fill: rgb("#eef4ff"), width: 12cm),
-    edge((0, 0), (0, 1), "->", [miss: recompute]),
-    node((0, 1), [SlateDB object-store block cache (foyer, on local disk)\ raw storage blocks], fill: rgb("#fff8e6"), width: 12cm),
-    edge((0, 1), (0, 2), "->", [miss: fetch object]),
-    node((0, 2), [object store (S3 / MinIO / filesystem)], fill: rgb("#e9fce9"), width: 12cm),
+    node((0, 0), [engine result caches (this chapter, `BoundedGraphCache`)\ parsed queries, relationship rows, matrix artifacts / GraphBLAS, ...], fill: reader-colors.info_soft, stroke: 0.6pt + reader-colors.info, width: 12cm),
+    edge((0, 0), (0, 1), "->", text(size: 8pt, fill: reader-colors.muted)[miss: recompute]),
+    node((0, 1), [SlateDB object-store block cache (foyer, on local disk)\ raw storage blocks], fill: reader-colors.warn_soft, stroke: 0.6pt + reader-colors.warn, width: 12cm),
+    edge((0, 1), (0, 2), "->", text(size: 8pt, fill: reader-colors.muted)[miss: fetch object]),
+    node((0, 2), [object store (S3 / MinIO / filesystem)], fill: reader-colors.ok_soft, stroke: 0.6pt + reader-colors.ok, width: 12cm),
   ),
-  caption: none,
-)
-#figcap[The two cache layers. The upper layer avoids recomputation; the lower layer avoids re-fetching bytes. A read consults the upper layer first, and only a full miss reaches the object store.]
+  caption: [The two cache layers: the upper layer avoids recomputation and the lower layer
+    avoids re-fetching bytes, so a read consults the upper layer first and only a full miss
+    reaches the object store.],
+) <fig-cache-two-layers>
 
 == The object-store block cache
 
 The lower layer is not TurboLay's own code. It is a feature of SlateDB that TurboLay turns on
 and configures.
 
-#term("Block cache")[
+#custom-box(title: [Term — Block cache], icon: "info")[
   A cache of raw storage blocks (chunks of an SST file) kept close to the process so repeated
   reads do not re-fetch them from slow storage. SlateDB keeps its block cache on local disk in
   front of the object store, so a warmed process reads most blocks from local disk instead of
@@ -47,7 +50,7 @@ and configures.
 
 TurboLay pins SlateDB with the `foyer` feature (`Cargo.toml:105`).
 
-#term("foyer")[
+#custom-box(title: [Term — foyer], icon: "info")[
   A hybrid caching library (memory plus disk) that SlateDB uses to implement its object-store
   cache. TurboLay does not call foyer directly; it enables it through the SlateDB feature and
   configures a cache directory and a size budget. From TurboLay's point of view foyer is the
@@ -90,7 +93,7 @@ the object store. Notice that the read-only reader path sets it to `false`
 `preload_sst_on_startup` warms the cache by loading all SST files at startup, trading a slower
 start for a faster first query.
 
-#why[
+#custom-box(title: [Why], icon: "tip")[
   Putting the block cache on disk rather than only in memory suits an object-store backend. The
   working set of a large graph will not fit in memory, but it can fit on a local SSD, and even a
   local SSD read is far cheaper than an S3 GET. Preloading exists because the first query after a
@@ -122,7 +125,7 @@ destination-pair cache and a newer one-hop source cache. The full set of fields
   columns: (auto, 1fr),
   inset: 5pt,
   align: (left + top, left + top),
-  stroke: 0.4pt + rgb("#d0d7de"),
+  stroke: 0.4pt + reader-colors.border,
   [*Cache*], [*What it saves and when it is consulted*],
   [`parsed_row_query_cache`], [The lowered form of a Cypher string, so a repeated query is not re-parsed. Consulted at the start of execution (read chapter, parse stage). The only cache whose key has no epoch.],
   [`matrix_artifact_cache` / `matrix_cache` / `graphblas_cache`], [A matrix artifact's manifest, its hydrated `MatrixAdjacency`, and its compiled GraphBLAS matrix. All three are keyed by `MatrixCacheKey { cell_id, edge_type, base_epoch }`. They form the base layer of the MVCC merge, so caching them saves rebuilding the base on every read.],
@@ -135,7 +138,7 @@ once and you understand all seven.
 
 == Inside BoundedGraphCache
 
-#term("Least-recently-used (LRU)")[
+#custom-box(title: [Term — Least-recently-used (LRU)], icon: "info")[
   An eviction policy: when the cache is full, throw out the entry that has gone longest without
   being read. It approximates "keep what is likely to be used again". TurboLay implements LRU
   with a logical clock that ticks on every access, stamping each entry with its last-access
@@ -271,7 +274,7 @@ is retained. In the default configuration only the *compiled GraphBLAS matrix* i
 entries / 128 MiB); the intermediate `MatrixAdjacency` map is hydrated when needed and dropped.
 Enabling the adjacency cache is an opt-in for workloads that want the map form resident.
 
-#why[
+#custom-box(title: [Why], icon: "tip")[
   Two budgets exist because entries and bytes fail differently. A cache of parsed queries could
   hold millions of tiny entries, so it needs a count cap. A cache of compiled GraphBLAS matrices
   could blow out memory with a handful of huge entries, so it needs a byte cap. Bounding only one
@@ -284,7 +287,7 @@ Some cached values are far more expensive to rebuild than others. A matrix artif
 with millions of edges took real work to compute and load. TurboLay pins those so they survive
 eviction unless the cache is truly out of room.
 
-#term("Pinning")[
+#custom-box(title: [Term — Pinning], icon: "info")[
   Marking a cache entry as protected so it is only evicted when there is no unpinned entry left
   to drop. TurboLay pins the entries that are most costly to recompute: large matrix artifacts
   and the compiled GraphBLAS matrices built from them. The eviction loop always drops unpinned
@@ -317,6 +320,7 @@ two regimes is the point of this section.
 
 #figure(
   diagram(
+    crossing-fill: reader-colors.paper,
     node-stroke: 0.55pt,
     spacing: (0.7cm, 0.7cm),
     // LEFT: per-read caches — self-invalidating.
@@ -344,16 +348,21 @@ two regimes is the point of this section.
     edge((0, 5), (1, 5), "->", stroke: reader-colors.muted, label: text(size: 7.5pt, fill: reader-colors.muted)[feeds]),
     node((1, 5), text(size: 8pt)[read-through hydration \ permit → load artifact → insert pinned], fill: reader-colors.ok_soft, stroke: reader-colors.ok, width: 4.7cm),
   ),
-  caption: none,
+  caption: [The two cache-correctness regimes. On the left, per-read caches embed
+    `read_epoch`, so a write just mints new keys and the stale entries age out under LRU —
+    the "no invalidation code" thesis holds exactly here. On the right, the matrix caches
+    reuse a deliberately lagging `base_epoch` across many read epochs (a read overlays
+    deltas on it), so a write does *not* self-invalidate them; they need real, GC-driven
+    eviction via `artifact_gc`'s `retain`, with entries hydrated read-through and fed by
+    the background refresh job.],
 ) <fig-ch05-two-regimes>
-#figcap[The two cache-correctness regimes. On the left, per-read caches embed `read_epoch`, so a write just mints new keys and the stale entries age out under LRU — the "no invalidation code" thesis holds exactly here. On the right, the matrix caches reuse a deliberately lagging `base_epoch` across many read epochs (a read overlays deltas on it), so a write does *not* self-invalidate them; they need real, GC-driven eviction via `artifact_gc`'s `retain`, with entries hydrated read-through and fed by the background refresh job.]
 
 === Regime one: per-read caches, epoch-keyed, self-invalidating
 
 The parsed-query, relationship-rows, source-relationship-rows, and relationship-property-rows
 caches are the classic epoch-keyed design.
 
-#term("Epoch-keyed invalidation")[
+#custom-box(title: [Term — Epoch-keyed invalidation], icon: "info")[
   The technique of putting the read epoch into the cache key, so that a new version is a new key
   rather than an overwrite of an old one. There is no explicit "invalidate this entry on write"
   step. A write advances the epoch; reads at the new epoch use new keys and miss the cache;
@@ -377,21 +386,24 @@ none of these caches.
 
 #figure(
   diagram(
-    node-stroke: 0.55pt,
-    spacing: (0.6cm, 0.75cm),
-    node((0, 0), [read at epoch 5\ key `(..., 5)`], fill: rgb("#eef4ff"), width: 3.6cm),
-    edge((0, 0), (1, 0), "->", [hit]),
-    node((1, 0), [cached value\ for epoch 5], fill: rgb("#e9fce9"), width: 3.6cm),
-    node((0, 1), [write advances\ epoch to 6], fill: rgb("#fff8e6"), width: 3.6cm),
+    crossing-fill: reader-colors.paper,
+    node-stroke: 0.55pt + reader-colors.border,
+    edge-stroke: reader-colors.muted,
+    spacing: (2.6cm, 0.75cm),
+    node((0, 0), [read at epoch 5\ key `(..., 5)`], fill: reader-colors.info_soft, stroke: 0.55pt + reader-colors.info, width: 3.6cm),
+    edge((0, 0), (1, 0), "->", text(size: 8pt, fill: reader-colors.muted)[hit]),
+    node((1, 0), [cached value\ for epoch 5], fill: reader-colors.ok_soft, stroke: 0.55pt + reader-colors.ok, width: 3.6cm),
+    node((0, 1), [write advances\ epoch to 6], fill: reader-colors.warn_soft, stroke: 0.55pt + reader-colors.warn, width: 3.6cm),
     edge((0, 1), (0, 2), "->"),
-    node((0, 2), [read at epoch 6\ key `(..., 6)`], fill: rgb("#eef4ff"), width: 3.6cm),
-    edge((0, 2), (1, 2), "->", [miss: recompute]),
-    node((1, 2), [fresh value\ for epoch 6], fill: rgb("#e9fce9"), width: 3.6cm),
-    node((2, 1), [epoch-5 entry\ still cached,\ never served to\ an epoch-6 read], fill: rgb("#f6f8fa"), width: 3.6cm),
+    node((0, 2), [read at epoch 6\ key `(..., 6)`], fill: reader-colors.info_soft, stroke: 0.55pt + reader-colors.info, width: 3.6cm),
+    edge((0, 2), (1, 2), "->", text(size: 8pt, fill: reader-colors.muted)[miss: recompute]),
+    node((1, 2), [fresh value\ for epoch 6], fill: reader-colors.ok_soft, stroke: 0.55pt + reader-colors.ok, width: 3.6cm),
+    node((2, 1), [epoch-5 entry\ still cached,\ never served to\ an epoch-6 read], fill: reader-colors.surface_soft, stroke: 0.55pt + reader-colors.border, width: 3.6cm),
   ),
-  caption: none,
-)
-#figcap[Epoch-keyed invalidation for the per-read caches. A write does not touch the cache at all. The new epoch produces new keys, so the reader misses old entries automatically and the stale ones age out.]
+  caption: [Epoch-keyed invalidation for the per-read caches: a write does not touch the
+    cache at all, because the new epoch produces new keys, so the reader misses old entries
+    automatically and the stale ones age out.],
+) <fig-cache-epoch-keyed>
 
 === Regime two: matrix caches, base-epoch keyed, deliberately lagging
 
@@ -432,7 +444,7 @@ self.graphblas_cache.lock().await.retain(/* same predicate */);
 and then drops the corresponding cache entries for that cell and edge type. This is the invalidation
 step that regime one does not need.
 
-#why[
+#custom-box(title: [Why], icon: "tip")[
   The write and delete chapters never mentioned invalidating the per-read caches because there
   genuinely is nothing to invalidate there: a stale entry has a key no current read will ever
   construct. But do not over-generalize that to the whole engine. The matrix caches trade freshness
