@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import statistics
 import threading
 import time
@@ -31,11 +32,18 @@ def parse_hops(value: str) -> tuple[int, ...]:
     return hops
 
 
+def cypher_identifier(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        raise argparse.ArgumentTypeError("must be a static Cypher identifier")
+    return value
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--uri", default="bolt://127.0.0.1:17687")
     parser.add_argument("--token", required=True)
     parser.add_argument("--database", default="default")
+    parser.add_argument("--source-label", type=cypher_identifier)
     parser.add_argument("--degree", type=positive_int, default=30)
     parser.add_argument("--hops", type=parse_hops, default=(1, 3, 5, 10))
     parser.add_argument("--warmup", type=int, default=10)
@@ -49,16 +57,17 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def query(hop: int) -> str:
+def query(hop: int, source_label: str | None = None) -> str:
+    label = f":{source_label}" if source_label else ""
     return (
-        f"MATCH (u {{id: 1}})-[:BENCH*{hop}..{hop}]->(v) "
+        f"MATCH (u{label} {{id: 1}})-[:BENCH*{hop}..{hop}]->(v) "
         "RETURN count(*) AS total"
     )
 
 
-def execute_read(session, hop: int, expected: int) -> float:
+def execute_read(session, hop: int, expected: int, source_label: str | None = None) -> float:
     started = time.perf_counter_ns()
-    row = session.run(query(hop)).single(strict=True)
+    row = session.run(query(hop, source_label)).single(strict=True)
     elapsed_us = (time.perf_counter_ns() - started) / 1_000.0
     if row["total"] != expected:
         raise AssertionError(
@@ -95,7 +104,7 @@ def concurrent_reads(driver, args: argparse.Namespace, hop: int) -> tuple[list[f
         with driver.session(database=args.database) as session:
             barrier.wait(timeout=30)
             return [
-                execute_read(session, hop, args.degree)
+                execute_read(session, hop, args.degree, args.source_label)
                 for _ in range(args.operations_per_worker)
             ]
 
@@ -137,10 +146,11 @@ def main() -> None:
         for hop in args.hops:
             with driver.session(database=args.database) as session:
                 for _ in range(args.warmup):
-                    execute_read(session, hop, args.degree)
+                    execute_read(session, hop, args.degree, args.source_label)
                 query_calls += args.warmup
                 samples = [
-                    execute_read(session, hop, args.degree) for _ in range(args.samples)
+                    execute_read(session, hop, args.degree, args.source_label)
+                    for _ in range(args.samples)
                 ]
                 query_calls += args.samples
             records.append(latency_record(hop, args.degree, samples))

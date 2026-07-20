@@ -163,9 +163,8 @@ async fn main() -> BenchResult<()> {
 }
 
 async fn seed_graph(cluster: &RoutedGraphCluster, fanout: u64, max_hop: u8) -> BenchResult<()> {
-    let shard = cluster.shard(CELL_ID)?;
-    shard
-        .bulk_append_edges_trusted_chunked(
+    cluster
+        .write_edges_batch_chunked(
             CELL_ID,
             EDGE_TYPE,
             layered_edges(fanout, max_hop),
@@ -174,13 +173,19 @@ async fn seed_graph(cluster: &RoutedGraphCluster, fanout: u64, max_hop: u8) -> B
         )
         .await?;
 
-    let epoch = shard.current_epoch(CELL_ID).await?;
-    shard
-        .build_adjacency_image(CELL_ID, EDGE_TYPE, epoch, 4_096)
-        .await?;
+    let shard = cluster.shard(CELL_ID)?;
     shard
         .refresh_edge_type_query_stats(CELL_ID, EDGE_TYPE)
         .await?;
+    let epoch = shard.current_epoch(CELL_ID).await?;
+    let index = shard.build_graph_index(CELL_ID, EDGE_TYPE).await?;
+    if index.base_sequence != epoch {
+        return Err(format!(
+            "graph index base sequence {} did not match seeded graph sequence {epoch}",
+            index.base_sequence
+        )
+        .into());
+    }
     eprintln!("benchmark-seeded fanout={fanout} max_hop={max_hop} edge_type={EDGE_TYPE}");
     Ok(())
 }
@@ -191,20 +196,20 @@ async fn verify_graphblas_artifacts(
 ) -> BenchResult<()> {
     let shard = cluster.shard(CELL_ID)?;
     let artifact = shard
-        .latest_matrix_artifact(CELL_ID, EDGE_TYPE, read_epoch)
+        .discover_graph_index(CELL_ID, EDGE_TYPE)
         .await?
         .ok_or_else(|| {
-            format!("missing adjacency image for edge type {EDGE_TYPE} at epoch {read_epoch}")
+            format!("missing graph index for edge type {EDGE_TYPE} at sequence {read_epoch}")
         })?;
-    if artifact.base_epoch != read_epoch {
+    if artifact.base_sequence != read_epoch {
         return Err(format!(
-            "stale adjacency image for edge type {EDGE_TYPE}: base epoch {}, read epoch {read_epoch}",
-            artifact.base_epoch
+            "stale graph index for edge type {EDGE_TYPE}: base sequence {}, read sequence {read_epoch}",
+            artifact.base_sequence
         )
         .into());
     }
     eprintln!(
-        "benchmark-artifact-verified edge_type={EDGE_TYPE} epoch={read_epoch} edges={}",
+        "benchmark-index-verified edge_type={EDGE_TYPE} sequence={read_epoch} edges={}",
         artifact.edge_count
     );
     Ok(())
