@@ -79,6 +79,23 @@ with GraphDatabase.driver(
             "MATCH (a {id: 1})-[:FOLLOWS]->(b) RETURN b.id AS id"
         ).single(strict=True)
         assert row["id"] == 2, row
+
+    scoped = {
+        "default.scope1.dGVuYW50LWE.Y29sbGVjdGlvbi1h": 3,
+        "default.scope1.dGVuYW50LWE.Y29sbGVjdGlvbi1i": 4,
+    }
+    for database, destination in scoped.items():
+        with driver.session(database=database) as session:
+            session.run(
+                "CREATE (a {id: 1})-[:FOLLOWS]->(b {id: $destination})",
+                destination=destination,
+            ).consume()
+    for database, destination in scoped.items():
+        with driver.session(database=database) as session:
+            rows = list(session.run(
+                "MATCH (a {id: 1})-[:FOLLOWS]->(b) RETURN b.id AS id"
+            ))
+            assert [row["id"] for row in rows] == [destination], (database, rows)
 PY
 
 http_result="$(curl -fsS -X POST \

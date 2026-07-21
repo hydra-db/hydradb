@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "query-transport")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,6 +26,8 @@ use crate::{
     GraphWriteGuard, LocalWriteGuard, MatrixAdjacency, MatrixCacheKey, RelationshipId,
     RelationshipRecord, Result, StorageSequence, VertexId,
 };
+#[cfg(feature = "query-transport")]
+use crate::{GraphId, NamespacePath};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum MatrixDirection {
@@ -88,6 +92,28 @@ pub struct RoutedGraphCluster {
     promotable: bool,
 }
 
+#[cfg(feature = "query-transport")]
+struct ScopedRoutedClusterEntry {
+    cluster: Arc<RoutedGraphCluster>,
+    last_used: u64,
+}
+
+#[cfg(feature = "query-transport")]
+pub struct ScopedRoutedGraphCluster {
+    base_path: String,
+    root_namespace: NamespacePath,
+    graph_id: GraphId,
+    local_node_id: String,
+    directory: ObjectStoreNodeDirectory,
+    object_store: Arc<dyn ObjectStore>,
+    scope_directory: ObjectStoreGraphScopeDirectory,
+    options: GraphOpenOptions,
+    memory: GraphMemoryConfig,
+    max_open_scopes: usize,
+    access_clock: AtomicU64,
+    clusters: tokio::sync::Mutex<BTreeMap<GraphScope, ScopedRoutedClusterEntry>>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphShardRuntimeMetrics {
     pub cell_id: String,
@@ -95,6 +121,12 @@ pub struct GraphShardRuntimeMetrics {
     pub cache: GraphCacheMetricsSnapshot,
     pub cache_entries: GraphCacheEntryCounts,
     pub cache_resident_bytes: GraphCacheResidentBytes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopedGraphShardRuntimeMetrics {
+    pub scope: GraphScope,
+    pub shard: GraphShardRuntimeMetrics,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -186,6 +218,9 @@ mod artifact_build;
 mod artifact_gc;
 mod cluster;
 mod index_store;
+mod scope_directory;
+
+pub use scope_directory::ObjectStoreGraphScopeDirectory;
 mod matrix_cache;
 mod traversal;
 mod verify;

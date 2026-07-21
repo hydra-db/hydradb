@@ -145,6 +145,7 @@ service:
 
 runtime:
   rustLog: info,slatedb_graph_kernel=info
+  maxOpenScopes: 8
   maxConcurrentQueries: 256
   maxQueryScanEdges: 1000000
   maxQueryRuntimeMs: 30000
