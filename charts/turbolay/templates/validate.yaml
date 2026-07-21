@@ -8,7 +8,7 @@
 {{- fail "tls.certManager.enabled requires public TLS" -}}
 {{- end -}}
 {{- if ne (len .Values.graph.cells) 1 -}}
-{{- fail "the production runtime currently exposes exactly one cell per graph scope; deploy another release for another independently writable scope" -}}
+{{- fail "graph.cells must contain exactly one cell identifier; every dynamic tenant/subtenant graph scope receives that cell independently" -}}
 {{- end -}}
 {{- if and .Values.tls.public.trustBundle.enabled (not .Values.tls.public.enabled) -}}
 {{- fail "tls.public.trustBundle.enabled requires public TLS" -}}

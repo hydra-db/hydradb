@@ -78,9 +78,12 @@ configure its trust source namespace to this release namespace. The chart then
 publishes only the public CA certificate into explicitly selected client
 namespaces; private keys never leave the Turbolay namespace.
 
-Each release currently serves exactly one graph scope and one cell. Deploy a
-separate release and object-store prefix for every
-independently writable namespace or subtenant.
+Each release serves one deployment root containing dynamically selected tenant
+and subtenant graph scopes. Clients select a scope with the versioned Bolt
+database name, and every scope receives its own `cell-0`, SlateDB WAL, writer
+fence, caches, and graph indexes under the shared object-store prefix. Do not
+deploy a separate release per tenant or subtenant. `runtime.maxOpenScopes`
+bounds warm scopes per query node; idle scopes are closed and reopen from S3.
 
 Client ingress is denied by default. Set `networkPolicy.clientIngressFrom` to
 the HydraDB and ingestion namespaces, Pods, or CIDRs that may reach Bolt and
@@ -127,5 +130,6 @@ part of the data path. Indexer Deployments can roll, fail, or scale independentl
 without blocking canonical reads or writes. While an index generation lags,
 query nodes combine its CSC base with the committed SlateDB WAL tail; if no
 usable generation exists, correctness falls back to bounded canonical reads.
-Deploy independently writable graph scopes as separate releases and
-object-store prefixes.
+Tenant and subtenant scopes are discovered and opened dynamically inside the
+release. Use separate releases only for separate environments, security
+boundaries, or object-store roots.
