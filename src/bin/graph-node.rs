@@ -15,10 +15,10 @@ use std::time::Duration;
 use config::RuntimeConfig;
 use slatedb_graph_kernel::{
     object_store_from_env, BoltServerConfig, ClientBoltServer, ClientHttpServer,
-    ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget, HttpQueryServerConfig,
-    ObjectStoreBoltRoutingTableProvider, ObjectStoreNodeDirectory, QueryTransportAction,
-    QueryTransportScopeGrant, RoutedGraphCluster, StaticClientDatabaseResolver,
-    StaticQueryTransportScopeAuthorizer,
+    ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget,
+    HierarchicalClientDatabaseResolver, HttpQueryServerConfig, ObjectStoreBoltRoutingTableProvider,
+    ObjectStoreNodeDirectory, QueryTransportAction, QueryTransportScopeGrant,
+    ScopedRoutedGraphCluster, StaticQueryTransportScopeAuthorizer,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -41,18 +41,17 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         config.cells.iter().cloned(),
         config.bolt_node_addresses.keys().cloned(),
     )?;
-    let node = Arc::new(
-        RoutedGraphCluster::open_promotable_scoped_with_memory_options(
-            config.data_path.clone(),
-            config.scope.clone(),
-            config.node_id.clone(),
-            directory.clone(),
-            object_store,
-            open_options,
-            memory_config,
-        )
-        .await?,
-    );
+    let node = Arc::new(ScopedRoutedGraphCluster::new(
+        config.data_path.clone(),
+        config.scope.namespace.clone(),
+        config.scope.graph_id.clone(),
+        config.node_id.clone(),
+        directory.clone(),
+        object_store,
+        open_options,
+        memory_config,
+        config.max_open_scopes,
+    )?);
     let (index_discovery_stop, index_discovery_task) = start_index_discovery(
         Arc::clone(&node),
         config.cells.clone(),
@@ -62,8 +61,10 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     let token = config.read_auth_token()?;
     let authorizer = StaticQueryTransportScopeAuthorizer::new().with_bearer_grant(
         token.clone(),
-        QueryTransportScopeGrant::graph(
-            config.scope.clone(),
+        QueryTransportScopeGrant::graph_namespace(
+            config.scope.namespace.clone(),
+            config.scope.graph_id.clone(),
+            true,
             [
                 QueryTransportAction::Read,
                 QueryTransportAction::Write,
@@ -86,7 +87,7 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
             ),
     )?;
     let target = ClientQueryTarget::new(config.scope.clone(), config.cell_id.clone())?;
-    let resolver = Arc::new(StaticClientDatabaseResolver::single(
+    let resolver = Arc::new(HierarchicalClientDatabaseResolver::new(
         config.database.clone(),
         target,
     )?);
@@ -135,7 +136,7 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     let http = ClientHttpServer::bind(config.http_addr, service.clone(), http_config).await?;
 
     let ready = Arc::new(AtomicBool::new(false));
-    let admin = admin::AdminServer::bind_routed(
+    let admin = admin::AdminServer::bind_scoped(
         config.admin_addr,
         Arc::clone(&ready),
         service.clone(),
@@ -172,7 +173,7 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
 }
 
 fn start_index_discovery(
-    node: Arc<RoutedGraphCluster>,
+    node: Arc<ScopedRoutedGraphCluster>,
     cells: Vec<String>,
     interval: Duration,
 ) -> (
@@ -182,28 +183,32 @@ fn start_index_discovery(
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         loop {
-            for cell_id in &cells {
-                let shard = node.shard(cell_id)?;
-                match shard.dirty_graph_index_edge_types(cell_id).await {
-                    Ok(edge_types) => {
-                        for (edge_type, _) in edge_types {
-                            if let Err(error) =
-                                shard.discover_graph_index(cell_id, &edge_type).await
-                            {
-                                tracing::warn!(
-                                    cell_id,
-                                    edge_type,
-                                    error = %error,
-                                    "failed to discover graph index generation"
-                                );
+            for cluster in node.loaded_clusters().await {
+                for cell_id in &cells {
+                    let shard = cluster.shard(cell_id)?;
+                    match shard.dirty_graph_index_edge_types(cell_id).await {
+                        Ok(edge_types) => {
+                            for (edge_type, _) in edge_types {
+                                if let Err(error) =
+                                    shard.discover_graph_index(cell_id, &edge_type).await
+                                {
+                                    tracing::warn!(
+                                        scope = %cluster.scope(),
+                                        cell_id,
+                                        edge_type,
+                                        error = %error,
+                                        "failed to discover graph index generation"
+                                    );
+                                }
                             }
                         }
+                        Err(error) => tracing::warn!(
+                            scope = %cluster.scope(),
+                            cell_id,
+                            error = %error,
+                            "failed to discover dirty graph index edge types"
+                        ),
                     }
-                    Err(error) => tracing::warn!(
-                        cell_id,
-                        error = %error,
-                        "failed to discover dirty graph index edge types"
-                    ),
                 }
             }
             tokio::select! {

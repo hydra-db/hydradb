@@ -333,6 +333,8 @@ cache, or cache volume changes cold-start latency only.
 
 ```text
 <base>/
++-- _graph_scopes/v1/<graph-id>/<root-namespace>/
+    +-- <encoded-tenant>/<encoded-subtenant>/__scope__
 +-- namespaces/<tenant>/
     +-- subnamespaces/<subtenant>/...
         +-- graphs/<graph-id>/
@@ -352,6 +354,14 @@ subnamespaces. A graph is selected within that namespace path, and each cell is
 opened as an independent SlateDB database under the graph. Consequently, every
 `(namespace path, graph, cell)` has independent WAL, snapshots, writer fencing,
 indexes, and cache locality.
+
+Bolt adapters select these scopes with a versioned database name:
+`<base-database>.scope1.<base64url-tenant>.<base64url-subtenant>`. The encoded
+components themselves are the storage-safe child namespace IDs; `_` denotes an
+absent subtenant. This mapping is deterministic and collision-free for opaque
+UTF-8 tenant and collection identifiers. Query nodes lazily open a bounded
+number of scopes, while immutable `__scope__` markers let indexers discover
+them with object-store LIST operations and no writable catalog service.
 
 Canonical graph keys are records inside SlateDB WAL/SST data. They include
 outbound topology, segment data and tombstones, vertex and relationship
