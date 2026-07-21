@@ -3144,6 +3144,7 @@ async fn routed_cluster_uses_slatedb_writer_fencing() {
     let _ = first.close().await;
 }
 
+#[cfg(feature = "query-transport")]
 #[tokio::test]
 async fn scoped_routed_cluster_isolates_collection_writers_and_registers_scopes() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

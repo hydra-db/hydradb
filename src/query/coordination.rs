@@ -3405,6 +3405,7 @@ impl QueryCellClient for RoutedGraphCluster {
     }
 }
 
+#[cfg(feature = "query-transport")]
 #[async_trait]
 impl QueryCellClient for crate::ScopedRoutedGraphCluster {
     async fn execute_cypher_rows(

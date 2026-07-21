@@ -130,12 +130,33 @@ jobs:
           path: .turbolay-source
           persist-credentials: false
 
-      - name: Synchronize canonical Helm chart
+      - name: Verify canonical Helm chart
         run: |
           set -euo pipefail
-          rsync -a --delete \
-            .turbolay-source/charts/turbolay/ \
-            infra/charts/turbolay/
+          source_chart=.turbolay-source/charts/turbolay
+          deployed_chart=infra/charts/turbolay
+          drift=0
+
+          # Infra-only extensions may coexist; canonical files must match exactly.
+          while IFS= read -r -d '' source_file; do
+            relative_path="${source_file#${source_chart}/}"
+            deployed_file="${deployed_chart}/${relative_path}"
+            if [[ ! -f "${deployed_file}" ]]; then
+              echo "::error file=${deployed_file}::Canonical Turbolay chart file is missing from the infra repository"
+              drift=1
+              continue
+            fi
+            if ! cmp -s "${source_file}" "${deployed_file}"; then
+              echo "::error file=${deployed_file}::Turbolay chart differs from the reviewed canonical chart"
+              diff -u "${deployed_file}" "${source_file}" || true
+              drift=1
+            fi
+          done < <(find "${source_chart}" -type f -print0)
+
+          if [[ "${drift}" -ne 0 ]]; then
+            echo "Submit and merge a reviewed hydradb-argocd chart update before deploying this image."
+            exit 1
+          fi
 
       - name: Update immutable image identity
         env:
@@ -184,7 +205,7 @@ jobs:
             echo "No changes to commit - image is already ${IMAGE_TAG}@${IMAGE_DIGEST}"
             exit 0
           fi
-          git add infra/charts/turbolay infra/environments/staging/turbolay/values.yaml
+          git add infra/environments/staging/turbolay/values.yaml
           git commit -m "deploy(turbolay): update staging image to ${IMAGE_TAG}" \
             -m "Digest: ${IMAGE_DIGEST}" \
             -m "Triggered by: ${TRIGGER_MESSAGE}" \
