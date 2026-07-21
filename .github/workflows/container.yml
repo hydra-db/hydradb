@@ -122,6 +122,21 @@ jobs:
           token: ${{ secrets.INFRA_REPO_TOKEN }}
           ref: main
 
+      - name: Checkout canonical Turbolay chart
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: .turbolay-source
+          persist-credentials: false
+
+      - name: Synchronize canonical Helm chart
+        run: |
+          set -euo pipefail
+          rsync -a --delete \
+            .turbolay-source/charts/turbolay/ \
+            infra/charts/turbolay/
+
       - name: Update immutable image identity
         env:
           IMAGE_REPOSITORY: ${{ needs.build-and-push.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}
@@ -169,7 +184,7 @@ jobs:
             echo "No changes to commit - image is already ${IMAGE_TAG}@${IMAGE_DIGEST}"
             exit 0
           fi
-          git add infra/environments/staging/turbolay/values.yaml
+          git add infra/charts/turbolay infra/environments/staging/turbolay/values.yaml
           git commit -m "deploy(turbolay): update staging image to ${IMAGE_TAG}" \
             -m "Digest: ${IMAGE_DIGEST}" \
             -m "Triggered by: ${TRIGGER_MESSAGE}" \
