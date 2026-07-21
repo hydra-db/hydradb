@@ -55,9 +55,10 @@ keys in GitHub. The ECR repository and role access are provisioned through the
 team's existing AWS infrastructure process.
 
 After publishing, the workflow checks out `usecortex/hydradb-argocd` with the
-existing `INFRA_REPO_TOKEN`, updates the staging tag and digest, validates the
-Helm release, and pushes the deployment commit to `main`. This is the same
-promotion path used by HydraDB application and ingestion services.
+existing `INFRA_REPO_TOKEN`, synchronizes this canonical chart into the infra
+repository, updates the staging tag and digest, validates the Helm release, and
+pushes the deployment commit to `main`. This is the same promotion path used by
+HydraDB application and ingestion services.
 
 Set the `TURBOLAY_STAGING_DEPLOY_ENABLED` repository variable to `true` only
 after the staging ECR repository, S3 roles, certificates, and client-auth Secret
