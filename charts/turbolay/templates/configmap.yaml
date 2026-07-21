@@ -46,6 +46,7 @@ data:
   GRAPH_TLS_CERTIFICATE: /var/run/secrets/turbolay/public/tls.crt
   GRAPH_TLS_PRIVATE_KEY: /var/run/secrets/turbolay/public/tls.key
   GRAPH_ALLOW_PLAINTEXT: {{ not .Values.tls.public.enabled | quote }}
+  GRAPH_MAX_OPEN_SCOPES: {{ include "turbolay.decimalInteger" .Values.runtime.maxOpenScopes | quote }}
   GRAPH_MAX_CONCURRENT_QUERIES: {{ include "turbolay.decimalInteger" .Values.runtime.maxConcurrentQueries | quote }}
   GRAPH_MAX_QUERY_SCAN_EDGES: {{ include "turbolay.decimalInteger" .Values.runtime.maxQueryScanEdges | quote }}
   GRAPH_MAX_QUERY_RUNTIME_MS: {{ include "turbolay.decimalInteger" .Values.runtime.maxQueryRuntimeMs | quote }}

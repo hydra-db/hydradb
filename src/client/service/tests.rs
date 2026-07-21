@@ -29,6 +29,61 @@ struct CursorTestClient {
     executions: Arc<AtomicU64>,
 }
 
+#[test]
+fn hierarchical_database_resolver_maps_each_collection_to_a_native_scope() {
+    let root = GraphScope::new(
+        NamespacePath::root(NamespaceId::new("hydradb").unwrap()),
+        GraphId::new("knowledge").unwrap(),
+    );
+    let resolver = HierarchicalClientDatabaseResolver::new(
+        "default",
+        ClientQueryTarget::new(root.clone(), "cell-0").unwrap(),
+    )
+    .unwrap();
+    let database = resolver
+        .scoped_database_name("tenant-a", Some("collection-b"))
+        .unwrap();
+    assert_eq!(database, "default.scope1.dGVuYW50LWE.Y29sbGVjdGlvbi1i");
+    let target = resolver.resolve_database(Some(&database)).unwrap();
+    assert_eq!(
+        target.scope.namespace.to_string(),
+        "hydradb/dGVuYW50LWE/Y29sbGVjdGlvbi1i"
+    );
+    assert_eq!(target.scope.graph_id.as_str(), "knowledge");
+    assert_eq!(target.cell_id, "cell-0");
+    assert_eq!(resolver.resolve_database(None).unwrap().scope, root);
+}
+
+#[test]
+fn hierarchical_database_resolver_rejects_malformed_or_unsafe_scopes() {
+    let resolver = HierarchicalClientDatabaseResolver::new(
+        "default",
+        ClientQueryTarget::new(GraphScope::default(), "cell-0").unwrap(),
+    )
+    .unwrap();
+    assert!(resolver
+        .resolve_database(Some("default.scope1.not+base64._"))
+        .is_err());
+    let escaped = resolver
+        .scoped_database_name("tenant/escape", Some("collection:name"))
+        .unwrap();
+    assert_eq!(
+        resolver
+            .resolve_database(Some(&escaped))
+            .unwrap()
+            .scope
+            .namespace
+            .to_string(),
+        "default/dGVuYW50L2VzY2FwZQ/Y29sbGVjdGlvbjpuYW1l"
+    );
+    assert!(resolver
+        .scoped_database_name("", Some("collection"))
+        .is_err());
+    assert!(resolver
+        .resolve_database(Some("another.scope1.dGVuYW50._"))
+        .is_err());
+}
+
 struct SnapshotEpochClient;
 
 struct ConsistencyTestClient {

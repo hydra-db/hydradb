@@ -33,7 +33,7 @@ pub use client::service::{
     ClientBookmark, ClientDatabaseResolver, ClientQueryCredentials, ClientQueryMetricsSnapshot,
     ClientQueryPage, ClientQueryRequest, ClientQueryResult, ClientQueryService,
     ClientQueryServiceConfig, ClientQuerySession, ClientQueryTarget, ClientReadConsistency,
-    StaticClientDatabaseResolver,
+    HierarchicalClientDatabaseResolver, StaticClientDatabaseResolver,
 };
 pub(crate) use core::cache::BoundedGraphCache;
 #[cfg(feature = "opencypher")]
@@ -76,10 +76,13 @@ pub(crate) use core::state::{
 };
 pub use core::state::{GraphCacheEntryCounts, GraphCacheResidentBytes, GraphShard};
 pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
+#[cfg(feature = "query-transport")]
+pub use engine::ScopedRoutedGraphCluster;
 pub use engine::{
     local_object_store, object_store_from_env, ArtifactGcResult, BenchmarkResult, GraphCluster,
     GraphIndexGeneration, GraphShardRuntimeMetrics, MatrixArtifact, MatrixTraversalResult,
-    ObjectStoreNodeDirectory, RoutedGraphCluster, TraversalBackend,
+    ObjectStoreGraphScopeDirectory, ObjectStoreNodeDirectory, RoutedGraphCluster,
+    ScopedGraphShardRuntimeMetrics, TraversalBackend,
 };
 pub use placement::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,

@@ -3145,6 +3145,85 @@ async fn routed_cluster_uses_slatedb_writer_fencing() {
 }
 
 #[tokio::test]
+async fn scoped_routed_cluster_isolates_collection_writers_and_registers_scopes() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let root_namespace = NamespacePath::root(NamespaceId::new("production").unwrap());
+    let graph_id = GraphId::new("hydradb").unwrap();
+    let directory = ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap();
+    let runtime = ScopedRoutedGraphCluster::new(
+        "graph/native-scopes",
+        root_namespace.clone(),
+        graph_id.clone(),
+        "node-a",
+        directory,
+        Arc::clone(&object_store),
+        GraphOpenOptions::default(),
+        GraphMemoryConfig::default(),
+        4,
+    )
+    .unwrap();
+    let collection_a = GraphScope::new(
+        root_namespace
+            .child(NamespaceId::new("tenant-a").unwrap())
+            .unwrap()
+            .child(NamespaceId::new("collection-a").unwrap())
+            .unwrap(),
+        graph_id.clone(),
+    );
+    let collection_b = GraphScope::new(
+        root_namespace
+            .child(NamespaceId::new("tenant-a").unwrap())
+            .unwrap()
+            .child(NamespaceId::new("collection-b").unwrap())
+            .unwrap(),
+        graph_id.clone(),
+    );
+
+    let cluster_a = runtime.cluster_for_scope(&collection_a).await.unwrap();
+    let cluster_b = runtime.cluster_for_scope(&collection_b).await.unwrap();
+    let (write_a, write_b) = tokio::join!(
+        cluster_a.write_edge(typed_mutation("cell-0", "FOLLOWS", 1, 2, "scope-a")),
+        cluster_b.write_edge(typed_mutation("cell-0", "FOLLOWS", 1, 3, "scope-b")),
+    );
+    write_a.unwrap();
+    write_b.unwrap();
+
+    assert!(cluster_a
+        .shard("cell-0")
+        .unwrap()
+        .edge_exists("cell-0", "FOLLOWS", 1, 2)
+        .await
+        .unwrap());
+    assert!(!cluster_a
+        .shard("cell-0")
+        .unwrap()
+        .edge_exists("cell-0", "FOLLOWS", 1, 3)
+        .await
+        .unwrap());
+    assert!(cluster_b
+        .shard("cell-0")
+        .unwrap()
+        .edge_exists("cell-0", "FOLLOWS", 1, 3)
+        .await
+        .unwrap());
+
+    let scope_directory = ObjectStoreGraphScopeDirectory::new(
+        "graph/native-scopes",
+        root_namespace,
+        graph_id,
+        object_store,
+    );
+    assert_eq!(
+        scope_directory.list().await.unwrap(),
+        vec![collection_a, collection_b]
+    );
+
+    drop(cluster_a);
+    drop(cluster_b);
+    runtime.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn routed_reader_catches_up_to_a_remote_writer_storage_sequence() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let placement = ObjectStoreNodeDirectory::new(["cell-a"], ["node-a", "node-b"]).unwrap();

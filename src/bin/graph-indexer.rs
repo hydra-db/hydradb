@@ -8,8 +8,11 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use futures::StreamExt;
+use slatedb::object_store::path::Path;
 use slatedb_graph_kernel::{
     object_store_from_env, GraphCluster, GraphId, GraphScope, NamespaceId, NamespacePath,
+    ObjectStoreGraphScopeDirectory,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -45,7 +48,7 @@ async fn main() -> RuntimeResult<()> {
         .init();
 
     let data_path = env_value("GRAPH_DATA_PATH", "graph/data");
-    let scope = graph_scope()?;
+    let root_scope = graph_scope()?;
     let cells = env_value("GRAPH_CELLS", "cell-0")
         .split(',')
         .map(str::trim)
@@ -69,39 +72,27 @@ async fn main() -> RuntimeResult<()> {
     // ready to observe that namespace even though there is nothing to build.
     metrics.ready.store(true, Ordering::Release);
     let object_store = object_store_from_env(None)?;
+    let scope_directory = ObjectStoreGraphScopeDirectory::new(
+        data_path.clone(),
+        root_scope.namespace.clone(),
+        root_scope.graph_id.clone(),
+        Arc::clone(&object_store),
+    );
     let mut shutdown = Box::pin(shutdown_signal());
-    let cluster = loop {
-        match GraphCluster::open_cells_scoped(
-            data_path.clone(),
-            scope.clone(),
-            cells.clone(),
-            Arc::clone(&object_store),
-        )
-        .await
-        {
-            Ok(cluster) => break cluster,
-            Err(error) => {
-                metrics.open_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    error = %error,
-                    "graph data is not readable yet; waiting for writer initialization"
-                );
-            }
-        }
-        tokio::select! {
-            result = &mut shutdown => {
-                result?;
-                admin.stop().await?;
-                return Ok(());
-            }
-            _ = tokio::time::sleep(interval) => {}
-        }
-    };
-    tracing::info!(scope = %scope, ?cells, "graph indexer started");
+    tracing::info!(scope = %root_scope, ?cells, "graph indexer started");
 
     loop {
         metrics.cycles.fetch_add(1, Ordering::Relaxed);
-        match run_index_cycle(&cluster, &cells, retain_previous, &metrics).await {
+        match run_registered_scopes_cycle(
+            &data_path,
+            &scope_directory,
+            &cells,
+            Arc::clone(&object_store),
+            retain_previous,
+            &metrics,
+        )
+        .await
+        {
             Ok(()) => {
                 metrics.successful_cycles.fetch_add(1, Ordering::Relaxed);
                 metrics
@@ -125,10 +116,74 @@ async fn main() -> RuntimeResult<()> {
         }
     }
     metrics.ready.store(false, Ordering::Release);
-    cluster.close().await?;
     admin.stop().await?;
-    tracing::info!(scope = %scope, "graph indexer stopped");
+    tracing::info!(scope = %root_scope, "graph indexer stopped");
     Ok(())
+}
+
+async fn run_registered_scopes_cycle(
+    data_path: &str,
+    scope_directory: &ObjectStoreGraphScopeDirectory,
+    cells: &[String],
+    object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+    retain_previous: usize,
+    metrics: &IndexerMetrics,
+) -> RuntimeResult<()> {
+    let scopes = scope_directory.list().await?;
+    let mut failures = Vec::new();
+    for scope in scopes {
+        if !scope_has_data(data_path, &scope, cells, &object_store).await? {
+            continue;
+        }
+        let cluster = match GraphCluster::open_cells_scoped(
+            data_path.to_string(),
+            scope.clone(),
+            cells.to_vec(),
+            Arc::clone(&object_store),
+        )
+        .await
+        {
+            Ok(cluster) => cluster,
+            Err(error) => {
+                metrics.open_failures.fetch_add(1, Ordering::Relaxed);
+                failures.push(format!("open scope {scope}: {error}"));
+                continue;
+            }
+        };
+        if let Err(error) = run_index_cycle(&cluster, cells, retain_previous, metrics).await {
+            failures.push(format!("index scope {scope}: {error}"));
+        }
+        if let Err(error) = cluster.close().await {
+            failures.push(format!("close scope {scope}: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(failures.join("; ")).into())
+    }
+}
+
+async fn scope_has_data(
+    data_path: &str,
+    scope: &GraphScope,
+    cells: &[String],
+    object_store: &Arc<dyn slatedb::object_store::ObjectStore>,
+) -> RuntimeResult<bool> {
+    let scope_path = scope.scoped_store_path(data_path);
+    for cell_id in cells {
+        let prefix = Path::from(format!("{scope_path}/{cell_id}"));
+        if object_store
+            .list(Some(&prefix))
+            .next()
+            .await
+            .transpose()?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn run_index_cycle(
@@ -331,4 +386,92 @@ async fn shutdown_signal() -> RuntimeResult<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use slatedb::object_store::memory::InMemory;
+    use slatedb_graph_kernel::EdgeMutation;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn indexer_discovers_registered_scopes_and_ignores_empty_ones() {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let graph_id = GraphId::new("hydradb").unwrap();
+        let scope = GraphScope::new(
+            root.child(NamespaceId::new("dGVuYW50LWE").unwrap())
+                .unwrap()
+                .child(NamespaceId::new("Y29sbGVjdGlvbi1h").unwrap())
+                .unwrap(),
+            graph_id.clone(),
+        );
+        let directory = ObjectStoreGraphScopeDirectory::new(
+            "graph/data",
+            root,
+            graph_id,
+            Arc::clone(&object_store),
+        );
+        directory.register(&scope).await.unwrap();
+        let metrics = IndexerMetrics::default();
+
+        run_registered_scopes_cycle(
+            "graph/data",
+            &directory,
+            &["cell-0".to_string()],
+            Arc::clone(&object_store),
+            1,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.open_failures.load(Ordering::Relaxed), 0);
+
+        let writer = GraphCluster::open_cells_standalone_writers_scoped(
+            "graph/data",
+            scope.clone(),
+            ["cell-0"],
+            Arc::clone(&object_store),
+        )
+        .await
+        .unwrap();
+        writer
+            .shard("cell-0")
+            .unwrap()
+            .write_edge(EdgeMutation {
+                cell_id: "cell-0".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                dst: 2,
+                idempotency_key: "indexer-scope-write".to_string(),
+            })
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        run_registered_scopes_cycle(
+            "graph/data",
+            &directory,
+            &["cell-0".to_string()],
+            Arc::clone(&object_store),
+            1,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.generations_published.load(Ordering::Relaxed), 1);
+
+        let reader = GraphCluster::open_cells_scoped("graph/data", scope, ["cell-0"], object_store)
+            .await
+            .unwrap();
+        assert!(reader
+            .shard("cell-0")
+            .unwrap()
+            .current_graph_index("cell-0", "FOLLOWS")
+            .await
+            .unwrap()
+            .is_some());
+        reader.close().await.unwrap();
+    }
 }
