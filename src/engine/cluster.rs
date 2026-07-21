@@ -758,6 +758,215 @@ impl RoutedGraphCluster {
     }
 }
 
+#[cfg(feature = "query-transport")]
+impl ScopedRoutedGraphCluster {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        base_path: impl Into<String>,
+        root_namespace: NamespacePath,
+        graph_id: GraphId,
+        local_node_id: impl Into<String>,
+        directory: ObjectStoreNodeDirectory,
+        object_store: Arc<dyn ObjectStore>,
+        options: GraphOpenOptions,
+        memory: GraphMemoryConfig,
+        max_open_scopes: usize,
+    ) -> Result<Self> {
+        let base_path = base_path.into();
+        let local_node_id = local_node_id.into();
+        validate_component("node_id", &local_node_id)?;
+        if !directory.contains_node(&local_node_id)? {
+            return Err(GraphError::CorruptValue {
+                key: format!("directory/node/{local_node_id}"),
+                reason: "local node is not present in the object-store node directory".to_string(),
+            });
+        }
+        if max_open_scopes == 0 {
+            return Err(GraphError::AdmissionRejected {
+                operation: "max_open_scopes",
+                actual: 0,
+                limit: 1,
+            });
+        }
+        Ok(Self {
+            base_path: base_path.clone(),
+            root_namespace: root_namespace.clone(),
+            graph_id: graph_id.clone(),
+            local_node_id,
+            directory,
+            scope_directory: ObjectStoreGraphScopeDirectory::new(
+                base_path,
+                root_namespace,
+                graph_id,
+                Arc::clone(&object_store),
+            ),
+            object_store,
+            options,
+            memory,
+            max_open_scopes,
+            access_clock: AtomicU64::new(0),
+            clusters: tokio::sync::Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    pub fn root_scope(&self) -> GraphScope {
+        GraphScope::new(self.root_namespace.clone(), self.graph_id.clone())
+    }
+
+    fn validate_scope(&self, scope: &GraphScope) -> Result<()> {
+        if scope.graph_id == self.graph_id && scope.namespace.is_descendant_of(&self.root_namespace)
+        {
+            return Ok(());
+        }
+        Err(GraphError::GraphScopeMismatch {
+            expected: format!(
+                "{}/graphs/{} and descendants",
+                self.root_namespace, self.graph_id
+            ),
+            actual: scope.to_string(),
+        })
+    }
+
+    fn options_for_scope(&self, scope: &GraphScope) -> GraphOpenOptions {
+        let mut options = self.options.clone();
+        if let Some(root) = &options.cache.object_store_cache_dir {
+            let mut scoped_root = root.join("scopes");
+            for segment in scope.namespace.segments() {
+                scoped_root.push(segment.as_str());
+            }
+            scoped_root.push("graphs");
+            scoped_root.push(scope.graph_id.as_str());
+            options.cache.object_store_cache_dir = Some(scoped_root);
+        }
+        if let Some(bytes) = options.cache.object_store_cache_bytes {
+            options.cache.object_store_cache_bytes = Some((bytes / self.max_open_scopes).max(1));
+        }
+        options
+    }
+
+    pub(crate) async fn cluster_for_scope(
+        &self,
+        scope: &GraphScope,
+    ) -> Result<Arc<RoutedGraphCluster>> {
+        self.validate_scope(scope)?;
+        let access = self.access_clock.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut clusters = self.clusters.lock().await;
+        if let Some(entry) = clusters.get_mut(scope) {
+            entry.last_used = access;
+            return Ok(Arc::clone(&entry.cluster));
+        }
+
+        if clusters.len() >= self.max_open_scopes {
+            let candidate = clusters
+                .iter()
+                .filter(|(_, entry)| Arc::strong_count(&entry.cluster) == 1)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(scope, _)| scope.clone())
+                .ok_or(GraphError::AdmissionRejected {
+                    operation: "open_graph_scopes",
+                    actual: clusters.len().saturating_add(1) as u64,
+                    limit: self.max_open_scopes as u64,
+                })?;
+            let entry = clusters
+                .remove(&candidate)
+                .expect("selected scoped cluster must still exist");
+            let cluster = Arc::try_unwrap(entry.cluster).map_err(|_| GraphError::CorruptValue {
+                key: format!("scoped-cluster/{candidate}"),
+                reason: "idle scoped cluster acquired a concurrent owner during eviction"
+                    .to_string(),
+            })?;
+            cluster.close().await?;
+        }
+
+        let cluster = Arc::new(
+            RoutedGraphCluster::open_promotable_scoped_with_memory_options(
+                self.base_path.clone(),
+                scope.clone(),
+                self.local_node_id.clone(),
+                self.directory.clone(),
+                Arc::clone(&self.object_store),
+                self.options_for_scope(scope),
+                self.memory.clone(),
+            )
+            .await?,
+        );
+        if let Err(error) = self.scope_directory.register(scope).await {
+            if let Ok(cluster) = Arc::try_unwrap(cluster) {
+                let _ = cluster.close().await;
+            }
+            return Err(error);
+        }
+        clusters.insert(
+            scope.clone(),
+            ScopedRoutedClusterEntry {
+                cluster: Arc::clone(&cluster),
+                last_used: access,
+            },
+        );
+        Ok(cluster)
+    }
+
+    pub async fn loaded_scopes(&self) -> Vec<GraphScope> {
+        self.clusters.lock().await.keys().cloned().collect()
+    }
+
+    pub async fn loaded_clusters(&self) -> Vec<Arc<RoutedGraphCluster>> {
+        self.clusters
+            .lock()
+            .await
+            .values()
+            .map(|entry| Arc::clone(&entry.cluster))
+            .collect()
+    }
+
+    pub async fn local_shard_runtime_metrics(&self) -> Vec<ScopedGraphShardRuntimeMetrics> {
+        let clusters = self
+            .clusters
+            .lock()
+            .await
+            .iter()
+            .map(|(scope, entry)| (scope.clone(), Arc::clone(&entry.cluster)))
+            .collect::<Vec<_>>();
+        let mut metrics = Vec::new();
+        for (scope, cluster) in clusters {
+            metrics.extend(
+                cluster
+                    .local_shard_runtime_metrics()
+                    .await
+                    .into_iter()
+                    .map(|shard| ScopedGraphShardRuntimeMetrics {
+                        scope: scope.clone(),
+                        shard,
+                    }),
+            );
+        }
+        metrics
+    }
+
+    pub async fn close(&self) -> Result<()> {
+        let entries = std::mem::take(&mut *self.clusters.lock().await);
+        let mut failures = Vec::new();
+        for (scope, entry) in entries {
+            match Arc::try_unwrap(entry.cluster) {
+                Ok(cluster) => {
+                    if let Err(error) = cluster.close().await {
+                        failures.push(format!("{scope}: {error}"));
+                    }
+                }
+                Err(_) => failures.push(format!("{scope}: scoped cluster is still in use")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(GraphError::CorruptValue {
+                key: "runtime/scoped_clusters/close".to_string(),
+                reason: failures.join("; "),
+            })
+        }
+    }
+}
+
 async fn close_shards_best_effort(shards: BTreeMap<String, GraphShard>) {
     for shard in shards.into_values() {
         let _ = shard.close().await;
@@ -767,5 +976,60 @@ async fn close_shards_best_effort(shards: BTreeMap<String, GraphShard>) {
 async fn close_routed_shards_best_effort(shards: BTreeMap<String, Arc<GraphShard>>) {
     for shard in shards.into_values() {
         let _ = shard.close().await;
+    }
+}
+
+#[cfg(all(test, feature = "query-transport"))]
+mod scoped_cluster_tests {
+    use slatedb::object_store::memory::InMemory;
+
+    use super::*;
+    use crate::NamespaceId;
+
+    #[test]
+    fn scoped_clusters_partition_the_local_slate_cache_budget() {
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let graph_id = GraphId::new("hydradb").unwrap();
+        let runtime = ScopedRoutedGraphCluster::new(
+            "graph/data",
+            root.clone(),
+            graph_id.clone(),
+            "node-a",
+            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
+            Arc::new(InMemory::new()),
+            GraphOpenOptions {
+                cache: crate::GraphCacheConfig::disk_cache("/cache", 800),
+                ..GraphOpenOptions::default()
+            },
+            GraphMemoryConfig::default(),
+            8,
+        )
+        .unwrap();
+        let first = GraphScope::new(
+            root.child(NamespaceId::new("tenant-a").unwrap()).unwrap(),
+            graph_id.clone(),
+        );
+        let second = GraphScope::new(
+            runtime
+                .root_scope()
+                .namespace
+                .child(NamespaceId::new("tenant-b").unwrap())
+                .unwrap(),
+            graph_id,
+        );
+
+        let first_options = runtime.options_for_scope(&first);
+        let second_options = runtime.options_for_scope(&second);
+        assert_eq!(first_options.cache.object_store_cache_bytes, Some(100));
+        assert_eq!(second_options.cache.object_store_cache_bytes, Some(100));
+        assert_ne!(
+            first_options.cache.object_store_cache_dir,
+            second_options.cache.object_store_cache_dir
+        );
+        assert!(first_options
+            .cache
+            .object_store_cache_dir
+            .unwrap()
+            .ends_with("production/tenant-a/graphs/hydradb"));
     }
 }

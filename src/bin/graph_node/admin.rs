@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use slatedb_graph_kernel::{ClientQueryService, Result, RoutedGraphCluster};
+use slatedb_graph_kernel::{ClientQueryService, Result, ScopedRoutedGraphCluster};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 struct AdminState {
     ready: Arc<AtomicBool>,
     query: ClientQueryService,
-    routed_node: Arc<RoutedGraphCluster>,
+    routed_node: Arc<ScopedRoutedGraphCluster>,
 }
 
 pub struct AdminServer {
@@ -26,11 +26,11 @@ pub struct AdminServer {
 }
 
 impl AdminServer {
-    pub async fn bind_routed(
+    pub async fn bind_scoped(
         addr: SocketAddr,
         ready: Arc<AtomicBool>,
         query: ClientQueryService,
-        node: Arc<RoutedGraphCluster>,
+        node: Arc<ScopedRoutedGraphCluster>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr).await.map_err(admin_io_error)?;
         let local_addr = listener.local_addr().map_err(admin_io_error)?;
@@ -136,7 +136,7 @@ async fn metrics(State(state): State<AdminState>) -> Response {
 
 fn append_node_metrics(
     output: &mut String,
-    shard_metrics: Vec<slatedb_graph_kernel::GraphShardRuntimeMetrics>,
+    shard_metrics: Vec<slatedb_graph_kernel::ScopedGraphShardRuntimeMetrics>,
 ) {
     output.push_str(concat!(
         "# TYPE graph_query_graphblas_artifact_snapshots counter\n",
@@ -146,16 +146,21 @@ fn append_node_metrics(
         "# TYPE graph_cache_resident_bytes gauge\n"
     ));
     for metrics in shard_metrics {
+        let scope = metrics.scope.to_string();
+        let metrics = metrics.shard;
         output.push_str(&format!(
             concat!(
-                "graph_query_graphblas_artifact_snapshots{{cell_id=\"{}\"}} {}\n",
-                "graph_query_graphblas_rebuilt_snapshots{{cell_id=\"{}\"}} {}\n",
-                "graph_query_rust_sparse_fallbacks{{cell_id=\"{}\"}} {}\n"
+                "graph_query_graphblas_artifact_snapshots{{scope=\"{}\",cell_id=\"{}\"}} {}\n",
+                "graph_query_graphblas_rebuilt_snapshots{{scope=\"{}\",cell_id=\"{}\"}} {}\n",
+                "graph_query_rust_sparse_fallbacks{{scope=\"{}\",cell_id=\"{}\"}} {}\n"
             ),
+            scope,
             metrics.cell_id,
             metrics.operational.query_graphblas_artifact_snapshots,
+            scope,
             metrics.cell_id,
             metrics.operational.query_graphblas_rebuilt_snapshots,
+            scope,
             metrics.cell_id,
             metrics.operational.query_rust_sparse_fallbacks,
         ));
@@ -183,8 +188,8 @@ fn append_node_metrics(
             ),
         ] {
             output.push_str(&format!(
-                "graph_cache_entries{{cell_id=\"{}\",cache=\"{cache}\"}} {entries}\n",
-                metrics.cell_id
+                "graph_cache_entries{{scope=\"{}\",cell_id=\"{}\",cache=\"{cache}\"}} {entries}\n",
+                scope, metrics.cell_id
             ));
         }
         for (cache, bytes) in [
@@ -210,8 +215,8 @@ fn append_node_metrics(
             ),
         ] {
             output.push_str(&format!(
-                "graph_cache_resident_bytes{{cell_id=\"{}\",cache=\"{cache}\"}} {bytes}\n",
-                metrics.cell_id
+                "graph_cache_resident_bytes{{scope=\"{}\",cell_id=\"{}\",cache=\"{cache}\"}} {bytes}\n",
+                scope, metrics.cell_id
             ));
         }
     }

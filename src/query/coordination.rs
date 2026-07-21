@@ -511,6 +511,20 @@ impl QueryTransportScopeGrant {
         }
     }
 
+    pub fn graph_namespace(
+        namespace: NamespacePath,
+        graph_id: GraphId,
+        include_descendants: bool,
+        actions: impl IntoIterator<Item = QueryTransportAction>,
+    ) -> Self {
+        Self {
+            namespace,
+            graph_id: Some(graph_id),
+            include_descendants,
+            actions: actions.into_iter().collect(),
+        }
+    }
+
     pub fn read_graph(scope: GraphScope) -> Self {
         Self::graph(
             scope,
@@ -3391,6 +3405,74 @@ impl QueryCellClient for RoutedGraphCluster {
     }
 }
 
+#[cfg(feature = "query-transport")]
+#[async_trait]
+impl QueryCellClient for crate::ScopedRoutedGraphCluster {
+    async fn execute_cypher_rows(
+        &self,
+        context: QueryContext,
+        query: &str,
+    ) -> Result<QueryResultSet> {
+        let cluster = self.cluster_for_scope(&context.scope).await?;
+        QueryCellClient::execute_cypher_rows(cluster.as_ref(), context, query).await
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let cluster = self.cluster_for_scope(&context.scope).await?;
+        QueryCellClient::execute_cypher_rows_page(
+            cluster.as_ref(),
+            context,
+            query,
+            cursor,
+            page_size,
+        )
+        .await
+    }
+
+    async fn execute_batch(
+        &self,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+    ) -> Result<QueryResultSet> {
+        let cluster = self.cluster_for_scope(&context.scope).await?;
+        QueryCellClient::execute_batch(cluster.as_ref(), context, operation).await
+    }
+
+    async fn current_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+    ) -> Result<Option<crate::StorageSequence>> {
+        let cluster = self.cluster_for_scope(scope).await?;
+        QueryCellClient::current_storage_sequence(cluster.as_ref(), scope, cell_id).await
+    }
+
+    async fn wait_for_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+        minimum: crate::StorageSequence,
+    ) -> Result<Option<crate::StorageSequence>> {
+        let cluster = self.cluster_for_scope(scope).await?;
+        QueryCellClient::wait_for_storage_sequence(cluster.as_ref(), scope, cell_id, minimum).await
+    }
+
+    async fn refresh_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+    ) -> Result<Option<crate::StorageSequence>> {
+        let cluster = self.cluster_for_scope(scope).await?;
+        QueryCellClient::refresh_storage_sequence(cluster.as_ref(), scope, cell_id).await
+    }
+}
+
 fn routed_client_query_is_mutation(context: &QueryContext, query: &str) -> Result<bool> {
     let _ = context;
     Ok(matches!(
@@ -4661,5 +4743,36 @@ fn transport_remote_error(key: &str, message: String) -> GraphError {
     GraphError::UnsupportedQuery {
         dialect: "QueryTransport",
         feature: format!("{key}: {message}"),
+    }
+}
+
+#[cfg(all(test, feature = "query-transport"))]
+mod scope_grant_tests {
+    use super::*;
+    use crate::NamespaceId;
+
+    #[test]
+    fn graph_namespace_grant_restricts_descendants_to_one_graph_id() {
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let tenant = root
+            .child(NamespaceId::new("tenant-a").unwrap())
+            .unwrap()
+            .child(NamespaceId::new("collection-a").unwrap())
+            .unwrap();
+        let grant = QueryTransportScopeGrant::graph_namespace(
+            root,
+            GraphId::new("hydradb").unwrap(),
+            true,
+            [QueryTransportAction::Read, QueryTransportAction::Write],
+        );
+
+        assert!(grant.allows(
+            &GraphScope::new(tenant.clone(), GraphId::new("hydradb").unwrap()),
+            QueryTransportAction::Write,
+        ));
+        assert!(!grant.allows(
+            &GraphScope::new(tenant, GraphId::new("other").unwrap()),
+            QueryTransportAction::Read,
+        ));
     }
 }

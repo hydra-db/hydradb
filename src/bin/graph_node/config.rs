@@ -35,6 +35,7 @@ pub struct RuntimeConfig {
     pub max_relationship_property_rows_bytes: usize,
     pub max_concurrent_hydrations: usize,
     pub max_concurrent_matrix_compilations: usize,
+    pub max_open_scopes: usize,
     pub index_discovery_interval: Duration,
     pub bolt_addr: SocketAddr,
     pub http_addr: SocketAddr,
@@ -177,6 +178,7 @@ impl RuntimeConfig {
                 "GRAPH_MAX_CONCURRENT_MATRIX_COMPILATIONS",
                 1,
             )?,
+            max_open_scopes: parse_usize(&values, "GRAPH_MAX_OPEN_SCOPES", 8)?,
             index_discovery_interval: parse_duration(
                 &values,
                 "GRAPH_INDEX_DISCOVERY_INTERVAL_MS",
@@ -420,6 +422,7 @@ mod tests {
         assert_eq!(config.l0_sst_size_bytes, 16 * 1024 * 1024);
         assert_eq!(config.max_unflushed_bytes, 64 * 1024 * 1024);
         assert_eq!(config.max_concurrent_hydrations, 2);
+        assert_eq!(config.max_open_scopes, 8);
         assert_eq!(config.index_discovery_interval, Duration::from_secs(5));
         let memory = config.graph_memory_config();
         assert_eq!(memory.max_graphblas_bytes, 128 * 1024 * 1024);

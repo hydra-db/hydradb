@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use futures::FutureExt;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
@@ -51,6 +53,114 @@ impl ClientQueryTarget {
 
 pub trait ClientDatabaseResolver: Send + Sync {
     fn resolve_database(&self, database: Option<&str>) -> Result<ClientQueryTarget>;
+}
+
+const SCOPED_DATABASE_VERSION: &str = "scope1";
+
+#[derive(Clone)]
+pub struct HierarchicalClientDatabaseResolver {
+    base_database: String,
+    root_target: ClientQueryTarget,
+}
+
+impl HierarchicalClientDatabaseResolver {
+    pub fn new(base_database: impl Into<String>, root_target: ClientQueryTarget) -> Result<Self> {
+        let base_database = validate_database_name(base_database.into())?;
+        Ok(Self {
+            base_database,
+            root_target,
+        })
+    }
+
+    pub fn scoped_database_name(
+        &self,
+        tenant_id: &str,
+        sub_tenant_id: Option<&str>,
+    ) -> Result<String> {
+        let tenant = encode_database_scope_id("tenant_id", tenant_id)?;
+        let sub_tenant = sub_tenant_id
+            .filter(|value| !value.is_empty())
+            .map(|value| encode_database_scope_id("sub_tenant_id", value))
+            .transpose()?
+            .unwrap_or_else(|| "_".to_string());
+        validate_database_name(format!(
+            "{}.{}.{tenant}.{sub_tenant}",
+            self.base_database, SCOPED_DATABASE_VERSION
+        ))
+    }
+
+    fn scoped_target(&self, database: &str) -> Result<ClientQueryTarget> {
+        let prefix = format!("{}.{}.", self.base_database, SCOPED_DATABASE_VERSION);
+        let encoded = database
+            .strip_prefix(&prefix)
+            .ok_or_else(|| unknown_graph_database(database))?;
+        let (tenant, sub_tenant) = encoded
+            .split_once('.')
+            .filter(|(_, sub_tenant)| !sub_tenant.contains('.'))
+            .ok_or_else(|| unknown_graph_database(database))?;
+        let tenant = canonical_database_component(database, tenant)?;
+        let mut namespace = self
+            .root_target
+            .scope
+            .namespace
+            .child(NamespaceId::new(tenant)?)?;
+        if sub_tenant != "_" {
+            namespace = namespace.child(NamespaceId::new(canonical_database_component(
+                database, sub_tenant,
+            )?)?)?;
+        }
+        ClientQueryTarget::new(
+            GraphScope::new(namespace, self.root_target.scope.graph_id.clone()),
+            self.root_target.cell_id.clone(),
+        )
+    }
+}
+
+impl ClientDatabaseResolver for HierarchicalClientDatabaseResolver {
+    fn resolve_database(&self, database: Option<&str>) -> Result<ClientQueryTarget> {
+        let database = database.unwrap_or(&self.base_database);
+        let database = validate_database_name(database.to_string())?;
+        if database == self.base_database {
+            return Ok(self.root_target.clone());
+        }
+        self.scoped_target(&database)
+    }
+}
+
+fn encode_database_scope_id(component: &'static str, value: &str) -> Result<String> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(GraphError::InvalidKeyComponent {
+            component,
+            value: value.to_string(),
+        });
+    }
+    let encoded = URL_SAFE_NO_PAD.encode(value.as_bytes());
+    NamespaceId::new(encoded.clone())?;
+    Ok(encoded)
+}
+
+fn canonical_database_component(database: &str, encoded: &str) -> Result<String> {
+    if encoded.is_empty() {
+        return Err(unknown_graph_database(database));
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| unknown_graph_database(database))?;
+    let value = String::from_utf8(bytes).map_err(|_| unknown_graph_database(database))?;
+    if value.is_empty()
+        || value.chars().any(char::is_control)
+        || URL_SAFE_NO_PAD.encode(value.as_bytes()) != encoded
+    {
+        return Err(unknown_graph_database(database));
+    }
+    Ok(encoded.to_string())
+}
+
+fn unknown_graph_database(database: &str) -> GraphError {
+    GraphError::UnsupportedQuery {
+        dialect: "ClientProtocol",
+        feature: format!("unknown graph database {database}"),
+    }
 }
 
 #[derive(Clone, Default)]
@@ -108,10 +218,7 @@ impl ClientDatabaseResolver for StaticClientDatabaseResolver {
         self.targets
             .get(&database)
             .cloned()
-            .ok_or_else(|| GraphError::UnsupportedQuery {
-                dialect: "ClientProtocol",
-                feature: format!("unknown graph database {database}"),
-            })
+            .ok_or_else(|| unknown_graph_database(&database))
     }
 }
 
