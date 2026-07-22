@@ -12246,10 +12246,7 @@ async fn trusted_segment_reimport_under_a_fresh_key_preserves_an_acknowledged_de
         .unwrap();
     assert!(deleted.deleted, "delete must be acknowledged");
     assert!(
-        !shard
-            .edge_exists(cell_id, edge_type, 1, 2)
-            .await
-            .unwrap(),
+        !shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap(),
         "edge must be absent after its acknowledged delete"
     );
 
@@ -12563,12 +12560,7 @@ async fn compiled_traversal_reflects_writes_committed_after_the_graph_index_gene
     use crate::shard::topology_tail::GraphTopologyTail;
     let budget = crate::shard::QueryBudget::new(None, None);
     let tail = shard
-        .topology_tail_since(
-            &generation,
-            storage_snapshot.as_ref(),
-            read_epoch,
-            &budget,
-        )
+        .topology_tail_since(&generation, storage_snapshot.as_ref(), read_epoch, &budget)
         .await
         .unwrap();
 
@@ -12709,9 +12701,9 @@ async fn reader_built_generation_tail_covers_commits_in_its_own_wal_file() {
         .unwrap();
     let overlay = match tail {
         GraphTopologyTail::Complete(overlay) => overlay,
-        GraphTopologyTail::Unavailable => panic!(
-            "tail reported Unavailable; this repro needs the Complete branch"
-        ),
+        GraphTopologyTail::Unavailable => {
+            panic!("tail reported Unavailable; this repro needs the Complete branch")
+        }
     };
 
     assert_eq!(
@@ -12726,4 +12718,263 @@ async fn reader_built_generation_tail_covers_commits_in_its_own_wal_file() {
         generation.last_wal_id,
         overlay.test_len()
     );
+}
+
+/// Suspect 4 — the async indexer's generation GC is unfenced.
+///
+/// The indexer opens as a *reader* (`src/bin/graph-indexer.rs:138`) and mutates
+/// `_graph_index` purely through the object store, so SlateDB writer fencing
+/// never applies to it. `gc_graph_index_generations`
+/// (`src/engine/index_store.rs:210-237`) takes no lease and asks no reader
+/// whether it is mid-fetch: a SIGSTOP'd indexer that wakes up long after its
+/// view of the world went stale still gets to call `delete`.
+///
+/// This test drives that exact interleaving: a live reader resolves the
+/// `current` manifest, and only *then* does an unfenced zombie replica run GC
+/// with `retain_previous = 0` — the most aggressive retention the code accepts,
+/// stronger than the `1` the binary defaults to. The invariant under test is
+/// that the generation object named by the manifest a reader just resolved is
+/// still fetchable afterwards. Also runs the publish and the GC concurrently,
+/// so a delete can race a publish, to check no manifest is ever left dangling.
+#[tokio::test]
+async fn unfenced_index_gc_never_deletes_the_generation_the_current_manifest_names() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/unfenced-index-gc-fence";
+    let cell_id = "cell-a";
+    let edge_type = "CHAIN";
+    use slatedb::object_store::ObjectStoreExt;
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+
+    // Three reader-mode shards standing in for indexer replicas. None of them
+    // holds a SlateDB writer fence; every one of them can publish and delete
+    // `_graph_index` state through the object store alone.
+    let indexer = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let zombie = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let reader = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+
+    let generation_object = |generation: &crate::GraphIndexGeneration| {
+        slatedb::object_store::path::Path::from(format!(
+            "{path}/_graph_index/{cell_id}/{edge_type}/generations/{:020}-{}.csc",
+            generation.base_sequence, generation.generation
+        ))
+    };
+
+    let mut total_deleted = 0_u64;
+    for round in 0..6_u64 {
+        writer
+            .write_edge(typed_mutation(
+                cell_id,
+                edge_type,
+                round + 1,
+                round + 2,
+                &format!("unfenced-gc-{round}"),
+            ))
+            .await
+            .unwrap();
+        indexer.refresh_storage_sequence(cell_id).await.unwrap();
+        indexer.build_graph_index(cell_id, edge_type).await.unwrap();
+
+        // A live reader resolves the manifest and is now "mid-fetch": it holds
+        // the generation identity but has not read the object yet.
+        let resolved = reader
+            .current_graph_index(cell_id, edge_type)
+            .await
+            .unwrap()
+            .expect("a generation was just published");
+
+        // The paused zombie wakes up here, with no fence and no reader lease.
+        total_deleted = total_deleted.saturating_add(
+            zombie
+                .gc_graph_index_generations(cell_id, edge_type, 0)
+                .await
+                .unwrap(),
+        );
+
+        // The reader completes its fetch. If GC were unfenced with respect to
+        // the *current* generation this is where the object would be gone.
+        let location = generation_object(&resolved);
+        let payload = object_store
+            .get(&location)
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "round {round}: unfenced GC deleted the generation a live reader \
+                     had just resolved from the manifest ({location}): {err}"
+                )
+            })
+            .bytes()
+            .await
+            .unwrap();
+        assert!(
+            !payload.is_empty(),
+            "round {round}: generation object {location} is present but empty"
+        );
+    }
+
+    assert!(
+        total_deleted > 0,
+        "the invariant above is vacuous unless the zombie GC actually deleted \
+         generation objects; it deleted none"
+    );
+
+    // Now let a publish and two aggressive GCs race, so a delete can be issued
+    // against a listing taken before the publish landed.
+    for round in 6..10_u64 {
+        writer
+            .write_edge(typed_mutation(
+                cell_id,
+                edge_type,
+                round + 1,
+                round + 2,
+                &format!("unfenced-gc-race-{round}"),
+            ))
+            .await
+            .unwrap();
+        indexer.refresh_storage_sequence(cell_id).await.unwrap();
+        let (built, gc_a, gc_b) = tokio::join!(
+            indexer.build_graph_index(cell_id, edge_type),
+            zombie.gc_graph_index_generations(cell_id, edge_type, 0),
+            reader.gc_graph_index_generations(cell_id, edge_type, 0),
+        );
+        built.unwrap();
+        gc_a.unwrap();
+        gc_b.unwrap();
+
+        let current = reader
+            .current_graph_index(cell_id, edge_type)
+            .await
+            .unwrap()
+            .expect("a generation is published");
+        let location = generation_object(&current);
+        object_store.head(&location).await.unwrap_or_else(|err| {
+            panic!(
+                "round {round}: the published manifest points at a generation object \
+                 a racing unfenced GC had already deleted ({location}): {err}"
+            )
+        });
+    }
+
+    reader.close().await.unwrap();
+    zombie.close().await.unwrap();
+    indexer.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+/// Suspect 4, the reader-observable half. A generation that has been superseded
+/// *can* legitimately be deleted underneath a reader still holding it (that is
+/// what `retain_previous` bounds). The question that decides data-loss versus
+/// availability is what such a reader observes.
+///
+/// `graph_index_csc` (`src/engine/index_store.rs:148-180`) maps `NotFound` to
+/// `Ok(None)` at both the `get` and the `bytes` step, and
+/// `cached_graphblas_matrix` (`src/engine/matrix_cache.rs:84-87`) turns that
+/// into `forget_graph_index_generation` plus `Ok(None)`, which
+/// `compiled_graphblas_query_snapshot` and `matrix_reachable_with_kernel`
+/// (`src/engine/traversal.rs:69-94`) treat as "no compiled index, read from
+/// storage". So the reader must see a clean miss and correct data — never a
+/// truncated or silently-empty answer. This asserts exactly that, without
+/// touching the compiled SuiteSparse kernel.
+#[cfg(feature = "graphblas")]
+#[tokio::test]
+async fn reader_holding_a_gc_deleted_index_generation_sees_a_clean_miss_not_lost_edges() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/unfenced-index-gc-reader-miss";
+    let cell_id = "cell-a";
+    let edge_type = "CHAIN";
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+    let indexer = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let reader = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+
+    writer
+        .write_edge(typed_mutation(cell_id, edge_type, 1, 2, "reader-miss-seed"))
+        .await
+        .unwrap();
+    indexer.refresh_storage_sequence(cell_id).await.unwrap();
+    indexer.build_graph_index(cell_id, edge_type).await.unwrap();
+
+    // The reader resolves and caches generation G1 while it is still current.
+    let held = reader
+        .discover_graph_index(cell_id, edge_type)
+        .await
+        .unwrap()
+        .expect("G1 is published");
+    assert!(
+        reader.graph_index_csc(&held).await.unwrap().is_some(),
+        "the reader must be able to fetch G1 while it is current"
+    );
+
+    // Two newer generations land, which is what makes G1 collectable at all.
+    for (round, (src, dst)) in [(2_u64, 3_u64), (3, 4)].into_iter().enumerate() {
+        writer
+            .write_edge(typed_mutation(
+                cell_id,
+                edge_type,
+                src,
+                dst,
+                &format!("reader-miss-advance-{round}"),
+            ))
+            .await
+            .unwrap();
+        indexer.refresh_storage_sequence(cell_id).await.unwrap();
+        indexer.build_graph_index(cell_id, edge_type).await.unwrap();
+    }
+
+    // The unfenced zombie GC runs and takes G1 out from under the reader.
+    assert!(
+        indexer
+            .gc_graph_index_generations(cell_id, edge_type, 0)
+            .await
+            .unwrap()
+            >= 1,
+        "the test needs GC to actually delete the generation the reader holds"
+    );
+
+    // What the reader observes: a clean miss, not a corrupt-value error and not
+    // a partial CSC.
+    assert!(
+        reader.graph_index_csc(&held).await.unwrap().is_none(),
+        "a deleted generation must read back as a clean miss"
+    );
+    assert!(
+        reader
+            .cached_graphblas_matrix(cell_id, edge_type, held.base_sequence)
+            .await
+            .unwrap()
+            .is_none(),
+        "the compiled-matrix layer must report the deleted generation as absent \
+         so its callers fall back to storage"
+    );
+
+    // And the data itself is untouched: the fallback path answers in full.
+    reader.refresh_storage_sequence(cell_id).await.unwrap();
+    let read_epoch = reader.current_epoch(cell_id).await.unwrap();
+    assert_eq!(
+        reader.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+        vec![2],
+        "edges must survive an unfenced index GC"
+    );
+    assert_eq!(
+        reader
+            .direct_snapshot_reachable(cell_id, edge_type, &[1], 3, read_epoch)
+            .await
+            .unwrap()
+            .vertices,
+        vec![2, 3, 4],
+        "the storage fallback must answer in full after the index generation was \
+         deleted underneath the reader"
+    );
+
+    reader.close().await.unwrap();
+    indexer.close().await.unwrap();
+    writer.close().await.unwrap();
 }
