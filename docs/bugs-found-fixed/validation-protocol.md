@@ -73,8 +73,9 @@ directly in the workspace.
 ---
 id: BFG-001
 title: Short human-readable finding
-status: discovered # discovered | reproducing | fixed-pending-review | fixed | not-a-bug | blocked
+status: discovered # discovered | reproducing | open | fixed-pending-review | fixed | not-a-bug | blocked
 severity: P1
+classification: <confirmed-bug | ...-contract-gap | ...-risk>
 introduced_or_first_bad_commit: <sha | pending-bisect>
 fix_commit: <sha | none | pending>
 affected_range: <sha>..<sha>
@@ -117,14 +118,38 @@ Reviewer, date, and accepted status transition.
 
 ## Status meanings
 
-| Status | Meaning |
+| Status | Fix applied? | Meaning |
+|---|---|---|
+| `discovered` | no | Evidence identifies a possible defect; no historical replay is complete. |
+| `reproducing` | no | A model and historical worktree reproduction are in progress. |
+| `open` | no | Reproduced against current code by a committed failing regression; no fix has been written or applied. |
+| `fixed-pending-review` | yes | Old behavior was reproduced and current verification passes, awaiting review. |
+| `fixed` | yes | Reviewed historical and current evidence supports the fix. |
+| `not-a-bug` | n/a | The behavior is an approved API contract; the rationale is recorded. |
+| `blocked` | no | Progress requires an external decision or unavailable environment; the blocker is explicit. |
+
+## Found versus fixed: how to read the metadata
+
+This directory is an inventory of findings, not a changelog of repairs. A
+finding is fixed **only** when `status` is `fixed-pending-review` or `fixed`
+*and* `fix_commit` names a real SHA. Every record therefore carries both
+fields, and `fix_commit` is always present and explicit:
+
+| `fix_commit` | Meaning |
 |---|---|
-| `discovered` | Evidence identifies a possible defect; no historical replay is complete. |
-| `reproducing` | A model and historical worktree reproduction are in progress. |
-| `fixed-pending-review` | Old behavior was reproduced and current verification passes, awaiting review. |
-| `fixed` | Reviewed historical and current evidence supports the fix. |
-| `not-a-bug` | The behavior is an approved API contract; the rationale is recorded. |
-| `blocked` | Progress requires an external decision or unavailable environment; the blocker is explicit. |
+| `none` | No fix has been applied. Either none is intended (`not-a-bug`) or none has been written yet. |
+| `pending` | A fix is required and scoped but not yet written or merged. |
+| `<sha>` | The fix commit. Only this value may accompany a `fixed*` status. |
+
+A candidate or proposed fix that has not been accepted is recorded in
+`candidate_fix_commit`, never in `fix_commit`.
+
+`date_verified` is the date the record's *verdict* was verified — a fix
+validated against the model and the regression, or a `not-a-bug` contract
+confirmed against the implementation. It stays `null` while a defect is still
+unfixed, however thoroughly the reproduction itself has been verified;
+reproduction evidence lives in `current_verified_commit` and in the record
+body.
 
 ## Review gate for this inventory
 

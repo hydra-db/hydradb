@@ -14,9 +14,16 @@
 //      `out_neighbors_in_storage_snapshot`, `src/shard/query.rs:135-142`), so a
 //      point edge committed after the read epoch is still visible to it.
 //
-// `quint run` must violate the M2 epoch-scoped invariants here. That is what
-// proves the intended properties discriminate the reported bug rather than
-// holding vacuously.
+// `quint run` violates `epochScopedReadIsStable` and `readNeverSeesTheFuture`
+// here. That is what proves those two properties discriminate the reported bug
+// rather than holding vacuously.
+//
+// `readMatchesAcknowledgedHistory` is NOT violated by this module, and that is
+// expected: a read is atomic here — the epoch is derived and evaluated in one
+// action — so `observedAt == ackedEpoch` is only ever tested against the state
+// that produced the acknowledgement. The third e2e repro fails on the
+// non-atomic `query_read_epoch`-then-read composition, which needs a separate
+// module with a two-action read. See BFG-009, "Formal model".
 module m2_epoch_scoped_read_buggy {
   var epoch: int
   var segmentEpochs: Set[int]

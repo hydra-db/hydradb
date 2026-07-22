@@ -2,8 +2,14 @@
 // Deterministic BFG-009 scenarios. Main model remains scenario-free.
 //
 // Each run mirrors one of the three e2e repros in `src/tests.rs`. Under the
-// intended contract every one of them holds; under
-// `m2_epoch_scoped_read_buggy` the same interleavings violate the invariants.
+// intended contract every one of them holds.
+//
+// Under `m2_epoch_scoped_read_buggy` the first two interleavings violate their
+// invariants (`epochScopedReadIsStable`, `readNeverSeesTheFuture`). The third
+// does NOT: `readMatchesAcknowledgedHistory` is not discriminated by that
+// module, because a read here is atomic — the epoch is derived and evaluated in
+// one action — whereas the e2e repro depends on a writer committing between
+// `query_read_epoch` and the read. See BFG-009, "Formal model".
 module m2_epoch_scoped_read_test {
   import m2_epoch_scoped_read.* from "./m2_epoch_scoped_read"
 

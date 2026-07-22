@@ -5,6 +5,7 @@ status: reproducing
 severity: P1
 classification: confirmed-bug
 introduced_or_first_bad_commit: e875387bf121292c316f6c81d5a3d3e5fdce7d04
+fix_commit: none
 candidate_fix_commit: b1709ea
 affected_range: e875387bf121292c316f6c81d5a3d3e5fdce7d04..b1709ea
 model:

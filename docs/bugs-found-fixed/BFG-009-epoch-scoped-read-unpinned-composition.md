@@ -13,6 +13,7 @@ model:
   scenarios: quint-models/turbolay/m2_epoch_scoped_read_test.qnt
 current_verified_commit: a43ec61
 date_opened: 2026-07-22
+date_verified: null
 tags: [bugs, read-epoch, segments, tombstones, mvcc, data-loss, regression]
 ---
 
@@ -179,21 +180,55 @@ quint run m2_epoch_scoped_read.qnt --invariant=allSafety --max-steps=16 --max-sa
 [ok] No violation found
 ```
 
-All four witnesses (`deleteAcknowledgedReached`, `reappendAfterDeleteReached`,
-`rereadAfterReappendReached`, `pointEdgeAfterReadReached`) are reachable, so the
-invariants are not holding vacuously.
+All four witnesses are reachable (same run, with `--witnesses`), so the
+invariants are not holding vacuously:
+
+```text
+deleteAcknowledgedReached   witnessed in 49903 trace(s) out of 50000 (99.81%)
+reappendAfterDeleteReached  witnessed in 41679 trace(s) out of 50000 (83.36%)
+rereadAfterReappendReached  witnessed in 36530 trace(s) out of 50000 (73.06%)
+pointEdgeAfterReadReached   witnessed in 43300 trace(s) out of 50000 (86.60%)
+```
 
 `m2_epoch_scoped_read_buggy.qnt` models the two implementation behaviors — the
 re-append deleting preceding tombstones (`write.rs:4279`) and the unfiltered
-point-edge branch (`artifact_build.rs:497-506`) — and violates **all three**
-invariants, which is what proves they discriminate this bug. The shortest
-counterexample is the create → delete → re-append interleaving:
+point-edge branch (`artifact_build.rs:497-506`). It violates **two of the
+three** invariants:
 
 ```text
-[State 3] readAtCurrentEpoch  observedAt=2 observed=false  tombstoneEpochs=Set(2)
-[State 4] appendSegment       epoch=3      segmentEpochs=Set(3)
-                                           tombstoneEpochs=Set()   <-- delete destroyed
-[State 6] rereadFirstEpoch    observedAt=2 observed=true           <-- answer flipped
+quint run m2_epoch_scoped_read_buggy.qnt --invariant=epochScopedReadIsStable
+[violation] Found an issue                     <-- expression 1
+quint run m2_epoch_scoped_read_buggy.qnt --invariant=readNeverSeesTheFuture
+[violation] Found an issue                     <-- expression 2
+quint run m2_epoch_scoped_read_buggy.qnt --invariant=readMatchesAcknowledgedHistory
+[ok] No violation found                        <-- expression 3 NOT discriminated
+```
+
+The third result is not a defect in the e2e evidence and not a weakening of the
+report; it is a limit of this module. In the model a read is **atomic**: the
+epoch is derived and the state is evaluated in a single action. Every write
+action advances `epoch` and sets `ackedEpoch` to the new epoch, so
+`observedAt == ackedEpoch` is only ever tested against the state that produced
+the acknowledgement, and it always agrees (checked to `--max-steps=20
+--max-samples=200000`). The third e2e repro fails for the reason the model
+cannot express — `query_read_epoch` and the read are *separate* steps, and a
+writer commits between them. Discriminating expression 3 formally requires a
+module with a non-atomic read (derive-epoch and read-at-epoch as two actions);
+that model has not been written.
+
+The shortest counterexample to expression 1 is the create → delete → re-append
+interleaving, at five steps (`--max-steps=4` finds none):
+
+```text
+quint run m2_epoch_scoped_read_buggy.qnt --invariant=epochScopedReadIsStable \
+  --max-steps=5 --max-samples=20000 --verbosity=3 --seed=0x4
+
+[State 1] appendSegment       epoch=1  segmentEpochs=Set(1)   tombstoneEpochs=Set()
+[State 2] deleteEdge          epoch=2                         tombstoneEpochs=Set(2)
+[State 3] readAtCurrentEpoch  observedAt=2 observed=false     tombstoneEpochs=Set(2)
+[State 4] appendSegment       epoch=3  segmentEpochs=Set(1,3)
+                                       tombstoneEpochs=Set()   <-- delete destroyed
+[State 5] rereadFirstEpoch    observedAt=2 observed=true       <-- answer flipped
 ```
 
 `m2_epoch_scoped_read_test.qnt` holds four deterministic scenarios mirroring the
