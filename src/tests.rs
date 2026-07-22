@@ -11992,3 +11992,738 @@ async fn graphblas_empty_cache_reader_uses_persisted_csc_artifact() {
     assert_eq!(reader.graphblas_cache.lock().await.len(), 1);
     assert_eq!(reader.matrix_cache.lock().await.len(), 0);
 }
+
+#[tokio::test]
+#[ignore = "BFG-009 repro: fails until epoch-scoped reads stop composing over unpinned live state"]
+async fn epoch_scoped_read_is_stable_after_segment_reinsert_clears_the_tombstone() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/epoch-read-stability-reinsert",
+        object_store,
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+    let inserted = shard
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "stability-insert")
+        .await
+        .unwrap();
+    assert_eq!(inserted.end_epoch, 1);
+
+    let deleted = shard
+        .delete_edge(typed_mutation(cell_id, edge_type, 1, 2, "stability-delete"))
+        .await
+        .unwrap();
+    assert!(deleted.deleted);
+    let deleted_epoch = deleted.epoch;
+
+    let before_reinsert = shard
+        .edge_exists_at(cell_id, edge_type, 1, 2, deleted_epoch)
+        .await
+        .unwrap();
+    assert!(
+        !before_reinsert,
+        "edge must be absent at its acknowledged delete epoch {deleted_epoch}"
+    );
+
+    let reinserted = shard
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "stability-reinsert")
+        .await
+        .unwrap();
+    assert_eq!(reinserted.inserted, 1);
+
+    let after_reinsert = shard
+        .edge_exists_at(cell_id, edge_type, 1, 2, deleted_epoch)
+        .await
+        .unwrap();
+    assert!(
+        !after_reinsert,
+        "read at epoch {deleted_epoch} changed its answer after an unrelated later \
+         re-insert: the acknowledged delete at epoch {deleted_epoch} has been \
+         retroactively erased"
+    );
+}
+
+#[tokio::test]
+#[ignore = "BFG-009 repro: fails until the point-edge branch is epoch-filtered or snapshot-pinned"]
+async fn epoch_scoped_read_excludes_edges_committed_after_the_requested_epoch() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/epoch-read-excludes-future",
+        object_store,
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+    let first = shard
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "future-seed")
+        .await
+        .unwrap();
+    assert_eq!(first.end_epoch, 1);
+
+    let second = shard
+        .write_edge(typed_mutation(cell_id, edge_type, 1, 3, "future-point"))
+        .await
+        .unwrap();
+    assert_eq!(second.epoch, 2);
+
+    let at_first_epoch = shard
+        .out_neighbors_at(cell_id, edge_type, 1, first.end_epoch)
+        .await
+        .unwrap();
+    assert_eq!(
+        at_first_epoch,
+        vec![2],
+        "read at epoch {} returned an edge committed later at epoch {}",
+        first.end_epoch,
+        second.epoch
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "BFG-009 repro: fails until reads pin the snapshot matching their derived read_epoch"]
+async fn current_epoch_reads_match_acknowledged_history_under_concurrent_reinserts() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = Arc::new(
+        GraphShard::open_standalone_writer_with_options(
+            "graph/current-epoch-read-race",
+            object_store,
+            GraphOpenOptions {
+                index_policy: GraphIndexPolicy::OutboundOnly,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+    let seed = shard
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "race-seed")
+        .await
+        .unwrap();
+    assert_eq!(seed.end_epoch, 1);
+
+    // Acknowledged history: epoch -> edge exists after that epoch's operation.
+    let history = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::from([(
+        seed.end_epoch,
+        true,
+    )])));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let writer = {
+        let shard = Arc::clone(&shard);
+        let history = Arc::clone(&history);
+        let stop = Arc::clone(&stop);
+        tokio::spawn(async move {
+            let mut cycle = 0_u64;
+            while !stop.load(Ordering::Relaxed) {
+                let deleted = shard
+                    .delete_edge(typed_mutation(
+                        cell_id,
+                        edge_type,
+                        1,
+                        2,
+                        &format!("race-delete-{cycle}"),
+                    ))
+                    .await
+                    .unwrap();
+                assert!(deleted.deleted, "cycle {cycle} delete must apply");
+                history.lock().unwrap().insert(deleted.epoch, false);
+                let reinserted = shard
+                    .bulk_append_out_adjacency_segment_trusted(
+                        cell_id,
+                        edge_type,
+                        1,
+                        [2],
+                        &format!("race-reinsert-{cycle}"),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(reinserted.inserted, 1, "cycle {cycle} reinsert must apply");
+                history.lock().unwrap().insert(reinserted.end_epoch, true);
+                cycle += 1;
+            }
+        })
+    };
+
+    let mut anomalies = Vec::new();
+    for _ in 0..4000 {
+        let read_epoch = shard.current_epoch(cell_id).await.unwrap();
+        let observed = shard
+            .edge_exists_at(cell_id, edge_type, 1, 2, read_epoch)
+            .await
+            .unwrap();
+        let expected = {
+            let history = history.lock().unwrap();
+            match history.range(..=read_epoch).next_back() {
+                Some((_, exists)) => Some(*exists),
+                None => None,
+            }
+        };
+        // Only judge when the acknowledged history already covers read_epoch:
+        // the op that committed read_epoch must itself be recorded.
+        let covered = history.lock().unwrap().contains_key(&read_epoch);
+        if covered {
+            if let Some(expected) = expected {
+                if observed != expected {
+                    anomalies.push((read_epoch, expected, observed));
+                }
+            }
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.await.unwrap();
+
+    assert!(
+        anomalies.is_empty(),
+        "{} current-epoch reads contradicted acknowledged history; first: \
+         (read_epoch, expected, observed) = {:?}",
+        anomalies.len(),
+        anomalies.first()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Ranked data-loss suspects: reproduction attempts.
+//
+// Each test below encodes the intended contract for one suspect from the
+// static analysis. A test that fails has reproduced its bug; a test that
+// passes has disproven it through the currently reachable callers and stays
+// in the suite as a regression guard. Nothing here applies a fix.
+// ---------------------------------------------------------------------------
+
+/// Suspect 5 — trusted-append fingerprint resurrects acknowledged deletes.
+///
+/// `bulk_append_out_adjacency_segment_trusted` short-circuits on a content
+/// fingerprint, but when some fingerprinted edges have since been deleted it
+/// falls through and re-inserts them, deleting their tombstones
+/// (`src/shard/write.rs:4233-4242`, `:4279`). The chunked import APIs
+/// synthesize fresh per-chunk idempotency keys (`…-chunk-N`,
+/// `src/shard/write.rs:2780`, `:4145`), so a retried import that batches
+/// differently presents the same content under a new key.
+#[tokio::test]
+#[ignore = "suspect-5 repro: fails while a re-keyed trusted re-import undoes an acknowledged delete"]
+async fn trusted_segment_reimport_under_a_fresh_key_preserves_an_acknowledged_delete() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/trusted-reimport-resurrection",
+        object_store,
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+    // Create: the original import lands edge 1->2.
+    let imported = shard
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "import-run-1")
+        .await
+        .unwrap();
+    assert_eq!(imported.inserted, 1);
+
+    // Delete: acknowledged removal of that edge.
+    let deleted = shard
+        .delete_edge(typed_mutation(cell_id, edge_type, 1, 2, "reimport-delete"))
+        .await
+        .unwrap();
+    assert!(deleted.deleted, "delete must be acknowledged");
+    assert!(
+        !shard
+            .edge_exists(cell_id, edge_type, 1, 2)
+            .await
+            .unwrap(),
+        "edge must be absent after its acknowledged delete"
+    );
+
+    // Retry: the same logical import, same content, re-keyed the way a chunked
+    // retry would key it. The fingerprint already exists, so this is a replay
+    // of work the store has already accepted — not a new intent to append.
+    let replayed = shard
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "import-run-2")
+        .await
+        .unwrap();
+
+    let resurrected = shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap();
+    assert!(
+        !resurrected,
+        "a re-keyed replay of an already-fingerprinted import resurrected an \
+         acknowledged delete: replay reported inserted={} already_existed={}",
+        replayed.inserted, replayed.already_existed
+    );
+}
+
+/// Suspect 5, boundary case. An identical retry — same idempotency key — must
+/// short-circuit on the idempotency record before the fingerprint path runs,
+/// so it cannot resurrect anything. This documents where the hazard starts.
+#[tokio::test]
+async fn trusted_segment_reimport_under_the_same_key_is_a_noop_after_a_delete() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/trusted-reimport-same-key",
+        object_store,
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+    shard
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "same-key-import")
+        .await
+        .unwrap();
+    let deleted = shard
+        .delete_edge(typed_mutation(cell_id, edge_type, 1, 2, "same-key-delete"))
+        .await
+        .unwrap();
+    assert!(deleted.deleted);
+
+    shard
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "same-key-import")
+        .await
+        .unwrap();
+
+    assert!(
+        !shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap(),
+        "an identical retry must replay its idempotency record, not re-insert"
+    );
+}
+
+/// Suspect 3 — three uncoordinated deleters, no survivor invariant.
+///
+/// Segment compaction requires a matrix artifact at exactly its
+/// `compacted_through_epoch` (`src/shard/maintenance.rs:126-143`); artifact GC
+/// deletes artifacts below a caller-trusted `keep_epoch` with no check that
+/// anything newer survives (`src/engine/artifact_gc.rs:28`); index-generation
+/// GC deletes `_graph_index` files with no guard at all
+/// (`src/engine/index_store.rs:226-232`). Each checks a different survivor in a
+/// different store. This sequences all three through the public API and asks
+/// the only question that matters: does a committed edge stay readable?
+#[tokio::test]
+async fn committed_edges_stay_readable_after_compaction_then_artifact_gc() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/gc-survivor-sequencing",
+        object_store,
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+    // Create, then modify: two segment appends and one acknowledged delete, so
+    // the surviving set is a proper subset of everything ever written.
+    shard
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2, 3], "gc-seed-a")
+        .await
+        .unwrap();
+    shard
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [4], "gc-seed-b")
+        .await
+        .unwrap();
+    let deleted = shard
+        .delete_edge(typed_mutation(cell_id, edge_type, 1, 3, "gc-delete"))
+        .await
+        .unwrap();
+    assert!(deleted.deleted);
+
+    let expected = vec![2_u64, 4];
+    let before = shard.out_neighbors(cell_id, edge_type, 1).await.unwrap();
+    assert_eq!(before, expected, "baseline before any GC runs");
+
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    shard
+        .build_matrix_tiles(cell_id, edge_type, base_epoch, 4)
+        .await
+        .unwrap();
+
+    // Deleter 1: compaction collapses the raw segments through base_epoch.
+    shard
+        .compact_out_adjacency_segments(cell_id, edge_type, 1, base_epoch, "gc-compact")
+        .await
+        .unwrap();
+    let after_compaction = shard.out_neighbors(cell_id, edge_type, 1).await.unwrap();
+    assert_eq!(
+        after_compaction, expected,
+        "compaction must preserve the live edge set"
+    );
+
+    // Deleter 2: artifact GC with a caller-trusted keep_epoch above the only
+    // artifact that exists. Nothing checks that a newer artifact survives.
+    let gc = shard
+        .delete_graph_artifacts_before(cell_id, edge_type, base_epoch + 1)
+        .await
+        .unwrap();
+    assert!(
+        gc.deleted_keys > 0,
+        "the artifact at base_epoch should have been collected"
+    );
+
+    let after_artifact_gc = shard.out_neighbors(cell_id, edge_type, 1).await;
+    assert_eq!(
+        after_artifact_gc.unwrap(),
+        expected,
+        "committed edges must stay readable after compaction and artifact GC \
+         have both run; if this errors or truncates, the three deleters have \
+         destroyed the last readable copy"
+    );
+}
+
+/// Suspect 1 — compiled-index generation ahead of the pinned read snapshot.
+///
+/// `topology_tail_since` returns an empty overlay when
+/// `generation.base_sequence >= read_sequence` (`src/shard/topology_tail.rs:38`).
+/// Equality is sound; `>` would merge a CSC built at a newer sequence than the
+/// snapshot the read is pinned to. Guard test: assert no reachable caller can
+/// pair an old read epoch with a newer generation. `graph_index_generation_at`
+/// filters `base_sequence == base_epoch` (`src/engine/index_store.rs:200-207`)
+/// and the refresh branch filters `latest.base_sequence <= read_epoch`
+/// (`src/shard/query.rs:5281`), so this is expected to pass; it exists to fail
+/// loudly if either filter is ever relaxed.
+#[cfg(feature = "graphblas")]
+#[tokio::test]
+async fn compiled_graph_index_generation_never_exceeds_the_read_epoch() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/generation-ahead-guard",
+        object_store,
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let cell_id = "reddit-home";
+    let edge_type = "CHAIN";
+
+    for (idx, (src, dst)) in [(1_u64, 2_u64), (2, 3)].into_iter().enumerate() {
+        shard
+            .bulk_append_out_adjacency_segment_trusted(
+                cell_id,
+                edge_type,
+                src,
+                [dst],
+                &format!("guard-seed-{idx}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let pinned_read_epoch = shard.current_epoch(cell_id).await.unwrap();
+
+    // Advance the store, then publish a generation strictly ahead of the epoch
+    // a reader might still be holding.
+    shard
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 3, [4], "guard-advance")
+        .await
+        .unwrap();
+    let generation = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+    assert!(
+        generation.base_sequence > pinned_read_epoch,
+        "test setup must publish a generation ahead of the pinned read epoch"
+    );
+
+    let selected = shard
+        .graph_index_generation_at(cell_id, edge_type, pinned_read_epoch)
+        .await
+        .unwrap();
+    assert!(
+        selected.is_none_or(|selected| selected.base_sequence <= pinned_read_epoch),
+        "generation selection handed back an index built ahead of the read epoch"
+    );
+}
+
+/// Suspect 2 — WAL-file boundary hole in the base + WAL-tail merge.
+///
+/// `topology_tail_since` starts its scan at `generation.last_wal_id + 1`
+/// (`src/shard/topology_tail.rs:48`) and returns an empty overlay outright when
+/// `generation.last_wal_id >= last_durable_wal_id` (`:42-44`). The generation's
+/// `last_wal_id` comes from `snapshot.last_wal_id().unwrap_or(0)`
+/// (`src/engine/index_store.rs:114`), and on a writer node the durable frontier
+/// falls back to `last_flushed_wal_id()` (`src/core/state.rs:361-364`). Neither
+/// tracks `snapshot.seq()`. Any commit that lands in the generation's own WAL
+/// file — or that is acknowledged from the memtable before the WAL flushes —
+/// falls in a hole: not in the compiled base, not in the tail.
+///
+/// This drives the create → modify → delete interleaving through the public
+/// cypher kernel path and compares against the storage ground truth.
+#[cfg(feature = "graphblas")]
+#[tokio::test]
+#[ignore = "suspect-2 repro: fails while the WAL-tail overlay misses commits inside the generation's own WAL file"]
+async fn compiled_traversal_reflects_writes_committed_after_the_graph_index_generation() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/wal-tail-visibility-hole", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "CHAIN";
+
+    // Create: 1 -> 2 -> 3, so the two-hop answer from 1 is [3].
+    for (idx, (src, dst)) in [(1_u64, 2_u64), (2, 3)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: format!("wal-tail-seed-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Build the generation manifest exactly as `build_graph_index` computes it
+    // (`src/engine/index_store.rs:113-114`): base_sequence from the snapshot's
+    // sequence, last_wal_id from `snapshot.last_wal_id().unwrap_or(0)`. Only
+    // the manifest window matters here — the compiled CSC payload plays no part
+    // in whether the tail covers the commit window.
+    shard.db.refresh_durable_reader().await.unwrap();
+    let build_snapshot = shard.db.snapshot().await.unwrap();
+    let generation = crate::GraphIndexGeneration {
+        cell_id: cell_id.to_string(),
+        edge_type: edge_type.to_string(),
+        base_sequence: build_snapshot.seq(),
+        last_wal_id: build_snapshot.last_wal_id().unwrap_or(0),
+        edge_count: 2,
+        checksum: 0,
+        generation: "wal-tail-repro".to_string(),
+    };
+    drop(build_snapshot);
+
+    // Modify, then delete — both committed strictly after the generation was
+    // built, and both landing in the generation's own WAL file.
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            src: 2,
+            dst: 4,
+            idempotency_key: "wal-tail-add".to_string(),
+        })
+        .await
+        .unwrap();
+    let deleted = shard
+        .delete_edge(typed_mutation(cell_id, edge_type, 2, 3, "wal-tail-delete"))
+        .await
+        .unwrap();
+    assert!(deleted.deleted, "delete must be acknowledged");
+
+    let read_epoch = shard.current_epoch(cell_id).await.unwrap();
+    assert!(
+        read_epoch > generation.base_sequence,
+        "test setup must commit after the generation: read_epoch={read_epoch} \
+         base_sequence={}",
+        generation.base_sequence
+    );
+
+    // Ground truth from live storage: 1 -> 2 -> 4 only.
+    let hop_one = shard.out_neighbors(cell_id, edge_type, 1).await.unwrap();
+    assert_eq!(hop_one, vec![2]);
+    let hop_two = shard.out_neighbors(cell_id, edge_type, 2).await.unwrap();
+    assert_eq!(
+        hop_two,
+        vec![4],
+        "storage ground truth after the delete and the append"
+    );
+
+    // The overlay is what the compiled traversal merges onto the base CSC. It
+    // must carry every edge whose state changed in (base_sequence, read_epoch]:
+    // 2->3 as absent, 2->4 as present. Anything less and the compiled read
+    // silently answers from the base alone.
+    let storage_snapshot = shard.db.snapshot().await.unwrap();
+    assert_eq!(
+        storage_snapshot.seq(),
+        read_epoch,
+        "the pinned snapshot must match the read epoch for the tail to be usable"
+    );
+    use crate::shard::topology_tail::GraphTopologyTail;
+    let budget = crate::shard::QueryBudget::new(None, None);
+    let tail = shard
+        .topology_tail_since(
+            &generation,
+            storage_snapshot.as_ref(),
+            read_epoch,
+            &budget,
+        )
+        .await
+        .unwrap();
+
+    let overlay = match tail {
+        GraphTopologyTail::Complete(overlay) => overlay,
+        GraphTopologyTail::Unavailable => panic!(
+            "tail reported Unavailable, so the compiled path would fall back; \
+             this repro needs the Complete branch"
+        ),
+    };
+
+    assert_eq!(
+        overlay.test_state(2, 4),
+        Some(true),
+        "WAL-tail overlay lost an edge committed in (base_sequence={}, \
+         read_epoch={read_epoch}]: 2->4 is missing, so a compiled traversal \
+         answers from the stale base. overlay_len={} generation.last_wal_id={}",
+        generation.base_sequence,
+        overlay.test_len(),
+        generation.last_wal_id
+    );
+    assert_eq!(
+        overlay.test_state(2, 3),
+        Some(false),
+        "WAL-tail overlay lost an acknowledged delete committed in \
+         (base_sequence={}, read_epoch={read_epoch}]: 2->3 is missing, so a \
+         compiled traversal resurrects it from the base. overlay_len={} \
+         generation.last_wal_id={}",
+        generation.base_sequence,
+        overlay.test_len(),
+        generation.last_wal_id
+    );
+}
+
+/// Suspect 2, the reachable shape. A writer-mode snapshot yields
+/// `last_wal_id() == None`, so `unwrap_or(0)` makes the tail scan start at file
+/// 1 and sweep everything — the hole is closed by accident. The indexer opens
+/// as a *reader* (`src/bin/graph-indexer.rs:138`), and a reader snapshot yields
+/// `Some(L)` (`src/core/state.rs:102-105`). The tail then starts at `L + 1`
+/// (`src/shard/topology_tail.rs:48`), so any commit that lands in WAL file `L`
+/// itself is in neither the compiled base nor the tail.
+#[cfg(feature = "graphblas")]
+#[tokio::test]
+#[ignore = "suspect-2 repro: fails while a reader-built generation skips commits inside its own WAL file"]
+async fn reader_built_generation_tail_covers_commits_in_its_own_wal_file() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let placement = ObjectStoreNodeDirectory::new(["cell-a"], ["node-a", "node-b"]).unwrap();
+    let writer = RoutedGraphCluster::open_promotable_scoped_with_memory_options(
+        "graph-wal-tail-reader-hole",
+        GraphScope::default(),
+        "node-a",
+        placement.clone(),
+        Arc::clone(&object_store),
+        GraphOpenOptions::default(),
+        GraphMemoryConfig::default(),
+    )
+    .await
+    .unwrap();
+    let cell_id = "cell-a";
+    let edge_type = "CHAIN";
+
+    // Create: 1 -> 2 -> 3.
+    for (idx, (src, dst)) in [(1_u64, 2_u64), (2, 3)].into_iter().enumerate() {
+        writer
+            .write_edge(typed_mutation(
+                cell_id,
+                edge_type,
+                src,
+                dst,
+                &format!("reader-hole-seed-{idx}"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    // The indexer: a reader-mode shard building a generation off its snapshot.
+    let indexer = RoutedGraphCluster::open_readers(
+        "graph-wal-tail-reader-hole",
+        "node-b",
+        placement,
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    let indexer_shard = indexer.shard(cell_id).unwrap();
+
+    indexer_shard.db.refresh_durable_reader().await.unwrap();
+    let build_snapshot = indexer_shard.db.snapshot().await.unwrap();
+    let generation = crate::GraphIndexGeneration {
+        cell_id: cell_id.to_string(),
+        edge_type: edge_type.to_string(),
+        base_sequence: build_snapshot.seq(),
+        last_wal_id: build_snapshot.last_wal_id().unwrap_or(0),
+        edge_count: 2,
+        checksum: 0,
+        generation: "reader-hole-repro".to_string(),
+    };
+    drop(build_snapshot);
+    assert!(
+        generation.last_wal_id > 0,
+        "this repro needs a reader snapshot that reports a WAL id; got 0, which \
+         means the writer-mode unwrap_or(0) path was taken instead"
+    );
+
+    // Modify, then delete — committed after the generation, landing in the WAL
+    // file the generation already claims to have covered.
+    writer
+        .write_edge(typed_mutation(cell_id, edge_type, 2, 4, "reader-hole-add"))
+        .await
+        .unwrap();
+    let deleted = writer
+        .delete_edge(typed_mutation(
+            cell_id,
+            edge_type,
+            2,
+            3,
+            "reader-hole-delete",
+        ))
+        .await
+        .unwrap();
+    assert!(deleted.deleted, "delete must be acknowledged");
+
+    indexer_shard.db.refresh_durable_reader().await.unwrap();
+    let read_snapshot = indexer_shard.db.snapshot().await.unwrap();
+    let read_epoch = read_snapshot.seq();
+    assert!(
+        read_epoch > generation.base_sequence,
+        "the reader must have caught up past the generation: read_epoch={read_epoch} \
+         base_sequence={}",
+        generation.base_sequence
+    );
+
+    use crate::shard::topology_tail::GraphTopologyTail;
+    let budget = crate::shard::QueryBudget::new(None, None);
+    let tail = indexer_shard
+        .topology_tail_since(&generation, read_snapshot.as_ref(), read_epoch, &budget)
+        .await
+        .unwrap();
+    let overlay = match tail {
+        GraphTopologyTail::Complete(overlay) => overlay,
+        GraphTopologyTail::Unavailable => panic!(
+            "tail reported Unavailable; this repro needs the Complete branch"
+        ),
+    };
+
+    assert_eq!(
+        (overlay.test_state(2, 4), overlay.test_state(2, 3)),
+        (Some(true), Some(false)),
+        "reader-built generation's WAL tail missed commits in \
+         (base_sequence={}, read_epoch={read_epoch}]: the scan starts at \
+         last_wal_id + 1 = {}, so entries in file {} are in neither the base nor \
+         the tail. overlay_len={}",
+        generation.base_sequence,
+        generation.last_wal_id + 1,
+        generation.last_wal_id,
+        overlay.test_len()
+    );
+}

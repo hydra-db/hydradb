@@ -22,6 +22,19 @@ impl GraphTopologyOverlay {
             .and_then(|destinations| destinations.get(&dst))
             .copied()
     }
+
+    /// Test-only introspection. The WAL-tail overlay is otherwise only
+    /// observable through a compiled GraphBLAS traversal, which needs the
+    /// SuiteSparse C kernel; these let a repro assert on the overlay directly.
+    #[cfg(test)]
+    pub(crate) fn test_state(&self, src: VertexId, dst: VertexId) -> Option<bool> {
+        self.state(src, dst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_len(&self) -> usize {
+        self.states.values().map(BTreeMap::len).sum()
+    }
 }
 
 impl GraphShard {
