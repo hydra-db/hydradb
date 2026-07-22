@@ -6,12 +6,12 @@ severity: P0
 classification: confirmed-bug
 introduced_or_first_bad_commit: pending-bisect
 fix_commit: none
-affected_range: present at a43ec61 through a3ea7f4 (Turbolay-V3.5)
+affected_range: present at a43ec61 through 15d49fa (Turbolay-V3.5)
 model:
   intended: quint-models/turbolay/m2_epoch_scoped_read.qnt
   fault: quint-models/turbolay/m2_epoch_scoped_read_buggy.qnt
   scenarios: quint-models/turbolay/m2_epoch_scoped_read_test.qnt
-current_verified_commit: a3ea7f4
+current_verified_commit: 15d49fa
 date_opened: 2026-07-22
 date_verified: 2026-07-22
 tags: [bugs, read-epoch, segments, tombstones, mvcc, data-loss, regression]
@@ -36,8 +36,11 @@ behaviors then destroy the history the rule depends on:
 Result: an epoch-scoped read is not a pure function of its epoch. An
 acknowledged delete can be retroactively erased from the epoch at which it was
 acknowledged, and a read can return edges committed after its epoch. Under
-ordinary concurrency this contradicts acknowledged history on **17% of
-current-epoch reads** in the reproduction below.
+ordinary concurrency this contradicts acknowledged history on a **large
+double-digit percentage of current-epoch reads** in the reproduction below.
+The exact figure is timing-dependent and varies per run — observed at 681/4000
+(17%) and 603/4000 (15%) on separate runs — but it has never been zero. Treat
+the magnitude as the finding, not the specific number.
 
 ## Three proven expressions (all e2e, `src/tests.rs`, run with `--ignored`)
 
@@ -180,8 +183,19 @@ quint run m2_epoch_scoped_read.qnt --invariant=allSafety --max-steps=16 --max-sa
 [ok] No violation found
 ```
 
-All four witnesses are reachable (same run, with `--witnesses`), so the
-invariants are not holding vacuously:
+All four witnesses are reachable, so the invariants are not holding vacuously.
+Note the flag takes **space-separated** names; the comma-separated form fails on
+quint 0.32.0 with `[QNT501] Expected ... to be a valid expression`:
+
+```bash
+quint run m2_epoch_scoped_read.qnt --invariant=allSafety \
+  --max-steps=16 --max-samples=50000 --verbosity=1 --witnesses \
+  deleteAcknowledgedReached reappendAfterDeleteReached \
+  rereadAfterReappendReached pointEdgeAfterReadReached
+```
+
+These counts are random-sampling results and differ on every run; only
+reachability is being claimed, not the percentages:
 
 ```text
 deleteAcknowledgedReached   witnessed in 49903 trace(s) out of 50000 (99.81%)

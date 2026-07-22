@@ -219,7 +219,7 @@
 </table>
 </div>
 
-<p>Suite state: <strong>87 passed</strong>. The three repros are excluded by <code>#[ignore]</code> and fail by design under <code>--ignored</code> — they encode the intended contract, which the code at <code>a43ec61</code> does not satisfy.</p>
+<p>Suite state: <strong>90 passed</strong>. The three repros are excluded by <code>#[ignore]</code> and fail by design under <code>--ignored</code> — they encode the intended contract, which the code at <code>a43ec61</code> does not satisfy.</p>
 
 <h2>The bug itself</h2>
 
@@ -335,7 +335,7 @@ edge committed later at epoch 2
 <p>The shortest counterexample to the first invariant is your create → delete → re-append interleaving, with the destruction visible on one line:</p>
 
 <pre class="fail">[State 3] readAtCurrentEpoch  observedAt=2 observed=false  tombstoneEpochs=Set(2)
-[State 4] appendSegment       epoch=3      segmentEpochs=Set(3)
+[State 4] appendSegment       epoch=3      segmentEpochs=Set(1, 3)
                                            tombstoneEpochs=Set()   &lt;-- delete destroyed
 [State 5] rereadFirstEpoch    observedAt=2 observed=true           &lt;-- answer flipped</pre>
 
@@ -397,7 +397,7 @@ edge committed later at epoch 2
 
 <div class="callout">
   <span class="lbl">Local environment caveat</span>
-  <p>The graphblas-gated tests could not be exercised through the compiled GraphBLAS kernel on this machine: SuiteSparse 7.12.2 / libgraphblas 10.3.1 rejects the calls the code makes (<code>GxB_Desc_set_INT32 returned GraphBLAS status -3</code>). This is a pre-existing version incompatibility — 16 existing tests fail the same way with <code>--features graphblas</code>, independent of any change here. The WAL-tail repros therefore assert directly on the tail overlay, which is pure Rust and is where the suspected hole lives; the compiled CSC payload plays no part in whether the overlay covers the commit window. The default suite is unaffected: <strong>89 passed, 0 failed, 4 ignored</strong>.</p>
+  <p>The graphblas-gated tests could not be exercised through the compiled GraphBLAS kernel on this machine: SuiteSparse 7.12.2 / libgraphblas 10.3.1 rejects the calls the code makes (<code>GxB_Desc_set_INT32 returned GraphBLAS status -3</code>). This is a pre-existing version incompatibility — 17 existing tests fail the same way with <code>--features graphblas</code>, independent of any change here. The WAL-tail repros therefore assert directly on the tail overlay, which is pure Rust and is where the suspected hole lives; the compiled CSC payload plays no part in whether the overlay covers the commit window. The default suite is unaffected: <strong>90 passed, 0 failed, 4 ignored</strong>.</p>
 </div>
 
 <h2>Remaining targets</h2>
