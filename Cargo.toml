@@ -9,7 +9,9 @@ readme = "README.md"
 publish = false
 
 [features]
-default = []
+# graphblas is the production matrix kernel; the pure-Rust path is a fallback that
+# stays buildable via `--no-default-features`.
+default = ["graphblas"]
 opencypher = ["dep:libcypher-parser-sys"]
 graphblas = []
 chaos-harness = []
