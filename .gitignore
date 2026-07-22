@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+/_apalache-out/
 
 # Generated benchmark and stress outputs
 /bench-results/
@@ -25,3 +26,7 @@ Thumbs.db
 # Local environment files
 .env
 *.env
+docs/formal-methods-docs/
+docs/formal-methods/distributed-protocol-testing/
+# Generated PDFs (book builds, exports)
+*.pdf
