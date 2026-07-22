@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BFG-009 — epoch-scoped reads compose over unpinned live state</title>
+<style>
+  :root {
+    --bg: #fbfbf9;
+    --panel: #ffffff;
+    --ink: #16181d;
+    --muted: #5b6270;
+    --faint: #8a91a0;
+    --rule: #e2e4e9;
+    --accent: #9a3412;
+    --bad: #b42318;
+    --bad-bg: #fef3f2;
+    --good: #067647;
+    --good-bg: #ecfdf3;
+    --warn: #a16207;
+    --warn-bg: #fefce8;
+    --code-bg: #f5f5f2;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131417;
+      --panel: #1a1c21;
+      --ink: #e7e9ee;
+      --muted: #a3aab8;
+      --faint: #767d8c;
+      --rule: #2a2d34;
+      --accent: #fdba74;
+      --bad: #fda29b;
+      --bad-bg: #2a1614;
+      --good: #75e0a7;
+      --good-bg: #10241a;
+      --warn: #fde047;
+      --warn-bg: #241f0c;
+      --code-bg: #202329;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 56px 24px 120px; }
+  header { border-bottom: 1px solid var(--rule); padding-bottom: 28px; margin-bottom: 40px; }
+  .eyebrow {
+    font: 600 12px/1 var(--mono);
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: var(--faint);
+    margin-bottom: 14px;
+  }
+  h1 { font-size: 30px; line-height: 1.25; margin: 0 0 14px; letter-spacing: -.02em; font-weight: 650; }
+  .sub { color: var(--muted); font-size: 16.5px; margin: 0; max-width: 68ch; }
+  .tags { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+  .tag {
+    font: 600 11.5px/1 var(--mono); letter-spacing: .04em;
+    padding: 6px 9px; border-radius: 5px; border: 1px solid var(--rule); color: var(--muted);
+  }
+  .tag.p0 { color: var(--bad); background: var(--bad-bg); border-color: transparent; }
+  h2 {
+    font-size: 13px; font-weight: 650; letter-spacing: .085em; text-transform: uppercase;
+    color: var(--faint); margin: 52px 0 18px; padding-bottom: 9px; border-bottom: 1px solid var(--rule);
+  }
+  h3 { font-size: 17px; font-weight: 620; margin: 30px 0 10px; letter-spacing: -.01em; }
+  p { margin: 0 0 15px; }
+  a { color: inherit; }
+  code {
+    font-family: var(--mono); font-size: .875em;
+    background: var(--code-bg); padding: 2px 5px; border-radius: 4px;
+    border: 1px solid var(--rule); word-break: break-word;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--rule); border-radius: 8px;
+    padding: 14px 16px; overflow-x: auto; font-family: var(--mono); font-size: 13px;
+    line-height: 1.6; margin: 0 0 16px;
+  }
+  pre code { background: none; border: none; padding: 0; font-size: inherit; }
+  .verdict {
+    background: var(--panel); border: 1px solid var(--rule); border-left: 3px solid var(--bad);
+    border-radius: 8px; padding: 22px 24px; margin-bottom: 8px;
+  }
+  .verdict .answer { font-size: 21px; font-weight: 650; margin: 0 0 10px; letter-spacing: -.01em; }
+  .verdict p:last-child { margin-bottom: 0; }
+  .callout {
+    background: var(--panel); border: 1px solid var(--rule); border-radius: 8px;
+    padding: 18px 20px; margin: 0 0 18px;
+  }
+  .callout.warn { border-left: 3px solid var(--warn); }
+  .callout.good { border-left: 3px solid var(--good); }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout .lbl {
+    font: 650 11px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase;
+    color: var(--faint); display: block; margin-bottom: 9px;
+  }
+  .scroll { overflow-x: auto; margin: 0 0 18px; border: 1px solid var(--rule); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; background: var(--panel); }
+  th, td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font: 650 11.5px/1.3 var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--faint); }
+  tr:last-child td { border-bottom: none; }
+  td.yes { color: var(--good); font-weight: 600; }
+  td.no { color: var(--bad); font-weight: 600; }
+  .repro {
+    background: var(--panel); border: 1px solid var(--rule); border-radius: 8px;
+    padding: 20px 22px; margin-bottom: 18px;
+  }
+  .repro .n {
+    display: inline-block; font: 650 11.5px/1 var(--mono); letter-spacing: .06em;
+    color: var(--accent); margin-bottom: 8px;
+  }
+  .repro h3 { margin-top: 0; }
+  .fn { font-family: var(--mono); font-size: 12.5px; color: var(--muted); word-break: break-all; margin: 0 0 14px; }
+  .tl { list-style: none; margin: 0 0 16px; padding: 0; border-left: 2px solid var(--rule); }
+  .tl li { position: relative; padding: 0 0 12px 20px; font-size: 14.5px; }
+  .tl li::before {
+    content: ""; position: absolute; left: -5px; top: 8px; width: 8px; height: 8px;
+    border-radius: 50%; background: var(--rule);
+  }
+  .tl li.hit::before { background: var(--bad); }
+  .tl li.hit { color: var(--bad); font-weight: 550; }
+  .tl .ep { font: 650 11px/1 var(--mono); color: var(--faint); letter-spacing: .05em; }
+  .fail {
+    background: var(--bad-bg); border: 1px solid transparent; color: var(--bad);
+    border-radius: 6px; padding: 12px 14px; font-family: var(--mono); font-size: 12.5px;
+    line-height: 1.6; white-space: pre-wrap; margin: 0;
+  }
+  ul.plain { margin: 0 0 16px; padding-left: 20px; }
+  ul.plain li { margin-bottom: 9px; }
+  ol.steps { margin: 0 0 16px; padding-left: 20px; }
+  ol.steps li { margin-bottom: 11px; }
+  .meta-foot {
+    margin-top: 56px; padding-top: 20px; border-top: 1px solid var(--rule);
+    font-size: 13px; color: var(--faint);
+  }
+  .meta-foot code { font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">Bug finding · Turbolay V3.5 · verified at a43ec61</div>
+  <h1>BFG-009 — epoch-scoped reads compose over unpinned live state</h1>
+  <p class="sub">An epoch-scoped read is not a pure function of its epoch. Later writes rewrite the answer to an earlier question, so an acknowledged delete can be retroactively erased and a read can return data committed after its own epoch.</p>
+  <div class="tags">
+    <span class="tag p0">P0 · confirmed-bug</span>
+    <span class="tag">status: open</span>
+    <span class="tag">data-loss class</span>
+    <span class="tag">3 e2e repros</span>
+    <span class="tag">model: none-yet</span>
+  </div>
+</header>
+
+<h2>Your question: was a Quint spec written?</h2>
+
+<div class="verdict">
+  <p class="answer">No — not at the time you asked. It has since been written.</p>
+  <p>My earlier message ended with <em>"say the word and I'll write it"</em> — a proposal, not a report of completed work. At the moment you asked, nothing under <code>quint-models/</code> had been created or modified by this bug hunt. The module now exists; see <a href="#quint-now">the model section</a> below for what it proves.</p>
+</div>
+
+<p>The three checks that established the original answer:</p>
+
+<div class="scroll">
+<table>
+  <thead>
+    <tr><th>Check</th><th>Result</th><th>Reading</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>grep -rli "bfg-009"</code> across the repo</td>
+      <td>3 hits</td>
+      <td>The finding doc, the README row, and <code>src/tests.rs</code>. <strong>No <code>.qnt</code> file mentions BFG-009.</strong></td>
+    </tr>
+    <tr>
+      <td><code>git status --porcelain | grep -i qnt</code></td>
+      <td>empty</td>
+      <td>No Quint file was added, modified, or staged in this working tree.</td>
+    </tr>
+    <tr>
+      <td>Provenance of <code>quint-models/turbolay/</code></td>
+      <td>18 files, all pre-existing</td>
+      <td>Last touched by <code>aacf8a4</code> ("docs: resolve BFG-003 as intended idempotency-key contract"), well before this hunt.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout warn">
+  <span class="lbl">The near-miss worth naming</span>
+  <p><code>quint-models/turbolay/m2_snapshot_read_buggy.qnt</code> exists and is the file most likely to be mistaken for a BFG-009 model. Its own header says otherwise: <em>"Implementation-shaped counterpart for BFG-001 and BFG-002."</em> It models page materialization consulting live storage after snapshot selection — a related shape, but it is not this bug and does not encode this invariant.</p>
+</div>
+
+<p>The finding doc records the gap honestly rather than papering over it. Its frontmatter reads <code>model.intended: m2_snapshot_read.qnt (candidate family; no module written yet)</code> and <code>model.fault: none-yet</code>, and the validation-protocol section closes with <em>"not yet written."</em></p>
+
+<h2>What actually exists for BFG-009</h2>
+
+<div class="scroll">
+<table>
+  <thead>
+    <tr><th>Artifact</th><th>Exists</th><th>Where</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Finding doc — root cause, blast radius, ruled-out list, fix directions</td><td class="yes">Yes</td><td><code>docs/bugs-found-fixed/BFG-009-epoch-scoped-read-unpinned-composition.md</code></td></tr>
+    <tr><td>Three failing e2e regressions, <code>#[ignore]</code>-marked</td><td class="yes">Yes</td><td><code>src/tests.rs:11997</code>, <code>:12054</code>, <code>:12096</code></td></tr>
+    <tr><td>README index row</td><td class="yes">Yes</td><td><code>docs/bugs-found-fixed/README.md:34</code></td></tr>
+    <tr><td>Quint module encoding the invariant</td><td class="yes">Yes <span style="font-weight:400;color:var(--faint)">(written after you asked)</span></td><td><code>quint-models/turbolay/m2_epoch_scoped_read.qnt</code></td></tr>
+    <tr><td><code>_buggy.qnt</code> fault model that must violate it</td><td class="yes">Yes</td><td><code>quint-models/turbolay/m2_epoch_scoped_read_buggy.qnt</code></td></tr>
+    <tr><td>Deterministic scenarios</td><td class="yes">Yes</td><td><code>quint-models/turbolay/m2_epoch_scoped_read_test.qnt</code></td></tr>
+    <tr><td>Bisect for first-bad-commit</td><td class="no">No</td><td>frontmatter: <code>pending-bisect</code></td></tr>
+    <tr><td>Applied fix</td><td class="no">No</td><td>frontmatter: <code>fix_commit: none</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Suite state: <strong>87 passed</strong>. The three repros are excluded by <code>#[ignore]</code> and fail by design under <code>--ignored</code> — they encode the intended contract, which the code at <code>a43ec61</code> does not satisfy.</p>
+
+<h2>The bug itself</h2>
+
+<p>The visibility rule for segment adjacency is <code>segment.storage_sequence &lt;= read_epoch</code>, with a tombstone applying when <code>tombstone_epoch &lt;= read_epoch</code>. That rule is only sound when evaluated against storage state <em>pinned at</em> <code>read_epoch</code>. Several read paths evaluate it against live — or later-pinned — state instead.</p>
+
+<p>Two writer behaviors then destroy the history the rule depends on:</p>
+
+<ol class="steps">
+  <li><strong>Segment re-append deletes the tombstone key</strong> of a prior acknowledged delete (<code>src/shard/write.rs:4279</code>). Correct for current reads; it erases the only record that an epoch-scoped evaluation over newer state would need.</li>
+  <li><strong>The point-edge branch has no epoch filter at all</strong> (<code>src/engine/artifact_build.rs:497-506</code>, same shape in <code>out_neighbors_in_storage_snapshot</code> at <code>src/shard/query.rs:135-142</code>).</li>
+</ol>
+
+<p>Composition of the two: the same call, with the same epoch argument, returns different answers depending on what has been written since.</p>
+
+<h2>Three proven expressions</h2>
+
+<div class="repro">
+  <span class="n">REPRO 1 · deterministic</span>
+  <h3>An acknowledged delete is retroactively erased</h3>
+  <p class="fn">epoch_scoped_read_is_stable_after_segment_reinsert_clears_the_tombstone — src/tests.rs:11998</p>
+  <ul class="tl">
+    <li><span class="ep">EPOCH 1</span> — segment-append <code>1-&gt;2</code></li>
+    <li><span class="ep">EPOCH 2</span> — <code>delete_edge</code> acknowledged</li>
+    <li><span class="ep">READ</span> — <code>edge_exists_at(1, 2, epoch=2)</code> → <code>false</code> ✓ correct</li>
+    <li><span class="ep">EPOCH 3</span> — unrelated re-append; deletes the tombstone key</li>
+    <li class="hit"><span class="ep">READ</span> — <code>edge_exists_at(1, 2, epoch=2)</code> → <code>true</code> — same call, same epoch, different answer</li>
+  </ul>
+  <pre class="fail">read at epoch 2 changed its answer after an unrelated later
+re-insert: the acknowledged delete at epoch 2 has been
+retroactively erased</pre>
+</div>
+
+<div class="repro">
+  <span class="n">REPRO 2 · deterministic</span>
+  <h3>A read returns data from the future of its epoch</h3>
+  <p class="fn">epoch_scoped_read_excludes_edges_committed_after_the_requested_epoch — src/tests.rs:12055</p>
+  <p>A segment edge commits at epoch 1; a point edge commits at epoch 2. <code>out_neighbors_at(..., epoch=1)</code> returns both — the point-edge branch never applied a filter.</p>
+  <pre class="fail">assertion `left == right` failed: read at epoch 1 returned an
+edge committed later at epoch 2
+  left: [2, 3]
+ right: [2]</pre>
+  <p style="margin-bottom:0">This is the BFG-002 shape resurfacing at the shard <code>_at</code> APIs — <code>edge_exists_at</code> / <code>out_neighbors_at</code> / <code>out_degree_at</code> / <code>edges_at</code> (<code>src/shard/maintenance.rs:14-57</code>, <code>src/shard/query.rs:6012</code>) accept the epoch unvalidated and answer from live state.</p>
+</div>
+
+<div class="repro">
+  <span class="n">REPRO 3 · stress, ~4s</span>
+  <h3>Current-epoch reads contradict acknowledged history</h3>
+  <p class="fn">current_epoch_reads_match_acknowledged_history_under_concurrent_reinserts — src/tests.rs:12097</p>
+  <p>One writer cycles acknowledged <code>delete_edge</code> / segment re-append on a single edge, recording each acknowledged <code>(epoch, state)</code> pair. A reader derives <code>current_epoch()</code> and immediately reads at it — the exact <code>query_read_epoch</code>-then-read composition the kernel-page fallback uses (<code>query.rs:4495</code> → <code>query.rs:4894</code>, with no <code>seq == read_epoch</code> guard between them).</p>
+  <pre class="fail">681 current-epoch reads contradicted acknowledged history; first:
+(read_epoch, expected, observed) = Some((6, false, true))</pre>
+  <p style="margin-bottom:0"><strong>681 of 4000 reads — 17%.</strong> A read anchored at epoch 6 observed an edge whose delete was acknowledged <em>at</em> epoch 6. In Jepsen terms: a read-your-writes violation for the deleting session, and a <code>set-full</code> resurrection (present → acknowledged-absent → present).</p>
+</div>
+
+<h2>Root cause</h2>
+
+<p><code>edges_at</code> → <code>canonical_adjacency_at</code> → <code>current_matrix_rows</code> (<code>src/engine/artifact_build.rs:488-532</code>) performs three separate live prefix scans — point edges unfiltered, tombstones and segments epoch-filtered — with no snapshot pinning at all when called outside <code>scope_snapshot</code>.</p>
+
+<p>Meanwhile segment re-append deletes tombstone keys (<code>write.rs:4279</code>), and segment compaction deletes tombstones and rewrites segment sequences (<code>maintenance.rs:207-229</code>). Both are correct for current reads. Both erase the record that epoch-scoped evaluation over newer state requires. The <code>_at</code> APIs promise history the storage layer deliberately does not keep.</p>
+
+<h2>Blast radius — and what is safe</h2>
+
+<div class="callout good">
+  <span class="lbl">Safe</span>
+  <p>The main cypher rows path, <code>execute_parsed_opencypher_rows</code> (<code>src/shard/query.rs:461-476</code>), pins one snapshot via <code>scope_snapshot</code> and derives <code>read_epoch</code> from that snapshot, so its live scans resolve against pinned state. Indexer builds are likewise consistent: <code>build_graph_index</code> runs <code>canonical_adjacency_at(base_sequence)</code> inside <code>scope_snapshot</code> at <code>base_sequence == snapshot.seq()</code>, neutralizing both unpinned branches.</p>
+</div>
+
+<ul class="plain">
+  <li><strong>The <code>_at</code> APIs</strong> — the direct expression of repros 1 and 2.</li>
+  <li><strong>Kernel / streaming page fast paths</strong> (<code>query.rs:4475</code>, <code>:4607</code>) derive <code>read_epoch</code> from a dropped snapshot, and their storage fallback takes its <em>own fresh</em> snapshot (<code>reachable_from_storage_frontier</code>, <code>query.rs:4894</code>) with no <code>seq == read_epoch</code> guard. Any delete-plus-re-append committing between those two lines tears the composition inside a single page. The compiled path does guard (<code>seq() != read_epoch → fallback</code>, <code>query.rs:5268</code>) — but the fallback it lands on is the unguarded one.</li>
+  <li><strong><code>validate_cell_edge_type</code></strong> (<code>query.rs:6059</code>) reads <code>current_epoch</code> then <code>edges_at</code> unpinned; its repair report can claim false degree mismatches.</li>
+</ul>
+
+<h2>Checked and ruled out</h2>
+
+<ul class="plain">
+  <li><strong>Forced-sequence commits</strong> — <code>commit_txn_strict</code> pins the commit sequence to <code>seqnum()+1</code> (<code>src/codec.rs:143-159</code>), so epochs equal real commit sequences. Not the cause.</li>
+  <li><strong>Segment scan early <code>break</code></strong> — segment keys zero-pad the sequence (<code>src/keys.rs:67-74</code>), so lexicographic order is numeric order.</li>
+  <li><strong>Segment compaction atomicity</strong> — atomic, and preserves out-of-range tombstones and live-at-epoch semantics (<code>maintenance.rs:189-248</code>).</li>
+  <li><strong>DETACH DELETE coverage</strong> — scans segments as well as point edges (<code>write.rs:739-773</code>).</li>
+</ul>
+
+<h2>Fix directions (none applied)</h2>
+
+<ol class="steps">
+  <li><strong>Pin or reject.</strong> Pin every epoch-scoped read to a storage snapshot whose <code>seq() == read_epoch</code>, or reject with <code>SnapshotAhead</code> / <code>UnsupportedQuery</code> the way <code>snapshot_at</code> already does (<code>src/shard/lifecycle.rs:620-639</code>). This is the cheap fix.</li>
+  <li><strong>Derive the epoch from the snapshot you traverse.</strong> In the kernel and streaming page paths, take the snapshot first and use its <code>seq()</code>, mirroring <code>execute_parsed_opencypher_rows</code>.</li>
+  <li><strong>Stop destroying history</strong> — only if historical epoch answers are a genuine product requirement. Tombstone keys must not be deleted on re-append (write a supersede record instead), and point edges need an epoch-carrying record. Much larger change; 1+2 restores correctness without it.</li>
+</ol>
+
+<h2 id="quint-now">The Quint module, now written</h2>
+
+<p>Three files in the M2 family, following the existing convention.</p>
+
+<p><strong><code>m2_epoch_scoped_read.qnt</code> — the intended contract.</strong> Every append, point write, and tombstone is retained as a set, so any epoch can be reconstructed. Three invariants:</p>
+
+<ul class="plain">
+  <li><code>epochScopedReadIsStable</code> — re-reading an already-answered epoch gives the same answer, however many commits landed at later epochs.</li>
+  <li><code>readNeverSeesTheFuture</code> — the answer equals the state reconstructed at the read epoch.</li>
+  <li><code>readMatchesAcknowledgedHistory</code> — a read anchored at an acknowledged epoch agrees with that acknowledgement.</li>
+</ul>
+
+<pre><code>quint run m2_epoch_scoped_read.qnt --invariant=allSafety \
+  --max-steps=16 --max-samples=50000
+[ok] No violation found (328ms at 152439 traces/second)</code></pre>
+
+<p>All four witnesses — <code>deleteAcknowledgedReached</code>, <code>reappendAfterDeleteReached</code>, <code>rereadAfterReappendReached</code>, <code>pointEdgeAfterReadReached</code> — are reachable, so nothing holds vacuously.</p>
+
+<p><strong><code>m2_epoch_scoped_read_buggy.qnt</code> — the fault model.</strong> Encodes the two implementation behaviors: the re-append deleting preceding tombstones (<code>write.rs:4279</code>), and the point-edge branch with no epoch filter (<code>artifact_build.rs:497-506</code>). It violates <strong>all three</strong> invariants — which is what proves they discriminate this bug rather than passing on anything.</p>
+
+<p>The shortest counterexample is your create → delete → re-append interleaving, with the destruction visible on one line:</p>
+
+<pre class="fail">[State 3] readAtCurrentEpoch  observedAt=2 observed=false  tombstoneEpochs=Set(2)
+[State 4] appendSegment       epoch=3      segmentEpochs=Set(3)
+                                           tombstoneEpochs=Set()   &lt;-- delete destroyed
+[State 6] rereadFirstEpoch    observedAt=2 observed=true           &lt;-- answer flipped</pre>
+
+<p><strong><code>m2_epoch_scoped_read_test.qnt</code></strong> holds four deterministic scenarios mirroring the e2e repros; all four pass against the intended module under <code>quint test</code>.</p>
+
+<div class="callout warn">
+  <span class="lbl">Modeling note worth keeping</span>
+  <p>The first three drafts of the intended model failed their own invariants. Each time the cause was the same: a scalar where storage has history. A single <code>segmentEpoch</code> can't express that appends accumulate; a single <code>pointEdgeEpoch</code> can't express two point writes; a single <code>tombstoneEpoch</code> can't express two deletes. All three had to become sets before the intended contract could even be stated. That is the bug restated in miniature — the implementation keeps scalars where correctness needs history.</p>
+</div>
+
+<h2>Ranked suspects — reproduction results</h2>
+
+<p>Five ranked data-loss sites, each driven to a verdict by test rather than by reading. Nothing below was fixed. Every test is committed and runnable.</p>
+
+<div class="scroll">
+<table>
+  <thead>
+    <tr><th>#</th><th>Suspect</th><th>Verdict</th><th>Evidence</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>5</strong></td>
+      <td>Trusted-append fingerprint resurrects acknowledged deletes<br><code>write.rs:4233-4242, :4279</code></td>
+      <td class="no">REPRODUCED</td>
+      <td>e2e, deterministic. import → delete(acked) → re-import same content under a fresh key ⇒ edge back, reported <code>inserted=1</code>. Boundary established: an <em>identical</em> retry short-circuits on the idempotency record and is safe. The hazard is exactly a <strong>re-keyed</strong> replay — which is what the chunked import APIs synthesize (<code>…-chunk-N</code>).</td>
+    </tr>
+    <tr>
+      <td><strong>3</strong></td>
+      <td>Three uncoordinated deleters destroy the last readable copy</td>
+      <td class="yes">DISPROVEN as data loss</td>
+      <td>e2e sequences all three through the public API. Compaction rewrites live edges into a new compacted segment rather than relying on the artifact, so committed edges stayed readable even after artifact GC deleted the only artifact (<code>deleted_keys &gt; 0</code>). Remains an <strong>availability</strong> risk (a later compaction hard-errors without its artifact), not loss. Test kept as a guard.</td>
+    </tr>
+    <tr>
+      <td><strong>1</strong></td>
+      <td>Compiled-index generation ahead of the pinned read snapshot<br><code>topology_tail.rs:38</code></td>
+      <td class="yes">DISPROVEN via callers</td>
+      <td><code>graph_index_generation_at</code> filters <code>base_sequence == base_epoch</code> (<code>index_store.rs:200-207</code>) and the refresh branch filters <code>latest.base_sequence &lt;= read_epoch</code> (<code>query.rs:5281</code>). Guard test publishes a generation strictly ahead of a pinned epoch and asserts selection never returns it — passes. Guard stays so a relaxed filter fails loudly.</td>
+    </tr>
+    <tr>
+      <td><strong>2</strong></td>
+      <td>WAL-file boundary hole in the base + WAL-tail merge<br><code>topology_tail.rs:42-48</code></td>
+      <td style="color:var(--warn);font-weight:600">NOT REPRODUCED</td>
+      <td>Two configurations, both hold. <em>Writer-mode:</em> the snapshot yields <code>last_wal_id() == None</code>, so <code>unwrap_or(0)</code> makes the tail scan start at file 1 and sweep everything — the hole is closed by accident. <em>Reader-mode</em> (the indexer's shape, <code>Some(L)</code>): the overlay still covered both the append and the delete. Structural reason: a durable reader snapshot's sequence advances over whole WAL files, so entries in file <code>L</code> with <code>seq &gt; base_sequence</code> appear unreachable. Not a clean disproof — see below.</td>
+    </tr>
+    <tr>
+      <td><strong>4</strong></td>
+      <td>The async indexer is completely unfenced<br><code>index_store.rs:226-232</code></td>
+      <td style="color:var(--muted);font-weight:600">NOT YET ATTEMPTED</td>
+      <td>Needs the Jepsen pause nemesis extended to the indexer container; not reachable from an in-process e2e test. Publish is CAS-guarded; generation GC has no guard at all.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout warn">
+  <span class="lbl">Honest limit on suspect 2</span>
+  <p>Both attempts pass, but neither is a proof of safety. The repros run against <code>InMemory</code> object storage where each commit lands in its own WAL file, so the batched-commits-in-one-file case the analysis describes never arose. Deciding it needs what the original scoping called for: a delayed-WAL-PUT object-store wrapper that holds flushes open, or Jepsen. Both tests are committed and <code>#[ignore]</code>-marked so they can be re-pointed at that harness rather than rewritten.</p>
+</div>
+
+<div class="callout">
+  <span class="lbl">Local environment caveat</span>
+  <p>The graphblas-gated tests could not be exercised through the compiled GraphBLAS kernel on this machine: SuiteSparse 7.12.2 / libgraphblas 10.3.1 rejects the calls the code makes (<code>GxB_Desc_set_INT32 returned GraphBLAS status -3</code>). This is a pre-existing version incompatibility — 16 existing tests fail the same way with <code>--features graphblas</code>, independent of any change here. The WAL-tail repros therefore assert directly on the tail overlay, which is pure Rust and is where the suspected hole lives; the compiled CSC payload plays no part in whether the overlay covers the commit window. The default suite is unaffected: <strong>89 passed, 0 failed, 4 ignored</strong>.</p>
+</div>
+
+<h2>Remaining targets</h2>
+
+<p>Updated against the read-path map that came back from the mapping pass.</p>
+
+<div class="scroll">
+<table>
+  <thead>
+    <tr><th>Target</th><th>Standing</th><th>Note</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>WAL-tail visibility hole</strong><br><code>topology_tail.rs:42-44</code></td>
+      <td style="color:var(--bad);font-weight:600">Upgraded — chase next</td>
+      <td>Both maps converge here. The empty-overlay early return keys freshness on the flushed-WAL frontier (<code>last_durable_wal_id</code>), which on a writer-node snapshot falls back to <code>last_flushed_wal_id()</code> and can lag <code>snapshot.seq()</code>. When the graph-kernel page path calls it outside <code>scope_snapshot</code>, the frontier even comes from a different snapshot than the pinned one (<code>state.rs:361</code>). Committed edges in <code>(base_sequence, read_epoch]</code> can silently drop from compiled traversals while point reads still see them. Needs a delayed-WAL-PUT object-store wrapper, or Jepsen.</td>
+    </tr>
+    <tr>
+      <td><strong>Unfenced indexer</strong></td>
+      <td>Open</td>
+      <td>Publish is CAS-guarded, but generation GC has no guard at all. A pause nemesis on the indexer container is the natural Jepsen extension — JEP-001 never paused it.</td>
+    </tr>
+    <tr>
+      <td><strong>Generation ahead of snapshot</strong></td>
+      <td style="color:var(--muted)">Downgraded</td>
+      <td>Weakened by the map: <code>latest_matrix_artifact</code> and the refresh path both filter <code>base_sequence &lt;= read_epoch</code>, so the dangerous <code>&gt;</code> branch looks unreachable through current callers. Keep as a guard test, not a headline bug.</td>
+    </tr>
+    <tr>
+      <td><strong>Artifact GC, caller-trusted <code>keep_epoch</code></strong></td>
+      <td style="color:var(--muted)">Lower priority</td>
+      <td>Can make a pinned epoch hard-error (<code>CorruptValue</code>) — availability, not loss.</td>
+    </tr>
+    <tr>
+      <td><strong>Offset-only cursor paging gap</strong></td>
+      <td style="color:var(--muted)">Not re-reported</td>
+      <td>Real, but documented as the accepted BFG-008 contract.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="meta-foot">
+  Generated 2026-07-22 · branch <code>Turbolay-V3.5</code> · verified at <code>a43ec61</code><br>
+  Source of record: <code>docs/bugs-found-fixed/BFG-009-epoch-scoped-read-unpinned-composition.md</code>. This page is an explainer, not the finding doc — the doc governs.
+</div>
+
+</div>
+</body>
+</html>
