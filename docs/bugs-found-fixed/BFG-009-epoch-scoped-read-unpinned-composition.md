@@ -6,14 +6,14 @@ severity: P0
 classification: confirmed-bug
 introduced_or_first_bad_commit: pending-bisect
 fix_commit: none
-affected_range: present at a43ec61 (Turbolay-V3.5)
+affected_range: present at a43ec61 through a3ea7f4 (Turbolay-V3.5)
 model:
   intended: quint-models/turbolay/m2_epoch_scoped_read.qnt
   fault: quint-models/turbolay/m2_epoch_scoped_read_buggy.qnt
   scenarios: quint-models/turbolay/m2_epoch_scoped_read_test.qnt
-current_verified_commit: a43ec61
+current_verified_commit: a3ea7f4
 date_opened: 2026-07-22
-date_verified: null
+date_verified: 2026-07-22
 tags: [bugs, read-epoch, segments, tombstones, mvcc, data-loss, regression]
 ---
 

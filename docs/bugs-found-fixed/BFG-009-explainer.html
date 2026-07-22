@@ -146,7 +146,7 @@
 <div class="wrap">
 
 <header>
-  <div class="eyebrow">Bug finding · Turbolay V3.5 · verified at a43ec61</div>
+  <div class="eyebrow">Bug finding · Turbolay V3.5 · verified at a3ea7f4</div>
   <h1>BFG-009 — epoch-scoped reads compose over unpinned live state</h1>
   <p class="sub">An epoch-scoped read is not a pure function of its epoch. Later writes rewrite the answer to an earlier question, so an acknowledged delete can be retroactively erased and a read can return data committed after its own epoch.</p>
   <div class="tags">
@@ -154,7 +154,7 @@
     <span class="tag">status: open</span>
     <span class="tag">data-loss class</span>
     <span class="tag">3 e2e repros</span>
-    <span class="tag">model: none-yet</span>
+    <span class="tag">model: M2 epoch-scoped read</span>
   </div>
 </header>
 
@@ -328,14 +328,16 @@ edge committed later at epoch 2
 
 <p>All four witnesses — <code>deleteAcknowledgedReached</code>, <code>reappendAfterDeleteReached</code>, <code>rereadAfterReappendReached</code>, <code>pointEdgeAfterReadReached</code> — are reachable, so nothing holds vacuously.</p>
 
-<p><strong><code>m2_epoch_scoped_read_buggy.qnt</code> — the fault model.</strong> Encodes the two implementation behaviors: the re-append deleting preceding tombstones (<code>write.rs:4279</code>), and the point-edge branch with no epoch filter (<code>artifact_build.rs:497-506</code>). It violates <strong>all three</strong> invariants — which is what proves they discriminate this bug rather than passing on anything.</p>
+<p><strong><code>m2_epoch_scoped_read_buggy.qnt</code> — the fault model.</strong> Encodes the two implementation behaviors: the re-append deleting preceding tombstones (<code>write.rs:4279</code>), and the point-edge branch with no epoch filter (<code>artifact_build.rs:497-506</code>). It violates <strong>two of the three</strong> invariants — <code>epochScopedReadIsStable</code> and <code>readNeverSeesTheFuture</code> — which is what proves those two discriminate this bug rather than passing on anything.</p>
 
-<p>The shortest counterexample is your create → delete → re-append interleaving, with the destruction visible on one line:</p>
+<p>The third, <code>readMatchesAcknowledgedHistory</code>, is <em>not</em> discriminated — and that is a stated limit of the module, not a weakness in the e2e evidence. A read is <strong>atomic</strong> here: the epoch is derived and evaluated in one action, so <code>observedAt == ackedEpoch</code> is only ever tested against the state that produced the acknowledgement. Repro 3 fails for exactly the reason this model cannot express — <code>query_read_epoch</code> and the read are separate steps with a writer committing between them. Discriminating it formally needs a two-action-read module, which does not exist yet.</p>
+
+<p>The shortest counterexample to the first invariant is your create → delete → re-append interleaving, with the destruction visible on one line:</p>
 
 <pre class="fail">[State 3] readAtCurrentEpoch  observedAt=2 observed=false  tombstoneEpochs=Set(2)
 [State 4] appendSegment       epoch=3      segmentEpochs=Set(3)
                                            tombstoneEpochs=Set()   &lt;-- delete destroyed
-[State 6] rereadFirstEpoch    observedAt=2 observed=true           &lt;-- answer flipped</pre>
+[State 5] rereadFirstEpoch    observedAt=2 observed=true           &lt;-- answer flipped</pre>
 
 <p><strong><code>m2_epoch_scoped_read_test.qnt</code></strong> holds four deterministic scenarios mirroring the e2e repros; all four pass against the intended module under <code>quint test</code>.</p>
 
