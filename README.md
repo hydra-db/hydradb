@@ -70,7 +70,10 @@ Base build:
 Native query/traversal features:
 
 - `opencypher`: native `libcypher-parser`
-- `graphblas`: SuiteSparse GraphBLAS development headers and library
+- `graphblas`: SuiteSparse GraphBLAS development headers and library. **This is
+  a default feature** — it is the kernel we run in production. SuiteSparse is
+  therefore required for a plain `cargo build`. Build with
+  `--no-default-features` to fall back to the pure-Rust sparse kernel.
 - `query-transport-tls`: Rustls dependencies are pulled by Cargo; you provide
   certificates/configuration in the embedding service
 
@@ -91,17 +94,21 @@ brew install cleishm/neo4j/libcypher-parser
 rustup-init
 ```
 
-Then open a new shell and make the native libraries visible when using native
-features:
+Then open a new shell and make `libcypher-parser` visible:
 
 ```bash
 export PKG_CONFIG_PATH="$(brew --prefix libcypher-parser)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-export LIBRARY_PATH="$(brew --prefix suite-sparse)/lib:${LIBRARY_PATH:-}"
-export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix suite-sparse)/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
 
 pkg-config --exists cypher-parser
 test -f "$(brew --prefix suite-sparse)/lib/libgraphblas.dylib"
 ```
+
+You do **not** need to export `LIBRARY_PATH` or `RUSTFLAGS="-L ..."` for
+SuiteSparse. `build.rs` resolves the GraphBLAS link-search path itself, in this
+order: `GRAPHBLAS_LIB_DIR`, then `pkg-config --libs-only-L GraphBLAS`, then
+`brew --prefix suite-sparse`/lib on macOS. It emits nothing when none resolve,
+which is the correct behaviour on Debian/Ubuntu where `libgraphblas-dev` lands
+on the default linker path.
 
 ## Build And Test
 
@@ -109,11 +116,10 @@ test -f "$(brew --prefix suite-sparse)/lib/libgraphblas.dylib"
 git clone https://github.com/usecortex/slatedb-graph-kernel.git
 cd slatedb-graph-kernel
 
-cargo test --locked --lib
+cargo test --locked --lib                          # default features (graphblas on)
+cargo test --locked --no-default-features --lib    # pure-Rust sparse kernel
 cargo test --locked --features opencypher --lib
-cargo test --locked --features graphblas --lib
-cargo test --locked --features opencypher,graphblas --lib
-cargo check --locked --examples --features opencypher,graphblas
+cargo check --locked --examples --features opencypher
 cargo test --locked --all-targets --features public-client-protocols
 ```
 
