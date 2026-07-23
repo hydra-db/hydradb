@@ -108,7 +108,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "que
 rustls-pemfile = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-slatedb = { git = "https://github.com/usecortex/slatedb.git", rev = "224177d47a47952c76f5749ed780caed7d07a5d9", default-features = false, features = ["aws", "foyer"] }
+slatedb = { git = "https://github.com/usecortex/slatedb.git", rev = "3b6e645b9e1e972a51f10e0ebf015bc964f90591", default-features = false, features = ["aws", "foyer"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", optional = true }

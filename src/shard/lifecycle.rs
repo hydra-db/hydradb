@@ -142,7 +142,7 @@ impl GraphShard {
         );
         match &write_authority {
             GraphWriteAuthority::ReadOnly => {
-                db.open_reader().await?;
+                let _ = db.open_reader().await?;
             }
             GraphWriteAuthority::Promotable => {}
             GraphWriteAuthority::Writer => {
