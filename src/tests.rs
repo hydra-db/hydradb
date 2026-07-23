@@ -1186,6 +1186,10 @@ async fn read_only_shard_treats_uninitialized_store_as_empty_until_first_write()
         .await
         .unwrap();
     assert!(
+        reader.edge_exists("cell-a", "FOLLOWS", 1, 2).await.unwrap(),
+        "an ordinary read must discover initialization immediately after the durable write"
+    );
+    assert!(
         reader
             .wait_for_storage_sequence("cell-a", committed.epoch)
             .await

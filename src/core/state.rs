@@ -82,12 +82,10 @@ struct GraphStoreInner {
     durability: GraphDurabilityConfig,
     writer: StdRwLock<Option<Db>>,
     reader: AsyncRwLock<Option<Arc<DbReader>>>,
-    missing_reader_probe_ms: AtomicU64,
     writer_open_gate: Mutex<()>,
     reader_open_gate: Mutex<()>,
 }
 
-const MISSING_READER_RECHECK_MS: u64 = 10_000;
 static EMPTY_GRAPH_STORE: OnceCell<Db> = OnceCell::const_new();
 
 pub(crate) enum GraphStorageSnapshot {
@@ -166,7 +164,6 @@ impl GraphStore {
                 durability,
                 writer: StdRwLock::new(None),
                 reader: AsyncRwLock::new(None),
-                missing_reader_probe_ms: AtomicU64::new(0),
                 writer_open_gate: Mutex::new(()),
                 reader_open_gate: Mutex::new(()),
             }),
@@ -247,19 +244,8 @@ impl GraphStore {
     }
 
     pub(crate) async fn open_reader(&self) -> Result<Option<Arc<DbReader>>> {
-        self.open_reader_inner(false).await
-    }
-
-    async fn open_reader_inner(&self, force_missing_probe: bool) -> Result<Option<Arc<DbReader>>> {
         if let Some(reader) = self.inner.reader.read().await.as_ref().cloned() {
             return Ok(Some(reader));
-        }
-        let last_probe = self.inner.missing_reader_probe_ms.load(Ordering::Relaxed);
-        if !force_missing_probe
-            && last_probe != 0
-            && graph_now_millis().saturating_sub(last_probe) < MISSING_READER_RECHECK_MS
-        {
-            return Ok(None);
         }
         let _open_guard = self.inner.reader_open_gate.lock().await;
         if let Some(reader) = self.inner.reader.read().await.as_ref().cloned() {
@@ -275,15 +261,9 @@ impl GraphStore {
             Ok(reader) => {
                 let reader = Arc::new(reader);
                 *self.inner.reader.write().await = Some(Arc::clone(&reader));
-                self.inner
-                    .missing_reader_probe_ms
-                    .store(0, Ordering::Relaxed);
                 Ok(Some(reader))
             }
             Err(GraphError::Slate(error)) if matches!(error.kind(), ErrorKind::DatabaseMissing) => {
-                self.inner
-                    .missing_reader_probe_ms
-                    .store(graph_now_millis().max(1), Ordering::Relaxed);
                 Self::empty_store().await?;
                 Ok(None)
             }
@@ -427,7 +407,7 @@ impl GraphStore {
     }
 
     pub(crate) async fn refresh_durable_reader(&self) -> Result<u64> {
-        let Some(reader) = self.open_reader_inner(true).await? else {
+        let Some(reader) = self.open_reader().await? else {
             return Ok(0);
         };
         reader.refresh().await?;
