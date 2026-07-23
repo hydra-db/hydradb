@@ -3,12 +3,12 @@ use std::sync::{Arc, RwLock as StdRwLock};
 
 use slatedb::bytes::Bytes;
 use slatedb::config::{ReadOptions, ScanOptions};
-use slatedb::object_store::{path::Path, ObjectStore};
+use slatedb::object_store::{memory::InMemory, path::Path, ObjectStore};
 use slatedb::ErrorKind;
 use slatedb::{Db, DbReader, DbReaderSnapshot, DbSnapshot};
 #[cfg(feature = "opencypher")]
 use tokio::sync::watch;
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock as AsyncRwLock, Semaphore};
+use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard, RwLock as AsyncRwLock, Semaphore};
 #[cfg(feature = "opencypher")]
 use tokio::task::JoinHandle;
 
@@ -82,19 +82,24 @@ struct GraphStoreInner {
     durability: GraphDurabilityConfig,
     writer: StdRwLock<Option<Db>>,
     reader: AsyncRwLock<Option<Arc<DbReader>>>,
+    missing_reader_probe_ms: AtomicU64,
     writer_open_gate: Mutex<()>,
     reader_open_gate: Mutex<()>,
 }
 
+const MISSING_READER_RECHECK_MS: u64 = 10_000;
+static EMPTY_GRAPH_STORE: OnceCell<Db> = OnceCell::const_new();
+
 pub(crate) enum GraphStorageSnapshot {
     Writer(Arc<DbSnapshot>),
     Reader(Arc<DbReaderSnapshot>),
+    Empty(Arc<DbSnapshot>),
 }
 
 impl GraphStorageSnapshot {
     pub(crate) fn seq(&self) -> u64 {
         match self {
-            Self::Writer(snapshot) => snapshot.seq(),
+            Self::Writer(snapshot) | Self::Empty(snapshot) => snapshot.seq(),
             Self::Reader(snapshot) => snapshot.seq(),
         }
     }
@@ -103,6 +108,7 @@ impl GraphStorageSnapshot {
         match self {
             Self::Writer(_) => None,
             Self::Reader(snapshot) => Some(snapshot.last_wal_id()),
+            Self::Empty(_) => Some(0),
         }
     }
 
@@ -112,7 +118,9 @@ impl GraphStorageSnapshot {
         options: &ReadOptions,
     ) -> std::result::Result<Option<Bytes>, slatedb::Error> {
         match self {
-            Self::Writer(snapshot) => snapshot.get_with_options(key, options).await,
+            Self::Writer(snapshot) | Self::Empty(snapshot) => {
+                snapshot.get_with_options(key, options).await
+            }
             Self::Reader(snapshot) => snapshot.get_with_options(key, options).await,
         }
     }
@@ -127,7 +135,7 @@ impl GraphStorageSnapshot {
         T: slatedb::ByteRangeBounds + Send,
     {
         match self {
-            Self::Writer(snapshot) => {
+            Self::Writer(snapshot) | Self::Empty(snapshot) => {
                 snapshot
                     .scan_prefix_with_options(prefix, subrange, options)
                     .await
@@ -158,6 +166,7 @@ impl GraphStore {
                 durability,
                 writer: StdRwLock::new(None),
                 reader: AsyncRwLock::new(None),
+                missing_reader_probe_ms: AtomicU64::new(0),
                 writer_open_gate: Mutex::new(()),
                 reader_open_gate: Mutex::new(()),
             }),
@@ -225,24 +234,61 @@ impl GraphStore {
         Ok(true)
     }
 
-    pub(crate) async fn open_reader(&self) -> Result<Arc<DbReader>> {
+    async fn empty_store() -> Result<Db> {
+        EMPTY_GRAPH_STORE
+            .get_or_try_init(|| async {
+                Db::builder(Path::from("empty"), Arc::new(InMemory::new()))
+                    .build()
+                    .await
+                    .map_err(GraphError::from)
+            })
+            .await
+            .cloned()
+    }
+
+    pub(crate) async fn open_reader(&self) -> Result<Option<Arc<DbReader>>> {
+        self.open_reader_inner(false).await
+    }
+
+    async fn open_reader_inner(&self, force_missing_probe: bool) -> Result<Option<Arc<DbReader>>> {
         if let Some(reader) = self.inner.reader.read().await.as_ref().cloned() {
-            return Ok(reader);
+            return Ok(Some(reader));
+        }
+        let last_probe = self.inner.missing_reader_probe_ms.load(Ordering::Relaxed);
+        if !force_missing_probe
+            && last_probe != 0
+            && graph_now_millis().saturating_sub(last_probe) < MISSING_READER_RECHECK_MS
+        {
+            return Ok(None);
         }
         let _open_guard = self.inner.reader_open_gate.lock().await;
         if let Some(reader) = self.inner.reader.read().await.as_ref().cloned() {
-            return Ok(reader);
+            return Ok(Some(reader));
         }
-        let reader = Arc::new(
-            open_graph_reader(
-                self.inner.path.clone(),
-                Arc::clone(&self.inner.object_store),
-                &self.inner.cache,
-            )
-            .await?,
-        );
-        *self.inner.reader.write().await = Some(Arc::clone(&reader));
-        Ok(reader)
+        match open_graph_reader(
+            self.inner.path.clone(),
+            Arc::clone(&self.inner.object_store),
+            &self.inner.cache,
+        )
+        .await
+        {
+            Ok(reader) => {
+                let reader = Arc::new(reader);
+                *self.inner.reader.write().await = Some(Arc::clone(&reader));
+                self.inner
+                    .missing_reader_probe_ms
+                    .store(0, Ordering::Relaxed);
+                Ok(Some(reader))
+            }
+            Err(GraphError::Slate(error)) if matches!(error.kind(), ErrorKind::DatabaseMissing) => {
+                self.inner
+                    .missing_reader_probe_ms
+                    .store(graph_now_millis().max(1), Ordering::Relaxed);
+                Self::empty_store().await?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) async fn get_with_options(
@@ -256,8 +302,10 @@ impl GraphStore {
         if let Some(writer) = self.open_writer() {
             return Ok(writer.get_with_options(key, options).await?);
         }
-        Ok(self
-            .open_reader()
+        if let Some(reader) = self.open_reader().await? {
+            return Ok(reader.get_with_options(key, options).await?);
+        }
+        Ok(Self::empty_store()
             .await?
             .get_with_options(key, options)
             .await?)
@@ -293,14 +341,24 @@ impl GraphStore {
                 None => writer.scan_prefix_with_options(prefix, .., options).await?,
             });
         }
-        let reader = self.open_reader().await?;
+        if let Some(reader) = self.open_reader().await? {
+            return Ok(match start_suffix {
+                Some(start) => {
+                    reader
+                        .scan_prefix_with_options(prefix, start.., options)
+                        .await?
+                }
+                None => reader.scan_prefix_with_options(prefix, .., options).await?,
+            });
+        }
+        let empty = Self::empty_store().await?;
         Ok(match start_suffix {
             Some(start) => {
-                reader
+                empty
                     .scan_prefix_with_options(prefix, start.., options)
                     .await?
             }
-            None => reader.scan_prefix_with_options(prefix, .., options).await?,
+            None => empty.scan_prefix_with_options(prefix, .., options).await?,
         })
     }
 
@@ -326,20 +384,34 @@ impl GraphStore {
                 .map(|snapshot| Arc::new(GraphStorageSnapshot::Writer(snapshot)))
                 .map_err(Into::into);
         }
-        self.open_reader()
+        if let Some(reader) = self.open_reader().await? {
+            return reader
+                .snapshot()
+                .await
+                .map(|snapshot| Arc::new(GraphStorageSnapshot::Reader(snapshot)))
+                .map_err(Into::into);
+        }
+        Self::empty_store()
             .await?
             .snapshot()
             .await
-            .map(|snapshot| Arc::new(GraphStorageSnapshot::Reader(snapshot)))
+            .map(|snapshot| Arc::new(GraphStorageSnapshot::Empty(snapshot)))
             .map_err(Into::into)
     }
 
     pub(crate) async fn reader_snapshot(&self) -> Result<Arc<GraphStorageSnapshot>> {
-        self.open_reader()
+        if let Some(reader) = self.open_reader().await? {
+            return reader
+                .snapshot()
+                .await
+                .map(|snapshot| Arc::new(GraphStorageSnapshot::Reader(snapshot)))
+                .map_err(Into::into);
+        }
+        Self::empty_store()
             .await?
             .snapshot()
             .await
-            .map(|snapshot| Arc::new(GraphStorageSnapshot::Reader(snapshot)))
+            .map(|snapshot| Arc::new(GraphStorageSnapshot::Empty(snapshot)))
             .map_err(Into::into)
     }
 
@@ -347,11 +419,17 @@ impl GraphStore {
         if let Some(writer) = self.open_writer() {
             return Ok(writer.status().durable_seq);
         }
-        Ok(self.open_reader().await?.status().durable_seq)
+        Ok(self
+            .open_reader()
+            .await?
+            .map(|reader| reader.status().durable_seq)
+            .unwrap_or(0))
     }
 
     pub(crate) async fn refresh_durable_reader(&self) -> Result<u64> {
-        let reader = self.open_reader().await?;
+        let Some(reader) = self.open_reader_inner(true).await? else {
+            return Ok(0);
+        };
         reader.refresh().await?;
         Ok(reader.status().durable_seq)
     }

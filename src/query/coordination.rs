@@ -3413,7 +3413,12 @@ impl QueryCellClient for crate::ScopedRoutedGraphCluster {
         context: QueryContext,
         query: &str,
     ) -> Result<QueryResultSet> {
-        let cluster = self.cluster_for_scope(&context.scope).await?;
+        let cluster = if routed_client_query_is_mutation(&context, query)? {
+            self.cluster_for_scope_write(&context.scope, &context.cell_id)
+                .await?
+        } else {
+            self.cluster_for_scope(&context.scope).await?
+        };
         QueryCellClient::execute_cypher_rows(cluster.as_ref(), context, query).await
     }
 
@@ -3424,7 +3429,12 @@ impl QueryCellClient for crate::ScopedRoutedGraphCluster {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<QueryResultPage> {
-        let cluster = self.cluster_for_scope(&context.scope).await?;
+        let cluster = if routed_client_query_is_mutation(&context, query)? {
+            self.cluster_for_scope_write(&context.scope, &context.cell_id)
+                .await?
+        } else {
+            self.cluster_for_scope(&context.scope).await?
+        };
         QueryCellClient::execute_cypher_rows_page(
             cluster.as_ref(),
             context,
@@ -3440,7 +3450,12 @@ impl QueryCellClient for crate::ScopedRoutedGraphCluster {
         context: QueryContext,
         operation: crate::QueryBatchOperation,
     ) -> Result<QueryResultSet> {
-        let cluster = self.cluster_for_scope(&context.scope).await?;
+        let cluster = if operation.is_write() {
+            self.cluster_for_scope_write(&context.scope, &context.cell_id)
+                .await?
+        } else {
+            self.cluster_for_scope(&context.scope).await?
+        };
         QueryCellClient::execute_batch(cluster.as_ref(), context, operation).await
     }
 

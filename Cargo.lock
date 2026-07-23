@@ -2621,7 +2621,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slatedb"
 version = "0.14.1"
-source = "git+https://github.com/usecortex/slatedb.git?rev=224177d47a47952c76f5749ed780caed7d07a5d9#224177d47a47952c76f5749ed780caed7d07a5d9"
+source = "git+https://github.com/usecortex/slatedb.git?rev=3b6e645b9e1e972a51f10e0ebf015bc964f90591#3b6e645b9e1e972a51f10e0ebf015bc964f90591"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -2665,7 +2665,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.14.1"
-source = "git+https://github.com/usecortex/slatedb.git?rev=224177d47a47952c76f5749ed780caed7d07a5d9#224177d47a47952c76f5749ed780caed7d07a5d9"
+source = "git+https://github.com/usecortex/slatedb.git?rev=3b6e645b9e1e972a51f10e0ebf015bc964f90591#3b6e645b9e1e972a51f10e0ebf015bc964f90591"
 dependencies = [
  "chrono",
  "log",
@@ -2709,7 +2709,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.14.1"
-source = "git+https://github.com/usecortex/slatedb.git?rev=224177d47a47952c76f5749ed780caed7d07a5d9#224177d47a47952c76f5749ed780caed7d07a5d9"
+source = "git+https://github.com/usecortex/slatedb.git?rev=3b6e645b9e1e972a51f10e0ebf015bc964f90591#3b6e645b9e1e972a51f10e0ebf015bc964f90591"
 dependencies = [
  "async-trait",
  "bytes",
