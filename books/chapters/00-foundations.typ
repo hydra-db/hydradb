@@ -659,6 +659,14 @@ that all the storage keys carry. The architecture chapter follows this resolutio
 end; for now hold the mental model that the outside world speaks in namespaces and graph
 ids, and the storage layer speaks in cell ids.
 
+Two consequences of that chain are worth carrying forward, because they shape the runtime.
+First, the mapping is a *derivation*, not a lookup: the deployed resolver reads the tenant
+path out of the database name itself rather than finding the name in a registered table, so a
+tenant that has never been seen before still resolves. Second, and following from it, a scope
+is opened on demand — a node holds a bounded set of open scopes and opens a new one the first
+time a request names it. Namespaces are therefore not a static deployment decision you make
+once; they are created by use.
+
 == Writer, reader, and SlateDB manifest fencing
 
 Section 0.3 said the object store is the single source of truth. That raises a hazard: if two

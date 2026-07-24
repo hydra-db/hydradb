@@ -26,7 +26,7 @@ the compute node holds ways to reach it quickly.
     node((1, 0), text(size: 8pt)[graph-node A′ (replacement) — empty heap · cold cache],
       fill: reader-colors.surface_soft, stroke: reader-colors.border,
       shape: fletcher.shapes.rect, corner-radius: 3pt),
-    node((0.5, 1), text(size: 8pt)[Object store (SlateDB): edges · epochs · artifacts · deltas · write locks],
+    node((0.5, 1), text(size: 8pt)[Object store (SlateDB): edges · epochs · index generations · manifests],
       fill: reader-colors.purple_soft, stroke: reader-colors.purple,
       shape: fletcher.shapes.rect, corner-radius: 3pt),
     edge((0, 0), (0.5, 1), "--}>", stroke: (paint: reader-colors.bad, dash: "dashed"),
@@ -46,16 +46,18 @@ never a fact.
 == The one-sentence architecture
 
 TurboLay is an object-store-backed graph kernel that partitions a graph into
-cells, serializes each cell's writes with a single-writer cell write lock and
-epochs, and accelerates snapshot reads with durable artifacts plus disposable
-compute-local caches.
+cells, admits at most one writer per cell — a guarantee SlateDB's own manifest
+fencing enforces, not a lock TurboLay holds — and accelerates snapshot reads
+with durable index generations plus disposable compute-local caches.
 
 That sentence has four load-bearing nouns:
 
 - *Object store* — the durable home of SlateDB state.
-- *Cell* — the unit of storage path, placement, and write ownership.
-- *Epoch* — the version named by a mutation or a snapshot read.
-- *Artifact* — derived query structure built from canonical edges and deltas.
+- *Cell* — the unit of storage path and write ownership.
+- *Epoch* — the version named by a mutation or a snapshot read; concretely, a
+  SlateDB storage sequence number.
+- *Index generation* — derived query structure, immutable and rebuilt out of
+  process, built from canonical edges alone.
 
 #figure(
   table(
@@ -64,8 +66,8 @@ That sentence has four load-bearing nouns:
     inset: 8pt,
     table.header([*Clients*], [*Compute*], [*Durable storage*]),
     [Cypher and graph APIs], [parser, planner, traversal], [SlateDB on S3],
-    [query legs], [matrix and GraphBLAS caches], [edges, epochs, artifacts],
-    [writes], [writer lanes and cell write lock], [write locks, deltas, idempotency],
+    [query legs], [matrix and GraphBLAS caches], [edges, epochs, index generations],
+    [writes], [writer lanes and writer promotion], [manifest fencing, idempotency],
   ),
   caption: [The object store owns durable state; compute owns execution and acceleration.],
 ) <tab-architecture-boundary>
@@ -86,9 +88,12 @@ the same edges from an empty heap and cache.
 
 #custom-box(title: [Term — Replaceable compute], icon: "info")[
   “Replaceable compute” is more accurate than “stateless compute.” An active
-  process holds a writer role, a cell write lock, semaphores, parsed plans, and
-  hydrated matrices. Those are runtime state, but none is the sole durable copy
-  of the graph.
+  process holds a writer role, a promoted SlateDB writer handle, semaphores,
+  parsed plans, and hydrated matrices. Those are runtime state, but none is the
+  sole durable copy of the graph. Losing the writer handle is the interesting
+  case, and it is still not a durability event: a replacement node promotes its
+  own writer, and SlateDB's manifest fencing is what stops the old one from
+  committing afterwards.
 ]
 
 == Not a separate storage service
