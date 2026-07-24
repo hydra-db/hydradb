@@ -233,11 +233,13 @@ impl GraphStore {
 
     async fn empty_store() -> Result<Db> {
         EMPTY_GRAPH_STORE
-            .get_or_try_init(|| async {
-                Db::builder(Path::from("empty"), Arc::new(InMemory::new()))
-                    .build()
-                    .await
-                    .map_err(GraphError::from)
+            .get_or_try_init(|| {
+                Box::pin(async {
+                    Db::builder(Path::from("empty"), Arc::new(InMemory::new()))
+                        .build()
+                        .await
+                        .map_err(GraphError::from)
+                })
             })
             .await
             .cloned()
