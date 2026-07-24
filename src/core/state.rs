@@ -82,8 +82,12 @@ struct GraphStoreInner {
     durability: GraphDurabilityConfig,
     writer: StdRwLock<Option<Db>>,
     reader: AsyncRwLock<Option<Arc<DbReader>>>,
+    // A writer loss is acknowledged only by a reader refresh from the same or a later generation.
+    reader_refresh_generation: AtomicU64,
+    reader_refreshed_generation: AtomicU64,
     writer_open_gate: Mutex<()>,
     reader_open_gate: Mutex<()>,
+    reader_refresh_gate: Mutex<()>,
 }
 
 static EMPTY_GRAPH_STORE: OnceCell<Db> = OnceCell::const_new();
@@ -164,8 +168,11 @@ impl GraphStore {
                 durability,
                 writer: StdRwLock::new(None),
                 reader: AsyncRwLock::new(None),
+                reader_refresh_generation: AtomicU64::new(0),
+                reader_refreshed_generation: AtomicU64::new(0),
                 writer_open_gate: Mutex::new(()),
                 reader_open_gate: Mutex::new(()),
+                reader_refresh_gate: Mutex::new(()),
             }),
         }
     }
@@ -176,6 +183,42 @@ impl GraphStore {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn readable_writer(&self) -> Option<Db> {
+        let writer = self.open_writer()?;
+        if writer.status().close_reason.is_none() {
+            return Some(writer);
+        }
+        self.clear_closed_writer();
+        None
+    }
+
+    fn clear_closed_writer(&self) -> bool {
+        let mut writer = self
+            .inner
+            .writer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if writer
+            .as_ref()
+            .is_some_and(|current| current.status().close_reason.is_some())
+        {
+            *writer = None;
+            self.inner
+                .reader_refresh_generation
+                .fetch_add(1, Ordering::AcqRel);
+            return true;
+        }
+        false
+    }
+
+    fn recover_closed_writer_error(&self, error: &slatedb::Error) -> bool {
+        if !matches!(error.kind(), ErrorKind::Closed(_)) {
+            return false;
+        }
+        self.clear_closed_writer();
+        true
     }
 
     pub(crate) fn store_path(&self) -> &Path {
@@ -196,11 +239,7 @@ impl GraphStore {
         match writer.refresh_manifest().await {
             Ok(()) => Ok(()),
             Err(err) if matches!(err.kind(), ErrorKind::Closed(slatedb::CloseReason::Fenced)) => {
-                *self
-                    .inner
-                    .writer
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                self.clear_closed_writer();
                 Err(err.into())
             }
             Err(err) => Err(err.into()),
@@ -273,6 +312,38 @@ impl GraphStore {
         }
     }
 
+    async fn readable_reader(&self) -> Result<Option<Arc<DbReader>>> {
+        let Some(reader) = self.open_reader().await? else {
+            return Ok(None);
+        };
+        if self.inner.reader_refresh_generation.load(Ordering::Acquire)
+            == self
+                .inner
+                .reader_refreshed_generation
+                .load(Ordering::Acquire)
+        {
+            return Ok(Some(reader));
+        }
+
+        let _refresh_guard = self.inner.reader_refresh_gate.lock().await;
+        loop {
+            let required_generation = self.inner.reader_refresh_generation.load(Ordering::Acquire);
+            if required_generation
+                == self
+                    .inner
+                    .reader_refreshed_generation
+                    .load(Ordering::Acquire)
+            {
+                break;
+            }
+            reader.refresh().await?;
+            self.inner
+                .reader_refreshed_generation
+                .store(required_generation, Ordering::Release);
+        }
+        Ok(Some(reader))
+    }
+
     pub(crate) async fn get_with_options(
         &self,
         key: &[u8],
@@ -281,10 +352,14 @@ impl GraphStore {
         if let Ok(snapshot) = ACTIVE_STORAGE_SNAPSHOT.try_with(Arc::clone) {
             return Ok(snapshot.get_with_options(key, options).await?);
         }
-        if let Some(writer) = self.open_writer() {
-            return Ok(writer.get_with_options(key, options).await?);
+        if let Some(writer) = self.readable_writer() {
+            match writer.get_with_options(key, options).await {
+                Ok(value) => return Ok(value),
+                Err(error) if self.recover_closed_writer_error(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        if let Some(reader) = self.open_reader().await? {
+        if let Some(reader) = self.readable_reader().await? {
             return Ok(reader.get_with_options(key, options).await?);
         }
         Ok(Self::empty_store()
@@ -313,17 +388,23 @@ impl GraphStore {
                 }
             });
         }
-        if let Some(writer) = self.open_writer() {
-            return Ok(match start_suffix {
+        if let Some(writer) = self.readable_writer() {
+            let writer_start_suffix = start_suffix.clone();
+            let result = match writer_start_suffix {
                 Some(start) => {
                     writer
                         .scan_prefix_with_options(prefix, start.., options)
-                        .await?
+                        .await
                 }
-                None => writer.scan_prefix_with_options(prefix, .., options).await?,
-            });
+                None => writer.scan_prefix_with_options(prefix, .., options).await,
+            };
+            match result {
+                Ok(iter) => return Ok(iter),
+                Err(error) if self.recover_closed_writer_error(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        if let Some(reader) = self.open_reader().await? {
+        if let Some(reader) = self.readable_reader().await? {
             return Ok(match start_suffix {
                 Some(start) => {
                     reader
@@ -359,14 +440,14 @@ impl GraphStore {
         if let Ok(snapshot) = ACTIVE_STORAGE_SNAPSHOT.try_with(Arc::clone) {
             return Ok(snapshot);
         }
-        if let Some(writer) = self.open_writer() {
-            return writer
-                .snapshot()
-                .await
-                .map(|snapshot| Arc::new(GraphStorageSnapshot::Writer(snapshot)))
-                .map_err(Into::into);
+        if let Some(writer) = self.readable_writer() {
+            match writer.snapshot().await {
+                Ok(snapshot) => return Ok(Arc::new(GraphStorageSnapshot::Writer(snapshot))),
+                Err(error) if self.recover_closed_writer_error(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        if let Some(reader) = self.open_reader().await? {
+        if let Some(reader) = self.readable_reader().await? {
             return reader
                 .snapshot()
                 .await
@@ -382,7 +463,7 @@ impl GraphStore {
     }
 
     pub(crate) async fn reader_snapshot(&self) -> Result<Arc<GraphStorageSnapshot>> {
-        if let Some(reader) = self.open_reader().await? {
+        if let Some(reader) = self.readable_reader().await? {
             return reader
                 .snapshot()
                 .await
@@ -398,11 +479,11 @@ impl GraphStore {
     }
 
     pub(crate) async fn durable_sequence(&self) -> Result<u64> {
-        if let Some(writer) = self.open_writer() {
+        if let Some(writer) = self.readable_writer() {
             return Ok(writer.status().durable_seq);
         }
         Ok(self
-            .open_reader()
+            .readable_reader()
             .await?
             .map(|reader| reader.status().durable_seq)
             .unwrap_or(0))
@@ -412,7 +493,17 @@ impl GraphStore {
         let Some(reader) = self.open_reader().await? else {
             return Ok(0);
         };
-        reader.refresh().await?;
+        let _refresh_guard = self.inner.reader_refresh_gate.lock().await;
+        loop {
+            let required_generation = self.inner.reader_refresh_generation.load(Ordering::Acquire);
+            reader.refresh().await?;
+            self.inner
+                .reader_refreshed_generation
+                .store(required_generation, Ordering::Release);
+            if self.inner.reader_refresh_generation.load(Ordering::Acquire) == required_generation {
+                break;
+            }
+        }
         Ok(reader.status().durable_seq)
     }
 
