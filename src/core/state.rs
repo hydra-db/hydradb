@@ -178,6 +178,39 @@ impl GraphStore {
             .clone()
     }
 
+    fn readable_writer(&self) -> Option<Db> {
+        let writer = self.open_writer()?;
+        if writer.status().close_reason.is_none() {
+            return Some(writer);
+        }
+        self.clear_closed_writer();
+        None
+    }
+
+    fn clear_closed_writer(&self) -> bool {
+        let mut writer = self
+            .inner
+            .writer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if writer
+            .as_ref()
+            .is_some_and(|current| current.status().close_reason.is_some())
+        {
+            *writer = None;
+            return true;
+        }
+        false
+    }
+
+    fn recover_closed_writer_error(&self, error: &slatedb::Error) -> bool {
+        if !matches!(error.kind(), ErrorKind::Closed(_)) {
+            return false;
+        }
+        self.clear_closed_writer();
+        true
+    }
+
     pub(crate) fn store_path(&self) -> &Path {
         &self.inner.path
     }
@@ -281,8 +314,12 @@ impl GraphStore {
         if let Ok(snapshot) = ACTIVE_STORAGE_SNAPSHOT.try_with(Arc::clone) {
             return Ok(snapshot.get_with_options(key, options).await?);
         }
-        if let Some(writer) = self.open_writer() {
-            return Ok(writer.get_with_options(key, options).await?);
+        if let Some(writer) = self.readable_writer() {
+            match writer.get_with_options(key, options).await {
+                Ok(value) => return Ok(value),
+                Err(error) if self.recover_closed_writer_error(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         if let Some(reader) = self.open_reader().await? {
             return Ok(reader.get_with_options(key, options).await?);
@@ -313,15 +350,21 @@ impl GraphStore {
                 }
             });
         }
-        if let Some(writer) = self.open_writer() {
-            return Ok(match start_suffix {
+        if let Some(writer) = self.readable_writer() {
+            let writer_start_suffix = start_suffix.clone();
+            let result = match writer_start_suffix {
                 Some(start) => {
                     writer
                         .scan_prefix_with_options(prefix, start.., options)
-                        .await?
+                        .await
                 }
-                None => writer.scan_prefix_with_options(prefix, .., options).await?,
-            });
+                None => writer.scan_prefix_with_options(prefix, .., options).await,
+            };
+            match result {
+                Ok(iter) => return Ok(iter),
+                Err(error) if self.recover_closed_writer_error(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         if let Some(reader) = self.open_reader().await? {
             return Ok(match start_suffix {
@@ -359,12 +402,12 @@ impl GraphStore {
         if let Ok(snapshot) = ACTIVE_STORAGE_SNAPSHOT.try_with(Arc::clone) {
             return Ok(snapshot);
         }
-        if let Some(writer) = self.open_writer() {
-            return writer
-                .snapshot()
-                .await
-                .map(|snapshot| Arc::new(GraphStorageSnapshot::Writer(snapshot)))
-                .map_err(Into::into);
+        if let Some(writer) = self.readable_writer() {
+            match writer.snapshot().await {
+                Ok(snapshot) => return Ok(Arc::new(GraphStorageSnapshot::Writer(snapshot))),
+                Err(error) if self.recover_closed_writer_error(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         if let Some(reader) = self.open_reader().await? {
             return reader
@@ -398,7 +441,7 @@ impl GraphStore {
     }
 
     pub(crate) async fn durable_sequence(&self) -> Result<u64> {
-        if let Some(writer) = self.open_writer() {
+        if let Some(writer) = self.readable_writer() {
             return Ok(writer.status().durable_seq);
         }
         Ok(self

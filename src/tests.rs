@@ -2819,6 +2819,38 @@ async fn second_writer_open_fences_first_writer_instance() {
     second.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn fenced_writer_falls_back_to_reader_for_reads_and_index_discovery() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/fenced-writer-read-fallback";
+
+    let first = open_test_shard(path, Arc::clone(&object_store)).await;
+    first
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "first"))
+        .await
+        .unwrap();
+
+    let replacement = open_test_shard(path, object_store).await;
+    replacement
+        .write_edge(typed_mutation("cell-a", "CHAIN", 2, 3, "replacement"))
+        .await
+        .unwrap();
+
+    let stale_writer = first.db.writer().unwrap();
+    let error = stale_writer.refresh_manifest().await.unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        ErrorKind::Closed(slatedb::CloseReason::Fenced)
+    ));
+
+    let dirty = first.dirty_graph_index_edge_types("cell-a").await.unwrap();
+    assert!(dirty.iter().any(|(edge_type, _)| edge_type == "CHAIN"));
+    assert!(first.edge_exists("cell-a", "CHAIN", 2, 3).await.unwrap());
+
+    first.close().await.unwrap();
+    replacement.close().await.unwrap();
+}
+
 #[test]
 fn db_reader_child_process_entry() {
     if std::env::var("SLATEDB_GRAPH_READER_CHILD").ok().as_deref() != Some("1") {
