@@ -2825,13 +2825,17 @@ async fn fenced_writer_falls_back_to_reader_for_reads_and_index_discovery() {
     let path = "graph/fenced-writer-read-fallback";
 
     let first = open_test_shard(path, Arc::clone(&object_store)).await;
-    first
+    let first_commit = first
         .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "first"))
         .await
         .unwrap();
+    assert!(
+        first.refresh_storage_sequence("cell-a").await.unwrap() >= first_commit.epoch,
+        "the pre-fence reader should be cached at the first writer sequence"
+    );
 
     let replacement = open_test_shard(path, object_store).await;
-    replacement
+    let replacement_commit = replacement
         .write_edge(typed_mutation("cell-a", "CHAIN", 2, 3, "replacement"))
         .await
         .unwrap();
@@ -2845,7 +2849,21 @@ async fn fenced_writer_falls_back_to_reader_for_reads_and_index_discovery() {
 
     let dirty = first.dirty_graph_index_edge_types("cell-a").await.unwrap();
     assert!(dirty.iter().any(|(edge_type, _)| edge_type == "CHAIN"));
+    assert!(
+        first.current_storage_sequence("cell-a").await.unwrap() >= replacement_commit.epoch,
+        "writer demotion must refresh an already-cached reader"
+    );
     assert!(first.edge_exists("cell-a", "CHAIN", 2, 3).await.unwrap());
+
+    let later_commit = replacement
+        .write_edge(typed_mutation("cell-a", "CHAIN", 3, 4, "replacement-later"))
+        .await
+        .unwrap();
+    assert!(
+        first.refresh_storage_sequence("cell-a").await.unwrap() >= later_commit.epoch,
+        "strong and bookmarked reads must advance after later replacement writes"
+    );
+    assert!(first.edge_exists("cell-a", "CHAIN", 3, 4).await.unwrap());
 
     first.close().await.unwrap();
     replacement.close().await.unwrap();
