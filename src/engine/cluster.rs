@@ -890,12 +890,6 @@ impl ScopedRoutedGraphCluster {
             )
             .await?,
         );
-        if let Err(error) = self.scope_directory.register(scope).await {
-            if let Ok(cluster) = Arc::try_unwrap(cluster) {
-                let _ = cluster.close().await;
-            }
-            return Err(error);
-        }
         clusters.insert(
             scope.clone(),
             ScopedRoutedClusterEntry {
@@ -903,6 +897,17 @@ impl ScopedRoutedGraphCluster {
                 last_used: access,
             },
         );
+        Ok(cluster)
+    }
+
+    pub(crate) async fn cluster_for_scope_write(
+        &self,
+        scope: &GraphScope,
+        cell_id: &str,
+    ) -> Result<Arc<RoutedGraphCluster>> {
+        let cluster = self.cluster_for_scope(scope).await?;
+        cluster.ensure_local_writer(cell_id).await?;
+        self.scope_directory.register(scope).await?;
         Ok(cluster)
     }
 
