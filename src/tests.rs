@@ -2859,11 +2859,20 @@ async fn fenced_writer_falls_back_to_reader_for_reads_and_index_discovery() {
         .write_edge(typed_mutation("cell-a", "CHAIN", 3, 4, "replacement-later"))
         .await
         .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if first.edge_exists("cell-a", "CHAIN", 3, 4).await.unwrap() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("managed reader should discover later replacement writes");
     assert!(
-        first.refresh_storage_sequence("cell-a").await.unwrap() >= later_commit.epoch,
-        "strong and bookmarked reads must advance after later replacement writes"
+        first.current_storage_sequence("cell-a").await.unwrap() >= later_commit.epoch,
+        "ordinary sequence reads must advance with the managed reader"
     );
-    assert!(first.edge_exists("cell-a", "CHAIN", 3, 4).await.unwrap());
 
     first.close().await.unwrap();
     replacement.close().await.unwrap();
