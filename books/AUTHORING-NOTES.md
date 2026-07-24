@@ -2,8 +2,10 @@
 
 These notes are the binding brief for every chapter agent working in `books/`
 (`inside`, `conceptual`, `quint`). They are corrected against the **current**
-source at HEAD `8f97e0a`, branch `Turbolay-V3`, after the *graph kernel resync*
-merge (`4b4665f`). Every `file:line` below was opened and verified at that HEAD.
+source at HEAD `1f5b06d`, branch `Turbolay-V3-vishal`, after the *graph kernel
+resync* merge (`4b4665f`) and after `Turbolay-V3` was merged into the branch
+carrying the dynamic-scope work (§10 below). Every `file:line` below was opened
+and verified at that HEAD.
 
 > **If this file and a chapter disagree, this file wins — but re-verify anyway.**
 > Line numbers drift. Prefer citing a function/type name plus a file over a bare
@@ -33,8 +35,8 @@ Also deleted: `src/engine/artifact_refresh.rs` and its
 `start_matrix_artifact_refresh_job` / `MatrixArtifactRefreshPolicy`. Index
 building is now **out-of-process**. `src/engine/` today contains exactly:
 `artifact_build.rs`, `artifact_gc.rs`, `cluster.rs`, `index_store.rs`,
-`matrix_cache.rs`, `traversal.rs`, `verify.rs`. The binaries are
-`src/bin/graph-node.rs` and `src/bin/graph-indexer.rs`.
+`matrix_cache.rs`, `scope_directory.rs`, `traversal.rs`, `verify.rs`. The
+binaries are `src/bin/graph-node.rs` and `src/bin/graph-indexer.rs`.
 
 ---
 
@@ -100,6 +102,15 @@ vocabulary.
 write permit → per-cell `writer_lane` mutex → retry loop over `write_edge_txn`.
 `validate_write_fence_txn` (`src/shard/lifecycle.rs:436`) is a drop-guard plus
 authority check, not a token fence.
+
+**Where the fence is actually refreshed (verified at HEAD).** The summary above
+skips a step, and chapter agents have concluded from it that the fence is never
+refreshed per-write. It is. `write_edge_txn` calls `acquire_local_write_guard`
+(`src/shard/lifecycle.rs:253-263`), which takes the process-local guard **and**
+calls `self.db.refresh_writer_fence()` — so the manifest refresh happens before
+*every* attempt inside the retry loop, not once at open. That call is the real
+cross-process safety step, and it sits at exactly the position the deleted cell
+write lock used to occupy.
 
 **Never write "cell write lock" or "distributed write lock" as a current
 mechanism.** Say "SlateDB manifest fencing" (plus "writer promotion" where
@@ -215,13 +226,116 @@ note) but label it explicitly as PLANNED / FUTURE with a status callout at the
 top ("Status: planned, not in the current tree") and phrase claims as "would" /
 "is planned to", never "is".
 
-### 9. Relationships are hard-deleted.
+### 9. Deletes are mostly real deletes. (corrected — verified at HEAD)
 
 `delete_relationships_for_structural_edge_txn` (`src/shard/write.rs`) issues real
 `txn.delete`s for the relationship, its id index, its property indexes and the
-count. The structural *edge* is still soft-deleted; the relationships riding on
-it are physically removed. Do not over-generalize "everything is a soft delete" —
-and do not describe the soft delete as a `Minus` delta (§4).
+count.
+
+**Correction.** An earlier revision of this file said "the structural *edge* is
+still soft-deleted". That is wrong on the canonical path.
+`delete_structural_edge_txn` (`src/shard/write.rs:4921`) issues real `txn.delete`s
+on `keys::out_edge` and the reverse/metadata rows, and only adjusts the degree
+counters with `txn.put`. The soft delete lives on the **segment** path:
+`keys::out_segment_tombstone` (`src/keys.rs:89`), written when the edge being
+deleted lives inside a packed segment that cannot be edited in place.
+
+So the accurate sentence is: canonical rows and relationships are physically
+removed; a segment-resident edge leaves a tombstone instead. Do not write
+"everything is a soft delete", do not write "the structural edge is soft-deleted"
+without the segment qualifier, and do not describe any of it as a `Minus` delta (§4).
+
+### 10. Graph scopes are dynamic. One process serves many tenants. (verified at HEAD)
+
+This landed **after** every chapter was last written (`b5c933b`, `3f80551`,
+2026-07-21) and is invisible to any prose you inherit. All of it is verified at
+`1f5b06d`.
+
+**There are three cluster containers, not two.** `GraphCluster` (one scope, many
+shards) → `RoutedGraphCluster` (adds the fleet view; §6 above) →
+`ScopedRoutedGraphCluster` (`src/engine.rs:101-115`, impl
+`src/engine/cluster.rs:762-968`), which holds a `BTreeMap<GraphScope,
+RoutedGraphCluster>` and is **what `graph-node` actually constructs**
+(`src/bin/graph-node.rs:44`). Do not describe the node as opening one scope.
+
+- `cluster_for_scope` (`cluster.rs:847-907`) is the whole mechanism: validate →
+  LRU hit → evict if full → open + register.
+- `validate_scope` (`:816-828`) requires a matching `graph_id` and a namespace
+  **descendant of** `root_namespace`; otherwise `GraphError::GraphScopeMismatch`.
+  This is the tenant-isolation guard — nothing else enforces it.
+- Eviction only considers entries with `Arc::strong_count == 1` (nobody holding
+  it). If every slot is in use the request **fails** with
+  `GraphError::AdmissionRejected { operation: "open_graph_scopes" }`. It does
+  **not** block or queue — say so.
+- `max_open_scopes` comes from `GRAPH_MAX_OPEN_SCOPES`, **default 8**
+  (`src/bin/graph_node/config.rs:181`). Zero is rejected at construction.
+- `options_for_scope` (`:830-845`) gives each scope a private cache dir under
+  `scopes/<namespace…>/graphs/<id>` **and divides `object_store_cache_bytes` by
+  `max_open_scopes`** — by the capacity, not the live count. Test:
+  `scoped_clusters_partition_the_local_slate_cache_budget` (`:990`).
+- Metrics gained a scope dimension: `ScopedGraphShardRuntimeMetrics { scope,
+  shard }` (`src/engine.rs:126-130`), built by `local_shard_runtime_metrics`
+  (`:922-944`).
+
+**The scope directory is discovery, not authority.**
+`ObjectStoreGraphScopeDirectory` (`src/engine/scope_directory.rs`): `register`
+(`:40`) writes a marker with `PutMode::Create` and treats `AlreadyExists` as
+success (idempotent); `list` (`:54`) enumerates them. Nothing consults it to
+authorize a request — `validate_scope` does that.
+
+**The deployed resolver is hierarchical, not static.** `graph-node` wires
+`HierarchicalClientDatabaseResolver` (`src/bin/graph-node.rs:90`,
+`src/client/service.rs:61-127`), **not** `StaticClientDatabaseResolver`. The
+database name *encodes* the tenant path: `<base>.scope1.<tenant>.<sub_tenant>`,
+components base64url-encoded without padding (`encode_database_scope_id`,
+`:130-140`), absent sub-tenant written as the sentinel `_`,
+`SCOPED_DATABASE_VERSION = "scope1"` (`:58`). A name equal to the base database
+resolves to the root target unchanged. Graph id and cell id are inherited from
+the root target; **only the namespace path deepens — tenants are separated by
+namespace, not by cell.**
+
+**The indexer sweeps all scopes.** `graph-indexer` calls
+`scope_directory.list()` every cycle (`src/bin/graph-indexer.rs:132`), skips
+scopes with no data via `scope_has_data` (`:167-187`), and opens *and closes* a
+`GraphCluster` per scope per cycle — it caches nothing between cycles, unlike the
+data node. Failures are collected per scope, not fatal to the sweep. Any prose
+saying it "opens a read-side `GraphCluster` over those cells" and stops there is
+now incomplete.
+
+### 11. Known-wrong sections — RESOLVED for `inside` and `conceptual`
+
+All entries below were fixed in the deleted-subsystem sweep. Both books now pass a
+grep for `ShardPlacement`, `rendezvous`, `cell write lock`, `TopologySequence`,
+`last_epoch`, `delta_*`, `outbox`, `mutation log`, `artifact_refresh` and
+`supernode` with **only negations remaining** ("there is no…"), in prose and
+inside diagrams. Kept here as the record of what was wrong and where, because the
+`quint` book has not been swept and may still inherit any of it.
+
+Resolved:
+
+- **`05-caching.typ` §5.8 "Read-through hydration and background refresh"**
+  (~lines 470-500) documents `src/engine/artifact_refresh.rs` and
+  `start_matrix_artifact_refresh_job` as live. **That file was deleted** (§ the
+  resync section above). The section needs a rewrite onto index generations and
+  the out-of-process indexer, and it still contains one `TopologySequence`
+  (`min_epoch_lag`) that survives only because the surrounding section is being
+  replaced wholesale rather than patched.
+- **`intro-01-cells-and-placement.typ`** is still on the pre-resync edition
+  end to end: `ShardPlacement`, `rendezvous` hashing, and the object-store *cell
+  write lock* with an owner token and TTL, in both prose and the
+  `<fig-intro01-placement>` diagram. It cannot be patched — the figure encodes
+  the deleted model. Rewrite the chapter and the figure together in Wave 4.
+- **`intro-03-epochs-artifacts-overlays.typ`** asserts `TopologySequence` as a
+  live type at `:12` ("the monotonic topology-change counter") and again at
+  `:123` *inside a diagram node*, alongside `meta/last_epoch` — a key builder
+  that no longer exists. Same treatment as `intro-01`: rewrite with the figure,
+  do not patch the prose around a diagram that still teaches the old model.
+
+A useful invariant while working: in the `inside` book every surviving mention of
+a deleted subsystem is a **negation** ("there is no…", "if you find… it does
+not"), and that is correct and should stay. In the `conceptual` book they are
+still **assertions**. That difference is the whole remaining gap between the two
+books.
 
 ---
 
@@ -269,6 +383,12 @@ and do not describe the soft delete as a `Minus` delta (§4).
 - Distributed queries = bounded scatter/gather (directory-aware legs, concurrent
   execution, coordinator merge). Not a global planner, not a global snapshot,
   and not an owner lookup.
+- Say "graph scope" for the tenant coordinate (`<namespace>/graphs/<graph_id>`)
+  and keep "cell" for the isolation/ownership unit — they are different axes and
+  a node holds many scopes, each with the same cells. Never say a node "is
+  configured for a scope"; scopes are opened on demand and evicted under a
+  capacity bound. Never say a full node "waits" or "queues" for a scope slot: it
+  rejects with `AdmissionRejected`.
 
 ## Citations
 

@@ -103,7 +103,7 @@ module lives under `src/`. Grouped by job:
   [`keys.rs`], [Every storage key builder. One function per key shape. 316 lines of pure key formatting.],
   [`codec.rs`], [Every value encoder and decoder. Hand-written, versioned byte formats. 1543 lines.],
   [`shard/`], [The behavior of `GraphShard`, split by concern: `write.rs` (5108 lines), `query.rs` (8389 lines), `query_optimizer.rs`, `lifecycle.rs`, `maintenance.rs`, and `topology_tail.rs` (the recent-WAL overlay for reads, Section 1.7).],
-  [`engine.rs` + `engine/`], [Everything above a single shard: `cluster.rs` (the `GraphCluster` / `RoutedGraphCluster` containers and the `ObjectStoreNodeDirectory` that routes them), `artifact_build.rs` (building durable adjacency images), `index_store.rs` (the durable CSC *index generations* and their manifest/GC, Section 1.7), `artifact_gc.rs` (pruning old artifacts), `matrix_cache.rs` (hydrating artifacts into the in-memory matrix caches), `traversal.rs`, and `verify.rs`. There is no `artifact_refresh.rs`: index building now runs out-of-process (Section 1.8).],
+  [`engine.rs` + `engine/`], [Everything above a single shard: `cluster.rs` (the three containers — `GraphCluster`, `RoutedGraphCluster`, `ScopedRoutedGraphCluster` — and the `ObjectStoreNodeDirectory` that routes them), `scope_directory.rs` (the durable registry of which graph scopes exist, Section 1.6), `artifact_build.rs` (building durable adjacency images), `index_store.rs` (the durable CSC *index generations* and their manifest/GC, Section 1.7), `artifact_gc.rs` (pruning old artifacts), `matrix_cache.rs` (hydrating artifacts into the in-memory matrix caches), `traversal.rs`, and `verify.rs`. There is no `artifact_refresh.rs`: index building now runs out-of-process (Section 1.8).],
   [`query/`], [The query language and distribution: `opencypher.rs` (parse Cypher into the engine's own plan), `algebra.rs` (the plan types), `coordination.rs` (the query network protocol and distributed execution).],
   [`client/`], [The public front doors: `service.rs` (the shared `ClientQueryService`), `bolt.rs` (the Bolt server), `http.rs` (the HTTPS server).],
   [`sparse_kernel.rs`], [Sparse-matrix traversal, either in pure Rust or through the GraphBLAS C library.],
@@ -285,8 +285,8 @@ pub trait ClientDatabaseResolver: Send + Sync {
 }
 ```]
 
-The shipped implementation is a static table from name to target, with an optional default
-name used when the client does not specify one:
+Two implementations ship. The simpler one is a static table from name to target, with an
+optional default name used when the client does not specify one:
 
 #srcblock("src/client/service.rs:96-124 (abridged)")[```rust
 impl ClientDatabaseResolver for StaticClientDatabaseResolver {
@@ -310,6 +310,62 @@ pub fn single(database: impl Into<String>, target: ClientQueryTarget) -> Result<
         .with_default_database(database)
 }
 ```]
+
+A static table has a hard limit, though: every tenant it can serve must be known when the
+process starts. Adding a tenant means editing configuration and restarting. So the deployable
+binary wires the *other* implementation, `HierarchicalClientDatabaseResolver`
+(`src/bin/graph-node.rs:90`), which does not hold a table at all. It holds one base database
+name and one root target, and it *derives* the rest from the name the client sent
+(`src/client/service.rs:61-64`):
+
+```rust
+pub struct HierarchicalClientDatabaseResolver {
+    base_database: String,
+    root_target: ClientQueryTarget,
+}
+```
+
+The trick is that the database name carries the tenant path inside it. A scoped name is four
+dot-separated parts — the base name, a version marker, a tenant id, and a sub-tenant id — and
+`scoped_database_name` (`src/client/service.rs:75-90`) is the constructor clients use to build
+one. `SCOPED_DATABASE_VERSION` is the literal `"scope1"` (`src/client/service.rs:58`), and a
+client with no sub-tenant gets the sentinel `_`:
+
+```rust
+validate_database_name(format!(
+    "{}.{}.{tenant}.{sub_tenant}",
+    self.base_database, SCOPED_DATABASE_VERSION
+))
+```
+
+Tenant ids come from the outside world, so they cannot be dropped into a name unchecked: a
+tenant called `acme.corp` would add a dot and break the parse, and a namespace segment has its
+own validation rules besides. `encode_database_scope_id` (`src/client/service.rs:130-140`)
+rejects empty and control characters outright, then base64url-encodes (no padding) so that any
+surviving string is a single valid `NamespaceId`.
+
+Resolution is the same journey run backwards (`src/client/service.rs:92-127`). A name equal to
+the base database resolves to the root target unchanged — that is the un-scoped, single-tenant
+case, and it is why an existing client that knows nothing about tenants keeps working. Any
+other name must carry the `<base>.scope1.` prefix; the resolver strips it, splits the remainder
+on its single dot, decodes both halves, and descends from the root target's namespace:
+
+```rust
+let mut namespace = self.root_target.scope.namespace
+    .child(NamespaceId::new(tenant)?)?;
+if sub_tenant != "_" {
+    namespace = namespace.child(NamespaceId::new(/* decoded sub-tenant */)?)?;
+}
+ClientQueryTarget::new(
+    GraphScope::new(namespace, self.root_target.scope.graph_id.clone()),
+    self.root_target.cell_id.clone(),
+)
+```
+
+The graph id and the cell id are inherited from the root target; only the namespace path
+deepens. So a tenant is one level below the deployment root, a sub-tenant one level below that,
+and the cell id — the thing that actually prefixes storage keys — is the same for all of them.
+Tenants are separated by *namespace*, not by cell.
 
 So the full journey of a request name is a chain of translations:
 
@@ -335,9 +391,13 @@ So the full journey of a request name is a chain of translations:
 
 #custom-box(title: [Why], icon: "tip")[
   Keeping the name-to-cell mapping behind a trait means the same engine serves a single local
-  graph in a test and a multi-tenant fleet in production without changing the query path. In
-  the deployable binary the resolver is built from environment variables that name one cell;
-  a larger deployment registers many names, one per graph.
+  graph in a test and a multi-tenant fleet in production without changing the query path. A
+  test wires `StaticClientDatabaseResolver::single` and gets one name pointing at one target.
+  The deployable binary wires `HierarchicalClientDatabaseResolver` over the one scope its
+  environment names, and every tenant beneath that scope becomes reachable *by name alone* —
+  no table entry, no configuration change, no restart. That property is what makes the
+  dynamic scope runtime in the next section worth having: a resolver that had to be told
+  about a tenant in advance would give the runtime nothing to open on demand.
 ]
 
 == One process, or a cluster
@@ -436,6 +496,156 @@ and its controller loop no longer exist.
     share one `ObjectStoreNodeDirectory`; there is no controller and no static per-cell
     owner.],
 ) <fig-arch-topology>
+
+=== Many scopes in one process
+
+Both containers so far fix their scope when they open. `GraphCluster` stores a `scope` field;
+`RoutedGraphCluster` stores one too. That is fine as long as a process serves one graph. But
+the previous section left a loose end: `HierarchicalClientDatabaseResolver` will happily
+resolve `analytics.scope1.YWNtZQ._` into a namespace nobody has ever mentioned to the process
+before. Something has to open that scope, and it cannot be something that was configured at
+startup, because at startup the tenant did not exist.
+
+That something is the third and outermost container, `ScopedRoutedGraphCluster`. It is what
+`graph-node` actually constructs (`src/bin/graph-node.rs:44`) and what the query service is
+handed as its `QueryCellClient`. Where `RoutedGraphCluster` holds shards, this holds
+*`RoutedGraphCluster`s*, keyed by scope (`src/engine.rs:101-115`):
+
+```rust
+pub struct ScopedRoutedGraphCluster {
+    base_path: String,
+    root_namespace: NamespacePath,
+    graph_id: GraphId,
+    local_node_id: String,
+    directory: ObjectStoreNodeDirectory,
+    object_store: Arc<dyn ObjectStore>,
+    scope_directory: ObjectStoreGraphScopeDirectory,
+    options: GraphOpenOptions,
+    memory: GraphMemoryConfig,
+    max_open_scopes: usize,
+    access_clock: AtomicU64,
+    clusters: tokio::sync::Mutex<BTreeMap<GraphScope, ScopedRoutedClusterEntry>>,
+}
+```
+
+Read the last four fields together and the design is already visible: it is an LRU cache of
+open graphs. `clusters` is the map, `access_clock` is a monotonic counter that stands in for
+time, `max_open_scopes` is the capacity, and each entry records the `last_used` tick. Note
+what the struct stores instead of a scope: a `root_namespace` and a `graph_id`. It does not
+serve *one* scope; it serves one *subtree* of scopes.
+
+Construction does no I/O at all (`src/engine/cluster.rs:762-810`). It validates that the local
+node appears in the directory, rejects a `max_open_scopes` of zero with `AdmissionRejected`,
+builds the scope directory handle, and returns. Every scope is opened later, on the first
+request that names it.
+
+#custom-box(title: [Term — Graph scope directory], icon: "info")[
+  `ObjectStoreGraphScopeDirectory` (`src/engine/scope_directory.rs`) is the durable record of
+  which scopes exist. Opening a scope writes a small marker object under a registry prefix;
+  `list` (`:54`) enumerates the markers and decodes a `GraphScope` back out of each path.
+  `register` (`:40`) writes with `PutMode::Create` and treats `AlreadyExists` as success, so it
+  is idempotent — two nodes racing to serve the same new tenant both succeed. It is a discovery
+  aid, not an authority: nothing consults it to decide whether a request is allowed.
+]
+
+The registry is deliberately trivial on disk — a tree of empty marker objects named
+`__scope__`, one per scope, whose *path* is the data:
+
+```text
+<base>/_graph_scopes/v1/<graph-id>/<root-namespace>/
+    <encoded-tenant>/<encoded-subtenant>/__scope__
+```
+
+The encoded segments are exactly the base64url components from the database name in Section
+1.5, which is why the round trip works: a name produces a namespace, a namespace produces a
+marker path, and a `LIST` over the prefix produces the namespaces back. Discovery therefore
+costs one object-store listing and needs no catalog service, no database, and nothing writable
+in the control path.
+
+The graph data itself lives on a separate path, and the contrast is the point:
+
+```text
+<base>/namespaces/<tenant>/subnamespaces/<subtenant>/…/graphs/<graph-id>/<cell-id>/
+```
+
+The cell id sits at the *bottom*, below the whole namespace path. That is the storage-level
+statement of what Section 1.5 said about resolution: every tenant has the same cells, and it is
+the namespace prefix above them that keeps two tenants apart. Each `(namespace path, graph,
+cell)` is an independent SlateDB database, so tenants get independent WAL, snapshots, writer
+fencing and index generations without the engine doing anything special — the isolation is the
+path.
+
+Everything interesting happens in one function, `cluster_for_scope`
+(`src/engine/cluster.rs:847-907`), which every query goes through. It has four jobs, in order:
+
++ *Confine.* `validate_scope` (`:816-828`) rejects the request unless the scope's graph id
+  matches and its namespace is a descendant of `root_namespace`. Anything else is a
+  `GraphError::GraphScopeMismatch`. This runs before the map is even locked, and it is the
+  reason a resolver bug cannot make one tenant read another's storage: the runtime refuses
+  scopes outside the subtree it was built for.
++ *Serve a hit.* If the scope is already open, bump its `last_used` to the current tick and
+  return the shared handle.
++ *Make room.* If the map is full, evict — but only an entry that nobody is holding.
++ *Open a miss.* Open a `RoutedGraphCluster` for the scope, register the scope in the
+  directory, and insert it.
+
+The eviction rule is the subtle part, and it is worth reading in the original:
+
+```rust
+let candidate = clusters
+    .iter()
+    .filter(|(_, entry)| Arc::strong_count(&entry.cluster) == 1)
+    .min_by_key(|(_, entry)| entry.last_used)
+    .map(|(scope, _)| scope.clone())
+    .ok_or(GraphError::AdmissionRejected {
+        operation: "open_graph_scopes", ...
+    })?;
+```
+
+The `strong_count == 1` filter means: the map's own reference is the only one left, so no
+query is currently executing against this cluster. Evicting it closes a `RoutedGraphCluster`,
+which closes its shards, which drops any SlateDB writer handle the node had promoted for a
+cell in that scope. Doing that underneath a running write would be a bug, so the filter makes
+it impossible — an in-use scope is simply not a candidate.
+
+That leaves an honest failure mode, and the code chooses it deliberately. If all
+`max_open_scopes` entries are in use, there is no candidate, and the request fails with
+`AdmissionRejected` rather than waiting for a slot. A node under scope pressure sheds load; it
+does not queue.
+
+If the open succeeds but registering the scope fails, the freshly opened cluster is closed
+again before the error propagates (`:893-898`), so a failed request leaves nothing half-open
+behind.
+
+#custom-box(title: [Why], icon: "tip")[
+  The obvious alternative is to open every scope in the directory at startup and keep them
+  all. That fails on cost, not on correctness: each open scope is a live SlateDB instance
+  with its own memtables, its own block-cache share and its own file handles, so "one tenant,
+  one open graph" turns tenant count into a memory bill whether or not anybody is querying.
+  Bounding the count and evicting the coldest idle scope means a node's footprint tracks its
+  *active* tenants instead of its *registered* ones. The price is the first query for a cold
+  tenant paying an open, and a hard ceiling on how many tenants one node can serve at once —
+  `GRAPH_MAX_OPEN_SCOPES`, default 8 (`src/bin/graph_node/config.rs:181`).
+]
+
+Because scopes come and go, two more things become per-scope rather than global. The local
+SlateDB cache budget is divided across the capacity and each scope gets its own cache
+directory, which the caching chapter covers in its multi-tenancy section. And runtime metrics
+grow a scope dimension — `local_shard_runtime_metrics` (`:922-944`) walks every loaded cluster
+and tags each shard's metrics with the scope it came from (`src/engine.rs:126-130`):
+
+```rust
+pub struct ScopedGraphShardRuntimeMetrics {
+    pub scope: GraphScope,
+    pub shard: GraphShardRuntimeMetrics,
+}
+```
+
+Two smaller accessors, `loaded_scopes` and `loaded_clusters` (`:909-920`), expose the current
+contents of the map. The node's index-discovery loop uses `loaded_clusters` to sweep exactly
+the scopes that are open, rather than trying to enumerate all of them. `close` (`:946-967`)
+takes the map, closes each cluster, and reports any that were still in use rather than
+pretending shutdown was clean.
 
 == Traversal acceleration: index generations
 
@@ -540,9 +750,39 @@ read/write path builds generations anymore; the data node only *consumes* them.
 `graph-indexer` is a small loop. It reads its configuration from the environment — the data
 path, the cells to index, a poll interval (`GRAPH_INDEXER_INTERVAL_MS`, default 5000), how many
 previous generations to retain (`GRAPH_INDEXER_RETAIN_PREVIOUS`, default 1), and an admin
-address (`GRAPH_INDEXER_ADMIN_ADDR`, default `0.0.0.0:9091`) — opens a *read-side*
-`GraphCluster` over those cells, and exposes an admin HTTP server with `/livez`, `/readyz`, and
-a Prometheus `/metrics` endpoint. Each cycle, for every cell:
+address (`GRAPH_INDEXER_ADMIN_ADDR`, default `0.0.0.0:9091`) — and exposes an admin HTTP server
+with `/livez`, `/readyz`, and a Prometheus `/metrics` endpoint.
+
+The environment names one root scope, but the indexer does not index only that scope. Data
+nodes create tenant scopes on demand (Section 1.6), and those scopes need index generations
+too. So each cycle begins by asking the scope directory what exists
+(`src/bin/graph-indexer.rs:132`) and then works through the answer:
+
+```rust
+let scopes = scope_directory.list().await?;
+for scope in scopes {
+    if !scope_has_data(data_path, &scope, cells, &object_store).await? {
+        continue;
+    }
+    let cluster = GraphCluster::open_cells_scoped(/* … */).await;
+    run_index_cycle(&cluster, cells, retain_previous, metrics).await;
+    cluster.close().await;
+}
+```
+
+`scope_has_data` (`:167-187`) is a cheap guard: it lists the object store under each cell's
+prefix for that scope and skips the scope entirely if nothing is there. A registered scope that
+was never written to costs one listing, not a database open.
+
+Note that the cluster is opened and closed *inside* the loop, once per scope per cycle. Where
+the data node caches open scopes and evicts them under a capacity bound, the indexer keeps
+nothing between cycles. It can afford that because no client is waiting on it — an extra open
+every five seconds is invisible in a background builder, and holding nothing open means the
+indexer's memory does not grow with the tenant count at all. Failures are collected per scope
+rather than aborting the sweep, so one broken tenant does not stop the others from being
+indexed.
+
+Within each opened scope, for every cell:
 
 + `refresh_storage_sequence` to catch up the reader to the latest durable write;
 + `dirty_graph_index_edge_types` to find which edge types have drifted;

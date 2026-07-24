@@ -5,21 +5,52 @@
 
 “Distributed query support” can mean anything from two RPCs to a global
 optimizer with repartition joins. TurboLay implements a useful, deliberately
-bounded middle: route known query legs to cell owners, execute them concurrently,
+bounded middle: dispatch known query legs to nodes, execute them concurrently,
 then merge their rows at a coordinator.
 
 #boxeq[
-  *Distributed query = placement-aware cell legs + concurrent execution + a
+  *Distributed query = caller-named cell legs + concurrent execution + a
   bounded coordinator merge.*
 ]
 
 == The caller supplies the legs
 
-`DistributedQueryPlan` contains named legs. Each leg carries its own
-`QueryContext`, cell ID, Cypher string, and optional row estimate. The
-coordinator looks up the cell's owner in `ShardPlacement`, selects a registered
-`QueryCellClient`, and launches all legs with `join_all`
-(`src/query/coordination.rs`).
+`DistributedQueryPlan` contains named legs (`src/query/coordination.rs`). Each leg
+carries its own `QueryContext`, cell ID, Cypher string, and optional row estimate.
+The coordinator picks a registered `QueryCellClient` for each leg and launches them
+all with `join_all`.
+
+The interesting part is how it picks. `client_for_cell` first checks that the cell
+*exists* in the object-store node directory — an unknown cell is `UnknownShard` —
+and then chooses a client by hashing the cell id:
+
+```rust
+let mut hash = 0xcbf29ce484222325_u64;
+for byte in cell_id.as_bytes() {
+    hash ^= u64::from(*byte);
+    hash = hash.wrapping_mul(0x100000001b3);
+}
+let index = usize::try_from(hash % self.clients.len().max(1) as u64).unwrap_or(0);
+self.clients.values().nth(index)
+```
+
+That looks like a placement hash, and it is worth being precise about why it is not.
+The hash does not discover who *owns* the cell, because nobody does: every node in
+the directory opened every cell, so any registered client can answer this leg
+correctly. The hash exists so that the same cell tends to land on the same node
+across queries, which keeps that node's caches warm. It is cache affinity, not
+correctness authority — send the leg to the "wrong" node and you get the same rows,
+slightly slower.
+
+#custom-box(title: [Why], icon: "tip")[
+  This is the payoff of having no owner map. A routing table that decides
+  *correctness* has to be consistent, agreed upon, and updated under failure — that
+  is a consensus problem, and it is how the deleted `ShardPlacement` design pulled a
+  control plane into the read path. A routing hint that only decides *which cache is
+  warm* can be stale, disagreed upon, or wrong, and the worst outcome is a slower
+  query. Demoting routing from authority to hint is what let the coordinator become
+  this small.
+]
 
 #figure(
   table(
@@ -54,20 +85,22 @@ coordinator looks up the cell's owner in `ShardPlacement`, selects a registered
       fill: reader-colors.info_soft, stroke: reader-colors.info,
       shape: fletcher.shapes.rect, corner-radius: 3pt),
     edge((0, 1), (1, 0), "->", stroke: reader-colors.muted,
-      label: text(size: 8pt, fill: reader-colors.muted)[route leg (ShardPlacement)]),
+      label: text(size: 8pt, fill: reader-colors.muted)[dispatch leg (hash = cache affinity)]),
     edge((0, 1), (1, 2), "->", stroke: reader-colors.muted,
       label: text(size: 8pt, fill: reader-colors.muted)[concurrent (join_all)]),
     edge((1, 0), (2, 1), "->", stroke: reader-colors.muted),
     edge((1, 2), (2, 1), "->", stroke: reader-colors.muted),
   ),
-  caption: [The coordinator routes explicit cell legs to their owners, runs them
-    concurrently, and merges the returned rows — no global planner or global snapshot.],
+  caption: [The coordinator dispatches caller-named cell legs to nodes that can all serve
+    them, runs the legs concurrently, and merges the returned rows — no owner lookup, no
+    global planner, and no global snapshot.],
 ) <fig-intro05-scatter>
 
 Read it left to right. The coordinator does not plan the split — the caller already
-named the legs — so all it does is look up each leg's owner, run the legs
-concurrently, and merge what comes back. There is no global planner and no global
-snapshot anywhere in the picture, which is also why writes stay with the local owner.
+named the legs — so all it does is choose a node per leg, run the legs concurrently,
+and merge what comes back. There is no global planner and no global snapshot anywhere
+in the picture. Writes are the exception that proves the shape: a leg that mutates has
+to reach a node that is promotable for that cell, so writes do not fan out.
 
 Clients may be in-process implementations — `RoutedGraphCluster` itself
 implements `QueryCellClient` — or, with the `query-transport` feature, TCP
@@ -100,13 +133,21 @@ coordinator inner joins on nullable keys.]
 
 == Reads distribute further than writes
 
-The query transport exposes cell reads. Routed writes remain local-owner
-operations protected by the cell write lock. There is no automatic remote write
-forwarder and no transaction spanning cell owners.
+The query transport exposes cell reads. A write stays on the node that handles it:
+that node must be promotable for the cell, and it promotes a SlateDB writer locally
+before mutating. Uniqueness of that writer is SlateDB's manifest fencing, not a lock
+record. There is no automatic remote write forwarder and no transaction spanning
+cells.
 
-#info-box(title: [Built boundary])[Distributed reads are placement-aware and
-concurrent. Writes are independently sharded per cell. Neither implies a
-global distributed snapshot or multi-cell atomic commit.]
+That asymmetry is the whole reason reads distribute further than writes. A read is
+servable by every node because every node opened every cell, so the coordinator is
+free to pick any of them. A write has to reach a node willing to become the writer,
+and only one such promotion can survive per cell.
+
+#info-box(title: [Built boundary])[Distributed reads are directory-aware and
+concurrent — any node can serve any cell, and the coordinator's choice is a cache
+hint. Writes are independently sharded per cell and fenced by SlateDB's manifest.
+Neither implies a global distributed snapshot or multi-cell atomic commit.]
 
 == The production boundary
 

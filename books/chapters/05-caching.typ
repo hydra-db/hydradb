@@ -220,7 +220,7 @@ epoch) among those matching a predicate:
 pub(crate) fn get_latest_by(
     &mut self,
     mut predicate: impl FnMut(&K, &V) -> bool,
-    mut score: impl FnMut(&K, &V) -> TopologySequence,
+    mut score: impl FnMut(&K, &V) -> StorageSequence,
 ) -> Option<V> {
     let key = self.entries.iter()
         .filter(|(key, entry)| predicate(key, &entry.value))
@@ -231,9 +231,10 @@ pub(crate) fn get_latest_by(
 ```]
 
 This is how a read finds "the newest cached matrix artifact whose base epoch is at or below my
-read epoch" without knowing the exact base epoch in advance. The score is a `TopologySequence` —
-the topology-change cursor, not a distinct MVCC type — and the predicate does the
-`base_epoch <= read_epoch` test (`latest_matrix_artifact`, `src/engine/artifact_build.rs:607-617`).
+read epoch" without knowing the exact base epoch in advance. The score is a `StorageSequence` —
+SlateDB's own sequence number for a committed storage snapshot, and the only sequence type in
+the engine — and the predicate does the `base_epoch <= read_epoch` test
+(`latest_matrix_artifact`, `src/engine/artifact_build.rs:578`).
 
 == Two budgets: entries and bytes
 
@@ -338,13 +339,13 @@ two regimes is the point of this section.
     edge((1, 0), (1, 1), "->", stroke: reader-colors.muted),
     node((1, 1), text(size: 8pt)[read picks `base_epoch <= read_epoch`], fill: reader-colors.purple_soft, stroke: reader-colors.purple, width: 4.7cm),
     edge((1, 1), (1, 2), "->", stroke: reader-colors.muted),
-    node((1, 2), text(size: 8pt)[overlay deltas; write does not invalidate], fill: reader-colors.purple_soft, stroke: reader-colors.purple, width: 4.7cm),
+    node((1, 2), text(size: 8pt)[overlay WAL tail; write does not invalidate], fill: reader-colors.purple_soft, stroke: reader-colors.purple, width: 4.7cm),
     edge((1, 2), (1, 3), "->", stroke: reader-colors.muted),
     node((1, 3), text(size: 8pt)[`artifact_gc` prunes via `retain`], fill: reader-colors.purple_soft, stroke: reader-colors.purple, width: 4.7cm),
     node((1, 4), text(size: 7.5pt, fill: reader-colors.muted)[explicitly invalidated by GC], stroke: none, width: 4.7cm),
 
-    // BOTTOM: read-through hydration fed by the background refresh job.
-    node((0, 5), text(size: 8pt)[background refresh job], fill: reader-colors.surface_soft, stroke: reader-colors.border, width: 4.7cm),
+    // BOTTOM: read-through hydration fed by the out-of-process indexer.
+    node((0, 5), text(size: 8pt)[out-of-process indexer], fill: reader-colors.surface_soft, stroke: reader-colors.border, width: 4.7cm),
     edge((0, 5), (1, 5), "->", stroke: reader-colors.muted, label: text(size: 7.5pt, fill: reader-colors.muted)[feeds]),
     node((1, 5), text(size: 8pt)[read-through hydration \ permit → load artifact → insert pinned], fill: reader-colors.ok_soft, stroke: reader-colors.ok, width: 4.7cm),
   ),
@@ -352,9 +353,9 @@ two regimes is the point of this section.
     `read_epoch`, so a write just mints new keys and the stale entries age out under LRU —
     the "no invalidation code" thesis holds exactly here. On the right, the matrix caches
     reuse a deliberately lagging `base_epoch` across many read epochs (a read overlays
-    deltas on it), so a write does *not* self-invalidate them; they need real, GC-driven
-    eviction via `artifact_gc`'s `retain`, with entries hydrated read-through and fed by
-    the background refresh job.],
+    the WAL tail on it), so a write does *not* self-invalidate them; they need real,
+    GC-driven eviction via `artifact_gc`'s `retain`, with entries hydrated read-through
+    and their bases published by the out-of-process indexer.],
 ) <fig-ch05-two-regimes>
 
 === Regime one: per-read caches, epoch-keyed, self-invalidating
@@ -373,7 +374,8 @@ Each of these content-dependent keys embeds `read_epoch` (`RelationshipRowsCache
 `SourceRelationshipRowsCacheKey`, etc., in `src/core/cache.rs` and `src/lib.rs`). Put that
 together with the write and delete chapters:
 
-+ A write or delete advances the cell's topology cursor and appends a delta at the new epoch.
++ A write or delete commits a SlateDB transaction, and that commit's storage sequence becomes
+  the cell's new epoch. Nothing is appended anywhere for readers to replay.
 + The next read pins the new epoch, so it builds cache keys with the new epoch.
 + Those keys are not in the cache, so the read misses and computes fresh, correct results.
 + The old-epoch entries are still in the cache but can never match a new-epoch key, so they are
@@ -411,24 +413,26 @@ The three matrix caches (`matrix_artifact_cache`, `matrix_cache`, `graphblas_cac
 work this way, and it is a common mistake to assume they do. Their key is not the read epoch. It
 is a `base_epoch` that deliberately lags the read epoch:
 
-#srcblock("src/lib.rs:155-159")[```rust
+#srcblock("src/lib.rs:148-152")[```rust
 pub(crate) struct MatrixCacheKey {
     pub(crate) cell_id: String,
     pub(crate) edge_type: String,
-    pub(crate) base_epoch: TopologySequence,
+    pub(crate) base_epoch: StorageSequence,
 }
 ```]
 
 A matrix artifact is a periodically-rebuilt snapshot of the adjacency at some past epoch. A read
 at epoch $N+1$ does *not* build a fresh artifact keyed at $N+1$. Instead it asks
 `get_latest_by` for the newest cached artifact whose `base_epoch <= read_epoch`
-(`latest_matrix_artifact`, `src/engine/artifact_build.rs:607-639`) and then *merges the delta log*
-recorded since that base epoch on top of it. The base is old on purpose; correctness comes from
-overlaying the deltas, not from the base being current.
+(`latest_matrix_artifact`, `src/engine/artifact_build.rs:578`) and then closes the remaining gap
+with the *WAL-tail overlay* — `topology_tail_since` (`src/shard/topology_tail.rs:28`, called from
+`src/shard/query.rs:5293`) reads the writes recorded between the base sequence and the read
+sequence straight out of the WAL. The base is old on purpose; correctness comes from overlaying
+the tail, not from the base being current.
 
 The consequence is the opposite of regime one: a write at $N+1$ does *not* invalidate the base-$N$
 artifact, and a new epoch does *not* automatically miss. The base-$N$ artifact stays valid and
-keeps being reused, with an ever-growing delta overlay, until a newer artifact is built. So these
+keeps being reused, with an ever-growing WAL tail to walk, until a newer base is published. So these
 caches need real invalidation, and they have it. Garbage collection prunes them explicitly with
 `retain`:
 
@@ -448,48 +452,80 @@ step that regime one does not need.
   The write and delete chapters never mentioned invalidating the per-read caches because there
   genuinely is nothing to invalidate there: a stale entry has a key no current read will ever
   construct. But do not over-generalize that to the whole engine. The matrix caches trade freshness
-  of the *base* for the amortized cost of rebuilding it — the base lags, the delta log carries the
-  recent writes, and an explicit GC-time `retain` is what eventually reclaims superseded bases. Two
-  regimes, two correctness arguments: self-invalidating for per-read results, base-epoch plus
-  delta-merge plus GC-time prune for the matrix layer.
+  of the *base* for the amortized cost of rebuilding it — the base lags, the WAL-tail overlay
+  carries the recent writes, and an explicit GC-time `retain` is what eventually reclaims
+  superseded bases. Two regimes, two correctness arguments: self-invalidating for per-read
+  results, base-epoch plus WAL-tail overlay plus GC-time prune for the matrix layer.
 ]
 
-== Read-through hydration and background refresh
+== Read-through hydration and the out-of-process indexer
 
-Two engine files hold the machinery behind the matrix caches, and they explain both how an entry
-gets into the cache and why its `base_epoch` lags the write epoch.
+Two mechanisms sit behind the matrix caches, and between them they answer the two questions the
+previous section left open: how an entry gets into the cache at all, and why its `base_epoch` lags
+the read epoch.
 
-*Read-through hydration* lives in `src/engine/matrix_cache.rs`. On a matrix-cache miss the engine
-does not block indefinitely or hydrate unboundedly. It acquires a hydration permit
-(`acquire_hydration_permit`, bounded by `max_concurrent_hydrations`, default 16) for the adjacency
-path, or the `matrix_compilation_gate` semaphore for the compiled-GraphBLAS path, then loads the
-artifact from the object store — either the tiled on-disk format (`load_matrix_adjacency` walks the
-matrix tiles) or the newer GraphBLAS CSC format (`graphblas_csc`, recognized by a `GRAPHBLAS_CSC_MAGIC`
-header and checksum) — and finally calls `insert_sized(..., pinned)` to place the sized, possibly
-pinned entry into the cache. `cached_matrix_adjacency` and `cached_graphblas_matrix` are the two
-entry points; both hydrate on miss and return an `Arc` so the compiled matrix is shared, not copied.
+*Read-through hydration* lives in `src/engine/matrix_cache.rs`, and it answers the first. On a
+matrix-cache miss the engine does not block indefinitely or hydrate unboundedly.
+`cached_matrix_adjacency` records the miss, takes a hydration permit (`acquire_hydration_permit` in
+`src/shard/lifecycle.rs`, bounded by a semaphore sized from `max_concurrent_hydrations`, default
+16), loads the artifact — the canonical CSC form when the manifest reports no tiles, otherwise the
+tiled on-disk format walked by `load_matrix_adjacency` — and calls `insert_sized`, which stores the
+entry with its measured resident bytes and pins it when its edge count reaches
+`pin_matrix_min_edges`. The compiled-GraphBLAS path, `cached_graphblas_matrix`, is the same shape
+with one extra gate: it takes the `matrix_compilation_gate` semaphore, re-checks the cache after
+acquiring it — compiling the same matrix twice because two readers missed together would be pure
+waste — and only then compiles. Both return an `Arc`, so a compiled matrix is shared by every
+concurrent reader rather than copied.
 
-*Background refresh* lives in `src/engine/artifact_refresh.rs`. A Tokio job
-(`start_matrix_artifact_refresh_job`) periodically scans each cell's "dirty" matrix edge-type
-markers and rebuilds an artifact when one is *due* under the policy:
+What `cached_graphblas_matrix` loads is the more interesting half. It first asks
+`graph_index_generation_at` whether a published index generation exists at this base epoch. If one
+does, the CSC comes straight out of that generation's immutable object (`graph_index_csc`,
+`src/engine/index_store.rs`); if the object has since been collected, the shard calls
+`forget_graph_index_generation` to drop the stale pointer and returns `None` so the caller can fall
+back. Only when there is no generation does it try the older per-epoch CSC artifacts, and only when
+those are absent too does it compile from a hydrated adjacency.
 
-#srcblock("src/engine.rs:96-102")[```rust
-pub struct MatrixArtifactRefreshPolicy {
-    pub interval: Duration,
-    pub max_dirty_age: Duration,
-    pub min_epoch_lag: TopologySequence,
-    pub tile_size: u64,
-    pub max_edge_types_per_cycle: usize,
-}
-```]
+#custom-box(title: [Term — Index generation], icon: "info")[
+  One immutable, content-addressed build of a single cell's adjacency for a single edge type:
+  `GraphIndexGeneration { cell_id, edge_type, base_sequence, last_wal_id, edge_count, checksum,
+  generation }` (`src/engine/index_store.rs`), where `generation` is the SHA-256 of the encoded CSC
+  payload. Because the name is the hash, a generation is never rewritten in place: a new build is a
+  new object, and publishing it means atomically repointing a small `current` manifest.
+]
 
-Each cycle collects the dirty `(cell, edge_type)` markers, and for each candidate rebuilds only
-when the accumulated change is worth it — the epoch lag has reached `min_epoch_lag`, or the marker
-has aged past `max_dirty_age` — building at most `max_edge_types_per_cycle` artifacts per pass with
-`build_adjacency_image` (`src/engine/artifact_build.rs`). This is exactly *why* matrix artifacts
-lag the write epoch: they are rebuilt asynchronously off dirty markers, not synchronously on every
-write. The delta-merge at read time is what closes the gap between a lagging base and a current
-read.
+Nothing in the write path builds one. A write leaves only a marker, in the same transaction that
+commits the edge — `mark_adjacency_dirty_txn` in `src/shard/write.rs`:
+
+```rust
+txn.put(
+    keys::matrix_dirty(cell_id, edge_type).as_bytes(),
+    encode_u64(epoch),
+)?;
+```
+
+The rebuild happens in a *different process*. `src/bin/graph-indexer.rs` is its own binary: it
+never becomes a graph writer and never serves queries. Every cycle — `GRAPH_INDEXER_INTERVAL_MS`,
+default 5000 — it lists the registered graph scopes, skips the ones with no data, and opens a
+cluster per scope. For each cell it refreshes its durable reader, reads the markers back through
+`dirty_graph_index_edge_types`, and skips any edge type whose current generation already has a
+`base_sequence` at or beyond the marker. For the rest it calls `build_graph_index`, which pins a
+durable snapshot, takes `base_sequence` and `last_wal_id` from it, materializes the canonical
+adjacency, encodes one CSC matrix, hashes it, writes the generation object with `PutMode::Create`,
+and advances the `current` manifest with a compare-and-swap that refuses to move backwards. Older
+generations are then pruned by `gc_graph_index_generations` down to `GRAPH_INDEXER_RETAIN_PREVIOUS`
+(default 1).
+
+That is exactly *why* the matrix caches key on a lagging base: the base is whatever the indexer
+last published, and the indexer runs on its own clock in another process. The remaining gap is
+closed at read time by the WAL-tail overlay. `topology_tail_since` (`src/shard/topology_tail.rs`,
+called from `compiled_graphblas_query_snapshot` in `src/shard/query.rs`) walks the WAL files after
+the generation's `last_wal_id`, collects the edges touched between `base_sequence` and the read
+sequence, and resolves each one's final state against the pinned snapshot — an overlay of
+present-or-absent decisions, not a replay of a change log. It returns `Complete`, often with an
+empty overlay when the generation is already current, or `Unavailable` when the snapshot has moved
+under it or the WAL files it needs are gone. `Unavailable` is not an error: the query abandons the
+compiled matrix and reads adjacency from the snapshot directly. Slower, still correct, and worth
+knowing about when a traversal's latency jumps.
 
 == Multi-tenancy and metrics
 
@@ -500,6 +536,54 @@ bounds how many entries any one cell may hold, enforced by `enforce_tenant_quota
 eviction. Every cache operation is counted through `GraphCacheMetrics` (hits, misses, insertions,
 evictions, pinned insertions, tenant-quota rejections) and exposed per kind through
 `GraphCacheKind`, so operators can see hit rates and whether a cache is thrashing.
+
+That covers the engine's own caches, which are shared across cells inside one graph. But a
+data node also serves many *graph scopes* — tenants and sub-tenants opened on demand, as the
+architecture chapter described — and those do not share a SlateDB instance at all. Each open
+scope is its own database, so each brings its own block cache. Left alone, that would multiply
+the disk budget by the number of open tenants: configure a 4 GiB cache, open eight scopes, and
+the node quietly wants 32 GiB.
+
+`options_for_scope` (`src/engine/cluster.rs:830-845`) closes that hole by rewriting the cache
+configuration each time a scope is opened. It does two things:
+
+```rust
+if let Some(root) = &options.cache.object_store_cache_dir {
+    let mut scoped_root = root.join("scopes");
+    for segment in scope.namespace.segments() {
+        scoped_root.push(segment.as_str());
+    }
+    scoped_root.push("graphs");
+    scoped_root.push(scope.graph_id.as_str());
+    options.cache.object_store_cache_dir = Some(scoped_root);
+}
+if let Some(bytes) = options.cache.object_store_cache_bytes {
+    options.cache.object_store_cache_bytes = Some((bytes / self.max_open_scopes).max(1));
+}
+```
+
+The directory rewrite gives every scope a private path under `scopes/<namespace…>/graphs/<id>`,
+so two tenants can never collide on a cached block file. The byte rewrite divides the
+configured budget by `max_open_scopes` — not by the number *currently* open — so the node's
+total cache footprint is bounded by what was configured no matter how the LRU fills up. A test
+holds this property down by name, `scoped_clusters_partition_the_local_slate_cache_budget`
+(`src/engine/cluster.rs:990`).
+
+#custom-box(title: [Why], icon: "tip")[
+  Dividing by the capacity rather than by the live count is the conservative choice, and it
+  costs something: with one tenant open and a capacity of eight, that tenant gets an eighth of
+  the budget while seven eighths sit unused. The alternative — resizing every open scope's
+  cache whenever another opens or is evicted — would recover that space but makes a node's
+  cache behaviour depend on its neighbours' arrival times, which is exactly the kind of
+  coupling multi-tenancy is supposed to remove. A fixed share is predictable, and predictable
+  is worth more here than fully utilized.
+]
+
+Metrics follow the same split. `local_shard_runtime_metrics` on the scoped runtime walks every
+loaded scope and tags each shard's counters with the scope they came from, yielding
+`ScopedGraphShardRuntimeMetrics { scope, shard }` (`src/engine.rs:126-130`). Cache hit rates are
+therefore readable per tenant, not just per cell — which matters, because a cold tenant that was
+just opened and a hot tenant that is thrashing look identical in an aggregate number.
 
 == Recap, and the end of the tour
 
@@ -515,14 +599,18 @@ The caches are the last piece of the machine, and they close the loop the whole 
   per-tenant quota keeps cells fair.
 - Correctness comes in two regimes: the per-read caches are epoch-keyed and self-invalidating (a
   write just produces new keys), while the matrix caches key on a deliberately lagging base epoch,
-  merge the delta log at read time, and are pruned explicitly by garbage collection.
+  close the remaining gap with the WAL-tail overlay at read time, and are pruned explicitly by
+  garbage collection.
 
 You now have the whole engine end to end. The foundations gave you the vocabulary and the storage
 stack. The architecture chapter showed how the code is organized around `GraphShard`. The read
-chapter followed a query down to the adjacency keys and back, pinned to one epoch. The write
-chapter showed how that epoch and its deltas are created under a three-tier single-writer
-guarantee. The delete chapter showed deletes as epoch-stamped soft deletes and the garbage
-collection that eventually reclaims them without disturbing live readers. And this chapter showed
+chapter followed a query down to the adjacency keys and back, pinned to one snapshot. The write
+chapter showed how that storage sequence is stamped onto a record under a three-tier
+single-writer guarantee. The delete chapter showed the split treatment — canonical edge rows and the
+relationships riding on them really deleted, while an edge that lives in a packed segment
+leaves a tombstone instead — and the garbage collection that eventually reclaims the rest
+without disturbing live readers.
+And this chapter showed
 the caches that make all of it fast while the epoch discipline keeps them honest.
 
 From here the best next step is the code itself. Open `src/shard/query.rs` and `src/shard/write.rs`
