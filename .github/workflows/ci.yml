@@ -242,10 +242,16 @@ jobs:
       - name: Test chaos harness feature set
         run: cargo test --locked --features chaos-harness --lib
       - name: Test OpenCypher feature set
+        env:
+          RUST_MIN_STACK: 8388608
         run: cargo test --locked --features opencypher --lib
       - name: Test GraphBLAS and OpenCypher feature set
+        env:
+          RUST_MIN_STACK: 8388608
         run: cargo test --locked --features opencypher,graphblas --lib
       - name: Test full native feature set
+        env:
+          RUST_MIN_STACK: 8388608
         run: cargo test --locked --all-targets --features opencypher,graphblas,query-transport,query-transport-tls,query-service-discovery,public-client-protocols
       - name: Test public client protocols
         run: cargo test --locked --all-targets --features public-client-protocols
