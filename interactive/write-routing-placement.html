@@ -752,7 +752,7 @@
       <span><b>repo</b> turbolay</span>
       <span><b>branch</b> Turbolay-V3.5</span>
       <span><b>doc</b> 3 of 3 &mdash; the fix</span>
-      <span><b>status</b> crate landed, wiring blocked on Q4</span>
+      <span><b>status</b> crate landed, Q1-Q4 decided, wiring next</span>
       <span><b>refs</b> sleet &middot; tidb-master</span>
     </div>
     <h1>Placing the writer<span class="thin">rendezvous, heartbeats, and the bounded duel</span></h1>
@@ -1523,10 +1523,24 @@ exists assertion <b>DoubleRunReachable</b>:
         keeps its current assignments. For a compaction coordinator that is a safe double-run. For
         a <em>writer</em> it is an unbounded duel by construction: a node partitioned from the
         object store can never learn that it lost ownership, so it re-promotes forever against a
-        node that thinks it won. The proposal is that <b>a LIST failure sheds ownership</b> &mdash;
-        if we cannot read the live set we cannot claim to own anything, so refuse promotion and
-        return <code>NotCellWriter</code> with no owner hint. That trades availability for the
-        bound, which is the right trade on the writer path specifically. It is still open.
+        node that thinks it won. Shedding on the <em>first</em> failed LIST is the opposite
+        extreme and drops a healthy writer on one throttled request. The rule is <b>bounded</b>:
+        keep the last good view while it is younger than <code>heartbeat_timeout</code>, then go
+        unready, DELETE the heartbeat, and refuse promotion with no owner hint.
+      </p>
+
+      <p>
+        The grace is <code>heartbeat_timeout</code> rather than a new knob because peers take over
+        that long after the last successful PUT, and in a partition LIST and PUT fail together. A
+        shorter grace leaves a window where nobody owns the cell; a longer one leaves a duel; equal
+        makes the two coincide. The part that is easy to miss is that <b>shedding has to withdraw
+        the heartbeat</b>. In a partial failure &mdash; LIST throttled, PUTs still landing &mdash;
+        a node that sheds while still publishing stays the computed owner for everyone else, so
+        peers route writes to it and it refuses every one, permanently, with nothing left to time
+        out. Withdrawing makes peers take over, and it falls out of the readiness gating for free:
+        a node that cannot read the live set is not ready. Worst case for the cell is the 15s grace
+        plus peer detection &mdash; immediate if the DELETE lands, another 15s if the store is
+        fully unreachable. Thirty seconds, against sleet's forever.
       </p>
     </section>
 
@@ -1658,57 +1672,43 @@ node-1  WARN  fenced at epoch 18; current lease: <b>graph-node-2 @ 19</b></pre>
           <span class="kk">fence</span>
           <span class="kv">Match sleet's handler exactly (<code>daemon.rs:458-472</code>): <b>reset backoff to 1s</b> because a fence is view skew rather than a failure, wait exactly one <code>heartbeat_interval</code> sized to let the rival stand down, and retry <b>unconditionally</b> without re-checking ownership.</span>
         </div>
+        <div class="keep">
+          <span class="kk">LIST failure</span>
+          <span class="kv"><b>Bounded, then shed.</b> Keep the last good view while it is younger than <code>heartbeat_timeout</code>, then go unready, DELETE the heartbeat and refuse promotion. The grace equals the timeout because peers take over that long after the last successful PUT &mdash; shorter leaves a window with no owner, longer leaves a duel, equal makes them coincide. Withdrawing the heartbeat is what closes the partial-failure case where LIST is throttled but PUTs still land. Worst case for the cell is 30s, against sleet's unbounded.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">Q4 scope</span>
+          <span class="kv"><b>All of Phase 1, one release</b>, as seven staged commits: crate &rarr; publisher &rarr; (a) routing &rarr; (b)+(c) refusal and mapping &rarr; (d) fence backoff &rarr; 3a record &rarr; regression test. The publisher splits out of (e) and lands <em>before</em> (a), because (a) deletes the probe and cannot function until heartbeats exist. Commits 3 and 4 must not be separated.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">rolling restart</span>
+          <span class="kv"><code>directory.rs</code> distinguishes <b>never-published</b> from <b>expired</b>: for the first <code>heartbeat_timeout</code> after start, a configured peer with no heartbeat object counts as live. Only expiry is evidence of death. Without this, the first pod replaced in a rolling restart LISTs, sees only itself, and concludes it owns every cell.</span>
+        </div>
       </div>
 
       <h3>Open</h3>
 
       <div class="openq wide">
         <div class="q">
-          <span class="qh">Q4 &mdash; how far to build in the next pass?  <span class="chip high">open</span></span>
+          <span class="qh">Does <code>with_preferred_writer_node</code> survive?  <span class="chip high">open</span></span>
           <p>
-            Recommendation is all of Phase 1 as seven staged commits. <b>Answering Q2 reordered
-            them.</b> Touch point (a) deletes the probe, so it cannot function until something
-            publishes heartbeats &mdash; and publishing is part of (e), which the plan stages last.
-            That order is a rolling-upgrade hazard, not a cosmetic problem: a newly upgraded node
-            LISTs <code>_graph_nodes/v1/</code>, sees only itself because no old node publishes,
-            concludes it owns every cell, and promotes &mdash; while the old nodes carry on
-            promoting too. So the publisher splits out into its own commit ahead of the routing
-            change, where it writes objects nothing yet reads and can be watched in the bucket for
-            a day before anything depends on it.
+            The recommendation reversed on reading the code. It has <b>no production caller at
+            all</b>: <code>graph-node.rs:115-116</code> builds the provider and never calls it, so
+            the field is always its default &mdash; the lexicographically first key of a
+            <code>BTreeMap</code> (<code>routing.rs:76-80</code>). Its only caller in the tree is
+            <code>bolt/tests.rs:1373</code>. Both arguments for keeping it were also wrong:
+            single-node deploys have nothing to override, since rendezvous over one live node has
+            exactly one answer; and a test should <em>compute</em> the owner rather than pin it,
+            which is what the heartbeat widget above already does.
           </p>
           <p>
-            The revised order: crate &rarr; <b>publisher</b> &rarr; (a) routing &rarr; (b)+(c)
-            refusal and Bolt mapping &rarr; (d) fence backoff &rarr; 3a advisory record &rarr;
-            regression test. Commits 3 and 4 are the pair that must not be separated by a release,
-            and they are where the review effort belongs &mdash; roughly sixty lines that change who
-            is allowed to write. Everything else is mechanical.
-          </p>
-          <p>
-            The tempting small option, crate plus (b), is a trap. It does stop the duel, but it
-            substitutes a client that receives a refusal it cannot interpret, holds a routing table
-            naming the wrong writer, and retries into the same node until it gives up. Same symptom
-            &mdash; writes not landing &mdash; and harder to find, because the epoch counter stops
-            climbing and the logs go quiet. The signature that made the original incident findable
-            disappears.
-          </p>
-        </div>
-        <div class="q">
-          <span class="qh">LIST failure &mdash; shed ownership or keep it?  <span class="chip high">open</span></span>
-          <p>
-            Sleet keeps current assignments when the node LIST fails. For a writer that is an
-            unbounded duel, because a partitioned node can never learn it lost. The proposal is to
-            shed: refuse promotion and return <code>NotCellWriter</code> with no owner hint. That
-            deliberately trades availability for the convergence bound, and it is the one place
-            this design must diverge from its reference implementation. Not yet agreed.
-          </p>
-        </div>
-        <div class="q">
-          <span class="qh">Does <code>with_preferred_writer_node</code> survive?</span>
-          <p>
-            Proposal is to keep it as an explicit override above rendezvous &mdash; useful for
-            tests and single-node deploys, and it fails closed by validating the id against the
-            address map. Rendezvous replaces it as the <em>primary</em> mechanism either way, since
-            the <code>reachable.first()</code> fallback beneath it is half the instability.
+            Worse, keeping it becomes unsafe the moment (b) enforces ownership. Routing would
+            advertise the override while <code>ensure_local_writer</code> enforces rendezvous, so a
+            driver sent to the override is refused, re-routes to the rendezvous owner, and is sent
+            back by the next <code>ROUTE</code> refresh &mdash; a loop no timeout breaks, from a
+            misconfiguration that validates cleanly. Today the same field is harmless only because
+            nothing enforces ownership. Recommendation is to <b>delete it</b>; if a pin is ever
+            wanted it belongs inside <code>owner()</code> so both sides read one source.
           </p>
         </div>
         <div class="q">
