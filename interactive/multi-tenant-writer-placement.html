@@ -1,0 +1,2188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Placing writers for many tenants — four schemes, one function, two knobs</title>
+<style>
+  :root {
+    --ground: #eef1f5;
+    --surface: #fbfcfd;
+    --surface-2: #e7ecf3;
+    --ink: #16202e;
+    --ink-2: #4d5c72;
+    --ink-3: #7c8ba1;
+    --rule: #c8d2de;
+    --rule-soft: #dbe3ec;
+    --accent: #1e4fd8;
+    --accent-soft: #dfe6fb;
+    --crit: #a3231c;
+    --crit-soft: #f7e2e0;
+    --high: #97621b;
+    --high-soft: #f8ecd9;
+    --med: #2b6079;
+    --med-soft: #dcecf3;
+    --ok: #106b4e;
+    --ok-soft: #dbefe6;
+
+    --font-display: -apple-system, BlinkMacSystemFont, "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+    --font-body: "Iowan Old Style", Charter, "Bitstream Charter", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+    --font-mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+    --measure: 68ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0b1626;
+      --surface: #111e31;
+      --surface-2: #16263c;
+      --ink: #dce7f5;
+      --ink-2: #93a8c4;
+      --ink-3: #6a7f9c;
+      --rule: #24374f;
+      --rule-soft: #1b2c42;
+      --accent: #7ba5ff;
+      --accent-soft: #17294a;
+      --crit: #ff8478;
+      --crit-soft: #3a1d1d;
+      --high: #e5b46a;
+      --high-soft: #3a2e18;
+      --med: #6fb8d6;
+      --med-soft: #16303d;
+      --ok: #56cfa1;
+      --ok-soft: #12332a;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0b1626;
+    --surface: #111e31;
+    --surface-2: #16263c;
+    --ink: #dce7f5;
+    --ink-2: #93a8c4;
+    --ink-3: #6a7f9c;
+    --rule: #24374f;
+    --rule-soft: #1b2c42;
+    --accent: #7ba5ff;
+    --accent-soft: #17294a;
+    --crit: #ff8478;
+    --crit-soft: #3a1d1d;
+    --high: #e5b46a;
+    --high-soft: #3a2e18;
+    --med: #6fb8d6;
+    --med-soft: #16303d;
+    --ok: #56cfa1;
+    --ok-soft: #12332a;
+  }
+
+  :root[data-theme="light"] {
+    --ground: #eef1f5;
+    --surface: #fbfcfd;
+    --surface-2: #e7ecf3;
+    --ink: #16202e;
+    --ink-2: #4d5c72;
+    --ink-3: #7c8ba1;
+    --rule: #c8d2de;
+    --rule-soft: #dbe3ec;
+    --accent: #1e4fd8;
+    --accent-soft: #dfe6fb;
+    --crit: #a3231c;
+    --crit-soft: #f7e2e0;
+    --high: #97621b;
+    --high-soft: #f8ecd9;
+    --med: #2b6079;
+    --med-soft: #dcecf3;
+    --ok: #106b4e;
+    --ok-soft: #dbefe6;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  .page {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 24px 96px;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0 48px;
+  }
+
+  @media (min-width: 1080px) {
+    .page { grid-template-columns: 190px minmax(0, 1fr); }
+  }
+
+  .masthead {
+    grid-column: 1 / -1;
+    border-bottom: 2px solid var(--ink);
+    padding: 56px 0 26px;
+    margin-bottom: 40px;
+  }
+
+  .docmeta {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 22px;
+    margin-bottom: 26px;
+  }
+
+  .docmeta b { color: var(--ink-2); font-weight: 500; }
+
+  h1 {
+    font-family: var(--font-display);
+    font-size: clamp(2.1rem, 5.4vw, 3.5rem);
+    font-weight: 700;
+    letter-spacing: -.032em;
+    line-height: 1.02;
+    margin: 0 0 .45em;
+    text-wrap: balance;
+    max-width: 20ch;
+  }
+
+  h1 .thin { font-weight: 300; color: var(--ink-2); display: block; }
+
+  .standfirst {
+    font-size: 1.16rem;
+    color: var(--ink-2);
+    max-width: 60ch;
+    margin: 0;
+    line-height: 1.55;
+  }
+
+  .spine { display: none; }
+
+  @media (min-width: 1080px) {
+    .spine {
+      display: block;
+      position: sticky;
+      top: 0;
+      align-self: start;
+      padding-top: 6px;
+      max-height: 100vh;
+      overflow-y: auto;
+    }
+  }
+
+  .spine ol { list-style: none; margin: 0; padding: 0; }
+
+  .spine a {
+    display: grid;
+    grid-template-columns: 2.2em 1fr;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.4;
+    letter-spacing: .02em;
+    color: var(--ink-3);
+    text-decoration: none;
+    padding: 7px 0 7px 10px;
+    border-left: 2px solid var(--rule-soft);
+    transition: color .15s, border-color .15s;
+  }
+
+  .spine a:hover, .spine a:focus-visible { color: var(--accent); border-left-color: var(--accent); }
+  .spine a .n { font-variant-numeric: tabular-nums; color: var(--ink-3); }
+  .spine .wmark { color: var(--accent); }
+
+  .body { min-width: 0; }
+  .body > * { max-width: var(--measure); }
+  .body > .wide, .body > .rail { max-width: none; }
+
+  section { margin: 0 0 68px; }
+
+  h2 {
+    font-family: var(--font-display);
+    font-size: 1.62rem;
+    font-weight: 650;
+    letter-spacing: -.02em;
+    line-height: 1.18;
+    margin: 0 0 .2em;
+    text-wrap: balance;
+  }
+
+  h3 {
+    font-family: var(--font-display);
+    font-size: 1.06rem;
+    font-weight: 650;
+    letter-spacing: -.008em;
+    margin: 2.1em 0 .5em;
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .eyebrow::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
+
+  p { margin: 0 0 1.05em; }
+  .lede { font-size: 1.06rem; color: var(--ink-2); margin-bottom: 1.6em; }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  code, .mono { font-family: var(--font-mono); font-size: .86em; }
+
+  p code, li code, td code, th code, dd code, .rtext code, .kv code, .q p code {
+    background: var(--surface-2);
+    border: 1px solid var(--rule-soft);
+    border-radius: 3px;
+    padding: .08em .34em;
+    white-space: nowrap;
+  }
+
+  .src { font-family: var(--font-mono); font-size: .78em; color: var(--ink-3); white-space: nowrap; letter-spacing: -.01em; }
+  .src::before { content: "\21B3 "; }
+
+  ul, ol { margin: 0 0 1.05em; padding-left: 1.3em; }
+  li { margin-bottom: .4em; }
+
+  .doctrine {
+    border-left: 3px solid var(--accent);
+    padding: 2px 0 2px 20px;
+    margin: 1.6em 0;
+    color: var(--ink-2);
+  }
+
+  .doctrine p { font-style: italic; margin-bottom: .4em; }
+  .doctrine .attr { font-family: var(--font-mono); font-size: 11.5px; font-style: normal; color: var(--ink-3); letter-spacing: .02em; }
+
+  .chip {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 2px;
+    vertical-align: 2px;
+    white-space: nowrap;
+  }
+
+  .chip.med    { color: var(--med);  background: var(--med-soft); }
+  .chip.high   { color: var(--high); background: var(--high-soft); }
+  .chip.ok     { color: var(--ok);   background: var(--ok-soft); }
+
+  /* ---- tables ---- */
+
+  .tablewrap {
+    overflow-x: auto;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    margin: 26px 0;
+  }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+
+  thead th {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+
+  tbody tr:last-child td { border-bottom: none; }
+  td.m, th.m { font-family: var(--font-mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  td.nowrap { white-space: nowrap; }
+  td.note { font-family: var(--font-body); font-size: 14px; color: var(--ink-2); }
+  td.strong { font-family: var(--font-body); font-size: 14px; color: var(--ink); }
+  .wide-tbl { min-width: 700px; }
+
+  .caption {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--ink-3);
+    margin: -14px 0 30px;
+    letter-spacing: .01em;
+  }
+
+  /* ---- code / rule blocks ---- */
+
+  pre.listing {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.62;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--rule);
+    color: var(--ink-2);
+    padding: 14px 16px;
+    margin: 22px 0;
+    overflow-x: auto;
+  }
+
+  pre.listing b { color: var(--ink); font-weight: 600; }
+  pre.listing i { font-style: normal; color: var(--crit); }
+  pre.listing u { text-decoration: none; color: var(--accent); }
+  pre.listing.rust { border-left-color: var(--accent); }
+  pre.listing.incident { border-left-color: var(--crit); }
+
+  .rule-box {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.6;
+    background: var(--accent-soft);
+    color: var(--ink);
+    padding: 12px 14px;
+    border-radius: 2px;
+    margin: 20px 0;
+    overflow-x: auto;
+  }
+
+  .rule-box .lbl {
+    display: block;
+    font-size: 10px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 6px;
+  }
+
+  /* ---- keeps / open questions ---- */
+
+  .keeps { display: grid; gap: 2px; margin: 24px 0; }
+
+  .keep {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 14px;
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--ok);
+    padding: 13px 18px;
+    align-items: baseline;
+  }
+
+  .keep[data-v="open"] { border-left-color: var(--high); }
+  .keep[data-v="lean"] { border-left-color: var(--med); }
+
+  .keep .kk {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ok);
+    white-space: nowrap;
+  }
+
+  .keep[data-v="open"] .kk { color: var(--high); }
+  .keep[data-v="lean"] .kk { color: var(--med); }
+  .keep .kv { font-size: .95rem; }
+
+  .openq { display: grid; gap: 2px; margin: 24px 0; }
+
+  .q {
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--high);
+    padding: 15px 18px;
+  }
+
+  .q .qh {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink);
+    display: block;
+    margin-bottom: 5px;
+  }
+
+  .q p { font-size: .93rem; margin: 0; color: var(--ink-2); max-width: 74ch; }
+
+  /* ---- widgets ---- */
+
+  .widget {
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    margin: 28px 0 34px;
+    padding: 0;
+  }
+
+  .widget-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px 14px;
+    padding: 13px 20px 12px;
+    border-bottom: 1px solid var(--rule-soft);
+    background: var(--surface-2);
+  }
+
+  .widget-id {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .widget-title {
+    font-family: var(--font-display);
+    font-size: .96rem;
+    font-weight: 650;
+    letter-spacing: -.008em;
+    color: var(--ink);
+  }
+
+  .widget-body { padding: 20px; }
+
+  .widget-cap {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.55;
+    color: var(--ink-3);
+    border-top: 1px solid var(--rule-soft);
+    padding: 12px 20px 14px;
+    letter-spacing: .01em;
+  }
+
+  .widget-cap b { color: var(--ink-2); font-weight: 600; }
+
+  .ctlbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    margin-bottom: 16px;
+  }
+
+  .ctlbar + .ctlbar { margin-top: -6px; }
+
+  .btn {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .02em;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 6px 11px;
+    cursor: pointer;
+    transition: color .12s, border-color .12s, background .12s;
+  }
+
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .btn.danger:hover { border-color: var(--crit); color: var(--crit); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+
+  .ctl-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  .field {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 6px 9px;
+    min-width: 0;
+  }
+
+  .field:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+  .nodechip {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    padding: 5px 10px;
+    border-radius: 2px;
+    border: 1px solid var(--ok);
+    background: var(--ok-soft);
+    color: var(--ok);
+    cursor: pointer;
+  }
+
+  .nodechip[aria-pressed="false"] {
+    border-color: var(--rule);
+    background: var(--surface-2);
+    color: var(--ink-3);
+    text-decoration: line-through;
+  }
+
+  .nodechip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .readout {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    background: var(--surface-2);
+    border-radius: 2px;
+    padding: 10px 13px;
+    margin-top: 14px;
+  }
+
+  .readout b { color: var(--ink); font-weight: 600; }
+  .readout .good { color: var(--ok); }
+  .readout .bad { color: var(--crit); }
+  .readout .warn { color: var(--high); }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 2px;
+    margin: 14px 0 0;
+  }
+
+  .stat { background: var(--surface-2); padding: 9px 12px; }
+
+  .stat .sk {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: .11em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin-bottom: 2px;
+  }
+
+  .stat .sv {
+    font-family: var(--font-mono);
+    font-size: 17px;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    line-height: 1.2;
+  }
+
+  .stat[data-tone="crit"] .sv { color: var(--crit); }
+  .stat[data-tone="ok"] .sv { color: var(--ok); }
+  .stat[data-tone="accent"] .sv { color: var(--accent); }
+  .stat[data-tone="high"] .sv { color: var(--high); }
+  .stat .su { font-size: 11px; color: var(--ink-3); }
+
+  .scoretbl { width: 100%; border-collapse: collapse; font-size: 12px; font-family: var(--font-mono); }
+  .scoretbl th { font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); font-weight: 500; padding: 6px 10px; background: var(--surface-2); border-bottom: 1px solid var(--rule); text-align: left; }
+  .scoretbl td { padding: 6px 10px; border-bottom: 1px solid var(--rule-soft); vertical-align: middle; }
+  .scoretbl tr.dead td { color: var(--ink-3); text-decoration: line-through; }
+  .scoretbl tr.win td { background: var(--ok-soft); color: var(--ok); font-weight: 600; }
+  .scoretbl tr.win td.bar-td { background: var(--ok-soft); }
+  .scoretbl tr.moved td { color: var(--high); }
+  .scoretbl tr.gone td { color: var(--crit); }
+  .scoretbl td.bar-td { width: 30%; padding: 4px 10px; }
+  .scoretbl .bar { height: 8px; background: var(--rule); display: block; border-radius: 1px; }
+  .scoretbl tr.win .bar { background: var(--ok); }
+  .scoretbl tr.moved .bar { background: var(--high); }
+  .scoretbl tr.dead .bar { background: var(--rule-soft); }
+
+  .lamps { display: flex; flex-wrap: wrap; gap: 2px; margin: 22px 0; }
+
+  .lamp {
+    flex: 1 1 210px;
+    background: var(--surface-2);
+    padding: 11px 14px;
+    display: flex;
+    align-items: center;
+    gap: 11px;
+  }
+
+  .lamp .bulb { width: 13px; height: 13px; border-radius: 50%; background: var(--rule); flex: none; }
+  .lamp[data-on="ok"] .bulb { background: var(--ok); }
+  .lamp[data-on="crit"] .bulb { background: var(--crit); }
+  .lamp .lk { font-family: var(--font-mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); display: block; }
+  .lamp .lv { font-family: var(--font-mono); font-size: 12px; color: var(--ink); }
+  .lamp[data-on="ok"] .lv { color: var(--ok); }
+  .lamp[data-on="crit"] .lv { color: var(--crit); }
+
+  /* ---- page-local: the serves grid and the key line ---- */
+
+  .servegrid { display: grid; gap: 4px; margin-bottom: 14px; }
+
+  .serverow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .serverow .rowlab {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--ink-2);
+    min-width: 12ch;
+  }
+
+  .keyline {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.7;
+    background: var(--accent-soft);
+    color: var(--ink);
+    padding: 11px 14px;
+    border-radius: 2px;
+    margin-top: 14px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .keyline .lbl {
+    display: block;
+    font-size: 10px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 5px;
+  }
+
+  .keyline .sep { color: var(--crit); }
+  .keyline .dim { color: var(--ink-3); }
+
+  /* ---- SVG, themed through custom properties only ---- */
+
+  .wsvg { display: block; width: 100%; height: auto; overflow: visible; }
+  .wsvg text { font-family: var(--font-mono); font-size: 10px; fill: var(--ink-2); }
+  .wsvg .t-strong { fill: var(--ink); font-weight: 600; }
+  .wsvg .t-dim { fill: var(--ink-3); font-size: 9px; }
+  .wsvg .t-ok { fill: var(--ok); }
+  .wsvg .t-crit { fill: var(--crit); }
+  .wsvg .t-accent { fill: var(--accent); }
+  .wsvg .box { fill: var(--surface-2); stroke: var(--rule); stroke-width: 1; }
+  .wsvg .box.ok { fill: var(--ok-soft); stroke: var(--ok); }
+  .wsvg .box.crit { fill: var(--crit-soft); stroke: var(--crit); }
+  .wsvg .box.accent { fill: var(--accent-soft); stroke: var(--accent); }
+  .wsvg .box.dim { fill: var(--surface); stroke: var(--rule-soft); }
+  .wsvg .wire { stroke: var(--rule); stroke-width: 1; fill: none; }
+  .wsvg .wire.ok { stroke: var(--ok); stroke-width: 1.5; }
+  .wsvg .wire.crit { stroke: var(--crit); stroke-width: 1.5; }
+  .wsvg .wire.accent { stroke: var(--accent); stroke-width: 1.4; }
+  .wsvg .wire.faint { stroke: var(--rule-soft); }
+  .wsvg .fillok { fill: var(--ok); }
+  .wsvg .fillcrit { fill: var(--crit); }
+  .wsvg .fillaccent { fill: var(--accent); }
+  .wsvg .axis { stroke: var(--rule); stroke-width: 1; }
+  .wsvg .grid { stroke: var(--rule-soft); stroke-width: 1; }
+  .wsvg .dash { stroke-dasharray: 3 3; }
+
+  .static-fallback { border: 1px dashed var(--rule); padding: 16px; }
+  .static-note { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-3); margin: 10px 0 0; }
+
+  .handoff {
+    border-top: 2px solid var(--ink);
+    padding-top: 26px;
+    margin-top: 76px;
+    grid-column: 1 / -1;
+  }
+
+  .handoff h2 { font-size: 1.28rem; }
+  .handoff p { max-width: var(--measure); }
+
+  .themetoggle {
+    position: fixed;
+    top: 14px;
+    right: 14px;
+    z-index: 10;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 6px 10px;
+    cursor: pointer;
+    transition: color .15s, border-color .15s;
+  }
+
+  .themetoggle:hover { color: var(--accent); border-color: var(--accent); }
+  .themetoggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  @media print { .themetoggle { display: none; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem("turbolay-theme");
+      if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) {}
+  })();
+</script>
+</head>
+<body>
+
+<button class="themetoggle" type="button">Dark</button>
+
+<div class="page">
+
+  <header class="masthead">
+    <div class="docmeta">
+      <span><b>repo</b> turbolay</span>
+      <span><b>branch</b> Turbolay-V3.5</span>
+      <span><b>doc</b> design note &mdash; multi-tenancy</span>
+      <span><b>status</b> scheme 3 landed; 1, 2 and 4 unbuilt</span>
+      <span><b>refs</b> sleet</span>
+    </div>
+    <h1>Placing writers for many tenants<span class="thin">four schemes, one function, two knobs</span></h1>
+    <p class="standfirst">
+      The four ways you might want writes spread across a fleet are not four designs.
+      They are one function &mdash; <code>owner(key, candidates)</code> &mdash; with two
+      inputs varied: what goes into the hash, and which nodes are eligible at all. Three
+      of the four need no new mechanism. The fourth needs one small thing, and the shipped
+      design already has a place to put it.
+    </p>
+  </header>
+
+  <nav class="spine" aria-label="Sections">
+    <ol>
+      <li><a href="#asked"><span class="n">A</span><span>What was asked</span></a></li>
+      <li><a href="#function"><span class="n">B</span><span>One function <span class="wmark">W1</span></span></a></li>
+      <li><a href="#key"><span class="n">C</span><span>Schemes 1 and 2</span></a></li>
+      <li><a href="#candidates"><span class="n">D</span><span>Scheme 4 <span class="wmark">W2</span></span></a></li>
+      <li><a href="#pin"><span class="n">E</span><span>Where a pin belongs</span></a></li>
+      <li><a href="#blast"><span class="n">F</span><span>Losing a node <span class="wmark">W3</span></span></a></li>
+      <li><a href="#frozen"><span class="n">G</span><span>The frozen key <span class="wmark">W4</span></span></a></li>
+    </ol>
+  </nav>
+
+  <main class="body">
+
+    <section id="asked">
+      <p class="eyebrow">A &mdash; what was asked</p>
+      <h2>Four ways to decide which node writes</h2>
+      <p class="lede">
+        Multi-tenancy raises the placement question again, in four forms. They look like
+        four features. They are four arguments.
+      </p>
+
+      <p>
+        Three terms first, because the rest of the page leans on them. A <b>tenant</b> is a
+        customer: in the code that is a <em>namespace</em>, the first part of a graph's
+        address. A <b>cell</b> is one SlateDB database &mdash; a unit of storage that admits
+        exactly one writer at a time, enforced by a writer epoch in its manifest. The
+        <b>writer</b> for a cell is whichever graph-node currently holds that epoch; every
+        other node must send its writes there or be fenced out.
+      </p>
+
+      <p>
+        The four schemes, as asked, and the two inputs each one varies:
+      </p>
+
+      <div class="tablewrap wide">
+        <table class="wide-tbl">
+          <thead>
+            <tr><th>#</th><th>What you want</th><th class="m">key</th><th class="m">candidate set</th><th>state</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="m">1</td>
+              <td class="strong">All of one tenant's cells land on a single writer node</td>
+              <td class="m">tenant id alone<br>(cell omitted)</td>
+              <td class="m">all live nodes</td>
+              <td class="note">key change only</td>
+            </tr>
+            <tr>
+              <td class="m">2</td>
+              <td class="strong">Every tenant's writes land on one writer node</td>
+              <td class="m">a constant</td>
+              <td class="m">all live nodes</td>
+              <td class="note">key change only</td>
+            </tr>
+            <tr>
+              <td class="m">3</td>
+              <td class="strong">Shared cluster: each cell is tied to one writer, so servers stop flip-flopping</td>
+              <td class="m">tenant + cell</td>
+              <td class="m">all live nodes</td>
+              <td class="note"><b>already built</b>, tested, pinned</td>
+            </tr>
+            <tr>
+              <td class="m">4</td>
+              <td class="strong">A dedicated writer node per tenant</td>
+              <td class="m">tenant + cell</td>
+              <td class="m">live nodes <b>that serve that tenant</b></td>
+              <td class="note">needs nodes to advertise what they serve</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="caption">The whole page is this table, expanded. Nothing outside the two right-hand columns changes between schemes.</p>
+
+      <p>
+        Scheme 3 is not a proposal. It is <code>crates/placement/src/hash.rs</code> as it
+        stands on this branch: thirty lines, seven tests, four golden hex values pinned
+        against a Rust unit test. It is also the scheme that fixes the production incident
+        &mdash; three graph-nodes taking turns claiming one cell's writer epoch, each one
+        fencing out the last, forever, because nothing in the system decided which of them
+        should be the writer. That story is
+        <a href="write-routing-placement.html">Placing the writer</a>; this page assumes it.
+      </p>
+    </section>
+
+    <section id="function">
+      <p class="eyebrow">B &mdash; one function</p>
+      <h2>Highest score wins, and the score has exactly two inputs</h2>
+
+      <div class="rule-box">
+        <span class="lbl">the whole mechanism</span>
+        owner(key, candidates) = argmax<sub>n &isin; candidates</sub> H(key &Vert; 0x00 &Vert; node_id)<br>
+        H = FNV-1a 64 &nbsp;&middot;&nbsp; ties broken by node id ascending
+      </div>
+
+      <p>
+        This is <b>rendezvous hashing</b>: instead of storing who owns what, every node
+        hashes the pair (thing, candidate) for each candidate and picks the highest. There is
+        no assignment table, no election, no lock. Every node that agrees on the candidate
+        list computes the same owner, independently, with no round trip.
+      </p>
+
+      <p>
+        In the shipped code the key is two segments, and the signature makes both of the
+        knobs visible &mdash; the first two arguments are the key, the third is the
+        candidate set:
+      </p>
+
+      <pre class="listing rust">pub fn <b>score</b>(scope: &amp;str, cell_id: &amp;str, node_id: &amp;str) -&gt; u64;
+pub fn <b>rank</b>&lt;'a&gt;(scope: &amp;str, cell_id: &amp;str, live: &amp;[&amp;'a str]) -&gt; Vec&lt;&amp;'a str&gt;;
+pub fn <b>owner</b>&lt;'a&gt;(scope: &amp;str, cell_id: &amp;str, live: &amp;[&amp;'a str]) -&gt; Option&lt;&amp;'a str&gt;;</pre>
+      <p class="caption">crates/placement/src/hash.rs:35, :47, :63 &mdash; FNV-1a 64 over <code>scope ++ 0x00 ++ cell_id ++ 0x00 ++ node_id</code>. The <code>0x00</code> separator keeps segment boundaries distinct, so <code>("ab","c")</code> and <code>("a","bc")</code> cannot collide.</p>
+
+      <p>
+        <code>scope</code> today is <code>GraphScope</code>'s <code>Display</code> &mdash;
+        <code>"{namespace}/graphs/{graph_id}"</code>
+        (<code>src/core/namespace.rs:268&ndash;272</code>), so the tenant is already the
+        leading part of the key. <code>owner</code> returning <code>None</code> means
+        <em>placement has no opinion</em>, not <em>nobody may write</em>; the caller's rule
+        is to promote itself when it is the owner or when no owner is live, and to decline
+        otherwise.
+      </p>
+
+      <h3>The four pinned values, recomputed here</h3>
+
+      <p>
+        Everything on this page is computed in the browser by a port of that same hash. The
+        port is only trustworthy if it reproduces the values the Rust test pins, so it does
+        that first, on load:
+      </p>
+
+      <div class="lamps wide" id="goldlamps">
+        <div class="lamp" data-on="">
+          <span class="bulb"></span>
+          <span><span class="lk">social / cell-a / node-0</span><span class="lv">0xf0dc2317deb297c5</span></span>
+        </div>
+        <div class="lamp" data-on="">
+          <span class="bulb"></span>
+          <span><span class="lk">social / cell-a / node-1</span><span class="lv">0xf0dc2217deb29612</span></span>
+        </div>
+        <div class="lamp" data-on="">
+          <span class="bulb"></span>
+          <span><span class="lk">social / cell-b / node-0</span><span class="lv">0x39ffe3dd3cc79ffe</span></span>
+        </div>
+        <div class="lamp" data-on="">
+          <span class="bulb"></span>
+          <span><span class="lk">other / cell-a / node-0</span><span class="lv">0xc15e57802a479f04</span></span>
+        </div>
+      </div>
+      <p class="caption" id="goldnote">Pinned by <code>scores_are_frozen</code>, crates/placement/src/hash.rs:82&ndash;99. With JavaScript enabled each lamp turns green only if the page recomputes the pinned value byte for byte.</p>
+
+      <h3>The same fleet under all four schemes</h3>
+
+      <p>
+        The fixture below is four nodes, three tenants, eight cells. Switch schemes and only
+        two things change: the string being hashed, and which nodes are allowed to win. The
+        function is untouched.
+      </p>
+
+      <div class="widget wide" id="w1">
+        <div class="widget-head">
+          <span class="widget-id">W1</span>
+          <span class="widget-title">Scheme switcher &mdash; one fleet, four partitions, one function</span>
+        </div>
+        <div class="widget-body">
+          <div class="w1-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 720 250" role="img" aria-label="Under scheme 3 the eight cells of three tenants spread across three of four nodes">
+              <text class="t-strong" x="12" y="18">scheme 3 &mdash; key = scope + cell, candidates = all four live nodes</text>
+              <rect class="box" x="12" y="30" width="330" height="26" rx="2"></rect>
+              <text x="22" y="47">acme/graphs/social  cell-a  cell-b  cell-c</text>
+              <rect class="box" x="12" y="62" width="330" height="26" rx="2"></rect>
+              <text x="22" y="79">globex/graphs/orders  cell-a  cell-b</text>
+              <rect class="box" x="12" y="94" width="330" height="26" rx="2"></rect>
+              <text x="22" y="111">initech/graphs/main  cell-a  cell-b  cell-c</text>
+              <path class="wire accent" d="M342 43 L430 100"></path>
+              <path class="wire accent" d="M342 75 L430 110"></path>
+              <path class="wire accent" d="M342 107 L430 120"></path>
+              <rect class="box accent" x="430" y="30" width="270" height="26" rx="2"></rect>
+              <text class="t-accent" x="440" y="47">graph-node-0   3 cells</text>
+              <rect class="box accent" x="430" y="62" width="270" height="26" rx="2"></rect>
+              <text class="t-accent" x="440" y="79">graph-node-1   3 cells</text>
+              <rect class="box accent" x="430" y="94" width="270" height="26" rx="2"></rect>
+              <text class="t-accent" x="440" y="111">graph-node-2   2 cells</text>
+              <rect class="box dim" x="430" y="126" width="270" height="26" rx="2"></rect>
+              <text class="t-dim" x="440" y="143">graph-node-3   0 cells</text>
+              <text class="t-dim" x="12" y="170">scheme 1 would put all three of acme's cells on graph-node-0.</text>
+              <text class="t-dim" x="12" y="186">scheme 2 would put all eight cells on graph-node-3.</text>
+              <text class="t-dim" x="12" y="202">scheme 4 would restrict each tenant to the nodes that serve it.</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript to switch schemes and inspect the key that is hashed.</p>
+          </div>
+          <div class="w1-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> step through schemes 1 to 4 and watch the arrows redraw. Scheme 2 collapses
+          every cell onto one node; scheme 1 gives each tenant one node and leaves
+          <code>graph-node-1</code> with nothing; scheme 3 spreads cells; scheme 4 keeps each
+          tenant inside its own nodes. Then read the <b>key</b> panel: it is the literal string
+          being hashed, separators and all. That string is the only thing that changed between
+          schemes 1, 2 and 3.
+        </p>
+      </div>
+    </section>
+
+    <section id="key">
+      <p class="eyebrow">C &mdash; the key alone</p>
+      <h2>Schemes 1 and 2 are one argument, not one feature</h2>
+
+      <p>
+        Both are the same call to the same function with a different key. No new storage, no
+        new network call, no new failure mode. In the touch point that decides whether a node
+        may promote itself to writer:
+      </p>
+
+      <pre class="listing rust"><u>// scheme 3 — what ships today</u>
+placement::owner(&amp;scope.to_string(), cell_id, &amp;live)
+
+<u>// scheme 1 — one writer per tenant: drop the cell from the key</u>
+placement::owner(&amp;scope.<b>namespace</b>.to_string(), <b>""</b>, &amp;live)
+
+<u>// scheme 2 — one writer for the whole fleet: hash a constant</u>
+placement::owner(<b>"_fleet"</b>, <b>""</b>, &amp;live)</pre>
+      <p class="caption">The signature is unchanged in all three. <code>GraphScope.namespace</code> is a public field (<code>src/core/namespace.rs:227</code>), so the tenant is already in hand at the call site.</p>
+
+      <p>
+        Scheme 1 says: two cells of the same tenant must not hash apart, so do not put the
+        cell in the key. Scheme 2 says: nothing must hash apart, so put nothing distinguishing
+        in the key at all &mdash; the constant exists only so that the winner still moves when
+        a node dies.
+      </p>
+
+      <p>
+        Two honest costs. <b>Neither scheme balances.</b> Rendezvous distributes keys evenly
+        only when there are many keys; with three tenants over four nodes, scheme 1 leaves one
+        node idle in this fixture and there is no rule preventing all three tenants from
+        landing on one node. Scheme 2 is that outcome by construction: one node does every
+        write and the others serve reads. And <b>scheme 1 needs one decision frozen with it</b>
+        &mdash; namespaces nest, so "the tenant" is either the root segment or the whole
+        namespace path. Pick one, and it becomes part of the key format, with everything that
+        implies in section G.
+      </p>
+    </section>
+
+    <section id="candidates">
+      <p class="eyebrow">D &mdash; the candidate set</p>
+      <h2>Scheme 4 is the only one that needs something new</h2>
+      <p class="lede">
+        And what it needs is not a mechanism. It is a few characters in an object name.
+      </p>
+
+      <p>
+        A dedicated writer per tenant means some nodes must be ineligible for some tenants.
+        The key stays exactly as it is in scheme 3; what changes is the third argument:
+      </p>
+
+      <pre class="listing rust"><u>// scheme 4 — same key, smaller candidate list</u>
+let candidates: Vec&lt;&amp;str&gt; = live
+    .iter()
+    .copied()
+    .filter(|n| <b>serves</b>(n, &amp;scope.namespace))
+    .collect();
+
+placement::owner(&amp;scope.to_string(), cell_id, &amp;candidates)</pre>
+
+      <p>
+        The only new thing is <code>serves</code>. A node has to state which tenants it will
+        write for, and every other node has to be able to read that statement, because
+        rendezvous only works when all of them compute over the same candidate list.
+      </p>
+
+      <h3>Put it in the object name, not the object body</h3>
+
+      <p>
+        Liveness already works by heartbeat: every node PUTs an object under
+        <code>&lt;base&gt;/_graph_nodes/v1/&lt;node-id&gt;</code> every five seconds, and a node counts as
+        live while its object is younger than fifteen. The placement path never fetches those
+        objects. It does one <b>LIST</b> &mdash; the object-store operation that returns keys
+        and their timestamps, and nothing else &mdash; and works from names and
+        <code>LastModified</code> alone.
+      </p>
+
+      <p>
+        That is the property worth protecting. If the served-tenant list lived in the body,
+        computing an owner would need a GET per node on a path that currently needs none, and
+        every one of those GETs would be a chance for the fleet's views to diverge. Putting it
+        in the name keeps the cost at exactly one LIST, unchanged:
+      </p>
+
+      <pre class="listing">_graph_nodes/v1/graph-node-0.<b>ag</b>     LastModified 2s ago
+_graph_nodes/v1/graph-node-1.<b>a</b>      LastModified 1s ago
+_graph_nodes/v1/graph-node-2.<b>gi</b>     LastModified 3s ago
+_graph_nodes/v1/graph-node-3.<b>i</b>      LastModified 4s ago
+
+a = acme   g = globex   i = initech</pre>
+      <p class="caption">The extension point named in docs/plans/2026-07-25-rendezvous-placement.md &sect;3: "if nodes ever serve different cell subsets, encode that in the object <em>name</em> so placement still needs no GETs."</p>
+
+      <p>
+        This is not invented here. Sleet, the reference implementation the crate was ported
+        from, already does exactly this: it writes <code>nodes/&lt;node_id&gt;.&lt;letters&gt;.json</code>,
+        where the letters are the services the node offers, sorted and deduplicated
+        (<code>../sleet/src/heartbeat.rs</code>, <code>object_name</code> and
+        <code>parse_object_name</code>). Its rule that unknown letters are ignored on parse is
+        the part to copy &mdash; it is what lets a new tenant letter roll out across a fleet
+        one pod at a time without old nodes rejecting the name.
+      </p>
+
+      <div class="widget wide" id="w2">
+        <div class="widget-head">
+          <span class="widget-id">W2</span>
+          <span class="widget-title">The candidate filter &mdash; a LIST, no GETs</span>
+        </div>
+        <div class="widget-body">
+          <div class="w2-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 720 190" role="img" aria-label="A LIST of four heartbeat object names encoding served tenants, and the candidate set derived from it">
+              <text class="t-strong" x="12" y="18">LIST _graph_nodes/v1/   &mdash;   4 keys, 0 bodies fetched</text>
+              <rect class="box" x="12" y="28" width="330" height="24" rx="2"></rect>
+              <text x="22" y="44">graph-node-0.ag        2s ago</text>
+              <rect class="box" x="12" y="56" width="330" height="24" rx="2"></rect>
+              <text x="22" y="72">graph-node-1.a         1s ago</text>
+              <rect class="box" x="12" y="84" width="330" height="24" rx="2"></rect>
+              <text x="22" y="100">graph-node-2.gi        3s ago</text>
+              <rect class="box" x="12" y="112" width="330" height="24" rx="2"></rect>
+              <text x="22" y="128">graph-node-3.i         4s ago</text>
+              <rect class="box accent" x="380" y="28" width="320" height="108" rx="2"></rect>
+              <text class="t-accent" x="392" y="48">tenant globex &mdash; candidates: node-0, node-2</text>
+              <text x="392" y="70">globex/graphs/orders  cell-a  &rarr;  graph-node-0</text>
+              <text x="392" y="88">globex/graphs/orders  cell-b  &rarr;  graph-node-0</text>
+              <text class="t-dim" x="392" y="112">node-1 and node-3 never enter the ranking:</text>
+              <text class="t-dim" x="392" y="126">their names do not carry the letter g.</text>
+              <text class="t-dim" x="12" y="162">Placement reads names and timestamps only. Adding served tenants to the name costs zero extra requests.</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript to change which tenants each node serves.</p>
+          </div>
+          <div class="w2-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> switch off every node that serves <code>globex</code>. The candidate set
+          empties, <code>owner</code> returns <code>None</code>, and globex has no writer at all
+          until a serving node comes back. Under scheme 3 the fallback is the rest of the fleet;
+          under scheme 4 there is no fallback, and that is the real price of a dedicated node.
+          Note the request counter: it stays at one LIST and zero GETs no matter how the letters
+          change.
+        </p>
+      </div>
+    </section>
+
+    <section id="pin">
+      <p class="eyebrow">E &mdash; where a pin belongs</p>
+      <h2>Inside the computation, never beside it</h2>
+
+      <p>
+        Scheme 4 is the honest answer to "when is pinning a writer actually needed" &mdash; it
+        is a real requirement that rendezvous over the whole fleet cannot express. But its shape
+        matters more than its existence.
+      </p>
+
+      <p>
+        A pin can live in two places. Inside <code>owner()</code>, as a filter on the candidate
+        set, it is a constraint the function honours, so the router and the node both derive the
+        same answer from the same code. Beside <code>owner()</code>, as an override in the
+        routing layer, it is a second opinion &mdash; and two opinions can disagree.
+      </p>
+
+      <p>
+        The repository already has the second kind, unused:
+        <code>with_preferred_writer_node</code> on the routing provider. It is harmless today
+        only because nothing enforces ownership yet. Once a node refuses writes for cells it does
+        not own, an override that contradicts placement produces this:
+      </p>
+
+      <pre class="listing incident">routing table says        writes for cell-a go to graph-node-2   <i>(override)</i>
+ensure_local_writer says  graph-node-2 does not own cell-a       <i>(rendezvous)</i>
+                          -&gt; NotCellWriter { owner: graph-node-0 }
+driver re-routes to graph-node-0, which the routing table never advertises
+                          -&gt; next ROUTE refresh sends it back to graph-node-2</pre>
+      <p class="caption">docs/plans/2026-07-25-rendezvous-placement-open-questions.md &sect;B &mdash; a routing loop no timeout breaks, from a misconfiguration that validates cleanly.</p>
+
+      <p>
+        The candidate filter cannot produce that loop, because there is no second source to
+        disagree with. Routing asks <code>owner()</code>, the node asks <code>owner()</code>, and
+        the filter is inside it. This is the whole reason the current design can absorb scheme 4
+        later without a redesign &mdash; and the reason the answer to "should we keep the
+        preferred-writer override for this" is no. The override and the filter look alike and are
+        opposites.
+      </p>
+    </section>
+
+    <section id="blast">
+      <p class="eyebrow">F &mdash; losing a node</p>
+      <h2>What a failure costs differs more than the steady state does</h2>
+
+      <p>
+        In the steady state the schemes differ in how concentrated writes are, which is visible
+        and easy to reason about. They differ more sharply, and less visibly, in what a single
+        dead node moves &mdash; and movement is what costs. Every reassignment is a
+        <b>handover</b>: the new owner opens the SlateDB writer, claims the next epoch, and
+        writes for that cell stall until it does.
+      </p>
+
+      <p>
+        Rendezvous has one property that makes any of this tolerable: removing a node does not
+        reshuffle the survivors, so a failure moves only the cells the dead node owned. That is
+        asserted directly in <code>removing_a_node_preserves_the_order_of_the_rest</code>
+        (<code>hash.rs:124&ndash;132</code>). The differences below come from the key, not from the
+        hash.
+      </p>
+
+      <div class="widget wide" id="w3">
+        <div class="widget-head">
+          <span class="widget-id">W3</span>
+          <span class="widget-title">Blast radius &mdash; kill a node, count what moves</span>
+        </div>
+        <div class="widget-body">
+          <div class="w3-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 720 175" role="img" aria-label="Cells moved under each scheme when graph-node-0 is killed">
+              <text class="t-strong" x="12" y="18">graph-node-0 dies &mdash; cells reassigned, out of 8</text>
+              <rect class="box" x="12" y="30" width="690" height="26" rx="2"></rect>
+              <text x="22" y="47">scheme 1   tenant only</text>
+              <text class="t-strong" x="230" y="47">3 of 8</text>
+              <text class="t-dim" x="300" y="47">all of acme, in one move</text>
+              <rect class="box" x="12" y="62" width="690" height="26" rx="2"></rect>
+              <text x="22" y="79">scheme 2   constant</text>
+              <text class="t-strong" x="230" y="79">0 of 8</text>
+              <text class="t-dim" x="300" y="79">node-0 was not the writer; kill node-3 and all 8 move</text>
+              <rect class="box ok" x="12" y="94" width="690" height="26" rx="2"></rect>
+              <text class="t-ok" x="22" y="111">scheme 3   tenant + cell</text>
+              <text class="t-ok" x="230" y="111">3 of 8</text>
+              <text class="t-ok" x="300" y="111">only the cells node-0 owned, spread over the survivors</text>
+              <rect class="box" x="12" y="126" width="690" height="26" rx="2"></rect>
+              <text x="22" y="143">scheme 4   tenant + cell, filtered</text>
+              <text class="t-strong" x="230" y="143">4 of 8</text>
+              <text class="t-dim" x="300" y="143">acme and globex only, onto their own remaining nodes</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript to kill any combination of nodes.</p>
+          </div>
+          <div class="w3-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> kill <code>graph-node-3</code>. Under scheme 2 every cell in the fleet moves
+          at once, because one node was doing all the writing; under scheme 3 nothing moves,
+          because it owned nothing. That asymmetry is scheme 2's whole risk profile: zero blast
+          radius until the one that matters, then total. Then kill both nodes serving one tenant
+          and watch scheme 4 report cells with no owner while scheme 3 keeps placing them.
+        </p>
+      </div>
+    </section>
+
+    <section id="frozen">
+      <p class="eyebrow">G &mdash; the frozen key</p>
+      <h2>The catch that applies to all four</h2>
+      <p class="lede">
+        A scheme is not a setting. Changing what goes into the hash reassigns the entire fleet
+        at once.
+      </p>
+
+      <p>
+        The key is a wire format. Every node computes ownership independently, which only
+        works while every node derives the same string from the same facts. Two versions that
+        build the key differently are two fleets that disagree about who owns each cell &mdash;
+        each convinced, each willing to promote itself, which is precisely the incident that
+        motivated the crate. That is why the four hex values are pinned by a unit test rather
+        than merely produced by one:
+      </p>
+
+      <div class="doctrine">
+        <p>
+          The hash and its key encoding are FROZEN, like a wire format. Changing either splits
+          a mixed-version fleet into two disagreeing views of who owns a cell, which is the
+          exact failure this crate exists to prevent.
+        </p>
+        <p class="attr">crates/placement/src/hash.rs:8&ndash;12</p>
+      </div>
+
+      <p>
+        So the schemes are not per-request, per-tenant, or per-deployment options. Moving from
+        one to another is a fleet-wide migration whose cost is the count of cells whose owner
+        changes, each one a writer handover, all of them at the moment the new binary's view
+        wins:
+      </p>
+
+      <div class="widget wide" id="w4">
+        <div class="widget-head">
+          <span class="widget-id">W4</span>
+          <span class="widget-title">Migration cost &mdash; changing the key reassigns the fleet</span>
+        </div>
+        <div class="widget-body">
+          <div class="w4-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 720 150" role="img" aria-label="Cells reassigned when migrating between schemes, out of eight">
+              <text class="t-strong" x="12" y="18">cells reassigned, out of 8, with all four nodes live</text>
+              <rect class="box" x="12" y="30" width="690" height="24" rx="2"></rect>
+              <text x="22" y="46">scheme 3  &rarr;  scheme 1</text>
+              <text class="t-strong" x="240" y="46">6 of 8 move</text>
+              <rect class="box" x="12" y="58" width="690" height="24" rx="2"></rect>
+              <text x="22" y="74">scheme 3  &rarr;  scheme 2</text>
+              <text class="t-crit" x="240" y="74">8 of 8 move</text>
+              <rect class="box" x="12" y="86" width="690" height="24" rx="2"></rect>
+              <text x="22" y="102">scheme 3  &rarr;  scheme 4</text>
+              <text class="t-strong" x="240" y="102">4 of 8 move</text>
+              <text class="t-dim" x="12" y="132">Every move is a writer handover. There is no partial rollout: the key is either the old one or the new one.</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript to pick any pair of schemes.</p>
+          </div>
+          <div class="w4-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> any pair. Note that scheme 4 is the cheapest migration away from scheme 3
+          &mdash; it keeps the key and only narrows the candidates, so cells already owned by a
+          serving node stay put. Note also that no pair is cheap enough to do casually, and that
+          during a rolling restart the two halves of the fleet compute <em>different</em> owners
+          for the moving cells, which is the mixed-version hazard the golden test guards.
+        </p>
+      </div>
+
+      <p>
+        Two consequences worth stating plainly. A scheme change needs a migration plan of its own
+        &mdash; either a drained flag day, or a versioned key negotiated fleet-wide before it takes
+        effect, which is more machinery than any of the schemes themselves. And whichever key ships
+        first is the one whose golden values get pinned, so the cheapest moment to choose is before
+        anything is running on it.
+      </p>
+    </section>
+
+  </main>
+
+  <footer class="handoff">
+    <p class="eyebrow">summary</p>
+    <h2>Take scheme 3, because it is the one you already have</h2>
+    <p>
+      Scheme 3 is built, tested and pinned, and it is the scheme that answers the production
+      incident: one cell, one computed writer, no ping-pong. Nothing about it forecloses the
+      others. Schemes 1 and 2 are the same call with a shorter key, and scheme 4 is the same key
+      with a filtered candidate list, fed by letters in a heartbeat object name that costs no
+      extra request to read.
+    </p>
+    <p>
+      The thing to carry forward is not the ranking of the four schemes but the shape of the
+      question. Every future placement request &mdash; per-region writers, tenant tiers, draining
+      a node before maintenance &mdash; arrives as one of the same two knobs, and the useful
+      reflex is to ask which one. If the answer is neither, it is not a placement change; it is a
+      second opinion about ownership, and that is the one thing this design cannot hold without
+      contradicting itself.
+    </p>
+  </footer>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ------------------------------------------------------------------ theme */
+
+  var root = document.documentElement;
+  var themeBtn = document.querySelector(".themetoggle");
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+
+  function currentTheme() {
+    return root.getAttribute("data-theme") || (media.matches ? "dark" : "light");
+  }
+
+  function labelTheme() {
+    var next = currentTheme() === "dark" ? "Light" : "Dark";
+    themeBtn.textContent = next;
+    themeBtn.setAttribute("aria-label", "Switch to " + next.toLowerCase() + " theme");
+  }
+
+  themeBtn.addEventListener("click", function () {
+    var next = currentTheme() === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("turbolay-theme", next); } catch (e) {}
+    labelTheme();
+  });
+
+  media.addEventListener("change", labelTheme);
+  labelTheme();
+
+  /* ------------------------------------------------------- shared utilities */
+
+  var SVGNS = "http://www.w3.org/2000/svg";
+
+  function s(name, attrs) {
+    var e = document.createElementNS(SVGNS, name);
+    if (attrs) for (var k in attrs) if (attrs[k] !== null && attrs[k] !== undefined) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+
+  function stext(x, y, str, cls, anchor) {
+    var e = s("text", { x: x, y: y, "text-anchor": anchor || "start" });
+    if (cls) e.setAttribute("class", cls);
+    e.textContent = str;
+    return e;
+  }
+
+  function h(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+
+  function button(label, cls) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn" + (cls ? " " + cls : "");
+    b.textContent = label;
+    return b;
+  }
+
+  function svgRoot(viewBox, label) {
+    var e = s("svg", { viewBox: viewBox, class: "wsvg", role: "img" });
+    e.setAttribute("aria-label", label);
+    return e;
+  }
+
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  function stat(key, tone) {
+    var d = h("div", "stat");
+    if (tone) d.setAttribute("data-tone", tone);
+    d.appendChild(h("span", "sk", key));
+    var v = h("span", "sv", "—");
+    d.appendChild(v);
+    d.valueNode = v;
+    return d;
+  }
+
+  function table(headers, cls) {
+    var wrap = h("div", "tablewrap");
+    wrap.style.margin = "0";
+    var t = document.createElement("table");
+    t.className = cls || "scoretbl";
+    var thead = document.createElement("thead");
+    var tr = document.createElement("tr");
+    headers.forEach(function (k) {
+      var th = document.createElement("th");
+      th.textContent = k;
+      tr.appendChild(th);
+    });
+    thead.appendChild(tr);
+    t.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    t.appendChild(tbody);
+    wrap.appendChild(t);
+    wrap.bodyNode = tbody;
+    return wrap;
+  }
+
+  function row(tbody, values, cls) {
+    var tr = document.createElement("tr");
+    if (cls) tr.className = cls;
+    values.forEach(function (v) {
+      var td = document.createElement("td");
+      if (v && v.nodeType === 1) td.appendChild(v);
+      else td.textContent = v;
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+    return tr;
+  }
+
+  function activate(id, staticSel, liveSel) {
+    var wrap = document.getElementById(id);
+    if (!wrap) return null;
+    var st = wrap.querySelector(staticSel);
+    var live = wrap.querySelector(liveSel);
+    if (!st || !live) return null;
+    st.hidden = true;
+    live.hidden = false;
+    return live;
+  }
+
+  /* ------------------------------------------------------ the frozen hash */
+  /* FNV-1a 64 over key segments joined by 0x00.
+     Mirrors crates/placement/src/hash.rs exactly, in BigInt. */
+
+  var MASK64 = 0xFFFFFFFFFFFFFFFFn;
+  var FNV_OFFSET = 0xcbf29ce484222325n;
+  var FNV_PRIME = 0x100000001b3n;
+  var encoder = new TextEncoder();
+  var NUL = "\u0000";   /* the 0x00 separator, frozen with the hash */
+
+  function fnv1a64(str) {
+    var hsh = FNV_OFFSET;
+    var bytes = encoder.encode(str);
+    for (var i = 0; i < bytes.length; i++) {
+      hsh ^= BigInt(bytes[i]);
+      hsh = (hsh * FNV_PRIME) & MASK64;
+    }
+    return hsh;
+  }
+
+  function score(scope, cellId, nodeId) {
+    return fnv1a64(scope + NUL + cellId + NUL + nodeId);
+  }
+
+  function rank(scope, cellId, live) {
+    return live.slice().sort(function (a, b) {
+      var sa = score(scope, cellId, a);
+      var sb = score(scope, cellId, b);
+      if (sa < sb) return 1;
+      if (sa > sb) return -1;
+      return a < b ? -1 : (a > b ? 1 : 0);
+    });
+  }
+
+  function owner(scope, cellId, live) {
+    var r = rank(scope, cellId, live);
+    return r.length ? r[0] : null;
+  }
+
+  function hex64(v) {
+    return "0x" + v.toString(16).padStart(16, "0");
+  }
+
+  /* --------------------------------------------- the golden self-check strip */
+
+  var GOLDEN = [
+    ["acme/graphs/social", "cell-a", "graph-node-0", "0xf0dc2317deb297c5"],
+    ["acme/graphs/social", "cell-a", "graph-node-1", "0xf0dc2217deb29612"],
+    ["acme/graphs/social", "cell-b", "graph-node-0", "0x39ffe3dd3cc79ffe"],
+    ["acme/graphs/other", "cell-a", "graph-node-0", "0xc15e57802a479f04"]
+  ];
+
+  (function goldenStrip() {
+    var strip = document.getElementById("goldlamps");
+    var note = document.getElementById("goldnote");
+    if (!strip) return;
+    var lamps = strip.querySelectorAll(".lamp");
+    var allMatch = true;
+    GOLDEN.forEach(function (g, i) {
+      var got = hex64(score(g[0], g[1], g[2]));
+      var ok = got === g[3];
+      if (!ok) allMatch = false;
+      var lamp = lamps[i];
+      if (!lamp) return;
+      lamp.setAttribute("data-on", ok ? "ok" : "crit");
+      var lv = lamp.querySelector(".lv");
+      if (lv) lv.textContent = got + (ok ? "  MATCH" : "  DIVERGED");
+    });
+    if (note) {
+      note.innerHTML = allMatch
+        ? "All four values pinned by <code>scores_are_frozen</code> (crates/placement/src/hash.rs:82&ndash;99) are reproduced in this page by the same FNV-1a 64 over the same key encoding. The widgets below use this function and nothing else."
+        : "This page's hash disagrees with the pinned Rust values, which means every number below it is wrong.";
+    }
+  })();
+
+  /* ------------------------------------------------------------- the fixture */
+
+  var NODES = ["graph-node-0", "graph-node-1", "graph-node-2", "graph-node-3"];
+
+  var TENANTS = [
+    { id: "acme",    letter: "a", scope: "acme/graphs/social",   cells: ["cell-a", "cell-b", "cell-c"] },
+    { id: "globex",  letter: "g", scope: "globex/graphs/orders", cells: ["cell-a", "cell-b"] },
+    { id: "initech", letter: "i", scope: "initech/graphs/main",  cells: ["cell-a", "cell-b", "cell-c"] }
+  ];
+
+  /* Which tenants each node writes for, in scheme 4. The default fixture. */
+  var DEFAULT_SERVES = {
+    "graph-node-0": { acme: true,  globex: true,  initech: false },
+    "graph-node-1": { acme: true,  globex: false, initech: false },
+    "graph-node-2": { acme: false, globex: true,  initech: true },
+    "graph-node-3": { acme: false, globex: false, initech: true }
+  };
+
+  function copyServes(src) {
+    var out = {};
+    NODES.forEach(function (n) {
+      out[n] = {};
+      TENANTS.forEach(function (t) { out[n][t.id] = src[n][t.id]; });
+    });
+    return out;
+  }
+
+  var FLEET_KEY = "_fleet";
+
+  var SCHEMES = [
+    {
+      n: 1,
+      name: "one writer per tenant",
+      keyLabel: "tenant",
+      candLabel: "all live nodes",
+      key: function (t) { return [t.id, ""]; }
+    },
+    {
+      n: 2,
+      name: "one writer for everything",
+      keyLabel: "a constant",
+      candLabel: "all live nodes",
+      key: function () { return [FLEET_KEY, ""]; }
+    },
+    {
+      n: 3,
+      name: "one writer per cell",
+      keyLabel: "tenant + cell",
+      candLabel: "all live nodes",
+      key: function (t, cell) { return [t.scope, cell]; }
+    },
+    {
+      n: 4,
+      name: "one writer per cell, inside the tenant's nodes",
+      keyLabel: "tenant + cell",
+      candLabel: "live nodes serving the tenant",
+      key: function (t, cell) { return [t.scope, cell]; },
+      filter: true
+    }
+  ];
+
+  function schemeByN(n) {
+    for (var i = 0; i < SCHEMES.length; i++) if (SCHEMES[i].n === n) return SCHEMES[i];
+    return SCHEMES[2];
+  }
+
+  /* The eight cells of the fixture, in a stable order. */
+  var CELLS = [];
+  TENANTS.forEach(function (t) {
+    t.cells.forEach(function (c) { CELLS.push({ tenant: t, cell: c }); });
+  });
+
+  function candidatesFor(scheme, tenant, live, serves) {
+    if (!scheme.filter) return live;
+    return live.filter(function (n) { return serves[n][tenant.id]; });
+  }
+
+  /* The single place ownership is decided for the whole page. */
+  function assign(scheme, live, serves) {
+    return CELLS.map(function (c) {
+      var k = scheme.key(c.tenant, c.cell);
+      var cand = candidatesFor(scheme, c.tenant, live, serves);
+      return {
+        tenant: c.tenant,
+        cell: c.cell,
+        scope: k[0],
+        keyCell: k[1],
+        candidates: cand,
+        owner: owner(k[0], k[1], cand)
+      };
+    });
+  }
+
+  function lettersFor(node, serves) {
+    var out = "";
+    TENANTS.forEach(function (t) { if (serves[node][t.id]) out += t.letter; });
+    return out;
+  }
+
+  function shortNode(n) { return n ? n.replace("graph-", "") : "—"; }
+
+  /* A key string with its 0x00 separators made visible. */
+  function keyLine(scopePart, cellPart, nodePart) {
+    var frag = document.createDocumentFragment();
+    function seg(txt, cls) {
+      var sp = document.createElement("span");
+      if (cls) sp.className = cls;
+      sp.textContent = txt;
+      frag.appendChild(sp);
+    }
+    seg(scopePart === "" ? '""' : scopePart);
+    seg("\\0", "sep");
+    seg(cellPart === "" ? '""' : cellPart);
+    seg("\\0", "sep");
+    seg(nodePart);
+    return frag;
+  }
+
+  /* ==================================================================== W1
+     The scheme switcher. One fleet, four partitions, one function. */
+
+  (function w1() {
+    var mount = activate("w1", ".w1-static", ".w1-live");
+    if (!mount) return;
+
+    var st = { scheme: 3, inspect: 0 };
+    var serves = copyServes(DEFAULT_SERVES);
+
+    /* -- controls -- */
+
+    var bar1 = h("div", "ctlbar");
+    bar1.appendChild(h("span", "ctl-label", "scheme"));
+    var schemeBtns = [];
+    SCHEMES.forEach(function (sc) {
+      var b = button(sc.n + " — " + sc.name);
+      b.setAttribute("aria-pressed", sc.n === st.scheme ? "true" : "false");
+      b.addEventListener("click", function () {
+        st.scheme = sc.n;
+        schemeBtns.forEach(function (o) {
+          o.setAttribute("aria-pressed", o.schemeN === st.scheme ? "true" : "false");
+        });
+        render();
+      });
+      b.schemeN = sc.n;
+      schemeBtns.push(b);
+      bar1.appendChild(b);
+    });
+    mount.appendChild(bar1);
+
+    var bar2 = h("div", "ctlbar");
+    bar2.appendChild(h("span", "ctl-label", "inspect cell"));
+    var sel = document.createElement("select");
+    sel.className = "field";
+    sel.setAttribute("aria-label", "cell to score in detail");
+    CELLS.forEach(function (c, i) {
+      var o = document.createElement("option");
+      o.value = String(i);
+      o.textContent = c.tenant.id + " / " + c.cell;
+      sel.appendChild(o);
+    });
+    sel.value = "0";
+    sel.addEventListener("change", function () { st.inspect = parseInt(sel.value, 10); render(); });
+    bar2.appendChild(sel);
+    mount.appendChild(bar2);
+
+    /* -- panels -- */
+
+    var svgHost = h("div");
+    mount.appendChild(svgHost);
+
+    var key = h("div", "keyline");
+    mount.appendChild(key);
+
+    var tbl = table(["rank", "candidate", "score (FNV-1a 64)", "relative magnitude", "verdict"]);
+    tbl.style.marginTop = "14px";
+    mount.appendChild(tbl);
+
+    var stats = h("div", "stats");
+    var sWriters = stat("writers used", "accent");
+    var sBusiest = stat("busiest node");
+    var sIdle = stat("idle nodes");
+    var sOrphan = stat("cells with no owner");
+    [sWriters, sBusiest, sIdle, sOrphan].forEach(function (x) { stats.appendChild(x); });
+    mount.appendChild(stats);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    /* -- drawing -- */
+
+    var TWO64 = Math.pow(2, 64);
+
+    function draw(a, scheme) {
+      clear(svgHost);
+      var top = 26;
+      var rowH = 22;
+      var rowGap = 4;
+      var headH = 20;
+      var y = top;
+      var cellY = {};
+      var svg = svgRoot("0 0 720 340", "Cell to node ownership under scheme " + scheme.n);
+
+      svg.appendChild(stext(10, 14, "cells", "t-dim"));
+      svg.appendChild(stext(470, 14, "nodes", "t-dim"));
+
+      /* left column: tenants and their cells */
+      TENANTS.forEach(function (t) {
+        svg.appendChild(stext(10, y + 10, t.scope, "t-strong"));
+        y += headH;
+        t.cells.forEach(function (c) {
+          var idx = CELLS.findIndex(function (x) { return x.tenant.id === t.id && x.cell === c; });
+          var rec = a[idx];
+          var boxCls = rec.owner ? "box" : "box crit";
+          if (idx === st.inspect) boxCls = "box accent";
+          svg.appendChild(s("rect", { x: 18, y: y, width: 200, height: rowH, rx: 2, class: boxCls }));
+          svg.appendChild(stext(28, y + 15, c, idx === st.inspect ? "t-accent" : null));
+          svg.appendChild(stext(208, y + 15, rec.owner ? "" : "no owner", "t-crit", "end"));
+          cellY[idx] = y + rowH / 2;
+          y += rowH + rowGap;
+        });
+        y += 6;
+      });
+
+      var bottom = y;
+
+      /* right column: nodes */
+      var load = {};
+      NODES.forEach(function (n) { load[n] = 0; });
+      a.forEach(function (r) { if (r.owner) load[r.owner] += 1; });
+
+      var nodeBoxH = 40;
+      var nodeGap = (bottom - top - NODES.length * nodeBoxH) / (NODES.length - 1);
+      if (nodeGap < 10) nodeGap = 10;
+      var nodeY = {};
+      NODES.forEach(function (n, i) {
+        var ny = top + i * (nodeBoxH + nodeGap);
+        nodeY[n] = ny + nodeBoxH / 2;
+        var cls = load[n] > 0 ? "box accent" : "box dim";
+        svg.appendChild(s("rect", { x: 470, y: ny, width: 240, height: nodeBoxH, rx: 2, class: cls }));
+        svg.appendChild(stext(482, ny + 16, n, load[n] > 0 ? "t-accent" : "t-dim"));
+        var sub = load[n] + (load[n] === 1 ? " cell" : " cells");
+        if (scheme.filter) sub += "   serves " + (lettersFor(n, serves) || "nothing");
+        svg.appendChild(stext(482, ny + 31, sub, "t-dim"));
+      });
+
+      /* arrows */
+      a.forEach(function (r, idx) {
+        if (!r.owner) return;
+        var y1 = cellY[idx];
+        var y2 = nodeY[r.owner];
+        var x1 = 218;
+        var x2 = 470;
+        var mx = (x1 + x2) / 2;
+        var cls = idx === st.inspect ? "wire accent" : "wire faint";
+        svg.appendChild(s("path", {
+          d: "M" + x1 + " " + y1 + " C " + mx + " " + y1 + " " + mx + " " + y2 + " " + (x2 - 7) + " " + y2,
+          class: cls
+        }));
+        svg.appendChild(s("path", {
+          d: "M" + x2 + " " + y2 + " l -7 -3.5 l 0 7 z",
+          class: idx === st.inspect ? "fillaccent" : "wire faint"
+        }));
+      });
+
+      svg.setAttribute("viewBox", "0 0 720 " + Math.max(bottom + 10, 300));
+      svgHost.appendChild(svg);
+    }
+
+    function render() {
+      var scheme = schemeByN(st.scheme);
+      var a = assign(scheme, NODES, serves);
+      draw(a, scheme);
+
+      /* key panel */
+      clear(key);
+      var lbl = h("span", "lbl", "scheme " + scheme.n + " — the string being hashed, per candidate");
+      key.appendChild(lbl);
+      var rec = a[st.inspect];
+      key.appendChild(document.createTextNode("key template   "));
+      key.appendChild(keyLine(scheme.keyLabel, scheme.n <= 2 ? "" : "cell", "node_id"));
+      key.appendChild(document.createTextNode("\n" + rec.tenant.id + " / " + rec.cell + "     "));
+      key.appendChild(keyLine(rec.scope, rec.keyCell, "<node_id>"));
+      var candTxt = "\ncandidates     " + scheme.candLabel + " — " +
+        (rec.candidates.length ? rec.candidates.map(shortNode).join(", ") : "none");
+      key.appendChild(document.createTextNode(candTxt));
+
+      /* score table for the inspected cell */
+      clear(tbl.bodyNode);
+      var ranked = rank(rec.scope, rec.keyCell, NODES);
+      ranked.forEach(function (n) {
+        var eligible = rec.candidates.indexOf(n) !== -1;
+        var sc = score(rec.scope, rec.keyCell, n);
+        var pos = rec.candidates.length ? rank(rec.scope, rec.keyCell, rec.candidates).indexOf(n) : -1;
+        var barTd = h("span", "bar");
+        barTd.style.width = Math.max(2, Math.round((Number(sc) / TWO64) * 100)) + "%";
+        var tr = row(tbl.bodyNode, [
+          eligible ? String(pos + 1) : "—",
+          n,
+          hex64(sc),
+          barTd,
+          eligible ? (n === rec.owner ? "OWNER" : "standby") : "not a candidate"
+        ], eligible ? (n === rec.owner ? "win" : "") : "dead");
+        tr.cells[3].className = "bar-td";
+      });
+
+      /* stats */
+      var load = {};
+      NODES.forEach(function (n) { load[n] = 0; });
+      var orphans = 0;
+      a.forEach(function (r) { if (r.owner) load[r.owner] += 1; else orphans += 1; });
+      var used = NODES.filter(function (n) { return load[n] > 0; });
+      var busiest = NODES.slice().sort(function (x, y) { return load[y] - load[x]; })[0];
+      sWriters.valueNode.textContent = used.length + " / " + NODES.length;
+      sBusiest.valueNode.textContent = shortNode(busiest) + "  " + load[busiest];
+      sIdle.valueNode.textContent = String(NODES.length - used.length);
+      sOrphan.valueNode.textContent = String(orphans);
+      sOrphan.setAttribute("data-tone", orphans ? "crit" : "");
+
+      /* readout */
+      var perTenant = TENANTS.map(function (t) {
+        var owners = {};
+        a.forEach(function (r) { if (r.tenant.id === t.id && r.owner) owners[r.owner] = 1; });
+        return t.id + ": " + Object.keys(owners).length + " writer" + (Object.keys(owners).length === 1 ? "" : "s");
+      }).join("   ");
+      var msg = "<b>Scheme " + scheme.n + "</b> — " + scheme.name + ". Writers per tenant &mdash; " + perTenant + ".";
+      if (scheme.n === 3) {
+        msg += " This is <b>hash.rs as it stands</b>: the call is <b>owner(scope, cell_id, live)</b> with nothing added.";
+      } else if (scheme.n === 1) {
+        msg += " Same function, cell argument empty. Every cell of a tenant hashes identically, so they cannot land apart.";
+      } else if (scheme.n === 2) {
+        msg += " Same function, constant key. Nothing distinguishes the cells, so one node wins all of them.";
+      } else {
+        msg += " Same key as scheme 3; only the candidate list is narrower. Cells whose serving nodes are unchanged do not move.";
+      }
+      note.innerHTML = msg;
+    }
+
+    render();
+  })();
+
+  /* ==================================================================== W2
+     The candidate filter, derived from heartbeat object names alone. */
+
+  (function w2() {
+    var mount = activate("w2", ".w2-static", ".w2-live");
+    if (!mount) return;
+
+    var serves = copyServes(DEFAULT_SERVES);
+    var st = { tenant: "globex" };
+    var AGE = { "graph-node-0": 2, "graph-node-1": 1, "graph-node-2": 3, "graph-node-3": 4 };
+
+    var bar1 = h("div", "ctlbar");
+    bar1.appendChild(h("span", "ctl-label", "placing for"));
+    var tBtns = [];
+    TENANTS.forEach(function (t) {
+      var b = button(t.id);
+      b.setAttribute("aria-pressed", t.id === st.tenant ? "true" : "false");
+      b.addEventListener("click", function () {
+        st.tenant = t.id;
+        tBtns.forEach(function (o) { o.setAttribute("aria-pressed", o.tid === st.tenant ? "true" : "false"); });
+        render();
+      });
+      b.tid = t.id;
+      tBtns.push(b);
+      bar1.appendChild(b);
+    });
+    mount.appendChild(bar1);
+
+    mount.appendChild(h("div", "ctl-label", "which tenants each node writes for"));
+    var grid = h("div", "servegrid");
+    grid.style.marginTop = "8px";
+    NODES.forEach(function (n) {
+      var r = h("div", "serverow");
+      r.appendChild(h("span", "rowlab", n));
+      TENANTS.forEach(function (t) {
+        var c = document.createElement("button");
+        c.type = "button";
+        c.className = "nodechip";
+        c.textContent = t.id;
+        c.setAttribute("aria-pressed", serves[n][t.id] ? "true" : "false");
+        c.setAttribute("aria-label", n + " serves " + t.id);
+        c.addEventListener("click", function () {
+          serves[n][t.id] = !serves[n][t.id];
+          c.setAttribute("aria-pressed", serves[n][t.id] ? "true" : "false");
+          render();
+        });
+        r.appendChild(c);
+      });
+      grid.appendChild(r);
+    });
+    mount.appendChild(grid);
+
+    var listPane = h("div", "keyline");
+    mount.appendChild(listPane);
+
+    var tbl = table(["cell", "candidates from the LIST", "owner"]);
+    tbl.style.marginTop = "14px";
+    mount.appendChild(tbl);
+
+    var stats = h("div", "stats");
+    var sList = stat("LIST calls", "accent");
+    var sGets = stat("GETs on the placement path", "ok");
+    var sCand = stat("candidates for this tenant");
+    var sOrph = stat("cells with no owner");
+    [sList, sGets, sCand, sOrph].forEach(function (x) { stats.appendChild(x); });
+    mount.appendChild(stats);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    function render() {
+      var tenant = TENANTS.filter(function (t) { return t.id === st.tenant; })[0];
+      var scheme4 = schemeByN(4);
+
+      /* the LIST, names only */
+      clear(listPane);
+      listPane.appendChild(h("span", "lbl", "LIST _graph_nodes/v1/ — keys and LastModified, no bodies"));
+      NODES.forEach(function (n) {
+        var letters = lettersFor(n, serves);
+        var line = "_graph_nodes/v1/" + n + "." + (letters || "—") +
+          "        " + AGE[n] + "s ago";
+        listPane.appendChild(document.createTextNode(line + "\n"));
+      });
+      listPane.appendChild(document.createTextNode("\na = acme   g = globex   i = initech\n"));
+
+      var cands = NODES.filter(function (n) { return serves[n][tenant.id]; });
+
+      clear(tbl.bodyNode);
+      var orphans = 0;
+      tenant.cells.forEach(function (c) {
+        var o = owner(tenant.scope, c, cands);
+        if (!o) orphans += 1;
+        row(tbl.bodyNode, [
+          tenant.scope + "  " + c,
+          cands.length ? cands.map(shortNode).join(", ") : "none",
+          o || "None — placement has no opinion"
+        ], o ? "win" : "gone");
+      });
+
+      sList.valueNode.textContent = "1";
+      sGets.valueNode.textContent = "0";
+      sCand.valueNode.textContent = cands.length + " / " + NODES.length;
+      sOrph.valueNode.textContent = String(orphans);
+      sOrph.setAttribute("data-tone", orphans ? "crit" : "");
+
+      var msg;
+      if (!cands.length) {
+        msg = "<b class='bad'>No node serves " + tenant.id + ".</b> The candidate set is empty, " +
+          "<b>owner()</b> returns None for every one of its cells, and nothing places its writes. " +
+          "Under scheme 3 the candidate set is the whole fleet and this state cannot occur; " +
+          "under scheme 4 it is the price of the dedication.";
+      } else if (cands.length === 1) {
+        msg = "<b>" + shortNode(cands[0]) + " is the only node serving " + tenant.id + "</b>, so it owns every " +
+          tenant.id + " cell and there is no survivor to fail over to. A dedicated writer with no second " +
+          "candidate is a single point of failure by design, not by accident.";
+      } else {
+        msg = "Candidates come from the <b>names</b> in the LIST result — the letters after the node id — " +
+          "so narrowing placement to " + cands.length + " nodes costs <b>zero</b> extra object-store requests. " +
+          "The bodies are observability and are never fetched here.";
+      }
+      note.innerHTML = msg;
+    }
+
+    render();
+  })();
+
+  /* ==================================================================== W3
+     Blast radius: kill nodes, count what each scheme moves. */
+
+  (function w3() {
+    var mount = activate("w3", ".w3-static", ".w3-live");
+    if (!mount) return;
+
+    var serves = copyServes(DEFAULT_SERVES);
+    var dead = {};
+    NODES.forEach(function (n) { dead[n] = false; });
+
+    var bar = h("div", "ctlbar");
+    bar.appendChild(h("span", "ctl-label", "live set"));
+    var chips = h("div", "chips");
+    var chipEls = [];
+    NODES.forEach(function (n) {
+      var c = document.createElement("button");
+      c.type = "button";
+      c.className = "nodechip";
+      c.textContent = n + " · " + (lettersFor(n, serves) || "—");
+      c.setAttribute("aria-pressed", "true");
+      c.setAttribute("aria-label", "toggle " + n + " alive or dead");
+      c.addEventListener("click", function () {
+        dead[n] = !dead[n];
+        c.setAttribute("aria-pressed", dead[n] ? "false" : "true");
+        render();
+      });
+      chipEls.push(c);
+      chips.appendChild(c);
+    });
+    bar.appendChild(chips);
+    var reset = button("all alive");
+    reset.addEventListener("click", function () {
+      NODES.forEach(function (n, i) {
+        dead[n] = false;
+        chipEls[i].setAttribute("aria-pressed", "true");
+      });
+      render();
+    });
+    bar.appendChild(reset);
+    mount.appendChild(bar);
+
+    var tbl = table(["scheme", "key", "cells moved", "share of fleet", "who is affected"]);
+    mount.appendChild(tbl);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    function render() {
+      var live = NODES.filter(function (n) { return !dead[n]; });
+      clear(tbl.bodyNode);
+
+      var results = SCHEMES.map(function (scheme) {
+        var before = assign(scheme, NODES, serves);
+        var after = assign(scheme, live, serves);
+        var moved = 0, orphaned = 0;
+        var tenants = {};
+        before.forEach(function (b, i) {
+          var a = after[i];
+          if (b.owner !== a.owner) {
+            moved += 1;
+            tenants[b.tenant.id] = 1;
+            if (!a.owner) orphaned += 1;
+          }
+        });
+        return { scheme: scheme, moved: moved, orphaned: orphaned, tenants: Object.keys(tenants) };
+      });
+
+      results.forEach(function (r) {
+        var bar = h("span", "bar");
+        bar.style.width = Math.round((r.moved / CELLS.length) * 100) + "%";
+        var who = r.moved === 0 ? "nothing moves"
+          : r.tenants.join(", ") + (r.orphaned ? "  (" + r.orphaned + " left with no owner)" : "");
+        var cls = "";
+        if (r.orphaned) cls = "gone";
+        else if (r.moved === CELLS.length) cls = "moved";
+        else if (r.moved === 0) cls = "win";
+        var tr = row(tbl.bodyNode, [
+          "scheme " + r.scheme.n,
+          r.scheme.keyLabel,
+          r.moved + " of " + CELLS.length,
+          bar,
+          who
+        ], cls);
+        tr.cells[3].className = "bar-td";
+      });
+
+      var deadList = NODES.filter(function (n) { return dead[n]; });
+      var msg;
+      if (!deadList.length) {
+        msg = "All four nodes live. Nothing has moved under any scheme — this is the baseline the rows are diffed against.";
+      } else {
+        var s2 = results[1];
+        var s3 = results[2];
+        msg = "<b>Down: " + deadList.map(shortNode).join(", ") + ".</b> " +
+          "Scheme 2 moves <b>" + s2.moved + "</b> cells, scheme 3 moves <b>" + s3.moved + "</b>. " +
+          "Scheme 2 is all-or-nothing because one node holds every cell; scheme 3 moves only what the dead nodes owned, " +
+          "which is why the ordering of the survivors has to be stable. Each moved cell is one writer handover.";
+      }
+      note.innerHTML = msg;
+    }
+
+    render();
+  })();
+
+  /* ==================================================================== W4
+     Migration cost: changing the key reassigns the fleet at once. */
+
+  (function w4() {
+    var mount = activate("w4", ".w4-static", ".w4-live");
+    if (!mount) return;
+
+    var serves = copyServes(DEFAULT_SERVES);
+    var st = { from: 3, to: 1 };
+
+    function picker(label, initial, onChange) {
+      var wrap = h("span");
+      wrap.style.display = "inline-flex";
+      wrap.style.alignItems = "center";
+      wrap.style.gap = "8px";
+      wrap.appendChild(h("span", "ctl-label", label));
+      var sel = document.createElement("select");
+      sel.className = "field";
+      sel.setAttribute("aria-label", label);
+      SCHEMES.forEach(function (sc) {
+        var o = document.createElement("option");
+        o.value = String(sc.n);
+        o.textContent = "scheme " + sc.n + " — " + sc.keyLabel +
+          (sc.filter ? ", filtered" : "");
+        sel.appendChild(o);
+      });
+      sel.value = String(initial);
+      sel.addEventListener("change", function () { onChange(parseInt(sel.value, 10)); });
+      wrap.appendChild(sel);
+      return wrap;
+    }
+
+    var bar = h("div", "ctlbar");
+    bar.appendChild(picker("from", st.from, function (v) { st.from = v; render(); }));
+    bar.appendChild(picker("to", st.to, function (v) { st.to = v; render(); }));
+    mount.appendChild(bar);
+
+    var stats = h("div", "stats");
+    stats.style.margin = "0 0 14px";
+    var sMoved = stat("cells reassigned", "high");
+    var sShare = stat("share of the fleet");
+    var sHand = stat("writer handovers");
+    var sStay = stat("cells that stay put", "ok");
+    [sMoved, sShare, sHand, sStay].forEach(function (x) { stats.appendChild(x); });
+    mount.appendChild(stats);
+
+    var tbl = table(["cell", "old owner", "new owner", ""]);
+    mount.appendChild(tbl);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    function render() {
+      var from = schemeByN(st.from);
+      var to = schemeByN(st.to);
+      var a = assign(from, NODES, serves);
+      var b = assign(to, NODES, serves);
+
+      clear(tbl.bodyNode);
+      var moved = 0;
+      a.forEach(function (x, i) {
+        var y = b[i];
+        var changed = x.owner !== y.owner;
+        if (changed) moved += 1;
+        row(tbl.bodyNode, [
+          x.tenant.id + " / " + x.cell,
+          x.owner || "none",
+          y.owner || "none",
+          changed ? "handover" : "unchanged"
+        ], changed ? (y.owner ? "moved" : "gone") : "win");
+      });
+
+      sMoved.valueNode.textContent = moved + " of " + CELLS.length;
+      sShare.valueNode.textContent = Math.round((moved / CELLS.length) * 100) + "%";
+      sHand.valueNode.textContent = String(moved);
+      sStay.valueNode.textContent = String(CELLS.length - moved);
+
+      var msg;
+      if (from.n === to.n) {
+        msg = "Same scheme on both sides: nothing moves. Every other pair on this control is a migration.";
+      } else {
+        msg = "<b>" + moved + " of " + CELLS.length + " cells change owner</b> the moment the key changes, " +
+          "all at once, each one a writer handover. There is no per-tenant or per-request switch here — " +
+          "the key is either the old one or the new one, fleet-wide.";
+        if (from.n === 3 && to.n === 4) {
+          msg += " This pair is the cheap one: the key is identical and only the candidate list narrows, " +
+            "so a cell already owned by a serving node stays where it is.";
+        }
+        msg += " During a rolling restart the two halves of the fleet compute different owners for exactly these " +
+          "cells, which is the mixed-version split the pinned golden test exists to make impossible by accident.";
+      }
+      note.innerHTML = msg;
+    }
+
+    render();
+  })();
+
+})();
+</script>
+
+</body>
+</html>
