@@ -55,6 +55,8 @@ pub struct RuntimeConfig {
     pub max_cursor_buffer_bytes: u64,
     pub cursor_ttl: Duration,
     pub max_bolt_connections: usize,
+    pub bolt_idle_timeout: Duration,
+    pub bolt_max_connection_age: Duration,
     pub default_page_size: usize,
     pub graceful_shutdown_timeout: Duration,
 }
@@ -229,6 +231,16 @@ impl RuntimeConfig {
             )?,
             cursor_ttl: parse_duration(&values, "GRAPH_CURSOR_TTL_MS", 60_000)?,
             max_bolt_connections: parse_usize(&values, "GRAPH_MAX_BOLT_CONNECTIONS", 4_096)?,
+            bolt_idle_timeout: parse_duration(
+                &values,
+                "GRAPH_BOLT_IDLE_TIMEOUT_MS",
+                15 * 60 * 1_000,
+            )?,
+            bolt_max_connection_age: parse_duration(
+                &values,
+                "GRAPH_BOLT_MAX_CONNECTION_AGE_MS",
+                60 * 60 * 1_000,
+            )?,
             default_page_size: parse_usize(&values, "GRAPH_DEFAULT_PAGE_SIZE", 1_024)?,
             graceful_shutdown_timeout: parse_duration(
                 &values,
@@ -450,8 +462,6 @@ fn invalid<T>(message: impl Into<String>) -> ConfigResult<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn production_runtime_requires_tls() {
         let values = BTreeMap::from([("GRAPH_AUTH_TOKEN_FILE".to_string(), "/token".to_string())]);
@@ -475,6 +485,8 @@ mod tests {
         assert_eq!(config.index_discovery_interval, Duration::from_secs(5));
         assert_eq!(config.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(config.heartbeat_timeout, Duration::from_secs(15));
+        assert_eq!(config.bolt_idle_timeout, Duration::from_secs(15 * 60));
+        assert_eq!(config.bolt_max_connection_age, Duration::from_secs(60 * 60));
         let memory = config.graph_memory_config();
         assert_eq!(memory.max_graphblas_bytes, 128 * 1024 * 1024);
         assert_eq!(memory.max_matrix_adjacency_bytes, 0);

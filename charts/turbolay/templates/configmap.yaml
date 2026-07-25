@@ -54,6 +54,8 @@ data:
   GRAPH_MAX_CURSOR_BUFFER_BYTES: {{ include "turbolay.decimalInteger" .Values.runtime.maxCursorBufferBytes | quote }}
   GRAPH_CURSOR_TTL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.cursorTtlMs | quote }}
   GRAPH_MAX_BOLT_CONNECTIONS: {{ include "turbolay.decimalInteger" .Values.runtime.maxBoltConnections | quote }}
+  GRAPH_BOLT_IDLE_TIMEOUT_MS: {{ include "turbolay.decimalInteger" .Values.runtime.boltIdleTimeoutMs | quote }}
+  GRAPH_BOLT_MAX_CONNECTION_AGE_MS: {{ include "turbolay.decimalInteger" .Values.runtime.boltMaxConnectionAgeMs | quote }}
   GRAPH_DEFAULT_PAGE_SIZE: {{ include "turbolay.decimalInteger" .Values.runtime.defaultPageSize | quote }}
   GRAPH_GRACEFUL_SHUTDOWN_MS: {{ include "turbolay.decimalInteger" .Values.runtime.gracefulShutdownMs | quote }}
   GRAPH_TRIM_MEMORY_AFTER_HYDRATION: {{ .Values.runtime.trimMemoryAfterHydration | quote }}
