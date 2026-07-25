@@ -400,6 +400,7 @@ mod tests {
             max_matrix_artifacts: 1,
             max_matrix_adjacencies: 1,
             max_graphblas_matrices: 1,
+            sparse_kernel: crate::SparseKernelBackend::SuiteSparse,
             #[cfg(feature = "opencypher")]
             max_parsed_row_queries: 1,
             #[cfg(feature = "opencypher")]

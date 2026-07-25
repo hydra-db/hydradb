@@ -1,6 +1,6 @@
 ---
 title: Sparse kernel backend consolidation
-status: step-1-complete
+status: step-2-complete
 date: 2026-07-25
 branch: Turbolay-V3.5
 base_commit: 989cc72
@@ -66,6 +66,7 @@ three representations that could not be changed at runtime.
 Behaviour is unchanged, because `default` already enabled the feature. Kernel 1
 stays reachable at runtime via `SparseKernelBackend::RustSparse` and the
 `None`-fallthrough in `shard::query`; kernel 2 via `GRAPH_COMPILED_KERNEL=compact`.
+(Step 2 renamed that variant to `Adjacency` and added `GRAPH_SPARSE_KERNEL`.)
 
 ### Two bugs surfaced on the way
 
@@ -106,24 +107,55 @@ mean adopting `GxB_Context`.
 `chaos-harness` feature sets. Regression-checked by building a worktree at
 `989cc72` and diffing the failing test-name sets.
 
-## Step 2 — one runtime switch (not started)
+## Step 2 — one runtime switch (done)
 
-1. Replace `SparseKernelBackend` (2 variants) and `use_compact_kernel: bool`
-   with a single 3-valued `SparseKernel` enum: `Adjacency`, `CompactCsc`,
-   `SuiteSparse`.
-2. Add a `sparse_kernel: SparseKernel` field to `GraphCachePolicy`, defaulting
-   to `SuiteSparse`, parsed in `bin/graph_node/config.rs` beside
-   `max_graphblas_matrices`.
-3. Make `CompiledGraphBlasMatrix::new_from_csc` take the kernel as a parameter
-   instead of reading `use_compact_csc_kernel()` from the environment. Config is
-   read **once**, at matrix-compile time, and baked into the artifact.
-4. Have `default_matrix_kernel()` return the configured value. `Adjacency` makes
-   the compiled builders skip and `shard::query` return `None`, which the
-   existing fallthrough already handles.
-5. Report the executed kernel truthfully on `SparseTraversal.backend`. Kernel 2
-   currently reports `RustSparse`, indistinguishable from kernel 1, so telemetry
-   cannot today tell whether a query ran compiled or uncompiled.
-6. Verify by running the suite once per kernel value.
+The two incompatible runtime representations are now one. `SparseKernelBackend`
+keeps its name — it is public API, re-exported at `lib.rs` and used by
+`core::snapshot` — but has three variants, `Adjacency` / `CompactCsc` /
+`SuiteSparse`, and `use_compact_kernel: bool` is gone.
+
+| Change | Where |
+|---|---|
+| 3-valued enum, `Default` = `SuiteSparse` | `sparse_kernel/mod.rs` |
+| `sparse_kernel: SparseKernelBackend` on `GraphCachePolicy` | `core/metrics.rs` |
+| `GRAPH_SPARSE_KERNEL` = `adjacency`\|`compact`\|`suitesparse` | `bin/graph_node/config.rs` |
+| `kernel: SparseKernelBackend` field replaces the bool | `sparse_kernel/graphblas.rs` |
+| Constructors take the kernel; no env read | `new`, `new_from_csc`, `new_from_csc_owned`, `new_from_compact_u32` |
+| `default_matrix_kernel(&GraphCachePolicy)` | `engine/traversal.rs`, `engine/verify.rs`, `engine/artifact_build.rs`, `engine/matrix_cache.rs`, `shard/query.rs` |
+
+**Read-once.** The constructors no longer call `use_compact_csc_kernel()`. They
+take the kernel, narrow it through `compiled_kernel()` (kernel 1 has no compiled
+form, so it lands on the compact rung as a guard), store it on the artifact, and
+every downstream dispatch reads `self.kernel`.
+
+**`GRAPH_COMPILED_KERNEL` survives as a fallback.** `default_matrix_kernel` is
+the single place that reads it, and only while the policy is still at its
+default — an explicit `GRAPH_SPARSE_KERNEL` wins. `compact_csc_kernel_enabled()`
+was deleted; `matrix_cache` now branches on the resolved kernel instead.
+
+**`Adjacency` skips compilation.** Both artifact builders guard on
+`kernel != Adjacency`, `cached_graphblas_matrix` returns `Ok(None)` early, and
+the three `*_with_compiled_graph_kernel` methods in `shard::query` return
+`Ok(None)` before doing any artifact lookup. `matrix_reachable_with_kernel` now
+takes the compiled path for *both* compiled rungs (`!= Adjacency`) rather than
+for `SuiteSparse` alone.
+
+**Telemetry.** `CompiledCompactCscMatrix` reported `RustSparse`, making kernel 2
+indistinguishable from kernel 1; it now reports `CompactCsc`. `expand_rust` /
+`expand_range_rust` and the storage-frontier walk report `Adjacency`; the native
+paths report `SuiteSparse`. `expand_range_with_overlay` used to hard-code
+`SuiteSparseGraphBlas` even when running on the compact kernel — it now asks the
+compiled matrix, via `compiled_graphblas_kernel()`.
+
+**Known wrinkle.** `matrix_reachable_with_kernel` still takes a kernel argument,
+but a compiled artifact's kernel comes from the policy, not from that argument.
+So the argument decides compiled-vs-uncompiled routing only; passing
+`CompactCsc` against a `SuiteSparse` policy runs and reports SuiteSparse. That
+is the read-once invariant working as designed, not a bug, but it means the
+argument is weaker than its name suggests.
+
+Step 6 of the original plan — running the suite once per kernel value — is left
+to verification, not implementation.
 
 ## Step 3 — `CompiledKernel` trait (optional until a fourth engine appears)
 

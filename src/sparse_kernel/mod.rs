@@ -50,15 +50,31 @@
 //!
 //! # Selecting a kernel
 //!
+//! One 3-valued enum, [`SparseKernelBackend`], names the rungs. It is carried
+//! by `GraphCachePolicy::sparse_kernel` (default [`SparseKernelBackend::SuiteSparse`],
+//! parsed from `GRAPH_SPARSE_KERNEL` in `bin/graph_node/config.rs`), and
+//! [`default_matrix_kernel`] resolves the policy into the kernel a shard should
+//! use. The legacy `GRAPH_COMPILED_KERNEL=compact` environment override still
+//! applies, but only while the policy is left at its default.
+//!
 //! The choice is resolved once, at matrix-compile time, and baked into the
-//! compiled artifact; downstream code asks the artifact what it is rather than
-//! re-reading configuration. Keeping that invariant is what makes the kernel
-//! set cheap to extend — adding a rung to the ladder should not require
-//! touching call sites.
+//! compiled artifact: `CompiledGraphBlasMatrix` stores the resolved
+//! `SparseKernelBackend` it was built with and dispatches on that field, so
+//! downstream code asks the artifact what it is rather than re-reading
+//! configuration. Keeping that invariant is what makes the kernel set cheap to
+//! extend — adding a rung to the ladder should not require touching call sites.
+//!
+//! Kernel 1 has no compiled form, so `SparseKernelBackend::Adjacency` is
+//! enforced by *skipping* compilation: the artifact builders do not build a
+//! matrix and `shard::query` returns `None`, which routes to the existing
+//! `None`-fallthrough.
+//!
+//! Every traversal reports the rung that actually executed on
+//! `SparseTraversal::backend`, so telemetry can tell compiled from uncompiled.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{Result, VertexId};
+use crate::{GraphCachePolicy, Result, VertexId};
 
 pub(crate) type Adjacency = BTreeMap<VertexId, BTreeSet<VertexId>>;
 
@@ -123,10 +139,16 @@ impl GraphBlasCsc {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The three rungs of the kernel ladder described in the module docs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SparseKernelBackend {
-    RustSparse,
-    SuiteSparseGraphBlas,
+    /// Kernel 1: adjacency BFS over `BTreeMap`/`BTreeSet`. Never compiled.
+    Adjacency,
+    /// Kernel 2: BFS over the compiled flat CSC. No SuiteSparse involved.
+    CompactCsc,
+    /// Kernel 3: masked `GrB_mxv` over a compiled `GrB_Matrix`.
+    #[default]
+    SuiteSparse,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,8 +166,19 @@ pub(crate) struct SparseTraversalCount {
     pub backend: SparseKernelBackend,
 }
 
-pub(crate) fn default_matrix_kernel() -> SparseKernelBackend {
-    SparseKernelBackend::SuiteSparseGraphBlas
+/// Resolves the configured kernel for a shard.
+///
+/// The policy field is authoritative. The pre-existing `GRAPH_COMPILED_KERNEL`
+/// override is honoured only while the policy is left at its default, so
+/// benchmark scripts keep working without letting the environment silently
+/// contradict an explicit configuration.
+pub(crate) fn default_matrix_kernel(policy: &GraphCachePolicy) -> SparseKernelBackend {
+    match policy.sparse_kernel {
+        SparseKernelBackend::SuiteSparse if graphblas::use_compact_csc_kernel() => {
+            SparseKernelBackend::CompactCsc
+        }
+        kernel => kernel,
+    }
 }
 
 pub(crate) fn expand(
@@ -155,8 +188,12 @@ pub(crate) fn expand(
     backend: SparseKernelBackend,
 ) -> Result<SparseTraversal> {
     match backend {
-        SparseKernelBackend::RustSparse => Ok(expand_rust(adjacency, starts, hops)),
-        SparseKernelBackend::SuiteSparseGraphBlas => expand_graphblas(adjacency, starts, hops),
+        SparseKernelBackend::Adjacency => Ok(expand_rust(adjacency, starts, hops)),
+        SparseKernelBackend::CompactCsc => {
+            let compiled = compile_graphblas_matrix(adjacency, backend)?;
+            compiled.expand(adjacency, starts, hops)
+        }
+        SparseKernelBackend::SuiteSparse => expand_graphblas(adjacency, starts, hops),
     }
 }
 
@@ -169,10 +206,14 @@ pub(crate) fn expand_range(
     backend: SparseKernelBackend,
 ) -> Result<SparseTraversal> {
     match backend {
-        SparseKernelBackend::RustSparse => {
+        SparseKernelBackend::Adjacency => {
             Ok(expand_range_rust(adjacency, starts, min_hops, max_hops))
         }
-        SparseKernelBackend::SuiteSparseGraphBlas => {
+        SparseKernelBackend::CompactCsc => {
+            let compiled = compile_graphblas_matrix(adjacency, backend)?;
+            compiled.expand_range(adjacency, starts, min_hops, max_hops)
+        }
+        SparseKernelBackend::SuiteSparse => {
             expand_range_graphblas(adjacency, starts, min_hops, max_hops)
         }
     }
@@ -180,28 +221,34 @@ pub(crate) fn expand_range(
 
 pub(crate) use graphblas::CompiledGraphBlasMatrix;
 
-pub(crate) fn compile_graphblas_matrix(adjacency: &Adjacency) -> Result<CompiledGraphBlasMatrix> {
-    compile_graphblas(adjacency)
+pub(crate) fn compile_graphblas_matrix(
+    adjacency: &Adjacency,
+    kernel: SparseKernelBackend,
+) -> Result<CompiledGraphBlasMatrix> {
+    compile_graphblas(adjacency, kernel)
 }
 
-pub(crate) fn compile_graphblas_csc(csc: &GraphBlasCsc) -> Result<CompiledGraphBlasMatrix> {
-    compile_graphblas_from_csc(csc)
+pub(crate) fn compile_graphblas_csc(
+    csc: &GraphBlasCsc,
+    kernel: SparseKernelBackend,
+) -> Result<CompiledGraphBlasMatrix> {
+    compile_graphblas_from_csc(csc, kernel)
 }
 
-pub(crate) fn compile_graphblas_csc_owned(csc: GraphBlasCsc) -> Result<CompiledGraphBlasMatrix> {
-    compile_graphblas_from_csc_owned(csc)
-}
-
-pub(crate) fn compact_csc_kernel_enabled() -> bool {
-    graphblas::use_compact_csc_kernel()
+pub(crate) fn compile_graphblas_csc_owned(
+    csc: GraphBlasCsc,
+    kernel: SparseKernelBackend,
+) -> Result<CompiledGraphBlasMatrix> {
+    compile_graphblas_from_csc_owned(csc, kernel)
 }
 
 pub(crate) fn compile_graphblas_compact_csc_u32(
     vertices: Vec<VertexId>,
     pointers: Vec<u32>,
     indices: Vec<u32>,
+    kernel: SparseKernelBackend,
 ) -> Result<CompiledGraphBlasMatrix> {
-    graphblas::CompiledGraphBlasMatrix::new_from_compact_u32(vertices, pointers, indices)
+    graphblas::CompiledGraphBlasMatrix::new_from_compact_u32(vertices, pointers, indices, kernel)
 }
 
 pub(crate) fn graphblas_csc_from_adjacency(adjacency: &Adjacency) -> Result<GraphBlasCsc> {
@@ -252,6 +299,10 @@ pub(crate) fn expand_compiled_graphblas(
     hops: u8,
 ) -> Result<SparseTraversal> {
     expand_graphblas_compiled(compiled, adjacency, starts, hops)
+}
+
+pub(crate) fn compiled_graphblas_kernel(compiled: &CompiledGraphBlasMatrix) -> SparseKernelBackend {
+    compiled.kernel()
 }
 
 pub(crate) fn compiled_graphblas_contains_edge(
@@ -331,7 +382,7 @@ fn expand_rust(adjacency: &Adjacency, starts: &[VertexId], hops: u8) -> SparseTr
             .filter(|vertex| !start_set.contains(vertex))
             .collect(),
         edge_visits,
-        backend: SparseKernelBackend::RustSparse,
+        backend: SparseKernelBackend::Adjacency,
     }
 }
 
@@ -352,7 +403,7 @@ fn expand_range_rust(
         return SparseTraversal {
             vertices: reachable.into_iter().collect(),
             edge_visits,
-            backend: SparseKernelBackend::RustSparse,
+            backend: SparseKernelBackend::Adjacency,
         };
     }
     for depth in 1..=max_hops {
@@ -374,7 +425,7 @@ fn expand_range_rust(
     SparseTraversal {
         vertices: reachable.into_iter().collect(),
         edge_visits,
-        backend: SparseKernelBackend::RustSparse,
+        backend: SparseKernelBackend::Adjacency,
     }
 }
 
@@ -416,16 +467,25 @@ fn expand_range_graphblas(
     graphblas::expand_range(adjacency, starts, min_hops, max_hops)
 }
 
-fn compile_graphblas(adjacency: &Adjacency) -> Result<CompiledGraphBlasMatrix> {
-    graphblas::CompiledGraphBlasMatrix::new(adjacency)
+fn compile_graphblas(
+    adjacency: &Adjacency,
+    kernel: SparseKernelBackend,
+) -> Result<CompiledGraphBlasMatrix> {
+    graphblas::CompiledGraphBlasMatrix::new(adjacency, kernel)
 }
 
-fn compile_graphblas_from_csc(csc: &GraphBlasCsc) -> Result<CompiledGraphBlasMatrix> {
-    graphblas::CompiledGraphBlasMatrix::new_from_csc(csc)
+fn compile_graphblas_from_csc(
+    csc: &GraphBlasCsc,
+    kernel: SparseKernelBackend,
+) -> Result<CompiledGraphBlasMatrix> {
+    graphblas::CompiledGraphBlasMatrix::new_from_csc(csc, kernel)
 }
 
-fn compile_graphblas_from_csc_owned(csc: GraphBlasCsc) -> Result<CompiledGraphBlasMatrix> {
-    graphblas::CompiledGraphBlasMatrix::new_from_csc_owned(csc)
+fn compile_graphblas_from_csc_owned(
+    csc: GraphBlasCsc,
+    kernel: SparseKernelBackend,
+) -> Result<CompiledGraphBlasMatrix> {
+    graphblas::CompiledGraphBlasMatrix::new_from_csc_owned(csc, kernel)
 }
 
 fn expand_graphblas_compiled(
@@ -476,7 +536,9 @@ mod graphblas;
 mod tests {
     use super::*;
 
-    static COMPACT_KERNEL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The compiled kernel is now a constructor argument, so only the replica
+    // count is still read from the environment; this serialises that.
+    static REPLICA_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_adjacency() -> Adjacency {
         BTreeMap::from([
@@ -489,15 +551,15 @@ mod tests {
     }
 
     #[test]
-    fn rust_sparse_kernel_expands_reachable_vertices() {
+    fn adjacency_kernel_expands_reachable_vertices() {
         let result = expand(
             &test_adjacency(),
             &[1, 42],
             3,
-            SparseKernelBackend::RustSparse,
+            SparseKernelBackend::Adjacency,
         )
-        .expect("rust sparse expansion should succeed");
-        assert_eq!(result.backend, SparseKernelBackend::RustSparse);
+        .expect("adjacency expansion should succeed");
+        assert_eq!(result.backend, SparseKernelBackend::Adjacency);
         assert_eq!(
             result.vertices,
             vec![2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 16]
@@ -505,19 +567,14 @@ mod tests {
     }
 
     #[test]
-    fn graphblas_kernel_matches_rust_sparse_kernel() {
-        let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
+    fn graphblas_kernel_matches_adjacency_kernel() {
+        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
         let adjacency = test_adjacency();
-        let rust = expand(&adjacency, &[1, 42], 3, SparseKernelBackend::RustSparse)
-            .expect("rust sparse expansion should succeed");
-        let graphblas = expand(
-            &adjacency,
-            &[1, 42],
-            3,
-            SparseKernelBackend::SuiteSparseGraphBlas,
-        )
-        .expect("GraphBLAS expansion should succeed");
-        assert_eq!(graphblas.backend, SparseKernelBackend::SuiteSparseGraphBlas);
+        let rust = expand(&adjacency, &[1, 42], 3, SparseKernelBackend::Adjacency)
+            .expect("adjacency expansion should succeed");
+        let graphblas = expand(&adjacency, &[1, 42], 3, SparseKernelBackend::SuiteSparse)
+            .expect("GraphBLAS expansion should succeed");
+        assert_eq!(graphblas.backend, SparseKernelBackend::SuiteSparse);
         assert_eq!(graphblas.vertices, rust.vertices);
         assert_eq!(graphblas.edge_visits, rust.edge_visits);
     }
@@ -525,9 +582,10 @@ mod tests {
     #[cfg(feature = "opencypher")]
     #[test]
     fn graphblas_exact_hop_count_matches_materialized_range() {
-        let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
+        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
         let adjacency = test_adjacency();
-        let compiled = compile_graphblas_matrix(&adjacency).expect("matrix should compile");
+        let compiled = compile_graphblas_matrix(&adjacency, SparseKernelBackend::SuiteSparse)
+            .expect("matrix should compile");
         for hops in 0..=4 {
             let materialized =
                 expand_range_compiled_graphblas(&compiled, &adjacency, &[1], hops, hops)
@@ -543,9 +601,10 @@ mod tests {
     #[cfg(feature = "opencypher")]
     #[test]
     fn graphblas_exact_hop_count_preserves_materialized_cycle_semantics() {
-        let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
+        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
         let adjacency = BTreeMap::from([(1, BTreeSet::from([2])), (2, BTreeSet::from([1, 3]))]);
-        let compiled = compile_graphblas_matrix(&adjacency).expect("matrix should compile");
+        let compiled = compile_graphblas_matrix(&adjacency, SparseKernelBackend::SuiteSparse)
+            .expect("matrix should compile");
         for hops in 0..=4 {
             let materialized =
                 expand_range_compiled_graphblas(&compiled, &adjacency, &[1], hops, hops)
@@ -561,14 +620,13 @@ mod tests {
     #[cfg(feature = "opencypher")]
     #[test]
     fn graphblas_exact_hop_count_clears_reused_scratch() {
-        let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
-        let previous_kernel = std::env::var("GRAPH_COMPILED_KERNEL").ok();
+        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
         let previous_replicas = std::env::var("GRAPHBLAS_REPLICAS").ok();
-        std::env::remove_var("GRAPH_COMPILED_KERNEL");
         std::env::set_var("GRAPHBLAS_REPLICAS", "1");
 
         let adjacency = test_adjacency();
-        let compiled = compile_graphblas_matrix(&adjacency).expect("matrix should compile");
+        let compiled = compile_graphblas_matrix(&adjacency, SparseKernelBackend::SuiteSparse)
+            .expect("matrix should compile");
         let cases = [
             (vec![1], 1),
             (vec![42], 1),
@@ -592,10 +650,6 @@ mod tests {
             }
         }
 
-        match previous_kernel {
-            Some(value) => std::env::set_var("GRAPH_COMPILED_KERNEL", value),
-            None => std::env::remove_var("GRAPH_COMPILED_KERNEL"),
-        }
         match previous_replicas {
             Some(value) => std::env::set_var("GRAPHBLAS_REPLICAS", value),
             None => std::env::remove_var("GRAPHBLAS_REPLICAS"),
@@ -605,15 +659,14 @@ mod tests {
     #[cfg(feature = "opencypher")]
     #[test]
     fn graphblas_exact_hop_count_is_safe_across_replicas() {
-        let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
-        let previous_kernel = std::env::var("GRAPH_COMPILED_KERNEL").ok();
+        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
         let previous_replicas = std::env::var("GRAPHBLAS_REPLICAS").ok();
-        std::env::remove_var("GRAPH_COMPILED_KERNEL");
         std::env::set_var("GRAPHBLAS_REPLICAS", "2");
 
         let adjacency = test_adjacency();
         let compiled = std::sync::Arc::new(
-            compile_graphblas_matrix(&adjacency).expect("matrix should compile"),
+            compile_graphblas_matrix(&adjacency, SparseKernelBackend::SuiteSparse)
+                .expect("matrix should compile"),
         );
         assert_eq!(compiled.replica_count(), 2);
         std::thread::scope(|scope| {
@@ -643,10 +696,6 @@ mod tests {
             }
         });
 
-        match previous_kernel {
-            Some(value) => std::env::set_var("GRAPH_COMPILED_KERNEL", value),
-            None => std::env::remove_var("GRAPH_COMPILED_KERNEL"),
-        }
         match previous_replicas {
             Some(value) => std::env::set_var("GRAPHBLAS_REPLICAS", value),
             None => std::env::remove_var("GRAPHBLAS_REPLICAS"),
@@ -654,27 +703,32 @@ mod tests {
     }
 
     #[test]
-    fn compact_csc_kernel_matches_rust_sparse_kernel() {
-        let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
-        let previous = std::env::var("GRAPH_COMPILED_KERNEL").ok();
-        std::env::set_var("GRAPH_COMPILED_KERNEL", "compact");
-
+    fn compact_csc_kernel_matches_adjacency_kernel() {
         let adjacency = test_adjacency();
-        let rust = expand_range(&adjacency, &[1, 42], 1, 3, SparseKernelBackend::RustSparse)
-            .expect("rust sparse expansion should succeed");
+        let rust = expand_range(&adjacency, &[1, 42], 1, 3, SparseKernelBackend::Adjacency)
+            .expect("adjacency expansion should succeed");
         let csc = graphblas_csc_from_adjacency(&adjacency).expect("CSC build should succeed");
-        let compiled =
-            compile_graphblas_csc_owned(csc).expect("compact CSC compile should succeed");
+        let compiled = compile_graphblas_csc_owned(csc, SparseKernelBackend::CompactCsc)
+            .expect("compact CSC compile should succeed");
         let compact = expand_range_compiled_graphblas(&compiled, &BTreeMap::new(), &[1, 42], 1, 3)
             .expect("compact CSC expansion should succeed");
 
-        match previous {
-            Some(value) => std::env::set_var("GRAPH_COMPILED_KERNEL", value),
-            None => std::env::remove_var("GRAPH_COMPILED_KERNEL"),
-        }
-
-        assert_eq!(compact.backend, SparseKernelBackend::RustSparse);
+        assert_eq!(compact.backend, SparseKernelBackend::CompactCsc);
         assert_eq!(compact.vertices, rust.vertices);
         assert_eq!(compact.edge_visits, rust.edge_visits);
+    }
+
+    // The legacy `GRAPH_COMPILED_KERNEL` override is deliberately not exercised
+    // here: it is process-global and would race concurrent shard tests.
+    #[test]
+    fn a_non_default_policy_kernel_is_returned_verbatim() {
+        let policy = GraphCachePolicy {
+            sparse_kernel: SparseKernelBackend::Adjacency,
+            ..GraphCachePolicy::default()
+        };
+        assert_eq!(
+            default_matrix_kernel(&policy),
+            SparseKernelBackend::Adjacency
+        );
     }
 }

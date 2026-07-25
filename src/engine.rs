@@ -7,9 +7,8 @@ use std::time::{Duration, Instant};
 use slatedb::object_store::{local::LocalFileSystem, ObjectStore};
 
 use crate::sparse_kernel::{
-    compact_csc_kernel_enabled, compile_graphblas_compact_csc_u32, compile_graphblas_csc,
-    compile_graphblas_csc_owned, compile_graphblas_matrix, expand_compiled_graphblas,
-    CompiledGraphBlasMatrix,
+    compile_graphblas_compact_csc_u32, compile_graphblas_csc, compile_graphblas_csc_owned,
+    compile_graphblas_matrix, expand_compiled_graphblas, CompiledGraphBlasMatrix,
 };
 use crate::sparse_kernel::{
     default_matrix_kernel, expand as expand_sparse, graphblas_csc_from_adjacency, GraphBlasCsc,

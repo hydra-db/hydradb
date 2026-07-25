@@ -197,7 +197,7 @@ async fn graph_index_query_recovers_when_gc_removes_its_selected_generation() {
     assert!(compiled.is_some());
 
     let traversal = snapshot
-        .matrix_reachable_with_kernel("CHAIN", &[1], 2, SparseKernelBackend::SuiteSparseGraphBlas)
+        .matrix_reachable_with_kernel("CHAIN", &[1], 2, SparseKernelBackend::SuiteSparse)
         .await
         .unwrap();
     assert_eq!(traversal.vertices, vec![2, 3]);
@@ -510,7 +510,7 @@ async fn graphblas_wal_tail_resolves_edges_at_the_pinned_snapshot() {
         .unwrap();
 
     let traversal = pinned
-        .matrix_reachable_with_kernel("CHAIN", &[1], 1, SparseKernelBackend::SuiteSparseGraphBlas)
+        .matrix_reachable_with_kernel("CHAIN", &[1], 1, SparseKernelBackend::SuiteSparse)
         .await
         .unwrap();
     assert!(traversal.vertices.is_empty());
@@ -1315,7 +1315,7 @@ async fn graph_cache_policy_bounds_entries_and_reports_hits_misses() {
     let reader = GraphShard::open_with_options(path, object_store, options)
         .await
         .unwrap();
-    let kernel = SparseKernelBackend::SuiteSparseGraphBlas;
+    let kernel = SparseKernelBackend::SuiteSparse;
     for _ in 0..2 {
         reader
             .matrix_reachable_with_kernel(
@@ -11938,7 +11938,7 @@ async fn graphblas_matrix_kernel_matches_rust_kernel_after_canonical_snapshot_re
             &[1, 42],
             3,
             read_epoch,
-            SparseKernelBackend::RustSparse,
+            SparseKernelBackend::Adjacency,
         )
         .await
         .unwrap();
@@ -11949,15 +11949,12 @@ async fn graphblas_matrix_kernel_matches_rust_kernel_after_canonical_snapshot_re
             &[1, 42],
             3,
             read_epoch,
-            SparseKernelBackend::SuiteSparseGraphBlas,
+            SparseKernelBackend::SuiteSparse,
         )
         .await
         .unwrap();
 
-    assert_eq!(
-        graphblas.sparse_kernel,
-        SparseKernelBackend::SuiteSparseGraphBlas
-    );
+    assert_eq!(graphblas.sparse_kernel, SparseKernelBackend::SuiteSparse);
     assert_eq!(graphblas.vertices, rust.vertices);
     assert_eq!(graphblas.edge_visits, rust.edge_visits);
 }
@@ -12004,7 +12001,7 @@ async fn graphblas_matrix_kernel_reuses_compiled_base_matrix_cache() {
             &[1, 42],
             3,
             base_epoch,
-            SparseKernelBackend::SuiteSparseGraphBlas,
+            SparseKernelBackend::SuiteSparse,
         )
         .await
         .unwrap();
@@ -12016,7 +12013,7 @@ async fn graphblas_matrix_kernel_reuses_compiled_base_matrix_cache() {
             &[1, 42],
             3,
             base_epoch,
-            SparseKernelBackend::SuiteSparseGraphBlas,
+            SparseKernelBackend::SuiteSparse,
         )
         .await
         .unwrap();
@@ -12035,7 +12032,7 @@ async fn graphblas_matrix_kernel_reuses_compiled_base_matrix_cache() {
             &[1, 42],
             3,
             read_epoch,
-            SparseKernelBackend::SuiteSparseGraphBlas,
+            SparseKernelBackend::SuiteSparse,
         )
         .await
         .unwrap();
@@ -12083,7 +12080,7 @@ async fn graphblas_empty_cache_reader_uses_persisted_csc_artifact() {
             &[1, 42],
             3,
             base_epoch,
-            SparseKernelBackend::SuiteSparseGraphBlas,
+            SparseKernelBackend::SuiteSparse,
         )
         .await
         .unwrap();
@@ -12100,7 +12097,7 @@ async fn graphblas_empty_cache_reader_uses_persisted_csc_artifact() {
             &[1, 42],
             3,
             base_epoch,
-            SparseKernelBackend::SuiteSparseGraphBlas,
+            SparseKernelBackend::SuiteSparse,
         )
         .await
         .unwrap();

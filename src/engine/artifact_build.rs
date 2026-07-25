@@ -168,9 +168,13 @@ impl GraphShard {
             );
         }
 
-        if self.cache_policy.max_graphblas_matrices > 0 {
+        // Kernel 1 has no compiled form, so it skips compilation entirely.
+        let kernel = default_matrix_kernel(&self.cache_policy);
+        let compile_matrix = self.cache_policy.max_graphblas_matrices > 0
+            && kernel != SparseKernelBackend::Adjacency;
+        if compile_matrix {
             let started = Instant::now();
-            let compiled = Arc::new(compile_graphblas_csc(&graphblas_csc)?);
+            let compiled = Arc::new(compile_graphblas_csc(&graphblas_csc, kernel)?);
             record_matrix_profile(
                 matrix_profile_enabled(),
                 "build_matrix_tiles_precompile_graphblas",
@@ -354,10 +358,14 @@ impl GraphShard {
             );
         }
 
-        if self.cache_policy.max_graphblas_matrices > 0 {
+        // Kernel 1 has no compiled form, so it skips compilation entirely.
+        let kernel = default_matrix_kernel(&self.cache_policy);
+        let compile_matrix = self.cache_policy.max_graphblas_matrices > 0
+            && kernel != SparseKernelBackend::Adjacency;
+        if compile_matrix {
             let started = Instant::now();
             let graphblas_csc = matrix_rows_to_graphblas_csc(&rows)?;
-            let compiled = Arc::new(compile_graphblas_csc_owned(graphblas_csc)?);
+            let compiled = Arc::new(compile_graphblas_csc_owned(graphblas_csc, kernel)?);
             record_matrix_profile(
                 matrix_profile_enabled(),
                 "build_matrix_tiles_precompile_graphblas",

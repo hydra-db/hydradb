@@ -4931,7 +4931,7 @@ impl GraphShard {
         Ok(crate::sparse_kernel::SparseTraversal {
             vertices: reachable.into_iter().collect(),
             edge_visits,
-            backend: SparseKernelBackend::RustSparse,
+            backend: SparseKernelBackend::Adjacency,
         })
     }
 
@@ -5013,6 +5013,11 @@ impl GraphShard {
         budget: &QueryBudget,
     ) -> Result<Option<(Vec<VertexId>, u64)>> {
         let _ = (cell_id, edge_type, src, hop_range, read_epoch, budget);
+        if crate::sparse_kernel::default_matrix_kernel(&self.cache_policy)
+            == SparseKernelBackend::Adjacency
+        {
+            return Ok(None);
+        }
         {
             let (min_hops, max_hops) = hop_range;
             budget.check("cypher_graphblas_artifact_lookup")?;
@@ -5070,6 +5075,11 @@ impl GraphShard {
         budget: &QueryBudget,
     ) -> Result<Option<(u64, u64)>> {
         let _ = (cell_id, edge_type, src, hop_range, read_epoch, budget);
+        if crate::sparse_kernel::default_matrix_kernel(&self.cache_policy)
+            == SparseKernelBackend::Adjacency
+        {
+            return Ok(None);
+        }
         {
             let (min_hops, max_hops) = hop_range;
             budget.check("cypher_graphblas_count_artifact_lookup")?;
@@ -5152,6 +5162,11 @@ impl GraphShard {
         request: &ReachableWindowRequest<'_>,
     ) -> Result<Option<(Vec<VertexId>, u64)>> {
         let _ = request;
+        if crate::sparse_kernel::default_matrix_kernel(&self.cache_policy)
+            == SparseKernelBackend::Adjacency
+        {
+            return Ok(None);
+        }
         {
             let (min_hops, max_hops) = request.hop_range;
             request
