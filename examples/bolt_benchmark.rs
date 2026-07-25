@@ -71,8 +71,7 @@ async fn main() -> BenchResult<()> {
     let object_store = local_object_store(&object_root)?;
 
     eprintln!(
-        "Bolt benchmark: fanouts={fanouts:?} hops={hops:?} read_latency_iters={read_latency_iters} read_concurrency={read_concurrency} read_queries_per_worker={read_queries_per_worker} write_latency_iters={write_latency_iters} write_concurrency={write_concurrency} write_queries_per_worker={write_queries_per_worker} backend=local-object-store transport=tcp-loopback kernel={}",
-        if cfg!(feature = "graphblas") { "graphblas" } else { "rust" }
+        "Bolt benchmark: fanouts={fanouts:?} hops={hops:?} read_latency_iters={read_latency_iters} read_concurrency={read_concurrency} read_queries_per_worker={read_queries_per_worker} write_latency_iters={write_latency_iters} write_concurrency={write_concurrency} write_queries_per_worker={write_queries_per_worker} backend=local-object-store transport=tcp-loopback kernel=graphblas"
     );
     println!(
         "kind,backend,kernel,fanout,hops,latency_samples,p50_us,p95_us,p99_us,mean_us,concurrency,concurrent_operations,concurrent_p50_us,concurrent_p95_us,concurrent_p99_us,qps,operations_per_s,reachable_vertices_per_s,logical_edges_per_s,expected_count"
@@ -821,15 +820,7 @@ struct BenchRecord<'a> {
 }
 
 fn print_record(record: BenchRecord<'_>) -> BenchResult<()> {
-    print_record_with_backend(
-        record,
-        "local-object-store",
-        if cfg!(feature = "graphblas") {
-            "graphblas"
-        } else {
-            "rust"
-        },
-    )
+    print_record_with_backend(record, "local-object-store", "graphblas")
 }
 
 fn print_record_with_backend(

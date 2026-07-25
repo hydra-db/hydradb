@@ -18,9 +18,6 @@ const HOPS: &[u8] = &[1, 3, 5, 10];
 
 #[tokio::main]
 async fn main() -> BenchResult<()> {
-    if !cfg!(feature = "graphblas") {
-        return Err("s3_bolt_benchmark_server requires the graphblas feature".into());
-    }
     let fanout = env_u64("GRAPH_BENCH_FANOUT", 100)?;
     let max_hop = *HOPS.iter().max().expect("benchmark hops are nonempty");
     let prefix = required_env("GRAPH_BENCH_PREFIX")?;
@@ -102,7 +99,7 @@ async fn main() -> BenchResult<()> {
         .graph_compute_tasks
         .saturating_sub(metrics_before.graph_compute_tasks);
     let report = serde_json::json!({
-        "graphblas_compiled": cfg!(feature = "graphblas"),
+        "graphblas_compiled": true,
         "verified_matrix_artifacts": 1,
         "read_epoch": read_epoch,
         "expected_graphblas_tasks": expected_graphblas_tasks,
