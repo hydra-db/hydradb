@@ -227,10 +227,10 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Clippy chaos harness
         run: cargo clippy --locked --all-targets --features chaos-harness -- -D warnings
-      - name: Clippy native feature set
-        run: cargo clippy --locked --all-targets --features opencypher,graphblas -- -D warnings
+      - name: Clippy OpenCypher feature set
+        run: cargo clippy --locked --all-targets --features opencypher -- -D warnings
       - name: Clippy full native feature set
-        run: cargo clippy --locked --all-targets --features opencypher,graphblas,query-transport,query-transport-tls,query-service-discovery,public-client-protocols -- -D warnings
+        run: cargo clippy --locked --all-targets --features opencypher,query-transport,query-transport-tls,query-service-discovery,public-client-protocols -- -D warnings
       - name: Clippy public client protocols
         run: cargo clippy --locked --all-targets --features public-client-protocols -- -D warnings
       - name: Clippy production runtime
@@ -245,14 +245,10 @@ jobs:
         env:
           RUST_MIN_STACK: 8388608
         run: cargo test --locked --features opencypher --lib
-      - name: Test GraphBLAS and OpenCypher feature set
-        env:
-          RUST_MIN_STACK: 8388608
-        run: cargo test --locked --features opencypher,graphblas --lib
       - name: Test full native feature set
         env:
           RUST_MIN_STACK: 8388608
-        run: cargo test --locked --all-targets --features opencypher,graphblas,query-transport,query-transport-tls,query-service-discovery,public-client-protocols
+        run: cargo test --locked --all-targets --features opencypher,query-transport,query-transport-tls,query-service-discovery,public-client-protocols
       - name: Test public client protocols
         run: cargo test --locked --all-targets --features public-client-protocols
       - name: Test production runtime configuration
@@ -270,7 +266,7 @@ jobs:
       - name: Check chaos harness example
         run: cargo check --locked --examples --features chaos-harness
       - name: Check native feature examples
-        run: cargo check --locked --examples --features opencypher,graphblas
+        run: cargo check --locked --examples --features opencypher
 
   macos-default:
     runs-on: macos-latest
@@ -279,6 +275,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Install native dependencies
+        run: brew install suite-sparse
       - name: Clippy default feature set
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Clippy chaos harness

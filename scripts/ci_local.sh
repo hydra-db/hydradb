@@ -20,12 +20,12 @@ if pkg-config --exists cypher-parser; then
 fi
 
 if ldconfig -p 2>/dev/null | grep -qi 'libgraphblas'; then
-  cargo test --quiet --locked --features graphblas --lib
-  cargo check --quiet --locked --examples --features graphblas
+  cargo test --quiet --locked --lib
+  cargo check --quiet --locked --examples
   if pkg-config --exists cypher-parser; then
-    cargo test --quiet --locked --features opencypher,graphblas --lib
-    cargo check --quiet --locked --examples --features opencypher,graphblas
+    cargo test --quiet --locked --features opencypher --lib
+    cargo check --quiet --locked --examples --features opencypher
   fi
 else
-  echo "skipping graphblas feature tests because libgraphblas is not installed"
+  echo "skipping tests because libgraphblas is not installed"
 fi

@@ -46,6 +46,7 @@ where
     })?
 }
 
+#[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
 fn run_graph_compute_inline<T, F>(metrics: Arc<GraphOperationalMetrics>, compute: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
