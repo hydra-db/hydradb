@@ -8,6 +8,7 @@ on:
       - "Cargo.toml"
       - "Dockerfile"
       - "src/**"
+      - "crates/**"
   push:
     branches: [main]
   workflow_dispatch:

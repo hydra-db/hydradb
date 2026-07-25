@@ -225,6 +225,13 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      # Every other cargo line here is bare, so it selects the root package
+      # only. The workspace members need their own explicit -p lines or they
+      # are silently unlinted and untested.
+      - name: Clippy placement crate
+        run: cargo clippy --locked --all-targets -p turbolay-placement -- -D warnings
+      - name: Test placement crate
+        run: cargo test --locked -p turbolay-placement
       - name: Clippy chaos harness
         run: cargo clippy --locked --all-targets --features chaos-harness -- -D warnings
       - name: Clippy OpenCypher feature set

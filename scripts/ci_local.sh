@@ -7,6 +7,9 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/dgr
 cd "$ROOT"
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
+# Bare cargo lines select the root package only; workspace members need -p.
+cargo clippy --locked --all-targets -p turbolay-placement -- -D warnings
+cargo test --quiet --locked -p turbolay-placement
 cargo clippy --locked --all-targets --features chaos-harness -- -D warnings
 if pkg-config --exists cypher-parser; then
   cargo clippy --locked --all-targets --features opencypher -- -D warnings
