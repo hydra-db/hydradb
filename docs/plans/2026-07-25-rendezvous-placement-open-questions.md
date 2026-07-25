@@ -17,6 +17,15 @@ tags:
 Companion to `docs/plans/2026-07-25-rendezvous-placement.md`. That plan's §1 and
 §2 landed in `7b0d340`; §3–§5 are blocked on the four answers below.
 
+**Status: Q1 and Q3 settled. Q2 and Q4 still open.**
+
+| | Question | Answer |
+|---|---|---|
+| Q1 | Lease shape | **3a** — advisory record, observability only. 3c dropped; sleet shows it is not needed and neither slatedb tree can reach it. |
+| Q2 | Delete the `/readyz` fan-out | open |
+| Q3 | Heartbeat interval / timeout | **5s / 15s**, config with validation |
+| Q4 | Build scope for the next pass | open |
+
 **How to use this file.** Each question has a `### Your answer` block at the
 end. Write there — free text is fine, you do not have to pick one of the listed
 options. I read this file before writing any more code, and fold the answers
@@ -24,13 +33,13 @@ back into §7 of the main plan.
 
 ## Sources — read these before changing this file
 
-| Source | Holds |
-|---|---|
-| `docs/plans/2026-07-25-rendezvous-placement.md` | The plan these questions gate. §7 holds the two decisions already settled. |
-| `interactive/write-routing-problem.html` | Write path traced Bolt socket → WAL commit, file:line at each step. Failure modes F-01…F-10, requirements R1–R7. |
-| `interactive/write-routing-solutions.html` | TiDB/TiKV routing. OPT-1…OPT-4 scored against R1–R7. |
-| memory `cell-writer-fencing-pingpong` | The prod incident: log signature, root cause, impact. |
-| `../sleet/src/placement.rs`, `../sleet/src/heartbeat.rs`, `../sleet/src/root.rs:209`, `../sleet/src/daemon.rs:117-155` | The proven implementation of heartbeats, liveness filtering, and the self-always-live rule. |
+| Source                                                                                                                 | Holds                                                                                                            |
+| ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `docs/plans/2026-07-25-rendezvous-placement.md`                                                                        | The plan these questions gate. §7 holds the two decisions already settled.                                       |
+| `interactive/write-routing-problem.html`                                                                               | Write path traced Bolt socket → WAL commit, file:line at each step. Failure modes F-01…F-10, requirements R1–R7. |
+| `interactive/write-routing-solutions.html`                                                                             | TiDB/TiKV routing. OPT-1…OPT-4 scored against R1–R7.                                                             |
+| memory`cell-writer-fencing-pingpong`                                                                                   | The prod incident: log signature, root cause, impact.                                                            |
+| `../sleet/src/placement.rs`, `../sleet/src/heartbeat.rs`, `../sleet/src/root.rs:209`, `../sleet/src/daemon.rs:117-155` | The proven implementation of heartbeats, liveness filtering, and the self-always-live rule.                      |
 
 ---
 
@@ -70,7 +79,7 @@ let writer = reachable
 
 Two problems. The `reachable.first()` fallback moves whenever a `/readyz` probe
 flaps, so two clients probing at slightly different instants can name different
-writers. And whatever routing decides, `ensure_local_writer` promotes on *any*
+writers. And whatever routing decides, `ensure_local_writer` promotes on _any_
 node that receives a write — routing's opinion is advisory and unenforced. That
 gap is the ping-pong.
 
@@ -87,7 +96,190 @@ behind Q2 — see there.
 
 ---
 
-## Q1 — The lease: what shape, if any?
+## How sleet actually does it
+
+Added after you asked "is 3(c) how sleet does it?". Short answer: **no, and it
+is close to the opposite design.** This section is the evidence; Q1 below is
+finalised on it.
+
+### Sleet never opens a `Db` at all
+
+There is not one `Db::builder`, `Db::open` or `DbBuilder` in sleet's `src/`.
+Every hit is in `tests/`. The only handle sleet constructs is
+`slatedb::admin::Admin` (`../sleet/src/services.rs:71-91`):
+
+```rust
+pub fn from_parts(url: &str, store: Arc<dyn ObjectStore>, path: StorePath) -> Self {
+    let admin = AdminBuilder::new(path.clone(), store.clone()).build();
+    Self { url: url.to_string(), admin, store, path }
+}
+```
+
+So sleet is never a writer and never takes a `writer_epoch`. Its analogous
+problem is `compactor_epoch` ping-pong between two compaction coordinators —
+same shape, different epoch. Everything below is about that.
+
+Note also that `DatabaseHandle::open` takes only a URL. It has no node
+identity and no placement argument, so **it could not check ownership even in
+principle.** Ownership is checked somewhere else entirely.
+
+### There is no lease object in sleet. None.
+
+Sleet stores exactly three things under the fleet root: `sleet.toml` and
+`dbs/<db>.toml` (operator intent), and `nodes/<id>.<letters>.json` (liveness
+plus offered roles). The heartbeat is an **unconditional PUT** — no `PutMode`,
+no ETag, no `UpdateVersion` (`../sleet/src/daemon.rs:292`). It says "I am alive
+and I offer these services." It never says "I own database X."
+
+The only conditional writes in the whole codebase are `PutMode::Create` for
+`sleet register` (guarding a config file) and for mirror manifest commits.
+There is no compare-and-swap on ownership anywhere.
+
+**Sleet stores liveness and intent. It recomputes ownership from scratch every
+tick.** That is the entire model.
+
+### What a non-owner does
+
+`owned_assignments` (`../sleet/src/daemon.rs:117-162`) is a pure function —
+heartbeat entries in, a map of owned assignments out, no I/O. Non-ownership is
+just absence of a key:
+
+```rust
+let owners = placement::owners(url, service, count, &candidates);
+if owners.contains(&node_id) {
+    owned.insert((url.clone(), service, None), resolved.clone());
+}
+```
+
+`reconcile` then spawns only for keys present in the map, and cancels any
+running task whose key is absent (`daemon.rs:327-353`). The check happens
+**at task-spawn time only** — not at open, not per operation.
+
+### The fence handler — this is the part we need to copy exactly
+
+`../sleet/src/daemon.rs:458-472`:
+
+```rust
+let delay = match result {
+    Ok(()) => break,
+    Err(e) if e.is_fenced() => {
+        info!(database = %url, "coordinator fenced; retrying after one heartbeat interval");
+        backoff = Duration::from_secs(1);
+        heartbeat_interval
+    }
+    Err(e) => {
+        warn!(database = %url, service = service.as_str(), "task failed: {e}");
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+        backoff
+    }
+};
+```
+
+Three things here that our plan's touch point (d) currently gets wrong or
+leaves vague:
+
+1. A fence **resets** `backoff` to 1s rather than advancing the exponential
+   ladder. A fence is treated as *view skew*, not as a failure. Our (d) says
+   "wait one `heartbeat_interval`" but does not say it must not feed the
+   exponential path — and if it did, a fenced node would back off to minutes.
+2. The wait is exactly one `heartbeat_interval`, and the reason is stated in
+   the doc comment at `daemon.rs:391-394`: it gives *the rival* time to refresh
+   its view and stand down. It is not a politeness delay, it is sized to the
+   convergence period.
+3. The retry is **unconditional** — it does not re-check ownership. "Rerun, and
+   let the outer loop cancel me if I was wrong." Sleet accepts that a fenced
+   node will re-fence the winner once more before converging.
+
+### Double-running is explicitly permitted, not prevented
+
+This is the design's central claim, and it is stated four times.
+
+`../sleet/rfcs/0001-design.md:35-37`, Non-goals:
+
+> Sleet does not add a lock service. SlateDB's manifest CAS, epochs, and
+> compaction job claims remain the mutual exclusion mechanisms.
+
+`rfcs/0001-design.md:251-260`, Failure behavior:
+
+> Sleet treats placement as an efficiency decision. Safety belongs to SlateDB.
+
+`rfcs/0001-design.md:275-284`, Coordinator fencing — the direct ping-pong
+answer:
+
+> A running coordinator can be fenced by a newer `compactor_epoch`. Sleet
+> treats that as evidence of view skew. The fenced task waits one
+> `heartbeat_interval`, then reruns. […] **Mutual fencing can last only while
+> the two nodes disagree about ownership, which is bounded by `config_poll`
+> plus one heartbeat tick. The cost is a short compaction stall.**
+
+And `../sleet/src/daemon.rs:10-14`:
+
+```rust
+//! Assignment is an efficiency mechanism only: every failure mode here
+//! at worst double-runs a service, which SlateDB's fencing and CAS
+//! claims make safe.
+```
+
+Sleet even **counts itself live when its own heartbeat looks stale**
+(`daemon.rs:124-130`), deliberately choosing overlap over gaps: "peers that
+consider it dead take over in parallel, which is a safe double-run, whereas
+excluding itself would leave the share unowned."
+
+### It is model-checked, and the model asserts the ping-pong is reachable
+
+`../sleet/specs/coordination.fizz:167-175`:
+
+```
+# The design's stated worst case, a transient double-run, is
+# reachable in the model.
+exists assertion DoubleRunReachable:
+    return len([db for db in DBS if len(runners[db]) > 1]) > 0
+```
+
+Paired with a `Converged` liveness property (an `eventually always` requiring
+`runners[db] == [expected]` and `len(fenced[db]) == 0` after churn stops) whose
+stated purpose is to catch exactly the failure we care about — the spec header
+notes it "checks convergence and the absence of fence livelock in one property
+(a livelock would flap runners/fenced forever and violate eventually-always)."
+
+So sleet does not claim the duel cannot happen. It claims the duel is bounded,
+and it proves the bound.
+
+### Two hazards in sleet worth deciding on before we copy it
+
+- **A LIST failure freezes ownership rather than shedding it**
+  (`daemon.rs:243`): `Err(e) => warn!("failed to LIST nodes/: {e}; keeping
+  current assignments")`. A node partitioned from the object store keeps
+  running everything it had, indefinitely, while its peers time it out and take
+  over. For sleet that is a safe double-run. For a *writer* it is a
+  guaranteed epoch duel with no convergence, because the partitioned node's
+  view can never update. **We need a different answer here than sleet's.**
+- **The operator CLI bypasses placement entirely** (`../sleet/src/ops.rs:263`,
+  `:406`, and the `sleet mirror sync` one-shots). Our analogue is any admin or
+  HTTP path that can reach `ensure_local_writer` without going through
+  rendezvous.
+
+### Side-by-side
+
+| | sleet | this plan |
+|---|---|---|
+| Placement | rendezvous, recomputed each tick | same (`crates/placement`) |
+| Ownership stored? | no | Q1 |
+| Checked where | task spawn, in the supervisor | `ensure_local_writer`, per promotion — **stricter than sleet** |
+| On fence | reset backoff to 1s, wait one interval, retry unconditionally | touch point (d) — should match exactly |
+| Mutual exclusion | delegated to slatedb epochs; duel bounded, not prevented | same |
+| Duel bound | `config_poll` + one heartbeat tick | `heartbeat_timeout` |
+| Verified by | Fizz model, `Converged` liveness property | §5 integration test — see Q4 |
+
+The one place we are *stricter* than sleet: sleet checks ownership once at
+spawn and never again, so a task keeps running through an ownership change
+until the next reconcile tick. Our touch point (b) checks on **every**
+promotion. That is a better guarantee and costs nothing, because the live set
+is already in memory.
+
+---
+
+## Q1 — The lease: what shape, if any? — **FINALISED**
 
 ### What is actually being decided
 
@@ -102,13 +294,13 @@ Three things I confirmed:
   public, reachable through `DbStatus.current_manifest`. It is already a
   CAS-backed, monotonic, observable lease.
 - **It carries no identity.** The manifest records `epoch 18`. It never records
-  `graph-node-1 holds epoch 18`. You can detect *that* you were fenced. You
-  cannot learn *by whom*, or who should hold it instead. That missing identity
+  `graph-node-1 holds epoch 18`. You can detect _that_ you were fenced. You
+  cannot learn _by whom_, or who should hold it instead. That missing identity
   is the entire gap a lease object would fill.
 - **There is no fence-before-open hook.** No `expected_epoch`, no `skip_fence`,
   nothing in `Db::builder`. `build()` unconditionally claims a new epoch.
 
-The third point is decisive. A lease object cannot *prevent* anything, because
+The third point is decisive. A lease object cannot _prevent_ anything, because
 SlateDB never consults it. It can only stop a node that already chose to check.
 That is the definition of advisory, whatever we name it.
 
@@ -134,16 +326,15 @@ What each option changes:
 debugging three identical logs, each of which says only "someone took it from
 me." That is what the incident actually looked like.
 
-**3a — advisory record.** After a *successful* promotion the node writes
-`<base>/_cell_writers/v1/<cell>` containing `{"node_id":"graph-node-1",
-"epoch":18,"at":"..."}`. Now the same incident reads:
+**3a — advisory record.** After a _successful_ promotion the node writes
+`<base>/_cell_writers/v1/<cell>` containing `{"node_id":"graph-node-1", "epoch":18,"at":"..."}`. Now the same incident reads:
 
 ```
 node-0  WARN  fenced at epoch 17; current lease: graph-node-1 @ 18
 node-1  WARN  fenced at epoch 18; current lease: graph-node-2 @ 19
 ```
 
-Nothing is prevented. But the ping-pong is *visible* in one line instead of
+Nothing is prevented. But the ping-pong is _visible_ in one line instead of
 inferred across three logs, the `NotALeader` hint carries an observed owner
 rather than a computed guess, and post-incident you can answer "who actually
 had it at 14:32" from object storage.
@@ -168,36 +359,170 @@ let db = Db::builder(path, store)
 ```
 
 At `t=0.31` node-1's `build()` returns `Err` instead of claiming epoch 18.
-node-0 keeps the writer. This is *actual* mutual exclusion, and it is the only
+node-0 keeps the writer. This is _actual_ mutual exclusion, and it is the only
 option here that delivers it. It is buildable — `slatedb` is our fork
 (`usecortex/slatedb`, pinned at `9f4d304`), so this is an RFC against a repo we
 control, not a wish. But it changes the fencing contract `architecture.md` says
 everything rests on, and it belongs in its own review with its own tests.
 
+{user_note}: slatedb is our fork (usecortex/slatedb, pinned at 9f4d304) -> no! use the slatedb original , version 0.14.1 pls -- https://github.com/slatedb/slatedb , tell me if that works? 0.14.1 also has a distributed compaction (but more on that later. just note that.)
+
+**Answer: no, 0.14.1 does not work — and it would not help Q1 even if it did.**
+
+I checked both trees on disk. The fork is at
+`~/.cargo/git/checkouts/slatedb-c41af1fe6068aba3/9f4d304`, upstream 0.14.1 at
+`~/.cargo/registry/src/index.crates.io-*/slatedb-0.14.1` (sleet pulls it, so it
+is already local).
+
+**1. The fork is 0.14.1 + 43 upstream commits + 8 local ones.** Its
+`version` field says `0.14.1`, but it is not that tree — its base `c8e62bc` is
+43 commits past the release tag. Switching is a **51-commit downgrade**, not a
+sideways move. Among what we would give up: `#1900`, "re-establish `DbReader`
+checkpoint if GC removed it" — a correctness fix for exactly our reader path.
+
+**2. Six APIs we use do not exist upstream**, all in the durable-reader path:
+
+| API | turbolay call sites |
+|---|---|
+| `DbReaderSnapshot` (type does not exist upstream at all) | `core/state.rs:8, :96` |
+| `DbReader::snapshot()` | `core/state.rs:451, :458, :467, :474` |
+| `DbReaderSnapshot::{seq, last_wal_id, get_with_options, scan_prefix_with_options}` | `core/state.rs:105-150, :511` |
+| `DbReader::refresh()` | `core/state.rs:338, :498` |
+| `Db::last_flushed_wal_id()` | `core/state.rs:514` |
+| `ErrorKind::DatabaseMissing` | `core/state.rs:306` |
+
+`GraphStorageSnapshot::Reader(Arc<DbReaderSnapshot>)` has no upstream
+equivalent, so follower nodes would fall back to unpinned `DbReader::get/scan`
+— **losing snapshot isolation for every query served by a follower**, which
+contradicts `architecture.md:168` and `README.md:23`. That is a design change,
+not a dependency swap. `index_store.rs:112-134` also stamps every index
+generation off `snapshot.last_wal_id()`, and two open bugs
+(`BFG-011-wal-tail-visibility-hole.md:44`, `BFG-009-explainer.html:416`) are
+*about* that frontier — the fork API is load-bearing in unresolved correctness
+work.
+
+**3. On distributed compaction: 0.14.1 has it, and so does the fork.** Same
+file set — `compaction_worker.rs`, `compactor.rs`, `compactor_executor.rs`,
+`compactions_store.rs`, `subcompaction.rs` — exporting `CompactionWorker`,
+`CompactionWorkerBuilder`, `CompactorBuilder`, `VersionedCompactions`. **Nothing
+is gained by switching and nothing is lost by staying.** Noted for later as you
+asked; it is available to us today.
+
+**4. On fencing, which is what Q1 is about: 0.14.1 gives us nothing the fork
+lacks.** Neither tree has `expected_writer_epoch`, `skip_fence`, or any
+epoch/read-only option on `DbBuilder` — I grepped both. `build()` claims a new
+epoch unconditionally in both. `VersionedManifest::writer_epoch()`, `DbStatus`,
+`CloseReason::Fenced` and `WalReader::new` are identical. So switching would
+*remove* our ability to land a 3c-style change ourselves, and gain no fencing
+capability at all.
+
+**Two things that are genuinely non-issues**, worth stating because they are the
+usual blockers: both trees pin `object_store = "0.14.0"`, so
+`Arc<dyn ObjectStore>` unifies either way; and `default-features = false,
+features = ["aws", "foyer"]` works verbatim on 0.14.1.
+
+**If the goal is "stop depending on a fork"** — a reasonable goal, and no commit
+message ever recorded why the fork was adopted — the cheap path is to
+**upstream the 8 local commits** (+460 lines across 5 files, and upstream's own
+`DbReaderMode` work in `#1915` shows they are moving the same direction), then
+pin a future release. Downgrading to 0.14.1 is the expensive path to the same
+place. Happy to scope that as its own piece of work; it is independent of this
+plan.
+
 ### The options
 
-| | What it buys | What it costs | Stops the ping-pong? |
-|---|---|---|---|
-| **3a** advisory record | holder identity: observability, a real `NotALeader` hint, next incident's forensics | one PUT per promotion; nothing on the write path | No — rendezvous + touch point (b) does that |
-| **3b** advisory + precondition | nothing 3a doesn't | a GET on the write path, and a read-then-act race | No, and it looks like it does |
-| **3c** CAS-on-open in slatedb | real mutual exclusion | RFC against our fork; changes the fencing contract; separate review | Yes, by construction |
-| **none** | smallest diff | `NotALeader` carries a computed owner, not an observed one | No |
-
-### My recommendation
-
-**3a now, and scope 3c as a separate RFC if exclusion is the actual goal.**
-
-Worth saying plainly, because I think it was implicit in the original ask and
-should not be: **3a does not give you the mutual exclusion you were after.**
-Rendezvous plus the don't-promote rule in touch point (b) is what stops the
-ping-pong. The lease only records what happened. If exclusion is the goal
-rather than observability, 3c is the only path, and it is better to scope it now
-than to discover it after Phase 1 ships.
+|                                | What it buys                                                                       | What it costs                                                       | Stops the ping-pong?                        |
+| ------------------------------ | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------- | ------------------------------------------- |
+| **3a** advisory record         | holder identity: observability, a real`NotALeader` hint, next incident's forensics | one PUT per promotion; nothing on the write path                    | No — rendezvous + touch point (b) does that |
+| **3b** advisory + precondition | nothing 3a doesn't                                                                 | a GET on the write path, and a read-then-act race                   | No, and it looks like it does               |
+| **3c** CAS-on-open in slatedb  | real mutual exclusion                                                              | RFC against our fork; changes the fencing contract; separate review | Yes, by construction                        |
+| **none**                       | smallest diff                                                                      | `NotALeader` carries a computed owner, not an observed one          | No                                          |
 
 ### Your answer
 
-<!-- write here -->
+> is 3(c) how sleet does it? we do want to avoid ping pong
 
+**No. Sleet does none of 3a, 3b or 3c** — see the section above. It has no
+lease object, no CAS-on-open, and it never checks an epoch before opening. It
+recomputes ownership from a frozen hash every tick, declines to start when it
+is not the owner, and on a fence sleeps exactly one heartbeat interval and
+retries. It then *asserts in a model checker that the double-run is reachable*
+and proves only that it converges.
+
+So the answer to "we do want to avoid ping pong" is not the lease. It is:
+
+| | mechanism | in our plan |
+|---|---|---|
+| stops nodes from racing in the first place | deterministic rendezvous + decline if not owner | §2 (landed) + touch point **(b)** |
+| bounds the duel when views briefly disagree | fence → reset backoff, wait one interval, retry | touch point **(d)** |
+| makes the duel *visible* when it happens | an advisory record of who holds what | this question |
+
+**(b) and (d) are the fix. The lease is observability.** They are independent,
+and this plan already contains both.
+
+### Finalised: 3a — advisory record, scoped to observability. 3c dropped.
+
+Three reasons the sleet investigation moved this from "3a, and scope 3c" to
+"3a, and drop 3c":
+
+1. **3c is not required to avoid the ping-pong.** Sleet runs the same
+   architecture at fleet scale with no CAS-on-open and converges; the bound is
+   `config_poll` + one heartbeat tick, and it is model-checked. Our design is
+   *stricter* than sleet's — we check ownership on every promotion, sleet checks
+   once at task spawn — so our bound is no worse.
+2. **3c cannot be reached from either dependency.** Neither the fork nor
+   upstream 0.14.1 has any epoch option on `DbBuilder`. It is a real upstream
+   feature request, not a config change, and it would gate Phase 1 on a
+   dependency change. Not worth it for a bound we already have.
+3. **The prod incident's actual pain was diagnostic, not correctness.** Three
+   nodes logging an identical `Fenced` with no attribution. 3a fixes precisely
+   that, and nothing else claims to.
+
+**What 3a is, concretely.** After a *successful* promotion, and only then:
+
+```
+PUT <base>/_cell_writers/v1/<cell_id>
+    {"node_id":"graph-node-1","epoch":18,"at":"2026-07-25T14:32:07Z"}
+```
+
+Read on two paths only, both off the write path: when logging a
+`CloseReason::Fenced`, and when building the `NotCellWriter { owner }` hint in
+touch point (c). Never consulted to decide whether to promote — that is
+rendezvous' job, and consulting it would be 3b, which I still argue against
+(read-then-act race, a GET on the write path, and it looks like it works).
+
+**Explicitly recorded so nobody re-reads this as a guarantee:** the SlateDB
+writer epoch remains the only authority. The record can be stale — a node can
+be fenced a millisecond after writing it. It answers "who last successfully
+promoted", not "who holds the writer right now". If it ever disagrees with the
+manifest, the manifest is right.
+
+**One thing to copy from sleet that our plan currently under-specifies.** Touch
+point (d) says "wait one `heartbeat_interval` before re-promoting". Sleet's
+version also **resets the exponential backoff to 1s** on a fence, because a
+fence is view skew rather than a failure (`daemon.rs:461-464`). Without that,
+repeated fences ride the exponential ladder to `MAX_BACKOFF` and a node that is
+merely converging looks dead. I will match sleet exactly.
+
+**And one place we must *not* copy sleet.** On a failed LIST of the node
+directory, sleet keeps its current assignments (`daemon.rs:243`). For a
+compaction coordinator that is a safe double-run. For a *writer* it is a
+guaranteed unbounded duel: a node partitioned from the object store can never
+learn it lost ownership, so it re-promotes forever against a node that thinks
+it won. My proposal is that a **LIST failure sheds ownership** — if we cannot
+read the live set we cannot claim to own anything, so refuse promotion and
+return `NotCellWriter` with no owner hint. That trades availability for the
+bound, which is the right trade for the writer path specifically. Flag it in
+Q4's answer if you disagree.
+
+### Follow-up this opens (not for now)
+
+Sleet's convergence claim is backed by `../sleet/specs/coordination.fizz` — a
+`Converged` liveness property specifically designed to catch fence livelock.
+This repo already has `quint-models/` and prior formal-methods work, so the
+same property is expressible here. §5's integration test proves one scenario;
+a liveness spec would prove the class. Worth doing after Phase 1 lands, not
+before.
 
 ---
 
@@ -267,7 +592,7 @@ t=1    a driver dials node-1:7687 -> connection succeeds -> query fails
 A pure TCP-reachability check would pass here. The `/readyz` probe catches it
 today. Readiness-gated heartbeat publication also catches it — node-1 simply
 does not publish until `ready` flips true. Option 3 in the table below does
-*not* catch it, which is why I would not do that one.
+_not_ catch it, which is why I would not do that one.
 
 ### What "readiness-gated heartbeats" means concretely
 
@@ -286,15 +611,15 @@ proof it should stop (`../sleet/src/daemon.rs:124-131`).
 
 ### The options
 
-| | Detection: graceful | Detection: hard crash | Up-but-unready | Cost per ROUTE refresh |
-|---|---|---|---|---|
-| **1. Delete fan-out, gate heartbeats on ready** | immediate (DELETE) | up to `heartbeat_timeout` | caught | one LIST |
-| **2. Keep fan-out, add heartbeats alongside** | ~250 ms | ~250 ms | caught | N TCP connects + one LIST |
-| **3. Delete fan-out, no readiness gating** | up to timeout | up to timeout | **not caught** | one LIST |
+|                                                 | Detection: graceful | Detection: hard crash    | Up-but-unready | Cost per ROUTE refresh    |
+| ----------------------------------------------- | ------------------- | ------------------------ | -------------- | ------------------------- |
+| **1. Delete fan-out, gate heartbeats on ready** | immediate (DELETE)  | up to`heartbeat_timeout` | caught         | one LIST                  |
+| **2. Keep fan-out, add heartbeats alongside**   | ~250 ms             | ~250 ms                  | caught         | N TCP connects + one LIST |
+| **3. Delete fan-out, no readiness gating**      | up to timeout       | up to timeout            | **not caught** | one LIST                  |
 
 Option 2's hidden cost is not the TCP connects, it is that you now have two
 liveness signals that can disagree, and the probe result is still computed
-*per-caller* — two clients asking at the same instant can get different
+_per-caller_ — two clients asking at the same instant can get different
 answers. Consistency across callers is the main reason to move to heartbeats at
 all.
 
@@ -306,8 +631,9 @@ alone would be option 3. This folds into touch point (e) in the main plan.
 
 ### Your answer
 
-<!-- write here -->
+can you explain this more? in simple language? in terminal only.
 
+<!-- write here -->
 
 ---
 
@@ -320,14 +646,14 @@ who is live, and therefore about who owns a cell.
 
 sleet's defaults are 10s / 30s (`../sleet/src/config.rs:75-108`; validation
 requires `interval > 0` and `interval < timeout`). If Q2 lands as option 1,
-`heartbeat_timeout` becomes the *only* bound on how long a crashed node stays
+`heartbeat_timeout` becomes the _only_ bound on how long a crashed node stays
 in a Bolt routing table — which argues for something much tighter than 30s.
 
 ### The tension
 
 Tighter is not free, and the cost is not the PUTs.
 
-Rendezvous moves ownership the *instant* the live set changes, and this plan has
+Rendezvous moves ownership the _instant_ the live set changes, and this plan has
 **no rebalance dampening** — deliberately out of scope (§6). PD has
 leader-transfer scheduling for exactly this; rendezvous has nothing. So a node
 that flaps in and out reclaims its cells every time it returns, and every
@@ -352,25 +678,25 @@ One small object PUT per node per interval, plus one LIST per routing refresh.
 At S3 Standard request pricing (~$0.005 per 1,000 PUTs), for a 3-node fleet:
 
 | interval | PUTs/day (3 nodes) | ≈ $/month |
-|---|---|---|
-| 2s | 129,600 | ~$19 |
-| 5s | 51,840 | ~$8 |
-| 10s | 25,920 | ~$4 |
+| -------- | ------------------ | --------- |
+| 2s       | 129,600            | ~$19      |
+| 5s       | 51,840             | ~$8       |
+| 10s      | 25,920             | ~$4       |
 
 Scales linearly with node count. At 3 nodes this is noise at any of these
 settings; at 100 nodes on a 2s interval it is ~$650/month, so the choice should
 be a config default, not a constant. **In all cases: config, with these as
 defaults.** Note also that placement only ever reads the LIST result (name and
-`LastModified`) — heartbeat *bodies* are observability and are never fetched on
+`LastModified`) — heartbeat _bodies_ are observability and are never fetched on
 the placement path, so body size does not affect the hot path.
 
 ### The options
 
-| | Worst-case dead-node detection | Absorbs a 10s flap? | Convergence bound |
-|---|---|---|---|
-| **2s / 6s** | 6s | no | ~6s |
-| **5s / 15s** | 15s | partially | ~15s |
-| **10s / 30s** (sleet) | 30s | yes | ~30s |
+|                       | Worst-case dead-node detection | Absorbs a 10s flap? | Convergence bound |
+| --------------------- | ------------------------------ | ------------------- | ----------------- |
+| **2s / 6s**           | 6s                             | no                  | ~6s               |
+| **5s / 15s**          | 15s                            | partially           | ~15s              |
+| **10s / 30s** (sleet) | 30s                            | yes                 | ~30s              |
 
 ### My recommendation
 
@@ -388,8 +714,28 @@ it now.
 
 ### Your answer
 
-<!-- write here -->
+{user_note} you can use 5 / 15s pelase
 
+**Decided: `heartbeat_interval` 5s, `heartbeat_timeout` 15s.** Config, with
+these as defaults, and validated like sleet does (`interval > 0` and
+`interval < timeout`, `../sleet/src/config.rs:1018-1024`) so a misconfiguration
+that would make every node permanently dead is rejected at startup rather than
+in production.
+
+What these numbers now bind, in one place:
+
+| | value |
+|---|---|
+| worst-case dead-node detection (hard crash) | 15s |
+| graceful shutdown detection | immediate, via heartbeat DELETE |
+| placement convergence after a node dies | ~15s |
+| fence backoff in touch point (d) | 5s — one interval, per sleet |
+| heartbeat PUT cost, 3 nodes | ~52k/day, ~$8/month |
+
+The 15s timeout partially absorbs a ~10s flap, which is the case 6s would have
+churned on. If flapping still hurts in practice the fix is a minimum-tenure
+rule (an owner keeps a cell for at least T after acquiring it), not a longer
+timeout — noted as a follow-up in §6 of the main plan, not built now.
 
 ---
 
@@ -445,11 +791,11 @@ That is the prod incident, reproduced as a test. It cannot be written until
 
 ### The options
 
-| | What lands | What prod looks like after |
-|---|---|---|
-| **All of Phase 1**, staged commits | §3, (a)–(e), §5 including the regression test | ping-pong fixed, drivers re-route correctly, regression guarded |
-| **Crate only** (§3) | `heartbeat.rs`, `directory.rs`, tested against `InMemory` | unchanged — ping-pong continues |
-| **Crate + (b)** | §3 plus the don't-promote rule | ping-pong stops; non-owner writes fail opaquely and drivers retry into the same wrong node |
+|                                    | What lands                                                | What prod looks like after                                                                 |
+| ---------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| **All of Phase 1**, staged commits | §3, (a)–(e), §5 including the regression test             | ping-pong fixed, drivers re-route correctly, regression guarded                            |
+| **Crate only** (§3)                | `heartbeat.rs`, `directory.rs`, tested against `InMemory` | unchanged — ping-pong continues                                                            |
+| **Crate + (b)**                    | §3 plus the don't-promote rule                            | ping-pong stops; non-owner writes fail opaquely and drivers retry into the same wrong node |
 
 Staged commits in the first option would be roughly: §3 crate → (a) routing →
 (b)+(c) refusal and mapping → (d) backoff → (e) wiring → §5 regression test.
@@ -465,7 +811,6 @@ and the last one is the incident reproduced.
 ### Your answer
 
 <!-- write here -->
-
 
 ---
 
