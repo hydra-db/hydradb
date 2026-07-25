@@ -10,11 +10,11 @@ help:
 
 # Format Rust code.
 fmt:
-    cargo fmt
+    cargo fmt --all
 
 # Check Rust formatting.
 fmt-check:
-    cargo fmt --check
+    cargo fmt --all --check
 
 # Check all default-feature targets.
 check:
@@ -56,6 +56,12 @@ test-native:
 test-chaos:
     cargo test --locked --features chaos-harness --lib
 
+# Lint and test the workspace members. Every other recipe here is bare, so it
+# selects the root package only.
+test-placement:
+    cargo clippy --locked --all-targets -p turbolay-placement -- -D warnings
+    cargo test --locked -p turbolay-placement
+
 # Verify native libraries required by Rust FFI crates.
 native-check:
     #!/usr/bin/env bash
@@ -70,7 +76,7 @@ native-check:
     fi
 
 # Run the local CI-equivalent check set.
-ci: native-check fmt-check check test test-opencypher test-graphblas test-native test-chaos check-examples check-examples-native check-examples-chaos
+ci: native-check fmt-check check test-placement test test-opencypher test-graphblas test-native test-chaos check-examples check-examples-native check-examples-chaos
 
 # Run the local object-store smoke test.
 smoke:

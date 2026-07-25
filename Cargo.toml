@@ -1,3 +1,14 @@
+# The root stays the `slatedb-graph-kernel` package and merely gains a
+# `[workspace]` table, so every bare `cargo test --features …` in CI, the
+# justfile and scripts/ still resolves to the root package. A virtual manifest
+# would have broken all of them.
+#
+# `exclude` covers the vendored Quint/CosmWasm sample manifests under `docs/`,
+# which are gitignored but present in working trees.
+[workspace]
+members = ["crates/placement"]
+exclude = ["docs"]
+
 [package]
 name = "slatedb-graph-kernel"
 version = "0.1.0"

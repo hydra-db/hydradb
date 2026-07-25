@@ -1,0 +1,14 @@
+[package]
+name = "turbolay-placement"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "Rendezvous placement and node liveness for Turbolay cell writers"
+publish = false
+
+# Deliberately empty. The frozen hash is pure functions over `&str`, and
+# placement must not know about graphs, shards or queries — that is what keeps
+# it testable against `InMemory` alone. `heartbeat.rs` will add `slatedb` (for
+# the `slatedb::object_store` re-export, so `Arc<dyn ObjectStore>` unifies
+# across the crate boundary) once the readiness/lease decisions are settled.
+[dependencies]
