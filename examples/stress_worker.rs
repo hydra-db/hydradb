@@ -455,8 +455,7 @@ fn selected_matrix_kernel() -> SparseKernelBackend {
             SparseKernelBackend::SuiteSparseGraphBlas
         }
         Ok(value) if value.eq_ignore_ascii_case("rust") => SparseKernelBackend::RustSparse,
-        _ if cfg!(feature = "graphblas") => SparseKernelBackend::SuiteSparseGraphBlas,
-        _ => SparseKernelBackend::RustSparse,
+        _ => SparseKernelBackend::SuiteSparseGraphBlas,
     }
 }
 
