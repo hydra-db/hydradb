@@ -4,7 +4,7 @@ status: step-2-complete
 date: 2026-07-25
 branch: Turbolay-V3.5
 base_commit: 3bacd71
-head_commit: 7b0d340
+head_commit: ea942ec
 tags:
   - routing
   - placement
@@ -14,9 +14,11 @@ tags:
 
 # Rendezvous placement for cell writers — code plan
 
-Sections 1 and 2 landed in `7b0d340`. Sections 3–5 are unstarted.
+Sections 1 and 2 landed in `7b0d340`, with the finalizer following in `ea942ec`.
+Sections 3–5 are unstarted.
 
-§7 decisions 1–8 are settled; §7.9 lists the one call still open. All of Phase 1
+All twelve §7 decisions are settled; nothing is open. Decisions 10–12 fix the
+`heartbeat.rs` signatures and were taken before commit 1 for that reason. All of Phase 1
 ships in a single release as seven staged commits (§7.8) — the heartbeat
 publisher ahead of the routing change, because decision 4 deletes the probe. The
 reasoning behind every settled decision lives in
@@ -113,9 +115,17 @@ crates/placement/
   src/
     lib.rs         ✅ owner/rank/score re-exports
     hash.rs        ✅ frozen rendezvous scoring
-    heartbeat.rs   ⬜ write, list, parse, liveness — blocked on decision 4
-    directory.rs   ⬜ live set = configured membership ∩ fresh heartbeats
+    heartbeat.rs   ⬜ object names, body type, the LIST boundary
+    liveness.rs    ⬜ live set = configured membership ∩ fresh heartbeats
 ```
+
+`liveness.rs`, not `directory.rs` — decision 12. The kernel already has an
+`ObjectStoreNodeDirectory` and it is the *other* half of the intersection.
+
+The split follows sleet: `heartbeat.rs` is names, the body type, and the single
+impure `list_heartbeats`; `liveness.rs` is pure decision functions over
+pre-computed ages (decision 10). The publisher loop is not in this crate at all —
+it lands in `graph-node.rs` in commit 2.
 
 ## 2. The frozen hash — LANDED
 
@@ -203,6 +213,9 @@ local clock. A node is live if its heartbeat is younger than `heartbeat_timeout`
 Placement reads only the LIST result (name + timestamp); the body is
 observability and is never fetched on the placement path.
 
+Every liveness function receives the comparison time as a parameter and reads no
+clock of its own — decision 10, which fixes the signatures below.
+
 Following sleet: **a node always counts itself live.** If its own heartbeat looks
 stale it has no reliable proof it should stop.
 
@@ -282,19 +295,47 @@ the cluster.
 
 ## 5. Tests
 
+Three harnesses already exist and none of this needs new integration scaffolding:
+
+- **`src/tests.rs:3134` `routed_cluster_uses_slatedb_writer_fencing`** stands up
+  two `RoutedGraphCluster`s with different `local_node_id` over one shared
+  `InMemory` store and asserts the stale writer gets
+  `ErrorKind::Closed(Fenced)`. The regression test is that, with a third node and
+  concurrent writes.
+- **`RoutedGraphCluster` already carries `local_node_id` and `directory`**
+  (`cluster.rs:165-166`, both flowing through
+  `open_promotable_scoped_with_memory_options`), so touch point (b) is testable
+  in-process with an injected live set and no heartbeat plumbing at all.
+- **`examples/fence_worker.rs`** — incumbent/takeover/reader modes coordinating
+  through a signal dir, for real cross-process epoch contention. `jepsen/` for
+  the fleet-level property.
+
 | Test | Where | Guards |
 |---|---|---|
 | Golden hash values, pinned hex | `turbolay-placement` | the wire format |
 | Remove a node, order of the rest preserved | `turbolay-placement` | minimal disruption |
 | 3 similar node ids over 30 000 cells stay within 10% | `turbolay-placement` | the finalizer — fails at 2.00 without it |
 | Heartbeat expiry, self-always-live | `turbolay-placement` | liveness rules |
-| LIST failure inside grace keeps the view; past grace sheds and unpublishes | `turbolay-placement` | decision 7 — the bound |
+| LIST failure inside grace keeps the view; past grace sheds and unpublishes | `turbolay-placement` + `FaultStore` | decision 7 — the bound |
+| LIST fails while PUTs still land → node withdraws its heartbeat | `turbolay-placement` + `FaultStore` | decision 7's partial failure — the permanent-refusal trap |
 | Never-published peer counts live for one timeout after start, dead after | `turbolay-placement` | decision 8 — the rolling restart |
-| Routing table names the rendezvous owner for WRITE | `bolt/routing` tests | touch point (a) |
-| Non-owner write returns `NotCellWriter`, not a promotion | `cluster` tests | touch point (b) |
-| **3 promotable nodes, 1 cell, concurrent writes → exactly one epoch bump** | integration | **the prod regression** |
+| `interval >= timeout` is rejected at startup | `turbolay-placement` | decision 5's validation |
+| Publishes while ready, DELETEs on unready and on SIGTERM | `turbolay-placement` + `graph-node` smoke | decision 4 — readiness rides the heartbeat |
+| Routing table names the rendezvous owner for WRITE; `READ`/`ROUTE` unchanged; no probe fan-out remains | `bolt/routing` tests | touch point (a) |
+| Non-owner write returns `NotCellWriter`, not a promotion; owner promotes; `None` owner promotes | `cluster` tests | touch point (b), all three arms |
+| Maps to `Neo.ClientError.Cluster.NotALeader` with the owner hint; HTTP returns 421 | `bolt` tests | touch point (c) |
+| On `Fenced`: waits one interval, resets backoff to 1s, retries without re-checking ownership | `core/state.rs` unit | decision 6, all three rules |
+| Advisory record written only after a successful promotion, never read to decide one | `cluster` tests | 3a stays advisory |
+| **3 promotable nodes, 1 cell, concurrent writes → epoch growth bounded** | integration | **the prod regression** |
 
-The last row is the one that matters — it is the incident, reproduced.
+The last row is the one that matters — it is the incident, reproduced. It asserts
+a **bound on epoch growth, not zero re-fences**: decision 6.3 accepts that a
+fenced node re-fences the winner once more before converging, so a test demanding
+a single epoch bump would fail correctly-behaving code. Convergence within a
+bound is the invariant; that bound is what the test pins.
+
+Every time-dependent row above is a pure-function table test running in
+microseconds, because of decision 10. None of them sleep.
 
 ## 6. Explicitly out of scope
 
@@ -491,9 +532,9 @@ Seven commits, shipped together. No intermediate version reaches prod.
 
 | # | Commit | Runtime effect |
 |---|---|---|
-| 1 | §3 crate — `heartbeat.rs`, `directory.rs` | none |
+| 1 | §3 crate — `heartbeat.rs`, `liveness.rs` | none |
 | 2 | **publisher** — readiness-gated heartbeat task, DELETE on SIGTERM | writes objects nothing yet reads |
-| 3 | **(a)** routing — live set from LIST, `WRITE` names the owner, fan-out deleted | first client-visible change |
+| 3 | **(a)** routing — live set from LIST, `WRITE` names the owner, fan-out deleted, `with_preferred_writer_node` deleted | first client-visible change |
 | 4 | **(b)+(c)** don't-promote rule + `NotALeader` mapping | **the duel stops** |
 | 5 | **(d)** fence backoff + reset to 1s | bounds mutual fencing |
 | 6 | **3a** advisory record + fenced-log attribution | next incident readable in one line |
@@ -504,20 +545,108 @@ probe and cannot function until heartbeats exist. Commits 3 and 4 are the pair
 that must not be separated, and are where the review effort belongs.
 
 Shipping one release removes most of the mixed-version hazard but not all of it —
-a rolling restart replaces pods one at a time. So `directory.rs` distinguishes
+a rolling restart replaces pods one at a time. So `liveness.rs` distinguishes
 **never-published** from **expired**: for the first `heartbeat_timeout` after
 process start, a configured peer with no heartbeat object counts as live. Only
 expiry is evidence of death; the never-seen case degrades to today's behaviour
 instead of concluding the rest of the fleet is dead.
 
-### 9. Still open
+### 9. Delete `with_preferred_writer_node` — decided
 
-- **Does `with_preferred_writer_node` survive?** Recommendation reversed after
-  reading the code: **delete it**. It has no production caller —
-  `graph-node.rs:115-116` never calls it, so the field is always the address
-  map's first key (`routing.rs:76-80`) and its only caller is
-  `bolt/tests.rs:1373`. Keeping it once (b) enforces ownership creates a routing
-  loop no timeout breaks: routing advertises the override, `ensure_local_writer`
-  enforces rendezvous, and the driver bounces between them. If a pin is ever
-  wanted it belongs *inside* `owner()` in `turbolay-placement`, so both sides
-  read one source. Full argument in section B of the open-questions record.
+It has no production caller — `graph-node.rs:115-116` never calls it, so the
+field is always the address map's first key (`routing.rs:76-80`) and its only
+caller is `bolt/tests.rs:1373`. Keeping it once (b) enforces ownership creates a
+routing loop no timeout breaks: routing advertises the override,
+`ensure_local_writer` enforces rendezvous, and the driver bounces between them.
+
+Deleted **in commit 3**, with the probe fan-out, not deferred past it — commits 3
+and 4 are exactly what makes the override contradictory, so carrying it through
+them is how the loop reaches prod.
+
+If a pin is ever wanted it belongs *inside* `owner()` in `turbolay-placement`, so
+routing and `ensure_local_writer` cannot disagree. Full argument in section B of
+the open-questions record.
+
+### 10. Time is a parameter, never a clock read — decided
+
+Nothing in `turbolay-placement` calls `Utc::now()` or `Instant::now()`.
+
+Sleet does this better than "pass `now` everywhere", and reading it
+(`../sleet/src/root.rs:134-219`) improved the decision: **collapse the timestamp
+to a `Duration` age at the LIST boundary, and every function below it is pure and
+time-free.** `list_heartbeats` is the one impure function and the only thing that
+takes a `now`; `HeartbeatEntry` carries `age: Duration`; the decision functions
+take no time argument at all.
+
+```rust
+// The one impure boundary — the only thing that knows what time it is.
+pub async fn list_heartbeats(store: &dyn ObjectStore, prefix: &Path,
+                             now: DateTime<Utc>) -> Result<Vec<HeartbeatEntry>>;
+
+// Everything below: pure, synchronous, no clock, no Instant, no DateTime.
+pub fn youngest_per_node(entries: &[HeartbeatEntry]) -> BTreeMap<&str, &HeartbeatEntry>;
+pub fn live_nodes(entries: &[HeartbeatEntry], timeout: Duration) -> Vec<NodeView>;
+```
+
+Decision 7's `last_successful_list` and decision 8's process-start instant arrive
+as elapsed `Duration`s for the same reason.
+
+The payoff is visible in sleet's own tests: `node_view_dedups_youngest_and_drops_dead`
+(`root.rs:662-688`) is a plain `#[test]` that hand-builds
+`HeartbeatEntry { age: Duration::from_secs(120), .. }`. No store, no clock, no
+fake, no sleep. That is the property to copy, and it is a consequence of the age
+boundary rather than of any injection mechanism.
+
+Rejected a `Clock` trait — which is what sleet actually has (`root.rs:31-47`) —
+because it buys nothing once the age boundary exists, and it carries a real tax
+sleet pays: two clocks that must be advanced in lockstep, `TestClock::advance`
+for liveness and `tokio::time` for the loop (`../sleet/tests/dst.rs:93-98`).
+Rejected `tokio::time::pause()` as the sole mechanism because `InMemory` stamps
+`LastModified` from the real wall clock with no way to backdate it, so virtual
+time cannot express "this heartbeat is 16s old" — it moves tokio's timers, not
+the store's timestamps. It stays the right tool for the *scheduling* clock in
+decision 6's backoff test, which is a separate concern.
+
+Why, concretely: at 5s/15s defaults a test that genuinely waits costs 30s+ each
+and goes flaky under CI load, and there are four such rules. Worse, `InMemory`
+stamps `LastModified` from the real wall clock with **no way to backdate it**, so
+`tokio::time::pause()` cannot express "this heartbeat is 16s old" at all — it
+moves tokio's timers, not the store's timestamps. Rejected a `Clock` trait as
+well: it would be this crate's first abstraction, and the pure functions that need
+the time do not need an injected object to get it.
+
+Cheap now, expensive later — it fixes the §3 signatures, so it is settled before
+commit 1 rather than retrofitted through it.
+
+### 11. Test doubles live in placement, `#[cfg(test)]` — decided
+
+Nothing in the tree implements `ObjectStore` today (`impl ObjectStore for` has
+zero hits), so decision 7 needs a `FaultStore` decorator over `InMemory` built
+from scratch. It goes in a `#[cfg(test)]` module inside `crates/placement` — no
+new workspace member, no shipped code, no dev-dependency cycle back to the kernel.
+
+It scopes there cleanly because decision 7's rule lives in `liveness.rs`, and
+that is the only code path a failing LIST matters to: routing and cluster tests
+inject a live set directly and never need a broken store.
+
+**`fail_list` and `fail_put` must be independently settable.** Decision 7's
+partial failure — LIST throttled, PUTs still landing — is the case that motivates
+withdrawing the heartbeat, and a double that only fails everything at once cannot
+reproduce it. That is also the nastiest bug in this design: a node that sheds
+while still publishing stays the computed owner for every peer, so they route
+writes to it and it refuses every one, permanently, with nothing to time out.
+
+Revisit only if kernel tests come to want a failing store too (index GC, matrix
+publish); then it graduates to a `crates/test-support` member.
+
+### 12. `liveness.rs`, not `directory.rs` — decided
+
+The kernel already exports `ObjectStoreNodeDirectory` (`src/lib.rs:84`,
+`engine.rs:80`), and it is the *other* operand of the intersection: static
+validated cell and node ids, performing no object-store I/O whatsoever despite
+the name. Naming placement's module `directory.rs` would leave two things called
+directory whose relationship is `membership ∩ liveness`.
+
+Placement's is `liveness.rs` / `LiveNodeSet`. The kernel's name is left alone —
+it is the more misleading of the two, but it is a public re-export, so renaming it
+is a breaking change bought for nothing here.
