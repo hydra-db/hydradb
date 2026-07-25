@@ -512,6 +512,15 @@ Touch point (d) currently under-specifies this. Sleet's handler
 3. **Retries unconditionally**, without re-checking ownership. Sleet accepts that
    a fenced node re-fences the winner once more before converging.
 
+**One deliberate divergence, found while implementing.** Sleet's retry loop is
+unbounded because it is a *daemon supervisor* — nobody is waiting on it. Ours
+sits on the **write path**, where an unbounded loop hangs a client request
+forever, so it is capped at four attempts. The budget is spent on attempts
+rather than on sleeps: worst case is one 5s fence wait plus 2s + 4s ≈ 11s, then
+the last error returns to the caller. Rule 3 is preserved in the sense that
+matters — no ownership re-check between attempts — and the cap is what makes
+"retry blind" safe to do in front of a client.
+
 ### 7. A failed node LIST — bounded grace, then shed. Decided
 
 Sleet keeps its assignments on a failed LIST (`daemon.rs:243`). For a writer that

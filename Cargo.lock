@@ -2704,6 +2704,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "turbolay-placement",
 ]
 
 [[package]]
