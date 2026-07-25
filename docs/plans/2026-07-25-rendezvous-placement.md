@@ -1,10 +1,10 @@
 ---
 title: Rendezvous placement for cell writers
-status: step-2-complete
+status: step-3-complete
 date: 2026-07-25
 branch: Turbolay-V3.5
 base_commit: 3bacd71
-head_commit: ea942ec
+head_commit: 475c473
 tags:
   - routing
   - placement
@@ -15,7 +15,8 @@ tags:
 # Rendezvous placement for cell writers — code plan
 
 Sections 1 and 2 landed in `7b0d340`, with the finalizer following in `ea942ec`.
-Sections 3–5 are unstarted.
+Section 3 — the crate half of it, which is commit 1 of §7.8 — landed in
+`475c473`. Section 4 is unstarted, and it is where the runtime effect begins.
 
 All twelve §7 decisions are settled; nothing is open. Decisions 10–12 fix the
 `heartbeat.rs` signatures and were taken before commit 1 for that reason. All of Phase 1
@@ -115,8 +116,9 @@ crates/placement/
   src/
     lib.rs         ✅ owner/rank/score re-exports
     hash.rs        ✅ frozen rendezvous scoring
-    heartbeat.rs   ⬜ object names, body type, the LIST boundary
-    liveness.rs    ⬜ live set = configured membership ∩ fresh heartbeats
+    heartbeat.rs   ✅ object names, body type, the LIST boundary
+    liveness.rs    ✅ live set = configured membership ∩ fresh heartbeats
+    fault_store.rs ✅ #[cfg(test)] only — decision 11
 ```
 
 `liveness.rs`, not `directory.rs` — decision 12. The kernel already has an
@@ -256,13 +258,32 @@ The rule that ends the duel:
 > A node must not promote itself for a cell it does not own, unless the computed
 > owner is not live.
 
+There are **four** states here, not three — commit 1 corrected this. `owner`
+returning `None` and placement having shed its view are different situations
+with opposite answers, and collapsing them is how the permanent-refusal trap in
+decision 7 gets built by accident.
+
 ```rust
-match placement.owner(scope, cell_id) {
-    Some(o) if o == self.local_node_id => shard.promote_to_writer(..).await,
-    Some(o)                            => Err(GraphError::NotCellWriter { cell_id, owner: o }),
-    None                               => shard.promote_to_writer(..).await, // no live owner
+match view.candidates() {
+    // Shed: past the LIST grace, no idea who is live. Refuse, no hint.
+    None => Err(GraphError::NotCellWriter { cell_id, owner: None }),
+    Some(live) => match placement::owner(scope, cell_id, live) {
+        Some(o) if o == self.local_node_id => shard.promote_to_writer(..).await,
+        Some(o) => Err(GraphError::NotCellWriter { cell_id, owner: Some(o) }),
+        // Live set known and nobody owns it: promote.
+        None => shard.promote_to_writer(..).await,
+    },
 }
 ```
+
+`LiveView::candidates()` returns `Option<Vec<&str>>` precisely so this cannot be
+got wrong: `Some(&[])` means *no live owner*, which licenses self-promotion,
+while `None` means *I do not know the live set*, which must not. A shed view
+carries no node list at all, so there is no way to fall through into the
+promote arm.
+
+Note this makes `NotCellWriter`'s `owner` an `Option<String>`, not a `String`,
+which touch point (c) must carry through to the Bolt hint.
 
 This one branch is what converts "any node steals the epoch on demand" into
 "only a node with a placement reason claims it".
@@ -532,7 +553,7 @@ Seven commits, shipped together. No intermediate version reaches prod.
 
 | # | Commit | Runtime effect |
 |---|---|---|
-| 1 | §3 crate — `heartbeat.rs`, `liveness.rs` | none |
+| 1 | §3 crate — `heartbeat.rs`, `liveness.rs` — **LANDED `475c473`** | none |
 | 2 | **publisher** — readiness-gated heartbeat task, DELETE on SIGTERM | writes objects nothing yet reads |
 | 3 | **(a)** routing — live set from LIST, `WRITE` names the owner, fan-out deleted, `with_preferred_writer_node` deleted | first client-visible change |
 | 4 | **(b)+(c)** don't-promote rule + `NotALeader` mapping | **the duel stops** |
