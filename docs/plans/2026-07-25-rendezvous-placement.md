@@ -1,10 +1,10 @@
 ---
 title: Rendezvous placement for cell writers
-status: step-3-complete
+status: done
 date: 2026-07-25
 branch: Turbolay-V3.5
 base_commit: 3bacd71
-head_commit: 475c473
+head_commit: dddc1ec
 tags:
   - routing
   - placement
@@ -14,9 +14,14 @@ tags:
 
 # Rendezvous placement for cell writers — code plan
 
-Sections 1 and 2 landed in `7b0d340`, with the finalizer following in `ea942ec`.
-Section 3 — the crate half of it, which is commit 1 of §7.8 — landed in
-`475c473`. Section 4 is unstarted, and it is where the runtime effect begins.
+**All seven commits of §7.8 have landed** (`ea942ec..dddc1ec`). Phase 1 is
+complete: rendezvous picks one owner per cell, non-owners refuse with a
+re-routable hint, and the fenced-writer duel is bounded.
+
+Three things changed shape on contact with the code, all recorded below where
+they belong: decision 6 rule 3 **inverted** (§7.6), touch point (b) grew from
+three arms to **four** (§4), and decision 3's second read path was **not wired**
+(§7.3).
 
 All twelve §7 decisions are settled; nothing is open. Decisions 10–12 fix the
 `heartbeat.rs` signatures and were taken before commit 1 for that reason. All of Phase 1
@@ -118,6 +123,7 @@ crates/placement/
     hash.rs        ✅ frozen rendezvous scoring
     heartbeat.rs   ✅ object names, body type, the LIST boundary
     liveness.rs    ✅ live set = configured membership ∩ fresh heartbeats
+    cell_writer.rs ✅ the 3a advisory record — decision 3
     fault_store.rs ✅ #[cfg(test)] only — decision 11
 ```
 
@@ -435,6 +441,16 @@ we check ownership on every promotion, sleet once at task spawn. Neither the for
 nor upstream 0.14.1 has any epoch option on `DbBuilder`, so it is an upstream
 feature request that would gate a prod fix on a dependency change. And the
 incident's actual pain was diagnostic, not correctness.
+
+**Only one of the two read paths was wired, and deliberately.** The fence log
+reads the record; the `NotCellWriter { owner }` hint does not. Rendezvous
+already supplies the owner in the `Remote` arm with no I/O, and `Unknown` — the
+only arm where the record could add anything — is by construction the state in
+which this node's LIST against that same store has been failing past the grace
+window. The GET would fail alongside it, once per refused write, in a loop. Touch
+point (b) already settled that arm as `owner: None` because a stale guess may
+name a node that has itself shed. `read_cell_writer` is public and its rustdoc
+carries this reasoning.
 
 **Recorded so this is never re-read as a guarantee:** the SlateDB writer epoch
 remains the only authority. The record answers "who last successfully promoted",
