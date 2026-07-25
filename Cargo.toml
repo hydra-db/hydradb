@@ -161,10 +161,16 @@ sha2 = { workspace = true }
 subtle = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
+turbolay-placement = { path = "crates/placement" }
 
 [dev-dependencies]
 boltr = { workspace = true, features = ["client"] }
 serde = { workspace = true }
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs, and the fence
+# backoff tests in `src/core/state.rs` are built on it. It does arrive anyway
+# through feature unification with `fail-parallel`, a slatedb dependency, but
+# those tests would stop compiling the day that transitive path changes.
+tokio = { workspace = true, features = ["test-util"] }
 serde_yaml = { workspace = true }
 rcgen = { workspace = true }
 reqwest = { workspace = true }
