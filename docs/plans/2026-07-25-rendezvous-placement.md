@@ -126,10 +126,38 @@ variant (`score_target`/`rank_target`/`owner_target`) have no analogue here and
 were dropped. FNV-1a 64, key encoding and tie-break frozen as a wire format:
 
 ```
-score(scope, cell, node) = fnv1a64(scope ‖ 0x00 ‖ cell_id ‖ 0x00 ‖ node_id)
+score(scope, cell, node) = mix64(fnv1a64(scope ‖ 0x00 ‖ cell_id ‖ 0x00 ‖ node_id))
 rank                     = descending by score, ties broken by node_id ascending
 owner                    = rank[0], or None when no node is live
 ```
+
+### The finalizer, and why it was added after the fact
+
+`mix64` is splitmix64's three shift-xor-multiply rounds. It was **not** in the
+version that landed in `7b0d340`; it was added once the distribution was
+measured rather than assumed.
+
+FNV-1a ends on a single multiply, so keys that differ only in their final byte
+come out agreeing in their high bits and the ranking is settled by a handful of
+low ones. Node ids differing only in the final byte is not a corner case — it is
+what a StatefulSet produces:
+
+| | 3 nodes, 20 000 cells | max/min |
+|---|---|---|
+| plain FNV-1a, `graph-node-0..2` | 5000 / 5000 / 10000 | **2.00** |
+| plain FNV-1a, unrelated names | 6347 / 6932 / 6721 | 1.09 |
+| **FNV-1a + splitmix64**, `graph-node-0..2` | 10040 / 9980 / 9980 | **1.006** |
+
+One node owning half the fleet, at every scale, not converging with cell count.
+Reordering the key so the node id is hashed first does **not** fix it (measured
+1.42 at three nodes, 2.14 at six); only the finalizer does.
+
+Phase 1 is unaffected either way — one cell, and all that matters is that every
+node agrees. It would have bitten in Phase 2, as soon as cells outnumber nodes.
+Changing it costs one re-pin of the golden values today because nothing consumes
+placement yet; after Phase 1 ships it would be a fleet-wide reshuffle with a
+writer handover per cell. `ownership_is_balanced_across_similar_node_ids` guards
+the property, and would fail against the old hash.
 
 `scope` is `GraphScope`'s `Display` — `"{namespace}/graphs/{graph_id}"`
 (`src/core/namespace.rs:268-272`). **This becomes a compatibility surface the
@@ -146,15 +174,16 @@ pub fn owner<'a>(scope: &str, cell_id: &str, live: &[&'a str]) -> Option<&'a str
 write* — it is the third arm of touch point (b), where a node promotes itself
 because no owner is live.
 
-Seven tests, all passing. The pinned values, which are now a compatibility
-surface:
+Eight tests, all passing. The pinned values, which are now a compatibility
+surface — **re-pinned when the finalizer was added**, so any tree still
+asserting the `0xf0dc…` generation predates it:
 
 | `scope` | cell | node | score |
 |---|---|---|---|
-| `acme/graphs/social` | `cell-a` | `graph-node-0` | `0xf0dc2317deb297c5` |
-| `acme/graphs/social` | `cell-a` | `graph-node-1` | `0xf0dc2217deb29612` |
-| `acme/graphs/social` | `cell-b` | `graph-node-0` | `0x39ffe3dd3cc79ffe` |
-| `acme/graphs/other` | `cell-a` | `graph-node-0` | `0xc15e57802a479f04` |
+| `acme/graphs/social` | `cell-a` | `graph-node-0` | `0xf446a8f8dd607f2f` |
+| `acme/graphs/social` | `cell-a` | `graph-node-1` | `0x535527081c8d0fb0` |
+| `acme/graphs/social` | `cell-b` | `graph-node-0` | `0x36c7be50a933a232` |
+| `acme/graphs/other` | `cell-a` | `graph-node-0` | `0x29d54f9b37598022` |
 
 Two notes for whoever touches this next. The minimal-disruption and
 runner-up tests use `cell-b` deliberately: under `cell-a` the ranking happens
@@ -257,6 +286,7 @@ the cluster.
 |---|---|---|
 | Golden hash values, pinned hex | `turbolay-placement` | the wire format |
 | Remove a node, order of the rest preserved | `turbolay-placement` | minimal disruption |
+| 3 similar node ids over 30 000 cells stay within 10% | `turbolay-placement` | the finalizer — fails at 2.00 without it |
 | Heartbeat expiry, self-always-live | `turbolay-placement` | liveness rules |
 | LIST failure inside grace keeps the view; past grace sheds and unpublishes | `turbolay-placement` | decision 7 — the bound |
 | Never-published peer counts live for one timeout after start, dead after | `turbolay-placement` | decision 8 — the rolling restart |
