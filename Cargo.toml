@@ -9,11 +9,8 @@ readme = "README.md"
 publish = false
 
 [features]
-# graphblas is the production matrix kernel; the pure-Rust path is a fallback that
-# stays buildable via `--no-default-features`.
-default = ["graphblas"]
+default = []
 opencypher = ["dep:libcypher-parser-sys"]
-graphblas = []
 chaos-harness = []
 json-properties = ["dep:serde_json"]
 query-transport = ["opencypher", "dep:base64", "dep:serde", "dep:subtle", "json-properties", "tokio/io-util", "tokio/net"]
@@ -25,7 +22,6 @@ http-api = ["client-api", "query-transport-tls", "dep:axum", "dep:axum-server"]
 public-client-protocols = ["bolt-server", "http-api"]
 server-runtime = [
     "public-client-protocols",
-    "graphblas",
     "query-service-discovery",
     "dep:rustls-pemfile",
     "dep:tracing-subscriber",

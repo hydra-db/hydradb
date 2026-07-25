@@ -54,28 +54,7 @@ impl GraphShard {
             edges.len() as u64,
             self.limits.max_artifact_build_edges,
         )?;
-        let (out_tiles, transpose_tiles) = if cfg!(feature = "graphblas") {
-            (Vec::new(), Vec::new())
-        } else {
-            (
-                matrix_tiles_from_edges(
-                    cell_id,
-                    edge_type,
-                    base_epoch,
-                    tile_size,
-                    MatrixDirection::Out,
-                    &edges,
-                ),
-                matrix_tiles_from_edges(
-                    cell_id,
-                    edge_type,
-                    base_epoch,
-                    tile_size,
-                    MatrixDirection::In,
-                    &edges,
-                ),
-            )
-        };
+        let (out_tiles, transpose_tiles) = (Vec::new(), Vec::new());
         let adjacency = Arc::new(adjacency_from_edges(&edges));
         let graphblas_csc = graphblas_csc_from_adjacency(adjacency.as_ref())?;
         let artifact = MatrixArtifact {
@@ -177,7 +156,7 @@ impl GraphShard {
             &self.cache_metrics,
         );
         let retain_separate_adjacency = self.cache_policy.max_matrix_adjacencies > 0
-            && (!cfg!(feature = "graphblas") || self.cache_policy.max_graphblas_matrices == 0);
+            && self.cache_policy.max_graphblas_matrices == 0;
         if retain_separate_adjacency {
             self.matrix_cache.lock().await.insert_sized(
                 cache_key.clone(),
@@ -189,7 +168,6 @@ impl GraphShard {
             );
         }
 
-        #[cfg(feature = "graphblas")]
         if self.cache_policy.max_graphblas_matrices > 0 {
             let started = Instant::now();
             let compiled = Arc::new(compile_graphblas_csc(&graphblas_csc)?);
@@ -255,39 +233,7 @@ impl GraphShard {
                 prepare_matrix_artifact_build(self, cell_id, edge_type, base_epoch).await?;
                 let mut data_batch = GraphWriteBatch::new();
                 let mut pending_writes = 0_usize;
-                let (out_tiles, transpose_tiles) = if cfg!(feature = "graphblas") {
-                    (0, 0)
-                } else {
-                    let out_tiles = append_matrix_tiles_from_rows(
-                        self,
-                        &artifact_lock,
-                        &mut data_batch,
-                        &mut pending_writes,
-                        cell_id,
-                        edge_type,
-                        base_epoch,
-                        tile_size,
-                        MatrixDirection::Out,
-                        &rows.rows,
-                    )
-                    .await?;
-                    artifact_lock.renew().await?;
-                    let reversed = rows.reversed();
-                    let transpose_tiles = append_matrix_tiles_from_rows(
-                        self,
-                        &artifact_lock,
-                        &mut data_batch,
-                        &mut pending_writes,
-                        cell_id,
-                        edge_type,
-                        base_epoch,
-                        tile_size,
-                        MatrixDirection::In,
-                        &reversed.rows,
-                    )
-                    .await?;
-                    (out_tiles, transpose_tiles)
-                };
+                let (out_tiles, transpose_tiles) = (0, 0);
 
                 artifact_lock.renew().await?;
                 let graphblas_manifest = append_graphblas_csc_chunks_from_rows(
@@ -391,7 +337,7 @@ impl GraphShard {
         );
 
         let retain_separate_adjacency = self.cache_policy.max_matrix_adjacencies > 0
-            && (!cfg!(feature = "graphblas") || self.cache_policy.max_graphblas_matrices == 0);
+            && self.cache_policy.max_graphblas_matrices == 0;
         let adjacency = if retain_separate_adjacency {
             Some(Arc::new(rows.to_adjacency()))
         } else {
@@ -408,7 +354,6 @@ impl GraphShard {
             );
         }
 
-        #[cfg(feature = "graphblas")]
         if self.cache_policy.max_graphblas_matrices > 0 {
             let started = Instant::now();
             let graphblas_csc = matrix_rows_to_graphblas_csc(&rows)?;

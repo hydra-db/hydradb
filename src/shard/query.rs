@@ -1,4 +1,3 @@
-#[cfg(feature = "graphblas")]
 use super::topology_tail::{expand_range_with_overlay, GraphTopologyOverlay, GraphTopologyTail};
 use super::*;
 #[cfg(feature = "opencypher")]
@@ -6,7 +5,6 @@ use std::sync::atomic::AtomicU64;
 #[cfg(feature = "opencypher")]
 use std::time::Duration;
 
-#[cfg(feature = "graphblas")]
 async fn run_graph_compute<T, F>(
     metrics: Arc<GraphOperationalMetrics>,
     operation: &'static str,
@@ -48,7 +46,6 @@ where
     })?
 }
 
-#[cfg(feature = "graphblas")]
 fn run_graph_compute_inline<T, F>(metrics: Arc<GraphOperationalMetrics>, compute: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
@@ -5015,7 +5012,6 @@ impl GraphShard {
         budget: &QueryBudget,
     ) -> Result<Option<(Vec<VertexId>, u64)>> {
         let _ = (cell_id, edge_type, src, hop_range, read_epoch, budget);
-        #[cfg(feature = "graphblas")]
         {
             let (min_hops, max_hops) = hop_range;
             budget.check("cypher_graphblas_artifact_lookup")?;
@@ -5060,10 +5056,6 @@ impl GraphShard {
             .await?;
             Ok(Some((traversal.vertices, traversal.edge_visits)))
         }
-        #[cfg(not(feature = "graphblas"))]
-        {
-            Ok(None)
-        }
     }
 
     #[cfg(feature = "opencypher")]
@@ -5077,7 +5069,6 @@ impl GraphShard {
         budget: &QueryBudget,
     ) -> Result<Option<(u64, u64)>> {
         let _ = (cell_id, edge_type, src, hop_range, read_epoch, budget);
-        #[cfg(feature = "graphblas")]
         {
             let (min_hops, max_hops) = hop_range;
             budget.check("cypher_graphblas_count_artifact_lookup")?;
@@ -5152,10 +5143,6 @@ impl GraphShard {
             };
             Ok(Some((traversal.vertices, traversal.edge_visits)))
         }
-        #[cfg(not(feature = "graphblas"))]
-        {
-            Ok(None)
-        }
     }
 
     #[cfg(feature = "opencypher")]
@@ -5164,7 +5151,6 @@ impl GraphShard {
         request: &ReachableWindowRequest<'_>,
     ) -> Result<Option<(Vec<VertexId>, u64)>> {
         let _ = request;
-        #[cfg(feature = "graphblas")]
         {
             let (min_hops, max_hops) = request.hop_range;
             request
@@ -5239,13 +5225,8 @@ impl GraphShard {
             .await?;
             Ok(Some((traversal.vertices, traversal.edge_visits)))
         }
-        #[cfg(not(feature = "graphblas"))]
-        {
-            Ok(None)
-        }
     }
 
-    #[cfg(feature = "graphblas")]
     pub(crate) async fn compiled_graphblas_query_snapshot(
         &self,
         cell_id: &str,
@@ -5338,7 +5319,6 @@ impl GraphShard {
             .map(|compiled| (compiled, None, false)))
     }
 
-    #[cfg(feature = "graphblas")]
     fn record_graphblas_snapshot(&self, rebuilt: bool) {
         let counter = if rebuilt {
             &self.operation_metrics.query_graphblas_rebuilt_snapshots

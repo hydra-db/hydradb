@@ -144,7 +144,6 @@ impl GraphShard {
         Ok(published)
     }
 
-    #[cfg(feature = "graphblas")]
     pub(crate) async fn graph_index_csc(
         &self,
         generation: &GraphIndexGeneration,
@@ -179,7 +178,6 @@ impl GraphShard {
         Ok(Some(csc))
     }
 
-    #[cfg(feature = "graphblas")]
     pub(crate) async fn forget_graph_index_generation(&self, generation: &GraphIndexGeneration) {
         let key = MatrixCacheKey::new(
             &generation.cell_id,
@@ -190,7 +188,6 @@ impl GraphShard {
         self.graphblas_cache.lock().await.remove(&key);
     }
 
-    #[cfg(feature = "graphblas")]
     pub(crate) async fn graph_index_generation_at(
         &self,
         cell_id: &str,
@@ -408,7 +405,6 @@ fn encode_graph_index_csc(
     value
 }
 
-#[cfg(feature = "graphblas")]
 fn decode_graph_index_csc(
     key: &str,
     value: &[u8],
@@ -468,7 +464,6 @@ fn encode_index_u64s(out: &mut Vec<u8>, values: &[u64]) {
     }
 }
 
-#[cfg(feature = "graphblas")]
 fn decode_index_u64(key: &str, value: &[u8], cursor: &mut usize, field: &str) -> Result<u64> {
     let end = cursor.saturating_add(std::mem::size_of::<u64>());
     let bytes = value
@@ -483,7 +478,6 @@ fn decode_index_u64(key: &str, value: &[u8], cursor: &mut usize, field: &str) ->
     ))
 }
 
-#[cfg(feature = "graphblas")]
 fn decode_index_u64s(key: &str, value: &[u8], cursor: &mut usize, field: &str) -> Result<Vec<u64>> {
     let len = usize::try_from(decode_index_u64(key, value, cursor, field)?).map_err(|err| {
         GraphError::CorruptValue {

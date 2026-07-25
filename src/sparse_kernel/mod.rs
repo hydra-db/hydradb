@@ -136,7 +136,7 @@ pub(crate) struct SparseTraversal {
     pub backend: SparseKernelBackend,
 }
 
-#[cfg(all(feature = "graphblas", feature = "opencypher"))]
+#[cfg(feature = "opencypher")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SparseTraversalCount {
     pub vertices: u64,
@@ -145,11 +145,7 @@ pub(crate) struct SparseTraversalCount {
 }
 
 pub(crate) fn default_matrix_kernel() -> SparseKernelBackend {
-    if cfg!(feature = "graphblas") {
-        SparseKernelBackend::SuiteSparseGraphBlas
-    } else {
-        SparseKernelBackend::RustSparse
-    }
+    SparseKernelBackend::SuiteSparseGraphBlas
 }
 
 pub(crate) fn expand(
@@ -164,7 +160,7 @@ pub(crate) fn expand(
     }
 }
 
-#[cfg(all(test, feature = "graphblas"))]
+#[cfg(test)]
 pub(crate) fn expand_range(
     adjacency: &Adjacency,
     starts: &[VertexId],
@@ -182,33 +178,24 @@ pub(crate) fn expand_range(
     }
 }
 
-#[cfg(feature = "graphblas")]
 pub(crate) use graphblas::CompiledGraphBlasMatrix;
 
-#[cfg(not(feature = "graphblas"))]
-pub(crate) struct CompiledGraphBlasMatrix;
-
-#[cfg(feature = "graphblas")]
 pub(crate) fn compile_graphblas_matrix(adjacency: &Adjacency) -> Result<CompiledGraphBlasMatrix> {
     compile_graphblas(adjacency)
 }
 
-#[cfg(feature = "graphblas")]
 pub(crate) fn compile_graphblas_csc(csc: &GraphBlasCsc) -> Result<CompiledGraphBlasMatrix> {
     compile_graphblas_from_csc(csc)
 }
 
-#[cfg(feature = "graphblas")]
 pub(crate) fn compile_graphblas_csc_owned(csc: GraphBlasCsc) -> Result<CompiledGraphBlasMatrix> {
     compile_graphblas_from_csc_owned(csc)
 }
 
-#[cfg(feature = "graphblas")]
 pub(crate) fn compact_csc_kernel_enabled() -> bool {
     graphblas::use_compact_csc_kernel()
 }
 
-#[cfg(feature = "graphblas")]
 pub(crate) fn compile_graphblas_compact_csc_u32(
     vertices: Vec<VertexId>,
     pointers: Vec<u32>,
@@ -258,7 +245,6 @@ fn csc_vertex_ordinal(vertices: &[VertexId], vertex: VertexId, role: &str) -> Re
         })
 }
 
-#[cfg(feature = "graphblas")]
 pub(crate) fn expand_compiled_graphblas(
     compiled: &CompiledGraphBlasMatrix,
     adjacency: &Adjacency,
@@ -268,7 +254,6 @@ pub(crate) fn expand_compiled_graphblas(
     expand_graphblas_compiled(compiled, adjacency, starts, hops)
 }
 
-#[cfg(feature = "graphblas")]
 pub(crate) fn compiled_graphblas_contains_edge(
     compiled: &CompiledGraphBlasMatrix,
     src: VertexId,
@@ -277,7 +262,6 @@ pub(crate) fn compiled_graphblas_contains_edge(
     compiled.contains_edge(src, dst)
 }
 
-#[cfg(feature = "graphblas")]
 pub(crate) fn expand_range_compiled_graphblas(
     compiled: &CompiledGraphBlasMatrix,
     adjacency: &Adjacency,
@@ -288,7 +272,7 @@ pub(crate) fn expand_range_compiled_graphblas(
     expand_range_graphblas_compiled(compiled, adjacency, starts, min_hops, max_hops)
 }
 
-#[cfg(all(feature = "graphblas", feature = "opencypher"))]
+#[cfg(feature = "opencypher")]
 pub(crate) fn expand_range_count_compiled_graphblas(
     compiled: &CompiledGraphBlasMatrix,
     adjacency: &Adjacency,
@@ -299,7 +283,7 @@ pub(crate) fn expand_range_count_compiled_graphblas(
     expand_range_count_graphblas_compiled(compiled, adjacency, starts, min_hops, max_hops)
 }
 
-#[cfg(all(feature = "graphblas", feature = "opencypher"))]
+#[cfg(feature = "opencypher")]
 pub(crate) fn expand_range_window_compiled_graphblas(
     compiled: &CompiledGraphBlasMatrix,
     adjacency: &Adjacency,
@@ -311,7 +295,7 @@ pub(crate) fn expand_range_window_compiled_graphblas(
     expand_range_window_graphblas_compiled(compiled, adjacency, starts, min_hops, max_hops, window)
 }
 
-#[cfg(all(feature = "graphblas", feature = "opencypher"))]
+#[cfg(feature = "opencypher")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SparseTraversalWindow {
     pub skip: u64,
@@ -351,7 +335,7 @@ fn expand_rust(adjacency: &Adjacency, starts: &[VertexId], hops: u8) -> SparseTr
     }
 }
 
-#[cfg(all(test, feature = "graphblas"))]
+#[cfg(test)]
 fn expand_range_rust(
     adjacency: &Adjacency,
     starts: &[VertexId],
@@ -414,28 +398,6 @@ fn graphblas_vertices_from_adjacency(adjacency: &Adjacency) -> Result<Vec<Vertex
 
 const GRAPHBLAS_INDEX_MAX: u64 = (1_u64 << 60) - 1;
 
-#[cfg(not(feature = "graphblas"))]
-fn expand_graphblas(
-    _adjacency: &Adjacency,
-    _starts: &[VertexId],
-    _hops: u8,
-) -> Result<SparseTraversal> {
-    Err(crate::GraphError::SparseKernel {
-        backend: "SuiteSparseGraphBlas",
-        reason: "crate was built without the graphblas feature".to_string(),
-    })
-}
-
-#[cfg(not(feature = "graphblas"))]
-#[allow(dead_code)]
-fn compile_graphblas_from_csc(_csc: &GraphBlasCsc) -> Result<CompiledGraphBlasMatrix> {
-    Err(crate::GraphError::SparseKernel {
-        backend: "SuiteSparseGraphBlas",
-        reason: "crate was built without the graphblas feature".to_string(),
-    })
-}
-
-#[cfg(feature = "graphblas")]
 fn expand_graphblas(
     adjacency: &Adjacency,
     starts: &[VertexId],
@@ -444,7 +406,7 @@ fn expand_graphblas(
     graphblas::expand(adjacency, starts, hops)
 }
 
-#[cfg(all(test, feature = "graphblas"))]
+#[cfg(test)]
 fn expand_range_graphblas(
     adjacency: &Adjacency,
     starts: &[VertexId],
@@ -454,22 +416,18 @@ fn expand_range_graphblas(
     graphblas::expand_range(adjacency, starts, min_hops, max_hops)
 }
 
-#[cfg(feature = "graphblas")]
 fn compile_graphblas(adjacency: &Adjacency) -> Result<CompiledGraphBlasMatrix> {
     graphblas::CompiledGraphBlasMatrix::new(adjacency)
 }
 
-#[cfg(feature = "graphblas")]
 fn compile_graphblas_from_csc(csc: &GraphBlasCsc) -> Result<CompiledGraphBlasMatrix> {
     graphblas::CompiledGraphBlasMatrix::new_from_csc(csc)
 }
 
-#[cfg(feature = "graphblas")]
 fn compile_graphblas_from_csc_owned(csc: GraphBlasCsc) -> Result<CompiledGraphBlasMatrix> {
     graphblas::CompiledGraphBlasMatrix::new_from_csc_owned(csc)
 }
 
-#[cfg(feature = "graphblas")]
 fn expand_graphblas_compiled(
     compiled: &CompiledGraphBlasMatrix,
     adjacency: &Adjacency,
@@ -479,7 +437,6 @@ fn expand_graphblas_compiled(
     compiled.expand(adjacency, starts, hops)
 }
 
-#[cfg(feature = "graphblas")]
 fn expand_range_graphblas_compiled(
     compiled: &CompiledGraphBlasMatrix,
     adjacency: &Adjacency,
@@ -490,7 +447,7 @@ fn expand_range_graphblas_compiled(
     compiled.expand_range(adjacency, starts, min_hops, max_hops)
 }
 
-#[cfg(all(feature = "graphblas", feature = "opencypher"))]
+#[cfg(feature = "opencypher")]
 fn expand_range_count_graphblas_compiled(
     compiled: &CompiledGraphBlasMatrix,
     adjacency: &Adjacency,
@@ -501,7 +458,7 @@ fn expand_range_count_graphblas_compiled(
     compiled.expand_range_count(adjacency, starts, min_hops, max_hops)
 }
 
-#[cfg(all(feature = "graphblas", feature = "opencypher"))]
+#[cfg(feature = "opencypher")]
 fn expand_range_window_graphblas_compiled(
     compiled: &CompiledGraphBlasMatrix,
     adjacency: &Adjacency,
@@ -513,14 +470,12 @@ fn expand_range_window_graphblas_compiled(
     compiled.expand_range_window(adjacency, starts, min_hops, max_hops, window)
 }
 
-#[cfg(feature = "graphblas")]
 mod graphblas;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "graphblas")]
     static COMPACT_KERNEL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_adjacency() -> Adjacency {
@@ -549,7 +504,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "graphblas")]
     #[test]
     fn graphblas_kernel_matches_rust_sparse_kernel() {
         let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
@@ -568,7 +522,7 @@ mod tests {
         assert_eq!(graphblas.edge_visits, rust.edge_visits);
     }
 
-    #[cfg(all(feature = "graphblas", feature = "opencypher"))]
+    #[cfg(feature = "opencypher")]
     #[test]
     fn graphblas_exact_hop_count_matches_materialized_range() {
         let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
@@ -586,7 +540,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "graphblas", feature = "opencypher"))]
+    #[cfg(feature = "opencypher")]
     #[test]
     fn graphblas_exact_hop_count_preserves_materialized_cycle_semantics() {
         let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
@@ -604,7 +558,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "graphblas", feature = "opencypher"))]
+    #[cfg(feature = "opencypher")]
     #[test]
     fn graphblas_exact_hop_count_clears_reused_scratch() {
         let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
@@ -648,7 +602,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "graphblas", feature = "opencypher"))]
+    #[cfg(feature = "opencypher")]
     #[test]
     fn graphblas_exact_hop_count_is_safe_across_replicas() {
         let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");
@@ -699,7 +653,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "graphblas")]
     #[test]
     fn compact_csc_kernel_matches_rust_sparse_kernel() {
         let _guard = COMPACT_KERNEL_ENV_LOCK.lock().expect("env lock poisoned");

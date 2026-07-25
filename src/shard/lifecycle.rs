@@ -155,7 +155,6 @@ impl GraphShard {
         let cache_metrics = Arc::new(GraphCacheMetrics::default());
         let operation_metrics = Arc::new(GraphOperationalMetrics::default());
         let hydration_gate = Arc::new(Semaphore::new(cache_policy.hydration_permits()));
-        #[cfg(feature = "graphblas")]
         let matrix_compilation_gate = Arc::new(Semaphore::new(memory.matrix_compilation_permits()));
         let graph_write_gate = Arc::new(Semaphore::new(
             backpressure_policy.max_concurrent_graph_writes.max(1),
@@ -173,7 +172,6 @@ impl GraphShard {
             cache_metrics,
             operation_metrics,
             hydration_gate,
-            #[cfg(feature = "graphblas")]
             matrix_compilation_gate,
             graph_write_gate,
             artifact_build_gate,
