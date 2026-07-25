@@ -1,6 +1,9 @@
 use super::*;
 use crate::keys;
 
+use chrono::Utc;
+use turbolay_placement::cell_writer::{self, CellWriterRecord};
+
 impl GraphCluster {
     pub async fn open_cells(
         base_path: impl Into<String>,
@@ -468,7 +471,80 @@ impl RoutedGraphCluster {
         }
 
         self.await_writer_reopen(shard, cell_id).await?;
-        shard.promote_to_writer(cell_id, "routed_write").await
+        // Whether this shard already held a writer, taken *before* the call.
+        // `promote_to_writer` is idempotent and says nothing about which of the
+        // two it did, and the difference is the whole of "after a successful
+        // promotion, and only then": a shard that was already writing claimed no
+        // epoch, so there is nothing new to record and no PUT to make. Without
+        // this check the record would be rewritten on every single write, which
+        // is precisely the object-store request on the write path that decision
+        // 3 refuses to add.
+        let already_writing = shard.db.writer_epoch().is_some();
+        shard.promote_to_writer(cell_id, "routed_write").await?;
+        if !already_writing {
+            self.record_cell_writer(shard, cell_id).await;
+        }
+        Ok(())
+    }
+
+    /// Write down that this node just took `cell_id`'s writer, for whoever reads
+    /// the next incident's logs.
+    ///
+    /// Option 3a of decision 3 in
+    /// `docs/plans/2026-07-25-rendezvous-placement.md`, and the only place the
+    /// record is written. Three properties are load-bearing, and each is
+    /// deliberate rather than incidental:
+    ///
+    /// - **It returns nothing.** A failed PUT cannot fail the promotion, because
+    ///   the promotion has already succeeded — the epoch is claimed and the
+    ///   write is about to proceed. Turning a diagnostics write into an
+    ///   availability dependency on a second object-store request would be
+    ///   strictly worse than keeping no record at all, so the error is logged at
+    ///   `warn!` and dropped.
+    /// - **It runs after the promotion, never before.** Written first it would
+    ///   be a claim, and a claim that is read back is option 3b — the
+    ///   read-then-act race decision 3 rejects.
+    /// - **Nothing reads it here.** The promote path performs no GET. Ownership
+    ///   was settled above by rendezvous, synchronously and from the shared live
+    ///   set; this record is never an input to that decision. The epoch comes
+    ///   from the manifest of the writer just opened, which remains the only
+    ///   authority on who holds it.
+    async fn record_cell_writer(&self, shard: &GraphShard, cell_id: &str) {
+        let Some(epoch) = shard.db.writer_epoch() else {
+            // Racing a fence between the promotion and this line. The record
+            // would name an epoch this node no longer holds, so write nothing.
+            tracing::debug!(
+                node_id = %self.local_node_id,
+                cell_id,
+                "promoted writer was gone before it could be recorded"
+            );
+            return;
+        };
+        let Some((base, _)) = shard.db.cell_location() else {
+            tracing::warn!(
+                node_id = %self.local_node_id,
+                cell_id,
+                path = %shard.db.store_path(),
+                "no base path to write the advisory cell-writer record under"
+            );
+            return;
+        };
+        // The one clock read on this path, and it is here rather than inside
+        // `CellWriterRecord` by decision 10.
+        let record = CellWriterRecord::new(&self.local_node_id, epoch, Utc::now());
+        if let Err(error) =
+            cell_writer::put_cell_writer(shard.db.object_store().as_ref(), &base, cell_id, &record)
+                .await
+        {
+            // Advisory: the write path is already past this point.
+            tracing::warn!(
+                node_id = %self.local_node_id,
+                cell_id,
+                epoch,
+                %error,
+                "could not record the advisory cell writer; the promotion stands"
+            );
+        }
     }
 
     /// Touch point (d)'s backoff, enforced where the promotion happens.
@@ -1489,6 +1565,441 @@ mod placement_gate_tests {
             if self.fail_list.load(AtomicOrdering::SeqCst) {
                 return Err(Self::injected());
             }
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> slatedb::object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+}
+
+/// Commit 6 of §7.8: the advisory cell-writer record, and the three properties
+/// that keep it advisory.
+///
+/// The whole risk in a "who owns the writer" object is that somebody eventually
+/// believes it. These tests exist to make that a build failure: the record is
+/// written only by a promotion that really claimed an epoch, a store that
+/// refuses to take it cannot fail that promotion, and the promote path issues no
+/// GET for it at all — asserted on the object-store call counters rather than on
+/// the code's shape, so it stays true when the code moves.
+#[cfg(test)]
+mod cell_writer_record_tests {
+    use super::*;
+
+    use std::fmt;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::path::Path;
+    use slatedb::object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+    use turbolay_placement::cell_writer::{read_cell_writer, CellWriterRecord, CELL_WRITER_PREFIX};
+
+    const CELL: &str = "cell-a";
+    const FLEET: &[&str] = &["node-a", "node-b", "node-c"];
+
+    /// The node rendezvous names for `CELL`, and one that it does not.
+    fn owner_and_peer() -> (&'static str, &'static str) {
+        let scope = GraphScope::default().to_string();
+        let owner = turbolay_placement::hash::owner(&scope, CELL, FLEET)
+            .expect("a non-empty fleet has an owner");
+        let peer = FLEET
+            .iter()
+            .copied()
+            .find(|node_id| *node_id != owner)
+            .expect("three nodes cannot all be the owner");
+        (owner, peer)
+    }
+
+    async fn open_cluster(
+        base_path: &str,
+        local_node_id: &str,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> RoutedGraphCluster {
+        RoutedGraphCluster::open_promotable(
+            base_path,
+            local_node_id,
+            ObjectStoreNodeDirectory::new([CELL], FLEET.iter().copied())
+                .expect("a valid directory"),
+            PlacementView::new(
+                local_node_id,
+                FLEET.iter().copied(),
+                PlacementConfig::default(),
+            )
+            .expect("a valid fleet"),
+            object_store,
+        )
+        .await
+        .expect("the cluster opens")
+    }
+
+    fn edge(key: &str) -> crate::EdgeMutation {
+        crate::EdgeMutation {
+            cell_id: CELL.to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: key.to_string(),
+        }
+    }
+
+    /// Where the record for `CELL` lives, taken from the shard's own store path
+    /// rather than reconstructed — the same derivation the production write
+    /// uses, so a test cannot pass against a path nothing writes to.
+    fn record_base(cluster: &RoutedGraphCluster) -> Path {
+        cluster
+            .shard(CELL)
+            .expect("the shard is open")
+            .db
+            .cell_location()
+            .expect("a shard path always has a base")
+            .0
+    }
+
+    fn writer_epoch(cluster: &RoutedGraphCluster) -> Option<u64> {
+        cluster
+            .shard(CELL)
+            .expect("the shard is open")
+            .db
+            .writer_epoch()
+    }
+
+    /// A promotion that claimed an epoch writes exactly one record, and it names
+    /// this node and the epoch the manifest actually gave it.
+    #[tokio::test]
+    async fn a_successful_promotion_records_the_advisory_cell_writer() {
+        let (owner, _) = owner_and_peer();
+        let store = RecordStore::new();
+        let cluster = open_cluster(
+            "record/owner",
+            owner,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        )
+        .await;
+
+        cluster.write_edge(edge("owner-write")).await.unwrap();
+
+        assert_eq!(store.record_puts(), 1, "the promotion wrote no record");
+        let epoch = writer_epoch(&cluster).expect("the owner holds the writer");
+        let record = read_cell_writer(store.as_ref(), &record_base(&cluster), CELL)
+            .await
+            .expect("the record reads back")
+            .expect("a successful promotion wrote one");
+        assert_eq!(record.node_id, owner);
+        assert_eq!(
+            record.epoch, epoch,
+            "the record must carry the epoch the manifest gave the writer"
+        );
+        assert!(
+            epoch > 0,
+            "a zero epoch would make the assertion above vacuous"
+        );
+        cluster.close().await.unwrap();
+    }
+
+    /// **The PUT is per epoch claimed, not per write.** `promote_to_writer` is
+    /// called on every routed write and is idempotent; if the record were
+    /// written on each of those calls, decision 3's "no object-store request on
+    /// the write path" would be quietly false.
+    #[tokio::test]
+    async fn the_record_is_written_once_per_promotion_and_not_once_per_write() {
+        let (owner, _) = owner_and_peer();
+        let store = RecordStore::new();
+        let cluster = open_cluster(
+            "record/once",
+            owner,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        )
+        .await;
+
+        for i in 0..5 {
+            cluster
+                .write_edge(edge(&format!("write-{i}")))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.record_puts(),
+            1,
+            "the record was rewritten by writes that promoted nothing"
+        );
+        cluster.close().await.unwrap();
+    }
+
+    /// A refusal is not a promotion, so there is nothing to record. Writing one
+    /// here would be the worst version of this object: an attribution naming a
+    /// node that never held the writer.
+    #[tokio::test]
+    async fn a_refused_promotion_records_nothing() {
+        let (_, peer) = owner_and_peer();
+        let store = RecordStore::new();
+        let cluster = open_cluster(
+            "record/refused",
+            peer,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        )
+        .await;
+
+        let error = cluster.write_edge(edge("refused")).await.unwrap_err();
+        assert!(
+            matches!(error, GraphError::NotCellWriter { .. }),
+            "expected a refusal, got {error:?}"
+        );
+
+        assert_eq!(store.record_puts(), 0, "a refusal wrote a record");
+        assert!(
+            read_cell_writer(store.as_ref(), &record_base(&cluster), CELL)
+                .await
+                .expect("readable")
+                .is_none(),
+            "a node that never promoted named itself the writer"
+        );
+        cluster.close().await.unwrap();
+    }
+
+    /// Rule 3 of the module docs on `turbolay_placement::cell_writer`, at the
+    /// only place that can honour it: the epoch is already claimed and the write
+    /// is already committed by the time the record is attempted, so a store that
+    /// refuses it must cost nothing but a `warn!`. The alternative — a write
+    /// path that fails because its diagnostics could not be written — is
+    /// strictly worse than keeping no record at all.
+    #[tokio::test]
+    async fn a_failing_record_put_does_not_fail_the_promotion() {
+        let (owner, _) = owner_and_peer();
+        let store = RecordStore::new();
+        // Only the record's own PUTs. Failing every PUT would fail SlateDB's
+        // writer open too, and the test would prove nothing about the record.
+        store.break_record_puts();
+        let cluster = open_cluster(
+            "record/failing-put",
+            owner,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        )
+        .await;
+
+        cluster
+            .write_edge(edge("survives"))
+            .await
+            .expect("an unwritable record must not fail the write");
+
+        assert!(store.record_puts() > 0, "the record was never attempted");
+        assert!(
+            writer_epoch(&cluster).is_some(),
+            "the promotion itself must have stood"
+        );
+        store.heal_record_puts();
+        assert!(
+            read_cell_writer(store.as_ref(), &record_base(&cluster), CELL)
+                .await
+                .expect("readable")
+                .is_none(),
+            "the failed PUT left something behind"
+        );
+        cluster.close().await.unwrap();
+    }
+
+    /// **Option 3b, refused in a test.** A record naming another node with an
+    /// absurd epoch is sitting in the store; the rendezvous owner promotes
+    /// straight over it, because ownership comes from the live set and this
+    /// object is not an input to it. The GET counter is the proof: the promote
+    /// path never even looks.
+    #[tokio::test]
+    async fn the_record_is_not_read_on_the_promote_path() {
+        let (owner, peer) = owner_and_peer();
+        let store = RecordStore::new();
+        let cluster = open_cluster(
+            "record/not-consulted",
+            owner,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        )
+        .await;
+
+        let base = record_base(&cluster);
+        turbolay_placement::cell_writer::put_cell_writer(
+            store.as_ref(),
+            &base,
+            CELL,
+            &CellWriterRecord::new(peer, u64::MAX, chrono::Utc::now()),
+        )
+        .await
+        .expect("seeded");
+        store.reset_counters();
+
+        cluster
+            .write_edge(edge("promotes-anyway"))
+            .await
+            .expect("a record naming a peer must not stop the owner promoting");
+
+        assert_eq!(
+            store.record_gets(),
+            0,
+            "the promote path read the advisory record; that is option 3b"
+        );
+        assert_eq!(
+            store.record_puts(),
+            1,
+            "the promotion should have overwritten the seeded record exactly once"
+        );
+        let record = read_cell_writer(store.as_ref(), &base, CELL)
+            .await
+            .expect("readable")
+            .expect("written");
+        assert_eq!(record.node_id, owner);
+        assert_ne!(record.epoch, u64::MAX);
+        cluster.close().await.unwrap();
+    }
+
+    /// An `ObjectStore` that counts and can break requests **against the
+    /// cell-writer prefix alone**.
+    ///
+    /// The narrowness is the point twice over. Counting everything would drown
+    /// the record's one PUT in SlateDB's manifest and SST traffic, so the
+    /// "never read on the promote path" assertion could not be written at all.
+    /// And failing every PUT would fail the writer open, so the "a failed PUT
+    /// does not fail the promotion" test would be asserting that a promotion
+    /// which never happened did not happen.
+    ///
+    /// `crates/placement`'s richer `FaultStore` is `#[cfg(test)]` inside that
+    /// crate and cannot be imported here; it also has no notion of which prefix
+    /// a request is for, which is the one thing this needs.
+    struct RecordStore {
+        inner: Arc<dyn ObjectStore>,
+        record_puts: AtomicU64,
+        record_gets: AtomicU64,
+        fail_record_puts: AtomicBool,
+    }
+
+    impl RecordStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(InMemory::new()),
+                record_puts: AtomicU64::new(0),
+                record_gets: AtomicU64::new(0),
+                fail_record_puts: AtomicBool::new(false),
+            })
+        }
+
+        /// Whether a path is under `_cell_writers/…`, by the prefix constant's
+        /// own first segment rather than a copy of the string.
+        fn is_record(location: &Path) -> bool {
+            let head = CELL_WRITER_PREFIX
+                .split('/')
+                .next()
+                .expect("the prefix is not empty");
+            location.parts().any(|part| part.as_ref() == head)
+        }
+
+        /// Counted **including** requests the fault refuses: the thing being
+        /// asserted is that the attempt was made and survived.
+        fn record_puts(&self) -> u64 {
+            self.record_puts.load(AtomicOrdering::SeqCst)
+        }
+
+        fn record_gets(&self) -> u64 {
+            self.record_gets.load(AtomicOrdering::SeqCst)
+        }
+
+        fn reset_counters(&self) {
+            self.record_puts.store(0, AtomicOrdering::SeqCst);
+            self.record_gets.store(0, AtomicOrdering::SeqCst);
+        }
+
+        fn break_record_puts(&self) {
+            self.fail_record_puts.store(true, AtomicOrdering::SeqCst);
+        }
+
+        fn heal_record_puts(&self) {
+            self.fail_record_puts.store(false, AtomicOrdering::SeqCst);
+        }
+
+        /// `Error::Generic`, because that is what a throttled or refused request
+        /// arrives as once the SDK has given up, and it is not one of the
+        /// variants `read_cell_writer` special-cases.
+        fn injected() -> slatedb::object_store::Error {
+            slatedb::object_store::Error::Generic {
+                store: "RecordStore",
+                source: "injected cell-writer PUT fault".into(),
+            }
+        }
+    }
+
+    impl fmt::Display for RecordStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "RecordStore({})", self.inner)
+        }
+    }
+
+    impl fmt::Debug for RecordStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "RecordStore({:?})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RecordStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> slatedb::object_store::Result<PutResult> {
+            if Self::is_record(location) {
+                self.record_puts.fetch_add(1, AtomicOrdering::SeqCst);
+                if self.fail_record_puts.load(AtomicOrdering::SeqCst) {
+                    return Err(Self::injected());
+                }
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> slatedb::object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> slatedb::object_store::Result<GetResult> {
+            if Self::is_record(location) {
+                self.record_gets.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, slatedb::object_store::Result<Path>>,
+        ) -> BoxStream<'static, slatedb::object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, slatedb::object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> slatedb::object_store::Result<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
 
