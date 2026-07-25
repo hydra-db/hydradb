@@ -38,6 +38,8 @@ pub struct RuntimeConfig {
     pub max_concurrent_matrix_compilations: usize,
     pub max_open_scopes: usize,
     pub index_discovery_interval: Duration,
+    pub heartbeat_interval: Duration,
+    pub heartbeat_timeout: Duration,
     pub bolt_addr: SocketAddr,
     pub http_addr: SocketAddr,
     pub admin_addr: SocketAddr,
@@ -97,6 +99,22 @@ impl RuntimeConfig {
             || advertised_bolt_addr.chars().any(char::is_whitespace)
         {
             return invalid("GRAPH_ADVERTISED_BOLT_ADDR must be a non-empty host:port");
+        }
+        // Decision 5 of docs/plans/2026-07-25-rendezvous-placement.md. A node is
+        // live while its heartbeat object is younger than the timeout, so an
+        // interval at or past the timeout means every heartbeat expires before
+        // its own writer refreshes it and the entire fleet reads as dead — no
+        // node owns any cell, and nothing about the symptom points at the
+        // config. `parse_duration` already rejects zero, which is the same
+        // failure by a different route: a publisher that never ticks.
+        let heartbeat_interval = parse_duration(&values, "GRAPH_HEARTBEAT_INTERVAL_MS", 5_000)?;
+        let heartbeat_timeout = parse_duration(&values, "GRAPH_HEARTBEAT_TIMEOUT_MS", 15_000)?;
+        if heartbeat_interval >= heartbeat_timeout {
+            return invalid(format!(
+                "GRAPH_HEARTBEAT_INTERVAL_MS ({}) must be less than GRAPH_HEARTBEAT_TIMEOUT_MS ({})",
+                heartbeat_interval.as_millis(),
+                heartbeat_timeout.as_millis(),
+            ));
         }
         let bolt_node_addresses = parse_node_addresses(
             &values,
@@ -186,6 +204,8 @@ impl RuntimeConfig {
                 "GRAPH_INDEX_DISCOVERY_INTERVAL_MS",
                 5_000,
             )?,
+            heartbeat_interval,
+            heartbeat_timeout,
             bolt_addr: parse_socket(&values, "GRAPH_BOLT_ADDR", "0.0.0.0:7687")?,
             http_addr: parse_socket(&values, "GRAPH_HTTP_ADDR", "0.0.0.0:8443")?,
             admin_addr: parse_socket(&values, "GRAPH_ADMIN_ADDR", "0.0.0.0:9090")?,
@@ -453,6 +473,8 @@ mod tests {
         assert_eq!(config.max_concurrent_hydrations, 2);
         assert_eq!(config.max_open_scopes, 8);
         assert_eq!(config.index_discovery_interval, Duration::from_secs(5));
+        assert_eq!(config.heartbeat_interval, Duration::from_secs(5));
+        assert_eq!(config.heartbeat_timeout, Duration::from_secs(15));
         let memory = config.graph_memory_config();
         assert_eq!(memory.max_graphblas_bytes, 128 * 1024 * 1024);
         assert_eq!(memory.max_matrix_adjacency_bytes, 0);
@@ -499,6 +521,60 @@ mod tests {
         values.insert("GRAPH_SPARSE_KERNEL".to_string(), "cuda".to_string());
         let error = RuntimeConfig::from_values(values).unwrap_err();
         assert!(error.to_string().contains("GRAPH_SPARSE_KERNEL"));
+    }
+
+    #[test]
+    fn heartbeat_interval_must_be_shorter_than_the_timeout() {
+        // Both rejections describe the same production failure — every node's
+        // heartbeat expires before anything refreshes it, so the fleet computes
+        // an empty live set and no cell has an owner. Decision 5.
+        let base = || BTreeMap::from([("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string())]);
+
+        let mut values = base();
+        values.insert("GRAPH_HEARTBEAT_INTERVAL_MS".to_string(), "0".to_string());
+        let error = RuntimeConfig::from_values(values).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("GRAPH_HEARTBEAT_INTERVAL_MS must be greater than zero"),
+            "unexpected error: {error}"
+        );
+
+        let mut values = base();
+        values.insert(
+            "GRAPH_HEARTBEAT_INTERVAL_MS".to_string(),
+            "15000".to_string(),
+        );
+        let error = RuntimeConfig::from_values(values).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must be less than GRAPH_HEARTBEAT_TIMEOUT_MS"),
+            "unexpected error: {error}"
+        );
+
+        let mut values = base();
+        values.insert(
+            "GRAPH_HEARTBEAT_INTERVAL_MS".to_string(),
+            "20000".to_string(),
+        );
+        let error = RuntimeConfig::from_values(values).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must be less than GRAPH_HEARTBEAT_TIMEOUT_MS"),
+            "unexpected error: {error}"
+        );
+
+        let mut values = base();
+        values.insert(
+            "GRAPH_HEARTBEAT_INTERVAL_MS".to_string(),
+            "2000".to_string(),
+        );
+        values.insert("GRAPH_HEARTBEAT_TIMEOUT_MS".to_string(), "6000".to_string());
+        let config = RuntimeConfig::from_values(values).unwrap();
+        assert_eq!(config.heartbeat_interval, Duration::from_secs(2));
+        assert_eq!(config.heartbeat_timeout, Duration::from_secs(6));
     }
 
     #[test]

@@ -17,7 +17,14 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 mod client;
 mod core;
 mod engine;
-mod placement;
+// Storage locality layout: which SlateDB prefix a key belongs to. Named
+// `locality` and not `placement` because the kernel now has a real placement
+// module (`engine::placement`, which decides who owns a cell's *writer*), and
+// two modules called `placement` -- one of which is not about placement at all
+// -- is the same confusion decision 12 of the rendezvous plan avoided by
+// renaming. Private, so this costs nothing outside the crate: every item below
+// is re-exported under its own unchanged name.
+mod locality;
 mod query;
 mod sparse_kernel;
 
@@ -79,12 +86,13 @@ pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
 #[cfg(feature = "query-transport")]
 pub use engine::ScopedRoutedGraphCluster;
 pub use engine::{
-    local_object_store, object_store_from_env, ArtifactGcResult, BenchmarkResult, GraphCluster,
-    GraphIndexGeneration, GraphShardRuntimeMetrics, MatrixArtifact, MatrixTraversalResult,
-    ObjectStoreGraphScopeDirectory, ObjectStoreNodeDirectory, RoutedGraphCluster,
+    local_object_store, object_store_from_env, ArtifactGcResult, BenchmarkResult, CellOwnership,
+    GraphCluster, GraphIndexGeneration, GraphShardRuntimeMetrics, MatrixArtifact,
+    MatrixTraversalResult, ObjectStoreGraphScopeDirectory, ObjectStoreNodeDirectory,
+    PlacementConfig, PlacementRefreshHandle, PlacementView, RoutedGraphCluster,
     ScopedGraphShardRuntimeMetrics, TraversalBackend,
 };
-pub use placement::{
+pub use locality::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
     LocalityCellExtractor, LocalityLayoutExperiment, StorageLayout,
 };

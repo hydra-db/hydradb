@@ -2687,6 +2687,7 @@ dependencies = [
  "base64",
  "boltr",
  "bytes",
+ "chrono",
  "futures",
  "libcypher-parser-sys",
  "rcgen",

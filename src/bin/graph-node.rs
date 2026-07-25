@@ -12,7 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+
 use config::RuntimeConfig;
+use slatedb::object_store::{path::Path, ObjectStore};
 use slatedb_graph_kernel::{
     object_store_from_env, BoltServerConfig, ClientBoltServer, ClientHttpServer,
     ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget,
@@ -21,6 +24,7 @@ use slatedb_graph_kernel::{
     ScopedRoutedGraphCluster, StaticQueryTransportScopeAuthorizer,
 };
 use tracing_subscriber::EnvFilter;
+use turbolay_placement::heartbeat::{delete_heartbeat, put_heartbeat, validate_node_id, Heartbeat};
 
 type RuntimeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -33,6 +37,11 @@ async fn main() -> RuntimeResult<()> {
 }
 
 async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
+    let started_at = Utc::now();
+    // Rejected here rather than at the first PUT: an id the object layer cannot
+    // name is a node that runs, serves, and never appears in anyone's live set —
+    // a failure with no symptom other than a warning every heartbeat interval.
+    validate_node_id(&config.node_id)?;
     std::fs::create_dir_all(&config.data_cache_dir)?;
     let object_store = object_store_from_env(None)?;
     let open_options = config.graph_open_options();
@@ -47,7 +56,7 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         config.scope.graph_id.clone(),
         config.node_id.clone(),
         directory.clone(),
-        object_store,
+        Arc::clone(&object_store),
         open_options,
         memory_config,
         config.max_open_scopes,
@@ -144,6 +153,15 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     )
     .await?;
     ready.store(true, Ordering::Release);
+    let (heartbeat_stop, heartbeat_task) = start_heartbeat_publisher(
+        Arc::clone(&object_store),
+        Path::from(config.data_path.as_str()),
+        config.node_id.clone(),
+        config.cells.clone(),
+        Arc::clone(&ready),
+        started_at,
+        config.heartbeat_interval,
+    );
     tracing::info!(
         node_id = %config.node_id,
         bolt_addr = %bolt.local_addr(),
@@ -156,6 +174,23 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         result = shutdown_signal() => result?,
     }
     ready.store(false, Ordering::Release);
+    // Before anything drains. The publisher's last act is to DELETE this node's
+    // heartbeat, and awaiting it here is what makes a graceful restart hand the
+    // node's cells over immediately instead of costing peers a full
+    // `heartbeat_timeout` to notice — decision 4.
+    let _ = heartbeat_stop.send(true);
+    // Bounded, because a hung object-store request must not hold the drain open.
+    // Giving up on the withdrawal costs peers one `heartbeat_timeout` to notice —
+    // exactly the hard-crash bound decision 4 already accepts — whereas waiting
+    // forever would cost the whole shutdown.
+    match tokio::time::timeout(config.heartbeat_interval, heartbeat_task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(error = %error, "heartbeat publisher task failed"),
+        Err(_) => tracing::warn!(
+            node_id = %config.node_id,
+            "timed out withdrawing the heartbeat; peers will age this node out"
+        ),
+    }
     admin.stop().await?;
     http.stop().await?;
     bolt.stop().await?;
@@ -170,6 +205,106 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     node.close().await?;
     tracing::info!(node_id = %config.node_id, "graph node stopped");
     Ok(())
+}
+
+/// Publish this node's heartbeat while it is ready, withdraw it when it is not.
+///
+/// ```text
+/// every heartbeat_interval:   ready?  -> PUT    <base>/_graph_nodes/v1/<id>
+///                             not?    -> DELETE <base>/_graph_nodes/v1/<id>
+/// SIGTERM:                            -> DELETE <base>/_graph_nodes/v1/<id>, then drain
+/// ```
+///
+/// Decision 4 of `docs/plans/2026-07-25-rendezvous-placement.md`. **Presence of
+/// the object is the readiness signal**, not merely a liveness one: it replaces
+/// the per-caller `/readyz` fan-out that routing used to run, so a node that is
+/// up but unready must leave *no* object behind. That is why the unready branch
+/// DELETEs instead of skipping the PUT — a stale object would keep advertising a
+/// node that is not serving until it aged out. This is the one place the loop
+/// diverges from sleet's publisher (`../sleet/src/daemon.rs:213-310`), which
+/// publishes unconditionally.
+///
+/// Readiness is the same `AtomicBool` the admin server's `/readyz` reads, so the
+/// two answers cannot drift apart.
+///
+/// **Every store failure is a `warn!` and nothing more.** A node whose PUTs fail
+/// ages out of every peer's live set, which is the correct outcome and needs no
+/// help; a node that exited because it could not write a heartbeat would turn a
+/// transient object-store blip into an outage.
+fn start_heartbeat_publisher(
+    object_store: Arc<dyn ObjectStore>,
+    base_path: Path,
+    node_id: String,
+    cells: Vec<String>,
+    ready: Arc<AtomicBool>,
+    started_at: DateTime<Utc>,
+    interval: Duration,
+) -> (
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        loop {
+            publish_heartbeat(
+                object_store.as_ref(),
+                &base_path,
+                &node_id,
+                &cells,
+                started_at,
+                ready.load(Ordering::Acquire),
+            )
+            .await;
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(interval) => {}
+            }
+        }
+        // The withdrawal that makes a graceful restart instant. It runs on the
+        // way out even if the loop above just published, because `ready` is
+        // cleared and the stop signal sent in the same breath and the ordering
+        // between them is not worth relying on; `delete_heartbeat` is idempotent.
+        withdraw_heartbeat(object_store.as_ref(), &base_path, &node_id).await;
+    });
+    (stop_tx, task)
+}
+
+async fn publish_heartbeat(
+    store: &dyn ObjectStore,
+    base_path: &Path,
+    node_id: &str,
+    cells: &[String],
+    started_at: DateTime<Utc>,
+    ready: bool,
+) {
+    if !ready {
+        withdraw_heartbeat(store, base_path, node_id).await;
+        return;
+    }
+    // The publisher is the one place that legitimately reads a clock — decision
+    // 10 keeps every function below it pure, so the two timestamps are passed
+    // inward rather than read there. Both are this node's own clock and are
+    // observability only: liveness is the object's `LastModified`.
+    let body = Heartbeat::new(
+        node_id,
+        env!("CARGO_PKG_VERSION"),
+        started_at,
+        Utc::now(),
+        cells.to_vec(),
+    );
+    if let Err(error) = put_heartbeat(store, base_path, &body).await {
+        tracing::warn!(node_id, error = %error, "failed to publish heartbeat");
+    }
+}
+
+async fn withdraw_heartbeat(store: &dyn ObjectStore, base_path: &Path, node_id: &str) {
+    if let Err(error) = delete_heartbeat(store, base_path, node_id).await {
+        tracing::warn!(node_id, error = %error, "failed to withdraw heartbeat");
+    }
 }
 
 fn start_index_discovery(
@@ -247,4 +382,93 @@ async fn shutdown_signal() -> RuntimeResult<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use slatedb::object_store::{memory::InMemory, ObjectStoreExt};
+
+    use super::*;
+
+    /// Long enough to cover many publisher ticks, short enough that a genuine
+    /// hang fails the test instead of the suite.
+    const SETTLE: Duration = Duration::from_secs(5);
+    const TICK: Duration = Duration::from_millis(5);
+
+    async fn settles_to(store: &Arc<dyn ObjectStore>, path: &Path, present: bool) -> bool {
+        let deadline = std::time::Instant::now() + SETTLE;
+        while std::time::Instant::now() < deadline {
+            if store.head(path).await.is_ok() == present {
+                return true;
+            }
+            tokio::time::sleep(TICK).await;
+        }
+        false
+    }
+
+    /// Decision 4: the object's presence *is* the readiness signal, so going
+    /// unready has to remove it. A publisher that merely skipped the PUT would
+    /// keep advertising an unready node for a whole `heartbeat_timeout`, and
+    /// nothing downstream could tell the difference.
+    #[tokio::test]
+    async fn heartbeat_tracks_readiness_in_both_directions() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let base = Path::from("graph/data");
+        let path = Path::from("graph/data/_graph_nodes/v1/graph-node-0");
+        let ready = Arc::new(AtomicBool::new(true));
+        let (stop, task) = start_heartbeat_publisher(
+            Arc::clone(&store),
+            base,
+            "graph-node-0".to_string(),
+            vec!["cell-0".to_string()],
+            Arc::clone(&ready),
+            Utc::now(),
+            TICK,
+        );
+
+        assert!(settles_to(&store, &path, true).await, "never published");
+        ready.store(false, Ordering::Release);
+        assert!(
+            settles_to(&store, &path, false).await,
+            "stayed published while unready"
+        );
+        ready.store(true, Ordering::Release);
+        assert!(
+            settles_to(&store, &path, true).await,
+            "did not republish on becoming ready again"
+        );
+
+        let _ = stop.send(true);
+        task.await.unwrap();
+    }
+
+    /// The SIGTERM withdrawal, and the reason `run_node` awaits the task before
+    /// draining: peers take the node's cells over the moment this DELETE lands
+    /// rather than `heartbeat_timeout` later.
+    #[tokio::test]
+    async fn shutdown_withdraws_the_heartbeat_of_a_ready_node() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let base = Path::from("graph/data");
+        let path = Path::from("graph/data/_graph_nodes/v1/graph-node-0");
+        let ready = Arc::new(AtomicBool::new(true));
+        // A publisher interval far longer than the test: the withdrawal must
+        // come from the shutdown path, not from a tick that happened to land.
+        let (stop, task) = start_heartbeat_publisher(
+            Arc::clone(&store),
+            base,
+            "graph-node-0".to_string(),
+            vec!["cell-0".to_string()],
+            ready,
+            Utc::now(),
+            Duration::from_secs(600),
+        );
+
+        assert!(settles_to(&store, &path, true).await, "never published");
+        let _ = stop.send(true);
+        task.await.unwrap();
+        assert!(
+            store.head(&path).await.is_err(),
+            "heartbeat outlived the process"
+        );
+    }
 }

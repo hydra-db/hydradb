@@ -205,7 +205,10 @@ mod artifact_build;
 mod artifact_gc;
 mod cluster;
 mod index_store;
+mod placement;
 mod scope_directory;
+
+pub use placement::{CellOwnership, PlacementConfig, PlacementRefreshHandle, PlacementView};
 
 pub use scope_directory::ObjectStoreGraphScopeDirectory;
 mod matrix_cache;
