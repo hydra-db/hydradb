@@ -110,6 +110,19 @@ pub enum PlacementError {
         source: slatedb::object_store::Error,
     },
 
+    /// A cell id that cannot be encoded into an object name or a path.
+    ///
+    /// The cell-writer record's name *is* the cell id
+    /// ([`crate::cell_writer`]), so the same rule that guards a node id guards
+    /// this — see [`validate_node_id`], which shares its implementation.
+    #[error("invalid cell id {cell_id:?}: {reason}")]
+    InvalidCellId {
+        /// The rejected id, quoted for the same reason as `InvalidNodeId`.
+        cell_id: String,
+        /// Which rule it broke.
+        reason: &'static str,
+    },
+
     /// A heartbeat body would not serialize. Unreachable in practice — the body
     /// is strings, an integer and timestamps — but the alternative is an
     /// `expect` in a library.
@@ -117,6 +130,33 @@ pub enum PlacementError {
     EncodeBody {
         /// The node whose body failed to encode.
         node_id: String,
+        /// The underlying serde error.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// A cell-writer record would not serialize. As unreachable as
+    /// [`PlacementError::EncodeBody`], and here for the same reason.
+    #[error("could not encode the cell-writer record for {cell_id}")]
+    EncodeRecord {
+        /// The cell whose record failed to encode.
+        cell_id: String,
+        /// The underlying serde error.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// An object under a versioned prefix did not parse as the record that
+    /// prefix promises.
+    ///
+    /// Reachable, unlike the encode variants: a truncated write, a hand-edited
+    /// object, or a future format that should have bumped its prefix. It
+    /// carries the path because the first thing anyone will do about it is look
+    /// at the object.
+    #[error("could not decode the cell-writer record at {path}")]
+    DecodeRecord {
+        /// Where the unparseable object is.
+        path: String,
         /// The underlying serde error.
         #[source]
         source: serde_json::Error,
@@ -227,24 +267,36 @@ pub struct HeartbeatEntry {
 /// `Path::join` percent-encodes them to `%2E`, so either way the name would
 /// stop round-tripping — a node that never appears in its own live set.
 pub fn validate_node_id(node_id: &str) -> Result<(), PlacementError> {
-    let reason = if node_id.is_empty() {
+    match name_rule_violation(node_id) {
+        Some(reason) => Err(PlacementError::InvalidNodeId {
+            node_id: node_id.to_string(),
+            reason,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The single rule behind every object name this crate writes, or `None` if
+/// `value` breaks none of it.
+///
+/// Shared by [`validate_node_id`] and
+/// [`crate::cell_writer::validate_cell_id`] rather than copied, because the two
+/// names sit under sibling prefixes in the same bucket and a rule that drifted
+/// between them would mean an id one prefix accepts and the other percent-
+/// encodes. It returns the reason instead of an error so each caller can name
+/// the thing it rejected.
+pub(crate) fn name_rule_violation(value: &str) -> Option<&'static str> {
+    if value.is_empty() {
         Some("must not be empty")
-    } else if node_id == "." || node_id == ".." {
+    } else if value == "." || value == ".." {
         Some("must not be a relative path segment")
-    } else if !node_id
+    } else if !value
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
     {
         Some("must be ASCII alphanumeric, '_', '-' or '.'")
     } else {
         None
-    };
-    match reason {
-        Some(reason) => Err(PlacementError::InvalidNodeId {
-            node_id: node_id.to_string(),
-            reason,
-        }),
-        None => Ok(()),
     }
 }
 
@@ -277,7 +329,17 @@ pub fn parse_object_name(name: &str) -> Option<&str> {
 /// `_graph_nodes%2Fv1`; and re-parsing `format!("{base}/{HEARTBEAT_PREFIX}")`
 /// would encode any `%` already in `base` a second time.
 pub fn heartbeat_prefix(base: &Path) -> Path {
-    HEARTBEAT_PREFIX
+    versioned_prefix(base, HEARTBEAT_PREFIX)
+}
+
+/// `base` extended by a `a/b`-style prefix constant, one segment at a time.
+///
+/// Shared with [`crate::cell_writer`], which lays its objects out the same way
+/// and would otherwise copy the two mistakes this avoids: `join`ing the whole
+/// constant produces the single segment `_graph_nodes%2Fv1`, and re-parsing
+/// `format!("{base}/{prefix}")` encodes any `%` already in `base` a second time.
+pub(crate) fn versioned_prefix(base: &Path, prefix: &str) -> Path {
+    prefix
         .split('/')
         .fold(base.clone(), |path, segment| path.join(segment))
 }

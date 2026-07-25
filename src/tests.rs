@@ -3259,6 +3259,180 @@ async fn routed_cluster_uses_slatedb_writer_fencing() {
     let _ = first.close().await;
 }
 
+/// The prod incident in `cell-writer-fencing-pingpong`, reproduced: three
+/// graph-nodes, one cell, and writes arriving at all three of them at once.
+///
+/// Before rendezvous placement every node opened the SlateDB writer on demand.
+/// Whoever opened it last fenced the incumbent, the fenced node's next write
+/// took the epoch straight back, and the three traded one cell's `writer_epoch`
+/// for as long as traffic kept arriving. Nothing was wrong with the fencing —
+/// SlateDB did exactly what it promises — the bug was that nothing had decided
+/// which node *should* be holding the writer, so every node was equally
+/// entitled to steal it.
+///
+/// # Why this view is shared, where the fencing test's is not
+///
+/// `routed_cluster_uses_slatedb_writer_fencing` above gives each node
+/// `sole_writer_placement`, a view in which it believes it is the whole fleet,
+/// precisely so the two *do* fence each other and the epoch is exercised. This
+/// test is the opposite arrangement, and the agreement is its entire subject:
+/// all three nodes hold the same fleet view, so rendezvous names exactly one
+/// owner and the other two are refused at the gate instead of taking the epoch.
+///
+/// The winner is computed here from `turbolay_placement::hash::owner` rather
+/// than read back off whichever node happened to promote. A test that observed
+/// the winner would still pass if ownership were settled by a coin flip, and a
+/// coin flip is what the incident was.
+///
+/// # The epoch assertion is a bound, not a count
+///
+/// Decision 6 rule 3 retries a fenced writer *without* re-checking ownership,
+/// which accepts that a converging node may re-fence the winner once more
+/// before the two views agree. An assertion of "exactly one promotion" would
+/// therefore fail correctly-behaving code the first time that happened. The
+/// invariant that does hold is convergence within a bound: the incident's
+/// signature is an epoch that climbs with traffic and never settles, and no
+/// ceiling at all survives that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn three_nodes_writing_one_cell_at_once_leave_one_writer_and_a_bounded_epoch() {
+    const BASE: &str = "graph-writer-epoch-pingpong";
+    const CELL: &str = "cell-a";
+    const FLEET: [&str; 3] = ["node-a", "node-b", "node-c"];
+    // Rounds of concurrent writes, because a duel is only visible over repeated
+    // traffic: the incident's epoch climbed per write, not per process. Four is
+    // enough that unbounded growth overshoots the ceiling several times over
+    // while the test still costs milliseconds.
+    const ROUNDS: u64 = 4;
+    // One promotion by the rendezvous owner, plus one spare for decision 6
+    // rule 3's blind retry after a fence. Twelve writes fit inside this; the
+    // pre-fix behaviour of every node promoting on demand is already at three
+    // after the first round, so the bound discriminates rather than merely
+    // being generous.
+    const MAX_WRITER_EPOCH: u64 = 2;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let scope = GraphScope::default();
+    let expected_owner = turbolay_placement::hash::owner(&scope.to_string(), CELL, &FLEET)
+        .expect("a non-empty fleet has an owner");
+    let directory = ObjectStoreNodeDirectory::new([CELL], FLEET).unwrap();
+
+    let mut clusters = Vec::with_capacity(FLEET.len());
+    for node_id in FLEET {
+        clusters.push(
+            RoutedGraphCluster::open_promotable_scoped_with_memory_options(
+                BASE,
+                scope.clone(),
+                node_id,
+                directory.clone(),
+                // The shared fleet view. Every node computes ownership from the
+                // same candidate list, which is the whole precondition
+                // rendezvous needs to end the duel.
+                placement_over(node_id, &FLEET),
+                Arc::clone(&object_store),
+                fast_fence_options(),
+                GraphMemoryConfig::default(),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+
+    let mut promotions = 0_u64;
+    let mut refusals = 0_u64;
+    for round in 0..ROUNDS {
+        let (from_a, from_b, from_c) = tokio::join!(
+            clusters[0].write_edge(typed_mutation(
+                CELL,
+                "FOLLOWS",
+                1,
+                10 + round,
+                &format!("{}-round-{round}", FLEET[0]),
+            )),
+            clusters[1].write_edge(typed_mutation(
+                CELL,
+                "FOLLOWS",
+                2,
+                20 + round,
+                &format!("{}-round-{round}", FLEET[1]),
+            )),
+            clusters[2].write_edge(typed_mutation(
+                CELL,
+                "FOLLOWS",
+                3,
+                30 + round,
+                &format!("{}-round-{round}", FLEET[2]),
+            )),
+        );
+        for (node_id, result) in FLEET.iter().zip([from_a, from_b, from_c]) {
+            match result {
+                Ok(_) => {
+                    assert_eq!(
+                        *node_id, expected_owner,
+                        "round {round}: only the rendezvous owner may promote"
+                    );
+                    promotions += 1;
+                }
+                Err(GraphError::NotCellWriter {
+                    ref cell_id,
+                    owner: Some(ref hint),
+                }) => {
+                    assert_eq!(cell_id, CELL);
+                    assert_eq!(
+                        hint, expected_owner,
+                        "round {round}: {node_id} must name the rendezvous winner so the \
+                         driver re-routes instead of retrying into the same wrong node"
+                    );
+                    refusals += 1;
+                }
+                other => panic!(
+                    "round {round}: {node_id} should have promoted or refused with a hint, \
+                     got {other:?}"
+                ),
+            }
+        }
+    }
+    assert_eq!(promotions, ROUNDS, "the owner's write lands every round");
+    assert_eq!(refusals, 2 * ROUNDS, "the other two refuse every round");
+
+    // A refusal is only worth anything if the refusing node left the writer
+    // alone, so check the handles rather than trusting the error type.
+    for (node_id, cluster) in FLEET.iter().zip(&clusters) {
+        let holds_the_writer = cluster.shard(CELL).unwrap().db.writer().is_ok();
+        assert_eq!(
+            holds_the_writer,
+            *node_id == expected_owner,
+            "{node_id} holds_the_writer={holds_the_writer}, but the owner is {expected_owner}"
+        );
+    }
+
+    for cluster in clusters {
+        let _ = cluster.close().await;
+    }
+
+    // The epoch off the manifest SlateDB actually wrote. Decision 3 records that
+    // this is the only authority on who holds the writer, and it is the number
+    // the incident was watched on.
+    let shard_path = format!("{}/{CELL}", scope.scoped_store_path(BASE));
+    let manifest = slatedb::admin::Admin::builder(shard_path.as_str(), object_store)
+        .build()
+        .read_manifest(None)
+        .await
+        .expect("the shard's manifest is readable")
+        .expect("a promotion wrote a manifest");
+    let writer_epoch = manifest.writer_epoch();
+    assert!(
+        writer_epoch >= 1,
+        "somebody must have promoted, or this test proves nothing; epoch {writer_epoch}"
+    );
+    assert!(
+        writer_epoch <= MAX_WRITER_EPOCH,
+        "the writer epoch must converge rather than climb with traffic: {writer_epoch} \
+         after {} writes across {} nodes",
+        ROUNDS * FLEET.len() as u64,
+        FLEET.len()
+    );
+}
+
 #[cfg(feature = "query-transport")]
 #[test]
 fn scoped_routed_cluster_returns_empty_rows_without_registering_an_unwritten_scope() {

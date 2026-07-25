@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard, RwLock as AsyncRwLock, Semaphore};
 #[cfg(feature = "opencypher")]
 use tokio::task::JoinHandle;
+use turbolay_placement::cell_writer;
 
 #[cfg(feature = "opencypher")]
 use crate::query::opencypher::ParsedRowQuery;
@@ -325,8 +326,43 @@ impl GraphStore {
         &self.inner.object_store
     }
 
+    /// This shard's store path split into the base it shares with its sibling
+    /// cells and its own cell id, or `None` if the path has no base to split
+    /// off.
+    ///
+    /// Both cluster types lay shards out as `<base>/<cell_id>`
+    /// (`engine/cluster.rs`), so this is where the advisory cell-writer record
+    /// goes: beside the cell it describes, derived from where the shard
+    /// actually is rather than from a base passed down a second time and free
+    /// to disagree.
+    ///
+    /// `None` means a single-segment path — an embedder that opened a store at
+    /// the bucket root — which has no `<base>` and therefore no place to put the
+    /// record. The record is advisory, so the callers warn and carry on.
+    pub(crate) fn cell_location(&self) -> Option<(Path, String)> {
+        let mut parts: Vec<_> = self.inner.path.parts().collect();
+        let cell = parts.pop()?;
+        if parts.is_empty() {
+            return None;
+        }
+        Some((Path::from_iter(parts), cell.as_ref().to_string()))
+    }
+
     pub(crate) fn writer(&self) -> Result<Db> {
         self.open_writer().ok_or(GraphError::ReadOnlyShardStorage)
+    }
+
+    /// The SlateDB writer epoch this shard currently holds, or `None` if it
+    /// holds no writer.
+    ///
+    /// Straight off the open handle's manifest snapshot —
+    /// `DbStatus.current_manifest` and `VersionedManifest::writer_epoch()` — and
+    /// so it costs no I/O. **This is the authority.** The advisory record under
+    /// `_cell_writers/v1/` records what this returned at the moment of a
+    /// promotion; if the two ever disagree, this one is right.
+    pub(crate) fn writer_epoch(&self) -> Option<u64> {
+        self.open_writer()
+            .map(|db| db.status().current_manifest.writer_epoch())
     }
 
     /// Refresh the writer's manifest, which is where a fence surfaces: another
@@ -361,15 +397,77 @@ impl GraphStore {
                 Ok(())
             }
             Err(err) if matches!(err.kind(), ErrorKind::Closed(slatedb::CloseReason::Fenced)) => {
+                // Before the handle goes: the epoch this node thought it held.
+                // Half of the log line below is meaningless without it.
+                let lost_epoch = self.writer_epoch();
                 self.clear_closed_writer();
                 self.reopen_gate()
                     .note_fence(Instant::now(), self.inner.heartbeat_interval);
+                self.log_fence_attribution(lost_epoch).await;
                 Err(err.into())
             }
             Err(err) => {
                 self.reopen_gate().note_failure(Instant::now());
                 Err(err.into())
             }
+        }
+    }
+
+    /// Name whoever last successfully promoted, so a fence reads in one line.
+    ///
+    /// This is the incident in `cell-writer-fencing-pingpong`: three nodes
+    /// traded one cell's epoch, and every log line said a write had been fenced
+    /// without ever saying by whom, because SlateDB's writer epoch carries no
+    /// identity. The advisory record under `_cell_writers/v1/` is where that
+    /// identity is written down, and this is the first of its two read paths
+    /// (decision 3 of `docs/plans/2026-07-25-rendezvous-placement.md`).
+    ///
+    /// # Three things this deliberately is not
+    ///
+    /// It is **not on the write path**: it runs only in the fence arm, which is
+    /// an error path that has already lost its writer and is about to return an
+    /// error. A GET here costs a request per fence, not per write.
+    ///
+    /// It **decides nothing**. The record is read, formatted and dropped.
+    /// Nothing downstream branches on it — promotion is rendezvous' call, made
+    /// in `ensure_local_writer` with no I/O at all, and consulting the record to
+    /// decide would be option 3b, which decision 3 rejects.
+    ///
+    /// It is **not authoritative**. The record says who last *promoted*, which
+    /// stops being who *holds* the writer at the moment of the fence this
+    /// function is logging. The name is reported as attribution, and every field
+    /// is qualified accordingly — if it disagrees with the manifest, the
+    /// manifest is right.
+    async fn log_fence_attribution(&self, lost_epoch: Option<u64>) {
+        let Some((base, cell_id)) = self.cell_location() else {
+            tracing::warn!(
+                path = %self.inner.path,
+                lost_epoch,
+                "writer fenced; no base path to read the advisory cell-writer record from"
+            );
+            return;
+        };
+        match cell_writer::read_cell_writer(self.inner.object_store.as_ref(), &base, &cell_id).await
+        {
+            Ok(Some(record)) => tracing::warn!(
+                cell_id,
+                lost_epoch,
+                last_promoted_by = %record.node_id,
+                last_promoted_epoch = record.epoch,
+                last_promoted_at = %record.at,
+                "writer fenced; the advisory record names the last node to promote"
+            ),
+            Ok(None) => tracing::warn!(
+                cell_id,
+                lost_epoch,
+                "writer fenced; no advisory cell-writer record exists to name who took it"
+            ),
+            Err(error) => tracing::warn!(
+                cell_id,
+                lost_epoch,
+                %error,
+                "writer fenced; the advisory cell-writer record could not be read"
+            ),
         }
     }
 

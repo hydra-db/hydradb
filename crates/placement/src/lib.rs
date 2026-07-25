@@ -20,7 +20,7 @@
 //! liveness rules testable by hand-building entries instead of sleeping.
 //! Decision 10 of `docs/plans/2026-07-25-rendezvous-placement.md`.
 //!
-//! # The three modules
+//! # The four modules
 //!
 //! [`hash`] is the frozen rendezvous score — pure functions over `&str`, and a
 //! wire format: changing the key encoding, the finalizer or the tie-break
@@ -29,6 +29,12 @@
 //! [`heartbeat`] is the object layout under `_graph_nodes/v1/` and the LIST
 //! boundary. Everything placement needs is in the object *name*; the body is
 //! observability and is never fetched to make a decision.
+//!
+//! [`cell_writer`] is the **advisory** record of who last successfully promoted
+//! itself to a cell's writer, under `_cell_writers/v1/`. It is diagnostics, not
+//! a lease: it is never consulted to decide whether to promote, the SlateDB
+//! writer epoch remains the only authority, and a failed write of it must not
+//! fail the promotion it describes.
 //!
 //! [`liveness`] turns entries into a live set — configured membership
 //! intersected with heartbeat freshness — and carries the two rules that make
@@ -42,6 +48,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod cell_writer;
 pub mod hash;
 pub mod heartbeat;
 pub mod liveness;
@@ -49,6 +56,7 @@ pub mod liveness;
 #[cfg(test)]
 mod fault_store;
 
+pub use cell_writer::{put_cell_writer, read_cell_writer, CellWriterRecord};
 pub use hash::{owner, rank, score};
 pub use heartbeat::{HeartbeatEntry, PlacementError};
 pub use liveness::{live_nodes, LiveNodeSet, NodeView};
