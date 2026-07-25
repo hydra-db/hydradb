@@ -766,6 +766,7 @@
 
   <nav class="spine" aria-label="Sections">
     <ol>
+      <li><a href="#vocabulary"><span class="n">&sect;</span><span>Vocabulary</span></a></li>
       <li><a href="#incident"><span class="n">A</span><span>The incident <span class="wmark">W1</span></span></a></li>
       <li><a href="#nobody"><span class="n">B</span><span>Nothing decides</span></a></li>
       <li><a href="#rendezvous"><span class="n">C</span><span>Rendezvous <span class="wmark">W2</span></span></a></li>
@@ -778,6 +779,77 @@
   </nav>
 
   <main class="body">
+
+    <section id="vocabulary">
+      <p class="eyebrow">vocabulary &mdash; before section A</p>
+      <h2>The terms the rest of this page assumes</h2>
+
+      <p>
+        Everything below is used without further introduction. The first five carry the rest.
+      </p>
+
+      <div class="tablewrap wide">
+        <table>
+          <thead>
+            <tr><th class="m">term</th><th>meaning</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="m">Cell</td>
+              <td class="note">One SlateDB database. Admits exactly one writer at a time. The unit ownership is computed for.</td>
+            </tr>
+            <tr>
+              <td class="m">Writer / writer epoch</td>
+              <td class="note">The node currently allowed to write a cell. SlateDB stamps a number into the manifest on open; a higher number wins.</td>
+            </tr>
+            <tr>
+              <td class="m">Fenced</td>
+              <td class="note">You were the writer, another node opened the cell with a higher epoch, and your next write fails. The production incident is three nodes doing this to each other in a loop.</td>
+            </tr>
+            <tr>
+              <td class="m">Graph-node</td>
+              <td class="note">One of the server pods (<code>graph-node-0/1/2</code>). Serves Bolt, can read any cell, may write only the cells it owns.</td>
+            </tr>
+            <tr>
+              <td class="m">Client / driver</td>
+              <td class="note">The Neo4j Bolt driver inside the customer's application. Sends queries, caches routing tables, retries. Not a person, and not our code.</td>
+            </tr>
+            <tr>
+              <td class="m">Routing table</td>
+              <td class="note">What the driver receives in reply to a <code>ROUTE</code> request: which nodes to read from, which single node to write to, and a TTL.</td>
+            </tr>
+            <tr>
+              <td class="m">Scope</td>
+              <td class="note"><code>{namespace}/graphs/{graph_id}</code>, the database name the driver sends &mdash; for example <code>acme/graphs/social</code>.</td>
+            </tr>
+            <tr>
+              <td class="m">Tenant</td>
+              <td class="note">The customer; the <code>namespace</code> part of the scope.</td>
+            </tr>
+            <tr>
+              <td class="m">Owner</td>
+              <td class="note">The node rendezvous says should write a given cell. Computed on demand, never stored.</td>
+            </tr>
+            <tr>
+              <td class="m">Rendezvous hashing</td>
+              <td class="note">Score every (cell, node) pair; the highest score wins. Every node reaches the same answer with no coordination.</td>
+            </tr>
+            <tr>
+              <td class="m">Heartbeat</td>
+              <td class="note">A small object each node writes every 5s, meaning "alive and ready". Liveness comes from the object's timestamp, never a local clock.</td>
+            </tr>
+            <tr>
+              <td class="m">Live set</td>
+              <td class="note">The nodes with a fresh heartbeat; the candidate list rendezvous chooses from.</td>
+            </tr>
+            <tr>
+              <td class="m">Promotion</td>
+              <td class="note">A node opening a cell for writing and claiming the epoch. The action that must be restricted to the owner.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
 
     <section id="incident">
       <p class="eyebrow">A &mdash; the incident</p>
