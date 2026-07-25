@@ -37,7 +37,6 @@ pub struct GraphShard {
     pub(crate) cache_metrics: Arc<GraphCacheMetrics>,
     pub(crate) operation_metrics: Arc<GraphOperationalMetrics>,
     pub(crate) hydration_gate: Arc<Semaphore>,
-    #[cfg(feature = "graphblas")]
     pub(crate) matrix_compilation_gate: Arc<Semaphore>,
     pub(crate) graph_write_gate: Arc<Semaphore>,
     pub(crate) artifact_build_gate: Arc<Semaphore>,
@@ -507,7 +506,6 @@ impl GraphStore {
         Ok(reader.status().durable_seq)
     }
 
-    #[cfg(feature = "graphblas")]
     pub(crate) async fn last_durable_wal_id(&self) -> Result<u64> {
         let snapshot = self.snapshot().await?;
         if let Some(last_wal_id) = snapshot.last_wal_id() {
@@ -516,7 +514,6 @@ impl GraphStore {
         Ok(self.writer()?.last_flushed_wal_id())
     }
 
-    #[cfg(feature = "graphblas")]
     pub(crate) fn wal_reader(&self) -> slatedb::WalReader {
         slatedb::WalReader::new(
             self.inner.path.clone(),

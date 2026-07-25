@@ -1,5 +1,4 @@
 use super::*;
-#[cfg(feature = "graphblas")]
 use crate::shard::QueryBudget;
 
 impl GraphShard {
@@ -54,7 +53,6 @@ impl GraphShard {
 
         let base_epoch = artifact.as_ref().map_or(0, |artifact| artifact.base_epoch);
 
-        #[cfg(feature = "graphblas")]
         if sparse_kernel == SparseKernelBackend::SuiteSparseGraphBlas && artifact.is_some() {
             let started = Instant::now();
             let Some((compiled, overlay, _)) = self

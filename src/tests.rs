@@ -154,7 +154,6 @@ async fn graph_index_gc_keeps_current_and_bounded_previous_generations() {
     assert_eq!(generations.len(), 2);
 }
 
-#[cfg(feature = "graphblas")]
 #[tokio::test]
 async fn graph_index_query_recovers_when_gc_removes_its_selected_generation() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -294,7 +293,7 @@ async fn concurrent_indexers_publish_and_gc_without_regressing_current_generatio
     writer.close().await.unwrap();
 }
 
-#[cfg(all(feature = "opencypher", feature = "graphblas"))]
+#[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn graph_index_wal_tail_fails_at_its_bound_and_recovers_after_reindexing() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -379,7 +378,7 @@ async fn graph_index_wal_tail_fails_at_its_bound_and_recovers_after_reindexing()
     writer.close().await.unwrap();
 }
 
-#[cfg(all(feature = "opencypher", feature = "graphblas"))]
+#[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn cypher_graphblas_applies_wal_tail_after_edge_changes() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -490,7 +489,6 @@ async fn cypher_graphblas_applies_wal_tail_after_edge_changes() {
     writer.close().await.unwrap();
 }
 
-#[cfg(feature = "graphblas")]
 #[tokio::test]
 async fn graphblas_wal_tail_resolves_edges_at_the_pinned_snapshot() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -518,7 +516,7 @@ async fn graphblas_wal_tail_resolves_edges_at_the_pinned_snapshot() {
     assert!(traversal.vertices.is_empty());
 }
 
-#[cfg(all(feature = "opencypher", feature = "graphblas"))]
+#[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn cypher_cold_graphblas_snapshot_does_not_reacquire_compilation_gate() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -579,7 +577,7 @@ async fn cypher_cold_graphblas_snapshot_does_not_reacquire_compilation_gate() {
     reopened.close().await.unwrap();
 }
 
-#[cfg(all(feature = "opencypher", feature = "graphblas"))]
+#[cfg(feature = "opencypher")]
 #[tokio::test]
 async fn cypher_graphblas_matrix_survives_interleaved_unrelated_writes() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1317,11 +1315,7 @@ async fn graph_cache_policy_bounds_entries_and_reports_hits_misses() {
     let reader = GraphShard::open_with_options(path, object_store, options)
         .await
         .unwrap();
-    let kernel = if cfg!(feature = "graphblas") {
-        SparseKernelBackend::SuiteSparseGraphBlas
-    } else {
-        SparseKernelBackend::RustSparse
-    };
+    let kernel = SparseKernelBackend::SuiteSparseGraphBlas;
     for _ in 0..2 {
         reader
             .matrix_reachable_with_kernel(
@@ -1339,24 +1333,15 @@ async fn graph_cache_policy_bounds_entries_and_reports_hits_misses() {
         .matrix_reachable_with_kernel("reddit-home", "OTHER_EDGE", &[10], 1, 2, kernel)
         .await
         .unwrap();
-    if cfg!(feature = "graphblas") {
-        assert_eq!(reader.graphblas_cache.lock().await.len(), 1);
-    } else {
-        assert_eq!(reader.matrix_cache.lock().await.len(), 0);
-    }
+    assert_eq!(reader.graphblas_cache.lock().await.len(), 1);
     let metrics = reader.graph_cache_metrics();
     assert!(metrics.matrix_artifact_misses >= 1);
     assert!(metrics.matrix_artifact_hits >= 1);
-    if cfg!(feature = "graphblas") {
-        assert!(metrics.evictions >= 1);
-        assert!(metrics.graphblas_misses >= 1);
-        assert!(metrics.graphblas_hits >= 1);
-        assert_eq!(metrics.matrix_adjacency_misses, 0);
-        assert_eq!(metrics.matrix_adjacency_hits, 0);
-    } else {
-        assert_eq!(metrics.matrix_adjacency_misses, 0);
-        assert_eq!(metrics.matrix_adjacency_hits, 0);
-    }
+    assert!(metrics.evictions >= 1);
+    assert!(metrics.graphblas_misses >= 1);
+    assert!(metrics.graphblas_hits >= 1);
+    assert_eq!(metrics.matrix_adjacency_misses, 0);
+    assert_eq!(metrics.matrix_adjacency_hits, 0);
     assert!(metrics.hydration_started >= 2);
     assert!(metrics.hydration_completed >= 2);
     reader.close().await.unwrap();
@@ -9277,11 +9262,7 @@ async fn cypher_variable_hops_use_the_configured_graph_kernel_backend() {
         .optimizer_passes
         .contains(&RowQueryOptimizerPass::GraphKernel));
 
-    #[cfg(feature = "graphblas")]
     let before_metrics = shard.graph_cache_metrics();
-    #[cfg(not(feature = "graphblas"))]
-    let before_operations = shard.graph_operational_metrics();
-
     let rows = shard
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "cypher-varhop-matrix-artifact-read"),
@@ -9352,21 +9333,11 @@ async fn cypher_variable_hops_use_the_configured_graph_kernel_backend() {
             vec![QueryRow::new(vec![QueryValue::Count(2)])],
         )
     );
-    #[cfg(feature = "graphblas")]
     let first_metrics = {
         let metrics = shard.graph_cache_metrics();
         assert!(metrics.graphblas_hits > before_metrics.graphblas_hits);
         metrics
     };
-    #[cfg(not(feature = "graphblas"))]
-    let first_operations = {
-        let metrics = shard.graph_operational_metrics();
-        assert!(
-            metrics.query_rust_sparse_fallbacks > before_operations.query_rust_sparse_fallbacks
-        );
-        metrics
-    };
-
     shard
         .execute_cypher_rows(
             QueryContext::new("reddit-home", "cypher-varhop-matrix-artifact-hot"),
@@ -9374,16 +9345,7 @@ async fn cypher_variable_hops_use_the_configured_graph_kernel_backend() {
         )
         .await
         .unwrap();
-    #[cfg(feature = "graphblas")]
     assert!(shard.graph_cache_metrics().graphblas_hits > first_metrics.graphblas_hits);
-    #[cfg(not(feature = "graphblas"))]
-    assert!(
-        shard
-            .graph_operational_metrics()
-            .query_rust_sparse_fallbacks
-            > first_operations.query_rust_sparse_fallbacks
-    );
-
     shard.close().await.unwrap();
 }
 
@@ -11930,7 +11892,6 @@ async fn reopened_reader_sees_canonical_edge_records() {
         .unwrap());
 }
 
-#[cfg(feature = "graphblas")]
 #[tokio::test]
 async fn graphblas_matrix_kernel_matches_rust_kernel_after_canonical_snapshot_rebuild() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -12001,7 +11962,6 @@ async fn graphblas_matrix_kernel_matches_rust_kernel_after_canonical_snapshot_re
     assert_eq!(graphblas.edge_visits, rust.edge_visits);
 }
 
-#[cfg(feature = "graphblas")]
 #[tokio::test]
 async fn graphblas_matrix_kernel_reuses_compiled_base_matrix_cache() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -12083,7 +12043,6 @@ async fn graphblas_matrix_kernel_reuses_compiled_base_matrix_cache() {
     assert_eq!(shard.graphblas_cache.lock().await.len(), 1);
 }
 
-#[cfg(feature = "graphblas")]
 #[tokio::test]
 async fn graphblas_empty_cache_reader_uses_persisted_csc_artifact() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -12327,10 +12286,10 @@ async fn current_epoch_reads_match_acknowledged_history_under_concurrent_reinser
             .unwrap();
         let expected = {
             let history = history.lock().unwrap();
-            match history.range(..=read_epoch).next_back() {
-                Some((_, exists)) => Some(*exists),
-                None => None,
-            }
+            history
+                .range(..=read_epoch)
+                .next_back()
+                .map(|(_, exists)| *exists)
         };
         // Only judge when the acknowledged history already covers read_epoch:
         // the op that committed read_epoch must itself be recorded.
@@ -12560,7 +12519,6 @@ async fn committed_edges_stay_readable_after_compaction_then_artifact_gc() {
 /// and the refresh branch filters `latest.base_sequence <= read_epoch`
 /// (`src/shard/query.rs:5281`), so this is expected to pass; it exists to fail
 /// loudly if either filter is ever relaxed.
-#[cfg(feature = "graphblas")]
 #[tokio::test]
 async fn compiled_graph_index_generation_never_exceeds_the_read_epoch() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -12628,7 +12586,6 @@ async fn compiled_graph_index_generation_never_exceeds_the_read_epoch() {
 ///
 /// This drives the create → modify → delete interleaving through the public
 /// cypher kernel path and compares against the storage ground truth.
-#[cfg(feature = "graphblas")]
 #[tokio::test]
 #[ignore = "suspect-2 repro: fails while the WAL-tail overlay misses commits inside the generation's own WAL file"]
 async fn compiled_traversal_reflects_writes_committed_after_the_graph_index_generation() {
@@ -12760,7 +12717,6 @@ async fn compiled_traversal_reflects_writes_committed_after_the_graph_index_gene
 /// `Some(L)` (`src/core/state.rs:102-105`). The tail then starts at `L + 1`
 /// (`src/shard/topology_tail.rs:48`), so any commit that lands in WAL file `L`
 /// itself is in neither the compiled base nor the tail.
-#[cfg(feature = "graphblas")]
 #[tokio::test]
 #[ignore = "suspect-2 repro: fails while a reader-built generation skips commits inside its own WAL file"]
 async fn reader_built_generation_tail_covers_commits_in_its_own_wal_file() {
@@ -13038,7 +12994,6 @@ async fn unfenced_index_gc_never_deletes_the_generation_the_current_manifest_nam
 /// storage". So the reader must see a clean miss and correct data — never a
 /// truncated or silently-empty answer. This asserts exactly that, without
 /// touching the compiled SuiteSparse kernel.
-#[cfg(feature = "graphblas")]
 #[tokio::test]
 async fn reader_holding_a_gc_deleted_index_generation_sees_a_clean_miss_not_lost_edges() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

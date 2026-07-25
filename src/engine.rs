@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use slatedb::object_store::{local::LocalFileSystem, ObjectStore};
 
-#[cfg(feature = "graphblas")]
 use crate::sparse_kernel::{
     compact_csc_kernel_enabled, compile_graphblas_compact_csc_u32, compile_graphblas_csc,
     compile_graphblas_csc_owned, compile_graphblas_matrix, expand_compiled_graphblas,
@@ -394,7 +393,6 @@ async fn flush_matrix_tile_row(
     Ok(tile_count)
 }
 
-#[cfg(feature = "graphblas")]
 fn matrix_rows_to_graphblas_csc(rows: &MatrixRows) -> Result<GraphBlasCsc> {
     let vertices = matrix_rows_vertices(rows);
     let pointers = matrix_rows_pointers(rows, &vertices)?;
@@ -434,7 +432,6 @@ fn matrix_rows_pointers(rows: &MatrixRows, vertices: &[VertexId]) -> Result<Vec<
     Ok(pointers)
 }
 
-#[cfg(feature = "graphblas")]
 fn matrix_rows_indices(rows: &MatrixRows, vertices: &[VertexId]) -> Result<Vec<u64>> {
     let mut indices = Vec::with_capacity(rows.live_edges as usize);
     append_matrix_rows_indices(rows, vertices, |ordinal| {
@@ -444,7 +441,6 @@ fn matrix_rows_indices(rows: &MatrixRows, vertices: &[VertexId]) -> Result<Vec<u
     Ok(indices)
 }
 
-#[cfg(feature = "graphblas")]
 fn append_matrix_rows_indices(
     rows: &MatrixRows,
     vertices: &[VertexId],
@@ -1746,7 +1742,6 @@ fn decode_graphblas_csc_chunk(
     Ok(values)
 }
 
-#[cfg(feature = "graphblas")]
 fn decode_graphblas_csc_chunk_u32(
     key: &str,
     value: &[u8],
@@ -1817,7 +1812,6 @@ fn graphblas_csc_checksum(csc: &GraphBlasCsc) -> u64 {
     hash
 }
 
-#[cfg(feature = "graphblas")]
 fn graphblas_csc_checksum_compact(vertices: &[VertexId], pointers: &[u32], indices: &[u32]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     checksum_u64(&mut hash, 0x01);
@@ -1965,7 +1959,6 @@ fn decode_binary_u64s(
         .collect()
 }
 
-#[cfg(feature = "graphblas")]
 fn decode_binary_u32s_from_u64s(
     key: &str,
     value: &[u8],

@@ -43,7 +43,6 @@ impl GraphShard {
             .unwrap_or(adjacency))
     }
 
-    #[cfg(feature = "graphblas")]
     pub(crate) async fn cached_graphblas_matrix(
         &self,
         cell_id: &str,
@@ -141,7 +140,6 @@ impl GraphShard {
         ))
     }
 
-    #[cfg(feature = "graphblas")]
     async fn compact_graphblas_csc_matrix(
         &self,
         cell_id: &str,
@@ -306,7 +304,6 @@ impl GraphShard {
         Ok(values)
     }
 
-    #[cfg(feature = "graphblas")]
     async fn load_graphblas_csc_chunks_u32(
         &self,
         cell_id: &str,

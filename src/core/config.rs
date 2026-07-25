@@ -187,7 +187,6 @@ impl GraphMemoryConfig {
         }
     }
 
-    #[cfg(feature = "graphblas")]
     pub(crate) fn matrix_compilation_permits(&self) -> usize {
         self.max_concurrent_matrix_compilations.max(1)
     }
