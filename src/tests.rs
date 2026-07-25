@@ -1170,18 +1170,37 @@ async fn raw_graph_shard_open_is_read_only() {
 }
 
 #[tokio::test]
-async fn read_only_shard_requires_writer_initialized_store() {
+async fn read_only_shard_treats_uninitialized_store_as_empty_until_first_write() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let err = match GraphShard::open("graph/uninitialized-reader", object_store).await {
-        Ok(_) => panic!("read-only shard initialized an empty database"),
-        Err(err) => err,
-    };
-    assert!(matches!(
-        err,
-        GraphError::Slate(_) | GraphError::CorruptValue { .. }
-    ));
-}
+    let path = "graph/uninitialized-reader";
+    let reader = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
 
+    assert!(!reader.edge_exists("cell-a", "FOLLOWS", 1, 2).await.unwrap());
+    assert!(object_store.list(None).collect::<Vec<_>>().await.is_empty());
+
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+    let committed = writer
+        .write_edge(typed_mutation("cell-a", "FOLLOWS", 1, 2, "first-write"))
+        .await
+        .unwrap();
+    assert!(
+        reader.edge_exists("cell-a", "FOLLOWS", 1, 2).await.unwrap(),
+        "an ordinary read must discover initialization immediately after the durable write"
+    );
+    assert!(
+        reader
+            .wait_for_storage_sequence("cell-a", committed.epoch)
+            .await
+            .unwrap()
+            >= committed.epoch
+    );
+    assert!(reader.edge_exists("cell-a", "FOLLOWS", 1, 2).await.unwrap());
+
+    reader.close().await.unwrap();
+    writer.close().await.unwrap();
+}
 #[tokio::test]
 async fn write_authoritative_open_rejects_relaxed_durability() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -2799,6 +2818,64 @@ async fn second_writer_open_fences_first_writer_instance() {
     second.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn fenced_writer_falls_back_to_reader_for_reads_and_index_discovery() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/fenced-writer-read-fallback";
+
+    let first = open_test_shard(path, Arc::clone(&object_store)).await;
+    let first_commit = first
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "first"))
+        .await
+        .unwrap();
+    assert!(
+        first.refresh_storage_sequence("cell-a").await.unwrap() >= first_commit.epoch,
+        "the pre-fence reader should be cached at the first writer sequence"
+    );
+
+    let replacement = open_test_shard(path, object_store).await;
+    let replacement_commit = replacement
+        .write_edge(typed_mutation("cell-a", "CHAIN", 2, 3, "replacement"))
+        .await
+        .unwrap();
+
+    let stale_writer = first.db.writer().unwrap();
+    let error = stale_writer.refresh_manifest().await.unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        ErrorKind::Closed(slatedb::CloseReason::Fenced)
+    ));
+
+    let dirty = first.dirty_graph_index_edge_types("cell-a").await.unwrap();
+    assert!(dirty.iter().any(|(edge_type, _)| edge_type == "CHAIN"));
+    assert!(
+        first.current_storage_sequence("cell-a").await.unwrap() >= replacement_commit.epoch,
+        "writer demotion must refresh an already-cached reader"
+    );
+    assert!(first.edge_exists("cell-a", "CHAIN", 2, 3).await.unwrap());
+
+    let later_commit = replacement
+        .write_edge(typed_mutation("cell-a", "CHAIN", 3, 4, "replacement-later"))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if first.edge_exists("cell-a", "CHAIN", 3, 4).await.unwrap() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("managed reader should discover later replacement writes");
+    assert!(
+        first.current_storage_sequence("cell-a").await.unwrap() >= later_commit.epoch,
+        "ordinary sequence reads must advance with the managed reader"
+    );
+
+    first.close().await.unwrap();
+    replacement.close().await.unwrap();
+}
 #[test]
 fn db_reader_child_process_entry() {
     if std::env::var("SLATEDB_GRAPH_READER_CHILD").ok().as_deref() != Some("1") {
@@ -3145,6 +3222,70 @@ async fn routed_cluster_uses_slatedb_writer_fencing() {
 }
 
 #[cfg(feature = "query-transport")]
+#[test]
+fn scoped_routed_cluster_returns_empty_rows_without_registering_an_unwritten_scope() {
+    std::thread::Builder::new()
+        .name("empty-scoped-query".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(
+                    scoped_routed_cluster_returns_empty_rows_without_registering_an_unwritten_scope_inner(),
+                );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+async fn scoped_routed_cluster_returns_empty_rows_without_registering_an_unwritten_scope_inner() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let root_namespace = NamespacePath::root(NamespaceId::new("production").unwrap());
+    let graph_id = GraphId::new("hydradb").unwrap();
+    let scope = GraphScope::new(
+        root_namespace
+            .child(NamespaceId::new("tenant-empty").unwrap())
+            .unwrap()
+            .child(NamespaceId::new("collection-empty").unwrap())
+            .unwrap(),
+        graph_id.clone(),
+    );
+    let runtime = ScopedRoutedGraphCluster::new(
+        "graph/empty-native-scope",
+        root_namespace.clone(),
+        graph_id.clone(),
+        "node-a",
+        ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
+        Arc::clone(&object_store),
+        GraphOpenOptions::default(),
+        GraphMemoryConfig::default(),
+        4,
+    )
+    .unwrap();
+
+    let result = QueryCellClient::execute_cypher_rows(
+        &runtime,
+        QueryContext::new("cell-0", "empty-scope-read").in_scope(scope),
+        "MATCH (n:Source) RETURN count(*) AS total",
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.rows[0].values, vec![QueryValue::Count(0)]);
+
+    let scope_directory = ObjectStoreGraphScopeDirectory::new(
+        "graph/empty-native-scope",
+        root_namespace,
+        graph_id,
+        object_store,
+    );
+    assert!(scope_directory.list().await.unwrap().is_empty());
+    runtime.close().await.unwrap();
+}
+#[cfg(feature = "query-transport")]
 #[tokio::test]
 async fn scoped_routed_cluster_isolates_collection_writers_and_registers_scopes() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -3180,8 +3321,31 @@ async fn scoped_routed_cluster_isolates_collection_writers_and_registers_scopes(
         graph_id.clone(),
     );
 
-    let cluster_a = runtime.cluster_for_scope(&collection_a).await.unwrap();
-    let cluster_b = runtime.cluster_for_scope(&collection_b).await.unwrap();
+    let empty_cluster = runtime.cluster_for_scope(&collection_a).await.unwrap();
+    assert!(empty_cluster
+        .shard("cell-0")
+        .unwrap()
+        .dirty_graph_index_edge_types("cell-0")
+        .await
+        .unwrap()
+        .is_empty());
+    let scope_directory = ObjectStoreGraphScopeDirectory::new(
+        "graph/native-scopes",
+        root_namespace.clone(),
+        graph_id.clone(),
+        Arc::clone(&object_store),
+    );
+    assert!(scope_directory.list().await.unwrap().is_empty());
+    drop(empty_cluster);
+
+    let cluster_a = runtime
+        .cluster_for_scope_write(&collection_a, "cell-0")
+        .await
+        .unwrap();
+    let cluster_b = runtime
+        .cluster_for_scope_write(&collection_b, "cell-0")
+        .await
+        .unwrap();
     let (write_a, write_b) = tokio::join!(
         cluster_a.write_edge(typed_mutation("cell-0", "FOLLOWS", 1, 2, "scope-a")),
         cluster_b.write_edge(typed_mutation("cell-0", "FOLLOWS", 1, 3, "scope-b")),
@@ -3208,12 +3372,6 @@ async fn scoped_routed_cluster_isolates_collection_writers_and_registers_scopes(
         .await
         .unwrap());
 
-    let scope_directory = ObjectStoreGraphScopeDirectory::new(
-        "graph/native-scopes",
-        root_namespace,
-        graph_id,
-        object_store,
-    );
     assert_eq!(
         scope_directory.list().await.unwrap(),
         vec![collection_a, collection_b]

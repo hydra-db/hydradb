@@ -9,6 +9,11 @@ use slatedb::{Db, DbReader, DbReaderMode};
 use crate::{GraphCachePolicy, Result, StorageSequence};
 
 pub const DEFAULT_TRUSTED_APPEND_CHUNK_EDGES: usize = 4_096;
+#[cfg(not(test))]
+const GRAPH_READER_MANIFEST_POLL_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const GRAPH_READER_MANIFEST_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphLimits {
     pub max_bulk_import_edges: usize,
@@ -332,7 +337,10 @@ pub(crate) async fn open_graph_reader(
     object_store: Arc<dyn ObjectStore>,
     cache: &GraphCacheConfig,
 ) -> Result<DbReader> {
-    let mut options = DbReaderOptions::default();
+    let mut options = DbReaderOptions {
+        manifest_poll_interval: GRAPH_READER_MANIFEST_POLL_INTERVAL,
+        ..DbReaderOptions::default()
+    };
     cache.apply_to_reader_options(&mut options);
     Ok(DbReader::builder(path, object_store)
         .with_options(options)
