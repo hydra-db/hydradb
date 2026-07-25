@@ -1,11 +1,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine;
+use crate::SparseKernelBackend;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphCachePolicy {
     pub max_matrix_artifacts: usize,
     pub max_matrix_adjacencies: usize,
     pub max_graphblas_matrices: usize,
+    /// Which rung of the sparse-kernel ladder this shard traverses on. Read
+    /// once, at matrix-compile time, and baked into the compiled artifact.
+    pub sparse_kernel: SparseKernelBackend,
     #[cfg(feature = "opencypher")]
     pub max_parsed_row_queries: usize,
     #[cfg(feature = "opencypher")]
@@ -23,6 +27,7 @@ impl Default for GraphCachePolicy {
             max_matrix_artifacts: 1_024,
             max_matrix_adjacencies: 0,
             max_graphblas_matrices: 64,
+            sparse_kernel: SparseKernelBackend::SuiteSparse,
             #[cfg(feature = "opencypher")]
             max_parsed_row_queries: 4_096,
             #[cfg(feature = "opencypher")]

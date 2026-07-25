@@ -73,8 +73,11 @@ Native query/traversal features:
 SuiteSparse GraphBLAS is **not** a feature — it is always linked, because it is
 the kernel we run in production, so its development headers and library are
 required for a plain `cargo build`. To run traversals on a pure-Rust kernel
-instead, switch at runtime with `GRAPH_COMPILED_KERNEL=compact`; no rebuild is
-needed.
+instead, switch at runtime; no rebuild is needed. `GRAPH_SPARSE_KERNEL` selects
+one of `adjacency` (uncompiled BFS), `compact` (compiled flat CSC, no C) or
+`suitesparse` (the default). The older `GRAPH_COMPILED_KERNEL=compact` still
+works and is equivalent to `GRAPH_SPARSE_KERNEL=compact`, but only while
+`GRAPH_SPARSE_KERNEL` is unset.
 - `query-transport-tls`: Rustls dependencies are pulled by Cargo; you provide
   certificates/configuration in the embedding service
 
@@ -119,6 +122,7 @@ cd slatedb-graph-kernel
 
 cargo test --locked --lib
 GRAPH_COMPILED_KERNEL=compact cargo test --locked --lib   # pure-Rust sparse kernel
+                                                          # (same as GRAPH_SPARSE_KERNEL=compact)
 cargo test --locked --features opencypher --lib
 cargo check --locked --examples --features opencypher
 cargo test --locked --all-targets --features public-client-protocols

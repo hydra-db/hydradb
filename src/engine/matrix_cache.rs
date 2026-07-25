@@ -49,6 +49,11 @@ impl GraphShard {
         edge_type: &str,
         base_epoch: StorageSequence,
     ) -> Result<Option<Arc<CompiledGraphBlasMatrix>>> {
+        let kernel = default_matrix_kernel(&self.cache_policy);
+        if kernel == SparseKernelBackend::Adjacency {
+            // Kernel 1 has no compiled form; callers fall through to it.
+            return Ok(None);
+        }
         let cache_key = MatrixCacheKey::new(cell_id, edge_type, base_epoch);
         if let Some(cached) = self.graphblas_cache.lock().await.get(&cache_key) {
             self.cache_metrics.record_hit(GraphCacheKind::GraphBlas);
@@ -85,36 +90,45 @@ impl GraphShard {
                 return Ok(None);
             };
             let edge_count = csc.indices.len() as u64;
-            (Arc::new(compile_graphblas_csc_owned(csc)?), edge_count)
-        } else if compact_csc_kernel_enabled() {
+            (
+                Arc::new(compile_graphblas_csc_owned(csc, kernel)?),
+                edge_count,
+            )
+        } else if kernel == SparseKernelBackend::CompactCsc {
             if let Some((compiled, edge_count)) = self
-                .compact_graphblas_csc_matrix(cell_id, edge_type, base_epoch)
+                .compact_graphblas_csc_matrix(cell_id, edge_type, base_epoch, kernel)
                 .await?
             {
                 (Arc::new(compiled), edge_count)
             } else if let Some(csc) = self.graphblas_csc(cell_id, edge_type, base_epoch).await? {
                 let edge_count = csc.indices.len() as u64;
-                (Arc::new(compile_graphblas_csc_owned(csc)?), edge_count)
+                (
+                    Arc::new(compile_graphblas_csc_owned(csc, kernel)?),
+                    edge_count,
+                )
             } else {
                 let adjacency = self
                     .cached_matrix_adjacency(cell_id, edge_type, base_epoch)
                     .await?;
                 let edge_count = adjacency.values().map(|dsts| dsts.len() as u64).sum();
                 (
-                    Arc::new(compile_graphblas_matrix(adjacency.as_ref())?),
+                    Arc::new(compile_graphblas_matrix(adjacency.as_ref(), kernel)?),
                     edge_count,
                 )
             }
         } else if let Some(csc) = self.graphblas_csc(cell_id, edge_type, base_epoch).await? {
             let edge_count = csc.indices.len() as u64;
-            (Arc::new(compile_graphblas_csc_owned(csc)?), edge_count)
+            (
+                Arc::new(compile_graphblas_csc_owned(csc, kernel)?),
+                edge_count,
+            )
         } else {
             let adjacency = self
                 .cached_matrix_adjacency(cell_id, edge_type, base_epoch)
                 .await?;
             let edge_count = adjacency.values().map(|dsts| dsts.len() as u64).sum();
             (
-                Arc::new(compile_graphblas_matrix(adjacency.as_ref())?),
+                Arc::new(compile_graphblas_matrix(adjacency.as_ref(), kernel)?),
                 edge_count,
             )
         };
@@ -145,6 +159,7 @@ impl GraphShard {
         cell_id: &str,
         edge_type: &str,
         base_epoch: StorageSequence,
+        kernel: SparseKernelBackend,
     ) -> Result<Option<(CompiledGraphBlasMatrix, u64)>> {
         let key = graphblas_csc_key(cell_id, edge_type, base_epoch);
         let _permit = self
@@ -201,7 +216,7 @@ impl GraphShard {
             return corrupt(&key, "GraphBLAS CSC checksum mismatch");
         }
         let edge_count = indices.len() as u64;
-        let compiled = compile_graphblas_compact_csc_u32(vertices, pointers, indices)?;
+        let compiled = compile_graphblas_compact_csc_u32(vertices, pointers, indices, kernel)?;
         self.record_hydration_complete();
         Ok(Some((compiled, edge_count)))
     }

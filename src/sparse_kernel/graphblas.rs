@@ -152,7 +152,8 @@ struct Descriptor(GrBDescriptor);
 
 pub(crate) struct CompiledGraphBlasMatrix {
     canonical_out: CompiledCompactCscMatrix,
-    use_compact_kernel: bool,
+    // Resolved once by the constructor and never re-read from configuration.
+    kernel: SparseKernelBackend,
     replicas: Vec<Mutex<CompiledGraphBlasMatrixInner>>,
     next_replica: AtomicUsize,
     #[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
@@ -342,7 +343,7 @@ impl CompiledCompactCscMatrix {
         Ok(SparseTraversal {
             vertices,
             edge_visits,
-            backend: SparseKernelBackend::RustSparse,
+            backend: SparseKernelBackend::CompactCsc,
         })
     }
 
@@ -359,7 +360,7 @@ impl CompiledCompactCscMatrix {
                 .map(|ordinal| self.vertices[ordinal])
                 .collect(),
             edge_visits,
-            backend: SparseKernelBackend::RustSparse,
+            backend: SparseKernelBackend::CompactCsc,
         })
     }
 
@@ -374,7 +375,7 @@ impl CompiledCompactCscMatrix {
         Ok(SparseTraversalCount {
             vertices: result_seen.into_iter().filter(|seen| *seen).count() as u64,
             edge_visits,
-            backend: SparseKernelBackend::RustSparse,
+            backend: SparseKernelBackend::CompactCsc,
         })
     }
 
@@ -424,7 +425,7 @@ impl CompiledCompactCscMatrix {
         Ok(SparseTraversal {
             vertices: selected,
             edge_visits,
-            backend: SparseKernelBackend::RustSparse,
+            backend: SparseKernelBackend::CompactCsc,
         })
     }
 
@@ -502,7 +503,7 @@ fn compact_empty_traversal() -> SparseTraversal {
     SparseTraversal {
         vertices: Vec::new(),
         edge_visits: 0,
-        backend: SparseKernelBackend::RustSparse,
+        backend: SparseKernelBackend::CompactCsc,
     }
 }
 
@@ -530,19 +531,34 @@ impl Drop for Descriptor {
     }
 }
 
+/// Narrows a configured kernel to one that has a compiled representation.
+///
+/// Kernel 1 has none, so a matrix compiled under `Adjacency` lands on the
+/// compact CSC rung — its closest compiled peer. Callers that honour the
+/// `Adjacency` setting skip compilation entirely, so this is only a guard.
+fn compiled_kernel(requested: SparseKernelBackend) -> SparseKernelBackend {
+    match requested {
+        SparseKernelBackend::SuiteSparse => SparseKernelBackend::SuiteSparse,
+        SparseKernelBackend::Adjacency | SparseKernelBackend::CompactCsc => {
+            SparseKernelBackend::CompactCsc
+        }
+    }
+}
+
 impl CompiledGraphBlasMatrix {
-    pub(crate) fn new(adjacency: &Adjacency) -> Result<Self> {
+    pub(crate) fn new(adjacency: &Adjacency, kernel: SparseKernelBackend) -> Result<Self> {
         let csc = graphblas_csc_from_adjacency(adjacency)?;
-        Self::new_from_csc(&csc)
+        Self::new_from_csc(&csc, kernel)
     }
 
-    pub(crate) fn new_from_csc(csc: &GraphBlasCsc) -> Result<Self> {
+    pub(crate) fn new_from_csc(csc: &GraphBlasCsc, kernel: SparseKernelBackend) -> Result<Self> {
         validate_csc(csc)?;
+        let kernel = compiled_kernel(kernel);
         let canonical_out = CompiledCompactCscMatrix::from_csc(csc);
-        if use_compact_csc_kernel() {
+        if kernel == SparseKernelBackend::CompactCsc {
             return Ok(Self {
                 canonical_out,
-                use_compact_kernel: true,
+                kernel,
                 replicas: Vec::new(),
                 next_replica: AtomicUsize::new(0),
                 edge_count: csc.indices.len(),
@@ -561,7 +577,7 @@ impl CompiledGraphBlasMatrix {
         }
         Ok(Self {
             canonical_out,
-            use_compact_kernel: false,
+            kernel,
             replicas,
             next_replica: AtomicUsize::new(0),
             edge_count: csc.indices.len(),
@@ -570,31 +586,37 @@ impl CompiledGraphBlasMatrix {
         })
     }
 
-    pub(crate) fn new_from_csc_owned(csc: GraphBlasCsc) -> Result<Self> {
+    pub(crate) fn new_from_csc_owned(
+        csc: GraphBlasCsc,
+        kernel: SparseKernelBackend,
+    ) -> Result<Self> {
         validate_csc(&csc)?;
-        if use_compact_csc_kernel() {
+        let kernel = compiled_kernel(kernel);
+        if kernel == SparseKernelBackend::CompactCsc {
             let compact_bytes = compact_csc_resident_bytes(&csc);
             let canonical_out = CompiledCompactCscMatrix::from_owned_csc(csc);
             let edge_count = canonical_out.indices.len();
             return Ok(Self {
                 canonical_out,
-                use_compact_kernel: true,
+                kernel,
                 replicas: Vec::new(),
                 next_replica: AtomicUsize::new(0),
                 edge_count,
                 estimated_resident_bytes: compact_bytes,
             });
         }
-        Self::new_from_csc(&csc)
+        Self::new_from_csc(&csc, kernel)
     }
 
     pub(crate) fn new_from_compact_u32(
         vertices: Vec<VertexId>,
         pointers: Vec<u32>,
         indices: Vec<u32>,
+        kernel: SparseKernelBackend,
     ) -> Result<Self> {
         validate_compact_u32_csc(&vertices, &pointers, &indices)?;
-        if use_compact_csc_kernel() {
+        let kernel = compiled_kernel(kernel);
+        if kernel == SparseKernelBackend::CompactCsc {
             let one_orientation_bytes = vertices
                 .capacity()
                 .saturating_mul(std::mem::size_of::<VertexId>())
@@ -613,7 +635,7 @@ impl CompiledGraphBlasMatrix {
             let edge_count = canonical_out.indices.len();
             return Ok(Self {
                 canonical_out,
-                use_compact_kernel: true,
+                kernel,
                 replicas: Vec::new(),
                 next_replica: AtomicUsize::new(0),
                 edge_count,
@@ -625,7 +647,13 @@ impl CompiledGraphBlasMatrix {
             pointers: pointers.into_iter().map(u64::from).collect(),
             indices: indices.into_iter().map(u64::from).collect(),
         };
-        Self::new_from_csc_owned(csc)
+        Self::new_from_csc_owned(csc, kernel)
+    }
+
+    /// The kernel this artifact was compiled for. Downstream code asks the
+    /// artifact rather than re-reading configuration.
+    pub(crate) fn kernel(&self) -> SparseKernelBackend {
+        self.kernel
     }
 
     pub(crate) fn expand(
@@ -634,7 +662,7 @@ impl CompiledGraphBlasMatrix {
         starts: &[VertexId],
         hops: u8,
     ) -> Result<SparseTraversal> {
-        if self.use_compact_kernel {
+        if self.kernel == SparseKernelBackend::CompactCsc {
             return self.canonical_out.expand(starts, hops);
         }
         let inner = self.lock_available_replica()?;
@@ -656,7 +684,7 @@ impl CompiledGraphBlasMatrix {
         min_hops: u8,
         max_hops: u8,
     ) -> Result<SparseTraversal> {
-        if self.use_compact_kernel {
+        if self.kernel == SparseKernelBackend::CompactCsc {
             return self.canonical_out.expand_range(starts, min_hops, max_hops);
         }
         let inner = self.lock_available_replica()?;
@@ -671,7 +699,7 @@ impl CompiledGraphBlasMatrix {
         min_hops: u8,
         max_hops: u8,
     ) -> Result<SparseTraversalCount> {
-        if self.use_compact_kernel {
+        if self.kernel == SparseKernelBackend::CompactCsc {
             return self
                 .canonical_out
                 .expand_range_count(starts, min_hops, max_hops);
@@ -689,7 +717,7 @@ impl CompiledGraphBlasMatrix {
         max_hops: u8,
         window: SparseTraversalWindow,
     ) -> Result<SparseTraversal> {
-        if self.use_compact_kernel {
+        if self.kernel == SparseKernelBackend::CompactCsc {
             return self
                 .canonical_out
                 .expand_range_window(starts, min_hops, max_hops, window);
@@ -905,7 +933,7 @@ fn expand_with_compiled(
     Ok(SparseTraversal {
         vertices,
         edge_visits,
-        backend: SparseKernelBackend::SuiteSparseGraphBlas,
+        backend: SparseKernelBackend::SuiteSparse,
     })
 }
 
@@ -929,7 +957,7 @@ fn expand_range_with_compiled(
     Ok(SparseTraversal {
         vertices,
         edge_visits: range.edge_visits,
-        backend: SparseKernelBackend::SuiteSparseGraphBlas,
+        backend: SparseKernelBackend::SuiteSparse,
     })
 }
 
@@ -949,13 +977,13 @@ fn expand_range_count_with_compiled(
         return Ok(SparseTraversalCount {
             vertices: 0,
             edge_visits: range.edge_visits,
-            backend: SparseKernelBackend::SuiteSparseGraphBlas,
+            backend: SparseKernelBackend::SuiteSparse,
         });
     };
     Ok(SparseTraversalCount {
         vertices: vector_nvals(result)?,
         edge_visits: range.edge_visits,
-        backend: SparseKernelBackend::SuiteSparseGraphBlas,
+        backend: SparseKernelBackend::SuiteSparse,
     })
 }
 
@@ -969,21 +997,21 @@ fn exact_hop_count_with_compiled(
         return Ok(SparseTraversalCount {
             vertices: 0,
             edge_visits: 0,
-            backend: SparseKernelBackend::SuiteSparseGraphBlas,
+            backend: SparseKernelBackend::SuiteSparse,
         });
     };
     let Some(degree_vector) = compiled.degree_vector.as_ref() else {
         return Ok(SparseTraversalCount {
             vertices: 0,
             edge_visits: 0,
-            backend: SparseKernelBackend::SuiteSparseGraphBlas,
+            backend: SparseKernelBackend::SuiteSparse,
         });
     };
     if starts.is_empty() || compiled.ordinal_map.is_empty() {
         return Ok(SparseTraversalCount {
             vertices: 0,
             edge_visits: 0,
-            backend: SparseKernelBackend::SuiteSparseGraphBlas,
+            backend: SparseKernelBackend::SuiteSparse,
         });
     }
 
@@ -999,7 +1027,7 @@ fn exact_hop_count_with_compiled(
         return Ok(SparseTraversalCount {
             vertices: 0,
             edge_visits: 0,
-            backend: SparseKernelBackend::SuiteSparseGraphBlas,
+            backend: SparseKernelBackend::SuiteSparse,
         });
     }
 
@@ -1016,7 +1044,7 @@ fn exact_hop_count_with_compiled(
         return Ok(SparseTraversalCount {
             vertices: start_ordinals.len() as u64,
             edge_visits: 0,
-            backend: SparseKernelBackend::SuiteSparseGraphBlas,
+            backend: SparseKernelBackend::SuiteSparse,
         });
     }
 
@@ -1040,7 +1068,7 @@ fn exact_hop_count_with_compiled(
             return Ok(SparseTraversalCount {
                 vertices: 0,
                 edge_visits,
-                backend: SparseKernelBackend::SuiteSparseGraphBlas,
+                backend: SparseKernelBackend::SuiteSparse,
             });
         }
     }
@@ -1048,7 +1076,7 @@ fn exact_hop_count_with_compiled(
     Ok(SparseTraversalCount {
         vertices: vector_nvals(&scratch.frontier)?,
         edge_visits,
-        backend: SparseKernelBackend::SuiteSparseGraphBlas,
+        backend: SparseKernelBackend::SuiteSparse,
     })
 }
 
@@ -1086,7 +1114,7 @@ fn expand_range_window_with_compiled(
     Ok(SparseTraversal {
         vertices,
         edge_visits: range.edge_visits,
-        backend: SparseKernelBackend::SuiteSparseGraphBlas,
+        backend: SparseKernelBackend::SuiteSparse,
     })
 }
 
@@ -1171,7 +1199,7 @@ fn empty_traversal() -> SparseTraversal {
     SparseTraversal {
         vertices: Vec::new(),
         edge_visits: 0,
-        backend: SparseKernelBackend::SuiteSparseGraphBlas,
+        backend: SparseKernelBackend::SuiteSparse,
     }
 }
 
@@ -1207,6 +1235,11 @@ fn init() -> Result<()> {
     }
 }
 
+/// The legacy `GRAPH_COMPILED_KERNEL` switch, retained as a fallback default.
+///
+/// Compilation no longer consults it — constructors take the kernel explicitly.
+/// It is read once, by `super::default_matrix_kernel`, and only when the policy
+/// has been left at its default, so benchmark scripts keep working.
 pub(crate) fn use_compact_csc_kernel() -> bool {
     std::env::var("GRAPH_COMPILED_KERNEL").is_ok_and(|value| {
         matches!(

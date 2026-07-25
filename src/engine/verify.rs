@@ -372,7 +372,7 @@ impl GraphShard {
                         &[root],
                         hops,
                         request.read_epoch,
-                        default_matrix_kernel(),
+                        default_matrix_kernel(&self.cache_policy),
                     )
                     .await?
                     .vertices;

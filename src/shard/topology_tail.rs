@@ -205,6 +205,7 @@ pub(crate) fn expand_range_with_overlay(
     Ok(crate::sparse_kernel::SparseTraversal {
         vertices: reachable.into_iter().collect(),
         edge_visits,
-        backend: SparseKernelBackend::SuiteSparseGraphBlas,
+        // The overlay walk runs on whichever compiled kernel the matrix baked in.
+        backend: crate::sparse_kernel::compiled_graphblas_kernel(compiled),
     })
 }

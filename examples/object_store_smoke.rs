@@ -82,11 +82,10 @@ async fn main() -> Result<()> {
 }
 
 fn selected_matrix_kernel() -> SparseKernelBackend {
-    match std::env::var("GRAPH_MATRIX_KERNEL").or_else(|_| std::env::var("GRAPH_MATRIX_KERNEL")) {
-        Ok(value) if value.eq_ignore_ascii_case("graphblas") => {
-            SparseKernelBackend::SuiteSparseGraphBlas
-        }
-        Ok(value) if value.eq_ignore_ascii_case("rust") => SparseKernelBackend::RustSparse,
-        _ => SparseKernelBackend::SuiteSparseGraphBlas,
+    match std::env::var("GRAPH_MATRIX_KERNEL") {
+        Ok(value) if value.eq_ignore_ascii_case("graphblas") => SparseKernelBackend::SuiteSparse,
+        Ok(value) if value.eq_ignore_ascii_case("compact") => SparseKernelBackend::CompactCsc,
+        Ok(value) if value.eq_ignore_ascii_case("rust") => SparseKernelBackend::Adjacency,
+        _ => SparseKernelBackend::SuiteSparse,
     }
 }

@@ -16,7 +16,7 @@ impl GraphShard {
             starts,
             hops,
             read_epoch,
-            default_matrix_kernel(),
+            default_matrix_kernel(&self.cache_policy),
         )
         .await
     }
@@ -53,7 +53,9 @@ impl GraphShard {
 
         let base_epoch = artifact.as_ref().map_or(0, |artifact| artifact.base_epoch);
 
-        if sparse_kernel == SparseKernelBackend::SuiteSparseGraphBlas && artifact.is_some() {
+        // Both compiled rungs go through the compiled-matrix path; only kernel 1
+        // skips it, because it has no compiled form.
+        if sparse_kernel != SparseKernelBackend::Adjacency && artifact.is_some() {
             let started = Instant::now();
             let Some((compiled, overlay, _)) = self
                 .compiled_graphblas_query_snapshot(
@@ -169,7 +171,7 @@ impl GraphShard {
         let adjacency = self
             .canonical_adjacency_at(cell_id, edge_type, read_epoch)
             .await?;
-        let traversal = expand_sparse(&adjacency, starts, hops, SparseKernelBackend::RustSparse)?;
+        let traversal = expand_sparse(&adjacency, starts, hops, SparseKernelBackend::Adjacency)?;
         Ok(MatrixTraversalResult {
             backend: TraversalBackend::DirectSnapshot,
             vertices: traversal.vertices,

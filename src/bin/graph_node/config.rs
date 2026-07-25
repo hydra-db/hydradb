@@ -7,7 +7,7 @@ use std::time::Duration;
 use slatedb_graph_kernel::{
     GraphBackpressurePolicy, GraphCacheConfig, GraphCachePolicy, GraphDurabilityConfig, GraphId,
     GraphIndexPolicy, GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphScope,
-    GraphStorageMemoryConfig, NamespaceId, NamespacePath,
+    GraphStorageMemoryConfig, NamespaceId, NamespacePath, SparseKernelBackend,
 };
 
 type ConfigResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -30,6 +30,7 @@ pub struct RuntimeConfig {
     pub max_matrix_adjacency_bytes: usize,
     pub max_graphblas_matrices: usize,
     pub max_graphblas_bytes: usize,
+    pub sparse_kernel: SparseKernelBackend,
     pub max_relationship_rows_bytes: usize,
     pub max_source_relationship_rows_bytes: usize,
     pub max_relationship_property_rows_bytes: usize,
@@ -157,6 +158,7 @@ impl RuntimeConfig {
                 "GRAPH_MAX_GRAPHBLAS_BYTES",
                 128 * 1024 * 1024,
             )?,
+            sparse_kernel: parse_sparse_kernel(&values, "GRAPH_SPARSE_KERNEL")?,
             max_relationship_rows_bytes: parse_usize_allow_zero(
                 &values,
                 "GRAPH_MAX_RELATIONSHIP_ROWS_BYTES",
@@ -232,6 +234,7 @@ impl RuntimeConfig {
                 max_matrix_adjacencies: self.max_matrix_adjacencies,
                 max_graphblas_matrices: self.max_graphblas_matrices,
                 max_concurrent_hydrations: self.max_concurrent_hydrations,
+                sparse_kernel: self.sparse_kernel,
                 ..GraphCachePolicy::default()
             },
             backpressure_policy: GraphBackpressurePolicy::default(),
@@ -349,6 +352,23 @@ fn parse_usize_allow_zero(
     })
 }
 
+fn parse_sparse_kernel(
+    values: &BTreeMap<String, String>,
+    name: &str,
+) -> ConfigResult<SparseKernelBackend> {
+    match value(values, name, "suitesparse")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "adjacency" => Ok(SparseKernelBackend::Adjacency),
+        "compact" => Ok(SparseKernelBackend::CompactCsc),
+        "suitesparse" => Ok(SparseKernelBackend::SuiteSparse),
+        other => invalid(format!(
+            "invalid {name}={other}; expected adjacency, compact or suitesparse"
+        )),
+    }
+}
+
 fn parse_bool(values: &BTreeMap<String, String>, name: &str, default: bool) -> ConfigResult<bool> {
     match value(values, name, if default { "true" } else { "false" })
         .to_ascii_lowercase()
@@ -444,6 +464,32 @@ mod tests {
         let config = RuntimeConfig::from_values(values).unwrap();
         assert_eq!(config.max_query_scan_edges, 64);
         assert_eq!(config.graph_open_options().limits.max_query_scan_edges, 64);
+    }
+
+    #[test]
+    fn graph_node_config_selects_the_sparse_kernel() {
+        let base = || BTreeMap::from([("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string())]);
+        let config = RuntimeConfig::from_values(base()).unwrap();
+        assert_eq!(config.sparse_kernel, SparseKernelBackend::SuiteSparse);
+        assert_eq!(
+            config.graph_open_options().cache_policy.sparse_kernel,
+            SparseKernelBackend::SuiteSparse
+        );
+
+        let mut values = base();
+        values.insert("GRAPH_SPARSE_KERNEL".to_string(), "Compact".to_string());
+        let config = RuntimeConfig::from_values(values).unwrap();
+        assert_eq!(config.sparse_kernel, SparseKernelBackend::CompactCsc);
+
+        let mut values = base();
+        values.insert("GRAPH_SPARSE_KERNEL".to_string(), "ADJACENCY".to_string());
+        let config = RuntimeConfig::from_values(values).unwrap();
+        assert_eq!(config.sparse_kernel, SparseKernelBackend::Adjacency);
+
+        let mut values = base();
+        values.insert("GRAPH_SPARSE_KERNEL".to_string(), "cuda".to_string());
+        let error = RuntimeConfig::from_values(values).unwrap_err();
+        assert!(error.to_string().contains("GRAPH_SPARSE_KERNEL"));
     }
 
     #[test]
