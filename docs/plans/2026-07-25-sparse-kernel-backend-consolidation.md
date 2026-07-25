@@ -147,6 +147,27 @@ paths report `SuiteSparse`. `expand_range_with_overlay` used to hard-code
 `SuiteSparseGraphBlas` even when running on the compact kernel — it now asks the
 compiled matrix, via `compiled_graphblas_kernel()`.
 
+Every `SparseTraversal` construction site was audited and reports its own rung.
+But that is only half a metric: the three `*_with_compiled_graph_kernel` methods
+in `shard::query` return `(vertices, edge_visits)` and discard `backend`, so the
+Cypher path still cannot distinguish kernel 2 from kernel 3. `backend` reaches a
+caller only via `MatrixTraversalResult::sparse_kernel` on the `matrix_reachable*`
+API, and no counter or Prometheus series exports it. **Wiring a per-rung counter
+through `GraphOperationalMetrics` is outstanding** — `query_rust_sparse_fallbacks`
+still only separates compiled from uncompiled.
+
+**`Adjacency` is a ceiling, not a preference.** `matrix_reachable_with_kernel`
+clamps its kernel argument against the policy, because otherwise a caller asking
+for a compiled rung on an `Adjacency` shard falls through to `expand_sparse` with
+its own argument and compiles a matrix anyway. `adjacency_policy_compiles_no_matrix_at_all`
+in `tests.rs` is the regression guard; without the clamp it fails with
+`left: SuiteSparse, right: Adjacency`.
+
+Note that `Adjacency` also subjects queries to the storage-frontier scan limits
+(`max_query_scan_edges` and friends) that the compiled path does not apply, so
+switching a busy shard to it can turn working queries into hard errors rather
+than merely slow ones.
+
 **Known wrinkle.** `matrix_reachable_with_kernel` still takes a kernel argument,
 but a compiled artifact's kernel comes from the policy, not from that argument.
 So the argument decides compiled-vs-uncompiled routing only; passing

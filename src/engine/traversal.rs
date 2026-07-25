@@ -37,6 +37,15 @@ impl GraphShard {
             u64::from(hops),
             u64::from(self.limits.max_traversal_hops),
         )?;
+        // An `Adjacency` policy is a hard ceiling, not a default: it means this
+        // shard does no matrix compilation at all. Without this clamp a caller
+        // asking for a compiled rung would fall through to `expand_sparse` with
+        // its own argument and compile a matrix anyway, reporting a rung the
+        // policy had disabled.
+        let sparse_kernel = match default_matrix_kernel(&self.cache_policy) {
+            SparseKernelBackend::Adjacency => SparseKernelBackend::Adjacency,
+            _ => sparse_kernel,
+        };
         let profile = matrix_profile_enabled();
         let total_started = Instant::now();
 

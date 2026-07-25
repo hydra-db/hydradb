@@ -73,11 +73,21 @@ Native query/traversal features:
 SuiteSparse GraphBLAS is **not** a feature — it is always linked, because it is
 the kernel we run in production, so its development headers and library are
 required for a plain `cargo build`. To run traversals on a pure-Rust kernel
-instead, switch at runtime; no rebuild is needed. `GRAPH_SPARSE_KERNEL` selects
-one of `adjacency` (uncompiled BFS), `compact` (compiled flat CSC, no C) or
-`suitesparse` (the default). The older `GRAPH_COMPILED_KERNEL=compact` still
-works and is equivalent to `GRAPH_SPARSE_KERNEL=compact`, but only while
-`GRAPH_SPARSE_KERNEL` is unset.
+instead, switch at runtime; no rebuild is needed.
+
+`GRAPH_SPARSE_KERNEL` selects one of `adjacency` (uncompiled BFS), `compact`
+(compiled flat CSC, no C) or `suitesparse` (the default). **It is read by the
+`graph-node` binary only** — embedders set `GraphCachePolicy::sparse_kernel`
+directly, and it has no effect on `cargo test`. The older
+`GRAPH_COMPILED_KERNEL=compact` changes the *default* that policy field starts
+at, so it does apply to the library and its tests; an explicit
+`GRAPH_SPARSE_KERNEL`, or a policy set in code, always wins over it.
+
+Note that `adjacency` is a capability downgrade, not just a slower path. It has
+no count or window pushdown, and it routes queries through the storage frontier,
+which enforces `max_query_scan_edges` / `max_query_intermediate_rows` /
+`max_query_result_vertices` — limits the compiled path does not apply. A large
+traversal that succeeds on `suitesparse` can fail outright on `adjacency`.
 - `query-transport-tls`: Rustls dependencies are pulled by Cargo; you provide
   certificates/configuration in the embedding service
 
@@ -121,8 +131,7 @@ git clone https://github.com/usecortex/slatedb-graph-kernel.git
 cd slatedb-graph-kernel
 
 cargo test --locked --lib
-GRAPH_COMPILED_KERNEL=compact cargo test --locked --lib   # pure-Rust sparse kernel
-                                                          # (same as GRAPH_SPARSE_KERNEL=compact)
+GRAPH_COMPILED_KERNEL=compact cargo test --locked --lib   # pure-Rust compiled kernel
 cargo test --locked --features opencypher --lib
 cargo check --locked --examples --features opencypher
 cargo test --locked --all-targets --features public-client-protocols

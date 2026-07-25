@@ -356,10 +356,18 @@ fn parse_sparse_kernel(
     values: &BTreeMap<String, String>,
     name: &str,
 ) -> ConfigResult<SparseKernelBackend> {
-    match value(values, name, "suitesparse")
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    // Absent means "whatever GraphCachePolicy defaults to", which is where the
+    // legacy GRAPH_COMPILED_KERNEL override lands. Defaulting to the literal
+    // string "suitesparse" here would make an unset variable indistinguishable
+    // from an explicit one and silently outrank that override.
+    let Some(raw) = values
+        .get(name)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(GraphCachePolicy::default().sparse_kernel);
+    };
+    match raw.to_ascii_lowercase().as_str() {
         "adjacency" => Ok(SparseKernelBackend::Adjacency),
         "compact" => Ok(SparseKernelBackend::CompactCsc),
         "suitesparse" => Ok(SparseKernelBackend::SuiteSparse),

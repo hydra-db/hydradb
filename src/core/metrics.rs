@@ -27,7 +27,7 @@ impl Default for GraphCachePolicy {
             max_matrix_artifacts: 1_024,
             max_matrix_adjacencies: 0,
             max_graphblas_matrices: 64,
-            sparse_kernel: SparseKernelBackend::SuiteSparse,
+            sparse_kernel: crate::sparse_kernel::env_default_kernel(),
             #[cfg(feature = "opencypher")]
             max_parsed_row_queries: 4_096,
             #[cfg(feature = "opencypher")]
