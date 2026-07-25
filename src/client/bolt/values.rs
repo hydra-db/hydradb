@@ -156,6 +156,16 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             code: "Neo.TransientError.Transaction.Terminated".to_string(),
             message: error.to_string(),
         },
+        // Touch point (c). Drivers already know this code: discard the routing
+        // table, re-route, retry. Without it a refused write arrives as an
+        // opaque backend error and the driver retries into the same wrong node
+        // until it gives up. The owner rides in the message, TiKV's
+        // `NotLeader { leader_hint }` — and is absent, not guessed, when this
+        // node has shed its view and has nothing truthful to point at.
+        GraphError::NotCellWriter { .. } => BoltError::Query {
+            code: "Neo.ClientError.Cluster.NotALeader".to_string(),
+            message: error.to_string(),
+        },
         _ => {
             tracing::warn!(target: "slatedb_graph_kernel", error = %error, "Bolt suppressed internal graph error");
             BoltError::Backend("internal query execution error".to_string())

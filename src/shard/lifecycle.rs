@@ -139,6 +139,7 @@ impl GraphShard {
             options.cache.clone(),
             memory.storage.clone(),
             options.durability.clone(),
+            options.fence_backoff_interval,
         );
         match &write_authority {
             GraphWriteAuthority::ReadOnly => {

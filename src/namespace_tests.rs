@@ -245,6 +245,7 @@ async fn routed_queries_reject_a_context_from_another_graph_scope() {
         expected_scope.clone(),
         "node-a",
         ObjectStoreNodeDirectory::new(["cell-a"], ["node-a"]).unwrap(),
+        PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
         object_store,
     )
     .await

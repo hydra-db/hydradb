@@ -9,6 +9,48 @@ async fn open_test_shard(path: &str, object_store: Arc<dyn ObjectStore>) -> Grap
         .unwrap()
 }
 
+/// A placement view over a hand-picked fleet, for tests whose subject is not
+/// placement.
+///
+/// No store and no heartbeats are involved: before its first refresh a view is
+/// `Grace(members)` — decision 8's assume-the-configured-fleet posture — so
+/// ownership is simply the rendezvous winner over exactly `members`.
+fn placement_over(local_node_id: &str, members: &[&str]) -> PlacementView {
+    PlacementView::new(
+        local_node_id,
+        members.iter().copied(),
+        PlacementConfig::default(),
+    )
+    .expect("a valid test fleet")
+}
+
+/// The view a node holds when it believes it is the whole fleet: it owns every
+/// cell and promotes on demand, which is what every routed cluster did before
+/// ownership was checked at all.
+///
+/// Two clusters built this way are two nodes with *skewed* views, each certain
+/// it is alone — which is exactly the situation SlateDB's writer epoch has to
+/// survive, and the reason the fencing tests below use it rather than a shared
+/// fleet in which rendezvous would let only one of them promote.
+fn sole_writer_placement(local_node_id: &str) -> PlacementView {
+    placement_over(local_node_id, &[local_node_id])
+}
+
+/// Open options whose fenced-writer wait is measured in milliseconds.
+///
+/// The production value is 5s (decision 5), and it is a real wait: touch point
+/// (d) paces a fenced writer rather than letting it re-open at once. A test that
+/// drives a fence through the promotion gate therefore serves that wait for
+/// real, and at the default it would spend five seconds asleep to observe a
+/// state machine that takes microseconds to decide. The pacing is still
+/// exercised in full; only its magnitude changes.
+fn fast_fence_options() -> GraphOpenOptions {
+    GraphOpenOptions {
+        fence_backoff_interval: std::time::Duration::from_millis(20),
+        ..GraphOpenOptions::default()
+    }
+}
+
 #[tokio::test]
 async fn durable_reader_refreshes_to_writer_sequence_without_a_controller() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -3086,10 +3128,15 @@ async fn routed_cluster_readers_open_every_configured_cell() {
     let placement =
         ObjectStoreNodeDirectory::new(["reddit-home", "reddit-search"], ["node-a", "node-b"])
             .unwrap();
-    let cluster =
-        RoutedGraphCluster::open_readers("graph-routed-cluster", "node-a", placement, object_store)
-            .await
-            .unwrap();
+    let cluster = RoutedGraphCluster::open_readers(
+        "graph-routed-cluster",
+        "node-a",
+        placement,
+        placement_over("node-a", &["node-a", "node-b"]),
+        object_store,
+    )
+    .await
+    .unwrap();
     assert_eq!(cluster.local_cells(), vec!["reddit-home", "reddit-search"]);
 
     let read_only_error = cluster
@@ -3134,13 +3181,18 @@ async fn routed_cluster_readers_open_every_configured_cell() {
 async fn routed_cluster_uses_slatedb_writer_fencing() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let placement = ObjectStoreNodeDirectory::new(["cell-a"], ["node-a", "node-b"]).unwrap();
+    // Two nodes, each holding a view in which it is alone — the view skew that
+    // ownership cannot resolve and SlateDB's epoch must. A shared fleet here
+    // would let only the rendezvous winner promote, and this test would stop
+    // exercising the fence at all.
     let first = RoutedGraphCluster::open_promotable_scoped_with_memory_options(
         "graph-slate-writer-fencing",
         GraphScope::default(),
         "node-b",
         placement.clone(),
+        sole_writer_placement("node-b"),
         Arc::clone(&object_store),
-        GraphOpenOptions::default(),
+        fast_fence_options(),
         GraphMemoryConfig::default(),
     )
     .await
@@ -3155,8 +3207,9 @@ async fn routed_cluster_uses_slatedb_writer_fencing() {
         GraphScope::default(),
         "node-a",
         placement,
+        sole_writer_placement("node-a"),
         object_store,
-        GraphOpenOptions::default(),
+        fast_fence_options(),
         GraphMemoryConfig::default(),
     )
     .await
@@ -3245,8 +3298,9 @@ async fn scoped_routed_cluster_returns_empty_rows_without_registering_an_unwritt
         graph_id.clone(),
         "node-a",
         ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
+        sole_writer_placement("node-a"),
         Arc::clone(&object_store),
-        GraphOpenOptions::default(),
+        fast_fence_options(),
         GraphMemoryConfig::default(),
         4,
     )
@@ -3283,8 +3337,9 @@ async fn scoped_routed_cluster_isolates_collection_writers_and_registers_scopes(
         graph_id.clone(),
         "node-a",
         directory,
+        sole_writer_placement("node-a"),
         Arc::clone(&object_store),
-        GraphOpenOptions::default(),
+        fast_fence_options(),
         GraphMemoryConfig::default(),
         4,
     )
@@ -3376,8 +3431,9 @@ async fn routed_reader_catches_up_to_a_remote_writer_storage_sequence() {
         GraphScope::default(),
         "node-a",
         placement.clone(),
+        sole_writer_placement("node-a"),
         Arc::clone(&object_store),
-        GraphOpenOptions::default(),
+        fast_fence_options(),
         GraphMemoryConfig::default(),
     )
     .await
@@ -3391,6 +3447,7 @@ async fn routed_reader_catches_up_to_a_remote_writer_storage_sequence() {
         "graph-slate-multi-reader",
         "node-b",
         placement,
+        placement_over("node-b", &["node-a", "node-b"]),
         object_store,
     )
     .await
@@ -8495,6 +8552,7 @@ fn query_transport_child_process_entry() {
                 "query-child-process",
                 "node-child",
                 placement,
+                sole_writer_placement("node-child"),
                 object_store,
             )
             .await
@@ -12848,8 +12906,9 @@ async fn reader_built_generation_tail_covers_commits_in_its_own_wal_file() {
         GraphScope::default(),
         "node-a",
         placement.clone(),
+        sole_writer_placement("node-a"),
         Arc::clone(&object_store),
-        GraphOpenOptions::default(),
+        fast_fence_options(),
         GraphMemoryConfig::default(),
     )
     .await
@@ -12876,6 +12935,7 @@ async fn reader_built_generation_tail_covers_commits_in_its_own_wal_file() {
         "graph-wal-tail-reader-hole",
         "node-b",
         placement,
+        placement_over("node-b", &["node-a", "node-b"]),
         Arc::clone(&object_store),
     )
     .await

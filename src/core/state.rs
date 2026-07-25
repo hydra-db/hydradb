@@ -97,11 +97,6 @@ struct GraphStoreInner {
 
 static EMPTY_GRAPH_STORE: OnceCell<Db> = OnceCell::const_new();
 
-/// The heartbeat interval a fenced writer waits out, until the node config
-/// carries the configured value here. Decision 5 of the rendezvous placement
-/// plan fixes the default at 5s and validates `interval < timeout` at startup.
-const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-
 /// The floor of the retry ladder, and the value a fence resets it to.
 const FENCE_BACKOFF_FLOOR: Duration = Duration::from_secs(1);
 
@@ -183,9 +178,6 @@ impl WriterReopenGate {
     }
 
     /// How much longer the caller must wait, or `None` if it may proceed.
-    // Consumed by `ensure_local_writer` in commit 4, which is the promotion
-    // gate. Until that lands the only caller is this module's tests.
-    #[allow(dead_code)]
     fn remaining(&self, now: Instant) -> Option<Duration> {
         self.not_before
             .filter(|not_before| *not_before > now)
@@ -259,6 +251,7 @@ impl GraphStore {
         cache: GraphCacheConfig,
         storage_memory: GraphStorageMemoryConfig,
         durability: GraphDurabilityConfig,
+        heartbeat_interval: Duration,
     ) -> Self {
         Self {
             inner: Arc::new(GraphStoreInner {
@@ -274,7 +267,7 @@ impl GraphStore {
                 writer_open_gate: Mutex::new(()),
                 reader_open_gate: Mutex::new(()),
                 reader_refresh_gate: Mutex::new(()),
-                heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+                heartbeat_interval,
                 writer_reopen_gate: StdMutex::new(WriterReopenGate::default()),
             }),
         }
@@ -393,8 +386,6 @@ impl GraphStore {
     /// this node should own the cell at all. Ownership first, then pacing: a
     /// node that is not the owner must be refused outright rather than merely
     /// asked to wait.
-    // Consumed by `ensure_local_writer` in commit 4; dead until then.
-    #[allow(dead_code)]
     pub(crate) fn writer_reopen_delay(&self) -> Option<Duration> {
         self.reopen_gate().remaining(Instant::now())
     }

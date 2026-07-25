@@ -110,6 +110,48 @@ fn http_parameters_preserve_integer_sign_and_precision() {
     );
 }
 
+/// Touch point (c) for HTTP: 421 Misdirected Request, with the owner in the
+/// body because an HTTP client has no routing table to discard and re-fetch.
+/// The hint is *absent* rather than null when this node has shed its view —
+/// there is nothing truthful to point at, and an absent field says that where a
+/// null would invite a client to route to "unknown".
+#[test]
+fn a_write_to_a_non_owner_is_a_421_naming_the_owner() {
+    let hinted = HttpApiError::from_graph(GraphError::NotCellWriter {
+        cell_id: "cell-a".to_string(),
+        owner: Some("node-b".to_string()),
+    });
+    assert_eq!(hinted.status, StatusCode::MISDIRECTED_REQUEST);
+    assert_eq!(hinted.code, "not_cell_writer");
+    assert_eq!(hinted.owner.as_deref(), Some("node-b"));
+    assert!(hinted.message.contains("node-b"));
+    let body = serde_json::to_value(HttpErrorEnvelope {
+        error: HttpErrorBody {
+            code: hinted.code,
+            message: hinted.message,
+            owner: hinted.owner,
+        },
+    })
+    .unwrap();
+    assert_eq!(body["error"]["owner"], serde_json::json!("node-b"));
+
+    let shed = HttpApiError::from_graph(GraphError::NotCellWriter {
+        cell_id: "cell-a".to_string(),
+        owner: None,
+    });
+    assert_eq!(shed.status, StatusCode::MISDIRECTED_REQUEST);
+    assert_eq!(shed.owner, None);
+    let shed_body = serde_json::to_value(HttpErrorEnvelope {
+        error: HttpErrorBody {
+            code: shed.code,
+            message: shed.message,
+            owner: shed.owner,
+        },
+    })
+    .unwrap();
+    assert!(shed_body["error"].get("owner").is_none());
+}
+
 #[tokio::test]
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {
