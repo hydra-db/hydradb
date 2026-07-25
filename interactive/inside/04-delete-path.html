@@ -1,0 +1,889 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Delete Path · Inside TurboLay</title>
+<link rel="stylesheet" href="../assets/textbook.css">
+
+<div class="tb-progress"></div>
+
+<header class="tb-header">
+  <a class="tb-home" href="../index.html">Turbo<span>Lay</span> · Interactive</a>
+  <span class="tb-crumb">Inside TurboLay</span>
+  <span class="tb-crumb">The Delete Path</span>
+  <span class="tb-spacer"></span>
+  <button class="tb-theme-toggle" type="button">☾ Dark</button>
+</header>
+
+<main class="tb-main">
+  <div class="tb-chapter-kicker">Chapter 4 · Inside TurboLay</div>
+  <h1>The Delete Path</h1>
+
+  <p>The write chapter showed how data arrives. This one shows how it leaves, and the first thing
+  to say is that it leaves more completely than you might expect from a system built on
+  append-only storage.</p>
+
+  <p>There is a tempting line of reasoning here, and an earlier edition of TurboLay followed it:
+  the <span class="concept" data-concept="object-store">object store</span> cannot edit bytes in place, therefore the engine cannot really remove
+  anything, therefore every delete must be a marker written at a new <span class="concept" data-concept="epoch">epoch</span> and every read must
+  subtract those markers as it goes. That reasoning has a hidden assumption — that the graph
+  engine is the layer responsible for versioning. It is not. <span class="concept" data-concept="slatedb">SlateDB</span> is (Chapter 0, Section
+  0.7). Once record visibility belongs entirely to the SlateDB <span class="concept" data-concept="snapshot-isolation">snapshot</span>, the graph engine is
+  free to issue an ordinary <code>txn.delete</code>, because “ordinary delete” already means “invisible to
+  snapshots after this commit, still visible to snapshots before it”. The <span class="concept" data-concept="lsm">LSM</span> tree writes its
+  own <span class="concept" data-concept="tombstone">tombstone</span> and <span class="concept" data-concept="compaction">compacts</span> it away on its own schedule, and the graph never has to know.</p>
+
+  <p>So the shape of this chapter is: a delete is a delete. <code>txn.delete</code> on the <span class="concept" data-concept="adjacency">adjacency</span> keys,
+  <code>txn.delete</code> on the relationship rows. There is exactly one place where that does not work —
+  an edge packed inside a compacted adjacency <span class="concept" data-concept="segment">segment</span>, where the thing to be removed is not a
+  key but a <em>value inside</em> a key — and that one place is the only graph-level tombstone left in
+  the system. The rest of the chapter follows the delete outward: how it reaches readers at
+  three different layers, what it leaves behind, and which of the three collectors that reclaim
+  that residue actually runs on its own.</p>
+
+  <p>The code is <code>src/shard/write.rs</code> for the foreground deletes, <code>src/shard/maintenance.rs</code>,
+  <code>src/engine/artifact_gc.rs</code> and <code>src/engine/index_store.rs</code> for the collectors.</p>
+
+  <h2>A delete is a delete</h2>
+
+  <p>Start with the outcome, because it is short. Deleting a materialized edge removes three keys
+  and rewrites two counters:</p>
+
+  <pre><code>// src/shard/write.rs:3400-3421 (abridged)
+txn.delete(canonical_key.as_bytes())?;                          // cell/&lt;id&gt;/edge/…
+txn.delete(keys::out_edge(cell, edge_type, src, dst).as_bytes())?;  // cell/&lt;id&gt;/e/out/…
+txn.delete(keys::in_edge(cell, edge_type, dst, src).as_bytes())?;   // cell/&lt;id&gt;/e/in/…
+txn.put(out_degree_key.as_bytes(), encode_u64(out_degree))?;
+if let Some((in_degree_key, in_degree)) = in_degree {
+    txn.put(in_degree_key.as_bytes(), encode_u64(in_degree))?;
+}
+txn.put(idem_key.as_bytes(), encode_delete_idempotency(mutation, &amp;result))?;
+commit_txn_strict(txn, self.await_durable_writes).await?;</code></pre>
+
+  <p>No marker record is written for that edge. No log is appended. After this transaction commits
+  there is no key anywhere in the <span class="concept" data-concept="cell">cell</span> that says “an edge used to be here”. The edge is simply
+  absent, in the same sense that an edge which was never created is absent.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>A snapshot read is still correct across this delete, and it is correct for a reason that
+    costs the graph engine nothing. A query pins a SlateDB snapshot at <span class="concept" data-concept="sequence-number">sequence</span> <em>S</em> before it
+    starts (Section 0.7). If the delete commits at a sequence above <em>S</em>, the snapshot at <em>S</em>
+    continues to serve the old value of <code>cell/&lt;id&gt;/e/out/…</code> — SlateDB keeps both versions and
+    resolves which one a reader sees from the sequence, exactly as it does for an overwrite.
+    The engine does not need a second versioning scheme layered on top, and the previous edition
+    of this book was describing one it no longer has. The historical-epoch refusal in Section 0.7
+    is the honest boundary on this: you can read <em>as of a live snapshot</em>, and you cannot ask for
+    a sequence SlateDB has already compacted past.</p>
+  </div>
+
+  <p>The envelope around that transaction is the standard write envelope from the write chapter,
+  and <code>delete_edge</code> (<code>src/shard/write.rs:3184-3214</code>) is worth reading beside <code>write_edge</code> because
+  the two are structurally identical: validate the components, <code>ensure_write_authority</code>, take a
+  write permit, lock the cell's <code>writer_lane</code>, then a bounded retry loop over a <span class="concept" data-concept="serializable">serializable</span>
+  transaction. There is no lock and no lease. The transaction itself opens at
+  <code>IsolationLevel::SerializableSnapshot</code> and calls <code>validate_write_fence_txn</code>
+  (<code>src/shard/lifecycle.rs:436-455</code>) before touching anything — which, as Section 4.7 shows, is
+  also what makes dropping a whole cell safe.</p>
+
+  <p>Two other things happen in every successful delete and are easy to miss.</p>
+
+  <p>The first is that the delete marks the edge type dirty:</p>
+
+  <pre><code>// src/shard/write.rs:5002-5017
+fn mark_adjacency_dirty_txn(
+    txn: &amp;DbTransaction, cell_id: &amp;str, edge_type: &amp;str, epoch: StorageSequence,
+) -> Result&lt;()&gt; {
+    txn.put(keys::matrix_dirty(cell_id, edge_type).as_bytes(), encode_u64(epoch))?;
+    txn.put(keys::adjacency_generation(cell_id, edge_type).as_bytes(), encode_u64(epoch))?;
+    Ok(())
+}</code></pre>
+
+  <p>That is the <em>entire</em> asynchronous consequence of a delete: two flags, <code>meta/matrix_dirty/&lt;edge_type&gt;</code>
+  and <code>meta/adjacency_generation/&lt;edge_type&gt;</code> (<code>src/keys.rs:23-33</code>). The out-of-process indexer
+  polls the first of them and rebuilds the edge type's <span class="concept" data-concept="index-generation">index generation</span> (Chapter 1, Section 1.8).
+  A flag is not a queue — it carries no history, records no operation, and has nothing to
+  garbage-collect. Deleting a thousand edges and deleting one leave the same two keys behind.</p>
+
+  <p>The second is that the epoch on the result is derived, not allocated:</p>
+
+  <pre><code>// src/codec.rs:128-135
+pub(crate) async fn next_epoch_txn(txn: &amp;DbTransaction, cell_id: &amp;str) -> Result&lt;StorageSequence&gt; {
+    txn.seqnum()
+        .checked_add(1)
+        .ok_or_else(|| GraphError::CorruptValue { /* storage sequence overflow */ })
+}</code></pre>
+
+  <p><code>DeleteResult { epoch, deleted }</code> (<code>src/core/model.rs:282-285</code>) hands that number back so the
+  caller can turn it into a bookmark (Section 0.8) and read its own delete. Nothing writes it to
+  storage.</p>
+
+  <h2>The two branches of <code>delete_edge</code></h2>
+
+  <p><code>delete_edge_txn_locked</code> (<code>src/shard/write.rs:3225</code>) branches on one question, asked once: does
+  this edge have a live outgoing-adjacency row?</p>
+
+  <pre><code>// src/shard/write.rs:3252
+let Some(existing) = read_txn_remote(&amp;txn, &amp;edge_key).await? else {
+    // ... no e/out row: the edge may still live inside a compacted segment ...
+};
+decode_edge_record(&amp;edge_key, &amp;existing)?;   // ... it has a row: delete the keys.</code></pre>
+
+  <p>The <code>else</code> arm is where the interesting case lives. Recall from the write chapter that a
+  vertex with a large out-<span class="concept" data-concept="degree">degree</span> can have its adjacency packed into <em>segments</em>: a run of
+  destinations encoded into the value of a single <code>cell/&lt;id&gt;/seg/out/&lt;type&gt;/&lt;src&gt;/&lt;seq&gt;/&lt;id&gt;</code>
+  key (Section 0.6). A segment is one opaque encoded blob. Removing one destination from it
+  would mean decoding the blob, re-encoding it without that destination, and rewriting the key —
+  a read-modify-write over a potentially large value, on the foreground delete path, for the sake
+  of one edge.</p>
+
+  <p>So the delete does not touch the segment. It writes a tombstone next to it.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Segment tombstone</span>
+    <p>A key recording that one destination inside one source vertex's compacted segments is
+    deleted, and at which <code>StorageSequence</code>. The key is
+    <code>cell/&lt;cell&gt;/seg/tomb/out/&lt;edge_type&gt;/&lt;src&gt;/&lt;dst&gt;</code> (<code>src/keys.rs:89-96</code>) and its value is the
+    epoch. It is the only graph-level deletion marker TurboLay still writes, and it exists for a
+    narrow structural reason: the thing being deleted is not a key, it is a member of an encoded
+    value, and the storage engine's own tombstones only work at key granularity.</p>
+  </div>
+
+  <p>The segment branch establishes that a segment-resident edge really is there and really is not
+  already tombstoned, and only then commits the marker:</p>
+
+  <pre><code>// src/shard/write.rs:3253-3350 (abridged)
+let current_epoch = txn.seqnum();
+let segment_edge = self.out_segment_edge_record_at(cell, et, src, dst, current_epoch).await?;
+let Some((segment_sequence, _)) = segment_edge else {
+    // nothing here at all — record a no-op receipt and commit
+    let result = DeleteResult { epoch: current_epoch, deleted: false };
+    txn.put(idem_key.as_bytes(), encode_delete_idempotency(mutation, &amp;result))?;
+    commit_txn_strict(txn, self.await_durable_writes).await?;
+    return Ok(result);
+};
+let tombstone_key = keys::out_segment_tombstone(cell, et, src, dst);
+if let Some(value) = read_txn_remote(&amp;txn, &amp;tombstone_key).await? {
+    let tombstone_epoch = decode_u64(&amp;tombstone_key, &amp;value)?;
+    if !segment_edge_visible(segment_sequence, Some(tombstone_epoch)) {
+        /* already deleted — another no-op receipt */
+    }
+}
+let epoch = current_epoch.checked_add(1)...?;
+mark_adjacency_dirty_txn(&amp;txn, cell, et, epoch)?;
+delete_relationships_for_structural_edge_txn(&amp;txn, mutation, current_epoch).await?;
+txn.put(tombstone_key.as_bytes(), encode_u64(epoch))?;
+txn.put(out_degree_key.as_bytes(), encode_u64(out_degree))?;</code></pre>
+
+  <p>Note what the tombstone branch does <em>not</em> do: it does not decrement an in-degree or delete an
+  <code>e/in</code> key, because the segment representation is outgoing-only. And note the no-op paths.
+  Deleting an edge that does not exist, or one that a previous delete already tombstoned, is not
+  an error: the transaction still commits, writing an <span class="concept" data-concept="idempotency">idempotency</span> receipt carrying
+  <code>deleted: false</code>. A client that retries a delete after a lost acknowledgement gets the same
+  answer back rather than a second, differently-stamped delete.</p>
+
+  <figure>
+    <div class="tb-widget" id="w-delete-branch"></div>
+    <figcaption>Fig. 4.1 — The one branch in <code>delete_edge_txn_locked</code> (<code>src/shard/write.rs:3225</code>), and why it
+      exists. A materialized edge is removed with ordinary <code>txn.delete</code>s, because SlateDB's own
+      snapshot versioning already keeps it visible to readers pinned before the commit. An edge
+      packed inside a compacted adjacency segment cannot be removed that way — it is a member of
+      an encoded value, not a key of its own — so it gets the single surviving graph-level
+      marker, a segment tombstone stamped with the delete's epoch. Everything below the fork is
+      common to both paths.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Pick a branch: materialized keys vs. segment tombstone<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>The fork asks one question — <em>is there a live <code>e/out</code> row?</em> Choose the answer and watch
+      the path light up. The <strong>materialized</strong> branch does three ordinary <code>txn.delete</code>s and
+      decrements both degrees; nothing is left behind, because SlateDB's snapshot already hides the
+      key from later readers. The <strong>segment-resident</strong> branch cannot delete a key that does not
+      exist on its own — the edge is buried inside an encoded segment value — so it writes the one
+      surviving graph-level marker, the segment tombstone, and touches only the out-degree. Both
+      branches then rejoin: relationships hard-deleted, <code>matrix_dirty</code> set, one idempotency receipt,
+      one serializable commit.</p>
+    </div>
+  </details>
+
+  <p>Deleting a whole vertex is built on this primitive rather than replacing it. <code>delete_vertex</code>
+  and <code>detach_delete_vertex</code> (<code>src/shard/write.rs:422-440</code>) both route into
+  <code>delete_vertex_with_options</code>, whose transaction (<code>delete_vertex_txn_locked</code>,
+  <code>src/shard/write.rs:496</code>) scans the vertex's incident edges and relationships, calls
+  <code>delete_edge_txn_locked</code> and <code>delete_relationship_txn_locked</code> on each in turn, and returns a
+  <code>VertexDeleteResult { epoch, vertex_deleted, incident_edges_deleted, relationships_deleted }</code>
+  (<code>src/core/model.rs:297-302</code>). The counts are how a caller learns that “detach delete” actually
+  detached something.</p>
+
+  <h2>The relationships riding on the edge</h2>
+
+  <p>Chapter 0 distinguished the cheap structural <em>edge</em> from the richer <em>relationship</em> that carries
+  its own id and properties. Deletes treat the two differently, and this is the one asymmetry in
+  the chapter worth memorizing.</p>
+
+  <p>Both branches above call <code>delete_relationships_for_structural_edge_txn</code>
+  (<code>src/shard/write.rs:5019-5065</code>), which is unambiguous about what it does:</p>
+
+  <pre><code>// src/shard/write.rs:5025-5054 (abridged)
+let relationships = live_relationships_for_edge_txn(txn, cell, et, src, dst, read_epoch).await?;
+for record in &amp;relationships {
+    txn.delete(keys::relationship(cell, et, src, dst, record.relationship_id).as_bytes())?;
+    txn.delete(keys::relationship_id(cell, record.relationship_id).as_bytes())?;
+    delete_relationship_property_indexes_txn(txn, record, &amp;record.metadata)?;
+}
+txn.delete(keys::relationship_count(cell, et, src, dst).as_bytes())?;</code></pre>
+
+  <p>Every relationship record, its entry in the global relationship-id index, every one of its
+  property-index entries (<code>src/shard/write.rs:5067-5087</code> walks
+  <code>metadata.properties</code> and deletes one <code>rprop_idx</code> key per property), and the count — all removed
+  in the same transaction that removes the edge. A relationship never outlives the structural
+  edge that carries it, and there is no reconciliation pass that would have to notice if it did.</p>
+
+  <p>The traffic runs the other way as well. Deleting the <em>last</em> relationship between a pair of
+  vertices takes the structural edge with it. <code>delete_relationship_txn_locked</code>
+  (<code>src/shard/write.rs:2253</code>) counts what remains and, if nothing does, calls
+  <code>delete_structural_edge_txn</code> (<code>src/shard/write.rs:4921-5000</code>):</p>
+
+  <pre><code>// src/shard/write.rs:2338-2340
+if !other_live_relationships {
+    delete_structural_edge_txn(self, &amp;txn, mutation, epoch).await?;
+}</code></pre>
+
+  <p><code>delete_structural_edge_txn</code> is the materialized branch of Section 4.2 factored out: it returns
+  immediately if there is no <code>e/out</code> row, otherwise marks the edge type dirty, decrements the
+  degrees, clears any edge metadata and its property indexes, and deletes <code>edge</code>, <code>e/out</code>, and —
+  when the reverse index is enabled — <code>e/in</code>. It has no segment branch, which is the honest
+  boundary: relationship deletion can retire a materialized structural edge, but it will not
+  tombstone a segment-resident one.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>The previous edition of this book generalized these two behaviours into a single rule and got
+    it backwards, describing the structural edge as soft-deleted and the relationships as the
+    exception. There is no soft/hard split any more, because there is no soft delete: both are
+    ordinary <code>txn.delete</code>s and both are invisible from the next snapshot onward. What remains is a
+    <em>containment</em> rule, and it runs in both directions — a relationship cannot outlive its edge,
+    and an edge does not outlive its last relationship. One transaction enforces both, so no
+    intermediate state where a relationship dangles is ever committed, let alone observable.</p>
+  </div>
+
+  <h2>How a delete reaches a reader</h2>
+
+  <p>A deleted edge has to disappear from three quite different structures, and it disappears from
+  each by a different mechanism. Following one delete through all three is the clearest way to
+  see why the tombstone is confined to the middle layer.</p>
+
+  <p><strong>The adjacency keys.</strong> Nothing to do. <code>out_neighbors</code> (<code>src/shard/query.rs:5372-5404</code>) prefix-scans
+  <code>cell/&lt;id&gt;/e/out/&lt;type&gt;/&lt;src&gt;/</code> and decodes what it finds. A deleted row is not in the snapshot,
+  so it is not in the result. Readers pinned before the delete scan an older snapshot and still
+  find it.</p>
+
+  <p><strong>The compacted segments.</strong> Here the row <em>is</em> still there — inside the segment value — so the read
+  has to consult the tombstone. The comparison is one line:</p>
+
+  <pre><code>// src/codec.rs:1506-1511
+pub(crate) fn segment_edge_visible(
+    edge_epoch: StorageSequence,
+    tombstone_epoch: Option&lt;StorageSequence&gt;,
+) -> bool {
+    tombstone_epoch.is_none_or(|epoch| edge_epoch &gt; epoch)
+}</code></pre>
+
+  <p>An edge in a segment written at sequence <em>E</em> is visible unless a tombstone exists at some
+  sequence <em>T &ge; E</em>. Strict inequality is what lets an edge be deleted, re-created, and packed
+  into a <em>newer</em> segment without the stale tombstone suppressing it. The same scan appears in the
+  per-source path (<code>scan_out_segment_tombstones_for_src_at</code>, <code>src/shard/query.rs:5793</code>), the
+  whole-edge-type path (<code>out_segment_tombstones_at</code>, <code>:5830</code>), and the single-edge probe
+  (<code>out_segment_tombstone_epoch_at</code>, <code>:5777</code>) — the reader loads the relevant tombstones into a
+  <span class="concept" data-concept="btreeset">BTreeMap</span> once and filters the segment destinations through it.</p>
+
+  <p><strong>The index generation.</strong> The <span class="concept" data-concept="graphblas">GraphBLAS</span> <span class="concept" data-concept="csc">CSC</span> matrix the traversal path uses (Chapter 1, Section
+  1.7) was built by a separate process at some <code>base_sequence</code> that may predate the delete
+  entirely. It is immutable, so the delete cannot edit it. Instead the reader closes the gap with
+  the <span class="concept" data-concept="wal-tail-overlay">WAL-tail overlay</span> — and the overlay carries deletions, not just insertions:</p>
+
+  <pre><code>// src/shard/topology_tail.rs:4-12
+pub(crate) struct GraphTopologyOverlay {
+    states: BTreeMap&lt;VertexId, BTreeMap&lt;VertexId, bool&gt;&gt;,   // (src, dst) -> exists
+}
+
+pub(crate) enum GraphTopologyTail {
+    Complete(GraphTopologyOverlay),
+    Unavailable,
+}</code></pre>
+
+  <p>That <code>bool</code> is the delete path's presence in the read path. <code>topology_tail_since</code>
+  (<code>src/shard/topology_tail.rs:28-97</code>) walks the <span class="concept" data-concept="wal">WAL</span> files written after the generation's
+  <code>last_wal_id</code>, collects every edge the tail <em>touched</em>, and then re-resolves each one against the
+  pinned snapshot, recording <code>exists: false</code> for the ones the delete removed. Crucially,
+  <code>collect_topology_entry</code> (<code>:100-136</code>) matches both key shapes this chapter produces:</p>
+
+  <pre><code>// src/shard/topology_tail.rs:110-120
+["cell", key_cell, "e", "out", key_type, src, dst] if ... =&gt; {
+    affected.insert((parse_u64(key, src, "src")?, parse_u64(key, dst, "dst")?));
+}
+["cell", key_cell, "seg", "tomb", "out", key_type, src, dst] if ... =&gt; {
+    affected.insert((parse_u64(key, src, "src")?, parse_u64(key, dst, "dst")?));
+}</code></pre>
+
+  <p>So a hard-deleted <code>e/out</code> key and a newly written segment tombstone both enter the overlay by
+  the same route, and <code>expand_range_with_overlay</code> (<code>:139</code>) then subtracts them from each hop of a
+  traversal — removing a destination only when no other vertex in the frontier still reaches it.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>The overlay is where the delete path pays for the indexer being out-of-process. An index
+    generation is immutable and content-addressed precisely so that a reader can never observe a
+    half-built one; the price is that it is also <em>stale</em>, and a delete committed a second ago is
+    still present in it. Overlaying the WAL tail is the cheap way to be correct anyway: the
+    reader pays only for the edges touched since the generation was built, and it re-checks each
+    one against its own snapshot rather than trusting the WAL entry's opinion of the outcome.</p>
+  </div>
+
+  <p>The degradation is honest and worth stating plainly, because it is the failure mode you will
+  meet in production. <code>topology_tail_since</code> returns <code>Unavailable</code> in two cases: when the snapshot
+  handed to it does not match the read sequence (<code>:35-37</code>), and when a WAL file it needs can no
+  longer be opened (<code>:50-59</code>, which logs “graph index WAL tail is unavailable; using snapshot
+  adjacency”). In both, the query abandons the accelerated path and answers from the snapshot
+  adjacency keys instead. That is slower, and it is always correct, because the adjacency keys are
+  the source of truth and the index generation never was.</p>
+
+  <figure>
+    <div class="tb-widget" id="w-delete-visibility"></div>
+    <figcaption>Fig. 4.2 — One delete, three structures, three different mechanisms — and only the middle one
+      needs a marker. The adjacency keys need nothing because SlateDB's snapshot already hides a
+      deleted key from later readers and shows it to earlier ones. The compacted segments need a
+      tombstone because the edge is a member of an encoded value rather than a key. The immutable
+      index generation needs the WAL-tail overlay, which carries <code>exists: false</code> for deletes just
+      as it carries <code>true</code> for inserts; when that tail cannot be read the query degrades to the
+      snapshot adjacency keys, which are the source of truth in every case.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Step the delete through all three layers<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Advance the stepper to watch one delete resolve in each structure. The <strong>adjacency keys</strong>
+      need no help — the key is simply gone from the snapshot. The <strong>compacted segments</strong> still
+      hold the edge inside a value, so the read consults the tombstone and hides it when
+      <code>T &ge; E</code>. The <strong>index generation</strong> is immutable and stale, so the WAL-tail overlay carries
+      <code>exists: false</code> forward. The final step flips the tail to <code>Unavailable</code>: the accelerated path
+      is abandoned and the query answers from snapshot adjacency — slower, always correct.</p>
+    </div>
+  </details>
+
+  <h2>What is not here</h2>
+
+  <p>Two mechanisms that a reader of the previous edition — or of most LSM-backed graph systems —
+  would expect at this point do not exist, and it is worth naming them rather than leaving their
+  absence to be inferred.</p>
+
+  <p><strong>There is no delete log.</strong> No outbox, no mutation log, no delta stream, and no <code>DeltaKind::Minus</code>.
+  The entire delta subsystem was removed in the graph-kernel resync; <code>DeltaKind</code> has zero
+  occurrences in <code>src/</code>, and with it went the key builders <code>outbox*</code>, <code>delta_*</code>, <code>owner_delta</code>,
+  <code>pair_delta</code> and <code>last_epoch</code>. A delete is not appended anywhere and is not replayed at read
+  time. What Section 4.1 showed is all of it.</p>
+
+  <p><strong>There is no GC watermark, and the error that guarded it is dead code.</strong> The old design carried
+  a per-edge-type <code>delta_gc_watermark</code> key recording how far history had been collected, and
+  refused any read below it with <code>GraphError::SnapshotExpired</code>. The key builder is gone. The
+  error variant, however, is still <em>declared</em>:</p>
+
+  <pre><code>// src/core/error.rs:87
+    SnapshotExpired {</code></pre>
+
+  <p>and is never constructed anywhere in <code>src/</code>. Nothing raises it; nothing can catch it in
+  practice. It is a leftover declaration, and this book flags it as such rather than reasoning
+  from its presence — a variant that exists in the type system but not in the control flow will
+  mislead you about what the system guarantees.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Both absences follow from the same move. Once record visibility is delegated wholly to the
+    SlateDB snapshot, the graph engine no longer owns a history, and a subsystem that owns no
+    history needs neither a log to replay nor a watermark to bound how much of it survives. The
+    guarantee that used to require a watermark — “a read is never served from history that has
+    already been collected” — is now provided by SlateDB refusing to open a snapshot at a
+    compacted-away sequence, which is the refusal you already met in Section 0.7. The engine did
+    not weaken the promise; it stopped re-implementing it.</p>
+  </div>
+
+  <h2>Reclaiming space: three collectors</h2>
+
+  <p>Deletes and index builds still leave residue: segment values holding destinations nobody can
+  see, tombstones that have outlived the segments they suppressed, superseded matrix artifacts,
+  and superseded index generations. Three separate routines <span class="concept" data-concept="reclamation">reclaim</span> it. They share no scheduler,
+  no watermark, and no notion of a safe epoch — each takes a boundary from its caller and trusts
+  it.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Garbage collection (as used here)</span>
+    <p>Physically removing storage that no live reader needs. In TurboLay this is always
+    caller-driven: every collector takes an explicit boundary parameter (<code>compacted_through_epoch</code>,
+    <code>keep_epoch</code>, <code>retain_previous</code>) and does exactly what it is told. There is no <span class="concept" data-concept="retention">retention</span>
+    policy, no computed safe epoch, and no read lease anywhere in the current tree. All three take
+    the shard's <code>gc_gate</code> permit, so collection cannot crowd out reads and writes.</p>
+  </div>
+
+  <p><strong>Segment compaction</strong> — <code>compact_out_adjacency_segments</code> (<code>src/shard/maintenance.rs:59</code>) — is the
+  one that closes the loop opened in Section 4.2. For one <code>(cell, edge_type, src)</code> it reads every
+  segment at or below <code>compacted_through_epoch</code>, filters the destinations through
+  <code>segment_edge_visible</code> against the tombstones (<code>:189-204</code>), writes a single fresh segment holding
+  only the survivors, and deletes both the source segments and the tombstones it has just honoured:</p>
+
+  <pre><code>// src/shard/maintenance.rs:207-229 (abridged)
+for (key, _) in &amp;source_segments { batch.delete(key.as_bytes()); }
+for (_, (epoch, key)) in tombstones {
+    if epoch &lt;= compacted_through_epoch {
+        batch.delete(key.as_bytes());
+        deleted_tombstone_keys = deleted_tombstone_keys.saturating_add(1);
+    }
+}
+if !compacted_destinations.is_empty() {
+    batch.put(keys::out_segment(cell, et, src, compacted_through_epoch,
+        &amp;format!("compact-{idempotency_key}")), encode_out_edge_segment_records(&amp;compacted_destinations));
+}</code></pre>
+
+  <p>A tombstone is only deleted alongside the segment it was suppressing, in one batch — which is
+  what keeps the deletion durable once the marker is gone. The routine has one guard, and it is a
+  strict one: a matrix artifact must already exist at <em>exactly</em> <code>compacted_through_epoch</code>
+  (<code>src/shard/maintenance.rs:126-143</code>), and a <code>compacted_through_epoch</code> ahead of the cell's current
+  epoch is rejected with <code>SnapshotAhead</code> (<code>:119-125</code>). It reports a
+  <code>SegmentCompactionResult { compacted_through_epoch, source_segments, deleted_segment_keys,
+  deleted_tombstone_keys, input_edges, output_edges }</code> (<code>src/core/model.rs:313-320</code>).</p>
+
+  <p><strong>Artifact GC</strong> — <code>delete_graph_artifacts_before</code> (<code>src/engine/artifact_gc.rs:4</code>) — prunes the
+  durable matrix artifacts. It scans four key prefixes (<code>graph_artifact_gc_prefixes</code>,
+  <code>src/engine.rs:860-867</code>: the matrix manifest, the matrix payload, and the two GraphBLAS CSC
+  prefixes), deletes every key whose <code>base_epoch</code> is strictly below <code>keep_epoch</code>, and flushes in
+  batches of <code>GRAPH_ARTIFACT_GC_BATCH_KEYS</code> (512, <code>src/engine.rs:884</code>). It then prunes memory to
+  match, which is the part worth reading:</p>
+
+  <pre><code>// src/engine/artifact_gc.rs:56-64
+self.matrix_artifact_cache.lock().await.retain(|key, _| {
+    key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch &gt;= keep_epoch
+});
+self.matrix_cache.lock().await.retain(/* same predicate */);
+self.graphblas_cache.lock().await.retain(/* same predicate */);</code></pre>
+
+  <p>All three matrix caches are swept with the same predicate, so no in-memory hydration survives an
+  artifact its durable bytes no longer back. The result is
+  <code>ArtifactGcResult { deleted_keys, retained_keys }</code> (<code>src/engine.rs:101-104</code>).</p>
+
+  <p><strong>Index-generation GC</strong> — <code>gc_graph_index_generations</code> (<code>src/engine/index_store.rs:210-236</code>) —
+  works on the object store rather than the key space. It finds the current generation, lists every
+  published generation under the prefix, keeps the newest <code>retain_previous</code> of those older than
+  current, and deletes the rest by object path. It is guarded by construction: if there is no
+  current generation it returns <code>0</code> and deletes nothing, so it can never orphan the generation
+  readers are using.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Of the three, only index-generation GC has an in-tree scheduler: <code>graph-indexer</code> calls it at
+    the end of every cycle (<code>src/bin/graph-indexer.rs:185</code>) with the retention its environment
+    configures (<code>GRAPH_INDEXER_RETAIN_PREVIOUS</code>, default 1 — Chapter 1, Section 1.8). Segment
+    compaction and artifact GC have <em>no caller anywhere in <code>src/</code></em>; they are operator-invoked APIs,
+    exercised in the tree only by <code>examples/stress_worker.rs:247</code>. That is a real gap and this book
+    will not paper over it: an unattended deployment reclaims stale index generations automatically
+    and accumulates segment tombstones and superseded matrix artifacts indefinitely. The
+    correctness argument is unaffected — every collector's boundary is supplied by its caller, so a
+    collector that is never called simply never collects — but the operational one is that
+    compaction is currently something you schedule, not something that happens.</p>
+  </div>
+
+  <figure>
+    <div class="tb-widget" id="w-reclaim"></div>
+    <figcaption>Fig. 4.3 — The three collectors, what each one owns, and which of them actually runs. Every
+      boundary in the middle row is a parameter supplied by the caller — there is no computed safe
+      epoch and no watermark anywhere in this row. The bottom row is the operational reality: only
+      index-generation GC is scheduled, by <code>graph-indexer</code> (<code>src/bin/graph-indexer.rs:185</code>), while
+      segment compaction and artifact GC are operator-invoked APIs with no caller in <code>src/</code>, so an
+      unattended deployment accumulates tombstones and superseded artifacts.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Run an unattended deployment: watch residue accumulate<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Toggle <em>unattended deployment</em> to model a cluster with no operator scripting compaction.
+      Index-generation GC keeps running — <code>graph-indexer</code> calls it every cycle — so stale generations
+      are pruned. But segment compaction and artifact GC have no caller in <code>src/</code>: with nobody to
+      invoke them, segment tombstones and superseded matrix artifacts pile up without bound. Every
+      boundary each collector needs (<code>compacted_through_epoch</code>, <code>keep_epoch</code>, <code>retain_previous</code>) comes
+      from the caller, so a collector that is never called simply never collects. Correctness is
+      untouched; the residue is an operational bill.</p>
+    </div>
+  </details>
+
+  <h2>Dropping a whole graph</h2>
+
+  <p>The largest delete removes an entire cell. <code>drop_cell</code> (<code>src/shard/write.rs:783</code>) takes the same
+  envelope as every other write — authority check, write permit, writer lane, bounded retry — and
+  the work happens in <code>drop_cell_locked</code> (<code>src/shard/write.rs:821</code>). What makes it interesting is
+  that it cannot be one transaction: a cell may hold millions of keys, so the scan-and-delete has
+  to be chunked, and a chunked deletion needs protection against a concurrent writer refilling
+  what it has already emptied.</p>
+
+  <p>The protection is a marker written <em>before</em> the deletion starts, in its own committed
+  transaction:</p>
+
+  <pre><code>// src/shard/write.rs:854-862 (abridged)
+let marker_epoch = match read_txn_remote(&amp;txn, &amp;pending_marker_key).await? {
+    Some(value) =&gt; decode_u64(&amp;pending_marker_key, &amp;value)?,
+    None =&gt; {
+        let epoch = txn.seqnum().saturating_add(1);
+        txn.put(pending_marker_key.as_bytes(), encode_u64(epoch))?;
+        epoch
+    }
+};
+commit_txn_strict(txn, self.await_durable_writes).await?;</code></pre>
+
+  <p>That is phase one of three. Phase two scans <code>cell_prefix(cell_id)</code> and deletes everything it
+  finds in batches of <code>GRAPH_MAINTENANCE_BATCH_KEYS</code> (512, <code>src/lib.rs:177</code>), each batch its own
+  fence-validated serializable transaction (<code>flush_drop_cell_batch</code>, <code>src/shard/write.rs:916-938</code>),
+  renewing the local write guard around each flush so a long drop does not look like a stall.
+  Phase three commits the <em>final</em> marker, removes the pending one, and records the idempotency
+  receipt.</p>
+
+  <p>The two markers are the entire concurrency story, and they work because of one line in the
+  write fence every other operation passes through:</p>
+
+  <pre><code>// src/shard/lifecycle.rs:442-453
+if operation != "drop_cell" {
+    let drop_marker = keys::cell_drop_marker(cell_id);
+    let pending_drop_marker = keys::cell_drop_pending_marker(cell_id);
+    if read_txn_remote(txn, &amp;drop_marker).await?.is_some()
+        || read_txn_remote(txn, &amp;pending_drop_marker).await?.is_some()
+    {
+        return Err(GraphError::CellDropped { operation, cell_id: cell_id.to_string() });
+    }
+}</code></pre>
+
+  <p>Once the pending marker is durable, every write to that cell — including every delete in this
+  chapter — fails with <code>CellDropped</code> before it can touch a key, while <code>drop_cell</code> itself is
+  exempted by name so its own batches proceed. The cell is sealed for the whole of the scan, not
+  just for one transaction.</p>
+
+  <p>Both markers live at <code>graph/drop/…</code> (<code>src/keys.rs:7-17</code>), <em>outside</em> the <code>cell/&lt;cell_id&gt;/</code> prefix.
+  That placement is deliberate and load-bearing: the phase-two scan deletes the cell prefix
+  wholesale, so a marker stored inside it would delete itself midway and unseal the cell it was
+  protecting. The result is <code>GraphCellDropResult { marker_epoch, deleted_keys, batches,
+  already_dropped }</code> (<code>src/core/model.rs:305-310</code>); the <code>already_dropped</code> flag is how a re-issued
+  drop reports that it found the final marker and did nothing.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Splitting the marker in two — pending during the scan, final afterwards — separates “this cell
+    is being torn down” from “this cell is gone”. A crash between phases leaves the pending marker
+    behind, which is exactly the right failure mode: the cell stays sealed rather than reopening
+    half-emptied, and a re-issued <code>drop_cell</code> picks up the same <code>marker_epoch</code> from the pending
+    marker (<code>src/shard/write.rs:854-856</code>) and resumes the scan rather than starting a new drop with
+    a new epoch. It is the same instinct as the segment tombstone one section up — when you cannot
+    make the change atomic, make the <em>incomplete</em> state a state the rest of the system already
+    knows how to refuse.</p>
+  </div>
+
+  <h2>Recap: the life of a deleted edge</h2>
+
+  <p>Trace one edge out of the graph:</p>
+
+  <ol>
+    <li><code>delete_edge</code> runs the ordinary write envelope and opens a serializable transaction
+      (<code>src/shard/write.rs:3184</code>).</li>
+    <li>If the edge has a live <code>e/out</code> row, the transaction <em>deletes</em> <code>edge</code>, <code>e/out</code> and <code>e/in</code>
+      outright and decrements the degree counters. If it only exists inside a compacted segment, the
+      transaction instead writes one <code>seg/tomb/out/…</code> tombstone stamped with the new epoch.</li>
+    <li>Either way, the relationships riding on that edge — records, id index, property indexes,
+      count — are deleted in the same transaction, and the edge type is flagged
+      <code>meta/matrix_dirty/&lt;edge_type&gt;</code>.</li>
+    <li>From the next snapshot onward the edge is gone: absent from the adjacency scan, filtered out of
+      the segments by <code>segment_edge_visible</code>, and carried into the traversal path as <code>exists: false</code>
+      in the WAL-tail overlay. Readers pinned at an earlier <code>StorageSequence</code> still see it, because
+      SlateDB still has that version.</li>
+    <li>The out-of-process indexer notices the dirty flag and publishes a new index generation without
+      the edge (Chapter 1, Section 1.8), then prunes superseded generations.</li>
+    <li>If — and only if — an operator invokes it, <code>compact_out_adjacency_segments</code> rewrites the
+      segment without the destination and deletes the tombstone in the same batch, and
+      <code>delete_graph_artifacts_before</code> prunes the artifacts and the matrix caches beneath a
+      <code>keep_epoch</code> it is given.</li>
+  </ol>
+
+  <p>The through-line of this chapter is a subtraction. Deleting the delta log, the GC watermark and
+  the soft-delete framing did not cost the system a guarantee; it revealed that SlateDB's snapshot
+  was already providing the guarantee twice. What is left is a delete that is a delete, one
+  tombstone confined to the one representation that genuinely cannot express absence, and three
+  collectors that do precisely what their caller asks and nothing more. The next chapter turns to
+  the caches sitting in front of all of this, and how they stay correct while the sequence advances
+  underneath them.</p>
+
+  <nav class="tb-chapnav">
+    <a class="prev" href="03-write-path.html"><span class="cn-dir">‹ Prev</span><br><span class="cn-title">The Write Path</span></a>
+    <a class="next" href="05-caching.html"><span class="cn-dir">Next ›</span><br><span class="cn-title">Caching</span></a>
+  </nav>
+</main>
+
+<script src="../assets/glossary.js"></script>
+<script>
+/* page-local glossary additions for Chapter 4 — new nouns this chapter introduces */
+window.TB_GLOSSARY = Object.assign(window.TB_GLOSSARY || {}, {
+  "tombstone": {
+    title: "Tombstone",
+    html: "<p>A marker recording that something has been <em>deleted</em>, kept because the underlying store cannot edit data in place. An <span class=\"concept\" data-concept=\"lsm\">LSM</span> engine writes its own key-level tombstones and <span class=\"concept\" data-concept=\"compaction\">compacts</span> them away later.</p><p>TurboLay leans on SlateDB's tombstones for ordinary deletes and keeps exactly one of its own — the <em>segment tombstone</em> — for edges buried inside an encoded <span class=\"concept\" data-concept=\"segment\">segment</span> value, where key-level deletion cannot reach.</p>"
+  },
+  "segment": {
+    title: "Adjacency segment",
+    html: "<p>A compacted run of a vertex's outgoing neighbours encoded into the value of a single key, <code>cell/&lt;id&gt;/seg/out/&lt;type&gt;/&lt;src&gt;/…</code>. Used when a vertex's out-<span class=\"concept\" data-concept=\"degree\">degree</span> is large enough that one key per edge would be wasteful.</p><p>Because a destination lives <em>inside</em> an opaque blob rather than as a key of its own, it cannot be removed by an ordinary delete — hence the segment <span class=\"concept\" data-concept=\"tombstone\">tombstone</span>.</p>"
+  },
+  "garbage-collection": {
+    title: "Garbage collection (in TurboLay)",
+    html: "<p>Physically removing storage that no live reader needs — superseded segments, spent <span class=\"concept\" data-concept=\"tombstone\">tombstones</span>, old matrix artifacts, retired <span class=\"concept\" data-concept=\"index-generation\">index generations</span>. In TurboLay it is always <em>caller-driven</em>: each collector takes an explicit boundary and does exactly what it is told.</p><p>There is no computed safe <span class=\"concept\" data-concept=\"epoch\">epoch</span>, no retention policy, and no read lease — the correctness of a boundary is the caller's responsibility.</p>"
+  },
+  "reclamation": {
+    title: "Reclamation",
+    html: "<p>Turning space that a delete or a rebuild made logically dead back into free storage. TurboLay reclaims through three independent routines — segment compaction, artifact GC, and index-generation GC — that share no scheduler and no watermark.</p><p>Only index-generation GC has an in-tree caller; the other two are operator-invoked, so an unattended deployment accumulates residue it never collects.</p>"
+  },
+  "retention": {
+    title: "Retention",
+    html: "<p>How much superseded state a collector is told to keep. In TurboLay retention is a plain parameter — <code>retain_previous</code> for index generations (default 1), <code>keep_epoch</code> for artifacts, <code>compacted_through_epoch</code> for segments — not a policy the engine computes.</p><p>Keeping a generation or two lets in-flight readers finish on the version they pinned before it is deleted.</p>"
+  }
+});
+</script>
+<script src="../assets/textbook.js"></script>
+<script>
+/* ==========================================================================
+   Chapter 4 widgets — the delete path, rendered as inline SVG.
+   Colors come from CSS custom properties so they track the theme toggle.
+   ========================================================================== */
+(function () {
+  var NS = "http://www.w3.org/2000/svg";
+  function el(n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  function mkbtn(label, cls) { var b = document.createElement("button"); b.className = "tb-btn" + (cls ? " " + cls : ""); b.textContent = label; return b; }
+  function box(x, y, w, h, fill, stroke, dash) {
+    return el("rect", { x: x, y: y, width: w, height: h, rx: 6, fill: fill, stroke: stroke, "stroke-width": 1.2, "stroke-dasharray": dash || "none", class: "wnode" });
+  }
+  function txt(x, y, t, anchor, size, weight, fill) {
+    var e = el("text", { x: x, y: y, "text-anchor": anchor || "middle", class: "wnode-label" });
+    if (size) e.setAttribute("font-size", size);
+    if (weight) e.setAttribute("font-weight", weight);
+    if (fill) e.setAttribute("fill", fill);
+    e.textContent = t; return e;
+  }
+  function defsArrow(svg, id, color) {
+    var defs = el("defs", {});
+    var m = el("marker", { id: id, viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    m.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: color }));
+    defs.appendChild(m); svg.appendChild(defs);
+  }
+  function onTheme(fn) {
+    window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", fn);
+    var t = document.querySelector(".tb-theme-toggle");
+    if (t) t.addEventListener("click", function () { setTimeout(fn, 0); });
+  }
+
+  /* ---------- Fig 4.1 — the delete_edge branch ---------------------------- */
+  TB.widget("w-delete-branch", function (mount) {
+    var branch = null; // null | "mat" | "seg"
+    var controls = document.createElement("div"); controls.className = "tb-controls";
+    var bMat = mkbtn("Materialized (has e/out row)", "");
+    var bSeg = mkbtn("Segment-resident (no e/out row)", "");
+    var bReset = mkbtn("Reset", "");
+    controls.append(bMat, bSeg, bReset);
+    var svg = el("svg", { viewBox: "0 0 470 300", width: "100%", style: "max-width:470px;display:block;margin:0 auto" });
+    var readout = document.createElement("div");
+    readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.6em;color:var(--muted)";
+    var wrap = document.createElement("div"); wrap.append(controls, svg, readout); mount.appendChild(wrap);
+
+    function render() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var mut = css("--muted"), border = css("--border");
+      defsArrow(svg, "arw41", mut);
+
+      // question node
+      var gQ = el("g", {});
+      gQ.appendChild(box(120, 12, 230, 52, css("--info-soft"), css("--info")));
+      gQ.appendChild(txt(235, 34, "delete_edge_txn_locked", "middle", 12, "700"));
+      gQ.appendChild(txt(235, 52, "is there a live e/out row?", "middle", 10, null, mut));
+      svg.appendChild(gQ);
+
+      // edges to branches
+      svg.appendChild(el("path", { d: "M175 64 L110 108", stroke: branch === "seg" ? css("--ash") : mut, "stroke-width": 1.3, fill: "none", "marker-end": "url(#arw41)" }));
+      svg.appendChild(el("path", { d: "M300 64 L360 108", stroke: branch === "mat" ? css("--ash") : mut, "stroke-width": 1.3, fill: "none", "marker-end": "url(#arw41)" }));
+
+      // materialized branch (left)
+      var matOn = branch === "mat", matDim = branch === "seg";
+      var gM = el("g", { class: "wnode" + (matOn ? " wflash" : matDim ? " wdim" : "") });
+      gM.appendChild(box(12, 108, 210, 96, matOn ? css("--ok-soft") : css("--surface-soft"), matOn ? css("--ok") : border));
+      gM.appendChild(txt(117, 126, "yes — materialized", "middle", 9.5, null, mut));
+      gM.appendChild(txt(117, 146, "delete the keys", "middle", 11, "700"));
+      gM.appendChild(txt(117, 164, "txn.delete: edge · e/out · e/in", "middle", 9));
+      gM.appendChild(txt(117, 180, "both degrees decremented", "middle", 9));
+      gM.appendChild(txt(117, 196, "no marker left behind", "middle", 9, null, matOn ? css("--ok") : mut));
+      svg.appendChild(gM);
+
+      // segment branch (right)
+      var segOn = branch === "seg", segDim = branch === "mat";
+      var gS = el("g", { class: "wnode" + (segOn ? " wflash" : segDim ? " wdim" : "") });
+      gS.appendChild(box(248, 108, 210, 96, segOn ? css("--warn-soft") : css("--surface-soft"), segOn ? css("--warn") : border));
+      gS.appendChild(txt(353, 126, "no — segment-resident", "middle", 9.5, null, mut));
+      gS.appendChild(txt(353, 146, "write one tombstone", "middle", 11, "700"));
+      gS.appendChild(txt(353, 164, "seg/tomb/out/… = epoch", "middle", 9));
+      gS.appendChild(txt(353, 180, "segment untouched", "middle", 9));
+      gS.appendChild(txt(353, 196, "out-degree decremented", "middle", 9, null, segOn ? css("--warn") : mut));
+      svg.appendChild(gS);
+
+      // join edges
+      svg.appendChild(el("path", { d: "M117 204 L210 246", stroke: matDim ? css("--ash") : mut, "stroke-width": 1.3, fill: "none", "marker-end": "url(#arw41)" }));
+      svg.appendChild(el("path", { d: "M353 204 L260 246", stroke: segDim ? css("--ash") : mut, "stroke-width": 1.3, fill: "none", "marker-end": "url(#arw41)" }));
+
+      // common node
+      var gC = el("g", { class: "wnode" + (branch ? " wflash" : "") });
+      gC.appendChild(box(70, 246, 330, 46, css("--surface-soft"), border));
+      gC.appendChild(txt(235, 266, "both branches rejoin", "middle", 10, "700"));
+      gC.appendChild(txt(235, 282, "relationships hard-deleted · matrix_dirty set · idempotency receipt · one serializable commit", "middle", 8));
+      svg.appendChild(gC);
+
+      if (!branch) readout.innerHTML = "One question, asked once. Pick an answer to light up the path a delete takes.";
+      else if (branch === "mat") readout.innerHTML = "<strong style='color:var(--ok)'>Materialized:</strong> three ordinary <code>txn.delete</code>s and two decremented degrees. SlateDB's snapshot hides the gone keys from later readers — <strong>nothing</strong> is left behind.";
+      else readout.innerHTML = "<strong style='color:var(--warn)'>Segment-resident:</strong> the edge lives inside an encoded value, so a single <code>seg/tomb/out/…</code> tombstone is written next to the untouched segment. Only the out-degree moves.";
+      bMat.disabled = branch === "mat"; bSeg.disabled = branch === "seg";
+    }
+    bMat.onclick = function () { branch = "mat"; render(); };
+    bSeg.onclick = function () { branch = "seg"; render(); };
+    bReset.onclick = function () { branch = null; render(); };
+    render(); onTheme(render);
+  });
+
+  /* ---------- Fig 4.2 — one delete, three structures --------------------- */
+  TB.widget("w-delete-visibility", function (mount) {
+    var step = 0; // 0 none, 1 adjacency, 2 segments, 3 index-gen, 4 unavailable
+    var controls = document.createElement("div"); controls.className = "tb-controls";
+    var bStep = mkbtn("Step ▸", "primary");
+    var bReset = mkbtn("Reset", "");
+    controls.append(bStep, bReset);
+    var svg = el("svg", { viewBox: "0 0 480 260", width: "100%", style: "max-width:480px;display:block;margin:0 auto" });
+    var readout = document.createElement("div");
+    readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.6em;color:var(--muted)";
+    var wrap = document.createElement("div"); wrap.append(controls, svg, readout); mount.appendChild(wrap);
+
+    var rows = [
+      { y: 12, left: ["adjacency keys", "e/out · e/in"], softv: "--ok-soft", strv: "--ok",
+        mech: ["the key is gone", "the snapshot simply does not contain it"] },
+      { y: 92, left: ["compacted segments", "seg/out"], softv: "--warn-soft", strv: "--warn",
+        mech: ["tombstone compared", "segment_edge_visible(E, T) — hidden when T ≥ E"] },
+      { y: 172, left: ["index generation", "(immutable CSC)"], softv: "--info-soft", strv: "--info",
+        mech: ["overlay says false", "WAL tail re-resolved against the pinned snapshot"] }
+    ];
+
+    function render() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var mut = css("--muted"), border = css("--border");
+      defsArrow(svg, "arw42", mut);
+      rows.forEach(function (r, i) {
+        var on = step >= i + 1;
+        var g = el("g", { class: "wnode" + (step === i + 1 ? " wflash" : "") });
+        // left label box
+        g.appendChild(box(8, r.y, 150, 56, i === 2 ? css("--purple-soft") : css("--surface-soft"), i === 2 ? css("--purple") : border));
+        g.appendChild(txt(83, r.y + 26, r.left[0], "middle", 9.5, "700"));
+        g.appendChild(txt(83, r.y + 42, r.left[1], "middle", 8.5, null, mut));
+        // arrow
+        g.appendChild(el("path", { d: "M160 " + (r.y + 28) + " L206 " + (r.y + 28), stroke: on ? css(r.strv) : mut, "stroke-width": on ? 1.8 : 1.2, fill: "none", "marker-end": "url(#arw42)" }));
+        // mechanism box
+        g.appendChild(box(208, r.y, 264, 56, on ? css(r.softv) : css("--surface-soft"), on ? css(r.strv) : border, on ? null : "5 4"));
+        g.appendChild(txt(340, r.y + 24, on ? r.mech[0] : "…", "middle", 10, "700", on ? css(r.strv) : mut));
+        if (on) g.appendChild(txt(340, r.y + 42, r.mech[1], "middle", 8.5, null, mut));
+        svg.appendChild(g);
+      });
+      // Unavailable fallback under the index-gen row
+      if (step >= 4) {
+        var gf = el("g", { class: "wnode wflash" });
+        gf.appendChild(el("path", { d: "M340 228 L340 236", stroke: mut, "stroke-width": 1.2, fill: "none", "stroke-dasharray": "3 3" }));
+        gf.appendChild(box(208, 232, 264, 24, "none", mut, "4 3"));
+        gf.appendChild(txt(340, 248, "tail Unavailable → fall back to snapshot adjacency", "middle", 8.5, null, mut));
+        svg.appendChild(gf);
+      }
+
+      var msg = [
+        "One deleted edge must vanish from three structures — each by a different mechanism. Step through them.",
+        "<strong style='color:var(--ok)'>Adjacency keys:</strong> nothing to do. The key is absent from the snapshot, so the scan never sees it.",
+        "<strong style='color:var(--warn)'>Compacted segments:</strong> the row is still inside the value, so the read compares the tombstone and hides it when <code>T ≥ E</code>.",
+        "<strong style='color:var(--info)'>Index generation:</strong> immutable and stale, so the WAL-tail overlay carries <code>exists: false</code> forward.",
+        "<strong style='color:var(--bad)'>Tail Unavailable:</strong> the accelerated path is abandoned; the query answers from snapshot adjacency — slower, always correct."
+      ];
+      readout.innerHTML = msg[step];
+      bStep.disabled = step >= 4;
+    }
+    bStep.onclick = function () { if (step < 4) step++; render(); };
+    bReset.onclick = function () { step = 0; render(); };
+    render(); onTheme(render);
+  });
+
+  /* ---------- Fig 4.3 — three collectors, which one runs ----------------- */
+  TB.widget("w-reclaim", function (mount) {
+    var unattended = false;
+    var controls = document.createElement("div"); controls.className = "tb-controls";
+    var lbl = document.createElement("label");
+    var chk = document.createElement("input"); chk.type = "checkbox";
+    lbl.append(chk, document.createTextNode(" unattended deployment (no operator scripting)"));
+    controls.append(lbl);
+    var svg = el("svg", { viewBox: "0 0 480 250", width: "100%", style: "max-width:480px;display:block;margin:0 auto" });
+    var readout = document.createElement("div");
+    readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.6em;color:var(--muted)";
+    var wrap = document.createElement("div"); wrap.append(controls, svg, readout); mount.appendChild(wrap);
+
+    var cols = [
+      { x: 8, name: ["compact_out_", "adjacency_segments"], owns: ["segments + the", "tombstones they suppressed"], bound: "compacted_through_epoch", scheduled: false },
+      { x: 164, name: ["delete_graph_", "artifacts_before"], owns: ["matrix artifact keys", "+ the three caches"], bound: "keep_epoch", scheduled: false },
+      { x: 320, name: ["gc_graph_index_", "generations"], owns: ["published CSC generations", "in the object store"], bound: "retain_previous", scheduled: true }
+    ];
+
+    function render() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var mut = css("--muted"), border = css("--border");
+      defsArrow(svg, "arw43", mut);
+      cols.forEach(function (c) {
+        var dead = unattended && !c.scheduled;
+        var g = el("g", { class: "wnode" + (dead ? " wdim" : "") });
+        // collector head
+        g.appendChild(box(c.x, 8, 152, 46, c.scheduled ? css("--ok-soft") : css("--warn-soft"), c.scheduled ? css("--ok") : css("--warn")));
+        g.appendChild(txt(c.x + 76, 27, c.name[0], "middle", 9, "700"));
+        g.appendChild(txt(c.x + 76, 42, c.name[1], "middle", 9, "700"));
+        // owns box
+        g.appendChild(el("path", { d: "M" + (c.x + 76) + " 54 L" + (c.x + 76) + " 74", stroke: mut, "stroke-width": 1.2, fill: "none", "marker-end": "url(#arw43)" }));
+        g.appendChild(box(c.x, 76, 152, 58, css("--surface-soft"), border));
+        g.appendChild(txt(c.x + 76, 96, c.owns[0], "middle", 8.5));
+        g.appendChild(txt(c.x + 76, 110, c.owns[1], "middle", 8.5));
+        g.appendChild(txt(c.x + 76, 126, "bound: " + c.bound, "middle", 8, null, mut));
+        svg.appendChild(g);
+        // runner row
+        var dashed = !c.scheduled;
+        svg.appendChild(el("path", { d: "M" + (c.x + 76) + " 134 L" + (c.x + 76) + " 156", stroke: mut, "stroke-width": 1.2, fill: "none", "stroke-dasharray": dashed ? "4 3" : "none", "marker-end": dashed ? "" : "url(#arw43)" }));
+        var runFill = c.scheduled ? css("--info-soft") : "none";
+        var runStroke = c.scheduled ? css("--info") : mut;
+        var gr = el("g", { class: "wnode" + (unattended && dead ? " wflash" : "") });
+        gr.appendChild(box(c.x, 158, 152, 46, runFill, runStroke, c.scheduled ? null : "4 3"));
+        if (c.scheduled) {
+          gr.appendChild(txt(c.x + 76, 178, "called every cycle", "middle", 8.5, "700", css("--info")));
+          gr.appendChild(txt(c.x + 76, 193, "by graph-indexer", "middle", 8.5, null, mut));
+        } else if (unattended) {
+          gr.appendChild(txt(c.x + 76, 178, "no in-tree caller", "middle", 8.5, "700", css("--bad")));
+          gr.appendChild(txt(c.x + 76, 193, "residue accumulates", "middle", 8.5, null, css("--bad")));
+        } else {
+          gr.appendChild(txt(c.x + 76, 178, "operator-invoked", "middle", 8.5, "700", css("--warn")));
+          gr.appendChild(txt(c.x + 76, 193, "no in-tree caller", "middle", 8.5, null, mut));
+        }
+        svg.appendChild(gr);
+      });
+      // residue banner
+      if (unattended) {
+        var gb = el("g", { class: "wnode wflash" });
+        gb.appendChild(box(8, 216, 464, 26, css("--bad-soft"), css("--bad")));
+        gb.appendChild(txt(240, 233, "tombstones + superseded matrix artifacts pile up without bound — correctness untouched", "middle", 9, "700", css("--bad")));
+        svg.appendChild(gb);
+      }
+
+      if (!unattended) readout.innerHTML = "Three collectors, three caller-supplied boundaries, no shared scheduler. Only <code>gc_graph_index_generations</code> runs on its own.";
+      else readout.innerHTML = "<strong style='color:var(--bad)'>Unattended:</strong> index-generation GC still runs every cycle, but segment compaction and artifact GC have <strong>no caller in <code>src/</code></strong>. With nobody to invoke them, tombstones and stale artifacts accumulate indefinitely.";
+    }
+    chk.onchange = function () { unattended = chk.checked; render(); };
+    render(); onTheme(render);
+  });
+})();
+</script>

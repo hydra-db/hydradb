@@ -1,0 +1,318 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>From Cypher to Roaring Rows · TurboLay Conceptual Guide</title>
+<link rel="stylesheet" href="../assets/textbook.css">
+
+<div class="tb-progress"></div>
+
+<header class="tb-header">
+  <a class="tb-home" href="../index.html">Turbo<span>Lay</span> · Interactive</a>
+  <span class="tb-crumb">A Conceptual Guide</span>
+  <span class="tb-crumb">The Architecture</span>
+  <span class="tb-spacer"></span>
+  <button class="tb-theme-toggle" type="button">☾ Dark</button>
+</header>
+
+<main class="tb-main">
+  <div class="tb-chapter-kicker">Chapter 4 · The Architecture</div>
+  <h1>From Cypher to Roaring Rows</h1>
+
+  <p>A <span class="concept" data-concept="cypher">Cypher</span> query begins as text. The storage layer understands keys,
+  <span class="concept" data-concept="epoch">epochs</span>, edges, indexes, and artifacts. The interesting work is the bridge between
+  them: choosing an access path without changing the query's meaning.</p>
+
+  <div class="callout status">
+    <span class="callout-title">Status: planned</span>
+    <p><span class="concept" data-concept="roaring">Roaring</span> matrix rows are a proposed
+    optimization, <strong>not yet in the current tree</strong>. On this branch the hydrated
+    <span class="concept" data-concept="adjacency">adjacency</span> is still <code>BTreeMap&lt;VertexId, BTreeSet&lt;VertexId&gt;&gt;</code> (<code>src/lib.rs</code>), there
+    is no <code>Roaring</code> symbol in <code>src/</code>, and <code>roaring</code> is not a Cargo dependency. The
+    Cypher-to-access-path pipeline below is real and shipped; the Roaring payoff
+    is future work. Read every Roaring claim here as a design intent, not behavior
+    you can observe today.</p>
+  </div>
+
+  <h2>The local execution pipeline</h2>
+
+  <p>With the <code>opencypher</code> feature enabled, a cell-local query moves through:</p>
+
+  <figure>
+    <div class="tb-table-wrap">
+      <table>
+        <tbody>
+          <tr><td>Cypher parser</td><td><code>→</code></td><td>row plan + optimizer</td><td><code>→</code></td><td>GraphShard executor</td></tr>
+          <tr><td>bindings and predicates</td><td><code>→</code></td><td>physical access path</td><td><code>→</code></td><td>rows/page/count</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <figcaption>Tab. 4.1 — Parsing describes the question; optimization chooses how the cell answers it.</figcaption>
+  </figure>
+
+  <figure>
+    <div class="tb-widget" id="w-pipeline"></div>
+    <figcaption>Fig. 4.1 — Parsing describes the question; the optimizer chooses a physical
+      access path. Roaring row compression is a planned optimization at the
+      hydration seam.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Step through the pipeline: text → plan → access path → rows<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>The widget above walks a Cypher pattern down the same path a cell-local query takes.
+      Press <em>Next stage</em> to advance the highlight: <strong>Cypher text</strong> is the question as
+      the client wrote it; <strong>parse</strong> turns it into a <code>ParsedCypher</code>
+      <span class="concept" data-concept="ast">abstract syntax tree</span>; the <strong>row plan + optimizer</strong>
+      chooses <em>how</em> to answer without changing <em>what</em> is asked; and the
+      <strong>GraphShard executor</strong> runs it, emitting rows, a page, or a count. Reach the executor and
+      the fan-out lights up: the physical <span class="concept" data-concept="access-path">access paths</span> the executor may
+      pick. Two of them — neighbor expansion and matrix artifacts — descend across the
+      <span class="concept" data-concept="sparse-matrix">sparse-kernel</span> seam into the Rust sparse backend (default) and
+      <span class="concept" data-concept="graphblas">GraphBLAS</span> (optional). The dashed node is the planned Roaring row
+      compression, which attaches at the hydration seam and nowhere else.</p>
+    </div>
+  </details>
+
+  <p>Read the top row left to right: parsing describes the question, and the optimizer
+  chooses how to answer it. The row below is the choice itself — the physical access
+  paths the executor may pick — and two of them descend into the sparse kernel and
+  its two backends. The dashed node is the planned Roaring row compression, which
+  attaches at the hydration seam and nowhere else.</p>
+
+  <p>The executor can use point reads, label or property indexes, neighbor expansion,
+  edge-exists checks, matrix artifacts, and specialized streaming paths.
+  Variable-length reachability crosses the sparse-kernel seam.</p>
+
+  <h2>Why Roaring would belong at the seam</h2>
+
+  <p>Today, hydrated matrix adjacency is
+  <code>BTreeMap&lt;VertexId, BTreeSet&lt;VertexId&gt;&gt;</code>. Each destination is a separate tree
+  node with allocator and pointer overhead. Graph rows are sorted sets of <code>u64</code>,
+  which is precisely the shape <code>RoaringTreemap</code> compresses.</p>
+
+  <p>The current type is:</p>
+
+<pre><code>type MatrixAdjacency = BTreeMap&lt;VertexId, BTreeSet&lt;VertexId&gt;&gt;;</code></pre>
+
+  <p>The planned change swaps the inner row for a compressed bitmap at the same
+  hydration seam:</p>
+
+<pre><code>// planned
+type MatrixAdjacency = BTreeMap&lt;VertexId, RoaringTreemap&gt;;</code></pre>
+
+  <p>The outer map would still find a source row. The row itself would become a
+  compressed, deduplicated, ordered bitmap. Iteration would still yield ascending
+  vertex IDs, so <span class="concept" data-concept="csc">CSC</span> construction, deterministic result ordering, and the Rust
+  kernel would retain their behavior.</p>
+
+  <div class="boxeq">
+    <strong>Keep the durable artifact stable; compress the hydrated row where compute
+    pays the memory bill.</strong>
+  </div>
+
+  <h2>Rust sparse and GraphBLAS are two backends</h2>
+
+  <p>The default build uses the Rust sparse kernel. With the <code>graphblas</code> feature,
+  the same adjacency or persisted <span class="concept" data-concept="csc">CSC</span> can compile into a SuiteSparse <span class="concept" data-concept="graphblas">GraphBLAS</span>
+  matrix. GraphBLAS is an optional traversal backend, not the durable graph model
+  and not a requirement for ordinary graph operations.</p>
+
+  <p>Roaring would not guarantee every query becomes faster. Tiny sparse rows have
+  less to gain, and the current Rust <span class="concept" data-concept="traversal">BFS</span> still uses <span class="concept" data-concept="btreeset">BTreeSet</span> frontiers. The
+  narrower claim is that cached matrix rows would be compressed and provide a
+  better set-algebra substrate. Quantified latency and RSS claims require the
+  benchmark chapter that has not yet been written.</p>
+
+  <p>One cell can now answer one query. The final architecture question is how many
+  cells participate in one request.</p>
+
+  <nav class="tb-chapnav">
+    <a class="prev" href="intro-03-epochs-artifacts-overlays.html"><span class="cn-dir">‹ Prev</span><br><span class="cn-title">Reads Name the World They See</span></a>
+    <a class="next" href="intro-05-bounded-distributed-queries.html"><span class="cn-dir">Next ›</span><br><span class="cn-title">Distribution with Edges Around It</span></a>
+  </nav>
+</main>
+
+<script src="../assets/glossary.js"></script>
+<script>
+window.TB_GLOSSARY = Object.assign(window.TB_GLOSSARY || {}, {
+  "ast": {
+    title: "Abstract syntax tree (ParsedCypher)",
+    html: "<p>An <strong>abstract syntax tree (AST)</strong> is the structured, tree-shaped representation of a query after parsing: clauses, patterns, and predicates become nodes instead of raw characters. In TurboLay the parser turns Cypher text into a <code>ParsedCypher</code> value. The AST captures <em>what</em> was asked but says nothing about <em>how</em> to answer it — that choice belongs to the optimizer.</p>"
+  },
+  "access-path": {
+    title: "Physical access path",
+    html: "<p>A <strong>physical access path</strong> is the concrete method the executor uses to fetch matching data: a point read by key, a lookup through a label or property index, neighbor expansion over adjacency, an edge-exists check, or a scan of a matrix artifact. The optimizer picks an access path that returns the correct rows while doing the least work; different paths give identical answers at very different cost.</p>"
+  },
+  "traversal": {
+    title: "Graph traversal (BFS)",
+    html: "<p><strong>Traversal</strong> is walking a graph by following edges from a starting set of vertices. <strong>Breadth-first search (BFS)</strong> visits everything one hop away, then two hops, and so on, expanding a frontier of vertices layer by layer. Variable-length reachability and neighbor expansion are traversals; in TurboLay they cross the sparse-kernel seam so they can run as set algebra over matrix rows.</p>"
+  }
+});
+</script>
+<script src="../assets/textbook.js"></script>
+<script>
+/* Widget: the Cypher-to-access-path pipeline. Step the highlight left to right;
+   reaching the executor reveals the access-path fan-out, the sparse-kernel seam,
+   its two backends, and the planned (dashed) Roaring row-compression node. */
+TB.widget("w-pipeline", function (mount) {
+  var NS = "http://www.w3.org/2000/svg";
+  function el(n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+  var stage = 0; // 0..4 across the top pipeline
+  var MAX = 4;
+
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div");
+  controls.className = "tb-controls";
+  var btnPrev = mk("‹ Prev stage", "");
+  var btnNext = mk("Next stage ›", "primary");
+  var btnReset = mk("Reset", "");
+  controls.append(btnPrev, btnNext, btnReset);
+
+  var svg = el("svg", { viewBox: "0 0 620 380", width: "100%", style: "max-width:620px;display:block;margin:0 auto" });
+  var readout = document.createElement("div");
+  readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:3em;color:var(--muted)";
+
+  wrap.append(controls, svg, readout);
+  mount.appendChild(wrap);
+
+  function mk(label, cls) { var b = document.createElement("button"); b.className = "tb-btn" + (cls ? " " + cls : ""); b.textContent = label; return b; }
+
+  var pipe = [
+    { x: 12,  t: ["Cypher text"] },
+    { x: 134, t: ["parse", "(ParsedCypher)"] },
+    { x: 256, t: ["row plan +", "optimizer"] },
+    { x: 378, t: ["GraphShard", "executor"] },
+    { x: 500, t: ["rows / page /", "count"] }
+  ];
+  var PW = 108, PH = 46, PY = 20;
+
+  var readouts = [
+    "Stage 0 — Cypher text: the question exactly as the client wrote it. No decisions made yet.",
+    "Stage 1 — parse: the text becomes a ParsedCypher abstract syntax tree. It captures what is asked, not how to answer.",
+    "Stage 2 — row plan + optimizer: the optimizer chooses how to answer without changing the query's meaning.",
+    "Stage 3 — GraphShard executor: it runs the plan by picking physical access paths (fanned out below). Two descend across the sparse-kernel seam.",
+    "Stage 4 — rows / page / count: the executor emits the result. The dashed Roaring node is a planned compression at the hydration seam — not built today."
+  ];
+
+  function rect(x, y, w, h, fill, stroke, dash) {
+    return el("rect", { x: x, y: y, width: w, height: h, rx: 4, fill: fill, stroke: stroke, "stroke-width": 1.2, "stroke-dasharray": dash || "none" });
+  }
+  function label(x, y, t, size, weight, fill) {
+    var e = el("text", { x: x, y: y, "text-anchor": "middle", class: "wnode-label" });
+    if (size) e.setAttribute("font-size", size);
+    if (weight) e.setAttribute("font-weight", weight);
+    if (fill) e.setAttribute("fill", fill);
+    e.textContent = t; return e;
+  }
+  function boxLabel(cx, cy, lines, size) {
+    var g = el("g", {});
+    var n = lines.length, lh = 11;
+    var start = cy - ((n - 1) * lh) / 2 + 3;
+    for (var i = 0; i < n; i++) g.appendChild(label(cx, start + i * lh, lines[i], size || 8.5, "600"));
+    return g;
+  }
+  function arrow(x1, y1, x2, y2, color, dash) {
+    return el("path", { d: "M" + x1 + " " + y1 + " L" + x2 + " " + y2, stroke: color, "stroke-width": 1.4, fill: "none", "stroke-dasharray": dash || "none", "marker-end": "url(#arw)" });
+  }
+
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+    var muted = css("--muted"), border = css("--border");
+    var soft = css("--surface-soft");
+    var info = css("--info") || css("--purple"), infoSoft = css("--info-soft") || css("--purple-soft");
+    var ok = css("--ok"), okSoft = css("--ok-soft");
+    var warn = css("--bad"), warnSoft = css("--bad-soft");
+    var accent = css("--accent") || css("--purple");
+
+    var defs = el("defs", {});
+    var mk2 = el("marker", { id: "arw", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    mk2.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: muted }));
+    defs.appendChild(mk2); svg.appendChild(defs);
+
+    // top pipeline
+    for (var i = 0; i < pipe.length; i++) {
+      var active = i === stage, done = i < stage;
+      var fill = active ? accent : (done ? okSoft : soft);
+      var stroke = active ? accent : (done ? ok : border);
+      var g = el("g", {});
+      g.appendChild(rect(pipe[i].x, PY, PW, PH, fill, stroke));
+      var txtColor = active ? css("--on-accent") || "#fff" : null;
+      g.appendChild(boxLabel(pipe[i].x + PW / 2, PY + PH / 2, pipe[i].t));
+      if (active) { for (var c = 0; c < g.childNodes.length; c++) { var nd = g.childNodes[c]; if (nd.tagName === "g") { var tx = nd.childNodes; for (var j = 0; j < tx.length; j++) tx[j].setAttribute("fill", css("--on-accent") || "#fff"); } } }
+      svg.appendChild(g);
+      if (i < pipe.length - 1) svg.appendChild(arrow(pipe[i].x + PW, PY + PH / 2, pipe[i + 1].x, PY + PH / 2, done ? ok : muted));
+    }
+
+    var revealed = stage >= 3;
+    var dim = revealed ? "1" : "0.28";
+
+    // access-path fan-out (row below executor)
+    var access = [
+      { cx: 70,  t: ["point reads"] },
+      { cx: 195, t: ["label/property", "index"] },
+      { cx: 320, t: ["neighbor", "expansion"] },
+      { cx: 445, t: ["matrix", "artifacts"] }
+    ];
+    var AY = 120, AW = 108, AH = 40;
+    var execCx = pipe[3].x + PW / 2;
+    for (var a = 0; a < access.length; a++) {
+      var ga = el("g", { opacity: dim });
+      ga.appendChild(rect(access[a].cx - AW / 2, AY, AW, AH, infoSoft, info));
+      ga.appendChild(boxLabel(access[a].cx, AY + AH / 2, access[a].t));
+      svg.appendChild(ga);
+      if (revealed) svg.appendChild(arrow(execCx, PY + PH, access[a].cx, AY, muted));
+    }
+
+    // sparse kernel seam
+    var seam = el("g", { opacity: dim });
+    var skX = 258, skY = 200, skW = 108, skH = 40;
+    seam.appendChild(rect(skX, skY, skW, skH, soft, border));
+    seam.appendChild(boxLabel(skX + skW / 2, skY + skH / 2, ["sparse kernel"]));
+    svg.appendChild(seam);
+    if (revealed) {
+      svg.appendChild(arrow(access[2].cx, AY + AH, skX + skW / 2 - 22, skY, muted));  // neighbor -> seam
+      svg.appendChild(arrow(access[3].cx, AY + AH, skX + skW / 2 + 22, skY, muted));  // matrix -> seam
+    }
+
+    // two backends
+    var backends = [
+      { cx: 150, t: ["Rust sparse", "(default)"], strong: true },
+      { cx: 370, t: ["GraphBLAS", "(optional)"], strong: false }
+    ];
+    var BY = 290, BW = 118, BH = 44;
+    for (var b = 0; b < backends.length; b++) {
+      var gb = el("g", { opacity: dim });
+      gb.appendChild(rect(backends[b].cx - BW / 2, BY, BW, BH, backends[b].strong ? okSoft : soft, backends[b].strong ? ok : border));
+      gb.appendChild(boxLabel(backends[b].cx, BY + BH / 2, backends[b].t));
+      svg.appendChild(gb);
+      if (revealed) svg.appendChild(arrow(skX + skW / 2, skY + skH, backends[b].cx, BY, muted));
+    }
+
+    // PLANNED Roaring node at the hydration seam
+    var rX = 470, rY = 200, rW = 128, rH = 44;
+    var gr = el("g", { opacity: dim });
+    gr.appendChild(rect(rX, rY, rW, rH, warnSoft, warn, "5 4"));
+    gr.appendChild(boxLabel(rX + rW / 2, rY + rH / 2, ["Roaring rows", "(planned)"]));
+    svg.appendChild(gr);
+    if (revealed) svg.appendChild(arrow(access[3].cx, AY + AH, rX + rW / 2, rY, warn, "5 4"));
+
+    // captions on the seam
+    if (revealed) {
+      svg.appendChild(label(312, 190, "hydration seam", 8, "600", muted));
+    }
+
+    readout.textContent = readouts[stage];
+    btnPrev.disabled = stage === 0;
+    btnNext.disabled = stage === MAX;
+  }
+
+  btnNext.onclick = function () { if (stage < MAX) { stage++; render(); } };
+  btnPrev.onclick = function () { if (stage > 0) { stage--; render(); } };
+  btnReset.onclick = function () { stage = 0; render(); };
+  render();
+  window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+  document.querySelector(".tb-theme-toggle").addEventListener("click", function () { setTimeout(render, 0); });
+});
+</script>
