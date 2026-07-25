@@ -12041,6 +12041,130 @@ async fn graphblas_matrix_kernel_reuses_compiled_base_matrix_cache() {
 }
 
 #[tokio::test]
+async fn compact_csc_policy_runs_and_reports_the_compact_kernel() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let options = GraphOpenOptions {
+        cache_policy: GraphCachePolicy {
+            sparse_kernel: SparseKernelBackend::CompactCsc,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/kernel-policy-compact",
+        object_store,
+        options,
+    )
+    .await
+    .unwrap();
+
+    for (idx, (src, dst)) in [
+        (1, 2),
+        (1, 3),
+        (2, 4),
+        (3, 4),
+        (4, 5),
+        (42, 100),
+        (42, 101),
+        (101, 102),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .write_edge(mutation(src, dst, &format!("compact-policy-{idx}")))
+            .await
+            .unwrap();
+    }
+    let base_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    shard
+        .build_matrix_tiles("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", base_epoch, 2)
+        .await
+        .unwrap();
+
+    // The argument asks for kernel 3; the policy is authoritative for which
+    // compiled rung the artifact was built as, so kernel 2 is what runs.
+    let compact = shard
+        .matrix_reachable_with_kernel(
+            "reddit-home",
+            "USER_SUBSCRIBED_TO_SUBREDDIT",
+            &[1, 42],
+            3,
+            base_epoch,
+            SparseKernelBackend::SuiteSparse,
+        )
+        .await
+        .unwrap();
+    assert_eq!(compact.sparse_kernel, SparseKernelBackend::CompactCsc);
+    assert_eq!(shard.graphblas_cache.lock().await.len(), 1);
+
+    let adjacency = shard
+        .matrix_reachable_with_kernel(
+            "reddit-home",
+            "USER_SUBSCRIBED_TO_SUBREDDIT",
+            &[1, 42],
+            3,
+            base_epoch,
+            SparseKernelBackend::Adjacency,
+        )
+        .await
+        .unwrap();
+    assert_eq!(adjacency.sparse_kernel, SparseKernelBackend::Adjacency);
+    assert_eq!(compact.vertices, adjacency.vertices);
+    assert_eq!(compact.edge_visits, adjacency.edge_visits);
+}
+
+#[tokio::test]
+async fn adjacency_policy_compiles_no_matrix_at_all() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let options = GraphOpenOptions {
+        cache_policy: GraphCachePolicy {
+            sparse_kernel: SparseKernelBackend::Adjacency,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/kernel-policy-adjacency",
+        object_store,
+        options,
+    )
+    .await
+    .unwrap();
+
+    for (idx, (src, dst)) in [(1, 2), (1, 3), (2, 4), (3, 4), (4, 5), (42, 100)]
+        .into_iter()
+        .enumerate()
+    {
+        shard
+            .write_edge(mutation(src, dst, &format!("adjacency-policy-{idx}")))
+            .await
+            .unwrap();
+    }
+    let base_epoch = shard.current_epoch("reddit-home").await.unwrap();
+    shard
+        .build_matrix_tiles("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", base_epoch, 2)
+        .await
+        .unwrap();
+
+    // The policy is a ceiling: asking for kernel 3 must not compile one.
+    let traversal = shard
+        .matrix_reachable_with_kernel(
+            "reddit-home",
+            "USER_SUBSCRIBED_TO_SUBREDDIT",
+            &[1, 42],
+            3,
+            base_epoch,
+            SparseKernelBackend::SuiteSparse,
+        )
+        .await
+        .unwrap();
+    assert_eq!(traversal.sparse_kernel, SparseKernelBackend::Adjacency);
+    assert_eq!(shard.graphblas_cache.lock().await.len(), 0);
+    assert!(traversal.vertices.contains(&5));
+}
+
+#[tokio::test]
 async fn graphblas_empty_cache_reader_uses_persisted_csc_artifact() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let writer = open_test_shard(

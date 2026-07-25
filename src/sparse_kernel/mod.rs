@@ -166,19 +166,28 @@ pub(crate) struct SparseTraversalCount {
     pub backend: SparseKernelBackend,
 }
 
-/// Resolves the configured kernel for a shard.
+/// The kernel a [`GraphCachePolicy`] starts at, resolved once per process.
 ///
-/// The policy field is authoritative. The pre-existing `GRAPH_COMPILED_KERNEL`
-/// override is honoured only while the policy is left at its default, so
-/// benchmark scripts keep working without letting the environment silently
-/// contradict an explicit configuration.
-pub(crate) fn default_matrix_kernel(policy: &GraphCachePolicy) -> SparseKernelBackend {
-    match policy.sparse_kernel {
-        SparseKernelBackend::SuiteSparse if graphblas::use_compact_csc_kernel() => {
+/// The legacy `GRAPH_COMPILED_KERNEL` override supplies only this *default*, so
+/// an explicit `sparse_kernel` — whether from `GRAPH_SPARSE_KERNEL` or set in
+/// code — always wins. Resolving it here rather than at each traversal is what
+/// keeps `std::env::var` off the query path: the environment is read once, on
+/// first use, and never again.
+pub(crate) fn env_default_kernel() -> SparseKernelBackend {
+    static RESOLVED: std::sync::OnceLock<SparseKernelBackend> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        if graphblas::use_compact_csc_kernel() {
             SparseKernelBackend::CompactCsc
+        } else {
+            SparseKernelBackend::SuiteSparse
         }
-        kernel => kernel,
-    }
+    })
+}
+
+/// Resolves the configured kernel for a shard. The policy field is the single
+/// authority; see [`env_default_kernel`] for where that field's default is from.
+pub(crate) fn default_matrix_kernel(policy: &GraphCachePolicy) -> SparseKernelBackend {
+    policy.sparse_kernel
 }
 
 pub(crate) fn expand(
