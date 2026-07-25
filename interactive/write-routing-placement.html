@@ -752,7 +752,7 @@
       <span><b>repo</b> turbolay</span>
       <span><b>branch</b> Turbolay-V3.5</span>
       <span><b>doc</b> 3 of 3 &mdash; the fix</span>
-      <span><b>status</b> crate landed, wiring blocked on Q2/Q4</span>
+      <span><b>status</b> crate landed, wiring blocked on Q4</span>
       <span><b>refs</b> sleet &middot; tidb-master</span>
     </div>
     <h1>Placing the writer<span class="thin">rendezvous, heartbeats, and the bounded duel</span></h1>
@@ -1647,8 +1647,16 @@ node-1  WARN  fenced at epoch 18; current lease: <b>graph-node-2 @ 19</b></pre>
           <span class="kv"><b>heartbeat_interval 5s, heartbeat_timeout 15s.</b> Config, with startup validation that <code>interval &lt; timeout</code>. The fence backoff in touch point (d) is one interval, so 5s.</span>
         </div>
         <div class="keep">
+          <span class="kk">Q2 readyz</span>
+          <span class="kv"><b>Delete the client-side fan-out.</b> <code>reachable_nodes</code>, <code>probe_node_readiness</code>, <code>replace_address_port</code> and the <code>reachable.first()</code> writer fallback all go &mdash; replaced by one LIST, with heartbeat publication gated on <code>AdminState.ready</code>. Deletion and gating are one change, not two. The <code>/readyz</code> endpoint itself (<code>graph_node/admin.rs:48</code>) and its k8s, smoke-test and Jepsen consumers are untouched; none of them touch routing.</span>
+        </div>
+        <div class="keep">
           <span class="kk">rule</span>
           <span class="kv">A node must not promote itself for a cell it does not own, unless the computed owner is not live. <code>None</code> from <code>owner()</code> means placement has no opinion, and promotion proceeds.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">fence</span>
+          <span class="kv">Match sleet's handler exactly (<code>daemon.rs:458-472</code>): <b>reset backoff to 1s</b> because a fence is view skew rather than a failure, wait exactly one <code>heartbeat_interval</code> sized to let the rival stand down, and retry <b>unconditionally</b> without re-checking ownership.</span>
         </div>
       </div>
 
@@ -1656,26 +1664,32 @@ node-1  WARN  fenced at epoch 18; current lease: <b>graph-node-2 @ 19</b></pre>
 
       <div class="openq wide">
         <div class="q">
-          <span class="qh">Q2 &mdash; delete the /readyz fan-out?  <span class="chip med">inclined yes</span></span>
-          <p>
-            Delete <code>reachable_nodes</code>, <code>probe_node_readiness</code> and
-            <code>replace_address_port</code> from the routing provider &mdash; <b>conditional on
-            readiness-gated heartbeat publication landing in the same change.</b> The deletion and
-            the gating are one change, not two; shipping the deletion alone means unready nodes get
-            advertised to drivers, because Bolt clients bypass the k8s Service entirely. The
-            <code>/readyz</code> endpoint itself (<code>graph_node/admin.rs:48</code>) and its k8s,
-            smoke-test and Jepsen consumers stay untouched &mdash; none of them touch routing.
-          </p>
-        </div>
-        <div class="q">
           <span class="qh">Q4 &mdash; how far to build in the next pass?  <span class="chip high">open</span></span>
           <p>
-            Recommendation on the table is all of Phase 1 as staged commits: heartbeats, then
-            routing (a), then the refusal and Bolt mapping (b)+(c), then the fence backoff (d), then
-            the wiring (e), then the regression test. The crate alone changes nothing in prod, and
-            crate plus (b) fixes the duel while leaving clients unable to recover from it. The last
-            commit is the one that matters &mdash; three promotable nodes, one cell, concurrent
-            writes, exactly one epoch bump. It cannot be written until (a), (b) and (e) all exist.
+            Recommendation is all of Phase 1 as seven staged commits. <b>Answering Q2 reordered
+            them.</b> Touch point (a) deletes the probe, so it cannot function until something
+            publishes heartbeats &mdash; and publishing is part of (e), which the plan stages last.
+            That order is a rolling-upgrade hazard, not a cosmetic problem: a newly upgraded node
+            LISTs <code>_graph_nodes/v1/</code>, sees only itself because no old node publishes,
+            concludes it owns every cell, and promotes &mdash; while the old nodes carry on
+            promoting too. So the publisher splits out into its own commit ahead of the routing
+            change, where it writes objects nothing yet reads and can be watched in the bucket for
+            a day before anything depends on it.
+          </p>
+          <p>
+            The revised order: crate &rarr; <b>publisher</b> &rarr; (a) routing &rarr; (b)+(c)
+            refusal and Bolt mapping &rarr; (d) fence backoff &rarr; 3a advisory record &rarr;
+            regression test. Commits 3 and 4 are the pair that must not be separated by a release,
+            and they are where the review effort belongs &mdash; roughly sixty lines that change who
+            is allowed to write. Everything else is mechanical.
+          </p>
+          <p>
+            The tempting small option, crate plus (b), is a trap. It does stop the duel, but it
+            substitutes a client that receives a refusal it cannot interpret, holds a routing table
+            naming the wrong writer, and retries into the same node until it gives up. Same symptom
+            &mdash; writes not landing &mdash; and harder to find, because the epoch counter stops
+            climbing and the logs go quiet. The signature that made the original incident findable
+            disappears.
           </p>
         </div>
         <div class="q">

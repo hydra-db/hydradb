@@ -14,8 +14,14 @@ tags:
 
 # Rendezvous placement for cell writers — code plan
 
-Sections 1 and 2 landed in `7b0d340`. Sections 3–5 are unstarted; section 3 is
-blocked on decision 4 in §7.
+Sections 1 and 2 landed in `7b0d340`. Sections 3–5 are unstarted.
+
+§7 decisions 1–6 are settled. What remains open is **Q4 — how much of Phase 1
+lands in the next pass** — plus two smaller calls listed in §7.7. Decision 4
+reorders the build: the heartbeat publisher must ship *before* the routing
+change, not after it. The reasoning behind every settled decision lives in
+`docs/plans/2026-07-25-rendezvous-placement-open-questions.md`; §7 carries only
+the outcome.
 
 Fixes the prod incident in `cell-writer-fencing-pingpong`: three graph-nodes
 ping-ponging one cell's SlateDB writer epoch, because nothing decides which node
@@ -171,10 +177,15 @@ observability and is never fetched on the placement path.
 Following sleet: **a node always counts itself live.** If its own heartbeat looks
 stale it has no reliable proof it should stop.
 
-Defaults: `heartbeat_interval` 10s, `heartbeat_timeout` 30s. Convergence after a
-node dies is therefore bounded by ~`heartbeat_timeout`. Decision 4 in §7 argues
-for tightening these to ~2s/6s, since heartbeat freshness would then be the
-only readiness signal Bolt clients have.
+Publication is **gated on `AdminState.ready`** (decision 4): a node publishes
+only while ready, deletes its object when it goes unready, and deletes it in the
+SIGTERM handler before draining. Heartbeat freshness is then the only readiness
+signal Bolt clients have, which is why it must carry readiness and not merely
+liveness.
+
+Defaults: `heartbeat_interval` **5s**, `heartbeat_timeout` **15s** (decision 5),
+config with startup validation. Convergence after a node dies is bounded by
+~`heartbeat_timeout`.
 
 Extension point, not built now: if nodes ever serve different cell subsets,
 encode that in the object *name* (sleet's service-letter trick) so placement
@@ -231,7 +242,9 @@ and is a follow-up, not this change.
 
 `refresh_writer_fence` currently just drops the handle, so the next write
 reopens immediately. Add: on `CloseReason::Fenced`, wait one `heartbeat_interval`
-before re-promoting. Combined with (b), mutual fencing is then bounded by view
+(5s) before re-promoting, **and reset the exponential backoff to 1s** — a fence
+is view skew, not a failure. Decision 6 in §7 has the three rules to match, all
+from sleet's handler. Combined with (b), mutual fencing is then bounded by view
 convergence rather than by nothing.
 
 **e. `graph-node.rs`** — start the heartbeat task; build the placement handle
@@ -253,10 +266,10 @@ The last row is the one that matters — it is the incident, reproduced.
 
 ## 6. Explicitly out of scope
 
-- **CAS lease objects.** Superseded by decision 3 in §7 — the argument there is
-  sharper than "two authorities" and rests on what SlateDB actually exposes. An
-  advisory record (3a) is in scope for the crate; an authoritative one (3c) is
-  a separate RFC against our `slatedb` fork.
+- **CAS lease objects.** Superseded by decision 3 in §7. The advisory record
+  (3a) is in scope; an authoritative CAS-on-open (3c) is **dropped**, not
+  deferred — neither the fork nor upstream 0.14.1 exposes any epoch option on
+  `DbBuilder`, and sleet demonstrates the bound is reachable without one.
 - Phase 2: cell addressability on the wire.
 - Rebalance dampening. Rendezvous moves ownership the instant the live set
   changes, so a flapping node reclaims its cells each time it returns, each
@@ -294,71 +307,130 @@ placement over object storage is not SlateDB-specific. It will depend on
 `slatedb` only to re-export `object_store`, and if that re-export is ever
 replaced by a direct dep the name becomes a lie.
 
-### 3. Lease — STILL OPEN
+### 3. Lease — 3a, advisory record only. Decided
 
-Correcting the framing in §6 below: the problem is not "two authorities", it is
-that **an authoritative lease is not currently implementable**. Three things
-confirmed against the tree:
+Full reasoning in Q1 of the open-questions record; the short version:
 
-- The writer epoch **is** readable — `VersionedManifest::writer_epoch()` is
-  public via `DbStatus.current_manifest`. It is already a CAS-backed,
-  monotonic, observable lease.
-- It carries **no identity**. The manifest records "epoch 18", never "node-1
-  holds epoch 18". You can detect that you were fenced; not by whom. That
-  missing identity is the entire gap a lease object would fill.
-- There is **no fence-before-open hook** — no `expected_epoch`, no
-  `skip_fence`, nothing in `Db::builder`. `build()` unconditionally claims a
-  new epoch.
+An authoritative lease is **not implementable** against SlateDB as it stands.
+The writer epoch is readable (`VersionedManifest::writer_epoch()` via
+`DbStatus.current_manifest`) and is already a CAS-backed monotonic lease — but it
+carries **no identity**, and there is **no fence-before-open hook** on
+`Db::builder`. `build()` claims a new epoch unconditionally. A lease object
+therefore cannot *prevent* anything, because SlateDB never consults it.
 
-The third point is decisive: a lease object cannot *prevent* anything, because
-SlateDB never consults it. It can only stop a node that already chose to check.
-That is advisory, whatever we call it.
+**3a** — after a *successful* promotion, and only then:
 
-| | What it buys | Cost |
-|---|---|---|
-| **3a** advisory record — write `{node_id, epoch}` after a successful promotion | the missing identity: observability, the `NotALeader` hint, the next incident's debugging | none on the write path; epoch stays sole authority |
-| **3b** advisory + precondition — `promote_writer` reads the lease and refuses if a different live node holds a ≥ epoch | nothing 3a doesn't | an object-store read on the write path, and it *still* cannot stop a buggy or partitioned node — worst of both |
-| **3c** genuinely authoritative — add `expected_writer_epoch` CAS-on-open to SlateDB, so `build()` fails instead of fencing | real mutual exclusion | changes the fencing contract `architecture.md` rests on; needs its own review and tests |
+```
+PUT <base>/_cell_writers/v1/<cell_id>
+    {"node_id":"graph-node-1","epoch":18,"at":"2026-07-25T14:32:07Z"}
+```
 
-Recommendation: **3a now, 3c as a separate RFC.** 3c is buildable —
-`slatedb` is our fork (`usecortex/slatedb`, pinned at `9f4d304`), so it is an
-RFC against a repo we control, not a wish.
+Read on exactly two paths, both off the write path: logging a
+`CloseReason::Fenced`, and building the `NotCellWriter { owner }` hint in touch
+point (c). **Never consulted to decide whether to promote** — that is
+rendezvous' job, and consulting it would be 3b, which is a read-then-act race
+that looks like it works.
 
-Said plainly: **3a does not deliver mutual exclusion.** Rendezvous plus the
-don't-promote rule in touch point (b) is what stops the ping-pong; the lease
-only records what happened. If exclusion is the actual goal, 3c is the only
-path and should be scoped now rather than discovered later.
+3b rejected: buys nothing 3a doesn't, adds a GET to the write path, still cannot
+stop a partitioned node.
 
-### 4. Deleting the `/readyz` probe path — STILL OPEN
+**3c (CAS-on-open in SlateDB) dropped**, not deferred. Three reasons: sleet runs
+this architecture at fleet scale with no CAS-on-open and converges, model-checked
+(`../sleet/specs/coordination.fizz`), and our design is *stricter* than sleet's —
+we check ownership on every promotion, sleet once at task spawn. Neither the fork
+nor upstream 0.14.1 has any epoch option on `DbBuilder`, so it is an upstream
+feature request that would gate a prod fix on a dependency change. And the
+incident's actual pain was diagnostic, not correctness.
 
-There are two independent consumers, previously conflated here.
+**Recorded so this is never re-read as a guarantee:** the SlateDB writer epoch
+remains the only authority. The record answers "who last successfully promoted",
+not "who holds the writer now". If it disagrees with the manifest, the manifest
+is right.
 
-**Keep, untouched** — the endpoint at `graph_node/admin.rs:48`, driven by the
-k8s `readinessProbe` on the admin port (`node-statefulset.yaml:118-120`,
-`indexer-deployment.yaml:96`, `multinode_k3s.sh:114`), plus
-`scripts/runtime_smoke.sh:51` and the bounded wait in the Jepsen harness. None
-of these touch routing.
+### 4. Deleting the `/readyz` client-side fan-out — YES, decided
+
+**Keep, untouched** — the endpoint at `graph_node/admin.rs:48` and every
+non-routing consumer: the k8s `readinessProbe` (`node-statefulset.yaml:118-120`,
+`indexer-deployment.yaml:96`, `multinode_k3s.sh:114`), `scripts/runtime_smoke.sh:51`,
+the bounded wait in the Jepsen harness.
 
 **Delete** — only the client-side fan-out inside the routing provider:
 `reachable_nodes`, `probe_node_readiness`, `replace_address_port`
-(`routing.rs:152-168, 196-218`).
+(`routing.rs:152-168, 196-218`). Also the `reachable.first()` writer fallback
+(`routing.rs:236-241`), which moves whenever a probe flaps and is half the
+instability.
 
-The catch: Bolt clients do **not** reach nodes through a k8s Service. They
-connect directly to pod addresses handed out by `GRAPH_BOLT_NODE_ADDRESSES`
-(`charts/turbolay/templates/configmap.yaml:44`), so k8s readiness does not gate
-Bolt traffic at all. That is precisely why `routing.rs` probes independently.
-Deleting the probe without replacing the signal would advertise unready nodes
-to drivers.
+The reason is consistency, not cost. The probe is computed **per caller**, so
+two drivers asking at the same instant can get different answers — and
+rendezvous only works if every node computes ownership from the *same* live set.
+One LIST gives that; N probes cannot.
 
-The replacement, which must not be skipped and folds into touch point (e): a
-node publishes its heartbeat **only while `AdminState.ready` is true**, and
-deletes it on graceful shutdown or when it goes unready. Readiness then
-propagates through the same channel as liveness.
+The catch that makes this non-obvious: Bolt clients do **not** reach nodes
+through a k8s Service. They connect directly to pod addresses from
+`GRAPH_BOLT_NODE_ADDRESSES` (`charts/turbolay/templates/configmap.yaml:44`), so
+k8s readiness gates no Bolt traffic at all. That is why `routing.rs` probes
+independently, and why deleting the probe alone would advertise unready nodes.
 
-One genuine regression: detecting a hard-crashed node goes from ~250 ms to up
-to `heartbeat_timeout`. Graceful cases stay immediate (heartbeat deleted).
-Since a heartbeat is one small object per node, tightening the §3 defaults from
-sleet's 10s/30s to roughly **2s interval / 6s timeout** buys most of that back.
+**The deletion and its replacement are one change, not two.** A node publishes
+its heartbeat *only while `AdminState.ready` is true*, and deletes it on graceful
+shutdown or when it goes unready:
 
-Recommendation: yes, delete the fan-out — **conditional** on moving readiness
-into heartbeat publication.
+```
+every heartbeat_interval:   ready?  -> PUT    <base>/_graph_nodes/v1/<id>
+                            not?    -> DELETE <base>/_graph_nodes/v1/<id>
+SIGTERM:                            -> DELETE <base>/_graph_nodes/v1/<id>, then drain
+```
+
+Readiness then propagates through the same channel as liveness. One accepted
+regression: a hard-crashed node goes from ~250 ms detection to up to
+`heartbeat_timeout` = 15s. Graceful restarts — the common case — stay immediate,
+because the node deletes its own heartbeat before exiting.
+
+### 5. Heartbeat interval and timeout — 5s / 15s, decided
+
+Config, with sleet's startup validation (`interval > 0`, `interval < timeout`,
+`../sleet/src/config.rs:1018-1024`) so a misconfiguration that would make every
+node permanently dead is rejected at startup rather than in production. This
+supersedes the 10s/30s in §3 and the 2s/6s floated there.
+
+| | value |
+|---|---|
+| worst-case dead-node detection (hard crash) | 15s |
+| graceful shutdown detection | immediate, via heartbeat DELETE |
+| placement convergence after a node dies | ~15s |
+| fence backoff in touch point (d) | 5s — one interval, per sleet |
+| heartbeat PUT cost, 3 nodes | ~52k/day, ~$8/month |
+
+15s partially absorbs a ~10s flap, which 6s would have churned on. If flapping
+still hurts, the fix is a minimum-tenure rule, not a longer timeout — §6
+follow-up, not built now.
+
+### 6. Fence handling must match sleet exactly
+
+Touch point (d) currently under-specifies this. Sleet's handler
+(`../sleet/src/daemon.rs:458-472`) does three things, and all three matter:
+
+1. **Resets `backoff` to 1s** rather than advancing the exponential ladder — a
+   fence is view skew, not a failure. Without this, repeated fences ride the
+   ladder to `MAX_BACKOFF` and a node that is merely converging looks dead.
+2. **Waits exactly one `heartbeat_interval`**, sized to give *the rival* time to
+   refresh its view and stand down (`daemon.rs:391-394`). Not a politeness delay.
+3. **Retries unconditionally**, without re-checking ownership. Sleet accepts that
+   a fenced node re-fences the winner once more before converging.
+
+### 7. Still open
+
+- **Q4 — build scope for the next pass.** Recommendation is all of Phase 1 in
+  seven staged commits. Note that decision 4 above **reorders the staging**: (a)
+  deletes the probe, so it cannot function until heartbeats are published, which
+  means the publisher must ship in an earlier commit than the routing change.
+  Otherwise a partially-upgraded fleet has new nodes computing ownership over a
+  live set that omits every old node.
+- **A failed node LIST — shed ownership or keep it?** Sleet keeps assignments
+  (`daemon.rs:243`). For a writer that is an unbounded duel, because a
+  partitioned node can never learn it lost. Proposal is to shed: refuse
+  promotion, return `NotCellWriter` with no owner hint. The one place this design
+  must diverge from its reference implementation.
+- **Does `with_preferred_writer_node` survive?** Proposal is yes, as an explicit
+  override above rendezvous — tests and single-node deploys — validating the id
+  against the address map so it fails closed.
