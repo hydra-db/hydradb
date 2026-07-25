@@ -1,9 +1,9 @@
 //! Build script for `slatedb-graph-kernel`.
 //!
-//! Its only job is to teach the linker where SuiteSparse:GraphBLAS lives when the
-//! `graphblas` feature is enabled (which it now is by default). Without this, a
-//! Homebrew install on macOS fails with `ld: library 'graphblas' not found`
-//! unless every developer exports `RUSTFLAGS="-L /opt/homebrew/lib"` by hand.
+//! Its only job is to teach the linker where SuiteSparse:GraphBLAS lives.
+//! Without this, a Homebrew install on macOS fails with
+//! `ld: library 'graphblas' not found` unless every developer exports
+//! `RUSTFLAGS="-L /opt/homebrew/lib"` by hand.
 //!
 //! Resolution order (first hit wins):
 //!   1. `GRAPHBLAS_LIB_DIR` — explicit override, also used by the docs in
@@ -17,7 +17,8 @@
 //! needed and emitting a bogus one would only add noise.
 //!
 //! The library name itself is declared by `#[link(name = "graphblas")]` in
-//! `src/sparse_kernel.rs`; this script deliberately only contributes search paths.
+//! `src/sparse_kernel/graphblas.rs`; this script deliberately only contributes
+//! search paths.
 
 use std::path::Path;
 use std::process::Command;
@@ -25,11 +26,6 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=GRAPHBLAS_LIB_DIR");
-
-    // Cargo sets CARGO_FEATURE_<NAME> for every enabled feature.
-    if std::env::var_os("CARGO_FEATURE_GRAPHBLAS").is_none() {
-        return;
-    }
 
     for dir in graphblas_link_search_paths() {
         println!("cargo:rustc-link-search=native={dir}");
