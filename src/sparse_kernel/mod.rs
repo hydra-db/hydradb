@@ -1,3 +1,61 @@
+//! Sparse traversal kernels.
+//!
+//! Three kernels live behind this module. They are *not* two backends with a
+//! feature flag between them — they form a ladder, where each rung adds
+//! capability and setup cost:
+//!
+//! | # | Kernel | Where | Representation | Compiled? |
+//! |---|--------|-------|----------------|-----------|
+//! | 1 | Adjacency BFS | [`expand_rust`] in this file | `BTreeMap<VertexId, BTreeSet<VertexId>>` | no |
+//! | 2 | Compact CSC BFS | `graphblas::CompiledCompactCscMatrix` | flat `u32`/`u64` CSC + `seen` bitmap | yes |
+//! | 3 | SuiteSparse GraphBLAS | `graphblas::expand_with_compiled` | `GrB_Matrix`, traversal is a masked `GrB_mxv` | yes |
+//!
+//! Kernel 2 contains no C. It lives in `graphblas.rs` because it shares that
+//! module's compiled-matrix representation, not because it needs SuiteSparse.
+//!
+//! # Capability surface
+//!
+//! All three agree on results — the cross-kernel equivalence tests at the
+//! bottom of this file assert kernel 1 and kernel 3 return identical vertex
+//! sets. They do *not* agree on which operations exist:
+//!
+//! | Operation | 1 Adjacency | 2 Compact CSC | 3 SuiteSparse |
+//! |-----------|-------------|---------------|---------------|
+//! | `expand` (fixed hops) | yes | yes | yes |
+//! | `expand_range` (min..max hops) | yes | yes | yes |
+//! | `expand_range_count` (count pushdown) | no | yes | yes |
+//! | `expand_range_window` (skip/limit pushdown) | no | yes | yes |
+//! | `contains_edge` | no | yes | yes |
+//! | Precompiled, cached per epoch | no | yes | yes |
+//!
+//! Kernel 1 is therefore a strict subset. When the compiled path is
+//! unavailable it returns `None` and callers fall through to kernel 1 (see
+//! `shard::query`, counted by `query_rust_sparse_fallbacks`) — which is a
+//! capability downgrade, not merely a slower path: counts and windows must be
+//! answered by materialising the full vertex set and trimming afterwards.
+//!
+//! # Cost model
+//!
+//! - **Kernel 1** allocates per frontier node and chases pointers through
+//!   B-trees. No setup cost, works on whatever adjacency was hydrated.
+//! - **Kernel 2** is the same algorithm over flat arrays. Needs a CSC build
+//!   step, which is cheap and cacheable.
+//! - **Kernel 3** folds "expand and exclude already-seen" into one masked
+//!   `mxv`. It pays for a C dependency and, because a `GrB_Matrix` is not
+//!   thread-safe, keeps up to four replicas of hot matrices
+//!   (`graphblas_replica_count`) — a memory multiplier kernel 2 does not pay.
+//!   Note that the descriptor built by `exact_count_descriptor` defaults to a
+//!   single thread, so kernel 3's advantage rests on `mxv` efficiency rather
+//!   than on parallelism.
+//!
+//! # Selecting a kernel
+//!
+//! The choice is resolved once, at matrix-compile time, and baked into the
+//! compiled artifact; downstream code asks the artifact what it is rather than
+//! re-reading configuration. Keeping that invariant is what makes the kernel
+//! set cheap to extend — adding a rung to the ladder should not require
+//! touching call sites.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{Result, VertexId};
