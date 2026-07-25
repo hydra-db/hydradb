@@ -41,6 +41,12 @@ tags:
 ---
 ```
 
+A plan that rests on prior analysis opens with a **Sources** section naming the
+files that hold it — design notes under `interactive/`, memory entries, and the
+exact paths in any reference repo (`../sleet`, `../tidb-master`). Name the file
+and what it holds, not just the repo, so the next session reads instead of
+re-deriving.
+
 `docs/plans/2026-07-25-sparse-kernel-backend-consolidation.md` is the reference
 example. `optimisation-phases.md` predates the convention and does not conform;
 leave it unless asked, since `build.rs:10` references it by name.
