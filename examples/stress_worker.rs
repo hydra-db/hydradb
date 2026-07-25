@@ -463,9 +463,10 @@ fn graph_open_options() -> GraphOpenOptions {
         Ok(value) if value.eq_ignore_ascii_case("outbound-only") => GraphIndexPolicy::OutboundOnly,
         _ => GraphIndexPolicy::default(),
     };
-    GraphOpenOptions {
-        index_policy,
-        ..Default::default()
+    {
+        let mut options = GraphOpenOptions::default();
+        options.index_policy = index_policy;
+        options
     }
 }
 

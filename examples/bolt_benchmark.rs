@@ -529,8 +529,9 @@ async fn open_environment(
 
 fn graph_options(fanout: u64, max_hop: u8, cache_dir: std::path::PathBuf) -> GraphOpenOptions {
     let edges = fanout.saturating_mul(u64::from(max_hop));
-    GraphOpenOptions {
-        limits: GraphLimits {
+    {
+        let mut options = GraphOpenOptions::default();
+        options.limits = GraphLimits {
             max_bulk_import_edges: usize::try_from(edges.saturating_add(1_000))
                 .unwrap_or(usize::MAX),
             max_artifact_source_epochs: u64::MAX,
@@ -544,22 +545,24 @@ fn graph_options(fanout: u64, max_hop: u8, cache_dir: std::path::PathBuf) -> Gra
                 .unwrap_or(usize::MAX),
             max_query_scan_edges: edges.saturating_mul(u64::from(max_hop)).max(1),
             max_query_runtime_ms: Some(120_000),
-        },
-        cache: GraphCacheConfig::disk_cache_without_preload(cache_dir, 2 * 1024 * 1024 * 1024),
-        cache_policy: GraphCachePolicy {
-            max_matrix_adjacencies: 0,
-            max_graphblas_matrices: 1,
-            max_entries_per_cell: None,
-            pin_matrix_min_edges: 0,
-            max_concurrent_hydrations: 32,
-            ..Default::default()
-        },
-        backpressure_policy: GraphBackpressurePolicy {
+        };
+        options.cache =
+            GraphCacheConfig::disk_cache_without_preload(cache_dir, 2 * 1024 * 1024 * 1024);
+        options.cache_policy = {
+            let mut cache_policy = GraphCachePolicy::default();
+            cache_policy.max_matrix_adjacencies = 0;
+            cache_policy.max_graphblas_matrices = 1;
+            cache_policy.max_entries_per_cell = None;
+            cache_policy.pin_matrix_min_edges = 0;
+            cache_policy.max_concurrent_hydrations = 32;
+            cache_policy
+        };
+        options.backpressure_policy = GraphBackpressurePolicy {
             max_concurrent_graph_writes: 1,
             ..Default::default()
-        },
-        index_policy: GraphIndexPolicy::Full,
-        ..Default::default()
+        };
+        options.index_policy = GraphIndexPolicy::Full;
+        options
     }
 }
 

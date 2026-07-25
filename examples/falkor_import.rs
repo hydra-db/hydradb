@@ -33,8 +33,9 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|cache_dir| GraphCacheConfig::disk_cache(cache_dir, config.cache_bytes))
         .unwrap_or_default();
-    let options = GraphOpenOptions {
-        limits: GraphLimits {
+    let options = {
+        let mut options = GraphOpenOptions::default();
+        options.limits = GraphLimits {
             max_bulk_import_edges: config
                 .edge_batch_size
                 .max(config.metadata_batch_size)
@@ -43,9 +44,9 @@ async fn main() -> Result<()> {
             max_query_scan_edges: source.edge_count.max(1),
             max_query_index_candidates: manifest_node_count.max(manifest_edge_count).max(1),
             ..GraphLimits::default()
-        },
-        cache,
-        ..GraphOpenOptions::default()
+        };
+        options.cache = cache;
+        options
     };
 
     let shard = GraphShard::open_standalone_writer_with_options(

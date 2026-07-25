@@ -51,11 +51,11 @@
 //! # Selecting a kernel
 //!
 //! One 3-valued enum, [`SparseKernelBackend`], names the rungs. It is carried
-//! by `GraphCachePolicy::sparse_kernel` (default [`SparseKernelBackend::SuiteSparse`],
-//! parsed from `GRAPH_SPARSE_KERNEL` in `bin/graph_node/config.rs`), and
-//! [`default_matrix_kernel`] resolves the policy into the kernel a shard should
-//! use. The legacy `GRAPH_COMPILED_KERNEL=compact` environment override still
-//! applies, but only while the policy is left at its default.
+//! by `GraphCachePolicy::sparse_kernel`, parsed from `GRAPH_SPARSE_KERNEL` in
+//! `bin/graph_node/config.rs`, and [`default_matrix_kernel`] is a pure read of
+//! that field. The legacy `GRAPH_COMPILED_KERNEL=compact` override supplies the
+//! field's *default value* only (see [`env_default_kernel`]), so an explicit
+//! policy always outranks it and no traversal re-reads the environment.
 //!
 //! The choice is resolved once, at matrix-compile time, and baked into the
 //! compiled artifact: `CompiledGraphBlasMatrix` stores the resolved
@@ -67,10 +67,14 @@
 //! Kernel 1 has no compiled form, so `SparseKernelBackend::Adjacency` is
 //! enforced by *skipping* compilation: the artifact builders do not build a
 //! matrix and `shard::query` returns `None`, which routes to the existing
-//! `None`-fallthrough.
+//! `None`-fallthrough. It is a ceiling rather than a preference —
+//! `matrix_reachable_with_kernel` clamps its kernel argument against the policy,
+//! or a caller asking for a compiled rung would compile one anyway.
 //!
 //! Every traversal reports the rung that actually executed on
-//! `SparseTraversal::backend`, so telemetry can tell compiled from uncompiled.
+//! `SparseTraversal::backend`. Note that `shard::query` currently discards it,
+//! so the Cypher path still cannot distinguish kernel 2 from kernel 3; only the
+//! `matrix_reachable*` API surfaces it, via `MatrixTraversalResult`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -140,7 +144,12 @@ impl GraphBlasCsc {
 }
 
 /// The three rungs of the kernel ladder described in the module docs.
+///
+/// Non-exhaustive: the ladder is designed to grow, and the whole point of the
+/// consolidation is that adding a rung should not require touching call sites.
+/// Downstream `match`es therefore need a wildcard arm.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SparseKernelBackend {
     /// Kernel 1: adjacency BFS over `BTreeMap`/`BTreeSet`. Never compiled.
     Adjacency,

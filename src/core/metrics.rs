@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine;
 use crate::SparseKernelBackend;
+/// Non-exhaustive; see [`crate::GraphOpenOptions`] for the construction pattern.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct GraphCachePolicy {
     pub max_matrix_artifacts: usize,
     pub max_matrix_adjacencies: usize,

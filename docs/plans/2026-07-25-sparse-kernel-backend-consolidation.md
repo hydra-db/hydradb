@@ -189,6 +189,38 @@ The trait must **not** span kernel 1. It lacks count, window, `contains_edge`
 and caching entirely, so a trait over all three would be half `Option`-returning
 stubs. Kernel 1 stays the `None`-fallthrough lane.
 
+## Breaking changes
+
+Step 2 changed the public API twice. Both are recorded here because the crate
+has no changelog and `publish = false` is not a licence to break embedders
+silently.
+
+| Break | Migration |
+|---|---|
+| `SparseKernelBackend::RustSparse` → `Adjacency` | rename; note the old name covered *both* uncompiled and compiled-Rust traversals, so check whether a use site meant `CompactCsc` |
+| `SparseKernelBackend::SuiteSparseGraphBlas` → `SuiteSparse` | rename |
+| `SparseKernelBackend` is now `#[non_exhaustive]` | downstream `match`es need a wildcard arm |
+| `GraphCachePolicy` gained `sparse_kernel`, and both it and `GraphOpenOptions` are now `#[non_exhaustive]` | construct from `default()` and assign fields; every field stays `pub` |
+
+The `#[non_exhaustive]` markers are the point: they are a one-time break that
+makes every *future* field or rung addition non-breaking. The enum in particular
+is designed to grow — the whole goal of the consolidation is that adding a rung
+should not require touching call sites, and that promise cannot hold if adding a
+variant breaks every downstream `match`.
+
+The canary test at `core/config.rs` was renamed to
+`public_options_stay_constructible_without_exhaustive_literals` and now pins the
+*supported* construction pattern. The previous version asserted that exhaustive
+struct literals compile, which meant every added field forced an edit to the very
+test meant to flag that addition — as happened in `c0e3d83`. The new version does
+not need editing when a field is added; if it ever does, the change broke
+embedders and that is the thing to reconsider.
+
+Examples and `graph-node` compile as separate crates against the library, so they
+act as a live conformance check for exactly this: all ten construction sites were
+migrated to the `default()`-and-assign pattern. Clippy exempts `#[non_exhaustive]`
+types from `field_reassign_with_default`, so the pattern is warning-clean.
+
 ## Open items
 
 - `docs/plans/optimisation-phases.md` still references `--features graphblas` in

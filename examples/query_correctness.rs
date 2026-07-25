@@ -481,8 +481,9 @@ fn page_slice(vertices: &[u64], skip: usize, limit: usize) -> Vec<u64> {
 fn graph_options(cache_dir: Option<&Path>, fanout: u64, max_hop: u8) -> GraphOpenOptions {
     let edges = layered_edge_count(fanout, max_hop);
     let query_rows = edges.saturating_add(fanout).saturating_add(1_024);
-    GraphOpenOptions {
-        limits: GraphLimits {
+    {
+        let mut options = GraphOpenOptions::default();
+        options.limits = GraphLimits {
             max_bulk_import_edges: usize::try_from(edges).unwrap_or(usize::MAX).max(1),
             max_artifact_source_epochs: u64::MAX,
             max_traversal_hops: max_hop,
@@ -492,18 +493,19 @@ fn graph_options(cache_dir: Option<&Path>, fanout: u64, max_hop: u8) -> GraphOpe
             max_query_index_candidates: usize::try_from(query_rows).unwrap_or(usize::MAX),
             max_query_scan_edges: edges.saturating_mul(u64::from(max_hop).max(1)).max(1),
             max_query_runtime_ms: Some(env_u64("GRAPH_QUERY_CORRECTNESS_TIMEOUT_MS", 120_000)),
-        },
-        cache: cache_dir
+        };
+        options.cache = cache_dir
             .map(|path| GraphCacheConfig::disk_cache_without_preload(path, 512 * 1024 * 1024))
-            .unwrap_or_default(),
-        cache_policy: GraphCachePolicy {
-            max_matrix_adjacencies: 8,
-            max_graphblas_matrices: 8,
-            max_entries_per_cell: None,
-            max_concurrent_hydrations: 16,
-            ..Default::default()
-        },
-        ..Default::default()
+            .unwrap_or_default();
+        options.cache_policy = {
+            let mut cache_policy = GraphCachePolicy::default();
+            cache_policy.max_matrix_adjacencies = 8;
+            cache_policy.max_graphblas_matrices = 8;
+            cache_policy.max_entries_per_cell = None;
+            cache_policy.max_concurrent_hydrations = 16;
+            cache_policy
+        };
+        options
     }
 }
 

@@ -191,13 +191,14 @@ fn graph_options(
     let cache = cache_dir
         .map(|cache_dir| GraphCacheConfig::disk_cache(cache_dir, cache_bytes))
         .unwrap_or_default();
-    GraphOpenOptions {
-        cache,
-        limits: GraphLimits {
+    {
+        let mut options = GraphOpenOptions::default();
+        options.cache = cache;
+        options.limits = GraphLimits {
             max_query_runtime_ms: query_timeout_ms,
             ..GraphLimits::default()
-        },
-        ..GraphOpenOptions::default()
+        };
+        options
     }
 }
 

@@ -353,19 +353,18 @@ fn writer_options(
     await_durable_writes: bool,
     index_policy: GraphIndexPolicy,
 ) -> GraphOpenOptions {
-    GraphOpenOptions {
-        limits: GraphLimits {
-            max_bulk_import_edges: usize::try_from(max_edges).unwrap_or(usize::MAX),
-            max_artifact_source_epochs: u64::MAX,
-            max_artifact_build_edges: u64::MAX,
-            ..Default::default()
-        },
-        cache: GraphCacheConfig::disk_cache_without_preload(cache_dir, cache_bytes),
-        durability: GraphDurabilityConfig::low_latency_durable(wal_flush_interval_ms)
-            .with_await_durable_writes(await_durable_writes),
-        index_policy,
+    let mut options = GraphOpenOptions::default();
+    options.limits = GraphLimits {
+        max_bulk_import_edges: usize::try_from(max_edges).unwrap_or(usize::MAX),
+        max_artifact_source_epochs: u64::MAX,
+        max_artifact_build_edges: u64::MAX,
         ..Default::default()
-    }
+    };
+    options.cache = GraphCacheConfig::disk_cache_without_preload(cache_dir, cache_bytes);
+    options.durability = GraphDurabilityConfig::low_latency_durable(wal_flush_interval_ms)
+        .with_await_durable_writes(await_durable_writes);
+    options.index_policy = index_policy;
+    options
 }
 
 fn parse_index_policy(value: &str) -> ProfileResult<GraphIndexPolicy> {
