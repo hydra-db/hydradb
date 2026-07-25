@@ -219,27 +219,28 @@ impl RuntimeConfig {
     }
 
     pub fn graph_open_options(&self) -> GraphOpenOptions {
-        GraphOpenOptions {
-            limits: GraphLimits {
-                max_query_scan_edges: self.max_query_scan_edges,
-                max_query_runtime_ms: Some(self.max_query_runtime_ms),
-                ..GraphLimits::default()
-            },
-            cache: GraphCacheConfig::disk_cache_without_preload(
-                &self.data_cache_dir,
-                self.data_cache_bytes,
-            ),
-            durability: GraphDurabilityConfig::default(),
-            cache_policy: GraphCachePolicy {
-                max_matrix_adjacencies: self.max_matrix_adjacencies,
-                max_graphblas_matrices: self.max_graphblas_matrices,
-                max_concurrent_hydrations: self.max_concurrent_hydrations,
-                sparse_kernel: self.sparse_kernel,
-                ..GraphCachePolicy::default()
-            },
-            backpressure_policy: GraphBackpressurePolicy::default(),
-            index_policy: GraphIndexPolicy::Full,
-        }
+        let mut options = GraphOpenOptions::default();
+        options.limits = GraphLimits {
+            max_query_scan_edges: self.max_query_scan_edges,
+            max_query_runtime_ms: Some(self.max_query_runtime_ms),
+            ..GraphLimits::default()
+        };
+        options.cache = GraphCacheConfig::disk_cache_without_preload(
+            &self.data_cache_dir,
+            self.data_cache_bytes,
+        );
+        options.durability = GraphDurabilityConfig::default();
+        options.cache_policy = {
+            let mut cache_policy = GraphCachePolicy::default();
+            cache_policy.max_matrix_adjacencies = self.max_matrix_adjacencies;
+            cache_policy.max_graphblas_matrices = self.max_graphblas_matrices;
+            cache_policy.max_concurrent_hydrations = self.max_concurrent_hydrations;
+            cache_policy.sparse_kernel = self.sparse_kernel;
+            cache_policy
+        };
+        options.backpressure_policy = GraphBackpressurePolicy::default();
+        options.index_policy = GraphIndexPolicy::Full;
+        options
     }
 
     pub fn graph_memory_config(&self) -> GraphMemoryConfig {

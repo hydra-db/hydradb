@@ -130,7 +130,12 @@ impl GraphCacheConfig {
     }
 }
 
+/// Non-exhaustive: construct with [`Default::default`] and assign the fields you
+/// care about. Every field stays `pub`, so nothing is hidden — but embedders may
+/// not use an exhaustive struct literal, which is what lets this crate add
+/// options without breaking them.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct GraphOpenOptions {
     pub limits: GraphLimits,
     pub cache: GraphCacheConfig,
@@ -394,31 +399,35 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    /// `GraphOpenOptions` and `GraphCachePolicy` are `#[non_exhaustive]`, so
+    /// embedders construct them from `default()` and assign what they need.
+    /// That is deliberate: it is what lets this crate add an option without
+    /// breaking every downstream struct literal.
+    ///
+    /// This test pins the supported shape. It does **not** need editing when a
+    /// field is added — if it ever does, the field was added in a way that
+    /// breaks embedders, and that is the thing to reconsider.
+    // `#[non_exhaustive]` is inert inside the defining crate, so clippy still
+    // suggests the struct literal here. Embedders cannot use one, which is the
+    // whole point of the test.
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
-    fn existing_public_option_literals_remain_source_compatible() {
-        let cache_policy = GraphCachePolicy {
-            max_matrix_artifacts: 1,
-            max_matrix_adjacencies: 1,
-            max_graphblas_matrices: 1,
-            sparse_kernel: crate::SparseKernelBackend::SuiteSparse,
-            #[cfg(feature = "opencypher")]
-            max_parsed_row_queries: 1,
-            #[cfg(feature = "opencypher")]
-            #[cfg(feature = "opencypher")]
-            max_relationship_row_sets: 1,
-            #[cfg(feature = "opencypher")]
-            max_relationship_property_row_sets: 1,
-            max_entries_per_cell: Some(1),
-            pin_matrix_min_edges: 1,
-            max_concurrent_hydrations: 1,
-        };
-        let _options = GraphOpenOptions {
-            limits: GraphLimits::default(),
-            cache: GraphCacheConfig::default(),
-            durability: GraphDurabilityConfig::default(),
-            cache_policy,
-            backpressure_policy: GraphBackpressurePolicy::default(),
-            index_policy: GraphIndexPolicy::default(),
-        };
+    fn public_options_stay_constructible_without_exhaustive_literals() {
+        let mut cache_policy = GraphCachePolicy::default();
+        cache_policy.max_matrix_artifacts = 1;
+        cache_policy.max_graphblas_matrices = 1;
+        cache_policy.sparse_kernel = crate::SparseKernelBackend::Adjacency;
+
+        let mut options = GraphOpenOptions::default();
+        options.limits = GraphLimits::default();
+        options.cache_policy = cache_policy.clone();
+        options.index_policy = GraphIndexPolicy::default();
+
+        // Every field stays `pub`: nothing is hidden, only the literal is.
+        assert_eq!(options.cache_policy, cache_policy);
+        assert_eq!(
+            options.cache_policy.sparse_kernel,
+            crate::SparseKernelBackend::Adjacency
+        );
     }
 }

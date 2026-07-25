@@ -152,10 +152,9 @@ fn load_object_store(value: &str) -> Result<Arc<dyn ObjectStore>> {
 }
 
 fn graph_options() -> GraphOpenOptions {
-    GraphOpenOptions {
-        index_policy: GraphIndexPolicy::OutboundOnly,
-        ..Default::default()
-    }
+    let mut options = GraphOpenOptions::default();
+    options.index_policy = GraphIndexPolicy::OutboundOnly;
+    options
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {

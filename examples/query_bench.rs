@@ -857,8 +857,9 @@ fn graph_options(
     let query_rows = edges.saturating_add(fanout).saturating_add(1_024);
     let max_matrix_adjacencies = env_usize("GRAPH_QUERY_BENCH_MAX_MATRIX_ADJACENCIES", 0);
     let max_graphblas_matrices = env_usize("GRAPH_QUERY_BENCH_MAX_GRAPHBLAS_MATRICES", 1);
-    GraphOpenOptions {
-        limits: GraphLimits {
+    {
+        let mut options = GraphOpenOptions::default();
+        options.limits = GraphLimits {
             max_bulk_import_edges: usize::try_from(edges).unwrap_or(usize::MAX).max(1),
             max_artifact_source_epochs: u64::MAX,
             max_traversal_hops: max_hop,
@@ -868,21 +869,22 @@ fn graph_options(
             max_query_index_candidates: usize::try_from(query_rows).unwrap_or(usize::MAX),
             max_query_scan_edges: edges.saturating_mul(u64::from(max_hop).max(1)).max(1),
             max_query_runtime_ms: Some(env_u64("GRAPH_QUERY_BENCH_QUERY_TIMEOUT_MS", 120_000)),
-        },
-        cache: cache_dir
+        };
+        options.cache = cache_dir
             .filter(|_| cache_bytes > 0)
             .map(|path| GraphCacheConfig::disk_cache_without_preload(path, cache_bytes))
-            .unwrap_or_else(GraphCacheConfig::disabled),
-        cache_policy: GraphCachePolicy {
-            max_matrix_adjacencies,
-            max_graphblas_matrices,
-            max_entries_per_cell: None,
-            pin_matrix_min_edges: 50_000,
-            max_concurrent_hydrations: 32,
-            ..Default::default()
-        },
-        index_policy,
-        ..GraphOpenOptions::default()
+            .unwrap_or_else(GraphCacheConfig::disabled);
+        options.cache_policy = {
+            let mut cache_policy = GraphCachePolicy::default();
+            cache_policy.max_matrix_adjacencies = max_matrix_adjacencies;
+            cache_policy.max_graphblas_matrices = max_graphblas_matrices;
+            cache_policy.max_entries_per_cell = None;
+            cache_policy.pin_matrix_min_edges = 50_000;
+            cache_policy.max_concurrent_hydrations = 32;
+            cache_policy
+        };
+        options.index_policy = index_policy;
+        options
     }
 }
 
