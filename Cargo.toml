@@ -21,7 +21,12 @@ axum-server = { version = "0.8.0", default-features = false, features = ["tls-ru
 base64 = "0.22"
 boltr = "0.2.0"
 bytes = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# `serde` is declared rather than inherited. It does arrive anyway through
+# feature unification with `object_store`, but placement's heartbeat body
+# derives Serialize/Deserialize on a `DateTime<Utc>`, and a dependency that
+# compiles only because something else happens to turn a feature on breaks the
+# day that something else stops.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures = "0.3"
 libcypher-parser-sys = "0.6.1-1"
 rcgen = "0.13"

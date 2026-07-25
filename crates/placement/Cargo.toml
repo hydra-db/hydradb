@@ -27,5 +27,11 @@ serde_json = { workspace = true }
 slatedb = { workspace = true }
 thiserror = { workspace = true }
 
+# `async-trait` is a dev-dependency and must stay one. `ObjectStore` is an
+# `#[async_trait]` trait, so the only thing in this crate that needs the macro is
+# the `#[cfg(test)]` `FaultStore`; written by hand instead, its five async
+# methods cost ~30 lines of `'life0`/`'async_trait` bounds that cannot be elided
+# (E0195, late-bound vs early-bound). None of it ships.
 [dev-dependencies]
+async-trait = { workspace = true }
 tokio = { workspace = true }
