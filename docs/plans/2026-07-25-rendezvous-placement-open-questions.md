@@ -17,18 +17,16 @@ tags:
 Companion to `docs/plans/2026-07-25-rendezvous-placement.md`. That plan's §1 and
 §2 landed in `7b0d340`; §3–§5 are blocked on the four answers below.
 
-**Status: Q1, Q2 and Q3 settled. Q4 still open.**
+**Status: Q1–Q4 settled. One smaller decision left.**
 
 | | Question | Answer |
 |---|---|---|
 | Q1 | Lease shape | **3a** — advisory record, observability only. 3c dropped; sleet shows it is not needed and neither slatedb tree can reach it. |
 | Q2 | Delete the `/readyz` fan-out | **Option 1** — delete the client-side fan-out, gate heartbeat publication on `AdminState.ready`. One change, not two. |
 | Q3 | Heartbeat interval / timeout | **5s / 15s**, config with validation |
-| Q4 | Build scope for the next pass | open |
-
-Two smaller things surfaced by Q1 and Q2 and not yet agreed, carried at the end
-of this file: **what a failed node LIST does to ownership**, and **whether
-`with_preferred_writer_node` survives**.
+| Q4 | Build scope for the next pass | **All of Phase 1, one release**, seven staged commits |
+| A | Failed node LIST | **Bounded** — keep the last good view for `heartbeat_timeout`, then go unready and shed |
+| B | `with_preferred_writer_node` | **open** — recommendation changed to *delete*, see the end of this file |
 
 **How to use this file.** Each question has a `### Your answer` block at the
 end. Write there — free text is fine, you do not have to pick one of the listed
@@ -955,16 +953,37 @@ that matter are isolated, and the last one is the incident reproduced as a test.
 
 ### Your answer
 
-<!-- write here -->
+> we will ship Q1–Q4 in prod, in one go
+
+**Decided: all of Phase 1, one release.** The seven commits above stay as the
+*commit* structure — they keep the review legible and each one separately
+revertable — but they ship together. No intermediate version reaches prod.
+
+That removes most of the rolling-upgrade hazard, but not all of it: **a rolling
+restart still passes through a mixed-version window**, because pods are replaced
+one at a time. For the minutes it takes, an upgraded node LISTs
+`_graph_nodes/v1/` and sees only the pods already upgraded.
+
+The cheap mitigation, and the reason `directory.rs` is specified as *configured
+membership ∩ fresh heartbeats* rather than heartbeats alone: for the first
+`heartbeat_timeout` after process start, treat a configured peer that has **never
+published a heartbeat** as live rather than dead. Never-seen and expired are
+different states, and only the second is evidence of death. A node that has never
+published is either starting up or running an older build; assuming it dead is
+the assumption that causes the bad case, and assuming it live degrades to exactly
+today's behaviour. After the grace window, absence means dead as normal.
+
+This costs one timestamp in `directory.rs` and removes the only way the rollout
+itself can make prod worse.
 
 ---
 
-## Carried over — two smaller decisions, not yet agreed
+## Carried over — two smaller decisions
 
 Both surfaced while answering Q1 and Q2. Neither blocks starting on §3, but both
 must be settled before commit 4.
 
-### A. A failed node LIST — shed ownership, or keep it?
+### A. A failed node LIST — DECIDED: bounded grace, then shed
 
 Sleet keeps its current assignments when the LIST fails (`daemon.rs:243`,
 `warn!("failed to LIST nodes/: {e}; keeping current assignments")`). For a
@@ -974,23 +993,132 @@ ownership, so it re-promotes forever against a node that believes it won. There
 is no convergence, because convergence requires both views to update and one of
 them cannot.
 
-Proposal: **shed.** If we cannot read the live set we cannot claim to own
-anything — refuse promotion, return `NotCellWriter` with no owner hint. This
-deliberately trades availability for the bound, and it is the one place this
-design must diverge from its reference implementation.
+Shedding on the first failed LIST is the other extreme, and it is too brittle —
+a single throttled or 503-ing LIST would drop a healthy writer.
 
-The counter-argument worth stating: a node partitioned from the object store
-cannot write to SlateDB either, so shedding may be moot in the common case. It is
-not moot for a *partial* failure — LIST throttled or 503-ing while writes still
-succeed — which is the case the rule exists for.
+**Decided: keep the last good view for a bounded grace period, then shed.**
 
-### B. Does `with_preferred_writer_node` survive?
+```
+grace = heartbeat_timeout  (15s)
 
-Proposal: **keep it as an explicit override above rendezvous.** Useful for tests
-and single-node deploys, and it fails closed by validating the id against the
-address map. What must go either way is the `reachable.first()` fallback beneath
-it (`routing.rs:236-241`) — that fallback moves whenever a probe flaps and is
-half the instability Q2 is deleting.
+now - last_successful_list <= grace
+    -> serve the cached live set; ownership decisions proceed normally
+    -> keep retrying the LIST with backoff
+
+now - last_successful_list >  grace
+    -> go unready: stop publishing, DELETE the heartbeat
+    -> refuse promotion: NotCellWriter with no owner hint
+```
+
+**Why the grace is exactly `heartbeat_timeout`, and not a new knob.** Peers take
+over `heartbeat_timeout` after my last successful PUT. In the common partition
+LIST and PUT fail together, so anchoring my grace to the same number makes the
+two coincide:
+
+| grace vs timeout | what happens |
+|---|---|
+| grace < timeout | I shed at `grace`, peers take over at `timeout` — a gap of `timeout - grace` where **nobody owns the cell** and writes are refused |
+| grace > timeout | peers take over at `timeout`, I still believe I own until `grace` — a **duel** of `grace - timeout` |
+| **grace = timeout** | they coincide; overlap and gap are both ≈ 0 |
+
+Any other value buys a gap or a duel in exchange for nothing.
+
+**Shedding and going unready are the same act, and that is what closes the last
+hole.** Consider the partial failure this rule exists for — LIST throttled while
+PUTs still succeed:
+
+```
+without withdrawing the heartbeat:
+  my heartbeat stays fresh -> peers compute ME as the owner -> they route writes to me
+  I have shed -> I refuse every one of them
+  -> the cell is permanently unwritable, and nothing times out to fix it
+```
+
+Withdrawing the heartbeat on shed makes peers time me out and take over. It also
+falls straight out of Q2's readiness gating — a node that cannot read the live
+set is not ready, and `AdminState.ready` already controls publication. No new
+mechanism.
+
+Worst case unavailability for the cell: `grace` (15s) + peer detection —
+immediate if the DELETE lands, another `heartbeat_timeout` if the store is fully
+unreachable. So **≤ 30s**, bounded either way, versus unbounded under sleet's
+rule.
+
+Two implementation notes. `last_successful_list` is a monotonic local `Instant`
+measuring *elapsed duration*, never compared across nodes — the cross-node
+comparison stays on object-storage `LastModified`, per sleet. And an **empty**
+LIST result is not a failed LIST: it is a valid answer meaning nobody published.
+It cannot arise in practice on the placement path because a node always counts
+itself live, but the two must not share a code path.
+
+### B. Does `with_preferred_writer_node` survive? — STILL OPEN, answer changed
+
+I proposed keeping it as an override above rendezvous. **Having read the code, I
+now think that is wrong, and both of the reasons I gave for it are false.**
+
+**What it actually is.** A builder method on the routing provider
+(`routing.rs:134-142`) that sets one field, validated against the address map so
+it fails closed. It has **one caller in the entire tree, and that caller is a
+test** (`bolt/tests.rs:1373`). `graph-node.rs:115-116` builds the provider with
+`new(...).with_readiness_port(...)` and never calls it. There is no env var, no
+chart value, no config field.
+
+So in production the field is always its default (`routing.rs:76-80`):
+
+```rust
+let preferred_writer_node = addresses.keys().next().expect("non-empty address map").clone();
+```
+
+The **lexicographically first node id in a `BTreeMap`** — `graph-node-0`. Not a
+preference anyone expressed. It is a tie-break that happens to be stable, and
+then `reachable.first()` moves it whenever a probe flaps.
+
+**Why both of my justifications were wrong.**
+
+*Single-node deploys.* With one live node, rendezvous returns that node for every
+cell — `owner()` over a one-element live set has exactly one answer. There is
+nothing to override.
+
+*Tests.* Rendezvous is deterministic and pure, so a test computes the owner
+rather than pinning it. `write-routing-placement.html` already does precisely
+this in its heartbeat widget: it uses `cell-b` because `cell-b`'s rendezvous
+owner over those three nodes really is `graph-node-1`, computed rather than
+asserted. A pinned override would let a test pass while `rank` ignored the score
+entirely — the same trap §2 of the main plan already documents for `cell-a`.
+
+**And the reason it is actively unsafe to keep in routing.** Post-rendezvous the
+override would set what routing *advertises*, while touch point (b) decides what
+a node *accepts*, and the two read different sources. Set them apart and:
+
+```
+routing says            -> writes for cell-a go to graph-node-2   (override)
+ensure_local_writer says -> graph-node-2 does not own cell-a       (rendezvous)
+                         -> NotCellWriter { owner: graph-node-0 }
+driver re-routes to graph-node-0, which routing never advertises
+                         -> next ROUTE refresh sends it back to graph-node-2
+```
+
+A routing loop that no timeout breaks, produced by a misconfiguration that
+validates cleanly. Today the same field cannot do this, because
+`ensure_local_writer` accepts writes anywhere — the override is harmless
+precisely because nothing enforces ownership. Adding enforcement is what makes it
+dangerous.
+
+**The two real options.**
+
+| | |
+|---|---|
+| **B1 — delete it** | Remove `with_preferred_writer_node` and the `preferred_writer_node` field; rendezvous is the only writer selection. Rewrite `bolt/tests.rs:1373` to compute the expected owner. Smallest surface, no way to contradict placement. |
+| **B2 — move it into placement as a pin** | If an operational pin is genuinely wanted, it belongs in `turbolay-placement`, consulted *inside* `owner()`, so routing and `ensure_local_writer` derive from one source and cannot disagree. Real work: config plumbing, validation that the pinned node is live, and a decision about what happens when it is not. |
+
+**Recommendation: B1.** B2 solves a problem nobody currently has — there is no
+production caller, so no operator has ever pinned a writer. If a pin is wanted
+later it is a small addition to a crate that will already exist, and doing it
+then means designing it against a real requirement instead of guessing at one.
+
+Either way the `reachable.first()` fallback beneath it (`routing.rs:236-241`)
+goes — that fallback moves whenever a probe flaps and is half the instability Q2
+is deleting.
 
 ## After you answer
 
@@ -999,6 +1127,5 @@ Q1, Q2 and Q3 are folded into §7 of
 `interactive/write-routing-placement.html`. This file stays as the decision
 record — the reasoning lives here, the settled outcome lives in the plan.
 
-Outstanding: **Q4**, plus the two carried-over decisions above. Q4 gates how much
-of Phase 1 lands in the next pass; A and B gate commit 4 specifically, not the
-start of the work.
+Outstanding: **B only** — whether `with_preferred_writer_node` is deleted or
+moved into placement as a pin. It gates commit 3, not the start of the work.
