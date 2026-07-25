@@ -147,6 +147,13 @@ axum-server = { workspace = true, optional = true }
 boltr = { workspace = true, optional = true }
 bytes = { workspace = true }
 base64 = { workspace = true, optional = true }
+# Direct, not transitive. `turbolay-placement` takes `DateTime<Utc>` on its
+# heartbeat and LIST boundaries, and without this the type is not nameable in
+# the kernel at all — `object_store` does not re-export chrono. Two independent
+# attempts at the placement wiring both worked around that by writing
+# `SystemTime::now().into()` and leaning on inference to pick the conversion,
+# which is the same instant by the same clock but says so nowhere.
+chrono = { workspace = true }
 futures = { workspace = true }
 libcypher-parser-sys = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }

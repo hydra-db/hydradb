@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock as StdRwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, RwLock as StdRwLock};
+use std::time::{Duration, Instant};
 
 use slatedb::bytes::Bytes;
 use slatedb::config::{ReadOptions, ScanOptions};
@@ -91,6 +91,8 @@ struct GraphStoreInner {
     // How long a fenced writer waits before re-promoting: exactly one heartbeat
     // interval, so the rival has published a fresh view and stood down.
     heartbeat_interval: Duration,
+    // Armed by a fence or a failed refresh, consulted by the promotion gate.
+    writer_reopen_gate: StdMutex<WriterReopenGate>,
 }
 
 static EMPTY_GRAPH_STORE: OnceCell<Db> = OnceCell::const_new();
@@ -107,61 +109,87 @@ const FENCE_BACKOFF_FLOOR: Duration = Duration::from_secs(1);
 /// the first plain failure sleeps 2s and the sixth reaches this.
 const MAX_FENCE_BACKOFF: Duration = Duration::from_secs(60);
 
-/// How many times a single `refresh_writer_fence` call may re-attempt before it
-/// gives the failure back to the caller. The write that triggered the refresh is
-/// blocked for the whole budget, so it is small: one fence wait plus two rungs
-/// of the ladder, ~11s worst case, is long enough for view skew to converge and
-/// short enough that a genuinely broken store still surfaces to the client.
-const WRITER_REFRESH_ATTEMPTS: u32 = 4;
-
-/// What one attempt at refreshing the writer produced. A fence is kept distinct
-/// from a plain failure because the two earn different waits: view skew
-/// converges on the heartbeat clock, a failing store on the exponential ladder.
-enum FenceAttempt {
-    Refreshed,
-    Fenced(GraphError),
-    Failed(GraphError),
+/// How long a shard must wait before it may re-open its writer, and why.
+///
+/// # Why this is a gate and not a retry loop
+///
+/// Decision 6 of the rendezvous plan takes its three rules from sleet's
+/// `supervise_with` (`../sleet/src/daemon.rs:436-485`), and the third of them is
+/// *retry unconditionally, without re-checking ownership*. That rule is safe in
+/// sleet and **unsafe here**, for a reason that is entirely about where the code
+/// sits rather than about what it does.
+///
+/// Sleet's retry lives in a daemon supervisor. Nothing is waiting on it, and its
+/// reconcile loop cancels the task out of band the moment ownership moves, so a
+/// blind retry can never outlive the node's claim to the work. This sits on the
+/// **write path**, where there is no out-of-band canceller: a loop that
+/// re-promotes on its own authority would walk straight past
+/// `ensure_local_writer`, which is the single place ownership is checked, and a
+/// fenced non-owner would take the epoch back anyway. That defeats touch point
+/// (b) — the one branch this whole plan exists to add.
+///
+/// So the wait is recorded here and enforced at the promotion gate, which
+/// re-derives ownership first. Rules 1 and 2 survive exactly; rule 3 inverts,
+/// deliberately.
+///
+/// # Why it takes `now`
+///
+/// Same reason as decision 10: a state machine that reads its own clock has to
+/// be tested by sleeping. Every method takes the instant, so the tests are plain
+/// `#[test]`s over hand-built `Instant`s and the whole policy is checked in
+/// microseconds.
+#[derive(Debug)]
+struct WriterReopenGate {
+    /// The earliest instant a writer may be re-opened, or `None` if now.
+    not_before: Option<Instant>,
+    /// The exponential ladder, advanced by plain failures and reset by a fence.
+    backoff: Duration,
 }
 
-/// The retry loop itself, generic over the attempt body so the backoff policy is
-/// unit-testable without a real SlateDB writer. Ported from sleet's
-/// `supervise_with` (`../sleet/src/daemon.rs:436-485`), which is the proven
-/// version of exactly this policy.
-///
-/// Returns the last error once `max_attempts` is spent; there is no sleep after
-/// the final attempt, since nobody is waiting on it.
-async fn retry_with_fence_backoff<F, Fut>(
-    mut attempt: F,
-    heartbeat_interval: Duration,
-    max_attempts: u32,
-) -> Result<()>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = FenceAttempt>,
-{
-    let mut backoff = FENCE_BACKOFF_FLOOR;
-    let mut remaining = max_attempts.max(1);
-    loop {
-        let (delay, err) = match attempt().await {
-            FenceAttempt::Refreshed => return Ok(()),
-            FenceAttempt::Fenced(err) => {
-                // A fence is view skew, not a failure: it says another node
-                // believes it owns this cell, and one heartbeat interval is what
-                // that belief takes to be re-derived. Riding the ladder here
-                // would make a node that is merely converging look dead.
-                backoff = FENCE_BACKOFF_FLOOR;
-                (heartbeat_interval, err)
-            }
-            FenceAttempt::Failed(err) => {
-                backoff = (backoff * 2).min(MAX_FENCE_BACKOFF);
-                (backoff, err)
-            }
-        };
-        remaining -= 1;
-        if remaining == 0 {
-            return Err(err);
+impl Default for WriterReopenGate {
+    fn default() -> Self {
+        Self {
+            not_before: None,
+            backoff: FENCE_BACKOFF_FLOOR,
         }
-        tokio::time::sleep(delay).await;
+    }
+}
+
+impl WriterReopenGate {
+    /// A fence: wait exactly one heartbeat interval, and reset the ladder.
+    ///
+    /// The interval is sized to give *the rival* time to refresh its view and
+    /// stand down, so it is the bare interval rather than anything derived from
+    /// the ladder. And the reset is what keeps a converging node from looking
+    /// dead: without it, repeated fences ride the ladder to [`MAX_FENCE_BACKOFF`]
+    /// even though nothing has actually failed.
+    fn note_fence(&mut self, now: Instant, heartbeat_interval: Duration) {
+        self.backoff = FENCE_BACKOFF_FLOOR;
+        self.not_before = Some(now + heartbeat_interval);
+    }
+
+    /// A plain failure: advance the ladder and wait that long.
+    ///
+    /// Doubling is applied *before* use, so the first failure waits 2s.
+    fn note_failure(&mut self, now: Instant) {
+        self.backoff = (self.backoff * 2).min(MAX_FENCE_BACKOFF);
+        self.not_before = Some(now + self.backoff);
+    }
+
+    /// A writer opened, or refreshed cleanly. Clear everything.
+    fn note_success(&mut self) {
+        self.backoff = FENCE_BACKOFF_FLOOR;
+        self.not_before = None;
+    }
+
+    /// How much longer the caller must wait, or `None` if it may proceed.
+    // Consumed by `ensure_local_writer` in commit 4, which is the promotion
+    // gate. Until that lands the only caller is this module's tests.
+    #[allow(dead_code)]
+    fn remaining(&self, now: Instant) -> Option<Duration> {
+        self.not_before
+            .filter(|not_before| *not_before > now)
+            .map(|not_before| not_before - now)
     }
 }
 
@@ -247,6 +275,7 @@ impl GraphStore {
                 reader_open_gate: Mutex::new(()),
                 reader_refresh_gate: Mutex::new(()),
                 heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+                writer_reopen_gate: StdMutex::new(WriterReopenGate::default()),
             }),
         }
     }
@@ -320,40 +349,54 @@ impl GraphStore {
     /// the caller, not here, so this node may re-fence the winner once more
     /// before the two views agree. All three rules are sleet's
     /// (`../sleet/src/daemon.rs:458-472`), matched deliberately.
+    /// Refresh the writer's manifest, recording a re-open delay if it is fenced.
+    ///
+    /// **This never promotes.** It drops the fenced handle, arms
+    /// [`WriterReopenGate`] and hands the error back; the next write re-derives
+    /// ownership through `ensure_local_writer` and is held off by
+    /// [`GraphStore::writer_reopen_delay`] until the wait is spent. Promoting
+    /// from in here would bypass the ownership check entirely — see the note on
+    /// [`WriterReopenGate`].
     pub(crate) async fn refresh_writer_fence(&self) -> Result<()> {
         let _open_guard = self.inner.writer_open_gate.lock().await;
         // No writer at all is a read-only shard, not a fenced one: waiting
-        // promotes nothing, so fail before spending any of the budget.
-        self.open_writer().ok_or(GraphError::ReadOnlyShardStorage)?;
-        retry_with_fence_backoff(
-            move || async move {
-                let writer = match self.open_writer() {
-                    Some(writer) => writer,
-                    // A previous attempt's fence cleared the handle; re-promote
-                    // under the gate we already hold.
-                    None => match self.install_writer().await {
-                        Ok(writer) => writer,
-                        Err(err) => return FenceAttempt::Failed(err),
-                    },
-                };
-                match writer.refresh_manifest().await {
-                    Ok(()) => FenceAttempt::Refreshed,
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            ErrorKind::Closed(slatedb::CloseReason::Fenced)
-                        ) =>
-                    {
-                        self.clear_closed_writer();
-                        FenceAttempt::Fenced(err.into())
-                    }
-                    Err(err) => FenceAttempt::Failed(err.into()),
-                }
-            },
-            self.inner.heartbeat_interval,
-            WRITER_REFRESH_ATTEMPTS,
-        )
-        .await
+        // promotes nothing, so there is no delay to arm.
+        let writer = self.open_writer().ok_or(GraphError::ReadOnlyShardStorage)?;
+        match writer.refresh_manifest().await {
+            Ok(()) => {
+                self.reopen_gate().note_success();
+                Ok(())
+            }
+            Err(err) if matches!(err.kind(), ErrorKind::Closed(slatedb::CloseReason::Fenced)) => {
+                self.clear_closed_writer();
+                self.reopen_gate()
+                    .note_fence(Instant::now(), self.inner.heartbeat_interval);
+                Err(err.into())
+            }
+            Err(err) => {
+                self.reopen_gate().note_failure(Instant::now());
+                Err(err.into())
+            }
+        }
+    }
+
+    fn reopen_gate(&self) -> StdMutexGuard<'_, WriterReopenGate> {
+        self.inner
+            .writer_reopen_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// How long before this shard may re-open its writer, or `None` if now.
+    ///
+    /// The promotion gate consults this *after* it has satisfied itself that
+    /// this node should own the cell at all. Ownership first, then pacing: a
+    /// node that is not the owner must be refused outright rather than merely
+    /// asked to wait.
+    // Consumed by `ensure_local_writer` in commit 4; dead until then.
+    #[allow(dead_code)]
+    pub(crate) fn writer_reopen_delay(&self) -> Option<Duration> {
+        self.reopen_gate().remaining(Instant::now())
     }
 
     pub(crate) async fn promote_writer(&self) -> Result<bool> {
@@ -386,6 +429,7 @@ impl GraphStore {
             .writer
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(writer.clone());
+        self.reopen_gate().note_success();
         Ok(writer)
     }
 
@@ -786,138 +830,110 @@ pub(crate) fn is_retryable_write_conflict(err: &GraphError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
-    use tokio::time::Instant;
 
-    /// Any error the loop can carry; the policy never inspects it beyond the
-    /// fenced/failed split the caller already made.
-    fn failure() -> GraphError {
-        GraphError::ReadOnlyShardStorage
+    /// A synthetic origin. The gate only ever compares instants and subtracts
+    /// them, so any origin works and none of these tests touch a real clock.
+    fn origin() -> Instant {
+        Instant::now()
     }
 
-    /// Decision 6's three rules in one scenario, on paused virtual time. This is
-    /// the scheduling clock only — nothing here reads object-store liveness.
+    /// Decision 6's rules 1 and 2, which are the two that survive the write-path
+    /// context intact.
     ///
-    /// A fence waits one heartbeat interval and *resets* the ladder, so the
-    /// plain failure after it sleeps 2s (the floor, doubled before use) rather
-    /// than the 10s it would have reached had the fence advanced the ladder; the
-    /// next failure sleeps 4s. Every attempt is entered straight from the sleep,
-    /// with no ownership re-check in between: the loop's only contact with the
-    /// outside world is calling the body, and it calls it a fourth time after
-    /// the fence without being told this node still owns the cell.
-    #[tokio::test(start_paused = true)]
-    async fn a_fence_waits_one_heartbeat_interval_and_resets_the_ladder_to_its_floor() {
-        let started = Instant::now();
-        let entered = RefCell::new(Vec::new());
+    /// A fence waits exactly one heartbeat interval — not the ladder, and not
+    /// the larger of the two — because the interval is sized to let the *rival*
+    /// re-derive its view and stand down. And it resets the ladder to its floor,
+    /// so the plain failure that follows waits 2s (the floor, doubled before
+    /// use) rather than the rung it would have reached had the fence advanced
+    /// it.
+    #[test]
+    fn a_fence_waits_one_heartbeat_interval_and_resets_the_ladder_to_its_floor() {
+        let now = origin();
+        let mut gate = WriterReopenGate::default();
 
-        let result = retry_with_fence_backoff(
-            || async {
-                let attempt = {
-                    let mut entered = entered.borrow_mut();
-                    entered.push(started.elapsed());
-                    entered.len()
-                };
-                match attempt {
-                    1 => FenceAttempt::Fenced(failure()),
-                    2 | 3 => FenceAttempt::Failed(failure()),
-                    _ => FenceAttempt::Refreshed,
-                }
-            },
-            Duration::from_secs(5),
-            WRITER_REFRESH_ATTEMPTS,
-        )
-        .await;
-
-        assert!(result.is_ok(), "the fourth attempt refreshed");
+        gate.note_fence(now, Duration::from_secs(5));
+        assert_eq!(gate.remaining(now), Some(Duration::from_secs(5)));
         assert_eq!(
-            entered.into_inner(),
-            vec![
-                Duration::ZERO,
-                Duration::from_secs(5), // one heartbeat interval after the fence
-                Duration::from_secs(7), // +2s: the ladder restarted at its floor
-                Duration::from_secs(11), // +4s: and then doubled
-            ]
+            gate.remaining(now + Duration::from_secs(5)),
+            None,
+            "the wait is over the instant it elapses"
+        );
+
+        gate.note_failure(now + Duration::from_secs(5));
+        assert_eq!(
+            gate.remaining(now + Duration::from_secs(5)),
+            Some(Duration::from_secs(2)),
+            "the fence reset the ladder, so this is the floor doubled, not a higher rung"
         );
     }
 
-    /// The ladder is sleet's: doubled before use, so the first failure sleeps 2s,
-    /// and capped, so a store that stays broken is retried every minute rather
-    /// than at an ever-receding deadline.
-    #[tokio::test(start_paused = true)]
-    async fn the_failure_ladder_doubles_before_each_wait_and_stops_at_the_maximum() {
-        let started = Instant::now();
-        let entered = RefCell::new(Vec::new());
+    /// Repeated fences never ride the ladder. Without the reset, a node that is
+    /// merely converging on a new view would back off to the 60s cap and look
+    /// dead, which is the failure decision 6 rule 1 exists to prevent.
+    #[test]
+    fn fencing_repeatedly_never_advances_the_ladder() {
+        let mut now = origin();
+        let mut gate = WriterReopenGate::default();
 
-        let _ = retry_with_fence_backoff(
-            || async {
-                entered.borrow_mut().push(started.elapsed());
-                FenceAttempt::Failed(failure())
-            },
-            Duration::from_secs(5),
-            8,
-        )
-        .await;
+        for _ in 0..10 {
+            gate.note_fence(now, Duration::from_secs(5));
+            assert_eq!(gate.remaining(now), Some(Duration::from_secs(5)));
+            now += Duration::from_secs(5);
+        }
+    }
 
-        let waits: Vec<Duration> = entered
-            .into_inner()
-            .windows(2)
-            .map(|pair| pair[1] - pair[0])
-            .collect();
+    /// The ladder is sleet's: doubled *before* use, so the first plain failure
+    /// waits 2s, and capped, so a store that stays broken is retried every
+    /// minute rather than at an ever-receding deadline.
+    #[test]
+    fn the_failure_ladder_doubles_before_each_wait_and_stops_at_the_maximum() {
+        let mut now = origin();
+        let mut gate = WriterReopenGate::default();
+        let mut waits = Vec::new();
+
+        for _ in 0..8 {
+            gate.note_failure(now);
+            let wait = gate.remaining(now).expect("a failure always arms the gate");
+            waits.push(wait);
+            now += wait;
+        }
+
         assert_eq!(
             waits,
-            vec![2, 4, 8, 16, 32, 60, 60]
+            vec![2, 4, 8, 16, 32, 60, 60, 60]
                 .into_iter()
                 .map(Duration::from_secs)
                 .collect::<Vec<_>>()
         );
     }
 
-    /// The budget is what keeps a blocked write from waiting forever. It is
-    /// spent on attempts, not sleeps: the last failure is handed back at once.
-    #[tokio::test(start_paused = true)]
-    async fn spending_the_attempt_budget_returns_the_last_failure_without_a_trailing_wait() {
-        let started = Instant::now();
-        let attempts = Cell::new(0u32);
+    /// A clean refresh or a fresh writer clears both halves of the gate, so the
+    /// next fence starts from the floor rather than from wherever the last
+    /// incident left the ladder.
+    #[test]
+    fn success_clears_the_wait_and_the_ladder_together() {
+        let now = origin();
+        let mut gate = WriterReopenGate::default();
 
-        let err = retry_with_fence_backoff(
-            || async {
-                attempts.set(attempts.get() + 1);
-                FenceAttempt::Failed(failure())
-            },
-            Duration::from_secs(5),
-            3,
-        )
-        .await
-        .expect_err("every attempt failed");
+        gate.note_failure(now);
+        gate.note_failure(now);
+        assert!(gate.remaining(now).is_some());
 
-        assert!(matches!(err, GraphError::ReadOnlyShardStorage));
-        assert_eq!(attempts.get(), 3);
+        gate.note_success();
+        assert_eq!(gate.remaining(now), None);
+
+        gate.note_failure(now);
         assert_eq!(
-            started.elapsed(),
-            Duration::from_secs(6),
-            "2s + 4s, no more"
+            gate.remaining(now),
+            Some(Duration::from_secs(2)),
+            "back to the floor, not to the rung the earlier failures reached"
         );
     }
 
-    /// A budget of one still makes one attempt: `max_attempts` counts attempts,
-    /// not retries, and zero would silently skip the refresh a write depends on.
-    #[tokio::test(start_paused = true)]
-    async fn a_refresh_that_succeeds_first_time_never_sleeps() {
-        let started = Instant::now();
-        let attempts = Cell::new(0u32);
-
-        retry_with_fence_backoff(
-            || async {
-                attempts.set(attempts.get() + 1);
-                FenceAttempt::Refreshed
-            },
-            Duration::from_secs(5),
-            WRITER_REFRESH_ATTEMPTS,
-        )
-        .await
-        .expect("refreshed");
-
-        assert_eq!(attempts.get(), 1);
-        assert_eq!(started.elapsed(), Duration::ZERO);
+    /// An un-armed gate never delays. A shard that has never been fenced must
+    /// promote on demand, which is the behaviour every non-contended cell has.
+    #[test]
+    fn a_gate_that_was_never_armed_lets_the_caller_straight_through() {
+        assert_eq!(WriterReopenGate::default().remaining(origin()), None);
     }
 }
