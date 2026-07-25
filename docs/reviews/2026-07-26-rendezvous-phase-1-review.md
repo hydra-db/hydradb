@@ -130,9 +130,17 @@ names the same type on both sides of the crate boundary.
 
 ## Verification
 
-125 lib tests, 51 placement, 9 bin, clippy clean on both packages, `cargo fmt
---all --check` clean. The lib suite runs in 0.13s, down from 5.07s before the
-commit-5 rework, because the retry loop's sleeps were real.
+136 lib tests, 303 under `server-runtime`, 67 placement, 9 bin, clippy clean on
+both packages, `cargo fmt --all --check` clean.
+
+The lib suite runs in 0.14s. It passed through 5.07s and 5.28s on the way, twice
+for the same underlying reason — a fenced writer's wait was a real one at the
+production 5s. The first time the sleeps were inside the retry loop the
+commit-5 rework deleted; the second time they were the gate's own wait, served
+honestly by a test using `GraphOpenOptions::default()`. That is what finished
+decision 5's wiring: `fence_backoff_interval` is now a field, `Default` is
+hand-written because `Duration::default()` is zero and a zero wait would let a
+fenced writer re-open immediately, and the fencing tests pace in milliseconds.
 
 **Known pre-existing failures, confirmed at `ea942ec` and unrelated to this
 work:** `useless_conversion` at `src/query/opencypher.rs:361` under
