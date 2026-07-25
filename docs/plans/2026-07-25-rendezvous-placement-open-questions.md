@@ -17,14 +17,18 @@ tags:
 Companion to `docs/plans/2026-07-25-rendezvous-placement.md`. That plan's §1 and
 §2 landed in `7b0d340`; §3–§5 are blocked on the four answers below.
 
-**Status: Q1 and Q3 settled. Q2 and Q4 still open.**
+**Status: Q1, Q2 and Q3 settled. Q4 still open.**
 
 | | Question | Answer |
 |---|---|---|
 | Q1 | Lease shape | **3a** — advisory record, observability only. 3c dropped; sleet shows it is not needed and neither slatedb tree can reach it. |
-| Q2 | Delete the `/readyz` fan-out | open |
+| Q2 | Delete the `/readyz` fan-out | **Option 1** — delete the client-side fan-out, gate heartbeat publication on `AdminState.ready`. One change, not two. |
 | Q3 | Heartbeat interval / timeout | **5s / 15s**, config with validation |
 | Q4 | Build scope for the next pass | open |
+
+Two smaller things surfaced by Q1 and Q2 and not yet agreed, carried at the end
+of this file: **what a failed node LIST does to ownership**, and **whether
+`with_preferred_writer_node` survives**.
 
 **How to use this file.** Each question has a `### Your answer` block at the
 end. Write there — free text is fine, you do not have to pick one of the listed
@@ -631,9 +635,80 @@ alone would be option 3. This folds into touch point (e) in the main plan.
 
 ### Your answer
 
-can you explain this more? in simple language? in terminal only.
+> can you explain this more? in simple language?
+>
+> yes
 
-<!-- write here -->
+**Decided: option 1.** Delete the client-side fan-out; gate heartbeat
+publication on readiness. The plain-language version of what that means,
+recorded here so the next reader does not have to reconstruct it from the
+options table.
+
+**What exists today.** Every time a Bolt driver asks "which nodes can I talk
+to?", the node answering opens a TCP connection to *every* node's admin port and
+calls `/readyz`. Three nodes, three connects, on every routing refresh. The
+answer is then built from whoever replied.
+
+Two problems with that. It is computed fresh **per caller**, so two drivers
+asking at the same instant can get different answers when a probe flaps — there
+is no shared truth about who is alive. And it is N connects per refresh, forever,
+to learn something that barely changes.
+
+**What replaces it.** Every node writes a small object every
+`heartbeat_interval`:
+
+```
+<base>/_graph_nodes/v1/graph-node-0
+<base>/_graph_nodes/v1/graph-node-1
+<base>/_graph_nodes/v1/graph-node-2
+```
+
+Alive means *your object exists and object storage reports `LastModified`
+younger than `heartbeat_timeout`*. Anyone needing the live set does **one LIST**
+and no connects. Everyone LISTing at the same instant sees the same bytes, and
+that is the actual requirement: rendezvous only works if every node computes
+ownership from the *same* live set. A per-caller probe cannot give that.
+
+**The catch.** You would assume Kubernetes readiness already protects clients.
+It does not. Bolt drivers connect straight to pod addresses from
+`GRAPH_BOLT_NODE_ADDRESSES`, never through a k8s Service, so the
+`readinessProbe` gates nothing for them. That is why `routing.rs` grew its own
+probe in the first place. Delete the probe and put nothing in its place and we
+start handing drivers the address of a node that has booted but cannot serve.
+
+**So it is one change, not two:** a node publishes its heartbeat only while it
+is ready, and deletes it the moment it is not.
+
+```
+every heartbeat_interval:   ready?  -> PUT    <base>/_graph_nodes/v1/<id>
+                            not?    -> DELETE <base>/_graph_nodes/v1/<id>
+SIGTERM:                            -> DELETE <base>/_graph_nodes/v1/<id>, then drain
+```
+
+Readiness and liveness now travel through the same channel. One signal instead
+of two that can disagree.
+
+**The three cases, including the one that gets worse:**
+
+| | today | after |
+|---|---|---|
+| Rolling restart (the common case) | ~250 ms | **immediate** — the node deletes its own heartbeat before exiting |
+| Hard crash / OOM-kill | ~250 ms | **up to 15s** — nothing deleted the object, it has to age out |
+| Booted but not ready yet | caught by the probe | caught — it never published |
+
+Row two is a real availability regression and is not being dressed up: a
+SIGKILLed node stays in routing tables for up to `heartbeat_timeout`, which Q3
+fixes at 15s. What it buys is one consistent live set instead of N per-caller
+probe results.
+
+**The wrong version of this change** is deleting the probe *without* the
+readiness gating — that is option 3, and it breaks the third row too. Deletion
+and gating ship together or not at all. Folds into touch point (e).
+
+Unchanged by this: the `/readyz` endpoint at `graph_node/admin.rs:48` and all of
+its non-routing consumers — the k8s `readinessProbe`, `scripts/runtime_smoke.sh:51`,
+the Jepsen harness wait. Only `reachable_nodes`, `probe_node_readiness` and
+`replace_address_port` are deleted.
 
 ---
 
@@ -789,24 +864,94 @@ correct refusal into a working client.
 That is the prod incident, reproduced as a test. It cannot be written until
 (a), (b) and (e) all exist.
 
-### The options
+### Q2 changed the shape of this question
+
+Answering Q2 as option 1 coupled two touch points that the main plan lists as
+independent. **(a) deletes the probe fan-out, so (a) cannot function until
+something publishes heartbeats — and publishing is part of (e).** The staging in
+the main plan puts (e) last. That order is now wrong.
+
+This is not a cosmetic reorder. It is a **rolling-upgrade hazard**, and it is
+the one thing here that can make prod briefly worse rather than better:
+
+```
+rollout in progress, 3 nodes, node-0 upgraded first
+
+node-0 (new):  publishes a heartbeat, LISTs _graph_nodes/v1/, sees ONE node
+               -> rendezvous says: node-0 owns every cell
+               -> promotes, claims the epoch
+node-1 (old):  still probing /readyz, still using preferred_writer_node
+               -> still promotes on any write it receives
+node-2 (old):  same
+```
+
+The new node is not wrong — it computed correctly over the live set it could
+see. The live set was just incomplete, because old nodes do not publish. During
+that window the duel continues exactly as today, and the "exactly one epoch
+bump" property does not hold until every node is upgraded.
+
+The fix is ordering, not code: **publish before anyone consumes.** If the
+heartbeat publisher ships in an earlier commit than the routing change, then by
+the time (a) lands every node is already publishing, and the first node to read
+the live set reads a complete one.
+
+### The staging, revised
+
+Seven commits, each separately revertable, each leaving the tree green:
+
+| # | Commit | Runtime effect on prod | Risk |
+|---|---|---|---|
+| 1 | §3 crate — `heartbeat.rs`, `directory.rs`, tested against `InMemory` | none — nothing calls it | none |
+| 2 | **publisher** — heartbeat task in `graph-node.rs`, gated on `AdminState.ready`, DELETE on SIGTERM | writes one small object per node per 5s; **nothing reads it yet** | near-zero, and independently observable in the bucket before anything depends on it |
+| 3 | **(a)** routing provider — live set from LIST, `WRITE` names the rendezvous owner, delete the fan-out | first client-visible change: writes are steered to one node | medium — the routing table changes shape |
+| 4 | **(b)+(c)** don't-promote rule + `NotCellWriter` → `Neo.ClientError.Cluster.NotALeader` | **the duel stops**; drivers re-route on refusal | medium — this is the behaviour change that matters |
+| 5 | **(d)** fence backoff: wait one interval, reset backoff to 1s | bounds mutual fencing during view skew | low |
+| 6 | **3a** advisory record `_cell_writers/v1/<cell_id>` + fenced-log attribution | the next incident is readable in one line | low |
+| 7 | **§5** regression test — 3 promotable nodes, 1 cell, concurrent writes, exactly one epoch bump | none; guards all of the above | none |
+
+Commit 2 is the addition. Splitting the publisher out of (e) is what makes the
+rollout safe, and it has a second benefit: the heartbeat objects can be watched
+in the bucket for a day before any code depends on them, which is the cheapest
+possible way to find out that the clock, the path or the readiness gate is wrong.
+
+Commits 3 and 4 are the pair that must not be separated by a release. 3 tells
+clients where to send writes; 4 makes a node refuse writes it should not take.
+Landing 3 without 4 means routing points at the right node while every other
+node still steals the epoch from it — no worse than today, but no better either.
+Landing 4 without 3 means correct refusals that drivers cannot act on, because
+the routing table still names the wrong writer.
+
+### What each stopping point actually leaves in prod
 
 |                                    | What lands                                                | What prod looks like after                                                                 |
 | ---------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| **All of Phase 1**, staged commits | §3, (a)–(e), §5 including the regression test             | ping-pong fixed, drivers re-route correctly, regression guarded                            |
+| **All of Phase 1**, staged commits | §3, publisher, (a)–(e), 3a, §5 regression test            | ping-pong fixed, drivers re-route correctly, regression guarded                            |
 | **Crate only** (§3)                | `heartbeat.rs`, `directory.rs`, tested against `InMemory` | unchanged — ping-pong continues                                                            |
 | **Crate + (b)**                    | §3 plus the don't-promote rule                            | ping-pong stops; non-owner writes fail opaquely and drivers retry into the same wrong node |
 
-Staged commits in the first option would be roughly: §3 crate → (a) routing →
-(b)+(c) refusal and mapping → (d) backoff → (e) wiring → §5 regression test.
-Each stands alone and is separately revertable.
+`crate + (b)` deserves a second look because it is the tempting small option and
+it is a trap. It does fix the duel. But the failure it substitutes is a client
+that receives a refusal it cannot interpret, holds a routing table that names
+the wrong writer, and retries into the same node until it gives up. That is a
+different outage with the same symptom — writes not landing — and it is arguably
+harder to diagnose than the ping-pong, because the epoch counter stops moving
+and the logs go quiet. The observable "epoch climbing forever" signature that
+made the original incident findable disappears.
+
+### Where the review effort actually goes
+
+Not evenly across the seven commits. Commits 1, 2, 5, 6 and 7 are mechanical —
+new code in a new crate, a background task, a backoff constant, a PUT, a test.
+The scrutiny belongs on 3 and 4, which together are perhaps 60 lines that change
+who is allowed to write. Splitting them out is what makes the full set reviewable
+despite being larger than the alternatives.
 
 ### My recommendation
 
-**All of Phase 1, staged commits.** The crate on its own changes nothing in
-prod, and `crate + (b)` fixes the duel while leaving clients unable to recover
-from it. The full set is a bigger review but the commits are individually small
-and the last one is the incident reproduced.
+**All of Phase 1, staged as the seven commits above.** The crate on its own
+changes nothing in prod; `crate + (b)` trades a visible failure for a quiet one.
+The full set is a bigger review, but the commits are individually small, the two
+that matter are isolated, and the last one is the incident reproduced as a test.
 
 ### Your answer
 
@@ -814,8 +959,46 @@ and the last one is the incident reproduced.
 
 ---
 
+## Carried over — two smaller decisions, not yet agreed
+
+Both surfaced while answering Q1 and Q2. Neither blocks starting on §3, but both
+must be settled before commit 4.
+
+### A. A failed node LIST — shed ownership, or keep it?
+
+Sleet keeps its current assignments when the LIST fails (`daemon.rs:243`,
+`warn!("failed to LIST nodes/: {e}; keeping current assignments")`). For a
+compaction coordinator that is a safe double-run. For a **writer** it is an
+unbounded duel: a node partitioned from the object store can never learn it lost
+ownership, so it re-promotes forever against a node that believes it won. There
+is no convergence, because convergence requires both views to update and one of
+them cannot.
+
+Proposal: **shed.** If we cannot read the live set we cannot claim to own
+anything — refuse promotion, return `NotCellWriter` with no owner hint. This
+deliberately trades availability for the bound, and it is the one place this
+design must diverge from its reference implementation.
+
+The counter-argument worth stating: a node partitioned from the object store
+cannot write to SlateDB either, so shedding may be moot in the common case. It is
+not moot for a *partial* failure — LIST throttled or 503-ing while writes still
+succeed — which is the case the rule exists for.
+
+### B. Does `with_preferred_writer_node` survive?
+
+Proposal: **keep it as an explicit override above rendezvous.** Useful for tests
+and single-node deploys, and it fails closed by validating the id against the
+address map. What must go either way is the `reachable.first()` fallback beneath
+it (`routing.rs:236-241`) — that fallback moves whenever a probe flaps and is
+half the instability Q2 is deleting.
+
 ## After you answer
 
-I fold the four answers and their rationale into §7 of
-`docs/plans/2026-07-25-rendezvous-placement.md`, update `status:` there, and
-start on §3. This file stays as the decision record.
+Q1, Q2 and Q3 are folded into §7 of
+`docs/plans/2026-07-25-rendezvous-placement.md` and into section H of
+`interactive/write-routing-placement.html`. This file stays as the decision
+record — the reasoning lives here, the settled outcome lives in the plan.
+
+Outstanding: **Q4**, plus the two carried-over decisions above. Q4 gates how much
+of Phase 1 lands in the next pass; A and B gate commit 4 specifically, not the
+start of the work.
