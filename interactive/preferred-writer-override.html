@@ -1,0 +1,2099 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The preferred-writer override — a setting nobody set</title>
+<style>
+  :root {
+    --ground: #eef1f5;
+    --surface: #fbfcfd;
+    --surface-2: #e7ecf3;
+    --ink: #16202e;
+    --ink-2: #4d5c72;
+    --ink-3: #7c8ba1;
+    --rule: #c8d2de;
+    --rule-soft: #dbe3ec;
+    --accent: #1e4fd8;
+    --accent-soft: #dfe6fb;
+    --crit: #a3231c;
+    --crit-soft: #f7e2e0;
+    --high: #97621b;
+    --high-soft: #f8ecd9;
+    --med: #2b6079;
+    --med-soft: #dcecf3;
+    --ok: #106b4e;
+    --ok-soft: #dbefe6;
+
+    --font-display: -apple-system, BlinkMacSystemFont, "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+    --font-body: "Iowan Old Style", Charter, "Bitstream Charter", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+    --font-mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+    --measure: 68ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0b1626;
+      --surface: #111e31;
+      --surface-2: #16263c;
+      --ink: #dce7f5;
+      --ink-2: #93a8c4;
+      --ink-3: #6a7f9c;
+      --rule: #24374f;
+      --rule-soft: #1b2c42;
+      --accent: #7ba5ff;
+      --accent-soft: #17294a;
+      --crit: #ff8478;
+      --crit-soft: #3a1d1d;
+      --high: #e5b46a;
+      --high-soft: #3a2e18;
+      --med: #6fb8d6;
+      --med-soft: #16303d;
+      --ok: #56cfa1;
+      --ok-soft: #12332a;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0b1626;
+    --surface: #111e31;
+    --surface-2: #16263c;
+    --ink: #dce7f5;
+    --ink-2: #93a8c4;
+    --ink-3: #6a7f9c;
+    --rule: #24374f;
+    --rule-soft: #1b2c42;
+    --accent: #7ba5ff;
+    --accent-soft: #17294a;
+    --crit: #ff8478;
+    --crit-soft: #3a1d1d;
+    --high: #e5b46a;
+    --high-soft: #3a2e18;
+    --med: #6fb8d6;
+    --med-soft: #16303d;
+    --ok: #56cfa1;
+    --ok-soft: #12332a;
+  }
+
+  :root[data-theme="light"] {
+    --ground: #eef1f5;
+    --surface: #fbfcfd;
+    --surface-2: #e7ecf3;
+    --ink: #16202e;
+    --ink-2: #4d5c72;
+    --ink-3: #7c8ba1;
+    --rule: #c8d2de;
+    --rule-soft: #dbe3ec;
+    --accent: #1e4fd8;
+    --accent-soft: #dfe6fb;
+    --crit: #a3231c;
+    --crit-soft: #f7e2e0;
+    --high: #97621b;
+    --high-soft: #f8ecd9;
+    --med: #2b6079;
+    --med-soft: #dcecf3;
+    --ok: #106b4e;
+    --ok-soft: #dbefe6;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  .page {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 24px 96px;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0 48px;
+  }
+
+  @media (min-width: 1080px) {
+    .page { grid-template-columns: 190px minmax(0, 1fr); }
+  }
+
+  .masthead {
+    grid-column: 1 / -1;
+    border-bottom: 2px solid var(--ink);
+    padding: 56px 0 26px;
+    margin-bottom: 40px;
+  }
+
+  .docmeta {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 22px;
+    margin-bottom: 26px;
+  }
+
+  .docmeta b { color: var(--ink-2); font-weight: 500; }
+
+  h1 {
+    font-family: var(--font-display);
+    font-size: clamp(2.1rem, 5.4vw, 3.5rem);
+    font-weight: 700;
+    letter-spacing: -.032em;
+    line-height: 1.02;
+    margin: 0 0 .45em;
+    text-wrap: balance;
+    max-width: 20ch;
+  }
+
+  h1 .thin { font-weight: 300; color: var(--ink-2); display: block; }
+
+  .standfirst {
+    font-size: 1.16rem;
+    color: var(--ink-2);
+    max-width: 60ch;
+    margin: 0;
+    line-height: 1.55;
+  }
+
+  .spine { display: none; }
+
+  @media (min-width: 1080px) {
+    .spine {
+      display: block;
+      position: sticky;
+      top: 0;
+      align-self: start;
+      padding-top: 6px;
+      max-height: 100vh;
+      overflow-y: auto;
+    }
+  }
+
+  .spine ol { list-style: none; margin: 0; padding: 0; }
+
+  .spine a {
+    display: grid;
+    grid-template-columns: 2.2em 1fr;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.4;
+    letter-spacing: .02em;
+    color: var(--ink-3);
+    text-decoration: none;
+    padding: 7px 0 7px 10px;
+    border-left: 2px solid var(--rule-soft);
+    transition: color .15s, border-color .15s;
+  }
+
+  .spine a:hover, .spine a:focus-visible { color: var(--accent); border-left-color: var(--accent); }
+  .spine a .n { font-variant-numeric: tabular-nums; color: var(--ink-3); }
+  .spine .wmark { color: var(--accent); }
+
+  .body { min-width: 0; }
+  .body > * { max-width: var(--measure); }
+  .body > .wide, .body > .rail { max-width: none; }
+
+  section { margin: 0 0 68px; }
+
+  h2 {
+    font-family: var(--font-display);
+    font-size: 1.62rem;
+    font-weight: 650;
+    letter-spacing: -.02em;
+    line-height: 1.18;
+    margin: 0 0 .2em;
+    text-wrap: balance;
+  }
+
+  h3 {
+    font-family: var(--font-display);
+    font-size: 1.06rem;
+    font-weight: 650;
+    letter-spacing: -.008em;
+    margin: 2.1em 0 .5em;
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .eyebrow::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
+
+  p { margin: 0 0 1.05em; }
+  .lede { font-size: 1.06rem; color: var(--ink-2); margin-bottom: 1.6em; }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  code, .mono { font-family: var(--font-mono); font-size: .86em; }
+
+  p code, li code, td code, th code, dd code, .rtext code, .kv code, .q p code {
+    background: var(--surface-2);
+    border: 1px solid var(--rule-soft);
+    border-radius: 3px;
+    padding: .08em .34em;
+    white-space: nowrap;
+  }
+
+  .src { font-family: var(--font-mono); font-size: .78em; color: var(--ink-3); white-space: nowrap; letter-spacing: -.01em; }
+  .src::before { content: "\21B3 "; }
+
+  ul, ol { margin: 0 0 1.05em; padding-left: 1.3em; }
+  li { margin-bottom: .4em; }
+
+  .doctrine {
+    border-left: 3px solid var(--accent);
+    padding: 2px 0 2px 20px;
+    margin: 1.6em 0;
+    color: var(--ink-2);
+  }
+
+  .doctrine p { font-style: italic; margin-bottom: .4em; }
+  .doctrine .attr { font-family: var(--font-mono); font-size: 11.5px; font-style: normal; color: var(--ink-3); letter-spacing: .02em; }
+
+  .chip {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 2px;
+    vertical-align: 2px;
+    white-space: nowrap;
+  }
+
+  .chip.med    { color: var(--med);  background: var(--med-soft); }
+  .chip.high   { color: var(--high); background: var(--high-soft); }
+  .chip.crit   { color: var(--crit); background: var(--crit-soft); }
+  .chip.ok     { color: var(--ok);   background: var(--ok-soft); }
+
+  /* ---- tables ---- */
+
+  .tablewrap {
+    overflow-x: auto;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    margin: 26px 0;
+  }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+
+  thead th {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+
+  tbody tr:last-child td { border-bottom: none; }
+  td.m, th.m { font-family: var(--font-mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  td.nowrap { white-space: nowrap; }
+  td.note { font-family: var(--font-body); font-size: 14px; color: var(--ink-2); }
+  td.strong { font-family: var(--font-body); font-size: 14px; color: var(--ink); }
+  .wide-tbl { min-width: 700px; }
+
+  .caption {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--ink-3);
+    margin: -14px 0 30px;
+    letter-spacing: .01em;
+  }
+
+  /* ---- code / rule blocks ---- */
+
+  pre.listing {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.62;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--rule);
+    color: var(--ink-2);
+    padding: 14px 16px;
+    margin: 22px 0;
+    overflow-x: auto;
+  }
+
+  pre.listing b { color: var(--ink); font-weight: 600; }
+  pre.listing i { font-style: normal; color: var(--crit); }
+  pre.listing u { text-decoration: none; color: var(--accent); }
+  pre.listing s { text-decoration: none; color: var(--ink-3); }
+  pre.listing.rust { border-left-color: var(--accent); }
+  pre.listing.incident { border-left-color: var(--crit); }
+  pre.listing.good { border-left-color: var(--ok); }
+
+  .rule-box {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.6;
+    background: var(--accent-soft);
+    color: var(--ink);
+    padding: 12px 14px;
+    border-radius: 2px;
+    margin: 20px 0;
+    overflow-x: auto;
+  }
+
+  .rule-box .lbl {
+    display: block;
+    font-size: 10px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 6px;
+  }
+
+  /* ---- keeps / open questions ---- */
+
+  .keeps { display: grid; gap: 2px; margin: 24px 0; }
+
+  .keep {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 14px;
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--ok);
+    padding: 13px 18px;
+    align-items: baseline;
+  }
+
+  .keep[data-v="open"] { border-left-color: var(--high); }
+  .keep[data-v="lean"] { border-left-color: var(--med); }
+  .keep[data-v="word"] { border-left-color: var(--accent); }
+
+  .keep .kk {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ok);
+    white-space: nowrap;
+  }
+
+  .keep[data-v="open"] .kk { color: var(--high); }
+  .keep[data-v="lean"] .kk { color: var(--med); }
+  .keep[data-v="word"] .kk { color: var(--accent); }
+  .keep .kv { font-size: .95rem; }
+
+  .openq { display: grid; gap: 2px; margin: 24px 0; }
+
+  .q {
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--high);
+    padding: 15px 18px;
+  }
+
+  .q .qh {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink);
+    display: block;
+    margin-bottom: 5px;
+  }
+
+  .q p { font-size: .93rem; margin: 0; color: var(--ink-2); max-width: 74ch; }
+  .q p + p { margin-top: .7em; }
+
+  /* ---- widgets ---- */
+
+  .widget {
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    margin: 28px 0 34px;
+    padding: 0;
+  }
+
+  .widget-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px 14px;
+    padding: 13px 20px 12px;
+    border-bottom: 1px solid var(--rule-soft);
+    background: var(--surface-2);
+  }
+
+  .widget-id {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .widget-title {
+    font-family: var(--font-display);
+    font-size: .96rem;
+    font-weight: 650;
+    letter-spacing: -.008em;
+    color: var(--ink);
+  }
+
+  .widget-body { padding: 20px; }
+
+  .widget-cap {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.55;
+    color: var(--ink-3);
+    border-top: 1px solid var(--rule-soft);
+    padding: 12px 20px 14px;
+    letter-spacing: .01em;
+  }
+
+  .widget-cap b { color: var(--ink-2); font-weight: 600; }
+
+  .ctlbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    margin-bottom: 16px;
+  }
+
+  .ctlbar + .ctlbar { margin-top: -6px; }
+
+  .btn {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .02em;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 6px 11px;
+    cursor: pointer;
+    transition: color .12s, border-color .12s, background .12s;
+  }
+
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .btn.danger:hover { border-color: var(--crit); color: var(--crit); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+
+  .switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink-2);
+    border: 1px solid var(--rule);
+    background: var(--surface-2);
+    border-radius: 2px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+
+  .switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .switch .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--crit); display: inline-block; }
+  .switch[aria-pressed="true"] { border-color: var(--ok); color: var(--ok); background: var(--ok-soft); }
+  .switch[aria-pressed="true"] .dot { background: var(--ok); }
+
+  .ctl-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  .field {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 6px 9px;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .field:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  input[type="range"] { accent-color: var(--accent); vertical-align: middle; max-width: 190px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+  .nodechip {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    padding: 5px 10px;
+    border-radius: 2px;
+    border: 1px solid var(--ok);
+    background: var(--ok-soft);
+    color: var(--ok);
+    cursor: pointer;
+  }
+
+  .nodechip[aria-pressed="false"] {
+    border-color: var(--rule);
+    background: var(--surface-2);
+    color: var(--ink-3);
+    text-decoration: line-through;
+  }
+
+  .nodechip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .readout {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    background: var(--surface-2);
+    border-radius: 2px;
+    padding: 10px 13px;
+    margin-top: 14px;
+  }
+
+  .readout b { color: var(--ink); font-weight: 600; }
+  .readout .good { color: var(--ok); }
+  .readout .bad { color: var(--crit); }
+  .readout .warn { color: var(--high); }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 2px;
+    margin: 14px 0 0;
+  }
+
+  .stat { background: var(--surface-2); padding: 9px 12px; }
+
+  .stat .sk {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: .11em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin-bottom: 2px;
+  }
+
+  .stat .sv {
+    font-family: var(--font-mono);
+    font-size: 17px;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    line-height: 1.2;
+  }
+
+  .stat[data-tone="crit"] .sv { color: var(--crit); }
+  .stat[data-tone="ok"] .sv { color: var(--ok); }
+  .stat[data-tone="accent"] .sv { color: var(--accent); }
+  .stat .su { font-size: 11px; color: var(--ink-3); }
+
+  .logpane {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.62;
+    background: var(--surface-2);
+    border: 1px solid var(--rule-soft);
+    border-radius: 2px;
+    padding: 10px 12px;
+    height: 220px;
+    overflow-y: auto;
+    margin-top: 14px;
+    white-space: pre;
+    color: var(--ink-2);
+  }
+
+  .logpane .l-fence { color: var(--crit); }
+  .logpane .l-ok    { color: var(--ok); }
+  .logpane .l-route { color: var(--accent); }
+  .logpane .l-warn  { color: var(--high); }
+  .logpane .l-dim   { color: var(--ink-3); }
+  .logpane .l-head  { color: var(--ink); }
+
+  .scoretbl { width: 100%; border-collapse: collapse; font-size: 12px; font-family: var(--font-mono); }
+  .scoretbl th { font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); font-weight: 500; padding: 6px 10px; background: var(--surface-2); border-bottom: 1px solid var(--rule); text-align: left; }
+  .scoretbl td { padding: 6px 10px; border-bottom: 1px solid var(--rule-soft); vertical-align: middle; }
+  .scoretbl tr.dead td { color: var(--ink-3); text-decoration: line-through; }
+  .scoretbl tr.win td { background: var(--ok-soft); color: var(--ok); font-weight: 600; }
+  .scoretbl tr.bad td { background: var(--crit-soft); color: var(--crit); }
+
+  .lamps { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 14px; }
+
+  .lamp {
+    flex: 1 1 200px;
+    background: var(--surface-2);
+    padding: 11px 14px;
+    display: flex;
+    align-items: center;
+    gap: 11px;
+  }
+
+  .lamp .bulb { width: 13px; height: 13px; border-radius: 50%; background: var(--rule); flex: none; }
+  .lamp[data-on="ok"] .bulb { background: var(--ok); }
+  .lamp[data-on="crit"] .bulb { background: var(--crit); }
+  .lamp .lk { font-family: var(--font-mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); display: block; }
+  .lamp .lv { font-family: var(--font-mono); font-size: 12px; color: var(--ink); }
+  .lamp[data-on="ok"] .lv { color: var(--ok); }
+  .lamp[data-on="crit"] .lv { color: var(--crit); }
+
+  /* ---- the golden-value strip ---- */
+
+  .goldstrip {
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    margin: 26px 0 30px;
+  }
+
+  .goldstrip .gs-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px 14px;
+    padding: 11px 18px;
+    border-bottom: 1px solid var(--rule-soft);
+    background: var(--surface-2);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .goldstrip .gs-body { padding: 14px 18px 16px; }
+
+  /* ---- SVG, themed through custom properties only ---- */
+
+  .wsvg { display: block; width: 100%; height: auto; overflow: visible; }
+  .wsvg text { font-family: var(--font-mono); font-size: 10px; fill: var(--ink-2); }
+  .wsvg .t-strong { fill: var(--ink); font-weight: 600; }
+  .wsvg .t-dim { fill: var(--ink-3); font-size: 9px; }
+  .wsvg .t-ok { fill: var(--ok); }
+  .wsvg .t-crit { fill: var(--crit); }
+  .wsvg .t-accent { fill: var(--accent); }
+  .wsvg .box { fill: var(--surface-2); stroke: var(--rule); stroke-width: 1; }
+  .wsvg .box.ok { fill: var(--ok-soft); stroke: var(--ok); }
+  .wsvg .box.crit { fill: var(--crit-soft); stroke: var(--crit); }
+  .wsvg .box.accent { fill: var(--accent-soft); stroke: var(--accent); }
+  .wsvg .box.dim { fill: var(--surface); stroke: var(--rule-soft); }
+  .wsvg .wire { stroke: var(--rule); stroke-width: 1; fill: none; }
+  .wsvg .wire.ok { stroke: var(--ok); stroke-width: 1.5; }
+  .wsvg .wire.crit { stroke: var(--crit); stroke-width: 1.5; }
+  .wsvg .wire.accent { stroke: var(--accent); stroke-width: 1.4; }
+  .wsvg .wire.faint { stroke: var(--rule-soft); }
+  .wsvg .fillok { fill: var(--ok); }
+  .wsvg .fillcrit { fill: var(--crit); }
+  .wsvg .fillaccent { fill: var(--accent); }
+  .wsvg .axis { stroke: var(--rule); stroke-width: 1; }
+  .wsvg .grid { stroke: var(--rule-soft); stroke-width: 1; }
+  .wsvg .dash { stroke-dasharray: 3 3; }
+
+  .static-fallback { border: 1px dashed var(--rule); padding: 16px; }
+  .static-note { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-3); margin: 10px 0 0; }
+
+  .handoff {
+    border-top: 2px solid var(--ink);
+    padding-top: 26px;
+    margin-top: 76px;
+    grid-column: 1 / -1;
+  }
+
+  .handoff h2 { font-size: 1.28rem; }
+  .handoff p { max-width: var(--measure); }
+
+  .themetoggle {
+    position: fixed;
+    top: 14px;
+    right: 14px;
+    z-index: 10;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 6px 10px;
+    cursor: pointer;
+    transition: color .15s, border-color .15s;
+  }
+
+  .themetoggle:hover { color: var(--accent); border-color: var(--accent); }
+  .themetoggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  @media print { .themetoggle { display: none; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem("turbolay-theme");
+      if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) {}
+  })();
+</script>
+</head>
+<body>
+
+<button class="themetoggle" type="button">Dark</button>
+
+<div class="page">
+
+  <header class="masthead">
+    <div class="docmeta">
+      <span><b>repo</b> turbolay</span>
+      <span><b>branch</b> Turbolay-V3.5</span>
+      <span><b>doc</b> decision B &mdash; companion to write-routing-placement.html</span>
+      <span><b>status</b> open &mdash; recommendation: delete</span>
+      <span><b>gates</b> commit 3 of 7</span>
+    </div>
+    <h1>The preferred-writer override<span class="thin">a setting nobody set, and the trap it becomes once ownership is enforced</span></h1>
+    <p class="standfirst">
+      One builder method lets you name the node that should receive writes. Production never
+      calls it, so the value is always whichever node id happens to sort first. That is harmless
+      today for exactly one reason: nothing enforces it. Three widgets below let you drive the
+      moment that stops being true.
+    </p>
+  </header>
+
+  <nav class="spine" aria-label="Sections">
+    <ol>
+      <li><a href="#setting"><span class="n">A</span><span>The setting <span class="wmark">W1</span></span></a></li>
+      <li><a href="#harmless"><span class="n">B</span><span>Harmless today</span></a></li>
+      <li><a href="#trap"><span class="n">C</span><span>The trap <span class="wmark">W2</span></span></a></li>
+      <li><a href="#wrong"><span class="n">D</span><span>Two wrong reasons <span class="wmark">W3</span></span></a></li>
+      <li><a href="#options"><span class="n">E</span><span>Delete or move</span></a></li>
+    </ol>
+  </nav>
+
+  <main class="body">
+
+    <section id="setting">
+      <p class="eyebrow">A &mdash; what the thing actually is</p>
+      <h2>One builder method, one caller, and that caller is a test</h2>
+      <p class="lede">
+        Before anything else: the vocabulary. Six words do all the work on this page, and every
+        one of them is defined here rather than assumed.
+      </p>
+
+      <div class="keeps wide">
+        <div class="keep" data-v="word">
+          <span class="kk">cell</span>
+          <span class="kv">One database file, living in object storage. A deployment has a handful. Reads can come from anywhere; <b>writes to one cell must come from one process at a time</b>, which is the whole subject of this page.</span>
+        </div>
+        <div class="keep" data-v="word">
+          <span class="kk">scope</span>
+          <span class="kv">Which customer's graph a cell belongs to, written as <code>namespace/graphs/graph_id</code> &mdash; for example <code>acme/graphs/social</code>. Two customers can both have a cell called <code>cell-a</code> without colliding.</span>
+        </div>
+        <div class="keep" data-v="word">
+          <span class="kk">routing table</span>
+          <span class="kv">A short list the server hands a client that says "send reads here, send writes there." It expires after 30 seconds and the client asks again. It is a recommendation, in the way a hotel concierge's restaurant suggestion is a recommendation.</span>
+        </div>
+        <div class="keep" data-v="word">
+          <span class="kk">driver</span>
+          <span class="kv">The client library inside the application &mdash; the thing that holds the routing table and decides which server to dial. Nobody writes this code; it ships with the Neo4j-compatible clients.</span>
+        </div>
+        <div class="keep" data-v="word">
+          <span class="kk">fencing</span>
+          <span class="kv">The storage layer's way of enforcing one writer. Each writer takes a numbered turn. When a new writer takes turn 18, the holder of turn 17 is <em>fenced</em>: its next write is rejected outright. Like changing the lock &mdash; the old key stops working, and nowhere does the door record who has the new key.</span>
+        </div>
+        <div class="keep" data-v="word">
+          <span class="kk">rendezvous&nbsp;hashing</span>
+          <span class="kv">A way to agree on an owner without anybody being in charge. Every node scores itself for the cell by hashing <code>(scope, cell, its own name)</code>, and the highest score wins. Every node computes the same scores, so they all reach the same answer with no messages exchanged &mdash; like a room full of people who all sort the same list the same way.</span>
+        </div>
+      </div>
+
+      <h3>The method</h3>
+
+      <p>
+        It sets one field on the routing provider, validated against the address map so a bad
+        value fails at construction rather than in production:
+      </p>
+
+      <pre class="listing rust">pub fn <b>with_preferred_writer_node</b>(mut self, node_id: impl Into&lt;String&gt;) -&gt; Result&lt;Self&gt; {
+    let node_id = node_id.into();
+    validate_component("node_id", &amp;node_id)?;
+    if !self.node_addresses.contains_key(&amp;node_id) {
+        return bolt_config_error("preferred writer node must be present in routing addresses");
+    }
+    <b>self.preferred_writer_node = node_id;</b>
+    Ok(self)
+}</pre>
+      <p class="caption">src/client/bolt/routing.rs:134&ndash;142</p>
+
+      <p>
+        The field is read in exactly one place, when the routing table is built. The node named by
+        the field is advertised for <code>WRITE</code> if it answered a health probe; otherwise the
+        first node that did:
+      </p>
+
+      <pre class="listing rust">let writer = reachable
+    .iter()
+    .find(|(node_id, _)| node_id == &amp;<b>self.preferred_writer_node</b>)
+    .or_else(|| <i>reachable.first()</i>)
+    .expect("reachable node list was checked")
+    .1
+    .clone();</pre>
+      <p class="caption">src/client/bolt/routing.rs:235&ndash;241</p>
+
+      <h3>And here is production building that provider</h3>
+
+      <pre class="listing rust">let routing = ObjectStoreBoltRoutingTableProvider::new(config.bolt_node_addresses.clone(), 30)?
+    .with_readiness_port(config.admin_addr.port())?;
+<s>// no .with_preferred_writer_node(...) &mdash; not here, not anywhere else in the binary</s>
+bolt_config = bolt_config.with_routing_table_provider(Arc::new(routing));</pre>
+      <p class="caption">src/bin/graph-node.rs:115&ndash;117</p>
+
+      <p>
+        That is the punchline. There is no environment variable, no Helm chart value, no config
+        field, and no call site. The method has <b>one caller in the entire repository</b> and it
+        is <code>src/client/bolt/tests.rs:1373</code>. In production the field is therefore always
+        its default, set once in the constructor:
+      </p>
+
+      <pre class="listing rust">let preferred_writer_node = addresses
+    .<b>keys()</b>
+    .<b>next()</b>
+    .expect("non-empty address map")
+    .clone();</pre>
+      <p class="caption">src/client/bolt/routing.rs:76&ndash;80 &mdash; <code>addresses</code> is a <code>BTreeMap</code>, which keeps its keys sorted, so <code>keys().next()</code> is the alphabetically first node id.</p>
+
+      <h3>Which node that is, concretely</h3>
+
+      <p>
+        A three-node deployment sets <code>GRAPH_BOLT_NODE_ADDRESSES</code> to a comma-separated
+        list of <code>id=address</code> pairs. Suppose the config lists them in this order:
+      </p>
+
+      <pre class="listing">GRAPH_BOLT_NODE_ADDRESSES=
+    graph-node-2=graph-node-2.headless:7687,
+    graph-node-0=graph-node-0.headless:7687,
+    graph-node-1=graph-node-1.headless:7687</pre>
+
+      <p>
+        The map sorts them, so the advertised writer is <b><code>graph-node-0</code></b> &mdash;
+        for every cell, for every customer, always. Nobody chose it. It sorts first. Rename a node
+        or add one whose id sorts earlier, and the advertised writer for the whole deployment moves
+        with no config change and no log line. W1 lets you do exactly that.
+      </p>
+
+      <div class="goldstrip wide" id="gold">
+        <div class="gs-head">
+          <span>self-check &mdash; this page's hash against the Rust golden test</span>
+        </div>
+        <div class="gs-body">
+          <div class="gold-static static-fallback">
+            <p style="margin:0;font-family:var(--font-mono);font-size:12px;line-height:1.7;color:var(--ink-2)">
+              score("acme/graphs/social", "cell-a", "graph-node-0") = 0xf0dc2317deb297c5<br>
+              score("acme/graphs/social", "cell-a", "graph-node-1") = 0xf0dc2217deb29612<br>
+              score("acme/graphs/social", "cell-b", "graph-node-0") = 0x39ffe3dd3cc79ffe<br>
+              score("acme/graphs/other", "cell-a", "graph-node-0") = 0xc15e57802a479f04
+            </p>
+            <p class="static-note">Static fallback: the four values as pinned in Rust. Enable JavaScript to recompute them here and compare.</p>
+          </div>
+          <div class="gold-live" hidden></div>
+        </div>
+      </div>
+      <p class="caption">
+        Every rendezvous number on this page is computed in the browser by a BigInt port of
+        <code>crates/placement/src/hash.rs</code> &mdash; FNV-1a 64 over
+        <code>scope ++ 0x00 ++ cell_id ++ 0x00 ++ node_id</code>. The four values above are the ones
+        <code>scores_are_frozen</code> (<code>hash.rs:82&ndash;99</code>) pins in the test suite. If
+        the strip ever reads DIVERGED, distrust every widget below it.
+      </p>
+
+      <div class="widget" id="w1">
+        <div class="widget-head">
+          <span class="widget-id">W1</span>
+          <span class="widget-title">Who is the preferred writer? &mdash; edit the address map and find out</span>
+        </div>
+        <div class="widget-body">
+          <div class="w1-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 700 210" role="img" aria-label="A three-entry address map sorted into BTreeMap order, with the first key advertised as the writer">
+              <text class="t-strong" x="12" y="18">GRAPH_BOLT_NODE_ADDRESSES, in config order</text>
+              <rect class="box dim" x="12" y="28" width="320" height="26" rx="2"></rect>
+              <text x="24" y="46">graph-node-2 = ...:7687</text>
+              <rect class="box dim" x="12" y="60" width="320" height="26" rx="2"></rect>
+              <text x="24" y="78">graph-node-0 = ...:7687</text>
+              <rect class="box dim" x="12" y="92" width="320" height="26" rx="2"></rect>
+              <text x="24" y="110">graph-node-1 = ...:7687</text>
+              <path class="wire accent" d="M340 73 L376 73"></path>
+              <text class="t-accent" x="344" y="66">BTreeMap</text>
+              <text class="t-strong" x="384" y="18">sorted, and keys().next() wins</text>
+              <rect class="box accent" x="384" y="28" width="300" height="26" rx="2"></rect>
+              <text class="t-accent" x="396" y="46">graph-node-0 &mdash; advertised for WRITE</text>
+              <rect class="box dim" x="384" y="60" width="300" height="26" rx="2"></rect>
+              <text x="396" y="78">graph-node-1</text>
+              <rect class="box dim" x="384" y="92" width="300" height="26" rx="2"></rect>
+              <text x="396" y="110">graph-node-2</text>
+              <text class="t-dim" x="12" y="150">The config order is irrelevant. The alphabet decides.</text>
+              <text class="t-dim" x="12" y="168">Rendezvous over the same three nodes: cell-a &rarr; graph-node-0, cell-b &rarr; graph-node-1,</text>
+              <text class="t-dim" x="12" y="184">cell-c &rarr; graph-node-2, cell-d &rarr; graph-node-2. The default agrees once in four.</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript to edit the node list.</p>
+          </div>
+          <div class="w1-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> press "add backup-0" and watch the advertised writer for the entire deployment
+          move to a node added for an unrelated reason &mdash; that is the whole mechanism, a string
+          comparison. Then shuffle the config order and watch nothing change, because
+          <code>BTreeMap</code> sorts. The right-hand column is the rendezvous owner for each cell over the same node
+          set, computed here with the frozen hash rather than quoted, so you can see how often the
+          alphabetical default happens to be right.
+        </p>
+      </div>
+    </section>
+
+    <section id="harmless">
+      <p class="eyebrow">B &mdash; why it does no damage today</p>
+      <h2>The routing table is a suggestion, and nothing checks it</h2>
+
+      <p>
+        Today any node that receives a write simply takes over writing. The function that opens the
+        writer, <code>ensure_local_writer</code> (<code>src/engine/cluster.rs:375&ndash;390</code>),
+        checks that this process is allowed to be a writer at all and that it holds a shard for the
+        cell. It never asks whether it <em>should</em> be this cell's writer. There is no such
+        question in the code.
+      </p>
+
+      <p>
+        So the write lands wherever the client sent it, the node opens the database, takes the next
+        turn number, and the previous holder is fenced. That is the production incident described
+        in <code>write-routing-placement.html</code>: three nodes, one cell, each one taking the
+        turn from the last, forever.
+      </p>
+
+      <pre class="listing incident">t=0.00  client A -&gt; graph-node-0   write   node-0 opens Db, claims epoch <b>17</b>
+t=0.31  client B -&gt; graph-node-1   write   node-1 opens Db, claims epoch <b>18</b>
+                                           node-0's next write -&gt; <i>Fenced</i>
+t=0.44  client C -&gt; graph-node-2   write   node-2 opens Db, claims epoch <b>19</b>
+                                           node-1's next write -&gt; <i>Fenced</i>
+        ... repeats. Every node makes progress on open and none on write.</pre>
+      <p class="caption">memory <code>cell-writer-fencing-pingpong</code></p>
+
+      <p>
+        Note what the override is doing during that incident: nothing. Routing advertises
+        <code>graph-node-0</code> for writes, some clients follow it, others were handed a
+        different node when a probe flapped, and the ones that ignore it entirely are not corrected.
+        A setting that only ever produces a suggestion cannot cause a loop, because there is nothing
+        for it to disagree with.
+      </p>
+
+      <div class="doctrine">
+        <p>
+          The override is safe today for the same reason the system is broken today: no node has an
+          opinion about who should own a cell, so no opinion can be contradicted.
+        </p>
+        <span class="attr">the one sentence this whole page turns on</span>
+      </div>
+    </section>
+
+    <section id="trap">
+      <p class="eyebrow">C &mdash; what changes when the bug is fixed</p>
+      <h2>Two answers to one question, and a loop between them</h2>
+      <p class="lede">
+        The fix adds a single branch: a node refuses a write for a cell it does not own. That branch
+        is what makes the override dangerous, and it does so immediately.
+      </p>
+
+      <pre class="listing rust">match placement.owner(scope, cell_id) {
+    Some(o) if o == self.local_node_id =&gt; shard.<b>promote_to_writer</b>(..).await,
+    Some(o)                            =&gt; Err(GraphError::<i>NotCellWriter</i> { cell_id, owner: o }),
+    None                               =&gt; shard.<b>promote_to_writer</b>(..).await, <u>// no live owner</u>
+}</pre>
+      <p class="caption">docs/plans/2026-07-25-rendezvous-placement.md &sect;4, touch point (b) &mdash; <code>src/engine/cluster.rs:375&ndash;390</code></p>
+
+      <p>
+        After that branch exists, "who is the writer for this cell" has two answers, produced by two
+        different pieces of code reading two different sources:
+      </p>
+
+      <div class="tablewrap wide">
+        <table>
+          <thead>
+            <tr><th>answer</th><th class="m">computed by</th><th class="m">from</th><th>used for</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="strong">the override</td>
+              <td class="m">routing.rs:235</td>
+              <td class="m">preferred_writer_node</td>
+              <td class="note">what the routing table <b>advertises</b> to clients</td>
+            </tr>
+            <tr>
+              <td class="strong">the computed owner</td>
+              <td class="m">cluster.rs:375</td>
+              <td class="m">owner(scope, cell, live)</td>
+              <td class="note">what the node itself will <b>accept</b></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        Set them apart and each component behaves perfectly while the system makes no progress:
+      </p>
+
+      <pre class="listing incident">routing says             -&gt; writes for cell-b go to <b>graph-node-0</b>   (the override)
+ensure_local_writer says -&gt; graph-node-0 does not own cell-b
+                         -&gt; <i>NotCellWriter { owner: graph-node-1 }</i>
+driver discards its routing table and asks again
+routing says             -&gt; writes for cell-b go to <b>graph-node-0</b>   (the override, again)
+                         -&gt; ... </pre>
+      <p class="caption">docs/plans/2026-07-25-rendezvous-placement-open-questions.md:1093&ndash;1099</p>
+
+      <p>
+        Nothing here times out. The refusal is fast and correct, the re-route is the documented
+        driver behaviour for that error code, and the routing table is served exactly as configured.
+        A misconfiguration that <code>validate_component</code> accepts without complaint produces
+        an unbounded loop out of three components that are each doing their job.
+      </p>
+
+      <div class="widget" id="w2">
+        <div class="widget-head">
+          <span class="widget-id">W2</span>
+          <span class="widget-title">The bounce &mdash; pick the advertised writer and watch the client loop</span>
+        </div>
+        <div class="widget-body">
+          <div class="w2-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 700 250" role="img" aria-label="A client bouncing between the routing table's advertised writer and the node that refuses the write">
+              <rect class="box" x="12" y="100" width="130" height="52" rx="3"></rect>
+              <text class="t-strong" x="24" y="122">Bolt driver</text>
+              <text class="t-dim" x="24" y="140">holds routing table</text>
+              <path class="wire accent" d="M142 116 L206 60"></path>
+              <text class="t-accent" x="152" y="80">ROUTE</text>
+              <rect class="box accent" x="206" y="30" width="250" height="56" rx="3"></rect>
+              <text class="t-accent" x="218" y="52">routing table (TTL 30s)</text>
+              <text class="t-accent" x="218" y="70">WRITE &rarr; graph-node-0 (override)</text>
+              <path class="wire crit" d="M456 58 L520 42"></path>
+              <rect class="box crit" x="520" y="20" width="168" height="46" rx="3"></rect>
+              <text class="t-crit" x="532" y="40">graph-node-0</text>
+              <text class="t-crit" x="532" y="56">refuses: not the owner</text>
+              <rect class="box ok" x="520" y="100" width="168" height="46" rx="3"></rect>
+              <text class="t-ok" x="532" y="120">graph-node-1</text>
+              <text class="t-ok" x="532" y="136">OWNER of cell-b</text>
+              <rect class="box dim" x="520" y="180" width="168" height="46" rx="3"></rect>
+              <text x="532" y="200">graph-node-2</text>
+              <text class="t-dim" x="532" y="216">not the owner</text>
+              <path class="wire crit dash" d="M520 60 L200 150 L142 140"></path>
+              <text class="t-crit" x="240" y="176">NotCellWriter { owner: graph-node-1 } &rarr; discard table, ask again</text>
+              <text class="t-dim" x="12" y="240">The cycle has no exit: the next routing table says graph-node-0 too.</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript to choose the override and run the loop.</p>
+          </div>
+          <div class="w2-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> leave the override on <code>graph-node-0</code> &mdash; the production default
+          &mdash; and press "run". Hops climb, refusals climb, commits stay at zero, and they will
+          stay that way as long as you leave it running; press "burst &times;200" if you would rather
+          not wait to be convinced. Then switch the override to <code>(deleted)</code> and press run
+          again: one hop per write, no refusals. The owner of <code>cell-b</code> is not asserted
+          anywhere in this widget &mdash; it is computed with the frozen hash over the live set, the
+          same call <code>ensure_local_writer</code> makes.
+        </p>
+      </div>
+
+      <p>
+        The switch marked <b>driver follows the owner hint</b> models the more generous case. The
+        refusal carries the owner's name, so a driver could dial that node directly instead of
+        re-fetching the table. Turn it on and writes do commit &mdash; each one costing a wasted
+        round trip and a refusal, forever, because the routing table it re-fetches afterwards still
+        names the override. Being clever converts a total stall into a permanent tax. It does not
+        exit the loop, because the loop is a disagreement between two sources of truth and no client
+        behaviour can resolve that.
+      </p>
+    </section>
+
+    <section id="wrong">
+      <p class="eyebrow">D &mdash; the two arguments for keeping it</p>
+      <h2>Both reasons were given in good faith, and both are false</h2>
+      <p class="lede">
+        An earlier draft of the placement plan recommended keeping the override. Reading the code
+        reversed that. Here are the two arguments it rested on, and why neither survives.
+      </p>
+
+      <h3>"We need it for single-node deployments"</h3>
+
+      <p>
+        The claim is that with one node you must be able to say "that one is the writer". But
+        rendezvous over one live node has exactly one answer, for every cell, by construction: the
+        highest score among one score is that score. There is no second candidate to overrule.
+      </p>
+
+      <div class="widget" id="w3">
+        <div class="widget-head">
+          <span class="widget-id">W3</span>
+          <span class="widget-title">Shrink the fleet &mdash; the computed owner collapses on its own</span>
+        </div>
+        <div class="widget-body">
+          <div class="w3-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 700 200" role="img" aria-label="Computed owner per cell as the live node count shrinks from three to one">
+              <text class="t-strong" x="12" y="18">three live nodes</text>
+              <text x="12" y="40">cell-a &rarr; graph-node-0</text>
+              <text x="12" y="58">cell-b &rarr; graph-node-1</text>
+              <text x="12" y="76">cell-c &rarr; graph-node-2</text>
+              <text x="12" y="94">cell-d &rarr; graph-node-2</text>
+              <text class="t-dim" x="12" y="118">override default: graph-node-0 for all four &mdash; agrees once</text>
+              <text class="t-strong" x="380" y="18">one live node</text>
+              <text class="t-ok" x="380" y="40">cell-a &rarr; graph-node-0</text>
+              <text class="t-ok" x="380" y="58">cell-b &rarr; graph-node-0</text>
+              <text class="t-ok" x="380" y="76">cell-c &rarr; graph-node-0</text>
+              <text class="t-ok" x="380" y="94">cell-d &rarr; graph-node-0</text>
+              <text class="t-dim" x="380" y="118">override default: graph-node-0 for all four &mdash; agrees always</text>
+              <text class="t-dim" x="12" y="160">With one node live there is nothing for an override to say that placement does not</text>
+              <text class="t-dim" x="12" y="176">already say. The single-node argument is the case where the override is most redundant.</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript for the fleet-size slider.</p>
+          </div>
+          <div class="w3-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> drag the slider down to one node. Every cell's computed owner collapses to that
+          node and the agreement counter reads four of four &mdash; the single-node deployment is the
+          one case where the override is provably redundant. Drag back up and watch the agreement
+          count fall, because the alphabetical default is a fixed answer to a question whose real
+          answer varies per cell. Both columns are computed here: the left by the frozen hash, the
+          right by sorting the node ids, exactly as <code>BTreeMap</code> does.
+        </p>
+      </div>
+
+      <h3>"We need it for tests"</h3>
+
+      <p>
+        This one is not merely unnecessary. It makes the test weaker than no test. Rendezvous is a
+        pure, deterministic function of three strings, so a test can compute the expected owner the
+        same way the production code will. Pinning the answer instead means the assertion no longer
+        depends on the computation at all.
+      </p>
+
+      <p>Today, at <code>src/client/bolt/tests.rs:1371&ndash;1389</code>:</p>
+
+      <pre class="listing rust">let preferred = provider
+    .clone()
+    .<b>with_preferred_writer_node("node-b")</b>          <i>// force the answer</i>
+    .unwrap()
+    .routing_table("default", &amp;target)
+    .await
+    .unwrap();
+assert_eq!(write_addresses(&amp;preferred), vec![fallback_address.clone()]);
+<i>// passes even if placement is completely broken: nothing here consults it</i></pre>
+
+      <p>What it becomes:</p>
+
+      <pre class="listing rust good">let live = ["node-a", "node-b"];
+let <b>expected</b> = turbolay_placement::owner(&amp;target.scope.to_string(), &amp;target.cell_id, &amp;live)
+    .expect("a live node exists");
+let table = provider.routing_table("default", &amp;target).await.unwrap();
+assert_eq!(write_addresses(&amp;table), vec![address_of(<b>expected</b>)]);
+<u>// now the test fails if routing and placement ever disagree, which is the bug</u></pre>
+
+      <p>
+        The second version asserts the property that matters &mdash; routing advertises whoever
+        placement names &mdash; instead of asserting a hardcoded string. It also gets stronger for
+        free every time the placement crate changes, because it re-derives its expectation. This is
+        the same discipline the sibling page's heartbeat widget uses: it picks <code>cell-b</code>
+        precisely because <code>cell-b</code>'s owner over three nodes really is
+        <code>graph-node-1</code>, computed rather than asserted.
+      </p>
+
+      <p>
+        There is a trap in the other direction worth naming, since the plan documents it: over
+        <code>graph-node-0..3</code>, <code>cell-a</code> happens to rank in plain alphabetical
+        order. A test written against <code>cell-a</code> would pass even if ranking ignored the
+        score entirely. Computing the expectation is necessary; computing it against an input that
+        can distinguish right from wrong is the other half.
+      </p>
+    </section>
+
+    <section id="options">
+      <p class="eyebrow">E &mdash; the decision</p>
+      <h2>Delete it, or move it inside the thing it would otherwise contradict</h2>
+
+      <div class="tablewrap wide">
+        <table class="wide-tbl">
+          <thead>
+            <tr><th></th><th>what it means</th><th>what it costs</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="strong">B1 &mdash; delete it <span class="chip ok">recommended</span></td>
+              <td class="note">Remove <code>with_preferred_writer_node</code> and the
+                <code>preferred_writer_node</code> field. Rendezvous becomes the only writer
+                selection, so routing and <code>ensure_local_writer</code> cannot disagree because
+                there is only one of them. Rewrite <code>bolt/tests.rs:1373</code> to compute its
+                expectation.</td>
+              <td class="note">One method, one field, one test. No configuration surface is lost,
+                because none was ever exposed.</td>
+            </tr>
+            <tr>
+              <td class="strong">B2 &mdash; move it into placement as a pin</td>
+              <td class="note">If an operational pin is genuinely wanted, it belongs inside
+                <code>owner()</code> in <code>turbolay-placement</code>, consulted before the hash.
+                Routing and the node then both derive from one source and <em>cannot</em> disagree,
+                which is the property that makes B2 safe where the status quo is not.</td>
+              <td class="note">Config plumbing to get the pin to every node; validation that the
+                pinned node is live; and a decision, with a test, about what happens when it is
+                not &mdash; fall back to the hash, or refuse writes and honour the operator.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        B2 is a real design, not a straw man, and its cost is mostly in that third item. "The pinned
+        node is dead" has no obviously correct answer: falling back to the hash silently discards
+        the operator's instruction at the moment they most likely meant it, and refusing writes turns
+        a typo into an outage that self-heals only when someone notices.
+      </p>
+
+      <p>
+        The recommendation is still <b>B1</b>, on the narrowest possible grounds: <b>nobody has ever
+        pinned a writer in production, because nobody could.</b> There is no env var and no chart
+        value. B2 spends real work, and a permanent branch in the ownership function, on a
+        requirement that has never been stated by anyone. If a pin is wanted later it is a small
+        addition to a crate that will already exist, and designing it then means designing it
+        against a real operational need rather than a guessed one.
+      </p>
+
+      <p>
+        Either way the fallback beneath the override goes too. <code>reachable.first()</code>
+        (<code>routing.rs:238</code>) moves whenever a 250&nbsp;ms health probe flaps, so two clients
+        asking at slightly different instants can be handed different writers. That instability is
+        half of what Q2 deletes when the probe fan-out is replaced by heartbeats.
+      </p>
+
+      <div class="openq wide">
+        <div class="q">
+          <span class="qh">Status <span class="chip high">awaiting a call</span></span>
+          <p>
+            Decision B is the last open item gating Phase 1. It blocks commit 3 of seven &mdash; the
+            routing change &mdash; not the start of the work. Q1 through Q4 and decision A are
+            settled; see section H of <code>write-routing-placement.html</code>.
+          </p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="handoff">
+    <p class="eyebrow">summary</p>
+    <h2>Dead configuration is not neutral; it is waiting</h2>
+    <p>
+      The override has been safe for a reason that reads, in hindsight, as an accusation: it was
+      safe because nothing in the system enforced ownership, so no setting could contradict one. It
+      was harmless in the way an unwired light switch is harmless. Fixing the writer duel is what
+      wires it up.
+    </p>
+    <p>
+      The general shape is worth keeping past this decision. When a system gains a computed
+      invariant, every existing setting that names the same thing by hand becomes a second source of
+      truth for it, and the two will eventually be set apart by someone with good intentions. There
+      are only two safe endings: the setting is deleted, or it is moved <em>inside</em> the
+      computation so that there is still only one answer. What is not available is leaving it where
+      it is, next to the invariant, disagreeing with it in a way that validates cleanly and loops
+      forever.
+    </p>
+  </footer>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ------------------------------------------------------------------ theme */
+
+  var root = document.documentElement;
+  var themeBtn = document.querySelector(".themetoggle");
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+
+  function currentTheme() {
+    return root.getAttribute("data-theme") || (media.matches ? "dark" : "light");
+  }
+
+  function labelTheme() {
+    var next = currentTheme() === "dark" ? "Light" : "Dark";
+    themeBtn.textContent = next;
+    themeBtn.setAttribute("aria-label", "Switch to " + next.toLowerCase() + " theme");
+  }
+
+  themeBtn.addEventListener("click", function () {
+    var next = currentTheme() === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("turbolay-theme", next); } catch (e) {}
+    labelTheme();
+  });
+
+  media.addEventListener("change", labelTheme);
+  labelTheme();
+
+  /* ------------------------------------------------------- shared utilities */
+
+  var SVGNS = "http://www.w3.org/2000/svg";
+
+  function s(name, attrs) {
+    var e = document.createElementNS(SVGNS, name);
+    if (attrs) for (var k in attrs) if (attrs[k] !== null && attrs[k] !== undefined) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+
+  function stext(x, y, str, cls, anchor) {
+    var e = s("text", { x: x, y: y, "text-anchor": anchor || "start" });
+    if (cls) e.setAttribute("class", cls);
+    e.textContent = str;
+    return e;
+  }
+
+  function h(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+
+  function button(label, cls) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn" + (cls ? " " + cls : "");
+    b.textContent = label;
+    return b;
+  }
+
+  function svgRoot(viewBox, label) {
+    var e = s("svg", { viewBox: viewBox, class: "wsvg", role: "img" });
+    e.setAttribute("aria-label", label);
+    return e;
+  }
+
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  function stat(key, tone) {
+    var d = h("div", "stat");
+    if (tone) d.setAttribute("data-tone", tone);
+    d.appendChild(h("span", "sk", key));
+    var v = h("span", "sv", "—");
+    d.appendChild(v);
+    d.valueNode = v;
+    return d;
+  }
+
+  function lamp(key) {
+    var d = h("div", "lamp");
+    d.appendChild(h("span", "bulb"));
+    var box = h("div");
+    box.appendChild(h("span", "lk", key));
+    var v = h("span", "lv", "—");
+    box.appendChild(v);
+    d.appendChild(box);
+    d.valueNode = v;
+    d.set = function (tone, text) {
+      d.setAttribute("data-on", tone);
+      v.textContent = text;
+    };
+    return d;
+  }
+
+  function table(headers, cls) {
+    var wrap = h("div", "tablewrap");
+    wrap.style.margin = "0";
+    var t = document.createElement("table");
+    t.className = cls || "scoretbl";
+    var thead = document.createElement("thead");
+    var tr = document.createElement("tr");
+    headers.forEach(function (k) {
+      var th = document.createElement("th");
+      th.textContent = k;
+      tr.appendChild(th);
+    });
+    thead.appendChild(tr);
+    t.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    t.appendChild(tbody);
+    wrap.appendChild(t);
+    wrap.body = tbody;
+    return wrap;
+  }
+
+  function row(tbody, cells, cls) {
+    var tr = document.createElement("tr");
+    if (cls) tr.className = cls;
+    cells.forEach(function (v) {
+      var td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+    return tr;
+  }
+
+  function activate(id, staticSel, liveSel) {
+    var wrap = document.getElementById(id);
+    if (!wrap) return null;
+    var st = wrap.querySelector(staticSel);
+    var live = wrap.querySelector(liveSel);
+    if (!st || !live) return null;
+    st.hidden = true;
+    live.hidden = false;
+    return live;
+  }
+
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  /* ------------------------------------------------------ the frozen hash */
+  /* FNV-1a 64 over scope ++ 0x00 ++ cell_id ++ 0x00 ++ node_id.
+     Mirrors crates/placement/src/hash.rs exactly, in BigInt. */
+
+  var MASK64 = 0xFFFFFFFFFFFFFFFFn;
+  var FNV_OFFSET = 0xcbf29ce484222325n;
+  var FNV_PRIME = 0x100000001b3n;
+  var encoder = new TextEncoder();
+  var NUL = "\u0000";   /* the 0x00 separator, frozen with the hash */
+
+  function fnv1a64(str) {
+    var hsh = FNV_OFFSET;
+    var bytes = encoder.encode(str);
+    for (var i = 0; i < bytes.length; i++) {
+      hsh ^= BigInt(bytes[i]);
+      hsh = (hsh * FNV_PRIME) & MASK64;
+    }
+    return hsh;
+  }
+
+  function score(scope, cellId, nodeId) {
+    return fnv1a64(scope + NUL + cellId + NUL + nodeId);
+  }
+
+  function rank(scope, cellId, live) {
+    return live.slice().sort(function (a, b) {
+      var sa = score(scope, cellId, a);
+      var sb = score(scope, cellId, b);
+      if (sa < sb) return 1;
+      if (sa > sb) return -1;
+      return a < b ? -1 : (a > b ? 1 : 0);
+    });
+  }
+
+  function owner(scope, cellId, live) {
+    var r = rank(scope, cellId, live);
+    return r.length ? r[0] : null;
+  }
+
+  function hex64(v) {
+    return "0x" + v.toString(16).padStart(16, "0");
+  }
+
+  /* BTreeMap<String, _>::keys().next() — byte-order sort, first key. */
+  function firstKey(ids) {
+    var sorted = ids.slice().sort(function (a, b) { return a < b ? -1 : (a > b ? 1 : 0); });
+    return sorted.length ? sorted[0] : null;
+  }
+
+  var SCOPE = "acme/graphs/social";
+  var CELLS = ["cell-a", "cell-b", "cell-c", "cell-d"];
+
+  /* ============================================================ gold strip
+     Recomputes the four values scores_are_frozen pins in hash.rs. */
+
+  (function goldStrip() {
+    var mount = activate("gold", ".gold-static", ".gold-live");
+    if (!mount) return;
+
+    var GOLDEN = [
+      ["acme/graphs/social", "cell-a", "graph-node-0", "0xf0dc2317deb297c5"],
+      ["acme/graphs/social", "cell-a", "graph-node-1", "0xf0dc2217deb29612"],
+      ["acme/graphs/social", "cell-b", "graph-node-0", "0x39ffe3dd3cc79ffe"],
+      ["acme/graphs/other", "cell-a", "graph-node-0", "0xc15e57802a479f04"]
+    ];
+
+    var bar = h("div", "ctlbar");
+    var again = button("recompute");
+    bar.appendChild(again);
+    var verdict = h("span", "ctl-label", "");
+    bar.appendChild(verdict);
+    mount.appendChild(bar);
+
+    var tw = table(["scope", "cell", "node", "hash.rs pins", "computed in this page", ""]);
+    mount.appendChild(tw);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    function run() {
+      clear(tw.body);
+      var all = true;
+      GOLDEN.forEach(function (g) {
+        var got = hex64(score(g[0], g[1], g[2]));
+        var ok = got === g[3];
+        if (!ok) all = false;
+        row(tw.body, [g[0], g[1], g[2], g[3], got, ok ? "MATCH" : "DIVERGED"], ok ? "win" : "bad");
+      });
+      verdict.textContent = all ? "4 of 4 match" : "DIVERGED";
+      note.innerHTML = all
+        ? "<b class='good'>This page and the Rust test agree byte for byte.</b> The four constants come from " +
+          "<b>scores_are_frozen</b> in crates/placement/src/hash.rs:82-99; the right-hand column is FNV-1a 64 " +
+          "recomputed here in BigInt. Everything the widgets below say about ownership rests on this."
+        : "<b class='bad'>Divergence.</b> The JavaScript port and the pinned Rust values disagree, so no ownership " +
+          "claim on this page can be trusted.";
+      return all;
+    }
+
+    again.addEventListener("click", run);
+    run();
+  })();
+
+  /* ==================================================================== W1
+     The address map, sorted, and who that makes the writer. */
+
+  (function w1() {
+    var mount = activate("w1", ".w1-static", ".w1-live");
+    if (!mount) return;
+
+    var st = { ids: ["graph-node-2", "graph-node-0", "graph-node-1"] };
+
+    var bar1 = h("div", "ctlbar");
+    bar1.appendChild(h("span", "ctl-label", "node ids, in config order"));
+    var idsIn = document.createElement("input");
+    idsIn.type = "text";
+    idsIn.className = "field";
+    idsIn.size = 46;
+    idsIn.value = st.ids.join(", ");
+    idsIn.setAttribute("aria-label", "Comma-separated node ids as GRAPH_BOLT_NODE_ADDRESSES lists them");
+    idsIn.addEventListener("input", function () {
+      st.ids = parse(idsIn.value);
+      render();
+    });
+    bar1.appendChild(idsIn);
+    mount.appendChild(bar1);
+
+    var bar2 = h("div", "ctlbar");
+    bar2.appendChild(h("span", "ctl-label", "presets"));
+
+    function preset(label, ids) {
+      var b = button(label);
+      b.addEventListener("click", function () {
+        st.ids = ids.slice();
+        idsIn.value = st.ids.join(", ");
+        render();
+      });
+      bar2.appendChild(b);
+    }
+
+    preset("prod fleet (3)", ["graph-node-0", "graph-node-1", "graph-node-2"]);
+    preset("shuffle config order", ["graph-node-1", "graph-node-2", "graph-node-0"]);
+    preset("add backup-0", ["graph-node-0", "graph-node-1", "graph-node-2", "backup-0"]);
+    preset("single node", ["graph-node-0"]);
+    mount.appendChild(bar2);
+
+    var tw = table(["btreemap order", "node id", "position in config", "role advertised"]);
+    mount.appendChild(tw);
+
+    var cellTw = table(["cell", "rendezvous owner (computed)", "preferred_writer_node default", "same?"]);
+    cellTw.style.marginTop = "2px";
+    mount.appendChild(cellTw);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    function parse(raw) {
+      var seen = {};
+      var out = [];
+      raw.split(",").forEach(function (part) {
+        var id = part.trim();
+        if (!id || seen[id]) return;
+        seen[id] = true;
+        out.push(id);
+      });
+      return out;
+    }
+
+    function render() {
+      clear(tw.body);
+      clear(cellTw.body);
+
+      if (!st.ids.length) {
+        note.innerHTML = "<b class='bad'>Empty address map.</b> The constructor rejects this: " +
+          "\"object-store routing requires at least one node address\" (routing.rs:73-75).";
+        return;
+      }
+
+      var sorted = st.ids.slice().sort(function (a, b) { return a < b ? -1 : (a > b ? 1 : 0); });
+      var writer = sorted[0];
+
+      sorted.forEach(function (id, i) {
+        row(tw.body, [
+          String(i + 1),
+          id,
+          "#" + (st.ids.indexOf(id) + 1),
+          i === 0 ? "WRITE + READ + ROUTE" : "READ + ROUTE"
+        ], i === 0 ? "win" : null);
+      });
+
+      var agree = 0;
+      CELLS.forEach(function (c) {
+        var o = owner(SCOPE, c, st.ids);
+        var same = o === writer;
+        if (same) agree++;
+        row(cellTw.body, [c, o, writer, same ? "yes" : "no"], same ? "win" : "bad");
+      });
+
+      var msg = "<b>preferred_writer_node = addresses.keys().next() = <span class='good'>" +
+        escapeHtml(writer) + "</span></b>";
+      msg += "<br>Chosen by sorting " + st.ids.length + " node id" + (st.ids.length === 1 ? "" : "s") +
+        " and taking the first. Config order is #" + (st.ids.indexOf(writer) + 1) + " in the list, which had no effect.";
+      if (st.ids.length === 1) {
+        msg += "<br><span class='good'>One node: the default and the computed owner agree for every cell, necessarily.</span>";
+      } else if (agree === CELLS.length) {
+        msg += "<br>Over scope " + escapeHtml(SCOPE) + ", this node also happens to be the rendezvous owner of all <b>" +
+          CELLS.length + "</b> cells shown, so the two answers coincide here by luck rather than by construction.";
+      } else {
+        msg += "<br>Over scope " + escapeHtml(SCOPE) + ", the advertised writer is also the rendezvous owner for <b>" +
+          agree + " of " + CELLS.length + "</b> cells. For the rest, routing would advertise a node that will refuse the write.";
+      }
+      note.innerHTML = msg;
+    }
+
+    render();
+  })();
+
+  /* ==================================================================== W2
+     The bounce. Pick the advertised writer; watch the client loop. */
+
+  (function w2() {
+    var mount = activate("w2", ".w2-static", ".w2-live");
+    if (!mount) return;
+
+    var NODES = ["graph-node-0", "graph-node-1", "graph-node-2"];
+    var CELL = "cell-b";
+    var DELETED = "__deleted__";
+
+    var st = {
+      override: "graph-node-0",
+      followHint: false,
+      phase: "route",       /* route | write | hint */
+      target: null,
+      hops: 0,
+      refusals: 0,
+      commits: 0,
+      epoch: 17,
+      holder: null,
+      clock: 0,
+      active: null,         /* which edge to highlight */
+      timer: null
+    };
+
+    function computedOwner() { return owner(SCOPE, CELL, NODES); }
+
+    function advertised() {
+      return st.override === DELETED ? computedOwner() : st.override;
+    }
+
+    /* -- controls -- */
+
+    var bar1 = h("div", "ctlbar");
+    bar1.appendChild(h("span", "ctl-label", "routing advertises WRITE →"));
+
+    var sel = document.createElement("select");
+    sel.className = "field";
+    sel.setAttribute("aria-label", "Which node the routing table advertises for writes");
+    NODES.forEach(function (n) {
+      var o = document.createElement("option");
+      o.value = n;
+      o.textContent = n + (n === "graph-node-0" ? "  (today's default)" : "");
+      sel.appendChild(o);
+    });
+    var od = document.createElement("option");
+    od.value = DELETED;
+    od.textContent = "(deleted) — advertise the computed owner";
+    sel.appendChild(od);
+    sel.value = st.override;
+    sel.addEventListener("change", function () {
+      st.override = sel.value;
+      reset();
+      log("l-head", st.override === DELETED
+        ? "override deleted -- routing advertises owner(" + SCOPE + ", " + CELL + ") = " + computedOwner()
+        : "override = " + st.override + "  |  computed owner = " + computedOwner());
+    });
+    bar1.appendChild(sel);
+
+    var hintSw = document.createElement("button");
+    hintSw.type = "button";
+    hintSw.className = "switch";
+    hintSw.setAttribute("aria-pressed", "false");
+    hintSw.appendChild(h("span", "dot"));
+    var hintLabel = h("span", null, "driver follows the owner hint: off");
+    hintSw.appendChild(hintLabel);
+    hintSw.addEventListener("click", function () {
+      st.followHint = !st.followHint;
+      hintSw.setAttribute("aria-pressed", st.followHint ? "true" : "false");
+      hintLabel.textContent = "driver follows the owner hint: " + (st.followHint ? "on" : "off");
+      reset();
+    });
+    bar1.appendChild(hintSw);
+    mount.appendChild(bar1);
+
+    var bar2 = h("div", "ctlbar");
+    var stepBtn = button("step");
+    stepBtn.addEventListener("click", function () { step(); });
+    bar2.appendChild(stepBtn);
+
+    var runBtn = button("run");
+    runBtn.setAttribute("aria-pressed", "false");
+    runBtn.addEventListener("click", function () {
+      if (st.timer) { stopRun(); return; }
+      runBtn.setAttribute("aria-pressed", "true");
+      runBtn.textContent = "stop";
+      st.timer = setInterval(step, 550);
+    });
+    bar2.appendChild(runBtn);
+
+    var burstBtn = button("burst ×200");
+    burstBtn.addEventListener("click", function () {
+      var quiet = true;
+      for (var i = 0; i < 200; i++) step(quiet);
+      log("l-dim", "        ... 200 hops elapsed, log suppressed. Counters above are exact.");
+      render();
+    });
+    bar2.appendChild(burstBtn);
+
+    var resetBtn = button("reset", "danger");
+    resetBtn.addEventListener("click", function () { reset(); });
+    bar2.appendChild(resetBtn);
+    mount.appendChild(bar2);
+
+    function stopRun() {
+      if (st.timer) clearInterval(st.timer);
+      st.timer = null;
+      runBtn.setAttribute("aria-pressed", "false");
+      runBtn.textContent = "run";
+    }
+
+    /* -- figure -- */
+
+    var svg = svgRoot("0 0 700 250", "A client bouncing between the advertised writer and the computed owner of cell-b");
+    mount.appendChild(svg);
+
+    /* -- stats and lamps -- */
+
+    var stats = h("div", "stats");
+    var sHops = stat("hops", "accent");
+    var sRefusals = stat("refusals", "crit");
+    var sCommits = stat("commits", "ok");
+    var sPerWrite = stat("hops per commit", "crit");
+    [sHops, sRefusals, sCommits, sPerWrite].forEach(function (x) { stats.appendChild(x); });
+    mount.appendChild(stats);
+
+    var lamps = h("div", "lamps");
+    var lAgree = lamp("advertised vs computed");
+    var lProgress = lamp("progress");
+    lamps.appendChild(lAgree);
+    lamps.appendChild(lProgress);
+    mount.appendChild(lamps);
+
+    var logPane = h("div", "logpane");
+    logPane.setAttribute("role", "log");
+    logPane.setAttribute("aria-live", "polite");
+    mount.appendChild(logPane);
+
+    function log(cls, line) {
+      var r = h("div", cls, line);
+      logPane.appendChild(r);
+      logPane.scrollTop = logPane.scrollHeight;
+      while (logPane.childNodes.length > 220) logPane.removeChild(logPane.firstChild);
+    }
+
+    function tstamp() {
+      st.clock += 0.04 + Math.random() * 0.05;
+      return "t=" + st.clock.toFixed(2);
+    }
+
+    function pad(str, n) {
+      var out = String(str);
+      while (out.length < n) out += " ";
+      return out;
+    }
+
+    /* -- the model: one hop per step -- */
+
+    function step(quiet) {
+      st.hops++;
+      var t = tstamp();
+      var own = computedOwner();
+
+      if (st.phase === "route") {
+        var adv = advertised();
+        st.target = adv;
+        st.active = "route";
+        if (!quiet) {
+          log("l-route", t + "  driver ROUTE" + pad("", 8) + "-> routing table: WRITE = " + adv +
+            (st.override === DELETED ? "   (computed owner)" : "   (override)"));
+        }
+        st.phase = "write";
+        if (!quiet) render();
+        return;
+      }
+
+      if (st.phase === "write" || st.phase === "hint") {
+        var target = st.phase === "hint" ? own : st.target;
+        st.active = st.phase === "hint" ? "hint" : "write";
+        if (target === own) {
+          var opened = st.holder !== target;
+          if (opened) { st.epoch++; st.holder = target; }
+          st.commits++;
+          if (!quiet) {
+            log("l-ok", t + "  write -> " + pad(target, 14) + "commits at epoch " + st.epoch +
+              (opened ? "  (opened the writer)" : "  (already the writer)"));
+          }
+          /* a committed write leaves the routing table intact, so the next
+             write goes straight back to the advertised node */
+          st.phase = advertised() === own ? "write" : "route";
+          if (st.phase === "route" && !quiet) {
+            log("l-dim", "        routing table still names " + advertised() + "; the next write starts over");
+          }
+        } else {
+          st.refusals++;
+          if (!quiet) {
+            log("l-fence", t + "  write -> " + pad(target, 14) + "NotCellWriter { cell: " + CELL + ", owner: " + own + " }");
+            log("l-dim", "        Neo.ClientError.Cluster.NotALeader -> driver discards its routing table");
+          }
+          st.phase = st.followHint ? "hint" : "route";
+          if (st.followHint && !quiet) {
+            log("l-warn", "        driver takes the hint and dials " + own + " directly");
+          }
+        }
+        if (!quiet) render();
+        return;
+      }
+    }
+
+    function reset() {
+      stopRun();
+      st.phase = "route";
+      st.target = null;
+      st.hops = 0;
+      st.refusals = 0;
+      st.commits = 0;
+      st.epoch = 17;
+      st.holder = null;
+      st.clock = 0;
+      st.active = null;
+      clear(logPane);
+      render();
+    }
+
+    /* -- render -- */
+
+    var NODE_Y = { "graph-node-0": 24, "graph-node-1": 104, "graph-node-2": 184 };
+
+    function render() {
+      var own = computedOwner();
+      var adv = advertised();
+      var agree = adv === own;
+
+      sHops.valueNode.textContent = st.hops;
+      sRefusals.valueNode.textContent = st.refusals;
+      sCommits.valueNode.textContent = st.commits;
+      sPerWrite.valueNode.textContent = st.commits ? (st.hops / st.commits).toFixed(1) : "∞";
+
+      lAgree.set(agree ? "ok" : "crit",
+        agree ? adv + " = " + own : adv + " ≠ " + own);
+      if (agree) {
+        lProgress.set("ok", "every write commits on the first hop");
+      } else if (st.followHint) {
+        lProgress.set("crit", "commits, but never without a refusal first");
+      } else {
+        lProgress.set("crit", "no write can ever commit");
+      }
+
+      clear(svg);
+
+      /* driver */
+      svg.appendChild(s("rect", { x: 12, y: 100, width: 130, height: 52, rx: 3, class: "box" }));
+      svg.appendChild(stext(24, 122, "Bolt driver", "t-strong"));
+      svg.appendChild(stext(24, 140, st.phase === "route" ? "needs a routing table" : "has a routing table", "t-dim"));
+
+      /* routing table */
+      var rtCls = agree ? "box ok" : "box crit";
+      svg.appendChild(s("rect", { x: 196, y: 26, width: 262, height: 56, rx: 3, class: rtCls }));
+      svg.appendChild(stext(208, 48, "routing table (TTL 30s)", agree ? "t-ok" : "t-crit"));
+      svg.appendChild(stext(208, 66, "WRITE → " + adv + (st.override === DELETED ? "  (computed)" : "  (override)"),
+        agree ? "t-ok" : "t-crit"));
+
+      /* the ROUTE edge */
+      svg.appendChild(s("path", {
+        d: "M142 112 L196 62",
+        class: st.active === "route" ? "wire accent" : "wire faint"
+      }));
+      svg.appendChild(stext(146, 86, "ROUTE", st.active === "route" ? "t-accent" : "t-dim"));
+
+      /* nodes */
+      NODES.forEach(function (n) {
+        var y = NODE_Y[n];
+        var isOwner = n === own;
+        var isTarget = (st.active === "write" && n === st.target) || (st.active === "hint" && isOwner);
+        var cls = isOwner ? "box ok" : "box dim";
+        if (isTarget && !isOwner) cls = "box crit";
+        svg.appendChild(s("rect", { x: 520, y: y, width: 168, height: 46, rx: 3, class: cls }));
+        svg.appendChild(stext(532, y + 20, n, isOwner ? "t-ok" : "t-strong"));
+        svg.appendChild(stext(532, y + 36,
+          isOwner ? "OWNER of " + CELL + " — accepts" : "not the owner — refuses",
+          isOwner ? "t-ok" : "t-dim"));
+      });
+
+      /* the WRITE edge, routing table -> advertised node */
+      var ay = NODE_Y[adv] + 23;
+      svg.appendChild(s("path", {
+        d: "M458 54 L520 " + ay,
+        class: st.active === "write" ? (agree ? "wire ok" : "wire crit") : "wire faint"
+      }));
+
+      /* the refusal edge, back to the driver */
+      if (!agree) {
+        svg.appendChild(s("path", {
+          d: "M520 " + (ay + 8) + " L300 210 L142 152",
+          class: st.active === "write" && !agree ? "wire crit dash" : "wire faint dash"
+        }));
+        svg.appendChild(stext(196, 226, "NotCellWriter { owner: " + own + " } → discard, ask again",
+          st.active === "write" ? "t-crit" : "t-dim"));
+      }
+
+      /* the hint edge */
+      if (st.followHint && !agree) {
+        svg.appendChild(s("path", {
+          d: "M142 126 L360 132 L520 " + (NODE_Y[own] + 23),
+          class: st.active === "hint" ? "wire accent" : "wire faint dash"
+        }));
+        svg.appendChild(stext(300, 122, "hint retry", st.active === "hint" ? "t-accent" : "t-dim"));
+      }
+
+      svg.appendChild(stext(12, 190, "cell-b  ·  scope " + SCOPE, "t-dim"));
+      svg.appendChild(stext(12, 206, "owner computed here, not asserted", "t-dim"));
+    }
+
+    reset();
+    log("l-head", "override = graph-node-0 (production default)  |  computed owner of " + CELL + " = " + computedOwner());
+    log("l-dim", "press step, or run, and watch the commit counter stay at zero");
+  })();
+
+  /* ==================================================================== W3
+     Shrink the fleet; the computed owner collapses to the last node. */
+
+  (function w3() {
+    var mount = activate("w3", ".w3-static", ".w3-live");
+    if (!mount) return;
+
+    var ALL = ["graph-node-0", "graph-node-1", "graph-node-2", "graph-node-3", "graph-node-4", "graph-node-5"];
+    var st = { n: 3 };
+
+    var bar = h("div", "ctlbar");
+    bar.appendChild(h("span", "ctl-label", "live nodes"));
+    var slider = document.createElement("input");
+    slider.type = "range";
+    slider.min = "1";
+    slider.max = String(ALL.length);
+    slider.step = "1";
+    slider.value = String(st.n);
+    slider.setAttribute("aria-label", "Number of live graph nodes");
+    slider.addEventListener("input", function () {
+      st.n = parseInt(slider.value, 10);
+      render();
+    });
+    bar.appendChild(slider);
+    var count = h("span", "ctl-label", "");
+    bar.appendChild(count);
+
+    var oneBtn = button("single-node deployment");
+    oneBtn.addEventListener("click", function () {
+      st.n = 1;
+      slider.value = "1";
+      render();
+    });
+    bar.appendChild(oneBtn);
+    mount.appendChild(bar);
+
+    var tw = table(["cell", "computed owner", "override default (first key)", "agree?"]);
+    mount.appendChild(tw);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    function render() {
+      var live = ALL.slice(0, st.n);
+      var dflt = firstKey(live);
+      count.textContent = live.join(", ");
+
+      clear(tw.body);
+      var agree = 0;
+      CELLS.forEach(function (c) {
+        var o = owner(SCOPE, c, live);
+        var same = o === dflt;
+        if (same) agree++;
+        row(tw.body, [c, o, dflt, same ? "yes" : "no"], same ? "win" : "bad");
+      });
+
+      var msg = "";
+      if (st.n === 1) {
+        msg = "<b class='good'>One live node.</b> owner(scope, cell, [" + escapeHtml(dflt) + "]) returns " +
+          escapeHtml(dflt) + " for every cell, because the highest score among one score is that score. " +
+          "The override and the computation agree " + agree + " of " + CELLS.length + " times, and cannot do otherwise. " +
+          "<b>There is nothing here for an override to override.</b>";
+      } else {
+        msg = "<b>" + st.n + " live nodes.</b> The override default is fixed at <b>" + escapeHtml(dflt) +
+          "</b> — one answer for every cell — while the computed owner varies per cell. They agree on <b>" +
+          agree + " of " + CELLS.length + "</b>. Each disagreement is a cell whose writes routing would send to a " +
+          "node that refuses them.";
+      }
+      note.innerHTML = msg;
+    }
+
+    render();
+  })();
+
+})();
+</script>
+
+</body>
+</html>
