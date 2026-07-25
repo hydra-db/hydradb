@@ -3,9 +3,9 @@ title: Rendezvous placement Phase 1 — implementation review
 date: 2026-07-26
 branch: Turbolay-V3.5
 base_commit: ea942ec
-head_commit: efc4c5a
+head_commit: dddc1ec
 plan: docs/plans/2026-07-25-rendezvous-placement.md
-status: commits-1-2-5-complete
+status: phase-1-complete
 tags:
   - routing
   - placement
@@ -16,10 +16,9 @@ tags:
 
 # Rendezvous placement Phase 1 — implementation review
 
-Covers `ea942ec..efc4c5a`: six commits, 15 files, ~4150 insertions. Three of the
-seven commits in §7.8 of the plan are done. What follows is what shipped, what
-changed in the plan while shipping it, and the one real defect found along the
-way.
+Covers `ea942ec..dddc1ec`. **All seven commits of §7.8 are done** and Phase 1 is
+complete. What follows is what shipped, what changed in the plan while shipping
+it, and the one real defect found along the way.
 
 ## Where the seven commits stand
 
@@ -27,16 +26,16 @@ way.
 |---|---|---|
 | 1 | crate — `heartbeat.rs`, `liveness.rs` | **done** — `475c473` |
 | 2 | readiness-gated publisher | **done** — `efc4c5a` |
-| 3 | (a) routing names the owner, probe deleted | in progress |
-| 4 | (b)+(c) don't-promote rule + `NotALeader` | in progress |
+| 3 | (a) routing names the owner, probe deleted | **done** — `dfbdf02` |
+| 4 | (b)+(c) don't-promote rule + `NotALeader` | **done** — `dfbdf02` |
 | 5 | (d) fence backoff | **done** — `8fa865f`, reworked by `efc4c5a` |
-| 6 | 3a advisory record | not started |
-| 7 | regression test | not started |
+| 6 | 3a advisory record | **done** — `dddc1ec` |
+| 7 | regression test | **done** — `dddc1ec` |
 
-Nothing has client-visible effect yet. The publisher writes objects nothing
-reads; the placement seam is built and tested but not yet wired into either
-consumer. Commits 3 and 4 are where that changes, and they are the pair the plan
-says must not be separated.
+`dfbdf02` is where behaviour changes. It also pulled in touch point (e), which
+was not optional: `graph-node.rs` called `with_readiness_port`, which decision 4
+deletes, so the tree could not compile without it — and a routing provider with
+no live set would have made commits 3 and 4 a no-op in production.
 
 ## The defect worth reading about
 
@@ -155,13 +154,28 @@ verified in a clean worktree rather than accepted on assertion.
   `libcypher-parser-dev` via apt and needs neither. Nothing documents the local
   equivalent; it belongs in the `justfile`.
 
+## The regression test, and why it discriminates
+
+`three_nodes_writing_one_cell_at_once_leave_one_writer_and_a_bounded_epoch` is
+the incident reproduced: three promotable nodes, one cell, twelve concurrent
+writes, all sharing one fleet view. Three details are what make it a test rather
+than a demonstration.
+
+- The expected owner is computed independently from `hash::owner` rather than
+  observed, so it would fail if ownership were settled by a coin flip.
+- It asserts writer *handles* — `db.writer().is_ok()` false on both peers — not
+  just the returned error. A refusal that still opened the writer **is** the
+  duel, and checking the error alone would miss exactly that.
+- The bound is `1 <= epoch <= 2`: one promotion plus one spare, because decision
+  6.3 permits a fenced node to re-fence the winner once before converging.
+  Asserting a single bump would fail correct code. Observed is 1; the pre-fix
+  behaviour reaches 3 after the first of four rounds, so the ceiling still fails
+  the old code. 33 runs, no flakes.
+
 ## What is left
 
-Commits 3 and 4 in progress. Then 6 (the advisory record at
-`_cell_writers/v1/<cell_id>`, read on exactly two off-path sites and never
-consulted to decide a promotion) and 7 (three promotable nodes, one cell,
-concurrent writes).
-
-Commit 7 asserts **bounded epoch growth, not zero re-fences** — decision 6.3
-permits one re-fence before convergence, so a stricter assertion would fail
-correct code.
+Phase 2 — cell addressability on the wire — and the §6 follow-ups: forwarding
+over `QueryServiceEndpoint` for HTTP clients, and a minimum-tenure rule if
+flapping proves painful. Rendezvous moves ownership the instant the live set
+changes, so a flapping node reclaims its cells each time it returns, at one
+writer open per reclaim.
