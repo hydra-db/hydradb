@@ -16,10 +16,10 @@ tags:
 
 Sections 1 and 2 landed in `7b0d340`. Sections 3–5 are unstarted.
 
-§7 decisions 1–6 are settled. What remains open is **Q4 — how much of Phase 1
-lands in the next pass** — plus two smaller calls listed in §7.7. Decision 4
-reorders the build: the heartbeat publisher must ship *before* the routing
-change, not after it. The reasoning behind every settled decision lives in
+§7 decisions 1–8 are settled; §7.9 lists the one call still open. All of Phase 1
+ships in a single release as seven staged commits (§7.8) — the heartbeat
+publisher ahead of the routing change, because decision 4 deletes the probe. The
+reasoning behind every settled decision lives in
 `docs/plans/2026-07-25-rendezvous-placement-open-questions.md`; §7 carries only
 the outcome.
 
@@ -258,6 +258,8 @@ the cluster.
 | Golden hash values, pinned hex | `turbolay-placement` | the wire format |
 | Remove a node, order of the rest preserved | `turbolay-placement` | minimal disruption |
 | Heartbeat expiry, self-always-live | `turbolay-placement` | liveness rules |
+| LIST failure inside grace keeps the view; past grace sheds and unpublishes | `turbolay-placement` | decision 7 — the bound |
+| Never-published peer counts live for one timeout after start, dead after | `turbolay-placement` | decision 8 — the rolling restart |
 | Routing table names the rendezvous owner for WRITE | `bolt/routing` tests | touch point (a) |
 | Non-owner write returns `NotCellWriter`, not a promotion | `cluster` tests | touch point (b) |
 | **3 promotable nodes, 1 cell, concurrent writes → exactly one epoch bump** | integration | **the prod regression** |
@@ -418,19 +420,74 @@ Touch point (d) currently under-specifies this. Sleet's handler
 3. **Retries unconditionally**, without re-checking ownership. Sleet accepts that
    a fenced node re-fences the winner once more before converging.
 
-### 7. Still open
+### 7. A failed node LIST — bounded grace, then shed. Decided
 
-- **Q4 — build scope for the next pass.** Recommendation is all of Phase 1 in
-  seven staged commits. Note that decision 4 above **reorders the staging**: (a)
-  deletes the probe, so it cannot function until heartbeats are published, which
-  means the publisher must ship in an earlier commit than the routing change.
-  Otherwise a partially-upgraded fleet has new nodes computing ownership over a
-  live set that omits every old node.
-- **A failed node LIST — shed ownership or keep it?** Sleet keeps assignments
-  (`daemon.rs:243`). For a writer that is an unbounded duel, because a
-  partitioned node can never learn it lost. Proposal is to shed: refuse
-  promotion, return `NotCellWriter` with no owner hint. The one place this design
-  must diverge from its reference implementation.
-- **Does `with_preferred_writer_node` survive?** Proposal is yes, as an explicit
-  override above rendezvous — tests and single-node deploys — validating the id
-  against the address map so it fails closed.
+Sleet keeps its assignments on a failed LIST (`daemon.rs:243`). For a writer that
+is an unbounded duel: a partitioned node can never learn it lost, so it
+re-promotes forever. Shedding on the *first* failure is the opposite extreme and
+drops a healthy writer on one throttled request. Neither is right.
+
+```
+grace = heartbeat_timeout (15s), measured from the last successful LIST
+
+within grace  -> serve the cached live set, keep retrying with backoff
+past grace    -> go unready: stop publishing, DELETE the heartbeat
+              -> refuse promotion: NotCellWriter with no owner hint
+```
+
+The grace is `heartbeat_timeout` and not a new knob because peers take over that
+long after the last successful PUT, and in a partition LIST and PUT fail
+together. A shorter grace leaves a window where nobody owns the cell; a longer
+one leaves a duel; equal makes them coincide.
+
+**Shedding must withdraw the heartbeat**, and that is the part that is easy to
+miss. In a partial failure — LIST throttled, PUTs still landing — a node that
+sheds while still publishing stays the computed owner for everyone else, so peers
+route writes to it and it refuses every one, permanently, with nothing to time
+out. Withdrawing makes peers take over. It also falls out of decision 4's
+readiness gating for free: a node that cannot read the live set is not ready.
+
+Worst case for the cell: 15s grace + peer detection (immediate if the DELETE
+lands, another 15s if the store is fully unreachable) — **≤ 30s**, bounded either
+way.
+
+`last_successful_list` is a monotonic local `Instant` measuring elapsed duration
+only; cross-node comparison stays on object-storage `LastModified`. An **empty**
+LIST is a valid answer, not a failure, and must not share the failure path.
+
+### 8. Build scope — all of Phase 1, one release. Decided
+
+Seven commits, shipped together. No intermediate version reaches prod.
+
+| # | Commit | Runtime effect |
+|---|---|---|
+| 1 | §3 crate — `heartbeat.rs`, `directory.rs` | none |
+| 2 | **publisher** — readiness-gated heartbeat task, DELETE on SIGTERM | writes objects nothing yet reads |
+| 3 | **(a)** routing — live set from LIST, `WRITE` names the owner, fan-out deleted | first client-visible change |
+| 4 | **(b)+(c)** don't-promote rule + `NotALeader` mapping | **the duel stops** |
+| 5 | **(d)** fence backoff + reset to 1s | bounds mutual fencing |
+| 6 | **3a** advisory record + fenced-log attribution | next incident readable in one line |
+| 7 | **§5** regression test | none |
+
+The publisher is split out of (e) and placed ahead of (a) because (a) deletes the
+probe and cannot function until heartbeats exist. Commits 3 and 4 are the pair
+that must not be separated, and are where the review effort belongs.
+
+Shipping one release removes most of the mixed-version hazard but not all of it —
+a rolling restart replaces pods one at a time. So `directory.rs` distinguishes
+**never-published** from **expired**: for the first `heartbeat_timeout` after
+process start, a configured peer with no heartbeat object counts as live. Only
+expiry is evidence of death; the never-seen case degrades to today's behaviour
+instead of concluding the rest of the fleet is dead.
+
+### 9. Still open
+
+- **Does `with_preferred_writer_node` survive?** Recommendation reversed after
+  reading the code: **delete it**. It has no production caller —
+  `graph-node.rs:115-116` never calls it, so the field is always the address
+  map's first key (`routing.rs:76-80`) and its only caller is
+  `bolt/tests.rs:1373`. Keeping it once (b) enforces ownership creates a routing
+  loop no timeout breaks: routing advertises the override, `ensure_local_writer`
+  enforces rendezvous, and the driver bounces between them. If a pin is ever
+  wanted it belongs *inside* `owner()` in `turbolay-placement`, so both sides
+  read one source. Full argument in section B of the open-questions record.
