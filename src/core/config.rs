@@ -134,7 +134,7 @@ impl GraphCacheConfig {
 /// care about. Every field stays `pub`, so nothing is hidden — but embedders may
 /// not use an exhaustive struct literal, which is what lets this crate add
 /// options without breaking them.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct GraphOpenOptions {
     pub limits: GraphLimits,
@@ -143,7 +143,35 @@ pub struct GraphOpenOptions {
     pub cache_policy: GraphCachePolicy,
     pub backpressure_policy: GraphBackpressurePolicy,
     pub index_policy: GraphIndexPolicy,
+    /// How long a fenced writer waits before it may re-open — one heartbeat
+    /// interval, sized so the rival has refreshed its view and stood down.
+    ///
+    /// Decision 5 of `docs/plans/2026-07-25-rendezvous-placement.md` fixes the
+    /// default at 5s and the node config validates `interval < timeout` at
+    /// startup. It is settable here so a test can pace a fence in milliseconds
+    /// instead of sleeping through the production value.
+    pub fence_backoff_interval: Duration,
 }
+
+// Hand-written rather than derived: `Duration::default()` is zero, and a zero
+// fence wait would let a fenced writer re-open immediately, which is the exact
+// behaviour touch point (d) exists to stop.
+impl Default for GraphOpenOptions {
+    fn default() -> Self {
+        Self {
+            limits: GraphLimits::default(),
+            cache: GraphCacheConfig::default(),
+            durability: GraphDurabilityConfig::default(),
+            cache_policy: GraphCachePolicy::default(),
+            backpressure_policy: GraphBackpressurePolicy::default(),
+            index_policy: GraphIndexPolicy::default(),
+            fence_backoff_interval: DEFAULT_FENCE_BACKOFF_INTERVAL,
+        }
+    }
+}
+
+/// Decision 5's heartbeat interval, which is also the fenced-writer wait.
+pub const DEFAULT_FENCE_BACKOFF_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphMemoryConfig {

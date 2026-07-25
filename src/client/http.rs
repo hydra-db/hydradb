@@ -333,12 +333,18 @@ struct HttpErrorEnvelope {
 struct HttpErrorBody {
     code: &'static str,
     message: String,
+    /// The node that owns the cell, on a 421. Serialized only when there is one
+    /// — a node that has shed its view of the fleet refuses with no hint at
+    /// all, and an absent field says that where a `null` would not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
 }
 
 struct HttpApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    owner: Option<String>,
     authenticate: bool,
 }
 
@@ -348,6 +354,7 @@ impl HttpApiError {
             status: StatusCode::UNAUTHORIZED,
             code: "unauthenticated",
             message: "valid bearer authentication is required".to_string(),
+            owner: None,
             authenticate: true,
         }
     }
@@ -362,18 +369,35 @@ impl HttpApiError {
                 status: StatusCode::FORBIDDEN,
                 code: "permission_denied",
                 message: error.to_string(),
+                owner: None,
                 authenticate: false,
             },
             GraphError::AdmissionRejected { .. } => Self {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 code: "resource_exhausted",
                 message: error.to_string(),
+                owner: None,
                 authenticate: false,
             },
             GraphError::QueryTimeout { .. } => Self {
                 status: StatusCode::REQUEST_TIMEOUT,
                 code: "query_timeout",
                 message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
+            // Touch point (c) for HTTP. 421 Misdirected Request is the honest
+            // status: the request reached a node that cannot serve it, and the
+            // fix is to send it elsewhere. Unlike a Bolt driver an HTTP client
+            // has no routing table to discard, so the owner is in the body
+            // rather than in a code the client is expected to already know.
+            // Forwarding the write over `QueryServiceEndpoint` is the better
+            // answer here, and is a deliberate follow-up.
+            GraphError::NotCellWriter { owner, .. } => Self {
+                status: StatusCode::MISDIRECTED_REQUEST,
+                code: "not_cell_writer",
+                message: error.to_string(),
+                owner: owner.clone(),
                 authenticate: false,
             },
             GraphError::InvalidKeyComponent { .. }
@@ -385,6 +409,7 @@ impl HttpApiError {
                 status: StatusCode::BAD_REQUEST,
                 code: "invalid_request",
                 message: error.to_string(),
+                owner: None,
                 authenticate: false,
             },
             _ => {
@@ -393,6 +418,7 @@ impl HttpApiError {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     code: "internal",
                     message: "internal query execution error".to_string(),
+                    owner: None,
                     authenticate: false,
                 }
             }
@@ -408,6 +434,7 @@ impl IntoResponse for HttpApiError {
                 error: HttpErrorBody {
                     code: self.code,
                     message: self.message,
+                    owner: self.owner,
                 },
             }),
         )
@@ -575,6 +602,7 @@ fn http_graph_scope(
                 status: StatusCode::BAD_REQUEST,
                 code: "missing_namespace",
                 message: format!("{GRAPH_NAMESPACE_HEADER} header is required"),
+                owner: None,
                 authenticate: false,
             })
         }
@@ -664,6 +692,7 @@ fn invalid_http_parameter(name: &str) -> HttpApiError {
         message: format!(
             "parameter ${name} must contain booleans, signed or unsigned integers, finite floats, strings, lists, or string-keyed maps"
         ),
+        owner: None,
         authenticate: false,
     }
 }

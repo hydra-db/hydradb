@@ -1,14 +1,7 @@
 use async_trait::async_trait;
-use futures::future::join_all;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::timeout;
 
 use super::*;
-use crate::validate_component;
-
-const DEFAULT_ROUTING_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+use crate::{validate_component, PlacementView};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoltRoutingServer {
@@ -38,24 +31,46 @@ pub trait BoltRoutingTableProvider: Send + Sync {
     ) -> Result<BoltRoutingTable>;
 }
 
-/// Bolt routing for object-store-native nodes. Every advertised node can read
-/// any configured cell. The first reachable node in stable preference order is
-/// advertised for writes to preserve a warm writer cache. Nodes are advertised
-/// only after their application readiness endpoint returns HTTP 200. SlateDB
-/// remains the authoritative writer fence.
+/// Bolt routing for object-store-native nodes.
+///
+/// Every advertised node can read any configured cell, so `READ` and `ROUTE`
+/// name the whole live fleet. `WRITE` names exactly one node: the rendezvous
+/// owner of the target cell, the same answer
+/// [`RoutedGraphCluster::ensure_local_writer`] enforces. Advertising anything
+/// else builds a loop no timeout breaks — routing sends the write to a node
+/// that then refuses it as a non-owner, and the driver bounces between the two.
+/// That is why decision 9 of `docs/plans/2026-07-25-rendezvous-placement.md`
+/// deletes the old `with_preferred_writer_node` override rather than keeping it
+/// as a pin.
+///
+/// # Liveness comes from the shared placement view, not from a probe
+///
+/// This used to fan out a `/readyz` probe to every configured node on every
+/// routing refresh and advertise the reachable ones. Decision 4 deletes that
+/// fan-out, and the reason is **consistency, not cost**: a probe is computed
+/// per caller, so two drivers asking at the same instant could get different
+/// answers, and rendezvous only converges if every reader derives ownership
+/// from the *same* live set. One object-store LIST behind one
+/// [`PlacementView`] gives that; N probes cannot. The `/readyz` endpoint
+/// itself is untouched — the k8s readiness probe, the runtime smoke script and
+/// the Jepsen harness still use it; only routing stopped calling it.
+///
+/// [`RoutedGraphCluster::ensure_local_writer`]: crate::RoutedGraphCluster
 #[derive(Clone)]
 pub struct ObjectStoreBoltRoutingTableProvider {
     node_addresses: BTreeMap<String, String>,
-    readiness_addresses: BTreeMap<String, String>,
-    preferred_writer_node: String,
+    /// The **shared** live set. This must be a clone of the handle the routed
+    /// cluster holds: a second view over the same store reintroduces exactly
+    /// the per-caller inconsistency deleting the probe removed.
+    placement: PlacementView,
     routing_ttl_secs: i64,
-    health_probe_timeout: Duration,
 }
 
 impl ObjectStoreBoltRoutingTableProvider {
     pub fn new(
         node_addresses: impl IntoIterator<Item = (String, String)>,
         routing_ttl_secs: i64,
+        placement: PlacementView,
     ) -> Result<Self> {
         if routing_ttl_secs <= 0 {
             return bolt_config_error("object-store routing TTL must be greater than zero");
@@ -73,148 +88,12 @@ impl ObjectStoreBoltRoutingTableProvider {
         if addresses.is_empty() {
             return bolt_config_error("object-store routing requires at least one node address");
         }
-        let preferred_writer_node = addresses
-            .keys()
-            .next()
-            .expect("non-empty address map")
-            .clone();
-        let readiness_addresses = addresses
-            .iter()
-            .map(|(node_id, address)| {
-                replace_address_port(address, 9090).map(|readiness| (node_id.clone(), readiness))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self {
             node_addresses: addresses,
-            readiness_addresses,
-            preferred_writer_node,
+            placement,
             routing_ttl_secs,
-            health_probe_timeout: DEFAULT_ROUTING_HEALTH_PROBE_TIMEOUT,
         })
     }
-
-    pub fn with_readiness_addresses(
-        mut self,
-        readiness_addresses: impl IntoIterator<Item = (String, String)>,
-    ) -> Result<Self> {
-        let mut parsed = BTreeMap::new();
-        for (node_id, address) in readiness_addresses {
-            validate_component("node_id", &node_id)?;
-            let address = address.trim().to_string();
-            if address.is_empty() || parsed.insert(node_id, address).is_some() {
-                return bolt_config_error(
-                    "routing readiness node ids must be unique and addresses cannot be empty",
-                );
-            }
-        }
-        let readiness_addresses = parsed;
-        if readiness_addresses.keys().ne(self.node_addresses.keys()) {
-            return bolt_config_error(
-                "routing readiness addresses must identify every configured graph node",
-            );
-        }
-        self.readiness_addresses = readiness_addresses;
-        Ok(self)
-    }
-
-    pub fn with_readiness_port(mut self, port: u16) -> Result<Self> {
-        if port == 0 {
-            return bolt_config_error("routing readiness port must be greater than zero");
-        }
-        self.readiness_addresses = self
-            .node_addresses
-            .iter()
-            .map(|(node_id, address)| {
-                replace_address_port(address, port).map(|readiness| (node_id.clone(), readiness))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
-        Ok(self)
-    }
-
-    pub fn with_preferred_writer_node(mut self, node_id: impl Into<String>) -> Result<Self> {
-        let node_id = node_id.into();
-        validate_component("node_id", &node_id)?;
-        if !self.node_addresses.contains_key(&node_id) {
-            return bolt_config_error("preferred writer node must be present in routing addresses");
-        }
-        self.preferred_writer_node = node_id;
-        Ok(self)
-    }
-
-    pub fn with_health_probe_timeout(mut self, probe_timeout: Duration) -> Result<Self> {
-        if probe_timeout.is_zero() {
-            return bolt_config_error("routing health probe timeout must be greater than zero");
-        }
-        self.health_probe_timeout = probe_timeout;
-        Ok(self)
-    }
-
-    async fn reachable_nodes(&self) -> Vec<(String, String)> {
-        let probes = self.node_addresses.iter().map(|(node_id, address)| {
-            let node_id = node_id.clone();
-            let address = address.clone();
-            let readiness_address = self
-                .readiness_addresses
-                .get(&node_id)
-                .expect("readiness addresses cover every graph node")
-                .clone();
-            async move {
-                let reachable =
-                    probe_node_readiness(&readiness_address, self.health_probe_timeout).await;
-                reachable.then_some((node_id, address))
-            }
-        });
-        join_all(probes).await.into_iter().flatten().collect()
-    }
-}
-
-fn replace_address_port(address: &str, port: u16) -> Result<String> {
-    let host = if let Some(rest) = address.strip_prefix('[') {
-        let (host, suffix) =
-            rest.split_once(']')
-                .ok_or_else(|| GraphError::InvalidKeyComponent {
-                    component: "bolt_routing_address",
-                    value: address.to_string(),
-                })?;
-        if !suffix.starts_with(':') || suffix[1..].parse::<u16>().is_err() || host.is_empty() {
-            return bolt_config_error("routing addresses must use host:port syntax");
-        }
-        format!("[{host}]")
-    } else {
-        address
-            .rsplit_once(':')
-            .filter(|(host, source_port)| !host.is_empty() && source_port.parse::<u16>().is_ok())
-            .map(|(host, _)| host.to_string())
-            .ok_or_else(|| GraphError::InvalidKeyComponent {
-                component: "bolt_routing_address",
-                value: address.to_string(),
-            })?
-    };
-    Ok(format!("{host}:{port}"))
-}
-
-async fn probe_node_readiness(address: &str, probe_timeout: Duration) -> bool {
-    let probe = async {
-        let mut stream = TcpStream::connect(address).await?;
-        let request =
-            format!("GET /readyz HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
-        stream.write_all(request.as_bytes()).await?;
-        let mut response = Vec::with_capacity(64);
-        while response.len() < 64 && !response.windows(2).any(|bytes| bytes == b"\r\n") {
-            let mut chunk = [0_u8; 32];
-            let bytes_read = stream.read(&mut chunk).await?;
-            if bytes_read == 0 {
-                break;
-            }
-            response.extend_from_slice(&chunk[..bytes_read]);
-        }
-        Ok::<bool, std::io::Error>(
-            response.starts_with(b"HTTP/1.1 200 ") || response.starts_with(b"HTTP/1.0 200 "),
-        )
-    };
-    timeout(probe_timeout, probe)
-        .await
-        .is_ok_and(|result| result.unwrap_or(false))
 }
 
 #[async_trait]
@@ -222,28 +101,52 @@ impl BoltRoutingTableProvider for ObjectStoreBoltRoutingTableProvider {
     async fn routing_table(
         &self,
         _database: &str,
-        _target: &ClientQueryTarget,
+        target: &ClientQueryTarget,
     ) -> Result<BoltRoutingTable> {
-        let reachable = self.reachable_nodes().await;
-        if reachable.is_empty() {
-            return bolt_config_error("object-store routing found no reachable graph nodes");
-        }
-        let addresses = reachable
+        // One snapshot for the whole table. Deriving the reader list and the
+        // writer from two `view()` calls would let a refresh land between them
+        // and produce a table naming two different fleets.
+        let view = self.placement.view();
+        let scope = target.scope.to_string();
+
+        // `nodes()` is empty for a shed view (decision 7), so a node that has
+        // lost sight of the fleet advertises nothing rather than a stale fleet.
+        // Sorted by node id, because the underlying set is, so a table is stable
+        // between refreshes that did not change the live set.
+        let live_addresses = view
+            .nodes()
             .iter()
-            .map(|(_, address)| address.clone())
+            .filter_map(|node| self.node_addresses.get(&node.node_id).cloned())
             .collect::<Vec<_>>();
-        let writer = reachable
-            .iter()
-            .find(|(node_id, _)| node_id == &self.preferred_writer_node)
-            .or_else(|| reachable.first())
-            .expect("reachable node list was checked")
-            .1
-            .clone();
+        if live_addresses.is_empty() {
+            return bolt_config_error("object-store routing found no live graph nodes");
+        }
+
+        // Deliberately resolved over the *unfiltered* live set, which is what
+        // `ensure_local_writer` computes over: silently picking the runner-up
+        // because the winner has no configured Bolt address would advertise a
+        // node that refuses every write it is sent.
+        let writer = match self.placement.owner_in(&view, &scope, &target.cell_id) {
+            Some(owner) => match self.node_addresses.get(&owner) {
+                Some(address) => address.clone(),
+                None => {
+                    return bolt_config_error(
+                        "object-store routing has no Bolt address for the cell's owning node",
+                    )
+                }
+            },
+            // `None` covers both a known-empty fleet and a shed view. A routing
+            // table has the same answer for either — there is no WRITE endpoint
+            // to advertise — which is why collapsing them is safe here and is
+            // not safe in `ensure_local_writer`.
+            None => return bolt_config_error("object-store routing found no owner for the cell"),
+        };
+
         BoltRoutingTable::new(
             self.routing_ttl_secs,
             vec![
-                BoltRoutingServer::new("ROUTE", addresses.clone())?,
-                BoltRoutingServer::new("READ", addresses)?,
+                BoltRoutingServer::new("ROUTE", live_addresses.clone())?,
+                BoltRoutingServer::new("READ", live_addresses)?,
                 BoltRoutingServer::new("WRITE", [writer])?,
             ],
         )

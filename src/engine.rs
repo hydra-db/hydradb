@@ -86,6 +86,9 @@ pub struct RoutedGraphCluster {
     scope: GraphScope,
     local_node_id: String,
     directory: ObjectStoreNodeDirectory,
+    /// Who owns each cell's writer. A clone of the process-wide handle, shared
+    /// with the Bolt routing provider — see `engine::placement`.
+    placement: PlacementView,
     shards: BTreeMap<String, Arc<GraphShard>>,
     promotable: bool,
 }
@@ -103,6 +106,7 @@ pub struct ScopedRoutedGraphCluster {
     graph_id: GraphId,
     local_node_id: String,
     directory: ObjectStoreNodeDirectory,
+    placement: PlacementView,
     object_store: Arc<dyn ObjectStore>,
     scope_directory: ObjectStoreGraphScopeDirectory,
     options: GraphOpenOptions,

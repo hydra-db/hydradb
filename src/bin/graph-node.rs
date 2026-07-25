@@ -20,8 +20,8 @@ use slatedb_graph_kernel::{
     object_store_from_env, BoltServerConfig, ClientBoltServer, ClientHttpServer,
     ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget,
     HierarchicalClientDatabaseResolver, HttpQueryServerConfig, ObjectStoreBoltRoutingTableProvider,
-    ObjectStoreNodeDirectory, QueryTransportAction, QueryTransportScopeGrant,
-    ScopedRoutedGraphCluster, StaticQueryTransportScopeAuthorizer,
+    ObjectStoreNodeDirectory, PlacementConfig, PlacementView, QueryTransportAction,
+    QueryTransportScopeGrant, ScopedRoutedGraphCluster, StaticQueryTransportScopeAuthorizer,
 };
 use tracing_subscriber::EnvFilter;
 use turbolay_placement::heartbeat::{delete_heartbeat, put_heartbeat, validate_node_id, Heartbeat};
@@ -50,12 +50,32 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         config.cells.iter().cloned(),
         config.bolt_node_addresses.keys().cloned(),
     )?;
+    // One placement handle for the whole process, cloned into the routed
+    // cluster and the Bolt routing provider. A second handle over the same
+    // store would be a second live set, and rendezvous only converges while
+    // every reader answers from the same one — see `engine::placement`.
+    let placement = PlacementView::from_directory(
+        config.node_id.clone(),
+        &directory,
+        PlacementConfig {
+            heartbeat_interval: config.heartbeat_interval,
+            heartbeat_timeout: config.heartbeat_timeout,
+        },
+    )?;
+    // Refreshed before the listeners open, so the first request cannot race the
+    // task's first tick and be answered from the assumed-fleet grace view.
+    let placement_base = Path::from(config.data_path.as_str());
+    let _ = placement
+        .refresh(object_store.as_ref(), &placement_base)
+        .await;
+    let placement_refresh = placement.spawn_refresh(Arc::clone(&object_store), placement_base);
     let node = Arc::new(ScopedRoutedGraphCluster::new(
         config.data_path.clone(),
         config.scope.namespace.clone(),
         config.scope.graph_id.clone(),
         config.node_id.clone(),
         directory.clone(),
+        placement.clone(),
         Arc::clone(&object_store),
         open_options,
         memory_config,
@@ -121,8 +141,14 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
         .with_default_database(config.database.clone())
         .with_max_connections(config.max_bolt_connections)
         .with_graceful_shutdown_timeout(config.graceful_shutdown_timeout);
-    let routing = ObjectStoreBoltRoutingTableProvider::new(config.bolt_node_addresses.clone(), 30)?
-        .with_readiness_port(config.admin_addr.port())?;
+    // No `/readyz` fan-out any more (decision 4): readiness rides the heartbeat
+    // the publisher below writes, and the routing table is derived from the same
+    // live set `ensure_local_writer` enforces.
+    let routing = ObjectStoreBoltRoutingTableProvider::new(
+        config.bolt_node_addresses.clone(),
+        30,
+        placement.clone(),
+    )?;
     bolt_config = bolt_config.with_routing_table_provider(Arc::new(routing));
     if let Some(provider) = &tls_provider {
         bolt_config = bolt_config.with_tls_provider(Arc::clone(provider));
@@ -191,6 +217,9 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
             "timed out withdrawing the heartbeat; peers will age this node out"
         ),
     }
+    // Nothing left to route or promote, so the view need not be refreshed while
+    // the listeners drain.
+    placement_refresh.abort();
     admin.stop().await?;
     http.stop().await?;
     bolt.stop().await?;

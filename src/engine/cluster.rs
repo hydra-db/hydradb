@@ -164,6 +164,7 @@ struct RoutedClusterOpenConfig {
     scope: GraphScope,
     local_node_id: String,
     directory: ObjectStoreNodeDirectory,
+    placement: PlacementView,
     object_store: Arc<dyn ObjectStore>,
     promotable: bool,
     options: GraphOpenOptions,
@@ -175,6 +176,7 @@ impl RoutedGraphCluster {
         base_path: impl Into<String>,
         local_node_id: impl Into<String>,
         directory: ObjectStoreNodeDirectory,
+        placement: PlacementView,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
         Self::open_readers_scoped(
@@ -182,6 +184,7 @@ impl RoutedGraphCluster {
             GraphScope::default(),
             local_node_id,
             directory,
+            placement,
             object_store,
         )
         .await
@@ -191,6 +194,7 @@ impl RoutedGraphCluster {
         base_path: impl Into<String>,
         local_node_id: impl Into<String>,
         directory: ObjectStoreNodeDirectory,
+        placement: PlacementView,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
         Self::open_promotable_scoped_with_memory_options(
@@ -198,6 +202,7 @@ impl RoutedGraphCluster {
             GraphScope::default(),
             local_node_id,
             directory,
+            placement,
             object_store,
             GraphOpenOptions::default(),
             GraphMemoryConfig::default(),
@@ -209,6 +214,7 @@ impl RoutedGraphCluster {
         base_path: impl Into<String>,
         local_node_id: impl Into<String>,
         directory: ObjectStoreNodeDirectory,
+        placement: PlacementView,
         object_store: Arc<dyn ObjectStore>,
         options: GraphOpenOptions,
     ) -> Result<Self> {
@@ -217,6 +223,7 @@ impl RoutedGraphCluster {
             GraphScope::default(),
             local_node_id,
             directory,
+            placement,
             object_store,
             options,
             GraphMemoryConfig::default(),
@@ -229,6 +236,7 @@ impl RoutedGraphCluster {
         scope: GraphScope,
         local_node_id: impl Into<String>,
         directory: ObjectStoreNodeDirectory,
+        placement: PlacementView,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
         let base_path = scope.scoped_store_path(&base_path.into());
@@ -237,6 +245,7 @@ impl RoutedGraphCluster {
             scope,
             local_node_id: local_node_id.into(),
             directory,
+            placement,
             object_store,
             promotable: false,
             options: GraphOpenOptions::default(),
@@ -245,11 +254,13 @@ impl RoutedGraphCluster {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_promotable_scoped_with_memory_options(
         base_path: impl Into<String>,
         scope: GraphScope,
         local_node_id: impl Into<String>,
         directory: ObjectStoreNodeDirectory,
+        placement: PlacementView,
         object_store: Arc<dyn ObjectStore>,
         options: GraphOpenOptions,
         memory: GraphMemoryConfig,
@@ -260,6 +271,7 @@ impl RoutedGraphCluster {
             scope,
             local_node_id: local_node_id.into(),
             directory,
+            placement,
             object_store,
             promotable: true,
             options,
@@ -274,6 +286,7 @@ impl RoutedGraphCluster {
             scope,
             local_node_id,
             directory,
+            placement,
             object_store,
             promotable,
             options,
@@ -284,6 +297,19 @@ impl RoutedGraphCluster {
             return Err(GraphError::CorruptValue {
                 key: format!("directory/node/{local_node_id}"),
                 reason: "local node is not present in the object-store node directory".to_string(),
+            });
+        }
+        // A placement view answers `Local` or `Remote` relative to *its* node
+        // id, so a handle built for another node would have this one refuse
+        // every write it owns and promote itself for every cell it does not —
+        // and nothing about either symptom points at the mismatch.
+        if placement.local_node_id() != local_node_id {
+            return Err(GraphError::CorruptValue {
+                key: format!("directory/node/{local_node_id}"),
+                reason: format!(
+                    "placement view belongs to node {}, not to this cluster's node",
+                    placement.local_node_id()
+                ),
             });
         }
         for cell_id in directory.cells() {
@@ -331,6 +357,7 @@ impl RoutedGraphCluster {
             scope,
             local_node_id,
             directory,
+            placement,
             shards,
             promotable,
         })
@@ -338,6 +365,12 @@ impl RoutedGraphCluster {
 
     pub fn local_node_id(&self) -> &str {
         &self.local_node_id
+    }
+    /// The shared placement handle, for a caller that must hand the same live
+    /// set to another reader (the Bolt routing provider) rather than build a
+    /// second one.
+    pub fn placement(&self) -> &PlacementView {
+        &self.placement
     }
     pub fn scope(&self) -> &GraphScope {
         &self.scope
@@ -372,6 +405,29 @@ impl RoutedGraphCluster {
             })
     }
 
+    /// The gate every routed write passes through, and the one branch that ends
+    /// the writer duel.
+    ///
+    /// > A node must not promote itself for a cell it does not own, unless the
+    /// > computed owner is not live.
+    ///
+    /// Touch point (b) of `docs/plans/2026-07-25-rendezvous-placement.md`.
+    /// Before this existed, any node opened the SlateDB writer on demand, which
+    /// fenced whoever held it; the fenced node's next write took it straight
+    /// back, and three nodes traded one cell's epoch forever. Rendezvous decides
+    /// which of them has a *reason* to hold it, and the other two decline here.
+    ///
+    /// # Ownership first, pacing second
+    ///
+    /// The order is deliberate. A node that does not own the cell must be
+    /// refused outright, not merely asked to wait — a wait it would spend and
+    /// then promote anyway is the duel with extra latency. Only once ownership
+    /// is settled does the fence backoff (touch point (d)) apply.
+    ///
+    /// [`CellOwnership::Unowned`] and [`CellOwnership::Unknown`] both mean
+    /// "rendezvous named nobody" and have opposite answers, which is why they
+    /// are matched separately here rather than through an `Option`: an empty
+    /// live set licenses promotion, a *shed* view forbids it.
     pub(crate) async fn ensure_local_writer(&self, cell_id: &str) -> Result<()> {
         validate_component("cell_id", cell_id)?;
         if !self.promotable {
@@ -386,7 +442,83 @@ impl RoutedGraphCluster {
             .ok_or_else(|| GraphError::UnknownShard {
                 cell_id: cell_id.to_string(),
             })?;
+
+        match self.placement.ownership(&self.scope.to_string(), cell_id) {
+            // The rendezvous owner, or a known-empty fleet with no owner to
+            // defer to. Either way this node may hold the writer.
+            CellOwnership::Local | CellOwnership::Unowned => {}
+            // A live peer owns the cell. Name it, so the driver re-routes
+            // instead of retrying into the same wrong node.
+            CellOwnership::Remote { node_id } => {
+                return Err(GraphError::NotCellWriter {
+                    cell_id: cell_id.to_string(),
+                    owner: Some(node_id),
+                })
+            }
+            // This node has shed its view (decision 7) and knows nothing about
+            // the fleet. Refuse with no hint: a stale guess would point at a
+            // node that may itself have shed, and promoting here is the
+            // unbounded duel — a partitioned node can never learn it lost.
+            CellOwnership::Unknown => {
+                return Err(GraphError::NotCellWriter {
+                    cell_id: cell_id.to_string(),
+                    owner: None,
+                })
+            }
+        }
+
+        self.await_writer_reopen(shard, cell_id).await?;
         shard.promote_to_writer(cell_id, "routed_write").await
+    }
+
+    /// Touch point (d)'s backoff, enforced where the promotion happens.
+    ///
+    /// `refresh_writer_fence` records the wait and returns; nothing re-opens a
+    /// writer until it comes back through here, so this is the one place the
+    /// pacing can be applied without walking past the ownership check above.
+    ///
+    /// # Waiting rather than refusing, and the cap on it
+    ///
+    /// This node is the owner, so there is nowhere better to send the write:
+    /// refusing would hand the driver an error it can only answer by retrying
+    /// into this same node, turning a bounded local wait into an unbounded
+    /// client-side one. So the common case — a fence, which arms exactly one
+    /// `heartbeat_interval` sized to let the rival refresh its view and stand
+    /// down — is waited out and the caller's write then succeeds on its
+    /// original request.
+    ///
+    /// The wait is capped at that same interval because the gate is also armed
+    /// by *plain* re-open failures, whose ladder climbs to a minute. Holding a
+    /// Bolt request open for a minute is worse for the client than telling it
+    /// to come back, so past the cap this refuses with a retryable
+    /// `AdmissionRejected` instead. The cap costs nothing in the case decision
+    /// 6 actually sizes: a fence never asks for longer than one interval.
+    async fn await_writer_reopen(&self, shard: &GraphShard, cell_id: &str) -> Result<()> {
+        // A shard that already holds its writer is not re-opening anything, so
+        // the gate does not apply to it — only a promotion that would really
+        // open a writer is paced.
+        if shard.db.writer().is_ok() {
+            return Ok(());
+        }
+        let Some(delay) = shard.db.writer_reopen_delay() else {
+            return Ok(());
+        };
+        let cap = self.placement.config().heartbeat_interval;
+        if delay > cap {
+            return Err(GraphError::AdmissionRejected {
+                operation: "writer_reopen",
+                actual: delay.as_millis() as u64,
+                limit: cap.as_millis() as u64,
+            });
+        }
+        tracing::debug!(
+            node_id = %self.local_node_id,
+            cell_id,
+            delay_ms = delay.as_millis(),
+            "pacing a writer re-open after a fence"
+        );
+        tokio::time::sleep(delay).await;
+        Ok(())
     }
 
     pub async fn write_edge(&self, mutation: crate::EdgeMutation) -> Result<crate::CommitResult> {
@@ -767,6 +899,7 @@ impl ScopedRoutedGraphCluster {
         graph_id: GraphId,
         local_node_id: impl Into<String>,
         directory: ObjectStoreNodeDirectory,
+        placement: PlacementView,
         object_store: Arc<dyn ObjectStore>,
         options: GraphOpenOptions,
         memory: GraphMemoryConfig,
@@ -779,6 +912,15 @@ impl ScopedRoutedGraphCluster {
             return Err(GraphError::CorruptValue {
                 key: format!("directory/node/{local_node_id}"),
                 reason: "local node is not present in the object-store node directory".to_string(),
+            });
+        }
+        if placement.local_node_id() != local_node_id {
+            return Err(GraphError::CorruptValue {
+                key: format!("directory/node/{local_node_id}"),
+                reason: format!(
+                    "placement view belongs to node {}, not to this runtime's node",
+                    placement.local_node_id()
+                ),
             });
         }
         if max_open_scopes == 0 {
@@ -794,6 +936,7 @@ impl ScopedRoutedGraphCluster {
             graph_id: graph_id.clone(),
             local_node_id,
             directory,
+            placement,
             scope_directory: ObjectStoreGraphScopeDirectory::new(
                 base_path,
                 root_namespace,
@@ -884,6 +1027,9 @@ impl ScopedRoutedGraphCluster {
                 scope.clone(),
                 self.local_node_id.clone(),
                 self.directory.clone(),
+                // Cloned, never rebuilt: every scope's cluster and the routing
+                // provider must answer from one live set.
+                self.placement.clone(),
                 Arc::clone(&self.object_store),
                 self.options_for_scope(scope),
                 self.memory.clone(),
@@ -1001,6 +1147,7 @@ mod scoped_cluster_tests {
             graph_id.clone(),
             "node-a",
             ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
+            PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
             Arc::new(InMemory::new()),
             GraphOpenOptions {
                 cache: crate::GraphCacheConfig::disk_cache("/cache", 800),
@@ -1036,5 +1183,322 @@ mod scoped_cluster_tests {
             .object_store_cache_dir
             .unwrap()
             .ends_with("production/tenant-a/graphs/hydradb"));
+    }
+}
+
+/// Touch point (b): the promotion gate, in all the states this layer can reach.
+#[cfg(test)]
+mod placement_gate_tests {
+    use super::*;
+
+    use std::fmt;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use futures::StreamExt;
+    use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::path::Path;
+    use slatedb::object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+
+    const CELL: &str = "cell-a";
+    const FLEET: &[&str] = &["node-a", "node-b", "node-c"];
+
+    fn scope_key() -> String {
+        GraphScope::default().to_string()
+    }
+
+    /// The node rendezvous names for `CELL`, and one that it does not.
+    fn owner_and_peer() -> (&'static str, &'static str) {
+        let owner = turbolay_placement::hash::owner(&scope_key(), CELL, FLEET)
+            .expect("a non-empty fleet has an owner");
+        let peer = FLEET
+            .iter()
+            .copied()
+            .find(|node_id| *node_id != owner)
+            .expect("three nodes cannot all be the owner");
+        (owner, peer)
+    }
+
+    fn fleet_view(local_node_id: &str, config: PlacementConfig) -> PlacementView {
+        PlacementView::new(local_node_id, FLEET.iter().copied(), config).expect("a valid fleet")
+    }
+
+    async fn open_cluster(
+        base_path: &str,
+        local_node_id: &str,
+        placement: PlacementView,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> RoutedGraphCluster {
+        RoutedGraphCluster::open_promotable(
+            base_path,
+            local_node_id,
+            ObjectStoreNodeDirectory::new([CELL], FLEET.iter().copied())
+                .expect("a valid directory"),
+            placement,
+            object_store,
+        )
+        .await
+        .expect("the cluster opens")
+    }
+
+    fn edge(key: &str) -> crate::EdgeMutation {
+        crate::EdgeMutation {
+            cell_id: CELL.to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: key.to_string(),
+        }
+    }
+
+    /// Whether the shard is actually holding the SlateDB writer, which is what
+    /// "refused rather than promoted" has to mean to be worth anything.
+    fn holds_the_writer(cluster: &RoutedGraphCluster) -> bool {
+        cluster
+            .shard(CELL)
+            .expect("the shard is open")
+            .db
+            .writer()
+            .is_ok()
+    }
+
+    /// The owner promotes and the write lands.
+    #[tokio::test]
+    async fn the_rendezvous_owner_opens_the_writer() {
+        let (owner, _) = owner_and_peer();
+        let cluster = open_cluster(
+            "gate/owner",
+            owner,
+            fleet_view(owner, PlacementConfig::default()),
+            Arc::new(InMemory::new()),
+        )
+        .await;
+
+        cluster.write_edge(edge("owner-write")).await.unwrap();
+        assert!(holds_the_writer(&cluster));
+        cluster.close().await.unwrap();
+    }
+
+    /// The branch that ends the duel: a node that is not the owner refuses, and
+    /// — the part that matters — leaves the writer alone rather than taking the
+    /// epoch from whoever holds it. The peer is named so the driver can
+    /// re-route instead of retrying into the same wrong node.
+    #[tokio::test]
+    async fn a_non_owner_refuses_the_write_and_does_not_promote() {
+        let (owner, peer) = owner_and_peer();
+        let cluster = open_cluster(
+            "gate/non-owner",
+            peer,
+            fleet_view(peer, PlacementConfig::default()),
+            Arc::new(InMemory::new()),
+        )
+        .await;
+
+        let error = cluster
+            .write_edge(edge("non-owner-write"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                GraphError::NotCellWriter { cell_id, owner: Some(hint) }
+                    if cell_id == CELL && hint == owner
+            ),
+            "expected a hinted refusal, got {error:?}"
+        );
+        assert!(
+            !holds_the_writer(&cluster),
+            "a refusal that still opened the writer is the duel"
+        );
+        cluster.close().await.unwrap();
+    }
+
+    /// Decision 7 at the gate: a node past its LIST grace knows nothing about
+    /// the fleet, so it refuses **with no hint** — a stale guess would point at
+    /// a node that may itself have shed — and it must not promote, because a
+    /// partitioned node that promotes can never learn it lost.
+    #[tokio::test]
+    async fn a_shed_view_refuses_with_no_hint_and_does_not_promote() {
+        let store = ListFailingStore::new();
+        // Milliseconds rather than the 5s/15s defaults, so grace expires within
+        // the test instead of being slept through. Decision 10 gives the crate's
+        // own rules this property for free; this is the cheapest way to extend
+        // it to a layer that measures real elapsed time.
+        let config = PlacementConfig {
+            heartbeat_interval: Duration::from_millis(1),
+            heartbeat_timeout: Duration::from_millis(5),
+        };
+        let (_, peer) = owner_and_peer();
+        let placement = fleet_view(peer, config);
+        let cluster = open_cluster(
+            "gate/shed",
+            peer,
+            placement.clone(),
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        )
+        .await;
+
+        store.break_list();
+        tokio::time::sleep(config.heartbeat_timeout * 2).await;
+        let view = placement
+            .refresh(store.as_ref(), &Path::from("gate/shed"))
+            .await;
+        assert_eq!(view.candidates(), None, "the view must have shed");
+
+        let error = cluster.write_edge(edge("shed-write")).await.unwrap_err();
+        assert!(
+            matches!(&error, GraphError::NotCellWriter { cell_id, owner: None } if cell_id == CELL),
+            "expected an unhinted refusal, got {error:?}"
+        );
+        assert!(!holds_the_writer(&cluster));
+        cluster.close().await.unwrap();
+    }
+
+    /// The fourth state, and the one this layer cannot reach on its own:
+    /// `LiveNodeSet` always counts the local node live, so a *successful* view
+    /// never has an empty candidate list. The seam's own tests build one by
+    /// hand; what is pinned here is the rule the gate's first arm implements —
+    /// `Unowned` and `Unknown` are both "nobody was named" and have opposite
+    /// answers, and folding them together is how the permanent-refusal trap
+    /// gets built.
+    #[test]
+    fn a_known_empty_fleet_licenses_promotion_where_a_shed_view_does_not() {
+        assert!(CellOwnership::Unowned.may_promote());
+        assert_eq!(CellOwnership::Unowned.owner_hint(), None);
+        assert!(!CellOwnership::Unknown.may_promote());
+        assert_eq!(CellOwnership::Unknown.owner_hint(), None);
+    }
+
+    /// Ownership is checked *before* the fence pacing, so a non-owner is
+    /// refused outright instead of being made to wait first: a wait it would
+    /// spend and then be refused anyway is latency bought for nothing.
+    #[tokio::test]
+    async fn ownership_is_refused_without_first_serving_the_reopen_delay() {
+        let (_, peer) = owner_and_peer();
+        let cluster = open_cluster(
+            "gate/order",
+            peer,
+            fleet_view(peer, PlacementConfig::default()),
+            Arc::new(InMemory::new()),
+        )
+        .await;
+
+        let started = Instant::now();
+        let error = cluster.write_edge(edge("ordered")).await.unwrap_err();
+        assert!(matches!(error, GraphError::NotCellWriter { .. }));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the refusal must not wait out anything"
+        );
+        cluster.close().await.unwrap();
+    }
+
+    /// An `ObjectStore` whose LIST can be switched off. The kernel has no
+    /// shared test double for this — `crates/placement`'s is `#[cfg(test)]`
+    /// inside that crate and cannot be imported — and decision 7's state is
+    /// only reachable through a failing LIST.
+    struct ListFailingStore {
+        inner: Arc<dyn ObjectStore>,
+        fail_list: AtomicBool,
+    }
+
+    impl ListFailingStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(InMemory::new()),
+                fail_list: AtomicBool::new(false),
+            })
+        }
+
+        fn break_list(&self) {
+            self.fail_list.store(true, AtomicOrdering::SeqCst);
+        }
+
+        fn injected() -> slatedb::object_store::Error {
+            slatedb::object_store::Error::Generic {
+                store: "ListFailingStore",
+                source: "injected LIST fault".into(),
+            }
+        }
+    }
+
+    impl fmt::Display for ListFailingStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "ListFailingStore({})", self.inner)
+        }
+    }
+
+    impl fmt::Debug for ListFailingStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "ListFailingStore({:?})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ListFailingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> slatedb::object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> slatedb::object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> slatedb::object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, slatedb::object_store::Result<Path>>,
+        ) -> BoxStream<'static, slatedb::object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, slatedb::object_store::Result<ObjectMeta>> {
+            if self.fail_list.load(AtomicOrdering::SeqCst) {
+                return futures::stream::once(async { Err(Self::injected()) }).boxed();
+            }
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> slatedb::object_store::Result<ListResult> {
+            if self.fail_list.load(AtomicOrdering::SeqCst) {
+                return Err(Self::injected());
+            }
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> slatedb::object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
     }
 }

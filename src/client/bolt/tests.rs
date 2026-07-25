@@ -2,11 +2,12 @@ use super::values::bolt_parameter_to_property;
 use super::wire::strict_decode_client_message;
 use super::*;
 use crate::{
-    ClientQueryServiceConfig, ObjectStoreNodeDirectory, QueryCellClient, QueryColumn, QueryContext,
-    QueryCursorToken, QueryFloat, QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow,
-    QueryTransportAction, QueryTransportScopeGrant, QueryValue, RoutedGraphCluster,
-    StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer,
-    StaticQueryTransportTlsServerConfigProvider, VertexPropertyValue,
+    ClientQueryServiceConfig, ObjectStoreNodeDirectory, PlacementConfig, PlacementView,
+    QueryCellClient, QueryColumn, QueryContext, QueryCursorToken, QueryFloat, QueryParameterValue,
+    QueryResultPage, QueryResultSet, QueryRow, QueryTransportAction, QueryTransportScopeGrant,
+    QueryValue, RoutedGraphCluster, StaticClientDatabaseResolver,
+    StaticQueryTransportScopeAuthorizer, StaticQueryTransportTlsServerConfigProvider,
+    VertexPropertyValue,
 };
 use boltr::chunk::{ChunkReader, ChunkWriter};
 use boltr::client::BoltSession;
@@ -366,9 +367,15 @@ async fn bolt_server_executes_autocommit_create_on_routed_cluster() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let placement = ObjectStoreNodeDirectory::new(["cell-a"], ["node-a"]).unwrap();
     let cluster = Arc::new(
-        RoutedGraphCluster::open_promotable("bolt-create/data", "node-a", placement, object_store)
-            .await
-            .unwrap(),
+        RoutedGraphCluster::open_promotable(
+            "bolt-create/data",
+            "node-a",
+            placement,
+            test_placement_view("node-a", &["node-a"]),
+            object_store,
+        )
+        .await
+        .unwrap(),
     );
     let scope = GraphScope::default();
     let authorizer = StaticQueryTransportScopeAuthorizer::new()
@@ -1316,128 +1323,231 @@ async fn bolt_server_closes_idle_post_handshake_connections() {
     server.stop().await.unwrap();
 }
 
-#[tokio::test]
-async fn object_store_routing_advertises_all_readers_and_one_soft_affinity_writer() {
-    let preferred_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let preferred_address = preferred_listener.local_addr().unwrap().to_string();
-    let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let fallback_address = fallback_listener.local_addr().unwrap().to_string();
-    let unready_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let unready_address = unready_listener.local_addr().unwrap().to_string();
-    let (preferred_readiness, preferred_readiness_task) = start_test_readiness_endpoint(true).await;
-    let (fallback_readiness, fallback_readiness_task) = start_test_readiness_endpoint(true).await;
-    let (unready_readiness, unready_readiness_task) = start_test_readiness_endpoint(false).await;
-    let provider = ObjectStoreBoltRoutingTableProvider::new(
-        [
-            ("node-a".to_string(), preferred_address.clone()),
-            ("node-b".to_string(), fallback_address.clone()),
-            ("node-c".to_string(), unready_address),
-        ],
-        30,
+/// A placement view over a hand-picked fleet. No store, no heartbeats: an
+/// unrefreshed view is `Grace(members)` — decision 8's assume-the-configured-
+/// fleet posture — so ownership here is the rendezvous winner over exactly
+/// `members`.
+fn test_placement_view(local_node_id: &str, members: &[&str]) -> PlacementView {
+    PlacementView::new(
+        local_node_id,
+        members.iter().copied(),
+        PlacementConfig::default(),
     )
-    .unwrap()
-    .with_readiness_addresses([
-        ("node-a".to_string(), preferred_readiness),
-        ("node-b".to_string(), fallback_readiness),
-        ("node-c".to_string(), unready_readiness),
-    ])
-    .unwrap()
-    .with_health_probe_timeout(Duration::from_secs(1))
-    .unwrap();
-    let table = provider
-        .routing_table(
-            "default",
-            &ClientQueryTarget::new(GraphScope::default(), "cell-a").unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(table.ttl_secs > 0 && table.ttl_secs <= 30);
-    let write = table
-        .servers
-        .iter()
-        .find(|server| server.role == "WRITE")
-        .unwrap();
-    assert_eq!(write.addresses, vec![preferred_address.clone()]);
-    let read = table
-        .servers
-        .iter()
-        .find(|server| server.role == "READ")
-        .unwrap();
-    assert_eq!(
-        read.addresses,
-        vec![preferred_address.clone(), fallback_address.clone()]
-    );
-
-    let preferred = provider
-        .clone()
-        .with_preferred_writer_node("node-b")
-        .unwrap()
-        .routing_table(
-            "default",
-            &ClientQueryTarget::new(GraphScope::default(), "cell-a").unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        preferred
-            .servers
-            .iter()
-            .find(|server| server.role == "WRITE")
-            .unwrap()
-            .addresses,
-        vec![fallback_address.clone()]
-    );
-
-    drop(preferred_listener);
-    preferred_readiness_task.abort();
-    let _ = preferred_readiness_task.await;
-    let failed_over = provider
-        .routing_table(
-            "default",
-            &ClientQueryTarget::new(GraphScope::default(), "cell-a").unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        failed_over
-            .servers
-            .iter()
-            .find(|server| server.role == "WRITE")
-            .unwrap()
-            .addresses,
-        vec![fallback_address.clone()]
-    );
-    assert_eq!(
-        failed_over
-            .servers
-            .iter()
-            .find(|server| server.role == "READ")
-            .unwrap()
-            .addresses,
-        vec![fallback_address]
-    );
-
-    fallback_readiness_task.abort();
-    unready_readiness_task.abort();
+    .expect("a valid test fleet")
 }
 
-async fn start_test_readiness_endpoint(ready: bool) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    let task = tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let mut request = [0_u8; 256];
-            let _ = stream.read(&mut request).await;
-            let status = if ready {
-                "HTTP/1.1 200 OK"
-            } else {
-                "HTTP/1.1 503 Service Unavailable"
-            };
-            let response = format!("{status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
+fn routing_role(table: &BoltRoutingTable, role: &str) -> Vec<String> {
+    table
+        .servers
+        .iter()
+        .find(|server| server.role == role)
+        .unwrap_or_else(|| panic!("routing table is missing the {role} role"))
+        .addresses
+        .clone()
+}
+
+async fn routing_table_for(
+    provider: &ObjectStoreBoltRoutingTableProvider,
+    cell_id: &str,
+) -> BoltRoutingTable {
+    provider
+        .routing_table(
+            "default",
+            &ClientQueryTarget::new(GraphScope::default(), cell_id).unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Touch point (c): a refused write arrives as a code drivers already act on —
+/// discard the routing table, re-route, retry — with the owner carried as a
+/// hint. Before this the module had exactly one Neo code and a fenced write was
+/// an opaque backend error, so the driver retried into the same wrong node.
+#[test]
+fn a_write_to_a_non_owner_maps_to_the_not_a_leader_code_with_the_owner_hint() {
+    let hinted = graph_error_to_bolt(GraphError::NotCellWriter {
+        cell_id: "cell-a".to_string(),
+        owner: Some("node-b".to_string()),
     });
-    (address, task)
+    match hinted {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.ClientError.Cluster.NotALeader");
+            assert!(message.contains("node-b"), "the hint must reach the driver");
+        }
+        other => panic!("expected a Neo-coded query error, got {other:?}"),
+    }
+
+    // A node that has shed its view refuses with the same code and no hint,
+    // rather than guessing at an owner that may itself have shed.
+    let shed = graph_error_to_bolt(GraphError::NotCellWriter {
+        cell_id: "cell-a".to_string(),
+        owner: None,
+    });
+    match shed {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.ClientError.Cluster.NotALeader");
+            assert!(message.contains("unknown"));
+        }
+        other => panic!("expected a Neo-coded query error, got {other:?}"),
+    }
+}
+
+/// Touch point (a): `WRITE` is the rendezvous owner's address — the same answer
+/// `ensure_local_writer` enforces — while `READ` and `ROUTE` still name the
+/// whole live fleet.
+#[tokio::test]
+async fn object_store_routing_names_the_rendezvous_owner_for_writes() {
+    let addresses = [
+        ("node-a".to_string(), "10.0.0.1:7687".to_string()),
+        ("node-b".to_string(), "10.0.0.2:7687".to_string()),
+        ("node-c".to_string(), "10.0.0.3:7687".to_string()),
+    ];
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
+        addresses.clone(),
+        30,
+        test_placement_view("node-a", &["node-a", "node-b", "node-c"]),
+    )
+    .unwrap();
+
+    let table = routing_table_for(&provider, "cell-a").await;
+    assert!(table.ttl_secs > 0 && table.ttl_secs <= 30);
+
+    let every_address = vec![
+        "10.0.0.1:7687".to_string(),
+        "10.0.0.2:7687".to_string(),
+        "10.0.0.3:7687".to_string(),
+    ];
+    assert_eq!(routing_role(&table, "READ"), every_address);
+    assert_eq!(routing_role(&table, "ROUTE"), every_address);
+
+    let scope = GraphScope::default().to_string();
+    let owner = turbolay_placement::hash::owner(&scope, "cell-a", &["node-a", "node-b", "node-c"])
+        .expect("a non-empty fleet has an owner");
+    let owner_address = addresses
+        .iter()
+        .find(|(node_id, _)| node_id == owner)
+        .map(|(_, address)| address.clone())
+        .unwrap();
+    assert_eq!(routing_role(&table, "WRITE"), vec![owner_address]);
+}
+
+/// The writer is resolved per cell rather than pinned to one node, which is what
+/// makes the table an answer to the client's target instead of a fixed
+/// preference order. `with_preferred_writer_node` — which pinned it — is gone
+/// (decision 9): once ownership is enforced, an override routing writes to a
+/// node that then refuses them is a loop no timeout breaks.
+#[tokio::test]
+async fn object_store_routing_resolves_the_writer_per_cell() {
+    let fleet = ["node-a", "node-b", "node-c"];
+    let addresses: Vec<(String, String)> = fleet
+        .iter()
+        .enumerate()
+        .map(|(index, node_id)| ((*node_id).to_string(), format!("10.0.0.{}:7687", index + 1)))
+        .collect();
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
+        addresses.clone(),
+        30,
+        test_placement_view("node-a", &fleet),
+    )
+    .unwrap();
+    let scope = GraphScope::default().to_string();
+
+    let mut writers = std::collections::BTreeSet::new();
+    for index in 0..16 {
+        let cell_id = format!("cell-{index}");
+        let owner = turbolay_placement::hash::owner(&scope, &cell_id, &fleet).unwrap();
+        let expected = addresses
+            .iter()
+            .find(|(node_id, _)| node_id == owner)
+            .map(|(_, address)| address.clone())
+            .unwrap();
+        let table = routing_table_for(&provider, &cell_id).await;
+        assert_eq!(routing_role(&table, "WRITE"), vec![expected.clone()]);
+        writers.insert(expected);
+    }
+    assert!(
+        writers.len() > 1,
+        "sixteen cells over three nodes must not all resolve to one writer: {writers:?}"
+    );
+}
+
+/// Only the live fleet is advertised, and the writer is chosen from it: a
+/// configured node that placement does not consider live is not a reader and
+/// cannot become the owner.
+#[tokio::test]
+async fn object_store_routing_advertises_only_the_live_fleet() {
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
+        [
+            ("node-a".to_string(), "10.0.0.1:7687".to_string()),
+            ("node-b".to_string(), "10.0.0.2:7687".to_string()),
+            ("node-c".to_string(), "10.0.0.3:7687".to_string()),
+        ],
+        30,
+        test_placement_view("node-a", &["node-a", "node-b"]),
+    )
+    .unwrap();
+
+    let table = routing_table_for(&provider, "cell-a").await;
+    let live = vec!["10.0.0.1:7687".to_string(), "10.0.0.2:7687".to_string()];
+    assert_eq!(routing_role(&table, "READ"), live);
+    assert_eq!(routing_role(&table, "ROUTE"), live);
+
+    let scope = GraphScope::default().to_string();
+    let owner = turbolay_placement::hash::owner(&scope, "cell-a", &["node-a", "node-b"]).unwrap();
+    assert!(
+        routing_role(&table, "WRITE")
+            == vec![if owner == "node-a" {
+                "10.0.0.1:7687".to_string()
+            } else {
+                "10.0.0.2:7687".to_string()
+            }],
+        "the writer comes from the live set"
+    );
+}
+
+/// Decision 4's deletion, asserted rather than assumed: nothing listens on any
+/// of these addresses and there is no readiness endpoint anywhere, yet the table
+/// is built. The old provider opened a TCP connection to every configured node's
+/// `/readyz` on every refresh and would have answered "no reachable graph
+/// nodes" here.
+#[tokio::test]
+async fn object_store_routing_builds_a_table_without_probing_any_node() {
+    let unbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unbound_address = unbound.local_addr().unwrap().to_string();
+    drop(unbound);
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
+        [("node-a".to_string(), unbound_address.clone())],
+        30,
+        test_placement_view("node-a", &["node-a"]),
+    )
+    .unwrap();
+
+    let table = routing_table_for(&provider, "cell-a").await;
+    assert_eq!(routing_role(&table, "READ"), vec![unbound_address.clone()]);
+    assert_eq!(routing_role(&table, "WRITE"), vec![unbound_address]);
+}
+
+/// A node with no live peer it has an address for advertises nothing at all,
+/// rather than a stale fleet. This is the posture a shed view produces
+/// (decision 7): `LiveView::nodes()` is empty, so there is no reader list and no
+/// writer to name.
+#[tokio::test]
+async fn object_store_routing_advertises_nothing_when_no_live_node_is_addressable() {
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
+        [("node-a".to_string(), "10.0.0.1:7687".to_string())],
+        30,
+        test_placement_view("node-z", &["node-z"]),
+    )
+    .unwrap();
+
+    let error = provider
+        .routing_table(
+            "default",
+            &ClientQueryTarget::new(GraphScope::default(), "cell-a").unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, GraphError::UnsupportedQuery { .. }));
 }
 
 async fn send_test_bolt_client_message<W>(writer: &mut ChunkWriter<W>, message: &ClientMessage)

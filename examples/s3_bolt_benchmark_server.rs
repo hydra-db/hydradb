@@ -5,8 +5,9 @@ use slatedb_graph_kernel::{
     object_store_from_env, BoltServerConfig, ClientBoltServer, ClientQueryService,
     ClientQueryServiceConfig, ClientQueryTarget, GraphBackpressurePolicy, GraphCacheConfig,
     GraphCachePolicy, GraphIndexPolicy, GraphLimits, GraphOpenOptions, GraphScope,
-    ObjectStoreNodeDirectory, QueryTransportAction, QueryTransportScopeGrant, RoutedGraphCluster,
-    StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer, StorageSequence,
+    ObjectStoreNodeDirectory, PlacementConfig, PlacementView, QueryTransportAction,
+    QueryTransportScopeGrant, RoutedGraphCluster, StaticClientDatabaseResolver,
+    StaticQueryTransportScopeAuthorizer, StorageSequence,
 };
 
 type BenchResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -34,6 +35,13 @@ async fn main() -> BenchResult<()> {
             format!("{prefix}/data"),
             "benchmark-node",
             ObjectStoreNodeDirectory::new([CELL_ID], ["benchmark-node"])?,
+            // A single-node fleet: this benchmark is the only writer, so it
+            // owns every cell.
+            PlacementView::new(
+                "benchmark-node",
+                ["benchmark-node"],
+                PlacementConfig::default(),
+            )?,
             object_store,
             graph_options(fanout, max_hop, cache_dir.into()),
         )

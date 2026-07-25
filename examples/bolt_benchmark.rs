@@ -16,8 +16,9 @@ use slatedb_graph_kernel::{
     local_object_store, BoltServerConfig, BoltServerHandle, ClientBoltServer, ClientQueryService,
     ClientQueryServiceConfig, ClientQueryTarget, GraphBackpressurePolicy, GraphCacheConfig,
     GraphCachePolicy, GraphIndexPolicy, GraphLimits, GraphOpenOptions, GraphScope,
-    ObjectStoreNodeDirectory, QueryTransportAction, QueryTransportScopeGrant, RoutedGraphCluster,
-    StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer,
+    ObjectStoreNodeDirectory, PlacementConfig, PlacementView, QueryTransportAction,
+    QueryTransportScopeGrant, RoutedGraphCluster, StaticClientDatabaseResolver,
+    StaticQueryTransportScopeAuthorizer,
 };
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
@@ -461,6 +462,13 @@ async fn open_environment(
             paths.graph,
             "benchmark-node",
             ObjectStoreNodeDirectory::new([CELL_ID], ["benchmark-node"])?,
+            // A single-node fleet: this benchmark is the only writer, so it
+            // owns every cell.
+            PlacementView::new(
+                "benchmark-node",
+                ["benchmark-node"],
+                PlacementConfig::default(),
+            )?,
             object_store,
             graph_options(fanout, max_hop, paths.cache),
         )

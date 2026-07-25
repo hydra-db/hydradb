@@ -74,6 +74,22 @@ pub enum GraphError {
         operation: &'static str,
         cell_id: String,
     },
+    /// This node is not the rendezvous owner of the cell, so it declined to open
+    /// the writer — touch point (b) of
+    /// `docs/plans/2026-07-25-rendezvous-placement.md`.
+    ///
+    /// `owner` is an `Option` and not a `String` because the two refusals are
+    /// different answers. `Some(node_id)` is *a live peer owns this cell*, which
+    /// a driver can act on: discard the routing table, re-route, retry. `None`
+    /// is *this node has shed its view of the fleet* (decision 7) and has
+    /// nothing truthful to point at — a stale guess would send the write to a
+    /// node that may itself have shed. Modelled on TiKV's
+    /// `NotLeader { leader_hint }`, whose hint is optional for the same reason.
+    #[error("cell {cell_id} is not owned by this node; owner: {}", owner.as_deref().unwrap_or("unknown"))]
+    NotCellWriter {
+        cell_id: String,
+        owner: Option<String>,
+    },
     #[error("operation requires writable SlateDB shard storage")]
     ReadOnlyShardStorage,
     #[error("cell {cell_id} has been dropped; {operation} is rejected")]
