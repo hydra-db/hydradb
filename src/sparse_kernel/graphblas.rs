@@ -1,7 +1,8 @@
 //! SuiteSparse:GraphBLAS FFI kernel.
 //!
-//! The whole file is graphblas-only; it is gated once at its `mod` declaration
-//! in `src/sparse_kernel.rs` rather than per item.
+//! Also hosts `CompiledCompactCscMatrix`, the pure-Rust kernel that shares this
+//! module's compiled-matrix representation without calling into SuiteSparse.
+//! See the module docs in `mod.rs` for how the two relate.
 
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -26,13 +27,20 @@ type GrBMatrix = *mut c_void;
 type GrBVector = *mut c_void;
 type GrBDescriptor = *mut c_void;
 type GrBBinaryOp = *mut c_void;
+type GrBGlobal = *mut c_void;
 
 const GRB_SUCCESS: GrBInfo = 0;
 const GRB_BLOCKING: c_int = 1;
 const GRB_MATERIALIZE: c_int = 1;
 const GRB_CSC_FORMAT: GrBFormat = 1;
 const GRB_INDEX_MAX: u64 = (1_u64 << 60) - 1;
-const GXB_NTHREADS: c_int = 5;
+// GxB_NTHREADS as defined by GraphBLAS v9 and later; it was 5 through v8.
+//
+// v9 also stopped accepting it as a *descriptor* field: GxB_Desc_set_INT32
+// returns GrB_INVALID_VALUE for it regardless of the constant used, even though
+// the v10 header still lists it under GrB_Desc_Field. Thread count is now only
+// settable globally (or per GxB_Context), which is what `init` does below.
+const GXB_NTHREADS: c_int = 7086;
 
 #[link(name = "graphblas")]
 unsafe extern "C" {
@@ -72,7 +80,8 @@ unsafe extern "C" {
     fn GrB_Vector_free(vector: *mut GrBVector) -> GrBInfo;
     fn GrB_Descriptor_new(descriptor: *mut GrBDescriptor) -> GrBInfo;
     fn GrB_Descriptor_free(descriptor: *mut GrBDescriptor) -> GrBInfo;
-    fn GxB_Desc_set_INT32(descriptor: GrBDescriptor, field: c_int, value: i32) -> GrBInfo;
+    static GrB_GLOBAL: GrBGlobal;
+    fn GrB_Global_set_INT32(global: GrBGlobal, value: i32, field: c_int) -> GrBInfo;
     fn GrB_Vector_clear(vector: GrBVector) -> GrBInfo;
     fn GrB_Vector_build_BOOL(
         vector: GrBVector,
@@ -133,6 +142,8 @@ unsafe extern "C" {
 }
 
 static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+// Only consumed by the opencypher-gated inline-count query path.
+#[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
 static INLINE_WORK_EDGES: OnceLock<usize> = OnceLock::new();
 
 struct Matrix(GrBMatrix);
@@ -144,6 +155,7 @@ pub(crate) struct CompiledGraphBlasMatrix {
     use_compact_kernel: bool,
     replicas: Vec<Mutex<CompiledGraphBlasMatrixInner>>,
     next_replica: AtomicUsize,
+    #[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
     edge_count: usize,
     estimated_resident_bytes: usize,
 }
@@ -163,9 +175,12 @@ struct CompiledGraphBlasMatrixInner {
     matrix: Option<Matrix>,
     ordinal_map: OrdinalMap,
     degree_vector: Option<Vector>,
+    #[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
     count_scratch: Option<GraphBlasCountScratch>,
 }
 
+// Scratch buffers for the opencypher-gated inline-count path.
+#[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
 struct GraphBlasCountScratch {
     frontier: Vector,
     next: Vector,
@@ -683,6 +698,7 @@ impl CompiledGraphBlasMatrix {
         expand_range_window_with_compiled(adjacency, starts, min_hops, max_hops, window, &inner)
     }
 
+    #[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
     pub(crate) fn prefer_inline_count(&self, max_hops: u8) -> bool {
         const DEFAULT_INLINE_WORK_EDGES: usize = 50_000;
         let threshold = *INLINE_WORK_EDGES.get_or_init(|| {
@@ -695,6 +711,7 @@ impl CompiledGraphBlasMatrix {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
     pub(crate) fn replica_count(&self) -> usize {
         self.replicas.len()
     }
@@ -1161,11 +1178,26 @@ fn empty_traversal() -> SparseTraversal {
 fn init() -> Result<()> {
     match INIT.get_or_init(|| unsafe {
         let info = GrB_init(GRB_BLOCKING);
-        if info == GRB_SUCCESS {
-            Ok(())
-        } else {
-            Err(format!("GrB_init returned GraphBLAS status {info}"))
+        if info != GRB_SUCCESS {
+            return Err(format!("GrB_init returned GraphBLAS status {info}"));
         }
+        // Only applied when explicitly requested; otherwise GraphBLAS keeps its
+        // own default (one thread per core). This used to be a descriptor field
+        // scoped to the exact-count path, which v9 no longer accepts.
+        if let Some(threads) = std::env::var("GRAPHBLAS_NTHREADS")
+            .or_else(|_| std::env::var("GRAPHBLAS_EXACT_COUNT_THREADS"))
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| *value > 0)
+        {
+            let info = GrB_Global_set_INT32(GrB_GLOBAL, threads, GXB_NTHREADS);
+            if info != GRB_SUCCESS {
+                return Err(format!(
+                    "GrB_Global_set_INT32(GxB_NTHREADS) returned GraphBLAS status {info}"
+                ));
+            }
+        }
+        Ok(())
     }) {
         Ok(()) => Ok(()),
         Err(reason) => Err(GraphError::SparseKernel {
@@ -1314,6 +1346,7 @@ fn vector_from_ordinals(dimension: GrBIndex, ordinals: &[GrBIndex]) -> Result<Ve
     Ok(vector)
 }
 
+#[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
 fn clear_vector(vector: &mut Vector) -> Result<()> {
     unsafe {
         check(GrB_Vector_clear(vector.0), "GrB_Vector_clear")?;
@@ -1321,6 +1354,7 @@ fn clear_vector(vector: &mut Vector) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
 fn reset_bool_vector(vector: &mut Vector, ordinals: &[GrBIndex]) -> Result<()> {
     clear_vector(vector)?;
     if ordinals.is_empty() {
@@ -1404,6 +1438,7 @@ fn multiply(matrix: &Matrix, input: &Vector, dimension: GrBIndex) -> Result<Vect
     Ok(Vector(raw))
 }
 
+#[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
 fn multiply_into(
     matrix: &Matrix,
     input: &Vector,
@@ -1482,21 +1517,9 @@ fn frontier_edge_visits_graphblas(
 }
 
 fn exact_count_descriptor() -> Result<Descriptor> {
-    let threads = std::env::var("GRAPHBLAS_EXACT_COUNT_THREADS")
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1);
     let mut descriptor = null_mut();
     unsafe {
         check(GrB_Descriptor_new(&mut descriptor), "GrB_Descriptor_new")?;
-        if let Err(error) = check(
-            GxB_Desc_set_INT32(descriptor, GXB_NTHREADS, threads),
-            "GxB_Desc_set_INT32",
-        ) {
-            let _ = GrB_Descriptor_free(&mut descriptor);
-            return Err(error);
-        }
     }
     Ok(Descriptor(descriptor))
 }

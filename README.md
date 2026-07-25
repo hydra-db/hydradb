@@ -70,10 +70,11 @@ Base build:
 Native query/traversal features:
 
 - `opencypher`: native `libcypher-parser`
-- `graphblas`: SuiteSparse GraphBLAS development headers and library. **This is
-  a default feature** — it is the kernel we run in production. SuiteSparse is
-  therefore required for a plain `cargo build`. Build with
-  `--no-default-features` to fall back to the pure-Rust sparse kernel.
+SuiteSparse GraphBLAS is **not** a feature — it is always linked, because it is
+the kernel we run in production, so its development headers and library are
+required for a plain `cargo build`. To run traversals on a pure-Rust kernel
+instead, switch at runtime with `GRAPH_COMPILED_KERNEL=compact`; no rebuild is
+needed.
 - `query-transport-tls`: Rustls dependencies are pulled by Cargo; you provide
   certificates/configuration in the embedding service
 
@@ -116,8 +117,8 @@ on the default linker path.
 git clone https://github.com/usecortex/slatedb-graph-kernel.git
 cd slatedb-graph-kernel
 
-cargo test --locked --lib                          # default features (graphblas on)
-cargo test --locked --no-default-features --lib    # pure-Rust sparse kernel
+cargo test --locked --lib
+GRAPH_COMPILED_KERNEL=compact cargo test --locked --lib   # pure-Rust sparse kernel
 cargo test --locked --features opencypher --lib
 cargo check --locked --examples --features opencypher
 cargo test --locked --all-targets --features public-client-protocols

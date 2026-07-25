@@ -20,7 +20,6 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ "${GRAPH_ENABLE_GRAPHBLAS:-0}" == "1" ]]; then
-  FEATURE_ARGS=(--features graphblas)
   export GRAPH_MATRIX_KERNEL="${GRAPH_MATRIX_KERNEL:-graphblas}"
 fi
 
