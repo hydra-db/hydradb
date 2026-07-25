@@ -14,13 +14,14 @@ Two books (the `quint` verification book is intentionally excluded):
 | **Inside TurboLay** | `inside/` | working engineer | `00-foundations`…`05-caching` |
 
 Plus a set of **design notes** — standalone analyses of open problems. These are not
-textbooks: no tooltips, no widgets, and they carry their own inline styles rather than
-`assets/textbook.css`.
+textbooks: no tooltips, and they carry their own inline styles rather than
+`assets/textbook.css`. The first two are static; the third carries its own widgets.
 
 | Note | File | Subject |
 |------|------|---------|
 | One Cell, One Writer | `write-routing-problem.html` | why a write cannot reach the correct single-writer node today |
 | Routing the Write | `write-routing-solutions.html` | four ways to place the writer, scored — TiDB/TiKV and sleet as reference |
+| Placing the Writer | `write-routing-placement.html` | the landed fix — rendezvous hashing, heartbeat liveness, the don't-promote rule, and why the duel is bounded rather than prevented. Five interactive SVG widgets (W1–W5), self-contained |
 
 ## The interactive layer (after the [interactive-textbook skill](https://github.com/alharkan7/skills))
 
