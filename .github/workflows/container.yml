@@ -60,7 +60,6 @@ jobs:
     permissions:
       id-token: write
       contents: read
-      attestations: write
     outputs:
       image_tag: ${{ env.IMAGE_TAG }}
       image_digest: ${{ steps.build.outputs.digest }}
@@ -99,13 +98,6 @@ jobs:
           cache-to: type=gha,scope=turbolay-linux-amd64,mode=max
           provenance: mode=max
           sbom: true
-
-      - name: Attest published image
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
 
   update-manifest:
     name: Update staging Kubernetes manifest
