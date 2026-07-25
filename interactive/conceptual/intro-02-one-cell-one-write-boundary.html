@@ -1,0 +1,301 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>One Cell, One Write Boundary · TurboLay Conceptual Guide</title>
+<link rel="stylesheet" href="../assets/textbook.css">
+
+<div class="tb-progress"></div>
+
+<header class="tb-header">
+  <a class="tb-home" href="../index.html">Turbo<span>Lay</span> · Interactive</a>
+  <span class="tb-crumb">A Conceptual Guide</span>
+  <span class="tb-crumb">The Architecture</span>
+  <span class="tb-spacer"></span>
+  <button class="tb-theme-toggle" type="button">☾ Dark</button>
+</header>
+
+<main class="tb-main">
+  <div class="tb-chapter-kicker">Chapter 2 · The Architecture</div>
+  <h1>One Cell, One Write Boundary</h1>
+
+  <p>“Insert edge 1 → 2” sounds like one fact. Physically it fans out into several
+  records: the <span class="concept" data-concept="adjacency">canonical outbound edge</span>, the reverse-direction record, the <span class="concept" data-concept="degree">degree</span>
+  counters on both endpoints, whatever metadata and property indexes the mutation
+  carries, a <span class="concept" data-concept="dirty-marker">dirty marker</span> telling the indexer this edge type moved, and an
+  <span class="concept" data-concept="idempotency">idempotency</span> result. If half land, the graph can contradict itself.</p>
+
+  <p>TurboLay therefore makes the <span class="concept" data-concept="cell">cell</span>-local transaction the visibility boundary.</p>
+
+  <div class="boxeq">
+    <strong>One logical mutation becomes one durable <span class="concept" data-concept="slatedb">SlateDB</span> transaction committing at a
+    single storage <span class="concept" data-concept="sequence-number">sequence</span>.</strong>
+  </div>
+
+  <h2>The guards before the transaction</h2>
+
+  <p>The public <code>write_edge</code> path (<code>src/shard/write.rs</code>) crosses several gates before
+  it reaches durable state. None of them is a lock in the <span class="concept" data-concept="object-store">object store</span>:</p>
+
+  <figure>
+    <div class="tb-table-wrap">
+      <table>
+        <thead><tr><th>Order</th><th>Guard</th><th>Failure prevented</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>write authority (<code>ensure_write_authority</code>)</td><td>a read-only process mutating the cell</td></tr>
+          <tr><td>2</td><td>write permit (<code>acquire_graph_write_permit</code>)</td><td>unbounded concurrent mutation work</td></tr>
+          <tr><td>3</td><td>per-cell <span class="concept" data-concept="writer-lane">writer lane</span></td><td>same-process races on one cell</td></tr>
+          <tr><td>4</td><td>manifest fence refresh (<code>refresh_writer_fence</code>)</td><td>a superseded writer committing after a newer one took over</td></tr>
+          <tr><td>5</td><td><span class="concept" data-concept="serializable">serializable</span> snapshot transaction</td><td>partial fan-out and concurrent conflicting writes</td></tr>
+          <tr><td>6</td><td><span class="concept" data-concept="dirty-marker">drop marker</span> + authority re-check (<code>validate_write_fence_txn</code>)</td><td>writes into a cell that is being dropped</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <figcaption>Tab. 2.1 — The write path narrows authority before it changes durable state; the
+    cross-process guarantee at step 4 is SlateDB's own <span class="concept" data-concept="fencing">manifest fencing</span>, not a
+    lock record.</figcaption>
+  </figure>
+
+  <figure>
+    <div class="tb-widget" id="w-funnel"></div>
+    <figcaption>Fig. 2.1 — Each guard narrows authority — and the cross-process guard is a
+    manifest fence refresh, not a lock — while one logical mutation fans out into
+    many records committed together at a single storage sequence; the dirty marker
+    is the only thing the write owes the traversal index.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Step through the funnel: watch authority narrow, then the fan-out commit together<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Press <em>Advance</em> to descend the funnel one guard at a time — or click any guard
+      directly. Each guard is <em>narrower</em> than the one above it: authority is progressively
+      reduced until a single serializable transaction is all that remains, and the readout names
+      the exact failure that guard exists to prevent. Only <strong>step 4</strong>, the manifest fence
+      refresh, is cross-process; the rest order work <em>inside</em> this process. Reach the bottom and
+      press <em>Commit</em>: the one transaction publishes all six records — canonical edge, reverse
+      edge, degree counters, metadata index, dirty marker, idempotency — flashing in <em>together</em>
+      at one storage sequence. Nothing lands halfway.</p>
+    </div>
+  </details>
+
+  <p>Read the left column downward: each guard is narrower than the one above it, so
+  authority is progressively reduced until a single serializable transaction is all
+  that remains. The right column is what that one transaction actually writes —
+  one logical mutation fanning out into many records, all published together at
+  the sequence the commit lands on. There is no delta row, no outbox row and no
+  mutation log; the fan-out ends where the transaction ends. Traversal
+  acceleration is decoupled instead of queued: the write marks the edge type dirty
+  (<code>keys::matrix_dirty</code>), an out-of-process indexer rebuilds an immutable <span class="concept" data-concept="index-generation">index
+  generation</span> from that hint, and readers close the remaining lag with the <span class="concept" data-concept="wal-tail-overlay">WAL-tail
+  overlay</span> (<code>topology_tail_since</code>, <code>src/shard/topology_tail.rs</code>). The write itself
+  never waits for any of that.</p>
+
+  <p>The layers overlap deliberately, and each one answers a different question. The
+  writer lane is cheap and only orders writers inside this process. Cross-process
+  safety comes from SlateDB itself: before every attempt the shard refreshes the
+  writer's <span class="concept" data-concept="manifest">manifest</span> (<code>refresh_writer_fence</code>, <code>src/core/state.rs</code>), and if a newer
+  writer has taken the cell the refresh comes back fenced, the cached writer
+  handle is dropped, and the write fails rather than committing behind the new
+  owner's back. SlateDB then provides atomicity and conflict detection for the
+  records themselves, and a conflicting transaction is simply retried — the loop
+  in <code>write_edge</code> re-runs <code>write_edge_txn</code> on a retryable conflict.</p>
+
+  <h2>Epoch and idempotency are part of the write</h2>
+
+  <p>Inside the serializable transaction the writer checks the idempotency key first
+  and returns the recorded result unchanged if this is a replay. Only then does it
+  read the <span class="concept" data-concept="epoch">epoch</span> — and it does not allocate one. It takes the transaction's own
+  <span class="concept" data-concept="sequence-number">sequence number</span>, <code>let current_epoch = txn.seqnum();</code>
+  (<code>write_edge_txn_locked_with_metadata</code>, <code>src/shard/write.rs</code>), inspects existing
+  edge state at that sequence, stamps the new records with the next sequence, and
+  builds the full batch. The idempotency record binds the caller's key to the
+  original mutation and result. Replaying the same request returns the same
+  logical outcome; reusing its key for another edge is rejected.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Epoch</span>
+    <p>An epoch is a SlateDB <span class="concept" data-concept="sequence-number">storage sequence number</span>, nothing more. It is not a
+    counter TurboLay maintains in a key of its own: there is no epoch key to read
+    and no epoch to allocate, so a write cannot lose a race for one.</p>
+  </div>
+
+  <p>The durable commit publishes the records and the sequence that names their
+  visibility together. A caller never observes “edge written, version missing.”</p>
+
+  <h2>The boundary stops at the cell</h2>
+
+  <p><code>RoutedGraphCluster::write_edge</code> (<code>src/engine/cluster.rs</code>) routes only to a cell
+  this node already opened from the object-store node directory; a cell it did not
+  open is refused with <code>UnknownShard</code>. The node must also be promotable — a
+  read-only node is refused with <code>WriteRequiresWriter</code> — and <code>ensure_local_writer</code>
+  then <span class="concept" data-concept="writer-promotion">promotes</span> it to the cell's SlateDB writer lazily, on the first write that
+  needs one. There is no owner map to consult and no write forwarded over the
+  query TCP transport, so remote routing stays with the embedding service.</p>
+
+  <div class="callout built">
+    <span class="callout-title">Built boundary</span>
+    <p>Writes are sharded per cell and fenced by
+    SlateDB's manifest. A single atomic transaction spanning two cells is not built.</p>
+  </div>
+
+  <p>The write has now landed at a storage sequence. The read side uses that sequence
+  to decide which world it is allowed to see.</p>
+
+  <nav class="tb-chapnav">
+    <a class="prev" href="intro-01-cells-and-placement.html"><span class="cn-dir">‹ Prev</span><br><span class="cn-title">A Graph Has Cells</span></a>
+    <a class="next" href="intro-03-epochs-artifacts-overlays.html"><span class="cn-dir">Next ›</span><br><span class="cn-title">Reads Name the World They See</span></a>
+  </nav>
+</main>
+
+<script src="../assets/glossary.js"></script>
+<script>
+/* Page-local concepts for terms this chapter introduces but the shared glossary does not carry. */
+window.TB_GLOSSARY = Object.assign(window.TB_GLOSSARY || {}, {
+  "writer-lane": {
+    title: "Per-cell writer lane",
+    html: "<p>A cheap in-process guard that serializes writers for one <span class=\"concept\" data-concept=\"cell\">cell</span> so two tasks in the <em>same</em> process cannot race on it. It orders writers locally and nothing more — cross-process safety is a separate job handled by SlateDB's manifest <span class=\"concept\" data-concept=\"fencing\">fencing</span>.</p>"
+  },
+  "dirty-marker": {
+    title: "Dirty marker",
+    html: "<p>A tiny hint (<code>keys::matrix_dirty</code>) a write leaves saying “this edge type moved.” It is the <em>only</em> thing the write owes the traversal index: an out-of-process indexer later rebuilds an immutable <span class=\"concept\" data-concept=\"index-generation\">index generation</span> from the hint. A related <em>drop marker</em> records that a cell is being dropped, so a late write into it is refused.</p>"
+  }
+});
+</script>
+<script src="../assets/textbook.js"></script>
+<script>
+/* Widget: the guard funnel + fan-out. Descend six narrowing guards, then commit
+   one logical mutation that fans out into many records at a single sequence. */
+TB.widget("w-funnel", function (mount) {
+  var NS = "http://www.w3.org/2000/svg";
+  function el(n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+  var GUARDS = [
+    { t: "write authority", code: "ensure_write_authority", fail: "a read-only process mutating the cell", w: 200 },
+    { t: "write permit", code: "acquire_graph_write_permit", fail: "unbounded concurrent mutation work", w: 185 },
+    { t: "per-cell writer lane", code: "writer lane", fail: "same-process races on one cell", w: 170 },
+    { t: "manifest fence refresh", code: "refresh_writer_fence", fail: "a superseded writer committing after a newer one took over", w: 155, xproc: true },
+    { t: "serializable transaction", code: "serializable snapshot txn", fail: "partial fan-out and concurrent conflicting writes", w: 140 },
+    { t: "drop marker check", code: "validate_write_fence_txn", fail: "writes into a cell that is being dropped", w: 125 }
+  ];
+  var RECS = ["canonical edge", "reverse edge", "degree counters", "metadata index", "dirty marker", "idempotency"];
+
+  var active = 0;      // highlighted guard 0..5
+  var reached = 0;     // deepest guard reached
+  var committed = false;
+
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div");
+  controls.className = "tb-controls";
+  var btnStep = mk("Advance ▸", "primary");
+  var btnCommit = mk("Commit", "");
+  var btnReset = mk("Reset", "");
+  controls.append(btnStep, btnCommit, btnReset);
+
+  var svg = el("svg", { viewBox: "0 0 640 300", width: "100%", style: "max-width:640px;display:block;margin:0 auto" });
+  var readout = document.createElement("div");
+  readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.6em;color:var(--muted)";
+
+  wrap.append(controls, svg, readout);
+  mount.appendChild(wrap);
+
+  function mk(label, cls) { var b = document.createElement("button"); b.className = "tb-btn" + (cls ? " " + cls : ""); b.textContent = label; return b; }
+  function label(x, y, t, anchor, size, weight, fill) {
+    var e = el("text", { x: x, y: y, "text-anchor": anchor || "middle", class: "wnode-label" });
+    if (size) e.setAttribute("font-size", size);
+    if (weight) e.setAttribute("font-weight", weight);
+    if (fill) e.setAttribute("fill", fill);
+    e.textContent = t; return e;
+  }
+
+  var GY0 = 14, GH = 26, GSTEP = 34, GCX = 135;
+
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var mut = css("--muted"), ink = css("--ink");
+
+    var defs = el("defs", {});
+    var mA = el("marker", { id: "arwf", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse" });
+    mA.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: mut }));
+    defs.appendChild(mA); svg.appendChild(defs);
+
+    // connectors between guards
+    for (var c = 0; c < GUARDS.length - 1; c++) {
+      var y1 = GY0 + c * GSTEP + GH, y2 = GY0 + (c + 1) * GSTEP;
+      svg.appendChild(el("line", { x1: GCX, y1: y1, x2: GCX, y2: y2, stroke: mut, "stroke-width": 1.2, "marker-end": "url(#arwf)" }));
+    }
+
+    // guards
+    for (var i = 0; i < GUARDS.length; i++) {
+      var g = GUARDS[i], gy = GY0 + i * GSTEP, gx = GCX - g.w / 2;
+      var isActive = (i === active) && !committed;
+      var passed = committed || i < active;
+      var fill, stroke;
+      if (isActive) { fill = css("--info-soft"); stroke = css("--info"); }
+      else if (passed) { fill = css("--ok-soft"); stroke = css("--ok"); }
+      else { fill = css("--surface-soft"); stroke = css("--border"); }
+      var grp = el("g", { class: "wnode" + (isActive ? " wflash" : (passed || i <= reached ? "" : " wdim")) });
+      grp.appendChild(el("rect", { x: gx, y: gy, width: g.w, height: GH, rx: 4, fill: fill, stroke: stroke, "stroke-width": g.xproc ? 1.8 : 1.1, style: "cursor:pointer" }));
+      grp.appendChild(label(GCX, gy + 13, g.t, "middle", 10.5, isActive ? "700" : "600", ink));
+      grp.appendChild(label(GCX, gy + 23, (i + 1) + (g.xproc ? " · cross-process" : ""), "middle", 8, null, mut));
+      (function (idx) { grp.onclick = function () { active = idx; if (idx > reached) reached = idx; committed = false; render(); }; })(i);
+      svg.appendChild(grp);
+    }
+
+    // durable commit node
+    var cy = GY0 + GUARDS.length * GSTEP + 4;
+    svg.appendChild(el("line", { x1: GCX, y1: cy - 8, x2: GCX, y2: cy, stroke: mut, "stroke-width": 1.2, "marker-end": "url(#arwf)" }));
+    var cFill = committed ? css("--ok-soft") : css("--surface-soft");
+    var cStroke = committed ? css("--ok") : css("--border");
+    var gc = el("g", { class: "wnode" + (committed ? " wflash" : "") });
+    gc.appendChild(el("rect", { x: GCX - 78, y: cy, width: 156, height: 30, rx: 4, fill: cFill, stroke: cStroke, "stroke-width": 1.4 }));
+    gc.appendChild(label(GCX, cy + 14, "durable commit @ sequence", "middle", 10, "700", ink));
+    gc.appendChild(label(GCX, cy + 25, committed ? "all records visible together" : "not yet committed", "middle", 8, null, mut));
+    svg.appendChild(gc);
+
+    // fan-out: insert edge -> records
+    var insX = 300, insY = 118;
+    var insG = el("g", {});
+    insG.appendChild(el("rect", { x: insX, y: insY, width: 110, height: 32, rx: 4, fill: css("--info-soft"), stroke: css("--info"), "stroke-width": 1.2 }));
+    insG.appendChild(label(insX + 55, insY + 20, "insert edge 1→2", "middle", 10.5, "700", ink));
+    svg.appendChild(insG);
+
+    var recX = 500, recW = 128, recH = 24, recStep = 32, recY0 = 20;
+    svg.appendChild(label(recX + recW / 2, recY0 - 6, "one txn · one sequence", "middle", 8.5, "600", mut));
+    for (var r = 0; r < RECS.length; r++) {
+      var ry = recY0 + r * recStep;
+      // fan-out edge from insert node
+      svg.appendChild(el("path", {
+        d: "M" + (insX + 110) + " " + (insY + 16) + " C" + (insX + 150) + " " + (insY + 16) + "," + (recX - 40) + " " + (ry + recH / 2) + "," + recX + " " + (ry + recH / 2),
+        stroke: committed ? css("--info") : mut, "stroke-width": committed ? 1.5 : 1, fill: "none", "stroke-dasharray": committed ? "none" : "3 3", "marker-end": "url(#arwf)"
+      }));
+      var rg = el("g", { class: "wnode" + (committed ? " wflash" : " wdim") });
+      rg.appendChild(el("rect", { x: recX, y: ry, width: recW, height: recH, rx: 4, fill: css("--info-soft"), stroke: css("--info"), "stroke-width": 1.1 }));
+      rg.appendChild(label(recX + recW / 2, ry + 16, RECS[r], "middle", 10, "600", ink));
+      svg.appendChild(rg);
+    }
+
+    // readout
+    if (committed) {
+      readout.innerHTML = "<strong style='color:var(--ok)'>Committed.</strong> One serializable transaction publishes all " + RECS.length +
+        " records — and the sequence naming their visibility — <strong>together</strong>. A caller never observes “edge written, version missing.”";
+    } else {
+      var g2 = GUARDS[active];
+      readout.innerHTML = "<strong>Guard " + (active + 1) + " — " + g2.t + "</strong> (<code>" + g2.code + "</code>) prevents: " + g2.fail + "." +
+        (g2.xproc ? " <em style='color:var(--info)'>This is the only cross-process guard — SlateDB's manifest fencing, not a lock.</em>" : "");
+    }
+
+    btnStep.disabled = committed;
+    btnCommit.disabled = committed || active < GUARDS.length - 1;
+  }
+
+  btnStep.onclick = function () {
+    if (active < GUARDS.length - 1) { active++; if (active > reached) reached = active; }
+    else committed = true;
+    render();
+  };
+  btnCommit.onclick = function () { committed = true; render(); };
+  btnReset.onclick = function () { active = 0; reached = 0; committed = false; render(); };
+  render();
+  window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+  document.querySelector(".tb-theme-toggle").addEventListener("click", function () { setTimeout(render, 0); });
+});
+</script>

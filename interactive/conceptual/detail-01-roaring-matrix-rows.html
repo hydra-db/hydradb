@@ -1,0 +1,443 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roaring Matrix Rows · TurboLay Conceptual Guide</title>
+<link rel="stylesheet" href="../assets/textbook.css">
+
+<div class="tb-progress"></div>
+
+<header class="tb-header">
+  <a class="tb-home" href="../index.html">Turbo<span>Lay</span> · Interactive</a>
+  <span class="tb-crumb">A Conceptual Guide</span>
+  <span class="tb-crumb">Implementation Deep Dives</span>
+  <span class="tb-spacer"></span>
+  <button class="tb-theme-toggle" type="button">☾ Dark</button>
+</header>
+
+<main class="tb-main">
+  <div class="tb-chapter-kicker">Deep Dive · Implementation</div>
+  <h1>Roaring Matrix Rows</h1>
+
+  <div class="callout status">
+    <span class="callout-title">Status: PLANNED</span>
+    <p>Roaring matrix rows are a <em>proposed</em> optimization. They are <em>not</em> in
+    the current tree: <span class="concept" data-concept="adjacency">adjacency</span> hydrates today as
+    <code>BTreeMap&lt;VertexId, BTreeSet&lt;VertexId&gt;&gt;</code>. This chapter describes the
+    intended change. When adopted it would touch only compute-local
+    <span class="concept" data-concept="hydration">hydrated</span> adjacency, not the durable
+    <span class="concept" data-concept="object-store">object-store</span> format.</p>
+  </div>
+
+  <h2>The type boundary</h2>
+
+  <p>The current aliases in <code>src/lib.rs</code> and <code>src/sparse_kernel.rs</code> represent an
+  adjacency as:</p>
+
+  <pre><code>BTreeMap&lt;VertexId, BTreeSet&lt;VertexId&gt;&gt;</code></pre>
+
+  <p>Under the planned change they would instead use:</p>
+
+  <pre><code>BTreeMap&lt;VertexId, RoaringTreemap&gt;</code></pre>
+
+  <p>Design note: <code>VertexId</code> is <code>u64</code>, so the plan calls for
+  <span class="concept" data-concept="roaring-treemap"><code>RoaringTreemap</code></span> rather than the 32-bit
+  <code>RoaringBitmap</code>. Tests for the change would deliberately include IDs above
+  <code>u32::MAX</code> to pin that requirement.</p>
+
+  <figure>
+    <div class="tb-widget" id="w-seam"></div>
+    <figcaption>Fig. D1.1 — The durable artifact format stays byte-for-byte stable; the planned
+      change compresses only the hydrated row at the matrix-cache hydration seam.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Flip the seam: today's row vs the planned Roaring row<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>The wall in the widget is the whole idea. Everything in the left column lives on the
+      <span class="concept" data-concept="object-store">object store</span> — <span class="concept" data-concept="slatedb">SlateDB</span>
+      records, <span class="concept" data-concept="matrix-tile">matrix tiles</span> stored as <code>Vec&lt;u64&gt;</code>,
+      and persisted <span class="concept" data-concept="csc">CSC</span> chunks. Toggle between <em>today</em> and
+      <em>planned</em>: the left column never moves. Only the in-memory row on the right of the
+      hydration seam changes shape, from a <span class="concept" data-concept="btreeset"><code>BTreeSet&lt;VertexId&gt;</code></span>
+      to a <span class="concept" data-concept="roaring-treemap"><code>RoaringTreemap</code></span>. The outer
+      <code>BTreeMap&lt;VertexId, …&gt;</code> that keys rows by source vertex is unchanged either way.</p>
+    </div>
+  </details>
+
+  <p>Read it as a wall between durable and hydrated. Everything on the object store
+  (left) would stay exactly as it is on disk; the only proposed change (right, dashed)
+  is to compress the in-memory row <em>after</em> it is hydrated. Because nothing durable
+  changes, no artifact would need rewriting and old artifacts stay readable.</p>
+
+  <h2>What stays byte-for-byte compatible</h2>
+
+  <p>The durable types have not changed:</p>
+
+  <figure>
+    <div class="tb-table-wrap">
+      <table>
+        <thead><tr><th>Layer</th><th>Representation</th><th>Changed?</th></tr></thead>
+        <tbody>
+          <tr><td>canonical edge/index keys</td><td>SlateDB records</td><td>no</td></tr>
+          <tr><td>matrix tile rows</td><td><code>BTreeMap&lt;u64, Vec&lt;u64&gt;&gt;</code></td><td>no</td></tr>
+          <tr><td>persisted CSC</td><td>vertex/pointer/index chunks</td><td>no</td></tr>
+          <tr><td>hydrated matrix row</td><td><code>BTreeSet&lt;VertexId&gt;</code> today; <code>RoaringTreemap</code> planned</td><td><strong>planned</strong></td></tr>
+          <tr><td>Rust/GraphBLAS adjacency input</td><td>Roaring rows (planned)</td><td><strong>planned</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <figcaption>Tab. D1.1 — Roaring would be introduced after hydration, preserving stored artifacts.</figcaption>
+  </figure>
+
+  <p>No migration would be required. A process can already open artifacts written by
+  a previous commit and decode their vector rows; under the plan it would extend a
+  Roaring row during hydration. Hydration lives in <code>src/engine/matrix_cache.rs</code>
+  (<code>load_matrix_adjacency</code>) — the old <code>src/engine/supernode.rs</code> has been deleted —
+  so the port would touch <code>matrix_cache.rs</code>.</p>
+
+  <h2>What the port will involve</h2>
+
+  <p><code>BTreeSet::iter()</code> yields <code>&amp;u64</code>; a <code>RoaringTreemap</code> iterator yields <code>u64</code>.
+  Porting will therefore require removing reference dereferences in:</p>
+
+  <ul>
+    <li>CSC construction;</li>
+    <li>sparse expansion;</li>
+    <li>graph vertex-dictionary construction;</li>
+    <li>reconstruction of <code>EdgeRecord</code>s from hydrated adjacency.</li>
+  </ul>
+
+  <p>Delta removal will also change from <code>row.remove(&amp;dst)</code> to <code>row.remove(dst)</code>.
+  Those small type changes are exactly where a silent high-ID truncation or
+  ordering regression could hide, so the tests for the change should cover sorted
+  deduplication, values above <code>u32::MAX</code>, Rust traversal, and plus/minus overlay.</p>
+
+  <h2>What Roaring would buy</h2>
+
+  <ul>
+    <li>one compressed row rather than one tree allocation per destination;</li>
+    <li>natural deduplication and ascending iteration;</li>
+    <li>efficient future union, intersection, and difference operations;</li>
+    <li>a lower-memory cache candidate for dense and high-<span class="concept" data-concept="degree">degree</span> rows.</li>
+  </ul>
+
+  <p>The outer <code>BTreeMap</code> would remain because matrix hydration and source-row lookup
+  are still organized by source vertex. A later measurement may justify a different
+  outer structure, but that is independent of row compression.</p>
+
+  <figure>
+    <div class="tb-widget" id="w-roaring"></div>
+    <figcaption>Fig. D1.2 — One adjacency row as a Roaring bitmap: the neighbour space is split into
+      65 536-value chunks, and each chunk picks an <em>array</em> container when sparse or a
+      <em>bitset</em> container when dense. Byte totals are illustrative (array ≈ 2 B/value, bitset =
+      8 192 B fixed, <code>BTreeSet&lt;u64&gt;</code> ≈ 24 B/value).</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Build a row: watch containers switch and the bytes fall<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>The widget holds one adjacency row — the neighbour set of a single source vertex. A
+      <span class="concept" data-concept="roaring">Roaring bitmap</span> never stores the set as one flat structure.
+      It slices the value space into blocks of 65 536 and, for each occupied block, stores the
+      members in a <span class="concept" data-concept="roaring-container">container</span> chosen from that block's
+      <span class="concept" data-concept="cardinality">cardinality</span>: a sorted <em>array container</em> while the
+      block is sparse, a fixed 8 192-byte <em>bitset container</em> once it turns dense (above 4 096
+      members). <em>Add sparse neighbours</em> scatters ids across blocks and keeps every container an
+      array; <em>Fill a dense block</em> pours thousands of neighbours into one block and you will see
+      that block flip to a bitset. Compare the two summary bars: against a plain
+      <span class="concept" data-concept="btreeset"><code>BTreeSet&lt;u64&gt;</code></span>, which pays a per-element tree
+      slot, the Roaring row wins hardest exactly where a bitset takes over. This same row is the
+      <span class="concept" data-concept="graphblas">GraphBLAS</span> / Rust traversal input, and building it is what
+      the <span class="concept" data-concept="hydration">hydration</span> seam would do.</p>
+    </div>
+  </details>
+
+  <h2>What it would not buy automatically</h2>
+
+  <p>The current Rust traversal uses <code>BTreeSet</code> for its frontier and accumulated
+  result. It would iterate each Roaring row into that frontier. Therefore the
+  change would not by itself prove lower query latency. Tiny rows may see little
+  benefit, and cache limits count entries rather than bytes.</p>
+
+  <div class="boxeq">
+    <strong>The proposed win is a compressed adjacency cache. The performance win would
+    remain a benchmark result, not a premise.</strong>
+  </div>
+
+  <nav class="tb-chapnav">
+    <a class="prev" href="intro-05-bounded-distributed-queries.html"><span class="cn-dir">‹ Prev</span><br><span class="cn-title">Distribution with Edges Around It</span></a>
+    <a class="next" href="detail-02-write-edge-path.html"><span class="cn-dir">Next ›</span><br><span class="cn-title">The write_edge Path</span></a>
+  </nav>
+</main>
+
+<script src="../assets/glossary.js"></script>
+<script>
+/* Page-local glossary entries for this chapter (merged after glossary.js, before textbook.js). */
+window.TB_GLOSSARY = Object.assign(window.TB_GLOSSARY || {}, {
+  "roaring-treemap": {
+    title: "RoaringTreemap",
+    html: "<p>The 64-bit sibling of a <span class=\"concept\" data-concept=\"roaring\">Roaring bitmap</span>. It keys a map from the high 32 bits of each value to a 32-bit <code>RoaringBitmap</code> holding the low 32 bits, so it can hold <code>u64</code> members.</p><p>TurboLay's <code>VertexId</code> is a <code>u64</code> and can exceed <code>u32::MAX</code>, so the planned row type is <code>RoaringTreemap</code>, not the 32-bit <code>RoaringBitmap</code>; tests deliberately use high ids to pin that.</p>"
+  },
+  "roaring-container": {
+    title: "Roaring container (array vs bitset)",
+    html: "<p>A <span class=\"concept\" data-concept=\"roaring\">Roaring bitmap</span> divides its value space into blocks of 65 536 and stores each occupied block's members in a <em>container</em> chosen from that block's <span class=\"concept\" data-concept=\"cardinality\">cardinality</span>.</p><p>An <em>array container</em> is a sorted list of 16-bit offsets, compact while the block is sparse. A <em>bitset container</em> is a fixed 8 192-byte (65 536-bit) array, chosen once the block turns dense (above ~4 096 members). Switching per block is what gives Roaring both small size and fast set operations.</p>"
+  },
+  "matrix-tile": {
+    title: "Matrix tile",
+    html: "<p>A durable slice of the <span class=\"concept\" data-concept=\"adjacency\">adjacency</span> matrix published inside an <span class=\"concept\" data-concept=\"index-generation\">index generation</span>. On disk a tile row is a plain <code>Vec&lt;u64&gt;</code> of neighbour ids (<code>BTreeMap&lt;u64, Vec&lt;u64&gt;&gt;</code>).</p><p>Tiles stay byte-for-byte stable on the object store; the planned Roaring change happens only after they are <span class=\"concept\" data-concept=\"hydration\">hydrated</span> into memory.</p>"
+  },
+  "cardinality": {
+    title: "Cardinality",
+    html: "<p>The number of members in a set. Here it is the count of neighbour ids that fall inside one 65 536-value block of a <span class=\"concept\" data-concept=\"roaring\">Roaring bitmap</span> — the single number that decides whether that block uses an array or a bitset <span class=\"concept\" data-concept=\"roaring-container\">container</span>.</p>"
+  },
+  "hydration": {
+    title: "Hydration",
+    html: "<p>Loading a durable artifact from the <span class=\"concept\" data-concept=\"object-store\">object store</span> into an in-memory query structure — here, building the adjacency <code>BTreeMap</code> rows from persisted <span class=\"concept\" data-concept=\"matrix-tile\">matrix tiles</span> and <span class=\"concept\" data-concept=\"csc\">CSC</span> chunks.</p><p>The hydrated copy is compute-local and disposable, never the durable truth. Hydration lives in <code>src/engine/matrix_cache.rs</code>, and it is the one seam the Roaring change would touch.</p>"
+  }
+});
+</script>
+<script src="../assets/textbook.js"></script>
+<script>
+/* Widget 1: the hydration seam — durable column is fixed; the hydrated row flips shape. */
+TB.widget("w-seam", function (mount) {
+  var NS = "http://www.w3.org/2000/svg";
+  function el(n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+  var planned = false;
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div");
+  controls.className = "tb-controls";
+  var btnToday = mk("Today · BTreeSet", "primary");
+  var btnPlan = mk("Planned · Roaring", "");
+  controls.append(btnToday, btnPlan);
+
+  var svg = el("svg", { viewBox: "0 0 470 250", width: "100%", style: "max-width:470px;display:block;margin:0 auto" });
+  var readout = document.createElement("div");
+  readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.4em;color:var(--muted)";
+  wrap.append(controls, svg, readout);
+  mount.appendChild(wrap);
+
+  function mk(l, c) { var b = document.createElement("button"); b.className = "tb-btn" + (c ? " " + c : ""); b.textContent = l; return b; }
+  function box(x, y, w, h, fill, stroke, dash) {
+    return el("rect", { x: x, y: y, width: w, height: h, rx: 5, fill: fill, stroke: stroke, "stroke-width": 1.2, "stroke-dasharray": dash || "none", class: "wnode" });
+  }
+  function label(x, y, t, size, weight, fill) {
+    var e = el("text", { x: x, y: y, "text-anchor": "middle", class: "wnode-label" });
+    if (size) e.setAttribute("font-size", size);
+    if (weight) e.setAttribute("font-weight", weight);
+    if (fill) e.setAttribute("fill", fill);
+    e.textContent = t; return e;
+  }
+
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var mut = css("--muted");
+
+    svg.appendChild(label(78, 16, "Durable — unchanged", 9, "700", mut));
+    svg.appendChild(label(360, 16, "Hydrated in compute", 9, "700", mut));
+
+    // durable column (left) — always identical
+    var dur = [["SlateDB records", 0], ["matrix tiles  Vec<u64>", 1], ["persisted CSC chunks", 2]];
+    dur.forEach(function (d) {
+      var y = 34 + d[1] * 46;
+      svg.appendChild(box(14, y, 150, 34, css("--purple-soft"), css("--purple")));
+      svg.appendChild(label(89, y + 21, d[0], 8.5, "600"));
+    });
+
+    // the wall
+    var wallX = 232;
+    svg.appendChild(el("line", { x1: wallX, y1: 26, x2: wallX, y2: 236, stroke: css("--border"), "stroke-width": 1.4, "stroke-dasharray": "3 4" }));
+    svg.appendChild(label(wallX, 248, "durable ▏ hydrated", 8, "600", mut));
+
+    // dotted enclosure for the outer BTreeMap
+    svg.appendChild(el("rect", { x: 286, y: 40, width: 172, height: 128, rx: 6, fill: "none", stroke: css("--border"), "stroke-width": 1, "stroke-dasharray": "1 3" }));
+    svg.appendChild(label(372, 182, "BTreeMap<VertexId, …>  (unchanged)", 7.5, "600", mut));
+
+    // hydrated row (right) — the one thing that flips
+    var todayActive = !planned;
+    var gT = el("g", { class: "wnode" + (todayActive ? " wflash" : " wdim") });
+    gT.appendChild(box(298, 54, 148, 40, todayActive ? css("--surface-soft") : css("--surface"), todayActive ? css("--ink") : css("--border")));
+    gT.appendChild(label(372, 72, "row: BTreeSet<VertexId>", 8.5, "700"));
+    gT.appendChild(label(372, 86, "today", 8, "400", mut));
+    svg.appendChild(gT);
+
+    var gP = el("g", { class: "wnode" + (planned ? " wflash" : " wdim") });
+    gP.appendChild(box(298, 112, 148, 40, planned ? css("--warn-soft") : css("--surface"), css("--warn"), "4 3"));
+    gP.appendChild(label(372, 130, "row: RoaringTreemap", 8.5, "700"));
+    gP.appendChild(label(372, 144, "planned", 8, "400", css("--warn")));
+    svg.appendChild(gP);
+
+    // planned transition arrow between the two hydrated rows
+    svg.appendChild(el("path", { d: "M372 94 L372 112", stroke: css("--warn"), "stroke-width": 1.3, fill: "none", "stroke-dasharray": "4 3", "marker-end": "url(#arwS)" }));
+
+    // hydrate seam edge: matrix tiles -> active hydrated row
+    var actY = planned ? 132 : 74;
+    var seam = el("path", { d: "M164 80 C220 80 232 " + actY + " 296 " + actY, stroke: mut, "stroke-width": 1.3, fill: "none", "marker-end": "url(#arwS)" });
+    svg.appendChild(seam);
+    svg.appendChild(label(210, planned ? 118 : 62, "hydrate (matrix_cache.rs)", 7, "600", mut));
+
+    var defs = el("defs", {});
+    var m = el("marker", { id: "arwS", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    m.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: mut })); defs.appendChild(m); svg.appendChild(defs);
+
+    readout.innerHTML = planned
+      ? "<strong style='color:var(--warn)'>Planned:</strong> the durable column is untouched; only the hydrated row becomes a <code>RoaringTreemap</code>. No artifact is rewritten, old artifacts stay readable."
+      : "<strong>Today:</strong> the hydrated row is a <code>BTreeSet&lt;VertexId&gt;</code>. The durable column already looks exactly the same as it would after the change.";
+
+    btnToday.classList.toggle("primary", todayActive);
+    btnPlan.classList.toggle("primary", planned);
+  }
+
+  btnToday.onclick = function () { planned = false; render(); };
+  btnPlan.onclick = function () { planned = true; render(); };
+  render();
+  window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+  document.querySelector(".tb-theme-toggle").addEventListener("click", function () { setTimeout(render, 0); });
+});
+
+/* Widget 2: one adjacency row as a Roaring bitmap — containers switch, bytes fall vs BTreeSet. */
+TB.widget("w-roaring", function (mount) {
+  var NS = "http://www.w3.org/2000/svg";
+  function el(n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+  var CHUNK = 65536, ARRAY_MAX = 4096;
+  var BTREE_PER = 24;       // illustrative bytes per element in a BTreeSet<u64>
+  var CHUNK_OVERHEAD = 8;   // illustrative Roaring per-container bookkeeping
+  var ids = [];             // ordered list of neighbour ids
+  var seen = Object.create(null);
+
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div");
+  controls.className = "tb-controls";
+  var btnSparse = mk("Add sparse neighbours", "primary");
+  var btnDense = mk("Fill a dense block", "");
+  var btnRemove = mk("Remove last", "");
+  var btnReset = mk("Reset", "");
+  controls.append(btnSparse, btnDense, btnRemove, btnReset);
+
+  var svg = el("svg", { width: "100%", style: "display:block;margin:0 auto" });
+  var readout = document.createElement("div");
+  readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.4em;color:var(--muted)";
+  wrap.append(controls, svg, readout);
+  mount.appendChild(wrap);
+
+  function mk(l, c) { var b = document.createElement("button"); b.className = "tb-btn" + (c ? " " + c : ""); b.textContent = l; return b; }
+  function add(v) { if (!seen[v]) { seen[v] = 1; ids.push(v); } }
+  function fmt(b) {
+    if (b >= 1048576) return (b / 1048576).toFixed(1) + " MB";
+    if (b >= 1024) return (b / 1024).toFixed(1) + " KB";
+    return b + " B";
+  }
+
+  function chunks() {
+    var m = Object.create(null);
+    for (var i = 0; i < ids.length; i++) { var k = Math.floor(ids[i] / CHUNK); m[k] = (m[k] || 0) + 1; }
+    var out = [];
+    for (var k in m) {
+      var card = m[k], bitset = card > ARRAY_MAX;
+      var bytes = (bitset ? 8192 : card * 2) + CHUNK_OVERHEAD;
+      out.push({ key: +k, card: card, type: bitset ? "bitset" : "array", bytes: bytes });
+    }
+    out.sort(function (a, b) { return a.key - b.key; });
+    return out;
+  }
+
+  function label(x, y, t, size, weight, fill, anchor) {
+    var e = el("text", { x: x, y: y, "text-anchor": anchor || "start", class: "wnode-label" });
+    if (size) e.setAttribute("font-size", size);
+    if (weight) e.setAttribute("font-weight", weight);
+    if (fill) e.setAttribute("fill", fill);
+    e.textContent = t; return e;
+  }
+
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var mut = css("--muted"), ink = css("--ink"), border = css("--border");
+    var okC = css("--ok"), okS = css("--ok-soft"), warnC = css("--warn"), warnS = css("--warn-soft");
+
+    var cs = chunks();
+    var shown = cs.slice(0, 6);
+    var rowH = 26, headH = 30, sumH = 78;
+    var H = headH + Math.max(1, shown.length) * rowH + (cs.length > 6 ? 16 : 0) + sumH;
+    svg.setAttribute("viewBox", "0 0 470 " + H);
+    svg.style.maxWidth = "470px";
+
+    svg.appendChild(label(8, 18, "one adjacency row → Roaring containers, keyed by 65 536-value block", 9, "700", ink));
+
+    if (shown.length === 0) {
+      svg.appendChild(label(8, headH + 18, "empty row — add some neighbours above.", 10, "400", mut));
+    }
+
+    var maxBytes = 1;
+    cs.forEach(function (c) { if (c.bytes > maxBytes) maxBytes = c.bytes; });
+
+    shown.forEach(function (c, i) {
+      var y = headH + i * rowH;
+      var isBit = c.type === "bitset";
+      // key / range label
+      svg.appendChild(label(8, y + 16, "block " + c.key + "  [" + (c.key * CHUNK).toLocaleString() + "…]", 8.5, "600", ink));
+      // container badge
+      var badgeX = 176, bw = 52;
+      svg.appendChild(el("rect", { x: badgeX, y: y + 4, width: bw, height: 16, rx: 8, fill: isBit ? warnS : okS, stroke: isBit ? warnC : okC, "stroke-width": 1, class: "wnode" }));
+      svg.appendChild(label(badgeX + bw / 2, y + 15, c.type, 8, "700", isBit ? warnC : okC, "middle"));
+      // cardinality
+      svg.appendChild(label(238, y + 16, "n=" + c.card, 8.5, "400", mut));
+      // bytes bar
+      var barX = 300, barMax = 118;
+      var w = Math.max(4, Math.round(barMax * c.bytes / maxBytes));
+      svg.appendChild(el("rect", { x: barX, y: y + 5, width: w, height: 14, rx: 3, fill: isBit ? warnC : okC, class: "wnode" }));
+      svg.appendChild(label(barX + w + 5, y + 16, fmt(c.bytes), 8, "600", ink));
+    });
+
+    var yAfter = headH + shown.length * rowH;
+    if (cs.length > 6) { svg.appendChild(label(8, yAfter + 12, "+ " + (cs.length - 6) + " more block(s) …", 8.5, "400", mut)); yAfter += 16; }
+
+    // summary bars: Roaring total vs BTreeSet total
+    var totalCard = ids.length;
+    var roar = 0; cs.forEach(function (c) { roar += c.bytes; }); roar += cs.length * 4;
+    var btree = totalCard * BTREE_PER;
+    var sy = yAfter + 14;
+    svg.appendChild(el("line", { x1: 8, y1: sy - 6, x2: 462, y2: sy - 6, stroke: css("--border-soft"), "stroke-width": 1 }));
+
+    var sMax = Math.max(roar, btree, 1), sBarMax = 300, sBarX = 150;
+    function sumBar(y, name, val, color) {
+      svg.appendChild(label(8, y + 11, name, 9, "700", ink));
+      var w = Math.max(3, Math.round(sBarMax * val / sMax));
+      svg.appendChild(el("rect", { x: sBarX, y: y + 1, width: w, height: 13, rx: 3, fill: color, class: "wnode" }));
+      svg.appendChild(label(sBarX + w + 6, y + 11, fmt(val), 9, "700", ink));
+    }
+    sumBar(sy, "Roaring row", roar, css("--purple"));
+    sumBar(sy + 22, "BTreeSet<u64>", btree, mut);
+
+    var ratio = roar > 0 ? (btree / roar) : 0;
+    if (totalCard === 0) readout.innerHTML = "Add neighbours to build the row. Sparse ids scatter into separate blocks (array containers); a dense block flips to a bitset.";
+    else readout.innerHTML = "Row holds <strong>" + totalCard.toLocaleString() + "</strong> neighbour(s) across <strong>" + cs.length + "</strong> block(s). Roaring ≈ <strong>" + fmt(roar) + "</strong> vs BTreeSet ≈ <strong>" + fmt(btree) + "</strong> — about <strong style='color:var(--purple)'>" + ratio.toFixed(1) + "×</strong> smaller.";
+
+    btnRemove.disabled = ids.length === 0;
+    btnReset.disabled = ids.length === 0;
+  }
+
+  btnSparse.onclick = function () {
+    for (var i = 0; i < 8; i++) { var v = Math.floor(Math.random() * 6 * CHUNK); add(v); }
+    render();
+  };
+  btnDense.onclick = function () {
+    // pour a dense block into an as-yet-untouched block so it flips to a bitset
+    var used = Object.create(null);
+    for (var i = 0; i < ids.length; i++) used[Math.floor(ids[i] / CHUNK)] = 1;
+    var k = 0; while (used[k]) k++;
+    var base = k * CHUNK;
+    for (var j = 0; j < 5000; j++) add(base + j);
+    render();
+  };
+  btnRemove.onclick = function () { var v = ids.pop(); if (v !== undefined) delete seen[v]; render(); };
+  btnReset.onclick = function () { ids = []; seen = Object.create(null); render(); };
+
+  // seed a small starting row so the reader sees structure immediately
+  [3, 41, 900, 7000, CHUNK + 12, CHUNK + 5000, 2 * CHUNK + 88].forEach(add);
+  render();
+  window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+  document.querySelector(".tb-theme-toggle").addEventListener("click", function () { setTimeout(render, 0); });
+});
+</script>

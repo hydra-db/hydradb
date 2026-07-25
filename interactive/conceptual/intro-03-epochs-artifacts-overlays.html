@@ -1,0 +1,501 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reads Name the World They See · TurboLay Conceptual Guide</title>
+<link rel="stylesheet" href="../assets/textbook.css">
+
+<div class="tb-progress"></div>
+
+<header class="tb-header">
+  <a class="tb-home" href="../index.html">Turbo<span>Lay</span> · Interactive</a>
+  <span class="tb-crumb">A Conceptual Guide</span>
+  <span class="tb-crumb">The Architecture</span>
+  <span class="tb-spacer"></span>
+  <button class="tb-theme-toggle" type="button">☾ Dark</button>
+</header>
+
+<main class="tb-main">
+  <div class="tb-chapter-kicker">Chapter 3 · The Architecture</div>
+  <h1>Reads Name the World They See</h1>
+
+  <p>A <span class="concept" data-concept="matrix-tile">matrix artifact</span> takes time to build. While it is being built, edges keep
+  arriving. If a query blindly uses the newest matrix it can find, it may answer
+  from yesterday's structure and silently omit today's edge.</p>
+
+  <p>TurboLay makes both sides explicit: the query names a <code>read_epoch</code>; every <span class="concept" data-concept="index-generation">index
+  generation</span> names a <code>base_sequence</code>. Both are values of the <em>same</em> type, and there
+  is only one such type in the engine — <span class="concept" data-concept="sequence-number"><code>StorageSequence</code></span> (<code>src/lib.rs</code>), which is
+  <span class="concept" data-concept="slatedb">SlateDB</span>'s sequence number for a committed storage <span class="concept" data-concept="snapshot-isolation">snapshot</span>.</p>
+
+  <p>That "only one" is worth pausing on, because an earlier design had two clocks: a
+  storage <span class="concept" data-concept="sequence-number">sequence</span> for <span class="concept" data-concept="mvcc">record visibility</span> and a separate topology counter for
+  acceleration. Two clocks mean a seam, and a seam means a way for a read to be
+  coherent on one axis and stale on the other. The engine now reads its <span class="concept" data-concept="epoch">epoch</span>
+  straight out of the <span class="concept" data-concept="snapshot-isolation">snapshot</span> it already pinned, and binds it as both bounds of the
+  same value (<code>src/shard/query.rs</code>):</p>
+
+  <pre><code>let context = context.with_validated_storage_read_epoch(read_epoch, read_epoch);</code></pre>
+
+  <p>The same argument twice is the whole point: there is nothing left to disagree.</p>
+
+  <div class="boxeq">
+    <strong>answer at read_epoch = <span class="concept" data-concept="index-generation">index generation</span> at base_sequence + the <span class="concept" data-concept="wal">WAL</span> tail
+    through read_epoch</strong>
+  </div>
+
+  <h2>Canonical truth and derived accelerators</h2>
+
+  <p>Canonical edge and metadata records are the source of graph meaning. Builders
+  derive several durable query structures:</p>
+
+  <ul>
+    <li><span class="concept" data-concept="matrix-tile">matrix tiles</span> for <span class="concept" data-concept="sparse-matrix">sparse</span> traversal;</li>
+    <li>compact <span class="concept" data-concept="csc">CSC</span> chunks for <span class="concept" data-concept="graphblas">GraphBLAS</span> hydration;</li>
+    <li><span class="concept" data-concept="manifest">manifests</span> that publish a coherent artifact <span class="concept" data-concept="epoch">epoch</span>.</li>
+  </ul>
+
+  <p>These are durable accelerators, not competing truths. An unpublished or partial
+  artifact is ignored. A published <span class="concept" data-concept="manifest">manifest</span> identifies the complete base.</p>
+
+  <h2>Overlay closes the time gap</h2>
+
+  <p><code>latest_matrix_artifact</code> (<code>src/engine/artifact_build.rs</code>) selects the newest
+  artifact whose base is not newer than the requested read <span class="concept" data-concept="epoch">epoch</span>. For traversal, the
+  shard then closes the remaining interval with <code>topology_tail_since</code>
+  (<code>src/shard/topology_tail.rs</code>) — but not by replaying a log TurboLay wrote. There
+  is no such log. It reads <span class="concept" data-concept="slatedb">SlateDB</span>'s own <em>write-ahead log</em>, walking the <span class="concept" data-concept="wal">WAL</span> files
+  from the generation's <code>last_wal_id</code> up to the newest durable one and collecting
+  the edges that changed.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — WAL-tail overlay</span>
+    <p>The gap between what an <span class="concept" data-concept="index-generation">index generation</span> knows and what the read must see, read
+    directly out of SlateDB's <span class="concept" data-concept="wal">write-ahead log</span> rather than from any TurboLay-maintained
+    delta record. Because the WAL is already there for durability, the overlay costs no
+    extra write on the write path — the accelerator is reconciled by <em>reading</em> the same
+    bytes durability already required.</p>
+  </div>
+
+  <figure>
+    <div class="tb-table-wrap">
+      <table>
+        <tbody>
+          <tr>
+            <td>generation at 100</td>
+            <td><code>+</code></td>
+            <td>WAL tail 101…107</td>
+            <td><code>=</code></td>
+            <td>answer at 107</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <figcaption>Tab. 3.1 — The index generation is allowed to lag because the exact missing interval is
+      read back out of the write-ahead log.</figcaption>
+  </figure>
+
+  <figure>
+    <div class="tb-widget" id="w-overlay"></div>
+    <figcaption>Fig. 3.1 — The index generation is allowed to lag because the exact missing interval is read
+      back out of SlateDB's write-ahead log; a separate out-of-process indexer rebuilds the base
+      asynchronously.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Play with it: drag the read epoch, fold the WAL tail<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Drag <em>read_epoch</em> along the axis. The durable generation only knows the world up to its
+      <code>base_sequence</code> (start it at 100), so the read walks the <span class="concept" data-concept="wal">WAL</span> files covering the
+      interval <code>(base, read_epoch]</code> and folds those edges on top — the answer is always
+      <code>generation(B) + WAL tail (B..E] = answer @ E</code>. Push the read forward and the tail grows;
+      the base does not have to move to stay correct. Press <em>Indexer publishes fresher base</em> to
+      let the out-of-process indexer catch the base up to the current epoch, and watch the tail shrink
+      to nothing. Nothing on the write path did this work: the overlay is pure <em>reading</em>.</p>
+    </div>
+  </details>
+
+  <p>Read it left to right along the <span class="concept" data-concept="epoch">epoch</span> axis. The durable generation only knows the
+  world up to its base sequence (100), so a read at epoch 107 walks the <span class="concept" data-concept="wal">WAL</span> files
+  covering <code>(100, 107]</code> and folds the edges it finds there on top. The dashed arrow is
+  the out-of-process indexer that will later publish a fresher generation — which is
+  why the base is allowed to lag.</p>
+
+  <p>There is an honest limit here, and the code states it rather than hiding it.
+  <code>topology_tail_since</code> returns <code>Unavailable</code> in two cases: when the pinned <span class="concept" data-concept="snapshot-isolation">snapshot</span>
+  has moved out from under the read, and when the WAL files it needs are already gone.
+  In either case the query does not fail and does not answer from a stale base — it
+  falls back to reading <span class="concept" data-concept="adjacency">adjacency</span> straight from the snapshot, trading the accelerator's
+  speed for the canonical path's certainty. The accelerator is always optional; the
+  canonical records are always sufficient.</p>
+
+  <div class="callout status">
+    <span class="callout-title">Status: planned, not in the current tree</span>
+    <p>The <span class="concept" data-concept="roaring">Roaring</span> compression described next is future work. It is not on this branch: the
+    current hydrated adjacency row is a <span class="concept" data-concept="btreeset"><code>BTreeSet</code></span>
+    (<code>MatrixAdjacency = BTreeMap&lt;VertexId, BTreeSet&lt;VertexId&gt;&gt;</code>), there is no
+    <code>Roaring</code> type in <code>src/</code>, and <code>roaring</code> is not yet a dependency.</p>
+  </div>
+
+  <p>A planned <span class="concept" data-concept="roaring">Roaring</span> change would live after hydration: each matrix row would become
+  a compressed <code>RoaringTreemap</code> in place of today's <span class="concept" data-concept="btreeset"><code>BTreeSet</code></span>. Because it would
+  touch only the in-memory hydrated row, it would not alter <span class="concept" data-concept="matrix-tile">matrix-tile</span> or <span class="concept" data-concept="csc">CSC</span>
+  bytes in the <span class="concept" data-concept="object-store">object store</span>, so old artifacts would remain readable.</p>
+
+  <h2>Snapshots make long reads coherent</h2>
+
+  <p><code>snapshot_at</code> (<code>src/shard/lifecycle.rs</code>) pins a read <span class="concept" data-concept="epoch">epoch</span>. Pagination, index
+  lookup and the <span class="concept" data-concept="wal-tail-overlay">WAL-tail overlay</span> all use that version rather than drifting to the
+  newest epoch midway through the query. Coherence for an in-flight query comes from
+  the SlateDB <span class="concept" data-concept="dbsnapshot"><code>DbSnapshot</code></span> it holds for the duration of the result — every key it
+  reads is served from that one revision.</p>
+
+  <p>What <code>snapshot_at</code> will <em>not</em> do is travel backwards. An epoch ahead of the cell's
+  current one is rejected as <code>SnapshotAhead</code>; an epoch merely <em>behind</em> it is rejected
+  too, with the plain explanation that "historical graph epochs are not <span class="concept" data-concept="slatedb">SlateDB</span>
+  snapshots". Only the current sequence is openable.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Refusing historical reads looks like a lost feature, and it is — deliberately. A
+    SlateDB <span class="concept" data-concept="snapshot-isolation">snapshot</span> is a live handle on a storage revision, not an archive you can
+    reconstruct on request. Pretending otherwise would mean either keeping every
+    superseded version forever or quietly serving an approximation, and the second is
+    the kind of silent wrongness this chapter exists to rule out. A read that wants to
+    be causally after a specific write asks for it with a <span class="concept" data-concept="bookmark"><em>bookmark</em></span> instead, which
+    says "wait until you are at least this current" rather than "go back in time".</p>
+  </div>
+
+  <p>There are no read leases, and <span class="concept" data-concept="garbage-collection">garbage collection</span> does not consult active readers.
+  It trusts the caller's <span class="concept" data-concept="epoch">epoch</span> and prunes by <code>retain</code>
+  (<code>delete_graph_artifacts_before</code>, <code>src/engine/artifact_gc.rs</code>). There is no
+  watermark record to check against.</p>
+
+  <figure>
+    <div class="tb-widget" id="w-two-sequences"></div>
+    <figcaption>Fig. 3.2 — One sequence, two consumers: a read pins a SlateDB snapshot, takes its sequence
+      <em>S</em> as the read epoch, and the very same <em>S</em> is what the index generation's lagging base
+      is measured against — so there is no second clock that could drift out of step with
+      record visibility.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Play with it: lag the base, watch the answer stay coherent<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>The top row is SlateDB's job: opening a <span class="concept" data-concept="dbsnapshot"><code>DbSnapshot</code></span> fixes sequence <em>S</em>, and the read
+      binds it as <em>both</em> bounds — <code>with_validated_storage_read_epoch(S, S)</code>, the same value
+      twice, so there is no second cursor to disagree. The bottom row is TurboLay's job: drag the
+      <em>base_sequence B</em> to make the <span class="concept" data-concept="index-generation">index generation</span> lag further behind. The <span class="concept" data-concept="wal">WAL</span> tail
+      <code>(B..S]</code> stretches to cover the gap, but the read view is <em>always</em> measured against the
+      same <em>S</em> the snapshot pinned. That dotted "same <em>S</em>" line is the whole point: the base can
+      lag arbitrarily and the answer never drifts, because there is only one clock.</p>
+    </div>
+  </details>
+
+  <p>How to read it: the top row is SlateDB's job — opening a <span class="concept" data-concept="dbsnapshot"><code>DbSnapshot</code></span> fixes what every key
+  looks like, which is the only thing that makes a long read coherent. The bottom row is
+  TurboLay's job — the index generation may lag at <code>base_sequence B</code>, and the missing interval
+  up to <code>S</code> is read out of the <span class="concept" data-concept="wal">WAL</span>. The dotted line is the punchline, and it is the part worth
+  remembering: the bottom row is measured against the <em>same</em> <span class="concept" data-concept="sequence-number"><code>S</code></span> the top row pinned. An earlier
+  design gave acceleration its own counter, which meant a read could be coherent about records
+  and stale about structure at the same moment. Collapsing to one sequence removes that failure
+  mode by construction rather than by discipline.</p>
+
+  <div class="callout note">
+    <span class="callout-title">Note</span>
+    <p>Epoch consistency is <span class="concept" data-concept="cell">cell</span>-local. A distributed query can give each cell leg
+    an explicit <span class="concept" data-concept="epoch">epoch</span>, but the coordinator does not negotiate one global epoch
+    across unrelated cells.</p>
+  </div>
+
+  <h2>Maintenance has a proof obligation</h2>
+
+  <p>A newer base may replace an older one when <code>build_adjacency_image</code>
+  (<code>src/engine/artifact_build.rs</code>) publishes a fresher artifact. That rebuild does
+  not run on the write path, and it does not run in the data node at all: a separate
+  <code>graph-indexer</code> process (<code>src/bin/graph-indexer.rs</code>) scans the "dirty" edge-type
+  markers a write leaves behind and publishes a fresh <span class="concept" data-concept="index-generation">index generation</span> when one is
+  due. That is precisely why the base is allowed to lag <code>read_epoch</code> — the missing
+  interval is read from the <span class="concept" data-concept="wal">WAL</span> at read time.</p>
+
+  <p>The write path's entire contribution to this is one marker. A write does not build
+  an index, does not schedule a build, and does not wait for one; it records that an
+  edge type has moved and commits. Everything else happens in another process, on its
+  own clock, and can fail without the write noticing.</p>
+
+  <p>Artifact <span class="concept" data-concept="garbage-collection">GC</span> keeps versions still reachable by a permitted read <span class="concept" data-concept="epoch">epoch</span>. The invariant
+  is not "never delete"; it is "never delete the only route to a permitted read
+  epoch." Because the canonical records are always sufficient on their own, the worst
+  outcome of getting that wrong is a slower read, not a wrong one.</p>
+
+  <p>Once a coherent <span class="concept" data-concept="adjacency">adjacency</span> is available, the query engine still has to turn a
+  question into traversal work. That is the next layer.</p>
+
+  <nav class="tb-chapnav">
+    <a class="prev" href="intro-02-one-cell-one-write-boundary.html"><span class="cn-dir">‹ Prev</span><br><span class="cn-title">One Cell, One Write Boundary</span></a>
+    <a class="next" href="intro-04-from-cypher-to-roaring.html"><span class="cn-dir">Next ›</span><br><span class="cn-title">From Cypher to Roaring Rows</span></a>
+  </nav>
+</main>
+
+<script src="../assets/glossary.js"></script>
+<script>
+/* Page-local glossary: concepts introduced by this chapter. Merged after the
+   shared glossary.js and before textbook.js so the tooltip engine sees them. */
+window.TB_GLOSSARY = Object.assign({}, window.TB_GLOSSARY, {
+  "matrix-tile": {
+    title: "Matrix tile / artifact",
+    html: "<p>A durable, immutable block of a graph's <span class=\"concept\" data-concept=\"adjacency\">adjacency</span> matrix — one piece of an <span class=\"concept\" data-concept=\"index-generation\">index generation</span> — built out of process from canonical edges and stamped with the <span class=\"concept\" data-concept=\"sequence-number\">base sequence</span> it was built from. Tiles let a traversal load only the region of the <span class=\"concept\" data-concept=\"sparse-matrix\">sparse matrix</span> it needs. A partial or unpublished tile is simply ignored.</p>"
+  },
+  "dbsnapshot": {
+    title: "DbSnapshot",
+    html: "<p>SlateDB's live handle on one storage revision. Every key read through it reflects the <em>same</em> <span class=\"concept\" data-concept=\"sequence-number\">sequence number</span>, giving <span class=\"concept\" data-concept=\"snapshot-isolation\">snapshot isolation</span> for the life of a query. TurboLay pins one <code>DbSnapshot</code> for the whole result, which is what stops a long read from drifting to newer data halfway through. It is a live handle, not an archive — so it can only open the <em>current</em> revision, never a historical one.</p>"
+  },
+  "garbage-collection": {
+    title: "Artifact garbage collection",
+    html: "<p>Pruning superseded <span class=\"concept\" data-concept=\"index-generation\">index generations</span> so old durable accelerators do not accumulate forever. TurboLay's GC takes no read leases and consults no active-reader list; it trusts the caller's <span class=\"concept\" data-concept=\"epoch\">epoch</span> and keeps every version still reachable by a permitted read epoch. Its one invariant: never delete the only route to a permitted read epoch. Because canonical records always suffice, a GC mistake costs a slower read, never a wrong one.</p>"
+  },
+  "bookmark": {
+    title: "Bookmark (read-your-write)",
+    html: "<p>A token a client carries to say \"wait until you are at least this current\" — a request to be causally <em>after</em> a specific write, rather than a request to travel <em>back</em> to an old version. Because a <span class=\"concept\" data-concept=\"dbsnapshot\">DbSnapshot</span> can only open the current revision, a bookmark is how TurboLay expresses ordering guarantees without pretending to be a time machine.</p>"
+  }
+});
+</script>
+<script src="../assets/textbook.js"></script>
+<script>
+/* ---------------------------------------------------------------------------
+   Widget 1 — Overlay timeline: the index generation lags at base_sequence B,
+   and a read at read_epoch E folds the WAL tail (B..E] on top. An out-of-process
+   indexer occasionally publishes a fresher base.
+   --------------------------------------------------------------------------- */
+TB.widget("w-overlay", function (mount) {
+  var NS = "http://www.w3.org/2000/svg";
+  function el(n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  function mk(l, c) { var b = document.createElement("button"); b.className = "tb-btn" + (c ? " " + c : ""); b.textContent = l; return b; }
+
+  var MIN = 100, MAX = 112;
+  var readEpoch = 107, base = 100;
+
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div"); controls.className = "tb-controls";
+  var lab = document.createElement("label");
+  var reOut = document.createElement("strong"); reOut.textContent = readEpoch;
+  lab.appendChild(document.createTextNode("read_epoch "));
+  lab.appendChild(reOut);
+  var slider = document.createElement("input");
+  slider.type = "range"; slider.min = MIN; slider.max = MAX; slider.step = 1; slider.value = readEpoch;
+  slider.style.width = "180px"; slider.style.marginLeft = "0.4rem";
+  lab.appendChild(slider);
+  var btnPub = mk("Indexer publishes fresher base", "primary");
+  var btnReset = mk("Reset", "");
+  controls.append(lab, btnPub, btnReset);
+
+  var svg = el("svg", { viewBox: "0 0 480 260", width: "100%", style: "max-width:480px;display:block;margin:0 auto" });
+  var readout = document.createElement("div");
+  readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.6em;color:var(--muted)";
+  wrap.append(controls, svg, readout);
+  mount.appendChild(wrap);
+
+  function box(x, y, w, h, fill, stroke, dash) {
+    return el("rect", { x: x, y: y, width: w, height: h, rx: 5, fill: fill, stroke: stroke, "stroke-width": 1.1, "stroke-dasharray": dash || "none", class: "wnode" });
+  }
+  function label(x, y, t, anchor, size, weight, fill) {
+    var e = el("text", { x: x, y: y, "text-anchor": anchor || "middle", class: "wnode-label" });
+    if (size) e.setAttribute("font-size", size);
+    if (weight) e.setAttribute("font-weight", weight);
+    if (fill) e.setAttribute("fill", fill);
+    e.textContent = t; return e;
+  }
+
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var effBase = Math.min(base, readEpoch);
+    var tail = readEpoch - effBase;
+
+    var purple = css("--purple"), purpleSoft = css("--purple-soft");
+    var info = css("--info"), infoSoft = css("--info-soft");
+    var ok = css("--ok"), okSoft = css("--ok-soft");
+    var warn = css("--warn"), warnSoft = css("--warn-soft");
+    var pactive = css("--primary-active"), mut = css("--muted");
+
+    // defs / arrow marker
+    var defs = el("defs", {});
+    var m = el("marker", { id: "ov-arw", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    m.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: mut }));
+    defs.appendChild(m);
+    var mw = el("marker", { id: "ov-arw-w", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    mw.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: warn }));
+    defs.appendChild(mw);
+    svg.appendChild(defs);
+
+    // top: out-of-process indexer (dashed) rebuilding the base
+    svg.appendChild(el("path", { d: "M20 36 L460 36", stroke: warn, "stroke-width": 1.3, fill: "none", "stroke-dasharray": "5 4", "marker-end": "url(#ov-arw-w)" }));
+    svg.appendChild(label(240, 26, "out-of-process indexer rebuilds the base", "middle", 8.5, "600", warn));
+
+    // durable base generation (wide box)
+    var gy = 70, gh = 54;
+    svg.appendChild(box(16, gy, 150, gh, purpleSoft, purple));
+    svg.appendChild(label(91, gy + 22, "index generation", "middle", 9.5, "700"));
+    svg.appendChild(label(91, gy + 38, "base_sequence " + effBase, "middle", 9.5, "700", purple));
+
+    // WAL tail entries folded on top, from effBase+1 .. readEpoch
+    var seqs = [];
+    for (var s = effBase + 1; s <= readEpoch; s++) seqs.push(s);
+    var display;
+    if (seqs.length <= 4) display = seqs.map(String);
+    else display = [String(seqs[0]), String(seqs[1]), "…", String(seqs[seqs.length - 1])];
+
+    var bx = 178, bw = 34, step = 40;
+    if (tail === 0) {
+      svg.appendChild(label(250, gy + 30, "base is current — no WAL tail needed", "middle", 8.5, "600", ok));
+    } else {
+      for (var i = 0; i < display.length; i++) {
+        var x = bx + i * step;
+        if (display[i] === "…") {
+          svg.appendChild(label(x + bw / 2, gy + 32, "…", "middle", 14, "700", info));
+        } else {
+          svg.appendChild(box(x, gy + 8, bw, gh - 16, infoSoft, info));
+          svg.appendChild(label(x + bw / 2, gy + 28, "WAL", "middle", 8, "600", info));
+          svg.appendChild(label(x + bw / 2, gy + 38, display[i], "middle", 8.5, "700"));
+        }
+      }
+    }
+
+    // read_epoch marker at far right
+    svg.appendChild(box(392, gy, 72, gh, warnSoft, pactive));
+    svg.appendChild(label(428, gy + 22, "read_epoch", "middle", 8.5, "700"));
+    svg.appendChild(label(428, gy + 38, String(readEpoch), "middle", 11, "700", pactive));
+
+    // epoch axis
+    svg.appendChild(el("path", { d: "M16 150 L466 150", stroke: mut, "stroke-width": 1.2, fill: "none", "marker-end": "url(#ov-arw)" }));
+    svg.appendChild(label(240, 165, "epoch", "middle", 9, "600", mut));
+
+    // summary bracket
+    svg.appendChild(box(70, 190, 340, 42, okSoft, ok));
+    svg.appendChild(label(240, 208, "generation(" + effBase + ") + WAL tail (" + effBase + ".." + readEpoch + "]", "middle", 9.5, "700"));
+    svg.appendChild(label(240, 223, "= answer @ " + readEpoch, "middle", 10, "700", ok));
+
+    // readout
+    if (tail === 0) {
+      readout.innerHTML = "The base caught up: <strong>base_sequence " + effBase + "</strong> equals the read epoch, so the tail is empty. The answer is the durable generation alone.";
+    } else {
+      readout.innerHTML = "The generation lags at <strong style='color:var(--purple)'>base " + effBase + "</strong>. A read at epoch <strong style='color:var(--primary-active)'>" + readEpoch + "</strong> folds the <strong style='color:var(--info)'>WAL tail (" + effBase + ".." + readEpoch + "]</strong> — " + tail + " entr" + (tail === 1 ? "y" : "ies") + " — on top. No extra write did this; the overlay is pure reading.";
+    }
+  }
+
+  slider.oninput = function () { readEpoch = +slider.value; reOut.textContent = readEpoch; render(); };
+  btnPub.onclick = function () { base = readEpoch; render(); };
+  btnReset.onclick = function () { base = 100; readEpoch = 107; slider.value = 107; reOut.textContent = 107; render(); };
+  render();
+  window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+  document.querySelector(".tb-theme-toggle").addEventListener("click", function () { setTimeout(render, 0); });
+});
+
+/* ---------------------------------------------------------------------------
+   Widget 2 — One sequence, two consumers: db.snapshot() fixes S; the read binds
+   it as both bounds; the acceleration axis measures a lagging base B against the
+   SAME S. Drag B to lag; the answer stays coherent @ S.
+   --------------------------------------------------------------------------- */
+TB.widget("w-two-sequences", function (mount) {
+  var NS = "http://www.w3.org/2000/svg";
+  function el(n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+  var S = 107, B = 100;      // S fixed by the snapshot; B is the lagging base
+  var MIN = 92, MAX = 107;
+
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div"); controls.className = "tb-controls";
+  var lab = document.createElement("label");
+  var bOut = document.createElement("strong"); bOut.textContent = B;
+  lab.appendChild(document.createTextNode("base_sequence B "));
+  lab.appendChild(bOut);
+  var slider = document.createElement("input");
+  slider.type = "range"; slider.min = MIN; slider.max = MAX; slider.step = 1; slider.value = B;
+  slider.style.width = "180px"; slider.style.marginLeft = "0.4rem";
+  lab.appendChild(slider);
+  controls.append(lab);
+
+  var svg = el("svg", { viewBox: "0 0 480 300", width: "100%", style: "max-width:480px;display:block;margin:0 auto" });
+  var readout = document.createElement("div");
+  readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.6em;color:var(--muted)";
+  wrap.append(controls, svg, readout);
+  mount.appendChild(wrap);
+
+  function box(x, y, w, h, fill, stroke, dash) {
+    return el("rect", { x: x, y: y, width: w, height: h, rx: 5, fill: fill, stroke: stroke, "stroke-width": 1.1, "stroke-dasharray": dash || "none", class: "wnode" });
+  }
+  function label(x, y, t, anchor, size, weight, fill) {
+    var e = el("text", { x: x, y: y, "text-anchor": anchor || "middle", class: "wnode-label" });
+    if (size) e.setAttribute("font-size", size);
+    if (weight) e.setAttribute("font-weight", weight);
+    if (fill) e.setAttribute("fill", fill);
+    e.textContent = t; return e;
+  }
+
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var info = css("--info"), infoSoft = css("--info-soft");
+    var purple = css("--purple"), purpleSoft = css("--purple-soft");
+    var ok = css("--ok"), okSoft = css("--ok-soft");
+    var pactive = css("--primary-active"), mut = css("--muted");
+
+    var defs = el("defs", {});
+    var m = el("marker", { id: "ts-arw", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    m.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: mut }));
+    defs.appendChild(m);
+    var mp = el("marker", { id: "ts-arw-p", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    mp.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: pactive }));
+    defs.appendChild(mp);
+    svg.appendChild(defs);
+
+    // side tags
+    svg.appendChild(label(40, 44, "SlateDB", "middle", 8, "700", mut));
+    svg.appendChild(label(40, 55, "defines it", "middle", 8, "700", mut));
+    svg.appendChild(label(40, 214, "TurboLay", "middle", 8, "700", mut));
+    svg.appendChild(label(40, 225, "consumes it", "middle", 8, "700", mut));
+
+    // TOP: db.snapshot() -> S
+    svg.appendChild(box(90, 26, 340, 44, infoSoft, info));
+    svg.appendChild(label(260, 44, "db.snapshot() → StorageSequence S = " + S, "middle", 10, "700"));
+    svg.appendChild(label(260, 60, "one consistent view of every key · MVCC record visibility", "middle", 8, "400"));
+
+    // binding
+    svg.appendChild(el("path", { d: "M260 70 L260 96", stroke: pactive, "stroke-width": 1.4, fill: "none", "marker-end": "url(#ts-arw-p)" }));
+    svg.appendChild(label(268, 86, "read_epoch = snapshot.seq()", "start", 7.5, "600", pactive));
+    svg.appendChild(box(90, 100, 340, 42, infoSoft, info));
+    svg.appendChild(label(260, 118, "with_validated_storage_read_epoch(S, S)", "middle", 9.5, "700"));
+    svg.appendChild(label(260, 132, "the same value twice — no second cursor to disagree", "middle", 8, "400", mut));
+
+    // BOTTOM acceleration axis
+    var by = 232, bh = 46;
+    // index generation base B (purple) — lag proportional
+    svg.appendChild(box(74, by, 110, bh, purpleSoft, purple));
+    svg.appendChild(label(129, by + 20, "index generation", "middle", 8.5, "700"));
+    svg.appendChild(label(129, by + 34, "base_sequence B = " + B, "middle", 9, "700", purple));
+    // WAL tail (B..S]
+    svg.appendChild(box(200, by, 110, bh, infoSoft, info));
+    svg.appendChild(label(255, by + 20, "WAL tail", "middle", 8.5, "700"));
+    svg.appendChild(label(255, by + 34, "(" + B + " … " + S + "]", "middle", 9, "700", info));
+    // read view @ S (ok)
+    svg.appendChild(box(326, by, 110, bh, okSoft, ok));
+    svg.appendChild(label(381, by + 20, "read view", "middle", 8.5, "700"));
+    svg.appendChild(label(381, by + 34, "@ S = " + S, "middle", 9, "700", ok));
+    // arrows between bottom boxes
+    svg.appendChild(el("path", { d: "M184 " + (by + bh / 2) + " L200 " + (by + bh / 2), stroke: mut, "stroke-width": 1.1, fill: "none", "marker-end": "url(#ts-arw)" }));
+    svg.appendChild(el("path", { d: "M310 " + (by + bh / 2) + " L326 " + (by + bh / 2), stroke: mut, "stroke-width": 1.1, fill: "none", "marker-end": "url(#ts-arw)" }));
+    svg.appendChild(label(192, by - 4, "base lags", "middle", 7, "600", mut));
+    svg.appendChild(label(318, by - 4, "fold tail on", "middle", 7, "600", mut));
+
+    // the SAME S — dotted line from binding down to read view
+    svg.appendChild(el("path", { d: "M430 121 C 470 160, 460 200, 400 " + by, stroke: pactive, "stroke-width": 1.3, fill: "none", "stroke-dasharray": "2 3" }));
+    svg.appendChild(label(456, 185, "same S", "middle", 8, "700", pactive));
+
+    var lag = S - B;
+    readout.innerHTML = "The snapshot pins <strong style='color:var(--info)'>S = " + S + "</strong> and the read binds it twice. The base lags by <strong style='color:var(--purple)'>" + lag + "</strong> (B = " + B + "), so the <strong style='color:var(--info)'>WAL tail (" + B + ".." + S + "]</strong> covers the gap — yet the read view is <strong style='color:var(--ok)'>always @ S = " + S + "</strong>. One clock, so nothing drifts.";
+  }
+
+  slider.oninput = function () { B = +slider.value; bOut.textContent = B; render(); };
+  render();
+  window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+  document.querySelector(".tb-theme-toggle").addEventListener("click", function () { setTimeout(render, 0); });
+});
+</script>

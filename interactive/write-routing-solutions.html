@@ -1,0 +1,1244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Routing the write — solution space, with TiDB as reference</title>
+<style>
+  :root {
+    --ground: #eef1f5;
+    --surface: #fbfcfd;
+    --surface-2: #e7ecf3;
+    --ink: #16202e;
+    --ink-2: #4d5c72;
+    --ink-3: #7c8ba1;
+    --rule: #c8d2de;
+    --rule-soft: #dbe3ec;
+    --accent: #1e4fd8;
+    --accent-soft: #dfe6fb;
+    --crit: #a3231c;
+    --crit-soft: #f7e2e0;
+    --high: #97621b;
+    --high-soft: #f8ecd9;
+    --med: #2b6079;
+    --med-soft: #dcecf3;
+    --ok: #106b4e;
+    --ok-soft: #dbefe6;
+
+    --font-display: -apple-system, BlinkMacSystemFont, "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+    --font-body: "Iowan Old Style", Charter, "Bitstream Charter", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+    --font-mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+    --measure: 68ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0b1626;
+      --surface: #111e31;
+      --surface-2: #16263c;
+      --ink: #dce7f5;
+      --ink-2: #93a8c4;
+      --ink-3: #6a7f9c;
+      --rule: #24374f;
+      --rule-soft: #1b2c42;
+      --accent: #7ba5ff;
+      --accent-soft: #17294a;
+      --crit: #ff8478;
+      --crit-soft: #3a1d1d;
+      --high: #e5b46a;
+      --high-soft: #3a2e18;
+      --med: #6fb8d6;
+      --med-soft: #16303d;
+      --ok: #56cfa1;
+      --ok-soft: #12332a;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0b1626;
+    --surface: #111e31;
+    --surface-2: #16263c;
+    --ink: #dce7f5;
+    --ink-2: #93a8c4;
+    --ink-3: #6a7f9c;
+    --rule: #24374f;
+    --rule-soft: #1b2c42;
+    --accent: #7ba5ff;
+    --accent-soft: #17294a;
+    --crit: #ff8478;
+    --crit-soft: #3a1d1d;
+    --high: #e5b46a;
+    --high-soft: #3a2e18;
+    --med: #6fb8d6;
+    --med-soft: #16303d;
+    --ok: #56cfa1;
+    --ok-soft: #12332a;
+  }
+
+  :root[data-theme="light"] {
+    --ground: #eef1f5;
+    --surface: #fbfcfd;
+    --surface-2: #e7ecf3;
+    --ink: #16202e;
+    --ink-2: #4d5c72;
+    --ink-3: #7c8ba1;
+    --rule: #c8d2de;
+    --rule-soft: #dbe3ec;
+    --accent: #1e4fd8;
+    --accent-soft: #dfe6fb;
+    --crit: #a3231c;
+    --crit-soft: #f7e2e0;
+    --high: #97621b;
+    --high-soft: #f8ecd9;
+    --med: #2b6079;
+    --med-soft: #dcecf3;
+    --ok: #106b4e;
+    --ok-soft: #dbefe6;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  .page {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 24px 96px;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0 48px;
+  }
+
+  @media (min-width: 1080px) {
+    .page { grid-template-columns: 190px minmax(0, 1fr); }
+  }
+
+  .masthead {
+    grid-column: 1 / -1;
+    border-bottom: 2px solid var(--ink);
+    padding: 56px 0 26px;
+    margin-bottom: 40px;
+  }
+
+  .docmeta {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 22px;
+    margin-bottom: 26px;
+  }
+
+  .docmeta b { color: var(--ink-2); font-weight: 500; }
+
+  h1 {
+    font-family: var(--font-display);
+    font-size: clamp(2.1rem, 5.4vw, 3.5rem);
+    font-weight: 700;
+    letter-spacing: -.032em;
+    line-height: 1.02;
+    margin: 0 0 .45em;
+    text-wrap: balance;
+    max-width: 20ch;
+  }
+
+  h1 .thin { font-weight: 300; color: var(--ink-2); display: block; }
+
+  .standfirst {
+    font-size: 1.16rem;
+    color: var(--ink-2);
+    max-width: 60ch;
+    margin: 0;
+    line-height: 1.55;
+  }
+
+  .spine { display: none; }
+
+  @media (min-width: 1080px) {
+    .spine {
+      display: block;
+      position: sticky;
+      top: 0;
+      align-self: start;
+      padding-top: 6px;
+      max-height: 100vh;
+      overflow-y: auto;
+    }
+  }
+
+  .spine ol { list-style: none; margin: 0; padding: 0; }
+
+  .spine a {
+    display: grid;
+    grid-template-columns: 2.2em 1fr;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.4;
+    letter-spacing: .02em;
+    color: var(--ink-3);
+    text-decoration: none;
+    padding: 7px 0 7px 10px;
+    border-left: 2px solid var(--rule-soft);
+    transition: color .15s, border-color .15s;
+  }
+
+  .spine a:hover, .spine a:focus-visible { color: var(--accent); border-left-color: var(--accent); }
+  .spine a .n { font-variant-numeric: tabular-nums; color: var(--ink-3); }
+
+  .body { min-width: 0; }
+  .body > * { max-width: var(--measure); }
+  .body > .wide, .body > .rail { max-width: none; }
+
+  section { margin: 0 0 68px; }
+
+  h2 {
+    font-family: var(--font-display);
+    font-size: 1.62rem;
+    font-weight: 650;
+    letter-spacing: -.02em;
+    line-height: 1.18;
+    margin: 0 0 .2em;
+    text-wrap: balance;
+  }
+
+  h3 {
+    font-family: var(--font-display);
+    font-size: 1.06rem;
+    font-weight: 650;
+    letter-spacing: -.008em;
+    margin: 2.1em 0 .5em;
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .eyebrow::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
+
+  p { margin: 0 0 1.05em; }
+  .lede { font-size: 1.06rem; color: var(--ink-2); margin-bottom: 1.6em; }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  code, .mono { font-family: var(--font-mono); font-size: .86em; }
+
+  p code, li code, td code, th code, dd code, .rtext code {
+    background: var(--surface-2);
+    border: 1px solid var(--rule-soft);
+    border-radius: 3px;
+    padding: .08em .34em;
+    white-space: nowrap;
+  }
+
+  .src { font-family: var(--font-mono); font-size: .78em; color: var(--ink-3); white-space: nowrap; letter-spacing: -.01em; }
+  .src::before { content: "↳ "; }
+
+  ul, ol { margin: 0 0 1.05em; padding-left: 1.3em; }
+  li { margin-bottom: .4em; }
+
+  .doctrine {
+    border-left: 3px solid var(--accent);
+    padding: 2px 0 2px 20px;
+    margin: 1.6em 0;
+    color: var(--ink-2);
+  }
+
+  .doctrine p { font-style: italic; margin-bottom: .4em; }
+  .doctrine .attr { font-family: var(--font-mono); font-size: 11.5px; font-style: normal; color: var(--ink-3); letter-spacing: .02em; }
+
+  .chip {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 2px;
+    vertical-align: 2px;
+    white-space: nowrap;
+  }
+
+  .chip.adopt  { color: var(--ok);   background: var(--ok-soft); }
+  .chip.adapt  { color: var(--med);  background: var(--med-soft); }
+  .chip.caveat { color: var(--high); background: var(--high-soft); }
+  .chip.reject { color: var(--crit); background: var(--crit-soft); }
+
+  /* ---- tables ---- */
+
+  .tablewrap {
+    overflow-x: auto;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    margin: 26px 0;
+  }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+
+  thead th {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+
+  tbody tr:last-child td { border-bottom: none; }
+  td.m, th.m { font-family: var(--font-mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  td.nowrap { white-space: nowrap; }
+  td.note { font-family: var(--font-body); font-size: 14px; color: var(--ink-2); }
+  td.strong { font-family: var(--font-body); font-size: 14px; color: var(--ink); }
+  .matrix-tbl { min-width: 720px; }
+  .map-tbl { min-width: 640px; }
+
+  .caption {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--ink-3);
+    margin: -14px 0 30px;
+    letter-spacing: .01em;
+  }
+
+  /* ---- option cards ---- */
+
+  .options { display: grid; gap: 2px; margin: 28px 0 0; }
+
+  .opt {
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--rule);
+    padding: 20px 22px 18px;
+  }
+
+  .opt[data-v="adopt"]  { border-left-color: var(--ok); }
+  .opt[data-v="adapt"]  { border-left-color: var(--med); }
+  .opt[data-v="caveat"] { border-left-color: var(--high); }
+  .opt[data-v="reject"] { border-left-color: var(--crit); }
+
+  .opt-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 12px; margin-bottom: 4px; }
+  .opt-id { font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-3); letter-spacing: .04em; }
+  .opt h3 { font-size: 1.06rem; margin: 0; flex: 1 1 24ch; min-width: 0; }
+
+  .opt-ref {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--accent);
+    letter-spacing: .02em;
+    margin: 0 0 14px;
+  }
+
+  .opt p { font-size: .95rem; max-width: 74ch; margin-bottom: .7em; }
+
+  .ledger { display: grid; gap: 2px; margin: 14px 0 0; }
+
+  .ledger-row {
+    display: grid;
+    grid-template-columns: 7.2em 1fr;
+    gap: 14px;
+    font-size: .9rem;
+    background: var(--surface-2);
+    padding: 8px 12px;
+    align-items: baseline;
+  }
+
+  .ledger-row .k {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    padding-top: 2px;
+  }
+
+  .ledger-row .v { color: var(--ink-2); }
+  .ledger-row.buy .v { color: var(--ink); }
+
+  /* ---- layer stack (a real sequence) ---- */
+
+  .layers { display: grid; gap: 2px; margin: 28px 0; }
+
+  .layer {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 22px;
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    padding: 22px;
+  }
+
+  @media (max-width: 620px) {
+    .layer { grid-template-columns: 1fr; gap: 10px; }
+  }
+
+  .layer-n {
+    font-family: var(--font-mono);
+    font-size: 2.4rem;
+    font-weight: 300;
+    line-height: .9;
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -.04em;
+    padding-top: 4px;
+    min-width: 1.6em;
+  }
+
+  .layer h3 { margin: 0 0 .4em; font-size: 1.1rem; }
+  .layer p { font-size: .95rem; max-width: 72ch; }
+  .layer p:last-child { margin-bottom: 0; }
+
+  .rule-box {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.6;
+    background: var(--accent-soft);
+    color: var(--ink);
+    padding: 12px 14px;
+    border-radius: 2px;
+    margin: 14px 0 4px;
+    overflow-x: auto;
+  }
+
+  .rule-box .lbl {
+    display: block;
+    font-size: 10px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 6px;
+  }
+
+  /* ---- placement grid figure ---- */
+
+  .gridfig { border: 1px solid var(--rule); background: var(--surface); padding: 24px; margin: 26px 0; overflow-x: auto; }
+
+  .gridfig-title {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 18px;
+  }
+
+  .matrix-fig { display: grid; grid-template-columns: max-content repeat(4, minmax(84px, 1fr)); gap: 4px; min-width: 460px; }
+
+  .cellbox {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-align: center;
+    padding: 12px 4px;
+    border: 1px solid var(--rule-soft);
+    background: var(--surface-2);
+    color: var(--ink-3);
+    border-radius: 2px;
+    letter-spacing: .02em;
+  }
+
+  .cellbox.hdr { background: transparent; border-color: transparent; color: var(--ink-2); font-weight: 600; padding-bottom: 6px; }
+  .cellbox.rowhdr { background: transparent; border-color: transparent; text-align: right; padding-right: 12px; color: var(--ink-2); font-weight: 600; display: flex; align-items: center; justify-content: flex-end; }
+  .cellbox.writer { background: var(--ok-soft); border-color: var(--ok); color: var(--ok); font-weight: 600; }
+
+  .figlegend { display: flex; flex-wrap: wrap; gap: 8px 20px; font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); margin-top: 18px; letter-spacing: .01em; }
+  .figlegend span { display: inline-flex; align-items: center; gap: 7px; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; border: 1px solid var(--rule); display: inline-block; }
+  .swatch.writer { background: var(--ok-soft); border-color: var(--ok); }
+  .swatch.idle { background: var(--surface-2); }
+
+  /* ---- unchanged / open questions ---- */
+
+  .keeps { display: grid; gap: 2px; margin: 24px 0; }
+
+  .keep {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 14px;
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--ok);
+    padding: 13px 18px;
+    align-items: baseline;
+  }
+
+  .keep .kk {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ok);
+    white-space: nowrap;
+  }
+
+  .keep .kv { font-size: .95rem; }
+
+  .openq { counter-reset: q; display: grid; gap: 2px; margin: 24px 0; }
+
+  .q {
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--high);
+    padding: 15px 18px;
+  }
+
+  .q .qh {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink);
+    display: block;
+    margin-bottom: 5px;
+  }
+
+  .q p { font-size: .93rem; margin: 0; color: var(--ink-2); max-width: 74ch; }
+
+  .handoff {
+    border-top: 2px solid var(--ink);
+    padding-top: 26px;
+    margin-top: 76px;
+    grid-column: 1 / -1;
+  }
+
+  .handoff h2 { font-size: 1.28rem; }
+  .handoff p { max-width: var(--measure); }
+
+  .themetoggle {
+    position: fixed;
+    top: 14px;
+    right: 14px;
+    z-index: 10;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 6px 10px;
+    cursor: pointer;
+    transition: color .15s, border-color .15s;
+  }
+
+  .themetoggle:hover { color: var(--accent); border-color: var(--accent); }
+  .themetoggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  @media print { .themetoggle { display: none; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem("turbolay-theme");
+      if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) {}
+  })();
+</script>
+</head>
+<body>
+
+<button class="themetoggle" type="button">Dark</button>
+
+<div class="page">
+
+  <header class="masthead">
+    <div class="docmeta">
+      <span><b>repo</b> turbolay</span>
+      <span><b>branch</b> Turbolay-V3.5</span>
+      <span><b>doc</b> 2 of 2 — solution space</span>
+      <span><b>refs</b> tidb-master · sleet</span>
+    </div>
+    <h1>Routing the write<span class="thin">borrowing TiDB's shape without TiDB's dependencies</span></h1>
+    <p class="standfirst">
+      TiKV has the identical problem and solved it in three parts: an authoritative map, a
+      cached copy at the client, and an error that corrects the cache. Two of those transfer
+      to Turbolay unchanged. The third — the map — has to come from somewhere cheaper than PD.
+    </p>
+  </header>
+
+  <nav class="spine" aria-label="Sections">
+    <ol>
+      <li><a href="#tidb"><span class="n">A</span><span>How TiDB routes</span></a></li>
+      <li><a href="#transfer"><span class="n">B</span><span>What transfers</span></a></li>
+      <li><a href="#options"><span class="n">C</span><span>Four sources of truth</span></a></li>
+      <li><a href="#matrix"><span class="n">D</span><span>Scored against R1–R7</span></a></li>
+      <li><a href="#proposal"><span class="n">E</span><span>Three layers</span></a></li>
+      <li><a href="#unchanged"><span class="n">F</span><span>What does not change</span></a></li>
+      <li><a href="#open"><span class="n">G</span><span>Open questions</span></a></li>
+    </ol>
+  </nav>
+
+  <main class="body">
+
+    <section id="tidb">
+      <p class="eyebrow">A — the reference implementation</p>
+      <h2>How TiDB gets a write to the right node</h2>
+      <p class="lede">
+        Read this as a shape, not a shopping list. The mechanisms matter; the components
+        they run on mostly don't transfer.
+      </p>
+
+      <p>
+        TiKV splits the keyspace into <b>regions</b> — contiguous key ranges, the structural
+        equivalent of a Turbolay cell. Each region is a Raft group, and its <b>leader</b> is the
+        only peer that may accept a write. So far this is Turbolay's problem exactly: a partition
+        with one legal writer.
+      </p>
+
+      <p>
+        The first difference is decisive and worth naming before anything else. <b>Raft
+        elects; SlateDB fences.</b> A TiKV region always has an elected leader that the peers
+        themselves agreed on, and a follower that receives a write <em>knows</em> it is not the
+        leader and who is. A SlateDB database has whichever writer most recently opened it, and a
+        fenced writer only learns it lost after the fact. TiKV's routing layer therefore starts
+        from an authoritative answer it can publish; Turbolay's has to manufacture one.
+      </p>
+
+      <h3>Four mechanisms, in the order a write meets them</h3>
+
+      <p>
+        <b>1 — PD holds the authoritative map.</b> The Placement Driver stores region → peers →
+        leader, fed by region heartbeats. It also schedules: splitting hot regions, merging cold
+        ones, transferring leaders to balance load. TiDB additionally expresses <em>placement
+        intent</em> to PD through affinity groups — <code>CreateAffinityGroupsIfNotExists</code>
+        asks PD to co-locate a set of key ranges, and does so idempotently precisely so it stays
+        correct across a DDL owner switch or a network failure mid-retry.
+      </p>
+      <p class="src">tidb-master · pkg/domain/affinity/interface.go:47–56, manager.go:56–72</p>
+
+      <p>
+        <b>2 — The client caches the map, and the hot path never asks PD.</b> client-go's
+        <code>RegionCache</code> resolves a key to a <code>KeyLocation</code> locally. TiDB's
+        coprocessor layer builds request batches straight out of those cached locations. A PD
+        round trip on every write would defeat the entire design.
+      </p>
+      <p class="src">tidb-master · pkg/store/copr/region_cache.go — <code>tikv.KeyLocation</code> throughout</p>
+
+      <p>
+        <b>3 — Errors correct the cache; the write is never bounced back to the user.</b> This is
+        the mechanism Turbolay is missing entirely. TiKV replies with a typed region error —
+        <code>NotLeader</code> (carrying a leader hint), <code>EpochNotMatch</code>,
+        <code>RegionNotFound</code>, <code>StaleCommand</code> — and the client invalidates its
+        cache <em>with the reason attached</em>, backs off, and retries:
+      </p>
+
+      <div class="rule-box">
+        <span class="lbl">tidb-master · pkg/store/copr/batch_coprocessor.go:1556 · pkg/store/copr/mpp.go:187</span>
+        b.store.GetRegionCache().InvalidateCachedRegionWithReason(id, tikv.EpochNotMatch)
+      </div>
+
+      <p>
+        A stale routing table is treated as an expected, routine condition with a defined
+        recovery, not as an error. The application never sees it.
+      </p>
+
+      <p>
+        <b>4 — For singleton work, TiDB skips routing altogether.</b> DDL has exactly one legal
+        executor cluster-wide, which is the same single-writer shape at a coarser grain. TiDB does
+        not route DDL statements to the owner. Any node accepts the statement;
+        <code>JobSubmitter</code> writes it into a system table and notifies; only the owner's
+        scheduler picks it up.
+      </p>
+
+      <div class="doctrine">
+        <p>jobScheduler is used to schedule the DDL jobs, it's only run on the DDL owner.</p>
+        <span class="attr">tidb-master · pkg/ddl/job_scheduler.go:132</span>
+      </div>
+
+      <p>
+        The owner itself comes from an etcd election — <code>ownerManager</code> wrapping
+        <code>concurrency.Election</code> with a lease TTL. It is worth reading that file for its
+        scar tissue rather than its API: the comments around <code>ForceToBeOwner</code> document
+        a real production incident (issue #54689) where multiple owners coexisted during a
+        mixed-version rolling upgrade, mitigated by deleting all campaign keys and putting the new
+        one in a single transaction, plus a deliberate sleep to let the cluster settle.
+      </p>
+      <p class="src">tidb-master · pkg/owner/manager.go:179–262</p>
+
+      <p>
+        That is the cost of a real election service, paid by a team that already had etcd for
+        other reasons. It is exactly the cost Turbolay's architecture and sleet's RFC both
+        decline to pay.
+      </p>
+    </section>
+
+    <section id="transfer">
+      <p class="eyebrow">B — what transfers</p>
+      <h2>Two mechanisms port cleanly; the third needs a substitute</h2>
+
+      <div class="tablewrap wide">
+        <table class="map-tbl">
+          <thead>
+            <tr>
+              <th>TiDB / TiKV mechanism</th>
+              <th>what it buys</th>
+              <th>Turbolay status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="strong">Region → leader map in PD</td>
+              <td class="note">one authoritative answer to “who may write this”</td>
+              <td class="note"><span class="chip caveat">substitute needed</span> no map exists; PD is ruled out by R7</td>
+            </tr>
+            <tr>
+              <td class="strong">Client-side region cache with TTL</td>
+              <td class="note">no lookup on the hot path</td>
+              <td class="note"><span class="chip adopt">already present</span> the Bolt routing table <em>is</em> this — it just answers the same thing for every cell</td>
+            </tr>
+            <tr>
+              <td class="strong">NotLeader / EpochNotMatch, invalidate-with-reason, backoff</td>
+              <td class="note">wrong-node writes self-correct within a bounded number of retries</td>
+              <td class="note"><span class="chip reject">missing entirely</span> a fenced write returns an opaque error; the driver retries into the same node</td>
+            </tr>
+            <tr>
+              <td class="strong">DDL: submit to a table, owner executes</td>
+              <td class="note">routing becomes optional for a class of writes</td>
+              <td class="note"><span class="chip adapt">partially available</span> node-to-node transport exists; ack semantics would have to change</td>
+            </tr>
+            <tr>
+              <td class="strong">PD region split / merge / leader transfer</td>
+              <td class="note">partitions resize and rebalance under load</td>
+              <td class="note"><span class="chip caveat">out of scope</span> cells are static config — <code>GRAPH_CELLS</code>, identical on every node</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="caption">The middle row is the highest value-per-line change available, and it depends on nothing except a way to name the owner.</p>
+
+      <p>
+        The one thing that emphatically does not transfer is PD itself, and the reason is
+        structural rather than a matter of taste. TiDB can afford a placement driver because
+        Raft already requires a cluster manager — PD is incremental cost on a dependency that
+        must exist. Turbolay's premise is the opposite:
+      </p>
+
+      <div class="doctrine">
+        <p>
+          The design uses object storage, the shared service every SlateDB deployment already has.
+          Adding ZooKeeper, etcd, or a custom coordinator would make safety depend on another
+          system.
+        </p>
+        <span class="attr">sleet — rfcs/0001-design.md, “Motivation”</span>
+      </div>
+
+      <p>
+        So the question narrows usefully: <b>take TiKV's protocol shape — cached map plus
+        error-driven correction — and get the map from somewhere that costs nothing to
+        operate.</b>
+      </p>
+    </section>
+
+    <section id="options">
+      <p class="eyebrow">C — sources of truth</p>
+      <h2>Four places the ownership map could live</h2>
+
+      <div class="options wide">
+
+        <div class="opt" data-v="adopt">
+          <div class="opt-head">
+            <span class="opt-id">OPT-1</span>
+            <h3>Compute it — rendezvous hashing over live nodes</h3>
+            <span class="chip adopt">adopt</span>
+          </div>
+          <p class="opt-ref">reference: sleet — src/placement.rs, rfcs/0001-design.md “Placement”</p>
+
+          <p>
+            Store no assignment at all. Every node derives the same answer from the same inputs:
+            the cell identity and the set of live nodes.
+          </p>
+
+          <div class="rule-box">
+            <span class="lbl">the whole mechanism</span>
+            owner(scope, cell) = argmax<sub>n ∈ live</sub> H(scope ‖ 0x00 ‖ cell_id ‖ 0x00 ‖ node_id)
+          </div>
+
+          <p>
+            Liveness comes from heartbeat objects, not from probes: a node is live if its
+            heartbeat object is younger than <code>heartbeat_timeout</code>, timestamped by object
+            storage rather than by any local clock. sleet treats the hash and its key encoding as a
+            frozen wire format with a golden test, because mixed-version fleets must compute
+            identical owners. Removing a node moves only the cells it owned; adding one moves only
+            the cells it now wins — sleet has a test for exactly that property.
+          </p>
+
+          <p>
+            Turbolay already has the membership half. <code>ObjectStoreNodeDirectory</code> holds
+            validated cell ids and node ids and is threaded through every cluster constructor. What
+            it lacks is a liveness dimension, which is a heartbeat prefix and a
+            <code>LIST</code>.
+          </p>
+          <p class="src">src/engine/cluster.rs:101–160</p>
+
+          <div class="ledger">
+            <div class="ledger-row buy"><span class="k">buys</span><span class="v">R2 and R7 together — an ownership answer with zero new dependencies and zero stored state</span></div>
+            <div class="ledger-row"><span class="k">costs</span><span class="v">during view skew two nodes can both believe they own a cell; convergence bounded by <code>heartbeat_timeout</code> plus one tick</span></div>
+            <div class="ledger-row"><span class="k">risk</span><span class="v">the hash becomes a compatibility surface the moment two versions run together</span></div>
+          </div>
+        </div>
+
+        <div class="opt" data-v="caveat">
+          <div class="opt-head">
+            <span class="opt-id">OPT-2</span>
+            <h3>Store it — a CAS-held lease object per cell</h3>
+            <span class="chip caveat">hint only</span>
+          </div>
+          <p class="opt-ref">reference: the pattern PD implements, reduced to object storage</p>
+
+          <p>
+            Put <code>.../&lt;cell-id&gt;/_writer</code> in the store holding
+            <code>{node_id, epoch, expires_at}</code>, acquired and renewed with conditional PUT.
+            Ownership becomes explicit, inspectable by an operator, and a natural place to hang the
+            WRITE routing address.
+          </p>
+
+          <p>
+            The problem is that it creates a second source of truth for a question SlateDB's
+            writer epoch already answers, and the two can disagree. A node holding a valid lease
+            can be fenced; a fenced node can hold a valid lease. Whichever one you trust in that
+            moment, you have contradicted the other. sleet declines this explicitly — “Sleet does
+            not add a lock service” — and Turbolay's architecture rules out a writable controller
+            in the data path.
+          </p>
+
+          <div class="ledger">
+            <div class="ledger-row buy"><span class="k">buys</span><span class="v">explicit, operator-visible ownership; a stable place to publish the write address</span></div>
+            <div class="ledger-row"><span class="k">costs</span><span class="v">lease renewal on the write path, clock-skew semantics, two authorities for one question</span></div>
+            <div class="ledger-row"><span class="k">verdict</span><span class="v">viable only as an <em>advisory</em> object that records what OPT-1 computed — never as the authority</span></div>
+          </div>
+        </div>
+
+        <div class="opt" data-v="reject">
+          <div class="opt-head">
+            <span class="opt-id">OPT-3</span>
+            <h3>Elect it — an external election service</h3>
+            <span class="chip reject">rejected</span>
+          </div>
+          <p class="opt-ref">reference: tidb-master — pkg/owner/manager.go</p>
+
+          <p>
+            The strongest ownership semantics available: a real lease, real fencing on the control
+            plane, and mature primitives for the hard cases — <code>ResignOwner</code>,
+            <code>ForceToBeOwner</code>, <code>BreakCampaignLoop</code> for rolling upgrades.
+          </p>
+
+          <p>
+            It fails R7 by construction, and TiDB's own comments are the argument against adopting
+            it casually: the mitigations around issue #54689 exist because even with etcd, even
+            with a mature implementation, multiple owners appeared during a mixed-version upgrade.
+            An election service does not remove the need to be safe under split ownership — it
+            just changes how often you are.
+          </p>
+
+          <div class="ledger">
+            <div class="ledger-row buy"><span class="k">buys</span><span class="v">the strongest possible answer to R2</span></div>
+            <div class="ledger-row"><span class="k">costs</span><span class="v">a hard dependency in the data path; violates R7 and architecture.md:26–27</span></div>
+            <div class="ledger-row"><span class="k">verdict</span><span class="v">cite as the thing deliberately not being done, and why TiDB can afford it</span></div>
+          </div>
+        </div>
+
+        <div class="opt" data-v="adapt">
+          <div class="opt-head">
+            <span class="opt-id">OPT-4</span>
+            <h3>Sidestep it — forward the write to the owner</h3>
+            <span class="chip adapt">complement</span>
+          </div>
+          <p class="opt-ref">reference: tidb-master — pkg/ddl/job_submitter.go, job_scheduler.go</p>
+
+          <p>
+            TiDB's DDL answer: don't route, accept anywhere and deliver internally. Turbolay is
+            unusually well positioned for this because the transport already exists —
+            <code>QueryServiceEndpoint</code> and <code>QueryServiceDirectory</code> give
+            node-to-node RPC with TLS and mTLS, bearer auth, per-principal scope authorization,
+            frame limits, connection pooling, and cancellation.
+          </p>
+          <p class="src">src/query/coordination.rs:1282–1331</p>
+
+          <p>
+            This turns routing into a pure optimization: a wrong-node write costs one extra hop
+            instead of an epoch bump and two cold caches. But note what it does <em>not</em>
+            solve — the forwarding node still has to know who the owner is, so OPT-4 sits on top of
+            OPT-1 rather than replacing it.
+          </p>
+
+          <p>
+            The queue variant (append to a per-cell intake, owner drains) goes further and
+            collides with a stated contract: acking on enqueue is not acking on durable commit.
+          </p>
+
+          <div class="ledger">
+            <div class="ledger-row buy"><span class="k">buys</span><span class="v">R4 for clients that cannot re-route — HTTP, batch importers, anything non-Bolt</span></div>
+            <div class="ledger-row"><span class="k">costs</span><span class="v">one hop of latency; still requires an ownership function</span></div>
+            <div class="ledger-row"><span class="k">watch</span><span class="v">“Successful API return means the mutation has reached SlateDB's durable commit point” — architecture.md:258–259</span></div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <section id="matrix">
+      <p class="eyebrow">D — scored</p>
+      <h2>Against the requirements from doc 1</h2>
+
+      <div class="tablewrap wide">
+        <table class="matrix-tbl">
+          <thead>
+            <tr>
+              <th></th>
+              <th class="m">OPT-1 rendezvous</th>
+              <th class="m">OPT-2 lease object</th>
+              <th class="m">OPT-3 etcd election</th>
+              <th class="m">OPT-4 forwarding</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="strong">where authority lives</td>
+              <td class="note">nowhere — recomputed</td>
+              <td class="note">an object in the store</td>
+              <td class="note">an external cluster</td>
+              <td class="note">inherited from another option</td>
+            </tr>
+            <tr>
+              <td class="strong">new dependency <span class="chip adopt">R7</span></td>
+              <td class="note">none</td>
+              <td class="note">none, but a second authority</td>
+              <td class="note"><b>etcd</b></td>
+              <td class="note">none</td>
+            </tr>
+            <tr>
+              <td class="strong">hot-path cost</td>
+              <td class="note">a hash over the live set</td>
+              <td class="note">lease read or renewal</td>
+              <td class="note">cached lease read</td>
+              <td class="note">one intra-cluster hop</td>
+            </tr>
+            <tr>
+              <td class="strong">cost of a wrong-node write</td>
+              <td class="note">epoch bump, unless paired with correction</td>
+              <td class="note">epoch bump plus lease conflict</td>
+              <td class="note">rejected cleanly</td>
+              <td class="note"><b>one hop, no epoch bump</b></td>
+            </tr>
+            <tr>
+              <td class="strong">convergence bound <span class="chip adopt">R5</span></td>
+              <td class="note">heartbeat_timeout + one tick</td>
+              <td class="note">lease TTL</td>
+              <td class="note">session TTL</td>
+              <td class="note">inherited</td>
+            </tr>
+            <tr>
+              <td class="strong">ownership observable <span class="chip adopt">R2</span></td>
+              <td class="note">yes — anyone can recompute it offline</td>
+              <td class="note">yes — read one object</td>
+              <td class="note">yes</td>
+              <td class="note">inherited</td>
+            </tr>
+            <tr>
+              <td class="strong">doctrine fit</td>
+              <td class="note"><b>matches sleet exactly</b></td>
+              <td class="note">explicitly declined by sleet</td>
+              <td class="note">excluded by architecture.md</td>
+              <td class="note">matches TiDB's DDL model</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="caption">No single option satisfies R1–R7. OPT-1 answers “who owns it”, OPT-4 answers “what if we got it wrong”, and R1 is upstream of both.</p>
+    </section>
+
+    <section id="proposal">
+      <p class="eyebrow">E — proposal</p>
+      <h2>Three layers, in dependency order</h2>
+      <p class="lede">
+        Numbered because each layer is genuinely useless without the one above it. Layer 1 is
+        a prerequisite, not a preference.
+      </p>
+
+      <div class="layers wide">
+
+        <div class="layer">
+          <div class="layer-n">1</div>
+          <div>
+            <h3>Make the cell addressable, and derivable</h3>
+            <p>
+              Nothing else is possible while <code>cell_id</code> is a process constant. Either
+              extend the database-name grammar so a cell is nameable alongside the tenant scope, or
+              derive it from the statement itself.
+            </p>
+            <p>
+              The derivation machinery already exists and is not wired to the client path:
+              <code>locality_cell_id</code> and <code>LocalityCellExtractor</code> already extract a
+              cell from a key, and <code>compare_locality_layouts</code> already reports how cleanly
+              a key set partitions. Turbolay knows how to answer “which cell does this key belong
+              to”; the resolver has just never been asked.
+            </p>
+            <p class="src">src/placement.rs:30–102 — extractor, prefix, and layout experiment, all unused by the client path</p>
+            <p><b>Satisfies R1.</b> Everything below is blocked on this.</p>
+          </div>
+        </div>
+
+        <div class="layer">
+          <div class="layer-n">2</div>
+          <div>
+            <h3>Compute ownership, and publish it through the routing table</h3>
+            <p>
+              Add heartbeat objects under the scope root and give
+              <code>ObjectStoreNodeDirectory</code> a liveness dimension. Freeze a rendezvous hash
+              with the same discipline sleet applies — frozen key encoding, tie-break by node id, a
+              golden test that fails loudly when either changes.
+            </p>
+            <p>
+              Then let <code>routing_table</code> finally read the arguments it already receives:
+              <code>WRITE</code> becomes the address of
+              <code>owner(target.scope, target.cell_id)</code>; <code>READ</code> and
+              <code>ROUTE</code> stay as all live nodes. This is a contained change to a function
+              that has been handed the right inputs since it was written.
+            </p>
+            <p>
+              Drop the per-<code>ROUTE</code> <code>/readyz</code> fan-out in favour of heartbeat
+              freshness. That removes N TCP connects per routing refresh and — more importantly —
+              makes liveness consistent between two clients asking at the same moment, instead of
+              per-caller.
+            </p>
+            <p><b>Satisfies R2, R3.</b> The result is TiKV's region-cache shape without PD: a driver caching a correct, per-cell write address for a TTL.</p>
+          </div>
+        </div>
+
+        <div class="layer">
+          <div class="layer-n">3</div>
+          <div>
+            <h3>Make wrong-node writes self-correcting, and bound the duel</h3>
+            <p>
+              This is the layer with no current analogue anywhere in the codebase, and the highest
+              value per line. Three changes, in order of importance:
+            </p>
+
+            <div class="rule-box">
+              <span class="lbl">the rule that ends the duel</span>
+              A node MUST NOT promote itself for a cell it does not own,<br>
+              unless the computed owner is not live.
+            </div>
+
+            <p>
+              That single rule converts “any node steals the epoch on demand” into “only a node
+              with a placement reason claims the epoch.” It is the difference between F-05 being
+              unbounded and being bounded.
+            </p>
+            <p>
+              Second: map the not-the-owner condition to
+              <code>Neo.ClientError.Cluster.NotALeader</code> on Bolt, carrying the computed owner
+              as a hint — exactly TiKV's <code>NotLeader{leader_hint}</code>. Drivers already know
+              what to do with it: discard the routing table, re-route, retry. For HTTP and batch
+              clients that cannot re-route, forward over the existing
+              <code>QueryServiceEndpoint</code> transport instead.
+            </p>
+            <p>
+              Third: adopt sleet's fenced-task discipline. A writer that discovers it was fenced
+              waits one heartbeat interval before re-promoting, giving the rival the same
+              opportunity to stand down. The oscillation is then bounded by the same quantity as
+              view convergence, rather than by nothing.
+            </p>
+            <p><b>Satisfies R4, R5.</b></p>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="gridfig wide">
+        <p class="gridfig-title">Writer placement after layer 2 — same 4 cells, same 3 nodes</p>
+        <div class="matrix-fig">
+          <div class="cellbox hdr"></div>
+          <div class="cellbox hdr">cell-0</div>
+          <div class="cellbox hdr">cell-1</div>
+          <div class="cellbox hdr">cell-2</div>
+          <div class="cellbox hdr">cell-3</div>
+
+          <div class="cellbox rowhdr">graph-node-0</div>
+          <div class="cellbox writer">WRITER</div>
+          <div class="cellbox">reader</div>
+          <div class="cellbox">reader</div>
+          <div class="cellbox writer">WRITER</div>
+
+          <div class="cellbox rowhdr">graph-node-1</div>
+          <div class="cellbox">reader</div>
+          <div class="cellbox writer">WRITER</div>
+          <div class="cellbox">reader</div>
+          <div class="cellbox">reader</div>
+
+          <div class="cellbox rowhdr">graph-node-2</div>
+          <div class="cellbox">reader</div>
+          <div class="cellbox">reader</div>
+          <div class="cellbox writer">WRITER</div>
+          <div class="cellbox">reader</div>
+        </div>
+        <div class="figlegend">
+          <span><i class="swatch writer"></i> rendezvous-ranked owner — the only node that will promote</span>
+          <span><i class="swatch idle"></i> serving reads; declines writes with a NotALeader hint</span>
+        </div>
+      </div>
+
+      <p>
+        The distribution is a by-product, not the goal. The goal is that the answer is
+        <em>computable</em> — which is what lets a node decline a write it should not have, and
+        what lets a fenced node decide whether to come back.
+      </p>
+    </section>
+
+    <section id="unchanged">
+      <p class="eyebrow">F — invariants preserved</p>
+      <h2>What none of this changes</h2>
+
+      <div class="keeps wide">
+        <div class="keep">
+          <span class="kk">safety</span>
+          <span class="kv">The SlateDB writer epoch and WAL barrier remain the <em>only</em> mutual-exclusion mechanism. Placement never gains authority. If the router is wrong, writes stay correct and only get slower — the property sleet states as “safety never depends on sleet's scheduling.”</span>
+        </div>
+        <div class="keep">
+          <span class="kk">reads</span>
+          <span class="kv">Unchanged. Every ready query node continues to serve reads for every configured cell, from its own pinned snapshot. Both consistency modes and the indexed-base-plus-WAL-tail overlay are untouched.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">dependencies</span>
+          <span class="kv">Object storage stays the only coordination dependency. No consensus service, no writable graph controller, nothing new in the data path.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">durability</span>
+          <span class="kv">A successful API return still means the mutation reached SlateDB's durable commit point — provided the queue variant of OPT-4 stays out of scope.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">indexers</span>
+          <span class="kv">Unaffected. They never become writers, and content-addressed generations plus CAS on the <code>current</code> pointer already tolerate duplicate work.</span>
+        </div>
+      </div>
+    </section>
+
+    <section id="open">
+      <p class="eyebrow">G — unresolved</p>
+      <h2>Open questions worth settling before implementation</h2>
+
+      <div class="openq wide">
+        <div class="q">
+          <span class="qh">Where does cell derivation live — resolver or planner?</span>
+          <p>
+            Deriving the cell from the tenant scope is a resolver concern. Deriving it from the
+            <em>keys a statement touches</em> is a planner concern, and a statement can touch keys
+            in more than one cell. The answer determines whether layer 1 is a small change or a
+            planning change.
+          </p>
+        </div>
+        <div class="q">
+          <span class="qh">Multi-cell writes and bookmarks</span>
+          <p>
+            Once cells are independently routable this becomes urgent rather than theoretical.
+            Two cells means two transactions, two owners, two bookmarks and no atomicity. Decide
+            whether to reject such statements, split them with per-cell bookmarks, or define a
+            composite bookmark — before layer 1 makes them reachable.
+          </p>
+        </div>
+        <div class="q">
+          <span class="qh">Rebalancing has no dampening</span>
+          <p>
+            Rendezvous moves ownership the instant the live set changes. A node that flaps takes
+            its cells back each time it returns, and each move is a writer open. PD has explicit
+            leader-transfer scheduling and <code>evict-leader</code> for this; rendezvous has
+            nothing. A hysteresis term or a minimum-tenure rule probably belongs in layer 2.
+          </p>
+        </div>
+        <div class="q">
+          <span class="qh">Cells are static; regions are not</span>
+          <p>
+            PD splits hot regions and merges cold ones continuously. Turbolay cells come from
+            <code>GRAPH_CELLS</code>, identical on every node, fixed at process start. Nothing here
+            addresses a hot cell — routing it correctly to one writer is exactly what makes it a
+            bottleneck. Cell splitting is a separate problem and a larger one.
+          </p>
+        </div>
+        <div class="q">
+          <span class="qh">The hash becomes a compatibility surface</span>
+          <p>
+            sleet freezes its hash, key encoding and tie-break, and pins them with a golden test,
+            because mixed-version fleets must agree on owners. Turbolay would inherit the same
+            obligation from the first release that ships layer 2. Worth deciding the key encoding
+            deliberately rather than discovering it is load-bearing later.
+          </p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="handoff">
+    <p class="eyebrow">summary</p>
+    <h2>The short version</h2>
+    <p>
+      Turbolay has the client-side cache TiKV has, and is missing both the map and the
+      correction. sleet already demonstrates that the map can be computed rather than stored,
+      on the same primitives and in the same organisation. The correction is a Bolt error code
+      and one rule — <em>do not promote for a cell you do not own</em> — and it is the change
+      that turns an unbounded promotion duel into a bounded one.
+    </p>
+  </footer>
+
+</div>
+
+<script>
+  (function () {
+    var root = document.documentElement;
+    var btn = document.querySelector(".themetoggle");
+    var media = window.matchMedia("(prefers-color-scheme: dark)");
+
+    function current() {
+      return root.getAttribute("data-theme") || (media.matches ? "dark" : "light");
+    }
+
+    function label() {
+      var next = current() === "dark" ? "Light" : "Dark";
+      btn.textContent = next;
+      btn.setAttribute("aria-label", "Switch to " + next.toLowerCase() + " theme");
+    }
+
+    btn.addEventListener("click", function () {
+      var next = current() === "dark" ? "light" : "dark";
+      root.setAttribute("data-theme", next);
+      try { localStorage.setItem("turbolay-theme", next); } catch (e) {}
+      label();
+    });
+
+    media.addEventListener("change", label);
+    label();
+  })();
+</script>
+
+</body>
+</html>

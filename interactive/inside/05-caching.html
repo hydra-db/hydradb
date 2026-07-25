@@ -1,0 +1,923 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caching · Inside TurboLay</title>
+<link rel="stylesheet" href="../assets/textbook.css">
+
+<div class="tb-progress"></div>
+
+<header class="tb-header">
+  <a class="tb-home" href="../index.html">Turbo<span>Lay</span> · Interactive</a>
+  <span class="tb-crumb">Inside TurboLay</span>
+  <span class="tb-crumb">Caching</span>
+  <span class="tb-spacer"></span>
+  <button class="tb-theme-toggle" type="button">☾ Dark</button>
+</header>
+
+<main class="tb-main">
+  <div class="tb-chapter-kicker">Chapter 5 · Inside TurboLay</div>
+  <h1>Caching</h1>
+
+  <p>The read chapter kept meeting caches and deferring them to here. This chapter is that
+  explanation. It matters more in TurboLay than in a database backed by local disk, because
+  TurboLay's source of truth is a remote <span class="concept" data-concept="object-store">object store</span> where every miss can cost a network round
+  trip. Caching is not a nicety here; it is what makes the engine usable.</p>
+
+  <p>There are two layers of cache, and they are easy to confuse, so the chapter separates them
+  first and then goes deep on each. Underneath sits a byte cache that <span class="concept" data-concept="slatedb">SlateDB</span> manages, holding
+  raw storage blocks so the engine does not re-fetch them from the object store. Above it sits a
+  set of caches the engine manages itself, holding computed results such as parsed queries,
+  relationship rows, and matrix artifacts, so the engine does not recompute them. The code is in
+  <code>src/core/cache.rs</code> for the engine caches, <code>src/core/config.rs</code> and <code>src/core/metrics.rs</code> for
+  their configuration, and <code>src/shard/lifecycle.rs</code> for where they are built.</p>
+
+  <h2>Two layers</h2>
+
+  <figure>
+    <div class="tb-widget" id="w-two-layers"></div>
+    <figcaption>Fig. 5.1 — The two cache layers: the upper layer avoids recomputation and the lower layer
+      avoids re-fetching bytes, so a read consults the upper layer first and only a full miss
+      reaches the object store.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Play with it: warm read vs. cold read<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Send a <em>warm read</em> and the answer comes straight out of the engine's result caches — a
+      handful of work units. Send a <em>cold read</em> and the request falls through the engine caches
+      (recompute), then through the SlateDB block cache (fetch object), all the way to the object
+      store. Watch the cost meter climb. The key thing to notice: the value returned is
+      <strong>identical</strong> either way. A miss only ever costs work; it never changes the answer, which is
+      exactly why a replacement node can throw away every cache and still be correct.</p>
+    </div>
+  </details>
+
+  <h2>The object-store block cache</h2>
+
+  <p>The lower layer is not TurboLay's own code. It is a feature of SlateDB that TurboLay turns on
+  and configures.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Block cache</span>
+    <p>A cache of raw storage blocks (chunks of an <span class="concept" data-concept="sst">SST</span> file) kept close to the process so repeated
+    reads do not re-fetch them from slow storage. SlateDB keeps its <span class="concept" data-concept="block-cache">block cache</span> on local disk in
+    front of the object store, so a warmed process reads most blocks from local disk instead of
+    over the network.</p>
+  </div>
+
+  <p>TurboLay pins SlateDB with the <code>foyer</code> feature (<code>Cargo.toml:105</code>).</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — foyer</span>
+    <p>A hybrid <span class="concept" data-concept="foyer">caching library</span> (memory plus disk) that SlateDB uses to implement its object-store
+    cache. TurboLay does not call foyer directly; it enables it through the SlateDB feature and
+    configures a cache directory and a size budget. From TurboLay's point of view foyer is the
+    machinery that makes the disk block cache work.</p>
+  </div>
+
+  <p>TurboLay's control over this layer is the small <code>GraphCacheConfig</code>:</p>
+
+  <pre><code>// src/core/config.rs:59-64
+pub struct GraphCacheConfig {
+    pub object_store_cache_dir: Option&lt;PathBuf&gt;,
+    pub object_store_cache_bytes: Option&lt;usize&gt;,
+    pub object_store_cache_puts: bool,
+    pub preload_sst_on_startup: bool,
+}</code></pre>
+
+  <p>These four fields are translated into SlateDB's settings when the database is opened:</p>
+
+  <pre><code>// src/core/config.rs:95-108
+fn apply_to_settings(&amp;self, settings: &amp;mut Settings) {
+    if let Some(cache_dir) = &amp;self.object_store_cache_dir {
+        settings.object_store_cache_options.root_folder = Some(cache_dir.clone());
+    }
+    if let Some(max_cache_size_bytes) = self.object_store_cache_bytes {
+        settings.object_store_cache_options.max_cache_size_bytes = Some(max_cache_size_bytes);
+    }
+    settings.object_store_cache_options.cache_puts = self.object_store_cache_puts;
+    if self.preload_sst_on_startup {
+        settings.object_store_cache_options.preload_disk_cache_on_startup =
+            Some(PreloadLevel::AllSst);
+    }
+}</code></pre>
+
+  <p>Two options are worth calling out. <code>cache_puts</code> decides whether data the process writes is also
+  placed into the local cache, so a writer can read back what it just wrote from disk rather than
+  the object store. Notice that the read-only reader path sets it to <code>false</code>
+  (<code>apply_to_reader_options</code>, <code>config.rs:117</code>), because a pure reader has nothing to put.
+  <code>preload_sst_on_startup</code> warms the cache by loading all SST files at startup, trading a slower
+  start for a faster first query.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Putting the block cache on disk rather than only in memory suits an object-store backend. The
+    working set of a large graph will not fit in memory, but it can fit on a local SSD, and even a
+    local SSD read is far cheaper than an S3 GET. Preloading exists because the first query after a
+    cold start would otherwise pay the full object-store latency for every block it touches.</p>
+  </div>
+
+  <h2>The engine's result caches</h2>
+
+  <p>The upper layer is TurboLay's own. There are seven cache fields on the <code>GraphShard</code>
+  (Chapter 1), covering six kinds of computed result. Each is a <code>BoundedGraphCache</code> behind a
+  mutex. The kinds are enumerated for metrics:</p>
+
+  <pre><code>// src/core/metrics.rs:49-57
+pub enum GraphCacheKind {
+    MatrixArtifact,
+    MatrixAdjacency,
+    GraphBlas,
+    ParsedRowQuery,
+    RelationshipRows,
+    RelationshipPropertyRows,
+}</code></pre>
+
+  <p>The shard holds seven caches because the relationship-rows kind is split across two fields — a
+  destination-pair cache and a newer one-hop source cache. The full set of fields
+  (<code>src/core/state.rs:50-66</code>):</p>
+
+  <figure>
+    <div class="tb-table-wrap">
+      <table>
+        <thead><tr><th>Cache</th><th>What it saves and when it is consulted</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>parsed_row_query_cache</code></td>
+            <td>The lowered form of a <span class="concept" data-concept="cypher">Cypher</span> string, so a repeated query is not re-parsed. Consulted at the start of execution (read chapter, parse stage). The only cache whose key has no <span class="concept" data-concept="epoch">epoch</span>.</td>
+          </tr>
+          <tr>
+            <td><code>matrix_artifact_cache</code> / <code>matrix_cache</code> / <code>graphblas_cache</code></td>
+            <td>A matrix artifact's manifest, its hydrated <code>MatrixAdjacency</code>, and its compiled <span class="concept" data-concept="graphblas">GraphBLAS</span> matrix. All three are keyed by <code>MatrixCacheKey { cell_id, edge_type, base_epoch }</code>. They form the base layer of the <span class="concept" data-concept="mvcc">MVCC</span> merge, so caching them saves rebuilding the base on every read.</td>
+          </tr>
+          <tr>
+            <td><code>relationship_rows_cache</code> / <code>relationship_property_rows_cache</code></td>
+            <td>Relationship records for a source-destination pair (optionally by property) at a read epoch.</td>
+          </tr>
+          <tr>
+            <td><code>source_relationship_rows_cache</code></td>
+            <td>The newer one-hop cache: for a single source vertex, its list of destinations (<code>Arc&lt;Vec&lt;VertexId&gt;&gt;</code>), keyed by <code>SourceRelationshipRowsCacheKey</code>. Serves neighbor expansion without re-reading the relationship keyspace.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Every one of these caches shares the same implementation, <code>BoundedGraphCache</code>, so understand it
+  once and you understand all seven.</p>
+
+  <h2>Inside BoundedGraphCache</h2>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Least-recently-used (LRU)</span>
+    <p>An <span class="concept" data-concept="lru">eviction policy</span>: when the cache is full, throw out the entry that has gone longest without
+    being read. It approximates "keep what is likely to be used again". TurboLay implements LRU
+    with a logical clock that ticks on every access, stamping each entry with its last-access
+    time.</p>
+  </div>
+
+  <p>The <span class="concept" data-concept="bounded-graph-cache">cache</span> is a map from key to an entry that records the value, its owning tenant, whether it is
+  pinned, its last-access time, and how many bytes it occupies:</p>
+
+  <pre><code>// src/core/cache.rs:190-206
+struct CacheEntry&lt;V&gt; {
+    value: V,
+    tenant: String,
+    pinned: bool,
+    last_access: u64,
+    resident_bytes: usize,
+}
+
+pub(crate) struct BoundedGraphCache&lt;K, V&gt; {
+    max_entries: usize,
+    max_resident_bytes: usize,
+    resident_bytes: usize,
+    max_entries_per_tenant: Option&lt;usize&gt;,
+    clock: u64,
+    entries: BTreeMap&lt;K, CacheEntry&lt;V&gt;&gt;,
+    tenant_entries: BTreeMap&lt;String, usize&gt;,
+}</code></pre>
+
+  <p>A read bumps the clock and stamps the entry, which is what makes eviction LRU:</p>
+
+  <pre><code>// src/core/cache.rs:241-246
+pub(crate) fn get(&amp;mut self, key: &amp;K) -&gt; Option&lt;V&gt; {
+    self.clock = self.clock.saturating_add(1);
+    let entry = self.entries.get_mut(key)?;
+    entry.last_access = self.clock;
+    Some(entry.value.clone())
+}</code></pre>
+
+  <p>An insert enforces two independent budgets after adding the entry: a per-tenant entry quota and
+  a total limit that is both an entry count and a byte count. Eviction picks the least-recently
+  used entry that is eligible:</p>
+
+  <pre><code>// src/core/cache.rs:344-375 (abridged)
+fn enforce_total_limit(&amp;mut self, metrics: &amp;GraphCacheMetrics) {
+    while self.entries.len() &gt; self.max_entries || self.resident_bytes &gt; self.max_resident_bytes {
+        if self.evict_one(None, false, metrics).is_none()
+            &amp;&amp; self.evict_one(None, true, metrics).is_none()
+        {
+            break;
+        }
+    }
+}
+
+fn evict_one(&amp;mut self, tenant: Option&lt;&amp;str&gt;, allow_pinned: bool, metrics: &amp;GraphCacheMetrics) -&gt; Option&lt;()&gt; {
+    let key = self.entries.iter()
+        .filter(|(_, entry)| /* tenant matches */ &amp;&amp; (allow_pinned || !entry.pinned))
+        .min_by_key(|(_, entry)| entry.last_access)   // least recently used
+        .map(|(key, _)| key.clone())?;
+    self.remove(&amp;key);
+    metrics.evictions.fetch_add(1, Ordering::Relaxed);
+    Some(())
+}</code></pre>
+
+  <p>Two details in that eviction loop are important. First, it tries <code>evict_one(..., false)</code> before
+  <code>evict_one(..., true)</code>: it evicts unpinned entries first and only touches pinned ones if it has
+  no choice. Second, it enforces the byte budget the same way as the entry budget, so a cache full
+  of large values evicts on size, and a cache full of small values evicts on count. A single value
+  larger than the whole byte budget is simply not retained; the tests confirm an oversized entry
+  inserts as <code>None</code> and leaves the cache empty (<code>cache.rs:416-425</code>).</p>
+
+  <p>For the artifact caches there is a specialized read that picks the best entry rather than an
+  exact key, <code>get_latest_by</code>, which selects the entry with the highest score (the newest base
+  epoch) among those matching a predicate:</p>
+
+  <pre><code>// src/core/cache.rs:248-260
+pub(crate) fn get_latest_by(
+    &amp;mut self,
+    mut predicate: impl FnMut(&amp;K, &amp;V) -&gt; bool,
+    mut score: impl FnMut(&amp;K, &amp;V) -&gt; StorageSequence,
+) -&gt; Option&lt;V&gt; {
+    let key = self.entries.iter()
+        .filter(|(key, entry)| predicate(key, &amp;entry.value))
+        .max_by_key(|(key, entry)| score(key, &amp;entry.value))
+        .map(|(key, _)| key.clone())?;
+    self.get(&amp;key)
+}</code></pre>
+
+  <p>This is how a read finds "the newest cached matrix artifact whose base epoch is at or below my
+  read epoch" without knowing the exact base epoch in advance. The score is a <code>StorageSequence</code> —
+  SlateDB's own <span class="concept" data-concept="sequence-number">sequence number</span> for a committed storage snapshot, and the only sequence type in
+  the engine — and the predicate does the <code>base_epoch &lt;= read_epoch</code> test
+  (<code>latest_matrix_artifact</code>, <code>src/engine/artifact_build.rs:578</code>).</p>
+
+  <h2>Two budgets: entries and bytes</h2>
+
+  <p>Each cache is constructed with two limits that come from two different config structs. The entry
+  counts and the per-tenant quota come from <code>GraphCachePolicy</code>; the byte budgets come from
+  <code>GraphMemoryConfig</code>. You can see both feeding the constructors:</p>
+
+  <pre><code>// src/shard/lifecycle.rs:174-186
+matrix_artifact_cache: Mutex::new(BoundedGraphCache::new(
+    cache_policy.max_matrix_artifacts,
+    tenant_quota,
+)),
+matrix_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
+    cache_policy.max_matrix_adjacencies,
+    tenant_quota,
+    memory.max_matrix_adjacency_bytes,
+)),
+graphblas_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
+    cache_policy.max_graphblas_matrices,
+    tenant_quota,
+    memory.max_graphblas_bytes,
+)),</code></pre>
+
+  <p><code>GraphCachePolicy</code> (<code>metrics.rs:5</code>) sets the entry caps and the per-cell tenant quota; its
+  defaults give, for example, 1,024 matrix artifacts, 64 GraphBLAS matrices, 4,096 parsed row
+  queries, 1,024 relationship-row sets, and a per-cell quota of 8,192 entries (<code>metrics.rs:20-37</code>).
+  The small caches use only an entry cap; the ones that hold large values (GraphBLAS matrices,
+  relationship rows, source relationship rows, relationship property rows) also carry a byte budget
+  from <code>GraphMemoryConfig</code> (<code>config.rs:137-149</code>). The GraphBLAS byte budget defaults to 128 MiB, the
+  relationship-rows budgets to 8-16 MiB; a <code>low_memory</code> profile (<code>config.rs:168</code>) shrinks them for
+  constrained deployments.</p>
+
+  <p>One default is worth pausing on. The hydrated-adjacency cache is <strong>off by default</strong>:
+  <code>max_matrix_adjacencies = 0</code> (<code>metrics.rs:24</code>) and <code>max_matrix_adjacency_bytes = 0</code>
+  (<code>config.rs:154</code>). A cache built with <code>max_entries == 0</code> early-returns on every insert, so nothing
+  is retained. In the default configuration only the <strong>compiled GraphBLAS matrix</strong> is cached (64
+  entries / 128 MiB); the intermediate <code>MatrixAdjacency</code> map is hydrated when needed and dropped.
+  Enabling the adjacency cache is an opt-in for workloads that want the map form resident.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Two budgets exist because entries and bytes fail differently. A cache of parsed queries could
+    hold millions of tiny entries, so it needs a count cap. A cache of compiled GraphBLAS matrices
+    could blow out memory with a handful of huge entries, so it needs a byte cap. Bounding only one
+    would leave the other failure mode open, so the caches that can hit both bound both.</p>
+  </div>
+
+  <h2>Pinning the expensive results</h2>
+
+  <p>Some cached values are far more expensive to rebuild than others. A matrix artifact for a graph
+  with millions of edges took real work to compute and load. TurboLay pins those so they survive
+  eviction unless the cache is truly out of room.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Pinning</span>
+    <p>Marking a cache entry as <span class="concept" data-concept="pinning">protected</span> so it is only evicted when there is no unpinned entry left
+    to drop. TurboLay pins the entries that are most costly to recompute: large matrix artifacts
+    and the compiled GraphBLAS matrices built from them. The eviction loop always drops unpinned
+    entries first.</p>
+  </div>
+
+  <p>The decision is a single threshold on edge count:</p>
+
+  <pre><code>// src/core/metrics.rs:44-46
+pub(crate) fn pin_matrix_artifact(&amp;self, artifact: &amp;engine::MatrixArtifact) -&gt; bool {
+    artifact.edge_count &gt;= self.pin_matrix_min_edges          // default 1_000_000
+}</code></pre>
+
+  <p>There is no supernode pinning any more — the supernode subsystem is gone, and with it
+  <code>pin_supernode_group</code>. The <code>pin</code> flag is decided and applied at insert time in
+  <code>src/engine/matrix_cache.rs</code>: when the hydration path inserts a hydrated adjacency or a compiled
+  GraphBLAS matrix, it passes <code>edge_count &gt;= pin_matrix_min_edges</code> as the <code>pinned</code> argument to
+  <code>insert_sized</code>. So a million-edge artifact is pinned by default; smaller results are cheap enough
+  to rebuild that letting them age out is fine.</p>
+
+  <h2>Why the caches are correct: two regimes</h2>
+
+  <p>A cache is dangerous when it can serve stale data. TurboLay's result caches do not, but they
+  achieve it in two different ways, and the difference matters. There is a common temptation to say
+  "every key embeds an epoch, so a write makes a new key and old entries just age out — there is no
+  invalidation code because there is nothing to invalidate." That story is true, but only for one
+  family of caches. The matrix caches work differently and <strong>are</strong> explicitly pruned. Separating the
+  two regimes is the point of this section.</p>
+
+  <figure>
+    <div class="tb-widget" id="w-two-regimes"></div>
+    <figcaption>Fig. 5.2 — The two cache-correctness regimes. On the left, per-read caches embed
+      <code>read_epoch</code>, so a write just mints new keys and the stale entries age out under LRU —
+      the "no invalidation code" thesis holds exactly here. On the right, the matrix caches
+      reuse a deliberately lagging <code>base_epoch</code> across many read epochs (a read overlays
+      the WAL tail on it), so a write does <em>not</em> self-invalidate them; they need real,
+      GC-driven eviction via <code>artifact_gc</code>'s <code>retain</code>, with entries hydrated read-through
+      and their bases published by the out-of-process indexer.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Play with it: commit a write, then run GC<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Press <em>Commit write</em> and watch the two regimes diverge. On the left, the per-read caches
+      self-invalidate: the new epoch mints a new key, so the old entry becomes unreachable and simply
+      ages out — no code runs against the cache. On the right, the matrix caches do <strong>nothing</strong> in
+      response to the write: the lagging <code>base_epoch</code> entry is still valid and keeps being reused,
+      the WAL tail grows to carry the new edges, and only <em>Run GC</em> (an explicit <code>retain</code>) ever
+      reclaims a superseded base. Two caches, two correctness arguments.</p>
+    </div>
+  </details>
+
+  <h3>Regime one: per-read caches, epoch-keyed, self-invalidating</h3>
+
+  <p>The parsed-query, relationship-rows, source-relationship-rows, and relationship-property-rows
+  caches are the classic epoch-keyed design.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Epoch-keyed invalidation</span>
+    <p>The <span class="concept" data-concept="epoch-keyed">technique</span> of putting the read epoch into the cache key, so that a new version is a new key
+    rather than an overwrite of an old one. There is no explicit "invalidate this entry on write"
+    step. A write advances the epoch; reads at the new epoch use new keys and miss the cache;
+    entries for old epochs are never served to a new-epoch read and simply age out under LRU.</p>
+  </div>
+
+  <p>Each of these content-dependent keys embeds <code>read_epoch</code> (<code>RelationshipRowsCacheKey</code>,
+  <code>SourceRelationshipRowsCacheKey</code>, etc., in <code>src/core/cache.rs</code> and <code>src/lib.rs</code>). Put that
+  together with the write and delete chapters:</p>
+
+  <ol>
+    <li>A write or delete commits a SlateDB transaction, and that commit's storage sequence becomes
+      the cell's new epoch. Nothing is appended anywhere for readers to replay.</li>
+    <li>The next read pins the new epoch, so it builds cache keys with the new epoch.</li>
+    <li>Those keys are not in the cache, so the read misses and computes fresh, correct results.</li>
+    <li>The old-epoch entries are still in the cache but can never match a new-epoch key, so they are
+      never served incorrectly. They sit idle and are eventually evicted as least-recently-used.</li>
+  </ol>
+
+  <p>The parsed-query cache is the one deliberate exception whose key is only the query string,
+  because a parse result does not depend on graph contents. For this whole family, the "no
+  invalidation code because there is nothing to invalidate" thesis holds exactly: a write touches
+  none of these caches.</p>
+
+  <figure>
+    <div class="tb-widget" id="w-epoch-keyed"></div>
+    <figcaption>Fig. 5.3 — Epoch-keyed invalidation for the per-read caches: a write does not touch the
+      cache at all, because the new epoch produces new keys, so the reader misses old entries
+      automatically and the stale ones age out.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Play with it: read, write, read again<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Read at epoch 5 and you hit the cached value keyed <code>(..., 5)</code>. Now commit a write — the epoch
+      advances to 6, and notice the write does <strong>nothing</strong> to the cache. Read again at epoch 6: the key
+      <code>(..., 6)</code> is not present, so it misses and recomputes a fresh, correct value. The epoch-5 entry
+      is still sitting in the cache, but no epoch-6 read will ever construct its key, so it is never
+      served — it just waits to be evicted as least-recently-used. That is invalidation with no
+      invalidation code.</p>
+    </div>
+  </details>
+
+  <h3>Regime two: matrix caches, base-epoch keyed, deliberately lagging</h3>
+
+  <p>The three matrix caches (<code>matrix_artifact_cache</code>, <code>matrix_cache</code>, <code>graphblas_cache</code>) do <strong>not</strong>
+  work this way, and it is a common mistake to assume they do. Their key is not the read epoch. It
+  is a <span class="concept" data-concept="base-epoch"><code>base_epoch</code></span> that deliberately lags the read epoch:</p>
+
+  <pre><code>// src/lib.rs:148-152
+pub(crate) struct MatrixCacheKey {
+    pub(crate) cell_id: String,
+    pub(crate) edge_type: String,
+    pub(crate) base_epoch: StorageSequence,
+}</code></pre>
+
+  <p>A matrix artifact is a periodically-rebuilt snapshot of the <span class="concept" data-concept="adjacency">adjacency</span> at some past epoch. A read
+  at epoch N+1 does <strong>not</strong> build a fresh artifact keyed at N+1. Instead it asks
+  <code>get_latest_by</code> for the newest cached artifact whose <code>base_epoch &lt;= read_epoch</code>
+  (<code>latest_matrix_artifact</code>, <code>src/engine/artifact_build.rs:578</code>) and then closes the remaining gap
+  with the <strong>WAL-tail overlay</strong> — <code>topology_tail_since</code> (<code>src/shard/topology_tail.rs:28</code>, called from
+  <code>src/shard/query.rs:5293</code>) reads the writes recorded between the base sequence and the read
+  sequence straight out of the <span class="concept" data-concept="wal">WAL</span>. The base is old on purpose; correctness comes from overlaying
+  the tail, not from the base being current.</p>
+
+  <p>The consequence is the opposite of regime one: a write at N+1 does <strong>not</strong> invalidate the base-N
+  artifact, and a new epoch does <strong>not</strong> automatically miss. The base-N artifact stays valid and
+  keeps being reused, with an ever-growing WAL tail to walk, until a newer base is published. So these
+  caches need real invalidation, and they have it. Garbage collection prunes them explicitly with
+  <code>retain</code>:</p>
+
+  <pre><code>// src/engine/artifact_gc.rs:56-64
+self.matrix_artifact_cache.lock().await.retain(|key, _| {
+    key.cell_id != cell_id || key.edge_type != edge_type || key.base_epoch &gt;= keep_epoch
+});
+self.matrix_cache.lock().await.retain(/* same predicate */);
+self.graphblas_cache.lock().await.retain(/* same predicate */);</code></pre>
+
+  <p><code>delete_graph_artifacts_before</code> deletes the on-disk artifact keys with <code>base_epoch &lt; keep_epoch</code>
+  and then drops the corresponding cache entries for that cell and edge type. This is the invalidation
+  step that regime one does not need.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>The write and delete chapters never mentioned invalidating the per-read caches because there
+    genuinely is nothing to invalidate there: a stale entry has a key no current read will ever
+    construct. But do not over-generalize that to the whole engine. The matrix caches trade freshness
+    of the <strong>base</strong> for the amortized cost of rebuilding it — the base lags, the WAL-tail overlay
+    carries the recent writes, and an explicit GC-time <code>retain</code> is what eventually reclaims
+    superseded bases. Two regimes, two correctness arguments: self-invalidating for per-read
+    results, base-epoch plus <span class="concept" data-concept="wal-tail-overlay">WAL-tail overlay</span> plus GC-time prune for the matrix layer.</p>
+  </div>
+
+  <h2>Read-through hydration and the out-of-process indexer</h2>
+
+  <p>Two mechanisms sit behind the matrix caches, and between them they answer the two questions the
+  previous section left open: how an entry gets into the cache at all, and why its <code>base_epoch</code> lags
+  the read epoch.</p>
+
+  <p><strong>Read-through hydration</strong> lives in <code>src/engine/matrix_cache.rs</code>, and it answers the first. On a
+  matrix-cache miss the engine does not block indefinitely or hydrate unboundedly.
+  <code>cached_matrix_adjacency</code> records the miss, takes a <span class="concept" data-concept="hydration">hydration</span> permit (<code>acquire_hydration_permit</code> in
+  <code>src/shard/lifecycle.rs</code>, bounded by a <span class="concept" data-concept="semaphore">semaphore</span> sized from <code>max_concurrent_hydrations</code>, default
+  16), loads the artifact — the canonical <span class="concept" data-concept="csc">CSC</span> form when the manifest reports no tiles, otherwise the
+  tiled on-disk format walked by <code>load_matrix_adjacency</code> — and calls <code>insert_sized</code>, which stores the
+  entry with its measured resident bytes and pins it when its edge count reaches
+  <code>pin_matrix_min_edges</code>. The compiled-GraphBLAS path, <code>cached_graphblas_matrix</code>, is the same shape
+  with one extra gate: it takes the <code>matrix_compilation_gate</code> semaphore, re-checks the cache after
+  acquiring it — compiling the same matrix twice because two readers missed together would be pure
+  waste — and only then compiles. Both return an <code>Arc</code>, so a compiled matrix is shared by every
+  concurrent reader rather than copied.</p>
+
+  <p>What <code>cached_graphblas_matrix</code> loads is the more interesting half. It first asks
+  <code>graph_index_generation_at</code> whether a published <span class="concept" data-concept="index-generation">index generation</span> exists at this base epoch. If one
+  does, the CSC comes straight out of that generation's immutable object (<code>graph_index_csc</code>,
+  <code>src/engine/index_store.rs</code>); if the object has since been collected, the shard calls
+  <code>forget_graph_index_generation</code> to drop the stale pointer and returns <code>None</code> so the caller can fall
+  back. Only when there is no generation does it try the older per-epoch CSC artifacts, and only when
+  those are absent too does it compile from a hydrated adjacency.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Index generation</span>
+    <p>One immutable, content-addressed build of a single <span class="concept" data-concept="cell">cell</span>'s adjacency for a single edge type:
+    <code>GraphIndexGeneration { cell_id, edge_type, base_sequence, last_wal_id, edge_count, checksum,
+    generation }</code> (<code>src/engine/index_store.rs</code>), where <code>generation</code> is the SHA-256 of the encoded CSC
+    payload. Because the name is the hash, a generation is never rewritten in place: a new build is a
+    new object, and publishing it means atomically repointing a small <code>current</code> manifest.</p>
+  </div>
+
+  <p>Nothing in the write path builds one. A write leaves only a marker, in the same transaction that
+  commits the edge — <code>mark_adjacency_dirty_txn</code> in <code>src/shard/write.rs</code>:</p>
+
+  <pre><code>txn.put(
+    keys::matrix_dirty(cell_id, edge_type).as_bytes(),
+    encode_u64(epoch),
+)?;</code></pre>
+
+  <p>The rebuild happens in a <strong>different process</strong>. <code>src/bin/graph-indexer.rs</code> is its own binary: it
+  never becomes a graph writer and never serves queries. Every cycle — <code>GRAPH_INDEXER_INTERVAL_MS</code>,
+  default 5000 — it lists the registered graph scopes, skips the ones with no data, and opens a
+  cluster per scope. For each cell it refreshes its durable reader, reads the markers back through
+  <code>dirty_graph_index_edge_types</code>, and skips any edge type whose current generation already has a
+  <code>base_sequence</code> at or beyond the marker. For the rest it calls <code>build_graph_index</code>, which pins a
+  durable <span class="concept" data-concept="snapshot-isolation">snapshot</span>, takes <code>base_sequence</code> and <code>last_wal_id</code> from it, materializes the canonical
+  adjacency, encodes one CSC matrix, hashes it, writes the generation object with <code>PutMode::Create</code>,
+  and advances the <code>current</code> manifest with a compare-and-swap that refuses to move backwards. Older
+  generations are then pruned by <code>gc_graph_index_generations</code> down to <code>GRAPH_INDEXER_RETAIN_PREVIOUS</code>
+  (default 1).</p>
+
+  <p>That is exactly <strong>why</strong> the matrix caches key on a lagging base: the base is whatever the <span class="concept" data-concept="indexer-process">indexer</span>
+  last published, and the indexer runs on its own clock in another process. The remaining gap is
+  closed at read time by the WAL-tail overlay. <code>topology_tail_since</code> (<code>src/shard/topology_tail.rs</code>,
+  called from <code>compiled_graphblas_query_snapshot</code> in <code>src/shard/query.rs</code>) walks the WAL files after
+  the generation's <code>last_wal_id</code>, collects the edges touched between <code>base_sequence</code> and the read
+  sequence, and resolves each one's final state against the pinned snapshot — an overlay of
+  present-or-absent decisions, not a replay of a change log. It returns <code>Complete</code>, often with an
+  empty overlay when the generation is already current, or <code>Unavailable</code> when the snapshot has moved
+  under it or the WAL files it needs are gone. <code>Unavailable</code> is not an error: the query abandons the
+  compiled matrix and reads adjacency from the snapshot directly. Slower, still correct, and worth
+  knowing about when a traversal's latency jumps.</p>
+
+  <h2>Multi-tenancy and metrics</h2>
+
+  <p>Because one process serves many cells, the caches are shared, and a single busy tenant could
+  otherwise crowd everyone else out. The <span class="concept" data-concept="tenant-quota">per-tenant quota</span>, <code>max_entries_per_cell</code> (default 8,192),
+  bounds how many entries any one cell may hold, enforced by <code>enforce_tenant_quota</code>
+  (<code>cache.rs:328</code>) which evicts within the offending tenant before falling back to a global
+  eviction. Every cache operation is counted through <code>GraphCacheMetrics</code> (hits, misses, insertions,
+  evictions, pinned insertions, tenant-quota rejections) and exposed per kind through
+  <code>GraphCacheKind</code>, so operators can see hit rates and whether a cache is thrashing.</p>
+
+  <p>That covers the engine's own caches, which are shared across cells inside one graph. But a
+  data node also serves many <strong>graph scopes</strong> — tenants and sub-tenants opened on demand, as the
+  architecture chapter described — and those do not share a SlateDB instance at all. Each open
+  scope is its own database, so each brings its own block cache. Left alone, that would multiply
+  the disk budget by the number of open tenants: configure a 4 GiB cache, open eight scopes, and
+  the node quietly wants 32 GiB.</p>
+
+  <p><code>options_for_scope</code> (<code>src/engine/cluster.rs:830-845</code>) closes that hole by rewriting the cache
+  configuration each time a scope is opened. It does two things:</p>
+
+  <pre><code>if let Some(root) = &amp;options.cache.object_store_cache_dir {
+    let mut scoped_root = root.join("scopes");
+    for segment in scope.namespace.segments() {
+        scoped_root.push(segment.as_str());
+    }
+    scoped_root.push("graphs");
+    scoped_root.push(scope.graph_id.as_str());
+    options.cache.object_store_cache_dir = Some(scoped_root);
+}
+if let Some(bytes) = options.cache.object_store_cache_bytes {
+    options.cache.object_store_cache_bytes = Some((bytes / self.max_open_scopes).max(1));
+}</code></pre>
+
+  <p>The directory rewrite gives every scope a private path under <code>scopes/&lt;namespace…&gt;/graphs/&lt;id&gt;</code>,
+  so two tenants can never collide on a cached block file. The byte rewrite divides the
+  configured budget by <code>max_open_scopes</code> — not by the number <strong>currently</strong> open — so the node's
+  total cache footprint is bounded by what was configured no matter how the LRU fills up. A test
+  holds this property down by name, <code>scoped_clusters_partition_the_local_slate_cache_budget</code>
+  (<code>src/engine/cluster.rs:990</code>).</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Dividing by the capacity rather than by the live count is the conservative choice, and it
+    costs something: with one tenant open and a capacity of eight, that tenant gets an eighth of
+    the budget while seven eighths sit unused. The alternative — resizing every open scope's
+    cache whenever another opens or is evicted — would recover that space but makes a node's
+    cache behaviour depend on its neighbours' arrival times, which is exactly the kind of
+    coupling multi-tenancy is supposed to remove. A fixed share is predictable, and predictable
+    is worth more here than fully utilized.</p>
+  </div>
+
+  <p>Metrics follow the same split. <code>local_shard_runtime_metrics</code> on the scoped runtime walks every
+  loaded scope and tags each shard's counters with the scope they came from, yielding
+  <code>ScopedGraphShardRuntimeMetrics { scope, shard }</code> (<code>src/engine.rs:126-130</code>). Cache hit rates are
+  therefore readable per tenant, not just per cell — which matters, because a cold tenant that was
+  just opened and a hot tenant that is thrashing look identical in an aggregate number.</p>
+
+  <h2>Recap, and the end of the tour</h2>
+
+  <p>The caches are the last piece of the machine, and they close the loop the whole book has traced:</p>
+
+  <ul>
+    <li>The object store is the durable, slow source of truth (Chapter 0).</li>
+    <li>SlateDB's foyer-backed block cache keeps recently touched bytes on local disk so the engine
+      rarely re-fetches from the object store.</li>
+    <li>Above it, seven <code>BoundedGraphCache</code> instances keep computed results (parsed queries,
+      relationship rows, matrix artifacts, and their compiled GraphBLAS matrices) so the read path
+      rarely recomputes.</li>
+    <li>Both budgets, entries and bytes, are bounded; the expensive matrix results are pinned; a
+      per-tenant quota keeps cells fair.</li>
+    <li>Correctness comes in two regimes: the per-read caches are epoch-keyed and self-invalidating (a
+      write just produces new keys), while the matrix caches key on a deliberately lagging base epoch,
+      close the remaining gap with the WAL-tail overlay at read time, and are pruned explicitly by
+      garbage collection.</li>
+  </ul>
+
+  <p>You now have the whole engine end to end. The foundations gave you the vocabulary and the storage
+  stack. The architecture chapter showed how the code is organized around <code>GraphShard</code>. The read
+  chapter followed a query down to the adjacency keys and back, pinned to one snapshot. The write
+  chapter showed how that storage sequence is stamped onto a record under a three-tier
+  single-writer guarantee. The delete chapter showed the split treatment — canonical edge rows and the
+  relationships riding on them really deleted, while an edge that lives in a packed segment
+  leaves a tombstone instead — and the garbage collection that eventually reclaims the rest
+  without disturbing live readers.
+  And this chapter showed
+  the caches that make all of it fast while the epoch discipline keeps them honest.</p>
+
+  <p>From here the best next step is the code itself. Open <code>src/shard/query.rs</code> and <code>src/shard/write.rs</code>
+  with this book beside you, and the thousands of lines should now read as elaborations of the paths
+  you have already walked.</p>
+
+  <nav class="tb-chapnav">
+    <a class="prev" href="04-delete-path.html"><span class="cn-dir">‹ Prev</span><br><span class="cn-title">The Delete Path</span></a>
+    <a class="next disabled" href="#"><span class="cn-dir">Next</span><br><span class="cn-title">—</span></a>
+  </nav>
+</main>
+
+<script src="../assets/glossary.js"></script>
+<script>
+/* Page-local glossary: caching concepts not in the shared glossary.js.
+   Merged AFTER glossary.js and BEFORE textbook.js so the tooltip engine sees them. */
+window.TB_GLOSSARY = Object.assign(window.TB_GLOSSARY || {}, {
+  "block-cache": {
+    title: "Block cache",
+    html: "<p>A cache of raw storage blocks — chunks of an <span class=\"concept\" data-concept=\"sst\">SST</span> file — kept close to the process so repeated reads never re-fetch them from slow storage. SlateDB keeps its block cache on <em>local disk</em> in front of the <span class=\"concept\" data-concept=\"object-store\">object store</span>, so a warmed process reads most blocks from an SSD instead of over the network.</p><p>This is the lower of TurboLay's two cache layers, and it caches <em>bytes</em>, not computed results.</p>"
+  },
+  "foyer": {
+    title: "foyer",
+    html: "<p>A hybrid caching library — memory plus disk — that <span class=\"concept\" data-concept=\"slatedb\">SlateDB</span> uses to implement its object-store <span class=\"concept\" data-concept=\"block-cache\">block cache</span>. TurboLay does not call foyer directly; it turns the feature on and hands it a cache directory and a byte budget. From TurboLay's side, foyer is simply the machinery that makes the disk block cache work.</p>"
+  },
+  "lru": {
+    title: "Least-recently-used (LRU)",
+    html: "<p>An eviction policy: when the cache is full, drop the entry that has gone longest without being read — an approximation of \"keep what is likely to be used again\". TurboLay implements it with a logical clock that ticks on every access, stamping each entry with its last-access time; eviction picks the smallest stamp.</p>"
+  },
+  "pinning": {
+    title: "Pinning",
+    html: "<p>Marking a cache entry as protected so it is only evicted when there is no unpinned entry left to drop. TurboLay pins the entries that are most costly to rebuild — large matrix artifacts and the compiled <span class=\"concept\" data-concept=\"graphblas\">GraphBLAS</span> matrices built from them (edge count ≥ 1,000,000 by default). The eviction loop always tries to drop unpinned entries first.</p>"
+  },
+  "hydration": {
+    title: "Read-through hydration",
+    html: "<p>How an entry gets into a matrix cache in the first place: on a miss the engine takes a bounded <span class=\"concept\" data-concept=\"semaphore\">permit</span>, loads the artifact from the object store (the <span class=\"concept\" data-concept=\"csc\">CSC</span> form or the tiled on-disk format), and inserts it with its measured resident bytes — pinning it if it is large enough. The compiled-GraphBLAS path adds a second gate and a re-check so two racing readers never compile the same matrix twice.</p>"
+  },
+  "bounded-graph-cache": {
+    title: "BoundedGraphCache",
+    html: "<p>The single cache implementation behind all seven of the engine's result caches — a <span class=\"concept\" data-concept=\"btreeset\">BTreeMap</span> from key to an entry carrying the value, its tenant, a <span class=\"concept\" data-concept=\"pinning\">pinned</span> flag, a last-access stamp, and its resident byte count. It enforces three limits: an entry cap, a byte budget, and a per-tenant quota, all under <span class=\"concept\" data-concept=\"lru\">LRU</span> eviction.</p>"
+  },
+  "epoch-keyed": {
+    title: "Epoch-keyed invalidation",
+    html: "<p>Putting the read <span class=\"concept\" data-concept=\"epoch\">epoch</span> into the cache key, so a new version is a new key rather than an overwrite. There is no \"invalidate on write\" step: a write advances the epoch, reads at the new epoch build new keys and miss, and old-epoch entries — which no new read will ever look up — simply age out under <span class=\"concept\" data-concept=\"lru\">LRU</span>. TurboLay's per-read caches work exactly this way.</p>"
+  },
+  "base-epoch": {
+    title: "base_epoch (lagging base)",
+    html: "<p>The <span class=\"concept\" data-concept=\"sequence-number\">sequence number</span> a matrix artifact was built at — deliberately <em>behind</em> the read epoch. A read finds the newest cached artifact with <code>base_epoch &lt;= read_epoch</code> and closes the gap with the <span class=\"concept\" data-concept=\"wal-tail-overlay\">WAL-tail overlay</span>. Because the base is reused across many read epochs, a write does <em>not</em> invalidate it; only GC-time <code>retain</code> reclaims a superseded base.</p>"
+  },
+  "tenant-quota": {
+    title: "Per-tenant quota",
+    html: "<p><code>max_entries_per_cell</code> (default 8,192): the ceiling on how many cache entries any one <span class=\"concept\" data-concept=\"cell\">cell</span> may hold in a shared cache. When a tenant exceeds it, eviction happens <em>within that tenant</em> before any global eviction — so one busy tenant cannot crowd the others out of a process that serves many.</p>"
+  },
+  "indexer-process": {
+    title: "Out-of-process indexer",
+    html: "<p><code>graph-indexer</code>, a separate binary that never writes graph data and never serves queries. On its own clock (default every 5 s) it reads the dirty markers a write left behind, rebuilds each cell's <span class=\"concept\" data-concept=\"index-generation\">index generation</span> from a pinned <span class=\"concept\" data-concept=\"snapshot-isolation\">snapshot</span>, publishes it with a compare-and-swap, and prunes old generations. Its independent clock is exactly why the matrix caches key on a lagging <span class=\"concept\" data-concept=\"base-epoch\">base</span>.</p>"
+  }
+});
+</script>
+<script src="../assets/textbook.js"></script>
+<script>
+/* Widgets for Chapter 5 (Caching). Each fletcher diagram in the source becomes an
+   interactive TB.widget: inline SVG built with createElementNS, colours read from CSS
+   custom properties, re-rendered on theme toggle so the palette tracks light/dark. */
+(function () {
+  var NS = "http://www.w3.org/2000/svg";
+  function el(n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  function mkbtn(label, cls) { var b = document.createElement("button"); b.className = "tb-btn" + (cls ? " " + cls : ""); b.textContent = label; return b; }
+  function box(x, y, w, h, fill, stroke, dash) {
+    return el("rect", { x: x, y: y, width: w, height: h, rx: 6, fill: fill, stroke: stroke, "stroke-width": 1.2, "stroke-dasharray": dash || "none", class: "wnode" });
+  }
+  function label(svg, x, y, t, anchor, size, weight, fill) {
+    var e = el("text", { x: x, y: y, "text-anchor": anchor || "middle", class: "wnode-label" });
+    if (size) e.setAttribute("font-size", size);
+    if (weight) e.setAttribute("font-weight", weight);
+    if (fill) e.setAttribute("fill", fill);
+    e.textContent = t; svg.appendChild(e);
+  }
+  function defsArrow(svg, color) {
+    var defs = el("defs", {});
+    var m = el("marker", { id: "arw", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    m.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: color }));
+    defs.appendChild(m); svg.appendChild(defs);
+  }
+  function onTheme(render) {
+    window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+    var t = document.querySelector(".tb-theme-toggle");
+    if (t) t.addEventListener("click", function () { setTimeout(render, 0); });
+  }
+
+  /* ---------------------------------------------------------------- Fig 5.1
+     Two layers: a warm read is served by the engine caches; a cold read
+     falls all the way through to the object store. Cost climbs; answer is
+     identical either way. */
+  TB.widget("w-two-layers", function (mount) {
+    var served = -1; // -1 idle, 0 engine, 1 block cache, 2 object store
+    var wrap = document.createElement("div");
+    var controls = document.createElement("div"); controls.className = "tb-controls";
+    var bWarm = mkbtn("Warm read", "primary");
+    var bCold = mkbtn("Cold read", "danger");
+    var bReset = mkbtn("Reset", "");
+    controls.append(bWarm, bCold, bReset);
+    var svg = el("svg", { viewBox: "0 0 460 250", width: "100%", style: "max-width:460px;display:block;margin:0 auto" });
+    var readout = document.createElement("div");
+    readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:3.2em;color:var(--muted)";
+    wrap.append(controls, svg, readout); mount.appendChild(wrap);
+
+    var layers = [
+      { y: 18,  fill: "--info-soft", stroke: "--info", t1: "engine result caches", t2: "parsed queries · relationship rows · matrix / GraphBLAS", miss: "miss: recompute" },
+      { y: 96,  fill: "--warn-soft", stroke: "--warn", t1: "SlateDB block cache (foyer, local disk)", t2: "raw storage blocks", miss: "miss: fetch object" },
+      { y: 174, fill: "--ok-soft",   stroke: "--ok",   t1: "object store (S3 / MinIO / filesystem)", t2: "durable truth", miss: "" }
+    ];
+    function render() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var mut = css("--muted");
+      defsArrow(svg, mut);
+      for (var i = 0; i < layers.length; i++) {
+        var L = layers[i];
+        var active = served >= 0 && i <= served;
+        var g = el("g", { class: "wnode" + (served >= 0 && i > served ? " wdim" : "") });
+        g.appendChild(box(60, L.y, 340, 60, css(L.fill), css(L.stroke), null));
+        svg.appendChild(g);
+        label(svg, 230, L.y + 26, L.t1, "middle", 12, "700");
+        label(svg, 230, L.y + 44, L.t2, "middle", 9.5, null, mut);
+        if (i < layers.length - 1) {
+          var down = active && served > i;
+          var arr = el("path", { d: "M230 " + (L.y + 60) + " L230 " + (layers[i + 1].y), stroke: down ? css("--bad") : mut, "stroke-width": down ? 1.8 : 1.2, fill: "none", "marker-end": "url(#arw)", "stroke-dasharray": down ? "none" : "4 4" });
+          svg.appendChild(arr);
+          label(svg, 330, L.y + 72, L.miss, "start", 8.5, null, down ? css("--bad") : mut);
+        }
+      }
+      if (served >= 0) {
+        var Ls = layers[served];
+        var badge = el("g", {});
+        badge.appendChild(el("rect", { x: 20, y: Ls.y + 18, width: 30, height: 24, rx: 4, fill: css("--ok"), stroke: css("--ok") }));
+        label(svg, 35, Ls.y + 34, "✓", "middle", 15, "700", css("--paper"));
+        svg.appendChild(badge);
+      }
+      var cost = served < 0 ? 0 : (served === 0 ? 3 : served === 1 ? 40 : 220);
+      if (served < 0) readout.innerHTML = "Send a read. A warm read is served by the top layer; a cold read falls through every layer to the object store.";
+      else if (served === 0) readout.innerHTML = "<strong style='color:var(--ok)'>Hit at the engine caches.</strong> Cost ≈ " + cost + " work units. The result value is <code>{A,B,C}</code>.";
+      else readout.innerHTML = "<strong style='color:var(--bad)'>Full miss.</strong> Recompute, then fetch bytes, then reach the object store. Cost ≈ " + cost + " work units — yet the result value is still <code>{A,B,C}</code>. <em>A miss cost work, not correctness.</em>";
+    }
+    bWarm.onclick = function () { served = 0; render(); };
+    bCold.onclick = function () { served = 2; render(); };
+    bReset.onclick = function () { served = -1; render(); };
+    render(); onTheme(render);
+  });
+
+  /* ---------------------------------------------------------------- Fig 5.2
+     Two regimes. Commit a write and watch the per-read cache (left) self-
+     invalidate while the matrix cache (right) keeps reusing its lagging base
+     until an explicit GC retain reclaims it. */
+  TB.widget("w-two-regimes", function (mount) {
+    var epoch = 5;      // current epoch
+    var gcRun = false;  // has GC pruned the old base
+    var wrap = document.createElement("div");
+    var controls = document.createElement("div"); controls.className = "tb-controls";
+    var bWrite = mkbtn("Commit write", "primary");
+    var bGc = mkbtn("Run GC (retain)", "");
+    var bReset = mkbtn("Reset", "");
+    controls.append(bWrite, bGc, bReset);
+    var svg = el("svg", { viewBox: "0 0 460 250", width: "100%", style: "max-width:460px;display:block;margin:0 auto" });
+    var readout = document.createElement("div");
+    readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:3.4em;color:var(--muted)";
+    wrap.append(controls, svg, readout); mount.appendChild(wrap);
+
+    function render() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var mut = css("--muted"); defsArrow(svg, mut);
+      var wrote = epoch > 5;
+      // headers
+      label(svg, 115, 16, "per-read caches", "middle", 11, "700", css("--info"));
+      label(svg, 115, 30, "keyed by read_epoch", "middle", 8.5, null, mut);
+      label(svg, 345, 16, "matrix caches", "middle", 11, "700", css("--purple"));
+      label(svg, 345, 30, "keyed by lagging base_epoch", "middle", 8.5, null, mut);
+
+      // LEFT: old entry + (after write) fresh entry
+      // old epoch-5 entry
+      var leftOldDim = wrote;
+      var gl = el("g", { class: "wnode" + (leftOldDim ? " wdim" : "") });
+      gl.appendChild(box(30, 44, 170, 46, css("--info-soft"), css("--info"), leftOldDim ? "5 4" : null));
+      svg.appendChild(gl);
+      label(svg, 115, 64, "key (…, 5)", "middle", 10, "700");
+      label(svg, 115, 80, leftOldDim ? "stale · unreachable" : "hit", "middle", 9, null, leftOldDim ? css("--bad") : css("--ok"));
+      if (wrote) {
+        var gl2 = el("g", { class: "wnode wflash" });
+        gl2.appendChild(box(30, 104, 170, 46, css("--ok-soft"), css("--ok"), null));
+        svg.appendChild(gl2);
+        label(svg, 115, 124, "key (…, " + epoch + ")", "middle", 10, "700");
+        label(svg, 115, 140, "miss → recompute", "middle", 9, null, css("--ok"));
+        label(svg, 115, 168, "self-invalidating", "middle", 8.5, "700", mut);
+        label(svg, 115, 182, "(old entry just ages out)", "middle", 8, null, mut);
+      } else {
+        label(svg, 115, 168, "read at epoch 5", "middle", 8.5, null, mut);
+      }
+
+      // RIGHT: single base-N entry, stays valid until GC
+      var rightGone = gcRun;
+      var gr = el("g", { class: "wnode" + (rightGone ? " wdim" : "") });
+      var rFill = rightGone ? css("--surface-soft") : css("--purple-soft");
+      var rStroke = rightGone ? css("--border") : css("--purple");
+      gr.appendChild(box(260, 44, 170, 46, rFill, rStroke, rightGone ? "5 4" : null));
+      svg.appendChild(gr);
+      label(svg, 345, 64, "base_epoch = 4", "middle", 10, "700");
+      label(svg, 345, 80, rightGone ? "pruned by retain" : "valid · reused", "middle", 9, null, rightGone ? css("--bad") : css("--ok"));
+      // WAL tail box
+      var gw = el("g", {});
+      gw.appendChild(box(260, 104, 170, 46, css("--warn-soft"), css("--warn"), null));
+      svg.appendChild(gw);
+      label(svg, 345, 124, "WAL-tail overlay", "middle", 9.5, "700");
+      label(svg, 345, 140, wrote ? "grows: base…" + epoch : "base…5", "middle", 9, null, mut);
+      label(svg, 345, 168, gcRun ? "explicitly invalidated" : (wrote ? "write did NOT invalidate" : "base lags on purpose"), "middle", 8.5, "700", mut);
+
+      if (!wrote) readout.innerHTML = "Both caches hold entries at epoch 5. Commit a write to watch them diverge.";
+      else if (!gcRun) readout.innerHTML = "Write advanced the epoch to <strong>" + epoch + "</strong>. <span style='color:var(--info)'>Left:</span> a new key misses and the old entry is unreachable — no cache code ran. <span style='color:var(--purple)'>Right:</span> the base-4 artifact is <strong>still valid</strong>, the WAL tail just grew to carry the write. It needs a real prune.";
+      else readout.innerHTML = "<strong style='color:var(--ok)'>GC ran.</strong> <code>retain</code> dropped the superseded base on the right — the invalidation the left never needed. Two regimes, two correctness arguments.";
+      bWrite.disabled = wrote; bGc.disabled = !wrote || gcRun;
+    }
+    bWrite.onclick = function () { epoch = 6; render(); };
+    bGc.onclick = function () { gcRun = true; render(); };
+    bReset.onclick = function () { epoch = 5; gcRun = false; render(); };
+    render(); onTheme(render);
+  });
+
+  /* ---------------------------------------------------------------- Fig 5.3
+     Epoch-keyed invalidation: read@5 hits, a write advances the epoch, read@6
+     misses and recomputes, and the epoch-5 entry lingers but is never served. */
+  TB.widget("w-epoch-keyed", function (mount) {
+    // cache entries: array of {epoch, served}
+    var cache = [{ epoch: 5 }];
+    var epoch = 5;
+    var lastAction = "read5";
+    var wrap = document.createElement("div");
+    var controls = document.createElement("div"); controls.className = "tb-controls";
+    var bR5 = mkbtn("Read @ epoch 5", "");
+    var bW = mkbtn("Write → epoch 6", "primary");
+    var bR6 = mkbtn("Read @ epoch 6", "");
+    var bReset = mkbtn("Reset", "");
+    controls.append(bR5, bW, bR6, bReset);
+    var svg = el("svg", { viewBox: "0 0 460 210", width: "100%", style: "max-width:460px;display:block;margin:0 auto" });
+    var readout = document.createElement("div");
+    readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:3.2em;color:var(--muted)";
+    wrap.append(controls, svg, readout); mount.appendChild(wrap);
+
+    function render() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var mut = css("--muted"); defsArrow(svg, mut);
+      // read request node
+      var reqEpoch = lastAction === "read6" ? 6 : 5;
+      var gq = el("g", { class: "wnode" });
+      gq.appendChild(box(20, 70, 130, 60, css("--info-soft"), css("--info"), null));
+      svg.appendChild(gq);
+      label(svg, 85, 94, "read at epoch " + reqEpoch, "middle", 10.5, "700");
+      label(svg, 85, 112, "key (…, " + reqEpoch + ")", "middle", 9.5, null, mut);
+      // cache column
+      label(svg, 300, 22, "cache entries", "middle", 10.5, "700", mut);
+      var cy = 40;
+      for (var i = 0; i < cache.length; i++) {
+        var e = cache[i];
+        var isServed = (e.epoch === reqEpoch);
+        var fill = isServed ? css("--ok-soft") : css("--surface-soft");
+        var stroke = isServed ? css("--ok") : css("--border");
+        var g = el("g", { class: "wnode" + (isServed ? " wflash" : "") });
+        g.appendChild(box(220, cy, 160, 44, fill, stroke, isServed ? null : "5 4"));
+        svg.appendChild(g);
+        label(svg, 300, cy + 20, "key (…, " + e.epoch + ")", "middle", 10, "700");
+        label(svg, 300, cy + 36, isServed ? "served ✓" : "never served to a " + reqEpoch + "-read", "middle", 8.5, null, isServed ? css("--ok") : mut);
+        cy += 58;
+      }
+      // arrow request -> served entry (only on hit)
+      var hit = cache.some(function (e) { return e.epoch === reqEpoch; });
+      if (hit) {
+        var idx = cache.map(function (e) { return e.epoch; }).indexOf(reqEpoch);
+        var ty = 40 + idx * 58 + 22;
+        svg.appendChild(el("path", { d: "M150 100 C 190 100, 190 " + ty + ", 218 " + ty, stroke: css("--ok"), "stroke-width": 1.6, fill: "none", "marker-end": "url(#arw)" }));
+        label(svg, 185, 96, "hit", "middle", 8.5, null, css("--ok"));
+      } else {
+        svg.appendChild(el("path", { d: "M150 100 L 214 100", stroke: css("--bad"), "stroke-width": 1.6, fill: "none", "marker-end": "url(#arw)", "stroke-dasharray": "5 4" }));
+        label(svg, 185, 92, "miss", "middle", 8.5, null, css("--bad"));
+      }
+
+      if (lastAction === "read5") readout.innerHTML = "Read at epoch 5 builds key <code>(…, 5)</code> — present in the cache, so it <strong style='color:var(--ok)'>hits</strong>.";
+      else if (lastAction === "write") readout.innerHTML = "Write committed: epoch is now <strong>6</strong>. Notice the cache is <strong>untouched</strong> — no entry was invalidated. Now read at epoch 6.";
+      else readout.innerHTML = "Read at epoch 6 builds key <code>(…, 6)</code>, which is absent → <strong style='color:var(--bad)'>miss, recompute</strong>. A fresh entry is inserted. The epoch-5 entry lingers but no epoch-6 read will ever look it up, so it just ages out under LRU.";
+      bR5.disabled = (epoch !== 5);
+    }
+    bR5.onclick = function () { lastAction = "read5"; render(); };
+    bW.onclick = function () { epoch = 6; lastAction = "write"; render(); };
+    bR6.onclick = function () {
+      epoch = 6; lastAction = "read6";
+      if (!cache.some(function (e) { return e.epoch === 6; })) cache.push({ epoch: 6 });
+      render();
+    };
+    bReset.onclick = function () { cache = [{ epoch: 5 }]; epoch = 5; lastAction = "read5"; render(); };
+    render(); onTheme(render);
+  });
+})();
+</script>
