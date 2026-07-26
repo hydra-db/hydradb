@@ -365,20 +365,10 @@ impl GraphStore {
             .map(|db| db.status().current_manifest.writer_epoch())
     }
 
-    /// Refresh the writer's manifest, which is where a fence surfaces: another
-    /// node has taken the epoch while this one still holds an open handle.
-    ///
-    /// Dropping the fenced handle and returning is not enough — the next write
-    /// simply reopens the writer, re-fences the rival, and the two trade the
-    /// epoch forever. So the fence path drops the handle, waits exactly one
-    /// heartbeat interval (long enough for the rival to refresh its view and
-    /// stand down), re-promotes, and resets the backoff ladder to its floor: a
-    /// fence is view skew, not a failure, and a node that is merely converging
-    /// must not look dead. The retry is unconditional — ownership is enforced by
-    /// the caller, not here, so this node may re-fence the winner once more
-    /// before the two views agree. All three rules are sleet's
-    /// (`../sleet/src/daemon.rs:458-472`), matched deliberately.
     /// Refresh the writer's manifest, recording a re-open delay if it is fenced.
+    ///
+    /// A fence surfaces here: another node has taken the epoch while this one
+    /// still holds an open handle.
     ///
     /// **This never promotes.** It drops the fenced handle, arms
     /// [`WriterReopenGate`] and hands the error back; the next write re-derives
@@ -406,10 +396,12 @@ impl GraphStore {
                 self.log_fence_attribution(lost_epoch).await;
                 Err(err.into())
             }
-            Err(err) => {
-                self.reopen_gate().note_failure(Instant::now());
-                Err(err.into())
-            }
+            // Not a fence, and not a re-open: the handle is still open and
+            // still this node's. There is nothing for the gate to pace — a
+            // delay armed here would only be spent by some later promotion that
+            // this failure says nothing about. The ladder belongs to failed
+            // *opens*, which is where `promote_writer` arms it.
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -496,8 +488,18 @@ impl GraphStore {
         if self.open_writer().is_some() {
             return Ok(false);
         }
-        self.install_writer().await?;
-        Ok(true)
+        // A failed open is the ladder's case, and the only one: this is where a
+        // writer re-open actually happens, so it is the one place a wait can be
+        // armed that the next attempt will really spend. Without it a store that
+        // refuses every open is retried once per write, which is the hot loop
+        // the exponential ladder exists to damp.
+        match self.install_writer().await {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                self.reopen_gate().note_failure(Instant::now());
+                Err(err)
+            }
+        }
     }
 
     /// Open a fresh writer and install it. The caller must already hold
