@@ -1,5 +1,109 @@
 use super::*;
 
+use tracing::Instrument as _;
+
+/// Stamp a failure onto the span that raised it.
+///
+/// §6 of `docs/plans/2026-07-26-otel-telemetry-crate.md`: the innermost span is
+/// the one that says *why*. A `contention` class on `storage.commit` is a
+/// conflicting transaction; the same class at the root is only "a write failed".
+fn record_error_class(error: &GraphError) {
+    tracing::Span::current().record("error.class", error.class());
+}
+
+/// One `shard.write_txn` span per mutation, spanning the whole retry loop.
+///
+/// The span sits on the retry loop rather than on the individual `*_txn` call
+/// the plan's tree names, because `turbolay.writer.retries` only exists in the
+/// loop: a span per attempt would be a span *per retry*, with no single span
+/// carrying the count and nothing for a dashboard to group on.
+/// `GraphOperationalMetricsSnapshot` already counts `write_attempts`,
+/// `write_commits` and `write_retries` in aggregate — what was missing is
+/// attribution to a specific mutation, and the loop is where that lives.
+fn write_txn_span(cell_id: &str, edge_type: Option<&str>) -> tracing::Span {
+    let span = tracing::info_span!(
+        "shard.write_txn",
+        turbolay.cell_id = %cell_id,
+        turbolay.edge_type = tracing::field::Empty,
+        turbolay.commit_epoch = tracing::field::Empty,
+        turbolay.writer.retries = tracing::field::Empty,
+        error.class = tracing::field::Empty,
+    );
+    if let Some(edge_type) = edge_type {
+        span.record("turbolay.edge_type", edge_type);
+    }
+    span
+}
+
+/// The one edge type a batch touches, or `None` if it spans several.
+///
+/// A batch built by the coordinator from a single `UNWIND` carries one edge
+/// type, which is the case worth labelling. A mixed batch gets no attribute
+/// rather than a misleading one.
+fn common_edge_type(mutations: &[EdgeMutation]) -> Option<&str> {
+    let first = mutations.first()?.edge_type.as_str();
+    mutations
+        .iter()
+        .all(|mutation| mutation.edge_type == first)
+        .then_some(first)
+}
+
+/// Records `turbolay.writer.retries` on `shard.write_txn` however the retry
+/// loop exits, so no early return can forget it.
+struct WriteRetryCount {
+    span: tracing::Span,
+    retries: u64,
+}
+
+impl WriteRetryCount {
+    /// Must be constructed inside the `shard.write_txn` span.
+    fn new() -> Self {
+        Self {
+            span: tracing::Span::current(),
+            retries: 0,
+        }
+    }
+
+    fn note_retry(&mut self) {
+        self.retries += 1;
+    }
+}
+
+impl Drop for WriteRetryCount {
+    fn drop(&mut self) {
+        self.span.record("turbolay.writer.retries", self.retries);
+    }
+}
+
+/// `storage.commit`: the SlateDB commit, carrying the epoch it produced.
+///
+/// A thin wrapper over [`commit_txn_strict`] — same call, same durability
+/// argument, same error. It exists so the commit is a span of its own, which is
+/// what separates "the transaction conflicted" from "the transaction took nine
+/// seconds to become durable".
+async fn commit_txn_traced(
+    txn: DbTransaction,
+    await_durable: bool,
+    cell_id: &str,
+    edge_type: &str,
+    commit_epoch: StorageSequence,
+) -> Result<()> {
+    let span = tracing::info_span!(
+        "storage.commit",
+        turbolay.cell_id = %cell_id,
+        turbolay.edge_type = %edge_type,
+        turbolay.commit_epoch = commit_epoch,
+        error.class = tracing::field::Empty,
+    );
+    async {
+        commit_txn_strict(txn, await_durable)
+            .await
+            .inspect_err(record_error_class)
+    }
+    .instrument(span)
+    .await
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct IncidentEdge {
     edge_type: String,
@@ -2357,31 +2461,41 @@ impl GraphShard {
         validate_component("idempotency_key", &mutation.idempotency_key)?;
         self.ensure_write_authority(&mutation.cell_id, "write_edge")?;
 
-        let _permit = self.acquire_graph_write_permit("write_edge").await?;
-        let _writer = self.writer_lane(&mutation.cell_id).lock().await;
-        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
-            match self.write_edge_txn(&mutation).await {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
-                    tokio::task::yield_now().await;
+        let span = write_txn_span(&mutation.cell_id, Some(&mutation.edge_type));
+        async {
+            let mut retries = WriteRetryCount::new();
+            let _permit = self.acquire_graph_write_permit("write_edge").await?;
+            let _writer = self.writer_lane(&mutation.cell_id).lock().await;
+            for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+                match self.write_edge_txn(&mutation).await {
+                    Err(err)
+                        if is_retryable_write_conflict(&err)
+                            && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                    {
+                        self.operation_metrics
+                            .write_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                        retries.note_retry();
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(result) => {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::Span::current().record("turbolay.commit_epoch", result.epoch);
+                        return Ok(result);
+                    }
+                    result => return result.inspect_err(record_error_class),
                 }
-                Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(result);
-                }
-                result => return result,
             }
+            Err(GraphError::RetryExhausted {
+                operation: "graph transaction",
+                attempts: GRAPH_TXN_MAX_RETRIES,
+            })
+            .inspect_err(record_error_class)
         }
-        Err(GraphError::RetryExhausted {
-            operation: "graph transaction",
-            attempts: GRAPH_TXN_MAX_RETRIES,
-        })
+        .instrument(span)
+        .await
     }
 
     pub(crate) async fn write_edge_txn(&self, mutation: &EdgeMutation) -> Result<CommitResult> {
@@ -2607,7 +2721,14 @@ impl GraphShard {
                     idem_key.as_bytes(),
                     encode_commit_idempotency(mutation, &result),
                 )?;
-                commit_txn_strict(txn, self.await_durable_writes).await?;
+                commit_txn_traced(
+                    txn,
+                    self.await_durable_writes,
+                    &mutation.cell_id,
+                    &mutation.edge_type,
+                    result.epoch,
+                )
+                .await?;
                 return Ok(result);
             }
         }
@@ -2651,7 +2772,14 @@ impl GraphShard {
                 idem_key.as_bytes(),
                 encode_commit_idempotency(mutation, &result),
             )?;
-            commit_txn_strict(txn, self.await_durable_writes).await?;
+            commit_txn_traced(
+                txn,
+                self.await_durable_writes,
+                &mutation.cell_id,
+                &mutation.edge_type,
+                epoch,
+            )
+            .await?;
             return Ok(result);
         }
 
@@ -2705,7 +2833,14 @@ impl GraphShard {
             encode_commit_idempotency(mutation, &result),
         )?;
 
-        commit_txn_strict(txn, self.await_durable_writes).await?;
+        commit_txn_traced(
+            txn,
+            self.await_durable_writes,
+            &mutation.cell_id,
+            &mutation.edge_type,
+            epoch,
+        )
+        .await?;
         Ok(result)
     }
 
@@ -2847,36 +2982,46 @@ impl GraphShard {
         validate_edge_mutations_for_cell(cell_id, &mutations, "delete_edge_mutations_batch")?;
         validate_unique_delete_mutation_identities(&mutations)?;
 
-        let _permit = self
-            .acquire_graph_write_permit("delete_edge_mutations_batch")
-            .await?;
-        let _writer = self.writer_lane(cell_id).lock().await;
-        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
-            match self
-                .delete_edge_mutations_batch_txn(cell_id, &mutations)
-                .await
-            {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+        let span = write_txn_span(cell_id, common_edge_type(&mutations));
+        async {
+            let mut retries = WriteRetryCount::new();
+            let _permit = self
+                .acquire_graph_write_permit("delete_edge_mutations_batch")
+                .await?;
+            let _writer = self.writer_lane(cell_id).lock().await;
+            for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+                match self
+                    .delete_edge_mutations_batch_txn(cell_id, &mutations)
+                    .await
                 {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
-                    tokio::task::yield_now().await;
+                    Err(err)
+                        if is_retryable_write_conflict(&err)
+                            && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                    {
+                        self.operation_metrics
+                            .write_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                        retries.note_retry();
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(result) => {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::Span::current().record("turbolay.commit_epoch", result.end_epoch);
+                        return Ok(result);
+                    }
+                    result => return result.inspect_err(record_error_class),
                 }
-                Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(result);
-                }
-                result => return result,
             }
+            Err(GraphError::RetryExhausted {
+                operation: "graph transaction",
+                attempts: GRAPH_TXN_MAX_RETRIES,
+            })
+            .inspect_err(record_error_class)
         }
-        Err(GraphError::RetryExhausted {
-            operation: "graph transaction",
-            attempts: GRAPH_TXN_MAX_RETRIES,
-        })
+        .instrument(span)
+        .await
     }
 
     #[cfg(feature = "opencypher")]
@@ -3187,31 +3332,41 @@ impl GraphShard {
         validate_component("idempotency_key", &mutation.idempotency_key)?;
         self.ensure_write_authority(&mutation.cell_id, "delete_edge")?;
 
-        let _permit = self.acquire_graph_write_permit("delete_edge").await?;
-        let _writer = self.writer_lane(&mutation.cell_id).lock().await;
-        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
-            match self.delete_edge_txn(&mutation).await {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
-                    tokio::task::yield_now().await;
+        let span = write_txn_span(&mutation.cell_id, Some(&mutation.edge_type));
+        async {
+            let mut retries = WriteRetryCount::new();
+            let _permit = self.acquire_graph_write_permit("delete_edge").await?;
+            let _writer = self.writer_lane(&mutation.cell_id).lock().await;
+            for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+                match self.delete_edge_txn(&mutation).await {
+                    Err(err)
+                        if is_retryable_write_conflict(&err)
+                            && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                    {
+                        self.operation_metrics
+                            .write_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                        retries.note_retry();
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(result) => {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::Span::current().record("turbolay.commit_epoch", result.epoch);
+                        return Ok(result);
+                    }
+                    result => return result.inspect_err(record_error_class),
                 }
-                Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(result);
-                }
-                result => return result,
             }
+            Err(GraphError::RetryExhausted {
+                operation: "graph transaction",
+                attempts: GRAPH_TXN_MAX_RETRIES,
+            })
+            .inspect_err(record_error_class)
         }
-        Err(GraphError::RetryExhausted {
-            operation: "graph transaction",
-            attempts: GRAPH_TXN_MAX_RETRIES,
-        })
+        .instrument(span)
+        .await
     }
 
     pub(crate) async fn delete_edge_txn(&self, mutation: &EdgeMutation) -> Result<DeleteResult> {
@@ -3272,7 +3427,14 @@ impl GraphShard {
                     idem_key.as_bytes(),
                     encode_delete_idempotency(mutation, &result),
                 )?;
-                commit_txn_strict(txn, self.await_durable_writes).await?;
+                commit_txn_traced(
+                    txn,
+                    self.await_durable_writes,
+                    &mutation.cell_id,
+                    &mutation.edge_type,
+                    current_epoch,
+                )
+                .await?;
                 return Ok(result);
             };
             let tombstone_key = keys::out_segment_tombstone(
@@ -3292,7 +3454,14 @@ impl GraphShard {
                         idem_key.as_bytes(),
                         encode_delete_idempotency(mutation, &result),
                     )?;
-                    commit_txn_strict(txn, self.await_durable_writes).await?;
+                    commit_txn_traced(
+                        txn,
+                        self.await_durable_writes,
+                        &mutation.cell_id,
+                        &mutation.edge_type,
+                        current_epoch,
+                    )
+                    .await?;
                     return Ok(result);
                 }
             }
@@ -3344,7 +3513,14 @@ impl GraphShard {
                 idem_key.as_bytes(),
                 encode_delete_idempotency(mutation, &result),
             )?;
-            commit_txn_strict(txn, self.await_durable_writes).await?;
+            commit_txn_traced(
+                txn,
+                self.await_durable_writes,
+                &mutation.cell_id,
+                &mutation.edge_type,
+                epoch,
+            )
+            .await?;
             return Ok(result);
         };
 
@@ -3425,7 +3601,14 @@ impl GraphShard {
             encode_delete_idempotency(mutation, &result),
         )?;
 
-        commit_txn_strict(txn, self.await_durable_writes).await?;
+        commit_txn_traced(
+            txn,
+            self.await_durable_writes,
+            &mutation.cell_id,
+            &mutation.edge_type,
+            epoch,
+        )
+        .await?;
         Ok(result)
     }
 
@@ -3705,34 +3888,44 @@ impl GraphShard {
             }
         }
 
-        let _permit = self.acquire_graph_write_permit(operation).await?;
-        let _writer = self.writer_lane(cell_id).lock().await;
-        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
-            match self
-                .write_edge_mutations_batch_txn(cell_id, &mutations, operation, endpoint_labels)
-                .await
-            {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+        let span = write_txn_span(cell_id, common_edge_type(&mutations));
+        async {
+            let mut retries = WriteRetryCount::new();
+            let _permit = self.acquire_graph_write_permit(operation).await?;
+            let _writer = self.writer_lane(cell_id).lock().await;
+            for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+                match self
+                    .write_edge_mutations_batch_txn(cell_id, &mutations, operation, endpoint_labels)
+                    .await
                 {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
-                    tokio::task::yield_now().await;
+                    Err(err)
+                        if is_retryable_write_conflict(&err)
+                            && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                    {
+                        self.operation_metrics
+                            .write_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                        retries.note_retry();
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(result) => {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::Span::current().record("turbolay.commit_epoch", result.end_epoch);
+                        return Ok(result);
+                    }
+                    result => return result.inspect_err(record_error_class),
                 }
-                Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(result);
-                }
-                result => return result,
             }
+            Err(GraphError::RetryExhausted {
+                operation: "graph transaction",
+                attempts: GRAPH_TXN_MAX_RETRIES,
+            })
+            .inspect_err(record_error_class)
         }
-        Err(GraphError::RetryExhausted {
-            operation: "graph transaction",
-            attempts: GRAPH_TXN_MAX_RETRIES,
-        })
+        .instrument(span)
+        .await
     }
 
     pub async fn ingest_edge_mutations(
@@ -4999,12 +5192,27 @@ async fn delete_structural_edge_txn(
     Ok(())
 }
 
+/// `write.index_update`: the dirty marker and adjacency generation the indexer
+/// later polls.
+///
+/// Two in-transaction puts, so the span is nearly free — and it is the one place
+/// the write path and the indexing path name the same `(cell_id, edge_type,
+/// epoch)`. That triple is the attribute join §5 relies on to answer "did the
+/// write, the compile and the read agree on a generation", which is the
+/// BFG-006 / BFG-013 / BFG-014 question.
 fn mark_adjacency_dirty_txn(
     txn: &DbTransaction,
     cell_id: &str,
     edge_type: &str,
     epoch: StorageSequence,
 ) -> Result<()> {
+    let span = tracing::info_span!(
+        "write.index_update",
+        turbolay.cell_id = %cell_id,
+        turbolay.edge_type = %edge_type,
+        turbolay.commit_epoch = epoch,
+    );
+    let _entered = span.enter();
     txn.put(
         keys::matrix_dirty(cell_id, edge_type).as_bytes(),
         encode_u64(epoch),
