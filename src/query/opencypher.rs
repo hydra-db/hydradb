@@ -388,6 +388,9 @@ fn with_parsed_cypher<T>(
 /// paid once per distinct statement per thread. A query that fails to parse
 /// still has a fingerprint — it is computed from text, not from the AST — which
 /// matters because the root span is opened before anything is parsed.
+// The only caller is the client boundary; with `opencypher` alone the crate is
+// a library with no service in front of it.
+#[cfg_attr(not(feature = "client-api"), allow(dead_code))]
 pub(crate) fn opencypher_query_fingerprint(query: &str) -> String {
     PARSED_CYPHER_THREAD_CACHE.with(|cache| {
         if let Some(entry) = cache
