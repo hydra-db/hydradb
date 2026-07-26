@@ -173,6 +173,11 @@ nothing.
 
 ### 3a. Slow-query log
 
+> **Superseded.** `docs/plans/2026-07-26-otel-telemetry-crate.md` §3 adopts this
+> rule verbatim and owns its implementation, inside the `query.plan` span of the
+> read-path span tree. It is kept here for context; do not implement it twice.
+> Step 3b below is **not** superseded and stays owned by this plan.
+
 Lower risk, ship first. At query completion in `src/shard/query.rs`, where
 `explain_row_query_plan_with_stats` is already called (:408), emit a structured
 `WARN` when either condition holds:
