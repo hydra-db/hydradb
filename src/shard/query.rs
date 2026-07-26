@@ -4,6 +4,7 @@ use super::*;
 use std::sync::atomic::AtomicU64;
 #[cfg(feature = "opencypher")]
 use std::time::Duration;
+use tracing::Instrument as _;
 
 async fn run_graph_compute<T, F>(
     metrics: Arc<GraphOperationalMetrics>,
@@ -14,6 +15,13 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
+    // `kernel.expand` covers the queue wait as well as the compute, because
+    // `spawn_blocking` can sit behind a saturated blocking pool for longer than
+    // the traversal itself takes and the aggregate counters cannot tell the two
+    // apart on a single query. The span cannot follow the closure onto the
+    // blocking thread, which is exactly why the wrapper is the right place for
+    // it. `operation` is the rung of the sparse-kernel ladder that ran.
+    let span = tracing::info_span!("kernel.expand", turbolay.kernel = operation);
     let queued_at = std::time::Instant::now();
     tokio::task::spawn_blocking(move || {
         let queue_us = queued_at
@@ -39,6 +47,7 @@ where
         );
         result
     })
+    .instrument(span)
     .await
     .map_err(|err| GraphError::CorruptValue {
         key: format!("query/compute/{operation}"),
@@ -440,6 +449,21 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
+    // `skip_all` is not tidiness: `query` holds the lowered predicate tree with
+    // every parameter value already substituted in, and `context` holds the
+    // parameter map itself. Neither may ever reach a span.
+    #[tracing::instrument(
+        name = "query.execute",
+        level = "info",
+        skip_all,
+        fields(
+            turbolay.cell_id = %context.cell_id,
+            turbolay.read_epoch = tracing::field::Empty,
+            turbolay.query.rows_returned = tracing::field::Empty,
+            error.class = tracing::field::Empty,
+            turbolay.sampling.force = tracing::field::Empty,
+        )
+    )]
     async fn execute_parsed_opencypher_rows(
         &self,
         context: QueryContext,
@@ -457,14 +481,26 @@ impl GraphShard {
             .fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
         let result = if context.read_epoch.is_none() {
-            let snapshot = if context.uses_refreshed_reader() {
-                self.db.reader_snapshot().await
-            } else {
-                self.db.snapshot().await
-            };
+            // The epoch every freshness bug is an argument about is decided
+            // here, by whichever of the two readers the context selected — so
+            // the choice is a field, not an inference from which code path ran.
+            let snapshot = async {
+                if context.uses_refreshed_reader() {
+                    self.db.reader_snapshot().await
+                } else {
+                    self.db.snapshot().await
+                }
+            }
+            .instrument(tracing::info_span!(
+                "storage.snapshot",
+                turbolay.cell_id = %context.cell_id,
+                refreshed_reader = context.uses_refreshed_reader(),
+            ))
+            .await;
             match snapshot {
                 Ok(snapshot) => {
                     let read_epoch = snapshot.seq();
+                    tracing::Span::current().record("turbolay.read_epoch", read_epoch);
                     let context = context.with_validated_storage_read_epoch(read_epoch, read_epoch);
                     GraphStore::scope_snapshot(
                         snapshot,
@@ -482,6 +518,7 @@ impl GraphShard {
         self.operation_metrics
             .query_rows_duration_us
             .fetch_add(elapsed_us, Ordering::Relaxed);
+        let span = tracing::Span::current();
         match &result {
             Ok(result_set) => {
                 self.operation_metrics
@@ -490,11 +527,17 @@ impl GraphShard {
                 self.operation_metrics
                     .query_rows_returned
                     .fetch_add(result_set.rows.len() as u64, Ordering::Relaxed);
+                span.record("turbolay.query.rows_returned", result_set.rows.len() as u64);
+                if let Some(read_epoch) = result_set.read_epoch {
+                    span.record("turbolay.read_epoch", read_epoch);
+                }
             }
-            Err(_) => {
+            Err(err) => {
                 self.operation_metrics
                     .query_rows_failed
                     .fetch_add(1, Ordering::Relaxed);
+                span.record("error.class", err.class());
+                span.record("turbolay.sampling.force", true);
             }
         }
         result
@@ -5022,7 +5065,7 @@ impl GraphShard {
             let (min_hops, max_hops) = hop_range;
             budget.check("cypher_graphblas_artifact_lookup")?;
             let Some(artifact) = self
-                .latest_matrix_artifact(cell_id, edge_type, read_epoch)
+                .traced_latest_matrix_artifact(cell_id, edge_type, read_epoch)
                 .await?
             else {
                 return Ok(None);
@@ -5085,7 +5128,7 @@ impl GraphShard {
             budget.check("cypher_graphblas_count_artifact_lookup")?;
             let artifact_started = std::time::Instant::now();
             let Some(artifact) = self
-                .latest_matrix_artifact(cell_id, edge_type, read_epoch)
+                .traced_latest_matrix_artifact(cell_id, edge_type, read_epoch)
                 .await?
             else {
                 return Ok(None);
@@ -5173,7 +5216,11 @@ impl GraphShard {
                 .budget
                 .check("cypher_graphblas_window_artifact_lookup")?;
             let Some(artifact) = self
-                .latest_matrix_artifact(request.cell_id, request.edge_type, request.read_epoch)
+                .traced_latest_matrix_artifact(
+                    request.cell_id,
+                    request.edge_type,
+                    request.read_epoch,
+                )
                 .await?
             else {
                 return Ok(None);
@@ -5243,6 +5290,52 @@ impl GraphShard {
         }
     }
 
+    /// `latest_matrix_artifact` with the `artifact.lookup` span around it.
+    ///
+    /// The generation this resolves to is the join key that BFG-006, BFG-013
+    /// and BFG-014 are all really about: the question in every one of them is
+    /// whether the write, the index cycle and the read agreed on a generation.
+    /// The indexer records the same `cell_id` and `base_sequence` on the span
+    /// that produced the artifact, so the join is a backend query rather than
+    /// two log files and a clock.
+    async fn traced_latest_matrix_artifact(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        read_epoch: StorageSequence,
+    ) -> Result<Option<MatrixArtifact>> {
+        let span = tracing::info_span!(
+            "artifact.lookup",
+            turbolay.cell_id = %cell_id,
+            turbolay.edge_type = %edge_type,
+            turbolay.read_epoch = read_epoch,
+            turbolay.base_sequence = tracing::field::Empty,
+            found = tracing::field::Empty,
+            error.class = tracing::field::Empty,
+            turbolay.sampling.force = tracing::field::Empty,
+        );
+        let artifact = self
+            .latest_matrix_artifact(cell_id, edge_type, read_epoch)
+            .instrument(span.clone())
+            .await;
+        match &artifact {
+            Ok(Some(artifact)) => {
+                span.record("found", true);
+                span.record("turbolay.base_sequence", artifact.base_epoch);
+            }
+            // Absence is the interesting case: it means the read fell off the
+            // compiled path and back onto a scan.
+            Ok(None) => {
+                span.record("found", false);
+            }
+            Err(err) => {
+                span.record("error.class", err.class());
+                span.record("turbolay.sampling.force", true);
+            }
+        }
+        artifact
+    }
+
     pub(crate) async fn compiled_graphblas_query_snapshot(
         &self,
         cell_id: &str,
@@ -5286,10 +5379,37 @@ impl GraphShard {
                 if generation.base_sequence >= read_epoch {
                     return Ok(Some((compiled, None, false)));
                 }
-                match self
+                // The gap between the compiled generation and the read epoch,
+                // replayed from the WAL. BFG-011 was a hole in exactly this
+                // span's window, so both ends of it are recorded: what the
+                // artifact was built from and what the read needs to see.
+                let tail_span = tracing::info_span!(
+                    "storage.wal_tail",
+                    turbolay.cell_id = %cell_id,
+                    turbolay.edge_type = %edge_type,
+                    turbolay.read_epoch = read_epoch,
+                    turbolay.base_sequence = generation.base_sequence,
+                    outcome = tracing::field::Empty,
+                    error.class = tracing::field::Empty,
+                    turbolay.sampling.force = tracing::field::Empty,
+                );
+                let tail = self
                     .topology_tail_since(&generation, storage_snapshot.as_ref(), read_epoch, budget)
-                    .await
-                {
+                    .instrument(tail_span.clone())
+                    .await;
+                match &tail {
+                    Ok(GraphTopologyTail::Complete(_)) => {
+                        tail_span.record("outcome", "complete");
+                    }
+                    Ok(GraphTopologyTail::Unavailable) => {
+                        tail_span.record("outcome", "unavailable");
+                    }
+                    Err(err) => {
+                        tail_span.record("error.class", err.class());
+                        tail_span.record("turbolay.sampling.force", true);
+                    }
+                }
+                match tail {
                     Ok(GraphTopologyTail::Complete(overlay)) => {
                         return Ok(Some((compiled, Some(overlay), false)));
                     }
