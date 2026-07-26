@@ -115,7 +115,7 @@ fn routing_unavailable<T>(reason: &str) -> Result<T> {
 impl BoltRoutingTableProvider for ObjectStoreBoltRoutingTableProvider {
     async fn routing_table(
         &self,
-        _database: &str,
+        database: &str,
         target: &ClientQueryTarget,
     ) -> Result<BoltRoutingTable> {
         // One snapshot for the whole table. Deriving the reader list and the
@@ -123,54 +123,86 @@ impl BoltRoutingTableProvider for ObjectStoreBoltRoutingTableProvider {
         // and produce a table naming two different fleets.
         let view = self.placement.view();
         let scope = target.scope.to_string();
-
-        // `nodes()` is empty for a shed view (decision 7), so a node that has
-        // lost sight of the fleet advertises nothing rather than a stale fleet.
-        // Sorted by node id, because the underlying set is, so a table is stable
-        // between refreshes that did not change the live set.
-        let live_addresses = view
-            .nodes()
-            .iter()
-            .filter_map(|node| self.node_addresses.get(&node.node_id).cloned())
-            .collect::<Vec<_>>();
-        if live_addresses.is_empty() {
-            return routing_unavailable("no live graph node is addressable from this node");
-        }
-
-        // Deliberately resolved over the *unfiltered* live set, which is what
-        // `ensure_local_writer` computes over: silently picking the runner-up
-        // because the winner has no configured Bolt address would advertise a
-        // node that refuses every write it is sent.
-        let writer = match self.placement.owner_in(&view, &scope, &target.cell_id) {
-            Some(owner) => match self.node_addresses.get(&owner) {
-                Some(address) => address.clone(),
-                // Config, not liveness: this node's directory and its Bolt
-                // address map disagree about who the fleet is. `graph-node`
-                // builds the directory *from* the address map's keys, so the
-                // two cannot diverge there; reaching this means an embedder
-                // built them separately, and no other router will answer
-                // differently.
-                None => {
-                    return bolt_config_error(
-                        "object-store routing has no Bolt address for the cell's owning node",
-                    )
-                }
-            },
-            // `None` covers both a known-empty fleet and a shed view. A routing
-            // table has the same answer for either — there is no WRITE endpoint
-            // to advertise — which is why collapsing them is safe here and is
-            // not safe in `ensure_local_writer`.
-            None => return routing_unavailable("no live node owns this cell"),
+        let owner = self.placement.owner_in(&view, &scope, &target.cell_id);
+        let ownership = match owner.as_deref() {
+            Some(owner) if owner == self.placement.local_node_id() => "local",
+            Some(_) => "remote",
+            None if matches!(view.state(), turbolay_placement::liveness::ViewState::Shed) => {
+                "unknown"
+            }
+            None => "unowned",
         };
+        let span = tracing::info_span!(
+            "bolt.route",
+            db.system.name = "neo4j",
+            db.namespace = %database,
+            turbolay.scope = %scope,
+            turbolay.cell_id = %target.cell_id,
+            turbolay.node_id = %self.placement.local_node_id(),
+            turbolay.placement.state = view.state().as_str(),
+            turbolay.placement.live_nodes = view.nodes().len(),
+            turbolay.placement.ownership = ownership,
+            error.class = tracing::field::Empty,
+        );
+        let _entered = span.enter();
 
-        BoltRoutingTable::new(
-            self.routing_ttl_secs,
-            vec![
-                BoltRoutingServer::new("ROUTE", live_addresses.clone())?,
-                BoltRoutingServer::new("READ", live_addresses)?,
-                BoltRoutingServer::new("WRITE", [writer])?,
-            ],
-        )
+        let result = (|| {
+            // `nodes()` is empty for a shed view (decision 7), so a node that has
+            // lost sight of the fleet advertises nothing rather than a stale fleet.
+            // Sorted by node id, because the underlying set is, so a table is stable
+            // between refreshes that did not change the live set.
+            let live_addresses = view
+                .nodes()
+                .iter()
+                .filter_map(|node| self.node_addresses.get(&node.node_id).cloned())
+                .collect::<Vec<_>>();
+            if live_addresses.is_empty() {
+                return routing_unavailable("no live graph node is addressable from this node");
+            }
+
+            // Deliberately resolved over the *unfiltered* live set, which is what
+            // `ensure_local_writer` computes over: silently picking the runner-up
+            // because the winner has no configured Bolt address would advertise a
+            // node that refuses every write it is sent.
+            let writer =
+                match owner {
+                    Some(owner) => match self.node_addresses.get(&owner) {
+                        Some(address) => address.clone(),
+                        // Config, not liveness: this node's directory and its Bolt
+                        // address map disagree about who the fleet is. `graph-node`
+                        // builds the directory *from* the address map's keys, so the
+                        // two cannot diverge there; reaching this means an embedder
+                        // built them separately, and no other router will answer
+                        // differently.
+                        None => return bolt_config_error(
+                            "object-store routing has no Bolt address for the cell's owning node",
+                        ),
+                    },
+                    // `None` covers both a known-empty fleet and a shed view. A routing
+                    // table has the same answer for either — there is no WRITE endpoint
+                    // to advertise — which is why collapsing them is safe here and is
+                    // not safe in `ensure_local_writer`.
+                    None => return routing_unavailable("no live node owns this cell"),
+                };
+
+            BoltRoutingTable::new(
+                self.routing_ttl_secs,
+                vec![
+                    BoltRoutingServer::new("ROUTE", live_addresses.clone())?,
+                    BoltRoutingServer::new("READ", live_addresses)?,
+                    BoltRoutingServer::new("WRITE", [writer])?,
+                ],
+            )
+        })();
+        if let Err(error) = &result {
+            span.record("error.class", error.class());
+            tracing::warn!(
+                error.class = error.class(),
+                error = %error,
+                "Bolt routing request failed"
+            );
+        }
+        result
     }
 }
 

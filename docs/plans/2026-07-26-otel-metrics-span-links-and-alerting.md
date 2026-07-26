@@ -786,6 +786,29 @@ client, so the rate is not a user-impact rate. Pair it with
 alert on any occurrence. If it is not, the first question is which of the five
 variants is firing and whether that is a bug rather than an alerting problem.
 
+### Candidate 5 — correlated placement shedding
+
+**Signal.** The `placement view state changed` log carries
+`turbolay.placement.previous_state`, `turbolay.placement.state`,
+`turbolay.placement.live_nodes`, `node_id` and
+`since_last_success_ms`. It is emitted only on a state transition, including
+the recovery to `fresh`; the per-refresh LIST warning remains the detailed
+store-error stream. `bolt.route` spans carry the same current state plus
+`turbolay.placement.ownership`, so a routing refusal can be joined to the state
+that caused it without parsing its error text.
+
+**Alert on correlation, not one node.** One node entering `shed` can be a local
+object-store or network fault and is exactly the case withdrawal is designed to
+contain. Several `service.instance.id` values entering `shed` within one
+`heartbeat_timeout` means the shared LIST dependency is failing and Kubernetes
+is draining Service endpoints together. Page when the distinct-instance count
+reaches the deployment's replica count; chart and ticket a single-node event.
+Resolve on the matching transitions back to `fresh`.
+
+**Sampling is not a problem.** The transition is an OTel log record, not a
+sampled span, so the distinct-node count is exact. The `bolt.route` spans are
+diagnostic context and may remain ratio-sampled.
+
 ### Not candidates
 
 `query.admission` rejections and `QueryTimeout` are admission control working;

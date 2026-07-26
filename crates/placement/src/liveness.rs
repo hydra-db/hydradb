@@ -160,6 +160,20 @@ pub enum ViewState {
 }
 
 impl ViewState {
+    /// Stable telemetry vocabulary for this state.
+    ///
+    /// Lower-case strings are deliberate: they are emitted by the kernel when
+    /// a placement view changes state, so changing one is a telemetry schema
+    /// change rather than a cosmetic rename.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Grace => "grace",
+            Self::Shed => "shed",
+        }
+    }
+
     /// What the publisher must do with this node's heartbeat.
     #[must_use]
     pub fn heartbeat_action(self) -> HeartbeatAction {
@@ -644,5 +658,12 @@ mod tests {
     #[test]
     fn grace_is_exactly_the_heartbeat_timeout_and_not_a_separate_knob() {
         assert_eq!(fleet().grace(), TIMEOUT);
+    }
+
+    #[test]
+    fn view_state_telemetry_vocabulary_is_stable() {
+        assert_eq!(ViewState::Fresh.as_str(), "fresh");
+        assert_eq!(ViewState::Grace.as_str(), "grace");
+        assert_eq!(ViewState::Shed.as_str(), "shed");
     }
 }

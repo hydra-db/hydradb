@@ -484,9 +484,10 @@ impl PlacementView {
         &self,
         listed: std::result::Result<Vec<HeartbeatEntry>, PlacementError>,
     ) -> Arc<LiveView> {
-        let view = {
+        let (view, previous, current, since_last_success) = {
             let mut state = lock(&self.shared.refresh);
-            match listed {
+            let since_last_success = state.since_last_success();
+            let view = match listed {
                 Ok(entries) => {
                     let since_start = state.since_start();
                     let view = state.live.observe_list(&entries, since_start);
@@ -497,21 +498,38 @@ impl PlacementView {
                     // A failure teaches this node nothing about the fleet, so
                     // `observe_list_failure` takes `&self` and leaves the cache
                     // alone. All that changes is how long it has been trusted.
-                    let since_last_success = state.since_last_success();
                     let view = state.live.observe_list_failure(since_last_success);
                     tracing::warn!(
                         node_id = %self.shared.local_node_id,
-                        state = ?view.state(),
+                        turbolay.placement.state = view.state().as_str(),
                         since_last_success_ms = since_last_success.as_millis(),
                         error = %error,
                         "placement heartbeat LIST failed"
                     );
                     view
                 }
-            }
+            };
+            let view = Arc::new(view);
+            // Publish before releasing `refresh`. The loop normally has one
+            // writer, but `refresh` is public; keeping the two locks in this
+            // order prevents concurrent direct refreshes from publishing their
+            // snapshots out of observation order.
+            let mut published = write_lock(&self.shared.published);
+            let previous = published.state();
+            let current = view.state();
+            *published = Arc::clone(&view);
+            (view, previous, current, since_last_success)
         };
-        let view = Arc::new(view);
-        *write_lock(&self.shared.published) = Arc::clone(&view);
+        if previous != current {
+            tracing::info!(
+                node_id = %self.shared.local_node_id,
+                turbolay.placement.previous_state = previous.as_str(),
+                turbolay.placement.state = current.as_str(),
+                turbolay.placement.live_nodes = view.nodes().len(),
+                since_last_success_ms = since_last_success.as_millis(),
+                "placement view state changed"
+            );
+        }
         view
     }
 
