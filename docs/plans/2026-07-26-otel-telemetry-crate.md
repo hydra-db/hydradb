@@ -1,9 +1,10 @@
 ---
 title: OpenTelemetry logs and traces via a turbolay-telemetry crate
-status: draft-for-review
+status: step-4-complete
 date: 2026-07-26
 branch: Turbolay-V3.5
 base_commit: 4e7cb82
+head_commit: 8253c20
 tags:
   - observability
   - opentelemetry
@@ -82,6 +83,68 @@ the files it was derived from.
 - `../sleet/src/daemon.rs:458-472` — the fenced-handle re-open delay that
   `src/core/state.rs:380-410` deliberately matches. Worth reading before
   changing anything in `refresh_writer_fence`.
+
+## What implementation falsified
+
+Steps 1–4 and 5a landed in 22 commits, `0fe1e91`…`8253c20`. Five things in
+this plan turned out to be wrong about the code, and they are recorded here
+rather than silently corrected in the prose above, because each one was
+believed on the strength of a code read and only a build disproved it.
+
+**The crate had never been compiled.** `crates/telemetry` was written but never
+added to `[workspace] members`, and its `{ workspace = true }` dependencies
+meant `cargo metadata` inside it failed outright. All 2,602 lines were
+unverified against the OpenTelemetry API they target. That was the real risk in
+this plan and nothing in §1 hints at it, because §1 describes a crate that
+exists. It compiles now, both feature configurations.
+
+**The `otlp` feature was non-functional in both directions.** With no endpoint,
+the empty OTLP layer vector made `register_callsite` return `Interest::never()`
+and silenced every log line in the process — the fmt layer included — so a node
+built with the feature and deployed without a collector booted, served traffic
+and printed nothing. With an endpoint, `reqwest-client` panicked on the SDK's
+non-tokio batch threads and nothing reached the collector at all. §1's claim
+that "with the feature off the crate still builds and `init()` still works" was
+true; the *on* case was never exercised.
+
+**`span.record()` destroyed the fields set at span creation, in JSON only.**
+`FormatFields::add_fields` defaults to appending, so the stored buffer became
+two concatenated JSON objects and the event formatter dropped the span's
+fields entirely. This plan's own deferred-attribute pattern — declare `Empty`,
+fill on completion, pay nothing on the healthy path — was the trigger, so the
+fields most affected were `turbolay.cell_id` on exactly the
+`writer.fence_refresh` spans §4 wants grouped by cell. OTLP was unaffected,
+which is why it would have survived a collector-side test.
+
+**§4's span tree does not match the call graph.** `ensure_local_writer` calls
+neither `ensure_write_authority` nor `refresh_writer_fence`; the first is
+reached from ~30 shard write entry points and the second from
+`acquire_local_write_guard` / `validate_write_fence`. They are instrumented
+where they live, under `shard.write_txn`, rather than moving calls to match a
+drawing. Relatedly `shard.write_txn` sits on the retry *loop* rather than on
+`write_edge_txn`, because `turbolay.writer.retries` exists only in the loop —
+a span on the function would be one span per retry with nothing carrying the
+count.
+
+**§3's root span placement gave one trace per PULL.** Bolt never passes
+through `execute_page`: RUN goes to `prepare_page_request` and each PULL to
+`execute_prepared_page`. Rooting at that boundary — which is what "the point
+both Bolt and HTTP funnel through" implies — produces a separate trace per
+page for a lazily paging client, defeating the `query.page` span it was paired
+with. The root now opens once at RUN and is held on `PendingBoltResult`.
+
+Two smaller corrections: `query.plan` had to be attached to
+`optimize_row_match_groups_with_stats` and `optimize_row_patterns_with_stats`,
+not `explain_row_query_plan_with_stats`, which is reachable only from `EXPLAIN`
+and would never have fired in production; and `query.admission` sits on the
+namespace and query semaphores rather than `effective_runtime_limit_ms`, which
+is pure arithmetic and burns no budget.
+
+Still open: `turbolay.node_id` is on no read-path span, because the client
+service has no handle on its own node identity — it needs threading in from
+`init()`. `access_path` and `optimizer_passes` are comma-joined strings rather
+than `string[]`, since the `tracing` facade has no array value type; splitting
+them belongs in the OTLP bridge. Step 5b is not started.
 
 ## What we found first
 
