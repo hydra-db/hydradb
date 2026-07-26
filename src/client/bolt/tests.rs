@@ -1339,6 +1339,66 @@ async fn bolt_server_closes_connections_that_miss_the_authentication_deadline() 
 }
 
 #[tokio::test]
+async fn unauthenticated_reset_logoff_cannot_refresh_authentication_deadline() {
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        bolt_test_service(),
+        bolt_test_config()
+            .with_authentication_timeout(Duration::from_secs(1))
+            .with_idle_timeout(Duration::from_secs(3)),
+    )
+    .await
+    .unwrap();
+    let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
+    stream.write_all(&BOLT_MAGIC).await.unwrap();
+    stream
+        .write_all(&[0, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut selected = [0_u8; 4];
+    stream.read_exact(&mut selected).await.unwrap();
+    assert_eq!(selected, [0, 0, 4, 5]);
+
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut reader = ChunkReader::new(read_half);
+    let mut writer = ChunkWriter::new(write_half);
+    send_test_bolt_client_message(
+        &mut writer,
+        &ClientMessage::Hello {
+            extra: BoltDict::new(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+
+    send_test_bolt_client_message(&mut writer, &ClientMessage::Reset).await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Failure { .. }
+    ));
+    send_test_bolt_client_message(&mut writer, &ClientMessage::Reset).await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    send_test_bolt_client_message(&mut writer, &ClientMessage::Logoff).await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Failure { .. }
+    ));
+
+    let read = tokio::time::timeout(Duration::from_secs(1), reader.read_message())
+        .await
+        .unwrap();
+    assert!(read.is_err());
+    server.stop().await.unwrap();
+}
+#[tokio::test]
 async fn authenticated_bolt_connections_use_the_separate_idle_timeout() {
     let server = ClientBoltServer::bind(
         "127.0.0.1:0".parse().unwrap(),
