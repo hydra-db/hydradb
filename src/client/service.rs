@@ -17,9 +17,9 @@ use crate::query::coordination::{
     QueryTransportScopeAuthorizer, QueryTransportSecret, QueryTransportServerConfig,
 };
 use crate::query::opencypher::{
-    classify_opencypher_query_access, parse_opencypher_mutation_query_with_parameters,
-    parse_opencypher_row_query_with_parameters, parse_opencypher_unwind_batch,
-    OpenCypherQueryAccess, ParsedUnwindBatchKind,
+    classify_opencypher_query_access, opencypher_query_fingerprint,
+    parse_opencypher_mutation_query_with_parameters, parse_opencypher_row_query_with_parameters,
+    parse_opencypher_unwind_batch, OpenCypherQueryAccess, ParsedUnwindBatchKind,
 };
 use crate::{
     validate_component, EdgeMetadata, GraphError, GraphId, GraphScope, NamespaceId, NamespacePath,
@@ -28,6 +28,7 @@ use crate::{
     QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow, Result, StorageSequence,
     VertexMetadata, VertexPropertyValue,
 };
+use tracing::Instrument as _;
 
 const DEFAULT_MAX_QUERY_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_PARAMETERS: usize = 1024;
@@ -391,10 +392,7 @@ pub fn sanitize_caller_metadata(value: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed.len() > MAX_CALLER_METADATA_LEN {
         return None;
     }
-    if !trimmed
-        .chars()
-        .all(|ch| ch.is_ascii_graphic() || ch == ' ')
-    {
+    if !trimmed.chars().all(|ch| ch.is_ascii_graphic() || ch == ' ') {
         return None;
     }
     Some(trimmed.to_string())
@@ -872,28 +870,57 @@ impl ClientQueryService {
         })
     }
 
+    /// Block until this cell has durably reached the bookmarked epoch.
+    ///
+    /// The span exists only when a bookmark does, and its duration *is*
+    /// read-your-writes latency, which no counter measures today. It is the
+    /// first thing to look at for the BFG-007 class of complaint — "the write
+    /// succeeded but the read did not see it" — because it separates "we waited
+    /// for the epoch" from "we never waited and read stale".
+    ///
+    /// The bookmark value itself is never recorded: it is an opaque
+    /// caller-held token, and §2 puts it on the never-recorded list. Its
+    /// *epoch* is recorded, which is the part that explains anything.
     pub async fn ensure_bookmark(&self, bookmark: &ClientBookmark) -> Result<()> {
-        let current_sequence = self
-            .inner
-            .client
-            .wait_for_storage_sequence(
-                &bookmark.target.scope,
-                &bookmark.target.cell_id,
-                bookmark.epoch,
-            )
-            .await?
-            .ok_or_else(|| GraphError::UnsupportedQuery {
-                dialect: "ClientProtocol",
-                feature: "backend cannot prove bookmark durability".to_string(),
-            })?;
-        if current_sequence < bookmark.epoch {
-            return Err(GraphError::SnapshotAhead {
-                cell_id: bookmark.target.cell_id.clone(),
-                read_epoch: bookmark.epoch,
-                current_epoch: current_sequence,
-            });
+        let span = tracing::info_span!(
+            "query.bookmark_wait",
+            turbolay.scope = %bookmark.target.scope,
+            turbolay.cell_id = %bookmark.target.cell_id,
+            turbolay.read_epoch = bookmark.epoch,
+            observed_epoch = tracing::field::Empty,
+            error.class = tracing::field::Empty,
+            turbolay.sampling.force = tracing::field::Empty,
+        );
+        let outcome = async {
+            let current_sequence = self
+                .inner
+                .client
+                .wait_for_storage_sequence(
+                    &bookmark.target.scope,
+                    &bookmark.target.cell_id,
+                    bookmark.epoch,
+                )
+                .await?
+                .ok_or_else(|| GraphError::UnsupportedQuery {
+                    dialect: "ClientProtocol",
+                    feature: "backend cannot prove bookmark durability".to_string(),
+                })?;
+            tracing::Span::current().record("observed_epoch", current_sequence);
+            if current_sequence < bookmark.epoch {
+                return Err(GraphError::SnapshotAhead {
+                    cell_id: bookmark.target.cell_id.clone(),
+                    read_epoch: bookmark.epoch,
+                    current_epoch: current_sequence,
+                });
+            }
+            Ok(())
         }
-        Ok(())
+        .instrument(span.clone())
+        .await;
+        if let Err(err) = &outcome {
+            record_span_error(&span, err);
+        }
+        outcome
     }
 
     pub fn authenticate(
@@ -932,6 +959,31 @@ impl ClientQueryService {
     pub async fn execute_rows(
         &self,
         session: &ClientQuerySession,
+        request: ClientQueryRequest,
+    ) -> Result<ClientQueryResult> {
+        let span = client_root_span(&request, None);
+        let result = self
+            .execute_rows_inner(session, request)
+            .instrument(span.clone())
+            .await;
+        match &result {
+            Ok(response) => {
+                span.record(
+                    "turbolay.query.rows_returned",
+                    response.result.rows.len() as u64,
+                );
+                if let Some(read_epoch) = response.read_epoch {
+                    span.record("turbolay.read_epoch", read_epoch);
+                }
+            }
+            Err(err) => record_span_error(&span, err),
+        }
+        result
+    }
+
+    async fn execute_rows_inner(
+        &self,
+        session: &ClientQuerySession,
         mut request: ClientQueryRequest,
     ) -> Result<ClientQueryResult> {
         if request.read_epoch.is_some() {
@@ -943,6 +995,10 @@ impl ClientQueryService {
         }
         self.validate_request(&request, None)?;
         let runtime_limit_ms = self.normalize_runtime_limit(&mut request)?;
+        // The limit belongs on the root, not on admission: the staging report
+        // of "29999 ms; limit is 29999 ms" is only legible next to the budget
+        // it was measured against.
+        tracing::Span::current().record("runtime_limit_ms", runtime_limit_ms);
         let action = self.authorize_query(session, &request)?;
         let parsed_unwind = parse_opencypher_unwind_batch(&request.query)?;
         let (batch_operation, scalar_parameters) = match parsed_unwind {
@@ -1031,6 +1087,33 @@ impl ClientQueryService {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<ClientQueryPage> {
+        let span = client_root_span(&request, None);
+        let result = self
+            .execute_page_inner(session, request, cursor, page_size)
+            .instrument(span.clone())
+            .await;
+        match &result {
+            Ok(response) => {
+                span.record(
+                    "turbolay.query.rows_returned",
+                    response.page.rows.len() as u64,
+                );
+                if let Some(read_epoch) = response.read_epoch {
+                    span.record("turbolay.read_epoch", read_epoch);
+                }
+            }
+            Err(err) => record_span_error(&span, err),
+        }
+        result
+    }
+
+    async fn execute_page_inner(
+        &self,
+        session: &ClientQuerySession,
+        request: ClientQueryRequest,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<ClientQueryPage> {
         if cursor.is_none() && request.read_epoch.is_some() {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "ClientProtocol",
@@ -1041,11 +1124,45 @@ impl ClientQueryService {
         let prepared = self
             .prepare_page_request(session, request, page_size)
             .await?;
-        self.execute_prepared_page(session, prepared, cursor, page_size)
+        // Already inside this request's root span, so go straight to the body.
+        self.execute_prepared_page_inner(session, prepared, cursor, page_size)
             .await
     }
 
+    /// The Bolt execution boundary: RUN prepares, each PULL lands here.
+    ///
+    /// It carries its own root because Bolt never passes through
+    /// [`Self::execute_page`] — without one, the busiest read path in
+    /// production would be the only one with no correlation id, no fingerprint
+    /// and no trace at all.
     pub(crate) async fn execute_prepared_page(
+        &self,
+        session: &ClientQuerySession,
+        prepared: PreparedClientQuery,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<ClientQueryPage> {
+        let span = client_root_span(&prepared.request, Some(prepared.action));
+        let result = self
+            .execute_prepared_page_inner(session, prepared, cursor, page_size)
+            .instrument(span.clone())
+            .await;
+        match &result {
+            Ok(response) => {
+                span.record(
+                    "turbolay.query.rows_returned",
+                    response.page.rows.len() as u64,
+                );
+                if let Some(read_epoch) = response.read_epoch {
+                    span.record("turbolay.read_epoch", read_epoch);
+                }
+            }
+            Err(err) => record_span_error(&span, err),
+        }
+        result
+    }
+
+    async fn execute_prepared_page_inner(
         &self,
         session: &ClientQuerySession,
         prepared: PreparedClientQuery,
@@ -1177,7 +1294,8 @@ impl ClientQueryService {
             .prepare_requests
             .fetch_add(1, Ordering::Relaxed);
         self.validate_request(&request, Some(page_size))?;
-        self.normalize_runtime_limit(&mut request)?;
+        let runtime_limit_ms = self.normalize_runtime_limit(&mut request)?;
+        tracing::Span::current().record("runtime_limit_ms", runtime_limit_ms);
         let action = self.authorize_query(session, &request)?;
         self.validate_bookmark(&request).await?;
 
@@ -1616,10 +1734,31 @@ impl ClientQueryService {
             .queries_started
             .fetch_add(1, Ordering::Relaxed);
         let result = AssertUnwindSafe(async {
-            let _namespace_permits = self
-                .acquire_namespace_permits(&key.scope.namespace, cancellation_token)
-                .await?;
-            let _query_permit = self.acquire_query_permit(cancellation_token).await?;
+            // Admission is the only phase that can consume the whole runtime
+            // budget without the query having started, so it gets its own span:
+            // a trace where `query.admission` is most of the wall clock is a
+            // backpressure report, not a slow query.
+            let admission = tracing::info_span!(
+                "query.admission",
+                turbolay.scope = %key.scope,
+                error.class = tracing::field::Empty,
+            );
+            let permits = async {
+                let namespace_permits = self
+                    .acquire_namespace_permits(&key.scope.namespace, cancellation_token)
+                    .await?;
+                let query_permit = self.acquire_query_permit(cancellation_token).await?;
+                Ok((namespace_permits, query_permit))
+            }
+            .instrument(admission.clone())
+            .await;
+            let (_namespace_permits, _query_permit) = match permits {
+                Ok(permits) => permits,
+                Err(err) => {
+                    record_span_error(&admission, &err);
+                    return Err(err);
+                }
+            };
             execute.await
         })
         .catch_unwind()
@@ -1745,6 +1884,83 @@ impl ClientQueryService {
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Record a failure on the span that is closest to producing it.
+///
+/// The same error carried up to the root says only that a request failed; the
+/// class recorded here says which subsystem refused, which is a different
+/// question and the one an operator asks first.
+fn record_span_error(span: &tracing::Span, err: &GraphError) {
+    span.record("error.class", err.class());
+    // A head sampler decides before the span closes, so the keep decision has
+    // to be a field it can see rather than a status it cannot.
+    span.record("turbolay.sampling.force", true);
+}
+
+/// The trace root for one client request.
+///
+/// Opened at the service boundary — the point both Bolt and HTTP funnel
+/// through — so that every span below it inherits `scope`, `cell_id`, the query
+/// fingerprint and the caller's correlation fields without any of them being
+/// threaded through a call signature.
+///
+/// Reads and mutations get different *names* rather than an attribute, because
+/// the write path below this point is a different span tree entirely and a
+/// backend that has to filter on an attribute to separate them will get it
+/// wrong once.
+fn client_root_span(
+    request: &ClientQueryRequest,
+    action: Option<QueryTransportAction>,
+) -> tracing::Span {
+    let mutation = match action {
+        Some(action) => action == QueryTransportAction::Write,
+        // Cheap: classification runs through the same thread-local parse cache
+        // the request is about to use anyway, so this is a cache lookup and the
+        // authorization path below re-reads the same entry. A parse failure is
+        // not decided here — it surfaces with its real error a few lines later.
+        None => matches!(
+            classify_opencypher_query_access(&request.query),
+            Ok(OpenCypherQueryAccess::Write)
+        ),
+    };
+    let fingerprint = opencypher_query_fingerprint(&request.query);
+    macro_rules! root_span {
+        ($name:literal) => {
+            tracing::info_span!(
+                $name,
+                db.system.name = "neo4j",
+                turbolay.scope = %request.target.scope,
+                turbolay.cell_id = %request.target.cell_id,
+                turbolay.query.fingerprint = %fingerprint,
+                turbolay.consistency = ?request.consistency,
+                turbolay.correlation_id = tracing::field::Empty,
+                turbolay.caller.step = tracing::field::Empty,
+                turbolay.read_epoch = tracing::field::Empty,
+                turbolay.query.rows_returned = tracing::field::Empty,
+                runtime_limit_ms = tracing::field::Empty,
+                error.class = tracing::field::Empty,
+                turbolay.sampling.force = tracing::field::Empty,
+            )
+        };
+    }
+    let span = if mutation {
+        root_span!("client.mutate")
+    } else {
+        root_span!("client.query")
+    };
+    // Absent rather than empty: a blank correlation id is indistinguishable
+    // from one that failed validation, and both would join to nothing.
+    if let Some(correlation_id) = &request.correlation_id {
+        span.record("turbolay.correlation_id", correlation_id.as_str());
+    }
+    if let Some(caller_step) = &request.caller_step {
+        span.record("turbolay.caller.step", caller_step.as_str());
+    }
+    if let Some(limit) = request.max_runtime_ms {
+        span.record("runtime_limit_ms", limit);
+    }
+    span
 }
 
 fn client_query_key(session: &ClientQuerySession, request: &ClientQueryRequest) -> ClientQueryKey {
