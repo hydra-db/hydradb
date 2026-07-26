@@ -798,6 +798,11 @@ async fn run_bolt_protocol(
                     extra,
                 },
             ) => {
+                // Read before `extra` is consumed below. A malformed
+                // `tx_metadata` is reported by `prepare_bolt_run` a line later
+                // with the right error; there is nothing useful to say about it
+                // twice.
+                let inbound_traceparent = bolt_traceparent(&extra).ok().flatten();
                 let (authenticated, database, request) =
                     match prepare_bolt_run(&mut session, &context, query, parameters, extra) {
                         Ok(prepared) => prepared,
@@ -846,6 +851,13 @@ async fn run_bolt_protocol(
                 let statement_span = crate::client::service::client_root_span(
                     &prepared.request,
                     Some(prepared.action),
+                );
+                // Join the caller's trace if they sent one, before the span is
+                // ever entered. This is the ingestion-to-Turbolay edge; the
+                // node-to-node edge is the transport's own `traceparent` field.
+                crate::core::trace_context::adopt_remote_parent(
+                    &statement_span,
+                    inbound_traceparent.as_deref(),
                 );
                 session.pending = Some(PendingBoltResult {
                     database,
@@ -1205,15 +1217,23 @@ const TX_METADATA_CALLER_STEP: &str = "turbolay.caller.step";
 /// a span attribute and a log field, so the read is an allowlist rather than a
 /// pass-through: an unrecognised key is dropped, never forwarded.
 ///
-/// Step 5b of the telemetry plan adds `"traceparent"` here and reads it in
-/// [`bolt_caller_metadata`] alongside the two fields below — that is the one
-/// further key this channel is expected to carry. Anything else needs the same
-/// argument made again.
+/// `traceparent` is the W3C Trace Context header, added by Step 5b. It is the
+/// last key this channel is expected to carry; anything else needs the same
+/// argument made again from scratch.
 const TX_METADATA_ALLOWLIST: &[&str] = &[
     TX_METADATA_CONSISTENCY,
     TX_METADATA_CORRELATION_ID,
     TX_METADATA_CALLER_STEP,
+    TX_METADATA_TRACEPARENT,
 ];
+
+/// `tx_metadata` key carrying the caller's W3C trace context.
+///
+/// Spelled without the `turbolay.` prefix, unlike its neighbours, because it is
+/// not ours: `traceparent` is the name W3C Trace Context defines and every
+/// other tracing system already sends. Renaming it would mean every client
+/// library had to special-case Turbolay.
+const TX_METADATA_TRACEPARENT: &str = "traceparent";
 
 /// The caller-supplied correlation fields lifted out of `tx_metadata`, already
 /// validated. Absent and invalid are the same state: `None`.
@@ -1267,6 +1287,20 @@ fn bolt_caller_metadata(extra: &BoltDict) -> std::result::Result<BoltCallerMetad
         correlation_id: allowlisted_caller_value(metadata, TX_METADATA_CORRELATION_ID),
         caller_step: allowlisted_caller_value(metadata, TX_METADATA_CALLER_STEP),
     })
+}
+
+/// The caller's W3C trace context, if it sent a well-formed one.
+///
+/// Kept separate from [`bolt_caller_metadata`] because it has a different
+/// destination and a different lifetime: the correlation fields ride on the
+/// request as attributes, whereas this one is consumed once, at RUN, to give
+/// the statement span a remote parent. It is validated only for shape here —
+/// the layout check that matters happens where it is adopted.
+fn bolt_traceparent(extra: &BoltDict) -> std::result::Result<Option<String>, BoltError> {
+    let Some(metadata) = bolt_tx_metadata(extra)? else {
+        return Ok(None);
+    };
+    Ok(allowlisted_caller_value(metadata, TX_METADATA_TRACEPARENT))
 }
 
 /// One allowlisted key, validated. Non-strings are dropped like any other
@@ -1776,11 +1810,8 @@ mod caller_metadata_tests {
             ("app", string("cortex-ingestion")),
             ("turbolay.correlation_id", string("keep-me")),
             ("turbolay.password", string("hunter2")),
-            ("traceparent", string("00-0af7-b7ad-01")),
         ]);
         let caller = bolt_caller_metadata(&extra).expect("well-formed dict");
-        // Step 5b claims `traceparent`; until then it is an unknown key like
-        // any other and does not reach a span.
         assert_eq!(
             caller,
             BoltCallerMetadata {
@@ -1788,6 +1819,37 @@ mod caller_metadata_tests {
                 caller_step: None,
             }
         );
+    }
+
+    /// `traceparent` is read by [`bolt_traceparent`], not by
+    /// [`bolt_caller_metadata`]: it has a different destination — the statement
+    /// span's remote parent rather than an attribute on the request.
+    #[test]
+    fn a_traceparent_is_read_from_its_own_reader() {
+        let extra = tx_metadata([
+            ("turbolay.correlation_id", string("keep-me")),
+            (
+                "traceparent",
+                string("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+            ),
+        ]);
+        assert_eq!(
+            bolt_traceparent(&extra)
+                .expect("well-formed dict")
+                .as_deref(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
+        // And it does not leak into the correlation fields.
+        let caller = bolt_caller_metadata(&extra).expect("well-formed dict");
+        assert_eq!(caller.correlation_id.as_deref(), Some("keep-me"));
+        assert_eq!(caller.caller_step, None);
+    }
+
+    /// Absent is the common case and must not be an error.
+    #[test]
+    fn no_traceparent_is_not_an_error() {
+        let extra = tx_metadata([("turbolay.correlation_id", string("keep-me"))]);
+        assert_eq!(bolt_traceparent(&extra).expect("well-formed dict"), None);
     }
 
     #[test]

@@ -6,4 +6,5 @@ pub(crate) mod model;
 pub(crate) mod namespace;
 pub(crate) mod snapshot;
 pub(crate) mod state;
+pub(crate) mod trace_context;
 pub(crate) mod write_batch;
