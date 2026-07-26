@@ -17,7 +17,7 @@ use slatedb_graph_kernel::{
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing_subscriber::EnvFilter;
+use turbolay_telemetry::{ServiceIdentity, TelemetryConfig};
 
 type RuntimeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -41,11 +41,16 @@ struct IndexerAdminServer {
 
 #[tokio::main]
 async fn main() -> RuntimeResult<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // One subscriber for both binaries, so a shared log sink separates a node
+    // line from an indexer line by field rather than by message text. `init` is
+    // total: with `OTEL_EXPORTER_OTLP_ENDPOINT` unset it installs the fmt layer
+    // alone and returns `Ok`, so a missing collector never stops the indexer
+    // booting. The guard is held to the end of `main` because dropping it is
+    // what flushes batched spans and logs — without that flush the last seconds
+    // before a pod restart are lost, which is exactly the window that matters.
+    let telemetry = turbolay_telemetry::init(TelemetryConfig::from_env(
+        ServiceIdentity::GraphIndexer,
+    ))?;
 
     let data_path = env_value("GRAPH_DATA_PATH", "graph/data");
     let root_scope = graph_scope()?;
@@ -118,6 +123,7 @@ async fn main() -> RuntimeResult<()> {
     metrics.ready.store(false, Ordering::Release);
     admin.stop().await?;
     tracing::info!(scope = %root_scope, "graph indexer stopped");
+    telemetry.shutdown();
     Ok(())
 }
 
