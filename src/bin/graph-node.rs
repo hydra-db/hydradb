@@ -38,7 +38,8 @@ async fn main() -> RuntimeResult<()> {
     // error, is logged rather than lost. `init` is total — with no
     // `OTEL_EXPORTER_OTLP_ENDPOINT` set it installs the fmt layer alone, so a
     // missing collector is never why a node fails to boot.
-    let telemetry = turbolay_telemetry::init(TelemetryConfig::from_env(ServiceIdentity::GraphNode))?;
+    let telemetry =
+        turbolay_telemetry::init(TelemetryConfig::from_env(ServiceIdentity::GraphNode))?;
 
     let result = boot().await;
 
