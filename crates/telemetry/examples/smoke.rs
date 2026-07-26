@@ -32,7 +32,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("smoke: first line, outside any span");
 
-    let span = tracing::info_span!("smoke.parent", turbolay.cell_id = "cell-0");
+    // `turbolay.writer.epoch` is declared Empty and filled later, the way every
+    // deferred attribute on the write path is. The creation-time
+    // `turbolay.cell_id` must survive that `record` — it used not to.
+    let span = tracing::info_span!(
+        "smoke.parent",
+        turbolay.cell_id = "cell-0",
+        turbolay.writer.epoch = tracing::field::Empty,
+    );
+    span.record("turbolay.writer.epoch", 7_u64);
     span.in_scope(|| {
         tracing::info!(turbolay.read_epoch = 41_u64, "smoke: inside a span");
         let child = tracing::info_span!("smoke.child", turbolay.generation = 412_u64);

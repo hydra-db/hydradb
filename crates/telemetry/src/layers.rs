@@ -154,6 +154,60 @@ impl<'writer> FormatFields<'writer> for RedactingFields {
             visitor.finish()
         }
     }
+
+    /// Merge later-recorded fields into the object already stored for a span.
+    ///
+    /// The default implementation *appends*: it pushes a space and calls
+    /// [`FormatFields::format_fields`] again. For `key=value` text that is
+    /// exactly right, and the text arm below keeps it. For JSON it is fatal —
+    /// the stored buffer becomes `{"a":1} {"b":2}`, which is two objects and
+    /// not a document, so the `serde_json::from_str` in
+    /// [`TurbolayJson::format_event`] fails and drops the span's fields
+    /// *entirely*. The span still appears in the `spans` array, with nothing
+    /// but its name.
+    ///
+    /// That is not an edge case here, it is the common path. Attributes only
+    /// known once the work is done — `error.class`, `turbolay.writer.epoch`,
+    /// the three `last_promoted_*` fields — are declared
+    /// `tracing::field::Empty` at span creation and filled with
+    /// `Span::record`, which is what makes a healthy request pay nothing for
+    /// them. Every one of those spans was losing its creation-time fields in
+    /// the JSON logs: `turbolay.cell_id` and `turbolay.node_id` vanished from
+    /// precisely the fence spans whose whole purpose is to be grouped by
+    /// `cell_id`.
+    ///
+    /// OTLP was never affected — `tracing-opentelemetry` handles `on_record`
+    /// itself — so this silently degraded the stdout logs alone, which is the
+    /// half somebody reads at 2am with `grep`.
+    fn add_fields(
+        &self,
+        current: &'writer mut FormattedFields<Self>,
+        fields: &tracing::span::Record<'_>,
+    ) -> fmt::Result {
+        if !self.json {
+            if !current.fields.is_empty() {
+                current.fields.push(' ');
+            }
+            return self.format_fields(current.as_writer(), fields);
+        }
+
+        let mut merged: serde_json::Map<String, serde_json::Value> = if current.fields.is_empty() {
+            serde_json::Map::new()
+        } else {
+            serde_json::from_str(&current.fields).map_err(|_| fmt::Error)?
+        };
+
+        let mut visitor = JsonFieldVisitor::default();
+        let mut redacting = RedactingVisitor::new(&mut visitor);
+        fields.record(&mut redacting);
+        // Later wins. A field recorded twice is a deliberate correction — a
+        // retry count climbing, an outcome resolving from `Empty` — so the
+        // newest value is the true one.
+        merged.extend(visitor.into_map());
+
+        current.fields = serde_json::to_string(&merged).map_err(|_| fmt::Error)?;
+        Ok(())
+    }
 }
 
 /// Collects visited fields into a `serde_json` map.
@@ -480,6 +534,32 @@ mod tests {
         });
         assert_eq!(lines[0]["spans"][0]["name"], "client.query");
         assert_eq!(lines[0]["spans"][1]["name"], "query.plan");
+    }
+
+    /// A field recorded after span creation must not take the rest of the
+    /// span's fields with it.
+    ///
+    /// The whole deferred-attribute pattern rests on this: `error.class`,
+    /// `turbolay.writer.epoch` and the `last_promoted_*` fields are declared
+    /// `Empty` up front and filled only when the work resolves, so a healthy
+    /// request pays nothing. With the default appending `add_fields` the stored
+    /// buffer became two concatenated JSON objects, the event formatter's parse
+    /// failed, and the span was emitted with its name and *nothing else* —
+    /// losing `turbolay.cell_id` from exactly the fence spans that exist to be
+    /// grouped by it. Silent, JSON-only, and invisible to OTLP.
+    #[test]
+    fn recording_a_field_later_keeps_the_fields_set_at_creation() {
+        let lines = capture_json(ServiceIdentity::GraphNode, || {
+            let span = tracing::info_span!(
+                "writer.fence_refresh",
+                turbolay.cell_id = "cell-7",
+                turbolay.writer.epoch = tracing::field::Empty,
+            );
+            span.record("turbolay.writer.epoch", 412u64);
+            span.in_scope(|| tracing::info!("fenced"));
+        });
+        assert_eq!(lines[0]["spans"][0]["turbolay.cell_id"], "cell-7");
+        assert_eq!(lines[0]["spans"][0]["turbolay.writer.epoch"], 412);
     }
 
     #[test]
