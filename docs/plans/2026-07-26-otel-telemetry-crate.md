@@ -1,10 +1,10 @@
 ---
 title: OpenTelemetry logs and traces via a turbolay-telemetry crate
-status: step-4-complete
+status: done
 date: 2026-07-26
 branch: Turbolay-V3.5
 base_commit: 4e7cb82
-head_commit: 8253c20
+head_commit: 1a28d92
 tags:
   - observability
   - opentelemetry
@@ -144,7 +144,27 @@ Still open: `turbolay.node_id` is on no read-path span, because the client
 service has no handle on its own node identity — it needs threading in from
 `init()`. `access_path` and `optimizer_passes` are comma-joined strings rather
 than `string[]`, since the `tracing` facade has no array value type; splitting
-them belongs in the OTLP bridge. Step 5b is not started.
+them belongs in the OTLP bridge.
+
+**Step 5b landed after all, and cost less than this plan feared.** §7 calls it
+"the only step in this plan that changes a wire format" and sequences it last
+for that reason. The frames turned out to be serde JSON with no
+`deny_unknown_fields`, so an `Option<String>` with `serde(default,
+skip_serializing_if)` is invisible to an old peer in both directions — no
+version bump, no rollout step. What actually cost something was the layering:
+a `tracing` span id is not an OpenTelemetry trace id, so neither the kernel nor
+`turbolay-telemetry` can do the conversion alone without one depending on the
+other. The kernel declares a `TraceContextBridge` trait, the telemetry crate
+provides free functions, and `graph-node` writes the glue — the composition
+root being the one place entitled to name both sides. §1's claim that "neither
+side needs to name the other's types" survives, but only because a third place
+names both.
+
+Also unplanned: `turbolay.placement.ownership`, recorded for all four
+rendezvous answers rather than the refusals alone. `placement.resolve`
+originally carried only `error.class`, which meant the routing question the
+write-path work exists to answer had no denominator — a rate needs its
+successful case too.
 
 ## What we found first
 
