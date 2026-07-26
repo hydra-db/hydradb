@@ -365,6 +365,39 @@ pub struct ClientQueryRequest {
     pub max_runtime_ms: Option<u64>,
     pub bookmark: Option<ClientBookmark>,
     pub consistency: ClientReadConsistency,
+    /// Caller-supplied request identifier, carried through from Bolt
+    /// `tx_metadata` (`turbolay.correlation_id`). It exists so a Turbolay span
+    /// and the caller's own log line share a field; Turbolay never mints one,
+    /// because a server-invented value looks like a join key and joins nothing.
+    pub correlation_id: Option<String>,
+    /// Caller-supplied operation label (`turbolay.caller.step`) — which step of
+    /// a multi-step caller workflow issued this query.
+    pub caller_step: Option<String>,
+}
+
+/// Maximum accepted length of a caller-supplied correlation id or step label.
+const MAX_CALLER_METADATA_LEN: usize = 128;
+
+/// Validate a caller-supplied metadata value: printable ASCII, bounded length,
+/// non-empty. Returns `None` for anything else.
+///
+/// `tx_metadata` arrives from any Bolt client and becomes both a span attribute
+/// and a log field, so it is validated here rather than trusted from the
+/// caller's own sanitiser. Unlike the ingestion side, an invalid value is
+/// **dropped** rather than replaced: a fabricated identifier is worse than an
+/// absent one.
+pub fn sanitize_caller_metadata(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_CALLER_METADATA_LEN {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_graphic() || ch == ' ')
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -394,6 +427,8 @@ impl ClientQueryRequest {
             max_runtime_ms: None,
             bookmark: None,
             consistency: ClientReadConsistency::Causal,
+            correlation_id: None,
+            caller_step: None,
         }
     }
 
@@ -439,6 +474,20 @@ impl ClientQueryRequest {
 
     pub fn strong(mut self) -> Self {
         self.consistency = ClientReadConsistency::Strong;
+        self
+    }
+
+    /// Attach the caller's correlation id. Invalid values are dropped rather
+    /// than stored; see [`sanitize_caller_metadata`].
+    pub fn with_correlation_id(mut self, correlation_id: impl AsRef<str>) -> Self {
+        self.correlation_id = sanitize_caller_metadata(correlation_id.as_ref());
+        self
+    }
+
+    /// Attach the caller's operation label. Invalid values are dropped rather
+    /// than stored; see [`sanitize_caller_metadata`].
+    pub fn with_caller_step(mut self, caller_step: impl AsRef<str>) -> Self {
+        self.caller_step = sanitize_caller_metadata(caller_step.as_ref());
         self
     }
 }
