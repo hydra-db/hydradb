@@ -20,8 +20,8 @@ use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
 use super::service::{
-    ClientBookmark, ClientDatabaseResolver, ClientQueryCredentials, ClientQueryPage,
-    ClientQueryRequest, ClientQueryService, ClientQuerySession, ClientQueryTarget,
+    sanitize_caller_metadata, ClientBookmark, ClientDatabaseResolver, ClientQueryCredentials,
+    ClientQueryPage, ClientQueryRequest, ClientQueryService, ClientQuerySession, ClientQueryTarget,
     ClientReadConsistency, PreparedClientQuery,
 };
 use crate::{
@@ -1150,22 +1150,115 @@ fn bolt_query_request(
     if let Some(consistency) = bolt_read_consistency(extra)? {
         request = request.with_consistency(consistency);
     }
+    let caller = bolt_caller_metadata(extra)?;
+    if let Some(correlation_id) = caller.correlation_id {
+        request = request.with_correlation_id(correlation_id);
+    }
+    if let Some(caller_step) = caller.caller_step {
+        request = request.with_caller_step(caller_step);
+    }
     Ok(request)
+}
+
+/// `tx_metadata` key carrying the requested read consistency. This is the one
+/// key the channel has carried in production, and its handling below is
+/// unchanged by the allowlist that now surrounds it.
+const TX_METADATA_CONSISTENCY: &str = "turbolay.consistency";
+
+/// `tx_metadata` key carrying the caller's own request identifier — the field
+/// that makes a Turbolay log line and an ingestion log line joinable.
+const TX_METADATA_CORRELATION_ID: &str = "turbolay.correlation_id";
+
+/// `tx_metadata` key carrying the caller's operation label, e.g. which step of
+/// a multi-step workflow issued this query.
+const TX_METADATA_CALLER_STEP: &str = "turbolay.caller.step";
+
+/// Every `tx_metadata` key Turbolay reads.
+///
+/// The dict arrives from any Bolt client and everything taken out of it becomes
+/// a span attribute and a log field, so the read is an allowlist rather than a
+/// pass-through: an unrecognised key is dropped, never forwarded.
+///
+/// Step 5b of the telemetry plan adds `"traceparent"` here and reads it in
+/// [`bolt_caller_metadata`] alongside the two fields below — that is the one
+/// further key this channel is expected to carry. Anything else needs the same
+/// argument made again.
+const TX_METADATA_ALLOWLIST: &[&str] = &[
+    TX_METADATA_CONSISTENCY,
+    TX_METADATA_CORRELATION_ID,
+    TX_METADATA_CALLER_STEP,
+];
+
+/// The caller-supplied correlation fields lifted out of `tx_metadata`, already
+/// validated. Absent and invalid are the same state: `None`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct BoltCallerMetadata {
+    correlation_id: Option<String>,
+    caller_step: Option<String>,
+}
+
+/// The `tx_metadata` dict, type-checked once for every reader of it.
+fn bolt_tx_metadata(extra: &BoltDict) -> std::result::Result<Option<&BoltDict>, BoltError> {
+    match extra.get("tx_metadata") {
+        None => Ok(None),
+        Some(BoltValue::Dict(metadata)) => Ok(Some(metadata)),
+        Some(_) => Err(BoltError::Protocol(
+            "tx_metadata must be a dictionary".to_string(),
+        )),
+    }
+}
+
+/// Read the allowlisted caller-correlation keys out of `tx_metadata`.
+///
+/// Every value is untrusted. An over-long, non-printable, empty or wrongly
+/// typed value is **dropped**, not truncated and not repaired, and Turbolay
+/// never mints a replacement: a server-invented correlation id matches nothing
+/// upstream, so it looks like a join key while joining nothing. That is the
+/// deliberate difference from the ingestion side's `sanitize_correlation_id`,
+/// which generates a UUID4 when the header is absent.
+///
+/// A malformed value is not a protocol error either. Telemetry metadata must
+/// never be able to fail a query.
+fn bolt_caller_metadata(extra: &BoltDict) -> std::result::Result<BoltCallerMetadata, BoltError> {
+    let Some(metadata) = bolt_tx_metadata(extra)? else {
+        return Ok(BoltCallerMetadata::default());
+    };
+    let dropped = metadata
+        .keys()
+        .filter(|key| !TX_METADATA_ALLOWLIST.contains(&key.as_str()))
+        .count();
+    if dropped > 0 {
+        // The count, never the keys: they are caller-controlled strings and
+        // this line is here so "I set the key and nothing appeared" is
+        // diagnosable, not so unknown input reaches a log sink.
+        tracing::debug!(
+            target: "slatedb_graph_kernel",
+            dropped,
+            "Bolt tx_metadata keys outside the allowlist were dropped"
+        );
+    }
+    Ok(BoltCallerMetadata {
+        correlation_id: allowlisted_caller_value(metadata, TX_METADATA_CORRELATION_ID),
+        caller_step: allowlisted_caller_value(metadata, TX_METADATA_CALLER_STEP),
+    })
+}
+
+/// One allowlisted key, validated. Non-strings are dropped like any other
+/// invalid value.
+fn allowlisted_caller_value(metadata: &BoltDict, key: &str) -> Option<String> {
+    debug_assert!(TX_METADATA_ALLOWLIST.contains(&key));
+    match metadata.get(key) {
+        Some(BoltValue::String(value)) => sanitize_caller_metadata(value),
+        _ => None,
+    }
 }
 
 fn bolt_read_consistency(
     extra: &BoltDict,
 ) -> std::result::Result<Option<ClientReadConsistency>, BoltError> {
     let direct = extra.get("consistency");
-    let metadata = match extra.get("tx_metadata") {
-        None => None,
-        Some(BoltValue::Dict(metadata)) => metadata.get("turbolay.consistency"),
-        Some(_) => {
-            return Err(BoltError::Protocol(
-                "tx_metadata must be a dictionary".to_string(),
-            ));
-        }
-    };
+    let metadata =
+        bolt_tx_metadata(extra)?.and_then(|metadata| metadata.get(TX_METADATA_CONSISTENCY));
     let value = match (direct, metadata) {
         (Some(left), Some(right)) if left != right => {
             return Err(BoltError::Protocol(
@@ -1535,3 +1628,113 @@ fn bolt_io_error(operation: &'static str, error: std::io::Error) -> GraphError {
 
 #[cfg(test)]
 mod tests;
+
+/// `tx_metadata` is the one place in this file that parses hostile input, so it
+/// gets tests where the rest of the tracing work deliberately gets none.
+#[cfg(test)]
+mod caller_metadata_tests {
+    use super::*;
+
+    fn tx_metadata(entries: impl IntoIterator<Item = (&'static str, BoltValue)>) -> BoltDict {
+        let metadata = entries
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect::<BoltDict>();
+        BoltDict::from([("tx_metadata".to_string(), BoltValue::Dict(metadata))])
+    }
+
+    fn string(value: &str) -> BoltValue {
+        BoltValue::String(value.to_string())
+    }
+
+    #[test]
+    fn allowlisted_keys_are_read() {
+        let extra = tx_metadata([
+            ("turbolay.correlation_id", string("693cdeab-0f11-4f0a-9d55")),
+            ("turbolay.caller.step", string("delete_source.relates_3_0")),
+        ]);
+        let caller = bolt_caller_metadata(&extra).expect("valid metadata");
+        assert_eq!(
+            caller.correlation_id.as_deref(),
+            Some("693cdeab-0f11-4f0a-9d55")
+        );
+        assert_eq!(
+            caller.caller_step.as_deref(),
+            Some("delete_source.relates_3_0")
+        );
+    }
+
+    #[test]
+    fn absent_metadata_is_absent_never_minted() {
+        assert_eq!(
+            bolt_caller_metadata(&BoltDict::new()).expect("no metadata"),
+            BoltCallerMetadata::default()
+        );
+        assert_eq!(
+            bolt_caller_metadata(&tx_metadata([])).expect("empty metadata"),
+            BoltCallerMetadata::default()
+        );
+    }
+
+    #[test]
+    fn over_long_values_are_rejected_not_truncated() {
+        let long = "a".repeat(129);
+        let extra = tx_metadata([("turbolay.correlation_id", string(&long))]);
+        let caller = bolt_caller_metadata(&extra).expect("well-formed dict");
+        assert_eq!(caller.correlation_id, None);
+    }
+
+    #[test]
+    fn non_printable_and_non_ascii_values_are_rejected() {
+        for hostile in ["corr\nid", "corr\tid", "córrelation", "\u{7f}", "   "] {
+            let extra = tx_metadata([("turbolay.correlation_id", string(hostile))]);
+            let caller = bolt_caller_metadata(&extra).expect("well-formed dict");
+            assert_eq!(caller.correlation_id, None, "accepted {hostile:?}");
+        }
+    }
+
+    #[test]
+    fn non_string_values_are_dropped_rather_than_failing_the_query() {
+        let extra = tx_metadata([("turbolay.correlation_id", BoltValue::Integer(7))]);
+        let caller = bolt_caller_metadata(&extra).expect("well-formed dict");
+        assert_eq!(caller.correlation_id, None);
+    }
+
+    #[test]
+    fn unknown_keys_are_dropped_not_forwarded() {
+        let extra = tx_metadata([
+            ("app", string("cortex-ingestion")),
+            ("turbolay.correlation_id", string("keep-me")),
+            ("turbolay.password", string("hunter2")),
+            ("traceparent", string("00-0af7-b7ad-01")),
+        ]);
+        let caller = bolt_caller_metadata(&extra).expect("well-formed dict");
+        // Step 5b claims `traceparent`; until then it is an unknown key like
+        // any other and does not reach a span.
+        assert_eq!(
+            caller,
+            BoltCallerMetadata {
+                correlation_id: Some("keep-me".to_string()),
+                caller_step: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_malformed_dict_is_still_a_protocol_error() {
+        let extra = BoltDict::from([("tx_metadata".to_string(), string("not a dict"))]);
+        assert!(bolt_caller_metadata(&extra).is_err());
+    }
+
+    #[test]
+    fn correlation_keys_do_not_disturb_consistency() {
+        let extra = tx_metadata([
+            ("turbolay.consistency", string("strong")),
+            ("turbolay.correlation_id", string("keep-me")),
+        ]);
+        assert_eq!(
+            bolt_read_consistency(&extra).expect("valid consistency"),
+            Some(ClientReadConsistency::Strong)
+        );
+    }
+}
