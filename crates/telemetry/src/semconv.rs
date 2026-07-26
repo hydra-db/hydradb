@@ -102,6 +102,36 @@ pub const WRITER_LAST_PROMOTED_AT: &str = "turbolay.writer.last_promoted_at";
 /// Requested read consistency.
 pub const CONSISTENCY: &str = "turbolay.consistency";
 
+/// Caller-supplied request identifier, read from Bolt `tx_metadata`.
+///
+/// This is what joins a Turbolay span to the caller's own log line. Nothing
+/// else does: the query fingerprint says *which statement*, and only this says
+/// *which invocation of it*.
+///
+/// Three properties are load-bearing.
+///
+/// **Unbounded by construction** — one value per inbound request. That is the
+/// whole point, and it is why this must **never** become a metric label. It
+/// belongs in the spans-and-logs bucket alongside [`SCOPE`], more emphatically
+/// than [`SCOPE`] does.
+///
+/// **Never minted by Turbolay.** An absent value stays absent. A
+/// server-invented id matches nothing upstream and is worse than no field at
+/// all, because it looks like a join key and is not.
+///
+/// **Untrusted.** It arrives from any Bolt client and becomes both a span
+/// attribute and a log field, so it is validated on arrival — bounded length,
+/// printable ASCII, rejected rather than truncated.
+pub const CORRELATION_ID: &str = "turbolay.correlation_id";
+
+/// Caller-supplied label for the operation that issued the statement, read
+/// from Bolt `tx_metadata` under the same rules as [`CORRELATION_ID`].
+///
+/// Where [`CORRELATION_ID`] identifies the request, this identifies the step
+/// within it — one caller operation may issue many statements, several of them
+/// looping over batches, and without this they are indistinguishable.
+pub const CALLER_STEP: &str = "turbolay.caller.step";
+
 /// Outcome of a unit of indexing work — see [`crate::Outcome`]. Distinguishing
 /// "nothing to do" from "not running" is most of what an indexer needs to
 /// report, and only an explicit outcome does that.
@@ -147,6 +177,8 @@ pub const ALL_TURBOLAY_KEYS: &[&str] = &[
     WRITER_LAST_PROMOTED_EPOCH,
     WRITER_LAST_PROMOTED_AT,
     CONSISTENCY,
+    CORRELATION_ID,
+    CALLER_STEP,
     OUTCOME,
     SAMPLING_FORCE,
 ];
