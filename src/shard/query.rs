@@ -5310,7 +5310,7 @@ impl GraphShard {
             turbolay.edge_type = %edge_type,
             turbolay.read_epoch = read_epoch,
             turbolay.base_sequence = tracing::field::Empty,
-            found = tracing::field::Empty,
+            turbolay.outcome = tracing::field::Empty,
             error.class = tracing::field::Empty,
             turbolay.sampling.force = tracing::field::Empty,
         );
@@ -5320,13 +5320,13 @@ impl GraphShard {
             .await;
         match &artifact {
             Ok(Some(artifact)) => {
-                span.record("found", true);
+                span.record("turbolay.outcome", "hit");
                 span.record("turbolay.base_sequence", artifact.base_epoch);
             }
             // Absence is the interesting case: it means the read fell off the
             // compiled path and back onto a scan.
             Ok(None) => {
-                span.record("found", false);
+                span.record("turbolay.outcome", "miss");
             }
             Err(err) => {
                 span.record("error.class", err.class());
@@ -5389,7 +5389,7 @@ impl GraphShard {
                     turbolay.edge_type = %edge_type,
                     turbolay.read_epoch = read_epoch,
                     turbolay.base_sequence = generation.base_sequence,
-                    outcome = tracing::field::Empty,
+                    turbolay.outcome = tracing::field::Empty,
                     error.class = tracing::field::Empty,
                     turbolay.sampling.force = tracing::field::Empty,
                 );
@@ -5399,10 +5399,10 @@ impl GraphShard {
                     .await;
                 match &tail {
                     Ok(GraphTopologyTail::Complete(_)) => {
-                        tail_span.record("outcome", "complete");
+                        tail_span.record("turbolay.outcome", "complete");
                     }
                     Ok(GraphTopologyTail::Unavailable) => {
-                        tail_span.record("outcome", "unavailable");
+                        tail_span.record("turbolay.outcome", "unavailable");
                     }
                     Err(err) => {
                         tail_span.record("error.class", err.class());
