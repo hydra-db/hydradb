@@ -1135,6 +1135,7 @@ impl ClientQueryService {
     /// [`Self::execute_page`] — without one, the busiest read path in
     /// production would be the only one with no correlation id, no fingerprint
     /// and no trace at all.
+    #[cfg_attr(not(feature = "bolt-server"), allow(dead_code))]
     pub(crate) async fn execute_prepared_page(
         &self,
         session: &ClientQuerySession,
