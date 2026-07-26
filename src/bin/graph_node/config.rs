@@ -55,6 +55,7 @@ pub struct RuntimeConfig {
     pub max_cursor_buffer_bytes: u64,
     pub cursor_ttl: Duration,
     pub max_bolt_connections: usize,
+    pub bolt_authentication_timeout: Duration,
     pub bolt_idle_timeout: Duration,
     pub bolt_max_connection_age: Duration,
     pub default_page_size: usize,
@@ -231,6 +232,11 @@ impl RuntimeConfig {
             )?,
             cursor_ttl: parse_duration(&values, "GRAPH_CURSOR_TTL_MS", 60_000)?,
             max_bolt_connections: parse_usize(&values, "GRAPH_MAX_BOLT_CONNECTIONS", 4_096)?,
+            bolt_authentication_timeout: parse_duration(
+                &values,
+                "GRAPH_BOLT_AUTHENTICATION_TIMEOUT_MS",
+                30_000,
+            )?,
             bolt_idle_timeout: parse_duration(
                 &values,
                 "GRAPH_BOLT_IDLE_TIMEOUT_MS",
@@ -485,6 +491,7 @@ mod tests {
         assert_eq!(config.index_discovery_interval, Duration::from_secs(5));
         assert_eq!(config.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(config.heartbeat_timeout, Duration::from_secs(15));
+        assert_eq!(config.bolt_authentication_timeout, Duration::from_secs(30));
         assert_eq!(config.bolt_idle_timeout, Duration::from_secs(15 * 60));
         assert_eq!(config.bolt_max_connection_age, Duration::from_secs(60 * 60));
         let memory = config.graph_memory_config();

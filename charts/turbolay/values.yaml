@@ -153,6 +153,7 @@ runtime:
   maxCursorBufferBytes: 67108864
   cursorTtlMs: 60000
   maxBoltConnections: 4096
+  boltAuthenticationTimeoutMs: 30000
   boltIdleTimeoutMs: 900000
   boltMaxConnectionAgeMs: 3600000
   defaultPageSize: 1024

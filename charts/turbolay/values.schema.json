@@ -150,6 +150,7 @@
         "maxCursorBufferBytes": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "cursorTtlMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "maxBoltConnections": { "$ref": "#/definitions/unsignedDecimal" },
+        "boltAuthenticationTimeoutMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "boltIdleTimeoutMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "boltMaxConnectionAgeMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "defaultPageSize": { "$ref": "#/definitions/unsignedDecimal" },
