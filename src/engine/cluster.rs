@@ -2,7 +2,22 @@ use super::*;
 use crate::keys;
 
 use chrono::Utc;
+use tracing::Instrument as _;
 use turbolay_placement::cell_writer::{self, CellWriterRecord};
+
+/// Stamp a failure onto the span that raised it.
+///
+/// §6 of `docs/plans/2026-07-26-otel-telemetry-crate.md`: a `fencing` error seen
+/// at `client.mutate` says a write failed, and the same error on
+/// `placement.resolve` says why. So each site records its own class rather than
+/// letting an outer span report one it did not produce.
+///
+/// `contention` and `fencing` are expected classes. Nothing here logs — the
+/// attribute exists so a dashboard can chart the *rate*, not so each occurrence
+/// pages someone.
+fn record_error_class(error: &GraphError) {
+    tracing::Span::current().record("error.class", error.class());
+}
 
 impl GraphCluster {
     pub async fn open_cells(
@@ -431,44 +446,53 @@ impl RoutedGraphCluster {
     /// "rendezvous named nobody" and have opposite answers, which is why they
     /// are matched separately here rather than through an `Option`: an empty
     /// live set licenses promotion, a *shed* view forbids it.
+    ///
+    /// # What the span is for
+    ///
+    /// `writer.acquire` is the span the whole of §4 exists to produce. The
+    /// `cell-writer-fencing-pingpong` incident — three nodes trading one cell's
+    /// epoch — is invisible as scattered `Fenced` errors and obvious as a span
+    /// tree: three traces, three `turbolay.node_id`s, one `turbolay.cell_id`,
+    /// and `turbolay.writer.epoch` climbing on every acquisition. The epoch is
+    /// recorded after the promotion because that is the only moment it is known.
     pub(crate) async fn ensure_local_writer(&self, cell_id: &str) -> Result<()> {
-        validate_component("cell_id", cell_id)?;
+        let span = tracing::info_span!(
+            "writer.acquire",
+            turbolay.scope = %self.scope,
+            turbolay.cell_id = %cell_id,
+            turbolay.node_id = %self.local_node_id,
+            turbolay.writer.epoch = tracing::field::Empty,
+            error.class = tracing::field::Empty,
+        );
+        self.ensure_local_writer_traced(cell_id)
+            .instrument(span)
+            .await
+    }
+
+    /// The body of [`Self::ensure_local_writer`], running inside its span.
+    ///
+    /// Split out only so the span can wrap an `async fn` without an inline
+    /// `async` block swallowing the borrow checker's diagnostics; the control
+    /// flow is unchanged.
+    async fn ensure_local_writer_traced(&self, cell_id: &str) -> Result<()> {
+        validate_component("cell_id", cell_id).inspect_err(record_error_class)?;
         if !self.promotable {
-            return Err(GraphError::WriteRequiresWriter {
+            let error = GraphError::WriteRequiresWriter {
                 operation: "routed_write",
                 cell_id: cell_id.to_string(),
-            });
+            };
+            record_error_class(&error);
+            return Err(error);
         }
         let shard = self
             .shards
             .get(cell_id)
             .ok_or_else(|| GraphError::UnknownShard {
                 cell_id: cell_id.to_string(),
-            })?;
+            })
+            .inspect_err(record_error_class)?;
 
-        match self.placement.ownership(&self.scope.to_string(), cell_id) {
-            // The rendezvous owner, or a known-empty fleet with no owner to
-            // defer to. Either way this node may hold the writer.
-            CellOwnership::Local | CellOwnership::Unowned => {}
-            // A live peer owns the cell. Name it, so the driver re-routes
-            // instead of retrying into the same wrong node.
-            CellOwnership::Remote { node_id } => {
-                return Err(GraphError::NotCellWriter {
-                    cell_id: cell_id.to_string(),
-                    owner: Some(node_id),
-                })
-            }
-            // This node has shed its view (decision 7) and knows nothing about
-            // the fleet. Refuse with no hint: a stale guess would point at a
-            // node that may itself have shed, and promoting here is the
-            // unbounded duel — a partitioned node can never learn it lost.
-            CellOwnership::Unknown => {
-                return Err(GraphError::NotCellWriter {
-                    cell_id: cell_id.to_string(),
-                    owner: None,
-                })
-            }
-        }
+        self.resolve_placement(cell_id)?;
 
         self.await_writer_reopen(shard, cell_id).await?;
         // Whether this shard already held a writer, taken *before* the call.
@@ -481,10 +505,55 @@ impl RoutedGraphCluster {
         // 3 refuses to add.
         let already_writing = shard.db.writer_epoch().is_some();
         shard.promote_to_writer(cell_id, "routed_write").await?;
+        if let Some(epoch) = shard.db.writer_epoch() {
+            // The climbing value in the ping-pong query. Taken from the
+            // manifest, which is the authority; the advisory record written
+            // below only ever repeats it.
+            tracing::Span::current().record("turbolay.writer.epoch", epoch);
+        }
         if !already_writing {
             self.record_cell_writer(shard, cell_id).await;
         }
         Ok(())
+    }
+
+    /// Ask rendezvous who owns the cell, as its own span.
+    ///
+    /// Synchronous and I/O-free by decision 10, so the span costs a timestamp
+    /// pair. It earns that because the refusal it may return is the single most
+    /// common write-path `fencing` error, and a class recorded here says
+    /// "rendezvous named somebody else" rather than the far vaguer "a write
+    /// failed" that the same error carries at the root.
+    fn resolve_placement(&self, cell_id: &str) -> Result<()> {
+        let span = tracing::info_span!(
+            "placement.resolve",
+            turbolay.scope = %self.scope,
+            turbolay.cell_id = %cell_id,
+            turbolay.node_id = %self.local_node_id,
+            error.class = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        match self.placement.ownership(&self.scope.to_string(), cell_id) {
+            // The rendezvous owner, or a known-empty fleet with no owner to
+            // defer to. Either way this node may hold the writer.
+            CellOwnership::Local | CellOwnership::Unowned => Ok(()),
+            // A live peer owns the cell. Name it, so the driver re-routes
+            // instead of retrying into the same wrong node.
+            CellOwnership::Remote { node_id } => Err(GraphError::NotCellWriter {
+                cell_id: cell_id.to_string(),
+                owner: Some(node_id),
+            })
+            .inspect_err(record_error_class),
+            // This node has shed its view (decision 7) and knows nothing about
+            // the fleet. Refuse with no hint: a stale guess would point at a
+            // node that may itself have shed, and promoting here is the
+            // unbounded duel — a partitioned node can never learn it lost.
+            CellOwnership::Unknown => Err(GraphError::NotCellWriter {
+                cell_id: cell_id.to_string(),
+                owner: None,
+            })
+            .inspect_err(record_error_class),
+        }
     }
 
     /// Write down that this node just took `cell_id`'s writer, for whoever reads
@@ -581,11 +650,15 @@ impl RoutedGraphCluster {
         };
         let cap = self.placement.config().heartbeat_interval;
         if delay > cap {
-            return Err(GraphError::AdmissionRejected {
+            // Raised inside `writer.acquire`, which has no nested span here, so
+            // this *is* the innermost span for the refusal.
+            let error = GraphError::AdmissionRejected {
                 operation: "writer_reopen",
                 actual: delay.as_millis() as u64,
                 limit: cap.as_millis() as u64,
-            });
+            };
+            record_error_class(&error);
+            return Err(error);
         }
         tracing::debug!(
             node_id = %self.local_node_id,
