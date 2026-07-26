@@ -102,6 +102,22 @@ pub const WRITER_LAST_PROMOTED_AT: &str = "turbolay.writer.last_promoted_at";
 /// Requested read consistency.
 pub const CONSISTENCY: &str = "turbolay.consistency";
 
+/// What rendezvous said about who owns the cell: `local`, `remote`, `unowned`
+/// or `unknown`.
+///
+/// Distinct from [`OUTCOME`], which is a closed `success | skipped | failed`
+/// vocabulary about a unit of work. This is about *routing*, and the two
+/// answers that are neither success nor failure are the interesting ones:
+/// `unowned` is an empty fleet, `unknown` is a node that has shed its view and
+/// is refusing rather than guessing.
+///
+/// Without it the only ownership answer that reaches telemetry is `remote`,
+/// and only as text inside a `NotCellWriter` display — so "how often does a
+/// write land on a node that does not own the cell" is an inference from error
+/// strings rather than a query. Bounded to four values, so it is safe on a
+/// metric label as well as a span.
+pub const PLACEMENT_OWNERSHIP: &str = "turbolay.placement.ownership";
+
 /// Caller-supplied request identifier, read from Bolt `tx_metadata`.
 ///
 /// This is what joins a Turbolay span to the caller's own log line. Nothing
@@ -177,6 +193,7 @@ pub const ALL_TURBOLAY_KEYS: &[&str] = &[
     WRITER_LAST_PROMOTED_EPOCH,
     WRITER_LAST_PROMOTED_AT,
     CONSISTENCY,
+    PLACEMENT_OWNERSHIP,
     CORRELATION_ID,
     CALLER_STEP,
     OUTCOME,

@@ -530,10 +530,26 @@ impl RoutedGraphCluster {
             turbolay.scope = %self.scope,
             turbolay.cell_id = %cell_id,
             turbolay.node_id = %self.local_node_id,
+            turbolay.placement.ownership = tracing::field::Empty,
             error.class = tracing::field::Empty,
         );
         let _entered = span.enter();
-        match self.placement.ownership(&self.scope.to_string(), cell_id) {
+        let ownership = self.placement.ownership(&self.scope.to_string(), cell_id);
+        // Recorded for all four answers, not just the refusals. "How often does
+        // a write reach a node that does not own the cell" is the question the
+        // write-routing work exists to answer, and it cannot be answered from
+        // failures alone — a rate needs its denominator, and the successful
+        // `local` case is the denominator.
+        span.record(
+            "turbolay.placement.ownership",
+            match &ownership {
+                CellOwnership::Local => "local",
+                CellOwnership::Remote { .. } => "remote",
+                CellOwnership::Unowned => "unowned",
+                CellOwnership::Unknown => "unknown",
+            },
+        );
+        match ownership {
             // The rendezvous owner, or a known-empty fleet with no owner to
             // defer to. Either way this node may hold the writer.
             CellOwnership::Local | CellOwnership::Unowned => Ok(()),

@@ -1680,12 +1680,40 @@ impl ClientQueryService {
         read_storage_sequence: Option<StorageSequence>,
     ) -> Result<Option<ClientBookmark>> {
         let sequence = if action == QueryTransportAction::Read {
+            // The read already knows its sequence; nothing is fetched, so
+            // there is nothing to time.
             read_storage_sequence
         } else {
-            self.inner
+            // `write.bookmark` from §4 of the telemetry plan, and the last span
+            // on the write path. It is not bookkeeping: this arm reaches the
+            // object store on *every* mutation to read back the sequence the
+            // commit landed at, and that latency is charged to the caller's
+            // write even though no writing is left to do.
+            //
+            // It is also the number the whole freshness class of bugs is about
+            // — the bookmark handed back here is what a later read pins its
+            // epoch to, so `turbolay.commit_epoch` recorded here is the value
+            // `query.bookmark_wait` is waiting to catch up with, on a different
+            // trace and possibly a different node.
+            let span = tracing::info_span!(
+                "write.bookmark",
+                turbolay.scope = %request.target.scope,
+                turbolay.cell_id = %request.target.cell_id,
+                turbolay.commit_epoch = tracing::field::Empty,
+                error.class = tracing::field::Empty,
+                turbolay.sampling.force = tracing::field::Empty,
+            );
+            let sequence = self
+                .inner
                 .client
                 .current_storage_sequence(&request.target.scope, &request.target.cell_id)
-                .await?
+                .instrument(span.clone())
+                .await
+                .inspect_err(|err| record_span_error(&span, err))?;
+            if let Some(sequence) = sequence {
+                span.record("turbolay.commit_epoch", sequence);
+            }
+            sequence
         };
         Ok(sequence.map(|sequence| ClientBookmark::new(request.target.clone(), sequence)))
     }
