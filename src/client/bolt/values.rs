@@ -166,6 +166,18 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             code: "Neo.ClientError.Cluster.NotALeader".to_string(),
             message: error.to_string(),
         },
+        // A routing refusal is transient and belongs to *this node*, so the
+        // driver must move to the next router rather than fail the query. A
+        // `ClientError` here would be read as "your request is wrong" and end
+        // the attempt — which is the wrong answer for a node that has merely
+        // shed its view of the fleet (decision 7) while every peer can still
+        // answer. `TransientError` is what the drivers' retry logic is built
+        // around, and `DatabaseUnavailable` is the honest reason: this node
+        // cannot serve, ask another.
+        GraphError::RoutingUnavailable { .. } => BoltError::Query {
+            code: "Neo.TransientError.General.DatabaseUnavailable".to_string(),
+            message: error.to_string(),
+        },
         _ => {
             tracing::warn!(target: "slatedb_graph_kernel", error = %error, "Bolt suppressed internal graph error");
             BoltError::Backend("internal query execution error".to_string())
