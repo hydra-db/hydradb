@@ -1,6 +1,9 @@
 use super::*;
 
 #[cfg(feature = "opencypher")]
+use tracing::Instrument as _;
+
+#[cfg(feature = "opencypher")]
 #[derive(Clone, Debug)]
 pub(crate) struct OptimizedRowMatchGroup {
     pub(crate) group: RowMatchGroup,
@@ -22,23 +25,42 @@ impl GraphShard {
         read_epoch: StorageSequence,
         query: &ParsedRowQuery,
     ) -> Result<RowQueryPlan> {
-        let groups = self
-            .optimized_row_query_groups(cell_id, &query.patterns, &query.pattern_groups, read_epoch)
-            .await?;
-        let mut union_arms = Vec::with_capacity(query.union_arms.len());
-        for arm in &query.union_arms {
-            union_arms.push(
-                Box::pin(self.explain_row_query_plan_with_stats(cell_id, read_epoch, arm)).await?,
-            );
+        let span = query_plan_span(cell_id, read_epoch);
+        let started = std::time::Instant::now();
+        let plan = async {
+            let groups = self
+                .optimized_row_query_groups(
+                    cell_id,
+                    &query.patterns,
+                    &query.pattern_groups,
+                    read_epoch,
+                )
+                .await?;
+            let mut union_arms = Vec::with_capacity(query.union_arms.len());
+            for arm in &query.union_arms {
+                union_arms.push(
+                    Box::pin(self.explain_row_query_plan_with_stats(cell_id, read_epoch, arm))
+                        .await?,
+                );
+            }
+            Ok(RowQueryPlan {
+                cell_id: cell_id.to_string(),
+                read_epoch,
+                columns: query.columns.clone(),
+                groups: groups.into_iter().map(|group| group.plan).collect(),
+                union_all: query.union_all,
+                union_arms,
+            })
         }
-        Ok(RowQueryPlan {
-            cell_id: cell_id.to_string(),
-            read_epoch,
-            columns: query.columns.clone(),
-            groups: groups.into_iter().map(|group| group.plan).collect(),
-            union_all: query.union_all,
-            union_arms,
-        })
+        .instrument(span.clone())
+        .await;
+        match &plan {
+            Ok(plan) => {
+                RowQueryPlanSummary::from_plan(plan).record(&span, cell_id, started.elapsed())
+            }
+            Err(err) => record_plan_error(&span, err),
+        }
+        plan
     }
 
     pub(crate) async fn optimize_row_match_groups_with_stats(
@@ -47,12 +69,25 @@ impl GraphShard {
         groups: &[RowMatchGroup],
         read_epoch: StorageSequence,
     ) -> Result<Vec<RowMatchGroup>> {
-        Ok(self
+        let span = query_plan_span(cell_id, read_epoch);
+        let started = std::time::Instant::now();
+        let planned = self
             .optimize_row_match_group_plans_with_stats(cell_id, groups, read_epoch)
-            .await?
-            .into_iter()
-            .map(|group| group.group)
-            .collect())
+            .instrument(span.clone())
+            .await;
+        let planned = match planned {
+            Ok(planned) => planned,
+            Err(err) => {
+                record_plan_error(&span, &err);
+                return Err(err);
+            }
+        };
+        RowQueryPlanSummary::from_groups(planned.iter().map(|group| &group.plan)).record(
+            &span,
+            cell_id,
+            started.elapsed(),
+        );
+        Ok(planned.into_iter().map(|group| group.group).collect())
     }
 
     pub(crate) async fn optimize_row_patterns_with_stats(
@@ -62,12 +97,25 @@ impl GraphShard {
         read_epoch: StorageSequence,
         initial_bindings: &BTreeSet<String>,
     ) -> Result<Vec<RowPattern>> {
-        Ok(self
+        let span = query_plan_span(cell_id, read_epoch);
+        let started = std::time::Instant::now();
+        let planned = self
             .optimize_row_pattern_plans_with_stats(cell_id, patterns, read_epoch, initial_bindings)
-            .await?
-            .into_iter()
-            .map(|pattern| pattern.pattern)
-            .collect())
+            .instrument(span.clone())
+            .await;
+        let planned = match planned {
+            Ok(planned) => planned,
+            Err(err) => {
+                record_plan_error(&span, &err);
+                return Err(err);
+            }
+        };
+        RowQueryPlanSummary::from_patterns(planned.iter().map(|pattern| &pattern.plan)).record(
+            &span,
+            cell_id,
+            started.elapsed(),
+        );
+        Ok(planned.into_iter().map(|pattern| pattern.pattern).collect())
     }
 
     async fn optimized_row_query_groups(
@@ -776,10 +824,299 @@ fn row_node_bindings(node: &RowNodePattern) -> BTreeSet<String> {
     node.binding.iter().cloned().collect()
 }
 
+// ---------------------------------------------------------------------------
+// query.plan telemetry
+//
+// The planner already computes everything an operator needs to explain a slow
+// query — access path, optimizer passes, cardinality estimate — and then throws
+// it away: `optimize_row_match_groups_with_stats` and
+// `optimize_row_patterns_with_stats` both build a full plan and return only the
+// rewritten patterns, and `RowQueryPlan` never leaves the shard. Summarising it
+// onto the span before it is dropped is what turns "a query timed out" into
+// "a query timed out on FullEdgeScan over RELATES".
+// ---------------------------------------------------------------------------
+
+/// Slow-query threshold in milliseconds, from `GRAPH_SLOW_QUERY_MS`.
+///
+/// Read once. The value is a logging threshold, not a limit, so a process that
+/// starts before the variable is set simply logs at the default.
+#[cfg(feature = "opencypher")]
+fn slow_query_threshold_ms() -> u64 {
+    static THRESHOLD_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *THRESHOLD_MS.get_or_init(|| {
+        std::env::var("GRAPH_SLOW_QUERY_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(1_000)
+    })
+}
+
+/// A `RowQueryPlan` reduced to the handful of bounded-cardinality strings that
+/// belong on a span.
+///
+/// Every field here is schema-derived — access-path variants, edge types, label
+/// and property *names*, pass names. No parameter or property *value* is ever
+/// admitted, per §2 of the telemetry plan.
+#[cfg(feature = "opencypher")]
+#[derive(Default)]
+pub(crate) struct RowQueryPlanSummary {
+    access_paths: Vec<String>,
+    optimizer_passes: BTreeSet<&'static str>,
+    /// The largest cardinality any single planned unit is expected to produce.
+    /// A sum would double-count joined groups and a product would be dominated
+    /// by an arbitrary estimate; the maximum is the number that predicts which
+    /// plan blows up.
+    rows_estimated: u64,
+    full_scan: bool,
+}
+
+#[cfg(feature = "opencypher")]
+impl RowQueryPlanSummary {
+    fn absorb_pattern(&mut self, pattern: &RowQueryPlanPattern) {
+        self.access_paths.push(access_path_label(&pattern.access));
+        self.full_scan |= access_is_full_scan(&pattern.access);
+        self.rows_estimated = self.rows_estimated.max(pattern.estimated_cardinality);
+        for pass in &pattern.optimizer_passes {
+            self.absorb_pass(pass);
+        }
+    }
+
+    fn absorb_group(&mut self, group: &RowQueryPlanGroup) {
+        self.rows_estimated = self.rows_estimated.max(group.estimated_cardinality);
+        for pass in &group.optimizer_passes {
+            self.absorb_pass(pass);
+        }
+        for pattern in &group.patterns {
+            self.absorb_pattern(pattern);
+        }
+    }
+
+    fn absorb_plan(&mut self, plan: &RowQueryPlan) {
+        for group in &plan.groups {
+            self.absorb_group(group);
+        }
+        for arm in &plan.union_arms {
+            self.absorb_plan(arm);
+        }
+    }
+
+    fn absorb_pass(&mut self, pass: &RowQueryOptimizerPass) {
+        if matches!(pass, RowQueryOptimizerPass::FullScanFallback) {
+            self.full_scan = true;
+        }
+        self.optimizer_passes.insert(optimizer_pass_label(pass));
+    }
+
+    fn from_groups<'a>(groups: impl IntoIterator<Item = &'a RowQueryPlanGroup>) -> Self {
+        let mut summary = Self::default();
+        for group in groups {
+            summary.absorb_group(group);
+        }
+        summary
+    }
+
+    fn from_patterns<'a>(patterns: impl IntoIterator<Item = &'a RowQueryPlanPattern>) -> Self {
+        let mut summary = Self::default();
+        for pattern in patterns {
+            summary.absorb_pattern(pattern);
+        }
+        summary
+    }
+
+    fn from_plan(plan: &RowQueryPlan) -> Self {
+        let mut summary = Self::default();
+        summary.absorb_plan(plan);
+        summary
+    }
+
+    fn access_paths(&self) -> String {
+        self.access_paths.join(",")
+    }
+
+    fn optimizer_passes(&self) -> String {
+        self.optimizer_passes
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Stamp the summary onto `span` and, if the plan or the elapsed time asks
+    /// for it, emit the structured slow-query / bad-plan WARN.
+    ///
+    /// Two independent triggers, per §3 of the telemetry plan. The elapsed-time
+    /// one is the obvious one; the full-scan one is the one that pays, because
+    /// it catches a bad plan on a small graph *before* it becomes a timeout on
+    /// a large one. A full-scanning query that returns in 3ms today is a
+    /// 30-second timeout after the tenant grows, and only that rule sees it
+    /// coming.
+    fn record(&self, span: &tracing::Span, cell_id: &str, elapsed: std::time::Duration) {
+        let access_paths = self.access_paths();
+        let optimizer_passes = self.optimizer_passes();
+        span.record("turbolay.query.access_path", access_paths.as_str());
+        span.record("turbolay.query.optimizer_passes", optimizer_passes.as_str());
+        span.record("turbolay.query.rows_estimated", self.rows_estimated);
+        span.record("turbolay.query.full_scan", self.full_scan);
+        if self.full_scan {
+            // The head sampler cannot see a span's attributes after the fact,
+            // so the keep decision has to be visible as a field.
+            span.record("turbolay.sampling.force", true);
+        }
+
+        let elapsed_ms = elapsed.as_millis() as u64;
+        let slow = elapsed_ms >= slow_query_threshold_ms();
+        if !slow && !self.full_scan {
+            return;
+        }
+        tracing::warn!(
+            turbolay.cell_id = %cell_id,
+            turbolay.query.access_path = %access_paths,
+            turbolay.query.optimizer_passes = %optimizer_passes,
+            turbolay.query.rows_estimated = self.rows_estimated,
+            turbolay.query.full_scan = self.full_scan,
+            planning_elapsed_ms = elapsed_ms,
+            reason = if self.full_scan { "full_scan" } else { "slow" },
+            "query plan warrants attention"
+        );
+    }
+}
+
+/// A bounded, schema-derived label for one access path.
+///
+/// The qualifier matters: `FullEdgeScan` alone says a query scanned;
+/// `FullEdgeScan:RELATES` says which relationship to go index. Edge types,
+/// labels and property names are all schema, so they are bounded and safe as
+/// span attributes — property *values* are not, and never appear here.
+#[cfg(feature = "opencypher")]
+fn access_path_label(access: &RowQueryAccess) -> String {
+    match access {
+        RowQueryAccess::VertexIdSeek => "VertexIdSeek".to_string(),
+        RowQueryAccess::VertexPropertyIndex { property } => {
+            format!("VertexPropertyIndex:{property}")
+        }
+        RowQueryAccess::VertexLabelScan { label } => format!("VertexLabelScan:{label}"),
+        RowQueryAccess::AllVertexScan => "AllVertexScan".to_string(),
+        RowQueryAccess::BoundOutExpand { edge_type } => format!("BoundOutExpand:{edge_type}"),
+        RowQueryAccess::BoundInExpand { edge_type } => format!("BoundInExpand:{edge_type}"),
+        RowQueryAccess::ExpandInto { edge_type } => format!("ExpandInto:{edge_type}"),
+        RowQueryAccess::EdgePropertyIndex {
+            edge_type,
+            property,
+        } => format!("EdgePropertyIndex:{edge_type}.{property}"),
+        RowQueryAccess::FullEdgeScan { edge_type } => format!("FullEdgeScan:{edge_type}"),
+        RowQueryAccess::VariableLengthExpand {
+            edge_type,
+            min_hops,
+            max_hops,
+        } => format!("VariableLengthExpand:{edge_type}:{min_hops}..{max_hops}"),
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn access_is_full_scan(access: &RowQueryAccess) -> bool {
+    matches!(
+        access,
+        RowQueryAccess::AllVertexScan | RowQueryAccess::FullEdgeScan { .. }
+    )
+}
+
+#[cfg(feature = "opencypher")]
+fn optimizer_pass_label(pass: &RowQueryOptimizerPass) -> &'static str {
+    match pass {
+        RowQueryOptimizerPass::UtilizeVertexIndex => "UtilizeVertexIndex",
+        RowQueryOptimizerPass::UtilizeEdgeIndex => "UtilizeEdgeIndex",
+        RowQueryOptimizerPass::CostBasedLabelScan => "CostBasedLabelScan",
+        RowQueryOptimizerPass::ConnectivityOrder => "ConnectivityOrder",
+        RowQueryOptimizerPass::JoinOrder => "JoinOrder",
+        RowQueryOptimizerPass::ExpandInto => "ExpandInto",
+        RowQueryOptimizerPass::GraphKernel => "GraphKernel",
+        RowQueryOptimizerPass::ReverseExpand => "ReverseExpand",
+        RowQueryOptimizerPass::FullScanFallback => "FullScanFallback",
+        RowQueryOptimizerPass::PreserveOptionalBoundary => "PreserveOptionalBoundary",
+    }
+}
+
+/// Record a planning failure on the `query.plan` span itself.
+///
+/// The innermost span that produced the error is the one that carries it: the
+/// same failure surfacing at `client.query` says a query failed, while here it
+/// says planning failed, which is a different bug.
+#[cfg(feature = "opencypher")]
+fn record_plan_error(span: &tracing::Span, err: &GraphError) {
+    span.record("error.class", err.class());
+    span.record("turbolay.sampling.force", true);
+}
+
+/// The `query.plan` span, with every recorded field declared empty up front —
+/// `Span::record` only accepts fields the callsite already knows about.
+#[cfg(feature = "opencypher")]
+fn query_plan_span(cell_id: &str, read_epoch: StorageSequence) -> tracing::Span {
+    tracing::info_span!(
+        "query.plan",
+        turbolay.cell_id = %cell_id,
+        turbolay.read_epoch = read_epoch,
+        turbolay.query.access_path = tracing::field::Empty,
+        turbolay.query.optimizer_passes = tracing::field::Empty,
+        turbolay.query.rows_estimated = tracing::field::Empty,
+        turbolay.query.full_scan = tracing::field::Empty,
+        turbolay.sampling.force = tracing::field::Empty,
+        error.class = tracing::field::Empty,
+    )
+}
+
 #[cfg(feature = "opencypher")]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_pattern(
+        access: RowQueryAccess,
+        passes: Vec<RowQueryOptimizerPass>,
+    ) -> RowQueryPlanPattern {
+        RowQueryPlanPattern {
+            original_index: 0,
+            access,
+            estimated_cardinality: 7,
+            bindings: Vec::new(),
+            optimizer_passes: passes,
+        }
+    }
+
+    /// Rule 2 of the slow-query/bad-plan warn is the one that pays, so it is
+    /// the one worth pinning: the alarm bit is a property of the plan, not of
+    /// how long the plan took to build.
+    #[test]
+    fn full_scan_alarm_bit_is_set_by_plan_shape_alone() {
+        let full_edge_scan = RowQueryPlanSummary::from_patterns(&[plan_pattern(
+            RowQueryAccess::FullEdgeScan {
+                edge_type: "RELATES".to_string(),
+            },
+            Vec::new(),
+        )]);
+        assert!(full_edge_scan.full_scan);
+        assert_eq!(full_edge_scan.access_paths(), "FullEdgeScan:RELATES");
+
+        let all_vertex_scan = RowQueryPlanSummary::from_patterns(&[plan_pattern(
+            RowQueryAccess::AllVertexScan,
+            Vec::new(),
+        )]);
+        assert!(all_vertex_scan.full_scan);
+
+        let fallback_pass = RowQueryPlanSummary::from_patterns(&[plan_pattern(
+            RowQueryAccess::VertexIdSeek,
+            vec![RowQueryOptimizerPass::FullScanFallback],
+        )]);
+        assert!(fallback_pass.full_scan);
+
+        let indexed = RowQueryPlanSummary::from_patterns(&[plan_pattern(
+            RowQueryAccess::ExpandInto {
+                edge_type: "RELATES".to_string(),
+            },
+            vec![RowQueryOptimizerPass::UtilizeEdgeIndex],
+        )]);
+        assert!(!indexed.full_scan);
+        assert_eq!(indexed.optimizer_passes(), "UtilizeEdgeIndex");
+    }
 
     #[test]
     fn access_priority_prefers_expand_into_before_scans() {
