@@ -19,6 +19,8 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
+use tracing::Instrument;
+
 use super::service::{
     sanitize_caller_metadata, ClientBookmark, ClientDatabaseResolver, ClientQueryCredentials,
     ClientQueryPage, ClientQueryRequest, ClientQueryService, ClientQuerySession, ClientQueryTarget,
@@ -567,6 +569,10 @@ struct PendingBoltResult {
     deadline: Instant,
     columns: Vec<QueryColumn>,
     started: bool,
+    /// How many pages have been fetched from the service for this result. Only
+    /// telemetry reads it — it is what orders the `query.page` spans of one
+    /// lazily paging client.
+    pages: u64,
     rows: VecDeque<QueryRow>,
     next_cursor: Option<QueryCursorToken>,
     bookmark: Option<ClientBookmark>,
@@ -829,6 +835,7 @@ async fn run_bolt_protocol(
                     prepared,
                     deadline: query_deadline,
                     started: false,
+                    pages: 0,
                     rows: VecDeque::new(),
                     next_cursor: None,
                     bookmark: None,
@@ -1408,18 +1415,50 @@ where
             pending.started = true;
             None
         };
-        pending.prepared.request.max_runtime_ms =
-            Some(remaining_bolt_runtime_ms(pending.deadline)?);
         let fetch_size = count.map_or(prefetch_rows, |count| prefetch_rows.min(count.max(1)));
         let query_id = pending.prepared.request.query_id.clone();
         let scope = pending.prepared.request.target.scope.clone();
+        // One span per fetch, which is at least one per PULL. The budget below
+        // is recomputed here against a fixed deadline, so a stream that reports
+        // "29999 ms; limit is 29999 ms" explains itself from the span sequence
+        // instead of from a code read — and a client that pages lazily shows
+        // where the wall-clock actually went.
+        pending.pages += 1;
+        let page_span = tracing::info_span!(
+            target: "slatedb_graph_kernel",
+            "query.page",
+            turbolay.scope = %scope,
+            turbolay.correlation_id = tracing::field::Empty,
+            turbolay.caller.step = tracing::field::Empty,
+            turbolay.read_epoch = tracing::field::Empty,
+            turbolay.query.rows_returned = tracing::field::Empty,
+            error.class = tracing::field::Empty,
+            page = pending.pages,
+            fetch_size,
+            remaining_runtime_ms = tracing::field::Empty,
+        );
+        if let Some(correlation_id) = pending.prepared.request.correlation_id.as_deref() {
+            page_span.record("turbolay.correlation_id", correlation_id);
+        }
+        if let Some(caller_step) = pending.prepared.request.caller_step.as_deref() {
+            page_span.record("turbolay.caller.step", caller_step);
+        }
+        let remaining_runtime_ms = match remaining_bolt_runtime_ms(pending.deadline) {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                page_span.record("error.class", "admission");
+                return Err(error);
+            }
+        };
+        page_span.record("remaining_runtime_ms", remaining_runtime_ms);
+        pending.prepared.request.max_runtime_ms = Some(remaining_runtime_ms);
         let task = context.service.execute_prepared_page(
             authenticated,
             pending.prepared.clone(),
             cursor,
             fetch_size,
         );
-        match await_bolt_page(
+        let awaited = await_bolt_page(
             task,
             &context.service,
             authenticated,
@@ -1427,19 +1466,30 @@ where
             &query_id,
             channels,
         )
-        .await?
-        {
+        .instrument(page_span.clone())
+        .await?;
+        match awaited {
             PageAwaitResult::Complete(Ok(page)) => {
                 if page.page.columns != pending.columns {
-                    return Ok(PageAwaitResult::Complete(Err(GraphError::CorruptValue {
+                    let error = GraphError::CorruptValue {
                         key: "client/bolt/result_columns".to_string(),
                         reason: "result columns changed between cursor pages".to_string(),
-                    })));
+                    };
+                    page_span.record("error.class", error.class());
+                    return Ok(PageAwaitResult::Complete(Err(error)));
+                }
+                page_span.record("turbolay.query.rows_returned", page.page.rows.len() as u64);
+                if let Some(read_epoch) = page.read_epoch {
+                    page_span.record("turbolay.read_epoch", read_epoch);
                 }
                 pending.prepared.request.read_epoch = page.read_epoch;
                 pending.rows.extend(page.page.rows);
                 pending.next_cursor = page.page.next_cursor;
                 pending.bookmark = page.bookmark;
+            }
+            PageAwaitResult::Complete(Err(error)) => {
+                page_span.record("error.class", error.class());
+                return Ok(PageAwaitResult::Complete(Err(error)));
             }
             outcome => return Ok(outcome),
         }
