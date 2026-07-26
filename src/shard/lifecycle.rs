@@ -1,5 +1,7 @@
 use super::*;
 
+use tracing::Instrument as _;
+
 impl GraphShard {
     pub async fn open(path: impl Into<Path>, object_store: Arc<dyn ObjectStore>) -> Result<Self> {
         Self::open_with_options(path, object_store, GraphOpenOptions::default()).await
@@ -400,11 +402,23 @@ impl GraphShard {
             })
     }
 
+    /// Whether this shard may write at all, as its own span.
+    ///
+    /// In-memory and I/O-free, so the span is a timestamp pair. It is worth that
+    /// because it separates two failures a caller cannot otherwise tell apart:
+    /// a shard opened read-only, and a shard whose writer handle has gone. Both
+    /// classify as `fencing`, and only the span name says which.
     pub(crate) fn ensure_write_authority(
         &self,
         cell_id: &str,
         operation: &'static str,
     ) -> Result<()> {
+        let span = tracing::info_span!(
+            "writer.authority",
+            turbolay.cell_id = %cell_id,
+            error.class = tracing::field::Empty,
+        );
+        let _entered = span.enter();
         match &self.write_authority {
             GraphWriteAuthority::ReadOnly => Err(GraphError::WriteRequiresWriter {
                 operation,
@@ -414,8 +428,28 @@ impl GraphShard {
                 self.db.writer().map(|_| ())
             }
         }
+        .inspect_err(|error| {
+            tracing::Span::current().record("error.class", error.class());
+        })
     }
 
+    /// Take the SlateDB writer for `cell_id`, if this node does not already
+    /// hold it.
+    ///
+    /// # Why the span is conditional
+    ///
+    /// The don't-promote-a-cell-you-do-not-own rule from the rendezvous
+    /// placement note is a correctness invariant, and a span that materialises
+    /// only when a promotion *actually happens* makes violations countable
+    /// rather than theoretical. A `writer.promote` per write — which is what an
+    /// unconditional span would give, since this function is idempotent and is
+    /// called on every routed write — would bury the handful of real promotions
+    /// under the no-ops and make the count meaningless.
+    ///
+    /// The pre-check is the same one `await_writer_reopen` already makes and is
+    /// racy in the same harmless way: losing the race emits one span for a
+    /// promotion that turned out to be a no-op, which is a diagnostic
+    /// imprecision and not a behaviour change.
     pub(crate) async fn promote_to_writer(
         &self,
         cell_id: &str,
@@ -423,13 +457,41 @@ impl GraphShard {
     ) -> Result<()> {
         validate_component("cell_id", cell_id)?;
         if matches!(&self.write_authority, GraphWriteAuthority::ReadOnly) {
-            return Err(GraphError::WriteRequiresWriter {
+            let error = GraphError::WriteRequiresWriter {
                 operation,
                 cell_id: cell_id.to_string(),
-            });
+            };
+            tracing::Span::current().record("error.class", error.class());
+            return Err(error);
         }
-        self.db.promote_writer().await?;
-        Ok(())
+        if self.db.writer().is_ok() {
+            // Already holding it: `promote_writer` short-circuits and there is
+            // no promotion to make countable.
+            self.db.promote_writer().await?;
+            return Ok(());
+        }
+        let span = tracing::info_span!(
+            "writer.promote",
+            turbolay.cell_id = %cell_id,
+            turbolay.writer.epoch = tracing::field::Empty,
+            error.class = tracing::field::Empty,
+        );
+        async {
+            match self.db.promote_writer().await {
+                Ok(_) => {
+                    if let Some(epoch) = self.db.writer_epoch() {
+                        tracing::Span::current().record("turbolay.writer.epoch", epoch);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    tracing::Span::current().record("error.class", error.class());
+                    Err(error)
+                }
+            }
+        }
+        .instrument(span)
+        .await
     }
 
     pub(crate) async fn validate_write_fence_txn(
