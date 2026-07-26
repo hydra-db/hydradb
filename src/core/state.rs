@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard, RwLock as AsyncRwLock, Semaphore};
 #[cfg(feature = "opencypher")]
 use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 use turbolay_placement::cell_writer;
 
 #[cfg(feature = "opencypher")]
@@ -376,11 +377,47 @@ impl GraphStore {
     /// [`GraphStore::writer_reopen_delay`] until the wait is spent. Promoting
     /// from in here would bypass the ownership check entirely — see the note on
     /// [`WriterReopenGate`].
+    ///
+    /// # The span
+    ///
+    /// `writer.fence_refresh` is where the writer ping-pong becomes one backend
+    /// query. The three attribution fields are declared empty and filled in by
+    /// [`Self::log_fence_attribution`] only on the fence arm, so a healthy
+    /// refresh carries no extra cost and a fence carries the identity of
+    /// whoever took the epoch. Grouping these spans by `turbolay.cell_id` and
+    /// counting distinct `turbolay.writer.last_promoted_by` over five minutes is
+    /// the incident, stated as a query.
+    ///
+    /// **Emission only.** Every branch, every gate and every wait below is
+    /// exactly as it was; this function deliberately matches sleet's fenced-
+    /// handle re-open delay (`../sleet/src/daemon.rs:458-472`) and the timing is
+    /// not this plan's to touch.
     pub(crate) async fn refresh_writer_fence(&self) -> Result<()> {
+        let span = tracing::info_span!(
+            "writer.fence_refresh",
+            // `Path::filename` is the cell directory and costs no allocation;
+            // `cell_location` is only paid for on the fence arm.
+            turbolay.cell_id = self.inner.path.filename().unwrap_or_default(),
+            turbolay.writer.epoch = tracing::field::Empty,
+            turbolay.writer.last_promoted_by = tracing::field::Empty,
+            turbolay.writer.last_promoted_epoch = tracing::field::Empty,
+            turbolay.writer.last_promoted_at = tracing::field::Empty,
+            error.class = tracing::field::Empty,
+        );
+        self.refresh_writer_fence_traced().instrument(span).await
+    }
+
+    /// The body of [`Self::refresh_writer_fence`], running inside its span.
+    async fn refresh_writer_fence_traced(&self) -> Result<()> {
         let _open_guard = self.inner.writer_open_gate.lock().await;
         // No writer at all is a read-only shard, not a fenced one: waiting
         // promotes nothing, so there is no delay to arm.
-        let writer = self.open_writer().ok_or(GraphError::ReadOnlyShardStorage)?;
+        let writer = self
+            .open_writer()
+            .ok_or(GraphError::ReadOnlyShardStorage)
+            .inspect_err(|error| {
+                tracing::Span::current().record("error.class", error.class());
+            })?;
         match writer.refresh_manifest().await {
             Ok(()) => {
                 self.reopen_gate().note_success();
@@ -390,18 +427,30 @@ impl GraphStore {
                 // Before the handle goes: the epoch this node thought it held.
                 // Half of the log line below is meaningless without it.
                 let lost_epoch = self.writer_epoch();
+                if let Some(epoch) = lost_epoch {
+                    tracing::Span::current().record("turbolay.writer.epoch", epoch);
+                }
                 self.clear_closed_writer();
                 self.reopen_gate()
                     .note_fence(Instant::now(), self.inner.heartbeat_interval);
                 self.log_fence_attribution(lost_epoch).await;
-                Err(err.into())
+                let error: GraphError = err.into();
+                // `fencing` is expected, not alarming — the class is here so a
+                // dashboard can chart the rate, and the warn that already exists
+                // in `log_fence_attribution` stays the only line emitted.
+                tracing::Span::current().record("error.class", error.class());
+                Err(error)
             }
             // Not a fence, and not a re-open: the handle is still open and
             // still this node's. There is nothing for the gate to pace — a
             // delay armed here would only be spent by some later promotion that
             // this failure says nothing about. The ladder belongs to failed
             // *opens*, which is where `promote_writer` arms it.
-            Err(err) => Err(err.into()),
+            Err(err) => {
+                let error: GraphError = err.into();
+                tracing::Span::current().record("error.class", error.class());
+                Err(error)
+            }
         }
     }
 
@@ -430,6 +479,17 @@ impl GraphStore {
     /// function is logging. The name is reported as attribution, and every field
     /// is qualified accordingly — if it disagrees with the manifest, the
     /// manifest is right.
+    ///
+    /// # Why the three fields are also span attributes
+    ///
+    /// As a warn line these were a genuinely good diagnostic with nothing to
+    /// correlate them to — one free-floating message per fence, joinable to the
+    /// rest of the incident only by timestamp. Promoted onto the enclosing
+    /// `writer.fence_refresh` span they answer the ping-pong question directly:
+    /// group by `turbolay.cell_id`, count distinct
+    /// `turbolay.writer.last_promoted_by` over a window, and a count above one
+    /// *is* the duel. The warn stays exactly as it was, for whoever is tailing a
+    /// pod rather than querying a backend.
     async fn log_fence_attribution(&self, lost_epoch: Option<u64>) {
         let Some((base, cell_id)) = self.cell_location() else {
             tracing::warn!(
@@ -441,14 +501,26 @@ impl GraphStore {
         };
         match cell_writer::read_cell_writer(self.inner.object_store.as_ref(), &base, &cell_id).await
         {
-            Ok(Some(record)) => tracing::warn!(
-                cell_id,
-                lost_epoch,
-                last_promoted_by = %record.node_id,
-                last_promoted_epoch = record.epoch,
-                last_promoted_at = %record.at,
-                "writer fenced; the advisory record names the last node to promote"
-            ),
+            Ok(Some(record)) => {
+                let span = tracing::Span::current();
+                span.record(
+                    "turbolay.writer.last_promoted_by",
+                    tracing::field::display(&record.node_id),
+                );
+                span.record("turbolay.writer.last_promoted_epoch", record.epoch);
+                span.record(
+                    "turbolay.writer.last_promoted_at",
+                    tracing::field::display(&record.at),
+                );
+                tracing::warn!(
+                    cell_id,
+                    lost_epoch,
+                    last_promoted_by = %record.node_id,
+                    last_promoted_epoch = record.epoch,
+                    last_promoted_at = %record.at,
+                    "writer fenced; the advisory record names the last node to promote"
+                );
+            }
             Ok(None) => tracing::warn!(
                 cell_id,
                 lost_epoch,
