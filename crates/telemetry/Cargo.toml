@@ -1,0 +1,53 @@
+[package]
+name = "turbolay-telemetry"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "OpenTelemetry logs and traces for the Turbolay graph-node and graph-indexer binaries"
+publish = false
+
+# No dependency on `slatedb-graph-kernel`, and the kernel must not gain one on
+# this crate. The kernel emits through the plain `tracing` facade, which is a
+# no-op with no subscriber installed; this crate owns only the *subscriber*
+# side. Keeping the arrow pointing this way is what lets OTel land without
+# touching a single `[features]` entry in the root manifest — see
+# `docs/plans/2026-07-26-otel-telemetry-crate.md` §1.
+#
+# `tracing` and `tracing-subscriber` are inherited from the root
+# `[workspace.dependencies]` so this crate cannot drift from the kernel.
+#
+# Every third-party version is inherited from the root `[workspace.dependencies]`,
+# including the six `opentelemetry-*` crates, so this crate cannot drift from the
+# kernel. `optional` is not inheritable and stays here at the use site.
+#
+# Version pairing is not free choice: `tracing-opentelemetry` 0.33 is the
+# release that targets `opentelemetry` 0.32. Bump the pair together in the root
+# table or the `OpenTelemetrySpanExt` trait will not apply to the installed
+# tracer.
+[features]
+default = []
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry-appender-tracing",
+    "dep:opentelemetry-semantic-conventions",
+    "dep:tracing-opentelemetry",
+]
+
+[dependencies]
+chrono = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry-appender-tracing = { workspace = true, optional = true }
+opentelemetry-semantic-conventions = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
