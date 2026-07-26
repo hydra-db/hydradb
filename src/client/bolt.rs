@@ -757,7 +757,11 @@ async fn run_bolt_protocol(
                 ClientMessage::Reset => {
                     clear_pending_result(&context, &mut session).await;
                     send_bolt_success(&mut writer, BoltDict::new()).await?;
-                    state = BoltState::Ready;
+                    state = if session.authenticated.is_some() {
+                        BoltState::Ready
+                    } else {
+                        BoltState::Authentication
+                    };
                 }
                 ClientMessage::Goodbye => {
                     clear_pending_result(&context, &mut session).await;
