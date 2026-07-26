@@ -4,7 +4,7 @@ status: done
 date: 2026-07-25
 branch: Turbolay-V3.5
 base_commit: 3bacd71
-head_commit: dddc1ec
+head_commit: b638fd8
 tags:
   - routing
   - placement
@@ -343,8 +343,8 @@ Three harnesses already exist and none of this needs new integration scaffolding
 | Remove a node, order of the rest preserved | `turbolay-placement` | minimal disruption |
 | 3 similar node ids over 30 000 cells stay within 10% | `turbolay-placement` | the finalizer — fails at 2.00 without it |
 | Heartbeat expiry, self-always-live | `turbolay-placement` | liveness rules |
-| LIST failure inside grace keeps the view; past grace sheds and unpublishes | `turbolay-placement` + `FaultStore` | decision 7 — the bound |
-| LIST fails while PUTs still land → node withdraws its heartbeat | `turbolay-placement` + `FaultStore` | decision 7's partial failure — the permanent-refusal trap |
+| LIST failure inside grace keeps the view; past grace sheds | `turbolay-placement` (pure, over injected elapsed times) and `engine::placement` (over a LIST-failing store) | decision 7 — the bound |
+| A shed view withdraws the heartbeat of an otherwise healthy node | `graph_node/readiness.rs` | decision 7's partial failure — the permanent-refusal trap |
 | Never-published peer counts live for one timeout after start, dead after | `turbolay-placement` | decision 8 — the rolling restart |
 | `interval >= timeout` is rejected at startup | `turbolay-placement` | decision 5's validation |
 | Publishes while ready, DELETEs on unready and on SIGTERM | `turbolay-placement` + `graph-node` smoke | decision 4 — readiness rides the heartbeat |
@@ -528,14 +528,27 @@ Touch point (d) currently under-specifies this. Sleet's handler
 3. **Retries unconditionally**, without re-checking ownership. Sleet accepts that
    a fenced node re-fences the winner once more before converging.
 
-**One deliberate divergence, found while implementing.** Sleet's retry loop is
-unbounded because it is a *daemon supervisor* — nobody is waiting on it. Ours
-sits on the **write path**, where an unbounded loop hangs a client request
-forever, so it is capped at four attempts. The budget is spent on attempts
-rather than on sleeps: worst case is one 5s fence wait plus 2s + 4s ≈ 11s, then
-the last error returns to the caller. Rule 3 is preserved in the sense that
-matters — no ownership re-check between attempts — and the cap is what makes
-"retry blind" safe to do in front of a client.
+**Rule 3 inverts. Rules 1 and 2 survive exactly.** Sleet's blind retry is safe
+because it is a *daemon supervisor*: nothing waits on it, and its reconcile loop
+cancels the task out of band when ownership moves, so a retry can never outlive
+the node's claim to the work. Ours sits on the **write path**, where no
+canceller exists — and a loop that re-promotes on its own authority walks
+straight past `ensure_local_writer`, which is the single place ownership is
+checked. Implemented literally (`8fa865f`) it took the epoch straight back and
+would have made touch point (b) dead on arrival.
+
+So `refresh_writer_fence` never promotes. It drops the handle, arms a
+`WriterReopenGate` for one `heartbeat_interval`, and returns the error;
+`ensure_local_writer` is the single promotion gate and applies **ownership
+first, then pacing**, because a non-owner must be refused outright rather than
+asked to wait. The retry is the client's, and it re-derives ownership on the way
+in.
+
+The ladder of rule 1 is armed by a failed *open* (`promote_writer`), which is
+the only place a re-open actually happens and therefore the only place a wait
+can be armed that the next attempt will spend. A wait longer than one interval
+— reachable only through that ladder, never through a fence — is refused with a
+retryable `AdmissionRejected` rather than held open in front of a Bolt client.
 
 ### 7. A failed node LIST — bounded grace, then shed. Decided
 
@@ -563,6 +576,16 @@ sheds while still publishing stays the computed owner for everyone else, so peer
 route writes to it and it refuses every one, permanently, with nothing to time
 out. Withdrawing makes peers take over. It also falls out of decision 4's
 readiness gating for free: a node that cannot read the live set is not ready.
+
+**"For free" was wrong, and it shipped that way.** The rule was implemented and
+tested in `turbolay-placement`, and then nothing in `graph-node` consulted it:
+the publisher gated on the lifecycle flag alone, which a shed view does not
+touch, so `heartbeat_action` had no caller outside the kernel seam. `f0a1843`
+wires it — `graph_node/readiness.rs`'s `NodeReadiness` is lifecycle **and**
+placement, read by both the publisher and `/readyz` so the two answers cannot
+drift. The general lesson is the one the fence defect already taught: a rule
+that lives in a library and is enforced by a caller is not done until the caller
+exists.
 
 Worst case for the cell: 15s grace + peer detection (immediate if the DELETE
 lands, another 15s if the store is fully unreachable) — **≤ 30s**, bounded either
@@ -684,6 +707,16 @@ writes to it and it refuses every one, permanently, with nothing to time out.
 
 Revisit only if kernel tests come to want a failing store too (index GC, matrix
 publish); then it graduates to a `crates/test-support` member.
+
+**It scoped less cleanly than that, and the trigger has already fired twice.**
+Decision 7's rule turned out to need a caller on the kernel side as well as a
+pure rule on the crate side, so `engine::placement` hand-rolled a
+`ListFailingStore` and `graph_node/readiness.rs` a `FailingStore`, each because
+`FaultStore` is `#[cfg(test)]` inside a crate they cannot import from. That is
+two of the three instances the "revisit" clause asks for, and both are strictly
+weaker doubles — no counters, no backdating. The graduation is now the cheaper
+option and is the recommended next move; `FaultStore` itself is unchanged and
+correct, and its own tests stay where they are.
 
 ### 12. `liveness.rs`, not `directory.rs` — decided
 

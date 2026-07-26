@@ -3,7 +3,7 @@ title: Rendezvous placement Phase 1 — implementation review
 date: 2026-07-26
 branch: Turbolay-V3.5
 base_commit: ea942ec
-head_commit: dddc1ec
+head_commit: b638fd8
 plan: docs/plans/2026-07-25-rendezvous-placement.md
 status: phase-1-complete
 tags:
@@ -16,7 +16,7 @@ tags:
 
 # Rendezvous placement Phase 1 — implementation review
 
-Covers `ea942ec..dddc1ec`. **All seven commits of §7.8 are done** and Phase 1 is
+Covers `ea942ec..b638fd8`. **All seven commits of §7.8 are done** and Phase 1 is
 complete. What follows is what shipped, what changed in the plan while shipping
 it, and the one real defect found along the way.
 
@@ -98,8 +98,9 @@ contact with the code.
 
 ## Deviations from the plan, all recorded in it
 
-- The fence retry is **bounded**, where sleet's is unbounded — write path, not
-  daemon, so an unbounded loop hangs a client request.
+- There is **no fence retry at all**, where sleet's is an unbounded loop — write
+  path, not daemon, so the wait is recorded and the client's own retry spends it,
+  through the gate that re-derives ownership first.
 - Placement's module is `liveness.rs`, not `directory.rs`, because the kernel
   already has an `ObjectStoreNodeDirectory` and it is the *other* operand of the
   intersection.
@@ -130,8 +131,10 @@ names the same type on both sides of the crate boundary.
 
 ## Verification
 
-136 lib tests, 303 under `server-runtime`, 67 placement, 9 bin, clippy clean on
-both packages, `cargo fmt --all --check` clean.
+136 lib tests, 303 under `server-runtime`, 67 placement, 11 bin, clippy clean on
+both packages including `--features server-runtime,indexer-runtime`, and
+`cargo fmt --all --check` clean. All of it through `just`, which now exports the
+build environment those feature sets need.
 
 The lib suite runs in 0.14s. It passed through 5.07s and 5.28s on the way, twice
 for the same underlying reason — a fenced writer's wait was a real one at the
@@ -142,12 +145,9 @@ decision 5's wiring: `fence_backoff_interval` is now a field, `Default` is
 hand-written because `Duration::default()` is zero and a zero wait would let a
 fenced writer re-open immediately, and the fencing tests pace in milliseconds.
 
-**Known pre-existing failures, confirmed at `ea942ec` and unrelated to this
-work:** `useless_conversion` at `src/query/opencypher.rs:361` under
-`--features opencypher` (macOS-specific; the file is untouched since `215bed9`),
-and a stack overflow in
-`cypher_relationship_properties_are_indexed_mutable_and_snapshot_safe`. Both
-verified in a clean worktree rather than accepted on assertion.
+**Two "known pre-existing failures" were recorded here, and both were the local
+environment rather than defects.** Corrected in the review pass below; neither
+survives.
 
 **Gaps:**
 
@@ -156,11 +156,12 @@ verified in a clean worktree rather than accepted on assertion.
   `InMemory` cannot fail, and `FaultStore` is `#[cfg(test)]` inside the placement
   crate so the kernel cannot import it. If that wall is hit a third time,
   promoting it to a `crates/test-support` member is the fix decision 11 already
-  anticipates.
+  anticipates. **It has been hit twice more since**, so this is now the
+  recommended next move — see decision 11 in the plan.
 - `--features server-runtime` needs `BINDGEN_EXTRA_CLANG_ARGS=-I/opt/homebrew/include`
   and `LIBRARY_PATH=/opt/homebrew/lib` on macOS. CI installs
   `libcypher-parser-dev` via apt and needs neither. Nothing documents the local
-  equivalent; it belongs in the `justfile`.
+  equivalent; it belongs in the `justfile`. **Fixed in `d3ce0ca`.**
 
 ## The regression test, and why it discriminates
 
@@ -180,6 +181,50 @@ than a demonstration.
   behaviour reaches 3 after the first of four rounds, so the ceiling still fails
   the old code. 33 runs, no flakes.
 
+## The review pass, `d3ce0ca..b638fd8`
+
+A second read of the shipped code against both plan documents. Three things it
+found, and what happened to each.
+
+**Decision 7 was built, tested, and not connected.** `heartbeat_action` and
+`is_ready` had no consumer outside `engine::placement`: the publisher gated on
+the lifecycle `AtomicBool` alone, and nothing about a shed view touches it. So a
+node past the grace window refused every promotion *and kept publishing* —
+precisely the permanent-refusal trap the decision, `ViewState::Shed`'s own
+docs, and `fault_store.rs`'s module header all describe. Two supporting claims
+were false with it: §5's two `FaultStore`-backed rows named tests that do not
+exist (`FaultStore`'s twelve tests all test `FaultStore`), and
+`engine/placement.rs`'s module docs asserted the wiring. Fixed in `f0a1843` —
+`NodeReadiness` is lifecycle **and** placement, read by the publisher and by
+`/readyz`.
+
+It is the same shape as the fence defect this review already documents: a rule
+correct in the library, enforced by a caller that was never written, with green
+tests on both sides of the gap.
+
+**The reverted rule-3 design outlived its revert, in two documents.** The doc
+comment above `refresh_writer_fence` still described the retry loop `efc4c5a`
+deleted — "waits one heartbeat interval, re-promotes, the retry is
+unconditional" — immediately above the paragraph saying the function never
+promotes; and §7.6 still described the four-attempt cap. Both now describe the
+gate (`b638fd8`).
+
+**The re-open ladder was armed where it could never be spent.** It was armed
+only from the non-fence error arm of `refresh_writer_fence`, which leaves the
+writer open, and `await_writer_reopen` returns early whenever a writer is open —
+so every wait it armed was skipped and the `AdmissionRejected` cap could not
+fire. Moved to `promote_writer`, where a re-open actually happens (`b638fd8`).
+
+**Corrections to this document's own verification section.** Neither recorded
+failure was a defect. The stack overflow in
+`cypher_relationship_properties_are_indexed_mutable_and_snapshot_safe` is a
+missing `RUST_MIN_STACK` — `ci.yml` sets 8 MiB on both OpenCypher test jobs and
+the `justfile` did not; the test passes at that stack size. The
+`useless_conversion` at `opencypher.rs:361` is real on macOS and required on
+Linux, because bindgen types the constant per platform; it is now an annotated
+`#[allow]` rather than a standing lint failure. With `d3ce0ca` exporting all
+three variables, `just ci` is clean on macOS.
+
 ## What is left
 
 Phase 2 — cell addressability on the wire — and the §6 follow-ups: forwarding
@@ -187,3 +232,21 @@ over `QueryServiceEndpoint` for HTTP clients, and a minimum-tenure rule if
 flapping proves painful. Rendezvous moves ownership the instant the live set
 changes, so a flapping node reclaims its cells each time it returns, at one
 writer open per reclaim.
+
+Four smaller items the review pass raised and did not act on:
+
+- **A shed node answers `ROUTE` with `Neo.ClientError.Statement.InvalidSyntax`**
+  (`bolt_config_error` → `UnsupportedQuery`). Decision 7 makes shedding routine,
+  and a driver receiving a client error from the routing procedure will not fail
+  over to the next router. A transient code is the right answer;
+  `bolt/tests.rs`'s `object_store_routing_advertises_nothing_when_no_live_node_is_addressable`
+  pins the current one and would change with it.
+- **`GRAPH_HEARTBEAT_INTERVAL_MS` / `_TIMEOUT_MS` appear in no chart, manifest
+  or doc.** Decision 5 chose config over constants precisely because the cost
+  scales with fleet size; operationally they are still constants.
+- **No demotion path.** A node that loses ownership keeps its SlateDB handle
+  until the new owner's first write fences it.
+- **Decision 8's startup window can name a gracefully-removed peer** as a cell's
+  owner for up to one `heartbeat_timeout` after a restart, refusing writes with a
+  hint pointing at a node that is gone. Bounded, and the right trade against the
+  alternative, but the plan argues the decision only from the other direction.
