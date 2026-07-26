@@ -1,5 +1,23 @@
 set shell := ["bash", "-eu", "-c"]
 
+# The build environment every recipe below needs, so that `just <recipe>` works
+# on a clean checkout without anyone rediscovering these three by bisecting a
+# link error. An already-exported value always wins.
+#
+# Homebrew's prefix is macOS only: `opencypher` (and therefore `server-runtime`)
+# runs bindgen against libcypher-parser, and `graphblas` links libgraphblas.
+# Neither is on the default search path there. CI is Linux and installs both
+# from apt, which is why nothing in `ci.yml` sets them.
+brew_prefix := if os() == "macos" { shell("brew --prefix 2>/dev/null || echo /opt/homebrew") } else { "" }
+export BINDGEN_EXTRA_CLANG_ARGS := env_var_or_default("BINDGEN_EXTRA_CLANG_ARGS", if os() == "macos" { "-I" + brew_prefix + "/include" } else { "" })
+export LIBRARY_PATH := env_var_or_default("LIBRARY_PATH", if os() == "macos" { brew_prefix + "/lib" } else { "" })
+
+# Every platform, and matching `ci.yml`'s OpenCypher test jobs exactly. Without
+# it `cypher_relationship_properties_are_indexed_mutable_and_snapshot_safe`
+# overflows the 2 MiB default test-thread stack and aborts the whole run with
+# SIGABRT, which reads like a crash in the code rather than a missing knob.
+export RUST_MIN_STACK := env_var_or_default("RUST_MIN_STACK", "8388608")
+
 # Show available recipes.
 default:
     @just --list
@@ -56,6 +74,12 @@ test-native:
 test-chaos:
     cargo test --locked --features chaos-harness --lib
 
+# The library under this feature set is covered by test-native; this recipe is
+# the graph-node binary's own config, publisher and heartbeat tests.
+# Test the production runtime configuration, as `ci.yml` does.
+test-server-runtime:
+    cargo test --locked --features server-runtime --bin graph-node
+
 # Lint and test the workspace members. Every other recipe here is bare, so it
 # selects the root package only.
 test-placement:
@@ -76,7 +100,7 @@ native-check:
     fi
 
 # Run the local CI-equivalent check set.
-ci: native-check fmt-check check test-placement test test-opencypher test-graphblas test-native test-chaos check-examples check-examples-native check-examples-chaos
+ci: native-check fmt-check check test-placement test test-opencypher test-graphblas test-native test-chaos test-server-runtime check-examples check-examples-native check-examples-chaos
 
 # Run the local object-store smoke test.
 smoke:
