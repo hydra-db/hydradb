@@ -358,6 +358,12 @@ impl ParsedCypher {
                 query.len() as u64,
                 null_mut(),
                 null_mut(),
+                // bindgen gives this constant the width the platform's headers
+                // give it: `u64` where CI runs, already `u32` on macOS. The
+                // conversion is therefore load-bearing on one platform and a
+                // no-op on the other, and clippy only ever sees the platform it
+                // is running on.
+                #[allow(clippy::useless_conversion)]
                 sys::CYPHER_PARSE_ONLY_STATEMENTS.into(),
             );
             if result.is_null() {
