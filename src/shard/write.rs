@@ -239,38 +239,47 @@ impl GraphShard {
             updates.len() as u64,
             self.limits.max_bulk_import_edges as u64,
         )?;
-        let _permit = self
-            .acquire_graph_write_permit("merge_vertex_metadata_batch")
-            .await?;
-        let _writer = self.writer_lane(cell_id).lock().await;
-        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
-            match self
-                .merge_vertex_metadata_batch_txn(cell_id, updates.clone())
-                .await
-            {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+        let span = write_txn_span(cell_id, None);
+        async {
+            let mut retries = WriteRetryCount::new();
+            let _permit = self
+                .acquire_graph_write_permit("merge_vertex_metadata_batch")
+                .await?;
+            let _writer = self.writer_lane(cell_id).lock().await;
+            for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+                match self
+                    .merge_vertex_metadata_batch_txn(cell_id, updates.clone())
+                    .await
                 {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
-                    tokio::task::yield_now().await;
-                }
-                Ok(changed) => {
-                    if changed > 0 {
+                    Err(err)
+                        if is_retryable_write_conflict(&err)
+                            && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                    {
                         self.operation_metrics
-                            .write_commits
+                            .write_retries
                             .fetch_add(1, Ordering::Relaxed);
+                        retries.note_retry();
+                        tokio::task::yield_now().await;
                     }
-                    return Ok(changed);
+                    Ok(changed) => {
+                        if changed > 0 {
+                            self.operation_metrics
+                                .write_commits
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Ok(changed);
+                    }
+                    result => return result.inspect_err(record_error_class),
                 }
-                result => return result,
             }
+            Err(GraphError::RetryExhausted {
+                operation: "graph transaction",
+                attempts: GRAPH_TXN_MAX_RETRIES,
+            })
+            .inspect_err(record_error_class)
         }
-        Err(GraphError::RetryExhausted {
-            operation: "graph transaction",
-            attempts: GRAPH_TXN_MAX_RETRIES,
-        })
+        .instrument(span)
+        .await
     }
 
     pub async fn import_vertex_metadata_batch(
@@ -559,42 +568,52 @@ impl GraphShard {
         };
         self.ensure_write_authority(cell_id, operation)?;
 
-        let _permit = self.acquire_graph_write_permit(operation).await?;
-        let _writer = self.writer_lane(cell_id).lock().await;
-        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
-            let lock = self.acquire_local_write_guard(cell_id, operation).await?;
-            let result = self
-                .delete_vertex_txn_locked(
-                    cell_id,
-                    vertex_id,
-                    idempotency_key,
-                    detach,
-                    operation,
-                    &lock,
-                )
-                .await;
-            match finish_local_write(lock, result).await {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
-                {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
-                    tokio::task::yield_now().await;
+        let span = write_txn_span(cell_id, None);
+        async {
+            let mut retries = WriteRetryCount::new();
+            let _permit = self.acquire_graph_write_permit(operation).await?;
+            let _writer = self.writer_lane(cell_id).lock().await;
+            for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+                let lock = self.acquire_local_write_guard(cell_id, operation).await?;
+                let result = self
+                    .delete_vertex_txn_locked(
+                        cell_id,
+                        vertex_id,
+                        idempotency_key,
+                        detach,
+                        operation,
+                        &lock,
+                    )
+                    .await;
+                match finish_local_write(lock, result).await {
+                    Err(err)
+                        if is_retryable_write_conflict(&err)
+                            && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                    {
+                        self.operation_metrics
+                            .write_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                        retries.note_retry();
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(result) => {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::Span::current().record("turbolay.commit_epoch", result.epoch);
+                        return Ok(result);
+                    }
+                    result => return result.inspect_err(record_error_class),
                 }
-                Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(result);
-                }
-                result => return result,
             }
+            Err(GraphError::RetryExhausted {
+                operation: "graph transaction",
+                attempts: GRAPH_TXN_MAX_RETRIES,
+            })
+            .inspect_err(record_error_class)
         }
-        Err(GraphError::RetryExhausted {
-            operation: "graph transaction",
-            attempts: GRAPH_TXN_MAX_RETRIES,
-        })
+        .instrument(span)
+        .await
     }
 
     async fn delete_vertex_txn_locked(
@@ -1255,41 +1274,51 @@ impl GraphShard {
         });
         let fingerprint = relationship_import_fingerprint(cell_id, edge_type, &relationships);
 
-        let _permit = self.acquire_graph_write_permit(options.operation).await?;
-        let _writer = self.writer_lane(cell_id).lock().await;
-        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
-            match self
-                .import_relationships_batch_txn(
-                    cell_id,
-                    edge_type,
-                    &relationships,
-                    idempotency_key,
-                    fingerprint,
-                    options,
-                )
-                .await
-            {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+        let span = write_txn_span(cell_id, Some(edge_type));
+        async {
+            let mut retries = WriteRetryCount::new();
+            let _permit = self.acquire_graph_write_permit(options.operation).await?;
+            let _writer = self.writer_lane(cell_id).lock().await;
+            for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+                match self
+                    .import_relationships_batch_txn(
+                        cell_id,
+                        edge_type,
+                        &relationships,
+                        idempotency_key,
+                        fingerprint,
+                        options,
+                    )
+                    .await
                 {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
-                    tokio::task::yield_now().await;
+                    Err(err)
+                        if is_retryable_write_conflict(&err)
+                            && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                    {
+                        self.operation_metrics
+                            .write_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                        retries.note_retry();
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(result) => {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::Span::current().record("turbolay.commit_epoch", result.end_epoch);
+                        return Ok(result);
+                    }
+                    result => return result.inspect_err(record_error_class),
                 }
-                Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(result);
-                }
-                result => return result,
             }
+            Err(GraphError::RetryExhausted {
+                operation: "graph transaction",
+                attempts: GRAPH_TXN_MAX_RETRIES,
+            })
+            .inspect_err(record_error_class)
         }
-        Err(GraphError::RetryExhausted {
-            operation: "graph transaction",
-            attempts: GRAPH_TXN_MAX_RETRIES,
-        })
+        .instrument(span)
+        .await
     }
 
     async fn set_edge_metadata_txn(
