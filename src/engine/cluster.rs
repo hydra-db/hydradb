@@ -665,25 +665,52 @@ impl RoutedGraphCluster {
             return Ok(());
         };
         let cap = self.placement.config().heartbeat_interval;
-        if delay > cap {
-            // Raised inside `writer.acquire`, which has no nested span here, so
-            // this *is* the innermost span for the refusal.
-            let error = GraphError::AdmissionRejected {
-                operation: "writer_reopen",
-                actual: delay.as_millis() as u64,
-                limit: cap.as_millis() as u64,
-            };
-            record_error_class(&error);
-            return Err(error);
-        }
-        tracing::debug!(
-            node_id = %self.local_node_id,
-            cell_id,
-            delay_ms = delay.as_millis(),
-            "pacing a writer re-open after a fence"
+        let span = tracing::info_span!(
+            "writer.reopen_wait",
+            turbolay.node_id = %self.local_node_id,
+            turbolay.cell_id = %cell_id,
+            turbolay.writer.reopen_delay_ms = delay.as_millis(),
+            turbolay.writer.reopen_cap_ms = cap.as_millis(),
+            turbolay.outcome = tracing::field::Empty,
+            error.class = tracing::field::Empty,
         );
-        tokio::time::sleep(delay).await;
-        Ok(())
+        let result = async {
+            if delay > cap {
+                let error = GraphError::AdmissionRejected {
+                    operation: "writer_reopen",
+                    actual: delay.as_millis() as u64,
+                    limit: cap.as_millis() as u64,
+                };
+                record_error_class(&error);
+                tracing::Span::current().record("turbolay.outcome", "failed");
+                tracing::warn!(
+                    operation = "writer_reopen",
+                    delay_ms = delay.as_millis(),
+                    cap_ms = cap.as_millis(),
+                    error.class = error.class(),
+                    "writer re-open delay exceeded the request wait cap"
+                );
+                return Err(error);
+            }
+            tracing::info!(
+                operation = "writer_reopen",
+                delay_ms = delay.as_millis(),
+                cap_ms = cap.as_millis(),
+                "pacing a writer re-open"
+            );
+            tokio::time::sleep(delay).await;
+            tracing::Span::current().record("turbolay.outcome", "success");
+            Ok(())
+        }
+        .instrument(span)
+        .await;
+        if let Err(error) = &result {
+            // The nested span says where the rejection arose; the enclosing
+            // `writer.acquire` span must still report that the acquisition
+            // itself failed.
+            record_error_class(error);
+        }
+        result
     }
 
     pub async fn write_edge(&self, mutation: crate::EdgeMutation) -> Result<crate::CommitResult> {

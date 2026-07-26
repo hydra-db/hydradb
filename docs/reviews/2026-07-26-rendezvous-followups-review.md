@@ -28,12 +28,16 @@ against its own two planning documents. The findings themselves are recorded in
 | `08c1dfe` | plan and review corrected where they described code that was never wired or later reverted |
 | `4ab2c2b` | routing refusals classified transient rather than as a syntax error |
 
-## The one that changes production behaviour
+## Production behaviour changes
 
-`f0a1843`. Everything else is either build tooling, dead code, documentation, or
-an error code.
+Three commits change production behaviour. `f0a1843` changes readiness and
+heartbeat withdrawal, `b638fd8` changes failed writer opens from unpaced
+per-write retries into bounded waits and admission refusals, and `4ab2c2b`
+changes a routing refusal from a client error into a transient one that a driver
+may retry. The latter two are examined under “Judgement calls” below.
 
-`/readyz` now answers 503 when placement has shed, which is decision 7's
+`f0a1843` has the fleet-wide consequence worth stating out loud. `/readyz` now
+answers 503 when placement has shed, which is decision 7's
 "go unready" arriving at the endpoint that word refers to. **The consequence
 worth stating out loud is correlated:** the shed condition is a failing LIST
 against the shared object store, so a store-wide LIST outage takes *every* node

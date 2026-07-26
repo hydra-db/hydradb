@@ -118,6 +118,21 @@ pub const CONSISTENCY: &str = "turbolay.consistency";
 /// metric label as well as a span.
 pub const PLACEMENT_OWNERSHIP: &str = "turbolay.placement.ownership";
 
+/// Placement view state: `fresh`, `grace` or `shed`.
+pub const PLACEMENT_STATE: &str = "turbolay.placement.state";
+
+/// Previous placement view state on a transition event.
+pub const PLACEMENT_PREVIOUS_STATE: &str = "turbolay.placement.previous_state";
+
+/// Number of live nodes carried by the current placement view.
+pub const PLACEMENT_LIVE_NODES: &str = "turbolay.placement.live_nodes";
+
+/// Delay applied before the next writer re-open attempt.
+pub const WRITER_REOPEN_DELAY_MS: &str = "turbolay.writer.reopen_delay_ms";
+
+/// Maximum delay one client request is allowed to wait for a writer re-open.
+pub const WRITER_REOPEN_CAP_MS: &str = "turbolay.writer.reopen_cap_ms";
+
 /// Caller-supplied request identifier, read from Bolt `tx_metadata`.
 ///
 /// This is what joins a Turbolay span to the caller's own log line. Nothing
@@ -194,6 +209,11 @@ pub const ALL_TURBOLAY_KEYS: &[&str] = &[
     WRITER_LAST_PROMOTED_AT,
     CONSISTENCY,
     PLACEMENT_OWNERSHIP,
+    PLACEMENT_STATE,
+    PLACEMENT_PREVIOUS_STATE,
+    PLACEMENT_LIVE_NODES,
+    WRITER_REOPEN_DELAY_MS,
+    WRITER_REOPEN_CAP_MS,
     CORRELATION_ID,
     CALLER_STEP,
     OUTCOME,
