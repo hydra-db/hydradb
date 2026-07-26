@@ -573,6 +573,17 @@ struct PendingBoltResult {
     /// telemetry reads it — it is what orders the `query.page` spans of one
     /// lazily paging client.
     pages: u64,
+    /// The `client.query` / `client.mutate` root, opened at RUN and held for
+    /// the whole statement.
+    ///
+    /// It lives here rather than being opened per PULL because a lazily paging
+    /// client would otherwise produce one trace per page, each holding a single
+    /// `query.page` and no way to see the statement as a whole. Held as a
+    /// handle and used as an explicit `parent:`, never entered across an
+    /// await — the pages are fetched from a `select!` that also services
+    /// pipelined messages, and an entered guard would leak the span onto
+    /// whatever else that loop touches.
+    statement_span: tracing::Span,
     rows: VecDeque<QueryRow>,
     next_cursor: Option<QueryCursorToken>,
     bookmark: Option<ClientBookmark>,
@@ -829,6 +840,13 @@ async fn run_bolt_protocol(
                     ]),
                 )
                 .await?;
+                // Opened here, at RUN, and not at the execution boundary the
+                // PULLs land on: one statement is one trace, however many
+                // pages the client chooses to pull.
+                let statement_span = crate::client::service::client_root_span(
+                    &prepared.request,
+                    Some(prepared.action),
+                );
                 session.pending = Some(PendingBoltResult {
                     database,
                     columns: prepared.columns.clone(),
@@ -836,6 +854,7 @@ async fn run_bolt_protocol(
                     deadline: query_deadline,
                     started: false,
                     pages: 0,
+                    statement_span,
                     rows: VecDeque::new(),
                     next_cursor: None,
                     bookmark: None,
@@ -1426,6 +1445,7 @@ where
         pending.pages += 1;
         let page_span = tracing::info_span!(
             target: "slatedb_graph_kernel",
+            parent: &pending.statement_span,
             "query.page",
             turbolay.scope = %scope,
             turbolay.correlation_id = tracing::field::Empty,

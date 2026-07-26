@@ -1131,10 +1131,22 @@ impl ClientQueryService {
 
     /// The Bolt execution boundary: RUN prepares, each PULL lands here.
     ///
-    /// It carries its own root because Bolt never passes through
-    /// [`Self::execute_page`] — without one, the busiest read path in
-    /// production would be the only one with no correlation id, no fingerprint
-    /// and no trace at all.
+    /// This deliberately opens **no root span**. Bolt never passes through
+    /// [`Self::execute_page`], so it would be easy to conclude — as a first
+    /// pass here did — that the root belongs at this boundary. It does not: a
+    /// client that pages lazily calls this once per PULL, so a root here yields
+    /// one trace *per page* rather than one per statement, and the very
+    /// question `query.page` exists to answer ("where did this slow query
+    /// actually spend its time across its pages?") becomes unanswerable
+    /// precisely because each page is a separate trace.
+    ///
+    /// Instead `client.query` is opened once at RUN in the Bolt loop, held on
+    /// `PendingBoltResult`, and every `query.page` is parented to it. This
+    /// function inherits that context through the ambient subscriber, so the
+    /// spans below it still carry the fingerprint and the correlation id.
+    ///
+    /// Errors are recorded on the enclosing `query.page`, which already carries
+    /// this page's `rows_returned` and `read_epoch`.
     #[cfg_attr(not(feature = "bolt-server"), allow(dead_code))]
     pub(crate) async fn execute_prepared_page(
         &self,
@@ -1143,24 +1155,8 @@ impl ClientQueryService {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<ClientQueryPage> {
-        let span = client_root_span(&prepared.request, Some(prepared.action));
-        let result = self
-            .execute_prepared_page_inner(session, prepared, cursor, page_size)
-            .instrument(span.clone())
-            .await;
-        match &result {
-            Ok(response) => {
-                span.record(
-                    "turbolay.query.rows_returned",
-                    response.page.rows.len() as u64,
-                );
-                if let Some(read_epoch) = response.read_epoch {
-                    span.record("turbolay.read_epoch", read_epoch);
-                }
-            }
-            Err(err) => record_span_error(&span, err),
-        }
-        result
+        self.execute_prepared_page_inner(session, prepared, cursor, page_size)
+            .await
     }
 
     async fn execute_prepared_page_inner(
@@ -1910,7 +1906,11 @@ fn record_span_error(span: &tracing::Span, err: &GraphError) {
 /// the write path below this point is a different span tree entirely and a
 /// backend that has to filter on an attribute to separate them will get it
 /// wrong once.
-fn client_root_span(
+///
+/// Bolt opens this once at RUN and keeps it for the whole statement rather than
+/// per PULL — see [`Self::execute_prepared_page`]. HTTP opens it per call,
+/// which for a non-paging transport is the same thing.
+pub(crate) fn client_root_span(
     request: &ClientQueryRequest,
     action: Option<QueryTransportAction>,
 ) -> tracing::Span {
