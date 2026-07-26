@@ -5,16 +5,19 @@ mod admin;
 #[path = "graph_node/config.rs"]
 mod config;
 #[allow(dead_code)]
+#[path = "graph_node/readiness.rs"]
+mod readiness;
+#[allow(dead_code)]
 #[path = "graph_node/tls.rs"]
 mod tls;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
 use config::RuntimeConfig;
+use readiness::NodeReadiness;
 use slatedb::object_store::{path::Path, ObjectStore};
 use slatedb_graph_kernel::{
     object_store_from_env, BoltServerConfig, ClientBoltServer, ClientHttpServer,
@@ -25,6 +28,7 @@ use slatedb_graph_kernel::{
 };
 use tracing_subscriber::EnvFilter;
 use turbolay_placement::heartbeat::{delete_heartbeat, put_heartbeat, validate_node_id, Heartbeat};
+use turbolay_placement::liveness::HeartbeatAction;
 
 type RuntimeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -170,21 +174,25 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     }
     let http = ClientHttpServer::bind(config.http_addr, service.clone(), http_config).await?;
 
-    let ready = Arc::new(AtomicBool::new(false));
+    // One readiness answer for `/readyz` and the publisher, and it accounts for
+    // placement: a node that has shed its view of the fleet (decision 7) is not
+    // ready and must withdraw its heartbeat, or it stays the computed owner for
+    // every peer while refusing every write they route to it.
+    let ready = NodeReadiness::new(placement.clone());
     let admin = admin::AdminServer::bind_scoped(
         config.admin_addr,
-        Arc::clone(&ready),
+        ready.clone(),
         service.clone(),
         Arc::clone(&node),
     )
     .await?;
-    ready.store(true, Ordering::Release);
+    ready.mark_ready();
     let (heartbeat_stop, heartbeat_task) = start_heartbeat_publisher(
         Arc::clone(&object_store),
         Path::from(config.data_path.as_str()),
         config.node_id.clone(),
         config.cells.clone(),
-        Arc::clone(&ready),
+        ready.clone(),
         started_at,
         config.heartbeat_interval,
     );
@@ -199,7 +207,7 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     tokio::select! {
         result = shutdown_signal() => result?,
     }
-    ready.store(false, Ordering::Release);
+    ready.mark_unready();
     // Before anything drains. The publisher's last act is to DELETE this node's
     // heartbeat, and awaiting it here is what makes a graceful restart hand the
     // node's cells over immediately instead of costing peers a full
@@ -253,8 +261,10 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
 /// diverges from sleet's publisher (`../sleet/src/daemon.rs:213-310`), which
 /// publishes unconditionally.
 ///
-/// Readiness is the same `AtomicBool` the admin server's `/readyz` reads, so the
-/// two answers cannot drift apart.
+/// "Ready" is [`NodeReadiness`], the same value `/readyz` reports, so the two
+/// answers cannot drift apart — and it folds in decision 7's obligation: a node
+/// that has shed its view of the fleet withdraws even though its lifecycle is
+/// healthy. See `graph_node/readiness.rs` for why that pairing is not optional.
 ///
 /// **Every store failure is a `warn!` and nothing more.** A node whose PUTs fail
 /// ages out of every peer's live set, which is the correct outcome and needs no
@@ -265,7 +275,7 @@ fn start_heartbeat_publisher(
     base_path: Path,
     node_id: String,
     cells: Vec<String>,
-    ready: Arc<AtomicBool>,
+    ready: NodeReadiness,
     started_at: DateTime<Utc>,
     interval: Duration,
 ) -> (
@@ -281,7 +291,7 @@ fn start_heartbeat_publisher(
                 &node_id,
                 &cells,
                 started_at,
-                ready.load(Ordering::Acquire),
+                ready.heartbeat_action(),
             )
             .await;
             tokio::select! {
@@ -308,9 +318,9 @@ async fn publish_heartbeat(
     node_id: &str,
     cells: &[String],
     started_at: DateTime<Utc>,
-    ready: bool,
+    action: HeartbeatAction,
 ) {
-    if !ready {
+    if matches!(action, HeartbeatAction::Withdraw) {
         withdraw_heartbeat(store, base_path, node_id).await;
         return;
     }
@@ -424,6 +434,19 @@ mod tests {
     const SETTLE: Duration = Duration::from_secs(5);
     const TICK: Duration = Duration::from_millis(5);
 
+    /// A readiness handle over a fleet of one, already up. Placement is
+    /// `Grace(configured fleet)` until something refreshes it, which is the
+    /// ready posture — the shed half of this type is exercised in
+    /// `graph_node/readiness.rs`, where a failing store can produce it.
+    fn ready_node() -> NodeReadiness {
+        let readiness = NodeReadiness::new(
+            PlacementView::new("graph-node-0", ["graph-node-0"], PlacementConfig::default())
+                .expect("a valid fleet"),
+        );
+        readiness.mark_ready();
+        readiness
+    }
+
     async fn settles_to(store: &Arc<dyn ObjectStore>, path: &Path, present: bool) -> bool {
         let deadline = std::time::Instant::now() + SETTLE;
         while std::time::Instant::now() < deadline {
@@ -444,24 +467,24 @@ mod tests {
         let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let base = Path::from("graph/data");
         let path = Path::from("graph/data/_graph_nodes/v1/graph-node-0");
-        let ready = Arc::new(AtomicBool::new(true));
+        let ready = ready_node();
         let (stop, task) = start_heartbeat_publisher(
             Arc::clone(&store),
             base,
             "graph-node-0".to_string(),
             vec!["cell-0".to_string()],
-            Arc::clone(&ready),
+            ready.clone(),
             Utc::now(),
             TICK,
         );
 
         assert!(settles_to(&store, &path, true).await, "never published");
-        ready.store(false, Ordering::Release);
+        ready.mark_unready();
         assert!(
             settles_to(&store, &path, false).await,
             "stayed published while unready"
         );
-        ready.store(true, Ordering::Release);
+        ready.mark_ready();
         assert!(
             settles_to(&store, &path, true).await,
             "did not republish on becoming ready again"
@@ -479,7 +502,6 @@ mod tests {
         let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let base = Path::from("graph/data");
         let path = Path::from("graph/data/_graph_nodes/v1/graph-node-0");
-        let ready = Arc::new(AtomicBool::new(true));
         // A publisher interval far longer than the test: the withdrawal must
         // come from the shutdown path, not from a tick that happened to land.
         let (stop, task) = start_heartbeat_publisher(
@@ -487,7 +509,7 @@ mod tests {
             base,
             "graph-node-0".to_string(),
             vec!["cell-0".to_string()],
-            ready,
+            ready_node(),
             Utc::now(),
             Duration::from_secs(600),
         );

@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -12,9 +11,11 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::readiness::NodeReadiness;
+
 #[derive(Clone)]
 struct AdminState {
-    ready: Arc<AtomicBool>,
+    ready: NodeReadiness,
     query: ClientQueryService,
     routed_node: Arc<ScopedRoutedGraphCluster>,
 }
@@ -28,7 +29,7 @@ pub struct AdminServer {
 impl AdminServer {
     pub async fn bind_scoped(
         addr: SocketAddr,
-        ready: Arc<AtomicBool>,
+        ready: NodeReadiness,
         query: ClientQueryService,
         node: Arc<ScopedRoutedGraphCluster>,
     ) -> Result<Self> {
@@ -87,8 +88,15 @@ async fn live() -> StatusCode {
     StatusCode::OK
 }
 
+/// 200 exactly when the heartbeat publisher would publish.
+///
+/// That includes decision 7: a node whose heartbeat LIST has been failing past
+/// the grace window has shed its view of the fleet, refuses every promotion, and
+/// reports itself unready here as well — one signal, not two that can disagree.
+/// `/livez` is unaffected, so k8s takes a shed node out of Service endpoints
+/// without restarting it, which is what lets it recover when the store does.
 async fn readiness(State(state): State<AdminState>) -> StatusCode {
-    if state.ready.load(Ordering::Acquire) {
+    if state.ready.is_ready() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -98,7 +106,7 @@ async fn readiness(State(state): State<AdminState>) -> StatusCode {
 async fn metrics(State(state): State<AdminState>) -> Response {
     let mut output = format!(
         "# TYPE graph_runtime_ready gauge\ngraph_runtime_ready {}\n",
-        u8::from(state.ready.load(Ordering::Acquire)),
+        u8::from(state.ready.is_ready()),
     );
     let query = state.query.metrics();
     output.push_str(&format!(
