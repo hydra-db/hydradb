@@ -37,6 +37,8 @@ use tokio_rustls::rustls::{
 };
 #[cfg(feature = "query-transport-tls")]
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+#[cfg(feature = "query-transport")]
+use tracing::Instrument as _;
 
 #[cfg(feature = "query-transport")]
 use crate::QueryCancellationToken;
@@ -2141,6 +2143,7 @@ impl QueryCellClient for TcpQueryCellClient {
             auth: self.auth(),
             context,
             query: query.to_string(),
+            traceparent: crate::core::trace_context::current_traceparent(),
         };
         match self.send(request).await? {
             QueryTransportResponse::Rows { result } => Ok(result),
@@ -2172,6 +2175,7 @@ impl QueryCellClient for TcpQueryCellClient {
             query: query.to_string(),
             cursor,
             page_size,
+            traceparent: crate::core::trace_context::current_traceparent(),
         };
         match self.send(request).await? {
             QueryTransportResponse::Page { result } => Ok(result),
@@ -2199,6 +2203,7 @@ impl QueryCellClient for TcpQueryCellClient {
             auth: self.auth(),
             context,
             operation,
+            traceparent: crate::core::trace_context::current_traceparent(),
         };
         match self.send(request).await? {
             QueryTransportResponse::Rows { result } => Ok(result),
@@ -2230,6 +2235,7 @@ impl QueryCellClient for TcpQueryCellClient {
             operation,
             cursor,
             page_size,
+            traceparent: crate::core::trace_context::current_traceparent(),
         };
         match self.send(request).await? {
             QueryTransportResponse::Page { result } => Ok(result),
@@ -2286,6 +2292,7 @@ impl TcpQueryCellClient {
             auth: self.auth(),
             scope,
             query_id,
+            traceparent: crate::core::trace_context::current_traceparent(),
         };
         match self.send_control(request).await? {
             QueryTransportResponse::Cancelled => Ok(()),
@@ -3740,6 +3747,8 @@ enum QueryTransportRequest {
         auth: QueryTransportAuth,
         context: QueryContext,
         query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
     },
     Page {
         version: u16,
@@ -3748,12 +3757,16 @@ enum QueryTransportRequest {
         query: String,
         cursor: Option<QueryCursorToken>,
         page_size: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
     },
     Batch {
         version: u16,
         auth: QueryTransportAuth,
         context: QueryContext,
         operation: crate::QueryBatchOperation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
     },
     BatchPage {
         version: u16,
@@ -3762,12 +3775,16 @@ enum QueryTransportRequest {
         operation: crate::QueryBatchOperation,
         cursor: Option<QueryCursorToken>,
         page_size: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
     },
     Cancel {
         version: u16,
         auth: QueryTransportAuth,
         scope: GraphScope,
         query_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
     },
 }
 
@@ -3775,6 +3792,21 @@ enum QueryTransportRequest {
 impl QueryTransportRequest {
     fn is_cancel(&self) -> bool {
         matches!(self, Self::Cancel { .. })
+    }
+
+    /// The caller's trace context, if it sent one.
+    ///
+    /// Read once at the serve boundary rather than in each of the five arms, so
+    /// there is a single place where an inbound trace context is adopted and a
+    /// single place to audit.
+    fn traceparent(&self) -> Option<&str> {
+        match self {
+            Self::Rows { traceparent, .. }
+            | Self::Page { traceparent, .. }
+            | Self::Batch { traceparent, .. }
+            | Self::BatchPage { traceparent, .. }
+            | Self::Cancel { traceparent, .. } => traceparent.as_deref(),
+        }
     }
 }
 
@@ -4005,12 +4037,36 @@ async fn execute_query_transport_request(
     runtime: Arc<QueryTransportServerRuntime>,
     identity: QueryTransportConnectionIdentity,
 ) -> QueryTransportResponse {
+    // The join point for a distributed query. Without it each node starts its
+    // own trace and a query fanned across three nodes is three unrelated
+    // traces, none of which shows the fan-out that explains its latency.
+    //
+    // Adopted here, once, rather than in each of the five arms below: there is
+    // one place an inbound trace context enters this process, which is also the
+    // only place worth auditing when asking whether a peer can influence our
+    // telemetry. It cannot do more than name a trace — see
+    // `core::trace_context`.
+    let span = tracing::info_span!("query.transport_serve");
+    crate::core::trace_context::adopt_remote_parent(&span, request.traceparent());
+    execute_query_transport_request_inner(client, request, runtime, identity)
+        .instrument(span)
+        .await
+}
+
+#[cfg(feature = "query-transport")]
+async fn execute_query_transport_request_inner(
+    client: Arc<dyn QueryCellClient>,
+    request: QueryTransportRequest,
+    runtime: Arc<QueryTransportServerRuntime>,
+    identity: QueryTransportConnectionIdentity,
+) -> QueryTransportResponse {
     match request {
         QueryTransportRequest::Rows {
             version,
             auth,
             context,
             query,
+            ..
         } => {
             if !query_transport_version_supported(version) {
                 return transport_version_error(version);
@@ -4049,6 +4105,7 @@ async fn execute_query_transport_request(
             query,
             cursor,
             page_size,
+            ..
         } => {
             if !query_transport_version_supported(version) {
                 return transport_version_error(version);
@@ -4096,6 +4153,7 @@ async fn execute_query_transport_request(
             auth,
             context,
             operation,
+            ..
         } => {
             if !query_transport_version_supported(version) {
                 return transport_version_error(version);
@@ -4135,6 +4193,7 @@ async fn execute_query_transport_request(
             operation,
             cursor,
             page_size,
+            ..
         } => {
             if !query_transport_version_supported(version) {
                 return transport_version_error(version);
@@ -4197,6 +4256,7 @@ async fn execute_query_transport_request(
             auth,
             scope,
             query_id,
+            ..
         } => {
             if !query_transport_version_supported(version) {
                 return transport_version_error(version);

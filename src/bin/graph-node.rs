@@ -32,6 +32,45 @@ use turbolay_telemetry::{ServiceIdentity, TelemetryConfig};
 
 type RuntimeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Join the kernel's trace-context hook to the OpenTelemetry implementation.
+///
+/// This adapter exists here, in the binary, because it is the only place
+/// entitled to name both sides. The kernel declares `TraceContextBridge` but
+/// cannot implement it — a `tracing` span id is an internal subscriber handle,
+/// not an OpenTelemetry trace id. `turbolay-telemetry` can perform both
+/// operations but must not name the kernel's trait, because depending on the
+/// kernel would reverse the arrow that keeps `opentelemetry-*` out of
+/// `cargo test`. So neither library depends on the other and the composition
+/// root does twelve lines of glue.
+///
+/// Without the `otlp` feature there is nothing to install: no exporter means no
+/// OpenTelemetry ids, and a fabricated `traceparent` would join to nothing. The
+/// kernel then sends no trace context and each node starts its own trace, which
+/// is exactly the pre-5b behaviour.
+#[cfg(feature = "otlp")]
+fn install_trace_context_bridge() {
+    struct Bridge;
+
+    impl slatedb_graph_kernel::TraceContextBridge for Bridge {
+        fn current_traceparent(&self) -> Option<String> {
+            turbolay_telemetry::bridge::current_traceparent()
+        }
+
+        fn adopt_remote_parent(&self, span: &tracing::Span, traceparent: &str) {
+            turbolay_telemetry::bridge::adopt_remote_parent(span, traceparent);
+        }
+    }
+
+    // Failure means one was already installed, which in a single `main` cannot
+    // happen — and if it somehow did, the first one is as good as this one.
+    if let Err(error) = slatedb_graph_kernel::install_trace_context_bridge(&Bridge) {
+        tracing::warn!(error, "trace context bridge was already installed");
+    }
+}
+
+#[cfg(not(feature = "otlp"))]
+fn install_trace_context_bridge() {}
+
 #[tokio::main]
 async fn main() -> RuntimeResult<()> {
     // First statement in the process: everything after it, including a config
@@ -40,6 +79,7 @@ async fn main() -> RuntimeResult<()> {
     // missing collector is never why a node fails to boot.
     let telemetry =
         turbolay_telemetry::init(TelemetryConfig::from_env(ServiceIdentity::GraphNode))?;
+    install_trace_context_bridge();
 
     let result = boot().await;
 

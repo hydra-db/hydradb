@@ -85,6 +85,8 @@ pub mod redact;
 pub mod semconv;
 
 #[cfg(feature = "otlp")]
+pub mod bridge;
+#[cfg(feature = "otlp")]
 pub mod otlp;
 #[cfg(feature = "otlp")]
 pub mod sampling;

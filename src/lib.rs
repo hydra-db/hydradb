@@ -82,6 +82,7 @@ pub(crate) use core::state::{
     GraphWriteAuthority, GraphWriteOp, LocalWriteGuard,
 };
 pub use core::state::{GraphCacheEntryCounts, GraphCacheResidentBytes, GraphShard};
+pub use core::trace_context::{install_trace_context_bridge, TraceContextBridge};
 pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
 #[cfg(feature = "query-transport")]
 pub use engine::ScopedRoutedGraphCluster;
