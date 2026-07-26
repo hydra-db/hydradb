@@ -1531,6 +1531,11 @@ async fn object_store_routing_builds_a_table_without_probing_any_node() {
 /// rather than a stale fleet. This is the posture a shed view produces
 /// (decision 7): `LiveView::nodes()` is empty, so there is no reader list and no
 /// writer to name.
+///
+/// The refusal must be **transient**, and that is the half worth pinning. A
+/// shed node is one node in trouble while every peer answers normally, so the
+/// driver has to move to the next router; a `ClientError` would end the attempt
+/// and turn one node's object-store trouble into a failed query.
 #[tokio::test]
 async fn object_store_routing_advertises_nothing_when_no_live_node_is_addressable() {
     let provider = ObjectStoreBoltRoutingTableProvider::new(
@@ -1547,7 +1552,55 @@ async fn object_store_routing_advertises_nothing_when_no_live_node_is_addressabl
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, GraphError::UnsupportedQuery { .. }));
+    assert!(
+        matches!(error, GraphError::RoutingUnavailable { .. }),
+        "expected a transient routing refusal, got {error:?}"
+    );
+    match graph_error_to_bolt(error) {
+        BoltError::Query { code, .. } => assert_eq!(
+            code, "Neo.TransientError.General.DatabaseUnavailable",
+            "a driver reads the class of this code to decide whether to try the next router"
+        ),
+        other => panic!("expected a coded Bolt error, got {other:?}"),
+    }
+}
+
+/// The other half of the split: a routing *misconfiguration* stays a client
+/// error, because no other router will answer differently. Reached by giving the
+/// provider an address map that does not cover the fleet the placement view
+/// names — `graph-node` builds the directory from the address map's own keys, so
+/// only an embedder can construct this.
+#[tokio::test]
+async fn object_store_routing_reports_a_missing_owner_address_as_a_config_error() {
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
+        [("node-a".to_string(), "10.0.0.1:7687".to_string())],
+        30,
+        test_placement_view("node-a", &["node-a", "node-b"]),
+    )
+    .unwrap();
+
+    // node-b owns some cell over this two-node fleet, and the provider has no
+    // address for it. Find that cell rather than assuming which one it is.
+    let scope = GraphScope::default();
+    let cell = (0..64)
+        .map(|n| format!("cell-{n}"))
+        .find(|cell| {
+            turbolay_placement::hash::owner(&scope.to_string(), cell, &["node-a", "node-b"])
+                == Some("node-b")
+        })
+        .expect("some cell hashes to node-b");
+
+    let error = provider
+        .routing_table(
+            "default",
+            &ClientQueryTarget::new(scope, cell.as_str()).unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, GraphError::UnsupportedQuery { .. }),
+        "a config mismatch is not transient: {error:?}"
+    );
 }
 
 async fn send_test_bolt_client_message<W>(writer: &mut ChunkWriter<W>, message: &ClientMessage)

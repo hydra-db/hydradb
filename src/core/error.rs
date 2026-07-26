@@ -90,6 +90,23 @@ pub enum GraphError {
         cell_id: String,
         owner: Option<String>,
     },
+    /// This node cannot answer a routing request right now — it has no live
+    /// fleet to advertise, or no owner for the cell being asked about.
+    ///
+    /// Distinct from a routing *misconfiguration* because a driver must treat
+    /// the two differently, and only one of them is the driver's problem. This
+    /// is a **transient** condition of one node: past decision 7's grace window
+    /// a node that cannot LIST sheds its view of the fleet, and shedding is a
+    /// routine state, not a broken deployment. A driver that receives it should
+    /// ask the next router in its list, which every peer that can still LIST
+    /// will answer.
+    ///
+    /// It carries no node hint, deliberately. A node in this state either has no
+    /// view of the fleet or knows the fleet has no owner for the cell; there is
+    /// nothing truthful to point at, and the driver already holds the router
+    /// list it needs. That is the same rule as `NotCellWriter { owner: None }`.
+    #[error("routing is unavailable on this node: {reason}")]
+    RoutingUnavailable { reason: String },
     #[error("operation requires writable SlateDB shard storage")]
     ReadOnlyShardStorage,
     #[error("cell {cell_id} has been dropped; {operation} is rejected")]

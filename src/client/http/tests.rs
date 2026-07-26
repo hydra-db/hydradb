@@ -152,6 +152,25 @@ fn a_write_to_a_non_owner_is_a_421_naming_the_owner() {
     assert!(shed_body["error"].get("owner").is_none());
 }
 
+/// A routing refusal is *this node* being unable to serve, not a bad request.
+/// 503 rather than the catch-all's 500, so a client and any proxy in front of it
+/// read it as retryable — the HTTP analogue of the `TransientError` class the
+/// Bolt mapping uses, minus the router list an HTTP client does not have.
+#[test]
+fn a_routing_refusal_is_a_503_and_not_an_internal_error() {
+    let unavailable = HttpApiError::from_graph(GraphError::RoutingUnavailable {
+        reason: "no live node owns this cell".to_string(),
+    });
+    assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(unavailable.code, "routing_unavailable");
+    assert_eq!(unavailable.owner, None);
+    assert!(
+        unavailable.message.contains("no live node owns this cell"),
+        "the reason must survive to the client: {}",
+        unavailable.message
+    );
+}
+
 #[tokio::test]
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {

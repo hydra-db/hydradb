@@ -393,6 +393,18 @@ impl HttpApiError {
             // rather than in a code the client is expected to already know.
             // Forwarding the write over `QueryServiceEndpoint` is the better
             // answer here, and is a deliberate follow-up.
+            // Transient and local to this node, so 503 with the standard
+            // "come back" semantics rather than the 500 the catch-all would
+            // give. HTTP clients do not hold a router list, so unlike Bolt
+            // there is nowhere better to point them; the honest answer is that
+            // this node cannot serve right now.
+            GraphError::RoutingUnavailable { .. } => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "routing_unavailable",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
             GraphError::NotCellWriter { owner, .. } => Self {
                 status: StatusCode::MISDIRECTED_REQUEST,
                 code: "not_cell_writer",

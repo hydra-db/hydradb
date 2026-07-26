@@ -96,6 +96,21 @@ impl ObjectStoreBoltRoutingTableProvider {
     }
 }
 
+/// This node cannot answer a routing request, and another node can.
+///
+/// Kept apart from [`bolt_config_error`] because the two reach a driver as
+/// different classes: a config error is a `ClientError`, which ends the
+/// attempt, while this is a `TransientError`, which sends the driver to the
+/// next router. Decision 7 makes shedding a routine state — a node whose LIST
+/// has been failing sheds while every peer keeps answering — so classifying it
+/// as the client's mistake would turn one node's object-store trouble into a
+/// failed query.
+fn routing_unavailable<T>(reason: &str) -> Result<T> {
+    Err(GraphError::RoutingUnavailable {
+        reason: reason.to_string(),
+    })
+}
+
 #[async_trait]
 impl BoltRoutingTableProvider for ObjectStoreBoltRoutingTableProvider {
     async fn routing_table(
@@ -119,7 +134,7 @@ impl BoltRoutingTableProvider for ObjectStoreBoltRoutingTableProvider {
             .filter_map(|node| self.node_addresses.get(&node.node_id).cloned())
             .collect::<Vec<_>>();
         if live_addresses.is_empty() {
-            return bolt_config_error("object-store routing found no live graph nodes");
+            return routing_unavailable("no live graph node is addressable from this node");
         }
 
         // Deliberately resolved over the *unfiltered* live set, which is what
@@ -129,6 +144,12 @@ impl BoltRoutingTableProvider for ObjectStoreBoltRoutingTableProvider {
         let writer = match self.placement.owner_in(&view, &scope, &target.cell_id) {
             Some(owner) => match self.node_addresses.get(&owner) {
                 Some(address) => address.clone(),
+                // Config, not liveness: this node's directory and its Bolt
+                // address map disagree about who the fleet is. `graph-node`
+                // builds the directory *from* the address map's keys, so the
+                // two cannot diverge there; reaching this means an embedder
+                // built them separately, and no other router will answer
+                // differently.
                 None => {
                     return bolt_config_error(
                         "object-store routing has no Bolt address for the cell's owning node",
@@ -139,7 +160,7 @@ impl BoltRoutingTableProvider for ObjectStoreBoltRoutingTableProvider {
             // table has the same answer for either — there is no WRITE endpoint
             // to advertise — which is why collapsing them is safe here and is
             // not safe in `ensure_local_writer`.
-            None => return bolt_config_error("object-store routing found no owner for the cell"),
+            None => return routing_unavailable("no live node owns this cell"),
         };
 
         BoltRoutingTable::new(
