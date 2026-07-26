@@ -6,7 +6,7 @@
 # `exclude` covers the vendored Quint/CosmWasm sample manifests under `docs/`,
 # which are gitignored but present in working trees.
 [workspace]
-members = ["crates/placement"]
+members = ["crates/placement", "crates/telemetry"]
 exclude = ["docs"]
 
 # One place for every third-party version, so a member cannot drift from the
@@ -29,6 +29,18 @@ bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures = "0.3"
 libcypher-parser-sys = "0.6.1-1"
+# The OpenTelemetry set is used only by `crates/telemetry`, behind its
+# off-by-default `otlp` feature, so nothing here reaches the kernel or a bare
+# `cargo test`. They live in this table anyway because the versions are paired,
+# not free: `tracing-opentelemetry` 0.33 is the release that targets
+# `opentelemetry` 0.32, and bumping one without the others silently stops the
+# `OpenTelemetrySpanExt` trait applying to the installed tracer. One table, one
+# bump. `optional` is not inheritable and stays at the use site.
+opentelemetry = "0.32"
+opentelemetry-appender-tracing = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "logs", "http-proto", "reqwest-client"] }
+opentelemetry-semantic-conventions = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 rcgen = "0.13"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 rustls-pemfile = "2"
@@ -43,6 +55,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26"
 tracing = "0.1"
+tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 [package]
@@ -72,8 +85,18 @@ server-runtime = [
     "query-service-discovery",
     "dep:rustls-pemfile",
     "dep:tracing-subscriber",
+    "dep:turbolay-telemetry",
 ]
-indexer-runtime = ["dep:axum", "dep:tracing-subscriber", "tokio/net"]
+indexer-runtime = ["dep:axum", "dep:tracing-subscriber", "tokio/net", "dep:turbolay-telemetry"]
+
+# OTLP export, off by default and never enabled by another feature. Off, the
+# binaries still initialise telemetry and still emit JSON to stdout — they just
+# install no exporter, so a build without a collector is the normal build. This
+# is the one deviation from `docs/plans/2026-07-26-otel-telemetry-crate.md` §1,
+# which claimed no root `[features]` entry would be needed: true of the library,
+# but the binaries are in this package, so shipping OTLP at all needs a switch
+# here. It is additive — no existing combination changes meaning.
+otlp = ["turbolay-telemetry/otlp"]
 
 [[bin]]
 name = "graph-node"
@@ -169,6 +192,17 @@ subtle = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
 turbolay-placement = { path = "crates/placement" }
+# Optional, because only `src/bin/` uses it: the library half of this package
+# emits through the plain `tracing` facade and must keep compiling — and
+# testing — with no subscriber crate in sight. `server-runtime` and
+# `indexer-runtime` turn it on because those are the two features that build a
+# binary, which is the only place a subscriber may be installed.
+#
+# Note this pulls no `opentelemetry-*`: the telemetry crate's own `otlp` feature
+# is off by default, so a bare `cargo test` and every existing feature
+# combination resolve exactly as they did before. Turning OTLP on is the root
+# `otlp` feature below, and nothing enables it implicitly.
+turbolay-telemetry = { path = "crates/telemetry", optional = true }
 
 [dev-dependencies]
 boltr = { workspace = true, features = ["client"] }

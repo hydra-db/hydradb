@@ -173,4 +173,78 @@ pub enum GraphError {
     },
 }
 
+impl GraphError {
+    /// The coarse failure class recorded as the `error.class` span attribute.
+    ///
+    /// Errors otherwise reach a log as `%error` display strings, which carry a
+    /// key and an epoch and are therefore unique per occurrence — a backend
+    /// cannot group them, so it cannot chart a rate or alert on a change in
+    /// one. This is the grouping key.
+    ///
+    /// # Why the mapping is here rather than in `turbolay-telemetry`
+    ///
+    /// This resolves the open decision in
+    /// `docs/plans/2026-07-26-otel-telemetry-crate.md` §8 in favour of an
+    /// inherent method. It keeps the match arms next to the variants they
+    /// classify, so adding a variant without classifying it is a compile error
+    /// rather than a silent `other`; and returning `&'static str` means the
+    /// kernel gains no telemetry dependency, preserving the direction of the
+    /// arrow that lets `cargo test` stay free of `opentelemetry-*`.
+    ///
+    /// The strings are the wire vocabulary and must stay identical to
+    /// `turbolay_telemetry::ErrorClass::as_str`; `error_class.rs` holds the
+    /// matching test.
+    ///
+    /// **`contention` and `fencing` are expected, not alarming.** Retries and
+    /// writer handover are how the system is supposed to behave under
+    /// concurrency. The class exists so a dashboard can chart the rate and
+    /// alert on a *change* in it, not so each occurrence pages someone.
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::ConditionalWriteConflict { .. }
+            | Self::IdempotencyConflict { .. }
+            | Self::ControlMetadataConflict { .. }
+            | Self::RetryExhausted { .. } => "contention",
+
+            // `RoutingUnavailable` joins this group rather than getting one of
+            // its own: it means the caller reached a node that does not own the
+            // cell and the owner is not yet known, which is the same transient,
+            // retry-and-it-resolves shape as losing a fence. Commit 4ab2c2b
+            // made it transient rather than a syntax error for exactly that
+            // reason, and classifying it apart would split one operational
+            // question across two dashboard series.
+            Self::WriteRequiresWriter { .. }
+            | Self::NotCellWriter { .. }
+            | Self::UnknownShard { .. }
+            | Self::CellDropped { .. }
+            | Self::RoutingUnavailable { .. } => "fencing",
+
+            Self::SnapshotAhead { .. }
+            | Self::SnapshotExpired { .. }
+            | Self::SnapshotChanged { .. }
+            | Self::QueryStatsSnapshotChanged { .. }
+            | Self::ControlWatermarkRegression { .. } => "freshness",
+
+            Self::AdmissionRejected { .. } | Self::QueryTimeout { .. } => "admission",
+
+            Self::QueryParse { .. }
+            | Self::UnsupportedQuery { .. }
+            | Self::MissingQueryParameter { .. } => "query",
+
+            Self::GraphScopeMismatch { .. } | Self::GraphScopeAccessDenied { .. } => "authz",
+
+            Self::CorruptValue { .. } | Self::InvalidKeyComponent { .. } => "corruption",
+
+            // Both are a refusal to act on how this process was configured, not
+            // a failure of the operation itself: one rejects an unsafe
+            // durability setting, the other a write to a shard opened read-only.
+            Self::UnsafeDurabilityConfig { .. } | Self::ReadOnlyShardStorage => "config",
+
+            Self::Slate(_) | Self::ObjectStore(_) => "storage",
+
+            Self::SparseKernel { .. } => "kernel",
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, GraphError>;
