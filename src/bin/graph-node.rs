@@ -229,6 +229,7 @@ async fn run_node(
     let mut bolt_config = BoltServerConfig::new(resolver)
         .with_default_database(config.database.clone())
         .with_max_connections(config.max_bolt_connections)
+        .with_authentication_timeout(config.bolt_authentication_timeout)
         .with_idle_timeout(config.bolt_idle_timeout)
         .with_max_connection_age(config.bolt_max_connection_age)
         .with_graceful_shutdown_timeout(config.graceful_shutdown_timeout);
