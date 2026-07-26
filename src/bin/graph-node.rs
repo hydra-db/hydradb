@@ -26,15 +26,36 @@ use slatedb_graph_kernel::{
     ObjectStoreNodeDirectory, PlacementConfig, PlacementView, QueryTransportAction,
     QueryTransportScopeGrant, ScopedRoutedGraphCluster, StaticQueryTransportScopeAuthorizer,
 };
-use tracing_subscriber::EnvFilter;
 use turbolay_placement::heartbeat::{delete_heartbeat, put_heartbeat, validate_node_id, Heartbeat};
 use turbolay_placement::liveness::HeartbeatAction;
+use turbolay_telemetry::{ServiceIdentity, TelemetryConfig};
 
 type RuntimeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::main]
 async fn main() -> RuntimeResult<()> {
-    init_tracing();
+    // First statement in the process: everything after it, including a config
+    // error, is logged rather than lost. `init` is total — with no
+    // `OTEL_EXPORTER_OTLP_ENDPOINT` set it installs the fmt layer alone, so a
+    // missing collector is never why a node fails to boot.
+    let telemetry = turbolay_telemetry::init(TelemetryConfig::from_env(ServiceIdentity::GraphNode))?;
+
+    let result = boot().await;
+
+    // Explicitly, and last. The guard flushes on drop too, but the ordering of
+    // a destructor against the rest of `main` is easy to get wrong, and what
+    // this flush protects is the final few seconds before a pod restart —
+    // precisely the window that matters when diagnosing why it restarted.
+    // Note it runs on the error path as well: a node that died during startup
+    // is the case whose logs are least affordable to drop.
+    telemetry.shutdown();
+    result
+}
+
+/// Everything between the subscriber being installed and it being torn down.
+///
+/// Split out of `main` only so the shutdown above cannot be skipped by a `?`.
+async fn boot() -> RuntimeResult<()> {
     let config = RuntimeConfig::from_env()?;
     tracing::info!(scope = %config.scope, "starting graph node");
     run_node(config).await
@@ -396,16 +417,6 @@ fn start_index_discovery(
         }
     });
     (stop_tx, task)
-}
-
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .json()
-        .with_current_span(false)
-        .with_span_list(false)
-        .init();
 }
 
 async fn shutdown_signal() -> RuntimeResult<()> {
