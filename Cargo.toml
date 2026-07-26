@@ -38,7 +38,13 @@ libcypher-parser-sys = "0.6.1-1"
 # bump. `optional` is not inheritable and stays at the use site.
 opentelemetry = "0.32"
 opentelemetry-appender-tracing = "0.32"
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "logs", "http-proto", "reqwest-client"] }
+# `reqwest-blocking-client`, not `reqwest-client`, and it is not a preference.
+# `opentelemetry_sdk`'s batch processors run on their own dedicated OS threads,
+# which are not tokio workers, so the async client panics there with "there is
+# no reactor running" and no span or log record ever reaches the collector. The
+# blocking client is what upstream enables by default for this exact reason;
+# the batching already keeps the export off the request path.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "logs", "http-proto", "reqwest-blocking-client"] }
 opentelemetry-semantic-conventions = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 rcgen = "0.13"

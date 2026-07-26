@@ -48,13 +48,34 @@ pub fn install(config: TelemetryConfig) -> Result<TelemetryGuard, TelemetryError
     #[cfg(feature = "otlp")]
     {
         let (otlp_layers, providers) = crate::otlp::build(&config)?;
-        let registry = tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer(&config))
-            .with(otlp_layers);
-        registry
-            .try_init()
-            .map_err(|_| TelemetryError::AlreadyInitialised)?;
+        // The empty case gets its own branch rather than attaching an empty
+        // layer vector, and the difference is not stylistic: `Vec<L>`'s
+        // `Layer::register_callsite` seeds `Interest::never()` and folds each
+        // element into it, so an *empty* vector returns `never` — whereupon
+        // `Layered::register_callsite` short-circuits and disables the callsite
+        // for the whole subscriber. Attaching one silences every log line in
+        // the process, fmt layer included.
+        //
+        // That is precisely the no-endpoint configuration: the default way to
+        // run a node built with `--features otlp` but no collector, which the
+        // plan requires to behave exactly like a normal build. The symptom is
+        // also maximally confusing — the process boots, serves traffic and
+        // prints nothing at all — so it stays a branch, not an `Option` whose
+        // correctness rests on a blanket impl elsewhere.
+        if otlp_layers.is_empty() {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt_layer(&config))
+                .try_init()
+                .map_err(|_| TelemetryError::AlreadyInitialised)?;
+        } else {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt_layer(&config))
+                .with(otlp_layers)
+                .try_init()
+                .map_err(|_| TelemetryError::AlreadyInitialised)?;
+        }
         Ok(TelemetryGuard { providers })
     }
 
