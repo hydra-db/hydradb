@@ -363,10 +363,15 @@ operator can actually query today.
   could be reconciled against `slow_queries`; that reconciliation is currently
   not performable on a `graph-node` scrape. The query above is still the right
   one — there is just nothing to check it against yet.
-- **No counter is registered as an OTel instrument.** All 67 enumerated counters
-  reach `/metrics`; none reach the meter. `OTEL_COUNTERS` exists so that the
-  parity test is total, not because the instruments are live. Histograms do reach
-  both.
+- **Counters reach the meter for one snapshot only.** All 67 enumerated counters
+  reach `/metrics`. As of `2a5a8d1` the 34 registrable operational (shard)
+  scalars also reach the meter, summed by `cell_id` across scopes;
+  `ClientQueryMetricsSnapshot` (10), `GraphCacheMetricsSnapshot` (19) and the two
+  per-`error.class` breakdowns do not, the last pending a `cell_id × error.class`
+  cardinality decision. `METERED_COUNTER_SOURCES` is where that scope is
+  declared, and `only_the_shard_scalars_are_registered_this_round` pins it, so
+  the next round is a decision rather than a discovery. Histograms reach both
+  exports in full.
 
 ## Where this differs from the plan
 
