@@ -87,12 +87,24 @@ under `GrB_Desc_Field`.
 was dead on any SuiteSparse >= v9**. This is pre-existing — it reproduces
 identically at `989cc72`. It accounted for all 17 failing lib tests.
 
-The fix moves the thread count to `GrB_Global_set_INT32` at init. Two behaviour
+The fix moves the thread count to a global set at init. Two behaviour
 consequences: it is applied only when `GRAPHBLAS_NTHREADS` (or the older
 `GRAPHBLAS_EXACT_COUNT_THREADS`) is set, so the default is now GraphBLAS's own
 one-thread-per-core rather than the single thread the descriptor asked for; and
 it is global rather than scoped to the exact-count path. Scoping it back would
 mean adopting `GxB_Context`.
+
+**The v9 global setter does not exist on the version CI and the image build
+against.** The first version of that fix called `GrB_Global_set_INT32` against
+the `GrB_GLOBAL` handle, which is v9-and-later API. Ubuntu 24.04 ships
+GraphBLAS 7.4.0, so both `ci.yml`'s `test` job and the Docker build failed to
+*link* — `undefined symbol: GrB_GLOBAL` — whether or not the call was reached,
+while the macOS job stayed green on Homebrew's v10. `GxB_Global_Option_set_INT32`
+is exported by v7 through v10 alike and is what init now calls. Its field number
+is the one thing that moved (5 through v8, 7086 from v9), and each library
+rejects the other's with `GrB_INVALID_VALUE`, so init tries the current number
+and falls back to the legacy one. Verified from C against both 7.4.0 and
+10.3.1: 7.4.0 accepts 5 and rejects 7086; 10.3.1 does the reverse.
 
 ### Verification
 

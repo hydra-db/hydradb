@@ -27,20 +27,25 @@ type GrBMatrix = *mut c_void;
 type GrBVector = *mut c_void;
 type GrBDescriptor = *mut c_void;
 type GrBBinaryOp = *mut c_void;
-type GrBGlobal = *mut c_void;
 
 const GRB_SUCCESS: GrBInfo = 0;
+const GRB_INVALID_VALUE: GrBInfo = -3;
 const GRB_BLOCKING: c_int = 1;
 const GRB_MATERIALIZE: c_int = 1;
 const GRB_CSC_FORMAT: GrBFormat = 1;
 const GRB_INDEX_MAX: u64 = (1_u64 << 60) - 1;
-// GxB_NTHREADS as defined by GraphBLAS v9 and later; it was 5 through v8.
+// GxB_NTHREADS, whose value changed between major GraphBLAS releases: 5 through
+// v8, 7086 from v9 on. Neither library accepts the other's constant — both
+// return GrB_INVALID_VALUE — so `init` tries the current one and falls back.
+// Ubuntu 24.04, which both CI and the runtime image build against, still ships
+// v7.4; Homebrew ships v10.
 //
-// v9 also stopped accepting it as a *descriptor* field: GxB_Desc_set_INT32
+// v9 also stopped accepting the field on a *descriptor*: GxB_Desc_set_INT32
 // returns GrB_INVALID_VALUE for it regardless of the constant used, even though
 // the v10 header still lists it under GrB_Desc_Field. Thread count is now only
 // settable globally (or per GxB_Context), which is what `init` does below.
 const GXB_NTHREADS: c_int = 7086;
+const GXB_NTHREADS_LEGACY: c_int = 5;
 
 #[link(name = "graphblas")]
 unsafe extern "C" {
@@ -80,8 +85,11 @@ unsafe extern "C" {
     fn GrB_Vector_free(vector: *mut GrBVector) -> GrBInfo;
     fn GrB_Descriptor_new(descriptor: *mut GrBDescriptor) -> GrBInfo;
     fn GrB_Descriptor_free(descriptor: *mut GrBDescriptor) -> GrBInfo;
-    static GrB_GLOBAL: GrBGlobal;
-    fn GrB_Global_set_INT32(global: GrBGlobal, value: i32, field: c_int) -> GrBInfo;
+    // The v9 spelling of this is GrB_Global_set_INT32 against the GrB_GLOBAL
+    // handle, but neither symbol exists before v9, so naming them here fails to
+    // *link* on v7 whether or not the call is reached. GxB_Global_Option_set_INT32
+    // is exported by v7 through v10 alike.
+    fn GxB_Global_Option_set_INT32(field: c_int, value: i32) -> GrBInfo;
     fn GrB_Vector_clear(vector: GrBVector) -> GrBInfo;
     fn GrB_Vector_build_BOOL(
         vector: GrBVector,
@@ -1218,10 +1226,14 @@ fn init() -> Result<()> {
             .and_then(|value| value.parse::<i32>().ok())
             .filter(|value| *value > 0)
         {
-            let info = GrB_Global_set_INT32(GrB_GLOBAL, threads, GXB_NTHREADS);
+            let mut info = GxB_Global_Option_set_INT32(GXB_NTHREADS, threads);
+            if info == GRB_INVALID_VALUE {
+                // Pre-v9 library: the field is the same one under its old number.
+                info = GxB_Global_Option_set_INT32(GXB_NTHREADS_LEGACY, threads);
+            }
             if info != GRB_SUCCESS {
                 return Err(format!(
-                    "GrB_Global_set_INT32(GxB_NTHREADS) returned GraphBLAS status {info}"
+                    "GxB_Global_Option_set_INT32(GxB_NTHREADS) returned GraphBLAS status {info}"
                 ));
             }
         }
