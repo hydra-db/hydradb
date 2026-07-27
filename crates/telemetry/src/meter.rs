@@ -2,6 +2,13 @@
 //! snapshots, and the histogram family that exists because OpenTelemetry has no
 //! observable histogram.
 //!
+//! Two instrument kinds live here, and they share a shape rather than an
+//! implementation. [`ObservableCounter`] mirrors one cumulative `u64` per label
+//! set; [`ObservableHistogram`] mirrors a whole `[u64; N]` ladder plus a sum as
+//! three instruments. Both cache what the collection task published and both are
+//! read synchronously by an OTel callback that never awaits and never locks
+//! anything the kernel's hot paths touch.
+//!
 //! # Why a family of counters and not a histogram
 //!
 //! The kernel computes its own fixed-bound duration histogram — a `[u64; 18]`
@@ -47,15 +54,19 @@
 //!
 //! This crate must not name a kernel type — its `Cargo.toml` forbids the
 //! dependency, and the arrow pointing this way is what keeps the kernel free of
-//! OpenTelemetry. So the entire interface is three pieces of plain data:
+//! OpenTelemetry. So the entire interface is four pieces of plain data:
 //!
 //! 1. `&[u64]` — the finite bucket upper bounds, in **microseconds**, ascending
 //!    ([`ObservableHistogram::register`]).
 //! 2. `&[u64]` — the bucket counts, one per bound plus one overflow bucket.
 //! 3. `u64` — the sum, in microseconds.
+//! 4. `u64` — one counter's cumulative total ([`ObservableCounter::record`]).
 //!
-//! ([`ObservableHistogram::record_snapshot`] for the last two.) The kernel owns
-//! the ladder and the arithmetic; this module owns the exposition.
+//! ([`ObservableHistogram::record_snapshot`] for 2 and 3.) The kernel owns the
+//! ladder and the arithmetic; this module owns the exposition. The binaries own
+//! the *names*, which is why no metric name appears in this file outside a test:
+//! the kernel enumerates by Rust identifier and `src/bin/graph_node/` holds the
+//! two name tables.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -178,6 +189,236 @@ pub enum HistogramError {
         /// The metric name stem.
         name: &'static str,
     },
+}
+
+/// The unit an exported counter is reported in.
+///
+/// Two values, and the vocabulary is closed on purpose. Every kernel counter is
+/// either a count of events or a **cumulative sum of microseconds** — the `_us`
+/// fields that `rate(sum) / rate(count)` turns into a mean. There is no
+/// `Seconds`, and its absence is the design: [`HistogramUnit::Seconds`] exists
+/// because one semantic convention fixes one *histogram* in seconds, whereas
+/// scaling a counter here would make it disagree with the `_microseconds` series
+/// the Prometheus endpoint renders from the same field, and nothing downstream
+/// could detect the factor of a million.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CounterUnit {
+    /// A count of events. UCUM `1`.
+    Count,
+    /// A cumulative sum of microseconds. UCUM `us`.
+    Microseconds,
+}
+
+impl CounterUnit {
+    /// The UCUM unit annotation for the instrument.
+    pub fn ucum(self) -> &'static str {
+        match self {
+            Self::Count => "1",
+            Self::Microseconds => "us",
+        }
+    }
+}
+
+/// What an exported counter is called and what it means.
+///
+/// One instrument, not three: unlike [`HistogramSpec`] there is no `.bucket` /
+/// `.sum` / `.count` derivation, so `name` is the metric name exactly as it
+/// reaches the wire.
+#[derive(Clone, Copy, Debug)]
+pub struct CounterSpec {
+    /// Metric name. `db.*` where a semantic convention genuinely exists,
+    /// `turbolay.*` otherwise — and for counters it is always the latter, because
+    /// the one stable database metric is a histogram.
+    pub name: &'static str,
+    /// One-line description, exported as the instrument description.
+    pub description: &'static str,
+    /// The unit the value is reported in.
+    pub unit: CounterUnit,
+}
+
+/// Why a counter observation was rejected.
+///
+/// Deliberately its own type rather than a share of [`HistogramError`]: a counter
+/// has no ladder, so `Bounds` and `BucketCount` are unreachable for it, and an
+/// error enum two thirds of whose variants cannot occur is a worse signature than
+/// two small enums. Both variants are programming errors and neither is a panic,
+/// for the reason [`HistogramError`] gives.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[non_exhaustive]
+pub enum CounterError {
+    /// The same label key was supplied twice for one series.
+    #[error("counter {name}: label {key} was supplied twice")]
+    DuplicateLabel {
+        /// The metric name.
+        name: &'static str,
+        /// The repeated key.
+        key: &'static str,
+    },
+
+    /// A caller tried to supply `le`, which belongs to a histogram family.
+    ///
+    /// A scalar counter carrying `le` claims to be one bucket of a distribution
+    /// it is not part of, and after a collector's Prometheus conversion it would
+    /// sit in the same name space as [`ObservableHistogram`]'s buckets.
+    #[error("counter {name}: {LE} belongs to a histogram family, not to a scalar counter")]
+    ReservedLabel {
+        /// The metric name.
+        name: &'static str,
+    },
+}
+
+/// A cumulative kernel counter, exported as one `u64` observable counter.
+///
+/// # Why observable, and why cumulative
+///
+/// The source is an `AtomicU64` that only ever increases. An OTel
+/// `Counter::add()` takes a **delta**, so mirroring a cumulative source through a
+/// synchronous counter means storing the last exported value and adding the
+/// difference — a second copy of the state that can drift, and one that produces a
+/// spurious spike or a spurious zero at every process restart.
+/// `u64_observable_counter` reports the absolute value and lets the SDK compute
+/// temporality, so the mapping is exact and there is no arithmetic to get wrong.
+///
+/// [`Self::record`] therefore **replaces** rather than accumulates. Adding would
+/// double-count every interval, since the value handed in is already the total.
+///
+/// # What it does not do
+///
+/// It does not scale, sum across series, or invent a zero. A series that has never
+/// been recorded is not reported at all — an observable instrument that reports a
+/// zero for a label set that does not exist is how a dashboard grows rows for
+/// shards that were never opened. A series that *stops* being recorded keeps
+/// reporting its last value, which for a cumulative counter is the correct
+/// degradation: a gap reads as a reset and produces a spurious `rate()` spike.
+///
+/// # Labels
+///
+/// `&[(MetricLabel, &str)]`, the same as [`ObservableHistogram::record_snapshot`],
+/// which is what makes "no `turbolay.scope` on a metric" a type error rather than
+/// a review comment — [`MetricLabel`]'s constructor is private to
+/// [`crate::semconv`].
+#[derive(Debug)]
+pub struct ObservableCounter {
+    name: &'static str,
+    state: Arc<RwLock<HashMap<SeriesKey, u64>>>,
+}
+
+impl ObservableCounter {
+    /// Register one `u64` observable counter on `meter`.
+    ///
+    /// Infallible, and that is the honest signature rather than a `Result` kept
+    /// for symmetry with [`ObservableHistogram::register`]: there is no ladder to
+    /// validate. The registration itself cannot be observed to fail — the SDK
+    /// validates instrument names internally and silently drops what it rejects,
+    /// which is why the proof that a name survives is an export-level test and
+    /// not a return value.
+    ///
+    /// The handle the builder returns is dropped for the same reason it is for
+    /// histograms: in `opentelemetry` 0.32 an
+    /// [`opentelemetry::metrics::ObservableCounter`] is a `PhantomData` marker and
+    /// the callback lives in the meter's pipeline, so keeping it buys nothing.
+    pub fn register(meter: &Meter, spec: CounterSpec) -> Self {
+        let counter = Self {
+            name: spec.name,
+            state: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let observed = counter.shallow_clone();
+        let _ = meter
+            .u64_observable_counter(spec.name)
+            .with_description(spec.description)
+            .with_unit(spec.unit.ucum())
+            .with_callback(move |observer| {
+                for observation in observed.observations() {
+                    observer.observe(observation.value, &observation.attributes);
+                }
+            })
+            .build();
+
+        counter
+    }
+
+    /// Publish the latest cumulative value for one series.
+    ///
+    /// `value` is the absolute total, not an increment. Callers must not pass
+    /// [`crate::semconv::LE`].
+    pub fn record(&self, labels: &[(MetricLabel, &str)], value: u64) -> Result<(), CounterError> {
+        let key = self.series_key(labels)?;
+        self.write().insert(key, value);
+        Ok(())
+    }
+
+    /// How many series this counter is currently reporting.
+    ///
+    /// One instrument's cardinality, directly — there is no bucket multiplier the
+    /// way there is for [`ObservableHistogram::series_count`].
+    pub fn series_count(&self) -> usize {
+        self.read().len()
+    }
+
+    /// What the callback reports: one observation per recorded series.
+    ///
+    /// Public for the same reason the histogram's observation vectors are:
+    /// standing up an `SdkMeterProvider` to find out whether a label survived is a
+    /// test of the SDK, not of this code.
+    pub fn observations(&self) -> Vec<Observation<u64>> {
+        self.read()
+            .iter()
+            .map(|(key, value)| Observation {
+                attributes: attributes_of(key),
+                value: *value,
+            })
+            .collect()
+    }
+
+    /// Canonicalise a label set into a series key, rejecting `le` and duplicates.
+    ///
+    /// Sorted on the key so two callers passing the same labels in different
+    /// orders address one series rather than two.
+    fn series_key(&self, labels: &[(MetricLabel, &str)]) -> Result<SeriesKey, CounterError> {
+        let mut key: SeriesKey = labels
+            .iter()
+            .map(|(label, value)| (label.key(), (*value).to_string()))
+            .collect();
+        if key.iter().any(|(name, _)| *name == LE) {
+            return Err(CounterError::ReservedLabel { name: self.name });
+        }
+        key.sort_unstable();
+        if let Some(duplicate) = key
+            .windows(2)
+            .find(|pair| pair[0].0 == pair[1].0)
+            .map(|pair| pair[0].0)
+        {
+            return Err(CounterError::DuplicateLabel {
+                name: self.name,
+                key: duplicate,
+            });
+        }
+        Ok(key)
+    }
+
+    /// A handle onto the same state, for the callback.
+    fn shallow_clone(&self) -> Self {
+        Self {
+            name: self.name,
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Poisoning is recovered from rather than propagated, for the reason the
+    /// histogram's accessor gives: a metrics pipeline that stops for the life of
+    /// the process because something else panicked is worse than a stale series.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<SeriesKey, u64>> {
+        self.state
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<SeriesKey, u64>> {
+        self.state
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 }
 
 /// One recorded series: the label values it is keyed by, its bucket counts and
@@ -676,5 +917,143 @@ mod tests {
         assert!(histogram.bucket_observations().is_empty());
         assert!(histogram.sum_observations().is_empty());
         assert!(histogram.count_observations().is_empty());
+    }
+
+    fn counter(unit: CounterUnit) -> ObservableCounter {
+        let meter = opentelemetry::global::meter("turbolay-telemetry-tests");
+        ObservableCounter::register(
+            &meter,
+            CounterSpec {
+                name: "turbolay.test.events",
+                description: "test",
+                unit,
+            },
+        )
+    }
+
+    fn cell_of(observation: &Observation<u64>) -> Option<String> {
+        observation
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == L_CELL_ID.key())
+            .map(|attribute| attribute.value.to_string())
+    }
+
+    /// The source is cumulative, so recording twice must **replace**. Adding
+    /// would double-count every interval, which is the failure a synchronous
+    /// `Counter::add` mirror of a cumulative source produces by construction.
+    #[test]
+    fn recording_a_counter_twice_replaces_rather_than_accumulates() {
+        let counter = counter(CounterUnit::Count);
+        counter
+            .record(&[(L_CELL_ID, "cell-7")], 10)
+            .expect("one label");
+        counter
+            .record(&[(L_CELL_ID, "cell-7")], 14)
+            .expect("one label");
+
+        assert_eq!(counter.series_count(), 1);
+        let observations = counter.observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].value, 14);
+        assert_eq!(cell_of(&observations[0]).as_deref(), Some("cell-7"));
+    }
+
+    /// One series per cell, and the label value is what keys them apart —
+    /// `cell_id` alone, never `cell_id × edge_type` and never `scope`, which the
+    /// [`MetricLabel`] type is what enforces.
+    #[test]
+    fn each_cell_is_its_own_counter_series() {
+        let counter = counter(CounterUnit::Count);
+        for (cell, value) in [("cell-1", 1u64), ("cell-2", 2), ("cell-3", 3)] {
+            counter.record(&[(L_CELL_ID, cell)], value).expect("labels");
+        }
+        assert_eq!(counter.series_count(), 3);
+
+        let mut reported: Vec<(Option<String>, u64)> = counter
+            .observations()
+            .iter()
+            .map(|observation| (cell_of(observation), observation.value))
+            .collect();
+        reported.sort();
+        assert_eq!(
+            reported,
+            vec![
+                (Some("cell-1".to_string()), 1),
+                (Some("cell-2".to_string()), 2),
+                (Some("cell-3".to_string()), 3),
+            ]
+        );
+    }
+
+    /// An unrecorded counter reports nothing rather than a zero. A zero for a
+    /// label set that does not exist is how a dashboard grows rows for shards
+    /// that were never opened.
+    #[test]
+    fn an_unrecorded_counter_reports_nothing() {
+        assert!(counter(CounterUnit::Count).observations().is_empty());
+    }
+
+    /// A process-global counter has no labels at all, and the empty attribute set
+    /// must still address exactly one series.
+    #[test]
+    fn an_unlabelled_counter_is_a_single_series() {
+        let counter = counter(CounterUnit::Microseconds);
+        counter.record(&[], 900).expect("no labels");
+        counter.record(&[], 1_000).expect("no labels");
+        assert_eq!(counter.series_count(), 1);
+        assert!(counter.observations()[0].attributes.is_empty());
+        assert_eq!(counter.observations()[0].value, 1_000);
+    }
+
+    #[test]
+    fn counter_label_order_does_not_create_a_second_series() {
+        let counter = counter(CounterUnit::Count);
+        counter
+            .record(&[(L_CELL_ID, "cell-3"), (L_DB_SYSTEM_NAME, "neo4j")], 1)
+            .expect("two labels");
+        counter
+            .record(&[(L_DB_SYSTEM_NAME, "neo4j"), (L_CELL_ID, "cell-3")], 2)
+            .expect("two labels");
+        assert_eq!(counter.series_count(), 1);
+        assert_eq!(counter.observations()[0].value, 2);
+    }
+
+    #[test]
+    fn a_duplicate_counter_label_is_rejected() {
+        let counter = counter(CounterUnit::Count);
+        assert_eq!(
+            counter.record(&[(L_CELL_ID, "cell-1"), (L_CELL_ID, "cell-2")], 1),
+            Err(CounterError::DuplicateLabel {
+                name: "turbolay.test.events",
+                key: L_CELL_ID.key(),
+            })
+        );
+        assert!(counter.observations().is_empty());
+    }
+
+    /// `le` belongs to a histogram family. A scalar counter carrying one would
+    /// land in the same Prometheus name space as
+    /// [`ObservableHistogram`]'s buckets and claim to be part of a distribution
+    /// it is not in.
+    #[test]
+    fn a_counter_may_not_claim_a_bucket_bound() {
+        let counter = counter(CounterUnit::Count);
+        assert_eq!(
+            counter.record(&[(crate::semconv::L_LE, "0.5")], 1),
+            Err(CounterError::ReservedLabel {
+                name: "turbolay.test.events",
+            })
+        );
+        assert!(counter.observations().is_empty());
+    }
+
+    /// No `Seconds`: a counter scaled here would disagree with the
+    /// `_microseconds` series `/metrics` renders from the same field, by a factor
+    /// of a million and undetectably.
+    #[test]
+    fn counter_units_are_count_or_microseconds() {
+        assert_eq!(CounterUnit::Count.ucum(), "1");
+        assert_eq!(CounterUnit::Microseconds.ucum(), "us");
     }
 }
