@@ -19,9 +19,9 @@
 //!
 //! A key is a metric label when it is something you *group by* and its value
 //! set is closed — [`KERNEL`], [`OUTCOME`], [`PLACEMENT_OWNERSHIP`],
-//! [`PLACEMENT_STATE`] and [`QUERY_FULL_SCAN`] are enums or bools;
-//! [`CELL_ID`] and [`EDGE_TYPE`] are bounded per node by deployment size and
-//! by schema. Everything else is span-only, for one of three reasons:
+//! [`PLACEMENT_STATE`], [`QUERY_FULL_SCAN`] and [`DB_OPERATION_NAME`] are enums
+//! or bools; [`CELL_ID`] and [`EDGE_TYPE`] are bounded per node by deployment
+//! size and by schema. Everything else is span-only, for one of three reasons:
 //!
 //! - **Unbounded by construction.** [`SCOPE`] grows with tenant count,
 //!   [`CORRELATION_ID`] takes one value per request, [`CALLER_STEP`] is
@@ -240,6 +240,32 @@ pub const DB_SYSTEM_NAME: &str = "db.system.name";
 /// Value for [`DB_SYSTEM_NAME`].
 pub const DB_SYSTEM_NEO4J: &str = "neo4j";
 
+/// Which database operation a measurement covers, per OTel semantic
+/// conventions.
+///
+/// This key exists for exactly one reason, and it is a naming reason rather
+/// than an analytical one. `db.client.operation.duration` is a *stable* semantic
+/// convention, and semconv separates a read distribution from a write
+/// distribution with this attribute — not with two metric names. Without it the
+/// two are forced into `db.client.operation.duration.read` and `….write`, which
+/// is a Turbolay name wearing a semconv prefix and matches no vendor's database
+/// view; with it there is one instrument and two series, which is what every
+/// consumer of that metric already expects.
+///
+/// Bounded, and bounded by this codebase rather than by the convention: the
+/// only two values anything emits are [`DB_OPERATION_READ`] and
+/// [`DB_OPERATION_WRITE`], because `QueryTransportAction`'s four variants fold
+/// into exactly two distributions at the recording site. It is deliberately
+/// **not** the statement text, the Cypher verb or the fingerprint — semconv
+/// permits a low-cardinality operation name and those are none of them.
+pub const DB_OPERATION_NAME: &str = "db.operation.name";
+
+/// [`DB_OPERATION_NAME`] value: an execution that did not commit.
+pub const DB_OPERATION_READ: &str = "read";
+
+/// [`DB_OPERATION_NAME`] value: an execution that committed a mutation.
+pub const DB_OPERATION_WRITE: &str = "write";
+
 /// Bucket upper bound on an exported histogram family — the Prometheus `le`
 /// convention, spelled the same way in the OTLP export.
 ///
@@ -343,6 +369,17 @@ pub const L_QUERY_FULL_SCAN: MetricLabel = MetricLabel(QUERY_FULL_SCAN);
 /// pay the cost of the naming split and collect none of the benefit.
 pub const L_DB_SYSTEM_NAME: MetricLabel = MetricLabel(DB_SYSTEM_NAME);
 
+/// [`DB_OPERATION_NAME`] as a metric dimension. Two values.
+///
+/// The one label in this table whose absence would be *invisible*. Two
+/// histograms under one instrument name with nothing to tell them apart do not
+/// error and do not warn — they interleave into a single series, and the last
+/// writer of each interval wins. So this label is not an extra dimension on an
+/// existing metric; it is the thing that makes the semconv metric name usable
+/// at all, and the alternative is two instruments neither of which is
+/// `db.client.operation.duration`.
+pub const L_DB_OPERATION_NAME: MetricLabel = MetricLabel(DB_OPERATION_NAME);
+
 /// [`LE`] as a metric dimension — bucket bounds on an exported histogram
 /// family. Never a span attribute.
 pub const L_LE: MetricLabel = MetricLabel(LE);
@@ -360,6 +397,7 @@ pub const METRIC_LABELS: &[MetricLabel] = &[
     L_PLACEMENT_PREVIOUS_STATE,
     L_QUERY_FULL_SCAN,
     L_DB_SYSTEM_NAME,
+    L_DB_OPERATION_NAME,
     L_LE,
 ];
 
@@ -435,10 +473,11 @@ pub const ALL_TURBOLAY_KEYS: &[&str] = &[
 /// [`ALL_TURBOLAY_KEYS`] stays the namespaced subset, because that is what the
 /// namespace test and the redaction cross-check are about. This is the superset
 /// the classification tests iterate, and the distinction is not pedantry: the
-/// three keys that are *not* `turbolay.`-namespaced are [`ERROR_CLASS`],
-/// [`DB_SYSTEM_NAME`] and [`LE`] — one of which is first on the safe-label list
-/// and all three of which a test over `ALL_TURBOLAY_KEYS` would classify
-/// vacuously, passing while checking nothing.
+/// four keys that are *not* `turbolay.`-namespaced are [`ERROR_CLASS`],
+/// [`DB_SYSTEM_NAME`], [`DB_OPERATION_NAME`] and [`LE`] — one of which is first
+/// on the safe-label list and all four of which a test over
+/// `ALL_TURBOLAY_KEYS` would classify vacuously, passing while checking
+/// nothing.
 pub const ALL_REGISTRY_KEYS: &[&str] = &[
     SCOPE,
     CELL_ID,
@@ -474,6 +513,7 @@ pub const ALL_REGISTRY_KEYS: &[&str] = &[
     SAMPLING_TAIL_KEEP,
     ERROR_CLASS,
     DB_SYSTEM_NAME,
+    DB_OPERATION_NAME,
     LE,
 ];
 
@@ -526,9 +566,9 @@ mod tests {
         }
         assert_eq!(
             ALL_REGISTRY_KEYS.len(),
-            ALL_TURBOLAY_KEYS.len() + 3,
+            ALL_TURBOLAY_KEYS.len() + 4,
             "ALL_REGISTRY_KEYS is ALL_TURBOLAY_KEYS plus error.class, \
-             db.system.name and le — no more and no less"
+             db.system.name, db.operation.name and le — no more and no less"
         );
     }
 
@@ -593,6 +633,12 @@ mod tests {
         assert!(SPAN_ONLY_KEYS.contains(&CORRELATION_ID));
         assert!(SPAN_ONLY_KEYS.contains(&QUERY_FINGERPRINT));
         assert!(METRIC_LABELS.iter().any(|l| l.key() == ERROR_CLASS));
+        // Not a judgement call so much as a load-bearing one: this key is what
+        // lets the read and write distributions share the stable semconv
+        // instrument name instead of inventing two Turbolay names under a
+        // semconv prefix. Span-only would have re-forced the split.
+        assert!(METRIC_LABELS.iter().any(|l| l.key() == DB_OPERATION_NAME));
+        assert!(!SPAN_ONLY_KEYS.contains(&DB_OPERATION_NAME));
     }
 
     #[test]

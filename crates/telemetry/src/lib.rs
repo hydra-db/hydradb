@@ -152,6 +152,43 @@ impl TelemetryGuard {
     pub fn shutdown(self) {
         drop(self);
     }
+
+    /// The OTLP providers, or `None` when no endpoint is configured.
+    ///
+    /// This is the *only* way to reach the metrics pipeline, and it is an
+    /// accessor rather than a call to `opentelemetry::global::set_meter_provider`
+    /// for three reasons, in order of weight.
+    ///
+    /// **The global outlives the guard.** [`TelemetryGuard`] exists to make
+    /// shutdown ordered and explicit — the meter provider is shut down *last*
+    /// because its shutdown runs one final collection ([`otlp::Providers::shutdown`]).
+    /// A process-global handle is a second owner of the same pipeline that
+    /// nothing drops, so after `shutdown()` a call to `global::meter` still
+    /// hands out instruments against a dead provider and they fail silently.
+    /// A `#[must_use]` guard whose contents can be reached without it is not a
+    /// guard.
+    ///
+    /// **Absence must be visible.** With no endpoint there is no metrics
+    /// pipeline at all, and this returns `None` — a caller cannot spend an
+    /// interval task collecting snapshots for a provider that does not exist.
+    /// `global::meter` on an uninstalled global returns a *no-op* meter that
+    /// accepts every instrument and reports nothing, which is the same
+    /// symptom-free failure the metrics path already spent a commit being.
+    ///
+    /// **The registration is already explicit.** Traces and logs reach their
+    /// providers through the installed subscriber, so nothing has to name them.
+    /// Instruments do not: every observable callback is registered by hand
+    /// against a [`Meter`](opentelemetry::metrics::Meter). A global would hide
+    /// that asymmetry rather than remove it.
+    ///
+    /// Registration order is the caller's problem either way — an instrument
+    /// built before the provider exists reports to nothing — and doing it
+    /// through a returned handle makes that ordering a borrow rather than a
+    /// convention.
+    #[cfg(feature = "otlp")]
+    pub fn providers(&self) -> Option<&otlp::Providers> {
+        self.providers.as_ref()
+    }
 }
 
 impl Drop for TelemetryGuard {

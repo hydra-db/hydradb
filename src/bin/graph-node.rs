@@ -5,6 +5,9 @@ mod admin;
 #[path = "graph_node/config.rs"]
 mod config;
 #[allow(dead_code)]
+#[path = "graph_node/otel_metrics.rs"]
+mod otel_metrics;
+#[allow(dead_code)]
 #[path = "graph_node/readiness.rs"]
 mod readiness;
 #[allow(dead_code)]
@@ -77,11 +80,18 @@ async fn main() -> RuntimeResult<()> {
     // error, is logged rather than lost. `init` is total — with no
     // `OTEL_EXPORTER_OTLP_ENDPOINT` set it installs the fmt layer alone, so a
     // missing collector is never why a node fails to boot.
-    let telemetry =
-        turbolay_telemetry::init(TelemetryConfig::from_env(ServiceIdentity::GraphNode))?;
+    let telemetry_config = TelemetryConfig::from_env(ServiceIdentity::GraphNode);
+    // Read off the config before `init` consumes it, because the metric
+    // collection task and the SDK's `PeriodicReader` must use the *same*
+    // number and this is the only place both can see it. Re-reading
+    // `OTEL_METRIC_EXPORT_INTERVAL` further down would be a second parse of one
+    // value, and the two parses differ: `TelemetryConfig` rejects a zero that
+    // the SDK silently ignores.
+    let metric_export_interval = telemetry_config.metric_export_interval;
+    let telemetry = turbolay_telemetry::init(telemetry_config)?;
     install_trace_context_bridge();
 
-    let result = boot().await;
+    let result = boot(&telemetry, metric_export_interval).await;
 
     // Explicitly, and last. The guard flushes on drop too, but the ordering of
     // a destructor against the rest of `main` is easy to get wrong, and what
@@ -96,13 +106,26 @@ async fn main() -> RuntimeResult<()> {
 /// Everything between the subscriber being installed and it being torn down.
 ///
 /// Split out of `main` only so the shutdown above cannot be skipped by a `?`.
-async fn boot() -> RuntimeResult<()> {
+///
+/// The guard is borrowed rather than moved because it is also what owns the
+/// meter provider: the metric collection task registers its instruments against
+/// `TelemetryGuard::providers()`, and the guard has to outlive that task so the
+/// meter's final collection at shutdown happens after the task has stopped
+/// publishing into it.
+async fn boot(
+    telemetry: &turbolay_telemetry::TelemetryGuard,
+    metric_export_interval: Duration,
+) -> RuntimeResult<()> {
     let config = RuntimeConfig::from_env()?;
     tracing::info!(scope = %config.scope, "starting graph node");
-    run_node(config).await
+    run_node(config, telemetry, metric_export_interval).await
 }
 
-async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
+async fn run_node(
+    config: RuntimeConfig,
+    telemetry: &turbolay_telemetry::TelemetryGuard,
+    metric_export_interval: Duration,
+) -> RuntimeResult<()> {
     let started_at = Utc::now();
     // Rejected here rather than at the first PUT: an id the object layer cannot
     // name is a node that runs, serves, and never appears in anyone's live set —
@@ -249,6 +272,15 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     )
     .await?;
     ready.mark_ready();
+    // The OTel half of the same numbers `/metrics` serves. Inert without the
+    // `otlp` feature and inert with it when no collector endpoint is
+    // configured, so the ordinary build spawns nothing and takes no lock.
+    let metric_collection = otel_metrics::MetricCollection::start(
+        telemetry,
+        metric_export_interval,
+        service.clone(),
+        Arc::clone(&node),
+    );
     let (heartbeat_stop, heartbeat_task) = start_heartbeat_publisher(
         Arc::clone(&object_store),
         Path::from(config.data_path.as_str()),
@@ -298,6 +330,10 @@ async fn run_node(config: RuntimeConfig) -> RuntimeResult<()> {
     }
     let _ = index_discovery_stop.send(true);
     index_discovery_task.await??;
+    // Before `drop(service)` and before the `try_unwrap` below: the task holds
+    // a clone of both, so a collection still in flight would turn a clean
+    // shutdown into "graph node still has active runtime references".
+    metric_collection.stop().await;
     drop(service);
     let node =
         Arc::try_unwrap(node).map_err(|_| "graph node still has active runtime references")?;
