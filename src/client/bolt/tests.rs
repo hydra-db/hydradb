@@ -1296,11 +1296,13 @@ async fn bolt_server_accepts_authenticated_queries_over_tls() {
 }
 
 #[tokio::test]
-async fn bolt_server_closes_idle_post_handshake_connections() {
+async fn bolt_server_closes_connections_that_miss_the_authentication_deadline() {
     let server = ClientBoltServer::bind(
         "127.0.0.1:0".parse().unwrap(),
         bolt_test_service(),
-        bolt_test_config().with_idle_timeout(Duration::from_millis(20)),
+        bolt_test_config()
+            .with_authentication_timeout(Duration::from_secs(1))
+            .with_idle_timeout(Duration::from_secs(3)),
     )
     .await
     .unwrap();
@@ -1314,12 +1316,156 @@ async fn bolt_server_closes_idle_post_handshake_connections() {
     stream.read_exact(&mut selected).await.unwrap();
     assert_eq!(selected, [0, 0, 4, 5]);
 
-    let mut byte = [0_u8; 1];
-    let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut reader = ChunkReader::new(read_half);
+    let mut writer = ChunkWriter::new(write_half);
+    send_test_bolt_client_message(
+        &mut writer,
+        &ClientMessage::Hello {
+            extra: BoltDict::new(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+
+    let read = tokio::time::timeout(Duration::from_secs(2), reader.read_message())
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(read, 0);
+    assert!(read.is_err());
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn unauthenticated_reset_logoff_cannot_refresh_authentication_deadline() {
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        bolt_test_service(),
+        bolt_test_config()
+            .with_authentication_timeout(Duration::from_secs(1))
+            .with_idle_timeout(Duration::from_secs(3)),
+    )
+    .await
+    .unwrap();
+    let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
+    stream.write_all(&BOLT_MAGIC).await.unwrap();
+    stream
+        .write_all(&[0, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut selected = [0_u8; 4];
+    stream.read_exact(&mut selected).await.unwrap();
+    assert_eq!(selected, [0, 0, 4, 5]);
+
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut reader = ChunkReader::new(read_half);
+    let mut writer = ChunkWriter::new(write_half);
+    send_test_bolt_client_message(
+        &mut writer,
+        &ClientMessage::Hello {
+            extra: BoltDict::new(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+
+    send_test_bolt_client_message(&mut writer, &ClientMessage::Reset).await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Failure { .. }
+    ));
+    send_test_bolt_client_message(&mut writer, &ClientMessage::Reset).await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    send_test_bolt_client_message(&mut writer, &ClientMessage::Logoff).await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Failure { .. }
+    ));
+
+    let read = tokio::time::timeout(Duration::from_secs(1), reader.read_message())
+        .await
+        .unwrap();
+    assert!(read.is_err());
+    server.stop().await.unwrap();
+}
+#[tokio::test]
+async fn authenticated_bolt_connections_use_the_separate_idle_timeout() {
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        bolt_test_service(),
+        bolt_test_config()
+            .with_authentication_timeout(Duration::from_secs(1))
+            .with_idle_timeout(Duration::from_secs(3)),
+    )
+    .await
+    .unwrap();
+    let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
+    stream.write_all(&BOLT_MAGIC).await.unwrap();
+    stream
+        .write_all(&[0, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut selected = [0_u8; 4];
+    stream.read_exact(&mut selected).await.unwrap();
+    assert_eq!(selected, [0, 0, 4, 5]);
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut reader = ChunkReader::new(read_half);
+    let mut writer = ChunkWriter::new(write_half);
+
+    send_test_bolt_client_message(
+        &mut writer,
+        &ClientMessage::Hello {
+            extra: BoltDict::from([(
+                "user_agent".to_string(),
+                BoltValue::String("sgk-auth-timeout-test".to_string()),
+            )]),
+        },
+    )
+    .await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+    send_test_bolt_client_message(
+        &mut writer,
+        &ClientMessage::Logon {
+            auth: BoltDict::from([
+                ("scheme".to_string(), BoltValue::String("basic".to_string())),
+                (
+                    "principal".to_string(),
+                    BoltValue::String("neo4j".to_string()),
+                ),
+                (
+                    "credentials".to_string(),
+                    BoltValue::String("bolt-secret".to_string()),
+                ),
+            ]),
+        },
+    )
+    .await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    send_test_bolt_client_message(&mut writer, &ClientMessage::Reset).await;
+    assert!(matches!(
+        decode_test_bolt_server_message(&mut reader).await,
+        ServerMessage::Success { .. }
+    ));
+    drop(reader);
+    drop(writer);
     server.stop().await.unwrap();
 }
 

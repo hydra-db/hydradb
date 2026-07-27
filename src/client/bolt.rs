@@ -52,8 +52,9 @@ const BOLT_SUPPORTED_VERSIONS: [(u8, u8); 4] = [(5, 4), (5, 3), (5, 2), (5, 1)];
 const DEFAULT_BOLT_MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_BOLT_MAX_CONNECTIONS: usize = 1024;
 const DEFAULT_BOLT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_BOLT_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BOLT_GRACEFUL_SHUTDOWN: Duration = Duration::from_secs(30);
-const DEFAULT_BOLT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_BOLT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_BOLT_MAX_CONNECTION_AGE: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_BOLT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BOLT_ROUTING_TTL_SECS: i64 = 30;
@@ -79,6 +80,7 @@ pub struct BoltServerConfig {
     pub prefetch_rows: usize,
     pub max_pipelined_messages: usize,
     pub handshake_timeout: Duration,
+    pub authentication_timeout: Duration,
     pub idle_timeout: Duration,
     pub max_connection_age: Duration,
     pub write_timeout: Duration,
@@ -100,6 +102,7 @@ impl BoltServerConfig {
             prefetch_rows: DEFAULT_BOLT_PREFETCH_ROWS,
             max_pipelined_messages: DEFAULT_BOLT_MAX_PIPELINED_MESSAGES,
             handshake_timeout: DEFAULT_BOLT_HANDSHAKE_TIMEOUT,
+            authentication_timeout: DEFAULT_BOLT_AUTHENTICATION_TIMEOUT,
             idle_timeout: DEFAULT_BOLT_IDLE_TIMEOUT,
             max_connection_age: DEFAULT_BOLT_MAX_CONNECTION_AGE,
             write_timeout: DEFAULT_BOLT_WRITE_TIMEOUT,
@@ -154,6 +157,11 @@ impl BoltServerConfig {
 
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
+        self
+    }
+
+    pub fn with_authentication_timeout(mut self, timeout: Duration) -> Self {
+        self.authentication_timeout = timeout;
         self
     }
 
@@ -223,6 +231,7 @@ impl BoltServerConfig {
             );
         }
         if self.handshake_timeout.is_zero()
+            || self.authentication_timeout.is_zero()
             || self.idle_timeout.is_zero()
             || self.max_connection_age.is_zero()
             || self.write_timeout.is_zero()
@@ -374,6 +383,7 @@ async fn run_bolt_server(
                     Arc::clone(&config),
                     Arc::clone(&metrics),
                     permit,
+                    Instant::now() + config.authentication_timeout,
                 ));
             }
             completed = connections.join_next(), if !connections.is_empty() => {
@@ -401,9 +411,12 @@ async fn serve_bolt_connection(
     config: Arc<BoltServerConfig>,
     metrics: Arc<BoltServerMetrics>,
     _permit: OwnedSemaphorePermit,
+    authentication_deadline: Instant,
 ) {
     metrics.active_connections.fetch_add(1, Ordering::Relaxed);
-    let result = serve_bolt_connection_inner(stream, peer_addr, service, config).await;
+    let result =
+        serve_bolt_connection_inner(stream, peer_addr, service, config, authentication_deadline)
+            .await;
     metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
     if let Err(err) = result {
         if matches!(err, BoltError::Protocol(_)) {
@@ -418,6 +431,7 @@ async fn serve_bolt_connection_inner(
     peer_addr: SocketAddr,
     service: ClientQueryService,
     config: Arc<BoltServerConfig>,
+    authentication_deadline: Instant,
 ) -> std::result::Result<(), BoltError> {
     stream.set_nodelay(true)?;
     let (mut io, identity): (Box<dyn BoltIo>, QueryTransportConnectionIdentity) =
@@ -426,8 +440,11 @@ async fn serve_bolt_connection_inner(
                 let server_config = provider
                     .current_server_config()
                     .map_err(|err| BoltError::Backend(err.to_string()))?;
-                let tls_stream = tokio::time::timeout(
-                    config.handshake_timeout,
+                let tls_stream = tokio::time::timeout_at(
+                    std::cmp::min(
+                        Instant::now() + config.handshake_timeout,
+                        authentication_deadline,
+                    ),
                     TlsAcceptor::from(server_config).accept(stream),
                 )
                 .await
@@ -441,9 +458,15 @@ async fn serve_bolt_connection_inner(
                 QueryTransportConnectionIdentity::default(),
             ),
         };
-    tokio::time::timeout(config.handshake_timeout, bolt_server_handshake(&mut *io))
-        .await
-        .map_err(|_| BoltError::Protocol("Bolt handshake timed out".to_string()))??;
+    tokio::time::timeout_at(
+        std::cmp::min(
+            Instant::now() + config.handshake_timeout,
+            authentication_deadline,
+        ),
+        bolt_server_handshake(&mut *io),
+    )
+    .await
+    .map_err(|_| BoltError::Protocol("Bolt handshake timed out".to_string()))??;
 
     let context = Arc::new(BoltConnectionContext::new(
         service,
@@ -454,7 +477,14 @@ async fn serve_bolt_connection_inner(
         config.routing_table_provider.clone(),
         identity,
     ));
-    run_bolt_protocol(io, peer_addr, context, config.as_ref()).await
+    run_bolt_protocol(
+        io,
+        peer_addr,
+        context,
+        config.as_ref(),
+        authentication_deadline,
+    )
+    .await
 }
 
 fn bolt_tls_identity<S>(
@@ -665,6 +695,7 @@ async fn run_bolt_protocol(
     peer_addr: SocketAddr,
     context: Arc<BoltConnectionContext>,
     config: &BoltServerConfig,
+    mut authentication_deadline: Instant,
 ) -> std::result::Result<(), BoltError> {
     let (read_half, write_half) = tokio::io::split(io);
     let (message_tx, mut message_rx) = mpsc::channel(config.max_pipelined_messages);
@@ -680,18 +711,31 @@ async fn run_bolt_protocol(
     let connection_deadline = Instant::now() + config.max_connection_age;
 
     loop {
-        if Instant::now() >= connection_deadline {
+        let now = Instant::now();
+        if now >= connection_deadline {
             break;
+        }
+        if session.authenticated.is_none() && now >= authentication_deadline {
+            return Err(BoltError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Bolt authentication timeout elapsed",
+            )));
         }
         let incoming = match queued.pop_front() {
             Some(message) => Some(Ok(message)),
             None => {
                 tokio::select! {
                     incoming = message_rx.recv() => incoming,
-                    _ = tokio::time::sleep(config.idle_timeout) => {
+                    _ = tokio::time::sleep(config.idle_timeout), if session.authenticated.is_some() => {
                         return Err(BoltError::Io(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             "Bolt connection idle timeout elapsed",
+                        )));
+                    }
+                    _ = tokio::time::sleep_until(authentication_deadline), if session.authenticated.is_none() => {
+                        return Err(BoltError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Bolt authentication timeout elapsed",
                         )));
                     }
                     _ = tokio::time::sleep_until(connection_deadline) => break,
@@ -713,7 +757,11 @@ async fn run_bolt_protocol(
                 ClientMessage::Reset => {
                     clear_pending_result(&context, &mut session).await;
                     send_bolt_success(&mut writer, BoltDict::new()).await?;
-                    state = BoltState::Ready;
+                    state = if session.authenticated.is_some() {
+                        BoltState::Ready
+                    } else {
+                        BoltState::Authentication
+                    };
                 }
                 ClientMessage::Goodbye => {
                     clear_pending_result(&context, &mut session).await;
@@ -787,6 +835,7 @@ async fn run_bolt_protocol(
                 clear_pending_result(&context, &mut session).await;
                 session.authenticated = None;
                 session.database = None;
+                authentication_deadline = Instant::now() + config.authentication_timeout;
                 send_bolt_success(&mut writer, BoltDict::new()).await?;
                 state = BoltState::Authentication;
             }
