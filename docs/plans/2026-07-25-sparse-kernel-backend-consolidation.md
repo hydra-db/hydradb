@@ -223,6 +223,16 @@ types from `field_reassign_with_default`, so the pattern is warning-clean.
 
 ## Open items
 
+- **`just ci` cannot pass, and has not been able to since Step 1.** The
+  `graphblas` feature is gone from `Cargo.toml`, but the justfile still passes
+  `--features graphblas` in `test-graphblas`, `test-native`,
+  `check-examples-graphblas` and `check-examples-native` — all four are in the
+  `ci` recipe, so `just ci` fails at the first of them (`test-graphblas`) with
+  `error: the package 'slatedb-graph-kernel' does not contain this feature:
+  graphblas`. `smoke-graphblas` carries the same dead flag but is not in `ci`.
+  Deliberately deferred (2026-07-27): the four
+  recipes collapse into their non-graphblas siblings, which is a decision about
+  which feature sets CI should cover, not a find-and-replace.
 - `docs/plans/optimisation-phases.md` still references `--features graphblas` in
   three places.
 - `src/query/opencypher.rs:361` trips `clippy::useless_conversion` locally under
