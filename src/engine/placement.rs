@@ -1088,11 +1088,15 @@ mod tests {
         .expect("a valid fleet");
 
         let handle = view.spawn_refresh(Arc::clone(&store), base());
+        // Sleep rather than `yield_now`: the first tick is immediate only once
+        // the time driver has run, and the driver runs when the runtime parks.
+        // A pure yield loop keeps this task perpetually ready, so on Linux it
+        // starves the timer it is waiting for and never observes the tick.
         for _ in 0..100 {
             if view.state() == ViewState::Fresh {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(
             view.state(),
