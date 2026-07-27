@@ -208,6 +208,40 @@ pub struct GraphCacheMetricsSnapshot {
     pub hydration_completed: u64,
 }
 
+// Nineteen counters that reached no export at all until M2. The `cache` field
+// they arrive on (`crate::GraphShardRuntimeMetrics::cache`) was always
+// populated by `local_shard_runtime_metrics` -- the gap was on the export side,
+// not the plumbing side.
+//
+// No histograms, and the empty block is written out rather than made optional:
+// "this type records no durations" is a claim worth stating, and a duration
+// added here later has to delete the empty block to compile, which is exactly
+// when somebody should be looking at it.
+snapshot_fields!(GraphCacheMetricsSnapshot {
+    counters {
+        matrix_artifact_hits,
+        matrix_artifact_misses,
+        matrix_adjacency_hits,
+        matrix_adjacency_misses,
+        graphblas_hits,
+        graphblas_misses,
+        parsed_row_query_hits,
+        parsed_row_query_misses,
+        relationship_rows_hits,
+        relationship_rows_misses,
+        relationship_property_rows_hits,
+        relationship_property_rows_misses,
+        insertions,
+        evictions,
+        pinned_insertions,
+        tenant_quota_rejections,
+        hydration_started,
+        hydration_waited,
+        hydration_completed,
+    }
+    histograms {}
+});
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GraphOperationalMetricsSnapshot {
     pub write_attempts: u64,

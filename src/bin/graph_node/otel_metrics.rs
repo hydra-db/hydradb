@@ -1,17 +1,29 @@
-//! The OTel half of the duration-histogram export, and the name table it is
+//! The OTel half of the metrics export, and the name tables both halves are
 //! driven by.
 //!
 //! # Two exports, one enumeration
 //!
-//! The kernel enumerates its histograms by **Rust identifier** — `read_latency`,
-//! `query_rows_latency` — and knows nothing about either exposition vocabulary
-//! (`slatedb_graph_kernel::ClientQueryMetricsSnapshot::histogram_fields` and
-//! friends). The two vocabularies live here and in [`crate::admin`]: this module
-//! holds the OTel names, `admin.rs` holds the Prometheus names, and
-//! [`tests::every_histogram_field_reaches_both_exports`] fails the build if a
-//! field the kernel enumerates is missing from either. That is the property
-//! §1.6 of `docs/plans/2026-07-26-otel-metrics-span-links-and-alerting.md` asks
-//! for: adding a histogram cannot silently reach one export and not the other.
+//! The kernel enumerates its metrics by **Rust identifier** — `read_latency`,
+//! `query_rows_latency`, `write_attempts` — and knows nothing about either
+//! exposition vocabulary
+//! (`slatedb_graph_kernel::ClientQueryMetricsSnapshot::histogram_fields`,
+//! `::counter_fields`, `::class_counter_fields` and their siblings). The two
+//! vocabularies live here and in [`crate::admin`]: this module holds the OTel
+//! names, `admin.rs` holds the Prometheus names, and
+//! [`tests::every_histogram_field_reaches_both_exports`] and
+//! [`tests::every_counter_field_reaches_both_exports`] fail the build if a field
+//! the kernel enumerates is missing from either. That is the property §1.6 of
+//! `docs/plans/2026-07-26-otel-metrics-span-links-and-alerting.md` asks for:
+//! adding a metric cannot silently reach one export and not the other.
+//!
+//! # Counters reach `/metrics` and not the meter, this round
+//!
+//! All 65 kernel counters are exported through `/metrics`; none are registered
+//! as OTel instruments. [`OTEL_COUNTERS`] explains why, and §1.4 is what makes
+//! the asymmetry legitimate rather than an oversight — the two exports are
+//! allowed to differ in *dimensionality*, and they already do: `/metrics`
+//! carries `turbolay.scope` on three counter families and OTLP carries it
+//! nowhere.
 //!
 //! # Names
 //!
@@ -231,6 +243,469 @@ pub fn otel_instrument_groups() -> Vec<(&'static str, Vec<&'static OtelHistogram
         }
     }
     groups
+}
+
+/// Which snapshot type a counter row belongs to.
+///
+/// Every counter table is keyed by `(source, field)` rather than by `field`
+/// alone, because the kernel's identifiers are **not** unique across the three
+/// snapshots: `backpressure_waits` is a field of both
+/// `ClientQueryMetricsSnapshot` and `GraphOperationalMetricsSnapshot`, and they
+/// count different events at different layers. A flat table keyed by the
+/// identifier would silently give one of them the other's name.
+///
+/// There is deliberately **no variant for `QueryTransportMetricsSnapshot`**,
+/// whose twenty-three counters this binary cannot obtain: it instantiates
+/// neither `TcpQueryServer` nor `TcpQueryCellClient`, so it holds no transport
+/// snapshot to render. Its two *histograms* are named in both tables because
+/// `graph-node` renders them from a snapshot handed in by a test, and a name
+/// table that decided which binary may have a field would be the wrong thing --
+/// but a counter with no value to render and no name to render it under is
+/// better absent than invented. Adding the variant is what a future round that
+/// wires the transport in has to do, and the absence is what stops that being
+/// forgotten quietly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CounterSource {
+    /// `ClientQueryMetricsSnapshot`. One per node, not per shard.
+    Client,
+    /// `GraphOperationalMetricsSnapshot`. One per shard.
+    Shard,
+    /// `GraphCacheMetricsSnapshot`. One per shard.
+    ShardCache,
+}
+
+/// How one counter reaches OTLP -- or why it does not reach it on its own.
+///
+/// The dimensionality here is deliberately **not** the Prometheus one. §1.4 of
+/// the metrics plan says the two exports have different cost functions and
+/// should not be forced to the same shape: `/metrics` is scraped by a Prometheus
+/// already sized for the tenant count it sees and carries `turbolay.scope` on
+/// three counter families for historical reasons, while OTLP ships to a vendor
+/// billing per series. No variant here carries a scope, and there is no way to
+/// spell one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OtelCounterExport {
+    /// One process-global sum, no attributes beyond the resource.
+    Global(&'static str),
+    /// One sum per `turbolay.cell_id`, summed over every scope open on the node.
+    PerCell(&'static str),
+    /// Not an instrument of its own. The counter is a restatement of the `.sum`
+    /// of the named histogram instruments, which are already exported, so a
+    /// second instrument would be a second name for one number.
+    Derived(&'static [&'static str]),
+}
+
+impl OtelCounterExport {
+    /// The instrument name, or `None` for a derived counter.
+    pub fn name(self) -> Option<&'static str> {
+        match self {
+            Self::Global(name) | Self::PerCell(name) => Some(name),
+            Self::Derived(_) => None,
+        }
+    }
+}
+
+/// One row of the OTel counter name table.
+///
+/// There is no `description` field, and its absence is the honest shape rather
+/// than an omission: a description is an argument to instrument registration,
+/// nothing registers a counter instrument yet (see [`OTEL_COUNTERS`]), and
+/// sixty-five invented sentences for code that does not run would read as though
+/// it did.
+#[derive(Clone, Copy, Debug)]
+pub struct OtelCounter {
+    pub source: CounterSource,
+    /// The kernel's Rust identifier -- the key both name tables are keyed by.
+    pub field: &'static str,
+    pub export: OtelCounterExport,
+}
+
+/// The OTel counter name table. One row per counter the kernel enumerates.
+///
+/// **Nothing registers these yet, and that is a deliberate stop.** An observable
+/// counter needs a wrapper of the shape `turbolay_telemetry::meter` gives
+/// histograms -- a cached series map plus an `Fn` callback -- and that crate has
+/// one for histograms only. Building it in this binary instead would mean a
+/// direct `opentelemetry` dependency on the root package, since a callback
+/// observes through `opentelemetry::KeyValue`, which the root package does not
+/// depend on. Either is a change outside this module's file set, so this round
+/// exports every counter through `/metrics` and none through the meter.
+///
+/// The table is here anyway because it is what makes
+/// [`tests::every_counter_field_reaches_both_exports`] total: a counter added to
+/// the kernel today cannot reach one export and quietly miss the other on the
+/// day the instruments land.
+///
+/// `turbolay.*` throughout. §1.9 says `db.*` where a semantic convention
+/// genuinely exists, and there is no semconv counter for any of these -- the one
+/// stable database metric, `db.client.operation.duration`, is a histogram and is
+/// already claimed by [`OTEL_HISTOGRAMS`].
+pub const OTEL_COUNTERS: &[OtelCounter] = &[
+    // `ClientQueryMetricsSnapshot`, in declaration order.
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "queries_started",
+        export: OtelCounterExport::Global("turbolay.client.queries.started"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "queries_completed",
+        export: OtelCounterExport::Global("turbolay.client.queries.completed"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "queries_failed",
+        export: OtelCounterExport::Global("turbolay.client.queries.failed"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "rows_returned",
+        export: OtelCounterExport::Global("turbolay.client.rows.returned"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "auth_failures",
+        export: OtelCounterExport::Global("turbolay.client.auth.failures"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "scope_denials",
+        export: OtelCounterExport::Global("turbolay.client.scope.denials"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "cancellations",
+        export: OtelCounterExport::Global("turbolay.client.queries.cancelled"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "backpressure_waits",
+        export: OtelCounterExport::Global("turbolay.client.backpressure.waits"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "prepare_requests",
+        export: OtelCounterExport::Global("turbolay.client.prepare.requests"),
+    },
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "prepare_duration_us",
+        export: OtelCounterExport::Global("turbolay.client.prepare.duration.sum"),
+    },
+    // Derived: the kernel builds it from `read_latency.sum_us +
+    // write_latency.sum_us`, and both instruments already publish a `.sum`.
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "execution_duration_us",
+        export: OtelCounterExport::Derived(&["db.client.operation.duration"]),
+    },
+    // `GraphOperationalMetricsSnapshot`, in declaration order.
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "write_attempts",
+        export: OtelCounterExport::PerCell("turbolay.shard.write.attempts"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "write_commits",
+        export: OtelCounterExport::PerCell("turbolay.shard.write.commits"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "write_retries",
+        export: OtelCounterExport::PerCell("turbolay.shard.write.retries"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "bulk_import_batches_profiled",
+        export: OtelCounterExport::PerCell("turbolay.shard.bulk_import.batches_profiled"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "bulk_import_preflight_us",
+        export: OtelCounterExport::PerCell("turbolay.shard.bulk_import.preflight.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "bulk_import_batch_build_us",
+        export: OtelCounterExport::PerCell("turbolay.shard.bulk_import.batch_build.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "bulk_import_counter_read_us",
+        export: OtelCounterExport::PerCell("turbolay.shard.bulk_import.counter_read.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "bulk_import_commit_us",
+        export: OtelCounterExport::PerCell("turbolay.shard.bulk_import.commit.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "artifact_builds_started",
+        export: OtelCounterExport::PerCell("turbolay.shard.artifact.builds.started"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "artifact_builds_completed",
+        export: OtelCounterExport::PerCell("turbolay.shard.artifact.builds.completed"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "artifact_build_duration_us",
+        export: OtelCounterExport::PerCell("turbolay.shard.artifact.build.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "artifact_publish_batches",
+        export: OtelCounterExport::PerCell("turbolay.shard.artifact.publish.batches"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "artifact_records_published",
+        export: OtelCounterExport::PerCell("turbolay.shard.artifact.records.published"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "artifact_publish_duration_us",
+        export: OtelCounterExport::PerCell("turbolay.shard.artifact.publish.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "gc_jobs_started",
+        export: OtelCounterExport::PerCell("turbolay.shard.gc.jobs.started"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "gc_jobs_completed",
+        export: OtelCounterExport::PerCell("turbolay.shard.gc.jobs.completed"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "gc_keys_deleted",
+        export: OtelCounterExport::PerCell("turbolay.shard.gc.keys.deleted"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "gc_duration_us",
+        export: OtelCounterExport::PerCell("turbolay.shard.gc.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "verifier_runs",
+        export: OtelCounterExport::PerCell("turbolay.shard.verifier.runs"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "verifier_failures",
+        export: OtelCounterExport::PerCell("turbolay.shard.verifier.failures"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "verifier_duration_us",
+        export: OtelCounterExport::PerCell("turbolay.shard.verifier.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_rows_started",
+        export: OtelCounterExport::PerCell("turbolay.shard.query.rows.started"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_rows_completed",
+        export: OtelCounterExport::PerCell("turbolay.shard.query.rows.completed"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_rows_failed",
+        export: OtelCounterExport::PerCell("turbolay.shard.query.rows.failed"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_rows_returned",
+        export: OtelCounterExport::PerCell("turbolay.shard.query.rows.returned"),
+    },
+    // Derived: the kernel sets it from `query_rows_latency.sum_us`.
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_rows_duration_us",
+        export: OtelCounterExport::Derived(&["turbolay.query.rows.duration"]),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_artifact_lookup_us",
+        export: OtelCounterExport::PerCell("turbolay.shard.query.artifact_lookup.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_graphblas_cache_us",
+        export: OtelCounterExport::PerCell("turbolay.shard.query.graphblas_cache.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_graphblas_artifact_snapshots",
+        export: OtelCounterExport::PerCell("turbolay.shard.query.graphblas.artifact_snapshots"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_graphblas_rebuilt_snapshots",
+        export: OtelCounterExport::PerCell("turbolay.shard.query.graphblas.rebuilt_snapshots"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_rust_sparse_fallbacks",
+        export: OtelCounterExport::PerCell("turbolay.shard.query.rust_sparse_fallbacks"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "graph_compute_tasks",
+        export: OtelCounterExport::PerCell("turbolay.shard.compute.tasks"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "graph_compute_queue_us",
+        export: OtelCounterExport::PerCell("turbolay.shard.compute.queue.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "graph_compute_duration_us",
+        export: OtelCounterExport::PerCell("turbolay.shard.compute.duration.sum"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "backpressure_waits",
+        export: OtelCounterExport::PerCell("turbolay.shard.backpressure.waits"),
+    },
+    // `GraphCacheMetricsSnapshot`, in declaration order.
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "matrix_artifact_hits",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.matrix_artifact.hits"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "matrix_artifact_misses",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.matrix_artifact.misses"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "matrix_adjacency_hits",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.matrix_adjacency.hits"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "matrix_adjacency_misses",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.matrix_adjacency.misses"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "graphblas_hits",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.graphblas.hits"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "graphblas_misses",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.graphblas.misses"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "parsed_row_query_hits",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.parsed_row_query.hits"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "parsed_row_query_misses",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.parsed_row_query.misses"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "relationship_rows_hits",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.relationship_rows.hits"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "relationship_rows_misses",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.relationship_rows.misses"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "relationship_property_rows_hits",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.relationship_property_rows.hits"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "relationship_property_rows_misses",
+        export: OtelCounterExport::PerCell(
+            "turbolay.shard.cache.relationship_property_rows.misses",
+        ),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "insertions",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.insertions"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "evictions",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.evictions"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "pinned_insertions",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.pinned_insertions"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "tenant_quota_rejections",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.tenant_quota_rejections"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "hydration_started",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.hydration.started"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "hydration_waited",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.hydration.waited"),
+    },
+    OtelCounter {
+        source: CounterSource::ShardCache,
+        field: "hydration_completed",
+        export: OtelCounterExport::PerCell("turbolay.shard.cache.hydration.completed"),
+    },
+];
+
+/// The OTel names for the counters dimensioned by `error.class`.
+///
+/// A separate table because the series carry an extra attribute the scalar rows
+/// do not, and folding a `by_class` flag into [`OtelCounter`] would put a
+/// boolean on sixty-five rows to distinguish two.
+///
+/// The name is *not* the scalar's. `turbolay.client.queries.failed` with an
+/// `error.class` attribute would be the tidier modelling, but the scalar is also
+/// exported and the two would then be one instrument reporting a total and a
+/// breakdown under the same name -- the kind of double count a dashboard sums
+/// without noticing.
+pub const OTEL_CLASS_COUNTERS: &[OtelCounter] = &[
+    OtelCounter {
+        source: CounterSource::Client,
+        field: "queries_failed_by_class",
+        export: OtelCounterExport::Global("turbolay.client.queries.failed.by_class"),
+    },
+    OtelCounter {
+        source: CounterSource::Shard,
+        field: "query_rows_failed_by_class",
+        export: OtelCounterExport::PerCell("turbolay.shard.query.rows.failed.by_class"),
+    },
+];
+
+/// The OTel row for a `(source, field)` pair, over both counter tables.
+pub fn otel_counter(source: CounterSource, field: &str) -> Option<&'static OtelCounter> {
+    OTEL_COUNTERS
+        .iter()
+        .chain(OTEL_CLASS_COUNTERS)
+        .find(|export| export.source == source && export.field == field)
 }
 
 /// The instrumentation scope every instrument registered here belongs to.
@@ -593,12 +1068,15 @@ async fn collect_forever(
 #[cfg(test)]
 mod tests {
     use slatedb_graph_kernel::{
-        ClientQueryMetricsSnapshot, GraphOperationalMetricsSnapshot, QueryTransportMetricsSnapshot,
-        DURATION_BUCKET_BOUNDS_US, DURATION_BUCKET_COUNT,
+        ClientQueryMetricsSnapshot, GraphCacheMetricsSnapshot, GraphOperationalMetricsSnapshot,
+        QueryTransportMetricsSnapshot, DURATION_BUCKET_BOUNDS_US, DURATION_BUCKET_COUNT,
     };
 
     use super::*;
-    use crate::admin::{prometheus_histogram, PROMETHEUS_HISTOGRAMS};
+    use crate::admin::{
+        prometheus_counter, prometheus_histogram, PrometheusCounterExport,
+        PROMETHEUS_CLASS_COUNTERS, PROMETHEUS_COUNTERS, PROMETHEUS_HISTOGRAMS,
+    };
 
     /// Every histogram field the kernel enumerates, from every snapshot type
     /// that has one. This is the enumeration both exports are derived from, so
@@ -654,6 +1132,229 @@ mod tests {
                 export.field
             );
         }
+    }
+
+    /// Every counter field the kernel enumerates, from every snapshot type this
+    /// binary can obtain, tagged with the snapshot it came from.
+    ///
+    /// Scalar counters and per-class counters in one list, because a name table
+    /// row is a name table row and the two tables are searched together. The
+    /// class rows arrive flattened — one per field per class — and are collapsed
+    /// with a consecutive `dedup`, which is enough because
+    /// `class_counter_fields` groups by field.
+    ///
+    /// `QueryTransportMetricsSnapshot` is absent on purpose; see
+    /// [`CounterSource`].
+    fn enumerated_counter_fields() -> Vec<(CounterSource, &'static str)> {
+        let client = ClientQueryMetricsSnapshot::default();
+        let operational = GraphOperationalMetricsSnapshot::default();
+        let cache = GraphCacheMetricsSnapshot::default();
+        let mut fields: Vec<(CounterSource, &'static str)> = Vec::new();
+        fields.extend(
+            client
+                .counter_fields()
+                .map(|(field, _)| (CounterSource::Client, field)),
+        );
+        fields.extend(
+            client
+                .class_counter_fields()
+                .map(|(field, _, _)| (CounterSource::Client, field)),
+        );
+        fields.extend(
+            operational
+                .counter_fields()
+                .map(|(field, _)| (CounterSource::Shard, field)),
+        );
+        fields.extend(
+            operational
+                .class_counter_fields()
+                .map(|(field, _, _)| (CounterSource::Shard, field)),
+        );
+        fields.extend(
+            cache
+                .counter_fields()
+                .map(|(field, _)| (CounterSource::ShardCache, field)),
+        );
+        fields.dedup();
+        fields
+    }
+
+    /// §1.6, for counters. The same property
+    /// [`every_histogram_field_reaches_both_exports`] holds for the five
+    /// duration histograms, over the sixty-five counters that are the actual
+    /// gap: `/metrics` exported eight of them before M2.
+    ///
+    /// The reverse direction matters more here than it did for histograms. A
+    /// name table with sixty-five rows can grow a row for a field that was
+    /// renamed or deleted and nothing else will ever notice, and a dead row
+    /// reads exactly like a live counter whose recording site is missing.
+    #[test]
+    fn every_counter_field_reaches_both_exports() {
+        let enumerated = enumerated_counter_fields();
+        assert_eq!(
+            enumerated.len(),
+            67,
+            "35 operational + 19 cache + 11 client counters, plus the two \
+             error-class breakdowns: {enumerated:#?}"
+        );
+
+        for (source, field) in &enumerated {
+            assert!(
+                otel_counter(*source, field).is_some(),
+                "{source:?}::{field} is recorded by the kernel but has no OTel name"
+            );
+            assert!(
+                prometheus_counter(*source, field).is_some(),
+                "{source:?}::{field} is recorded by the kernel but has no Prometheus name"
+            );
+        }
+
+        for export in OTEL_COUNTERS.iter().chain(OTEL_CLASS_COUNTERS) {
+            assert!(
+                enumerated.contains(&(export.source, export.field)),
+                "OTEL_COUNTERS names {:?}::{}, which no snapshot enumerates",
+                export.source,
+                export.field
+            );
+        }
+        for export in PROMETHEUS_COUNTERS.iter().chain(PROMETHEUS_CLASS_COUNTERS) {
+            assert!(
+                enumerated.contains(&(export.source, export.field)),
+                "PROMETHEUS_COUNTERS names {:?}::{}, which no snapshot enumerates",
+                export.source,
+                export.field
+            );
+        }
+    }
+
+    /// A counter that restates a histogram's sum must be marked derived on
+    /// **both** sides or on neither.
+    ///
+    /// The two exports are allowed to disagree about dimensionality (§1.4) and
+    /// about names (§1.9). They are not allowed to disagree about whether a
+    /// number is exported at all, because that is the one difference an operator
+    /// reading two dashboards would read as data.
+    #[test]
+    fn the_two_exports_agree_about_which_counters_are_derived() {
+        for (source, field) in enumerated_counter_fields() {
+            let otel = otel_counter(source, field).expect("named for OTel");
+            let prometheus = prometheus_counter(source, field).expect("named for Prometheus");
+            assert_eq!(
+                matches!(otel.export, OtelCounterExport::Derived(_)),
+                matches!(prometheus.export, PrometheusCounterExport::Derived(_)),
+                "{source:?}::{field} is derived in one export and a series in the other"
+            );
+        }
+    }
+
+    /// A derived counter has to point at a histogram family that is really
+    /// exported, or "it is already on the wire" is an unchecked claim.
+    #[test]
+    fn derived_counters_point_at_exported_histogram_families() {
+        for export in OTEL_COUNTERS {
+            let OtelCounterExport::Derived(families) = export.export else {
+                continue;
+            };
+            assert!(
+                !families.is_empty(),
+                "{} is derived from nothing",
+                export.field
+            );
+            for family in families {
+                assert!(
+                    OTEL_HISTOGRAMS.iter().any(|row| row.name == *family),
+                    "{} is derived from {family}, which no OTel histogram is named",
+                    export.field
+                );
+            }
+        }
+        for export in PROMETHEUS_COUNTERS {
+            let PrometheusCounterExport::Derived(families) = export.export else {
+                continue;
+            };
+            assert!(
+                !families.is_empty(),
+                "{} is derived from nothing",
+                export.field
+            );
+            for family in families {
+                assert!(
+                    PROMETHEUS_HISTOGRAMS.iter().any(|row| row.name == *family),
+                    "{} is derived from {family}, which no Prometheus histogram is named",
+                    export.field
+                );
+            }
+        }
+    }
+
+    /// One name, one metric — across the counter tables *and* the histogram
+    /// tables, because the collision that actually bites is between the two.
+    ///
+    /// `query_rows_duration_us` is the kernel's name for
+    /// `query_rows_latency.sum_us`, and the obvious Prometheus name for it is
+    /// `graph_query_rows_duration_microseconds` — which is already the histogram
+    /// family's stem. Two `# TYPE` lines for one name, one `counter` and one
+    /// `histogram`, is a rejected scrape rather than an extra series, so this is
+    /// the test that made [`PrometheusCounterExport::Derived`] exist.
+    #[test]
+    fn no_two_metrics_share_an_exported_name() {
+        let mut prometheus: Vec<&str> = PROMETHEUS_COUNTERS
+            .iter()
+            .chain(PROMETHEUS_CLASS_COUNTERS)
+            .filter_map(|export| export.export.name())
+            .chain(PROMETHEUS_HISTOGRAMS.iter().map(|export| export.name))
+            .collect();
+        let before = prometheus.len();
+        prometheus.sort_unstable();
+        prometheus.dedup();
+        assert_eq!(
+            before,
+            prometheus.len(),
+            "two Prometheus metrics share a name"
+        );
+
+        // `OTEL_HISTOGRAMS` names are deliberately not unique — read and write
+        // share `db.client.operation.duration` and are told apart by
+        // `db.operation.name` — so they are deduplicated before being joined
+        // rather than counted twice.
+        let mut histograms: Vec<&str> = OTEL_HISTOGRAMS.iter().map(|export| export.name).collect();
+        histograms.sort_unstable();
+        histograms.dedup();
+        let mut otel: Vec<&str> = OTEL_COUNTERS
+            .iter()
+            .chain(OTEL_CLASS_COUNTERS)
+            .filter_map(|export| export.export.name())
+            .chain(histograms)
+            .collect();
+        let before = otel.len();
+        otel.sort_unstable();
+        otel.dedup();
+        assert_eq!(before, otel.len(), "two OTel metrics share a name");
+    }
+
+    /// `turbolay.scope` is unbounded per tenant, and §1.4's decision was to
+    /// leave the families that already carry it and let nothing new join them.
+    ///
+    /// "Nothing new" is three specific families, named here. On the OTel side
+    /// there is nothing to assert because there is nothing to say: no
+    /// [`OtelCounterExport`] variant carries a scope.
+    #[test]
+    fn only_the_three_pre_existing_families_are_dimensioned_by_scope() {
+        let scoped: Vec<&str> = PROMETHEUS_COUNTERS
+            .iter()
+            .chain(PROMETHEUS_CLASS_COUNTERS)
+            .filter(|export| matches!(export.export, PrometheusCounterExport::ScopePerCell(_)))
+            .map(|export| export.field)
+            .collect();
+        assert_eq!(
+            scoped,
+            vec![
+                "query_graphblas_artifact_snapshots",
+                "query_graphblas_rebuilt_snapshots",
+                "query_rust_sparse_fallbacks",
+            ],
+            "a new counter family took a scope label"
+        );
     }
 
     /// The names may diverge — `/metrics` keeps `graph_*` and OTLP takes
