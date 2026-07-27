@@ -5,6 +5,66 @@ mod tests;
 
 use crate::engine;
 use crate::{AtomicDurationHistogram, DurationHistogramSnapshot, SparseKernelBackend};
+
+/// Enumerate a metrics snapshot's fields, keyed by the **Rust identifier**.
+///
+/// Generates `counter_fields()` and `histogram_fields()` on `$ty`. The key is
+/// the identifier and nothing else: a Prometheus `graph_*` name and an OTel
+/// `db.*`/`turbolay.*` name are exposition vocabulary, and neither may appear
+/// in this crate. The binaries hold the name tables, which is also where the
+/// test that the two exports cannot disagree about a name belongs.
+///
+/// The destructuring pattern is deliberately **exhaustive** — no `..` arm. Add
+/// a field to the snapshot struct and both accessors stop compiling until it is
+/// classified as a counter or as a histogram, which is what turns "adding a
+/// counter must not silently reach one export and not the other" from a review
+/// comment into a build failure. The binary's
+/// `every_histogram_field_reaches_both_exports` picks up where this leaves off:
+/// this macro proves the field is *enumerated*, that test proves it is *named*.
+macro_rules! snapshot_fields {
+    (
+        $ty:ident {
+            counters { $($counter:ident),* $(,)? }
+            histograms { $($histogram:ident),* $(,)? }
+        }
+    ) => {
+        impl $ty {
+            /// Every scalar counter on this snapshot, keyed by its Rust
+            /// identifier, in declaration order.
+            pub fn counter_fields(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+                // Exhaustive on purpose; see the macro's documentation.
+                let Self {
+                    $($counter,)*
+                    $($histogram: _,)*
+                } = self;
+                [$((stringify!($counter), *$counter),)*].into_iter()
+            }
+
+            /// Every duration histogram on this snapshot, keyed by its Rust
+            /// identifier, in declaration order.
+            pub fn histogram_fields(
+                &self,
+            ) -> impl Iterator<Item = (&'static str, &$crate::DurationHistogramSnapshot)> + '_
+            {
+                // Exhaustive on purpose; see the macro's documentation.
+                let Self {
+                    $($counter: _,)*
+                    $($histogram,)*
+                } = self;
+                [$((stringify!($histogram), $histogram),)*].into_iter()
+            }
+        }
+    };
+}
+
+// Both out-of-module users sit behind `query-transport` -- `ClientQueryMetrics`
+// behind `client-api`, which implies it, and `QueryTransportMetrics` directly --
+// while `GraphOperationalMetricsSnapshot` below invokes the macro by name and
+// does not go through the re-export. Under default features the re-export is
+// therefore genuinely unused, and cfg-ing it is more honest than an `allow`.
+#[cfg(feature = "query-transport")]
+pub(crate) use snapshot_fields;
+
 /// Non-exhaustive; see [`crate::GraphOpenOptions`] for the construction pattern.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -136,6 +196,49 @@ pub struct GraphOperationalMetricsSnapshot {
     pub graph_compute_duration_us: u64,
     pub backpressure_waits: u64,
 }
+
+snapshot_fields!(GraphOperationalMetricsSnapshot {
+    counters {
+        write_attempts,
+        write_commits,
+        write_retries,
+        bulk_import_batches_profiled,
+        bulk_import_preflight_us,
+        bulk_import_batch_build_us,
+        bulk_import_counter_read_us,
+        bulk_import_commit_us,
+        artifact_builds_started,
+        artifact_builds_completed,
+        artifact_build_duration_us,
+        artifact_publish_batches,
+        artifact_records_published,
+        artifact_publish_duration_us,
+        gc_jobs_started,
+        gc_jobs_completed,
+        gc_keys_deleted,
+        gc_duration_us,
+        verifier_runs,
+        verifier_failures,
+        verifier_duration_us,
+        query_rows_started,
+        query_rows_completed,
+        query_rows_failed,
+        query_rows_returned,
+        query_rows_duration_us,
+        query_artifact_lookup_us,
+        query_graphblas_cache_us,
+        query_graphblas_artifact_snapshots,
+        query_graphblas_rebuilt_snapshots,
+        query_rust_sparse_fallbacks,
+        graph_compute_tasks,
+        graph_compute_queue_us,
+        graph_compute_duration_us,
+        backpressure_waits,
+    }
+    histograms {
+        query_rows_latency,
+    }
+});
 
 #[derive(Default)]
 pub(crate) struct GraphOperationalMetrics {

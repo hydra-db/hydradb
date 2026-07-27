@@ -1238,6 +1238,39 @@ pub struct QueryTransportMetricsSnapshot {
 }
 
 #[cfg(feature = "query-transport")]
+crate::core::metrics::snapshot_fields!(QueryTransportMetricsSnapshot {
+    counters {
+        requests_started,
+        requests_completed,
+        requests_failed,
+        auth_failures,
+        namespace_access_denials,
+        namespace_quota_waits,
+        cancellations,
+        cancelled_rejections,
+        slow_queries,
+        backpressure_waits,
+        client_retries,
+        bytes_sent,
+        bytes_received,
+        remote_latency_us,
+        connections_accepted,
+        connections_active,
+        connections_rejected,
+        connections_created,
+        connections_reused,
+        client_connection_waits,
+        handshake_failures,
+        idle_timeouts,
+        forced_shutdowns,
+    }
+    histograms {
+        rpc_latency,
+        serve_latency,
+    }
+});
+
+#[cfg(feature = "query-transport")]
 #[derive(Default)]
 struct QueryTransportMetrics {
     requests_started: AtomicU64,
