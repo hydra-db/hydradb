@@ -1,6 +1,10 @@
 use thiserror::Error;
 
 use crate::StorageSequence;
+
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug, Error)]
 pub enum GraphError {
     #[error("slatedb error: {0}")]
@@ -174,6 +178,50 @@ pub enum GraphError {
 }
 
 impl GraphError {
+    /// Every value [`Self::class`] can return, in [`Self::class_index`] order.
+    ///
+    /// The array *is* the vocabulary. [`Self::class_index`] returns a position
+    /// in it and [`Self::class`] is a lookup, so a class name and the slot a
+    /// per-class metric counts it in cannot drift apart: there is one match, not
+    /// two.
+    ///
+    /// The strings are the wire vocabulary and must stay identical to
+    /// `turbolay_telemetry::ErrorClass::as_str` minus its `other`, which nothing
+    /// in this tree constructs.
+    pub const CLASSES: [&'static str; 10] = [
+        "contention",
+        "fencing",
+        "freshness",
+        "admission",
+        "query",
+        "authz",
+        "corruption",
+        "config",
+        "storage",
+        "kernel",
+    ];
+
+    /// How many classes there are, for dimensioning an array by class.
+    ///
+    /// Derived from [`Self::CLASSES`] rather than written out, so a class added
+    /// to the vocabulary resizes every such array instead of silently leaving
+    /// the new one uncounted.
+    pub const CLASS_COUNT: usize = Self::CLASSES.len();
+
+    // Positions in `CLASSES`, so the match arms in `class_index` read as the
+    // names they are. `class_constants_index_their_own_name` pins each one
+    // against the array, which is the only place the two can disagree.
+    pub(crate) const CLASS_CONTENTION: usize = 0;
+    pub(crate) const CLASS_FENCING: usize = 1;
+    pub(crate) const CLASS_FRESHNESS: usize = 2;
+    pub(crate) const CLASS_ADMISSION: usize = 3;
+    pub(crate) const CLASS_QUERY: usize = 4;
+    pub(crate) const CLASS_AUTHZ: usize = 5;
+    pub(crate) const CLASS_CORRUPTION: usize = 6;
+    pub(crate) const CLASS_CONFIG: usize = 7;
+    pub(crate) const CLASS_STORAGE: usize = 8;
+    pub(crate) const CLASS_KERNEL: usize = 9;
+
     /// The coarse failure class recorded as the `error.class` span attribute.
     ///
     /// Errors otherwise reach a log as `%error` display strings, which carry a
@@ -191,20 +239,30 @@ impl GraphError {
     /// kernel gains no telemetry dependency, preserving the direction of the
     /// arrow that lets `cargo test` stay free of `opentelemetry-*`.
     ///
-    /// The strings are the wire vocabulary and must stay identical to
-    /// `turbolay_telemetry::ErrorClass::as_str`; `error_class.rs` holds the
-    /// matching test.
-    ///
     /// **`contention` and `fencing` are expected, not alarming.** Retries and
     /// writer handover are how the system is supposed to behave under
     /// concurrency. The class exists so a dashboard can chart the rate and
     /// alert on a *change* in it, not so each occurrence pages someone.
     pub fn class(&self) -> &'static str {
+        Self::CLASSES[self.class_index()]
+    }
+
+    /// The same classification as [`Self::class`], as a position in
+    /// [`Self::CLASSES`].
+    ///
+    /// This is where the taxonomy actually lives, and the exhaustive match with
+    /// no wildcard and no `other` arm is the point of it: a `GraphError` variant
+    /// added without a class is a compile error here, not a silent bucket. It
+    /// returns an index rather than a string because the per-class error
+    /// counters are `[AtomicU64; Self::CLASS_COUNT]` — an array indexed in O(1)
+    /// with no hashing and no allocation on a failure path, and one whose length
+    /// is the vocabulary's own.
+    pub fn class_index(&self) -> usize {
         match self {
             Self::ConditionalWriteConflict { .. }
             | Self::IdempotencyConflict { .. }
             | Self::ControlMetadataConflict { .. }
-            | Self::RetryExhausted { .. } => "contention",
+            | Self::RetryExhausted { .. } => Self::CLASS_CONTENTION,
 
             // `RoutingUnavailable` joins this group rather than getting one of
             // its own: it means the caller reached a node that does not own the
@@ -217,33 +275,89 @@ impl GraphError {
             | Self::NotCellWriter { .. }
             | Self::UnknownShard { .. }
             | Self::CellDropped { .. }
-            | Self::RoutingUnavailable { .. } => "fencing",
+            | Self::RoutingUnavailable { .. } => Self::CLASS_FENCING,
 
             Self::SnapshotAhead { .. }
             | Self::SnapshotExpired { .. }
             | Self::SnapshotChanged { .. }
             | Self::QueryStatsSnapshotChanged { .. }
-            | Self::ControlWatermarkRegression { .. } => "freshness",
+            | Self::ControlWatermarkRegression { .. } => Self::CLASS_FRESHNESS,
 
-            Self::AdmissionRejected { .. } | Self::QueryTimeout { .. } => "admission",
+            Self::AdmissionRejected { .. } | Self::QueryTimeout { .. } => Self::CLASS_ADMISSION,
 
             Self::QueryParse { .. }
             | Self::UnsupportedQuery { .. }
-            | Self::MissingQueryParameter { .. } => "query",
+            | Self::MissingQueryParameter { .. } => Self::CLASS_QUERY,
 
-            Self::GraphScopeMismatch { .. } | Self::GraphScopeAccessDenied { .. } => "authz",
+            Self::GraphScopeMismatch { .. } | Self::GraphScopeAccessDenied { .. } => {
+                Self::CLASS_AUTHZ
+            }
 
-            Self::CorruptValue { .. } | Self::InvalidKeyComponent { .. } => "corruption",
+            Self::CorruptValue { .. } | Self::InvalidKeyComponent { .. } => Self::CLASS_CORRUPTION,
 
             // Both are a refusal to act on how this process was configured, not
             // a failure of the operation itself: one rejects an unsafe
             // durability setting, the other a write to a shard opened read-only.
-            Self::UnsafeDurabilityConfig { .. } | Self::ReadOnlyShardStorage => "config",
+            Self::UnsafeDurabilityConfig { .. } | Self::ReadOnlyShardStorage => Self::CLASS_CONFIG,
 
-            Self::Slate(_) | Self::ObjectStore(_) => "storage",
+            Self::Slate(_) | Self::ObjectStore(_) => Self::CLASS_STORAGE,
 
-            Self::SparseKernel { .. } => "kernel",
+            Self::SparseKernel { .. } => Self::CLASS_KERNEL,
         }
+    }
+}
+
+#[cfg(test)]
+impl GraphError {
+    /// One error per class, in [`Self::CLASSES`] order.
+    ///
+    /// Lives here rather than in a test module because two of them need it —
+    /// `error/tests.rs` for the taxonomy, `core/metrics/tests.rs` for the
+    /// counters — and a second copy of the table is a second thing that can be
+    /// wrong. `one_error_per_class_is_in_classes_order` is what makes the order
+    /// a fact rather than a comment.
+    pub(crate) fn one_per_class() -> [Self; Self::CLASS_COUNT] {
+        [
+            Self::ConditionalWriteConflict {
+                operation: "test",
+                key: "cell/edge".into(),
+            },
+            Self::NotCellWriter {
+                cell_id: "cell".into(),
+                owner: None,
+            },
+            Self::SnapshotAhead {
+                cell_id: "cell".into(),
+                read_epoch: 9,
+                current_epoch: 4,
+            },
+            Self::AdmissionRejected {
+                operation: "test",
+                actual: 2,
+                limit: 1,
+            },
+            Self::QueryParse {
+                dialect: "cypher",
+                reason: "unexpected token".into(),
+            },
+            Self::GraphScopeMismatch {
+                expected: "a".into(),
+                actual: "b".into(),
+            },
+            Self::CorruptValue {
+                key: "cell/edge".into(),
+                reason: "short header".into(),
+            },
+            Self::ReadOnlyShardStorage,
+            Self::ObjectStore(slatedb::object_store::Error::Generic {
+                store: "test",
+                source: "injected".into(),
+            }),
+            Self::SparseKernel {
+                backend: "rust",
+                reason: "dimension mismatch".into(),
+            },
+        ]
     }
 }
 

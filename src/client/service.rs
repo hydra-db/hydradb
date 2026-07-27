@@ -642,6 +642,12 @@ pub struct ClientQueryMetricsSnapshot {
     pub queries_started: u64,
     pub queries_completed: u64,
     pub queries_failed: u64,
+    /// The same failures as [`Self::queries_failed`], split by
+    /// [`GraphError::class`] and indexed by [`GraphError::class_index`].
+    ///
+    /// Total by construction: one call increments both, so the array sums to the
+    /// scalar. Enumerate it with [`Self::class_counter_fields`].
+    pub queries_failed_by_class: [u64; GraphError::CLASS_COUNT],
     pub rows_returned: u64,
     pub auth_failures: u64,
     pub scope_denials: u64,
@@ -681,6 +687,9 @@ crate::core::metrics::snapshot_fields!(ClientQueryMetricsSnapshot {
         read_latency,
         write_latency,
     }
+    class_counters {
+        queries_failed_by_class,
+    }
 });
 
 #[derive(Default)]
@@ -688,6 +697,7 @@ struct ClientQueryMetrics {
     queries_started: AtomicU64,
     queries_completed: AtomicU64,
     queries_failed: AtomicU64,
+    queries_failed_by_class: crate::core::metrics::ErrorClassCounters,
     rows_returned: AtomicU64,
     auth_failures: AtomicU64,
     scope_denials: AtomicU64,
@@ -713,6 +723,9 @@ impl ClientQueryMetrics {
             queries_started: self.queries_started.load(Ordering::Relaxed),
             queries_completed: self.queries_completed.load(Ordering::Relaxed),
             queries_failed: self.queries_failed.load(Ordering::Relaxed),
+            queries_failed_by_class: crate::core::metrics::load_class_counters(
+                &self.queries_failed_by_class,
+            ),
             rows_returned: self.rows_returned.load(Ordering::Relaxed),
             auth_failures: self.auth_failures.load(Ordering::Relaxed),
             scope_denials: self.scope_denials.load(Ordering::Relaxed),
@@ -723,6 +736,25 @@ impl ClientQueryMetrics {
             execution_duration_us: read_latency.sum_us.saturating_add(write_latency.sum_us),
             read_latency,
             write_latency,
+        }
+    }
+
+    /// Count one finished request: its rows, and either its completion or its
+    /// failure under the failing subsystem's class.
+    ///
+    /// The scalar and the per-class array are incremented by this one call, so
+    /// the array sums to the scalar by construction rather than by every future
+    /// call site remembering to bump both.
+    fn record_result(&self, rows: usize, error: Option<&GraphError>) {
+        self.rows_returned.fetch_add(rows as u64, Ordering::Relaxed);
+        match error {
+            None => {
+                self.queries_completed.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(error) => {
+                self.queries_failed.fetch_add(1, Ordering::Relaxed);
+                self.queries_failed_by_class[error.class_index()].fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -1135,7 +1167,7 @@ impl ClientQueryService {
                 .as_ref()
                 .map(|response| response.result.rows.len())
                 .unwrap_or(0),
-            result.is_ok(),
+            result.as_ref().err(),
         );
         result
     }
@@ -1326,7 +1358,7 @@ impl ClientQueryService {
                 .as_ref()
                 .map(|response| response.page.rows.len())
                 .unwrap_or(0),
-            result.is_ok(),
+            result.as_ref().err(),
         );
         self.inner
             .metrics
@@ -1952,17 +1984,20 @@ impl ClientQueryService {
         Ok(permits)
     }
 
-    fn record_result_metrics(&self, _action: QueryTransportAction, rows: usize, succeeded: bool) {
-        self.inner
-            .metrics
-            .rows_returned
-            .fetch_add(rows as u64, Ordering::Relaxed);
-        let counter = if succeeded {
-            &self.inner.metrics.queries_completed
-        } else {
-            &self.inner.metrics.queries_failed
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
+    /// Count one finished request.
+    ///
+    /// Takes the error rather than a `succeeded: bool` because both callers hold
+    /// the `Result` and `as_ref().err()` is free there, and because the class is
+    /// the whole reason to distinguish one failure from another: a rate of
+    /// `queries_failed` says a client is unhappy, and the same rate split by
+    /// class says which subsystem to look at first.
+    fn record_result_metrics(
+        &self,
+        _action: QueryTransportAction,
+        rows: usize,
+        error: Option<&GraphError>,
+    ) {
+        self.inner.metrics.record_result(rows, error);
     }
 }
 
