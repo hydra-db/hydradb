@@ -514,10 +514,9 @@ impl GraphShard {
             self.execute_parsed_opencypher_rows_inner(context, query)
                 .await
         };
-        let elapsed_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
         self.operation_metrics
-            .query_rows_duration_us
-            .fetch_add(elapsed_us, Ordering::Relaxed);
+            .query_rows_latency
+            .record(started.elapsed());
         let span = tracing::Span::current();
         match &result {
             Ok(result_set) => {
@@ -4729,10 +4728,9 @@ impl GraphShard {
         self.operation_metrics
             .query_rows_returned
             .fetch_add(row_count as u64, Ordering::Relaxed);
-        let elapsed_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
         self.operation_metrics
-            .query_rows_duration_us
-            .fetch_add(elapsed_us, Ordering::Relaxed);
+            .query_rows_latency
+            .record(started.elapsed());
     }
 
     #[cfg(feature = "opencypher")]
@@ -4743,10 +4741,9 @@ impl GraphShard {
         self.operation_metrics
             .query_rows_failed
             .fetch_add(1, Ordering::Relaxed);
-        let elapsed_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
         self.operation_metrics
-            .query_rows_duration_us
-            .fetch_add(elapsed_us, Ordering::Relaxed);
+            .query_rows_latency
+            .record(started.elapsed());
     }
 
     #[cfg(feature = "opencypher")]

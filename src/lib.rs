@@ -56,9 +56,9 @@ pub use core::config::{
     DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
 };
 pub use core::error::{GraphError, Result};
-// Widen this as H1 converts the client and shard duration counters; today the
-// transport histograms are the only consumer.
-#[cfg(feature = "query-transport")]
+// Widen this as H1 converts the remaining client duration counters. It is no
+// longer feature-gated: `GraphOperationalMetrics::query_rows_latency` is a
+// default-features field, so the type is constructed on every build.
 pub(crate) use core::histogram::AtomicDurationHistogram;
 pub use core::histogram::{
     DurationHistogramSnapshot, DURATION_BUCKET_BOUNDS_US, DURATION_BUCKET_COUNT,
