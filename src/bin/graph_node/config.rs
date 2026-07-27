@@ -468,6 +468,8 @@ fn invalid<T>(message: impl Into<String>) -> ConfigResult<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn production_runtime_requires_tls() {
         let values = BTreeMap::from([("GRAPH_AUTH_TOKEN_FILE".to_string(), "/token".to_string())]);
