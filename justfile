@@ -188,6 +188,20 @@ test-server-runtime:
 test-indexer:
     cargo test --locked --features indexer-runtime --bin graph-indexer
 
+# The same gap test-indexer closed, one binary over: test-server-runtime omits
+# `otlp` and check-all-features only compiles it, so the graph-node binary's OTLP
+# export tests were built by `ci` and never run. They are the only tests that
+# prove an instrument reaches a collector rather than merely registering — an
+# observable instrument whose callback the SDK never invokes is silent, and
+# silence is indistinguishable from a counter that is genuinely zero. That is
+# the failure mode M1 shipped and `aa53595` was written to close, so it is worth
+# a recipe of its own rather than a feature added to the line above: the OTLP
+# tests bind a loopback socket and wait on a real export interval, and that
+# belongs in a recipe an operator can run alone.
+# Test the graph-node binary's OTLP metric export.
+test-node-otlp:
+    cargo test --locked --features server-runtime,otlp --bin graph-node
+
 # Every other recipe here is bare, so it selects the root package only; a
 # workspace member needs its own explicit `-p` line or it is never built.
 # Lint and test the placement crate.
@@ -230,7 +244,7 @@ native-check:
 # would pay for the same compile twice, once through rustc and once through
 # clippy-driver, for no extra coverage.
 # Run the local CI-equivalent check set.
-ci: native-check fmt-check clippy clippy-chaos clippy-opencypher clippy-native clippy-client-protocols clippy-runtime test-placement test-telemetry check-all-features check-client-api check-bolt-server test test-opencypher test-native test-client-protocols test-chaos test-server-runtime test-indexer
+ci: native-check fmt-check clippy clippy-chaos clippy-opencypher clippy-native clippy-client-protocols clippy-runtime test-placement test-telemetry check-all-features check-client-api check-bolt-server test test-opencypher test-native test-client-protocols test-chaos test-server-runtime test-indexer test-node-otlp
 
 # Run the local object-store smoke test.
 smoke:
