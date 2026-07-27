@@ -1,7 +1,9 @@
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -196,6 +198,85 @@ fn record_success(span: &tracing::Span) {
     span.record(semconv::OUTCOME, Outcome::Success.as_str());
 }
 
+/// The Prometheus label name for the cell dimension, paired with the registry
+/// entry that authorises it.
+///
+/// `/metrics` has always spelled its labels bare (`cell_id`) and the registry
+/// spells its keys dotted (`turbolay.cell_id`); this is the one place in the
+/// indexer where the two vocabularies meet, so the pairing is written down
+/// rather than derived. The pairing also carries §1.3's rule: only a key the
+/// registry classified as a metric dimension has a [`semconv::MetricLabel`]
+/// constant, and `MetricLabel`'s constructor is private to the registry, so a
+/// `scope` dimension declared this way does not compile — [`semconv::SCOPE`] is
+/// a `&str`. That is not airtight, since a bare `"scope"` written straight into
+/// the format string below would compile, which is why
+/// `no_indexer_series_carries_scope` asserts the same thing against the
+/// rendered output.
+const CELL_ID_LABEL: (&str, semconv::MetricLabel) = ("cell_id", semconv::L_CELL_ID);
+
+/// The Prometheus label name for the edge-type dimension. See [`CELL_ID_LABEL`].
+const EDGE_TYPE_LABEL: (&str, semconv::MetricLabel) = ("edge_type", semconv::L_EDGE_TYPE);
+
+/// The most `{cell_id, edge_type}` pairs the indexer reports separately.
+///
+/// `cell_id` is bounded by configuration — `GRAPH_CELLS`, a comma-separated
+/// list read once at startup. `edge_type` is **not bounded by anything**. It is
+/// a free-form string minted by whoever wrote the edge, checked only for its
+/// character class (`validate_component`, `src/codec.rs:175`); no schema
+/// declares the legal set, and `dirty_graph_index_edge_types` discovers them by
+/// listing keys rather than by consulting one. The indexer also sweeps *every*
+/// registered scope in the namespace, so its edge-type dimension is the union
+/// across tenants, not one tenant's schema.
+///
+/// So the product is capped rather than trusted. Past the cap every new pair
+/// folds into [`OVERFLOW_LABEL`]: the counter **totals stay exact** — no
+/// increment is ever dropped — and only the attribution degrades.
+/// `graph_indexer_dimensions` reports the live pair count so that degradation
+/// is visible instead of silent.
+const MAX_DIMENSIONS: usize = 512;
+
+/// The value both dimensions take once [`MAX_DIMENSIONS`] is reached.
+///
+/// Not a legal `cell_id` or `edge_type` — `validate_component` permits only
+/// ASCII alphanumerics, `_`, `-` and `.`, so a real value can contain neither
+/// pair of underscores in this position by construction, and the sentinel
+/// cannot collide with a genuine series.
+const OVERFLOW_LABEL: &str = "__overflow__";
+
+/// How many series each `{cell_id, edge_type}` pair costs.
+const DIMENSIONED_FAMILIES: usize = 3;
+
+/// The three counters that carry `{cell_id, edge_type}`.
+///
+/// One enumeration, one name table: [`DimensionedCounters::series`]
+/// destructures `Self` with no `..`, so a fourth counter added to this struct
+/// does not compile until it has been given a Prometheus name. That is the
+/// property `snapshot_fields!` buys the kernel in `8d7e939`; there is one
+/// exposition here rather than two, so there is one name table rather than two.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DimensionedCounters {
+    generations_published: u64,
+    generation_failures: u64,
+    generations_deleted: u64,
+}
+
+impl DimensionedCounters {
+    /// Every field, paired with the series name it renders as.
+    fn series(&self) -> [(&'static str, u64); DIMENSIONED_FAMILIES] {
+        // No `..` in this pattern, deliberately.
+        let Self {
+            generations_published,
+            generation_failures,
+            generations_deleted,
+        } = *self;
+        [
+            ("graph_indexer_generations_published", generations_published),
+            ("graph_indexer_generation_failures", generation_failures),
+            ("graph_indexer_generations_deleted", generations_deleted),
+        ]
+    }
+}
+
 #[derive(Default)]
 struct IndexerMetrics {
     ready: AtomicBool,
@@ -203,10 +284,83 @@ struct IndexerMetrics {
     successful_cycles: AtomicU64,
     failed_cycles: AtomicU64,
     open_failures: AtomicU64,
-    generations_published: AtomicU64,
-    generation_failures: AtomicU64,
-    generations_deleted: AtomicU64,
+    /// `generations_published`, `generation_failures` and `generations_deleted`,
+    /// keyed by `{cell_id, edge_type}`.
+    ///
+    /// The four counters above stay process-global because they describe the
+    /// process: a cycle is not a property of a cell. These three describe work
+    /// done *to* a cell, and every site that increments them already holds both
+    /// identifiers — the same fields [`IndexFailure`] keeps structured so they
+    /// survive to the top. `graph_indexer_generation_failures` going up used to
+    /// say only "a generation failed"; it now says which one.
+    ///
+    /// `scope` is deliberately absent. It is one value per tenant and unbounded
+    /// by product decision, and no dimension of a metric may be unbounded.
+    ///
+    /// A `Mutex` rather than an atomic per pair because the key set is
+    /// discovered at runtime. It is never held across an `await`, and every
+    /// increment sits behind an object-store round trip that costs several
+    /// orders of magnitude more than the lock. Entries are never removed: a
+    /// counter series that disappears reads to Prometheus as a reset.
+    dimensioned: Mutex<BTreeMap<(String, String), DimensionedCounters>>,
     last_success_ms: AtomicU64,
+}
+
+impl IndexerMetrics {
+    /// Apply `record` to the counters for one `{cell_id, edge_type}` pair,
+    /// folding into [`OVERFLOW_LABEL`] once the map is full.
+    fn dimension<F: FnOnce(&mut DimensionedCounters)>(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        record: F,
+    ) {
+        let mut counters = self.lock_dimensioned();
+        let key = (cell_id.to_string(), edge_type.to_string());
+        // A pair already being tracked keeps its own series however full the
+        // map is; only genuinely new pairs can be turned away.
+        let entry = if counters.contains_key(&key) || counters.len() < MAX_DIMENSIONS {
+            counters.entry(key).or_default()
+        } else {
+            counters
+                .entry((OVERFLOW_LABEL.to_string(), OVERFLOW_LABEL.to_string()))
+                .or_default()
+        };
+        record(entry);
+    }
+
+    fn record_generation_published(&self, cell_id: &str, edge_type: &str) {
+        self.dimension(cell_id, edge_type, |counters| {
+            counters.generations_published = counters.generations_published.saturating_add(1);
+        });
+    }
+
+    fn record_generation_failure(&self, cell_id: &str, edge_type: &str) {
+        self.dimension(cell_id, edge_type, |counters| {
+            counters.generation_failures = counters.generation_failures.saturating_add(1);
+        });
+    }
+
+    fn record_generations_deleted(&self, cell_id: &str, edge_type: &str, deleted: u64) {
+        self.dimension(cell_id, edge_type, |counters| {
+            counters.generations_deleted = counters.generations_deleted.saturating_add(deleted);
+        });
+    }
+
+    fn dimensioned_snapshot(&self) -> BTreeMap<(String, String), DimensionedCounters> {
+        self.lock_dimensioned().clone()
+    }
+
+    /// A poisoned metrics mutex must not take the indexer down with it. The map
+    /// holds counters and nothing else, so the worst a panicking writer can
+    /// leave behind is a half-applied increment.
+    fn lock_dimensioned(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<(String, String), DimensionedCounters>> {
+        self.dimensioned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 struct IndexerAdminServer {
@@ -759,7 +913,7 @@ async fn run_index_cycle(
                     generation
                 }
                 Err(error) => {
-                    metrics.generation_failures.fetch_add(1, Ordering::Relaxed);
+                    metrics.record_generation_failure(cell_id, &edge_type);
                     let failure = IndexFailure::kernel(
                         "artifact_build",
                         format!("index scope {scope}: build index {cell_id}/{edge_type}"),
@@ -776,9 +930,7 @@ async fn run_index_cycle(
                 }
             };
 
-            metrics
-                .generations_published
-                .fetch_add(1, Ordering::Relaxed);
+            metrics.record_generation_published(cell_id, &edge_type);
             edge_span.record(semconv::GENERATION, generation.generation.as_str());
             edge_span.record(semconv::BASE_SEQUENCE, generation.base_sequence);
 
@@ -858,9 +1010,7 @@ async fn run_index_cycle(
                             Outcome::Success.as_str()
                         },
                     );
-                    metrics
-                        .generations_deleted
-                        .fetch_add(deleted, Ordering::Relaxed);
+                    metrics.record_generations_deleted(cell_id, &edge_type, deleted);
                 }
                 Err(error) => {
                     // Unchanged in effect: cleanup that fails has never failed
@@ -933,7 +1083,25 @@ async fn indexer_readiness(State(metrics): State<Arc<IndexerMetrics>>) -> Status
 }
 
 async fn indexer_metrics(State(metrics): State<Arc<IndexerMetrics>>) -> Response {
-    let output = format!(
+    (
+        [
+            ("content-type", "text/plain; version=0.0.4; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
+        render_metrics(&metrics),
+    )
+        .into_response()
+}
+
+/// The `/metrics` body.
+///
+/// Split out of the handler so the exposition can be asserted on directly
+/// rather than through an HTTP round trip; the handler adds headers and nothing
+/// else. The three dimensioned families keep the position they had when they
+/// were scalars, so a diff of the output shows labels appearing and no series
+/// moving.
+fn render_metrics(metrics: &IndexerMetrics) -> String {
+    let mut output = format!(
         concat!(
             "# TYPE graph_indexer_ready gauge\n",
             "graph_indexer_ready {}\n",
@@ -945,33 +1113,84 @@ async fn indexer_metrics(State(metrics): State<Arc<IndexerMetrics>>) -> Response
             "graph_indexer_failed_cycles {}\n",
             "# TYPE graph_indexer_open_failures counter\n",
             "graph_indexer_open_failures {}\n",
-            "# TYPE graph_indexer_generations_published counter\n",
-            "graph_indexer_generations_published {}\n",
-            "# TYPE graph_indexer_generation_failures counter\n",
-            "graph_indexer_generation_failures {}\n",
-            "# TYPE graph_indexer_generations_deleted counter\n",
-            "graph_indexer_generations_deleted {}\n",
-            "# TYPE graph_indexer_last_success_ms gauge\n",
-            "graph_indexer_last_success_ms {}\n",
         ),
         u8::from(metrics.ready.load(Ordering::Acquire)),
         metrics.cycles.load(Ordering::Relaxed),
         metrics.successful_cycles.load(Ordering::Relaxed),
         metrics.failed_cycles.load(Ordering::Relaxed),
         metrics.open_failures.load(Ordering::Relaxed),
-        metrics.generations_published.load(Ordering::Relaxed),
-        metrics.generation_failures.load(Ordering::Relaxed),
-        metrics.generations_deleted.load(Ordering::Relaxed),
-        metrics.last_success_ms.load(Ordering::Relaxed),
     );
-    (
-        [
-            ("content-type", "text/plain; version=0.0.4; charset=utf-8"),
-            ("cache-control", "no-store"),
-        ],
-        output,
-    )
-        .into_response()
+    append_dimensioned(&mut output, &metrics.dimensioned_snapshot());
+    output.push_str(&format!(
+        concat!(
+            "# TYPE graph_indexer_last_success_ms gauge\n",
+            "graph_indexer_last_success_ms {}\n",
+        ),
+        metrics.last_success_ms.load(Ordering::Relaxed),
+    ));
+    output
+}
+
+/// The three `{cell_id, edge_type}` families, plus the gauge that says how much
+/// of the cardinality budget they are using.
+///
+/// Family-major, and the `# TYPE` line comes from the same enumeration the
+/// samples do, so a family with no pairs yet still declares itself instead of
+/// vanishing from the scrape until the first generation is built.
+fn append_dimensioned(
+    output: &mut String,
+    counters: &BTreeMap<(String, String), DimensionedCounters>,
+) {
+    let cell = CELL_ID_LABEL.0;
+    let edge = EDGE_TYPE_LABEL.0;
+    for (slot, (name, _)) in DimensionedCounters::default().series().iter().enumerate() {
+        output.push_str(&format!("# TYPE {name} counter\n"));
+        for ((cell_id, edge_type), value) in counters {
+            let (_, count) = value.series()[slot];
+            let cell_value = escape_label_value(cell_id);
+            let edge_value = escape_label_value(edge_type);
+            output.push_str(&format!(
+                "{name}{{{cell}=\"{cell_value}\",{edge}=\"{edge_value}\"}} {count}\n"
+            ));
+        }
+    }
+    // Additive, and the reason the cap is safe to have: without it, a fleet
+    // that has quietly saturated `MAX_DIMENSIONS` and is folding everything
+    // into `__overflow__` looks exactly like one that has not.
+    output.push_str(&format!(
+        concat!(
+            "# TYPE graph_indexer_dimensions gauge\n",
+            "graph_indexer_dimensions {}\n",
+        ),
+        counters.len(),
+    ));
+}
+
+/// Escape a Prometheus label value.
+///
+/// Defensive rather than load-bearing: every value that reaches here today has
+/// been through `validate_component`, which permits only ASCII alphanumerics,
+/// `_`, `-` and `.`, so none of the three characters below can appear. That is
+/// a three-hop argument through the kernel, and it is one refactor away from
+/// being wrong — an unescaped `"` in a label value does not error, it produces
+/// an exposition the scraper rejects wholesale.
+fn escape_label_value(value: &str) -> Cow<'_, str> {
+    if !value
+        .bytes()
+        .any(|byte| matches!(byte, b'\\' | b'"' | b'\n'))
+    {
+        return Cow::Borrowed(value);
+    }
+    let mut escaped = String::with_capacity(value.len() + 8);
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            _ => escaped.push(character),
+        }
+    }
+    Cow::Owned(escaped)
 }
 
 fn unix_time_ms() -> u64 {
@@ -1087,7 +1306,18 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(metrics.generations_published.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.dimensioned_snapshot(),
+            BTreeMap::from([(
+                ("cell-0".to_string(), "FOLLOWS".to_string()),
+                DimensionedCounters {
+                    generations_published: 1,
+                    generation_failures: 0,
+                    generations_deleted: 0,
+                },
+            )]),
+            "the publish should be attributed to the cell and edge type that produced it",
+        );
 
         let reader = GraphCluster::open_cells_scoped("graph/data", scope, ["cell-0"], object_store)
             .await
@@ -1100,5 +1330,157 @@ mod tests {
             .unwrap()
             .is_some());
         reader.close().await.unwrap();
+    }
+
+    /// The eleven series a scrape sees when nothing has been indexed yet.
+    ///
+    /// Pinned in full rather than probed, because the point of this change is
+    /// that the process-global half did *not* move: `ready` through
+    /// `open_failures` and `last_success_ms` keep their exact names, their
+    /// absence of labels and their positions, and the three families that
+    /// gained labels still declare a `# TYPE` line with no samples under it.
+    #[test]
+    fn an_idle_indexer_declares_every_family() {
+        let metrics = IndexerMetrics::default();
+        metrics.ready.store(true, Ordering::Release);
+        metrics.cycles.store(3, Ordering::Relaxed);
+
+        assert_eq!(
+            render_metrics(&metrics),
+            concat!(
+                "# TYPE graph_indexer_ready gauge\n",
+                "graph_indexer_ready 1\n",
+                "# TYPE graph_indexer_cycles counter\n",
+                "graph_indexer_cycles 3\n",
+                "# TYPE graph_indexer_successful_cycles counter\n",
+                "graph_indexer_successful_cycles 0\n",
+                "# TYPE graph_indexer_failed_cycles counter\n",
+                "graph_indexer_failed_cycles 0\n",
+                "# TYPE graph_indexer_open_failures counter\n",
+                "graph_indexer_open_failures 0\n",
+                "# TYPE graph_indexer_generations_published counter\n",
+                "# TYPE graph_indexer_generation_failures counter\n",
+                "# TYPE graph_indexer_generations_deleted counter\n",
+                "# TYPE graph_indexer_dimensions gauge\n",
+                "graph_indexer_dimensions 0\n",
+                "# TYPE graph_indexer_last_success_ms gauge\n",
+                "graph_indexer_last_success_ms 0\n",
+            )
+        );
+    }
+
+    #[test]
+    fn the_three_failure_families_carry_cell_and_edge_type() {
+        let metrics = IndexerMetrics::default();
+        metrics.record_generation_published("cell-0", "FOLLOWS");
+        metrics.record_generation_published("cell-1", "RELATES");
+        metrics.record_generation_failure("cell-1", "RELATES");
+        metrics.record_generations_deleted("cell-0", "FOLLOWS", 4);
+
+        let output = render_metrics(&metrics);
+        for expected in [
+            "graph_indexer_generations_published{cell_id=\"cell-0\",edge_type=\"FOLLOWS\"} 1\n",
+            "graph_indexer_generations_published{cell_id=\"cell-1\",edge_type=\"RELATES\"} 1\n",
+            "graph_indexer_generation_failures{cell_id=\"cell-0\",edge_type=\"FOLLOWS\"} 0\n",
+            "graph_indexer_generation_failures{cell_id=\"cell-1\",edge_type=\"RELATES\"} 1\n",
+            "graph_indexer_generations_deleted{cell_id=\"cell-0\",edge_type=\"FOLLOWS\"} 4\n",
+            "graph_indexer_dimensions 2\n",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing {expected:?} in\n{output}"
+            );
+        }
+    }
+
+    /// §1.3's rule, asserted against the exposition rather than trusted.
+    ///
+    /// `scope` is one value per tenant and unbounded by product decision, and
+    /// the indexer sweeps every registered scope, so it is the single label a
+    /// well-meaning change is most likely to add here. `MetricLabel` stops the
+    /// declared route; this closes the undeclared one.
+    #[test]
+    fn no_indexer_series_carries_scope() {
+        let metrics = IndexerMetrics::default();
+        metrics.record_generation_published("cell-0", "FOLLOWS");
+
+        let output = render_metrics(&metrics);
+        assert!(!output.contains("scope="), "scope leaked into\n{output}");
+        assert!(
+            !output.contains(semconv::SCOPE),
+            "scope leaked into\n{output}"
+        );
+    }
+
+    #[test]
+    fn the_two_dimensions_are_registry_metric_labels() {
+        for (prometheus, label) in [CELL_ID_LABEL, EDGE_TYPE_LABEL] {
+            assert!(
+                semconv::METRIC_LABELS.contains(&label),
+                "{label} is not classified as a metric label",
+            );
+            assert_eq!(
+                label.key(),
+                format!("turbolay.{prometheus}"),
+                "the Prometheus name and the registry key have drifted",
+            );
+        }
+    }
+
+    /// Past the cap, attribution degrades and the totals do not.
+    ///
+    /// The second assertion is the one that matters: an operator who has
+    /// saturated the budget still gets a correct `sum(...)` over the family,
+    /// which is what every alert on these counters is built from.
+    #[test]
+    fn the_dimension_map_is_capped_and_the_totals_survive() {
+        let metrics = IndexerMetrics::default();
+        let recorded = MAX_DIMENSIONS + 64;
+        for index in 0..recorded {
+            metrics.record_generation_published("cell-0", &format!("EDGE-{index}"));
+        }
+        // Every pair already tracked keeps its own series, cap or no cap.
+        metrics.record_generation_published("cell-0", "EDGE-0");
+
+        let snapshot = metrics.dimensioned_snapshot();
+        assert_eq!(
+            snapshot.len(),
+            MAX_DIMENSIONS + 1,
+            "the map should hold the cap plus one overflow bucket",
+        );
+        assert_eq!(
+            snapshot
+                .values()
+                .map(|counters| counters.generations_published)
+                .sum::<u64>(),
+            recorded as u64 + 1,
+            "folding into the overflow bucket must not drop an increment",
+        );
+        assert_eq!(
+            snapshot[&(OVERFLOW_LABEL.to_string(), OVERFLOW_LABEL.to_string())],
+            DimensionedCounters {
+                generations_published: 64,
+                generation_failures: 0,
+                generations_deleted: 0,
+            },
+        );
+        assert_eq!(
+            snapshot[&("cell-0".to_string(), "EDGE-0".to_string())].generations_published,
+            2,
+            "a tracked pair should keep counting after the cap is reached",
+        );
+        assert!(render_metrics(&metrics).contains(&format!(
+            "graph_indexer_dimensions {}\n",
+            MAX_DIMENSIONS + 1
+        )));
+    }
+
+    #[test]
+    fn label_values_are_escaped() {
+        assert!(matches!(
+            escape_label_value("cell-0"),
+            Cow::Borrowed("cell-0")
+        ));
+        assert_eq!(escape_label_value("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
     }
 }
