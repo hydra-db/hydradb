@@ -16,14 +16,22 @@
 //! `docs/plans/2026-07-26-otel-metrics-span-links-and-alerting.md` asks for:
 //! adding a metric cannot silently reach one export and not the other.
 //!
-//! # Counters reach `/metrics` and not the meter, this round
+//! # One counter snapshot reaches the meter; the other two reach `/metrics` only
 //!
-//! All 65 kernel counters are exported through `/metrics`; none are registered
-//! as OTel instruments. [`OTEL_COUNTERS`] explains why, and §1.4 is what makes
-//! the asymmetry legitimate rather than an oversight — the two exports are
-//! allowed to differ in *dimensionality*, and they already do: `/metrics`
-//! carries `turbolay.scope` on three counter families and OTLP carries it
-//! nowhere.
+//! All 65 kernel counters are exported through `/metrics`. Thirty-four are also
+//! registered as OTel instruments: `GraphOperationalMetricsSnapshot`'s
+//! thirty-five scalars, less the one that restates a histogram's sum.
+//! [`METERED_COUNTER_SOURCES`] is that decision as a value rather than a
+//! paragraph — one variant long — and [`otel_counter_instruments`] is what
+//! [`NodeCounters::register`] iterates. `ClientQueryMetricsSnapshot` and
+//! `GraphCacheMetricsSnapshot` are named there and deliberately not wired; each
+//! needs a variant in that list and a `record_*` method beside
+//! [`NodeCounters::record_shard_totals`], and nothing else.
+//!
+//! §1.4 is what makes the asymmetry legitimate rather than an oversight — the
+//! two exports are allowed to differ in *dimensionality*, and they already do:
+//! `/metrics` carries `turbolay.scope` on three counter families and OTLP
+//! carries it nowhere.
 //!
 //! # Names
 //!
@@ -70,12 +78,29 @@
 //!
 //! # Wiring
 //!
-//! [`NodeHistograms::register`] takes a `turbolay_telemetry::otlp::Providers`,
-//! reached through `TelemetryGuard::providers()`. [`MetricCollection::start`] is
-//! what `graph-node.rs` calls: it registers the instruments once and owns the
-//! interval task that snapshots the kernel and publishes into them. Without the
-//! `otlp` feature, or with no OTLP endpoint configured, it is inert and starts
-//! no task at all.
+//! [`NodeHistograms::register`] and [`NodeCounters::register`] take a
+//! `turbolay_telemetry::otlp::Providers`, reached through
+//! `TelemetryGuard::providers()`. That accessor is the only way in on purpose:
+//! `opentelemetry::global::meter` on a provider that was never installed
+//! globally returns a **no-op** meter that accepts every instrument, reports
+//! nothing, and fails no test — silence indistinguishable from a working
+//! pipeline, which is the failure `Providers` exists to make unreachable. It is
+//! not even reachable from here, and that is worth more than the discipline:
+//! `opentelemetry` is not a dependency of the root package, only of
+//! `crates/telemetry`, so naming `global::meter` in this file is an unresolved
+//! crate rather than a silent series.
+//!
+//! [`MetricCollection::start`] is what `graph-node.rs` calls: it registers the
+//! instruments once and owns the interval task that snapshots the kernel and
+//! publishes into them. Without the `otlp` feature, or with no OTLP endpoint
+//! configured, it is inert and starts no task at all.
+//!
+//! Two of the three pieces the wiring rests on are deliberately outside the
+//! `otlp` cfg, because no `just` recipe *executes* this binary's `otlp` code —
+//! `check-all-features` compiles it and stops there. [`otel_instrument_groups`]
+//! is the histograms' registration invariant and [`shard_counter_totals`] is the
+//! counters' arithmetic, and both are plain functions a default-feature test
+//! reaches. What is left behind the gate is a loop over what they return.
 //!
 //! `record_transport` remains unfed, and that is a *structural* fact rather than
 //! an unfinished table. [`FieldSource`] is the type that says so,
@@ -100,6 +125,26 @@
 // Only the recording half names a snapshot, and that half is behind `otlp`.
 #[cfg(feature = "otlp")]
 use slatedb_graph_kernel::DurationHistogramSnapshot;
+
+/// The export proof, in its own file because a stand-in collector is a hundred
+/// lines that have nothing to say about metric names.
+///
+/// Gated on `otlp` as well as on `test`, because everything it touches is: there
+/// is no [`NodeCounters`] to register without the feature. That also means no
+/// `just` recipe runs it — `check-all-features` compiles it and stops — which is
+/// why the properties that can be checked without a meter are checked in
+/// [`tests`] instead, and this file is confined to the one claim that genuinely
+/// needs a socket.
+///
+/// The `#[path]` is not decoration. This module is itself declared with a `#[path]`
+/// in `graph-node.rs`, and a child of such a module resolves against the
+/// *directory of that path* — `src/bin/graph_node/` — rather than against
+/// `…/otel_metrics/`. Without the attribute rustc looks for
+/// `graph_node/otlp_export_tests.rs`, which would put a child of this module beside
+/// its parent.
+#[cfg(all(test, feature = "otlp"))]
+#[path = "otel_metrics/otlp_export_tests.rs"]
+mod otlp_export_tests;
 
 /// The unit an exported histogram's bounds and sum are **rendered** in.
 ///
@@ -344,7 +389,10 @@ pub fn otel_instrument_groups() -> Vec<(&'static str, Vec<&'static OtelHistogram
 /// [`tests::every_counter_source_has_a_graph_node_snapshot`] until the tables and
 /// a renderer exist. That is what stops the series staying quietly missing on the
 /// day a source appears.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// `Hash` because [`NodeCounters`] keys its registered instruments by
+/// `(source, field)`; see that type for why the pair and not the field alone.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CounterSource {
     /// `ClientQueryMetricsSnapshot`. One per node, not per shard.
     Client,
@@ -457,13 +505,64 @@ impl OtelCounterExport {
     }
 }
 
+/// What an exported counter counts, which is what fixes its unit.
+///
+/// Derived from the kernel's field identifier rather than declared per row, and
+/// the derivation is the `_us` suffix: every cumulative microsecond total the
+/// kernel keeps is named for it — `gc_duration_us`, `bulk_import_commit_us`,
+/// `graph_compute_queue_us` — and nothing else is. A column would be sixty-seven
+/// values to distinguish two cases, and it would be free to drift from the names
+/// the *other* export already derives from the same convention: every one of
+/// these rows is spelled `_microseconds` in [`crate::admin::PROMETHEUS_COUNTERS`].
+/// [`tests::the_microsecond_counters_are_named_for_their_unit`] holds the
+/// derivation and both name tables together in all three directions, which is
+/// what a column could not do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CounterQuantity {
+    /// A count of events. UCUM `1`.
+    Events,
+    /// A cumulative sum of microseconds — the counter an operator divides by the
+    /// matching event count to get a mean. UCUM `us`.
+    Microseconds,
+}
+
+impl CounterQuantity {
+    /// The quantity a kernel counter field measures.
+    pub fn of_field(field: &str) -> Self {
+        if field.ends_with("_us") {
+            Self::Microseconds
+        } else {
+            Self::Events
+        }
+    }
+
+    /// The same choice, spelled the way the meter spells it.
+    ///
+    /// There is no `Seconds` to map onto and that is deliberate on the meter's
+    /// side, not an omission here: scaling a counter at this boundary would make
+    /// it disagree by a factor of a million with the `_microseconds` series
+    /// `/metrics` renders from the very same field, undetectably.
+    #[cfg(feature = "otlp")]
+    fn meter_unit(self) -> turbolay_telemetry::meter::CounterUnit {
+        use turbolay_telemetry::meter::CounterUnit;
+        match self {
+            Self::Events => CounterUnit::Count,
+            Self::Microseconds => CounterUnit::Microseconds,
+        }
+    }
+}
+
 /// One row of the OTel counter name table.
 ///
-/// There is no `description` field, and its absence is the honest shape rather
-/// than an omission: a description is an argument to instrument registration,
-/// nothing registers a counter instrument yet (see [`OTEL_COUNTERS`]), and
-/// sixty-five invented sentences for code that does not run would read as though
-/// it did.
+/// There is no `description` field, and its absence is a decision rather than an
+/// omission. Registration needs one — [`NodeCounters::register`] passes
+/// [`OtelCounter::field`] — and the kernel identifier is the better string than a
+/// sentence would be: sixty-seven generated sentences would each restate the
+/// metric name in longer words, whereas the identifier is the one thing the name
+/// does *not* carry, and it is the key `/metrics`, the kernel's enumeration and
+/// both name tables are joined on. An operator who finds
+/// `turbolay.shard.compute.queue.duration.sum` on a dashboard and wants the code
+/// gets `graph_compute_queue_us` for free.
 #[derive(Clone, Copy, Debug)]
 pub struct OtelCounter {
     pub source: CounterSource,
@@ -474,19 +573,13 @@ pub struct OtelCounter {
 
 /// The OTel counter name table. One row per counter the kernel enumerates.
 ///
-/// **Nothing registers these yet, and that is a deliberate stop.** An observable
-/// counter needs a wrapper of the shape `turbolay_telemetry::meter` gives
-/// histograms -- a cached series map plus an `Fn` callback -- and that crate has
-/// one for histograms only. Building it in this binary instead would mean a
-/// direct `opentelemetry` dependency on the root package, since a callback
-/// observes through `opentelemetry::KeyValue`, which the root package does not
-/// depend on. Either is a change outside this module's file set, so this round
-/// exports every counter through `/metrics` and none through the meter.
-///
-/// The table is here anyway because it is what makes
+/// **Not every row is a registered instrument.** [`METERED_COUNTER_SOURCES`] says
+/// which are, [`otel_counter_instruments`] applies it, and the two sources it
+/// leaves out reach `/metrics` alone for now. A row is in this table whether or
+/// not it is on the meter, because that is what makes
 /// [`tests::every_counter_field_reaches_both_exports`] total: a counter added to
-/// the kernel today cannot reach one export and quietly miss the other on the
-/// day the instruments land.
+/// the kernel today cannot reach one export and quietly miss the other on the day
+/// the remaining instruments land.
 ///
 /// `turbolay.*` throughout. §1.9 says `db.*` where a semantic convention
 /// genuinely exists, and there is no semconv counter for any of these -- the one
@@ -860,6 +953,98 @@ pub fn otel_counter(source: CounterSource, field: &str) -> Option<&'static OtelC
         .find(|export| export.source == source && export.field == field)
 }
 
+/// Which counter snapshots this binary registers instruments for and feeds.
+///
+/// One variant, and the whole of the remaining wiring is this list. Adding
+/// [`CounterSource::Client`] registers eleven more instruments and needs a
+/// `record_client_counters` beside [`NodeCounters::record_shard_totals`] fed from
+/// `ClientQueryService::metrics()`, which `collect_once` already holds; adding
+/// [`CounterSource::ShardCache`] registers nineteen and needs the same over
+/// `metrics.shard.cache`, off the slice `collect_once` already has. Neither is a
+/// design question any more, which is exactly why the stopping point is a value
+/// here rather than a sentence somewhere.
+///
+/// `/metrics` is the decided consumer of these numbers, so the list is short by
+/// intent rather than by inattention: the point of the shard family being on the
+/// meter is that the pattern exists and is proven end to end, not that every
+/// counter is on the wire.
+pub const METERED_COUNTER_SOURCES: &[CounterSource] = &[CounterSource::Shard];
+
+/// The [`OTEL_COUNTERS`] rows that become registered instruments.
+///
+/// **One row is one instrument**, which is the opposite of
+/// [`otel_instrument_groups`] and is why no grouping happens here: counter names
+/// are unique across both tables, and
+/// [`tests::no_two_metrics_share_an_exported_name`] is what keeps that true. Two
+/// counter rows sharing a name would be the same silent collapse the histograms'
+/// grouping exists to prevent, with nothing to tell the series apart.
+///
+/// Three filters, all of them load-bearing:
+///
+/// - [`METERED_COUNTER_SOURCES`], so a source with no recording path registers no
+///   instrument. An instrument nothing records into exports nothing at all
+///   (`crates/telemetry/tests/meter_export.rs::an_unrecorded_counter_exports_nothing`),
+///   so registering the other two sources now would be harmless on the wire and
+///   dishonest in the code — a callback the collection task never reaches.
+/// - [`OtelCounterExport::name`], which is `None` exactly for the derived rows.
+///   Those restate the `.sum` of a histogram family that is already exported, so a
+///   second instrument would be a second name for one number.
+/// - [`OTEL_CLASS_COUNTERS`] is not consulted. A per-class instrument is
+///   `cell_id × error.class`, ten series per cell rather than one, and choosing
+///   that multiplier for a vendor billing per series is a §1.4 dimensionality
+///   decision this round did not take.
+///   [`tests::only_the_shard_scalars_are_registered_this_round`] pins the absence
+///   so it stays a decision.
+pub fn otel_counter_instruments() -> Vec<&'static OtelCounter> {
+    OTEL_COUNTERS
+        .iter()
+        .filter(|row| METERED_COUNTER_SOURCES.contains(&row.source))
+        .filter(|row| row.export.name().is_some())
+        .collect()
+}
+
+/// Every shard's operational counters, summed by `cell_id`.
+///
+/// [`OtelCounterExport::PerCell`] reads "one sum per `turbolay.cell_id`, summed
+/// over every scope open on the node", and this is where the summing happens.
+/// Publishing per scope instead would not duplicate and would not warn: the series
+/// identity is the label set, so the last scope recorded in an interval would
+/// simply *replace* the others and the counter would report one tenant's traffic
+/// as the cell's. The same arithmetic on the `/metrics` side is
+/// `admin::append_per_cell_counters`, and it is there for a sharper version of the
+/// same reason — two identical series in one scrape is an outright rejection
+/// rather than a plausible undercount.
+///
+/// Outside the `otlp` cfg on purpose. This is the half of
+/// [`NodeCounters::record_shard_totals`] that a name table cannot check and that no
+/// `just` recipe would otherwise execute, so it lives where
+/// [`tests::two_scopes_on_one_cell_sum_rather_than_overwrite`] reaches it under
+/// default features, and the gated half is reduced to a loop over what it returns.
+///
+/// Ordered by `cell_id`, then by the kernel's declaration order within a cell.
+/// Nothing downstream depends on either — a series is addressed by its labels —
+/// but a deterministic order is what lets a test assert on the whole return value
+/// instead of searching it.
+pub fn shard_counter_totals(
+    shards: &[slatedb_graph_kernel::ScopedGraphShardRuntimeMetrics],
+) -> Vec<(&str, Vec<(&'static str, u64)>)> {
+    let mut totals: std::collections::BTreeMap<&str, Vec<(&'static str, u64)>> =
+        std::collections::BTreeMap::new();
+    for shard in shards {
+        let cell = totals.entry(shard.shard.cell_id.as_str()).or_default();
+        for (field, value) in shard.shard.operational.counter_fields() {
+            match cell.iter_mut().find(|(name, _)| *name == field) {
+                // Saturating for the reason `admin::accumulate` gives: these are
+                // `u64` counters only a decades-long uptime could overflow, and a
+                // wrapped total on a metrics series is a phantom incident.
+                Some(slot) => slot.1 = slot.1.saturating_add(value),
+                None => cell.push((field, value)),
+            }
+        }
+    }
+    totals.into_iter().collect()
+}
+
 /// The instrumentation scope every instrument registered here belongs to.
 #[cfg(feature = "otlp")]
 const METER_NAME: &str = "turbolay.graph_node";
@@ -1028,6 +1213,146 @@ impl NodeHistograms {
     }
 }
 
+/// Every registered counter instrument, keyed by `(source, field)`.
+///
+/// Keyed by the pair and never by the field alone, for the reason
+/// [`CounterSource`] gives: `backpressure_waits` is a field of two different
+/// snapshots counting two different events, so a map keyed by the identifier would
+/// hand one of them the other's instrument. Only one source is registered today
+/// and the collision is therefore latent rather than live — which is precisely
+/// when a key is cheap to get right.
+///
+/// The values are owned rather than `Arc`ed, and that is the difference from
+/// [`NodeHistograms`]: two histogram rows share `db.client.operation.duration` and
+/// are told apart by a label, whereas one counter row is one instrument name.
+#[cfg(feature = "otlp")]
+#[derive(Debug)]
+pub struct NodeCounters {
+    registered: std::collections::HashMap<
+        (CounterSource, &'static str),
+        turbolay_telemetry::meter::ObservableCounter,
+    >,
+}
+
+#[cfg(feature = "otlp")]
+impl NodeCounters {
+    /// Register one observable counter per [`otel_counter_instruments`] row
+    /// against the process's meter.
+    ///
+    /// Infallible, and the signature is honest rather than symmetrical with
+    /// [`NodeHistograms::register`]: a counter has no ladder to validate, and
+    /// `ObservableCounter::register` returns no `Result` because the SDK validates
+    /// instrument names internally and silently drops what it rejects. A name
+    /// surviving is therefore an export-level claim, not a return value, which is
+    /// what `otlp_export_tests::the_shard_counters_reach_an_otlp_collector_summed_by_cell`
+    /// is for.
+    ///
+    /// `providers` is the meter from `TelemetryGuard::providers()` and there is no
+    /// other way in — see the module note: `global::meter` would register every
+    /// instrument against a no-op meter and report nothing, and the root package's
+    /// manifest is what makes it unreachable rather than merely discouraged.
+    pub fn register(providers: &turbolay_telemetry::otlp::Providers) -> Self {
+        use turbolay_telemetry::meter::{CounterSpec, ObservableCounter};
+
+        let meter = providers.meter(METER_NAME);
+        let instruments = otel_counter_instruments();
+        let mut registered = std::collections::HashMap::with_capacity(instruments.len());
+        for row in instruments {
+            let Some(name) = row.export.name() else {
+                debug_assert!(false, "otel_counter_instruments filters the derived rows");
+                continue;
+            };
+            registered.insert(
+                (row.source, row.field),
+                ObservableCounter::register(
+                    &meter,
+                    CounterSpec {
+                        name,
+                        description: row.field,
+                        unit: CounterQuantity::of_field(row.field).meter_unit(),
+                    },
+                ),
+            );
+        }
+        Self { registered }
+    }
+
+    /// Publish one counter's cumulative total for one series.
+    ///
+    /// A field with no registered instrument is skipped, and the `debug_assert`
+    /// is what separates the two ways that happens: a *derived* row has no
+    /// instrument by design, and anything else is a hole between the kernel's
+    /// enumeration and [`otel_counter_instruments`]. Skipped rather than raised
+    /// for [`NodeHistograms::record`]'s reason — losing one series is a better
+    /// outcome on a metrics thread than losing the interval.
+    fn record(
+        &self,
+        source: CounterSource,
+        field: &'static str,
+        labels: &[(turbolay_telemetry::semconv::MetricLabel, &str)],
+        value: u64,
+    ) -> Result<(), turbolay_telemetry::meter::CounterError> {
+        let Some(counter) = self.registered.get(&(source, field)) else {
+            debug_assert!(
+                matches!(
+                    otel_counter(source, field).map(|row| row.export),
+                    Some(OtelCounterExport::Derived(_))
+                ),
+                "{source:?}::{field} is enumerated and not derived, but no instrument was registered"
+            );
+            return Ok(());
+        };
+        counter.record(labels, value)
+    }
+
+    /// Every shard's operational counters, labelled by `cell_id` alone.
+    ///
+    /// Takes the whole slice rather than one shard at a time, and that is
+    /// [`shard_counter_totals`]'s doing rather than a convenience: a per-cell
+    /// series is a sum over the scopes on that cell, and a method that saw one
+    /// scope could not compute it. `NodeHistograms::record_shard` is per shard
+    /// because its own signature predates the question.
+    ///
+    /// Never `scope`, which `/metrics` does carry on three families — that
+    /// divergence is §1.4 and is the reason both exports exist. Never
+    /// `cell_id × edge_type`, which is where §1.3's cardinality arithmetic stops
+    /// being affordable. Neither is expressible here anyway: the label type's
+    /// constructor is private to `turbolay_telemetry::semconv` and `scope` is not
+    /// in the registry at all.
+    pub fn record_shard_totals(
+        &self,
+        shards: &[slatedb_graph_kernel::ScopedGraphShardRuntimeMetrics],
+    ) -> Result<(), turbolay_telemetry::meter::CounterError> {
+        use turbolay_telemetry::semconv::L_CELL_ID;
+
+        for (cell_id, fields) in shard_counter_totals(shards) {
+            for (field, value) in fields {
+                self.record(CounterSource::Shard, field, &[(L_CELL_ID, cell_id)], value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every series each registered instrument is currently reporting.
+    ///
+    /// The published totals, read back through the same accessor the SDK's
+    /// callback uses. It exists because the export proof asserts on a protobuf
+    /// frame, where an instrument name is a literal substring and a value is a
+    /// varint: the socket is what proves the series *left the process*, and this is
+    /// what proves the number in it was the sum and not one scope's share.
+    #[cfg(test)]
+    fn observations(
+        &self,
+        source: CounterSource,
+        field: &'static str,
+    ) -> Vec<turbolay_telemetry::meter::Observation<u64>> {
+        self.registered
+            .get(&(source, field))
+            .map(turbolay_telemetry::meter::ObservableCounter::observations)
+            .unwrap_or_default()
+    }
+}
+
 /// The interval task that feeds the registered instruments, or nothing at all.
 ///
 /// This type exists in both feature configurations so `graph-node.rs` needs no
@@ -1083,16 +1408,21 @@ impl MetricCollection {
             return Self { running: None };
         };
         let histograms = match NodeHistograms::register(providers) {
-            Ok(histograms) => std::sync::Arc::new(histograms),
+            Ok(histograms) => histograms,
             Err(error) => {
                 tracing::warn!(error = %error, "OTel histograms did not register; no metrics will be exported");
                 return Self { running: None };
             }
         };
+        let instruments = std::sync::Arc::new(NodeInstruments {
+            histograms,
+            counters: NodeCounters::register(providers),
+        });
 
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(collect_forever(histograms, query, node, interval, stop_rx));
+        let task = tokio::spawn(collect_forever(instruments, query, node, interval, stop_rx));
         tracing::info!(
+            counters = otel_counter_instruments().len(),
             interval_ms = interval.as_millis() as u64,
             "OTel metric collection started"
         );
@@ -1135,19 +1465,40 @@ impl std::fmt::Debug for MetricCollection {
     }
 }
 
-/// One pass: publish the client histograms, then every shard's.
+/// Everything registered against the meter, held by the collection task.
+///
+/// One `Arc` for both kinds rather than one each. They are registered together,
+/// fed from the same two snapshots on the same interval, and dropped together;
+/// two handles would only be two chances to feed one of them and not the other.
+#[cfg(feature = "otlp")]
+#[derive(Debug)]
+struct NodeInstruments {
+    histograms: NodeHistograms,
+    counters: NodeCounters,
+}
+
+/// One pass: publish the client histograms, then every shard's, then the shard
+/// counters.
 ///
 /// The order is deliberate. `ClientQueryService::metrics()` is a set of relaxed
 /// `AtomicU64` loads — synchronous, lock-free, unconditionally cheap — while the
 /// shard snapshot takes twelve cache mutexes per cell. Recording the cheap half
 /// first means a shard that cannot be sampled costs only the shard series.
+///
+/// The counters come last and take the whole slice at once, because a per-cell
+/// counter is a sum over the scopes on that cell and the histograms' per-shard
+/// loop has no place to put it. See [`shard_counter_totals`].
 #[cfg(feature = "otlp")]
 async fn collect_once(
-    histograms: &NodeHistograms,
+    instruments: &NodeInstruments,
     query: &slatedb_graph_kernel::ClientQueryService,
     node: &slatedb_graph_kernel::ScopedRoutedGraphCluster,
     shard_budget: std::time::Duration,
 ) {
+    let NodeInstruments {
+        histograms,
+        counters,
+    } = instruments;
     if let Err(error) = histograms.record_client(&query.metrics()) {
         tracing::warn!(error = %error, "client query histograms were not published");
     }
@@ -1175,6 +1526,9 @@ async fn collect_once(
                     );
                 }
             }
+            if let Err(error) = counters.record_shard_totals(&shards) {
+                tracing::warn!(error = %error, "shard counters were not published");
+            }
         }
         Err(_) => tracing::warn!(
             budget_ms = shard_budget.as_millis() as u64,
@@ -1191,7 +1545,7 @@ async fn collect_once(
 /// of.
 #[cfg(feature = "otlp")]
 async fn collect_forever(
-    histograms: std::sync::Arc<NodeHistograms>,
+    instruments: std::sync::Arc<NodeInstruments>,
     query: slatedb_graph_kernel::ClientQueryService,
     node: std::sync::Arc<slatedb_graph_kernel::ScopedRoutedGraphCluster>,
     interval: std::time::Duration,
@@ -1210,7 +1564,7 @@ async fn collect_forever(
                     return;
                 }
             }
-            () = collect_once(&histograms, &query, &node, shard_budget) => {}
+            () = collect_once(&instruments, &query, &node, shard_budget) => {}
         }
         tokio::select! {
             changed = stop_rx.changed() => {
@@ -1226,8 +1580,10 @@ async fn collect_forever(
 #[cfg(test)]
 mod tests {
     use slatedb_graph_kernel::{
-        ClientQueryMetricsSnapshot, GraphCacheMetricsSnapshot, GraphOperationalMetricsSnapshot,
-        QueryTransportMetricsSnapshot, DURATION_BUCKET_BOUNDS_US, DURATION_BUCKET_COUNT,
+        ClientQueryMetricsSnapshot, GraphCacheMetricsSnapshot, GraphId,
+        GraphOperationalMetricsSnapshot, GraphScope, GraphShardRuntimeMetrics, NamespaceId,
+        QueryTransportMetricsSnapshot, ScopedGraphShardRuntimeMetrics, DURATION_BUCKET_BOUNDS_US,
+        DURATION_BUCKET_COUNT,
     };
 
     use super::*;
@@ -1864,5 +2220,220 @@ mod tests {
     #[test]
     fn the_ladder_comes_from_the_kernel() {
         assert_eq!(DURATION_BUCKET_BOUNDS_US.len() + 1, DURATION_BUCKET_COUNT);
+    }
+
+    /// Two shards on one `cell_id` under different tenants, plus a third cell.
+    ///
+    /// The shape `local_shard_runtime_metrics` returns on a node hosting two
+    /// tenants that both have work on the same cell — the case that makes the
+    /// summing in [`shard_counter_totals`] necessary rather than tidy.
+    fn two_tenants_on_one_cell_and_one_alone() -> Vec<ScopedGraphShardRuntimeMetrics> {
+        [
+            ("alpha", "cell-a", 3u64, 700u64),
+            ("beta", "cell-a", 4, 90),
+            ("alpha", "cell-b", 5, 1),
+        ]
+        .into_iter()
+        .map(
+            |(tenant, cell_id, write_attempts, gc_duration_us)| ScopedGraphShardRuntimeMetrics {
+                scope: GraphScope::tenant(
+                    NamespaceId::new(tenant).expect("a valid namespace id"),
+                    GraphId::default(),
+                ),
+                shard: GraphShardRuntimeMetrics {
+                    cell_id: cell_id.to_string(),
+                    operational: GraphOperationalMetricsSnapshot {
+                        write_attempts,
+                        gc_duration_us,
+                        ..Default::default()
+                    },
+                    cache: GraphCacheMetricsSnapshot::default(),
+                    cache_entries: Default::default(),
+                    cache_resident_bytes: Default::default(),
+                },
+            },
+        )
+        .collect()
+    }
+
+    /// The counters `NodeCounters` registers are exactly
+    /// `GraphOperationalMetricsSnapshot`'s scalars that are not derived — total
+    /// over the kernel's own enumeration, in both directions.
+    ///
+    /// This is what stops the wiring being advisory. Before it, a shard counter
+    /// added to the kernel would get a name from
+    /// [`every_counter_field_reaches_both_exports`], reach `/metrics`, and reach
+    /// the meter only if somebody remembered — and a missing OTLP series looks
+    /// exactly like a counter at rest. The `iff` is the whole assertion: a
+    /// registered derived row would double-count a histogram's `.sum` under a
+    /// second name, and an unregistered plain row is a silent hole.
+    #[test]
+    fn every_shard_counter_is_registered_as_an_instrument() {
+        let registered: Vec<(CounterSource, &str)> = otel_counter_instruments()
+            .iter()
+            .map(|row| (row.source, row.field))
+            .collect();
+
+        let enumerated: Vec<&'static str> = GraphOperationalMetricsSnapshot::default()
+            .counter_fields()
+            .map(|(field, _)| field)
+            .collect();
+        assert_eq!(
+            enumerated.len(),
+            35,
+            "the operational snapshot's scalar counters changed: {enumerated:#?}"
+        );
+
+        let mut derived = 0;
+        for field in &enumerated {
+            let row = otel_counter(CounterSource::Shard, field).expect("named for OTel");
+            let is_derived = matches!(row.export, OtelCounterExport::Derived(_));
+            derived += usize::from(is_derived);
+            assert_eq!(
+                registered.contains(&(CounterSource::Shard, *field)),
+                !is_derived,
+                "{field} is registered as an instrument iff it is not derived"
+            );
+        }
+        assert_eq!(
+            derived, 1,
+            "query_rows_duration_us is the one shard counter that restates a histogram sum"
+        );
+        assert_eq!(
+            registered.len(),
+            enumerated.len() - derived,
+            "otel_counter_instruments names something the operational snapshot does not \
+             enumerate: {registered:#?}"
+        );
+    }
+
+    /// One snapshot is on the meter and two are not, and the stopping point is
+    /// pinned rather than described.
+    ///
+    /// Three absences, each of which would otherwise be indistinguishable from an
+    /// oversight: the two unwired sources, named so that a reader knows the gap is
+    /// bounded and knows what closing it costs; and the error-class breakdowns,
+    /// which are absent because `cell_id × error.class` is ten series per cell
+    /// instead of one and that multiplier is a §1.4 decision, not a wiring detail.
+    #[test]
+    fn only_the_shard_scalars_are_registered_this_round() {
+        assert_eq!(METERED_COUNTER_SOURCES, &[CounterSource::Shard]);
+        let unwired: Vec<CounterSource> = CounterSource::ALL
+            .iter()
+            .copied()
+            .filter(|source| !METERED_COUNTER_SOURCES.contains(source))
+            .collect();
+        assert_eq!(
+            unwired,
+            vec![CounterSource::Client, CounterSource::ShardCache],
+            "the set of counter snapshots reaching /metrics alone changed"
+        );
+
+        let instruments = otel_counter_instruments();
+        for row in OTEL_CLASS_COUNTERS {
+            assert!(
+                !instruments
+                    .iter()
+                    .any(|instrument| instrument.source == row.source
+                        && instrument.field == row.field),
+                "{} is registered, so it now costs cell_id × error.class series",
+                row.field
+            );
+        }
+    }
+
+    /// A counter's unit is derived from its field name, so the derivation and both
+    /// name tables have to agree — in all three directions, or the derivation is
+    /// just a guess that happens to be right today.
+    ///
+    /// A microsecond total exported as a count is not a wrong number an operator
+    /// can see; it is a series whose scale has to be guessed, and guessed against
+    /// the `_microseconds` series `/metrics` renders from the same field.
+    #[test]
+    fn the_microsecond_counters_are_named_for_their_unit() {
+        let mut microseconds = 0;
+        for (source, field) in enumerated_counter_fields() {
+            let quantity = CounterQuantity::of_field(field);
+            let otel = otel_counter(source, field).expect("named for OTel");
+            let prometheus = prometheus_counter(source, field).expect("named for Prometheus");
+            // Derived rows have no name in either table, so there is nothing to
+            // cross-check them against — the field name is the only evidence and
+            // this test would be circular. Both of them are `_us`.
+            let Some(otel_name) = otel.export.name() else {
+                assert_eq!(quantity, CounterQuantity::Microseconds);
+                continue;
+            };
+            let prometheus_name = prometheus.export.name().expect("agreed to be a series");
+
+            microseconds += usize::from(quantity == CounterQuantity::Microseconds);
+            assert_eq!(
+                quantity == CounterQuantity::Microseconds,
+                otel_name.ends_with(".duration.sum"),
+                "{source:?}::{field} is a {quantity:?} counter named {otel_name}"
+            );
+            assert_eq!(
+                quantity == CounterQuantity::Microseconds,
+                prometheus_name.ends_with("_microseconds"),
+                "{source:?}::{field} is a {quantity:?} counter named {prometheus_name}"
+            );
+        }
+        assert!(
+            microseconds > 0,
+            "no counter is a microsecond total, so the derivation is untested"
+        );
+    }
+
+    /// Two tenants with work on one cell produce **one** series per counter,
+    /// carrying the sum.
+    ///
+    /// The failure this rules out is silent in a way the `/metrics` one is not.
+    /// `admin::tests::per_cell_counters_are_summed_across_scopes` guards a
+    /// duplicate series in a scrape, which Prometheus rejects outright; here the
+    /// series identity is the label set, so publishing per scope would make the
+    /// last tenant recorded *overwrite* the others and the cell would report one
+    /// tenant's traffic as its own — a plausible number, permanently low, with
+    /// nothing anywhere to say so.
+    #[test]
+    fn two_scopes_on_one_cell_sum_rather_than_overwrite() {
+        let shards = two_tenants_on_one_cell_and_one_alone();
+        let totals = shard_counter_totals(&shards);
+        let cells: Vec<&str> = totals.iter().map(|(cell_id, _)| *cell_id).collect();
+        assert_eq!(
+            cells,
+            vec!["cell-a", "cell-b"],
+            "one entry per cell, whatever the tenant count"
+        );
+
+        let value = |cell: &str, field: &str| {
+            totals
+                .iter()
+                .find(|(cell_id, _)| *cell_id == cell)
+                .and_then(|(_, fields)| fields.iter().find(|(name, _)| *name == field))
+                .map(|(_, value)| *value)
+                .unwrap_or_else(|| panic!("no {field} for {cell} in {totals:#?}"))
+        };
+        assert_eq!(value("cell-a", "write_attempts"), 7, "3 + 4, not 4");
+        assert_eq!(value("cell-a", "gc_duration_us"), 790, "700 + 90");
+        assert_eq!(value("cell-b", "write_attempts"), 5);
+
+        // Every enumerated field is present for every cell, including the ones
+        // that are zero: the recording loop drives off this, so a field dropped
+        // here is a series that silently stops rather than one that reads zero.
+        let enumerated = GraphOperationalMetricsSnapshot::default()
+            .counter_fields()
+            .count();
+        for (cell_id, fields) in &totals {
+            assert_eq!(fields.len(), enumerated, "{cell_id} lost a counter field");
+        }
+    }
+
+    /// No shard, no series — not a row of zeroes.
+    ///
+    /// A node that has opened no scope yet must publish nothing, because an
+    /// observable counter reporting a zero for a label set that does not exist is
+    /// how a dashboard grows rows for cells that were never hosted here.
+    #[test]
+    fn a_node_with_no_shards_publishes_no_counter_series() {
+        assert!(shard_counter_totals(&[]).is_empty());
     }
 }
