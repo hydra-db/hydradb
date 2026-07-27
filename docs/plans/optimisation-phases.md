@@ -48,6 +48,26 @@ turbolay depends on `graphblas-traversal` by path (turbolay `Cargo.toml:50`),
 behind the non-default cargo feature `graphblas`. Bench scripts pass
 `--features opencypher,graphblas`.
 
+> **Stale as of 2026-07-27 — read this before acting on the paragraph above.**
+> The sparse-kernel consolidation
+> (`docs/plans/2026-07-25-sparse-kernel-backend-consolidation.md`, Step 1,
+> `f80d9c6`) **deleted the `graphblas` cargo feature** and, with it, the path
+> dependency. `Cargo.toml` today declares no `graphblas-traversal` and no
+> `graphblas` feature; SuiteSparse is reached through turbolay's own FFI in
+> `src/sparse_kernel/graphblas.rs`, declared by `#[link(name = "graphblas")]`
+> and linked **unconditionally** — `build.rs` only contributes search paths.
+> SuiteSparse is the default kernel and the backend is now selected at runtime
+> by `GRAPH_MATRIX_KERNEL` / `SparseKernelBackend`, not at compile time.
+>
+> So **`--features opencypher,graphblas` no longer exists**: pass
+> `--features opencypher` and select the kernel by environment.
+> `scripts/query_bench.sh` already defaults to `FEATURES=opencypher`.
+>
+> This note annotates the flag rather than rewriting the plan. Phases 2–6
+> target the `rs-graphblas` repo, whose relationship to turbolay this paragraph
+> also describes; whether they are still the right phases is a question for
+> whoever picks the plan up, not a citation fix.
+
 ### Environment (this Mac)
 
 SuiteSparse comes from Homebrew (`suite-sparse 7.12.2`, GraphBLAS **10.3.1**,
@@ -133,8 +153,12 @@ the pure-Rust kernel, **not** GraphBLAS. Phase 1 flips this.
 ### Correctness gates (run for every code-changing phase)
 
 1. `cd rs-graphblas && cargo test --workspace` (with the env vars above).
-2. `cd turbolay && just ci` — or at minimum its graphblas targets:
-   `cargo test --features graphblas` and the graphblas example checks.
+2. `cd turbolay && just ci` — or at minimum `just test-opencypher` and
+   `just check-examples`. (Was "its graphblas targets: `cargo test --features
+   graphblas` and the graphblas example checks". The feature is gone; so are
+   `test-graphblas` and `check-examples-graphblas`, deleted in `425bedf` as
+   byte-identical to their siblings once the dead flag came off. SuiteSparse now
+   links into every build, so every test target already exercises it.)
 3. rs-graphblas discipline: FFI surface changes get a matching C baseline test
    in `graphblas-tests/c/` (see repo README; `scripts/check-constants.sh` guards
    constant drift). Consult `GraphBLAS.h` at

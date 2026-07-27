@@ -383,9 +383,17 @@ collection future parked mid-flight (one cache mutex held, `poll!` once, as in
 than returning `AdmissionRejected`. Against the current code it returns the
 error, which is the regression the test exists to pin.
 
-### Step 4 — amend the OTel plan
+### Step 4 — amend the OTel plan — **done, 2026-07-27**
 
-`docs/plans/2026-07-26-otel-metrics-span-links-and-alerting.md:205`–`:218` says a
+The BUG-2 entry in `docs/plans/2026-07-26-otel-metrics-span-links-and-alerting.md`
+now records that the promotable open is I/O-free, that the eviction close is
+where the milliseconds are, and that the double-open concern is a self-fence
+rather than waste. §3's finding is filed there as **BUG-4** with its own entry,
+is repeated in that document's §5.5, and is named a **prerequisite for M2**
+rather than a neighbour of it. §1.5's "the interval task will occasionally block
+for a shard open" is retracted in place. Steps 1–3 remain unimplemented.
+
+The original text of this step, for the record: `:205`–`:218` says a
 shard open is multi-millisecond and that the interval task "will occasionally
 block for a shard open". Both are wrong for the promotable path. Amend BUG-2 in
 place — that file already carries corrections in this style — to say the open is

@@ -223,18 +223,38 @@ types from `field_reassign_with_default`, so the pattern is warning-clean.
 
 ## Open items
 
-- **`just ci` cannot pass, and has not been able to since Step 1.** The
-  `graphblas` feature is gone from `Cargo.toml`, but the justfile still passes
-  `--features graphblas` in `test-graphblas`, `test-native`,
-  `check-examples-graphblas` and `check-examples-native` — all four are in the
-  `ci` recipe, so `just ci` fails at the first of them (`test-graphblas`) with
-  `error: the package 'slatedb-graph-kernel' does not contain this feature:
-  graphblas`. `smoke-graphblas` carries the same dead flag but is not in `ci`.
-  Deliberately deferred (2026-07-27): the four
-  recipes collapse into their non-graphblas siblings, which is a decision about
-  which feature sets CI should cover, not a find-and-replace.
-- `docs/plans/optimisation-phases.md` still references `--features graphblas` in
-  three places.
+- ~~**`just ci` cannot pass, and has not been able to since Step 1.**~~
+  **Fixed in `425bedf` (2026-07-27).** The four recipes that still passed the
+  deleted `--features graphblas` were resolved the way this item predicted —
+  `ci.yml` had already been migrated by Step 1, so the destination for each was
+  written down rather than a judgement call. `test-graphblas` and
+  `check-examples-graphblas` were **deleted** as byte-identical to `test` and
+  `check-examples` once the dead flag came off; `test-native` now mirrors
+  `ci.yml`'s full native feature set; `check-examples-native` is
+  `--features opencypher`; `smoke-graphblas` simply dropped the flag. Verified
+  end to end: `just ci` exits 0, 45 test binaries, 0 failures. No recipe in the
+  justfile passes `--features graphblas` today.
+
+  Two things that item did *not* cover and that are still true, recorded so the
+  next reader does not mistake the fix for a clean bill of health. `just ci` is
+  still not green, for an unrelated reason: under the default and
+  `chaos-harness` feature sets, `clippy -D warnings` fails on
+  `AtomicDurationHistogram::{bucket_index, record_micros, record}` in
+  `src/core/histogram.rs`, which are genuinely dead there because all three call
+  sites sit behind `#[cfg(feature = "opencypher")]`. That is a metrics-plan
+  leftover, not a sparse-kernel one, and it is documented in the justfile beside
+  the `clippy` recipe. And `just ci` gained six root-package clippy recipes in
+  `d72c70f`, so a green `just ci` now means something much closer to green CI
+  than it did when this item was written.
+- ~~`docs/plans/optimisation-phases.md` still references `--features graphblas`
+  in three places.~~ **Corrected there (2026-07-27), and the underlying premise
+  is worse than a flag.** That document is written against a tree where turbolay
+  depended on the `rs-graphblas` workspace by path behind a cargo feature.
+  Neither is true now: `Cargo.toml` has no `graphblas-traversal` dependency and
+  no `graphblas` feature, and SuiteSparse is reached through turbolay's own FFI
+  in `src/sparse_kernel/graphblas.rs`, linked unconditionally by `build.rs`. The
+  flag references are annotated; the phases that target the other repo are left
+  alone, since retargeting them is a plan rewrite rather than a correction.
 - `src/query/opencypher.rs:361` trips `clippy::useless_conversion` locally under
   `--features opencypher`. It is bindgen-type-dependent — the constant is
   already `u32` from Homebrew's libcypher-parser 0.6.2 but may not be against
