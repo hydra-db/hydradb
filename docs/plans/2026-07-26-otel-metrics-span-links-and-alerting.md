@@ -4,7 +4,7 @@ status: step-h3-complete
 date: 2026-07-26
 branch: Turbolay-V3.5
 base_commit: 6255ca3
-head_commit: 9cd10f2
+head_commit: 2a5a8d1
 tags:
   - observability
   - opentelemetry
@@ -100,9 +100,15 @@ scope against eviction, and the prerequisite for M2's measurement half — in
   therefore exported nowhere**, so the 500 ms rung's whole purpose — reconciling
   the mass above it against that counter (§1.10, H2's "done when") — is not
   performable on a `graph-node` scrape today.
-- **The observable-counter wrapper exists** (`9cd10f2`), so wiring counters to
-  the meter is a wiring task rather than a design one. Under the decided export
-  path it stays the lower-value half; `/metrics` already carries all 67.
+- **Counters now reach the meter, for one snapshot.** `9cd10f2` built the
+  wrapper; `2a5a8d1` registered the 34 registrable operational scalars, summed by
+  `cell_id` across scopes, and declared the scope of the round as a value
+  (`METERED_COUNTER_SOURCES`) rather than as a comment. Under the decided export
+  path this stays the lower-value half — `/metrics` already carries all 67 — but
+  the pattern is now proven against a real collector rather than designed.
+  `global::set_meter_provider` turns out to be **unreachable**, not merely
+  unwise: `opentelemetry` is not a dependency of the root package. "We chose not
+  to" and "we cannot" are different facts, and §1.5 said the former.
 
 **And a fifth recipe gap, outside this document's scope but found by it**
 (`6ba2511`): nothing executed the indexer's tests. `clippy-runtime` lints
@@ -2536,8 +2542,12 @@ longer carries any of it:
 5. **`slow_queries` and the transport counters reach no export**, so the 500 ms
    rung's reconciliation cannot be performed. Pinned as `TransportOnly` in
    `9cd10f2` rather than fixed, because `graph-node` holds no transport snapshot.
-6. **Counters through the meter** — the wrapper exists, no binary registers one.
-   Lower-value half by the export-path decision.
+6. **Counters through the meter, beyond the shard scalars** — `2a5a8d1` wired 34
+   of 67. Left: `ClientQueryMetricsSnapshot` (10, `Global`),
+   `GraphCacheMetricsSnapshot` (19, `PerCell`), and the two per-`error.class`
+   breakdowns, which need a `cell_id × error.class` decision (10 series per cell)
+   before they are wired rather than after. Lower-value half by the export-path
+   decision, and each is now a list entry rather than a discovery.
 7. **The `#[instrument]` migration** (~85 sites, `skip_all` plus explicit
    `fields(...)` mandatory). Deliberately deferred, not forgotten.
 8. **Steps 1 and 2 of the scoped-cluster plan** — pin that the promotable open
