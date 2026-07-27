@@ -1,3 +1,15 @@
+---
+title: GraphBLAS optimisation phases
+status: draft-for-review
+date: 2026-07-18
+branch: Turbolay-V3.5
+base_commit: 0a15b8d
+tags:
+  - graphblas
+  - performance
+  - sparse-kernel
+---
+
 # GraphBLAS optimisation phases
 
 Phased plan to measure and improve CPU performance of the SuiteSparse:GraphBLAS
