@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::otel_metrics::{CounterSource, ExportUnit};
+use crate::otel_metrics::{CounterSource, ExportUnit, FieldSource};
 use crate::readiness::NodeReadiness;
 
 /// One row of the Prometheus name table.
@@ -33,6 +33,15 @@ pub struct PrometheusHistogram {
     pub name: &'static str,
     /// Bound and sum unit. Must match the OTel row's, and a test says so.
     pub unit: ExportUnit,
+    /// Whether this binary has anything to render into the family.
+    ///
+    /// Must match the OTel row's, and
+    /// `crate::otel_metrics::tests::only_the_transport_histograms_declare_no_graph_node_source`
+    /// says so. Three of the five rows below are
+    /// [`FieldSource::GraphNode`]; the other two are named and rendered but have
+    /// no source in this process, which is a property of the *binary* and not of
+    /// the endpoint — see [`FieldSource`].
+    pub source: FieldSource,
 }
 
 /// The Prometheus name table. One row per histogram the kernel enumerates.
@@ -51,26 +60,31 @@ pub const PROMETHEUS_HISTOGRAMS: &[PrometheusHistogram] = &[
         field: "read_latency",
         name: "graph_client_operation_read_duration_seconds",
         unit: ExportUnit::Seconds,
+        source: FieldSource::GraphNode,
     },
     PrometheusHistogram {
         field: "write_latency",
         name: "graph_client_operation_write_duration_seconds",
         unit: ExportUnit::Seconds,
+        source: FieldSource::GraphNode,
     },
     PrometheusHistogram {
         field: "query_rows_latency",
         name: "graph_query_rows_duration_microseconds",
         unit: ExportUnit::Microseconds,
+        source: FieldSource::GraphNode,
     },
     PrometheusHistogram {
         field: "rpc_latency",
         name: "graph_query_transport_rpc_duration_microseconds",
         unit: ExportUnit::Microseconds,
+        source: FieldSource::TransportOnly,
     },
     PrometheusHistogram {
         field: "serve_latency",
         name: "graph_query_transport_serve_duration_microseconds",
         unit: ExportUnit::Microseconds,
+        source: FieldSource::TransportOnly,
     },
 ];
 
@@ -1352,10 +1366,14 @@ mod tests {
 
     /// The transport families render from the same enumeration and the same
     /// name table as everything else. They are asserted here rather than
-    /// through `/metrics` because this binary instantiates no
-    /// `TcpQueryServer` and no `TcpQueryCellClient`, so it holds no
-    /// `QueryTransportMetricsSnapshot` to feed them -- see the module note in
-    /// `otel_metrics.rs`.
+    /// through `/metrics` because both rows are
+    /// `crate::otel_metrics::FieldSource::TransportOnly` -- this binary holds no
+    /// `QueryTransportMetricsSnapshot`, for the reasons that type documents.
+    ///
+    /// So this test *is* the only exercise those two families get, which is why
+    /// it renders them from a hand-built snapshot rather than skipping them: a
+    /// name table row nothing ever renders is a row whose `le` arithmetic and
+    /// unit suffix nobody has checked.
     #[test]
     fn the_transport_families_render_from_the_same_enumeration() {
         let mut snapshot = QueryTransportMetricsSnapshot::default();

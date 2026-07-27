@@ -41,7 +41,10 @@ use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
 
 use opentelemetry::metrics::MeterProvider as _;
-use turbolay_telemetry::meter::{HistogramSpec, HistogramUnit, ObservableHistogram, LE_INFINITY};
+use turbolay_telemetry::meter::{
+    CounterSpec, CounterUnit, HistogramSpec, HistogramUnit, ObservableCounter, ObservableHistogram,
+    LE_INFINITY,
+};
 use turbolay_telemetry::semconv::{
     DB_OPERATION_READ, DB_OPERATION_WRITE, DB_SYSTEM_NEO4J, LE, L_CELL_ID, L_DB_OPERATION_NAME,
     L_DB_SYSTEM_NAME,
@@ -57,20 +60,37 @@ struct Series {
     operation: Option<String>,
     le: Option<String>,
     value: u64,
+    /// Whether the SDK classified the data point as a **monotonic** sum.
+    ///
+    /// Captured because it is the one property that distinguishes a counter from
+    /// a gauge on the wire, and getting it wrong is invisible in the value: a
+    /// non-monotonic sum makes every `rate()` and `increase()` over the series
+    /// wrong without changing a single number a dashboard displays directly.
+    monotonic: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 struct Capture(Arc<Mutex<Vec<Series>>>);
+
+/// One data point as the capture reads it out of a sum: its attribute set, its
+/// value, and whether the sum it came from is monotonic.
+type Point = (Vec<(String, String)>, u64, bool);
 
 impl PushMetricExporter for Capture {
     async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
         let mut captured = self.0.lock().expect("capture lock");
         for scope in metrics.scope_metrics() {
             for metric in scope.metrics() {
-                let points: Vec<(Vec<(String, String)>, u64)> = match metric.data() {
+                let points: Vec<Point> = match metric.data() {
                     AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
                         .data_points()
-                        .map(|point| (attributes_of(point.attributes()), point.value()))
+                        .map(|point| {
+                            (
+                                attributes_of(point.attributes()),
+                                point.value(),
+                                sum.is_monotonic(),
+                            )
+                        })
                         .collect(),
                     AggregatedMetrics::F64(MetricData::Sum(sum)) => sum
                         .data_points()
@@ -78,12 +98,13 @@ impl PushMetricExporter for Capture {
                             (
                                 attributes_of(point.attributes()),
                                 point.value().round() as u64,
+                                sum.is_monotonic(),
                             )
                         })
                         .collect(),
                     _ => Vec::new(),
                 };
-                for (attributes, value) in points {
+                for (attributes, value, monotonic) in points {
                     captured.push(Series {
                         metric: metric.name().to_string(),
                         unit: metric.unit().to_string(),
@@ -91,6 +112,7 @@ impl PushMetricExporter for Capture {
                         operation: lookup(&attributes, L_DB_OPERATION_NAME.key()),
                         le: lookup(&attributes, LE),
                         value,
+                        monotonic,
                     });
                 }
             }
@@ -364,6 +386,113 @@ fn read_and_write_share_one_instrument_and_stay_two_series() {
     provider.shutdown().expect("shutdown");
 }
 
+/// An [`ObservableCounter`] reaches the exporter as one **monotonic** `u64` sum
+/// per recorded label set, in the declared unit.
+///
+/// Three claims the observation vectors in `meter.rs` cannot make, because they
+/// stop at what the callback reports:
+///
+/// - The callback is *called at all*. An observable instrument whose callback the
+///   SDK never invokes is silent, and silence is indistinguishable from a counter
+///   that is genuinely zero.
+/// - The data point is monotonic. That is what makes it a counter rather than a
+///   gauge, and it is the property `rate()` rests on.
+/// - The `us` unit survives onto the metric. The µs sums are the counters an
+///   operator divides to get a mean, and a unit lost in registration is a series
+///   whose scale has to be guessed.
+#[test]
+fn a_counter_reaches_the_exporter_as_a_monotonic_sum_per_cell() {
+    let capture = Capture::default();
+    let reader = PeriodicReader::builder(capture.clone())
+        .with_interval(Duration::from_secs(3_600))
+        .build();
+    let provider = SdkMeterProvider::builder().with_reader(reader).build();
+    let meter = provider.meter("turbolay.test");
+
+    let counter = ObservableCounter::register(
+        &meter,
+        CounterSpec {
+            name: "turbolay.shard.gc.duration.sum",
+            description: "cumulative microseconds spent in GC",
+            unit: CounterUnit::Microseconds,
+        },
+    );
+    counter
+        .record(&[(L_CELL_ID, "cell-a")], 4_000)
+        .expect("one label");
+    counter
+        .record(&[(L_CELL_ID, "cell-b")], 9_000)
+        .expect("one label");
+    // Cumulative source: the later value replaces rather than adds.
+    counter
+        .record(&[(L_CELL_ID, "cell-a")], 4_500)
+        .expect("one label");
+
+    provider.force_flush().expect("flush");
+    let mut captured = capture.0.lock().expect("capture lock").clone();
+    captured.sort();
+
+    assert_eq!(
+        captured,
+        vec![
+            Series {
+                metric: "turbolay.shard.gc.duration.sum".to_string(),
+                unit: "us".to_string(),
+                cell_id: Some("cell-a".to_string()),
+                operation: None,
+                le: None,
+                value: 4_500,
+                monotonic: true,
+            },
+            Series {
+                metric: "turbolay.shard.gc.duration.sum".to_string(),
+                unit: "us".to_string(),
+                cell_id: Some("cell-b".to_string()),
+                operation: None,
+                le: None,
+                value: 9_000,
+                monotonic: true,
+            },
+        ],
+        "two cells, one series each, replaced not accumulated"
+    );
+
+    provider.shutdown().expect("shutdown");
+}
+
+/// A registered counter that was never recorded into must export **no** series.
+///
+/// The mirror of `an_unrecorded_histogram_exports_nothing`, and it matters more
+/// for counters: `graph-node` will register every counter instrument at boot and
+/// only ever record the cells it actually opens, so an instrument that reported a
+/// zero on registration would put a series on the wire for every cell in the
+/// fleet from every node in it.
+#[test]
+fn an_unrecorded_counter_exports_nothing() {
+    let capture = Capture::default();
+    let reader = PeriodicReader::builder(capture.clone())
+        .with_interval(Duration::from_secs(3_600))
+        .build();
+    let provider = SdkMeterProvider::builder().with_reader(reader).build();
+
+    let _counter = ObservableCounter::register(
+        &provider.meter("turbolay.test"),
+        CounterSpec {
+            name: "turbolay.shard.write.retries",
+            description: "write retries",
+            unit: CounterUnit::Count,
+        },
+    );
+
+    provider.force_flush().expect("flush");
+    assert!(
+        capture.0.lock().expect("capture lock").is_empty(),
+        "nothing recorded means no series"
+    );
+
+    provider.shutdown().expect("shutdown");
+}
+
 /// Every request the stand-in collector received: request path and raw body.
 type CapturedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
@@ -439,9 +568,9 @@ fn contains(haystack: &[u8], needle: &str) -> bool {
             .any(|window| window == needle)
 }
 
-/// **The end-to-end claim.** A histogram registered against the meter
-/// `TelemetryGuard::providers()` hands out leaves the process as an OTLP
-/// `/v1/metrics` request.
+/// **The end-to-end claim.** Instruments registered against the meter
+/// `TelemetryGuard::providers()` hands out leave the process as an OTLP
+/// `/v1/metrics` request — a histogram family *and* a counter, on one meter.
 ///
 /// Every other test in this file builds its own `SdkMeterProvider`, which is
 /// exactly the step production code was missing — so none of them could fail
@@ -450,6 +579,14 @@ fn contains(haystack: &[u8], needle: &str) -> bool {
 /// `PeriodicReader`'s own OS thread, the blocking HTTP client that thread
 /// requires, and the endpoint composition in `otlp::build`. If any one of those
 /// is wrong, nothing arrives.
+///
+/// Both instrument kinds are asserted in **one** test rather than two, and that is
+/// a constraint rather than a convenience: `turbolay_telemetry::init` installs the
+/// process-global `tracing` subscriber, so a second call in the same test binary
+/// returns `TelemetryError::AlreadyInitialised`. One process, one `init`, one
+/// guard — so the counter's proof of export shares this one, which incidentally
+/// makes it a stronger claim: the two kinds coexist on a single meter without one
+/// shadowing the other's registration.
 ///
 /// The body is checked as bytes rather than decoded: protobuf encodes strings
 /// literally, so the instrument name and the label key are substrings of the
@@ -467,21 +604,35 @@ fn a_metric_recorded_through_the_guards_meter_reaches_an_otlp_exporter() {
     config.export_timeout = Duration::from_secs(5);
 
     let guard = turbolay_telemetry::init(config).expect("telemetry installs");
-    let histogram = {
+    let (histogram, counter) = {
         let providers = guard
             .providers()
             .expect("an endpoint must produce providers");
-        ObservableHistogram::register(
-            &providers.meter("turbolay.graph_node"),
-            HistogramSpec {
-                name: "db.client.operation.duration",
-                description: "client query latency",
-                unit: HistogramUnit::Seconds,
-            },
-            &BOUNDS,
+        let meter = providers.meter("turbolay.graph_node");
+        (
+            ObservableHistogram::register(
+                &meter,
+                HistogramSpec {
+                    name: "db.client.operation.duration",
+                    description: "client query latency",
+                    unit: HistogramUnit::Seconds,
+                },
+                &BOUNDS,
+            )
+            .expect("the kernel ladder is ascending"),
+            ObservableCounter::register(
+                &meter,
+                CounterSpec {
+                    name: "turbolay.shard.write.retries",
+                    description: "optimistic write retries",
+                    unit: CounterUnit::Count,
+                },
+            ),
         )
-        .expect("the kernel ladder is ascending")
     };
+    counter
+        .record(&[(L_CELL_ID, "cell-a")], 17)
+        .expect("cell_id alone");
 
     let mut reads = [0u64; 18];
     reads[1] = 3;
@@ -517,6 +668,11 @@ fn a_metric_recorded_through_the_guards_meter_reaches_an_otlp_exporter() {
             .find(|(path, body)| {
                 path.ends_with("/v1/metrics")
                     && contains(body, "db.client.operation.duration.bucket")
+                    // Both kinds in the *same* frame: one collection cycle reads
+                    // every callback registered on the meter, so a counter
+                    // arriving a cycle later than the histogram would mean the
+                    // two are not on one pipeline.
+                    && contains(body, "turbolay.shard.write.retries")
             })
             .map(|(_, body)| body.clone());
         if let Some(body) = found {
@@ -556,6 +712,10 @@ fn a_metric_recorded_through_the_guards_meter_reaches_an_otlp_exporter() {
     assert!(
         contains(&body, LE),
         "the bucket bound label did not reach the exporter"
+    );
+    assert!(
+        contains(&body, L_CELL_ID.key()) && contains(&body, "cell-a"),
+        "the counter's only dimension did not reach the exporter"
     );
     // The deliberate semconv non-conformance, asserted rather than described:
     // `db.namespace` is required-if-applicable and it is applicable — the

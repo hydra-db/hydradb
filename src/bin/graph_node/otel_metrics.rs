@@ -77,12 +77,14 @@
 //! `otlp` feature, or with no OTLP endpoint configured, it is inert and starts
 //! no task at all.
 //!
-//! `record_transport` remains unfed: `graph-node` instantiates neither
-//! `TcpQueryServer` nor `TcpQueryCellClient`, so it holds no
-//! `QueryTransportMetricsSnapshot` to record. The name table and the rendering
-//! cover `rpc_latency` and `serve_latency` regardless, because the field lives
-//! in the kernel and the export must not be the thing that decides which
-//! binary is allowed to have it.
+//! `record_transport` remains unfed, and that is a *structural* fact rather than
+//! an unfinished table. [`FieldSource`] is the type that says so,
+//! [`TRANSPORT_ONLY_COUNTERS`] is the pinned list, and
+//! [`tests::the_transport_counters_are_pinned_as_sourceless`] plus
+//! [`tests::only_the_transport_histograms_declare_no_graph_node_source`] are what
+//! make it check rather than merely claim. See [`FieldSource::TransportOnly`] for
+//! the evidence, and [`CounterSource::field_source`] for the trip-wire that fires
+//! the day a source appears.
 //!
 //! # Why a counter family and not a histogram data point
 //!
@@ -152,6 +154,59 @@ impl ExportUnit {
     }
 }
 
+/// Whether `graph-node` holds a live source for a metric field, or whether only
+/// some other process does.
+///
+/// # Why the type exists
+///
+/// The kernel enumerates four metrics snapshots. `graph-node` obtains three of
+/// them and cannot obtain the fourth, and before this type said so the fact lived
+/// in three doc comments that a reader had to trust. It is now declared per row
+/// and checked against the kernel's own enumeration, so a name table with more
+/// rows than there are live sources reads as a deliberate shape rather than as an
+/// abandoned migration.
+///
+/// # The evidence, as of `1d66650`
+///
+/// It is **not** a feature gap. `graph-node` requires `server-runtime`
+/// (`Cargo.toml:117`), which implies `query-service-discovery` and therefore
+/// `query-transport` (`Cargo.toml:89-98`), so `TcpQueryServer` and
+/// `TcpQueryCellClient` are compiled into the binary. It is an architectural
+/// fact: nothing constructs one.
+///
+/// - `graph-node`'s query fan-in is Bolt (`ClientBoltServer::bind`,
+///   `src/bin/graph-node.rs:247`) and HTTP (`ClientHttpServer::bind`, `:260`),
+///   both over one `ClientQueryService` whose cell client is
+///   `Arc<ScopedRoutedGraphCluster>` — in-process (`:194-196`).
+/// - Cross-node work is routed at the **Bolt protocol** layer, by handing the
+///   client a routing table (`ObjectStoreBoltRoutingTableProvider`, `:236-241`),
+///   so there is no server-to-server query hop for a transport client to make.
+/// - `QueryTransportMetrics` is owned only by `TcpQueryCellClient`
+///   (`src/query/coordination.rs:1757`) and by `TcpQueryServer` and its runtime
+///   (`:1874`, `:1881`, `:1937`). The only non-test construction of either in the
+///   tree is `MultiCellQueryCoordinator::from_service_directory`
+///   (`src/query/coordination.rs:2799`), which no binary calls — it is a library
+///   facility for an embedder that brings its own fan-out.
+///
+/// So the transport snapshot has no `graph-node` source under any feature set or
+/// configuration, and inventing a transport server to have something to enumerate
+/// would be building production code to satisfy a name table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FieldSource {
+    /// `graph-node` holds a live snapshot of this field at runtime, so both
+    /// exports carry real series for it.
+    GraphNode,
+    /// Only a process that constructs a `TcpQueryServer` or a
+    /// `TcpQueryCellClient` holds this field's source. See the type's docs for
+    /// why `graph-node` is not such a process.
+    ///
+    /// A row marked this way is named and rendered — the field lives in the
+    /// kernel and an export must not be the thing that decides which binary is
+    /// allowed to have it — but on this binary it renders zeroes from a
+    /// default-constructed snapshot in a test and nothing at all in production.
+    TransportOnly,
+}
+
 /// One row of the OTel name table.
 #[derive(Clone, Copy, Debug)]
 pub struct OtelHistogram {
@@ -177,12 +232,25 @@ pub struct OtelHistogram {
     /// measure, so a second dimension would be a distinction the name already
     /// makes.
     pub operation: Option<&'static str>,
+    /// Whether this binary has anything to record into the instrument.
+    ///
+    /// Declared per row rather than inferred, and cross-checked against the
+    /// kernel's enumeration by
+    /// [`tests::only_the_transport_histograms_declare_no_graph_node_source`].
+    /// This column is the answer to "why does a five-row table have three live
+    /// families".
+    pub source: FieldSource,
 }
 
 /// The OTel name table. One row per histogram the kernel enumerates.
 ///
 /// Adding a histogram to a snapshot type and not adding it here fails
 /// [`tests::every_histogram_field_reaches_both_exports`].
+///
+/// Five rows, three of them with a `graph-node` source. That is not a table
+/// half-finished: see [`FieldSource`], and
+/// [`tests::only_the_transport_histograms_declare_no_graph_node_source`] for the
+/// assertion that keeps the three-of-five accounting honest.
 pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
     OtelHistogram {
         field: "read_latency",
@@ -190,6 +258,7 @@ pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
         description: "End-to-end client operation execution",
         unit: ExportUnit::Seconds,
         operation: Some(turbolay_telemetry::semconv::DB_OPERATION_READ),
+        source: FieldSource::GraphNode,
     },
     OtelHistogram {
         field: "write_latency",
@@ -197,6 +266,7 @@ pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
         description: "End-to-end client operation execution",
         unit: ExportUnit::Seconds,
         operation: Some(turbolay_telemetry::semconv::DB_OPERATION_WRITE),
+        source: FieldSource::GraphNode,
     },
     OtelHistogram {
         field: "query_rows_latency",
@@ -204,6 +274,7 @@ pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
         description: "Shard row-query execution",
         unit: ExportUnit::Microseconds,
         operation: None,
+        source: FieldSource::GraphNode,
     },
     OtelHistogram {
         field: "rpc_latency",
@@ -211,6 +282,7 @@ pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
         description: "Query-transport client RPC round-trip",
         unit: ExportUnit::Microseconds,
         operation: None,
+        source: FieldSource::TransportOnly,
     },
     OtelHistogram {
         field: "serve_latency",
@@ -218,6 +290,7 @@ pub const OTEL_HISTOGRAMS: &[OtelHistogram] = &[
         description: "Query-transport server executor time",
         unit: ExportUnit::Microseconds,
         operation: None,
+        source: FieldSource::TransportOnly,
     },
 ];
 
@@ -255,15 +328,22 @@ pub fn otel_instrument_groups() -> Vec<(&'static str, Vec<&'static OtelHistogram
 /// identifier would silently give one of them the other's name.
 ///
 /// There is deliberately **no variant for `QueryTransportMetricsSnapshot`**,
-/// whose twenty-three counters this binary cannot obtain: it instantiates
-/// neither `TcpQueryServer` nor `TcpQueryCellClient`, so it holds no transport
-/// snapshot to render. Its two *histograms* are named in both tables because
-/// `graph-node` renders them from a snapshot handed in by a test, and a name
-/// table that decided which binary may have a field would be the wrong thing --
-/// but a counter with no value to render and no name to render it under is
-/// better absent than invented. Adding the variant is what a future round that
-/// wires the transport in has to do, and the absence is what stops that being
-/// forgotten quietly.
+/// whose twenty-three counters this binary cannot obtain — see [`FieldSource`]
+/// for the evidence and [`TRANSPORT_ONLY_COUNTERS`] for the pinned list. Its two
+/// *histograms* are named in both tables because `graph-node` renders them from a
+/// snapshot handed in by a test, and a name table that decided which binary may
+/// have a field would be the wrong thing -- but a counter with no value to render
+/// and no name to render it under is better absent than invented.
+///
+/// **This enum is the trip-wire.** Both counter name tables are keyed by
+/// `(source, field)` and every renderer in [`crate::admin`] takes a
+/// `CounterSource`, so a transport counter cannot reach either export without a
+/// variant here. Adding one does not compile until
+/// [`CounterSource::field_source`]'s exhaustive match classifies it, and
+/// classifying it as [`FieldSource::TransportOnly`] fails
+/// [`tests::every_counter_source_has_a_graph_node_snapshot`] until the tables and
+/// a renderer exist. That is what stops the series staying quietly missing on the
+/// day a source appears.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CounterSource {
     /// `ClientQueryMetricsSnapshot`. One per node, not per shard.
@@ -273,6 +353,78 @@ pub enum CounterSource {
     /// `GraphCacheMetricsSnapshot`. One per shard.
     ShardCache,
 }
+
+impl CounterSource {
+    /// Every variant, so the tests that must be total over them can be.
+    ///
+    /// Kept in step with the enum by
+    /// [`tests::every_counter_source_has_a_graph_node_snapshot`], which asserts
+    /// the length alongside the classification — the one place a variant added
+    /// without being listed here would otherwise slip through.
+    pub const ALL: &'static [Self] = &[Self::Client, Self::Shard, Self::ShardCache];
+
+    /// Where `graph-node` obtains a snapshot of this source, or that it cannot.
+    ///
+    /// The match is exhaustive on purpose. A variant added to
+    /// [`CounterSource`] stops this compiling until its author decides which
+    /// answer is true, and the accompanying comment is where the runtime
+    /// call site goes.
+    pub const fn field_source(self) -> FieldSource {
+        match self {
+            // `ClientQueryService::metrics()`, held by `graph-node.rs:194` and
+            // read by `admin::metrics` at `admin.rs:648`.
+            Self::Client => FieldSource::GraphNode,
+            // `ScopedRoutedGraphCluster::local_shard_runtime_metrics()`, read by
+            // `admin::metrics` at `admin.rs:668`. Both snapshots arrive on the
+            // same `GraphShardRuntimeMetrics`.
+            Self::Shard | Self::ShardCache => FieldSource::GraphNode,
+        }
+    }
+}
+
+/// Every counter on `QueryTransportMetricsSnapshot`, which `graph-node` has no
+/// source for.
+///
+/// Written out rather than derived so the *absence* is a thing in the source
+/// tree: a reader who wonders why sixty-five counters are exported when the kernel
+/// declares eighty-eight finds the missing twenty-three named here, with
+/// [`FieldSource`] above explaining why. Pinned against the kernel's own
+/// enumeration by [`tests::the_transport_counters_are_pinned_as_sourceless`], so a
+/// counter added to that snapshot fails the build rather than joining a silent
+/// gap.
+///
+/// Note the three identifiers that also name a *different* measurement one layer
+/// up — `auth_failures`, `cancellations` and `backpressure_waits` are also fields
+/// of `ClientQueryMetricsSnapshot` (and `backpressure_waits` of
+/// `GraphOperationalMetricsSnapshot` besides), and those rows are exported. That
+/// collision is
+/// why both counter tables are keyed by `(source, field)` and never by `field`
+/// alone, and the pin test asserts it rather than leaving it to be rediscovered.
+pub const TRANSPORT_ONLY_COUNTERS: &[&str] = &[
+    "requests_started",
+    "requests_completed",
+    "requests_failed",
+    "auth_failures",
+    "namespace_access_denials",
+    "namespace_quota_waits",
+    "cancellations",
+    "cancelled_rejections",
+    "slow_queries",
+    "backpressure_waits",
+    "client_retries",
+    "bytes_sent",
+    "bytes_received",
+    "remote_latency_us",
+    "connections_accepted",
+    "connections_active",
+    "connections_rejected",
+    "connections_created",
+    "connections_reused",
+    "client_connection_waits",
+    "handshake_failures",
+    "idle_timeouts",
+    "forced_shutdowns",
+];
 
 /// How one counter reaches OTLP -- or why it does not reach it on its own.
 ///
@@ -859,6 +1011,12 @@ impl NodeHistograms {
     /// Unlabelled: only one of `rpc_latency` and `serve_latency` is ever
     /// non-empty on a given instance, so the instrument name already says which
     /// side of the wire it was measured on.
+    ///
+    /// **No production caller, by construction** — both rows are
+    /// [`FieldSource::TransportOnly`]. It exists so the two instruments have a
+    /// recording path the day a process that *does* hold a transport snapshot
+    /// registers them, and so `collect_once` does not have to grow a branch for a
+    /// snapshot it will never see.
     pub fn record_transport(
         &self,
         snapshot: &slatedb_graph_kernel::QueryTransportMetricsSnapshot,
@@ -1223,6 +1381,174 @@ mod tests {
                 "PROMETHEUS_COUNTERS names {:?}::{}, which no snapshot enumerates",
                 export.source,
                 export.field
+            );
+        }
+    }
+
+    /// The `PROMETHEUS_HISTOGRAMS`-names-five-when-three-have-sources
+    /// reconciliation, as an assertion rather than a paragraph.
+    ///
+    /// Three properties in one test because they are one claim:
+    ///
+    /// 1. Exactly the fields `QueryTransportMetricsSnapshot` enumerates are
+    ///    declared [`FieldSource::TransportOnly`], in **both** tables. Flip one
+    ///    row either way and this fails.
+    /// 2. The two tables agree per field, so a future round cannot decide the
+    ///    transport is reachable for `/metrics` and not for the meter.
+    /// 3. The count of `graph-node`-sourced rows equals the number of histograms
+    ///    the two snapshots this binary *does* hold enumerate — derived from the
+    ///    kernel, not written as `3`, so it stays true when H3 adds a family.
+    #[test]
+    fn only_the_transport_histograms_declare_no_graph_node_source() {
+        let transport: Vec<&str> = QueryTransportMetricsSnapshot::default()
+            .histogram_fields()
+            .map(|(field, _)| field)
+            .collect();
+        assert_eq!(
+            transport,
+            vec!["rpc_latency", "serve_latency"],
+            "the transport snapshot's histograms changed; reclassify the rows"
+        );
+
+        let expected = |field: &str| {
+            if transport.contains(&field) {
+                FieldSource::TransportOnly
+            } else {
+                FieldSource::GraphNode
+            }
+        };
+        for export in OTEL_HISTOGRAMS {
+            assert_eq!(
+                export.source,
+                expected(export.field),
+                "OTEL_HISTOGRAMS misclassifies {}",
+                export.field
+            );
+        }
+        for export in PROMETHEUS_HISTOGRAMS {
+            assert_eq!(
+                export.source,
+                expected(export.field),
+                "PROMETHEUS_HISTOGRAMS misclassifies {}",
+                export.field
+            );
+            let otel = otel_histogram(export.field).expect("named for OTel");
+            assert_eq!(
+                export.source, otel.source,
+                "{} has a source in one export and not the other",
+                export.field
+            );
+        }
+
+        let node_sourced = ClientQueryMetricsSnapshot::default()
+            .histogram_fields()
+            .count()
+            + GraphOperationalMetricsSnapshot::default()
+                .histogram_fields()
+                .count();
+        for table in [
+            PROMETHEUS_HISTOGRAMS
+                .iter()
+                .filter(|row| row.source == FieldSource::GraphNode)
+                .count(),
+            OTEL_HISTOGRAMS
+                .iter()
+                .filter(|row| row.source == FieldSource::GraphNode)
+                .count(),
+        ] {
+            assert_eq!(
+                table, node_sourced,
+                "a name table claims a live family this binary has no snapshot for"
+            );
+        }
+    }
+
+    /// The twenty-three counters that reach neither export, pinned.
+    ///
+    /// This is the test that makes the absence structural. Three directions:
+    ///
+    /// - The kernel's own enumeration equals [`TRANSPORT_ONLY_COUNTERS`], so a
+    ///   counter added to `QueryTransportMetricsSnapshot` fails here instead of
+    ///   joining a silent gap — and a counter *removed* from it leaves a dead
+    ///   entry that also fails.
+    /// - Every counter the kernel declares is accounted for: the sixty-seven rows
+    ///   `every_counter_field_reaches_both_exports` covers plus these
+    ///   twenty-three is the whole of it, so "sixty-five exported" is a complete
+    ///   statement rather than a count of what somebody got round to.
+    /// - Where a transport identifier *does* have a name-table row, a `graph-node`
+    ///   snapshot must also enumerate it. Otherwise the row would be exporting a
+    ///   transport number under a source that cannot produce one, which is the
+    ///   exact mistake a table keyed by `field` alone would invite —
+    ///   `auth_failures`, `cancellations` and `backpressure_waits` all take this
+    ///   branch (the last of them twice, since the shard has one too), so it is
+    ///   not vacuous.
+    #[test]
+    fn the_transport_counters_are_pinned_as_sourceless() {
+        let enumerated: Vec<&str> = QueryTransportMetricsSnapshot::default()
+            .counter_fields()
+            .map(|(field, _)| field)
+            .collect();
+        assert_eq!(
+            enumerated, TRANSPORT_ONLY_COUNTERS,
+            "the transport snapshot's counters changed; TRANSPORT_ONLY_COUNTERS is the pin"
+        );
+
+        let exported = enumerated_counter_fields();
+        assert_eq!(
+            exported.len() + TRANSPORT_ONLY_COUNTERS.len(),
+            67 + 23,
+            "every counter the kernel declares is either exported or pinned here"
+        );
+
+        let mut collided: Vec<(CounterSource, &str)> = Vec::new();
+        for field in TRANSPORT_ONLY_COUNTERS {
+            for source in CounterSource::ALL {
+                if otel_counter(*source, field).is_none() {
+                    continue;
+                }
+                collided.push((*source, field));
+                assert!(
+                    exported.contains(&(*source, *field)),
+                    "{source:?}::{field} has a name table row, but only the transport \
+                     snapshot enumerates that identifier"
+                );
+            }
+        }
+        assert_eq!(
+            collided,
+            vec![
+                (CounterSource::Client, "auth_failures"),
+                (CounterSource::Client, "cancellations"),
+                (CounterSource::Client, "backpressure_waits"),
+                (CounterSource::Shard, "backpressure_waits"),
+            ],
+            "the identifiers a transport counter shares with an exported one changed"
+        );
+    }
+
+    /// The trip-wire for the day a transport source appears.
+    ///
+    /// Vacuous today, and deliberately so: every [`CounterSource`] variant is
+    /// [`FieldSource::GraphNode`] and there is nothing else to say. What makes it
+    /// worth its lines is the *pair* — [`CounterSource::field_source`]'s
+    /// exhaustive match means a new variant does not compile until it is
+    /// classified, and a variant classified [`FieldSource::TransportOnly`] fails
+    /// here. So a future round that gives `graph-node` a transport snapshot gets a
+    /// red test naming exactly what it still owes, instead of twenty-three series
+    /// that stay missing because nobody remembered the tables.
+    #[test]
+    fn every_counter_source_has_a_graph_node_snapshot() {
+        assert_eq!(
+            CounterSource::ALL.len(),
+            3,
+            "CounterSource::ALL is out of step with the enum"
+        );
+        for source in CounterSource::ALL {
+            assert_eq!(
+                source.field_source(),
+                FieldSource::GraphNode,
+                "{source:?} has no graph-node snapshot, so its counters need name \
+                 table rows and a renderer in admin.rs before this can pass"
             );
         }
     }
