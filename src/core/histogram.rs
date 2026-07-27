@@ -35,6 +35,9 @@
 //! `docs/plans/2026-07-26-otel-metrics-span-links-and-alerting.md`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+// Only `record` names this, and `record` is gated; an ungated import would be
+// an `unused_imports` error under `-D warnings` with `default = []`.
+#[cfg(any(feature = "opencypher", test))]
 use std::time::Duration;
 
 /// Inclusive upper bounds, in microseconds.
@@ -86,6 +89,10 @@ impl AtomicDurationHistogram {
     /// to a bound lands in that bound's bucket, per `le` semantics. A value
     /// above every bound yields [`DURATION_BUCKET_BOUNDS_US`]`.len()`, the
     /// overflow bucket.
+    ///
+    /// Gated with the two recording methods for the reason given on
+    /// [`Self::record_micros`]; it has no caller but them.
+    #[cfg(any(feature = "opencypher", test))]
     #[inline]
     fn bucket_index(micros: u64) -> usize {
         DURATION_BUCKET_BOUNDS_US.partition_point(|bound| *bound < micros)
@@ -99,6 +106,23 @@ impl AtomicDurationHistogram {
     /// bounded, and the alternative is a lock on the query path. `count` is
     /// derived from the buckets rather than stored, so `_count` and the
     /// `+Inf` bucket agree by construction regardless.
+    ///
+    /// # Why this is gated and [`Self::snapshot`] is not
+    ///
+    /// Every non-test caller of either recording method sits behind
+    /// `opencypher`: `src/shard/query.rs` records `query_rows_latency` from
+    /// three `#[cfg(feature = "opencypher")]` functions, `src/query/
+    /// coordination.rs` is a module `src/query/mod.rs` declares only under
+    /// that feature, and `src/client/service.rs` reaches it through
+    /// `client-api → query-transport → opencypher`. With `default = []` these
+    /// methods are genuinely unreachable, so an ungated `pub(crate)` fn is a
+    /// `dead_code` error under the six `-D warnings` clippy lines in `ci.yml`.
+    /// `test` is the other arm because `src/core/histogram/tests.rs` and
+    /// `src/core/metrics/tests.rs` both record without `opencypher` on.
+    ///
+    /// [`Self::snapshot`] stays ungated: `GraphOperationalMetrics::snapshot`
+    /// in `src/core/metrics.rs` calls it on every build.
+    #[cfg(any(feature = "opencypher", test))]
     #[inline]
     pub(crate) fn record_micros(&self, micros: u64) {
         self.buckets[Self::bucket_index(micros)].fetch_add(1, Ordering::Relaxed);
@@ -106,6 +130,9 @@ impl AtomicDurationHistogram {
     }
 
     /// Record one observation from a [`Duration`].
+    ///
+    /// Same gate as [`Self::record_micros`], for the same reason.
+    #[cfg(any(feature = "opencypher", test))]
     #[inline]
     pub(crate) fn record(&self, duration: Duration) {
         self.record_micros(crate::codec::duration_micros_u64(duration));
