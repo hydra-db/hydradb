@@ -3,16 +3,29 @@ title: OTel metrics, span links and trace-driven alerting
 status: draft-for-review
 date: 2026-07-26
 branch: Turbolay-V3.5
-base_commit: 02eba8c
+base_commit: 6255ca3
 tags:
   - observability
   - opentelemetry
   - metrics
   - cardinality
   - alerting
+  - histograms
 ---
 
 # OTel metrics, span links and trace-driven alerting
+
+**Amended 2026-07-27 against `6255ca3`.** The original was written against
+`02eba8c`, which predates two commits of this plan's own lineage (`93b5077`,
+`6255ca3`); `base_commit` above is corrected accordingly. The amendment does
+four things: it settles all four of §5's open decisions from code rather than
+from a staging week, it records three live bugs a second pass through the same
+files turned up, it corrects a structural claim in §1.5 that does not survive
+contact with the OpenTelemetry metrics API, and it adds §1.9 (the naming
+decision) and §1.10 (percentiles, H1–H3) — the latter being what §1.5's
+"if percentiles are wanted later" was pointing at. Everything the second pass
+falsified is listed in "What the code audit falsified" below and also corrected
+in place; nothing that still holds has been removed.
 
 Goal: finish the observability story that `docs/plans/2026-07-26-otel-telemetry-crate.md`
 started, by taking the four things it deferred and deciding them — metrics
@@ -63,9 +76,9 @@ already being broken by the code it was told to leave alone.
   `append_node_metrics` (:145) are what actually reaches Prometheus today.
 - `src/bin/graph-indexer.rs` — `IndexerMetrics` (:200) and `indexer_metrics`
   (:935), the second, unrelated metrics vocabulary.
-- `src/engine/cluster.rs:1238` and `src/shard/lifecycle.rs:234-320` — the
+- `src/engine/cluster.rs:1265` and `src/shard/lifecycle.rs:234-330` — the
   collection path, and the reason half of it is lock-free and half is not.
-- `src/engine/index_store.rs` — `GraphIndexGeneration` (:11),
+- `src/engine/index_store.rs` — `GraphIndexGeneration` (:12),
   `build_graph_index` (:101), `publish_graph_index` (:236),
   `encode_graph_index_manifest` (:350) and `decode_graph_index_manifest`
   (:364). §2 is entirely about these.
@@ -95,6 +108,195 @@ already being broken by the code it was told to leave alone.
 - `cell-writer-fencing-pingpong` — three graph-nodes trading one cell's writer.
   The alert in §3 exists to catch this, and §3's honesty about baselines comes
   from the fact that nobody currently knows how often it happens.
+
+**Read for the 2026-07-27 amendment, and not read the first time**
+
+The four §5 decisions were all supposed to need a staging week. None of them
+did; each was settled by reading a file this plan had not opened. Those files
+are named here so the next reader can check the answers rather than re-derive
+them.
+
+- `src/client/service.rs:1570` (`validate_request`), `:1900`
+  (`record_result_metrics`), `:1923`, `:1941`, `:1956` — the order in which a
+  request is validated, fingerprinted and recorded. This is what settles the
+  fingerprint decision, and it is an ordering fact, not a workload fact.
+- `src/core/error.rs:202` — the exhaustive `ErrorClass` match with no `other`
+  arm. Ten classes are reachable, not the eleven the enum declares.
+- `crates/telemetry/src/bridge.rs` and `src/core/trace_context.rs` — the W3C
+  traceparent bridge that shipped in `1a28d92`, after this plan's §2 was
+  written. §2 now has to say why it does not serve the manifest hop.
+- `crates/telemetry/src/sampling.rs:66-74` — `is_always_sampled`, and the
+  reason §3's candidate 2 was wrong about full-scan spans being kept.
+- `src/core/cache.rs:237` — `resident_bytes` is already O(1), which strikes
+  §5's proposed remedy for the cache gauges before it is written.
+- `src/shard/lifecycle.rs:285-330` — the two gauge functions, read for their
+  guard *scoping* rather than their lock count. That is where BUG-1 was.
+- `src/engine/cluster.rs:1188`, `:1216-1230` — `cluster_for_scope`. BUG-2.
+- `src/query/coordination.rs:59`, `:926`, `:1211` — the query transport's
+  timeout, its slow-query threshold and its `remote_latency_us`. Two of the
+  three histogram bucket bounds in §1.10 are these constants, not taste.
+- `src/bin/graph_node/config.rs:223` — `DEFAULT_MAX_QUERY_RUNTIME_MS`, the
+  third forced bound.
+- `~/.cargo/registry/.../opentelemetry-0.32.0/src/metrics/instruments/mod.rs`
+  and `~/.cargo/registry/.../opentelemetry_sdk-0.32.1/src/metrics/` — read a
+  second time, this time for what is *absent*: there is no observable
+  histogram and no `MetricProducer`. §1.5's correction turns on that absence.
+- `~/.cargo/registry/.../opentelemetry_sdk-0.32.1/src/metrics/internal/mod.rs`
+  — `ValueMap::measure`, which is why §1.10 does not use OTel's own
+  `Histogram` type in the query path.
+
+## What the code audit falsified
+
+The prior plan has a section with this name, written after implementation. This
+one is written *before* implementation, from a second read of the same files at
+`6255ca3`. That is a weaker instrument and it still found nine things, three of
+which are live bugs. They are recorded here rather than silently corrected in
+the prose below, for the same reason the prior plan gives: each was believed on
+the strength of a code read, and a second code read is the cheapest thing that
+disproves one.
+
+### Three live bugs
+
+**BUG-1 — the cache gauges hold seven mutexes at once.**
+`graph_cache_entry_counts` and `graph_cache_resident_bytes`
+(`src/shard/lifecycle.rs:285`, `:317`) built their return value as a struct
+literal in tail position, with each field initialised directly from
+`lock().await`. The struct literal *is* the function's tail expression, so
+every `MutexGuard` temporary lived until the function returned: seven mutexes
+held simultaneously in the first function, five in the second, each acquisition
+an await point, all of them read-path mutexes. `BoundedGraphCache::get` takes
+`&mut self` for the LRU clock bump, so even a cache *hit* needs the exclusive
+lock. This is not twelve cheap acquisitions once a minute — it is a convoy that
+serialises the read path for the duration of the collection.
+
+Fixed by binding each lock to a `let` before the struct literal, which turns
+twelve overlapping acquisitions into twelve disjoint O(1) ones with zero
+behaviour change. **Fixed in the working tree at the time of this amendment.**
+§1.5 and §5 both reasoned about this code and both counted the locks correctly
+while missing that they overlapped.
+
+**BUG-2 — `cluster_for_scope` holds the `clusters` mutex across a shard open.**
+`src/engine/cluster.rs:1216-1230` holds `clusters` across
+`open_promotable_scoped_with_memory_options(...).await`. A shard open is
+multi-millisecond, and every other taker of that mutex — including the metrics
+collector §1.5 proposes, and the read path itself via `cluster_for_scope`
+(`:1188`) — inherits the stall.
+
+**Not fixed, and deliberately left open.** Narrowing the critical section is not
+a mechanical change: releasing the lock around the open admits a double-open
+race between two callers for the same scope, so the fix needs a
+one-open-per-scope guard (an in-flight map, or a per-scope `OnceCell`) designed
+on its own terms. It is recorded here so it is not lost, because it is the
+reason M2's "measure the collector against read-path p99" step could produce a
+confusing result: with BUG-2 present, a slow collection and a slow read can
+share a cause that has nothing to do with the cache gauges.
+
+**BUG-3 — `SAMPLING_FORCE` never fires.** `is_always_sampled`
+(`crates/telemetry/src/sampling.rs:66-74`) reads `turbolay.sampling.force` and
+`turbolay.query.full_scan` from the attributes present **at span start**. All
+seven sites that set them do so by post-creation `span.record`, having declared
+the field `tracing::field::Empty` at creation:
+`src/query/opencypher.rs:353`, `src/client/service.rs:1923`,
+`src/shard/query_optimizer.rs:963` and `:1047`, `src/shard/query.rs:540`,
+`:5333`, `:5409`; `turbolay.query.full_scan` likewise (recorded at
+`query_optimizer.rs:959`, `Empty` at `:1061`).
+
+So the force flag has never once been honoured. Only the three
+`ALWAYS_SAMPLE_SPANS` names fire, and only on roots. Every error trace is
+ratio-sampled at 5%, which means the `corruption`, `kernel` and `config`
+classes read zero for hours at a time. The existing unit tests pass because
+they hand attributes directly to `should_sample` and never exercise the
+`field::Empty` + `record` path; the regression test must reproduce the real
+path or it will pass against the bug.
+
+**Being fixed alongside this amendment.** This is the same class of mistake the
+prior plan's implementation record already contains — "`span.record()` destroyed
+the fields set at span creation" — and it is the second time the deferred-
+attribute pattern has broken something downstream of span creation. That is
+worth generalising: *anything that reads span attributes before the span
+completes is reading the creation-time set, not the recorded set.* The sampler
+is a head sampler; a decision made at head cannot see a field recorded later,
+by construction. Making `sampling.force` work at all means either setting it at
+creation or moving the decision to the collector's tail sampler.
+
+BUG-3 is load-bearing for two claims in this document. §1.7's consolation prize
+("filter the traces on the same attribute") and §3's candidate 2 ("sampling is
+handled, so this rate is exact") are both false until it is fixed. Both are
+corrected in place below.
+
+### The structural correction to §1.5
+
+**OpenTelemetry has no observable (asynchronous) histogram, and the Rust SDK
+has no `MetricProducer`.** `opentelemetry` 0.32 offers
+`u64_observable_counter`, `f64_observable_up_down_counter` and
+`u64_observable_gauge`, but for histograms only the *synchronous*
+`f64_histogram` / `u64_histogram`; and `opentelemetry_sdk` 0.32.1 has no
+`MetricProducer` trait to register an external source against. §1.5's central
+device — a cached snapshot read synchronously behind observable instruments —
+therefore covers counters and gauges and **does not extend to histograms at
+all**. The consequence is written into §1.5 and designed around in §1.10.
+
+### Smaller corrections, all of them factual
+
+- **The registry has 31 `turbolay.*` keys, not 26.** §1.3 and §1.4 classify 26,
+  so the partition test §1.4 proposes would fail on the day it was written.
+  The seven unclassified keys are `PLACEMENT_STATE`, `PLACEMENT_PREVIOUS_STATE`,
+  `PLACEMENT_LIVE_NODES`, `WRITER_REOPEN_DELAY_MS`, `WRITER_REOPEN_CAP_MS`,
+  `CONSISTENCY` and `WRITER_RETRIES`. §1.3 now places them.
+- **`error.class` is not in `ALL_TURBOLAY_KEYS`.** It is not `turbolay.`-
+  namespaced (`semconv.rs:172`), and neither is `db.system.name` (`:182`). The
+  proposed test iterates `ALL_TURBOLAY_KEYS`, so it would silently never
+  classify the one attribute §1.3 puts *first* on the safe-label list. An
+  `ALL_REGISTRY_KEYS` superset is required; §1.4 now says so.
+- **§1.6's "both read the same lock-free atomics" is false** for the two gauge
+  sets. Neither export is lock-free there — that is the whole subject of BUG-1.
+  The claim is true of the three counter structs and only of those.
+- **`acquire_local_write_guard` has 28 call sites, not 29.** The original count
+  included the definition. Cited twice, in "What we found first" and in §3
+  candidate 1. It changes nothing about the argument; it is corrected because
+  this document said its numbers would be checked.
+- **`ErrorClass` has 10 reachable values, not 11.** See §1.3.
+- **§2's premise is stale.** A W3C traceparent bridge shipped in `1a28d92`
+  (`crates/telemetry/src/bridge.rs`, `src/core/trace_context.rs`) after §2 was
+  written. §2 now has to explain why it does not serve the manifest hop rather
+  than write as though no propagation existed.
+
+### Drifted line references
+
+The prose was written against `02eba8c`. These are the citations that moved.
+
+| Cited | Correct at `6255ca3` |
+|---|---|
+| `src/engine/cluster.rs:1238` (Sources, §1.5) | **`:1265`** — `local_shard_runtime_metrics` |
+| "scoped-cluster mutex at `:1239`" (§1.5) | **`:1266-1272`** |
+| `log_fence_attribution` `src/core/state.rs:455` (§"What we found first", §3) | **`:493`** — and it was wrong when written; `:455` was the call site, now `:436` |
+| `src/engine/index_store.rs:11` (Sources, §2) | **`:12`** — `:11` is the derive attribute |
+| `semconv.rs:127-141` (§1.3) | **`:142-156`** |
+| `semconv.rs:229-237` (§1.4) | **`:249-257`** |
+
+`semconv.rs` shifted by a rule, which is worth stating so the next citation can
+be repaired without a diff: line numbers ≤120 are unchanged, 121–208 shifted by
+**+15**, and ≥209 by **+20**. No other file this document cites changed between
+`02eba8c` and `6255ca3`.
+
+### Confirmed, and not to be re-litigated
+
+Four claims survived a second, independent read and should not be checked a
+third time.
+
+- `/metrics` exports **8 of 65** counters (35 operational + 19 cache + 11
+  client). Exact. The whole fleet maintains 72 including the indexer's seven
+  counters — the indexer's nine *values* are seven counters plus `ready`, a
+  gauge, and `last_success_ms`, a timestamp — but the indexer is a separate
+  binary and its seven are not part of the 65.
+- The cardinality trap is sprung, and worse than stated: `scope` is a label on
+  all five per-shard series (`admin.rs:161`, `:162`, `:163`, `:199`, `:226`),
+  and `validate_component` (`src/codec.rs:175-187`) bounds only the *character
+  set* of a scope component. There is no length limit, and `MAX_NAMESPACE_DEPTH
+  = 8` bounds depth, not breadth. The label is unbounded in the strong sense.
+- `turbolay.query.access_path` is unbounded (`src/shard/query_optimizer.rs:862`).
+- `writer.fence_refresh` is on the write path (`src/shard/lifecycle.rs:262`,
+  `:523`).
 
 ## What we found first
 
@@ -157,6 +359,13 @@ counters, `:199` for `graph_cache_entries`, `:226` for
 attribute `crates/telemetry/src/semconv.rs:22-25` says must never become a
 metric dimension, and it has been one for as long as the endpoint has existed.
 
+It is also unbounded in the strong sense, which the original draft only
+implied. `validate_component` (`src/codec.rs:175-187`) constrains the
+*character set* of a scope component and nothing else — no length limit — and
+`MAX_NAMESPACE_DEPTH = 8` bounds how deep a namespace may nest, not how many
+distinct ones may exist. Nothing in the write path bounds the number of scopes
+a fleet will see.
+
 The rule this document is charged with protecting is therefore not a rule that
 is being upheld and might be broken. It is a rule that is being broken, in the
 code the prior plan said to leave untouched. §1.4 has to say what to do about
@@ -189,7 +398,7 @@ doc comment is wrong on this point and §1.4 fixes it.
 spans that are "low-volume and high-value" and always sampled. `refresh_writer_fence`
 (`src/core/state.rs:395`) is called from exactly two places —
 `acquire_local_write_guard` (`src/shard/lifecycle.rs:262`) and
-`validate_write_fence` (`:523`) — and `acquire_local_write_guard` has 29 call
+`validate_write_fence` (`:523`) — and `acquire_local_write_guard` has 28 call
 sites. It runs once per write, not once per incident.
 
 The always-sample rule only fires for spans with no valid parent
@@ -198,7 +407,8 @@ nothing is over-sampled. But the *span* is high-volume, and it matters for §3:
 the ping-pong alert cannot be "fence refreshes are happening". The
 distinguishing fields — `turbolay.writer.last_promoted_by` and its two
 companions — are recorded only in the fence arm (`src/core/state.rs:426-442`,
-via `log_fence_attribution` at `:455`), so they are present on a small subset
+via `log_fence_attribution`, defined at `:493` and called at `:436`), so they
+are present on a small subset
 of a large population. Any alert must key on those, and any dashboard must
 carry both numbers or the rate will look catastrophic.
 
@@ -209,9 +419,15 @@ carry both numbers or the rate will look catastrophic.
 Add an OTel meter provider to `crates/telemetry`, fed by **observable
 (asynchronous) instruments** whose callbacks read a snapshot cached by a
 separate tokio task. Export **all 65 counters and both gauge sets**, from both
-binaries, under one naming scheme. **Duplicate `/metrics` rather than replace
-it**, and treat that duplication as permanent, not transitional. Enforce the
-label allowlist with a type in `semconv.rs`, not a convention.
+binaries. **Duplicate `/metrics` rather than replace it**, and treat that
+duplication as permanent, not transitional. Enforce the label allowlist with a
+type in `semconv.rs`, not a convention.
+
+Two additions from the 2026-07-27 amendment. The naming scheme is **not** one
+vocabulary: it is the OTel semantic-convention name where one genuinely exists
+and `turbolay.*` everywhere else (§1.9). And three of the fifteen duration
+counters become **real histograms in the kernel** (§1.10), which is a kernel
+change this document originally put out of scope and now does not.
 
 The rest of this section argues each of those.
 
@@ -250,10 +466,15 @@ without either side renaming anything.
 
 ### 1.3 Which attributes may be labels
 
-The registry (`crates/telemetry/src/semconv.rs`) currently classifies its 26
-keys informally, in a doc comment, into "bounded and safe anywhere",
-"bounded in practice", and "spans only". That is not enough resolution to build
-a meter on. The classification below is the one to encode.
+The registry (`crates/telemetry/src/semconv.rs`) currently classifies its
+**31** `turbolay.*` keys informally, in a doc comment, into "bounded and safe
+anywhere", "bounded in practice", and "spans only". That is not enough
+resolution to build a meter on. The classification below is the one to encode.
+
+(The original draft said 26 and classified 26. That was a miscount, and it
+matters more than a miscount usually does, because §1.4's whole mechanism is a
+test asserting the classification is *total*. Seven keys were missing; they are
+placed at the end of this section.)
 
 **Safe as metric labels.**
 
@@ -262,9 +483,16 @@ a meter on. The classification below is the one to encode.
 | `turbolay.placement.ownership` | 4 | closed vocabulary `local`/`remote`/`unowned`/`unknown`, `semconv.rs:105-119`, recorded at `src/engine/cluster.rs:528-551` |
 | `turbolay.kernel` | 3 | the sparse-kernel ladder: `Adjacency`, `CompactCsc`, `SuiteSparse` |
 | `turbolay.outcome` | 3 | `Outcome` — success / skipped / failed |
-| `error.class` | 11 | `ErrorClass`, `crates/telemetry/src/error_class.rs:29-58` |
+| `error.class` | 10 | `ErrorClass`, `crates/telemetry/src/error_class.rs:29-58` — but see below |
 | `turbolay.cell_id` | cells per node | configured, `GRAPH_CELLS`, `src/bin/graph-indexer.rs:231` |
 | `turbolay.edge_type` | schema | relationship types the tenant defines |
+
+`error.class` is **10**, not the 11 the enum declares. `GraphError::class`
+(`src/core/error.rs:202`) is an exhaustive match with no `other` arm, and
+`ErrorClass::Other` is constructed nowhere in the tree. The eleventh value
+exists in the type and cannot reach a label. This is the kind of number that
+should be right, because it is the one an operator uses to decide whether a
+`{cell_id, edge_type, error_class}` series is affordable.
 
 The first four are closed enums and need no further argument. The last two are
 the ones worth being precise about: they are bounded per *node*, not globally,
@@ -280,10 +508,10 @@ after.
 | Attribute | Why not a label |
 |---|---|
 | `turbolay.scope` | one value per tenant, unbounded by product decision |
-| `turbolay.correlation_id` | one value per request, unbounded by construction; `semconv.rs:127-141` already says this in the strongest terms |
+| `turbolay.correlation_id` | one value per request, unbounded by construction; `semconv.rs:142-156` already says this in the strongest terms |
 | `turbolay.caller.step` | caller-supplied and untrusted. The prior plan's own worked example is `delete_source.delete_relates_batch_3_0` — a *batch index* inside the label. Unbounded by construction, and supplied by a process Turbolay does not control |
 | `turbolay.query.access_path`, `turbolay.query.optimizer_passes` | comma-joined sequences, combinatorial — see "What we found first" |
-| `turbolay.query.fingerprint` | bounded by distinct query shapes, which for a fixed application is small and for a multi-tenant engine accepting arbitrary Cypher is not. Not safe *by construction*, only by hoping about the workload |
+| `turbolay.query.fingerprint` | minted *before* validation, so an authenticated client mints series directly. Not workload-dependent — attacker-reachable. See §5 |
 | `turbolay.read_epoch`, `turbolay.commit_epoch`, `turbolay.base_sequence`, `turbolay.writer.epoch`, `turbolay.writer.last_promoted_epoch`, `turbolay.writer.last_promoted_at` | monotonic. A new value on every write or every tick |
 | `turbolay.generation` | a SHA-256 hex digest, `src/engine/index_store.rs:129`. A new value on every rebuild |
 | `turbolay.query.rows_estimated`, `turbolay.query.rows_returned` | measurements. They are what a histogram *records*, not what it is keyed by |
@@ -307,6 +535,31 @@ which is a trace-side query (§3) and would be a cardinality bomb as a label.
 **`turbolay.query.full_scan` is a bool and is the one genuinely new label
 worth adding.** Two values, and a `query_rows_started{full_scan="true"}` rate is
 the single most actionable series in this document.
+
+**The seven keys the original draft did not classify.**
+
+| Attribute | Placement | Why |
+|---|---|---|
+| `turbolay.placement.state` | **label**, 3 | closed vocabulary, `crates/placement/src/liveness.rs:167-173`, pinned by the test at `:664-669` |
+| `turbolay.placement.previous_state` | **label**, 3 | same vocabulary, same test |
+| `turbolay.placement.live_nodes` | span-only | a count. A measurement, not a key |
+| `turbolay.writer.reopen_delay_ms` | span-only | a duration. Measurement |
+| `turbolay.writer.reopen_cap_ms` | span-only | a duration. Measurement |
+| `turbolay.writer.retries` | span-only | a count. Measurement — and note the prior plan put `shard.write_txn` on the retry loop *specifically* to carry it |
+| `turbolay.consistency` | span-only | a per-request mode. Small vocabulary, but nothing pins it and no metric asks the question |
+
+The two placement states earn label status for the same reason
+`placement.ownership` does: a closed vocabulary with a test standing on it.
+`placement.state` is also what §3's candidate 5 alerts on, and candidate 5 is
+explicitly a *count of distinct instances in `shed`* — a question a metric can
+answer only if the state is a dimension.
+
+The other five are all measurements. That is the same distinction the table
+above draws for `rows_estimated` and `rows_returned`, and the fact that five
+more keys land on the same side of it is a small argument that the distinction
+is the right one: a registry key is either something you *group by* or
+something you *record*, and the ones that are recorded are exactly the ones
+§1.10 turns into buckets.
 
 ### 1.4 Making the rule structural
 
@@ -335,10 +588,14 @@ pub const L_KERNEL: MetricLabel = MetricLabel(KERNEL);
 pub const L_OUTCOME: MetricLabel = MetricLabel(OUTCOME);
 pub const L_ERROR_CLASS: MetricLabel = MetricLabel(ERROR_CLASS);
 pub const L_PLACEMENT_OWNERSHIP: MetricLabel = MetricLabel(PLACEMENT_OWNERSHIP);
+pub const L_PLACEMENT_STATE: MetricLabel = MetricLabel(PLACEMENT_STATE);
+pub const L_PLACEMENT_PREVIOUS_STATE: MetricLabel = MetricLabel(PLACEMENT_PREVIOUS_STATE);
 pub const L_QUERY_FULL_SCAN: MetricLabel = MetricLabel(QUERY_FULL_SCAN);
+pub const L_DB_SYSTEM_NAME: MetricLabel = MetricLabel(DB_SYSTEM_NAME);
+pub const L_LE: MetricLabel = MetricLabel(LE);   // §1.10, bucket upper bound
 
-pub const METRIC_LABELS: &[MetricLabel] = &[/* the seven above */];
-pub const SPAN_ONLY_KEYS: &[&str] = &[/* the nineteen others */];
+pub const METRIC_LABELS: &[MetricLabel] = &[/* the eleven above */];
+pub const SPAN_ONLY_KEYS: &[&str] = &[/* the twenty-three others */];
 ```
 
 The constructor stays private to the module, so `MetricLabel` cannot be built
@@ -346,19 +603,53 @@ from an arbitrary string outside `semconv.rs`. Every meter helper takes
 `&[(MetricLabel, &str)]` rather than `&[KeyValue]`. Passing `SCOPE` to a metric
 is then not a policy violation to be caught in review — it is a type error.
 
-The partition test is what makes it total, and it is the direct descendant of
-`no_registry_key_is_redacted` (`semconv.rs:229-237`):
+Three of those eleven were not in the original list and are worth a line each.
+`placement.state` and `placement.previous_state` are §1.3's late additions.
+`db.system.name` is a *consequence of §1.9's naming decision*: it has exactly
+one value (`neo4j`, `semconv.rs:185`), it costs nothing, and it is the
+attribute the vendor's database view keys off — putting `db.*` names on the
+wire and then omitting it would spend the cost of the decision and collect none
+of the benefit. `le` is §1.10's bucket bound; it needs a registry constant
+rather than a bare string precisely so the partition test below stays total.
+
+**The partition test as originally written would not have worked.** It is still
+the right idea, and it is still the direct descendant of
+`no_registry_key_is_redacted` (`semconv.rs:249-257`), but it iterates
+`ALL_TURBOLAY_KEYS` — and `error.class` (`semconv.rs:172`) and `db.system.name`
+(`:182`) are not `turbolay.`-namespaced and so are not in that list. The test
+would have passed while never classifying the attribute §1.3 puts first on the
+safe-label list. It needs a superset:
 
 ```rust
+/// Every key this crate defines, `turbolay.`-namespaced or not.
+/// `ALL_TURBOLAY_KEYS` remains the namespaced subset the redaction tests use.
+pub const ALL_REGISTRY_KEYS: &[&str] =
+    &[/* ALL_TURBOLAY_KEYS, then ERROR_CLASS, DB_SYSTEM_NAME, LE */];
+
 #[test]
 fn every_registry_key_is_classified_exactly_once() {
-    for key in ALL_TURBOLAY_KEYS {
+    for key in ALL_REGISTRY_KEYS {
         let label = METRIC_LABELS.iter().any(|l| l.key() == *key);
         let span_only = SPAN_ONLY_KEYS.contains(key);
         assert!(label ^ span_only, "{key} is in neither list, or in both");
     }
 }
+
+#[test]
+fn every_metric_label_is_a_registry_key() {
+    for label in METRIC_LABELS {
+        let key = label.key();
+        assert!(ALL_REGISTRY_KEYS.contains(&key), "{key} is not in the registry");
+    }
+}
 ```
+
+The second test is the one that catches the `le` mistake — a `MetricLabel`
+built from a string that was never added to the registry would otherwise
+silently escape the partition, which is exactly the hole `error.class` was
+already sitting in. With both tests, 34 keys partition into 11 labels and 23
+span-only, and neither list can gain a member without the other being
+considered.
 
 A new attribute cannot be added to the registry without deciding, in the same
 commit, whether it may be a metric dimension. That is the property worth
@@ -394,14 +685,23 @@ pub type Callback<T> = Box<dyn Fn(&dyn AsyncInstrument<T>) + Send + Sync>;
 
 The callback is `Fn`, not `async fn`. And the snapshot is only reachable
 through `ScopedRoutedGraphCluster::local_shard_runtime_metrics`
-(`src/engine/cluster.rs:1238`), which is `async` — it locks the scoped-cluster
-mutex at `:1239`, and per shard calls `graph_cache_entry_counts`
+(`src/engine/cluster.rs:1265`), which is `async` — it locks the scoped-cluster
+mutex at `:1266-1272`, and per shard calls `graph_cache_entry_counts`
 (`src/shard/lifecycle.rs:285`, seven `Mutex::lock().await`) and
-`graph_cache_resident_bytes` (`:304`, five more). Twelve async cache-mutex
+`graph_cache_resident_bytes` (`:317`, five more). Twelve async cache-mutex
 acquisitions per cell per collection, on the same mutexes the read path takes
 on every cache lookup. You cannot `.await` any of that inside an OTel callback,
 and `block_on` inside a callback that the SDK runs on its own OS thread
 (`periodic_reader.rs:171`) is how you deadlock a node.
+
+Two things about that path were wrong when this was written, and both are
+worse than the version above rather than better. Those twelve acquisitions were
+*overlapping*, not sequential — BUG-1, now fixed, and the reason "twelve cheap
+locks once a minute" was not the right way to think about the cost. And the
+scoped-cluster mutex at `:1266` is itself held across a shard open elsewhere in
+the same file — BUG-2, not fixed. The interval task will therefore occasionally
+block for a shard open before it takes a single cache lock, which is worth
+knowing before anyone attributes a collection stall to the gauges.
 
 Note the asymmetry, because it is the design: `graph_operational_metrics`
 (`src/shard/lifecycle.rs:238`) and `graph_cache_metrics` (`:234`) are
@@ -436,6 +736,31 @@ histogram built from a pre-summed total is a lie about the distribution. If
 percentiles are wanted later, that is a change to the kernel's counters, not to
 the export — and it should be argued on its own, because it costs a per-observation
 recording where today there is one `fetch_add`.
+
+That argument is now made, in §1.10, for three of the fifteen. Everything above
+stands: the twelve that stay are still sums, still exported as
+`ObservableCounter`, and `rate/rate` is still the only honest thing to do with
+them.
+
+**Correction: this section's device does not extend to histograms.** The whole
+shape above — a cached snapshot read synchronously behind an observable
+instrument — depends on the instrument having an *observable* form.
+`opentelemetry` 0.32 provides `u64_observable_counter`,
+`f64_observable_up_down_counter` and `u64_observable_gauge`; for histograms it
+provides only the synchronous `f64_histogram` and `u64_histogram`. There is no
+observable histogram in the API, and no `MetricProducer` trait in
+`opentelemetry_sdk` 0.32.1 to register an external source against either. Both
+escape hatches are absent, not merely awkward.
+
+The consequence is concrete and belongs in the runbook alongside the `scope`
+divergence: **bucket counts reach OTLP as a family of `ObservableCounter`s
+carrying an `le` label**, one series per bucket, rather than as an OTLP
+histogram data point. Semantically that is the same information — it is what a
+Prometheus histogram *is* — and `histogram_quantile` over the family works. But
+a vendor's native latency widget looks for a histogram data point and will not
+light up on a family of sums. That is a real cost of the SDK's shape and it is
+paid whichever naming scheme §1.9 picks; do not let anyone conclude the
+instrument was chosen carelessly.
 
 **Interval.** 60s, matching a Prometheus scrape and keeping the twelve cache
 locks per cell to once a minute. `OTEL_METRIC_EXPORT_INTERVAL` is the standard
@@ -476,11 +801,28 @@ is a worse system, and OTLP push is by construction contingent.
 *The two have different cost functions.* §1.4's `scope` divergence only works
 if both exist. Collapse to one and you have to pick which cost you pay.
 
-*Duplication is nearly free here.* Both read the same lock-free atomics. The
-marginal cost of the second export is one more read of a `Vec` the interval
-task already built. This is not the usual "two systems, two truths" trap,
-because there is exactly one source of truth — the `AtomicU64`s — and both
-exports are pure functions of it.
+*Duplication is nearly free here — for the counters.* The marginal cost of the
+second export is one more read of a `Vec` the interval task already built. This
+is not the usual "two systems, two truths" trap, because there is exactly one
+source of truth — the `AtomicU64`s — and both exports are pure functions of it.
+
+The original draft said "both read the same lock-free atomics", and **that is
+false for the two gauge sets.** `GraphCacheEntryCounts` and
+`GraphCacheResidentBytes` are not atomics and neither export path is lock-free
+there: both go through the twelve cache-mutex acquisitions of
+`src/shard/lifecycle.rs:285` and `:317`. The claim is true of
+`GraphOperationalMetricsSnapshot`, `GraphCacheMetricsSnapshot` and
+`ClientQueryMetricsSnapshot`, and true of nothing else.
+
+It matters because "free" was the argument for duplication, and for the gauges
+duplication is not free: `/metrics` pays the locks once per scrape and the
+interval task pays them again once per export interval. Aligning the two
+intervals is not enough — they are unsynchronised. Either accept two collections
+a minute (the recommendation: it is twelve O(1) acquisitions each, post-BUG-1),
+or have `/metrics` serve the interval task's cached `Arc` instead of collecting
+its own, which is a change to `/metrics` and therefore out of scope by §6. The
+first option is right; it is written down so the second is not rediscovered as
+though it were free.
 
 The one thing that must not happen is the two disagreeing about *names*. Pick
 the OTel names once, write them next to the Prometheus names in the runbook,
@@ -530,14 +872,45 @@ them *and* the sampling story from §3's baseline week is settled. Until then,
 span gives the same navigation — see the spike, filter the traces on the same
 attribute — without a pointer that can dangle.
 
+**With one caveat that BUG-3 introduces.** That consolation prize assumes the
+full-scan spans are actually in the backend to be filtered. They are not: the
+sampler never sees `turbolay.query.full_scan`, because it is recorded after
+span creation and `is_always_sampled` reads the creation-time attribute set
+(`sampling.rs:66-74`). Today a full-scanning query's spans are ratio-sampled
+at 5% like everything else, so "filter the traces on the same attribute"
+returns one in twenty. The navigation story here is contingent on the BUG-3 fix
+landing first, which is why it is first in the sequencing.
+
 ### 1.8 Sequencing
+
+**Two steps come before M1, and neither is a metrics step.**
+
+**BUG-3, the sampler fix, first.** It is the smallest change here and the most
+load-bearing: §1.7's navigation story, §3's candidate 2 and every "read it off
+the traces" fallback in this document are false while it stands. Fixing it also
+changes what the staging week will show, so doing it after the baseline would
+mean taking the baseline twice.
+
+**BUG-1, the guard scoping, second.** M2 is explicitly the step that measures
+collection cost against read-path latency; measuring it with the convoy present
+would measure the convoy.
+
+**Then H1, before M1** — see §1.10. The ordering is not aesthetic. M1 writes
+the `ObservableCounter` field list and the one-enumeration test that ties the
+meter's instrument list to `append_node_metrics`. H1 changes which fields exist
+on three of those snapshots — `execution_duration_us` and two others stop being
+standalone counters. Doing M1 first means writing that field list and that test
+against a shape H1 immediately amends, so both get written twice and the second
+writing is a merge rather than a decision.
+
+The full order is: **BUG-3 → BUG-1 → H1 → M1 → H2 → M2 → M3 → H3.**
 
 **Step M1 — the meter provider and the operational counters.** Add
 `"metrics"` to `opentelemetry-otlp` in the root `Cargo.toml`; add
 `SdkMeterProvider` to `otlp::Providers` (`crates/telemetry/src/otlp.rs:43`) and
-to its `shutdown` (`:50`); add `MetricLabel`, `METRIC_LABELS`, `SPAN_ONLY_KEYS`
-and the partition test to `semconv.rs`; add the interval task and the
-`ObservableCounter` set for `GraphOperationalMetricsSnapshot` and
+to its `shutdown` (`:50`); add `MetricLabel`, `METRIC_LABELS`, `SPAN_ONLY_KEYS`,
+`ALL_REGISTRY_KEYS` and both partition tests to `semconv.rs`; add the interval
+task and the `ObservableCounter` set for `GraphOperationalMetricsSnapshot` and
 `ClientQueryMetricsSnapshot`, labelled by `cell_id` only.
 
 **Done when** `write_retries`, `query_rows_failed` and `verifier_failures` —
@@ -559,6 +932,277 @@ dimensioned by `cell_id` and `edge_type`.
 **Done when** "which cell's index is failing" is answerable from a metric
 rather than only from a trace.
 
+**After H3, and outside the metrics work: the `#[instrument]` migration.**
+`#[instrument]` is the standard for new spans from here, and the existing
+hand-rolled `span!` + `enter` sites migrate to it. One rule is non-negotiable
+and belongs next to the decision rather than in a review comment: **always
+`skip_all` (or an explicit `skip(...)`) plus explicit `fields(...)`.** The macro
+records every function argument by default, which on the query path means query
+text and bind parameters would be recorded as span fields — defeating
+`crates/telemetry/src/redact.rs`, which is a denylist and cannot know the names
+the macro invents. The migration is sequenced last because it touches many
+files and changes no behaviour, so it is the step most safely interrupted.
+
+### 1.9 Naming: `db.*` where a semantic convention genuinely exists
+
+**Decision: use the OTel semantic-convention name wherever one genuinely
+exists, and `turbolay.*` for everything else.** §5 left this open and leaned
+the other way — one vocabulary, `turbolay.*` throughout, on the argument that a
+dashboard and a trace view should feel like one system. The decision goes the
+other way, for native database-viewer compatibility: the vendor's out-of-the-box
+database view keys off `db.*`, and a metric named `turbolay.query.duration`
+will never appear in it no matter how good it is.
+
+**The evidence, including the part that argues against the decision.** Of the
+72 counters across both binaries, **two** have a semconv name:
+
+| Kernel quantity | Semconv name | Status |
+|---|---|---|
+| client query duration (§1.10's histogram 1) | `db.client.operation.duration` | **stable** |
+| rows returned to the client | `db.client.response.returned_rows` | development |
+
+The other 70 become `turbolay.*`. So the decision buys native rendering for one
+stable metric and one unstable one, at the cost of a vocabulary split — an
+operator reading a dashboard sees two namespaces and has to know which is which.
+That is a real cost and it is the honest reason §5 leaned the other way. It is
+outweighed because the one metric that does map is the *latency* metric, which
+is the one every database view is built around and the one an operator reaches
+for first.
+
+**And the decision is deliberately non-conformant in one dimension.** Semconv
+marks `db.namespace` as required-if-applicable on `db.client.*`. It is
+applicable here — the namespace is the `scope` — and it is **omitted anyway**,
+because `scope` is the unbounded tenant root §1.4 exists to keep off metrics.
+Emitting a conformant `db.client.operation.duration` would mean emitting the
+one label this entire section is written to prevent. So the series is emitted
+without it, knowingly, and **this must be in the runbook** next to the `scope`
+divergence, because a conformance checker will flag it and the flag will look
+like a bug.
+
+Two consequences to design around rather than discover:
+
+- **The unit.** Semconv fixes `db.client.operation.duration` in **seconds**;
+  §1.10's ladder is in microseconds because that is what the kernel measures
+  in. The kernel keeps µs; the export layer divides the bucket bounds by 1e6
+  for that one instrument. Since §1.10 exports the bounds once from the library
+  (so the two renderings cannot disagree), this is one conversion in one place
+  — but it has to be *there*, and a bound table in seconds must never leak back
+  into the kernel.
+- **The widget still will not light up.** §1.5's correction means the buckets
+  reach OTLP as an `ObservableCounter` family with an `le` label rather than as
+  a histogram data point. A vendor view that wants a histogram will not find
+  one, whatever the metric is called. So the compatibility this decision is
+  made for is *partial*: `db.system.name` and the metric name get the series
+  into the database view's world; the native latency panel needs a data-point
+  type the SDK cannot produce from a cached snapshot. Recording this here so
+  nobody concludes, on seeing an empty panel, that the naming decision was
+  implemented wrong.
+
+`db.system.name` becomes a metric label as a direct consequence — one value,
+`neo4j` (`semconv.rs:185`), and the attribute the database view keys on. See
+§1.4.
+
+### 1.10 Percentiles: a duration histogram in the kernel (H1–H3)
+
+§1.5 says that if percentiles are wanted, "that is a change to the kernel's
+counters, not to the export — and it should be argued on its own". This is that
+argument. It is in §1 rather than in its own top-level section because it is the
+same export, the same interval task and the same label discipline; what changes
+is what the kernel records.
+
+**Why now rather than later.** A mean is the wrong statistic for latency and
+everyone knows it, but the operational trigger is narrower than that: the
+`slow_queries` counter (`src/query/coordination.rs:4349`) fires at a 500 ms
+threshold (`:926`) and there is currently nothing that reconciles with it. When
+`slow_queries` rises, the only available follow-up is "the mean also rose,
+somewhat". A histogram whose ladder includes 500 ms turns that into an
+arithmetic identity: the mass above the 500 ms bound *is* the slow-query count,
+and the two disagreeing is a bug in one of them.
+
+#### The type, and why not any of the alternatives
+
+**Not OTel's own `Histogram`.** `ValueMap::measure`
+(`opentelemetry_sdk-0.32.1/src/metrics/internal/mod.rs`) takes an `RwLock` read,
+hashes a `Vec<KeyValue>` for the map lookup, and then takes a
+`std::sync::Mutex` *per attribute set*. A lock, a hash and a `Vec` allocation
+per observation, against the single relaxed `fetch_add` this codebase currently
+pays. It would be the first non-lock-free metric in the tree, and it would be
+in the query path. There is also a structural reason: `crates/telemetry`'s
+`Cargo.toml` forbids the kernel from depending on it, and the kernel is where
+the observation happens.
+
+**Not `hdrhistogram`** — roughly 1,500 buckets, which is superb for a local
+profile and unexportable as series. **Not a DDSketch crate** — the bucket set is
+not fixed, and neither Prometheus exposition nor OTel explicit-bucket histograms
+can carry a bucket set that changes shape between scrapes.
+
+**A fixed-bound array in `src/core/metrics.rs`, no new dependencies.** Seventeen
+finite bounds in microseconds, giving an 18-element array whose last element is
+the `+Inf` overflow, plus a `sum_us`:
+
+```rust
+[100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000,
+ 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000, 30_000_000]
+```
+
+Three of those bounds are **forced by code, not chosen by taste**, and that is
+the reason to write them down rather than reach for a round-number ladder:
+
+- **500 ms** is `slow_query_log_threshold` (`src/query/coordination.rs:926`).
+  Above, and the tail cannot be reconciled with the `slow_queries` counter.
+- **30 s** is both `DEFAULT_MAX_QUERY_RUNTIME_MS`
+  (`src/bin/graph_node/config.rs:223`) and `DEFAULT_QUERY_TRANSPORT_TIMEOUT_MS`
+  (`src/query/coordination.rs:59`). It is where the system gives up, so it is
+  where the last finite bucket must end; everything past it is a timeout, not a
+  slow query.
+- **100 µs** is the floor because nothing user-facing completes below it except
+  a pure cache hit. Buckets below it would all be the same bucket.
+
+**No `count` field.** Derive it by summing the buckets, so `_count` and
+`le="+Inf"` agree by construction rather than by two `fetch_add`s staying in
+step. **No min/max** — each needs a CAS loop, and neither has anywhere to go in
+Prometheus or OTLP exposition.
+
+**`#[repr(align(64))]` is load-bearing.** Without it the bucket array shares a
+cache line with whatever `AtomicU64` the struct layout puts next to it, and the
+histogram's writes invalidate a neighbouring counter's line on every
+observation. 152 B becomes 192 B padded, which is the cheapest 40 bytes in this
+document. Cost per observation is roughly 10 ns — against the ~40 ns the
+existing `Instant::now()` pair already costs at the same sites, so the marginal
+cost of recording a distribution instead of a sum is under a third of what
+measuring the duration already costs.
+
+#### Convert three, not fifteen
+
+There are fifteen `*_duration_us` counters. Three become histograms.
+
+1. **`ClientQueryMetricsSnapshot::execution_duration_us`**
+   (`src/client/service.rs:651`, recorded at `:1271`). Process-global, and both
+   transports funnel through `execute_prepared_page_inner` (`:1163`), so one
+   histogram covers Bolt and HTTP. **Split read from write on
+   `QueryTransportAction`**: `record_result_metrics` (`:1900`) ignores the
+   action today, so a mutation commit and a cached read land in the same
+   distribution. That conflation is invisible in a mean and glaring in a p99,
+   which is a small argument that the mean was hiding it rather than that
+   nobody noticed.
+2. **`GraphOperationalMetricsSnapshot::query_rows_duration_us`**
+   (`src/core/metrics.rs:116`; sites `src/shard/query.rs:517`, `:4732`,
+   `:4746`). Per-shard. **Label by `cell_id` only, never `cell_id × edge_type`**
+   — an 18-series bucket family times 96 is 1,728 series per instrument per
+   node, which is the point at which §1.3's arithmetic stops being affordable.
+3. **`QueryTransportMetricsSnapshot::remote_latency_us`**
+   (`src/query/coordination.rs:1211`). **Split client from server**: the same
+   field is fed from an RPC round-trip (`:2331`, `:2346`) and from server-side
+   executor time (`:4345`). `remote_latency` measured on the server is not
+   remote, and mixing a network round-trip into the same distribution as local
+   execution makes both unreadable.
+
+**Not converting, and the reason is the same for all of them.**
+`prepare_duration_us` has a narrow distribution and a mean describes it.
+`graph_compute_queue_us` / `graph_compute_duration_us` are the strongest
+"next", ranked fourth, and should wait for a question that needs them. The
+artifact-lookup and graphblas-cache durations have one code path each. And all
+the background durations — `gc_duration_us`, `verifier_duration_us`,
+`artifact_build_duration_us`, `artifact_publish_duration_us` and the five
+`bulk_import_*_us` — stay sums for three reasons that compound: they run of the
+order of once a minute, so a p99 over five samples is noise; the
+`artifact.build`, `artifact.publish` and `artifact.gc` spans already cover them
+at effectively 100% sampling, so the distribution is already available where it
+is actually asked for; and they would need a second ladder in
+seconds-to-minutes, which is a second constant to keep in sync with a second
+set of thresholds.
+
+#### Backward compatibility, and one deletion that is not optional
+
+**Delete the standalone `execution_duration_us: AtomicU64` and derive the
+snapshot field from the histogram's sum** in `ClientQueryMetrics::snapshot()`.
+Verified: it is written at exactly one site (`:1271`) and read at exactly one
+(`:682`). Keeping both means two `fetch_add`s on one quantity and two numbers
+that can disagree, which is the failure this document keeps arguing against
+elsewhere. Same for `query_rows_duration_us` and `remote_latency_us`. The
+public snapshot field keeps its name and type; only its provenance changes.
+
+`DurationHistogramSnapshot` must derive `Clone + Debug + Default + Eq +
+PartialEq`. It lands inside `ClientQueryMetricsSnapshot` and
+`GraphOperationalMetricsSnapshot`, and transitively inside
+`GraphShardRuntimeMetrics` (`src/engine.rs:119`) and
+`ScopedGraphShardRuntimeMetrics` (`:128`), all of which derive all five.
+`[u64; 18]` satisfies all five. **Do not use `Vec<u64>`** — it allocates on
+every snapshot, and the snapshot is taken per shard per interval. **Do not add
+`#[non_exhaustive]`** — it forbids `..Default::default()` for embedders, and
+these structs are constructed that way in tests.
+
+#### One enumeration, two exports
+
+The library exposes `counter_fields()` and `histogram_fields()` keyed by the
+**Rust identifier**. Neither exposition vocabulary — Prometheus `graph_*` names,
+OTel `db.*`/`turbolay.*` names — appears in the kernel; the two name tables live
+in the binary, which is where §1.6's "the two must not disagree about names"
+test belongs. Add `every_histogram_field_reaches_both_exports` alongside it: it
+fails `cargo test` until both names have been chosen for a newly added field,
+which is the property §1.6 wanted and now gets for histograms too. The bucket
+bounds are exported once from the library so the Prometheus rendering and the
+OTLP rendering cannot disagree about where a bucket ends.
+
+#### Steps
+
+**Step H1 — the type and the three conversions. Kernel only, nothing
+exported.** Add `DurationHistogram` / `DurationHistogramSnapshot` to
+`src/core/metrics.rs`; convert the three sites; split read/write on
+`QueryTransportAction` and client/server on `remote_latency_us`; delete the
+three standalone `AtomicU64`s and derive their snapshot fields; add
+`counter_fields()` / `histogram_fields()`.
+
+**Done when** `/metrics` output is byte-identical to before — which it will be
+**by construction**, not by luck: no duration counter is exported today
+(`admin.rs:112-130` exports five client counters, none of them durations;
+`:159-174` exports three operational, likewise), so H1 cannot change a byte of
+it. And when the three derived snapshot fields equal what the deleted atomics
+would have held, asserted in a unit test rather than eyeballed.
+
+**Step H2 — export the bucket family.** One `ObservableCounter` per bucket per
+histogram, carrying `L_LE`; plus `_sum`; `_count` derived from the buckets. The
+`db.client.operation.duration` family renders its bounds in seconds per §1.9;
+everything else stays in microseconds under a `turbolay.*` name. Both exports
+fed from `histogram_fields()`.
+
+**Done when** `histogram_quantile(0.99, …)` over the exported family in staging
+agrees with a p99 computed directly from the same node's raw snapshot to within
+one bucket, and the mass above the 500 ms bound matches the `slow_queries`
+counter over the same window.
+
+**Step H3 — the runbook and the dashboards.** Deliberately last, and a real
+step rather than a documentation afterthought, because every failure mode of a
+bucket histogram is a *misuse* failure and the misuses are predictable.
+
+**Done when** the runbook states, in these terms:
+
+- **The quantile is an estimate.** Worst-case relative error is about
+  (bucket ratio − 1), which for this ladder is 20–30% in practice. It answers
+  "is p99 10 ms or 100 ms" and "did it move 2×". It does **not** answer "did
+  p99 go from 42 ms to 47 ms", and an alert phrased that way will be noise.
+- **Do not average p99s across nodes.** Summing the bucket families and then
+  applying `histogram_quantile` is correct; averaging per-node p99s is
+  arithmetically meaningless. Nothing in the pipeline prevents the second, so
+  it is dashboard discipline or nothing.
+- **There is no per-tenant or per-fingerprint breakdown, and there will not
+  be.** This is the first thing an operator will ask for, and the answer is no
+  at this cost — see §5 on the fingerprint. "Which tenant got slow" remains a
+  trace question.
+- **Sum and buckets can skew by in-flight concurrency.** They are two
+  independent relaxed `fetch_add`s, so a snapshot taken between them
+  undercounts the sum by at most the number of observations in flight. `count`
+  is derived from the buckets, so `_count` and `le="+Inf"` never skew.
+
+**Revisit trigger, falsifiable.** The first time an alert of the form "p99 rose
+more than X% week-over-week" fires on bucket-boundary noise, or fails to fire on
+a real regression that stayed inside one bucket. Secondary: if any histogram
+shows 90% or more of its mass in two adjacent buckets, **re-cut the ladder
+first** — it is one constant — before anyone reaches for a sketch. Stating it
+this way is the same discipline §2 applies to span links: a named condition
+under which the decision is wrong, rather than "revisit if it proves
+insufficient".
+
 ## 2. Span links from the write path to the indexing path
 
 The prior plan adopted attribute-based correlation — `cell_id` plus
@@ -568,12 +1212,40 @@ persisted storage format. That deferral was correct. Having now read the
 format, it should be **deferred indefinitely**, and the reason is stronger than
 "it changes a format".
 
+### First, a premise that changed under this section
+
+This section was written as though no trace context crossed a process boundary
+in Turbolay. That is no longer true. `1a28d92` shipped a W3C `traceparent`
+bridge — `crates/telemetry/src/bridge.rs` and `src/core/trace_context.rs` — so
+a trace started on one graph-node continues on another across the query
+transport, and the prior plan's Step 5b record explains what it cost.
+
+It does not, however, do the job this section is about, and the reason is
+worth stating precisely because "we already have propagation" is exactly the
+argument someone will make against §2's conclusion.
+
+The bridge propagates across a **synchronous RPC**: caller and callee overlap
+in time, the caller's span is still open, and the context rides in a request
+frame that is serde JSON with no `deny_unknown_fields` — invisible to an old
+peer in both directions, no version bump, no rollout step. The write-to-index
+hop is **store-and-forward**: the write commits and its trace ends; minutes or
+hours later a *different process* reads a manifest out of object storage and
+builds an index from it. There is no live request to carry a header on. The
+only medium that spans the gap is the persisted manifest itself, and a manifest
+is a strict-arity tab-separated line read by every node in the fleet — which is
+the entire subject of the rest of this section.
+
+So the two hops look alike and are not: one adds an optional field to a
+self-describing wire format between two processes that are talking, and the
+other adds a field to a storage format read by processes that have not been
+deployed yet. The cheapness of the first is not evidence about the second.
+
 ### What the format change would actually be
 
 There are two persisted manifests, both tab-separated single lines with a magic
 first field and a strict field count.
 
-`GraphIndexGeneration` — `src/engine/index_store.rs:11`, encoded at `:350`:
+`GraphIndexGeneration` — `src/engine/index_store.rs:12`, encoded at `:350`:
 
 ```
 turbolay-index-current-v1 \t cell_id \t edge_type \t base_sequence \t
@@ -692,13 +1364,13 @@ phrased that way, and the baseline is what the staging week is for.
 distinct `turbolay.writer.last_promoted_by` over a five-minute window. A count
 above one *is* the duel — the `cell-writer-fencing-pingpong` incident stated as
 a query. The mechanism is already in place: `log_fence_attribution`
-(`src/core/state.rs:455`) reads the advisory cell-writer record and the three
-fields are promoted onto the enclosing span.
+(`src/core/state.rs:493`, called at `:436`) reads the advisory cell-writer
+record and the three fields are promoted onto the enclosing span.
 
 **The trap, and it is specific.** The three `last_promoted_*` attributes are
 recorded **only in the fence arm** (`src/core/state.rs:426-442`). Every other
 `writer.fence_refresh` span — the overwhelming majority, one per write across
-29 `acquire_local_write_guard` call sites — has them empty. An alert written
+28 `acquire_local_write_guard` call sites — has them empty. An alert written
 against "fence refresh spans" instead of "fence refresh spans with
 `last_promoted_by` set" is measuring write throughput.
 
@@ -708,6 +1380,15 @@ against "fence refresh spans" instead of "fence refresh spans with
 distinct values. Either force full sampling for spans carrying
 `last_promoted_by`, or accept that the alert detects sustained ping-pong and
 not a single exchange — and write which one it is into the alert description.
+
+BUG-3 narrows that choice. "Force full sampling" cannot be done by setting
+`turbolay.sampling.force` from the fence arm, because `last_promoted_by` is
+known only *after* the span has started and the head sampler has already
+decided. Forcing these spans means either deciding at creation — before the
+fence arm is known, so it would force every `writer.fence_refresh` span, which
+is one per write — or moving the decision to a collector-side tail sampler
+keyed on the attribute. The second is the right answer and it is a deployment
+change, not a code change.
 
 **Baseline needed.** Fence events per cell per hour under normal operation,
 and how many of those carry a `last_promoted_by` that differs from the local
@@ -732,13 +1413,35 @@ existing shape means a tenant grew into the problem. Both are changes; neither
 is a threshold on the absolute number, because some applications legitimately
 full-scan small collections and will do so forever.
 
-**Sampling is handled.** `RowQueryPlanSummary::record` sets
-`turbolay.sampling.force` when `full_scan` is true
-(`src/shard/query_optimizer.rs:960-963`), and the head sampler honours it
-(`sampling.rs:72-74`). Full-scan spans are kept at 100%, so this rate is exact
-rather than scaled — which is worth knowing, because it means candidate 2 and
-candidate 1 need *different* correction factors and mixing them on one
-dashboard will mislead.
+**Sampling is not handled, and this was the plan's worst error.** The original
+text read: "`RowQueryPlanSummary::record` sets `turbolay.sampling.force` when
+`full_scan` is true (`src/shard/query_optimizer.rs:960-963`), and the head
+sampler honours it (`sampling.rs:72-74`). Full-scan spans are kept at 100%, so
+this rate is exact rather than scaled." Every sentence of that is true in
+isolation and the conclusion is false. The sampler does contain the code; it
+never runs on these spans. `is_always_sampled` (`sampling.rs:66-74`) inspects
+the attributes present **at span creation**, and both `sampling.force` and
+`query.full_scan` are declared `tracing::field::Empty` at creation and filled
+by `span.record` afterwards — at all seven sites. See BUG-3.
+
+So full-scan spans are ratio-sampled at 5% like everything else, and the rate
+this candidate is built on is scaled by an unknown factor, not exact. Two
+consequences:
+
+- Candidate 2 cannot ship before the BUG-3 fix. Not "would be better after" —
+  the alert would be counting one full scan in twenty and calling it the rate.
+- The claim that candidates 1 and 2 need *different* correction factors is,
+  today, wrong in an ironic direction: they need the *same* one, because
+  neither is force-sampled. It becomes true once BUG-3 is fixed, and at that
+  point the warning about mixing them on one dashboard applies exactly as
+  written.
+
+This is worth dwelling on because of how it was missed. The code was read, the
+sampler was read, and the two were read separately. Nothing short of following
+the attribute from `record` to `should_sample` would have caught it — which is
+also why the existing unit tests pass: they hand attributes directly to
+`should_sample` and never construct a span. The regression test must go through
+a real span with a real `record`, or it will pass against the bug.
 
 **Better as a metric than an alert.** §1.3 puts `query.full_scan` on the safe-label
 list precisely so `rate(query_rows_started{full_scan="true"})` exists. Alert on
@@ -846,50 +1549,182 @@ counters cannot answer. The likeliest candidate is per-phase read-path latency
 as spans. If that turns out to be the recurring question, the right fix is
 probably a counter, not a collector processor.
 
-## 5. Open decisions
+## 5. Open decisions — all four resolved
 
-**Whether the cache gauges are worth their locks.** `graph_cache_entry_counts`
-and `graph_cache_resident_bytes` take twelve async mutex acquisitions per cell
-per collection (`src/shard/lifecycle.rs:285-320`), on mutexes the read path
-uses. `/metrics` already pays this per scrape and nobody has complained, which
-is weak evidence it is fine. **Settled by:** measuring `query.execute` p99 in
-staging with M2 on and off at a 60s interval and at 10s. If 10s is visible in
-p99, the gauges need their own slower interval, or `resident_bytes` needs to be
-maintained incrementally rather than computed on read.
+All four were written with a **Settled by:** clause naming a staging
+measurement. None of them needed one. Each was settled by reading a file, and
+in three of the four the *premise* turned out to be wrong — the question was
+asking about the wrong thing, so the measurement would have produced an answer
+to a question nobody had.
 
-**Whether `turbolay.query.fingerprint` may ever be a metric label.** It is the
-one attribute whose safety depends on the workload rather than on the schema.
-A `query_rows_duration_us` broken down by fingerprint would be genuinely
-excellent for exactly the "this shape got slower" question the fingerprint was
-built for. **Settled by:** counting distinct fingerprints per scope over the
-staging week. Under a few hundred, it is worth an opt-in flag with a hard cap
-and an overflow bucket. Above that, it stays span-only forever.
+That pattern is the most useful thing in this section, so each decision below
+records three things: what was decided, what settled it, and where the original
+framing was wrong. The third is the part worth reading.
 
-**Whether `error.class` should be a label on a dedicated error counter.** It is
-on the safe list at 11 values, but there is no error counter today to put it on
-— `query_rows_failed` is undimensioned. Adding one means a kernel change
-(`GraphError::class()` already exists, so the mapping is free) and a new atomic
-per class. **Settled by:** whether the staging week shows `error.class` being
-read off logs frequently enough to justify a counter. If every investigation
-starts with a log query grouped by class, that is the signal.
+### 5.1 The cache gauges — **keep, at 60s, conditional on the BUG-1 fix**
 
-**The metric naming scheme.** `turbolay.*` matching the span registry, or
-`graph_*` matching the existing Prometheus names, or OTel-idiomatic
-`db.client.*` where a semantic convention exists. Leaning toward `turbolay.*`
-for anything with no semconv equivalent, because one vocabulary across spans
-and metrics is what makes a dashboard and a trace view feel like one system.
-**Settled by:** checking whether the backend's out-of-the-box database
-dashboards key off `db.*` metric names the way the APM view keys off
-`db.system.name` — if they do, the semconv names earn their inconsistency.
+**Decided.** Keep both gauge sets on the 60s interval. Do not give them a
+separate slower interval. Do not make `resident_bytes` incremental.
+
+**What settled it.** Two reads. `src/core/cache.rs:237` — `resident_bytes` is
+**already O(1)**; it is a maintained field, not a walk of the cache. And
+`src/shard/lifecycle.rs:285`, `:317` — twelve `Mutex::lock().await` on an
+uncontended mutex is roughly 200–400 ns per cell, once a minute. Neither number
+needs a staging week; both are visible in the source.
+
+**Where the premise was wrong.** The question was "are twelve lock acquisitions
+too expensive". The acquisitions were never the risk. The risk was that all
+seven of them were held **simultaneously** — BUG-1 — because the struct literal
+they initialised was the function's tail expression, so no guard dropped until
+the function returned. That is a convoy on read-path mutexes, not a cost per
+acquisition, and it would not have shown up as "the gauges are a bit expensive"
+in a p99 comparison. It would have shown up as a read-path latency cliff under
+concurrency, at which point the p99 experiment would have been blamed on the
+wrong thing.
+
+And it is a **code fix, not a measurement**. Twelve overlapping acquisitions
+became twelve disjoint ones by binding each to a `let`, with zero behaviour
+change. The proposed experiment — 60s versus 10s, M2 on versus off — would have
+measured the convoy and concluded the gauges were expensive.
+
+The second half of the original remedy is struck outright: "or `resident_bytes`
+needs to be maintained incrementally rather than computed on read" describes
+work that was already done before the sentence was written.
+
+**What survives.** M2's done-when — p99 of `query.execute` unchanged with the
+collector on — is still worth checking, but now as a regression check rather
+than as a decision procedure. And it should be run after BUG-2 is understood,
+since a stall in `cluster_for_scope` will look exactly like a slow collection.
+
+### 5.2 `turbolay.query.fingerprint` as a metric label — **no, unconditionally, forever**
+
+**Decided.** Span-only. No opt-in flag, no hard cap, no overflow bucket. The
+`METRIC_LABELS` list must never contain it.
+
+**What settled it.** An ordering, not a distribution. The fingerprint is minted
+at `src/client/service.rs:1941` and `:1956` — **before** `validate_request`
+runs at `:1570`. Any authenticated client can therefore mint an unbounded set
+of fingerprints out of strings that are not valid queries and never execute.
+
+There is a second, independent reason. The normaliser is byte-level, not
+AST-level: `MATCH (n:Person)` and `MATCH (x:Person)` produce different
+fingerprints, and so do `match` and `MATCH`. So even a well-behaved client with
+a fixed set of query shapes produces one fingerprint per *spelling*, and the
+cardinality is a property of how the application's query strings are generated
+rather than of how many shapes it has.
+
+**Where the premise was wrong, twice.**
+
+The framing — "the one attribute whose safety depends on the workload rather
+than on the schema" — is the error. It does not depend on the workload. It is
+**attacker-reachable**: reachable by any authenticated caller, deliberately,
+with garbage, before validation. A cardinality bound that an authenticated
+client can violate on purpose is not a bound, and the distinction between "our
+tenants probably won't" and "a tenant cannot" is exactly the distinction §1.4
+builds a type to enforce.
+
+The proposed measurement was **also unsound on its own terms**. "Counting
+distinct fingerprints per scope over the staging week" would have counted them
+over a 5%-sampled trace population, and a distinct-count over a sample
+undercounts — worst precisely in the tail, where the rare-fingerprint mass
+lives. The experiment was structurally biased toward the answer "it's fine".
+A cardinality question can almost never be answered from a sample; that is
+worth remembering the next time one is asked.
+
+### 5.3 `error.class` on a dedicated error counter — **yes, build it**
+
+**Decided.** Add an error counter dimensioned by `error.class`, at 10 values.
+Three choke points where the error is already in hand and no plumbing is
+needed: `src/shard/query.rs:535`, `:4739`, and
+`src/client/service.rs:1900`.
+
+**What settled it.** `src/core/error.rs:202` — `GraphError::class` is an
+exhaustive match with no `other` arm, and `ErrorClass::Other` is constructed
+nowhere. Ten reachable values, not eleven. Ten is affordable; the three choke
+points mean the change is a counter increment at sites that already have the
+error, not a new error path.
+
+**Where the premise was wrong.** The stated criterion was: "whether the staging
+week shows `error.class` being read off logs frequently enough to justify a
+counter. If every investigation starts with a log query grouped by class, that
+is the signal." **That signal is unobservable.** `error.class` reaches an OTLP
+*log record* at 4 of the 20 sites that set it. At the other 16 it is a
+`span.record` on a span, and `OpenTelemetryTracingBridge` stamps `trace_id` and
+`span_id` onto log records — it does not copy span attributes onto them. So
+"group the logs by `error.class`" is a query that would return nearly nothing
+regardless of how badly an investigator wanted it, and the absence of that
+query in the staging week would have been read as evidence that nobody needs
+the counter.
+
+This is a general trap and it is the second instance of it in this section: a
+decision criterion phrased as "watch whether people use X" is only valid if X
+is *available* to be used. Check that first. Here, the fact that `error.class`
+is nearly unqueryable in the logs is an argument **for** the counter, not
+against it — it is the strongest one available, and the original criterion had
+its sign backwards.
+
+### 5.4 The naming scheme — **`db.*` where semconv exists, `turbolay.*` otherwise**
+
+**Decided.** See §1.9, which holds the full decision, the evidence and the
+costs. In brief: the semantic-convention name wherever one genuinely exists,
+`turbolay.*` for everything else, chosen for native database-viewer
+compatibility.
+
+**What settled it.** A survey of the semantic conventions against all 72
+counters. **Two** map: `db.client.operation.duration` (stable) and
+`db.client.response.returned_rows` (development). Seventy do not.
+
+**Where the premise was — not wrong, but incomplete.** The original leaned
+toward `turbolay.*` throughout, and its **Settled by:** clause was sound: check
+whether the backend's database dashboards key off `db.*` names. They do, so the
+semconv names earn their inconsistency, and the decision goes against the lean.
+What the framing missed is how *little* is being bought and how much it costs
+to buy it, and both belong on the record next to the decision:
+
+- Only 2 of 72, and only one of those at stable status. The vocabulary split
+  is permanent and buys native rendering for one metric.
+- `db.client.operation.duration` is emitted **without `db.namespace`**, which
+  semconv marks required-if-applicable. It is applicable — the namespace is the
+  `scope` — and it is omitted because `scope` is the unbounded label this whole
+  section exists to keep off metrics. Deliberately non-conformant in exactly
+  one dimension, and a runbook item, because a conformance checker will flag it
+  and the flag will look like a bug.
+- And per §1.5, the native latency widget will not light up anyway: the SDK
+  cannot produce a histogram data point from a cached snapshot, so the buckets
+  go out as an `ObservableCounter` family. The compatibility this decision buys
+  is partial. That does not reverse it — the name and `db.system.name` still
+  put the series in the right view — but a future reader is entitled to know
+  that the thing it was chosen for is only half delivered.
+
+### 5.5 Still open
+
+**BUG-2 — `cluster_for_scope` holding `clusters` across a shard open**
+(`src/engine/cluster.rs:1216-1230`). Not fixed, and not fixable mechanically:
+releasing the mutex around
+`open_promotable_scoped_with_memory_options(...).await` admits two callers
+opening the same scope concurrently. The fix needs a one-open-per-scope guard —
+an in-flight map keyed by scope, or a per-scope `OnceCell` — and that is a
+design with its own failure modes, not a narrowing of a critical section. It is
+recorded here rather than in a bug tracker because it interacts directly with
+M2: with BUG-2 present, a slow metrics collection and a slow read can share a
+cause that has nothing to do with the cache gauges, and M2's measurement will
+be read as though it did.
 
 ## 6. Explicitly out of scope
 
 - **Changing `/metrics`.** Same conclusion as the prior plan, now with the
   additional reason in §1.4: the two exports should be allowed to differ in
   dimensionality.
-- **Adding counters to the kernel.** §1 exports what exists. Where a counter is
-  missing — a per-rung traversal count, a per-class error count — it is named
-  as such and left to its own change.
+- ~~**Adding counters to the kernel.**~~ **No longer out of scope, and this is
+  the one scope change the amendment makes.** The original line said §1 exports
+  what exists, and that where a counter is missing it is named and left to its
+  own change. Two of those changes have now been argued and are in: the
+  per-class error counter (§5.3) and the three duration histograms (§1.10, step
+  H1). Both are kernel changes to `src/core/metrics.rs` and its call sites.
+  What stays out is everything *not* named here — H1 converts three of fifteen
+  durations and adds nothing else, and the twelve it declines are listed with
+  reasons so that declining them is a decision rather than an omission. The
+  per-rung traversal counter of §1.6 is still named-and-deferred.
 - **Fixing anything the metrics reveal.** Unchanged from the prior plan.
 - **Exemplars.** §1.7, and unlike the prior plan's version of this line, with a
   verified reason rather than a deferral.
