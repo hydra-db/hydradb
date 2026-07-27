@@ -90,9 +90,11 @@ check:
     cargo check --locked --all-targets
 
 # The widest compile surface in one line, so a feature that only *this* recipe
-# reaches — indexer-runtime and otlp are reached by nothing else in `ci` — cannot
-# rot unnoticed. `--all-features` rather than an enumerated list on purpose: an
-# enumerated list silently stops covering the next feature added to Cargo.toml.
+# reaches — the root package's `otlp` is reached by nothing else in `ci`, since
+# test-telemetry enables the *crate's* otlp under `-p turbolay-telemetry` and
+# never the root switch the binaries' cfg arms read — cannot rot unnoticed.
+# `--all-features` rather than an enumerated list on purpose: an enumerated list
+# silently stops covering the next feature added to Cargo.toml.
 # Check every target with every feature enabled.
 check-all-features:
     cargo check --locked --all-targets --all-features
@@ -174,6 +176,18 @@ test-chaos:
 test-server-runtime:
     cargo test --locked --features server-runtime --bin graph-node
 
+# `indexer-runtime` was reached only by compile-only recipes until this existed —
+# clippy-runtime lints it and check-all-features builds it, so the binary's seven
+# tests were compiled by `ci` and then never run. This is the only line in `ci`
+# that *executes* indexer code: the scope-discovery test and the six that pin the
+# `/metrics` rendering, including the cell and edge-type dimensions and the
+# `MAX_DIMENSIONS` cap. `--bin graph-indexer` because the binary declares
+# `required-features = ["indexer-runtime"]`, so no `--lib` or `--all-targets` line
+# anywhere else builds its test target.
+# Test the indexer runtime configuration.
+test-indexer:
+    cargo test --locked --features indexer-runtime --bin graph-indexer
+
 # Every other recipe here is bare, so it selects the root package only; a
 # workspace member needs its own explicit `-p` line or it is never built.
 # Lint and test the placement crate.
@@ -216,7 +230,7 @@ native-check:
 # would pay for the same compile twice, once through rustc and once through
 # clippy-driver, for no extra coverage.
 # Run the local CI-equivalent check set.
-ci: native-check fmt-check clippy clippy-chaos clippy-opencypher clippy-native clippy-client-protocols clippy-runtime test-placement test-telemetry check-all-features check-client-api check-bolt-server test test-opencypher test-native test-client-protocols test-chaos test-server-runtime
+ci: native-check fmt-check clippy clippy-chaos clippy-opencypher clippy-native clippy-client-protocols clippy-runtime test-placement test-telemetry check-all-features check-client-api check-bolt-server test test-opencypher test-native test-client-protocols test-chaos test-server-runtime test-indexer
 
 # Run the local object-store smoke test.
 smoke:
