@@ -34,29 +34,35 @@ fmt:
 fmt-check:
     cargo fmt --all --check
 
+# `default = []`, so this covers the `cfg(not(feature = ...))` arms and nothing
+# else — it is a real shipped configuration (`ci.yml` gates it on both Linux and
+# macOS), but it is a small slice of the crate. Pair it with check-all-features;
+# neither subsumes the other.
+#
+# It currently reports `AtomicDurationHistogram::{bucket_index, record_micros,
+# record}` as dead. That is true *of this feature set* — every caller sits behind
+# client-api -> query-transport -> opencypher — and false of the crate. The fix is
+# a cfg on the impl in `src/core/histogram.rs`, not a flag here, so the warning is
+# left standing rather than suppressed.
 # Check all default-feature targets.
 check:
     cargo check --locked --all-targets
+
+# The widest compile surface in one line, so a feature that only *this* recipe
+# reaches — indexer-runtime and otlp are reached by nothing else in `ci` — cannot
+# rot unnoticed. `--all-features` rather than an enumerated list on purpose: an
+# enumerated list silently stops covering the next feature added to Cargo.toml.
+# Check every target with every feature enabled.
+check-all-features:
+    cargo check --locked --all-targets --all-features
 
 # Check default-feature examples.
 check-examples:
     cargo check --locked --examples
 
-# BROKEN, and known: the `graphblas` cargo feature was deleted by the sparse-
-# kernel consolidation, so the four recipes that pass `--features graphblas` —
-# check-examples-graphblas, check-examples-native, test-graphblas, test-native —
-# all fail with "the package 'slatedb-graph-kernel' does not contain this
-# feature: graphblas", and all four are in `ci`, so `just ci` cannot pass either.
-# Deferred on purpose; see "Open items" in
-# docs/plans/2026-07-25-sparse-kernel-backend-consolidation.md.
-
-# Check examples with GraphBLAS enabled.
-check-examples-graphblas:
-    cargo check --locked --examples --features graphblas
-
-# Check examples with native parser and GraphBLAS enabled.
+# Check examples with the native OpenCypher parser enabled.
 check-examples-native:
-    cargo check --locked --examples --features opencypher,graphblas
+    cargo check --locked --examples --features opencypher
 
 # Check the feature-gated hard-fence chaos harness.
 check-examples-chaos:
@@ -70,13 +76,20 @@ test:
 test-opencypher:
     cargo test --locked --features opencypher --lib
 
-# Run library tests with GraphBLAS enabled.
-test-graphblas:
-    cargo test --locked --features graphblas --lib
-
-# Run library tests with all native features enabled.
+# `--all-targets`, not `--lib`, and it is load-bearing: `--lib` builds the client
+# stack as a plain dependency, so `src/client/service/tests.rs` never sees
+# `cfg(test)` and its tests silently do not exist. Mirrors `ci.yml`'s "Test full
+# native feature set" line exactly.
+# Run all targets with every native feature enabled.
 test-native:
-    cargo test --locked --features opencypher,graphblas --lib
+    cargo test --locked --all-targets --features opencypher,query-transport,query-transport-tls,query-service-discovery,public-client-protocols
+
+# The Bolt and HTTP surfaces without query-service-discovery, which is how an
+# embedder that brings its own routing builds them. test-native cannot catch a
+# `use reqwest::…` that leaked into the shared client path; this can.
+# Run all targets with the public Bolt and HTTP client protocols.
+test-client-protocols:
+    cargo test --locked --all-targets --features public-client-protocols
 
 # Run library tests with the feature-gated hard-fence harness enabled.
 test-chaos:
@@ -88,8 +101,9 @@ test-chaos:
 test-server-runtime:
     cargo test --locked --features server-runtime --bin graph-node
 
-# Lint and test the workspace members. Every other recipe here is bare, so it
-# selects the root package only.
+# Every other recipe here is bare, so it selects the root package only; a
+# workspace member needs its own explicit `-p` line or it is never built.
+# Lint and test the placement crate.
 test-placement:
     cargo clippy --locked --all-targets -p turbolay-placement -- -D warnings
     cargo test --locked -p turbolay-placement
@@ -98,6 +112,7 @@ test-placement:
 # the log bridge — are behind an off-by-default feature, so neither `just check`
 # nor `just test` reaches them. Without `--features otlp` the sampler is not even
 # compiled.
+# Lint and test the telemetry crate with OTLP export enabled.
 test-telemetry:
     cargo clippy --locked --all-targets -p turbolay-telemetry --features otlp -- -D warnings
     cargo test --locked -p turbolay-telemetry --features otlp
@@ -116,15 +131,19 @@ native-check:
     fi
 
 # Run the local CI-equivalent check set.
-ci: native-check fmt-check check test-placement test-telemetry test test-opencypher test-graphblas test-native test-chaos test-server-runtime check-examples check-examples-native check-examples-chaos
+ci: native-check fmt-check check check-all-features test-placement test-telemetry test test-opencypher test-native test-client-protocols test-chaos test-server-runtime check-examples check-examples-native check-examples-chaos
 
 # Run the local object-store smoke test.
 smoke:
     cargo run --example object_store_smoke
 
-# Run the local object-store smoke test with GraphBLAS enabled.
+# SuiteSparse is the default kernel now that the cargo feature is gone, so this
+# differs from `smoke` only by pinning it — which is the point, since `smoke`
+# inherits whatever GRAPH_MATRIX_KERNEL the caller's shell already exports.
+# `example/object_store_smoke.rs` also accepts `compact` and `rust`.
+# Run the local object-store smoke test pinned to the SuiteSparse kernel.
 smoke-graphblas:
-    GRAPH_MATRIX_KERNEL=graphblas cargo run --features graphblas --example object_store_smoke
+    GRAPH_MATRIX_KERNEL=graphblas cargo run --example object_store_smoke
 
 # Run local multiprocess stress against the local filesystem object store.
 stress:
