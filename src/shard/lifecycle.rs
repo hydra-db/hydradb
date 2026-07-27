@@ -283,42 +283,65 @@ impl GraphShard {
     }
 
     pub async fn graph_cache_entry_counts(&self) -> GraphCacheEntryCounts {
+        // Each lock is bound to its own `let` so the guard drops at the end of that
+        // statement. Building the struct literal directly from `lock().await` would
+        // keep every temporary guard alive until the function returns, holding all of
+        // these read-path mutexes simultaneously.
+        let matrix_artifacts = self.matrix_artifact_cache.lock().await.len();
+        let matrix_adjacencies = self.matrix_cache.lock().await.len();
+        let graphblas_matrices = self.graphblas_cache.lock().await.len();
+        #[cfg(feature = "opencypher")]
+        let parsed_row_queries = self.parsed_row_query_cache.lock().await.len();
+        #[cfg(feature = "opencypher")]
+        let relationship_row_sets = {
+            let relationship_rows = self.relationship_rows_cache.lock().await.len();
+            let source_relationship_rows = self.source_relationship_rows_cache.lock().await.len();
+            relationship_rows + source_relationship_rows
+        };
+        #[cfg(feature = "opencypher")]
+        let relationship_property_row_sets =
+            self.relationship_property_rows_cache.lock().await.len();
         GraphCacheEntryCounts {
-            matrix_artifacts: self.matrix_artifact_cache.lock().await.len(),
-            matrix_adjacencies: self.matrix_cache.lock().await.len(),
-            graphblas_matrices: self.graphblas_cache.lock().await.len(),
+            matrix_artifacts,
+            matrix_adjacencies,
+            graphblas_matrices,
             #[cfg(feature = "opencypher")]
-            parsed_row_queries: self.parsed_row_query_cache.lock().await.len(),
+            parsed_row_queries,
             #[cfg(feature = "opencypher")]
-            relationship_row_sets: self.relationship_rows_cache.lock().await.len()
-                + self.source_relationship_rows_cache.lock().await.len(),
+            relationship_row_sets,
             #[cfg(feature = "opencypher")]
-            relationship_property_row_sets: self
-                .relationship_property_rows_cache
-                .lock()
-                .await
-                .len(),
+            relationship_property_row_sets,
         }
     }
 
     pub async fn graph_cache_resident_bytes(&self) -> GraphCacheResidentBytes {
+        // See `graph_cache_entry_counts`: one `let` per lock keeps the acquisitions
+        // disjoint instead of overlapping for the whole function body.
+        let matrix_adjacencies = self.matrix_cache.lock().await.resident_bytes();
+        let graphblas_matrices = self.graphblas_cache.lock().await.resident_bytes();
+        #[cfg(feature = "opencypher")]
+        let relationship_rows = self.relationship_rows_cache.lock().await.resident_bytes();
+        #[cfg(feature = "opencypher")]
+        let source_relationship_rows = self
+            .source_relationship_rows_cache
+            .lock()
+            .await
+            .resident_bytes();
+        #[cfg(feature = "opencypher")]
+        let relationship_property_rows = self
+            .relationship_property_rows_cache
+            .lock()
+            .await
+            .resident_bytes();
         GraphCacheResidentBytes {
-            matrix_adjacencies: self.matrix_cache.lock().await.resident_bytes(),
-            graphblas_matrices: self.graphblas_cache.lock().await.resident_bytes(),
+            matrix_adjacencies,
+            graphblas_matrices,
             #[cfg(feature = "opencypher")]
-            relationship_rows: self.relationship_rows_cache.lock().await.resident_bytes(),
+            relationship_rows,
             #[cfg(feature = "opencypher")]
-            source_relationship_rows: self
-                .source_relationship_rows_cache
-                .lock()
-                .await
-                .resident_bytes(),
+            source_relationship_rows,
             #[cfg(feature = "opencypher")]
-            relationship_property_rows: self
-                .relationship_property_rows_cache
-                .lock()
-                .await
-                .resident_bytes(),
+            relationship_property_rows,
         }
     }
 
@@ -704,5 +727,75 @@ impl GraphShard {
             read_epoch,
             storage_snapshot: self.db.snapshot().await?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slatedb::object_store::memory::InMemory;
+
+    async fn open_shard(path: &str) -> GraphShard {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        GraphShard::open_standalone_writer(path, object_store)
+            .await
+            .unwrap()
+    }
+
+    /// The cache gauges must release each cache mutex before taking the next one.
+    ///
+    /// Guard lifetime is not observable through the public API, so the test drives
+    /// the collection future by hand: it holds one cache lock, polls the future
+    /// exactly once, and checks that the caches the future has already visited are
+    /// free while it is parked. Written as a single struct literal the guards are
+    /// temporaries of the tail expression, so they live until the function returns
+    /// and `try_lock` on an earlier cache fails. There is no timing and no second
+    /// task involved, so the test cannot flake.
+    #[tokio::test]
+    async fn cache_entry_count_gauges_release_each_lock_before_the_next() {
+        let shard = open_shard("cache-entry-count-locks").await;
+
+        let blocker = shard.graphblas_cache.lock().await;
+        let mut counts = std::pin::pin!(shard.graph_cache_entry_counts());
+        assert!(
+            futures::poll!(counts.as_mut()).is_pending(),
+            "the held graphblas_cache lock should have parked the collection"
+        );
+        assert!(
+            shard.matrix_artifact_cache.try_lock().is_ok(),
+            "matrix_artifact_cache is still held while the gauge collection waits \
+             on a later cache: the guards overlap"
+        );
+        assert!(
+            shard.matrix_cache.try_lock().is_ok(),
+            "matrix_cache is still held while the gauge collection waits on a \
+             later cache: the guards overlap"
+        );
+        drop(blocker);
+        assert_eq!(counts.await, GraphCacheEntryCounts::default());
+
+        shard.close().await.unwrap();
+    }
+
+    /// See above; `graph_cache_resident_bytes` has the same shape one lock shorter.
+    #[tokio::test]
+    async fn cache_resident_byte_gauges_release_each_lock_before_the_next() {
+        let shard = open_shard("cache-resident-byte-locks").await;
+
+        let blocker = shard.graphblas_cache.lock().await;
+        let mut resident = std::pin::pin!(shard.graph_cache_resident_bytes());
+        assert!(
+            futures::poll!(resident.as_mut()).is_pending(),
+            "the held graphblas_cache lock should have parked the collection"
+        );
+        assert!(
+            shard.matrix_cache.try_lock().is_ok(),
+            "matrix_cache is still held while the gauge collection waits on a \
+             later cache: the guards overlap"
+        );
+        drop(blocker);
+        assert_eq!(resident.await, GraphCacheResidentBytes::default());
+
+        shard.close().await.unwrap();
     }
 }
