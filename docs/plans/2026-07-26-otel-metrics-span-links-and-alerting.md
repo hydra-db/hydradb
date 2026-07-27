@@ -1,9 +1,10 @@
 ---
 title: OTel metrics, span links and trace-driven alerting
-status: draft-for-review
+status: step-m1-complete
 date: 2026-07-26
 branch: Turbolay-V3.5
 base_commit: 6255ca3
+head_commit: 68efadf
 tags:
   - observability
   - opentelemetry
@@ -36,6 +37,20 @@ corrected in place. The short version: the head-sampling decision is taken at a
 span's **first entry**, not at creation, and full-scan spans are still
 ratio-sampled — by design, and now waiting on a collector policy rather than on
 code.
+
+**Corrected 2026-07-27 against `68efadf`, from implementing it.** BUG-1, H1 and
+M1 have now landed (`08e78df`; `3c2728a`/`5d97fb8`/`fbdfca3`/`1037a0c`;
+`68efadf`), and building them falsified seven things this document asserted from
+a code read. Four are in §1.4 and §1.5 — the key arithmetic was one behind
+(35 → 11 + 24, not 34 → 11 + 23), two `semconv.rs` citations had drifted again,
+"one `ObservableCounter` per bucket" is not what the SDK does, and the export
+interval needed less wiring than the draft implied while still needing a config
+field for a reason the draft did not have. Three are in §1.8 and §1.10: M1
+shipped the provider without wiring a single kernel counter to it, H1 put the
+histogram in a different module under a different name, and
+`QueryTransportAction` turned out to have four variants rather than two. Each is
+corrected where it occurs and none of them changes a decision. **§1.8's step
+order is unchanged and H2 is next.**
 
 Goal: finish the observability story that `docs/plans/2026-07-26-otel-telemetry-crate.md`
 started, by taking the four things it deferred and deciding them — metrics
@@ -301,10 +316,22 @@ all**. The consequence is written into §1.5 and designed around in §1.10.
   `8f150b2`**, which added `SAMPLING_TAIL_KEEP` to `ALL_TURBOLAY_KEYS`; §1.3
   places it span-only alongside `SAMPLING_FORCE`, so the partition holds.
 - **`error.class` is not in `ALL_TURBOLAY_KEYS`.** It is not `turbolay.`-
-  namespaced (`semconv.rs:172`), and neither is `db.system.name` (`:182`). The
+  namespaced (`semconv.rs:191`), and neither is `db.system.name` (`:238`). The
   proposed test iterates `ALL_TURBOLAY_KEYS`, so it would silently never
   classify the one attribute §1.3 puts *first* on the safe-label list. An
-  `ALL_REGISTRY_KEYS` superset is required; §1.4 now says so.
+  `ALL_REGISTRY_KEYS` superset is required; §1.4 now says so, and `68efadf`
+  built it.
+  **Both citations, and §1.4's and §1.9's copies of them, drifted twice and are
+  now quoted against `68efadf`.** They read `:172` and `:182`, which were
+  correct at `6255ca3` — the shift rule below does not apply to them, because
+  they were written by the amendment directly against that tree rather than
+  carried over from `02eba8c`. `8f150b2` then moved `DB_SYSTEM_NAME` to `:219`
+  (`DB_SYSTEM_NEO4J` `:222`) without moving `ERROR_CLASS`, and `3d7f326` did not
+  catch it; `68efadf` moved both again. Current: `ERROR_CLASS` `:191`,
+  `DB_SYSTEM_NAME` `:238`, `DB_SYSTEM_NEO4J` `:241`. The lesson is the one the
+  drift table already states and this is the third instance of — a citation into
+  `semconv.rs` is invalidated by any commit that adds a key, and this document
+  has now added keys three times.
 - **§1.6's "both read the same lock-free atomics" is false** for the two gauge
   sets. Neither export is lock-free there — that is the whole subject of BUG-1.
   The claim is true of the three counter structs and only of those.
@@ -523,10 +550,16 @@ without either side renaming anything.
 
 ### 1.3 Which attributes may be labels
 
-The registry (`crates/telemetry/src/semconv.rs`) currently classifies its
-**31** `turbolay.*` keys informally, in a doc comment, into "bounded and safe
+The registry (`crates/telemetry/src/semconv.rs`) classified its
+**32** `turbolay.*` keys informally, in a doc comment, into "bounded and safe
 anywhere", "bounded in practice", and "spans only". That is not enough
-resolution to build a meter on. The classification below is the one to encode.
+resolution to build a meter on. The classification below is the one that was
+encoded, in `68efadf`.
+
+**32, counted from the file rather than carried forward.** `ALL_TURBOLAY_KEYS`
+(`semconv.rs:398-431`) has 32 members. The draft said 31, which was right until
+`8f150b2` added `turbolay.sampling.tail_keep`; every count in this section and
+in §1.4 is the post-`68efadf` file.
 
 (The original draft said 26 and classified 26. That was a miscount, and it
 matters more than a miscount usually does, because §1.4's whole mechanism is a
@@ -652,7 +685,7 @@ pub const L_DB_SYSTEM_NAME: MetricLabel = MetricLabel(DB_SYSTEM_NAME);
 pub const L_LE: MetricLabel = MetricLabel(LE);   // §1.10, bucket upper bound
 
 pub const METRIC_LABELS: &[MetricLabel] = &[/* the eleven above */];
-pub const SPAN_ONLY_KEYS: &[&str] = &[/* the twenty-three others */];
+pub const SPAN_ONLY_KEYS: &[&str] = &[/* the twenty-four others */];
 ```
 
 The constructor stays private to the module, so `MetricLabel` cannot be built
@@ -663,7 +696,7 @@ is then not a policy violation to be caught in review — it is a type error.
 Three of those eleven were not in the original list and are worth a line each.
 `placement.state` and `placement.previous_state` are §1.3's late additions.
 `db.system.name` is a *consequence of §1.9's naming decision*: it has exactly
-one value (`neo4j`, `semconv.rs:185`), it costs nothing, and it is the
+one value (`neo4j`, `DB_SYSTEM_NEO4J`, `semconv.rs:241`), it costs nothing, and it is the
 attribute the vendor's database view keys off — putting `db.*` names on the
 wire and then omitting it would spend the cost of the decision and collect none
 of the benefit. `le` is §1.10's bucket bound; it needs a registry constant
@@ -671,9 +704,9 @@ rather than a bare string precisely so the partition test below stays total.
 
 **The partition test as originally written would not have worked.** It is still
 the right idea, and it is still the direct descendant of
-`no_registry_key_is_redacted` (`semconv.rs:249-257`), but it iterates
-`ALL_TURBOLAY_KEYS` — and `error.class` (`semconv.rs:172`) and `db.system.name`
-(`:182`) are not `turbolay.`-namespaced and so are not in that list. The test
+`no_registry_key_is_redacted` (`semconv.rs:506-514` as built), but it iterates
+`ALL_TURBOLAY_KEYS` — and `error.class` (`semconv.rs:191`) and `db.system.name`
+(`:238`) are not `turbolay.`-namespaced and so are not in that list. The test
 would have passed while never classifying the attribute §1.3 puts first on the
 safe-label list. It needs a superset:
 
@@ -704,9 +737,17 @@ fn every_metric_label_is_a_registry_key() {
 The second test is the one that catches the `le` mistake — a `MetricLabel`
 built from a string that was never added to the registry would otherwise
 silently escape the partition, which is exactly the hole `error.class` was
-already sitting in. With both tests, 34 keys partition into 11 labels and 23
-span-only, and neither list can gain a member without the other being
+already sitting in. With both tests, **35 keys partition into 11 labels and 24
+span-only**, and neither list can gain a member without the other being
 considered.
+
+**The draft said 34 → 11 + 23, and that was one behind.** `8f150b2` added
+`turbolay.sampling.tail_keep` between the writing and the implementing. As
+built (`68efadf`): `METRIC_LABELS` `semconv.rs:352-364` — 11; `SPAN_ONLY_KEYS`
+`:369-394` — 24; `ALL_TURBOLAY_KEYS` `:398-431` — 32; `ALL_REGISTRY_KEYS`
+`:442-478` — 35, asserted to be exactly `ALL_TURBOLAY_KEYS` + 3 by
+`the_registry_contains_every_turbolay_key` (`:519-533`). The arithmetic is
+therefore load-bearing in the test suite and not only in this paragraph.
 
 A new attribute cannot be added to the registry without deciding, in the same
 commit, whether it may be a metric dimension. That is the property worth
@@ -810,19 +851,64 @@ observable histogram in the API, and no `MetricProducer` trait in
 escape hatches are absent, not merely awkward.
 
 The consequence is concrete and belongs in the runbook alongside the `scope`
-divergence: **bucket counts reach OTLP as a family of `ObservableCounter`s
-carrying an `le` label**, one series per bucket, rather than as an OTLP
-histogram data point. Semantically that is the same information — it is what a
-Prometheus histogram *is* — and `histogram_quantile` over the family works. But
-a vendor's native latency widget looks for a histogram data point and will not
-light up on a family of sums. That is a real cost of the SDK's shape and it is
-paid whichever naming scheme §1.9 picks; do not let anyone conclude the
-instrument was chosen carelessly.
+divergence: **bucket counts reach OTLP as an `ObservableCounter` carrying an
+`le` label**, one *series* per bucket, rather than as an OTLP histogram data
+point. Semantically that is the same information — it is what a Prometheus
+histogram *is* — and `histogram_quantile` over the family works. But a vendor's
+native latency widget looks for a histogram data point and will not light up on
+a family of sums. That is a real cost of the SDK's shape and it is paid
+whichever naming scheme §1.9 picks; do not let anyone conclude the instrument
+was chosen carelessly.
+
+**One instrument, eighteen series — not eighteen instruments.** The draft said
+"a family of `ObservableCounter`s" and §1.10's H2 step said "one
+`ObservableCounter` per bucket", and an implementer reading either literally
+would register eighteen instruments *sharing one name* — eighteen identically
+named metrics, which is a duplicate-instrument conflict rather than a histogram.
+In `opentelemetry` 0.32 an `ObservableCounter<T>` is a `PhantomData<T>` marker
+and nothing else (`opentelemetry-0.32.0/src/metrics/instruments/counter.rs:48-50`):
+the callback is moved into the meter's pipeline at `build()` and the returned
+handle carries no state, which is why `68efadf` drops the handles
+outright (`crates/telemetry/src/meter.rs:264-280`). One instrument named
+`<metric>.bucket` is registered; its single callback calls `observer.observe`
+once per bucket per label set, and each distinct attribute set — including `le`
+— becomes a series. The Prometheus exposition is identical either way; the
+mechanism is not, and only one of the two compiles into a working histogram.
+
+`68efadf` registers **three** instruments per histogram, not one:
+`<metric>.bucket` (`u64`, cumulative counts), `<metric>.sum` (`f64`, in the
+unit §1.9 requires) and `<metric>.count` (`u64`, derived from the buckets).
+Cardinality is therefore `series_count × (bucket_count + 2)`, which
+`ObservableHistogram::series_count` (`meter.rs:363`) exists to make checkable
+before a dimension is added rather than after.
 
 **Interval.** 60s, matching a Prometheus scrape and keeping the twelve cache
 locks per cell to once a minute. `OTEL_METRIC_EXPORT_INTERVAL` is the standard
 name, consistent with the `OTEL_*`-where-OTel-defines-one rule already followed
-in `crates/telemetry/src/config.rs:169-190`.
+in `crates/telemetry/src/config.rs:185-225`.
+
+**Correction: this needs less wiring than the draft implied, and the wiring
+exists anyway.** `PeriodicReaderBuilder::new`
+(`opentelemetry_sdk-0.32.1/src/metrics/periodic_reader.rs:39-46`) already reads
+`OTEL_METRIC_EXPORT_INTERVAL` from the environment, already parses it as
+**milliseconds**, and already falls back to `DEFAULT_INTERVAL` — 60s, `:24`.
+`with_interval` (`:55-60`) ignores a zero rather than honouring it. So the
+reader would have done the right thing with no code at all, and anyone reading
+the draft as "plumb the env var to the SDK" would be reimplementing the SDK.
+
+`68efadf` plumbed it through `TelemetryConfig` regardless
+(`metric_export_interval`, `config.rs:106`; `DEFAULT_METRIC_EXPORT_INTERVAL`,
+`:132`; the env read, `:214-225`), and the reason is the one thing the SDK
+cannot do: **M2's collection task must use the same number as the reader.** The
+task is what takes the cache mutexes and the reader is what exports what the
+task published; if they disagree, every export either repeats a stale snapshot
+or discards a fresh one. A value that lives only inside
+`PeriodicReaderBuilder`'s private field is not a value the collection task can
+read. So the field exists to make the number *shareable*, not to make it
+*configurable* — and the local parse is deliberately stricter than the SDK's in
+one way that matters here: it rejects zero (`:221`) rather than silently
+substituting 60s, because a zero the SDK quietly ignores would still be a zero
+the collection task honoured, spinning the mutex-taking half of the pair.
 
 **Two hazards inherited from the prior plan's implementation notes.**
 
@@ -966,11 +1052,12 @@ full-scan traces are still ratio-sampled exactly as before — so the baseline w
 must not start until that policy is deployed, or it will be a baseline of the
 old behaviour under a new attribute name.
 
-**BUG-1, the guard scoping, second.** M2 is explicitly the step that measures
-collection cost against read-path latency; measuring it with the convoy present
-would measure the convoy.
+**BUG-1, the guard scoping, second. Done — `08e78df`.** M2 is explicitly the
+step that measures collection cost against read-path latency; measuring it with
+the convoy present would measure the convoy.
 
-**Then H1, before M1** — see §1.10. The ordering is not aesthetic. M1 writes
+**Then H1, before M1. Done — `3c2728a`, `5d97fb8`, `fbdfca3`, `1037a0c`** — see
+§1.10. The ordering is not aesthetic. M1 writes
 the `ObservableCounter` field list and the one-enumeration test that ties the
 meter's instrument list to `append_node_metrics`. H1 changes which fields exist
 on three of those snapshots — `execution_duration_us` and two others stop being
@@ -979,20 +1066,47 @@ against a shape H1 immediately amends, so both get written twice and the second
 writing is a merge rather than a decision.
 
 The full order is: **BUG-3 → BUG-1 → H1 → M1 → H2 → M2 → M3 → H3.** BUG-3 landed
-in `8f150b2` and BUG-1 was fixed in the working tree at the amendment; H1 is next,
-with the collector `tail_sampling` policy as a deployment task running alongside.
+in `8f150b2`, BUG-1 in `08e78df`, H1 across `3c2728a`/`5d97fb8`/`fbdfca3`/
+`1037a0c`, and M1 in `68efadf`. **H2 is next**, with the collector
+`tail_sampling` policy still outstanding as a deployment task running alongside.
 
-**Step M1 — the meter provider and the operational counters.** Add
+**Step M1 — the meter provider and the operational counters. Landed in
+`68efadf`, in part.** Add
 `"metrics"` to `opentelemetry-otlp` in the root `Cargo.toml`; add
-`SdkMeterProvider` to `otlp::Providers` (`crates/telemetry/src/otlp.rs:43`) and
-to its `shutdown` (`:50`); add `MetricLabel`, `METRIC_LABELS`, `SPAN_ONLY_KEYS`,
+`SdkMeterProvider` to `otlp::Providers` (`crates/telemetry/src/otlp.rs:61`) and
+to its `shutdown` (`:79`); add `MetricLabel`, `METRIC_LABELS`, `SPAN_ONLY_KEYS`,
 `ALL_REGISTRY_KEYS` and both partition tests to `semconv.rs`; add the interval
 task and the `ObservableCounter` set for `GraphOperationalMetricsSnapshot` and
 `ClientQueryMetricsSnapshot`, labelled by `cell_id` only.
 
+**What `68efadf` did.** The `"metrics"` feature; `SdkMeterProvider` on
+`Providers` with a `PeriodicReader`, shut down **last** because its shutdown
+runs one final collection and should follow the pipelines that only drain;
+`Providers::meter` (`otlp.rs:74`) as the registration handle, which traces and
+logs need no equivalent of because they arrive through the subscriber;
+`MetricLabel` with a module-private constructor, `METRIC_LABELS`,
+`SPAN_ONLY_KEYS`, `ALL_REGISTRY_KEYS` and the two partition tests, both of whose
+traps were checked by *introducing* the failure and reverting it rather than by
+inspection; `crates/telemetry/src/meter.rs`, the bucket-family export §1.10's H2
+consumes; and the module doc rewrite §1.4's last paragraph asked for — the
+`QUERY_ACCESS_PATH`-is-safe-anywhere sentence is gone (`semconv.rs:30-34` now
+records that it was wrong, rather than repeating it).
+
+**What `68efadf` deliberately did not do: no kernel counter is wired to the
+meter.** There is no interval task, no `ObservableCounter` over
+`GraphOperationalMetricsSnapshot` or `ClientQueryMetricsSnapshot`, and no binary
+calls `Providers::meter`. M1 shipped the provider and the rules that keep it
+honest; the counters it was also scoped to carry are still M1's remainder. That
+split is why the meter's only proof of life is an integration test
+(`crates/telemetry/tests/meter_export.rs`) that implements a `PushMetricExporter`
+in-test — which is also the only thing that establishes the SDK *accepts*
+`db.client.operation.duration.bucket` as an instrument name, since it silently
+drops names it rejects rather than erroring.
+
 **Done when** `write_retries`, `query_rows_failed` and `verifier_failures` —
 none of which have ever left a process — are charted per cell in staging, and
-`/metrics` returns byte-identical output to before.
+`/metrics` returns byte-identical output to before. **Not yet met**, and it is
+the counter half above that is outstanding.
 
 **Step M2 — cache counters and gauges.** The 19 `GraphCacheMetricsSnapshot`
 counters and the two gauge structs. Separate because it is the step that pays
@@ -1076,8 +1190,8 @@ Two consequences to design around rather than discover:
   implemented wrong.
 
 `db.system.name` becomes a metric label as a direct consequence — one value,
-`neo4j` (`semconv.rs:185`), and the attribute the database view keys on. See
-§1.4.
+`neo4j` (`DB_SYSTEM_NAME` `semconv.rs:238`, `DB_SYSTEM_NEO4J` `:241`), and the
+attribute the database view keys on. See §1.4.
 
 ### 1.10 Percentiles: a duration histogram in the kernel (H1–H3)
 
@@ -1212,7 +1326,8 @@ these structs are constructed that way in tests.
 #### One enumeration, two exports
 
 The library exposes `counter_fields()` and `histogram_fields()` keyed by the
-**Rust identifier**. Neither exposition vocabulary — Prometheus `graph_*` names,
+**Rust identifier**. (Neither exists yet — H1 landed without them and they move
+to H2; see the H1 divergences below.) Neither exposition vocabulary — Prometheus `graph_*` names,
 OTel `db.*`/`turbolay.*` names — appears in the kernel; the two name tables live
 in the binary, which is where §1.6's "the two must not disagree about names"
 test belongs. Add `every_histogram_field_reaches_both_exports` alongside it: it
@@ -1224,7 +1339,9 @@ OTLP rendering cannot disagree about where a bucket ends.
 #### Steps
 
 **Step H1 — the type and the three conversions. Kernel only, nothing
-exported.** Add `DurationHistogram` / `DurationHistogramSnapshot` to
+exported. Done — `3c2728a`, `5d97fb8`, `fbdfca3`, `1037a0c`, with one item
+carried to H2 (divergence 3 below).** Add
+`DurationHistogram` / `DurationHistogramSnapshot` to
 `src/core/metrics.rs`; convert the three sites; split read/write on
 `QueryTransportAction` and client/server on `remote_latency_us`; delete the
 three standalone `AtomicU64`s and derive their snapshot fields; add
@@ -1235,13 +1352,85 @@ three standalone `AtomicU64`s and derive their snapshot fields; add
 (`admin.rs:112-130` exports five client counters, none of them durations;
 `:159-174` exports three operational, likewise), so H1 cannot change a byte of
 it. And when the three derived snapshot fields equal what the deleted atomics
-would have held, asserted in a unit test rather than eyeballed.
+would have held, asserted in a unit test rather than eyeballed. **Met**, and
+more strongly than "equal": each conversion routes through
+`codec::duration_micros_u64`, which is the same
+`as_micros().try_into().unwrap_or(u64::MAX)` expression the old sites used, so
+the derived field is bit-identical rather than merely equal.
 
-**Step H2 — export the bucket family.** One `ObservableCounter` per bucket per
-histogram, carrying `L_LE`; plus `_sum`; `_count` derived from the buckets. The
-`db.client.operation.duration` family renders its bounds in seconds per §1.9;
-everything else stays in microseconds under a `turbolay.*` name. Both exports
-fed from `histogram_fields()`.
+**Four divergences between that paragraph and what shipped.** None changes the
+design; all four change what an implementer would go looking for.
+
+1. **The type lives in a new module and is named differently.** It is
+   `src/core/histogram.rs`, not `src/core/metrics.rs`, and the reason is that
+   all three conversions embed it — `src/core/metrics.rs`,
+   `src/client/service.rs` and `src/query/coordination.rs` — so the
+   operational-counters module was never its natural home. The recording side is
+   `AtomicDurationHistogram` and is `pub(crate)`
+   (`src/core/histogram.rs:74-76`); only `DurationHistogramSnapshot` (`:139`),
+   `DURATION_BUCKET_BOUNDS_US` (`:60`) and `DURATION_BUCKET_COUNT` (`:66`) are
+   public, re-exported from `src/lib.rs:62-65`. The name split is worth
+   keeping rather than reverting: the recorder and its snapshot are different
+   types with different visibility, which the draft's single `DurationHistogram`
+   concealed.
+2. **`QueryTransportAction` has four variants, not the two the design assumed**
+   — `Read`, `Write`, `Cancel`, `Admin`, in `src/query/coordination.rs`. Only
+   `Read` and `Write` reach an execution; `Cancel` and `Admin` authorize control
+   frames. They are **spelled out explicitly rather than folded into a `_` arm**
+   (`ClientQueryMetrics::record_execution`, `src/client/service.rs`) so that a
+   fifth variant is a compile error at the routing site instead of a silent
+   misfiling, and they fold into the read histogram so the two sums stay total
+   over every observation — which is what lets `execution_duration_us` be
+   derived as `read_latency.sum_us + write_latency.sum_us` and still be exact.
+3. **`counter_fields()` / `histogram_fields()` did not land.** Nothing in the
+   tree defines them. They are H2's prerequisite, not H1's output — the "one
+   enumeration, two exports" section above is the thing they serve, and there is
+   no second export yet to disagree with the first. Treat them as the first item
+   of H2 rather than as a missing piece of H1.
+4. **The new field names, since nothing else records them.** Client:
+   `read_latency` / `write_latency` on `ClientQueryMetrics` and its snapshot.
+   Shard: `query_rows_latency` on `GraphOperationalMetrics` and its snapshot.
+   Transport: `rpc_latency` / `serve_latency` on `QueryTransportMetrics` and its
+   snapshot. The three public sum fields — `execution_duration_us`,
+   `query_rows_duration_us`, `remote_latency_us` — all survive with their names
+   and types, derived.
+
+**Cited by symbol, not by line, for the three kernel files.**
+`src/core/metrics.rs`, `src/client/service.rs` and `src/query/coordination.rs`
+all moved by tens of lines during the writing of this correction. This
+document's line citations have been wrong three times and every instance was a
+citation into a file that was still being edited; a grep for the identifier is
+stable and a line number is not. `src/core/histogram.rs` and `src/lib.rs` keep
+their numbers because H1 finished them.
+
+**Step H2 — export the bucket family.** **The `crates/telemetry` half already
+exists**, built ahead of schedule in `68efadf` as `meter.rs`; what remains is
+the kernel-side enumeration and the call that feeds it.
+
+One `ObservableCounter` named `<metric>.bucket`, carrying `L_LE` and reporting
+one series per bucket — **not one instrument per bucket**, see §1.5's
+correction; plus `<metric>.sum`; plus `<metric>.count` derived from the buckets.
+The `db.client.operation.duration` family renders its bounds in seconds per
+§1.9; everything else stays in microseconds under a `turbolay.*` name. Both
+exports fed from `histogram_fields()`.
+
+**H2 needs no adapter, because H1's shape and `meter.rs`'s contract match
+exactly.** `ObservableHistogram::record_snapshot`
+(`crates/telemetry/src/meter.rs:317-322`) takes `&[(MetricLabel, &str)]`, a
+`&[u64]` of **per-bucket** counts and a `u64` microsecond sum — which is
+`DurationHistogramSnapshot`'s two fields verbatim, so the call is
+
+```rust
+histogram.record_snapshot(&labels, &snapshot.bucket_counts, snapshot.sum_us)?;
+```
+
+and registration is `ObservableHistogram::register(&meter, spec,
+&DURATION_BUCKET_BOUNDS_US)` (`meter.rs:240-244`). That is deliberate on both
+sides: `meter.rs` names no kernel type, and the kernel names no OTel type. The
+cumulative accumulation, the `le` rendering and the microsecond-to-second
+conversion for the one `db.*` metric all happen once, inside `meter.rs`, at the
+export boundary — so a second exposition cannot disagree with the first about
+where a bucket ends.
 
 **Done when** `histogram_quantile(0.99, …)` over the exported family in staging
 agrees with a p99 computed directly from the same node's raw snapshot to within
