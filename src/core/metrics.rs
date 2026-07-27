@@ -1,7 +1,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+mod tests;
+
 use crate::engine;
-use crate::SparseKernelBackend;
+use crate::{AtomicDurationHistogram, DurationHistogramSnapshot, SparseKernelBackend};
 /// Non-exhaustive; see [`crate::GraphOpenOptions`] for the construction pattern.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -113,7 +116,16 @@ pub struct GraphOperationalMetricsSnapshot {
     pub query_rows_completed: u64,
     pub query_rows_failed: u64,
     pub query_rows_returned: u64,
+    /// Total microseconds spent in the row-query path.
+    ///
+    /// Retained under its old name and type so nothing that read the sum has to
+    /// change, but derived from [`Self::query_rows_latency`] rather than stored:
+    /// one `fetch_add` on one quantity, so the sum and the distribution cannot
+    /// drift apart.
     pub query_rows_duration_us: u64,
+    /// The same measurement as a distribution. Every row query -- one-shot and
+    /// streaming, success and failure -- lands here.
+    pub query_rows_latency: DurationHistogramSnapshot,
     pub query_artifact_lookup_us: u64,
     pub query_graphblas_cache_us: u64,
     pub query_graphblas_artifact_snapshots: u64,
@@ -152,7 +164,10 @@ pub(crate) struct GraphOperationalMetrics {
     pub(crate) query_rows_completed: AtomicU64,
     pub(crate) query_rows_failed: AtomicU64,
     pub(crate) query_rows_returned: AtomicU64,
-    pub(crate) query_rows_duration_us: AtomicU64,
+    // Replaces the `query_rows_duration_us` sum. The snapshot field of that
+    // name survives, derived from this histogram's `sum_us`, so the only thing
+    // that changed for a reader is that the distribution is now there too.
+    pub(crate) query_rows_latency: AtomicDurationHistogram,
     pub(crate) query_artifact_lookup_us: AtomicU64,
     pub(crate) query_graphblas_cache_us: AtomicU64,
     pub(crate) query_graphblas_artifact_snapshots: AtomicU64,
@@ -166,6 +181,7 @@ pub(crate) struct GraphOperationalMetrics {
 
 impl GraphOperationalMetrics {
     pub(crate) fn snapshot(&self) -> GraphOperationalMetricsSnapshot {
+        let query_rows_latency = self.query_rows_latency.snapshot();
         GraphOperationalMetricsSnapshot {
             write_attempts: self.write_attempts.load(Ordering::Relaxed),
             write_commits: self.write_commits.load(Ordering::Relaxed),
@@ -192,7 +208,8 @@ impl GraphOperationalMetrics {
             query_rows_completed: self.query_rows_completed.load(Ordering::Relaxed),
             query_rows_failed: self.query_rows_failed.load(Ordering::Relaxed),
             query_rows_returned: self.query_rows_returned.load(Ordering::Relaxed),
-            query_rows_duration_us: self.query_rows_duration_us.load(Ordering::Relaxed),
+            query_rows_duration_us: query_rows_latency.sum_us,
+            query_rows_latency,
             query_artifact_lookup_us: self.query_artifact_lookup_us.load(Ordering::Relaxed),
             query_graphblas_cache_us: self.query_graphblas_cache_us.load(Ordering::Relaxed),
             query_graphblas_artifact_snapshots: self
