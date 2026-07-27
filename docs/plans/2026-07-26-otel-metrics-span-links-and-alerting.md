@@ -1,10 +1,10 @@
 ---
 title: OTel metrics, span links and trace-driven alerting
-status: step-m1-complete
+status: step-h2-complete
 date: 2026-07-26
 branch: Turbolay-V3.5
 base_commit: 6255ca3
-head_commit: 68efadf
+head_commit: aa53595
 tags:
   - observability
   - opentelemetry
@@ -52,6 +52,31 @@ histogram in a different module under a different name, and
 corrected where it occurs and none of them changes a decision. **§1.8's step
 order is unchanged and H2 is next.**
 
+**Corrected 2026-07-27 against `aa53595`, and the export path is now decided.**
+H2 landed (`8d7e939`, with its build break and its unreachable half fixed in
+`aa53595`) and M1 is complete (`68efadf` built the provider; `aa53595` made it
+reachable and fed it). **H3 is the only histogram step outstanding.** Four
+things changed that are not step bookkeeping:
+
+- **Prometheus scraping `/metrics` is the decided consumer of metrics.** That is
+  a *decision*, not an observation, and it re-points M2 and M3: they target
+  `/metrics` first and the meter second (§1.8). The gap that matters is no
+  longer "no kernel counter reaches the meter" — it is that **`/metrics`
+  exports 8 of 65 counters**, which is the same gap this document opened with.
+- **The OTLP interval task may be removable.** It was built anyway (`aa53595`),
+  it works, and §1.5's analysis of *why* it was needed is still correct on its
+  own terms. Under a pull-only export path it is machinery with no consumer.
+  §1.5 records this rather than deleting the analysis.
+- **§1.6's reasoning is vindicated**, not merely still standing. See §1.6.
+- **The `/metrics` `scope` label is reopened.** §6 listed it as a documented
+  wart on the explicit basis that nothing consumed the endpoint. Something does
+  now, so it is a live cardinality question with a real answer owed.
+
+BUG-2 is also corrected here and in §5.5, from
+`docs/plans/2026-07-27-scoped-cluster-map-lock-double-open.md` (`0b9eb31`),
+which investigated it and found the premise does not hold — and found a worse,
+unfiled bug that **this document's own collection path causes**.
+
 Goal: finish the observability story that `docs/plans/2026-07-26-otel-telemetry-crate.md`
 started, by taking the four things it deferred and deciding them — metrics
 first, because it is the one with a trap in it.
@@ -71,6 +96,14 @@ counters the kernel maintains, and it already uses the unbounded `scope` as a
 Prometheus label. The cardinality rule this document is supposed to protect is
 already being broken by the code it was told to leave alone.
 
+**Two of those three have since moved, and the third has hardened.** With
+Prometheus scraping `/metrics` decided as the export path, "leave `/metrics`
+untouched" narrows to "never change an existing series" — adding series is what
+M2 and M3 now *are* (§1.8, §6). The periodic-callback shape is still right for
+the pipeline it was designed for and has no consumer under a pull-only export
+(§1.5). And "8 of 65" is unchanged after H2 and is now the headline gap rather
+than a supporting observation.
+
 ## Sources
 
 **Prior plans in this repo**
@@ -89,18 +122,30 @@ already being broken by the code it was told to leave alone.
   items" note that no counter exports which sparse-kernel rung served a
   traversal. §1.6 below is where that gets fixed, since it is a metric-shaped
   gap rather than a span-shaped one.
+- `docs/plans/2026-07-27-scoped-cluster-map-lock-double-open.md` (`0b9eb31`) —
+  the investigation of BUG-2, written because this document filed it. Its
+  verdict is that the hold BUG-2 names costs microseconds and that the real
+  hold is the LRU eviction twenty lines above; its §3 records an unfiled bug
+  that the metrics path *causes* and that outranks BUG-2. Both are folded into
+  the BUG-2 entry below and into §5.5.
 
 **Code this analysis was derived from, and checked against**
 
-- `src/core/metrics.rs` — `GraphCacheMetricsSnapshot` (:67) and
-  `GraphOperationalMetricsSnapshot` (:90), the two kernel counter sets.
+- `src/core/metrics.rs` — `GraphCacheMetricsSnapshot` and
+  `GraphOperationalMetricsSnapshot`, the two kernel counter sets. **Cited by
+  symbol:** this file has been edited every day of this plan's life and the
+  original `:67` / `:90` are now `:189` / `:212`.
 - `src/client/service.rs:640` — `ClientQueryMetricsSnapshot`, the third set.
 - `src/core/state.rs:903` / `:916` — `GraphCacheEntryCounts` and
   `GraphCacheResidentBytes`, the two gauge sets.
-- `src/bin/graph_node/admin.rs` — the whole file; `metrics` (:106) and
-  `append_node_metrics` (:145) are what actually reaches Prometheus today.
+- `src/bin/graph_node/admin.rs` — the whole file; `metrics` and
+  `append_node_metrics` are what actually reaches Prometheus today, and since
+  `8d7e939` `append_histogram_types` / `append_histograms` are what render the
+  duration families. **Cited by symbol:** the original `:106` / `:145` are now
+  `:171` / `:215`, and this file is under active edit.
 - `src/bin/graph-indexer.rs` — `IndexerMetrics` (:200) and `indexer_metrics`
-  (:935), the second, unrelated metrics vocabulary.
+  (:935), the second, unrelated metrics vocabulary. Both still correct at
+  `aa53595`; prefer the symbols anyway.
 - `src/engine/cluster.rs:1265` and `src/shard/lifecycle.rs:234-330` — the
   collection path, and the reason half of it is lock-free and half is not.
 - `src/engine/index_store.rs` — `GraphIndexGeneration` (:12),
@@ -159,6 +204,10 @@ them.
 - `src/shard/lifecycle.rs:285-330` — the two gauge functions, read for their
   guard *scoping* rather than their lock count. That is where BUG-1 was.
 - `src/engine/cluster.rs:1188`, `:1216-1230` — `cluster_for_scope`. BUG-2.
+  Re-read in `0b9eb31`, which added `:1194-1214` (the LRU eviction, where the
+  milliseconds actually are), `:1197` (the `strong_count == 1` candidate
+  filter), `:1256` (`loaded_clusters`) and `:1265`
+  (`local_shard_runtime_metrics`) — BUG-4. All five verified at `aa53595`.
 - `src/query/coordination.rs:59`, `:926`, `:1211` — the query transport's
   timeout, its slow-query threshold and its `remote_latency_us`. Two of the
   three histogram bucket bounds in §1.10 are these constants, not taste.
@@ -182,7 +231,16 @@ the prose below, for the same reason the prior plan gives: each was believed on
 the strength of a code read, and a second code read is the cheapest thing that
 disproves one.
 
-### Three live bugs
+**Four bugs now, and the fourth makes the point better than the section does.**
+A *third* read of the same files — `0b9eb31`, done to design a fix for BUG-2 —
+demoted BUG-2 and turned up BUG-4, which nobody had filed and which outranks it.
+Three reads of `src/engine/cluster.rs` produced one bug that was real and
+expensive, one that was real and cheap and mis-described, and one that was
+invisible until something started consuming the endpoint. The reading is not
+"read it again"; it is that a hold's *cost* is not visible from the hold, and a
+retention's cost is not visible from the retention — both need the consumer.
+
+### Four live bugs
 
 **BUG-1 — the cache gauges hold seven mutexes at once.**
 `graph_cache_entry_counts` and `graph_cache_resident_bytes`
@@ -203,20 +261,79 @@ behaviour change. **Fixed in the working tree at the time of this amendment.**
 while missing that they overlapped.
 
 **BUG-2 — `cluster_for_scope` holds the `clusters` mutex across a shard open.**
-`src/engine/cluster.rs:1216-1230` holds `clusters` across
-`open_promotable_scoped_with_memory_options(...).await`. A shard open is
-multi-millisecond, and every other taker of that mutex — including the metrics
-collector §1.5 proposes, and the read path itself via `cluster_for_scope`
-(`:1188`) — inherits the stall.
+~~A shard open is multi-millisecond, and every other taker of that mutex —
+including the metrics collector §1.5 proposes, and the read path itself —
+inherits the stall.~~ **The premise does not hold. Corrected against
+`0b9eb31`.**
 
-**Not fixed, and deliberately left open.** Narrowing the critical section is not
-a mechanical change: releasing the lock around the open admits a double-open
-race between two callers for the same scope, so the fix needs a
-one-open-per-scope guard (an in-flight map, or a per-scope `OnceCell`) designed
-on its own terms. It is recorded here so it is not lost, because it is the
-reason M2's "measure the collector against read-path p99" step could produce a
-confusing result: with BUG-2 present, a slow collection and a slow read can
-share a cause that has nothing to do with the cache gauges.
+`docs/plans/2026-07-27-scoped-cluster-map-lock-double-open.md` investigated this
+before designing a fix, and **the promotable open performs no object-store I/O
+at all**. `GraphShard::open_internal`'s `GraphWriteAuthority` match has an
+*empty* arm for `Promotable`; the store is `GraphStore::lazy` with
+`writer: None` and `reader: None`; and the drop-marker read is guarded by
+`!promotable &&` and short-circuits. What is held is `O(cells)` allocations of
+empty maps, with no request issued and no await that can pend. Tens of
+microseconds. Every narrowing option considered buys exactly that.
+
+**Three consequences for this document.**
+
+*The stall M2 was told to expect is not there.* "Measure the collector against
+read-path p99" should no longer be run expecting `cluster_for_scope` to
+contribute one. §1.5's paragraph saying the interval task "will occasionally
+block for a shard open" is corrected in place.
+
+*There is a real multi-millisecond hold, and it is a different line.* The LRU
+eviction twenty lines above closes an entire cluster — every shard's SlateDB
+reader and writer, serially — **with the mutex held**. It is a cliff rather than
+a slope: below `max_open_scopes` (default 8) it never runs; above it, every miss
+serialises every query behind a close-then-open cycle.
+
+*The double-open concern was right for the wrong reason, and it is worse than
+wasteful.* Two live clusters for one scope each claim a SlateDB writer epoch for
+the same cell — `Db::builder(..).build()` claims one unconditionally, and every
+gate that would arbitrate (`writer_open_gate`, `WriterReopenGate`, the
+`local_write_guard` mutex) is per-`GraphShard`, so neither copy can see the
+other. The second promotion fences the first and the ping-pong runs *faster*
+than the network version, because `resolve_placement` answers `Local` for both.
+**The map lock is the interlock**, which is why the naive narrowing is unsafe
+and why the plan's recommendation is to leave it alone rather than to fix it.
+
+**The finding that outranks BUG-2, and it is ours.** See the entry below.
+
+**BUG-4 — the collector pins every scope against eviction, and the failure is
+`AdmissionRejected`.** `ScopedRoutedGraphCluster::local_shard_runtime_metrics`
+(`src/engine/cluster.rs:1265`) takes the `clusters` mutex only to clone the
+`Arc`s out and then releases it — that part is right — but it **retains those
+`Arc`s for the whole collection**, and eviction's candidate filter is
+`Arc::strong_count(&entry.cluster) == 1` (`:1197`). So while a scrape is
+collecting, **every open scope is un-evictable**. At `max_open_scopes`, a query
+for a scope that is not already open finds no eviction candidate and
+`cluster_for_scope` returns
+
+```
+AdmissionRejected { operation: "open_graph_scopes", actual: 9, limit: 8 }
+```
+
+straight to the client. Not a stall — a hard error, no retry, no wait.
+`loaded_clusters` (`:1256`) has the same shape and is worse: the index-discovery
+loop (`src/bin/graph-node.rs`, `start_index_discovery`) holds its clones across
+`dirty_graph_index_edge_types` and `discover_graph_index` per cell, which do
+perform I/O, so its window is far wider than the collector's.
+
+This is **the metrics path moving a user-visible error rate rather than a
+latency percentile**, which is the one outcome §1.5 and §1.6 were written to
+avoid, and it survives every proposed fix to BUG-2 because none of them touch
+it. It was not live while nothing scraped `/metrics` on a schedule and nothing
+fed the meter. Both are now true — `MetricCollection` runs on the export
+interval and Prometheus scrapes `metrics` — so it is live.
+
+The fix is step 3 of
+`docs/plans/2026-07-27-scoped-cluster-map-lock-double-open.md`: collect
+`Weak<RoutedGraphCluster>` under the lock and upgrade one at a time, dropping
+each `Arc` before the next. **Not implemented.** It is the one item in that
+plan's list that should be done first if only one thing gets done, and it is a
+prerequisite for M2 rather than a neighbour of it — running M2's measurement
+against a collector that can reject admissions measures the wrong thing twice.
 
 **BUG-3 — `SAMPLING_FORCE` never fires.** `is_always_sampled`
 (`crates/telemetry/src/sampling.rs:66-74`) reads `turbolay.sampling.force` and
@@ -374,10 +491,16 @@ third time.
   gauge, and `last_success_ms`, a timestamp — but the indexer is a separate
   binary and its seven are not part of the 65.
 - The cardinality trap is sprung, and worse than stated: `scope` is a label on
-  all five per-shard series (`admin.rs:161`, `:162`, `:163`, `:199`, `:226`),
-  and `validate_component` (`src/codec.rs:175-187`) bounds only the *character
-  set* of a scope component. There is no length limit, and `MAX_NAMESPACE_DEPTH
-  = 8` bounds depth, not breadth. The label is unbounded in the strong sense.
+  all five per-shard series — the three counters and the two cache gauge
+  families rendered by `append_node_metrics` (cited by symbol; the original
+  `admin.rs:161`, `:162`, `:163`, `:199`, `:226` are all stale after H2) — and
+  `validate_component` (`src/codec.rs:175-187`) bounds only the *character set*
+  of a scope component. There is no length limit, and `MAX_NAMESPACE_DEPTH = 8`
+  (`src/core/namespace.rs:7`) bounds depth, not breadth. The label is unbounded
+  in the strong sense. **Since `8d7e939` it is also on the per-shard duration
+  histogram (`query_rows_latency`), at 20 series per `scope × cell_id` pair**,
+  and since the export path was decided it is being stored rather than merely
+  emitted — which is why §6 no longer lists it as out of scope.
 - `turbolay.query.access_path` is unbounded (`src/shard/query_optimizer.rs:862`).
 - `writer.fence_refresh` is on the write path (`src/shard/lifecycle.rs:262`,
   `:523`).
@@ -397,21 +520,34 @@ The kernel maintains three counter structs, all cumulative `AtomicU64`:
 
 | Struct | Where | Counters |
 |---|---|---|
-| `GraphOperationalMetricsSnapshot` | `src/core/metrics.rs:90` | 35 |
-| `GraphCacheMetricsSnapshot` | `src/core/metrics.rs:67` | 19 |
+| `GraphOperationalMetricsSnapshot` | `src/core/metrics.rs` | 35 |
+| `GraphCacheMetricsSnapshot` | `src/core/metrics.rs` | 19 |
 | `ClientQueryMetricsSnapshot` | `src/client/service.rs:640` | 11 |
 
 (The prior plan says 36 operational counters. It is 35 — `write_attempts`
-through `backpressure_waits`, `src/core/metrics.rs:91-125`. A small thing, but
-this document is written on the assumption that its own numbers will be
-checked.)
+through `backpressure_waits`. A small thing, but this document is written on the
+assumption that its own numbers will be checked. **Cited by symbol:** the
+original `:90` / `:67` / `:91-125` are all stale, and `src/core/metrics.rs` is
+under active edit. The operational count is test-enforced since `8d7e939` —
+`snapshot_fields!(GraphOperationalMetricsSnapshot { … })` names all 35 in its
+`counters` bucket and the destructure has no `..`, so a 36th cannot appear
+unclassified. The 19 cache counters have no such enumeration at `aa53595`; see
+M2.)
 
-`src/bin/graph_node/admin.rs` exports **eight** of those 65. Five come from
-`ClientQueryMetricsSnapshot` at :112-130 — `queries_started`,
+`src/bin/graph_node/admin.rs` exports **eight** of those 65, and it is still
+eight after H2 — `8d7e939` added duration *histogram* families, not counters.
+Five come from `ClientQueryMetricsSnapshot`, in `metrics` — `queries_started`,
 `queries_completed`, `queries_failed`, `auth_failures`, `scope_denials`. Three
-come from `GraphOperationalMetricsSnapshot` at :159-174 —
+come from `GraphOperationalMetricsSnapshot`, in `append_node_metrics` —
 `query_graphblas_artifact_snapshots`, `query_graphblas_rebuilt_snapshots`,
-`query_rust_sparse_fallbacks`. That is the complete list.
+`query_rust_sparse_fallbacks`. That is the complete list. (Cited by symbol; the
+original `:112-130` and `:159-174` are stale.)
+
+**This is the gap M2 exists to close, and the export-path decision is what
+promotes it from an observation to the top of the queue.** Under the original
+framing the 57 unexported counters were a *meter* problem; they are not, they
+are a `/metrics` problem, and they have been the same `/metrics` problem since
+this document's first paragraph.
 
 Not exported, and therefore invisible in production: every write counter
 (`write_attempts`, `write_commits`, `write_retries`); every artifact counter
@@ -426,34 +562,44 @@ field on `GraphShardRuntimeMetrics` (`src/engine.rs:120`) is read by no binary
 at all — `matrix_artifact_hits` appears only in `src/tests.rs:1381` and
 `examples/query_bench.rs:981`.
 
-The gauges that *are* exported — `graph_cache_entries` (:175-202) and
-`graph_cache_resident_bytes` (:203-229) — come from `GraphCacheEntryCounts` and
-`GraphCacheResidentBytes`, which are different structs entirely.
+The gauges that *are* exported — `graph_cache_entries` and
+`graph_cache_resident_bytes`, both rendered in `append_node_metrics` — come from
+`GraphCacheEntryCounts` and `GraphCacheResidentBytes`, which are different
+structs entirely. (Cited by symbol; the original `:175-202` and `:203-229` are
+stale.)
 
 This reframes the whole section. "Mirror the existing snapshot into a meter" is
 not a parallel export of something already visible; for 57 of 65 counters it is
-the *first* time they leave the process.
+the *first* time they would leave the process — and per the export-path
+decision, the first place they should leave it is `/metrics`.
 
 ### The cardinality trap is already sprung, in `/metrics`
 
 `append_node_metrics` emits every per-shard series with
-`{scope="…",cell_id="…"}` — `src/bin/graph_node/admin.rs:161-163` for the three
-counters, `:199` for `graph_cache_entries`, `:226` for
-`graph_cache_resident_bytes`. `scope` is the tenant root. It is exactly the
-attribute `crates/telemetry/src/semconv.rs:22-25` says must never become a
-metric dimension, and it has been one for as long as the endpoint has existed.
+`{scope="…",cell_id="…"}` — the three counters, `graph_cache_entries`,
+`graph_cache_resident_bytes`, and since `8d7e939` the per-shard duration
+histogram `query_rows_latency` as well, at 20 series per pair. (Cited by symbol;
+the original `admin.rs:161-163`, `:199`, `:226` are stale.) `scope` is the tenant root. It is
+exactly the attribute `crates/telemetry/src/semconv.rs:22-25` says must never
+become a metric dimension, and it has been one for as long as the endpoint has
+existed.
 
 It is also unbounded in the strong sense, which the original draft only
-implied. `validate_component` (`src/codec.rs:175-187`) constrains the
-*character set* of a scope component and nothing else — no length limit — and
-`MAX_NAMESPACE_DEPTH = 8` bounds how deep a namespace may nest, not how many
-distinct ones may exist. Nothing in the write path bounds the number of scopes
-a fleet will see.
+implied. The value is `{namespace}/graphs/{graph_id}`
+(`impl Display for GraphScope`, `src/core/namespace.rs:268-272`), and both
+halves are user-created: `NamespaceId::new` (`:21-25`) and `GraphId::new`
+(`:70-74`) both go through `validate_component` (`src/codec.rs:175-187`), which
+constrains the *character set* and nothing else — no length limit — and
+`MAX_NAMESPACE_DEPTH = 8` (`src/core/namespace.rs:7`) bounds how deep a
+namespace may nest, not how many distinct ones may exist. Nothing in the write
+path bounds the number of scopes a fleet will see.
 
 The rule this document is charged with protecting is therefore not a rule that
 is being upheld and might be broken. It is a rule that is being broken, in the
-code the prior plan said to leave untouched. §1.4 has to say what to do about
-that, not just how to avoid repeating it.
+code the prior plan said to leave untouched. §1.4 says what to do about it on
+the OTLP side; **§6 now carries the `/metrics` side as an open decision**,
+because the argument for tolerating it — that nothing consumed the endpoint —
+expired when the export path was decided.
 
 ### `turbolay.query.access_path` is not bounded
 
@@ -512,6 +658,12 @@ vocabulary: it is the OTel semantic-convention name where one genuinely exists
 and `turbolay.*` everywhere else (§1.9). And three of the fifteen duration
 counters become **real histograms in the kernel** (§1.10), which is a kernel
 change this document originally put out of scope and now does not.
+
+**One reordering from the export-path decision.** "Export all 65 counters"
+stands; *where first* has changed. `/metrics` is the decided consumer, so the 57
+unexported counters reach `/metrics` before they reach the meter (§1.8, M2 and
+M3). "Duplicate `/metrics` rather than replace it" is unaffected and §1.6's
+argument for it is stronger than when it was made.
 
 The rest of this section argues each of those.
 
@@ -682,9 +834,10 @@ pub const L_PLACEMENT_STATE: MetricLabel = MetricLabel(PLACEMENT_STATE);
 pub const L_PLACEMENT_PREVIOUS_STATE: MetricLabel = MetricLabel(PLACEMENT_PREVIOUS_STATE);
 pub const L_QUERY_FULL_SCAN: MetricLabel = MetricLabel(QUERY_FULL_SCAN);
 pub const L_DB_SYSTEM_NAME: MetricLabel = MetricLabel(DB_SYSTEM_NAME);
+pub const L_DB_OPERATION_NAME: MetricLabel = MetricLabel(DB_OPERATION_NAME); // added in `aa53595`
 pub const L_LE: MetricLabel = MetricLabel(LE);   // §1.10, bucket upper bound
 
-pub const METRIC_LABELS: &[MetricLabel] = &[/* the eleven above */];
+pub const METRIC_LABELS: &[MetricLabel] = &[/* the twelve above */];
 pub const SPAN_ONLY_KEYS: &[&str] = &[/* the twenty-four others */];
 ```
 
@@ -693,8 +846,12 @@ from an arbitrary string outside `semconv.rs`. Every meter helper takes
 `&[(MetricLabel, &str)]` rather than `&[KeyValue]`. Passing `SCOPE` to a metric
 is then not a policy violation to be caught in review — it is a type error.
 
-Three of those eleven were not in the original list and are worth a line each.
+Four of those twelve were not in the original list and are worth a line each.
 `placement.state` and `placement.previous_state` are §1.3's late additions.
+`db.operation.name` is H2's: two values, `read` and `write`, and it exists
+because semconv gives `read_latency` and `write_latency` one instrument name and
+this label is the only thing that keeps them from silently collapsing back into
+the single distribution `5d97fb8` split them out of.
 `db.system.name` is a *consequence of §1.9's naming decision*: it has exactly
 one value (`neo4j`, `DB_SYSTEM_NEO4J`, `semconv.rs:241`), it costs nothing, and it is the
 attribute the vendor's database view keys off — putting `db.*` names on the
@@ -737,17 +894,23 @@ fn every_metric_label_is_a_registry_key() {
 The second test is the one that catches the `le` mistake — a `MetricLabel`
 built from a string that was never added to the registry would otherwise
 silently escape the partition, which is exactly the hole `error.class` was
-already sitting in. With both tests, **35 keys partition into 11 labels and 24
+already sitting in. With both tests, **36 keys partition into 12 labels and 24
 span-only**, and neither list can gain a member without the other being
 considered.
 
-**The draft said 34 → 11 + 23, and that was one behind.** `8f150b2` added
-`turbolay.sampling.tail_keep` between the writing and the implementing. As
-built (`68efadf`): `METRIC_LABELS` `semconv.rs:352-364` — 11; `SPAN_ONLY_KEYS`
-`:369-394` — 24; `ALL_TURBOLAY_KEYS` `:398-431` — 32; `ALL_REGISTRY_KEYS`
-`:442-478` — 35, asserted to be exactly `ALL_TURBOLAY_KEYS` + 3 by
-`the_registry_contains_every_turbolay_key` (`:519-533`). The arithmetic is
-therefore load-bearing in the test suite and not only in this paragraph.
+**The arithmetic has moved twice while this paragraph was being written, which
+is the argument for the test rather than against the count.** The draft said
+34 → 11 + 23; `8f150b2` added `turbolay.sampling.tail_keep` and made it
+35 → 11 + 24; `aa53595` added `L_DB_OPERATION_NAME` — the label that keeps
+`read_latency` and `write_latency` from collapsing into one series under
+`db.client.operation.duration`, see H2 — and made it **36 → 12 + 24**. Counted
+from the file at `aa53595`: `METRIC_LABELS` `semconv.rs:389-402` — 12;
+`SPAN_ONLY_KEYS` `:407-432` — 24; `ALL_TURBOLAY_KEYS` `:436-469` — 32;
+`ALL_REGISTRY_KEYS` `:481-518` — 36, asserted to be exactly
+`ALL_TURBOLAY_KEYS` + 4 by `the_registry_contains_every_turbolay_key`
+(`:559-573`). The arithmetic is load-bearing in the test suite and not only in
+this paragraph, which is why the drift is a doc bug rather than a code bug each
+time.
 
 A new attribute cannot be added to the registry without deciding, in the same
 commit, whether it may be a metric dimension. That is the property worth
@@ -757,18 +920,24 @@ Update the module doc comment at `semconv.rs:13-25` at the same time. It
 currently claims `QUERY_ACCESS_PATH` is safe anywhere, which is the one
 sentence in the crate that would talk somebody into the wrong thing.
 
-**And the existing violation.** `scope` is a Prometheus label today
-(`admin.rs:161`, `:199`, `:226`). Three options: leave it (the endpoint is not
-new, and whatever it costs it is already costing), drop it (breaks every
-existing dashboard and alert), or leave `/metrics` alone and simply not repeat
-it in the OTel export. **Recommend the third.** The prior plan's instruction to
-leave `/metrics` untouched is right, and it is right for a reason beyond
-caution: `/metrics` is scraped by a Prometheus that is already sized for
-whatever tenant count it sees, whereas the OTLP pipeline ships to a vendor
-billing per series. The two have different cost functions and should not be
-forced to the same dimensionality. Record the divergence in the runbook —
-"`scope` is on the Prometheus series and deliberately not on the OTLP series"
-is exactly the kind of thing that reads as a bug six months later.
+**And the existing violation.** `scope` is a Prometheus label today, on every
+per-shard series `append_node_metrics` renders. Three options: leave it (the
+endpoint is not new, and whatever it costs it is already costing), drop it
+(breaks every existing dashboard and alert), or leave `/metrics` alone and
+simply not repeat it in the OTel export. **Recommend the third.** `/metrics` is
+scraped by a Prometheus that is already sized for whatever tenant count it sees,
+whereas the OTLP pipeline ships to a vendor billing per series. The two have
+different cost functions and should not be forced to the same dimensionality.
+Record the divergence in the runbook — "`scope` is on the Prometheus series and
+deliberately not on the OTLP series" is exactly the kind of thing that reads as
+a bug six months later.
+
+**The half of that argument that has since expired.** "Whatever it costs it is
+already costing" was true of an endpoint nothing scraped on a schedule. It is
+not true of the decided export path, and it is not true at H2's series count.
+The recommendation above — do not repeat `scope` on the OTLP side — still
+stands and is implemented. Whether `scope` should stay on the *Prometheus* side
+is now an open decision; see §6, which no longer lists it as out of scope.
 
 ### 1.5 The shape: a cached snapshot behind observable instruments
 
@@ -792,14 +961,21 @@ on every cache lookup. You cannot `.await` any of that inside an OTel callback,
 and `block_on` inside a callback that the SDK runs on its own OS thread
 (`periodic_reader.rs:171`) is how you deadlock a node.
 
-Two things about that path were wrong when this was written, and both are
-worse than the version above rather than better. Those twelve acquisitions were
-*overlapping*, not sequential — BUG-1, now fixed, and the reason "twelve cheap
-locks once a minute" was not the right way to think about the cost. And the
-scoped-cluster mutex at `:1266` is itself held across a shard open elsewhere in
-the same file — BUG-2, not fixed. The interval task will therefore occasionally
-block for a shard open before it takes a single cache lock, which is worth
-knowing before anyone attributes a collection stall to the gauges.
+Two things about that path were wrong when this was written. Those twelve
+acquisitions were *overlapping*, not sequential — BUG-1, now fixed, and the
+reason "twelve cheap locks once a minute" was not the right way to think about
+the cost.
+
+The second correction goes the other way, and it is a retraction. This paragraph
+used to say the scoped-cluster mutex is held across a shard open elsewhere in
+the same file, so "the interval task will occasionally block for a shard open
+before it takes a single cache lock". **That is false on the promotable path**
+— the open issues no request and contains no await that can pend
+(`0b9eb31`; see BUG-2 above). The interval task does not block on it. What it
+*does* do is retain the cluster `Arc`s it cloned out for the whole collection,
+which makes every scope un-evictable for that window and can turn a query for a
+new scope into `AdmissionRejected` — BUG-4 above, and the reason the collector
+is a correctness concern here rather than a latency one.
 
 Note the asymmetry, because it is the design: `graph_operational_metrics`
 (`src/shard/lifecycle.rs:238`) and `graph_cache_metrics` (`:234`) are
@@ -814,6 +990,36 @@ calls `local_shard_runtime_metrics().await`, and publishes the `Vec` into an
 `ArcSwap` (or `RwLock<Arc<…>>`). The observable callbacks read that cached
 `Arc` synchronously and report from it. The callback never blocks, never locks
 a cache mutex, and never touches the runtime.
+
+**Built, working, and possibly unnecessary. Recorded rather than deleted.**
+`aa53595` shipped exactly this — `MetricCollection::start` /
+`collect_forever` / `collect_once` in `src/bin/graph_node/otel_metrics.rs`,
+publishing into `ObservableHistogram::record_snapshot` which is the cache the
+registered callbacks read. It is inert without `otlp` and inert with `otlp` on
+and no endpoint configured, the shard half is wrapped in
+`timeout(interval / 2)` so a slow collection can never overlap the next, and it
+reads `TelemetryConfig::metric_export_interval` rather than the env var a second
+time so it and the `PeriodicReader` cannot disagree.
+
+The reasoning above is still correct *for the pipeline it was written for*. It
+exists because an OTLP **push** exporter fires on its own clock, off the tokio
+runtime, and therefore needs a snapshot already taken. **Prometheus does not
+work that way.** A scrape is a request: `/metrics` collects synchronously, on a
+tokio task, inside the handler, at exactly the moment the data is wanted — no
+cached snapshot, no second clock, no staleness window. With `/metrics` decided
+as the consumer (§1.6, §1.8), the entire device this section argues for has no
+consumer.
+
+So: **the interval task is a candidate for removal, not a defect.** It is not
+being deleted here, for three reasons worth stating rather than assuming. It is
+the only thing that would feed an OTLP pipeline the day one is deployed, and
+that day is a configuration change rather than a code change. It costs nothing
+when no endpoint is set, which is the ordinary build. And the analysis above is
+the reason it has the shape it has — deleting the code and keeping the prose
+would leave a future reader re-deriving a constraint that was already paid for.
+What should *not* happen is anyone treating it as load-bearing for the
+Prometheus path. It is not. If it is removed, remove §1.5's device with it and
+say so here.
 
 **Observable instruments, not synchronous ones.** This is not a style
 preference. The source values are *cumulative* — `write_attempts` only ever
@@ -935,11 +1141,29 @@ deprecated and not changed.**
 Three reasons, in order of weight.
 
 *`/readyz` and `/metrics` are on the same server, and one of them is a control
-plane.* `graph_runtime_ready` (`admin.rs:108`) and `graph_indexer_ready`
-(`graph-indexer.rs:938`) mirror the readiness probe. A pull endpoint the
-cluster scrapes directly cannot depend on an external collector being up.
-Anything that makes liveness observability contingent on a third-party pipeline
-is a worse system, and OTLP push is by construction contingent.
+plane.* `graph_runtime_ready` (`metrics`, `src/bin/graph_node/admin.rs`) and
+`graph_indexer_ready` (`indexer_metrics`, `graph-indexer.rs:938`) mirror the
+readiness probe. A pull endpoint the cluster scrapes directly cannot depend on
+an external collector being up. Anything that makes liveness observability
+contingent on a third-party pipeline is a worse system, and OTLP push is by
+construction contingent.
+
+**This reason was vindicated, and it is worth saying so plainly.** When it was
+written it was a hedge — an argument for keeping a thing that already existed,
+made against a plan whose centre of gravity was the OTLP pipeline. The export
+path has since been decided the other way: **Prometheus scraping `/metrics` is
+the consumer** (§1.8). So the endpoint this section defended on the grounds that
+it must not become contingent on a collector is now the *primary* export, and
+the collector is the optional one. Had §1.6 gone the other way — deprecate
+`/metrics`, migrate to OTLP — the decision would now have to be unwound, and
+unwound in the one place where being wrong takes readiness observability down
+with it.
+
+The generalisable form, since this document keeps a record of what it got right
+as well as what it got wrong: *an endpoint that shares a process and a server
+with a control-plane probe should not acquire an external dependency, whatever
+the migration plan says.* That is a property of the colocation, not a forecast
+about which pipeline wins.
 
 *The two have different cost functions.* §1.4's `scope` divergence only works
 if both exist. Collapse to one and you have to pick which cost you pay.
@@ -966,6 +1190,21 @@ or have `/metrics` serve the interval task's cached `Arc` instead of collecting
 its own, which is a change to `/metrics` and therefore out of scope by §6. The
 first option is right; it is written down so the second is not rediscovered as
 though it were free.
+
+**And there is now a third option that did not exist when this was written:
+delete the interval task.** Under the decided export path there is one consumer
+and it collects per-scrape, synchronously, inside the handler. That is one
+collection a minute rather than two, with no cached snapshot and no staleness
+window — strictly better than either option above, and available for free the
+moment the OTLP pipeline is agreed not to be coming. See §1.5. Until that is
+decided the recommendation stands unchanged, because the task costs nothing when
+no endpoint is configured.
+
+**Neither collection is free in the way this paragraph assumed, though**, and
+the reason is BUG-4 rather than the locks: whichever path collects, it retains
+the cluster `Arc`s for the duration and makes every open scope un-evictable
+while it does. Two collections a minute means two such windows. That is an
+argument for fixing BUG-4 rather than for picking a side here.
 
 The one thing that must not happen is the two disagreeing about *names*. Pick
 the OTel names once, write them next to the Prometheus names in the runbook,
@@ -1067,11 +1306,36 @@ writing is a merge rather than a decision.
 
 The full order is: **BUG-3 → BUG-1 → H1 → M1 → H2 → M2 → M3 → H3.** BUG-3 landed
 in `8f150b2`, BUG-1 in `08e78df`, H1 across `3c2728a`/`5d97fb8`/`fbdfca3`/
-`1037a0c`, and M1 in `68efadf`. **H2 is next**, with the collector
-`tail_sampling` policy still outstanding as a deployment task running alongside.
+`1037a0c`, M1 in `68efadf` + `aa53595`, and H2 in `8d7e939` + `aa53595`.
+**M2 is next. H3 is the only histogram step outstanding**, and the collector
+`tail_sampling` policy is still outstanding as a deployment task running
+alongside.
 
-**Step M1 — the meter provider and the operational counters. Landed in
-`68efadf`, in part.** Add
+**And BUG-4 is now a prerequisite for M2**, not a neighbour of it. The collector
+retaining cluster `Arc`s can turn a scrape into `AdmissionRejected` for a
+new-scope query (see BUG-4 above); measuring M2's collection cost against
+read-path p99 while that stands would measure a latency question on a path that
+is failing outright. It is also the only item in this document that moves an
+error rate rather than a percentile, so it wins on its own merits regardless of
+sequencing.
+
+**The export path decision, and what it re-points.** Prometheus scraping
+`/metrics` is the decided consumer. M2 and M3 below were written as
+"…through the same meter", and that is now the *second* half of each rather
+than the first: **`/metrics` first, the meter second.** The reason is not
+preference, it is where the gap is. After H2, `/metrics` exports 8 of 65
+counters plus **three** duration histogram families — `read_latency`,
+`write_latency` and `query_rows_latency`; `PROMETHEUS_HISTOGRAMS` names five,
+but `rpc_latency` and `serve_latency` have no live source in `graph-node`, which
+instantiates neither `TcpQueryServer` nor `TcpQueryCellClient` and so holds no
+`QueryTransportMetricsSnapshot` to enumerate. The meter has the same five names
+and the same three live sources, and no counters at all. Wiring 57 counters to
+the meter first would
+build a second export of numbers the decided consumer still cannot see. Each
+step's **Done when** below is restated against `/metrics` accordingly.
+
+**Step M1 — the meter provider and the operational counters. Complete —
+`68efadf` and `aa53595`.** Add
 `"metrics"` to `opentelemetry-otlp` in the root `Cargo.toml`; add
 `SdkMeterProvider` to `otlp::Providers` (`crates/telemetry/src/otlp.rs:61`) and
 to its `shutdown` (`:79`); add `MetricLabel`, `METRIC_LABELS`, `SPAN_ONLY_KEYS`,
@@ -1092,33 +1356,78 @@ consumes; and the module doc rewrite §1.4's last paragraph asked for — the
 `QUERY_ACCESS_PATH`-is-safe-anywhere sentence is gone (`semconv.rs:30-34` now
 records that it was wrong, rather than repeating it).
 
-**What `68efadf` deliberately did not do: no kernel counter is wired to the
-meter.** There is no interval task, no `ObservableCounter` over
-`GraphOperationalMetricsSnapshot` or `ClientQueryMetricsSnapshot`, and no binary
-calls `Providers::meter`. M1 shipped the provider and the rules that keep it
-honest; the counters it was also scoped to carry are still M1's remainder. That
-split is why the meter's only proof of life is an integration test
-(`crates/telemetry/tests/meter_export.rs`) that implements a `PushMetricExporter`
-in-test — which is also the only thing that establishes the SDK *accepts*
-`db.client.operation.duration.bucket` as an instrument name, since it silently
-drops names it rejects rather than erroring.
+**What `68efadf` deliberately did not do: nothing left the process.** There was
+no interval task, no `ObservableCounter` over `GraphOperationalMetricsSnapshot`
+or `ClientQueryMetricsSnapshot`, and no binary called `Providers::meter` —
+which was private. Everything compiled and everything was tested; the meter was
+correct, reachable only from its own integration test, and unreachable from
+production. That is the failure mode this plan is least able to detect by
+reading, and it is worth naming: *a metrics pipeline that is never constructed
+by a binary has the same symptom as one that works — silence.*
 
-**Done when** `write_retries`, `query_rows_failed` and `verifier_failures` —
-none of which have ever left a process — are charted per cell in staging, and
-`/metrics` returns byte-identical output to before. **Not yet met**, and it is
-the counter half above that is outstanding.
+**`aa53595` closed it.** `TelemetryGuard::providers()` is public;
+`src/bin/graph_node/otel_metrics.rs` gains `NodeHistograms::register` and
+`MetricCollection::start`; `graph-node.rs` constructs it. `providers()` was
+chosen over `global::set_meter_provider` for two reasons — a process-global
+outlives the guard whose whole job is ordered shutdown, and `global::meter` on
+an uninstalled global returns a **no-op** meter that accepts every instrument
+and reports nothing, which is precisely the symptom-free failure above. Proof of
+export is a real HTTP sink on loopback asserting on the captured `/v1/metrics`
+protobuf, falsified by repointing at a closed port; every prior test built its
+own `SdkMeterProvider`, which is exactly the step production was skipping.
 
-**Step M2 — cache counters and gauges.** The 19 `GraphCacheMetricsSnapshot`
-counters and the two gauge structs. Separate because it is the step that pays
+**Marked complete, with the remainder named rather than hidden.** No
+`ObservableCounter` over either counter snapshot exists — the meter carries the
+five duration histograms and nothing else. Under the original framing that made
+M1 incomplete. Under the decided export path it does not: the counters' missing
+export is `/metrics`, not the meter, and that work is M2's and M3's. What is
+genuinely M1 is done — the provider exists, is reachable, is fed, and shuts down
+in the right order.
+
+**Done when** — restated. Originally: `write_retries`, `query_rows_failed` and
+`verifier_failures` charted per cell in staging. That is now **M2's** bar and it
+is a `/metrics` bar. M1's own bar is that the meter is constructed by a binary
+and observably exports, which the loopback test in `crates/telemetry` and
+`MetricCollection::start` together meet. **Met.**
+
+**Step M2 — the counters `/metrics` does not export, then the cache counters
+and gauges.** Two halves, in this order.
+
+*First, `/metrics`.* 57 of 65 counters have never left a process. The
+enumeration that makes this cheap mostly exists — `snapshot_fields!` generates
+`counter_fields()` / `histogram_fields()` keyed by the Rust identifier, with a
+destructuring pattern carrying no `..`, so a new field is a compile error until
+it is classified. At `aa53595` it is invoked for
+`GraphOperationalMetricsSnapshot`, `ClientQueryMetricsSnapshot` and
+`QueryTransportMetricsSnapshot`; **`GraphCacheMetricsSnapshot` does not invoke
+it**, so the 19 cache counters need the enumeration as well as the name table.
+For the other three, the Prometheus name table in
+`src/bin/graph_node/admin.rs` is the only thing missing, and the
+`every_histogram_field_reaches_both_exports` test in
+`src/bin/graph_node/otel_metrics.rs` is the pattern for keeping it honest. Note
+that `15d75de` added a third bucket, `class_counters`, for
+`query_rows_failed_by_class` (§5.3) — recorded by the kernel, exported by
+neither path, so it is part of this step rather than a separate one.
+
+*Second, the cache counters and gauges.* The 19 `GraphCacheMetricsSnapshot`
+counters and the two gauge structs. Separate because it is the half that pays
 the twelve-lock collection cost, and it should be measured against read-path
-latency before it is turned on everywhere.
+latency before it is turned on everywhere — **after BUG-4 is fixed**, or the
+measurement is taken against a collector that can reject admissions.
 
-**Done when** matrix-artifact hit rate is a series, and the p99 of
-`query.execute` in staging is unchanged with the collector on.
+**Done when** `write_retries`, `query_rows_failed`, `query_rows_failed_by_class`
+and `verifier_failures` are series on `/metrics`, matrix-artifact hit rate is a
+series, and the p99 of `query.execute` in staging is unchanged with the
+collector on.
 
-**Step M3 — the indexer.** `IndexerMetrics` through the same meter, with
-`generations_published` / `generation_failures` / `generations_deleted`
-dimensioned by `cell_id` and `edge_type`.
+**Step M3 — the indexer.** `IndexerMetrics` gains `cell_id` and `edge_type`
+dimensions on `generations_published` / `generation_failures` /
+`generations_deleted`, **on its own `/metrics` endpoint first**
+(`indexer_metrics`, `src/bin/graph-indexer.rs:935`) and through the meter
+second. The indexer's gap is dimensionality rather than absence — all nine of
+its values are already exported and none of them carries a dimension (§1.2) —
+so unlike M2 this step changes existing series rather than adding missing ones,
+and existing dashboards have to be considered.
 
 **Done when** "which cell's index is failing" is answerable from a metric
 rather than only from a trace.
@@ -1326,8 +1635,11 @@ these structs are constructed that way in tests.
 #### One enumeration, two exports
 
 The library exposes `counter_fields()` and `histogram_fields()` keyed by the
-**Rust identifier**. (Neither exists yet — H1 landed without them and they move
-to H2; see the H1 divergences below.) Neither exposition vocabulary — Prometheus `graph_*` names,
+**Rust identifier**. (H1 landed without them and they moved to H2, which built
+them — plus `class_counter_fields()` in `15d75de` — out of one
+`snapshot_fields!` macro. It is invoked by the three types that carry a
+histogram; `GraphCacheMetricsSnapshot` is not one of them and is M2's. See the
+H1 divergences below.) Neither exposition vocabulary — Prometheus `graph_*` names,
 OTel `db.*`/`turbolay.*` names — appears in the kernel; the two name tables live
 in the binary, which is where §1.6's "the two must not disagree about names"
 test belongs. Add `every_histogram_field_reaches_both_exports` alongside it: it
@@ -1382,11 +1694,13 @@ design; all four change what an implementer would go looking for.
    misfiling, and they fold into the read histogram so the two sums stay total
    over every observation — which is what lets `execution_duration_us` be
    derived as `read_latency.sum_us + write_latency.sum_us` and still be exact.
-3. **`counter_fields()` / `histogram_fields()` did not land.** Nothing in the
-   tree defines them. They are H2's prerequisite, not H1's output — the "one
-   enumeration, two exports" section above is the thing they serve, and there is
-   no second export yet to disagree with the first. Treat them as the first item
-   of H2 rather than as a missing piece of H1.
+3. **`counter_fields()` / `histogram_fields()` did not land in H1.** They were
+   H2's prerequisite, not H1's output — the "one enumeration, two exports"
+   section above is the thing they serve, and at H1 there was no second export
+   to disagree with the first. **Built in `8d7e939`**, by a `snapshot_fields!`
+   macro rather than by hand, which is what makes "a new field is a compile
+   error until it is classified" true of every type that invokes it rather than
+   true one field list at a time.
 4. **The new field names, since nothing else records them.** Client:
    `read_latency` / `write_latency` on `ClientQueryMetrics` and its snapshot.
    Shard: `query_rows_latency` on `GraphOperationalMetrics` and its snapshot.
@@ -1403,8 +1717,9 @@ citation into a file that was still being edited; a grep for the identifier is
 stable and a line number is not. `src/core/histogram.rs` and `src/lib.rs` keep
 their numbers because H1 finished them.
 
-**Step H2 — export the bucket family.** **The `crates/telemetry` half already
-exists**, built ahead of schedule in `68efadf` as `meter.rs`; what remains is
+**Step H2 — export the bucket family. Done — `8d7e939`, completed by
+`aa53595`.** **The `crates/telemetry` half already
+existed**, built ahead of schedule in `68efadf` as `meter.rs`; what remained was
 the kernel-side enumeration and the call that feeds it.
 
 One `ObservableCounter` named `<metric>.bucket`, carrying `L_LE` and reporting
@@ -1432,12 +1747,58 @@ conversion for the one `db.*` metric all happen once, inside `meter.rs`, at the
 export boundary — so a second exposition cannot disagree with the first about
 where a bucket ends.
 
+**What H2 shipped, and three divergences.** `8d7e939` added the
+`snapshot_fields!` macro to the library, generating `counter_fields()` /
+`histogram_fields()` keyed by the Rust identifier, with a destructuring pattern
+carrying no `..` — so a field added to a type that invokes it is a compile error
+until it is classified. **Invoked for three types, and they are not the same
+three as the counter structs above:** `GraphOperationalMetricsSnapshot`,
+`ClientQueryMetricsSnapshot` and `QueryTransportMetricsSnapshot` — the three
+that carry a *histogram*. `GraphCacheMetricsSnapshot` does not invoke it at
+`aa53595` and so has no enumeration, which is why its 19 counters are M2's work
+and not a table entry. No `graph_*`, `db.*` or `turbolay.*`
+string exists anywhere in the library: neither exposition vocabulary crosses
+into the kernel. The two name tables live in `src/bin/graph_node/admin.rs` and
+`src/bin/graph_node/otel_metrics.rs`, and
+`every_histogram_field_reaches_both_exports` asserts every recorded field
+appears in both — verified by removing a row from each table in turn and
+confirming the failure. `/metrics` gained 84 lines and lost none, captured
+through the real handler before and after and guarded by
+`the_pre_existing_series_are_untouched`.
+
+1. **`read_latency` and `write_latency` cannot both be
+   `db.client.operation.duration`.** Semconv separates them with
+   `db.operation.name`, which was not in `METRIC_LABELS` at `8d7e939`, so
+   `8d7e939` emitted `.read` / `.write` rather than let two series under one
+   instrument name silently collapse — re-conflating exactly what `5d97fb8`
+   split. `aa53595` added the label and they now share the semconv name, with
+   the label appended inside `record` rather than by callers, because a caller
+   that forgets it merges two populations invisibly. Only the OTel table
+   collapsed; the Prometheus names were already distinct and were left alone.
+2. **`8d7e939` does not compile as committed.** `mod otel_metrics;` was never
+   committed while `admin.rs` already imported from it — the module was staged
+   as a directory, which missed the binary root. Fixed in `aa53595`. Worth
+   recording because it is the second failure in this plan's lineage that a
+   green local test run did not catch.
+3. **`rpc_latency` and `serve_latency` have no live source in `graph-node`.**
+   The binary instantiates neither `TcpQueryServer` nor `TcpQueryCellClient`, so
+   it holds no `QueryTransportMetricsSnapshot`. Both render correctly and
+   nothing feeds them. Likewise `record_transport` on the meter side.
+
+Prometheus names carry `_microseconds` rather than the idiomatic `_seconds` for
+the four `turbolay.*` families, deliberately: the two exports reporting
+different numbers for one measurement is worse than a non-idiomatic suffix. Only
+the one `db.client.operation.duration` family converts, per §1.9.
+
 **Done when** `histogram_quantile(0.99, …)` over the exported family in staging
 agrees with a p99 computed directly from the same node's raw snapshot to within
 one bucket, and the mass above the 500 ms bound matches the `slow_queries`
-counter over the same window.
+counter over the same window. **Not yet checked in staging** — the code half is
+done and the staging half is a deployment task, in the same shape as BUG-3's
+collector policy.
 
-**Step H3 — the runbook and the dashboards.** Deliberately last, and a real
+**Step H3 — the runbook and the dashboards. The only histogram step
+outstanding.** Deliberately last, and a real
 step rather than a documentation afterthought, because every failure mode of a
 bucket histogram is a *misuse* failure and the misuses are predictable.
 
@@ -1894,8 +2255,14 @@ work that was already done before the sentence was written.
 
 **What survives.** M2's done-when — p99 of `query.execute` unchanged with the
 collector on — is still worth checking, but now as a regression check rather
-than as a decision procedure. And it should be run after BUG-2 is understood,
-since a stall in `cluster_for_scope` will look exactly like a slow collection.
+than as a decision procedure. ~~And it should be run after BUG-2 is understood,
+since a stall in `cluster_for_scope` will look exactly like a slow collection.~~
+**BUG-2 turned out not to produce a stall** (`0b9eb31`); the promotable open
+does no I/O. The prerequisite is **BUG-4** instead, and for a stronger reason
+than confounding: with the collector pinning every scope against eviction, the
+thing to measure is not a p99 at all — a new-scope query returns
+`AdmissionRejected` rather than arriving late, and a latency experiment will
+record it as a missing sample rather than as a failure.
 
 ### 5.2 `turbolay.query.fingerprint` as a metric label — **no, unconditionally, forever**
 
@@ -1938,6 +2305,28 @@ worth remembering the next time one is asked.
 Three choke points where the error is already in hand and no plumbing is
 needed: `src/shard/query.rs:535`, `:4739`, and
 `src/client/service.rs:1900`.
+
+**The kernel half landed in `15d75de`; neither export carries it yet.**
+`query_rows_failed_by_class: [u64; GraphError::CLASS_COUNT]` sits on
+`GraphOperationalMetricsSnapshot` and is total-by-construction against the
+scalar `query_rows_failed`, because both are incremented by the same call — so
+a dashboard can use one to check the other. The exhaustive match *moved* into
+`GraphError::class_index`, and `class()` is now `CLASSES[self.class_index()]`:
+one match rather than two, so a class name and the slot it counts in cannot
+drift apart. `snapshot_fields!` gained a third bucket, `class_counters`, which
+means the new array participates in the same compile-time exhaustiveness
+guarantee as the counters and histograms rather than sitting outside it — added
+an unclassified field and got three "pattern requires …" errors, one per
+accessor.
+
+Two corrections to this entry fall out of building it. **Nothing cross-checks
+the kernel's class strings against `crates/telemetry`'s**, and nothing can:
+`crates/telemetry` has no kernel dependency, so a real cross-check would have to
+live in a binary that depends on both. A doc comment claiming
+`error_class.rs` held such a test was removed. And **"`query_rows_failed` is not
+even exported" is half stale** — the *client's* `queries_failed` is on
+`/metrics`; the *shard's* `query_rows_failed` is not, and neither is the new
+per-class array. Exporting all three is part of M2.
 
 **What settled it.** `src/core/error.rs:202` — `GraphError::class` is an
 exhaustive match with no `other` arm, and `ErrorClass::Other` is constructed
@@ -2000,22 +2389,59 @@ to buy it, and both belong on the record next to the decision:
 ### 5.5 Still open
 
 **BUG-2 — `cluster_for_scope` holding `clusters` across a shard open**
-(`src/engine/cluster.rs:1216-1230`). Not fixed, and not fixable mechanically:
-releasing the mutex around
-`open_promotable_scoped_with_memory_options(...).await` admits two callers
-opening the same scope concurrently. The fix needs a one-open-per-scope guard —
-an in-flight map keyed by scope, or a per-scope `OnceCell` — and that is a
-design with its own failure modes, not a narrowing of a critical section. It is
-recorded here rather than in a bug tracker because it interacts directly with
-M2: with BUG-2 present, a slow metrics collection and a slow read can share a
-cause that has nothing to do with the cache gauges, and M2's measurement will
-be read as though it did.
+(`src/engine/cluster.rs:1216-1230`). **Investigated in `0b9eb31` and
+downgraded, not fixed.** The hold is real and the *cost* is not: the promotable
+open issues no object-store request and contains no await that can pend, so it
+is tens of microseconds of empty-map allocation. Every narrowing option — the
+in-flight map, the per-scope `OnceCell` — is a correct fix to a microsecond
+hold, and each puts at risk the one thing the map lock currently guarantees,
+which is that two live clusters for one scope cannot both be reachable. Two
+that are will each claim a SlateDB writer epoch and fence each other from
+inside one process. **Recommendation: leave it**, and pin "the promotable open
+does no I/O" with a test, so that the day someone adds I/O to it the test says
+so rather than production. See the BUG-2 entry above and
+`docs/plans/2026-07-27-scoped-cluster-map-lock-double-open.md` §1, §2 and §6
+step 1.
+
+It also stops interacting with M2 the way this entry used to claim. There is no
+shard-open stall for a slow collection to share a cause with.
+
+**BUG-4 — the collector pins every scope against eviction.** *This* is what
+interacts with M2, and it is ours rather than inherited.
+`local_shard_runtime_metrics` (`src/engine/cluster.rs:1265`) retains the cluster
+`Arc`s it cloned out for the whole collection, while eviction's candidate filter
+is `Arc::strong_count == 1` (`:1197`). At `max_open_scopes` a scrape therefore
+makes every open scope un-evictable, and a query for a new scope returns
+`AdmissionRejected` — a hard client error, not a stall. `loaded_clusters`
+(`:1256`) has the same shape and the index-discovery loop holds its clones
+across real I/O, so its window is wider still. **Not fixed**; the fix is
+`Weak` plus upgrade-one-at-a-time, step 3 of the same plan. It is a
+**prerequisite for M2** rather than a neighbour of it: measuring collection cost
+against read-path p99 on a path that can fail outright measures the wrong thing.
+Full detail in the BUG-4 entry above.
+
+**The `/metrics` `scope` label** (§6). Reopened by the export-path decision, and
+owed a series-budget measurement before M2 lands. Listed here as well as in §6
+because §6 is a scope statement and this is a decision.
+
+**Whether the OTLP interval task survives** (§1.5). Built in `aa53595`, works,
+and has no consumer under a pull-only export path. Not urgent — it costs
+nothing when no endpoint is configured — but it should end as an explicit keep
+or an explicit delete rather than as something nobody looked at again.
 
 ## 6. Explicitly out of scope
 
-- **Changing `/metrics`.** Same conclusion as the prior plan, now with the
+- **Changing `/metrics`.** ~~Same conclusion as the prior plan, now with the
   additional reason in §1.4: the two exports should be allowed to differ in
-  dimensionality.
+  dimensionality.~~ **Narrowed, twice over.** What is out of scope is *changing
+  an existing series* — its name, its labels or its value. **Adding** series is
+  not, and has not been since H2: `8d7e939` added 84 lines to `/metrics` and
+  removed none, guarded by `the_pre_existing_series_are_untouched`, which
+  captures the real handler's output before and after and asserts every
+  pre-existing line survives byte-identically and in order. That test is what
+  makes "additive only" a property rather than an intention, and M2 and M3 are
+  both additive under it. The §1.4 reason still stands unchanged: the two
+  exports may differ in dimensionality, and `scope` is where they do.
 - ~~**Adding counters to the kernel.**~~ **No longer out of scope, and this is
   the one scope change the amendment makes.** The original line said §1 exports
   what exists, and that where a counter is missing it is named and left to its
@@ -2029,5 +2455,60 @@ be read as though it did.
 - **Fixing anything the metrics reveal.** Unchanged from the prior plan.
 - **Exemplars.** §1.7, and unlike the prior plan's version of this line, with a
   verified reason rather than a deferral.
-- **The `/metrics` `scope` label.** Left as it is, deliberately, and documented
-  rather than fixed.
+- **The `/metrics` `scope` label.** ~~Left as it is, deliberately, and
+  documented rather than fixed.~~ **Reopened. This is an open decision, not a
+  settled one, and it is the largest one this document currently carries.**
+
+  *Why it was closed.* The reasoning was explicit and it was reasonable at the
+  time: the endpoint is not new, whatever the label costs it is already
+  costing, and dropping it breaks every existing dashboard and alert. That
+  argument has a load-bearing premise — **nothing consumed the endpoint.** An
+  unbounded label on a series nobody scrapes costs nothing, because nothing
+  stores it.
+
+  *What changed.* Prometheus scraping `/metrics` is now the decided export
+  path. A label that was a documented wart becomes a stored, indexed dimension
+  on every series it appears on, and the cost stops being hypothetical.
+
+  *The evidence, and it is worse than the original wart.*
+
+  - `scope` is `{namespace}/graphs/{graph_id}` — `impl Display for GraphScope`,
+    `src/core/namespace.rs:268-272`. Both halves are user-created.
+  - `validate_component` (`src/codec.rs:175-187`) bounds **only the character
+    set**: non-empty, and ASCII alphanumeric plus `_`, `-`, `.`. There is **no
+    length limit**. Every namespace segment and the graph id go through it
+    (`NamespaceId::new`, `src/core/namespace.rs:21-25`).
+  - `MAX_NAMESPACE_DEPTH = 8` (`src/core/namespace.rs:7`) bounds how *deep* a
+    namespace nests. Nothing anywhere bounds how *many* distinct scopes a fleet
+    sees. Unbounded in both count and per-value length.
+  - The blast radius grew with H2, and by a multiple rather than an increment.
+    `scope` is on the three per-shard counters and the two cache gauge families
+    as before — and now also on the per-shard histogram, via
+    `append_histograms(output, metrics.operational.histogram_fields(),
+    &[("scope", …), ("cell_id", …)])` in `append_node_metrics`. A histogram
+    family is 18 buckets plus `_sum` plus `_count`, so that one family is **20
+    series per `scope × cell_id` pair** where each counter was one. Today it is
+    exactly one family — `query_rows_latency` — because it is the only histogram
+    on `GraphOperationalMetricsSnapshot`; the client's `read_latency` and
+    `write_latency` are process-global and rendered with **no labels at all**,
+    which is the right default and worth preserving. Counted exactly, per
+    `scope × cell_id` pair: 3 counters + 6 `graph_cache_entries` + 5
+    `graph_cache_resident_bytes` = **14 before H2, 34 after**. Every per-shard
+    histogram added later adds twenty more, and M2 adds 57 counters.
+
+  *Why this is a decision and not a fix.* All three original options are still
+  the options, and each still costs what it cost: leave it (now with a real,
+  growing bill), drop it (breaks every existing dashboard and alert, and
+  `scope` is genuinely the dimension an operator wants when one tenant is
+  slow), or replace it with something bounded — a tenant id from a fixed
+  registry, a hash bucket, or a per-scope allowlist with an `other` bucket.
+  The third is the one nobody has costed, and it is the only one that keeps the
+  question answerable without keeping the cardinality.
+
+  *What would settle it, and it is a measurement this time rather than a code
+  read.* The distinct scope count a production fleet actually sees, against the
+  Prometheus instance's series budget. That number is not derivable from the
+  source — the source proves only that nothing bounds it — and unlike §5's four
+  decisions it is not a cardinality question over a *sampled* population (§5.2's
+  trap), because a Prometheus instance knows its own series count exactly. Ask
+  it before M2 adds 57 counters per `scope × cell_id`, not after.
