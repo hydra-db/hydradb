@@ -461,7 +461,7 @@ impl GraphShard {
             turbolay.read_epoch = tracing::field::Empty,
             turbolay.query.rows_returned = tracing::field::Empty,
             error.class = tracing::field::Empty,
-            turbolay.sampling.force = tracing::field::Empty,
+            turbolay.sampling.tail_keep = tracing::field::Empty,
         )
     )]
     async fn execute_parsed_opencypher_rows(
@@ -537,7 +537,7 @@ impl GraphShard {
                     .query_rows_failed
                     .fetch_add(1, Ordering::Relaxed);
                 span.record("error.class", err.class());
-                span.record("turbolay.sampling.force", true);
+                span.record("turbolay.sampling.tail_keep", "error");
             }
         }
         result
@@ -5312,7 +5312,7 @@ impl GraphShard {
             turbolay.base_sequence = tracing::field::Empty,
             turbolay.outcome = tracing::field::Empty,
             error.class = tracing::field::Empty,
-            turbolay.sampling.force = tracing::field::Empty,
+            turbolay.sampling.tail_keep = tracing::field::Empty,
         );
         let artifact = self
             .latest_matrix_artifact(cell_id, edge_type, read_epoch)
@@ -5330,7 +5330,7 @@ impl GraphShard {
             }
             Err(err) => {
                 span.record("error.class", err.class());
-                span.record("turbolay.sampling.force", true);
+                span.record("turbolay.sampling.tail_keep", "error");
             }
         }
         artifact
@@ -5391,7 +5391,7 @@ impl GraphShard {
                     turbolay.base_sequence = generation.base_sequence,
                     turbolay.outcome = tracing::field::Empty,
                     error.class = tracing::field::Empty,
-                    turbolay.sampling.force = tracing::field::Empty,
+                    turbolay.sampling.tail_keep = tracing::field::Empty,
                 );
                 let tail = self
                     .topology_tail_since(&generation, storage_snapshot.as_ref(), read_epoch, budget)
@@ -5406,7 +5406,7 @@ impl GraphShard {
                     }
                     Err(err) => {
                         tail_span.record("error.class", err.class());
-                        tail_span.record("turbolay.sampling.force", true);
+                        tail_span.record("turbolay.sampling.tail_keep", "error");
                     }
                 }
                 match tail {

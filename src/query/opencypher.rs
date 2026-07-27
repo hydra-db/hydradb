@@ -330,7 +330,7 @@ fn with_parsed_cypher<T>(
         turbolay.query.fingerprint = tracing::field::Empty,
         parse_cache_hit = tracing::field::Empty,
         error.class = tracing::field::Empty,
-        turbolay.sampling.force = tracing::field::Empty,
+        turbolay.sampling.tail_keep = tracing::field::Empty,
     );
     let _entered = span.enter();
     PARSED_CYPHER_THREAD_CACHE.with(|cache| {
@@ -350,7 +350,10 @@ fn with_parsed_cypher<T>(
                     // the client boundary says the request failed; seen here it
                     // says the statement is not Cypher we accept.
                     span.record("error.class", err.class());
-                    span.record("turbolay.sampling.force", true);
+                    // Marks the trace for the collector's tail sampler, which
+                    // is the only thing that can act on a verdict reached after
+                    // the span started. See `turbolay_telemetry::sampling`.
+                    span.record("turbolay.sampling.tail_keep", "error");
                     return Err(err);
                 }
             };

@@ -12,7 +12,8 @@
 //! Keeping error traces is genuinely a *tail* decision, and it belongs in the
 //! collector's tail-sampling processor, which buffers a whole trace before
 //! deciding. That is a deployment change, not a code change, and it is the
-//! right place for it.
+//! right place for it. The deployment requirement is spelled out under
+//! [*What the collector must do*](#what-the-collector-must-do) below.
 //!
 //! What this sampler does instead is honour the decisions that *are* knowable
 //! at span start:
@@ -23,11 +24,69 @@
 //!    refreshes are low-volume and are the entire reason the write path is
 //!    being instrumented; sampling them at 5% would mean waiting twenty
 //!    incidents to see one.
-//! 3. **Honour an explicit request.** A caller that already knows a span is
-//!    worth keeping — a query the planner just flagged as full-scanning — sets
-//!    [`semconv::SAMPLING_FORCE`] at creation and the trace is kept.
+//! 3. **Honour an explicit request.** A caller that knows *before it starts the
+//!    work* that a span is worth keeping sets [`semconv::SAMPLING_FORCE`] as a
+//!    creation-time attribute and the trace is kept.
 //! 4. **Ratio-sample everything else**, deterministically on the trace id, so
 //!    every service in a trace independently reaches the same answer.
+//!
+//! # The two limits on rule 3, precisely
+//!
+//! Rule 3 has two structural limits. Neither is a bug to be fixed here; both
+//! are consequences of head sampling, and both are easy to write code against
+//! by accident, so they are stated rather than left to be rediscovered.
+//!
+//! **The attribute must exist when the span starts.** `tracing` spans routinely
+//! declare a field as `tracing::field::Empty` and fill it in later with
+//! `Span::record`. That value never reaches [`ShouldSample`] — by the time it is
+//! recorded the span has been entered and the decision has been taken — so
+//! `span.record(SAMPLING_FORCE, true)` is a silent no-op. Worse, it is a
+//! *conditionally* silent one: recording before the span is first entered
+//! happens to land in the builder, so the same line can appear to work in one
+//! function and do nothing in the next. Do not rely on the ordering; set the
+//! attribute at creation or do not set it at all.
+//!
+//! **A child cannot overrule its parent.** Rule 1 wins over rule 3, so an
+//! explicit force on a non-root span does nothing when the root was dropped.
+//! That is correct: the surviving child would be a trace with a hole where its
+//! parent should be, missing the scope, fingerprint and correlation id that make
+//! it interpretable. A force is a statement about a *trace*, and only the span
+//! that starts one can make it.
+//!
+//! Together these mean the force attribute serves exactly one shape of call
+//! site: a root span whose keep-worthiness is known before the work begins.
+//! Every site that discovers keep-worthiness while the work runs — a failure, a
+//! full scan the planner only just found — is out of reach, permanently, and
+//! records [`semconv::SAMPLING_TAIL_KEEP`] instead.
+//!
+//! # What the collector must do
+//!
+//! [`semconv::SAMPLING_TAIL_KEEP`] is inert without a collector-side policy;
+//! nothing in this process acts on it. The deployment must run a
+//! `tail_sampling` processor with a policy that keeps any trace containing a
+//! span carrying it, for example:
+//!
+//! ```yaml
+//! processors:
+//!   tail_sampling:
+//!     decision_wait: 10s
+//!     policies:
+//!       - name: keep-flagged
+//!         type: string_attribute
+//!         string_attribute:
+//!           key: turbolay.sampling.tail_keep
+//!           values: [error, full_scan]
+//!       - name: baseline
+//!         type: probabilistic
+//!         probabilistic: { sampling_percentage: 5 }
+//! ```
+//!
+//! One consequence has to be accepted rather than worked around: a trace the
+//! *head* sampler dropped never reaches the collector at all, so the tail policy
+//! can only rescue traces this sampler kept. Running the head sampler at a ratio
+//! of 1.0 and doing all the thinning in the collector is the configuration that
+//! makes the tail policy fully effective, and it is the one to choose when
+//! error-trace coverage matters more than export bandwidth.
 
 use opentelemetry::trace::{Link, SpanKind, TraceContextExt, TraceId};
 use opentelemetry::{Context, KeyValue};
@@ -62,14 +121,23 @@ impl TurbolaySampler {
         self.ratio
     }
 
-    /// Whether a span is always kept irrespective of ratio.
+    /// Whether a trace-starting span is kept irrespective of ratio.
+    ///
+    /// `attributes` is what the span was *created* with. Only
+    /// [`semconv::SAMPLING_FORCE`] is consulted, and only because it exists for
+    /// no other purpose: a sampler that keys off a *data* attribute silently
+    /// couples retention volume to a workload property, so the day somebody
+    /// hoists that field to creation time the sampling ratio quietly becomes
+    /// 100% for a whole class of query. The force flag says "keep this" and
+    /// nothing else, which is why it is the only thing read here.
     fn is_always_sampled(name: &str, attributes: &[KeyValue]) -> bool {
         if ALWAYS_SAMPLE_SPANS.contains(&name) {
             return true;
         }
         attributes.iter().any(|attribute| {
-            let key = attribute.key.as_str();
-            (key == semconv::SAMPLING_FORCE || key == semconv::QUERY_FULL_SCAN)
+            attribute.key.as_str() == semconv::SAMPLING_FORCE
+                // Both spellings, because `info_span!(force = true)` arrives as
+                // a bool and a stringly-typed caller arrives as "true".
                 && attribute.value.as_str() == "true"
         })
     }
@@ -203,32 +271,62 @@ mod tests {
     }
 
     #[test]
-    fn full_scan_attribute_forces_a_keep() {
+    fn explicit_force_attribute_is_honoured() {
+        let sampler = TurbolaySampler::new(0.0);
+        for value in [
+            KeyValue::new(semconv::SAMPLING_FORCE, "true"),
+            KeyValue::new(semconv::SAMPLING_FORCE, true),
+        ] {
+            assert_eq!(
+                sample(&sampler, "anything", &[value]),
+                SamplingDecision::RecordAndSample
+            );
+        }
+    }
+
+    /// `force = false` is the common case and must not force a keep.
+    #[test]
+    fn a_false_flag_does_not_force_a_keep() {
+        let sampler = TurbolaySampler::new(0.0);
+        let attributes = [KeyValue::new(semconv::SAMPLING_FORCE, "false")];
+        assert_eq!(
+            sample(&sampler, "query.plan", &attributes),
+            SamplingDecision::Drop
+        );
+    }
+
+    /// `turbolay.query.full_scan` is a *data* attribute, not a sampling one.
+    ///
+    /// It used to force a keep here, which was dead code — it is only ever
+    /// recorded after the planner has run, on a child span, so the sampler never
+    /// saw it. Reviving it by hoisting the field to creation time would be worse
+    /// than the dead code: full scans are not rare in an analytics workload, and
+    /// the sampling ratio would silently become 100% for all of them. Keep
+    /// worthiness is stated with [`semconv::SAMPLING_FORCE`], which means that
+    /// and nothing else.
+    #[test]
+    fn a_data_attribute_never_forces_a_keep() {
         let sampler = TurbolaySampler::new(0.0);
         let attributes = [KeyValue::new(semconv::QUERY_FULL_SCAN, "true")];
         assert_eq!(
             sample(&sampler, "query.plan", &attributes),
-            SamplingDecision::RecordAndSample
+            SamplingDecision::Drop
         );
     }
 
+    /// The tail marker is the collector's input and must be inert here. If this
+    /// ever starts passing as `RecordAndSample`, the two mechanisms have been
+    /// conflated again and post-hoc call sites will once more look like they
+    /// force a keep.
     #[test]
-    fn explicit_force_attribute_is_honoured() {
+    fn the_tail_keep_marker_is_inert_in_the_head_sampler() {
         let sampler = TurbolaySampler::new(0.0);
-        let attributes = [KeyValue::new(semconv::SAMPLING_FORCE, "true")];
+        let attributes = [KeyValue::new(
+            semconv::SAMPLING_TAIL_KEEP,
+            semconv::SAMPLING_TAIL_KEEP_ERROR,
+        )];
         assert_eq!(
-            sample(&sampler, "anything", &attributes),
-            SamplingDecision::RecordAndSample
-        );
-    }
-
-    /// `full_scan = false` is the common case and must not force a keep.
-    #[test]
-    fn a_false_flag_does_not_force_a_keep() {
-        let sampler = TurbolaySampler::new(0.0);
-        let attributes = [KeyValue::new(semconv::QUERY_FULL_SCAN, "false")];
-        assert_eq!(
-            sample(&sampler, "query.plan", &attributes),
+            sample(&sampler, "client.query", &attributes),
             SamplingDecision::Drop
         );
     }

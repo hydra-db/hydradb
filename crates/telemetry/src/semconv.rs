@@ -171,10 +171,47 @@ pub const OUTCOME: &str = "turbolay.outcome";
 /// Coarse failure class. See [`crate::ErrorClass`].
 pub const ERROR_CLASS: &str = "error.class";
 
-/// Set at span creation to force the head sampler to keep the trace.
-/// See [`crate::sampling`] for why an attribute — and not the error status —
-/// is what a head sampler can act on.
+/// Force the head sampler to keep the trace. **Creation-time only, and only on
+/// a span that starts a trace.**
+///
+/// Both halves of that sentence are load-bearing, and getting either wrong
+/// produces a call site that reads like a guarantee and does nothing:
+///
+/// - `ShouldSample` runs once, when a span starts, and is handed the attributes
+///   *present at that moment*. A field declared `tracing::field::Empty` and
+///   filled in later by `Span::record` is not among them, so a post-hoc
+///   `span.record(SAMPLING_FORCE, true)` is a silent no-op.
+/// - The sampler defers to a valid parent, because re-deciding per span is what
+///   produces traces with holes in the middle. So this attribute is consulted
+///   only where there is no parent to defer to.
+///
+/// Anything whose keep-worthiness is discovered *while the work runs* — an
+/// error, a full scan the planner only just found — cannot use this. Use
+/// [`SAMPLING_TAIL_KEEP`], which is the collector's input, and read
+/// [`crate::sampling`] for why the two cannot be the same key.
 pub const SAMPLING_FORCE: &str = "turbolay.sampling.force";
+
+/// Marks a trace as worth keeping *after* the fact, for the collector's
+/// tail-sampling processor.
+///
+/// The value is the reason — `error` or `full_scan` — rather than a bare
+/// `true`, so one attribute supports separate retention rates per reason
+/// instead of forcing every alarm through one policy.
+///
+/// This is deliberately **not** [`SAMPLING_FORCE`] and deliberately invisible to
+/// the head sampler. By the time a call site knows to set it, the head sampling
+/// decision for the trace has already been taken and the sibling spans have
+/// already been dropped; no in-process mechanism can undo that. The separate
+/// name is what stops the two from being confused again — see
+/// [`crate::sampling`] for the collector policy this requires.
+pub const SAMPLING_TAIL_KEEP: &str = "turbolay.sampling.tail_keep";
+
+/// [`SAMPLING_TAIL_KEEP`] value: the span recorded a failure.
+pub const SAMPLING_TAIL_KEEP_ERROR: &str = "error";
+
+/// [`SAMPLING_TAIL_KEEP`] value: the planner produced a full scan or a fallback
+/// pass. See [`QUERY_FULL_SCAN`].
+pub const SAMPLING_TAIL_KEEP_FULL_SCAN: &str = "full_scan";
 
 /// Wire protocol spoken to the client, per OTel semantic conventions.
 /// Turbolay speaks Bolt, so APM database views key off `neo4j`. This describes
@@ -218,6 +255,7 @@ pub const ALL_TURBOLAY_KEYS: &[&str] = &[
     CALLER_STEP,
     OUTCOME,
     SAMPLING_FORCE,
+    SAMPLING_TAIL_KEEP,
 ];
 
 #[cfg(test)]
