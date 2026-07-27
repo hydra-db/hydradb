@@ -44,7 +44,14 @@ opentelemetry-appender-tracing = "0.32"
 # no reactor running" and no span or log record ever reaches the collector. The
 # blocking client is what upstream enables by default for this exact reason;
 # the batching already keeps the export off the request path.
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "logs", "http-proto", "reqwest-blocking-client"] }
+#
+# `metrics` is in the list for the same reason `trace` and `logs` are: with
+# `default-features = false` nothing is on implicitly, and without it
+# `opentelemetry_otlp::MetricExporter` simply does not exist in this build —
+# a missing-type error that reads like a version mismatch and is not one.
+# `PeriodicReader` runs on its own OS thread too, so `reqwest-blocking-client`
+# is load-bearing for the metrics pipeline exactly as it is for the other two.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "logs", "metrics", "http-proto", "reqwest-blocking-client"] }
 opentelemetry-semantic-conventions = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 rcgen = "0.13"

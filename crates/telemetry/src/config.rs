@@ -98,6 +98,12 @@ pub struct TelemetryConfig {
     pub sample_ratio: f64,
     /// Export batch timeout.
     pub export_timeout: Duration,
+    /// How often the metrics reader collects and exports.
+    ///
+    /// Also the period of the collection task that feeds the observable
+    /// instruments, and therefore how often the two cache-gauge sets take their
+    /// mutexes — the one metrics cost that is not a relaxed atomic load.
+    pub metric_export_interval: Duration,
     /// `service.version`.
     pub service_version: String,
     /// `service.instance.id` — the pod name.
@@ -116,6 +122,15 @@ impl TelemetryConfig {
     /// Default slow-query threshold.
     pub const DEFAULT_SLOW_QUERY_MS: u64 = 1_000;
 
+    /// Default metric export interval: 60s.
+    ///
+    /// Matched to a Prometheus scrape rather than picked for smoothness. The
+    /// counters are lock-free atomic loads and could be collected far more
+    /// often; the two cache-gauge sets take a dozen cache mutexes per cell per
+    /// collection, and those are the same mutexes the read path takes on every
+    /// lookup. 60s keeps that to once a minute.
+    pub const DEFAULT_METRIC_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
+
     /// A config that installs the fmt layer only. The base for tests, and what
     /// [`Self::from_env`] degrades to when no OTLP endpoint is set.
     pub fn new(identity: ServiceIdentity) -> Self {
@@ -128,6 +143,7 @@ impl TelemetryConfig {
             otlp_protocol: OtlpProtocol::default(),
             sample_ratio: Self::DEFAULT_SAMPLE_RATIO,
             export_timeout: Duration::from_secs(10),
+            metric_export_interval: Self::DEFAULT_METRIC_EXPORT_INTERVAL,
             service_version: env!("CARGO_PKG_VERSION").to_string(),
             instance_id: "unknown".to_string(),
             deployment_environment: None,
@@ -193,6 +209,19 @@ impl TelemetryConfig {
 
         if let Some(ms) = get("GRAPH_SLOW_QUERY_MS").and_then(|value| value.trim().parse().ok()) {
             config.slow_query_ms = ms;
+        }
+
+        // `OTEL_METRIC_EXPORT_INTERVAL` is the OTel-defined name and is in
+        // milliseconds. Zero is rejected rather than honoured: it would spin the
+        // reader thread and, with it, the collection task holding the cache
+        // mutexes — a telemetry setting that can stall the read path is one a
+        // typo must not be able to reach.
+        if let Some(interval) = get("OTEL_METRIC_EXPORT_INTERVAL")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+        {
+            config.metric_export_interval = interval;
         }
 
         if let Some(version) = get("GRAPH_BUILD_VERSION") {
@@ -354,6 +383,38 @@ mod tests {
                 env_from(&[("OTEL_TRACES_SAMPLER_ARG", value)]),
             );
             assert_eq!(config.sample_ratio, expected);
+        }
+    }
+
+    #[test]
+    fn metric_interval_defaults_to_a_minute() {
+        let config = TelemetryConfig::from_env_with(ServiceIdentity::GraphNode, env_from(&[]));
+        assert_eq!(config.metric_export_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn metric_interval_is_read_in_milliseconds() {
+        let config = TelemetryConfig::from_env_with(
+            ServiceIdentity::GraphNode,
+            env_from(&[("OTEL_METRIC_EXPORT_INTERVAL", " 15000 ")]),
+        );
+        assert_eq!(config.metric_export_interval, Duration::from_secs(15));
+    }
+
+    /// Zero would spin the reader thread, and the reader thread is what takes
+    /// the cache mutexes. It falls back rather than being honoured.
+    #[test]
+    fn a_nonsense_metric_interval_falls_back() {
+        for value in ["0", "banana", "-1", ""] {
+            let config = TelemetryConfig::from_env_with(
+                ServiceIdentity::GraphNode,
+                env_from(&[("OTEL_METRIC_EXPORT_INTERVAL", value)]),
+            );
+            assert_eq!(
+                config.metric_export_interval,
+                TelemetryConfig::DEFAULT_METRIC_EXPORT_INTERVAL,
+                "{value} should have fallen back"
+            );
         }
     }
 

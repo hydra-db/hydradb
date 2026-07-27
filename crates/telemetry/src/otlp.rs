@@ -1,7 +1,7 @@
-//! OTLP exporter wiring: the resource, the two providers, and the redaction
+//! OTLP exporter wiring: the resource, the three providers, and the redaction
 //! that sits between them and the network.
 //!
-//! Two pipelines are installed, both fed from the same `tracing` calls:
+//! Three pipelines are installed. Two are fed from the same `tracing` calls:
 //!
 //! - **Traces**, via `tracing-opentelemetry`, so `#[instrument]` and
 //!   `info_span!` become OTel spans.
@@ -12,6 +12,16 @@
 //!   `trace_id` and `span_id`, so clicking from a log line to its trace works
 //!   on day one.
 //!
+//! The third is not:
+//!
+//! - **Metrics**, via an [`SdkMeterProvider`] with a `PeriodicReader`. Nothing
+//!   `tracing` emits reaches it. The kernel's counters are `AtomicU64`s read by
+//!   observable instruments whose callbacks are registered by the binaries
+//!   against [`Providers::meter`]; see [`crate::meter`] for the histogram
+//!   families and [`crate::semconv::MetricLabel`] for what may be a dimension.
+//!   There is no exporter-side layer here because there is no subscriber
+//!   involvement at all.
+//!
 //! The log pipeline is the reason this is a logs-and-traces change rather than
 //! a traces change: the 28 existing tracing calls in `src/` start reporting to
 //! the collector the moment the binaries call [`crate::init`].
@@ -19,11 +29,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use opentelemetry::metrics::{Meter, MeterProvider as _};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider, SpanData, SpanProcessor};
 use opentelemetry_sdk::Resource;
 use tracing::Subscriber;
@@ -37,16 +49,33 @@ use crate::TelemetryError;
 
 /// The providers, kept alive by [`crate::TelemetryGuard`].
 ///
-/// Both must outlive the subscriber and both must be shut down explicitly:
-/// batched spans and logs still sitting in a queue at exit are exactly the
-/// records that explain why the process is exiting.
+/// All three must outlive the subscriber and all three must be shut down
+/// explicitly: batched spans and logs still sitting in a queue at exit are
+/// exactly the records that explain why the process is exiting, and the meter's
+/// last interval is the one covering the failure.
+///
+/// The meter provider is additionally the *only* handle to the metrics
+/// pipeline. Traces and logs reach it through the installed subscriber, so a
+/// caller never needs to touch them; instruments are registered explicitly, so
+/// a caller does — hence [`Providers::meter`].
 pub struct Providers {
     tracer: SdkTracerProvider,
     logger: SdkLoggerProvider,
+    meter: SdkMeterProvider,
 }
 
 impl Providers {
-    /// Flush and stop both pipelines.
+    /// A meter to register instruments against.
+    ///
+    /// `name` is the instrumentation scope, not the metric name: use one per
+    /// subsystem registering instruments (`"turbolay.shard"`,
+    /// `"turbolay.client"`), so a backend can attribute a series to the code
+    /// that produced it.
+    pub fn meter(&self, name: &'static str) -> Meter {
+        self.meter.meter(name)
+    }
+
+    /// Flush and stop all three pipelines.
     pub fn shutdown(self) {
         // Errors here are reported and swallowed. A failed flush during
         // shutdown is worth knowing about but is never worth a non-zero exit
@@ -56,6 +85,13 @@ impl Providers {
         }
         if let Err(error) = self.logger.shutdown() {
             eprintln!("turbolay-telemetry: logger shutdown failed: {error}");
+        }
+        // The meter goes last for a reason: its shutdown runs one final
+        // collection, and an observable callback that reads a snapshot the rest
+        // of the process is still updating is better ordered after the pipelines
+        // that only drain.
+        if let Err(error) = self.meter.shutdown() {
+            eprintln!("turbolay-telemetry: meter shutdown failed: {error}");
         }
     }
 }
@@ -110,6 +146,14 @@ where
     let log_exporter = opentelemetry_otlp::LogExporter::builder()
         .with_http()
         .with_endpoint(format!("{}/v1/logs", endpoint.trim_end_matches('/')))
+        .with_headers(headers.clone())
+        .with_timeout(config.export_timeout)
+        .build()
+        .map_err(|error| TelemetryError::Exporter(error.to_string()))?;
+
+    let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .with_endpoint(format!("{}/v1/metrics", endpoint.trim_end_matches('/')))
         .with_headers(headers)
         .with_timeout(config.export_timeout)
         .build()
@@ -127,8 +171,24 @@ where
         .build();
 
     let logger_provider = SdkLoggerProvider::builder()
-        .with_resource(resource)
+        .with_resource(resource.clone())
         .with_batch_exporter(log_exporter)
+        .build();
+
+    // `PeriodicReader` — not the `rt-tokio` variant — because it runs the
+    // collection on its own OS thread, which is what every observable callback
+    // registered against this provider is written against: a plain `Fn` that
+    // reads a cached snapshot and never awaits. The blocking HTTP client in the
+    // root manifest is load-bearing for the same reason it is for the batch
+    // span processor; an async client panics with "no reactor running" on this
+    // thread.
+    let meter_provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(
+            PeriodicReader::builder(metric_exporter)
+                .with_interval(config.metric_export_interval)
+                .build(),
+        )
         .build();
 
     let tracer = tracer_provider.tracer("turbolay");
@@ -142,6 +202,7 @@ where
         Some(Providers {
             tracer: tracer_provider,
             logger: logger_provider,
+            meter: meter_provider,
         }),
     ))
 }
@@ -311,6 +372,32 @@ mod tests {
             resource.get(&opentelemetry::Key::from_static_str("turbolay.binary")),
             Some("graph-indexer".into())
         );
+    }
+
+    /// The metrics pipeline is the one whose absence is a *missing type*
+    /// rather than a missing series: with `metrics` off in the root manifest's
+    /// `opentelemetry-otlp` entry, `MetricExporter` does not exist and the
+    /// error reads like a version mismatch. Building against a closed loopback
+    /// port exercises the construction of all three exporters without needing a
+    /// collector; the interval is set past the test's lifetime so nothing but
+    /// the shutdown flush ever tries to connect.
+    #[test]
+    fn an_endpoint_builds_all_three_pipelines() {
+        let mut config = TelemetryConfig::new(ServiceIdentity::GraphNode);
+        config.otlp_endpoint = Some("http://127.0.0.1:1".to_string());
+        config.export_timeout = Duration::from_millis(50);
+        config.metric_export_interval = Duration::from_secs(3_600);
+
+        let (layers, providers) =
+            build::<tracing_subscriber::Registry>(&config).expect("exporters must build");
+        assert_eq!(layers.len(), 2, "the trace bridge and the log appender");
+
+        let providers = providers.expect("an endpoint means providers");
+        // The meter is reachable, which is the whole point of holding it: unlike
+        // traces and logs, nothing reaches the metrics pipeline through the
+        // subscriber.
+        let _meter = providers.meter("turbolay.test");
+        providers.shutdown();
     }
 
     /// No endpoint must mean no exporter, no socket and no error — the path

@@ -12,17 +12,36 @@
 //!
 //! # Cardinality
 //!
-//! [`CELL_ID`], [`EDGE_TYPE`], [`NODE_ID`], [`QUERY_ACCESS_PATH`] and
-//! [`KERNEL`] are bounded by deployment size and are safe anywhere.
+//! Every key here is either a [`MetricLabel`] or is in [`SPAN_ONLY_KEYS`], and
+//! the partition is enforced by a test rather than by this paragraph. Read
+//! [`METRIC_LABELS`] for the list and the reasoning; what follows is the
+//! intuition behind it.
 //!
-//! [`QUERY_FINGERPRINT`] is bounded by the number of distinct query *shapes*,
-//! which for a fixed application is small — that is precisely why it is a
-//! fingerprint and not the query text.
+//! A key is a metric label when it is something you *group by* and its value
+//! set is closed — [`KERNEL`], [`OUTCOME`], [`PLACEMENT_OWNERSHIP`],
+//! [`PLACEMENT_STATE`] and [`QUERY_FULL_SCAN`] are enums or bools;
+//! [`CELL_ID`] and [`EDGE_TYPE`] are bounded per node by deployment size and
+//! by schema. Everything else is span-only, for one of three reasons:
 //!
-//! [`SCOPE`] is unbounded in principle, since it grows with tenant count. That
-//! is acceptable on spans, where the backend indexes rather than pre-aggregates,
-//! and it is the reason the plan defers mirroring these onto metric labels.
-//! Do not turn `SCOPE` into a metric dimension.
+//! - **Unbounded by construction.** [`SCOPE`] grows with tenant count,
+//!   [`CORRELATION_ID`] takes one value per request, [`CALLER_STEP`] is
+//!   supplied by a process Turbolay does not control, and
+//!   [`QUERY_FINGERPRINT`] is minted *before* validation, so an authenticated
+//!   client can mint series directly. [`QUERY_ACCESS_PATH`] and
+//!   [`QUERY_OPTIMIZER_PASSES`] are comma-joined sequences and therefore
+//!   combinatorial — an earlier version of this comment called
+//!   `QUERY_ACCESS_PATH` safe anywhere, which was the one sentence in this
+//!   crate that could have talked somebody into an unbounded metric.
+//! - **Monotonic.** Epochs, sequences, timestamps and [`GENERATION`] (a
+//!   SHA-256 digest) take a new value on every write, tick or rebuild.
+//! - **A measurement, not a key.** [`QUERY_ROWS_RETURNED`],
+//!   [`PLACEMENT_LIVE_NODES`], [`WRITER_RETRIES`] and the two reopen delays
+//!   are what an instrument *records*; keying by them is keying by the answer.
+//!
+//! [`NODE_ID`] is the one genuine judgement call. It is bounded by fleet size,
+//! but it is already on every exported record as the `service.instance.id`
+//! resource attribute, so as a metric dimension it would duplicate a resource
+//! attribute and double the exposure to id churn on rescale. Span-only.
 //!
 //! # What is never recorded
 //!
@@ -221,6 +240,159 @@ pub const DB_SYSTEM_NAME: &str = "db.system.name";
 /// Value for [`DB_SYSTEM_NAME`].
 pub const DB_SYSTEM_NEO4J: &str = "neo4j";
 
+/// Bucket upper bound on an exported histogram family — the Prometheus `le`
+/// convention, spelled the same way in the OTLP export.
+///
+/// This is the one registry key that is **never a span attribute**. It exists
+/// because OpenTelemetry has no observable histogram and the Rust SDK has no
+/// `MetricProducer`, so a histogram computed in the kernel and read from a
+/// cached snapshot cannot reach OTLP as a histogram data point. It reaches it
+/// as a family of observable counters, one series per bucket, keyed by this
+/// label — which is what a Prometheus histogram already is, and over which
+/// `histogram_quantile` works unchanged. See [`crate::meter`].
+///
+/// It is a registry key rather than a bare `"le"` at the one call site so that
+/// the partition test below stays total: a [`MetricLabel`] built from a string
+/// nobody added to the registry would otherwise escape the classification
+/// entirely.
+///
+/// Bounded by the ladder length — 18 values, closed at compile time.
+pub const LE: &str = "le";
+
+/// An attribute key that is allowed to be a **metric dimension**.
+///
+/// The constructor is private to this module, so a `MetricLabel` can only name
+/// a key that appears in [`METRIC_LABELS`] below. Every meter helper takes
+/// `&[(MetricLabel, &str)]` rather than `&[KeyValue]`, which turns "do not put
+/// `scope` on a metric" from a review comment into a type error.
+///
+/// The rule is structural for the same reason redaction is
+/// ([`crate::redact`]), but by a different mechanism, and the difference is
+/// worth knowing. Redaction is a *runtime* denylist because it defends against
+/// field names invented anywhere in the kernel, which this crate cannot see.
+/// Metric labels are attached by code this crate owns, so the compiler can
+/// enforce it — and where the compiler can, a runtime filter is strictly worse:
+/// it fails silently on a Tuesday instead of loudly at `cargo build`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct MetricLabel(&'static str);
+
+impl MetricLabel {
+    /// The dotted attribute key.
+    pub const fn key(self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for MetricLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// [`CELL_ID`] as a metric dimension. Bounded per node by `GRAPH_CELLS`.
+pub const L_CELL_ID: MetricLabel = MetricLabel(CELL_ID);
+
+/// [`EDGE_TYPE`] as a metric dimension. Bounded by the tenant's schema.
+///
+/// Note that the *product* `cell_id × edge_type` is what a per-shard series
+/// costs: 8 cells and 12 edge types is 96 series per instrument per node.
+/// Affordable for a counter, not for an 18-bucket histogram family.
+pub const L_EDGE_TYPE: MetricLabel = MetricLabel(EDGE_TYPE);
+
+/// [`KERNEL`] as a metric dimension. Three values — the sparse-kernel ladder.
+pub const L_KERNEL: MetricLabel = MetricLabel(KERNEL);
+
+/// [`OUTCOME`] as a metric dimension. Three values.
+pub const L_OUTCOME: MetricLabel = MetricLabel(OUTCOME);
+
+/// [`ERROR_CLASS`] as a metric dimension.
+///
+/// Ten reachable values, not the eleven the enum declares: `GraphError::class`
+/// is an exhaustive match with no `other` arm and `ErrorClass::Other` is
+/// constructed nowhere, so the eleventh exists in the type and cannot reach a
+/// label. The distinction matters because ten is the number an operator
+/// multiplies out when deciding whether a `{cell_id, edge_type, error_class}`
+/// series is affordable.
+pub const L_ERROR_CLASS: MetricLabel = MetricLabel(ERROR_CLASS);
+
+/// [`PLACEMENT_OWNERSHIP`] as a metric dimension. Four values.
+pub const L_PLACEMENT_OWNERSHIP: MetricLabel = MetricLabel(PLACEMENT_OWNERSHIP);
+
+/// [`PLACEMENT_STATE`] as a metric dimension. Three values, closed by
+/// `crates/placement/src/liveness.rs` and pinned by a test there.
+///
+/// This one earns label status by being *asked for* as a metric: "how many
+/// instances are in `shed` right now" is a count of distinct instances by
+/// state, which a metric can answer only if the state is a dimension.
+pub const L_PLACEMENT_STATE: MetricLabel = MetricLabel(PLACEMENT_STATE);
+
+/// [`PLACEMENT_PREVIOUS_STATE`] as a metric dimension. Same closed vocabulary
+/// as [`L_PLACEMENT_STATE`], so a transition counter can carry both ends.
+pub const L_PLACEMENT_PREVIOUS_STATE: MetricLabel = MetricLabel(PLACEMENT_PREVIOUS_STATE);
+
+/// [`QUERY_FULL_SCAN`] as a metric dimension. Two values, and the single most
+/// actionable one in the set: a rate of full-scanning queries is a leading
+/// indicator, where the elapsed time is a lagging one.
+pub const L_QUERY_FULL_SCAN: MetricLabel = MetricLabel(QUERY_FULL_SCAN);
+
+/// [`DB_SYSTEM_NAME`] as a metric dimension. Exactly one value.
+///
+/// It is here as a consequence of naming the two metrics that have a genuine
+/// semantic convention `db.*`: this is the attribute a vendor's database view
+/// keys off, so putting `db.*` names on the wire and then omitting it would
+/// pay the cost of the naming split and collect none of the benefit.
+pub const L_DB_SYSTEM_NAME: MetricLabel = MetricLabel(DB_SYSTEM_NAME);
+
+/// [`LE`] as a metric dimension — bucket bounds on an exported histogram
+/// family. Never a span attribute.
+pub const L_LE: MetricLabel = MetricLabel(LE);
+
+/// Every key that may be a metric dimension. The other half of
+/// [`SPAN_ONLY_KEYS`]; together they partition [`ALL_REGISTRY_KEYS`].
+pub const METRIC_LABELS: &[MetricLabel] = &[
+    L_CELL_ID,
+    L_EDGE_TYPE,
+    L_KERNEL,
+    L_OUTCOME,
+    L_ERROR_CLASS,
+    L_PLACEMENT_OWNERSHIP,
+    L_PLACEMENT_STATE,
+    L_PLACEMENT_PREVIOUS_STATE,
+    L_QUERY_FULL_SCAN,
+    L_DB_SYSTEM_NAME,
+    L_LE,
+];
+
+/// Every key that must stay on spans and logs and must never become a metric
+/// dimension. See the cardinality note at the top of the module for the three
+/// reasons a key lands here.
+pub const SPAN_ONLY_KEYS: &[&str] = &[
+    SCOPE,
+    NODE_ID,
+    READ_EPOCH,
+    COMMIT_EPOCH,
+    GENERATION,
+    BASE_SEQUENCE,
+    QUERY_FINGERPRINT,
+    QUERY_ACCESS_PATH,
+    QUERY_OPTIMIZER_PASSES,
+    QUERY_ROWS_ESTIMATED,
+    QUERY_ROWS_RETURNED,
+    WRITER_EPOCH,
+    WRITER_RETRIES,
+    WRITER_LAST_PROMOTED_BY,
+    WRITER_LAST_PROMOTED_EPOCH,
+    WRITER_LAST_PROMOTED_AT,
+    CONSISTENCY,
+    PLACEMENT_LIVE_NODES,
+    WRITER_REOPEN_DELAY_MS,
+    WRITER_REOPEN_CAP_MS,
+    CORRELATION_ID,
+    CALLER_STEP,
+    SAMPLING_FORCE,
+    SAMPLING_TAIL_KEEP,
+];
+
 /// Every `turbolay.*` key defined above, for tests and for the redaction
 /// layer's allowlist cross-check.
 pub const ALL_TURBOLAY_KEYS: &[&str] = &[
@@ -258,6 +430,53 @@ pub const ALL_TURBOLAY_KEYS: &[&str] = &[
     SAMPLING_TAIL_KEEP,
 ];
 
+/// Every key this crate defines, `turbolay.`-namespaced or not.
+///
+/// [`ALL_TURBOLAY_KEYS`] stays the namespaced subset, because that is what the
+/// namespace test and the redaction cross-check are about. This is the superset
+/// the classification tests iterate, and the distinction is not pedantry: the
+/// three keys that are *not* `turbolay.`-namespaced are [`ERROR_CLASS`],
+/// [`DB_SYSTEM_NAME`] and [`LE`] — one of which is first on the safe-label list
+/// and all three of which a test over `ALL_TURBOLAY_KEYS` would classify
+/// vacuously, passing while checking nothing.
+pub const ALL_REGISTRY_KEYS: &[&str] = &[
+    SCOPE,
+    CELL_ID,
+    NODE_ID,
+    READ_EPOCH,
+    COMMIT_EPOCH,
+    GENERATION,
+    BASE_SEQUENCE,
+    EDGE_TYPE,
+    QUERY_FINGERPRINT,
+    QUERY_ACCESS_PATH,
+    QUERY_OPTIMIZER_PASSES,
+    QUERY_ROWS_ESTIMATED,
+    QUERY_ROWS_RETURNED,
+    QUERY_FULL_SCAN,
+    KERNEL,
+    WRITER_EPOCH,
+    WRITER_RETRIES,
+    WRITER_LAST_PROMOTED_BY,
+    WRITER_LAST_PROMOTED_EPOCH,
+    WRITER_LAST_PROMOTED_AT,
+    CONSISTENCY,
+    PLACEMENT_OWNERSHIP,
+    PLACEMENT_STATE,
+    PLACEMENT_PREVIOUS_STATE,
+    PLACEMENT_LIVE_NODES,
+    WRITER_REOPEN_DELAY_MS,
+    WRITER_REOPEN_CAP_MS,
+    CORRELATION_ID,
+    CALLER_STEP,
+    OUTCOME,
+    SAMPLING_FORCE,
+    SAMPLING_TAIL_KEEP,
+    ERROR_CLASS,
+    DB_SYSTEM_NAME,
+    LE,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,11 +505,102 @@ mod tests {
     /// named `…parameters` this test is the thing that catches it.
     #[test]
     fn no_registry_key_is_redacted() {
-        for key in ALL_TURBOLAY_KEYS {
+        for key in ALL_REGISTRY_KEYS {
             assert!(
                 !crate::redact::is_redacted(key),
                 "{key} is in the registry but would be redacted before export"
             );
         }
+    }
+
+    /// The superset must actually be one. Cheap, and it is what keeps a key
+    /// added to `ALL_TURBOLAY_KEYS` alone from skipping the classification
+    /// below.
+    #[test]
+    fn the_registry_contains_every_turbolay_key() {
+        for key in ALL_TURBOLAY_KEYS {
+            assert!(
+                ALL_REGISTRY_KEYS.contains(key),
+                "{key} is in ALL_TURBOLAY_KEYS but not in ALL_REGISTRY_KEYS"
+            );
+        }
+        assert_eq!(
+            ALL_REGISTRY_KEYS.len(),
+            ALL_TURBOLAY_KEYS.len() + 3,
+            "ALL_REGISTRY_KEYS is ALL_TURBOLAY_KEYS plus error.class, \
+             db.system.name and le — no more and no less"
+        );
+    }
+
+    #[test]
+    fn registry_keys_are_unique() {
+        let mut sorted = ALL_REGISTRY_KEYS.to_vec();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "duplicate key in ALL_REGISTRY_KEYS");
+    }
+
+    /// The point of the whole exercise: a new attribute cannot be added to the
+    /// registry without deciding, in the same commit, whether it may be a
+    /// metric dimension. Neither list can gain a member without the other being
+    /// considered.
+    #[test]
+    fn every_registry_key_is_classified_exactly_once() {
+        for key in ALL_REGISTRY_KEYS {
+            let is_label = METRIC_LABELS.iter().any(|label| label.key() == *key);
+            let is_span_only = SPAN_ONLY_KEYS.contains(key);
+            assert!(
+                is_label ^ is_span_only,
+                "{key} is in neither METRIC_LABELS nor SPAN_ONLY_KEYS, or in both"
+            );
+        }
+    }
+
+    /// The complement of the partition test, and the one that catches the
+    /// mistake `error.class` was already sitting in: a `MetricLabel` built from
+    /// a string nobody added to the registry would otherwise escape the
+    /// classification entirely, because the partition test iterates the
+    /// registry and would never see it.
+    #[test]
+    fn every_metric_label_is_a_registry_key() {
+        for label in METRIC_LABELS {
+            let key = label.key();
+            assert!(
+                ALL_REGISTRY_KEYS.contains(&key),
+                "{key} is a MetricLabel but is not in ALL_REGISTRY_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn every_span_only_key_is_a_registry_key() {
+        for key in SPAN_ONLY_KEYS {
+            assert!(
+                ALL_REGISTRY_KEYS.contains(key),
+                "{key} is in SPAN_ONLY_KEYS but is not in ALL_REGISTRY_KEYS"
+            );
+        }
+    }
+
+    /// The three keys the classification is most likely to get wrong, asserted
+    /// by name rather than by rule. `scope` and `correlation_id` are the two
+    /// unbounded keys the type exists to keep off metrics; `error.class` is the
+    /// non-namespaced one an `ALL_TURBOLAY_KEYS`-shaped test cannot see.
+    #[test]
+    fn the_load_bearing_classifications_are_the_expected_ones() {
+        assert!(SPAN_ONLY_KEYS.contains(&SCOPE));
+        assert!(SPAN_ONLY_KEYS.contains(&CORRELATION_ID));
+        assert!(SPAN_ONLY_KEYS.contains(&QUERY_FINGERPRINT));
+        assert!(METRIC_LABELS.iter().any(|l| l.key() == ERROR_CLASS));
+    }
+
+    #[test]
+    fn metric_labels_are_unique() {
+        let mut sorted: Vec<&str> = METRIC_LABELS.iter().map(|label| label.key()).collect();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "duplicate key in METRIC_LABELS");
     }
 }
