@@ -1,0 +1,308 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+      - name: Validate single-node deployment script
+        env:
+          TURBOLAY_S3_BUCKET: ci-turbolay-bucket
+          TURBOLAY_PUBLIC_HOST: 203.0.113.10
+          TURBOLAY_STATE_DIR: /tmp/turbolay-single-node
+        run: |
+          bash -n scripts/deploy_single_node_k3s.sh
+          bash -n scripts/ec2_graphblas_benchmark.sh
+          python3 -m py_compile scripts/bolt_graphblas_client.py
+          bash scripts/deploy_single_node_k3s.sh --render-only
+      - name: Lint Helm chart
+        run: helm lint charts/turbolay --values charts/turbolay/ci/ci-values.yaml
+      - name: Render secure EKS example
+        run: helm template turbolay charts/turbolay --namespace turbolay --values charts/turbolay/examples/values-eks.yaml > /tmp/turbolay-eks.yaml
+      - name: Render development example
+        run: helm template turbolay charts/turbolay --namespace turbolay --values charts/turbolay/examples/values-development.yaml > /tmp/turbolay-development.yaml
+      - name: Verify chart invariants
+        run: |
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set auth.secretKey=custom-token > /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_AUTH_TOKEN_FILE: "/var/run/secrets/turbolay/custom-token"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_MAX_RELATIONSHIP_ROWS_BYTES: "8388608"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_MAX_SOURCE_RELATIONSHIP_ROWS_BYTES: "8388608"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_MAX_RELATIONSHIP_PROPERTY_ROWS_BYTES: "16777216"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'path: custom-token' /tmp/turbolay-custom-auth.yaml
+          if grep -q '^kind: RoleBinding$' /tmp/turbolay-custom-auth.yaml; then
+            echo "controllerless chart unexpectedly rendered a RoleBinding"
+            exit 1
+          fi
+          grep -q 'name: turbolay-bolt' /tmp/turbolay-custom-auth.yaml
+          grep -q 'name: turbolay-https' /tmp/turbolay-custom-auth.yaml
+          grep -q 'app.kubernetes.io/component: node' /tmp/turbolay-custom-auth.yaml
+          grep -q 'app.kubernetes.io/component: indexer' /tmp/turbolay-custom-auth.yaml
+          grep -q 'command: \["/usr/local/bin/graph-indexer"\]' /tmp/turbolay-custom-auth.yaml
+          grep -q 'name: turbolay-indexer-metrics' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_INDEX_DISCOVERY_INTERVAL_MS: "5000"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_RETAIN_PREVIOUS: "1"' /tmp/turbolay-custom-auth.yaml
+          if grep -q 'GRAPH_MATRIX_REFRESH_' /tmp/turbolay-custom-auth.yaml; then
+            echo "query-node matrix refresh configuration is still rendered"
+            exit 1
+          fi
+          grep -q 'Authorization: Bearer' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_DATA_CACHE_BYTES: "8589934592"' /tmp/turbolay-custom-auth.yaml
+          if grep -Eq 'GRAPH_[A-Z0-9_]+: "[0-9]+(\.[0-9]+)?e[+-][0-9]+"' /tmp/turbolay-custom-auth.yaml; then
+            echo "runtime integer was rendered in scientific notation"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-json runtime.maxConcurrentQueries=1.9 > /tmp/turbolay-fractional-runtime.yaml 2>&1; then
+            echo "fractional runtime integer was accepted"
+            exit 1
+          fi
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-string runtime.maxQueryRuntimeMs=18446744073709551615 \
+            > /tmp/turbolay-u64-runtime.yaml
+          grep -q 'GRAPH_MAX_QUERY_RUNTIME_MS: "18446744073709551615"' /tmp/turbolay-u64-runtime.yaml
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-string runtime.maxQueryRuntimeMs=18446744073709551616 \
+            > /tmp/turbolay-u64-overflow.yaml 2>&1; then
+            echo "overflowing unsigned runtime integer was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-json 'graph.cells=["cell-0","cell-1"]' > /tmp/turbolay-multiple-cells.yaml 2>&1; then
+            echo "multiple cells in one runtime release were accepted"
+            exit 1
+          fi
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            > /tmp/turbolay-digest-image.yaml
+          grep -q 'image: 525753068359.dkr.ecr.us-east-1.amazonaws.com/staging/turbolay@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' /tmp/turbolay-digest-image.yaml
+          grep -q 'port: 9000' /tmp/turbolay-development.yaml
+          grep -q 'app.kubernetes.io/component: helm-test' /tmp/turbolay-development.yaml
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set tests.enabled=false \
+            --show-only templates/networkpolicy.yaml > /tmp/turbolay-default-policy.yaml
+          if grep -q 'cidr: 0.0.0.0/0' /tmp/turbolay-default-policy.yaml; then
+            echo "network policy unexpectedly permits universal IPv4 egress"
+            exit 1
+          fi
+          grep -q 'cidr: 10.0.0.0/8' /tmp/turbolay-default-policy.yaml
+          if awk '/^  ingress:/{ingress=1; next} /^  egress:/{ingress=0} ingress && /port: 8443/{found=1} END{exit found ? 0 : 1}' /tmp/turbolay-default-policy.yaml; then
+            echo "default client ingress unexpectedly permits HTTPS"
+            exit 1
+          fi
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-json 'networkPolicy.clientIngressFrom=[{"ipBlock":{"cidr":"10.20.0.0/16"}}]' > /tmp/turbolay-scoped-client.yaml
+          grep -q 'cidr: 10.20.0.0/16' /tmp/turbolay-scoped-client.yaml
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-json 'networkPolicy.httpsEgressTo=[]' > /tmp/turbolay-unscoped-https.yaml 2>&1; then
+            echo "unscoped AWS HTTPS egress was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-json 'networkPolicy.httpsEgressTo=[{}]' > /tmp/turbolay-empty-https-peer.yaml 2>&1; then
+            echo "empty AWS HTTPS egress peer was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-json 'networkPolicy.httpsEgressTo=[{"ipBlock":{"cidr":"0.0.0.0/0"}}]' > /tmp/turbolay-universal-https.yaml 2>&1; then
+            echo "universal AWS HTTPS egress CIDR was accepted"
+            exit 1
+          fi
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml > /tmp/turbolay-custom-endpoint.yaml
+          grep -q 'port: 8080' /tmp/turbolay-custom-endpoint.yaml
+          grep -q 'cidr: 10.0.0.0/8' /tmp/turbolay-custom-endpoint.yaml
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-string objectStore.aws.endpoint=https://object-store.example \
+            --set-json 'objectStore.aws.endpointEgressTo=[{"ipBlock":{"cidr":"10.30.0.0/16"}}]' \
+            --set-json 'networkPolicy.httpsEgressTo=[]' > /tmp/turbolay-custom-endpoint-without-sts.yaml 2>&1; then
+            echo "IRSA custom endpoint without scoped STS egress was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set-string objectStore.aws.endpoint=http://object-store.example:8080 > /tmp/turbolay-unscoped-endpoint.yaml 2>&1; then
+            echo "unscoped custom object-store endpoint was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
+            --set-json 'objectStore.aws.endpointEgressTo=[{}]' > /tmp/turbolay-empty-endpoint-peer.yaml 2>&1; then
+            echo "empty custom object-store endpoint peer was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
+            --set-json 'objectStore.aws.endpointEgressTo=[{"namespaceSelector":{}}]' > /tmp/turbolay-empty-namespace-selector.yaml 2>&1; then
+            echo "empty custom object-store namespace selector was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
+            --set-json 'objectStore.aws.endpointEgressTo=[{"podSelector":{}}]' > /tmp/turbolay-empty-pod-selector.yaml 2>&1; then
+            echo "empty custom object-store Pod selector was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
+            --set-json 'objectStore.aws.endpointEgressTo=[{"ipBlock":{"cidr":"0.0.0.0/0"}}]' > /tmp/turbolay-universal-endpoint-cidr.yaml 2>&1; then
+            echo "universal custom object-store CIDR was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
+            --set-string objectStore.aws.endpoint=ftp://object-store.example > /tmp/turbolay-invalid-endpoint.yaml 2>&1; then
+            echo "unsupported object-store endpoint scheme was accepted"
+            exit 1
+          fi
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/custom-endpoint-values.yaml \
+            --set-string objectStore.aws.endpoint=http://object-store.example:70000 > /tmp/turbolay-invalid-port.yaml 2>&1; then
+            echo "invalid object-store endpoint port was accepted"
+            exit 1
+          fi
+      - name: Validate Kubernetes resources
+        run: |
+          docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary < /tmp/turbolay-development.yaml
+          docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary -ignore-missing-schemas < /tmp/turbolay-eks.yaml
+
+  test:
+    runs-on: ubuntu-latest
+    # `cypher_relationship_properties_are_indexed_mutable_and_snapshot_safe`
+    # overflows the 2 MiB default test-thread stack and aborts the whole test
+    # binary with SIGABRT, which reads like a crash in the code rather than a
+    # missing knob. It is reachable from every feature set that compiles the
+    # Cypher engine -- not only the two OpenCypher steps that used to set this
+    # per-step -- so it belongs to the job. `justfile` exports the same value
+    # for every recipe on every platform, which is why `just ci` never saw it.
+    env:
+      RUST_MIN_STACK: 8388608
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config libcypher-parser-dev libgraphblas-dev
+      - name: Verify native dependencies
+        run: |
+          pkg-config --exists cypher-parser
+          ldconfig -p | grep -q libgraphblas
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      # Every other cargo line here is bare, so it selects the root package
+      # only. The workspace members need their own explicit -p lines or they
+      # are silently unlinted and untested.
+      - name: Clippy placement crate
+        run: cargo clippy --locked --all-targets -p turbolay-placement -- -D warnings
+      - name: Test placement crate
+        run: cargo test --locked -p turbolay-placement
+      - name: Clippy chaos harness
+        run: cargo clippy --locked --all-targets --features chaos-harness -- -D warnings
+      - name: Clippy OpenCypher feature set
+        run: cargo clippy --locked --all-targets --features opencypher -- -D warnings
+      - name: Clippy full native feature set
+        run: cargo clippy --locked --all-targets --features opencypher,query-transport,query-transport-tls,query-service-discovery,public-client-protocols -- -D warnings
+      - name: Clippy public client protocols
+        run: cargo clippy --locked --all-targets --features public-client-protocols -- -D warnings
+      - name: Clippy production runtime
+        run: cargo clippy --locked --all-targets --features server-runtime,indexer-runtime -- -D warnings
+      - name: Check standalone Bolt server
+        run: cargo check --locked --all-targets --features bolt-server
+      - name: Test default feature set
+        run: cargo test --locked --lib
+      - name: Test chaos harness feature set
+        run: cargo test --locked --features chaos-harness --lib
+      - name: Test OpenCypher feature set
+        run: cargo test --locked --features opencypher --lib
+      - name: Test full native feature set
+        run: cargo test --locked --all-targets --features opencypher,query-transport,query-transport-tls,query-service-discovery,public-client-protocols
+      - name: Test public client protocols
+        run: cargo test --locked --all-targets --features public-client-protocols
+      - name: Test production runtime configuration
+        run: cargo test --locked --features server-runtime --bin graph-node
+      - name: Check indexing runtime
+        run: cargo check --locked --bin graph-indexer --features indexer-runtime
+      - name: Test official Neo4j driver compatibility
+        run: |
+          python3 -m pip install 'neo4j>=6,<7'
+          bash scripts/bolt_neo4j_driver_smoke.sh
+      - name: Test production runtime lifecycle
+        run: bash scripts/runtime_smoke.sh
+      - name: Check default examples
+        run: cargo check --locked --examples
+      - name: Check chaos harness example
+        run: cargo check --locked --examples --features chaos-harness
+      - name: Check native feature examples
+        run: cargo check --locked --examples --features opencypher
+
+  macos-default:
+    runs-on: macos-latest
+    # Same knob as the `test` job. This job's feature sets do not reach the
+    # offending test today, but the stack limit is not platform-specific --
+    # it reproduces identically on macOS -- so the two jobs stay in step.
+    env:
+      RUST_MIN_STACK: 8388608
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install native dependencies
+        run: brew install suite-sparse
+      - name: Clippy default feature set
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Clippy chaos harness
+        run: cargo clippy --locked --all-targets --features chaos-harness -- -D warnings
+      - name: Test default feature set
+        run: cargo test --locked --lib
+      - name: Test chaos harness feature set
+        run: cargo test --locked --features chaos-harness --lib
+      - name: Check default examples
+        run: cargo check --locked --examples
+      - name: Check chaos harness example
+        run: cargo check --locked --examples --features chaos-harness

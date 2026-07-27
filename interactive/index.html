@@ -1,0 +1,80 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TurboLay · Interactive Textbooks</title>
+<link rel="stylesheet" href="assets/textbook.css">
+
+<header class="tb-header">
+  <a class="tb-home" href="index.html">Turbo<span>Lay</span> · Interactive</a>
+  <span class="tb-spacer"></span>
+  <button class="tb-theme-toggle" type="button">☾ Dark</button>
+</header>
+
+<section class="tb-hero">
+  <div class="tb-chapter-kicker">Interactive Textbooks</div>
+  <h1>A property graph on object storage</h1>
+  <p class="tb-lede">Two guides to TurboLay (<code>slatedb-graph-kernel</code>), rebuilt as interactive
+  notebooks. Hover any <span class="concept" data-concept="epoch">dotted term</span> for a nested,
+  drill-down explanation; open the “deeper reading” blocks for interactive widgets that let you
+  <em>run</em> the model instead of only reading it. Below them, design notes on open problems —
+  plain reading, no widgets.</p>
+</section>
+
+<div class="tb-books">
+
+  <article class="tb-book">
+    <div class="tb-book-head">
+      <h2>TurboLay — A Conceptual Guide</h2>
+      <div class="tb-book-sub">Mental models for a property graph on object storage.</div>
+      <span class="tb-audience undergrad">For the curious CS undergraduate</span>
+    </div>
+    <ul class="tb-toc">
+      <li class="tb-part-label">Part I · The Architecture</li>
+      <li><a href="conceptual/intro-00-replaceable-compute.html"><span class="tb-ch-num">0</span><span><span class="tb-ch-title">The Compute Node Can Disappear</span> · <span class="tb-ch-blurb">durable truth vs. replaceable compute</span></span></a></li>
+      <li><a href="conceptual/intro-01-cells-and-placement.html"><span class="tb-ch-num">1</span><span><span class="tb-ch-title">A Graph Has Cells</span> · <span class="tb-ch-blurb">the addressable unit of ownership</span></span></a></li>
+      <li><a href="conceptual/intro-02-one-cell-one-write-boundary.html"><span class="tb-ch-num">2</span><span><span class="tb-ch-title">One Cell, One Write Boundary</span> · <span class="tb-ch-blurb">a mutation is one transaction</span></span></a></li>
+      <li><a href="conceptual/intro-03-epochs-artifacts-overlays.html"><span class="tb-ch-num">3</span><span><span class="tb-ch-title">Reads Name the World They See</span> · <span class="tb-ch-blurb">epochs, artifacts, the WAL overlay</span></span></a></li>
+      <li><a href="conceptual/intro-04-from-cypher-to-roaring.html"><span class="tb-ch-num">4</span><span><span class="tb-ch-title">From Cypher to Roaring Rows</span> · <span class="tb-ch-blurb">a query becomes traversal work</span></span></a></li>
+      <li><a href="conceptual/intro-05-bounded-distributed-queries.html"><span class="tb-ch-num">5</span><span><span class="tb-ch-title">Distribution with Edges Around It</span> · <span class="tb-ch-blurb">bounded scatter/gather</span></span></a></li>
+      <li class="tb-part-label">Part II · Implementation Deep Dives</li>
+      <li><a href="conceptual/detail-01-roaring-matrix-rows.html"><span class="tb-ch-num">6</span><span><span class="tb-ch-title">Roaring Matrix Rows</span> · <span class="tb-ch-blurb">compressing adjacency</span></span></a></li>
+      <li><a href="conceptual/detail-02-write-edge-path.html"><span class="tb-ch-num">7</span><span><span class="tb-ch-title">The <code>write_edge</code> Path</span> · <span class="tb-ch-blurb">four phases, one commit</span></span></a></li>
+    </ul>
+  </article>
+
+  <article class="tb-book">
+    <div class="tb-book-head">
+      <h2>Inside TurboLay</h2>
+      <div class="tb-book-sub">How this is implemented — a code-level guide to <code>slatedb-graph-kernel</code>.</div>
+      <span class="tb-audience engineer">For the working engineer</span>
+    </div>
+    <ul class="tb-toc">
+      <li><a href="inside/00-foundations.html"><span class="tb-ch-num">0</span><span><span class="tb-ch-title">Foundations</span> · <span class="tb-ch-blurb">every term the later chapters use</span></span></a></li>
+      <li><a href="inside/01-architecture.html"><span class="tb-ch-num">1</span><span><span class="tb-ch-title">Architecture</span> · <span class="tb-ch-blurb">the shape of the kernel</span></span></a></li>
+      <li><a href="inside/02-read-path.html"><span class="tb-ch-num">2</span><span><span class="tb-ch-title">The Read Path</span> · <span class="tb-ch-blurb">snapshot to rows</span></span></a></li>
+      <li><a href="inside/03-write-path.html"><span class="tb-ch-num">3</span><span><span class="tb-ch-title">The Write Path</span> · <span class="tb-ch-blurb">guards, fence, transaction</span></span></a></li>
+      <li><a href="inside/04-delete-path.html"><span class="tb-ch-num">4</span><span><span class="tb-ch-title">The Delete Path</span> · <span class="tb-ch-blurb">tombstones and reclamation</span></span></a></li>
+      <li><a href="inside/05-caching.html"><span class="tb-ch-num">5</span><span><span class="tb-ch-title">Caching</span> · <span class="tb-ch-blurb">the disposable acceleration layers</span></span></a></li>
+    </ul>
+  </article>
+
+  <article class="tb-book">
+    <div class="tb-book-head">
+      <h2>Design Notes — Write Routing</h2>
+      <div class="tb-book-sub">A working analysis of an open problem: one cell has a single writer, so how does an incoming write reach the right node? Read alongside <code>tidb-master</code> and <code>sleet</code>.</div>
+      <span class="tb-audience architect">For the architect · not a textbook</span>
+    </div>
+    <ul class="tb-toc">
+      <li><a href="write-routing-problem.html"><span class="tb-ch-num">1</span><span><span class="tb-ch-title">One Cell, One Writer</span> · <span class="tb-ch-blurb">the write path traced, the cell-blind routing table, ten failure modes</span></span></a></li>
+      <li><a href="write-routing-solutions.html"><span class="tb-ch-num">2</span><span><span class="tb-ch-title">Routing the Write</span> · <span class="tb-ch-blurb">four sources of truth, scored — with TiDB/TiKV and sleet as reference</span></span></a></li>
+    </ul>
+  </article>
+
+</div>
+
+<footer class="tb-footer">
+  Generated from <code>books/chapters/*.typ</code> · faithful to the printed guides · nested tooltips &amp; widgets after the
+  <a href="https://github.com/alharkan7/skills" target="_blank" rel="noopener">interactive-textbook</a> skill.
+</footer>
+
+<script src="assets/glossary.js"></script>
+<script src="assets/textbook.js"></script>

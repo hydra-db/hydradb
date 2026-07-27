@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jepsen Testing for Turbolay — Guide &amp; Reading List</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1d21; --muted: #5c6570; --line: #e3e7ec;
+    --card: #f7f9fb; --accent: #b4432a; --accent-soft: #fbeeea;
+    --code-bg: #f2f4f7; --ok: #1f7a4d; --warn: #9a6700; --bad: #b3261e;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a; --fg: #e6e9ed; --muted: #98a2ae; --line: #2a2f36;
+      --card: #1b1f24; --accent: #e8836a; --accent-soft: #2a1d19;
+      --code-bg: #1f242a; --ok: #62c48c; --warn: #d9a441; --bad: #f08279;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 3rem 1.25rem 6rem; }
+  header { border-bottom: 1px solid var(--line); padding-bottom: 1.75rem; margin-bottom: 2.5rem; }
+  h1 { font-size: 2.1rem; line-height: 1.2; margin: 0 0 .5rem; letter-spacing: -.02em; }
+  .sub { color: var(--muted); font-size: 1.05rem; margin: 0; }
+  h2 {
+    font-size: 1.35rem; margin: 3rem 0 .9rem; letter-spacing: -.01em;
+    padding-top: .5rem;
+  }
+  h3 { font-size: 1.05rem; margin: 1.9rem 0 .5rem; }
+  p { margin: 0 0 1rem; }
+  a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; }
+  a:hover { border-bottom-color: var(--accent); }
+  code { font-family: var(--mono); font-size: .875em; background: var(--code-bg);
+         padding: .12em .38em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: .9rem 1rem; overflow-x: auto; font-family: var(--mono);
+    font-size: .82rem; line-height: 1.55; margin: 0 0 1.2rem;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 1.1rem 1.25rem; margin: 0 0 1.2rem;
+  }
+  .card h3 { margin-top: 0; }
+  .note {
+    border-left: 3px solid var(--accent); background: var(--accent-soft);
+    padding: .85rem 1rem; border-radius: 0 8px 8px 0; margin: 0 0 1.2rem;
+  }
+  .note strong { color: var(--accent); }
+  .tbl-wrap { overflow-x: auto; margin: 0 0 1.4rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; min-width: 540px; }
+  th, td { text-align: left; padding: .55rem .7rem; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { font-weight: 600; color: var(--muted); font-size: .78rem;
+       text-transform: uppercase; letter-spacing: .04em; }
+  ul, ol { margin: 0 0 1rem; padding-left: 1.3rem; }
+  li { margin-bottom: .4rem; }
+  .toc { columns: 2; column-gap: 2rem; font-size: .92rem; }
+  .toc a { display: block; margin-bottom: .35rem; }
+  @media (max-width: 600px) { .toc { columns: 1; } }
+  .pill {
+    display: inline-block; font-size: .7rem; font-weight: 600; letter-spacing: .04em;
+    text-transform: uppercase; padding: .16em .5em; border-radius: 4px;
+    background: var(--accent-soft); color: var(--accent); vertical-align: middle;
+  }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+  footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--line);
+           color: var(--muted); font-size: .85rem; }
+  .lead { font-size: 1.05rem; }
+  dl { margin: 0 0 1.2rem; }
+  dt { font-weight: 600; margin-top: .8rem; }
+  dd { margin: .15rem 0 0 0; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Jepsen Testing for Turbolay</h1>
+  <p class="sub">What Jepsen actually does, how it maps onto an object-store-native graph engine, and where to read more.</p>
+</header>
+
+<nav class="toc">
+  <a href="#what">1. What Jepsen is</a>
+  <a href="#anatomy">2. Anatomy of a test</a>
+  <a href="#models">3. Consistency models</a>
+  <a href="#checkers">4. Checkers</a>
+  <a href="#turbolay">5. Turbolay's claims</a>
+  <a href="#findings">6. What the first runs found</a>
+  <a href="#workloads">7. The three workloads</a>
+  <a href="#faults">8. The fault schedule</a>
+  <a href="#running">9. Running the suite</a>
+  <a href="#reading">10. Reading results</a>
+  <a href="#pitfalls">11. Pitfalls</a>
+  <a href="#resources">12. Reading list</a>
+</nav>
+
+<h2 id="what">1. What Jepsen is</h2>
+
+<p class="lead">Jepsen is not a fuzzer and not a load generator. It is a <em>falsification harness</em>: it drives a real distributed database from outside, records a totally-ordered history of every request and response, injects faults while doing so, and then asks an offline checker whether that history could have been produced by a correct system.</p>
+
+<p>The three moving parts:</p>
+
+<dl>
+  <dt>The history</dt>
+  <dd>Every operation is logged twice — an <code>:invoke</code> when the client sends it and an <code>:ok</code> / <code>:fail</code> / <code>:info</code> when it resolves. The gap between the two is the window in which the operation may have taken effect.</dd>
+
+  <dt>The nemesis</dt>
+  <dd>A special client whose "operations" are faults: kill a process, partition the network, skew a clock, pause a node with <code>SIGSTOP</code>. Faults are scheduled into the same history, so the checker can correlate an anomaly with the fault that caused it.</dd>
+
+  <dt>The checker</dt>
+  <dd>A pure function from history to verdict. Because it runs offline over the recorded history, it can afford search that would be impossible online — Knossos explores possible linearizations; Elle infers a dependency graph and looks for cycles.</dd>
+</dl>
+
+<div class="note">
+  <strong>The key idea.</strong> A green Jepsen run proves nothing. A red one proves something concrete and reproducible: here is a history the database produced that no correct implementation could have produced. Design tests to <em>fail</em>, not to pass.
+</div>
+
+<h3>The <code>:info</code> outcome is the whole game</h3>
+<p>Most testing frameworks have two outcomes. Jepsen has three, and the third is what makes it sound. When a write times out, the client does not know whether it committed. Recording that as <code>:fail</code> would let a real lost update hide; recording it as <code>:ok</code> would produce false alarms. <code>:info</code> means <em>indeterminate</em> — the checker must consider both worlds. Every client you write must classify errors correctly, or the results are meaningless.</p>
+
+<pre><code>; From jepsen/turbolay/src/jepsen/turbolay/http.clj
+(catch SocketTimeoutException e   (assoc op :type :info, :error :timeout))
+(catch ConnectException e         (assoc op :type :fail, :error :connection-refused))
+;; 4xx  -> definitively rejected, nothing was mutated  -> :fail
+;; 5xx  -> server may have applied it before dying     -> :info</code></pre>
+
+<h2 id="anatomy">2. Anatomy of a test</h2>
+
+<p>A Jepsen test is a Clojure map. Six keys carry the weight:</p>
+
+<div class="tbl-wrap">
+<table>
+  <thead><tr><th>Key</th><th>Role</th><th>In this suite</th></tr></thead>
+  <tbody>
+    <tr><td><code>:db</code></td><td>Install / start / stop / kill / pause the database on each node</td><td><code>turbolay/db.clj</code> — launches <code>graph-node</code> with the S3 env, waits on <code>/readyz</code></td></tr>
+    <tr><td><code>:client</code></td><td>Turn abstract ops into real requests</td><td><code>http.clj</code> + one workload ns; POSTs Cypher to <code>/v1/graphs/default/query</code></td></tr>
+    <tr><td><code>:generator</code></td><td>Lazy tree of ops handed to worker threads</td><td>Per workload; mixed reads/writes, rate-limited by <code>gen/stagger</code></td></tr>
+    <tr><td><code>:nemesis</code></td><td>Fault injector</td><td><code>nemesis.clj</code> — standard faults plus an object-store partition</td></tr>
+    <tr><td><code>:checker</code></td><td>History → verdict</td><td><code>set-full</code>, Knossos linearizability, custom session checker</td></tr>
+    <tr><td><code>:os</code></td><td>Node OS setup</td><td>Debian/Ubuntu containers</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The lifecycle: <em>setup DB → run generator (clients and nemesis concurrently) → heal → quiesce → final read → teardown → check</em>. The final read matters: it runs after all faults have healed and the cluster has had time to settle, so anything still missing is definitively lost, not merely delayed.</p>
+
+<h2 id="models">3. Consistency models you can actually test</h2>
+
+<p>Jepsen checks against models, and models form a lattice. Testing against a model stronger than the database claims produces noise; weaker produces false confidence.</p>
+
+<div class="tbl-wrap">
+<table>
+  <thead><tr><th>Model</th><th>Informal statement</th><th>Checker</th></tr></thead>
+  <tbody>
+    <tr><td>Linearizable</td><td>Every op appears to take effect atomically at some instant between invoke and complete; reads see the latest committed write</td><td>Knossos (<code>checker/linearizable</code>)</td></tr>
+    <tr><td>Sequential</td><td>Some total order exists that respects each process's own order, but not real time</td><td>Elle</td></tr>
+    <tr><td>Snapshot isolation</td><td>Transactions read a consistent snapshot; no write-write conflicts</td><td>Elle (<code>:consistency-models [:snapshot-isolation]</code>)</td></tr>
+    <tr><td>Read-your-writes</td><td>A session never fails to see its own acknowledged writes</td><td>Custom / Elle session checks</td></tr>
+    <tr><td>Monotonic reads</td><td>A session never un-sees something it already saw</td><td>Custom</td></tr>
+    <tr><td>Grow-only set</td><td>Acknowledged elements are never lost; reads are subsets of what has been added</td><td><code>checker/set-full</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note">
+  <strong>Start with the set.</strong> <code>set-full</code> is the highest-value-per-line checker in Jepsen. It is cheap, it never gives false positives, and it catches the failure everyone actually fears: an acknowledged write that vanishes. Reach for Knossos and Elle after the set workload is clean.
+</div>
+
+<h2 id="checkers">4. The checkers, concretely</h2>
+
+<h3>set-full</h3>
+<p>Ops are <code>{:f :add :value v}</code> and <code>{:f :read :value #{...}}</code>. The checker classifies each added element:</p>
+<ul>
+  <li><span class="ok">ok</span> — acknowledged and present in the final read</li>
+  <li><span class="bad">lost</span> — acknowledged (<code>:ok</code>) but absent from a later read. <strong>Always a bug.</strong></li>
+  <li><span class="bad">recovered</span> — reported <code>:fail</code> but present anyway. Also a bug — a failed write applied.</li>
+  <li><span class="warn">stale</span> — present, then absent from a later read, then present again. Legal under weak consistency, a violation under strong.</li>
+</ul>
+<p>It also reports <em>stale-count</em> and <em>duplicated</em> elements, which is how you catch a WAL-tail-plus-index merge that double-counts an edge.</p>
+
+<h3>Knossos linearizability</h3>
+<p>Given a single-register model with reads and writes, Knossos searches for a linearization of the history. It is exponential in concurrency, so keep it to a handful of threads per key — hence <code>jepsen.independent</code>, which runs many small independent registers in parallel and checks each separately. If it finds no valid linearization, it emits an SVG showing the exact operations that cannot be ordered.</p>
+
+<h3>Elle</h3>
+<p>For transactional systems. Elle infers write-write, write-read, and read-write dependencies from the values transactions observe, builds a graph, and reports cycles — each cycle type maps to a named anomaly (G0 dirty write, G1c circular information flow, G2 anti-dependency cycle). It scales far better than Knossos. Turbolay's HTTP API is auto-commit only today, so Elle's transactional power is mostly unused here; that changes the day multi-statement transactions ship.</p>
+
+<h3>Custom session checker</h3>
+<p>Turbolay's <code>causal</code> mode plus bookmarks is a session-guarantee claim, and no stock checker encodes it. <code>causal.clj</code> folds the history per session and asserts two things: a read carrying an acknowledged write's bookmark must observe that write (read-your-writes), and a session's reads must never lose a previously observed element (monotonic reads).</p>
+
+<h2 id="turbolay">5. What Turbolay claims, restated as testable propositions</h2>
+
+<p>Turbolay is not a Raft cluster. Its architecture makes some Jepsen faults irrelevant and one fault unusually important.</p>
+
+<ul>
+  <li>The object store is the source of truth. SlateDB owns writer fencing, WAL durability, and commit ordering.</li>
+  <li>One writer per graph store; any number of reader processes. Nodes are stateless and controllerless — any node may lazily open the (fenced) writer.</li>
+  <li>Reads come in exactly two modes. <code>causal</code> serves from the node's local durable view, refreshing only when a supplied bookmark demands it. <code>strong</code> refreshes the SlateDB reader from object storage first, then pins one snapshot.</li>
+  <li>Reads combine an indexed base with the committed WAL tail when the async CSC indexer lags.</li>
+</ul>
+
+<p>Turned into propositions a checker can falsify:</p>
+
+<div class="tbl-wrap">
+<table>
+  <thead><tr><th>#</th><th>Proposition</th><th>Falsified by</th></tr></thead>
+  <tbody>
+    <tr><td>P1</td><td>An acknowledged write is never lost, regardless of which node accepted it or what happened next</td><td><code>set-full</code> reporting <em>lost</em></td></tr>
+    <tr><td>P2</td><td>Two nodes racing to open the writer never both commit — fencing holds</td><td><em>lost</em> or <em>duplicated</em> elements around a kill/pause</td></tr>
+    <tr><td>P3</td><td>A <code>strong</code> read observes every write committed before its refresh</td><td>Knossos linearizability violation</td></tr>
+    <tr><td>P4</td><td>A <code>causal</code> read carrying a bookmark observes the write that produced it, on any node</td><td>session checker read-your-writes violation</td></tr>
+    <tr><td>P5</td><td>Reads never regress within a session</td><td>session checker monotonic-reads violation</td></tr>
+    <tr><td>P6</td><td>The indexed-base + WAL-tail merge never duplicates or drops an edge</td><td><code>set-full</code> <em>duplicated</em>, or set-size mismatch while the indexer lags</td></tr>
+    <tr><td>P7</td><td>A node cut off from S3 either serves a stale-but-legal view or errors — it never serves a wrong one</td><td>object-store partition + <code>strong</code> reads returning <code>:ok</code> with missing data</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note">
+  <strong>The fault that matters most here is not a network partition between nodes.</strong> Turbolay nodes barely talk to each other. The dangerous configuration is a node partitioned <em>from the object store</em> while still reachable by clients: it can still accept connections and still answer from its local cache. That is why this suite ships a custom <code>object-store</code> nemesis that iptables-drops MinIO on a subset of nodes.
+</div>
+
+<h2 id="findings">6. What the first runs found</h2>
+
+<p>Three things surfaced before a single fault was injected. All three are worth recording, because two were harness bugs and one is a genuine operational constraint — and telling those apart is most of the work in Jepsen.</p>
+
+<div class="card">
+  <h3>Writer-affinity thrash <span class="pill">real</span></h3>
+  <p>Jepsen spreads client operations across all nodes by default. Against a single-writer store that means five nodes racing to open the SlateDB writer, fencing each other continuously. The first run produced <strong>80 <code>l0_manifest_writer error=Fenced</code> events</strong> and HTTP 500s on two thirds of all writes.</p>
+  <p>Fencing itself was <em>correct</em> — <code>lost-count 0</code>, no duplicates. Nothing was unsafe. But write throughput collapsed, and a test that only re-measures thrash cannot find anything else.</p>
+  <p><strong>The operational lesson:</strong> a client that fans writes across nodes will see most of them fail. Real clients must follow the Bolt routing table to the current writer. The suite now models this in <code>routing.clj</code> — writes go to one node and advance on failure — which is also what makes killing that node a meaningful <em>handover</em> test rather than noise.</p>
+</div>
+
+<div class="card">
+  <h3>Requested timeout above the server cap is rejected, not clamped <span class="pill">real</span></h3>
+  <p>Every read returned <code>429 resource_exhausted</code>. The client asked for <code>timeout_ms: 30000</code> while the node was configured with <code>GRAPH_MAX_QUERY_RUNTIME_MS=20000</code>. The service rejects an over-cap request outright (<code>src/client/service.rs:774</code>) rather than clamping it to the maximum.</p>
+  <p>Defensible, but sharp: a client with a generous default timeout gets zero successful queries against a conservatively configured node, and the error says "resource exhausted" — which reads like load shedding, not a misconfiguration.</p>
+</div>
+
+<div class="card">
+  <h3><code>nemesis-package</code> always constructs every fault <span class="pill">harness</span></h3>
+  <p><code>jepsen.nemesis.combined/nemesis-packages</code> builds all five stock packages regardless of <code>:faults</code>; only the <em>generators</em> are gated. The file-corruption nemesis downloads an x86_64-only <code>bitflip</code> release from GitHub in <code>setup!</code>, so on arm64 nodes — or any host without egress — the run aborts before issuing a single operation, even with <code>--nemesis none</code>. <code>nemesis.clj</code> selects packages by hand instead.</p>
+</div>
+
+<div class="card">
+  <h3>Server cursors are bound to a <code>query_id</code> <span class="pill">real</span></h3>
+  <p>Paginated reads failed with <code>400 invalid_request: result cursor does not belong to this query request</code>. The client omitted <code>query_id</code>, so the server generated a fresh one per HTTP request — and page 2's cursor no longer matched the query that created it.</p>
+  <p>This one is dangerous precisely because of how it fails. A truncated read is not an error to <code>set-full</code>; it is <em>evidence of catastrophic data loss</em>. A harness that silently stops at page 1 will confidently report a database bug that does not exist. Every page of one logical query must now carry the same client-generated <code>query_id</code>.</p>
+</div>
+
+<div class="card">
+  <h3>State leaked between runs <span class="pill">harness</span></h3>
+  <p><code>teardown!</code> clears the local SlateDB cache, but the object store <em>is</em> the source of truth — so it survived. Worse, the run-scoped object prefix keyed off <code>:run-id</code>, which is not a real Jepsen test key, so every run silently shared one path. Run <em>N</em>'s edges were still present in run <em>N+1</em>, which is what pushed result sets past the page size and exposed the cursor bug above.</p>
+  <p>For a database whose durable state lives outside the nodes, "tear down the nodes" is not "reset the database". <code>turbolay-test</code> now stamps a real per-run id into the test map.</p>
+</div>
+
+<div class="card">
+  <h3>The two phantom data-loss bugs <span class="pill">harness</span></h3>
+  <p>The first fault run reported <strong><code>lost-count 426</code></strong> — essentially every acknowledged write. That magnitude is itself the clue: total loss of everything acknowledged is far likelier to be a harness defect than a database one. Two separate bugs were behind it.</p>
+  <p><strong>A run-id recomputed per test-map construction.</strong> The object-store prefix came from <code>(System/currentTimeMillis)</code> evaluated inside the test-builder, and the test map is built more than once per <code>lein run</code>. <code>setup!</code> opened the database at one prefix; a later nemesis restart opened a <em>different, empty</em> one. The final reads found an empty graph. The object store settled it: the original prefix held 855 objects with writes right up to the end of the run — nothing had been lost at all. The fix is a top-level <code>def</code>, evaluated once per JVM.</p>
+  <p><strong>A stale pidfile.</strong> <code>cu/grepkill!</code> kills the process but leaves <code>/var/run/graph-node.pid</code>, so the next <code>start-stop-daemon</code> matched the stale file and reported <code>:already-running</code> without starting anything. The nemesis logged a healthy heal while the port stayed closed, and every post-fault read came back <code>:connection-refused</code>. Use <code>cu/stop-daemon!</code>, which removes the pidfile. A bounded <code>/readyz</code> wait was added to <code>start!</code> for the same reason — <code>db-nemesis</code> fires <code>:start</code> and moves on without waiting for the listener to bind.</p>
+</div>
+
+<div class="note">
+  <strong>Baseline, once those were fixed:</strong> 592 adds, 577 reads, 0 failures, 0 indeterminate, <code>lost-count 0</code>, <code>stale-count 0</code>, <code>duplicated-count 0</code>.
+  <br><br>
+  <strong>Under process kills:</strong> 405 acknowledged adds, all stable; 160 writes correctly reported <code>:fail</code> as the writer was killed; <code>lost-count 0</code>, <code>stale-count 0</code>, <code>duplicated-count 0</code>. Writer fencing and handover held.
+  <br><br>
+  Note the ratio: <strong>five of the seven problems found so far were in the test harness, not the database.</strong> That is normal, and it is the entire argument for the escalation ladder — every rung you skip is a harness bug you will later mistake for a distributed-systems bug. Two independent harness defects here manufactured a 426-write "data loss" that never happened.
+</div>
+
+<h3>Verdicts</h3>
+
+<div class="tbl-wrap">
+<table>
+  <thead><tr><th>Run</th><th>Verdict</th><th>Detail</th></tr></thead>
+  <tbody>
+    <tr><td><code>edge-set</code>, no faults</td><td class="ok">pass</td><td>592 adds, 577 reads, 0 fail, 0 info, <code>lost 0 stale 0 duplicated 0</code></td></tr>
+    <tr><td><code>edge-set</code>, <code>kill</code></td><td class="ok">pass</td><td>405 acknowledged adds all stable; 160 writes correctly <code>:fail</code> as the writer died</td></tr>
+    <tr><td><code>edge-set</code>, <code>pause</code></td><td class="ok">pass</td><td>471 acknowledged adds, 0 fail, 10 indeterminate; <code>lost 0 stale 0 duplicated 0</code></td></tr>
+    <tr><td><code>edge-set</code>, <code>object-store</code></td><td class="ok">pass</td><td>507 acknowledged adds; <strong>194 of ~504 reads indeterminate, 0 stale</strong></td></tr>
+    <tr><td><code>edge-set</code>, all four faults</td><td class="ok">pass</td><td>216 acknowledged adds all stable under kill + pause + partition + object-store at once; 875 operations correctly failed</td></tr>
+    <tr><td><code>register</code> (<code>strong</code>), <code>kill,pause</code></td><td class="ok">pass</td><td>Knossos linearized <strong>every</strong> key; 1769 ops, 905 writes / 546 reads acknowledged</td></tr>
+    <tr><td><code>causal</code>, <code>kill,partition,object-store</code></td><td class="ok">pass</td><td>21 sessions, <strong>0 read-your-writes and 0 monotonic-read violations</strong>; <code>lost 0 duplicated 0</code>, <code>stale 235</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Three things are worth drawing out of those numbers.</p>
+
+<p><strong>P1 and P2 hold under both kill and pause</strong>, and pause is the stronger result. A <code>SIGKILL</code>'d process cannot do damage; a <code>SIGSTOP</code>'d one resumes holding a stale writer handle and a cached epoch and tries to keep writing. Zero lost and zero duplicated across both means SlateDB's epoch fencing survives the case it exists for.</p>
+
+<p><strong>P7 holds, and this is the most valuable single result.</strong> Under object-store partition roughly 40% of reads became indeterminate and <em>none</em> became stale. A node cut off from S3 but still accepting client connections errors rather than quietly answering from its local cache. That is the failure that would be most dangerous in production and least likely to be noticed — a server that looks healthy and returns confident, wrong answers.</p>
+
+<p><strong>Nothing was ever spuriously acknowledged.</strong> <code>recovered-count</code> stayed 0 across every fault run: no write that reported <code>:fail</code> was later found present. That matters as much as the lost-write result — a database that applies writes it told you it rejected is just as broken as one that drops writes it accepted.</p>
+
+<p><strong>The bookmark contract survives node-hopping.</strong> Every one of the 21 causal sessions moved to a randomly chosen node on <em>every single operation</em>, and not one failed to observe its own acknowledged write or lost an element it had already seen. A session pinned to one node could not have detected a broken bookmark; these were not pinned.</p>
+
+<h3>The most informative number in the suite</h3>
+
+<div class="note">
+  <strong><code>stale 235</code> under <code>causal</code> — <code>stale 0</code> under <code>strong</code>.</strong>
+  Under faults of equal severity, the causal run recorded 235 stale observations (an element present, then absent, then present again) while all five strong runs recorded none.
+</div>
+
+<p>That is not a defect. <code>set-full</code> here runs with <code>:linearizable? false</code>, and staleness is precisely what causal consistency permits and strong consistency forbids. It is the most valuable result in the suite because it is <em>positive</em> evidence rather than an absence of failure: the two documented read modes are not merely labelled differently, they behave measurably differently, in exactly the documented direction.</p>
+
+<p>Consider the counterfactuals. A <code>causal</code> mode reporting <code>stale 0</code> would suggest it was quietly paying for strong reads and giving up the performance the mode exists to provide. A <code>strong</code> mode reporting <code>stale &gt; 0</code> would be a straightforward correctness bug. Neither happened — which is the sort of claim a checker can support and a benchmark cannot.</p>
+
+<h2 id="workloads">7. The three workloads</h2>
+
+<h3>edge-set <span class="pill">P1 P2 P6 P7</span></h3>
+<p>A grow-only set built out of edges. Writers <code>CREATE (root)-[:E]-&gt;({id: v})</code> with a unique <code>v</code>; readers scan the root's full outbound adjacency, paging through server cursors until exhausted. Checked with <code>set-full</code>.</p>
+<pre><code>add:  CREATE (a {id: 1})-[:E]-&gt;(b {id: $v})
+read: MATCH  (a {id: 1})-[:E]-&gt;(b) RETURN b.id AS v</code></pre>
+<p>This is the primary test. It exercises the write path, writer fencing, the WAL, the CSC index publication, generation GC, and paging — all at once — and any anomaly it reports is unambiguous.</p>
+
+<h3>register <span class="pill">P3</span></h3>
+<p>Many independent single-key registers held in a vertex property, read and written with <code>strong</code> consistency and checked by Knossos for linearizability. This is the direct test of the strong-read claim.</p>
+<pre><code>write: MERGE (u {id: $k})-[:ANCHOR]-&gt;(a {id: 999999999})
+       MATCH (u {id: $k}) SET u.val = $v
+read:  MATCH (u {id: $k}) RETURN u.val AS v</code></pre>
+
+<h3>causal <span class="pill">P4 P5</span></h3>
+<p>Same grow-only set, but every operation is deliberately sent to a <em>random</em> node while the client carries its bookmark forward. A session that never moves between nodes cannot detect a broken bookmark, which is exactly why this workload keeps moving.</p>
+
+<h2 id="faults">8. The fault schedule</h2>
+
+<div class="tbl-wrap">
+<table>
+  <thead><tr><th>Fault</th><th>Mechanism</th><th>What it probes</th></tr></thead>
+  <tbody>
+    <tr><td><code>kill</code></td><td><code>SIGKILL</code> graph-node, restart</td><td>Writer handover, epoch fencing, WAL recovery</td></tr>
+    <tr><td><code>pause</code></td><td><code>SIGSTOP</code> / <code>SIGCONT</code></td><td>The nastier case — a "dead" writer that comes back believing it is still the writer</td></tr>
+    <tr><td><code>partition</code></td><td>iptables between nodes</td><td>Routing-table and discovery behaviour</td></tr>
+    <tr><td><code>object-store</code></td><td>iptables drop toward MinIO</td><td class="warn">The important one: durability path severed, serving path intact</td></tr>
+    <tr><td><code>clock</code></td><td><code>bump</code> / <code>strobe</code> node clocks</td><td>Any lease, TTL, or timestamp that fencing secretly depends on</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><code>pause</code> deserves emphasis. A killed process cannot do damage. A paused one resumes with stale in-memory state — an open writer handle, a cached epoch — and tries to keep writing. If fencing is going to fail anywhere, it fails there.</p>
+
+<h2 id="running">9. Running the suite</h2>
+
+<pre><code># 0. Build the graph-node runtime image (from the repo root)
+docker build --target runtime -t turbolay:jepsen .
+
+# 1. Bring up MinIO + 5 DB nodes + the Jepsen control node
+cd jepsen/docker
+docker compose up -d --build
+
+# 2. Run a test from the control container
+docker compose exec control lein run test \
+  --workload edge-set \
+  --consistency strong \
+  --nemesis kill,pause,object-store \
+  --time-limit 300 \
+  --concurrency 20
+
+# 3. Browse results
+docker compose exec control lein run serve   # http://localhost:8080</code></pre>
+
+<p>A useful escalation ladder — never start at the top:</p>
+<ol>
+  <li><code>--nemesis none</code>, <code>edge-set</code>. If this fails, the bug is not a distributed-systems bug and Jepsen is the wrong tool to debug it.</li>
+  <li><code>--nemesis kill</code>. Writer handover under clean death.</li>
+  <li><code>--nemesis pause</code>. Writer handover under unclean death — the fencing test.</li>
+  <li><code>--nemesis object-store</code>. Durability severed, serving intact.</li>
+  <li><code>--workload register --nemesis kill,pause</code>. Linearizability of <code>strong</code>.</li>
+  <li><code>--workload causal --nemesis kill,partition,object-store</code>. Bookmark contract.</li>
+  <li>Everything at once, long duration, for soak.</li>
+</ol>
+
+<h2 id="reading">10. Reading the results</h2>
+
+<p>Each run writes to <code>store/&lt;test-name&gt;/&lt;timestamp&gt;/</code>:</p>
+
+<dl>
+  <dt><code>results.edn</code></dt><dd>The verdict. <code>:valid? true</code> / <code>false</code> / <code>:unknown</code>, plus per-checker detail.</dd>
+  <dt><code>history.txt</code></dt><dd>The full operation log. This is the evidence; everything else is derived from it.</dd>
+  <dt><code>jepsen.log</code></dt><dd>Harness log, including every nemesis action with timestamps.</dd>
+  <dt><code>latency-raw.png</code>, <code>rate.png</code></dt><dd>Latency and throughput with fault windows shaded — often the fastest way to see <em>when</em> things went wrong.</dd>
+  <dt><code>linear.svg</code></dt><dd>Only on a linearizability failure: the minimal non-linearizable operation set.</dd>
+  <dt><code>graph-node.log</code></dt><dd>Per-node server logs, pulled back by <code>db/LogFiles</code>. Correlate a <em>lost</em> element's timestamp against these.</dd>
+</dl>
+
+<div class="note">
+  <strong><code>:valid? :unknown</code> is not a pass.</strong> It usually means the checker timed out (Knossos on too much concurrency) or too many ops were <code>:info</code> to conclude anything. Reduce concurrency or shorten the run and re-check.
+</div>
+
+<h2 id="pitfalls">11. Pitfalls that produce false results</h2>
+
+<ul>
+  <li><strong>Misclassifying errors.</strong> A timeout recorded as <code>:fail</code> will hide real lost updates. When in doubt, <code>:info</code>.</li>
+  <li><strong>Reads that don't read everything.</strong> If the final read is paginated and you stop at the first page, <code>set-full</code> reports a catastrophic data-loss bug that does not exist. This client loops cursors to exhaustion.</li>
+  <li><strong>Not healing before the final read.</strong> Every anomaly becomes "lost" if the cluster is still broken when you look.</li>
+  <li><strong>Too much concurrency for Knossos.</strong> Twenty threads on one key will not finish. Use <code>jepsen.independent</code> and ~5 threads per key.</li>
+  <li><strong>Testing a stronger model than is claimed.</strong> Running Knossos against <code>causal</code> reads will "find" violations that are entirely legal.</li>
+  <li><strong>Clock skew without <code>SYS_TIME</code>.</strong> The nemesis silently no-ops in an unprivileged container, and you conclude the system tolerates skew when it was never tested.</li>
+  <li><strong>Short runs.</strong> Real anomalies need a fault to land inside a specific narrow window. Ten minutes finds things that ninety seconds never will.</li>
+</ul>
+
+<h2 id="resources">12. Reading list</h2>
+
+<h3>Start here</h3>
+<ul>
+  <li><a href="https://jepsen.io/consistency">jepsen.io/consistency</a> — the interactive consistency-model lattice. The single best 20 minutes you can spend before writing a test.</li>
+  <li><a href="https://github.com/jepsen-io/jepsen/blob/main/doc/tutorial/index.md">Official Jepsen tutorial</a> — builds an etcd test from nothing. Follow it end to end once; every later test is a variation.</li>
+  <li><a href="https://jepsen.io/analyses">Jepsen analyses index</a> — ~40 real reports. Read the ones for systems closest to yours.</li>
+</ul>
+
+<h3>Most relevant analyses for an object-store-backed, single-writer engine</h3>
+<ul>
+  <li><a href="https://jepsen.io/analyses/datomic-pro-1.0.7075">Datomic Pro</a> — single-writer transactor over shared durable storage. The closest architectural analogue to Turbolay in the whole corpus.</li>
+  <li><a href="https://jepsen.io/analyses/dgraph-1.1.1">Dgraph 1.1.1</a> — a distributed graph database; useful for what graph-specific anomalies look like.</li>
+  <li><a href="https://jepsen.io/analyses/etcd-3.4.3">etcd 3.4.3</a> — the canonical clean example of a well-scoped test.</li>
+  <li><a href="https://jepsen.io/analyses/mongodb-4.2.6">MongoDB 4.2.6</a> — the definitive study of how read-concern / write-concern levels interact, which is the same shape as <code>causal</code> vs <code>strong</code>.</li>
+  <li><a href="https://jepsen.io/analyses/redpanda-21.10.1">Redpanda 21.10.1</a> — object-store-adjacent log storage under fault injection.</li>
+</ul>
+
+<h3>Theory worth the time</h3>
+<ul>
+  <li><a href="https://arxiv.org/abs/2003.10554">Elle: Inferring Isolation Anomalies from Experimental Observations</a> (Kingsbury &amp; Alvaro) — how Elle recovers dependency graphs from black-box observations.</li>
+  <li><a href="https://www.cs.cornell.edu/andru/cs711/2002fa/reading/lipton88linearizability.pdf">Herlihy &amp; Wing, <em>Linearizability</em></a> — the original definition Knossos implements.</li>
+  <li><a href="https://jepsen.io/consistency/models/strong-session-consistent-prefix">Session guarantees</a> — read-your-writes and monotonic reads, defined precisely. Directly relevant to the bookmark contract.</li>
+  <li><a href="https://www.bailis.org/papers/hat-vldb2014.pdf">Bailis et al., <em>Highly Available Transactions</em></a> — which guarantees survive partitions and which cannot.</li>
+</ul>
+
+<h3>Talks</h3>
+<ul>
+  <li><a href="https://www.youtube.com/watch?v=tRc0O9VgzB0">"Jepsen VII: The Cybernetic Special"</a> — Kyle Kingsbury on the method itself.</li>
+  <li><a href="https://www.youtube.com/watch?v=OPb3jgKvITs">"Testing Distributed Systems with Deterministic Simulation"</a> (FoundationDB) — the complementary technique; worth knowing where each approach wins.</li>
+</ul>
+
+<h3>API reference</h3>
+<ul>
+  <li><a href="https://cljdoc.org/d/jepsen/jepsen">Jepsen on cljdoc</a> — <code>jepsen.checker</code>, <code>jepsen.generator</code>, <code>jepsen.nemesis.combined</code>, <code>jepsen.independent</code>.</li>
+  <li><a href="https://github.com/jepsen-io/elle">jepsen-io/elle</a> and <a href="https://github.com/jepsen-io/knossos">jepsen-io/knossos</a>.</li>
+  <li><a href="https://github.com/jepsen-io/jepsen/blob/main/doc/generators.md">Generator guide</a> — generators are the least intuitive part of the framework; this doc is essential.</li>
+</ul>
+
+<footer>
+  Companion to <code>jepsen/</code> in the turbolay repository.
+  Suite source: <code>jepsen/turbolay/src/jepsen/turbolay/</code> ·
+  Environment: <code>jepsen/docker/</code>
+</footer>
+
+</div>
+</body>
+</html>

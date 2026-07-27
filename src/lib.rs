@@ -1,64 +1,208 @@
-//! turbolay — an object-native property-graph database on SlateDB.
-//!
-//! This crate is the **M0 foundation**: the substrate wrapper over
-//! [`opendata-common`](common), the graph keyspace + order-preserving key
-//! encodings (RFC 0003), and crash-safe UID / interned-id / changelog-seq
-//! allocation (RFC 0004 §UID).
-//!
-//! Everything here is storage-model plumbing — the write path (M1), index
-//! framework (M2) and openCypher read path (M3) build on top of the keyspace
-//! and allocators defined in this crate. No graph semantics or query yet: M0
-//! is "we can encode/decode every key and value correctly and allocate ids
-//! crash-safely" (RFC 0003 acceptance).
-//!
-//! ## Module map
-//!
-//! - [`serde`] — the graph keyspace. `SUBSYSTEM GRAPH = 0x05`, the record-type
-//!   tags ([`serde::record_tag`]), every key builder/parser ([`serde::keys`]),
-//!   and the order-preserving index-token encodings ([`serde::token`]). All
-//!   ordering is baked into the *bytes* because SlateDB has no custom
-//!   comparators.
-//! - [`schema`] — name interning model (label/predicate/property → `u32` id),
-//!   the durable `SchemaEntry` value format, and the in-memory schema cache.
-//! - [`ids`] — [`ids::GraphAllocators`], block-reserved monotonic id spaces
-//!   built on [`common::SequenceAllocator`], plus `xid → uid` resolution.
-//! - [`merge`] — [`merge::GraphMergeOperator`], the record-tag-routed merge
-//!   operator (RFC 0003 dispatch table). **M0 stub** — the associative roaring
-//!   / counter merges land in M1 (RFC 0004/0005).
-//! - [`posting`] — [`posting::PostingValue`], the posting-list value type
-//!   (RFC 0005) stored at every adjacency/index/count key: its on-wire codec
-//!   and read-side set-algebra surface. M1 deliverable 1.
-//! - [`posting_ops`] — add/delete/split/rollup/neighbors: the operations that
-//!   turn adjacency keys into live, updatable posting lists (RFC 0005
-//!   §"Add/delete mechanics", §"Splitting supernodes"). M1 deliverable 4.
-//! - [`value`] — [`value::NodeRecord`]/[`value::TypedValue`] (RFC 0004
-//!   §"Node record") and [`value::ChangeRecord`] (§"ChangeRecord schema"):
-//!   the node blob and changelog value types, each with a fail-closed codec.
-//!   M1 deliverable 2.
-//! - [`storage`] — [`storage::GraphStorage`], the per-namespace substrate
-//!   wrapper that opens SlateDB via [`common::StorageBuilder`].
-//! - [`write`] — [`write::Writer`], the single-writer session: `UpsertNode`/
-//!   `UpsertEdge`/`DeleteNode`/`DeleteEdge` (RFC 0004 §"Write path") and
-//!   recovery on open (§"Logical sequence protocol"). M1 deliverables 5 + 6.
-//! - [`telemetry`] — `tracing` subscriber initialization.
-//! - [`obs`] — RFC 0017 Phase 0 observability spine: the instrumented
-//!   [`obs::InstrumentedObjectStore`], the write fan-out's phase-timer/
-//!   `turbolay_latest_seq` registry, and the invariant-counter taxonomy.
-//!   M1 Wave 4 Workstream C.
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-pub mod error;
-pub mod ids;
-pub mod merge;
-pub mod obs;
-pub mod posting;
-pub mod posting_ops;
-pub mod schema;
-pub mod serde;
-pub mod storage;
-pub mod telemetry;
-pub mod value;
-pub mod write;
+use slatedb::bytes::Bytes;
+use slatedb::config::{DurabilityLevel, ReadOptions, ScanOptions, WriteOptions};
+use slatedb::object_store::{path::Path, ObjectStore};
+#[cfg(test)]
+use slatedb::ErrorKind;
+#[cfg(test)]
+use slatedb::WriteBatch;
+use slatedb::{DbTransaction, IsolationLevel};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
-pub use error::{Error, Result};
-pub use serde::record_tag::RecordType;
-pub use serde::{Direction, LabelId, PredId, PropId, SchemaKind, Uid};
+#[cfg(feature = "client-api")]
+mod client;
+mod core;
+mod engine;
+// Storage locality layout: which SlateDB prefix a key belongs to. Named
+// `locality` and not `placement` because the kernel now has a real placement
+// module (`engine::placement`, which decides who owns a cell's *writer*), and
+// two modules called `placement` -- one of which is not about placement at all
+// -- is the same confusion decision 12 of the rendezvous plan avoided by
+// renaming. Private, so this costs nothing outside the crate: every item below
+// is re-exported under its own unchanged name.
+mod locality;
+mod query;
+mod sparse_kernel;
+
+#[cfg(feature = "bolt-server")]
+pub use client::bolt::{
+    BoltRoutingServer, BoltRoutingTable, BoltRoutingTableProvider, BoltServerConfig,
+    BoltServerHandle, ClientBoltServer, ObjectStoreBoltRoutingTableProvider,
+};
+#[cfg(feature = "http-api")]
+pub use client::http::{ClientHttpServer, HttpQueryServerConfig, HttpQueryServerHandle};
+#[cfg(feature = "client-api")]
+pub use client::service::{
+    ClientBookmark, ClientDatabaseResolver, ClientQueryCredentials, ClientQueryMetricsSnapshot,
+    ClientQueryPage, ClientQueryRequest, ClientQueryResult, ClientQueryService,
+    ClientQueryServiceConfig, ClientQuerySession, ClientQueryTarget, ClientReadConsistency,
+    HierarchicalClientDatabaseResolver, StaticClientDatabaseResolver,
+};
+pub(crate) use core::cache::BoundedGraphCache;
+#[cfg(feature = "opencypher")]
+pub(crate) use core::cache::{
+    source_relationship_rows_resident_bytes, RelationshipPropertyRowsCacheKey,
+    RelationshipRowsCacheEntry, RelationshipRowsCacheKey, RelationshipRowsCacheValue,
+    SourceRelationshipRowsCacheKey,
+};
+pub(crate) use core::config::{open_graph_db, open_graph_reader};
+pub use core::config::{
+    GraphBackpressurePolicy, GraphCacheConfig, GraphDurabilityConfig, GraphIndexPolicy,
+    GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphStorageMemoryConfig,
+    DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
+};
+pub use core::error::{GraphError, Result};
+// Widen this as H1 converts the remaining client duration counters. It is no
+// longer feature-gated: `GraphOperationalMetrics::query_rows_latency` is a
+// default-features field, so the type is constructed on every build.
+pub(crate) use core::histogram::AtomicDurationHistogram;
+pub use core::histogram::{
+    DurationHistogramSnapshot, DURATION_BUCKET_BOUNDS_US, DURATION_BUCKET_COUNT,
+};
+pub use core::metrics::{
+    GraphCacheKind, GraphCacheMetricsSnapshot, GraphCachePolicy, GraphOperationalMetricsSnapshot,
+};
+pub(crate) use core::metrics::{GraphCacheMetrics, GraphOperationalMetrics};
+pub(crate) use core::model::OutEdgeSegment;
+pub use core::model::{
+    BulkImportDuplicatePolicy, BulkImportOptions, BulkImportResult, CommitResult, DeleteResult,
+    EdgeDeleteBatchResult, EdgeExistenceBatchEntry, EdgeIngestOptions, EdgeIngestResult,
+    EdgeMetadata, EdgeMutation, EdgeMutationBatchResult, EdgeRecord, GraphCellDropResult,
+    GraphCorrectnessReport, GraphExportDigest, GraphRepairReport, NeighborBatchEntry, QueryFloat,
+    RelationshipCreateResult, RelationshipId, RelationshipImportResult, RelationshipMutation,
+    RelationshipRecord, SegmentCompactionResult, VertexDeleteResult, VertexMetadata,
+    VertexPropertyValue,
+};
+pub use core::namespace::{
+    GraphId, GraphScope, NamespaceId, NamespacePath, DEFAULT_GRAPH_ID, DEFAULT_NAMESPACE_ID,
+    MAX_NAMESPACE_DEPTH,
+};
+pub use core::snapshot::GraphSnapshot;
+#[cfg(feature = "opencypher")]
+pub use core::state::QueryStatsRefreshHandle;
+pub(crate) use core::state::{
+    finish_local_write, is_retryable_write_conflict, GraphStorageSnapshot, GraphStore,
+    GraphWriteAuthority, GraphWriteOp, LocalWriteGuard,
+};
+pub use core::state::{GraphCacheEntryCounts, GraphCacheResidentBytes, GraphShard};
+pub use core::trace_context::{install_trace_context_bridge, TraceContextBridge};
+pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
+#[cfg(feature = "query-transport")]
+pub use engine::ScopedRoutedGraphCluster;
+pub use engine::{
+    local_object_store, object_store_from_env, ArtifactGcResult, BenchmarkResult, CellOwnership,
+    GraphCluster, GraphIndexGeneration, GraphShardRuntimeMetrics, MatrixArtifact,
+    MatrixTraversalResult, ObjectStoreGraphScopeDirectory, ObjectStoreNodeDirectory,
+    PlacementConfig, PlacementRefreshHandle, PlacementView, RoutedGraphCluster,
+    ScopedGraphShardRuntimeMetrics, TraversalBackend,
+};
+pub use locality::{
+    compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
+    LocalityCellExtractor, LocalityLayoutExperiment, StorageLayout,
+};
+pub use query::algebra::{
+    LogicalQueryPlan, PhysicalQueryPlan, QueryBatchEdge, QueryBatchOperation,
+    QueryBatchRelationship, QueryBatchRelationshipMerge, QueryBatchVertex, QueryCancellationToken,
+    QueryCardinalityStatsKind, QueryCardinalityStatsRefresh, QueryColumn, QueryContext,
+    QueryCursorToken, QueryMutationResult, QueryOutput, QueryParameterValue, QueryPlan,
+    QueryPlanner, QueryResultPage, QueryResultSet, QueryRow, QueryStatement,
+    QueryStatsHistogramRefresh, QueryStatsRecord, QueryStatsRefreshKind, QueryStatsRefreshResult,
+    QueryStatsRefreshSpec, QueryValue, QueryWindow, RowQueryAccess, RowQueryOptimizerPass,
+    RowQueryPlan, RowQueryPlanGroup, RowQueryPlanPattern,
+};
+#[cfg(feature = "query-service-discovery")]
+pub use query::coordination::{
+    ConsulQueryServiceDiscovery, EtcdQueryServiceDiscovery, KubernetesQueryServiceDiscovery,
+};
+#[cfg(feature = "opencypher")]
+pub use query::coordination::{
+    DistributedQueryCoordinator, DistributedQueryJoin, DistributedQueryLeg, DistributedQueryMerge,
+    DistributedQueryPageRequest, DistributedQueryPlan, DistributedQueryPlanResult, QueryCellClient,
+};
+#[cfg(feature = "query-transport")]
+pub use query::coordination::{
+    QueryServiceDirectory, QueryServiceDiscovery, QueryServiceEndpoint, QueryTransportAction,
+    QueryTransportAuthPolicy, QueryTransportCancellationPrincipal, QueryTransportClientConfig,
+    QueryTransportConnectionIdentity, QueryTransportMetricsSnapshot, QueryTransportNamespaceQuotas,
+    QueryTransportPrincipal, QueryTransportScopeAuthorizer, QueryTransportScopeGrant,
+    QueryTransportSecret, QueryTransportServerConfig, StaticQueryServiceDiscovery,
+    StaticQueryTransportScopeAuthorizer, TcpQueryCellClient, TcpQueryRowStream, TcpQueryServer,
+};
+#[cfg(feature = "query-transport-tls")]
+pub use query::coordination::{
+    QueryTransportTlsClientConfigProvider, QueryTransportTlsServerConfigProvider,
+    ReloadableQueryTransportTlsClientConfigProvider,
+    ReloadableQueryTransportTlsServerConfigProvider, StaticQueryTransportTlsClientConfigProvider,
+    StaticQueryTransportTlsServerConfigProvider,
+};
+#[cfg(feature = "opencypher")]
+pub use query::corpus::{
+    parse_opencypher_tck_corpus, parse_opencypher_tck_corpus_dir, CypherTckCase,
+    CypherTckCompatibilityReport, CypherTckCorpus,
+};
+#[cfg(feature = "opencypher")]
+pub use query::opencypher::{
+    parse_opencypher_mutation_query_with_parameters, parse_opencypher_row_query,
+    parse_opencypher_row_query_with_parameters, ParsedMutationQuery, ParsedRowQuery,
+    RowAggregateFunction, RowComparisonOp, RowEdgePattern, RowExpression, RowMatchGroup,
+    RowMutationAction, RowNodePattern, RowPattern, RowPredicate, RowProjection, RowSort,
+    RowSortExpression,
+};
+pub use sparse_kernel::SparseKernelBackend;
+
+pub type VertexId = u64;
+/// SlateDB's sequence number for a committed storage snapshot.
+pub type StorageSequence = u64;
+
+pub(crate) type MatrixAdjacency = BTreeMap<VertexId, BTreeSet<VertexId>>;
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MatrixCacheKey {
+    pub(crate) cell_id: String,
+    pub(crate) edge_type: String,
+    pub(crate) base_epoch: StorageSequence,
+}
+
+impl MatrixCacheKey {
+    pub(crate) fn new(cell_id: &str, edge_type: &str, base_epoch: StorageSequence) -> Self {
+        Self {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            base_epoch,
+        }
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ParsedRowQueryCacheKey {
+    query: String,
+}
+
+#[cfg(feature = "opencypher")]
+impl ParsedRowQueryCacheKey {
+    pub(crate) fn new(query: &str) -> Self {
+        Self {
+            query: query.to_string(),
+        }
+    }
+}
+
+pub(crate) const GRAPH_TXN_MAX_RETRIES: usize = 32;
+pub(crate) const GRAPH_MAINTENANCE_BATCH_KEYS: usize = 512;
+pub(crate) const GRAPH_WRITE_LANES: usize = 64;
+
+mod codec;
+pub(crate) use codec::*;
+
+mod keys;
+mod shard;
+
+#[cfg(test)]
+mod namespace_tests;
+#[cfg(test)]
+mod tests;

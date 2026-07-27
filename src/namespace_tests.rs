@@ -1,0 +1,737 @@
+use std::sync::Arc;
+
+use slatedb::object_store::{memory::InMemory, ObjectStore};
+
+use crate::*;
+
+fn namespace(name: &str) -> NamespacePath {
+    NamespacePath::root(NamespaceId::new(name).unwrap())
+}
+
+fn subnamespace(tenant: &str, child: &str) -> NamespacePath {
+    namespace(tenant)
+        .child(NamespaceId::new(child).unwrap())
+        .unwrap()
+}
+
+fn scope(tenant: &str, child: &str, graph: &str) -> GraphScope {
+    GraphScope::new(subnamespace(tenant, child), GraphId::new(graph).unwrap())
+}
+
+#[test]
+fn namespace_paths_are_validated_hierarchical_and_collision_free() {
+    let tenant = namespace("acme");
+    let search = tenant.child(NamespaceId::new("search").unwrap()).unwrap();
+    let flat = namespace("acme-search");
+
+    assert_eq!(search.tenant_id().as_str(), "acme");
+    assert_eq!(search.leaf().as_str(), "search");
+    assert_eq!(search.depth(), 2);
+    assert!(search.is_descendant_of(&tenant));
+    assert!(!tenant.is_descendant_of(&search));
+
+    let nested_scope = GraphScope::new(search, GraphId::new("social").unwrap());
+    let flat_scope = GraphScope::new(flat, GraphId::new("social").unwrap());
+    assert_eq!(
+        nested_scope.scoped_store_path("graph-data"),
+        "graph-data/namespaces/acme/subnamespaces/search/graphs/social"
+    );
+    assert_eq!(
+        flat_scope.scoped_store_path("graph-data"),
+        "graph-data/namespaces/acme-search/graphs/social"
+    );
+    assert_ne!(
+        nested_scope.scoped_store_path("graph-data"),
+        flat_scope.scoped_store_path("graph-data")
+    );
+    assert_eq!(
+        nested_scope.scoped_store_path(""),
+        "namespaces/acme/subnamespaces/search/graphs/social"
+    );
+
+    assert!(NamespaceId::new("invalid/name").is_err());
+    assert!(GraphId::new("invalid/name").is_err());
+    assert!(NamespacePath::new(Vec::<NamespaceId>::new()).is_err());
+    let too_deep =
+        (0..=MAX_NAMESPACE_DEPTH).map(|index| NamespaceId::new(format!("n{index}")).unwrap());
+    assert!(matches!(
+        NamespacePath::new(too_deep),
+        Err(GraphError::AdmissionRejected {
+            operation: "namespace_depth",
+            ..
+        })
+    ));
+}
+
+#[cfg(feature = "query-transport")]
+#[test]
+fn query_context_scope_round_trips_and_unscoped_frames_are_rejected() {
+    let scoped = QueryContext::new("cell-a", "query-a").in_scope(scope("acme", "search", "social"));
+    let encoded = serde_json::to_value(&scoped).unwrap();
+    assert_eq!(
+        serde_json::from_value::<QueryContext>(encoded).unwrap(),
+        scoped
+    );
+
+    let unscoped = serde_json::json!({
+        "cell_id": "cell-a",
+        "idempotency_key": "unscoped-query",
+        "read_epoch": null,
+        "result_window": { "skip": 0, "limit": null },
+        "parameters": {},
+        "max_runtime_ms": null
+    });
+    assert!(serde_json::from_value::<QueryContext>(unscoped).is_err());
+
+    let invalid = serde_json::json!({
+        "scope": {
+            "namespace": ["acme", "invalid/name"],
+            "graph_id": "social"
+        },
+        "cell_id": "cell-a",
+        "idempotency_key": "invalid-scope",
+        "read_epoch": null,
+        "result_window": { "skip": 0, "limit": null },
+        "parameters": {},
+        "max_runtime_ms": null
+    });
+    assert!(serde_json::from_value::<QueryContext>(invalid).is_err());
+}
+
+#[tokio::test]
+async fn scoped_graph_clusters_isolate_identical_graph_keys() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let first_scope = scope("acme", "search", "social");
+    let second_scope = scope("acme", "billing", "social");
+
+    let first = GraphCluster::open_cells_standalone_writers_scoped(
+        "tenant-graphs",
+        first_scope.clone(),
+        ["cell-a"],
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    let second = GraphCluster::open_cells_standalone_writers_scoped(
+        "tenant-graphs",
+        second_scope.clone(),
+        ["cell-a"],
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+
+    first
+        .shard("cell-a")
+        .unwrap()
+        .write_edge(EdgeMutation {
+            cell_id: "cell-a".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 10,
+            idempotency_key: "same-request-id".to_string(),
+        })
+        .await
+        .unwrap();
+    second
+        .shard("cell-a")
+        .unwrap()
+        .write_edge(EdgeMutation {
+            cell_id: "cell-a".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 20,
+            idempotency_key: "same-request-id".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        first
+            .shard("cell-a")
+            .unwrap()
+            .out_neighbors("cell-a", "FOLLOWS", 1)
+            .await
+            .unwrap(),
+        vec![10]
+    );
+    assert_eq!(
+        second
+            .shard("cell-a")
+            .unwrap()
+            .out_neighbors("cell-a", "FOLLOWS", 1)
+            .await
+            .unwrap(),
+        vec![20]
+    );
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+
+    let reopened = GraphCluster::open_cells_scoped(
+        "tenant-graphs",
+        first_scope,
+        ["cell-a"],
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened
+            .shard("cell-a")
+            .unwrap()
+            .out_neighbors("cell-a", "FOLLOWS", 1)
+            .await
+            .unwrap(),
+        vec![10]
+    );
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn default_scope_convenience_apis_use_the_canonical_scoped_path() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let scoped = GraphCluster::open_cells_standalone_writers_scoped(
+        "default-scope",
+        GraphScope::default(),
+        ["cell-a"],
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    scoped
+        .shard("cell-a")
+        .unwrap()
+        .write_edge(EdgeMutation {
+            cell_id: "cell-a".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: "default-scope-write".to_string(),
+        })
+        .await
+        .unwrap();
+    scoped.close().await.unwrap();
+
+    let reopened = GraphCluster::open_cells("default-scope", ["cell-a"], Arc::clone(&object_store))
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .shard("cell-a")
+            .unwrap()
+            .out_neighbors("cell-a", "FOLLOWS", 1)
+            .await
+            .unwrap(),
+        vec![2]
+    );
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn routed_queries_reject_a_context_from_another_graph_scope() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let expected_scope = scope("acme", "search", "social");
+    let actual_scope = scope("acme", "billing", "social");
+    let seed_path = format!(
+        "{}/cell-a",
+        expected_scope.scoped_store_path("routed-scope")
+    );
+    let seed = GraphShard::open_standalone_writer(seed_path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    seed.close().await.unwrap();
+    let cluster = RoutedGraphCluster::open_readers_scoped(
+        "routed-scope",
+        expected_scope.clone(),
+        "node-a",
+        ObjectStoreNodeDirectory::new(["cell-a"], ["node-a"]).unwrap(),
+        PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
+        object_store,
+    )
+    .await
+    .unwrap();
+
+    let error = cluster
+        .execute_query_statement(
+            QueryContext::new("cell-a", "cross-scope-query").in_scope(actual_scope.clone()),
+            QueryStatement::MatchOut {
+                edge_type: "FOLLOWS".to_string(),
+                src: 1,
+                return_count: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    match error {
+        GraphError::GraphScopeMismatch { expected, actual } => {
+            assert_eq!(expected, expected_scope.to_string());
+            assert_eq!(actual, actual_scope.to_string());
+        }
+        other => panic!("expected graph scope mismatch, received {other}"),
+    }
+    cluster.close().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+struct StaticNamespaceQueryClient;
+
+#[cfg(feature = "query-transport")]
+#[async_trait::async_trait]
+impl QueryCellClient for StaticNamespaceQueryClient {
+    async fn execute_cypher_rows(
+        &self,
+        context: QueryContext,
+        _query: &str,
+    ) -> Result<QueryResultSet> {
+        Ok(QueryResultSet::new(
+            vec![QueryColumn::new("scope")],
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::String(context.scope.to_string()),
+            )])],
+        ))
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let rows = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn transport_tokens_are_confined_to_granted_namespace_and_graph_scopes() {
+    let tenant = namespace("acme");
+    let search = scope("acme", "search", "social");
+    let billing = scope("acme", "billing", "ledger");
+    let billing_other_graph = scope("acme", "billing", "analytics");
+    let other_tenant = scope("other", "search", "social");
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "tenant-token",
+            QueryTransportScopeGrant::read_namespace(tenant, true),
+        )
+        .unwrap()
+        .with_bearer_grant(
+            "billing-token",
+            QueryTransportScopeGrant::read_graph(billing.clone()),
+        )
+        .unwrap()
+        .with_bearer_grant(
+            "writer-token",
+            QueryTransportScopeGrant::graph(
+                search.clone(),
+                [QueryTransportAction::Read, QueryTransportAction::Write],
+            ),
+        )
+        .unwrap();
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(StaticNamespaceQueryClient),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_tokens([
+                "tenant-token".to_string(),
+                "billing-token".to_string(),
+                "writer-token".to_string(),
+            ])
+            .with_scope_authorizer(Arc::new(authorizer))
+            .insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+
+    let tenant_client = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("tenant-token")
+        .insecure_allow_plaintext();
+    let result = tenant_client
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "tenant-child-read").in_scope(search.clone()),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.rows[0].values[0],
+        QueryValue::Property(VertexPropertyValue::String(search.to_string()))
+    );
+    let denied = tenant_client
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "tenant-cross-read").in_scope(other_tenant),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(denied, GraphError::UnsupportedQuery { .. }));
+    assert!(denied.to_string().contains("not authorized"));
+
+    for (index, mutation_query) in [
+        "CREATE (u {id: 1})-[:FOLLOWS]->(v {id: 2})",
+        "MERGE (u {id: 1})-[:FOLLOWS]->(v {id: 2})",
+        "MATCH (u {id: 1})-[r:FOLLOWS]->(v {id: 2}) DELETE r",
+        "MATCH (u {id: 1}) SET u.name = 'alice'",
+        "MATCH (u {id: 1}) REMOVE u.name",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let denied = tenant_client
+            .execute_cypher_rows(
+                QueryContext::new("cell-a", format!("read-token-mutation-{index}"))
+                    .in_scope(search.clone()),
+                mutation_query,
+            )
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("not authorized to write"));
+    }
+    let unclassified = tenant_client
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "unsupported-clause").in_scope(search.clone()),
+            "UNWIND [1] AS value RETURN value",
+        )
+        .await
+        .unwrap_err();
+    let unclassified = unclassified.to_string();
+    assert!(unclassified.contains("UNWIND"), "{unclassified}");
+
+    let writer_client = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("writer-token")
+        .insecure_allow_plaintext();
+    writer_client
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "write-token-mutation").in_scope(search.clone()),
+            "CREATE (u {id: 1})-[:FOLLOWS]->(v {id: 2})",
+        )
+        .await
+        .unwrap();
+    let paged_mutation = writer_client
+        .execute_cypher_rows_page(
+            QueryContext::new("cell-a", "paged-mutation").in_scope(search),
+            "CREATE (u {id: 2})-[:FOLLOWS]->(v {id: 3})",
+            None,
+            10,
+        )
+        .await
+        .unwrap_err();
+    assert!(paged_mutation
+        .to_string()
+        .contains("mutation queries cannot use paged row execution"));
+
+    let billing_client = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("billing-token")
+        .insecure_allow_plaintext();
+    billing_client
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "billing-exact-read").in_scope(billing),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap();
+    let denied = billing_client
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "billing-other-graph").in_scope(billing_other_graph),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(denied.to_string().contains("not authorized"));
+
+    let metrics = server.metrics();
+    assert_eq!(metrics.auth_failures, 0);
+    assert_eq!(metrics.namespace_access_denials, 7);
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+struct NamespaceConcurrencyQueryClient {
+    active: std::sync::atomic::AtomicUsize,
+    max_active: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "query-transport")]
+#[async_trait::async_trait]
+impl QueryCellClient for NamespaceConcurrencyQueryClient {
+    async fn execute_cypher_rows(
+        &self,
+        _context: QueryContext,
+        _query: &str,
+    ) -> Result<QueryResultSet> {
+        let active = self
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.max_active
+            .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let rows = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn parent_namespace_quota_limits_queries_across_subtenants() {
+    let tenant = namespace("acme");
+    let search = scope("acme", "search", "social");
+    let billing = scope("acme", "billing", "ledger");
+    let query_client = Arc::new(NamespaceConcurrencyQueryClient {
+        active: std::sync::atomic::AtomicUsize::new(0),
+        max_active: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "tenant-token",
+            QueryTransportScopeGrant::read_namespace(tenant.clone(), true),
+        )
+        .unwrap();
+    let quotas = QueryTransportNamespaceQuotas::new().with_query_limit(tenant, 1);
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        query_client.clone(),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("tenant-token")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_namespace_quotas(quotas)
+            .with_max_concurrent_requests(8)
+            .insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut tasks = Vec::new();
+    for (query_id, graph_scope) in [("search-query", search), ("billing-query", billing)] {
+        let barrier = Arc::clone(&barrier);
+        let client = TcpQueryCellClient::new(server.local_addr())
+            .with_bearer_token("tenant-token")
+            .insecure_allow_plaintext();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            client
+                .execute_cypher_rows(
+                    QueryContext::new("cell-a", query_id).in_scope(graph_scope),
+                    "MATCH (u {id: 1}) RETURN u.id",
+                )
+                .await
+        }));
+    }
+    barrier.wait().await;
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    assert_eq!(
+        query_client
+            .max_active
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(server.metrics().namespace_quota_waits >= 1);
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+struct ScopeCancellationQueryClient {
+    started: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "query-transport")]
+#[async_trait::async_trait]
+impl QueryCellClient for ScopeCancellationQueryClient {
+    async fn execute_cypher_rows(
+        &self,
+        _context: QueryContext,
+        _query: &str,
+    ) -> Result<QueryResultSet> {
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let rows = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn query_cancellation_is_isolated_by_graph_scope() {
+    let tenant = namespace("acme");
+    let search = scope("acme", "search", "social");
+    let billing = scope("acme", "billing", "ledger");
+    let query_client = Arc::new(ScopeCancellationQueryClient {
+        started: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "tenant-token",
+            QueryTransportScopeGrant::read_namespace(tenant, true),
+        )
+        .unwrap();
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        query_client.clone(),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("tenant-token")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_max_concurrent_requests(4)
+            .insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let client = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("tenant-token")
+        .insecure_allow_plaintext();
+
+    let search_task = {
+        let client = client.clone();
+        let search = search.clone();
+        tokio::spawn(async move {
+            client
+                .execute_cypher_rows(
+                    QueryContext::new("cell-a", "shared-query-id").in_scope(search),
+                    "MATCH (u {id: 1}) RETURN u.id",
+                )
+                .await
+        })
+    };
+    let billing_task = {
+        let client = client.clone();
+        let billing = billing.clone();
+        tokio::spawn(async move {
+            client
+                .execute_cypher_rows(
+                    QueryContext::new("cell-a", "shared-query-id").in_scope(billing),
+                    "MATCH (u {id: 1}) RETURN u.id",
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if query_client
+                .started
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    client
+        .cancel_query_in_scope(search, "shared-query-id")
+        .await
+        .unwrap();
+    let search_error = search_task.await.unwrap().unwrap_err();
+    assert!(search_error
+        .to_string()
+        .contains("query_transport_cancelled"));
+    billing_task.await.unwrap().unwrap();
+    assert_eq!(server.metrics().cancellations, 1);
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
+async fn query_cancellation_requires_access_to_the_requested_graph_scope() {
+    let search = scope("acme", "search", "social");
+    let billing = scope("acme", "billing", "ledger");
+    let query_client = Arc::new(ScopeCancellationQueryClient {
+        started: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "search-token",
+            QueryTransportScopeGrant::read_graph(search.clone()),
+        )
+        .unwrap();
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        query_client.clone(),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("search-token")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_max_concurrent_requests(2)
+            .insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let client = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("search-token")
+        .insecure_allow_plaintext();
+
+    let query_task = {
+        let client = client.clone();
+        let search = search.clone();
+        tokio::spawn(async move {
+            client
+                .execute_cypher_rows(
+                    QueryContext::new("cell-a", "scoped-cancel-target").in_scope(search),
+                    "MATCH (u {id: 1}) RETURN u.id",
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if query_client
+                .started
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let unauthorized = client
+        .cancel_query_in_scope(billing, "scoped-cancel-target")
+        .await
+        .unwrap_err();
+    assert!(unauthorized
+        .to_string()
+        .contains("not authorized to cancel queries in"));
+
+    client
+        .cancel_query_in_scope(search, "scoped-cancel-target")
+        .await
+        .unwrap();
+    let query_error = query_task.await.unwrap().unwrap_err();
+    assert!(query_error
+        .to_string()
+        .contains("query_transport_cancelled"));
+    let metrics = server.metrics();
+    assert_eq!(metrics.namespace_access_denials, 1);
+    assert_eq!(metrics.cancellations, 1);
+    server.stop().await.unwrap();
+}

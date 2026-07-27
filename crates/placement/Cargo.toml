@@ -1,0 +1,37 @@
+[package]
+name = "turbolay-placement"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "Rendezvous placement and node liveness for Turbolay cell writers"
+publish = false
+
+# Still no dependency on `slatedb-graph-kernel`: placement must not know about
+# graphs, shards or queries, which is what keeps it testable against `InMemory`
+# alone.
+#
+# `slatedb` is here for the `slatedb::object_store` re-export and nothing else.
+# The kernel consumes `object_store` the same way (`src/lib.rs:8`), and
+# `Arc<dyn ObjectStore>` will not unify across the crate boundary unless both
+# sides name the same one.
+#
+# Every version is inherited from `[workspace.dependencies]` in the root
+# manifest so the member cannot drift from the kernel — `slatedb` especially,
+# since the whole point of depending on it is that `Arc<dyn ObjectStore>` names
+# the same type on both sides of the crate boundary.
+[dependencies]
+chrono = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+slatedb = { workspace = true }
+thiserror = { workspace = true }
+
+# `async-trait` is a dev-dependency and must stay one. `ObjectStore` is an
+# `#[async_trait]` trait, so the only thing in this crate that needs the macro is
+# the `#[cfg(test)]` `FaultStore`; written by hand instead, its five async
+# methods cost ~30 lines of `'life0`/`'async_trait` bounds that cannot be elided
+# (E0195, late-bound vs early-bound). None of it ships.
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }

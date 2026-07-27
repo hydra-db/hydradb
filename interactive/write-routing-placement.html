@@ -1,0 +1,2956 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Placing the writer — rendezvous, heartbeats, and the bounded duel</title>
+<style>
+  :root {
+    --ground: #eef1f5;
+    --surface: #fbfcfd;
+    --surface-2: #e7ecf3;
+    --ink: #16202e;
+    --ink-2: #4d5c72;
+    --ink-3: #7c8ba1;
+    --rule: #c8d2de;
+    --rule-soft: #dbe3ec;
+    --accent: #1e4fd8;
+    --accent-soft: #dfe6fb;
+    --crit: #a3231c;
+    --crit-soft: #f7e2e0;
+    --high: #97621b;
+    --high-soft: #f8ecd9;
+    --med: #2b6079;
+    --med-soft: #dcecf3;
+    --ok: #106b4e;
+    --ok-soft: #dbefe6;
+
+    --font-display: -apple-system, BlinkMacSystemFont, "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+    --font-body: "Iowan Old Style", Charter, "Bitstream Charter", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+    --font-mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+    --measure: 68ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0b1626;
+      --surface: #111e31;
+      --surface-2: #16263c;
+      --ink: #dce7f5;
+      --ink-2: #93a8c4;
+      --ink-3: #6a7f9c;
+      --rule: #24374f;
+      --rule-soft: #1b2c42;
+      --accent: #7ba5ff;
+      --accent-soft: #17294a;
+      --crit: #ff8478;
+      --crit-soft: #3a1d1d;
+      --high: #e5b46a;
+      --high-soft: #3a2e18;
+      --med: #6fb8d6;
+      --med-soft: #16303d;
+      --ok: #56cfa1;
+      --ok-soft: #12332a;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0b1626;
+    --surface: #111e31;
+    --surface-2: #16263c;
+    --ink: #dce7f5;
+    --ink-2: #93a8c4;
+    --ink-3: #6a7f9c;
+    --rule: #24374f;
+    --rule-soft: #1b2c42;
+    --accent: #7ba5ff;
+    --accent-soft: #17294a;
+    --crit: #ff8478;
+    --crit-soft: #3a1d1d;
+    --high: #e5b46a;
+    --high-soft: #3a2e18;
+    --med: #6fb8d6;
+    --med-soft: #16303d;
+    --ok: #56cfa1;
+    --ok-soft: #12332a;
+  }
+
+  :root[data-theme="light"] {
+    --ground: #eef1f5;
+    --surface: #fbfcfd;
+    --surface-2: #e7ecf3;
+    --ink: #16202e;
+    --ink-2: #4d5c72;
+    --ink-3: #7c8ba1;
+    --rule: #c8d2de;
+    --rule-soft: #dbe3ec;
+    --accent: #1e4fd8;
+    --accent-soft: #dfe6fb;
+    --crit: #a3231c;
+    --crit-soft: #f7e2e0;
+    --high: #97621b;
+    --high-soft: #f8ecd9;
+    --med: #2b6079;
+    --med-soft: #dcecf3;
+    --ok: #106b4e;
+    --ok-soft: #dbefe6;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  .page {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 24px 96px;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0 48px;
+  }
+
+  @media (min-width: 1080px) {
+    .page { grid-template-columns: 190px minmax(0, 1fr); }
+  }
+
+  .masthead {
+    grid-column: 1 / -1;
+    border-bottom: 2px solid var(--ink);
+    padding: 56px 0 26px;
+    margin-bottom: 40px;
+  }
+
+  .docmeta {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 22px;
+    margin-bottom: 26px;
+  }
+
+  .docmeta b { color: var(--ink-2); font-weight: 500; }
+
+  h1 {
+    font-family: var(--font-display);
+    font-size: clamp(2.1rem, 5.4vw, 3.5rem);
+    font-weight: 700;
+    letter-spacing: -.032em;
+    line-height: 1.02;
+    margin: 0 0 .45em;
+    text-wrap: balance;
+    max-width: 20ch;
+  }
+
+  h1 .thin { font-weight: 300; color: var(--ink-2); display: block; }
+
+  .standfirst {
+    font-size: 1.16rem;
+    color: var(--ink-2);
+    max-width: 60ch;
+    margin: 0;
+    line-height: 1.55;
+  }
+
+  .spine { display: none; }
+
+  @media (min-width: 1080px) {
+    .spine {
+      display: block;
+      position: sticky;
+      top: 0;
+      align-self: start;
+      padding-top: 6px;
+      max-height: 100vh;
+      overflow-y: auto;
+    }
+  }
+
+  .spine ol { list-style: none; margin: 0; padding: 0; }
+
+  .spine a {
+    display: grid;
+    grid-template-columns: 2.2em 1fr;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.4;
+    letter-spacing: .02em;
+    color: var(--ink-3);
+    text-decoration: none;
+    padding: 7px 0 7px 10px;
+    border-left: 2px solid var(--rule-soft);
+    transition: color .15s, border-color .15s;
+  }
+
+  .spine a:hover, .spine a:focus-visible { color: var(--accent); border-left-color: var(--accent); }
+  .spine a .n { font-variant-numeric: tabular-nums; color: var(--ink-3); }
+  .spine .wmark { color: var(--accent); }
+
+  .body { min-width: 0; }
+  .body > * { max-width: var(--measure); }
+  .body > .wide, .body > .rail { max-width: none; }
+
+  section { margin: 0 0 68px; }
+
+  h2 {
+    font-family: var(--font-display);
+    font-size: 1.62rem;
+    font-weight: 650;
+    letter-spacing: -.02em;
+    line-height: 1.18;
+    margin: 0 0 .2em;
+    text-wrap: balance;
+  }
+
+  h3 {
+    font-family: var(--font-display);
+    font-size: 1.06rem;
+    font-weight: 650;
+    letter-spacing: -.008em;
+    margin: 2.1em 0 .5em;
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .eyebrow::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
+
+  p { margin: 0 0 1.05em; }
+  .lede { font-size: 1.06rem; color: var(--ink-2); margin-bottom: 1.6em; }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  code, .mono { font-family: var(--font-mono); font-size: .86em; }
+
+  p code, li code, td code, th code, dd code, .rtext code, .kv code, .q p code {
+    background: var(--surface-2);
+    border: 1px solid var(--rule-soft);
+    border-radius: 3px;
+    padding: .08em .34em;
+    white-space: nowrap;
+  }
+
+  .src { font-family: var(--font-mono); font-size: .78em; color: var(--ink-3); white-space: nowrap; letter-spacing: -.01em; }
+  .src::before { content: "\21B3 "; }
+
+  ul, ol { margin: 0 0 1.05em; padding-left: 1.3em; }
+  li { margin-bottom: .4em; }
+
+  .doctrine {
+    border-left: 3px solid var(--accent);
+    padding: 2px 0 2px 20px;
+    margin: 1.6em 0;
+    color: var(--ink-2);
+  }
+
+  .doctrine p { font-style: italic; margin-bottom: .4em; }
+  .doctrine .attr { font-family: var(--font-mono); font-size: 11.5px; font-style: normal; color: var(--ink-3); letter-spacing: .02em; }
+
+  .chip {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 2px;
+    vertical-align: 2px;
+    white-space: nowrap;
+  }
+
+  .chip.med    { color: var(--med);  background: var(--med-soft); }
+  .chip.high   { color: var(--high); background: var(--high-soft); }
+
+  /* ---- tables ---- */
+
+  .tablewrap {
+    overflow-x: auto;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    margin: 26px 0;
+  }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+
+  thead th {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+
+  tbody tr:last-child td { border-bottom: none; }
+  td.m, th.m { font-family: var(--font-mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  td.nowrap { white-space: nowrap; }
+  td.note { font-family: var(--font-body); font-size: 14px; color: var(--ink-2); }
+  td.strong { font-family: var(--font-body); font-size: 14px; color: var(--ink); }
+  .wide-tbl { min-width: 700px; }
+
+  .caption {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--ink-3);
+    margin: -14px 0 30px;
+    letter-spacing: .01em;
+  }
+
+  /* ---- code / rule blocks ---- */
+
+  pre.listing {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.62;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--rule);
+    color: var(--ink-2);
+    padding: 14px 16px;
+    margin: 22px 0;
+    overflow-x: auto;
+  }
+
+  pre.listing b { color: var(--ink); font-weight: 600; }
+  pre.listing i { font-style: normal; color: var(--crit); }
+  pre.listing u { text-decoration: none; color: var(--accent); }
+  pre.listing.rust { border-left-color: var(--accent); }
+  pre.listing.incident { border-left-color: var(--crit); }
+
+  .rule-box {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.6;
+    background: var(--accent-soft);
+    color: var(--ink);
+    padding: 12px 14px;
+    border-radius: 2px;
+    margin: 20px 0;
+    overflow-x: auto;
+  }
+
+  .rule-box .lbl {
+    display: block;
+    font-size: 10px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 6px;
+  }
+
+  /* ---- keeps / open questions ---- */
+
+  .keeps { display: grid; gap: 2px; margin: 24px 0; }
+
+  .keep {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 14px;
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--ok);
+    padding: 13px 18px;
+    align-items: baseline;
+  }
+
+  .keep[data-v="open"] { border-left-color: var(--high); }
+  .keep[data-v="lean"] { border-left-color: var(--med); }
+
+  .keep .kk {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ok);
+    white-space: nowrap;
+  }
+
+  .keep[data-v="open"] .kk { color: var(--high); }
+  .keep[data-v="lean"] .kk { color: var(--med); }
+  .keep .kv { font-size: .95rem; }
+
+  .openq { display: grid; gap: 2px; margin: 24px 0; }
+
+  .q {
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--high);
+    padding: 15px 18px;
+  }
+
+  .q .qh {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink);
+    display: block;
+    margin-bottom: 5px;
+  }
+
+  .q p { font-size: .93rem; margin: 0; color: var(--ink-2); max-width: 74ch; }
+
+  /* ---- widgets ---- */
+
+  .widget {
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    margin: 28px 0 34px;
+    padding: 0;
+  }
+
+  .widget-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px 14px;
+    padding: 13px 20px 12px;
+    border-bottom: 1px solid var(--rule-soft);
+    background: var(--surface-2);
+  }
+
+  .widget-id {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .widget-title {
+    font-family: var(--font-display);
+    font-size: .96rem;
+    font-weight: 650;
+    letter-spacing: -.008em;
+    color: var(--ink);
+  }
+
+  .widget-body { padding: 20px; }
+
+  .widget-cap {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.55;
+    color: var(--ink-3);
+    border-top: 1px solid var(--rule-soft);
+    padding: 12px 20px 14px;
+    letter-spacing: .01em;
+  }
+
+  .widget-cap b { color: var(--ink-2); font-weight: 600; }
+
+  .ctlbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    margin-bottom: 16px;
+  }
+
+  .ctlbar + .ctlbar { margin-top: -6px; }
+
+  .btn {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .02em;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 6px 11px;
+    cursor: pointer;
+    transition: color .12s, border-color .12s, background .12s;
+  }
+
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .btn.danger:hover { border-color: var(--crit); color: var(--crit); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+
+  .switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink-2);
+    border: 1px solid var(--rule);
+    background: var(--surface-2);
+    border-radius: 2px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+
+  .switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .switch .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--crit); display: inline-block; }
+  .switch[aria-pressed="true"] { border-color: var(--ok); color: var(--ok); background: var(--ok-soft); }
+  .switch[aria-pressed="true"] .dot { background: var(--ok); }
+
+  .ctl-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  .field {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 6px 9px;
+    min-width: 0;
+  }
+
+  .field:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  input[type="range"] { accent-color: var(--accent); vertical-align: middle; max-width: 190px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+  .nodechip {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    padding: 5px 10px;
+    border-radius: 2px;
+    border: 1px solid var(--ok);
+    background: var(--ok-soft);
+    color: var(--ok);
+    cursor: pointer;
+  }
+
+  .nodechip[aria-pressed="false"] {
+    border-color: var(--rule);
+    background: var(--surface-2);
+    color: var(--ink-3);
+    text-decoration: line-through;
+  }
+
+  .nodechip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .readout {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    background: var(--surface-2);
+    border-radius: 2px;
+    padding: 10px 13px;
+    margin-top: 14px;
+  }
+
+  .readout b { color: var(--ink); font-weight: 600; }
+  .readout .good { color: var(--ok); }
+  .readout .bad { color: var(--crit); }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 2px;
+    margin: 14px 0 0;
+  }
+
+  .stat { background: var(--surface-2); padding: 9px 12px; }
+
+  .stat .sk {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: .11em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin-bottom: 2px;
+  }
+
+  .stat .sv {
+    font-family: var(--font-mono);
+    font-size: 17px;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    line-height: 1.2;
+  }
+
+  .stat[data-tone="crit"] .sv { color: var(--crit); }
+  .stat[data-tone="ok"] .sv { color: var(--ok); }
+  .stat[data-tone="accent"] .sv { color: var(--accent); }
+  .stat .su { font-size: 11px; color: var(--ink-3); }
+
+  .logpane {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.62;
+    background: var(--surface-2);
+    border: 1px solid var(--rule-soft);
+    border-radius: 2px;
+    padding: 10px 12px;
+    height: 220px;
+    overflow-y: auto;
+    margin-top: 14px;
+    white-space: pre;
+    color: var(--ink-2);
+  }
+
+  .logpane .l-fence { color: var(--crit); }
+  .logpane .l-ok    { color: var(--ok); }
+  .logpane .l-route { color: var(--accent); }
+  .logpane .l-warn  { color: var(--high); }
+  .logpane .l-dim   { color: var(--ink-3); }
+  .logpane .l-head  { color: var(--ink); }
+
+  .scoretbl { width: 100%; border-collapse: collapse; font-size: 12px; font-family: var(--font-mono); }
+  .scoretbl th { font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); font-weight: 500; padding: 6px 10px; background: var(--surface-2); border-bottom: 1px solid var(--rule); text-align: left; }
+  .scoretbl td { padding: 6px 10px; border-bottom: 1px solid var(--rule-soft); vertical-align: middle; }
+  .scoretbl tr.dead td { color: var(--ink-3); text-decoration: line-through; }
+  .scoretbl tr.win td { background: var(--ok-soft); color: var(--ok); font-weight: 600; }
+  .scoretbl tr.win td.bar-td { background: var(--ok-soft); }
+  .scoretbl td.bar-td { width: 34%; padding: 4px 10px; }
+  .scoretbl .bar { height: 8px; background: var(--rule); display: block; border-radius: 1px; }
+  .scoretbl tr.win .bar { background: var(--ok); }
+  .scoretbl tr.dead .bar { background: var(--rule-soft); }
+
+  .goldpane { margin-top: 14px; }
+  .goldpane[hidden] { display: none; }
+
+  .lamps { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 14px; }
+
+  .lamp {
+    flex: 1 1 200px;
+    background: var(--surface-2);
+    padding: 11px 14px;
+    display: flex;
+    align-items: center;
+    gap: 11px;
+  }
+
+  .lamp .bulb { width: 13px; height: 13px; border-radius: 50%; background: var(--rule); flex: none; }
+  .lamp[data-on="ok"] .bulb { background: var(--ok); }
+  .lamp[data-on="crit"] .bulb { background: var(--crit); }
+  .lamp .lk { font-family: var(--font-mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); display: block; }
+  .lamp .lv { font-family: var(--font-mono); font-size: 12px; color: var(--ink); }
+  .lamp[data-on="ok"] .lv { color: var(--ok); }
+  .lamp[data-on="crit"] .lv { color: var(--crit); }
+
+  /* ---- SVG, themed through custom properties only ---- */
+
+  .wsvg { display: block; width: 100%; height: auto; overflow: visible; }
+  .wsvg text { font-family: var(--font-mono); font-size: 10px; fill: var(--ink-2); }
+  .wsvg .t-strong { fill: var(--ink); font-weight: 600; }
+  .wsvg .t-dim { fill: var(--ink-3); font-size: 9px; }
+  .wsvg .t-ok { fill: var(--ok); }
+  .wsvg .t-crit { fill: var(--crit); }
+  .wsvg .t-accent { fill: var(--accent); }
+  .wsvg .box { fill: var(--surface-2); stroke: var(--rule); stroke-width: 1; }
+  .wsvg .box.ok { fill: var(--ok-soft); stroke: var(--ok); }
+  .wsvg .box.crit { fill: var(--crit-soft); stroke: var(--crit); }
+  .wsvg .box.accent { fill: var(--accent-soft); stroke: var(--accent); }
+  .wsvg .box.dim { fill: var(--surface); stroke: var(--rule-soft); }
+  .wsvg .wire { stroke: var(--rule); stroke-width: 1; fill: none; }
+  .wsvg .wire.ok { stroke: var(--ok); stroke-width: 1.5; }
+  .wsvg .wire.crit { stroke: var(--crit); stroke-width: 1.5; }
+  .wsvg .wire.accent { stroke: var(--accent); stroke-width: 1.4; }
+  .wsvg .wire.faint { stroke: var(--rule-soft); }
+  .wsvg .fillok { fill: var(--ok); }
+  .wsvg .fillcrit { fill: var(--crit); }
+  .wsvg .fillaccent { fill: var(--accent); }
+  .wsvg .axis { stroke: var(--rule); stroke-width: 1; }
+  .wsvg .grid { stroke: var(--rule-soft); stroke-width: 1; }
+  .wsvg .dash { stroke-dasharray: 3 3; }
+
+  .static-fallback { border: 1px dashed var(--rule); padding: 16px; }
+  .static-note { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-3); margin: 10px 0 0; }
+
+  .handoff {
+    border-top: 2px solid var(--ink);
+    padding-top: 26px;
+    margin-top: 76px;
+    grid-column: 1 / -1;
+  }
+
+  .handoff h2 { font-size: 1.28rem; }
+  .handoff p { max-width: var(--measure); }
+
+  .themetoggle {
+    position: fixed;
+    top: 14px;
+    right: 14px;
+    z-index: 10;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 6px 10px;
+    cursor: pointer;
+    transition: color .15s, border-color .15s;
+  }
+
+  .themetoggle:hover { color: var(--accent); border-color: var(--accent); }
+  .themetoggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  @media print { .themetoggle { display: none; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem("turbolay-theme");
+      if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) {}
+  })();
+</script>
+</head>
+<body>
+
+<button class="themetoggle" type="button">Dark</button>
+
+<div class="page">
+
+  <header class="masthead">
+    <div class="docmeta">
+      <span><b>repo</b> turbolay</span>
+      <span><b>branch</b> Turbolay-V3.5</span>
+      <span><b>doc</b> 3 of 3 &mdash; the fix</span>
+      <span><b>status</b> crate landed, Q1-Q4 decided, wiring next</span>
+      <span><b>refs</b> sleet &middot; tidb-master</span>
+    </div>
+    <h1>Placing the writer<span class="thin">rendezvous, heartbeats, and the bounded duel</span></h1>
+    <p class="standfirst">
+      Three graph-nodes took turns fencing each other out of one cell, forever, and
+      every log line said only <code>Fenced</code>. The fix is a hash, one branch, and an
+      honest headline: the duel becomes <em>bounded</em>, not impossible. Five working
+      widgets below let you drive each part of that claim yourself.
+    </p>
+  </header>
+
+  <nav class="spine" aria-label="Sections">
+    <ol>
+      <li><a href="#vocabulary"><span class="n">&sect;</span><span>Vocabulary</span></a></li>
+      <li><a href="#incident"><span class="n">A</span><span>The incident <span class="wmark">W1</span></span></a></li>
+      <li><a href="#nobody"><span class="n">B</span><span>Nothing decides</span></a></li>
+      <li><a href="#rendezvous"><span class="n">C</span><span>Rendezvous <span class="wmark">W2</span></span></a></li>
+      <li><a href="#rule"><span class="n">D</span><span>Don't promote</span></a></li>
+      <li><a href="#liveness"><span class="n">E</span><span>Heartbeats <span class="wmark">W3 W4 W5</span></span></a></li>
+      <li><a href="#bounded"><span class="n">F</span><span>The bounded duel</span></a></li>
+      <li><a href="#lease"><span class="n">G</span><span>The lease</span></a></li>
+      <li><a href="#status"><span class="n">H</span><span>Decided / open</span></a></li>
+    </ol>
+  </nav>
+
+  <main class="body">
+
+    <section id="vocabulary">
+      <p class="eyebrow">vocabulary &mdash; before section A</p>
+      <h2>The terms the rest of this page assumes</h2>
+
+      <p>
+        Everything below is used without further introduction. The first five carry the rest.
+      </p>
+
+      <div class="tablewrap wide">
+        <table>
+          <thead>
+            <tr><th class="m">term</th><th>meaning</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="m">Cell</td>
+              <td class="note">One SlateDB database. Admits exactly one writer at a time. The unit ownership is computed for.</td>
+            </tr>
+            <tr>
+              <td class="m">Writer / writer epoch</td>
+              <td class="note">The node currently allowed to write a cell. SlateDB stamps a number into the manifest on open; a higher number wins.</td>
+            </tr>
+            <tr>
+              <td class="m">Fenced</td>
+              <td class="note">You were the writer, another node opened the cell with a higher epoch, and your next write fails. The production incident is three nodes doing this to each other in a loop.</td>
+            </tr>
+            <tr>
+              <td class="m">Graph-node</td>
+              <td class="note">One of the server pods (<code>graph-node-0/1/2</code>). Serves Bolt, can read any cell, may write only the cells it owns.</td>
+            </tr>
+            <tr>
+              <td class="m">Client / driver</td>
+              <td class="note">The Neo4j Bolt driver inside the customer's application. Sends queries, caches routing tables, retries. Not a person, and not our code.</td>
+            </tr>
+            <tr>
+              <td class="m">Routing table</td>
+              <td class="note">What the driver receives in reply to a <code>ROUTE</code> request: which nodes to read from, which single node to write to, and a TTL.</td>
+            </tr>
+            <tr>
+              <td class="m">Scope</td>
+              <td class="note"><code>{namespace}/graphs/{graph_id}</code>, the database name the driver sends &mdash; for example <code>acme/graphs/social</code>.</td>
+            </tr>
+            <tr>
+              <td class="m">Tenant</td>
+              <td class="note">The customer; the <code>namespace</code> part of the scope.</td>
+            </tr>
+            <tr>
+              <td class="m">Owner</td>
+              <td class="note">The node rendezvous says should write a given cell. Computed on demand, never stored.</td>
+            </tr>
+            <tr>
+              <td class="m">Rendezvous hashing</td>
+              <td class="note">Score every (cell, node) pair; the highest score wins. Every node reaches the same answer with no coordination.</td>
+            </tr>
+            <tr>
+              <td class="m">Heartbeat</td>
+              <td class="note">A small object each node writes every 5s, meaning "alive and ready". Liveness comes from the object's timestamp, never a local clock.</td>
+            </tr>
+            <tr>
+              <td class="m">Live set</td>
+              <td class="note">The nodes with a fresh heartbeat; the candidate list rendezvous chooses from.</td>
+            </tr>
+            <tr>
+              <td class="m">Promotion</td>
+              <td class="note">A node opening a cell for writing and claiming the epoch. The action that must be restricted to the owner.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="incident">
+      <p class="eyebrow">A &mdash; the incident</p>
+      <h2>Three nodes, one cell, an epoch counter going up forever</h2>
+      <p class="lede">
+        This is not a hypothetical. It is a production trace, and it is the reason the
+        <code>turbolay-placement</code> crate exists.
+      </p>
+
+      <p>
+        All three graph-nodes were configured with the same <code>GRAPH_CELL_ID</code>, so every
+        client write targeted the same cell. Nothing in the system decides which node
+        <em>should</em> be that cell's writer, so any node that received a write opened the
+        <code>Db</code>, claimed a new epoch, and fenced whoever held it.
+      </p>
+
+      <pre class="listing incident">t=0.00  client A -&gt; graph-node-0   write   node-0 opens Db, claims epoch <b>17</b>
+t=0.31  client B -&gt; graph-node-1   write   node-1 opens Db, claims epoch <b>18</b>
+                                           node-0's next write -&gt; <i>Fenced</i>
+t=0.44  client C -&gt; graph-node-2   write   node-2 opens Db, claims epoch <b>19</b>
+                                           node-1's next write -&gt; <i>Fenced</i>
+t=0.52  client A retries -&gt; node-0          node-0 reopens, claims epoch <b>20</b>
+                                           node-2's next write -&gt; <i>Fenced</i>
+        ... repeats. Every node makes progress on open and none on write.</pre>
+      <p class="caption">memory <code>cell-writer-fencing-pingpong</code>, reproduced in docs/plans/2026-07-25-rendezvous-placement-open-questions.md:312&ndash;321</p>
+
+      <p>
+        Two distinct failures are stacked here, and separating them is the whole shape of the
+        fix. The first is the duel itself: no node has a reason to stand down, so the
+        oscillation has no reason to stop. The second is diagnostic. All three logs say only
+        <code>Fenced</code>. <b>None says by whom.</b> You are debugging three identical lines,
+        each of which reports "someone took it from me."
+      </p>
+
+      <div class="widget" id="w1">
+        <div class="widget-head">
+          <span class="widget-id">W1</span>
+          <span class="widget-title">The duel simulator &mdash; toggle rendezvous and watch it stop</span>
+        </div>
+        <div class="widget-body">
+          <div class="w1-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 700 250" role="img" aria-label="Three graph nodes contending for one cell's SlateDB writer epoch">
+              <rect class="box crit" x="20" y="24" width="190" height="70" rx="3"></rect>
+              <text class="t-strong" x="34" y="48">graph-node-0</text>
+              <text x="34" y="66">promotes on demand</text>
+              <text class="t-crit" x="34" y="82">fenced at epoch 17</text>
+              <rect class="box crit" x="255" y="24" width="190" height="70" rx="3"></rect>
+              <text class="t-strong" x="269" y="48">graph-node-1</text>
+              <text x="269" y="66">promotes on demand</text>
+              <text class="t-crit" x="269" y="82">fenced at epoch 18</text>
+              <rect class="box crit" x="490" y="24" width="190" height="70" rx="3"></rect>
+              <text class="t-strong" x="504" y="48">graph-node-2</text>
+              <text x="504" y="66">promotes on demand</text>
+              <text class="t-crit" x="504" y="82">holds epoch 19</text>
+              <path class="wire crit" d="M115 94 L330 160"></path>
+              <path class="wire crit" d="M350 94 L350 160"></path>
+              <path class="wire crit" d="M585 94 L370 160"></path>
+              <rect class="box" x="245" y="160" width="210" height="66" rx="3"></rect>
+              <text class="t-strong" x="259" y="184">cell-b &mdash; one SlateDB database</text>
+              <text x="259" y="202">writer_epoch 19 and climbing</text>
+              <text class="t-dim" x="259" y="218">manifest CAS admits exactly one writer</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript for the interactive simulator.</p>
+          </div>
+          <div class="w1-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> leave rendezvous OFF and press "random traffic" &mdash; the epoch climbs without
+          bound and the log fills with unattributed <code>Fenced</code> lines, exactly the production
+          signature. Then switch rendezvous ON and press it again: one promotion, one epoch bump, and
+          every other node answers <code>NotCellWriter</code> so the driver re-routes and succeeds.
+          The owner here is computed, not chosen &mdash; for <code>cell-b</code> it is
+          <code>graph-node-1</code>, not the lexically first node.
+        </p>
+      </div>
+    </section>
+
+    <section id="nobody">
+      <p class="eyebrow">B &mdash; why nothing decides</p>
+      <h2>Two independent gaps, both of them silent</h2>
+
+      <p>
+        Doc 1 traced the write path from the Bolt socket to the WAL commit and found no step
+        that asks who should own the cell. Two pieces of code make that concrete, and both are
+        worth reading before the fix, because the fix is shaped by them.
+      </p>
+
+      <h3>The routing table picks a writer, and the pick is unstable</h3>
+
+      <p>
+        There <em>is</em> a writer-selection mechanism today. It is part of the bug:
+      </p>
+
+      <pre class="listing rust">let writer = reachable
+    .iter()
+    .find(|(node_id, _)| node_id == &amp;self.preferred_writer_node)
+    .or_else(|| <i>reachable.first()</i>)
+    .expect("reachable node list was checked")
+    .1
+    .clone();</pre>
+      <p class="caption">src/client/bolt/routing.rs:235&ndash;241</p>
+
+      <p>
+        <code>reachable</code> is whatever answered a 250&nbsp;ms <code>/readyz</code> probe on
+        this particular call, so the <code>reachable.first()</code> fallback moves whenever a
+        probe flaps. Two clients probing at slightly different instants can be handed different
+        writers. The selection is per-caller, and it is not sticky.
+      </p>
+
+      <h3>And whatever routing decides, the node ignores it</h3>
+
+      <p>
+        <code>ensure_local_writer</code> (<code>src/engine/cluster.rs:375&ndash;390</code>) checks
+        that this process is promotable and that it holds a shard for the cell. It never asks
+        whether it <em>should</em> be the writer. Routing's opinion is advisory and
+        <em>unenforced</em>. That gap &mdash; an unstable suggestion plus an unconditional
+        promotion &mdash; is the ping-pong.
+      </p>
+
+      <p>
+        So the fix needs exactly two things that do not exist: a stable, cluster-wide answer to
+        "who owns this cell", and one node-side branch that respects it.
+      </p>
+    </section>
+
+    <section id="rendezvous">
+      <p class="eyebrow">C &mdash; rendezvous placement</p>
+      <h2>The answer is computed, so nobody has to store it</h2>
+      <p class="lede">
+        Landed as the crate <code>turbolay-placement</code> in <code>crates/placement</code>,
+        ported from <code>../sleet/src/placement.rs</code>.
+      </p>
+
+      <div class="rule-box">
+        <span class="lbl">the whole mechanism</span>
+        owner(scope, cell) = argmax<sub>n &isin; live</sub> H(scope &Vert; 0x00 &Vert; cell_id &Vert; 0x00 &Vert; node_id)
+      </div>
+
+      <p>
+        No stored assignment, no lease, no election service. Every node computes the same answer
+        from the same object-store LIST. The function is thirty lines and has no dependencies:
+      </p>
+
+      <pre class="listing rust">pub fn <b>score</b>(scope: &amp;str, cell_id: &amp;str, node_id: &amp;str) -&gt; u64;
+pub fn <b>rank</b>&lt;'a&gt;(scope: &amp;str, cell_id: &amp;str, live: &amp;[&amp;'a str]) -&gt; Vec&lt;&amp;'a str&gt;;
+pub fn <b>owner</b>&lt;'a&gt;(scope: &amp;str, cell_id: &amp;str, live: &amp;[&amp;'a str]) -&gt; Option&lt;&amp;'a str&gt;;</pre>
+      <p class="caption">crates/placement/src/hash.rs:35, :47, :63</p>
+
+      <h3>The hash is a wire format, and it is frozen</h3>
+
+      <p>
+        FNV-1a 64 &mdash; offset <code>0xcbf29ce484222325</code>, prime
+        <code>0x100000001b3</code>, wrapping multiply &mdash; over
+        <code>scope ++ 0x00 ++ cell_id ++ 0x00 ++ node_id</code>, ranked descending by score with
+        ties broken by node id ascending. Changing any part of that splits a mixed-version fleet
+        into two disagreeing views of who owns a cell, which is the exact failure the crate
+        exists to prevent. The separator is load-bearing: without it <code>("ab", "c")</code> and
+        <code>("a", "bc")</code> hash alike.
+      </p>
+
+      <p>
+        <code>scope</code> is <code>GraphScope</code>'s <code>Display</code> &mdash;
+        <code>"{namespace}/graphs/{graph_id}"</code>
+        (<code>src/core/namespace.rs:268&ndash;272</code>). Pinning golden values against it
+        freezes <em>that</em> impl as a wire format too. Changing the format string reshuffles
+        every cell in the fleet.
+      </p>
+
+      <div class="tablewrap wide">
+        <table>
+          <thead>
+            <tr><th class="m">scope</th><th class="m">cell</th><th class="m">node</th><th class="m">score</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="m">acme/graphs/social</td><td class="m">cell-a</td><td class="m">graph-node-0</td><td class="m">0xf0dc2317deb297c5</td></tr>
+            <tr><td class="m">acme/graphs/social</td><td class="m">cell-a</td><td class="m">graph-node-1</td><td class="m">0xf0dc2217deb29612</td></tr>
+            <tr><td class="m">acme/graphs/social</td><td class="m">cell-b</td><td class="m">graph-node-0</td><td class="m">0x39ffe3dd3cc79ffe</td></tr>
+            <tr><td class="m">acme/graphs/other</td><td class="m">cell-a</td><td class="m">graph-node-0</td><td class="m">0xc15e57802a479f04</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="caption">crates/placement/src/hash.rs:82&ndash;99 &mdash; <code>scores_are_frozen</code>. W2 below computes these same four values in the browser; if the widget and the test ever disagree, one of them is wrong.</p>
+
+      <h3>Minimal disruption is the property that makes it usable</h3>
+
+      <p>
+        Removing a node preserves the relative order of the survivors. One failure therefore
+        moves only that node's cells, rather than reshuffling the fleet. That is asserted
+        directly &mdash; <code>removing_a_node_preserves_the_order_of_the_rest</code>
+        (<code>hash.rs:124&ndash;132</code>), and deliberately against <code>cell-b</code>: under
+        <code>cell-a</code> the ranking happens to come out in lexical node order, so a test
+        written against it would pass even if <code>rank</code> ignored the score entirely.
+      </p>
+
+      <div class="tablewrap wide">
+        <table>
+          <thead>
+            <tr><th class="m">scope</th><th class="m">cell</th><th class="m">rank over graph-node-0..3</th><th>note</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="m">acme/graphs/social</td><td class="m">cell-a</td><td class="m">[0, 1, 2, 3]</td><td class="note">coincidentally lexical &mdash; useless as a test fixture</td></tr>
+            <tr><td class="m">acme/graphs/social</td><td class="m">cell-b</td><td class="m">[1, 0, 3, 2]</td><td class="note">the fixture the disruption tests use</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="widget" id="w2">
+        <div class="widget-head">
+          <span class="widget-id">W2</span>
+          <span class="widget-title">Rendezvous explorer &mdash; real FNV-1a 64, computed in the page</span>
+        </div>
+        <div class="widget-body">
+          <div class="w2-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 700 190" role="img" aria-label="Rendezvous scores for four nodes over one cell, highest wins">
+              <text class="t-strong" x="12" y="20">score(acme/graphs/social, cell-b, node) &mdash; highest wins</text>
+              <rect class="box ok" x="12" y="34" width="676" height="30" rx="2"></rect>
+              <text class="t-strong" x="24" y="53">graph-node-1</text>
+              <text class="t-ok" x="150" y="53">0x39ffe4dd3cc7a1b1</text>
+              <text class="t-ok" x="330" y="53">OWNER</text>
+              <rect class="box" x="12" y="70" width="676" height="30" rx="2"></rect>
+              <text class="t-strong" x="24" y="89">graph-node-0</text>
+              <text x="150" y="89">0x39ffe3dd3cc79ffe</text>
+              <rect class="box" x="12" y="106" width="676" height="30" rx="2"></rect>
+              <text class="t-strong" x="24" y="125">graph-node-3</text>
+              <text x="150" y="125">0x39ffe2dd3cc79e4b</text>
+              <rect class="box" x="12" y="142" width="676" height="30" rx="2"></rect>
+              <text class="t-strong" x="24" y="161">graph-node-2</text>
+              <text x="150" y="161">0x39ffe1dd3cc79c98</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript to edit the scope and cell and kill nodes.</p>
+          </div>
+          <div class="w2-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> press "verify golden values" &mdash; the four pinned hex values from
+          <code>hash.rs</code> are recomputed here with BigInt and must all read MATCH. Then kill
+          <code>graph-node-1</code> with its chip: ownership moves to the runner-up and the
+          disruption line confirms that nobody else's relative position changed. Edit the scope to
+          <code>acme/graphs/other</code> and the whole ranking changes &mdash; which is why the
+          <code>GraphScope</code> Display string is frozen too.
+        </p>
+      </div>
+    </section>
+
+    <section id="rule">
+      <p class="eyebrow">D &mdash; the don't-promote rule</p>
+      <h2>One branch converts theft into a placement decision</h2>
+
+      <p>
+        Rendezvous on its own changes nothing in production. It is a pure function; it has no
+        effect until a node consults it and is willing to say no. That is touch point (b), in
+        <code>RoutedGraphCluster::ensure_local_writer</code>
+        (<code>src/engine/cluster.rs:375&ndash;390</code>):
+      </p>
+
+      <pre class="listing rust">match placement.owner(scope, cell_id) {
+    Some(o) if o == self.local_node_id =&gt; shard.<b>promote_to_writer</b>(..).await,
+    Some(o)                            =&gt; Err(GraphError::<i>NotCellWriter</i> { cell_id, owner: o }),
+    None                               =&gt; shard.<b>promote_to_writer</b>(..).await, <u>// no live owner</u>
+}</pre>
+
+      <p>
+        The third arm matters as much as the second. <code>None</code> means
+        <em>placement has no opinion</em>, not <em>nobody may write</em>
+        (<code>hash.rs:57&ndash;62</code>). If no node is live &mdash; which, given a node always
+        counts itself live, means the LIST returned nothing usable &mdash; refusing every write
+        would trade a bounded stall for a total outage. This one branch is what converts "any
+        node steals the epoch on demand" into "only a node with a placement reason claims it."
+      </p>
+
+      <h3>The refusal has to reach the driver, or it accomplishes nothing</h3>
+
+      <p>
+        <code>GraphError::NotCellWriter { cell_id, owner }</code> maps to the Bolt error code
+        <code>Neo.ClientError.Cluster.NotALeader</code>, carrying the owner as a hint &mdash;
+        modelled directly on TiKV's <code>NotLeader{leader_hint}</code>. Drivers already know
+        this code: discard the routing table, re-route, retry.
+      </p>
+
+      <p>
+        Today the Bolt module has exactly one Neo code
+        (<code>src/client/bolt.rs:1366</code>, <code>Neo.TransientError.Transaction.Terminated</code>),
+        so a fenced write is opaque and the driver retries into the same wrong node. Without the
+        error code, the refusal is a correct answer that the client cannot act on:
+      </p>
+
+      <pre class="listing">without the code:  client -&gt; graph-node-2 (not the owner)
+                   node-2 returns a generic error
+                   driver has no reason to discard its routing table
+                   driver retries -&gt; graph-node-2 -&gt; same error -&gt; ...
+
+with the code:     node-2 returns <b>Neo.ClientError.Cluster.NotALeader</b>, owner=graph-node-1
+                   driver discards the routing table, re-routes, retries
+                   -&gt; graph-node-1 -&gt; <b>ok</b></pre>
+      <p class="caption">docs/plans/2026-07-25-rendezvous-placement-open-questions.md:768&ndash;777</p>
+
+      <p>
+        HTTP clients cannot re-route, so <code>ClientHttpServer</code> returns 421 with the owner
+        in the body. Forwarding over the existing <code>QueryServiceEndpoint</code> transport is
+        the better answer for HTTP, and is a follow-up rather than part of this change.
+      </p>
+
+      <p>
+        W1 above implements exactly this pair. With rendezvous ON, watch the log: the non-owner
+        emits <code>NotCellWriter</code>, the simulated driver re-routes, and the retry lands on
+        the owner without an epoch bump.
+      </p>
+    </section>
+
+    <section id="liveness">
+      <p class="eyebrow">E &mdash; liveness</p>
+      <h2>Heartbeats replace the per-request <code>/readyz</code> fan-out</h2>
+      <p class="lede">
+        Rendezvous needs a live set. Turbolay computes one today, badly, on every single
+        <code>ROUTE</code> request.
+      </p>
+
+      <h3>What happens today</h3>
+
+      <p>
+        Every <code>ROUTE</code> request makes the receiving node open a TCP connection to
+        <em>every</em> node's admin port and hand-write <code>GET /readyz HTTP/1.1</code>, all of
+        them concurrently through <code>join_all</code>:
+      </p>
+
+      <pre class="listing">async fn reachable_nodes(&amp;self) -&gt; Vec&lt;(String, String)&gt; {
+    let probes = self.node_addresses.iter().map(|(node_id, address)| { ... });
+    <i>join_all(probes)</i>.await.into_iter().flatten().collect()
+}
+
+async fn probe_node_readiness(address: &amp;str, probe_timeout: Duration) -&gt; bool {
+    let mut stream = <i>TcpStream::connect(address)</i>.await?;
+    let request = format!("GET /readyz HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    ...
+}</pre>
+      <p class="caption">src/client/bolt/routing.rs:152&ndash;168, 196&ndash;218 &mdash; the fan-out</p>
+
+      <p>
+        One driver question becomes N TCP connections. Worse than the cost: each node probes
+        independently, so two nodes can disagree about who is up <em>at the same instant</em>.
+        Feeding an inconsistent liveness view into a placement function whose entire value is
+        that everyone computes the same answer defeats the point.
+      </p>
+
+      <div class="widget" id="w3">
+        <div class="widget-head">
+          <span class="widget-id">W3</span>
+          <span class="widget-title">Fan-out vs LIST &mdash; connections per routing refresh</span>
+        </div>
+        <div class="widget-body">
+          <div class="w3-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 700 230" role="img" aria-label="Left: each driver's ROUTE request fans out to every node. Right: each driver's ROUTE costs one LIST.">
+              <text class="t-strong" x="12" y="18">TODAY &mdash; /readyz fan-out</text>
+              <text class="t-strong" x="372" y="18">PROPOSED &mdash; one LIST</text>
+              <path class="wire faint" d="M350 26 L350 220"></path>
+              <rect class="box" x="12" y="34" width="80" height="26" rx="2"></rect>
+              <text x="24" y="51">driver</text>
+              <rect class="box accent" x="120" y="34" width="90" height="26" rx="2"></rect>
+              <text class="t-accent" x="132" y="51">ROUTE</text>
+              <path class="wire crit" d="M210 47 L250 80"></path>
+              <path class="wire crit" d="M210 47 L250 120"></path>
+              <path class="wire crit" d="M210 47 L250 160"></path>
+              <circle class="fillcrit" cx="256" cy="80" r="4"></circle>
+              <circle class="fillcrit" cx="256" cy="120" r="4"></circle>
+              <circle class="fillcrit" cx="256" cy="160" r="4"></circle>
+              <text class="t-crit" x="266" y="84">node admin :9090</text>
+              <text class="t-crit" x="266" y="124">node admin :9090</text>
+              <text class="t-crit" x="266" y="164">node admin :9090</text>
+              <text class="t-dim" x="12" y="205">N TCP connections per ROUTE, per driver</text>
+              <rect class="box" x="372" y="34" width="80" height="26" rx="2"></rect>
+              <text x="384" y="51">driver</text>
+              <rect class="box accent" x="480" y="34" width="90" height="26" rx="2"></rect>
+              <text class="t-accent" x="492" y="51">ROUTE</text>
+              <path class="wire ok" d="M570 47 L600 110"></path>
+              <rect class="box ok" x="560" y="110" width="128" height="50" rx="2"></rect>
+              <text class="t-ok" x="572" y="130">LIST _graph_nodes/v1/</text>
+              <text class="t-ok" x="572" y="148">name + LastModified</text>
+              <text class="t-dim" x="372" y="205">one object-store LIST, same answer for every caller</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript for the live counters and animation.</p>
+          </div>
+          <div class="w3-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> drag the node slider to 20 and the driver slider to 50. The fan-out counter is
+          the product of the two and grows quadratically as a fleet scales in both dimensions; the
+          LIST counter grows only with driver count. The heartbeat PUT rate is shown alongside
+          because it is the cost you are buying instead &mdash; and it is linear in nodes, not in
+          drivers.
+        </p>
+      </div>
+
+      <h3>What replaces it</h3>
+
+      <p>
+        Each node PUTs a small object every <code>heartbeat_interval</code>:
+      </p>
+
+      <pre class="listing">publish loop:  every heartbeat_interval, if AdminState.ready { PUT &lt;base&gt;/_graph_nodes/v1/&lt;node-id&gt; }
+                                         else                { DELETE it if present }
+SIGTERM:       DELETE &lt;base&gt;/_graph_nodes/v1/&lt;node-id&gt;, then drain
+liveness:      node is live iff its object exists and now - <b>LastModified</b> &lt; heartbeat_timeout</pre>
+
+      <p>
+        Liveness comes from the object's <code>LastModified</code>
+        <b>as reported by object storage, never a local clock</b>. That is sleet's rule
+        (<code>../sleet/src/root.rs:147, 209</code>) and it is why nodes with skewed clocks still
+        agree on the same live set. Placement reads only the LIST result &mdash; name and
+        timestamp. Bodies are observability and are never fetched on the placement path.
+        Following sleet, <b>a node always counts itself live</b>
+        (<code>../sleet/src/daemon.rs:124&ndash;131</code>): if its own heartbeat looks stale it has
+        no reliable proof it should stop.
+      </p>
+
+      <div class="tablewrap wide">
+        <table>
+          <thead>
+            <tr><th class="m">setting</th><th class="m">value</th><th>binds</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="m">heartbeat_interval</td><td class="m">5s</td><td class="note">PUT period; also the fence backoff in touch point (d)</td></tr>
+            <tr><td class="m">heartbeat_timeout</td><td class="m">15s</td><td class="note">worst-case dead-node detection, and the placement convergence bound</td></tr>
+            <tr><td class="m">validation</td><td class="m">interval &gt; 0, interval &lt; timeout</td><td class="note">rejected at startup, like sleet's <code>../sleet/src/config.rs:1018&ndash;1024</code>, rather than in production</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="caption">Q3, settled &mdash; docs/plans/2026-07-25-rendezvous-placement-open-questions.md:717&ndash;738. Config, with these as defaults.</p>
+
+      <h3>The catch: Bolt clients never touch a k8s Service</h3>
+
+      <p>
+        This is the fact that makes deleting the fan-out non-obvious, and skipping it is how you
+        ship an outage. Bolt clients connect <b>directly to pod addresses</b> handed out by
+        <code>GRAPH_BOLT_NODE_ADDRESSES</code>
+        (<code>charts/turbolay/templates/configmap.yaml:44</code>). The k8s
+        <code>readinessProbe</code> gates Service endpoints, and no Bolt client is using the
+        Service &mdash; so <b>k8s readiness does not gate Bolt traffic at all.</b>
+      </p>
+
+      <p>
+        That is precisely why <code>routing.rs</code> probes independently. Deleting the fan-out
+        without replacing the signal would advertise unready nodes to drivers. The replacement is
+        the readiness gate on publication above: a node publishes a heartbeat only while
+        <code>AdminState.ready</code>, and DELETEs it on graceful shutdown. Readiness then
+        propagates through the same channel as liveness, and both are consistent across callers.
+      </p>
+
+      <p>
+        Note what this catches that a plain TCP-reachability check would not: a node whose Bolt
+        listener is bound and accepting while it is still opening the object store and warming
+        state. The <code>/readyz</code> probe catches that today; readiness-gated heartbeats catch
+        it too; deleting the probe <em>without</em> the gate would not.
+      </p>
+
+      <h3>The regression, stated precisely</h3>
+
+      <p>
+        On a graceful shutdown the heartbeat is DELETEd in the SIGTERM handler, so the very next
+        LIST omits the node. Detection is immediate &mdash; the same as today, and this is the
+        majority of real restarts.
+      </p>
+
+      <p>
+        On a <b>hard crash</b> &mdash; OOM kill, SIGKILL, no shutdown hook &mdash; the heartbeat
+        object lingers until it ages out. Reads are fine: the driver dials the dead pod, gets
+        ECONNREFUSED, and routes around it itself, with no help from placement. <b>Writes to cells
+        the dead node owned fail for up to <code>heartbeat_timeout</code></b>, because placement
+        still names the dead node as owner and every live node correctly declines.
+      </p>
+
+      <p>
+        Then it self-heals with no operator action: the heartbeat ages out of the live set,
+        placement recomputes over the survivors, and the new owner promotes on the next write.
+        Today that stall is roughly 250&nbsp;ms via the probe. But today the alternative to a
+        stall is an <em>unbounded</em> duel, so the trade being made is
+        <code>unbounded &rarr; 15s</code>, not <code>good &rarr; bad</code>.
+      </p>
+
+      <div class="widget" id="w4">
+        <div class="widget-head">
+          <span class="widget-id">W4</span>
+          <span class="widget-title">Crash timeline &mdash; scrub 0 to 20s through a SIGKILL</span>
+        </div>
+        <div class="widget-body">
+          <div class="w4-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 700 250" role="img" aria-label="Timeline showing graph-node-1 heartbeat ageing out at 15 seconds and writes recovering">
+              <path class="wire" d="M60 200 L680 200"></path>
+              <text class="t-dim" x="56" y="216">0s</text>
+              <text class="t-dim" x="510" y="216">15s</text>
+              <text class="t-dim" x="664" y="216">20s</text>
+              <path class="wire crit dash" d="M60 40 L60 200"></path>
+              <text class="t-crit" x="66" y="36">SIGKILL graph-node-1</text>
+              <path class="wire ok dash" d="M525 40 L525 200"></path>
+              <text class="t-ok" x="410" y="36">heartbeat ages out</text>
+              <rect class="box crit" x="60" y="60" width="465" height="26" rx="2"></rect>
+              <text class="t-crit" x="72" y="78">WRITES to cell-b: refused, owner graph-node-1 is named but dead</text>
+              <rect class="box ok" x="525" y="60" width="155" height="26" rx="2"></rect>
+              <text class="t-ok" x="537" y="78">owner graph-node-0</text>
+              <rect class="box ok" x="60" y="98" width="620" height="26" rx="2"></rect>
+              <text class="t-ok" x="72" y="116">READS: unaffected throughout &mdash; the driver routes around ECONNREFUSED itself</text>
+              <rect class="box" x="60" y="136" width="620" height="26" rx="2"></rect>
+              <text x="72" y="154">graph-node-1 heartbeat age: 0s at SIGKILL, crosses heartbeat_timeout = 15s</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript for the draggable playhead.</p>
+          </div>
+          <div class="w4-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> drag the playhead across t=15s and watch three things flip together &mdash;
+          the live set loses <code>graph-node-1</code>, the computed owner becomes
+          <code>graph-node-0</code>, and the WRITES lamp goes green. Then switch to the graceful
+          path: the heartbeat is DELETEd at t=0 and there is no red band at all. The cell here is
+          <code>cell-b</code> because its rendezvous owner over these three nodes really is
+          <code>graph-node-1</code> &mdash; the widget computes it rather than asserting it.
+        </p>
+      </div>
+
+      <h3>Choosing the two numbers</h3>
+
+      <p>
+        Tighter is not free, and the cost is not the PUTs. Rendezvous moves ownership the instant
+        the live set changes, and this design has <b>no rebalance dampening</b> &mdash;
+        deliberately out of scope. So a node that flaps in and out reclaims its cells every time
+        it returns, and every reclaim costs a writer open: a manifest CAS and an epoch bump.
+      </p>
+
+      <div class="widget" id="w5">
+        <div class="widget-head">
+          <span class="widget-id">W5</span>
+          <span class="widget-title">Timeout trade-off &mdash; detection latency against flap churn</span>
+        </div>
+        <div class="widget-body">
+          <div class="w5-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 700 220" role="img" aria-label="Writer opens per minute against flap period, for three interval and timeout settings">
+              <path class="wire" d="M52 176 L680 176"></path>
+              <path class="wire" d="M52 20 L52 176"></path>
+              <text class="t-dim" x="52" y="196">flap period (s)</text>
+              <text class="t-dim" x="8" y="24">opens/min</text>
+              <path class="wire crit" d="M52 176 L146 176 L146 40 L270 96 L680 138"></path>
+              <text class="t-crit" x="152" y="34">2s / 6s &mdash; a 10s flap already churns</text>
+              <path class="wire ok" d="M52 176 L288 176 L288 122 L420 144 L680 152"></path>
+              <text class="t-ok" x="294" y="116">5s / 15s &mdash; chosen; absorbs a 10s flap</text>
+              <path class="wire accent" d="M52 176 L524 176 L524 154 L680 158"></path>
+              <text class="t-accent" x="404" y="148">10s / 30s &mdash; absorbs more, detects a real death 30s late</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript for the sliders.</p>
+          </div>
+          <div class="w5-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> leave the flap at 10s and walk the timeout down from 30s to 6s. It reads zero
+          until the timeout drops below the flap, then jumps &mdash; that is the moment the node
+          starts ageing out of the live set on every blip and ownership begins bouncing, each bounce
+          a manifest CAS and an epoch bump. Push the timeout back up and dead-node detection gets
+          worse instead. The worst case for any timeout sits just past it, which is why the curves
+          peak rather than rise. 5s/15s is marked: it absorbs a 10s flap and still detects a real
+          death in 15s. Setting <code>interval &gt;= timeout</code> is rejected here the same way
+          startup validation rejects it.
+        </p>
+      </div>
+
+      <p>
+        The pricing in that widget is the same arithmetic as the decision record: one small object
+        PUT per node per interval, at roughly $0.005 per 1,000 S3 Standard PUTs. Three nodes at a
+        5s interval is about 52,000 PUTs a day and about $8 a month &mdash; noise. A hundred nodes
+        at 2s is about $650 a month, which is why the interval is config and not a constant.
+      </p>
+
+      <p>
+        If flapping turns out to hurt in practice, the fix is a minimum-tenure rule &mdash; an
+        owner keeps a cell for at least T after acquiring it &mdash; not a longer timeout. That is
+        a recorded follow-up, not part of this change.
+      </p>
+    </section>
+
+    <section id="bounded">
+      <p class="eyebrow">F &mdash; the honest headline</p>
+      <h2>The duel is bounded, not prevented</h2>
+      <p class="lede">
+        This is the claim the whole design rests on, and it should be said plainly rather than
+        buried. Two nodes can still both believe they own a cell, briefly. Nothing here makes
+        that impossible.
+      </p>
+
+      <p>
+        The evidence that this is workable is not a proof we wrote. It is <code>../sleet</code>,
+        which runs this architecture at fleet scale on the same storage primitives, in the same
+        organisation.
+      </p>
+
+      <h3>What sleet actually does</h3>
+
+      <p>
+        <b>Sleet never opens a SlateDB <code>Db</code> at all.</b> There is not one
+        <code>Db::builder</code>, <code>Db::open</code> or <code>DbBuilder</code> in sleet's
+        <code>src/</code>; every hit is in <code>tests/</code>. The only handle it constructs is
+        <code>slatedb::admin::Admin</code> (<code>../sleet/src/services.rs:71&ndash;91</code>). So
+        sleet is never a writer and never takes a <code>writer_epoch</code> &mdash; its analogue
+        is <code>compactor_epoch</code> ping-pong between two compaction coordinators. Same shape,
+        different epoch. Read every sleet claim below with that substitution in mind.
+      </p>
+
+      <p>
+        <b>No lease object exists.</b> Sleet stores exactly three things under the fleet root:
+        <code>sleet.toml</code> and <code>dbs/&lt;db&gt;.toml</code> for operator intent, and
+        <code>nodes/&lt;id&gt;.&lt;letters&gt;.json</code> for liveness plus offered roles. The
+        heartbeat is an <b>unconditional PUT</b> &mdash; no <code>PutMode</code>, no ETag, no
+        <code>UpdateVersion</code> (<code>../sleet/src/daemon.rs:292</code>). It says "I am alive
+        and I offer these services." It never says "I own database X." Sleet stores liveness and
+        intent, and recomputes ownership from the frozen hash every tick.
+      </p>
+
+      <p>
+        <b>A non-owner simply has no key in the owned map</b>, so it never spawns the task; a
+        running task whose key is absent is cancelled on the next reconcile
+        (<code>../sleet/src/daemon.rs:117&ndash;162</code>, <code>:327&ndash;353</code>). Absence,
+        not refusal.
+      </p>
+
+      <h3>The fence handler, which is the part to copy exactly</h3>
+
+      <pre class="listing rust">let delay = match result {
+    Ok(()) =&gt; break,
+    Err(e) if e.is_fenced() =&gt; {
+        info!(database = %url, "coordinator fenced; retrying after one heartbeat interval");
+        <b>backoff = Duration::from_secs(1);</b>
+        <b>heartbeat_interval</b>
+    }
+    Err(e) =&gt; {
+        warn!(database = %url, service = service.as_str(), "task failed: {e}");
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+        backoff
+    }
+};</pre>
+      <p class="caption">../sleet/src/daemon.rs:458&ndash;472</p>
+
+      <p>
+        Three details, all of them deliberate. A fence <b>resets</b> the exponential backoff to
+        1s rather than advancing the ladder &mdash; a fence is treated as view skew, not as a
+        failure, and without the reset a merely-converging node backs off to minutes and looks
+        dead. The wait is exactly one <code>heartbeat_interval</code>, sized to let the rival
+        refresh its view and stand down; it is not a politeness delay. And the retry is
+        <b>unconditional</b>: it does not re-check ownership. Rerun, and let the outer loop cancel
+        you if you were wrong. Sleet accepts that a fenced node will re-fence the winner once more
+        before converging.
+      </p>
+
+      <h3>Double-running is permitted by design, and asserted by the model</h3>
+
+      <div class="doctrine">
+        <p>
+          Sleet does not add a lock service. SlateDB's manifest CAS, epochs, and compaction job
+          claims remain the mutual exclusion mechanisms.
+        </p>
+        <p>Sleet treats placement as an efficiency decision. Safety belongs to SlateDB.</p>
+        <span class="attr">../sleet/rfcs/0001-design.md:35&ndash;37, :251&ndash;260</span>
+      </div>
+
+      <p>
+        The model checker does not try to rule the double-run out. It <em>asserts that it is
+        reachable</em>:
+      </p>
+
+      <pre class="listing"># The design's stated worst case, a transient double-run, is
+# reachable in the model.
+exists assertion <b>DoubleRunReachable</b>:
+    return len([db for db in DBS if len(runners[db]) &gt; 1]) &gt; 0</pre>
+      <p class="caption">../sleet/specs/coordination.fizz:167&ndash;175</p>
+
+      <p>
+        Paired with it is a <code>Converged</code> liveness property &mdash; an
+        <em>eventually always</em> requiring the expected single runner and no outstanding fences
+        after churn stops &mdash; whose stated purpose is to catch fence livelock, because a
+        livelock would flap runners and fences forever and violate eventually-always. Sleet does
+        not claim the duel cannot happen. It claims the duel is bounded, and it proves the bound:
+        <code>config_poll</code> plus one heartbeat tick, with "the cost is a short compaction
+        stall."
+      </p>
+
+      <p>
+        Sleet even counts itself live when its own heartbeat looks stale
+        (<code>../sleet/src/daemon.rs:124&ndash;130</code>), deliberately choosing overlap over
+        gaps: peers that consider it dead take over in parallel, which is a safe double-run,
+        whereas excluding itself would leave the share unowned.
+      </p>
+
+      <h3>Where we deviate, in both directions</h3>
+
+      <div class="tablewrap wide">
+        <table class="wide-tbl">
+          <thead>
+            <tr><th></th><th>sleet</th><th>this design</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="strong">Placement</td>
+              <td class="note">rendezvous, recomputed each tick</td>
+              <td class="note">same, <code>crates/placement</code></td>
+            </tr>
+            <tr>
+              <td class="strong">Ownership stored?</td>
+              <td class="note">no</td>
+              <td class="note">advisory record only &mdash; see section G</td>
+            </tr>
+            <tr>
+              <td class="strong">Ownership checked where</td>
+              <td class="note">once, at task spawn, in the supervisor</td>
+              <td class="note"><b>every promotion</b> &mdash; stricter than sleet</td>
+            </tr>
+            <tr>
+              <td class="strong">On a fence</td>
+              <td class="note">reset backoff to 1s, wait one interval, retry unconditionally</td>
+              <td class="note">match exactly, touch point (d), <code>src/core/state.rs:235&ndash;246</code></td>
+            </tr>
+            <tr>
+              <td class="strong">Mutual exclusion</td>
+              <td class="note">delegated to SlateDB epochs; duel bounded, not prevented</td>
+              <td class="note">same</td>
+            </tr>
+            <tr>
+              <td class="strong">On a failed LIST of the node directory</td>
+              <td class="note">keep current assignments (<code>daemon.rs:243</code>)</td>
+              <td class="note"><b>must differ</b> &mdash; proposal is to shed ownership</td>
+            </tr>
+            <tr>
+              <td class="strong">Verified by</td>
+              <td class="note">Fizz model, <code>Converged</code> liveness property</td>
+              <td class="note">an integration test: 3 nodes, 1 cell, concurrent writes, exactly one epoch bump</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        <b>Stricter than sleet, in one place.</b> Sleet checks ownership once at task spawn and
+        never again, so a task keeps running through an ownership change until the next reconcile
+        tick. Touch point (b) checks on every promotion. That is a better guarantee and costs
+        nothing, because the live set is already in memory.
+      </p>
+
+      <p>
+        <b>And one place we must not copy sleet.</b> On a failed LIST of the node directory sleet
+        keeps its current assignments. For a compaction coordinator that is a safe double-run. For
+        a <em>writer</em> it is an unbounded duel by construction: a node partitioned from the
+        object store can never learn that it lost ownership, so it re-promotes forever against a
+        node that thinks it won. Shedding on the <em>first</em> failed LIST is the opposite
+        extreme and drops a healthy writer on one throttled request. The rule is <b>bounded</b>:
+        keep the last good view while it is younger than <code>heartbeat_timeout</code>, then go
+        unready, DELETE the heartbeat, and refuse promotion with no owner hint.
+      </p>
+
+      <p>
+        The grace is <code>heartbeat_timeout</code> rather than a new knob because peers take over
+        that long after the last successful PUT, and in a partition LIST and PUT fail together. A
+        shorter grace leaves a window where nobody owns the cell; a longer one leaves a duel; equal
+        makes the two coincide. The part that is easy to miss is that <b>shedding has to withdraw
+        the heartbeat</b>. In a partial failure &mdash; LIST throttled, PUTs still landing &mdash;
+        a node that sheds while still publishing stays the computed owner for everyone else, so
+        peers route writes to it and it refuses every one, permanently, with nothing left to time
+        out. Withdrawing makes peers take over, and it falls out of the readiness gating for free:
+        a node that cannot read the live set is not ready. Worst case for the cell is the 15s grace
+        plus peer detection &mdash; immediate if the DELETE lands, another 15s if the store is
+        fully unreachable. Thirty seconds, against sleet's forever.
+      </p>
+    </section>
+
+    <section id="lease">
+      <p class="eyebrow">G &mdash; the lease</p>
+      <h2>An authoritative lease is not implementable, so the record is advisory</h2>
+
+      <p>
+        The obvious instinct is a CAS-held lease object naming the writer. The obstacle is not
+        philosophical &mdash; not "two authorities" &mdash; it is that the primitive does not
+        exist. Three things confirmed against the tree:
+      </p>
+
+      <div class="keeps wide">
+        <div class="keep">
+          <span class="kk">readable</span>
+          <span class="kv"><code>VersionedManifest::writer_epoch()</code> is public via <code>DbStatus.current_manifest</code>. It is already a CAS-backed, monotonic, observable lease.</span>
+        </div>
+        <div class="keep" data-v="open">
+          <span class="kk">no identity</span>
+          <span class="kv">The manifest records "epoch 18". It never records "graph-node-1 holds epoch 18". You can detect <em>that</em> you were fenced; never <em>by whom</em>. That missing identity is the entire gap a lease object would fill.</span>
+        </div>
+        <div class="keep" data-v="open">
+          <span class="kk">no hook</span>
+          <span class="kv">There is no fence-before-open hook. <code>Db::builder</code> has no <code>expected_epoch</code> and no <code>skip_fence</code>; <code>build()</code> unconditionally claims a new epoch. Verified absent from <b>both</b> the usecortex fork and upstream slatedb 0.14.1.</span>
+        </div>
+      </div>
+
+      <p>
+        The third point is decisive. A lease object cannot <em>prevent</em> anything, because
+        SlateDB never consults it. It can only stop a node that already chose to check. That is
+        advisory, whatever we call it.
+      </p>
+
+      <h3>What is being built instead</h3>
+
+      <p>
+        After a successful promotion, and only then:
+      </p>
+
+      <pre class="listing">PUT &lt;base&gt;/_cell_writers/v1/&lt;cell_id&gt;
+    {"node_id":"graph-node-1","epoch":18,"at":"2026-07-25T14:32:07Z"}</pre>
+
+      <p>
+        Read on exactly two paths, both off the write path: when logging a
+        <code>CloseReason::Fenced</code>, and when building the
+        <code>NotCellWriter { owner }</code> hint. <b>Never consulted to decide whether to
+        promote</b> &mdash; that is rendezvous' job, and consulting it would be a read-then-act
+        race that adds a GET to the write path and looks like it works.
+      </p>
+
+      <p>
+        What it buys is the diagnostic half of the incident. The same production trace becomes:
+      </p>
+
+      <pre class="listing">node-0  WARN  fenced at epoch 17; current lease: <b>graph-node-1 @ 18</b>
+node-1  WARN  fenced at epoch 18; current lease: <b>graph-node-2 @ 19</b></pre>
+
+      <p>
+        Nothing is prevented. But the ping-pong is visible in one line instead of inferred across
+        three logs, the <code>NotALeader</code> hint carries an observed owner rather than a
+        computed guess, and after the fact you can answer "who actually had it at 14:32" from
+        object storage.
+      </p>
+
+      <div class="doctrine">
+        <p>
+          The SlateDB writer epoch remains the only authority. The record can be stale &mdash; a
+          node can be fenced a millisecond after writing it. It answers "who last successfully
+          promoted", not "who holds the writer right now". If it ever disagrees with the manifest,
+          the manifest is right.
+        </p>
+        <span class="attr">Q1, finalised &mdash; docs/plans/2026-07-25-rendezvous-placement-open-questions.md:493&ndash;498</span>
+      </div>
+
+      <p>
+        The genuinely authoritative option &mdash; adding an <code>expected_writer_epoch</code>
+        compare-and-set to <code>Db::builder</code> so that <code>build()</code> fails instead of
+        fencing &mdash; was scoped and then dropped. It is buildable, since the dependency is our
+        fork. But sleet demonstrates the bound is achievable without it, our check is stricter
+        than sleet's, and it would gate a production fix on a dependency change that alters the
+        fencing contract <code>architecture.md</code> rests on. The prod incident's actual pain
+        was diagnostic, not a correctness failure; the advisory record fixes precisely that and
+        nothing else claims to.
+      </p>
+    </section>
+
+    <section id="status">
+      <p class="eyebrow">H &mdash; state of play</p>
+      <h2>What is decided, what has landed, what is still open</h2>
+
+      <h3>Landed</h3>
+
+      <div class="keeps wide">
+        <div class="keep">
+          <span class="kk">crate</span>
+          <span class="kv"><code>crates/placement</code>, package <code>turbolay-placement</code>, <code>publish = false</code>. No dependencies; the frozen hash is pure functions over <code>&amp;str</code>. No dependency on <code>slatedb-graph-kernel</code> either &mdash; placement must not know about graphs, shards or queries.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">hash</span>
+          <span class="kv"><code>hash.rs</code> with <code>score</code> / <code>rank</code> / <code>owner</code> and seven tests, including the pinned golden values and the minimal-disruption property.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">workspace</span>
+          <span class="kv">The root stays the <code>slatedb-graph-kernel</code> package and merely gains a <code>[workspace]</code> table &mdash; a virtual manifest would break every bare <code>cargo test --features ...</code> in CI, a root-package workspace does not. CI needed additions, not edits.</span>
+        </div>
+      </div>
+
+      <h3>Decided</h3>
+
+      <div class="keeps wide">
+        <div class="keep">
+          <span class="kk">Q1 lease</span>
+          <span class="kv"><b>Advisory record only.</b> <code>_cell_writers/v1/&lt;cell_id&gt;</code>, written after a successful promotion, read only for logging and the owner hint. CAS-on-open dropped.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">Q3 timings</span>
+          <span class="kv"><b>heartbeat_interval 5s, heartbeat_timeout 15s.</b> Config, with startup validation that <code>interval &lt; timeout</code>. The fence backoff in touch point (d) is one interval, so 5s.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">Q2 readyz</span>
+          <span class="kv"><b>Delete the client-side fan-out.</b> <code>reachable_nodes</code>, <code>probe_node_readiness</code>, <code>replace_address_port</code> and the <code>reachable.first()</code> writer fallback all go &mdash; replaced by one LIST, with heartbeat publication gated on <code>AdminState.ready</code>. Deletion and gating are one change, not two. The <code>/readyz</code> endpoint itself (<code>graph_node/admin.rs:48</code>) and its k8s, smoke-test and Jepsen consumers are untouched; none of them touch routing.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">rule</span>
+          <span class="kv">A node must not promote itself for a cell it does not own, unless the computed owner is not live. <code>None</code> from <code>owner()</code> means placement has no opinion, and promotion proceeds.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">fence</span>
+          <span class="kv">Match sleet's handler exactly (<code>daemon.rs:458-472</code>): <b>reset backoff to 1s</b> because a fence is view skew rather than a failure, wait exactly one <code>heartbeat_interval</code> sized to let the rival stand down, and retry <b>unconditionally</b> without re-checking ownership.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">LIST failure</span>
+          <span class="kv"><b>Bounded, then shed.</b> Keep the last good view while it is younger than <code>heartbeat_timeout</code>, then go unready, DELETE the heartbeat and refuse promotion. The grace equals the timeout because peers take over that long after the last successful PUT &mdash; shorter leaves a window with no owner, longer leaves a duel, equal makes them coincide. Withdrawing the heartbeat is what closes the partial-failure case where LIST is throttled but PUTs still land. Worst case for the cell is 30s, against sleet's unbounded.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">Q4 scope</span>
+          <span class="kv"><b>All of Phase 1, one release</b>, as seven staged commits: crate &rarr; publisher &rarr; (a) routing &rarr; (b)+(c) refusal and mapping &rarr; (d) fence backoff &rarr; 3a record &rarr; regression test. The publisher splits out of (e) and lands <em>before</em> (a), because (a) deletes the probe and cannot function until heartbeats exist. Commits 3 and 4 must not be separated.</span>
+        </div>
+        <div class="keep">
+          <span class="kk">rolling restart</span>
+          <span class="kv"><code>directory.rs</code> distinguishes <b>never-published</b> from <b>expired</b>: for the first <code>heartbeat_timeout</code> after start, a configured peer with no heartbeat object counts as live. Only expiry is evidence of death. Without this, the first pod replaced in a rolling restart LISTs, sees only itself, and concludes it owns every cell.</span>
+        </div>
+      </div>
+
+      <h3>Open</h3>
+
+      <div class="openq wide">
+        <div class="q">
+          <span class="qh">Does <code>with_preferred_writer_node</code> survive?  <span class="chip high">open</span></span>
+          <p>
+            The recommendation reversed on reading the code. It has <b>no production caller at
+            all</b>: <code>graph-node.rs:115-116</code> builds the provider and never calls it, so
+            the field is always its default &mdash; the lexicographically first key of a
+            <code>BTreeMap</code> (<code>routing.rs:76-80</code>). Its only caller in the tree is
+            <code>bolt/tests.rs:1373</code>. Both arguments for keeping it were also wrong:
+            single-node deploys have nothing to override, since rendezvous over one live node has
+            exactly one answer; and a test should <em>compute</em> the owner rather than pin it,
+            which is what the heartbeat widget above already does.
+          </p>
+          <p>
+            Worse, keeping it becomes unsafe the moment (b) enforces ownership. Routing would
+            advertise the override while <code>ensure_local_writer</code> enforces rendezvous, so a
+            driver sent to the override is refused, re-routes to the rendezvous owner, and is sent
+            back by the next <code>ROUTE</code> refresh &mdash; a loop no timeout breaks, from a
+            misconfiguration that validates cleanly. Today the same field is harmless only because
+            nothing enforces ownership. Recommendation is to <b>delete it</b>; if a pin is ever
+            wanted it belongs inside <code>owner()</code> so both sides read one source.
+          </p>
+        </div>
+        <div class="q">
+          <span class="qh">Rebalance dampening, cell splitting, multi-cell atomicity</span>
+          <p>
+            All explicitly out of scope, all still real. Rendezvous moves ownership the instant the
+            live set changes; if flapping hurts, a minimum-tenure rule is the answer, not a longer
+            timeout. Cells come from <code>GRAPH_CELLS</code> and are static, so routing a hot cell
+            correctly to one writer is exactly what makes it a bottleneck. And Phase 2 &mdash;
+            letting a write name its cell on the wire &mdash; is the change that makes multi-cell
+            atomicity urgent rather than theoretical.
+          </p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="handoff">
+    <p class="eyebrow">summary</p>
+    <h2>Three moving parts, and one claim that has to stay honest</h2>
+    <p>
+      A frozen hash gives every node the same answer to "who owns this cell", computed from an
+      object-store LIST and nothing else. One branch in <code>ensure_local_writer</code> makes
+      that answer binding, and a Bolt error code lets the driver act on the refusal. Heartbeats
+      replace a per-request probe fan-out with a single consistent liveness view, at the price of
+      a 15-second write stall on a hard crash of the owning node.
+    </p>
+    <p>
+      None of it prevents two nodes from briefly believing they both own a cell. SlateDB's writer
+      epoch remains the only mutual-exclusion mechanism, exactly as
+      <code>architecture.md</code> requires. What changes is that the disagreement now has a
+      deadline: it lasts as long as two views of the live set differ, and no longer.
+      <b>Unbounded becomes fifteen seconds.</b> That is the whole trade, and it is worth making.
+    </p>
+  </footer>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ------------------------------------------------------------------ theme */
+
+  var root = document.documentElement;
+  var themeBtn = document.querySelector(".themetoggle");
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+
+  function currentTheme() {
+    return root.getAttribute("data-theme") || (media.matches ? "dark" : "light");
+  }
+
+  function labelTheme() {
+    var next = currentTheme() === "dark" ? "Light" : "Dark";
+    themeBtn.textContent = next;
+    themeBtn.setAttribute("aria-label", "Switch to " + next.toLowerCase() + " theme");
+  }
+
+  themeBtn.addEventListener("click", function () {
+    var next = currentTheme() === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("turbolay-theme", next); } catch (e) {}
+    labelTheme();
+  });
+
+  media.addEventListener("change", labelTheme);
+  labelTheme();
+
+  /* ------------------------------------------------------- shared utilities */
+
+  var SVGNS = "http://www.w3.org/2000/svg";
+
+  function s(name, attrs) {
+    var e = document.createElementNS(SVGNS, name);
+    if (attrs) for (var k in attrs) if (attrs[k] !== null && attrs[k] !== undefined) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+
+  function stext(x, y, str, cls, anchor) {
+    var e = s("text", { x: x, y: y, "text-anchor": anchor || "start" });
+    if (cls) e.setAttribute("class", cls);
+    e.textContent = str;
+    return e;
+  }
+
+  function h(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+
+  function button(label, cls) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn" + (cls ? " " + cls : "");
+    b.textContent = label;
+    return b;
+  }
+
+  function svgRoot(viewBox, label) {
+    var e = s("svg", { viewBox: viewBox, class: "wsvg", role: "img" });
+    e.setAttribute("aria-label", label);
+    return e;
+  }
+
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  function stat(key, tone) {
+    var d = h("div", "stat");
+    if (tone) d.setAttribute("data-tone", tone);
+    d.appendChild(h("span", "sk", key));
+    var v = h("span", "sv", "—");
+    d.appendChild(v);
+    d.valueNode = v;
+    return d;
+  }
+
+  function activate(id, staticSel, liveSel) {
+    var wrap = document.getElementById(id);
+    if (!wrap) return null;
+    var st = wrap.querySelector(staticSel);
+    var live = wrap.querySelector(liveSel);
+    if (!st || !live) return null;
+    st.hidden = true;
+    live.hidden = false;
+    return live;
+  }
+
+  /* ------------------------------------------------------ the frozen hash */
+  /* FNV-1a 64 over scope ++ 0x00 ++ cell_id ++ 0x00 ++ node_id.
+     Mirrors crates/placement/src/hash.rs exactly, in BigInt. */
+
+  var MASK64 = 0xFFFFFFFFFFFFFFFFn;
+  var FNV_OFFSET = 0xcbf29ce484222325n;
+  var FNV_PRIME = 0x100000001b3n;
+  var encoder = new TextEncoder();
+  var NUL = "\u0000";   /* the 0x00 separator, frozen with the hash */
+
+  function fnv1a64(str) {
+    var hsh = FNV_OFFSET;
+    var bytes = encoder.encode(str);
+    for (var i = 0; i < bytes.length; i++) {
+      hsh ^= BigInt(bytes[i]);
+      hsh = (hsh * FNV_PRIME) & MASK64;
+    }
+    return hsh;
+  }
+
+  function score(scope, cellId, nodeId) {
+    return fnv1a64(scope + NUL + cellId + NUL + nodeId);
+  }
+
+  function rank(scope, cellId, live) {
+    return live.slice().sort(function (a, b) {
+      var sa = score(scope, cellId, a);
+      var sb = score(scope, cellId, b);
+      if (sa < sb) return 1;
+      if (sa > sb) return -1;
+      return a < b ? -1 : (a > b ? 1 : 0);
+    });
+  }
+
+  function owner(scope, cellId, live) {
+    var r = rank(scope, cellId, live);
+    return r.length ? r[0] : null;
+  }
+
+  function hex64(v) {
+    return "0x" + v.toString(16).padStart(16, "0");
+  }
+
+  /* ==================================================================== W1
+     The duel simulator. Three nodes, one cell, one epoch counter.
+     Rendezvous OFF reproduces the production incident; ON stops it. */
+
+  (function w1() {
+    var mount = activate("w1", ".w1-static", ".w1-live");
+    if (!mount) return;
+
+    var SCOPE = "acme/graphs/social";
+    var CELL = "cell-b";
+    var NODES = ["graph-node-0", "graph-node-1", "graph-node-2"];
+
+    var st = {
+      rendezvous: false,
+      epoch: 16,
+      holder: null,
+      fenced: {},
+      clock: 0,
+      bumps: 0,
+      fences: 0,
+      commits: 0,
+      declines: 0,
+      timer: null
+    };
+
+    NODES.forEach(function (n) { st.fenced[n] = false; });
+
+    function liveOwner() { return owner(SCOPE, CELL, NODES); }
+
+    /* -- controls -- */
+
+    var bar1 = h("div", "ctlbar");
+    var sw = document.createElement("button");
+    sw.type = "button";
+    sw.className = "switch";
+    sw.setAttribute("aria-pressed", "false");
+    var dot = h("span", "dot");
+    var swLabel = h("span", null, "rendezvous OFF");
+    sw.appendChild(dot);
+    sw.appendChild(swLabel);
+    sw.addEventListener("click", function () {
+      st.rendezvous = !st.rendezvous;
+      sw.setAttribute("aria-pressed", st.rendezvous ? "true" : "false");
+      swLabel.textContent = "rendezvous " + (st.rendezvous ? "ON" : "OFF");
+      reset(true);
+      log("l-head", st.rendezvous
+        ? "rendezvous ON  -- owner(" + SCOPE + ", " + CELL + ") = " + liveOwner()
+        : "rendezvous OFF -- no node has an opinion about who should write");
+    });
+    bar1.appendChild(sw);
+
+    var ownerNote = h("span", "ctl-label", "");
+    bar1.appendChild(ownerNote);
+    mount.appendChild(bar1);
+
+    var bar2 = h("div", "ctlbar");
+    NODES.forEach(function (n, i) {
+      var b = button("write → node-" + i);
+      b.addEventListener("click", function () { sendWrite(n); });
+      bar2.appendChild(b);
+    });
+
+    var randomBtn = button("random traffic", "");
+    randomBtn.setAttribute("aria-pressed", "false");
+    randomBtn.addEventListener("click", function () {
+      if (st.timer) { stopTraffic(); return; }
+      randomBtn.setAttribute("aria-pressed", "true");
+      randomBtn.textContent = "stop traffic";
+      st.timer = setInterval(function () {
+        sendWrite(NODES[Math.floor(Math.random() * NODES.length)]);
+      }, 750);
+    });
+    bar2.appendChild(randomBtn);
+
+    var resetBtn = button("reset", "danger");
+    resetBtn.addEventListener("click", function () { reset(false); });
+    bar2.appendChild(resetBtn);
+    mount.appendChild(bar2);
+
+    function stopTraffic() {
+      if (st.timer) clearInterval(st.timer);
+      st.timer = null;
+      randomBtn.setAttribute("aria-pressed", "false");
+      randomBtn.textContent = "random traffic";
+    }
+
+    /* -- figure -- */
+
+    var svg = svgRoot("0 0 700 250", "Three graph nodes contending for one cell's SlateDB writer epoch");
+    mount.appendChild(svg);
+
+    /* -- stats -- */
+
+    var stats = h("div", "stats");
+    var sBumps = stat("epoch bumps", "crit");
+    var sFences = stat("fenced events", "crit");
+    var sCommits = stat("commits", "ok");
+    var sDeclines = stat("NotCellWriter", "accent");
+    var sEpoch = stat("writer_epoch", "accent");
+    [sBumps, sFences, sCommits, sDeclines, sEpoch].forEach(function (x) { stats.appendChild(x); });
+    mount.appendChild(stats);
+
+    /* -- log -- */
+
+    var logPane = h("div", "logpane");
+    logPane.setAttribute("role", "log");
+    logPane.setAttribute("aria-live", "polite");
+    mount.appendChild(logPane);
+
+    function log(cls, line) {
+      var row = h("div", cls, line);
+      logPane.appendChild(row);
+      logPane.scrollTop = logPane.scrollHeight;
+      while (logPane.childNodes.length > 220) logPane.removeChild(logPane.firstChild);
+    }
+
+    function tstamp() {
+      st.clock += 0.09 + Math.random() * 0.32;
+      return "t=" + st.clock.toFixed(2);
+    }
+
+    function pad(str, n) {
+      var out = String(str);
+      while (out.length < n) out += " ";
+      return out;
+    }
+
+    /* -- the model -- */
+
+    function sendWrite(node) {
+      var t = tstamp();
+      if (!st.rendezvous) {
+        promote(t, node, "");
+        return;
+      }
+      var own = liveOwner();
+      if (node === own) {
+        promote(t, node, "");
+        return;
+      }
+      st.declines++;
+      log("l-route", t + "  client -> " + pad(node, 13) + "write   " +
+        "declines: NotCellWriter { cell: " + CELL + ", owner: " + own + " }");
+      log("l-dim", "        driver: Neo.ClientError.Cluster.NotALeader -> discard routing table, re-route");
+      var t2 = tstamp();
+      promote(t2, own, "  (after re-route)");
+      render();
+    }
+
+    function promote(t, node, suffix) {
+      if (st.holder === node) {
+        st.commits++;
+        log("l-ok", t + "  client -> " + pad(node, 13) + "write   commits at epoch " + st.epoch +
+          " (already the writer, no open)" + suffix);
+        render();
+        return;
+      }
+      var previous = st.holder;
+      st.epoch++;
+      st.bumps++;
+      st.commits++;
+      st.holder = node;
+      NODES.forEach(function (n) { st.fenced[n] = false; });
+      log("l-warn", t + "  client -> " + pad(node, 13) + "write   opens Db, claims epoch " + st.epoch + suffix);
+      if (previous) {
+        st.fenced[previous] = true;
+        st.fences++;
+        log("l-fence", "        " + pad(previous, 13) + "ERROR   next write -> Fenced");
+        if (!st.rendezvous) {
+          log("l-dim", "        (the log does not say by whom -- there is no identity in the manifest)");
+        }
+      }
+      render();
+    }
+
+    function reset(keepMode) {
+      stopTraffic();
+      st.epoch = 16;
+      st.holder = null;
+      st.clock = 0;
+      st.bumps = 0;
+      st.fences = 0;
+      st.commits = 0;
+      st.declines = 0;
+      NODES.forEach(function (n) { st.fenced[n] = false; });
+      clear(logPane);
+      if (!keepMode) {
+        st.rendezvous = false;
+        sw.setAttribute("aria-pressed", "false");
+        swLabel.textContent = "rendezvous OFF";
+      }
+      render();
+    }
+
+    /* -- render -- */
+
+    function render() {
+      var own = st.rendezvous ? liveOwner() : null;
+      ownerNote.textContent = st.rendezvous
+        ? "owner(" + SCOPE + ", " + CELL + ") = " + own
+        : "nothing decides which node should be the writer";
+
+      sBumps.valueNode.textContent = st.bumps;
+      sFences.valueNode.textContent = st.fences;
+      sCommits.valueNode.textContent = st.commits;
+      sDeclines.valueNode.textContent = st.declines;
+      sEpoch.valueNode.textContent = st.epoch;
+
+      clear(svg);
+      var boxW = 200, boxH = 82, gap = 30, x0 = 20;
+
+      NODES.forEach(function (n, i) {
+        var x = x0 + i * (boxW + gap);
+        var isHolder = st.holder === n;
+        var isFenced = st.fenced[n];
+        var isOwner = own === n;
+        var cls = "box";
+        if (isFenced) cls = "box crit";
+        else if (isHolder) cls = "box ok";
+        else if (isOwner) cls = "box accent";
+        else if (st.rendezvous) cls = "box dim";
+        svg.appendChild(s("rect", { x: x, y: 18, width: boxW, height: boxH, rx: 3, class: cls }));
+        svg.appendChild(stext(x + 14, 40, n, "t-strong"));
+
+        var role;
+        if (!st.rendezvous) role = "promotes on demand";
+        else if (isOwner) role = "OWNER — may promote";
+        else role = "not owner — declines";
+        svg.appendChild(stext(x + 14, 58, role, isOwner ? "t-accent" : "t-dim"));
+
+        var state;
+        var scls = "t-dim";
+        if (isFenced) { state = "fenced"; scls = "t-crit"; }
+        else if (isHolder) { state = "holds epoch " + st.epoch; scls = "t-ok"; }
+        else { state = "idle"; }
+        svg.appendChild(stext(x + 14, 76, state, scls));
+
+        var wireCls = "wire faint";
+        if (isFenced) wireCls = "wire crit dash";
+        else if (isHolder) wireCls = "wire ok";
+        svg.appendChild(s("path", {
+          d: "M" + (x + boxW / 2) + " 100 L350 160",
+          class: wireCls
+        }));
+      });
+
+      svg.appendChild(s("rect", { x: 240, y: 160, width: 220, height: 72, rx: 3, class: "box" }));
+      svg.appendChild(stext(254, 182, CELL + " — one SlateDB database", "t-strong"));
+      svg.appendChild(stext(254, 200, "writer_epoch " + st.epoch, st.bumps > 3 && !st.rendezvous ? "t-crit" : "t-accent"));
+      svg.appendChild(stext(254, 220, "manifest CAS admits exactly one writer", "t-dim"));
+
+      svg.appendChild(stext(480, 182,
+        st.rendezvous ? "bumps: " + st.bumps + " (bounded)" : "bumps: " + st.bumps + " (unbounded)",
+        st.rendezvous ? "t-ok" : "t-crit"));
+      svg.appendChild(stext(480, 200, "fences: " + st.fences, st.fences ? "t-crit" : "t-dim"));
+    }
+
+    reset(false);
+    log("l-head", "rendezvous OFF -- reproducing the production incident");
+    log("l-dim", "press a write button, or 'random traffic', and watch the epoch climb");
+  })();
+
+  /* ==================================================================== W2
+     Rendezvous explorer. Real FNV-1a 64 in BigInt over editable inputs. */
+
+  (function w2() {
+    var mount = activate("w2", ".w2-static", ".w2-live");
+    if (!mount) return;
+
+    var ALL = ["graph-node-0", "graph-node-1", "graph-node-2", "graph-node-3", "graph-node-4", "graph-node-5"];
+    var st = { scope: "acme/graphs/social", cell: "cell-b", dead: {} };
+    ALL.forEach(function (n) { st.dead[n] = n === "graph-node-4" || n === "graph-node-5"; });
+
+    /* -- inputs -- */
+
+    var bar1 = h("div", "ctlbar");
+    bar1.appendChild(h("span", "ctl-label", "scope"));
+    var scopeIn = document.createElement("input");
+    scopeIn.type = "text";
+    scopeIn.className = "field";
+    scopeIn.size = 24;
+    scopeIn.value = st.scope;
+    scopeIn.setAttribute("aria-label", "GraphScope Display string");
+    scopeIn.addEventListener("input", function () { st.scope = scopeIn.value; render(); });
+    bar1.appendChild(scopeIn);
+
+    bar1.appendChild(h("span", "ctl-label", "cell"));
+    var cellIn = document.createElement("input");
+    cellIn.type = "text";
+    cellIn.className = "field";
+    cellIn.size = 10;
+    cellIn.value = st.cell;
+    cellIn.setAttribute("aria-label", "cell id");
+    cellIn.addEventListener("input", function () { st.cell = cellIn.value; render(); });
+    bar1.appendChild(cellIn);
+
+    var goldBtn = button("verify golden values");
+    goldBtn.setAttribute("aria-pressed", "false");
+    goldBtn.setAttribute("aria-expanded", "false");
+    bar1.appendChild(goldBtn);
+    mount.appendChild(bar1);
+
+    var bar2 = h("div", "ctlbar");
+    bar2.appendChild(h("span", "ctl-label", "live set"));
+    var chips = h("div", "chips");
+    ALL.forEach(function (n) {
+      var c = document.createElement("button");
+      c.type = "button";
+      c.className = "nodechip";
+      c.textContent = n;
+      c.setAttribute("aria-pressed", st.dead[n] ? "false" : "true");
+      c.addEventListener("click", function () {
+        st.dead[n] = !st.dead[n];
+        c.setAttribute("aria-pressed", st.dead[n] ? "false" : "true");
+        render(n);
+      });
+      chips.appendChild(c);
+    });
+    bar2.appendChild(chips);
+    mount.appendChild(bar2);
+
+    /* -- table + bars -- */
+
+    var tblWrap = h("div", "tablewrap");
+    tblWrap.style.margin = "0";
+    var tbl = document.createElement("table");
+    tbl.className = "scoretbl";
+    var thead = document.createElement("thead");
+    var hr = document.createElement("tr");
+    ["rank", "node", "score (FNV-1a 64)", "relative magnitude", "verdict"].forEach(function (k) {
+      var th = document.createElement("th");
+      th.textContent = k;
+      hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+    tbl.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    tbl.appendChild(tbody);
+    tblWrap.appendChild(tbl);
+    mount.appendChild(tblWrap);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    /* -- golden panel -- */
+
+    var gold = h("div", "goldpane");
+    gold.hidden = true;
+    mount.appendChild(gold);
+
+    var GOLDEN = [
+      ["acme/graphs/social", "cell-a", "graph-node-0", "0xf0dc2317deb297c5"],
+      ["acme/graphs/social", "cell-a", "graph-node-1", "0xf0dc2217deb29612"],
+      ["acme/graphs/social", "cell-b", "graph-node-0", "0x39ffe3dd3cc79ffe"],
+      ["acme/graphs/other", "cell-a", "graph-node-0", "0xc15e57802a479f04"]
+    ];
+
+    goldBtn.addEventListener("click", function () {
+      gold.hidden = !gold.hidden;
+      goldBtn.setAttribute("aria-pressed", gold.hidden ? "false" : "true");
+      goldBtn.setAttribute("aria-expanded", gold.hidden ? "false" : "true");
+      if (!gold.hidden) renderGold();
+    });
+
+    function renderGold() {
+      clear(gold);
+      var w = h("div", "tablewrap");
+      w.style.margin = "0";
+      var t = document.createElement("table");
+      t.className = "scoretbl";
+      var th = document.createElement("thead");
+      var r = document.createElement("tr");
+      ["scope", "cell", "node", "hash.rs pins", "computed here", ""].forEach(function (k) {
+        var c = document.createElement("th");
+        c.textContent = k;
+        r.appendChild(c);
+      });
+      th.appendChild(r);
+      t.appendChild(th);
+      var b = document.createElement("tbody");
+      var allMatch = true;
+      GOLDEN.forEach(function (g) {
+        var got = hex64(score(g[0], g[1], g[2]));
+        var ok = got === g[3];
+        if (!ok) allMatch = false;
+        var tr = document.createElement("tr");
+        if (ok) tr.className = "win";
+        [g[0], g[1], g[2], g[3], got, ok ? "MATCH" : "DIVERGED"].forEach(function (v) {
+          var td = document.createElement("td");
+          td.textContent = v;
+          tr.appendChild(td);
+        });
+        b.appendChild(tr);
+      });
+      t.appendChild(b);
+      w.appendChild(t);
+      gold.appendChild(w);
+      var cap = h("div", "readout");
+      cap.innerHTML = allMatch
+        ? "<b class='good'>All four pinned values reproduce.</b> These are the same constants asserted by <b>scores_are_frozen</b> in crates/placement/src/hash.rs:82-99. This page and the Rust test agree byte for byte, which is the property that keeps a mixed-version fleet from splitting into two views of who owns a cell."
+        : "<b class='bad'>Divergence.</b> The page and the pinned test values disagree, which is exactly the failure the frozen wire format exists to prevent.";
+      gold.appendChild(cap);
+    }
+
+    /* -- render -- */
+
+    var TWO64 = Math.pow(2, 64);
+
+    function magnitude(v) {
+      return Number(v) / TWO64;
+    }
+
+    function render(justToggled) {
+      var live = ALL.filter(function (n) { return !st.dead[n]; });
+      var fullRank = rank(st.scope, st.cell, ALL);
+      var liveRank = rank(st.scope, st.cell, live);
+      var win = liveRank.length ? liveRank[0] : null;
+
+      clear(tbody);
+      fullRank.forEach(function (n, i) {
+        var tr = document.createElement("tr");
+        var isDead = st.dead[n];
+        if (isDead) tr.className = "dead";
+        else if (n === win) tr.className = "win";
+
+        var pos = liveRank.indexOf(n);
+        var cells = [
+          isDead ? "—" : String(pos + 1),
+          n,
+          hex64(score(st.scope, st.cell, n))
+        ];
+        cells.forEach(function (v) {
+          var td = document.createElement("td");
+          td.textContent = v;
+          tr.appendChild(td);
+        });
+
+        var barTd = document.createElement("td");
+        barTd.className = "bar-td";
+        var bar = h("span", "bar");
+        bar.style.width = Math.max(2, magnitude(score(st.scope, st.cell, n)) * 100).toFixed(2) + "%";
+        barTd.appendChild(bar);
+        tr.appendChild(barTd);
+
+        var vt = document.createElement("td");
+        vt.textContent = isDead ? "not live" : (n === win ? "OWNER" : "declines writes");
+        tr.appendChild(vt);
+
+        tbody.appendChild(tr);
+      });
+
+      /* minimal disruption: the live ranking must be the full ranking with the
+         dead nodes deleted, and nothing else moved. */
+      var expected = fullRank.filter(function (n) { return !st.dead[n]; });
+      var preserved = expected.length === liveRank.length && expected.every(function (n, i) { return liveRank[i] === n; });
+
+      var deadList = ALL.filter(function (n) { return st.dead[n]; });
+      var msg = "";
+      if (!live.length) {
+        msg = "<b>owner() returns None.</b> Placement has no opinion — which the don't-promote rule reads as " +
+          "\"promote anyway\", not \"refuse everything\". Refusing every write when the live set is empty would " +
+          "trade a bounded stall for a total outage.";
+      } else {
+        msg = "<b>owner(" + escapeHtml(st.scope) + ", " + escapeHtml(st.cell) + ") = <span class='good'>" + win + "</span></b>";
+        msg += "<br>live: " + live.length + " of " + ALL.length + " nodes";
+        if (deadList.length) msg += " &middot; not live: " + deadList.join(", ");
+        msg += "<br><b>Minimal disruption:</b> the live ranking is the full ranking with the dead nodes deleted, " +
+          "and the survivors' relative order is <b class='" + (preserved ? "good'>unchanged" : "bad'>DISTURBED") + "</b>. " +
+          "One failure moves only that node's cells.";
+        if (justToggled) {
+          msg += "<br><span class='good'>" + justToggled + " toggled</span> — nothing else in the ranking moved.";
+        }
+      }
+      note.innerHTML = msg;
+
+      if (!gold.hidden) renderGold();
+    }
+
+    function escapeHtml(str) {
+      return String(str).replace(/[&<>"]/g, function (c) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+      });
+    }
+
+    render(null);
+  })();
+
+  /* ==================================================================== W3
+     Fan-out vs LIST. The quadratic term made visible. */
+
+  (function w3() {
+    var mount = activate("w3", ".w3-static", ".w3-live");
+    if (!mount) return;
+
+    var st = { nodes: 5, drivers: 6, interval: 5 };
+
+    var bar = h("div", "ctlbar");
+
+    function slider(labelText, min, max, val, unit, onInput) {
+      var wrap = h("span", "ctlbar");
+      wrap.style.margin = "0";
+      wrap.appendChild(h("span", "ctl-label", labelText));
+      var r = document.createElement("input");
+      r.type = "range";
+      r.min = min; r.max = max; r.value = val; r.step = 1;
+      r.setAttribute("aria-label", labelText);
+      var out = h("span", "ctl-label", val + unit);
+      out.style.minWidth = "3.6em";
+      r.addEventListener("input", function () {
+        out.textContent = r.value + unit;
+        onInput(parseInt(r.value, 10));
+      });
+      wrap.appendChild(r);
+      wrap.appendChild(out);
+      return wrap;
+    }
+
+    bar.appendChild(slider("graph nodes", 3, 20, st.nodes, "", function (v) { st.nodes = v; render(); }));
+    bar.appendChild(slider("drivers", 1, 50, st.drivers, "", function (v) { st.drivers = v; render(); }));
+    mount.appendChild(bar);
+
+    var svg = svgRoot("0 0 700 260", "Left: each driver's ROUTE request fans out to every node. Right: each driver's ROUTE costs one object-store LIST.");
+    mount.appendChild(svg);
+
+    var stats = h("div", "stats");
+    var sFan = stat("fan-out TCP conns / refresh", "crit");
+    var sList = stat("object-store LISTs / refresh", "ok");
+    var sPut = stat("heartbeat PUTs / minute", "accent");
+    var sRatio = stat("ratio", "crit");
+    [sFan, sList, sPut, sRatio].forEach(function (x) { stats.appendChild(x); });
+    mount.appendChild(stats);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    function render() {
+      var fan = st.nodes * st.drivers;
+      var lists = st.drivers;
+      var puts = Math.round(st.nodes * 60 / st.interval);
+
+      sFan.valueNode.textContent = fan.toLocaleString();
+      sList.valueNode.textContent = lists.toLocaleString();
+      sPut.valueNode.textContent = puts.toLocaleString();
+      sRatio.valueNode.textContent = st.nodes + "×";
+
+      clear(svg);
+
+      var shownDrivers = Math.min(st.drivers, 6);
+      var shownNodes = Math.min(st.nodes, 8);
+
+      svg.appendChild(stext(12, 16, "TODAY — /readyz fan-out, per ROUTE, per caller", "t-strong"));
+      svg.appendChild(stext(372, 16, "PROPOSED — one LIST of _graph_nodes/v1/", "t-strong"));
+      svg.appendChild(s("path", { d: "M350 26 L350 250", class: "wire faint" }));
+
+      var i, y, dy = 26;
+
+      /* left: drivers spraying connections */
+      for (i = 0; i < shownDrivers; i++) {
+        y = 44 + i * dy;
+        svg.appendChild(s("rect", { x: 12, y: y - 10, width: 62, height: 18, rx: 2, class: "box" }));
+        svg.appendChild(stext(18, y + 3, "driver", "t-dim"));
+      }
+      for (i = 0; i < shownNodes; i++) {
+        y = 40 + i * (170 / Math.max(1, shownNodes - 1));
+        svg.appendChild(s("circle", { cx: 300, cy: y, r: 4, class: "fillcrit" }));
+      }
+      for (i = 0; i < shownDrivers; i++) {
+        var sy = 44 + i * dy;
+        for (var j = 0; j < shownNodes; j++) {
+          var ny = 40 + j * (170 / Math.max(1, shownNodes - 1));
+          var p = s("path", { d: "M76 " + sy + " L296 " + ny, class: "wire crit" });
+          p.setAttribute("opacity", "0.28");
+          svg.appendChild(p);
+        }
+      }
+      svg.appendChild(stext(12, 232, st.drivers + " drivers × " + st.nodes + " nodes = " + fan.toLocaleString() + " TCP connects", "t-crit"));
+      svg.appendChild(stext(12, 248, "each node probes independently — callers can disagree", "t-dim"));
+
+      /* right: one LIST each */
+      for (i = 0; i < shownDrivers; i++) {
+        y = 44 + i * dy;
+        svg.appendChild(s("rect", { x: 372, y: y - 10, width: 62, height: 18, rx: 2, class: "box" }));
+        svg.appendChild(stext(378, y + 3, "driver", "t-dim"));
+        svg.appendChild(s("path", { d: "M436 " + y + " L556 125", class: "wire ok" }));
+      }
+      svg.appendChild(s("rect", { x: 556, y: 96, width: 132, height: 58, rx: 3, class: "box ok" }));
+      svg.appendChild(stext(568, 118, "LIST", "t-ok"));
+      svg.appendChild(stext(568, 134, "_graph_nodes/v1/", "t-ok"));
+      svg.appendChild(stext(568, 148, "name + LastModified", "t-dim"));
+      svg.appendChild(stext(372, 232, st.drivers + " LISTs — independent of node count", "t-ok"));
+      svg.appendChild(stext(372, 248, "+ " + st.nodes + " PUTs every " + st.interval + "s, linear in nodes", "t-dim"));
+
+      note.innerHTML = "At <b>" + st.nodes + "</b> nodes and <b>" + st.drivers + "</b> drivers, one routing refresh " +
+        "cycle costs <b class='bad'>" + fan.toLocaleString() + "</b> TCP connections today against " +
+        "<b class='good'>" + lists.toLocaleString() + "</b> object-store LISTs after the change — a factor of " +
+        st.nodes + ". The fan-out is the product of both dimensions; the LIST count is not. " +
+        "The heartbeat cost that replaces it, <b>" + puts.toLocaleString() + "</b> PUTs per minute, does not depend on " +
+        "how many drivers are connected at all.";
+    }
+
+    render();
+  })();
+
+  /* ==================================================================== W4
+     Crash timeline scrubber. Heartbeat ageing, live set, owner, two lamps. */
+
+  (function w4() {
+    var mount = activate("w4", ".w4-static", ".w4-live");
+    if (!mount) return;
+
+    var SCOPE = "acme/graphs/social";
+    var CELL = "cell-b";
+    var NODES = ["graph-node-0", "graph-node-1", "graph-node-2"];
+    var VICTIM = "graph-node-1";
+    var INTERVAL = 5;
+    var TIMEOUT = 15;
+    var TMAX = 20;
+
+    var st = { t: 0, graceful: false };
+
+    var bar = h("div", "ctlbar");
+    bar.appendChild(h("span", "ctl-label", "t"));
+    var scrub = document.createElement("input");
+    scrub.type = "range";
+    scrub.min = 0; scrub.max = TMAX; scrub.step = 0.1; scrub.value = 0;
+    scrub.style.maxWidth = "300px";
+    scrub.setAttribute("aria-label", "time in seconds since graph-node-1 died");
+    scrub.addEventListener("input", function () { st.t = parseFloat(scrub.value); render(); });
+    bar.appendChild(scrub);
+    var tOut = h("span", "ctl-label", "0.0s");
+    tOut.style.minWidth = "4em";
+    bar.appendChild(tOut);
+
+    var modeBtn = button("compare: graceful shutdown");
+    modeBtn.setAttribute("aria-pressed", "false");
+    modeBtn.addEventListener("click", function () {
+      st.graceful = !st.graceful;
+      modeBtn.setAttribute("aria-pressed", st.graceful ? "true" : "false");
+      modeBtn.textContent = st.graceful ? "compare: hard crash (SIGKILL)" : "compare: graceful shutdown";
+      render();
+    });
+    bar.appendChild(modeBtn);
+
+    var jump = button("jump to t=15s");
+    jump.addEventListener("click", function () {
+      st.t = 15; scrub.value = 15; render();
+    });
+    bar.appendChild(jump);
+    mount.appendChild(bar);
+
+    var svg = svgRoot("0 0 700 290", "Timeline of heartbeat ageing after graph-node-1 dies, with read and write availability");
+    mount.appendChild(svg);
+
+    var lamps = h("div", "lamps");
+    function lamp(key) {
+      var l = h("div", "lamp");
+      l.appendChild(h("span", "bulb"));
+      var box = h("div");
+      box.appendChild(h("span", "lk", key));
+      var v = h("span", "lv", "—");
+      box.appendChild(v);
+      l.appendChild(box);
+      l.valueNode = v;
+      return l;
+    }
+    var lampRead = lamp("reads, any cell");
+    var lampWrite = lamp("writes to " + CELL);
+    var lampOwner = lamp("computed owner");
+    lamps.appendChild(lampRead);
+    lamps.appendChild(lampWrite);
+    lamps.appendChild(lampOwner);
+    mount.appendChild(lamps);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    function heartbeatAge(node, t) {
+      if (node !== VICTIM) return t % INTERVAL;   /* still publishing every 5s */
+      if (st.graceful) return null;               /* object DELETEd at t=0 */
+      return t;                                   /* frozen at the moment of SIGKILL */
+    }
+
+    function isLive(node, t) {
+      var age = heartbeatAge(node, t);
+      if (age === null) return false;
+      return age < TIMEOUT;
+    }
+
+    function render() {
+      var t = st.t;
+      tOut.textContent = t.toFixed(1) + "s";
+
+      var live = NODES.filter(function (n) { return isLive(n, t); });
+      var own = owner(SCOPE, CELL, live);
+      var victimLive = isLive(VICTIM, t);
+      var writesOk = own !== null && own !== VICTIM;
+      /* at exactly t = 0 in the crash case the node is still, correctly, live */
+      var crossover = st.graceful ? 0 : TIMEOUT;
+
+      clear(svg);
+
+      var x0 = 96, x1 = 686, span = x1 - x0;
+      function px(sec) { return x0 + (sec / TMAX) * span; }
+
+      /* axis */
+      svg.appendChild(s("path", { d: "M" + x0 + " 244 L" + x1 + " 244", class: "axis" }));
+      for (var g = 0; g <= TMAX; g += 5) {
+        svg.appendChild(s("path", { d: "M" + px(g) + " 244 L" + px(g) + " 250", class: "axis" }));
+        svg.appendChild(stext(px(g), 264, g + "s", "t-dim", "middle"));
+      }
+
+      /* event markers */
+      svg.appendChild(s("path", { d: "M" + px(0) + " 22 L" + px(0) + " 244", class: "wire crit dash" }));
+      svg.appendChild(stext(px(0) + 6, 18, st.graceful ? "SIGTERM: heartbeat DELETEd" : "SIGKILL " + VICTIM, "t-crit"));
+      if (!st.graceful) {
+        svg.appendChild(s("path", { d: "M" + px(TIMEOUT) + " 22 L" + px(TIMEOUT) + " 244", class: "wire ok dash" }));
+        svg.appendChild(stext(px(TIMEOUT) - 6, 18, "heartbeat_timeout", "t-ok", "end"));
+      }
+
+      /* heartbeat lanes */
+      NODES.forEach(function (n, i) {
+        var y = 44 + i * 42;
+        svg.appendChild(stext(12, y + 4, n, "t-strong"));
+        svg.appendChild(s("path", { d: "M" + x0 + " " + y + " L" + x1 + " " + y, class: "wire faint" }));
+
+        if (n === VICTIM) {
+          if (st.graceful) {
+            svg.appendChild(s("circle", { cx: px(0), cy: y, r: 4, class: "fillcrit" }));
+            svg.appendChild(stext(px(0) + 8, y - 8, "object deleted — gone from the very next LIST", "t-crit"));
+          } else {
+            svg.appendChild(s("circle", { cx: px(0), cy: y, r: 4, class: "fillcrit" }));
+            var deadX = px(Math.min(t, TIMEOUT));
+            svg.appendChild(s("rect", {
+              x: px(0), y: y - 5, width: Math.max(0, deadX - px(0)), height: 10, rx: 2,
+              class: t >= TIMEOUT ? "box dim" : "box crit"
+            }));
+            if (t >= TIMEOUT) {
+              svg.appendChild(s("rect", { x: px(TIMEOUT), y: y - 5, width: px(t) - px(TIMEOUT), height: 10, rx: 2, class: "box dim" }));
+            }
+            svg.appendChild(stext(px(0) + 8, y - 10,
+              "last PUT, then nothing — age " + t.toFixed(1) + "s",
+              victimLive ? "t-crit" : "t-dim"));
+          }
+        } else {
+          for (var k = 0; k <= TMAX; k += INTERVAL) {
+            if (k > t) break;
+            svg.appendChild(s("circle", { cx: px(k), cy: y, r: 3.5, class: "fillok" }));
+          }
+          svg.appendChild(stext(px(Math.min(t, TMAX)) + 8, y - 8,
+            "age " + (t % INTERVAL).toFixed(1) + "s", "t-ok"));
+        }
+      });
+
+      /* availability bands */
+      var yr = 178, yw = 206;
+      svg.appendChild(stext(12, yr + 4, "READS", "t-strong"));
+      svg.appendChild(s("rect", { x: x0, y: yr - 8, width: span, height: 16, rx: 2, class: "box ok" }));
+      svg.appendChild(stext(x0 + 10, yr + 4, "green throughout — the driver gets ECONNREFUSED and routes around it itself", "t-ok"));
+
+      svg.appendChild(stext(12, yw + 4, "WRITES", "t-strong"));
+      if (crossover > 0) {
+        svg.appendChild(s("rect", { x: x0, y: yw - 8, width: px(crossover) - x0, height: 16, rx: 2, class: "box crit" }));
+        svg.appendChild(s("rect", { x: px(crossover), y: yw - 8, width: x1 - px(crossover), height: 16, rx: 2, class: "box ok" }));
+        svg.appendChild(stext(x0 + 10, yw + 4, "owner named but dead — live nodes correctly decline", "t-crit"));
+        svg.appendChild(stext(px(crossover) + 10, yw + 4, "survivor promotes", "t-ok"));
+      } else {
+        svg.appendChild(s("rect", { x: x0, y: yw - 8, width: span, height: 16, rx: 2, class: "box ok" }));
+        svg.appendChild(stext(x0 + 10, yw + 4, "no stall — the live set lost the node on the very next LIST", "t-ok"));
+      }
+
+      /* playhead */
+      svg.appendChild(s("path", { d: "M" + px(t) + " 26 L" + px(t) + " 250", class: "wire accent" }));
+      svg.appendChild(s("circle", { cx: px(t), cy: 26, r: 4, class: "fillaccent" }));
+
+      /* lamps */
+      lampRead.setAttribute("data-on", "ok");
+      lampRead.valueNode.textContent = "available";
+      lampWrite.setAttribute("data-on", writesOk ? "ok" : "crit");
+      lampWrite.valueNode.textContent = writesOk ? "available" : "refused";
+      lampOwner.setAttribute("data-on", writesOk ? "ok" : "crit");
+      lampOwner.valueNode.textContent = own || "none";
+
+      var msg = "<b>t = " + t.toFixed(1) + "s</b> &middot; live set = { " + live.join(", ") + " }" +
+        " &middot; owner(" + CELL + ") = <b>" + (own || "None") + "</b><br>";
+      if (st.graceful) {
+        msg += "<b class='good'>Graceful path.</b> The SIGTERM handler DELETEs " +
+          "<code>&lt;base&gt;/_graph_nodes/v1/" + VICTIM + "</code> before draining, so the very next LIST omits it. " +
+          "Detection is immediate, the same as the probe gives today. This is the majority of real restarts.";
+      } else if (t < TIMEOUT) {
+        msg += "<b class='bad'>Stalled.</b> " + VICTIM + "'s heartbeat is " + t.toFixed(1) + "s old, still under the " +
+          TIMEOUT + "s timeout, so placement continues to name it as owner and every live node correctly declines. " +
+          (TIMEOUT - t).toFixed(1) + "s of write unavailability remain for this cell. Reads are unaffected.";
+      } else {
+        msg += "<b class='good'>Self-healed.</b> The heartbeat aged past " + TIMEOUT + "s, placement recomputed over the " +
+          "survivors, and <b>" + own + "</b> promotes on the next write. No operator action, no failover controller. " +
+          "The trade this widget is measuring is <b>unbounded duel → " + TIMEOUT + "s stall</b>, not good → bad.";
+      }
+      note.innerHTML = msg;
+    }
+
+    render();
+  })();
+
+  /* ==================================================================== W5
+     Timeout trade-off. Detection latency against flap-induced writer opens. */
+
+  (function w5() {
+    var mount = activate("w5", ".w5-static", ".w5-live");
+    if (!mount) return;
+
+    var st = { interval: 5, timeout: 15, flap: 10, nodes: 3 };
+
+    var bar = h("div", "ctlbar");
+
+    function slider(labelText, min, max, step, get, set) {
+      var wrap = h("span", "ctlbar");
+      wrap.style.margin = "0";
+      wrap.appendChild(h("span", "ctl-label", labelText));
+      var r = document.createElement("input");
+      r.type = "range";
+      r.min = min; r.max = max; r.step = step; r.value = get();
+      r.setAttribute("aria-label", labelText);
+      var out = h("span", "ctl-label", get() + "s");
+      out.style.minWidth = "3.4em";
+      r.addEventListener("input", function () {
+        set(parseFloat(r.value));
+        out.textContent = r.value + "s";
+        render();
+      });
+      wrap.appendChild(r);
+      wrap.appendChild(out);
+      wrap.range = r;
+      wrap.out = out;
+      return wrap;
+    }
+
+    var sInterval = slider("interval", 1, 15, 1, function () { return st.interval; }, function (v) { st.interval = v; });
+    var sTimeout = slider("timeout", 2, 60, 1, function () { return st.timeout; }, function (v) { st.timeout = v; });
+    var sFlap = slider("flap period", 2, 40, 1, function () { return st.flap; }, function (v) { st.flap = v; });
+    bar.appendChild(sInterval);
+    bar.appendChild(sTimeout);
+    bar.appendChild(sFlap);
+    mount.appendChild(bar);
+
+    var bar2 = h("div", "ctlbar");
+    bar2.appendChild(h("span", "ctl-label", "presets"));
+    [[2, 6, "2s / 6s"], [5, 15, "5s / 15s  (chosen)"], [10, 30, "10s / 30s  (sleet)"]].forEach(function (p) {
+      var b = button(p[2]);
+      b.addEventListener("click", function () {
+        st.interval = p[0];
+        st.timeout = p[1];
+        sInterval.range.value = p[0];
+        sInterval.out.textContent = p[0] + "s";
+        sTimeout.range.value = p[1];
+        sTimeout.out.textContent = p[1] + "s";
+        render();
+      });
+      bar2.appendChild(b);
+    });
+    mount.appendChild(bar2);
+
+    var svg = svgRoot("0 0 700 240", "Writer opens per minute caused by flap churn, as a function of flap period, for the current timeout");
+    mount.appendChild(svg);
+
+    var stats = h("div", "stats");
+    var sDetect = stat("dead-node detection", "crit");
+    var sChurn = stat("writer opens / min", "crit");
+    var sPuts = stat("PUTs / day, 3 nodes", "accent");
+    var sCost = stat("approx $ / month", "accent");
+    [sDetect, sChurn, sPuts, sCost].forEach(function (x) { stats.appendChild(x); });
+    mount.appendChild(stats);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    /* A node flapping on period P is unreachable for about P, then back for
+       about P. Ownership only moves if the down phase outlasts
+       heartbeat_timeout; when it does, the cell leaves and comes back, so each
+       full flap cycle of 2P costs two writer opens. Shorter flaps than the
+       timeout are absorbed entirely, which is the whole argument for a longer
+       timeout. Matches the worked example in the decision record: a ~10s flap
+       churns at a 6s timeout and is absorbed at 30s. */
+    function opensPerMinute(period, timeout) {
+      if (period <= timeout) return 0;
+      return 2 * (60 / (2 * period));
+    }
+
+    function render() {
+      var valid = st.interval < st.timeout;
+
+      var detect = st.timeout;
+      var churn = opensPerMinute(st.flap, st.timeout);
+      var puts = Math.round(st.nodes * 86400 / st.interval);
+      var cost = puts * 30 / 1000 * 0.005;
+
+      sDetect.valueNode.textContent = valid ? detect + "s" : "—";
+      sChurn.valueNode.textContent = valid ? churn.toFixed(1) : "—";
+      sChurn.setAttribute("data-tone", churn > 0 ? "crit" : "ok");
+      sPuts.valueNode.textContent = puts.toLocaleString();
+      sCost.valueNode.textContent = "$" + cost.toFixed(0);
+
+      clear(svg);
+
+      var x0 = 56, x1 = 686, y0 = 200, y1 = 26;
+      var PMAX = 40, OMAX = 30;
+      function px(p) { return x0 + (p / PMAX) * (x1 - x0); }
+      function py(o) { return y0 - (Math.min(o, OMAX) / OMAX) * (y0 - y1); }
+
+      svg.appendChild(s("path", { d: "M" + x0 + " " + y0 + " L" + x1 + " " + y0, class: "axis" }));
+      svg.appendChild(s("path", { d: "M" + x0 + " " + y1 + " L" + x0 + " " + y0, class: "axis" }));
+      svg.appendChild(stext(x0, 226, "flap period (s)", "t-dim"));
+      svg.appendChild(stext(6, 20, "writer opens / min", "t-dim"));
+
+      var p, gp;
+      for (gp = 0; gp <= PMAX; gp += 10) {
+        svg.appendChild(s("path", { d: "M" + px(gp) + " " + y0 + " L" + px(gp) + " " + (y0 + 6), class: "axis" }));
+        svg.appendChild(stext(px(gp), y0 + 20, String(gp), "t-dim", "middle"));
+      }
+      for (var go = 0; go <= OMAX; go += 5) {
+        svg.appendChild(s("path", { d: "M" + x0 + " " + py(go) + " L" + x1 + " " + py(go), class: "grid" }));
+        svg.appendChild(stext(x0 - 8, py(go) + 3, String(go), "t-dim", "end"));
+      }
+
+      /* reference curves for the three presets, then the live one */
+      var refs = [[6, "t-crit", "wire crit"], [15, "t-ok", "wire ok"], [30, "t-accent", "wire accent"]];
+      refs.forEach(function (r) {
+        var d = "";
+        for (p = 1; p <= PMAX; p += 0.5) {
+          var o = opensPerMinute(p, r[0]);
+          d += (d ? " L" : "M") + px(p).toFixed(1) + " " + py(o).toFixed(1);
+        }
+        var path = s("path", { d: d, class: r[2] });
+        path.setAttribute("opacity", r[0] === st.timeout ? "1" : "0.35");
+        path.setAttribute("fill", "none");
+        svg.appendChild(path);
+      });
+
+      /* label each reference curve at its own peak, which sits just past its timeout */
+      refs.forEach(function (r) {
+        if (r[0] >= PMAX) return;
+        svg.appendChild(stext(px(r[0]) + 8, py(opensPerMinute(r[0] + 0.5, r[0])) - 6,
+          "timeout " + r[0] + "s", r[1]));
+      });
+
+      /* the live curve for whatever timeout is set, if not one of the presets */
+      if ([6, 15, 30].indexOf(st.timeout) === -1 && valid) {
+        var dl = "";
+        for (p = 1; p <= PMAX; p += 0.5) {
+          dl += (dl ? " L" : "M") + px(p).toFixed(1) + " " + py(opensPerMinute(p, st.timeout)).toFixed(1);
+        }
+        var lp = s("path", { d: dl, class: "wire accent" });
+        lp.setAttribute("fill", "none");
+        svg.appendChild(lp);
+        svg.appendChild(stext(px(2), py(21), "timeout " + st.timeout + "s", "t-accent"));
+      }
+
+      /* the operating point */
+      svg.appendChild(s("path", { d: "M" + px(st.flap) + " " + y1 + " L" + px(st.flap) + " " + y0, class: "wire accent dash" }));
+      svg.appendChild(s("circle", { cx: px(st.flap), cy: py(churn), r: 5, class: churn > 0 ? "fillcrit" : "fillok" }));
+      svg.appendChild(stext(px(st.flap) + 9, py(churn) - 8,
+        st.interval + "s / " + st.timeout + "s at a " + st.flap + "s flap → " + churn.toFixed(1) + " opens/min",
+        churn > 0 ? "t-crit" : "t-ok"));
+
+      if (!valid) {
+        note.innerHTML = "<b class='bad'>Rejected at startup.</b> Validation requires " +
+          "<code>interval &gt; 0</code> and <code>interval &lt; timeout</code>, following " +
+          "<code>../sleet/src/config.rs:1018-1024</code>. With interval " + st.interval + "s &ge; timeout " +
+          st.timeout + "s every node's own heartbeat would be stale before the next one landed, so the fleet " +
+          "would consider everyone permanently dead. This is caught at startup rather than in production.";
+        return;
+      }
+
+      var msg = "<b>" + st.interval + "s interval / " + st.timeout + "s timeout.</b> " +
+        "Worst-case detection of a hard-crashed node: <b class='bad'>" + detect + "s</b>. " +
+        "Graceful shutdown stays immediate either way, via the heartbeat DELETE.<br>";
+      if (churn > 0) {
+        msg += "<b class='bad'>Churning.</b> A " + st.flap + "s flap outlasts the " + st.timeout +
+          "s timeout, so the node ages out of the live set and rejoins it every cycle — ownership leaves and " +
+          "returns, at <b>" + churn.toFixed(1) + "</b> writer opens per minute, each one a manifest CAS and an " +
+          "epoch bump. There is no rebalance dampening in this design, deliberately. The worst case sits just " +
+          "past the timeout, at about " + (60 / st.timeout).toFixed(1) + " opens/min.";
+      } else {
+        msg += "<b class='good'>Absorbed.</b> A " + st.flap + "s flap never crosses the " + st.timeout +
+          "s timeout, so the node never leaves the live set, ownership never moves, and no writer reopens. " +
+          "That immunity is exactly what you pay for with a longer detection window.";
+      }
+      msg += "<br>Cost: <b>" + puts.toLocaleString() + "</b> PUTs/day across 3 nodes, about <b>$" + cost.toFixed(0) +
+        "</b>/month at S3 Standard rates. Linear in node count — at 100 nodes on a 2s interval it is around " +
+        "$650/month, which is why this is config and not a constant.";
+      note.innerHTML = msg;
+    }
+
+    render();
+  })();
+
+})();
+</script>
+
+</body>
+</html>

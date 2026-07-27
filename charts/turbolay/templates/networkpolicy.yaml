@@ -1,0 +1,97 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "turbolay.fullname" . }}-default-deny
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "turbolay.selectorLabels" . | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "turbolay.fullname" . }}-runtime
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "turbolay.selectorLabels" . | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    {{- with .Values.networkPolicy.clientIngressFrom }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 7687
+        - protocol: TCP
+          port: 8443
+    {{- end }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 14 }}
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.monitoringNamespaceSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: 9090
+        - protocol: TCP
+          port: 9091
+    {{- if .Values.tests.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "turbolay.componentLabels" (dict "root" . "component" "helm-test") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 7687
+        - protocol: TCP
+          port: 8443
+    {{- end }}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "turbolay.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 7687
+        - protocol: TCP
+          port: 8443
+        - protocol: TCP
+          port: 9090
+        - protocol: TCP
+          port: 9091
+    {{- with .Values.networkPolicy.httpsEgressTo }}
+    - to:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+    {{- if .Values.objectStore.aws.endpoint }}
+    - to:
+        {{- toYaml .Values.objectStore.aws.endpointEgressTo | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ include "turbolay.objectStoreEndpointPort" . }}
+    {{- end }}
+    {{- with .Values.networkPolicy.additionalEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

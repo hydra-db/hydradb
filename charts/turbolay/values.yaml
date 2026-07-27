@@ -1,0 +1,203 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: 525753068359.dkr.ecr.us-east-1.amazonaws.com/staging/turbolay
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+objectStore:
+  cloudProvider: aws
+  aws:
+    bucketName: ""
+    region: us-east-1
+    allowHttp: false
+    endpoint: ""
+    endpointEgressTo: []
+
+graph:
+  namespace: production
+  graphId: default
+  database: default
+  cells:
+    - cell-0
+  dataPath: slatedb-graph/data
+
+auth:
+  existingSecret: ""
+  secretKey: auth-token
+  create: true
+  token: ""
+  preserveGeneratedToken: true
+  externalSecret:
+    enabled: false
+    targetSecretName: ""
+    refreshInterval: 1h
+    secretStoreRef:
+      kind: ClusterSecretStore
+      name: ""
+    remoteRef:
+      key: slatedb-graph/client-auth
+      property: token
+
+tls:
+  public:
+    enabled: true
+    secretName: ""
+    additionalDnsNames: []
+    trustBundle:
+      enabled: false
+      name: ""
+      sourceSecretName: ""
+      sourceSecretKey: tls.crt
+      namespaceSelector: {}
+  certManager:
+    enabled: false
+    publicIssuerRef:
+      group: cert-manager.io
+      kind: ClusterIssuer
+      name: ""
+    publicDuration: 2160h
+    publicRenewBefore: 360h
+
+node:
+  replicaCount: 1
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  priorityClassName: ""
+  terminationGracePeriodSeconds: 60
+  updateStrategy: RollingUpdate
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+      ephemeral-storage: 12Gi
+    limits:
+      cpu: "8"
+      memory: 16Gi
+      ephemeral-storage: 24Gi
+  cache:
+    type: emptyDir
+    memoryLimitBytes: 8589934592
+    emptyDir:
+      sizeLimit: 20Gi
+      medium: ""
+    persistentVolume:
+      size: 40Gi
+      storageClassName: ""
+      accessModes:
+        - ReadWriteOnce
+      annotations: {}
+  tmpSizeLimit: 1Gi
+  affinity: {}
+  topologySpreadConstraints: []
+  tolerations: []
+  nodeSelector: {}
+  extraEnv: []
+
+indexer:
+  enabled: true
+  replicaCount: 1
+  intervalMs: 5000
+  retainPreviousGenerations: 1
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  priorityClassName: ""
+  terminationGracePeriodSeconds: 60
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+      ephemeral-storage: 2Gi
+    limits:
+      cpu: "8"
+      memory: 16Gi
+      ephemeral-storage: 8Gi
+  affinity: {}
+  topologySpreadConstraints: []
+  tolerations: []
+  nodeSelector: {}
+  extraEnv: []
+
+service:
+  advertisedBoltAddress: ""
+  bolt:
+    type: ClusterIP
+    port: 7687
+    annotations: {}
+    loadBalancerSourceRanges: []
+  https:
+    type: ClusterIP
+    port: 443
+    annotations: {}
+    loadBalancerSourceRanges: []
+  adminPort: 9090
+
+runtime:
+  rustLog: info,slatedb_graph_kernel=info
+  maxOpenScopes: 8
+  maxConcurrentQueries: 256
+  maxQueryScanEdges: 1000000
+  maxQueryRuntimeMs: 30000
+  maxServerCursors: 1024
+  maxCursorBufferBytes: 67108864
+  cursorTtlMs: 60000
+  maxBoltConnections: 4096
+  defaultPageSize: 1024
+  gracefulShutdownMs: 30000
+  l0SstSizeBytes: 16777216
+  maxUnflushedBytes: 67108864
+  maxWalFlushesBeforeL0Flush: 4096
+  l0FlushParallelism: 1
+  maxMatrixAdjacencies: 0
+  maxMatrixAdjacencyBytes: 0
+  maxGraphblasMatrices: 16
+  maxGraphblasBytes: 134217728
+  maxRelationshipRowsBytes: 8388608
+  maxSourceRelationshipRowsBytes: 8388608
+  maxRelationshipPropertyRowsBytes: 16777216
+  maxConcurrentHydrations: 2
+  maxConcurrentMatrixCompilations: 1
+  indexDiscoveryIntervalMs: 5000
+  trimMemoryAfterHydration: true
+
+podDisruptionBudget:
+  enabled: true
+  node:
+    minAvailable: 1
+  indexer:
+    minAvailable: 1
+
+networkPolicy:
+  enabled: true
+  clientIngressFrom: []
+  httpsEgressTo: []
+  monitoringNamespaceSelector:
+    matchLabels:
+      graph.usecortex.io/monitoring-access: "true"
+  additionalEgress: []
+
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  scrapeTimeout: 5s
+  labels: {}
+
+tests:
+  enabled: true
+  image:
+    repository: curlimages/curl
+    tag: "8.14.1"
+    pullPolicy: IfNotPresent
+
+extraObjects: []

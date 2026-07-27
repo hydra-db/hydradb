@@ -1,0 +1,1345 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture · Inside TurboLay</title>
+<link rel="stylesheet" href="../assets/textbook.css">
+
+<div class="tb-progress"></div>
+
+<header class="tb-header">
+  <a class="tb-home" href="../index.html">Turbo<span>Lay</span> · Interactive</a>
+  <span class="tb-crumb">Inside TurboLay</span>
+  <span class="tb-crumb">Architecture</span>
+  <span class="tb-spacer"></span>
+  <button class="tb-theme-toggle" type="button">☾ Dark</button>
+</header>
+
+<main class="tb-main">
+  <div class="tb-chapter-kicker">Chapter 1 · Inside TurboLay</div>
+  <h1>Architecture</h1>
+
+  <p>Chapter 0 gave you the vocabulary. This chapter shows how the code is organized, which
+  build contains which parts, and how the pieces connect into one running system. The aim is
+  that when you open the tree you know which file to look in and why it exists.</p>
+
+  <p>We move from the outside in. First the build shapes (Cargo features), then the module map,
+  then the single type that ties storage and graph together
+  (<span class="concept" data-concept="graphshard">GraphShard</span>), then how an incoming
+  query name is resolved down to storage keys, how one process becomes a cluster of symmetric
+  nodes, and finally where the separate out-of-process indexer fits.</p>
+
+  <h2>One crate, many builds</h2>
+
+  <p>TurboLay is a single Rust crate. It is not a workspace of many crates. Instead it uses
+  <span class="concept" data-concept="cargo-feature">Cargo features</span> to include or exclude
+  large slices of itself, so the same source can build as a small embedded library or as a full
+  network server.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Cargo feature</span>
+    <p>A named, optional slice of a crate. Code guarded by <code>#[cfg(feature = "x")]</code> only
+    compiles when feature <code>x</code> is turned on. Features can depend on other features, so
+    turning one on can pull in a whole stack. This lets one crate ship many configurations.</p>
+  </div>
+
+  <p>The feature list is a tower. Each higher feature turns on the ones below it:</p>
+
+  <pre><code># Cargo.toml, [features]
+default = []
+opencypher = ["dep:libcypher-parser-sys"]
+graphblas = []
+query-transport = ["opencypher", "dep:serde", "dep:subtle", "json-properties", ...]
+query-transport-tls = ["query-transport", "dep:tokio-rustls"]
+query-service-discovery = ["query-transport", "dep:base64", "dep:reqwest"]
+client-api = ["query-transport"]
+bolt-server = ["client-api", "query-transport-tls", "dep:boltr"]
+http-api = ["client-api", "query-transport-tls", "dep:axum", "dep:axum-server"]
+public-client-protocols = ["bolt-server", "http-api"]
+server-runtime = ["public-client-protocols", "graphblas", "query-service-discovery", ...]
+indexer-runtime = ["dep:axum", "dep:tracing-subscriber", "tokio/net"]
+</code></pre>
+
+  <p>Read from the bottom up:</p>
+
+  <ul>
+    <li>With <em>no features</em> you get the embedded engine: the graph model, keys, codec, the
+      shard, the storage stack, writes, reads by direct API, and garbage collection. No query
+      language, no network.</li>
+    <li><code>opencypher</code> adds the <span class="concept" data-concept="cypher">Cypher</span>
+      query language (it pulls in a native parser, <code>libcypher-parser-sys</code>).</li>
+    <li><code>query-transport</code> adds the internal query network protocol and the types needed
+      to send a query between nodes. <code>client-api</code> builds the shared client service on
+      top.</li>
+    <li><code>bolt-server</code> and <code>http-api</code> add the two public front doors.
+      <code>public-client-protocols</code> turns on both.</li>
+    <li><code>server-runtime</code> is the full deployable build of the <em>data node</em>: both
+      front doors, the <span class="concept" data-concept="graphblas">GraphBLAS</span> traversal
+      backend, service discovery for finding other nodes, and logging. This is what the
+      <code>graph-node</code> binary compiles with.</li>
+    <li><code>indexer-runtime</code> is a deliberately <em>lean, parallel</em> build — not part of
+      the tower above. It pulls in only an HTTP admin surface, logging, and Tokio networking (no
+      front doors, no GraphBLAS, no discovery). It is what the separate <code>graph-indexer</code>
+      binary compiles with, and it exists so the out-of-process index builder (Section 1.8) stays
+      small and cheap to run.</li>
+  </ul>
+
+  <figure>
+    <div class="tb-widget" id="w-feature-tower"></div>
+    <figcaption>Fig. 1.1 — The feature tower: a build is a horizontal slice, everything from some
+      level down. The deployable <em>data node</em> (<code>graph-node</code>) builds with
+      <code>server-runtime</code>; the two example servers in <code>examples/</code> build with
+      <code>bolt-server</code>. <code>indexer-runtime</code> (bottom, shaded) is not part of the
+      tower — it is a separate lean slice over the embedded engine that produces the
+      <code>graph-indexer</code> binary.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Pick a build target, watch its slice light up<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Press <em>graph-node</em> and the whole tower — <code>default</code> up through
+      <code>server-runtime</code> — turns on: both front doors, GraphBLAS, and discovery.
+      Press <em>example server</em> and the top layer narrows to the <code>bolt-server</code>
+      front door only. Press <em>graph-indexer</em> and the highlight jumps <em>off</em> the tower
+      entirely: the lean <code>indexer-runtime</code> slice is only the embedded engine plus an
+      admin surface, no front doors and no GraphBLAS. The picture is the whole point of the tower —
+      a build is a contiguous slice from some level down, and the indexer is a different shape.</p>
+    </div>
+  </details>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>A single crate with features, rather than many small crates, keeps the internal types
+    shared without a web of crate boundaries and version bumps. The cost is that you must read the
+    <code>#[cfg(...)]</code> attributes to know whether a given item exists in your build. When you
+    cannot find where a <code>pub use</code> symbol comes from, check whether it is behind a
+    feature.</p>
+  </div>
+
+  <h2>The module map</h2>
+
+  <p>The crate root, <code>src/lib.rs</code>, declares the modules and re-exports the public API.
+  Every module lives under <code>src/</code>. Grouped by job:</p>
+
+  <figure>
+    <div class="tb-table-wrap">
+      <table>
+        <thead><tr><th>Area</th><th>What lives there</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>core/</code></td>
+            <td>The foundations: <code>state.rs</code> (the
+              <span class="concept" data-concept="graphshard">GraphShard</span> type and write
+              authority), <code>model.rs</code> (vertex, edge, relationship, property types),
+              <code>config.rs</code> (open options and the SlateDB open functions),
+              <code>namespace.rs</code> (namespaces, graph ids, scopes), <code>snapshot.rs</code>,
+              <code>cache.rs</code>, <code>metrics.rs</code>, <code>error.rs</code>,
+              <code>write_batch.rs</code>.</td>
+          </tr>
+          <tr>
+            <td><code>keys.rs</code></td>
+            <td>Every storage key builder. One function per key shape. 316 lines of pure key
+              formatting.</td>
+          </tr>
+          <tr>
+            <td><code>codec.rs</code></td>
+            <td>Every value encoder and decoder. Hand-written, versioned byte formats. 1543
+              lines.</td>
+          </tr>
+          <tr>
+            <td><code>shard/</code></td>
+            <td>The behavior of <span class="concept" data-concept="graphshard">GraphShard</span>,
+              split by concern: <code>write.rs</code> (5108 lines), <code>query.rs</code> (8389
+              lines), <code>query_optimizer.rs</code>, <code>lifecycle.rs</code>,
+              <code>maintenance.rs</code>, and <code>topology_tail.rs</code> (the recent-<span class="concept" data-concept="wal-tail-overlay">WAL overlay</span>
+              for reads, Section 1.7).</td>
+          </tr>
+          <tr>
+            <td><code>engine.rs</code> + <code>engine/</code></td>
+            <td>Everything above a single shard: <code>cluster.rs</code> (the three containers —
+              <code>GraphCluster</code>, <code>RoutedGraphCluster</code>,
+              <code>ScopedRoutedGraphCluster</code> — and the
+              <span class="concept" data-concept="object-store-node-directory">ObjectStoreNodeDirectory</span>
+              that routes them), <code>scope_directory.rs</code> (the durable registry of which
+              graph scopes exist, Section 1.6), <code>artifact_build.rs</code> (building durable
+              <span class="concept" data-concept="adjacency">adjacency</span> images),
+              <code>index_store.rs</code> (the durable <span class="concept" data-concept="csc">CSC</span>
+              <span class="concept" data-concept="index-generation">index generations</span> and
+              their manifest/GC, Section 1.7), <code>artifact_gc.rs</code> (pruning old artifacts),
+              <code>matrix_cache.rs</code> (hydrating artifacts into the in-memory matrix caches),
+              <code>traversal.rs</code>, and <code>verify.rs</code>. There is no
+              <code>artifact_refresh.rs</code>: index building now runs out-of-process (Section
+              1.8).</td>
+          </tr>
+          <tr>
+            <td><code>query/</code></td>
+            <td>The query language and distribution: <code>opencypher.rs</code> (parse
+              <span class="concept" data-concept="cypher">Cypher</span> into the engine's own
+              plan), <code>algebra.rs</code> (the plan types), <code>coordination.rs</code> (the
+              query network protocol and distributed execution).</td>
+          </tr>
+          <tr>
+            <td><code>client/</code></td>
+            <td>The public front doors: <code>service.rs</code> (the shared
+              <code>ClientQueryService</code>), <code>bolt.rs</code> (the
+              <span class="concept" data-concept="bolt">Bolt</span> server), <code>http.rs</code>
+              (the HTTPS server).</td>
+          </tr>
+          <tr>
+            <td><code>sparse_kernel.rs</code></td>
+            <td>Sparse-matrix traversal, either in pure Rust or through the
+              <span class="concept" data-concept="graphblas">GraphBLAS</span> C library.</td>
+          </tr>
+          <tr>
+            <td><code>placement.rs</code></td>
+            <td>Experiments in how vertex ids map to
+              <span class="concept" data-concept="cell">cells</span> for locality.</td>
+          </tr>
+          <tr>
+            <td><code>bin/</code></td>
+            <td>Two executables: <code>graph-node</code> (the data node,
+              <code>server-runtime</code>) and <code>graph-indexer</code> (the out-of-process index
+              builder, <code>indexer-runtime</code>).</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The line counts tell you where the real work is. <code>shard/query.rs</code> and
+  <code>shard/write.rs</code> together are over thirteen thousand lines. Those two files are the
+  subject of the read and write chapters.</p>
+
+  <h2>GraphShard: the type that ties it together</h2>
+
+  <div class="callout term">
+    <span class="callout-title">Term — GraphShard</span>
+    <p>The central type of the engine. One <span class="concept" data-concept="graphshard">GraphShard</span>
+    is one open handle to one <span class="concept" data-concept="cell">cell</span>'s data on the
+    object store, plus everything needed to read and write it: the
+    <span class="concept" data-concept="slatedb">SlateDB</span> storage handle, the configured
+    limits and policies, the concurrency controls, and all the in-memory caches. Nearly every
+    operation in the engine is a method on <code>GraphShard</code>.</p>
+  </div>
+
+  <p>Its fields fall into four groups. Storage and configuration first:</p>
+
+  <pre><code>// src/core/state.rs:33-50
+pub struct GraphShard {
+    pub(crate) db: GraphStore,
+    pub(crate) limits: GraphLimits,
+    pub(crate) cache_policy: GraphCachePolicy,
+    // ... cache and operation metrics, then the concurrency gates
+    pub(crate) index_policy: GraphIndexPolicy,
+    pub(crate) await_durable_writes: bool,
+    pub(crate) write_authority: GraphWriteAuthority,
+    pub(crate) local_write_guard: Arc&lt;Mutex&lt;()&gt;&gt;,
+    pub(crate) local_artifact_guard: Arc&lt;Mutex&lt;()&gt;&gt;,
+    pub(crate) writer_lanes: Vec&lt;Mutex&lt;()&gt;&gt;,
+</code></pre>
+
+  <p><code>db</code> is the <span class="concept" data-concept="graphstore">GraphStore</span> from
+  Chapter 0. Where the durable data lives (<code>object_store</code>, <code>store_path</code>) now
+  lives <em>inside</em> <code>GraphStore</code> rather than on the shard.
+  <code>write_authority</code> and <code>writer_lanes</code> are the write-authority and lane
+  machinery from Section 0.10; <code>write_authority</code> is one of <code>ReadOnly</code>,
+  <code>Promotable</code>, or <code>Writer</code> (Section 1.6).</p>
+
+  <p>Second, the concurrency gates. Each is a
+  <span class="concept" data-concept="semaphore">semaphore</span> that bounds how many of one kind
+  of expensive operation can run at once:</p>
+
+  <pre><code>// src/core/state.rs:39-44
+    pub(crate) hydration_gate: Arc&lt;Semaphore&gt;,
+    #[cfg(feature = "graphblas")]
+    pub(crate) matrix_compilation_gate: Arc&lt;Semaphore&gt;,
+    pub(crate) graph_write_gate: Arc&lt;Semaphore&gt;,
+    pub(crate) artifact_build_gate: Arc&lt;Semaphore&gt;,
+    pub(crate) gc_gate: Arc&lt;Semaphore&gt;,
+</code></pre>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Semaphore (as used here)</span>
+    <p>A counter that hands out a fixed number of permits. A task must take a permit before doing
+    the guarded work and returns it when done. If no permit is free the task waits. TurboLay uses
+    one <span class="concept" data-concept="semaphore">semaphore</span> per class of heavy work
+    (loading data into memory, compiling a matrix, writing, building artifacts, garbage
+    collecting) so that, for example, a burst of writes cannot starve reads of memory.</p>
+  </div>
+
+  <p>Third, the caches. There are many, one per kind of computed result, and each is a
+  <code>BoundedGraphCache</code> (the subject of the caching chapter):</p>
+
+  <pre><code>// src/core/state.rs:51-69
+    pub(crate) matrix_artifact_cache:
+        Mutex&lt;BoundedGraphCache&lt;MatrixCacheKey, engine::MatrixArtifact&gt;&gt;,
+    pub(crate) graph_index_generations:
+        Mutex&lt;BTreeMap&lt;MatrixCacheKey, engine::GraphIndexGeneration&gt;&gt;,
+    pub(crate) matrix_cache: Mutex&lt;BoundedGraphCache&lt;MatrixCacheKey, Arc&lt;MatrixAdjacency&gt;&gt;&gt;,
+    pub(crate) graphblas_cache:
+        Mutex&lt;BoundedGraphCache&lt;MatrixCacheKey, Arc&lt;sparse_kernel::CompiledGraphBlasMatrix&gt;&gt;&gt;,
+    #[cfg(feature = "opencypher")]
+    pub(crate) parsed_row_query_cache:
+        Mutex&lt;BoundedGraphCache&lt;ParsedRowQueryCacheKey, ParsedRowQuery&gt;&gt;,
+    #[cfg(feature = "opencypher")]
+    pub(crate) relationship_rows_cache:
+        Mutex&lt;BoundedGraphCache&lt;RelationshipRowsCacheKey, RelationshipRowsCacheValue&gt;&gt;,
+    #[cfg(feature = "opencypher")]
+    pub(crate) source_relationship_rows_cache:
+        Mutex&lt;BoundedGraphCache&lt;SourceRelationshipRowsCacheKey, Arc&lt;Vec&lt;VertexId&gt;&gt;&gt;&gt;,
+    #[cfg(feature = "opencypher")]
+    pub(crate) relationship_property_rows_cache:
+        Mutex&lt;BoundedGraphCache&lt;RelationshipPropertyRowsCacheKey, RelationshipRowsCacheValue&gt;&gt;,
+</code></pre>
+
+  <p>The traversal-acceleration state sits at the top: <code>matrix_artifact_cache</code> holds
+  durable artifact metadata, <code>graph_index_generations</code> is the in-memory registry of the
+  current durable <span class="concept" data-concept="index-generation">index generation</span> per
+  <code>(cell, edge type)</code> (Section 1.7), and <code>matrix_cache</code> /
+  <code>graphblas_cache</code> hold the hydrated adjacency and the compiled
+  <span class="concept" data-concept="graphblas">GraphBLAS</span> matrix. The rest are per-read
+  result caches behind the query language.</p>
+
+  <p>The <code>#[cfg(feature = "opencypher")]</code> on some caches is the feature tower showing
+  through: a build without the query language does not carry the query-result caches.</p>
+
+  <p>The single-writer rule used to be an enum: <code>GraphStore</code> was either a
+  <code>Writer(Db)</code> or a <code>Reader(DbReader)</code>. After the graph-kernel resync it is
+  instead a small handle that opens its writer and reader <em>lazily</em> and caches them:</p>
+
+  <pre><code>// src/core/state.rs:72-87
+#[derive(Clone)]
+pub(crate) struct GraphStore { inner: Arc&lt;GraphStoreInner&gt; }
+
+struct GraphStoreInner {
+    path: Path,
+    object_store: Arc&lt;dyn ObjectStore&gt;,
+    // ... cache / memory / durability config ...
+    writer: StdRwLock&lt;Option&lt;Db&gt;&gt;,           // opened on first write
+    reader: AsyncRwLock&lt;Option&lt;Arc&lt;DbReader&gt;&gt;&gt;,
+    writer_open_gate: Mutex&lt;()&gt;,
+    reader_open_gate: Mutex&lt;()&gt;,
+}
+</code></pre>
+
+  <p><code>writer()</code> no longer matches a variant; it returns the cached SlateDB writer, or
+  fails if one was never promoted — so a node that is not allowed to write still cannot:</p>
+
+  <pre><code>// src/core/state.rs:183-185
+pub(crate) fn writer(&amp;self) -&gt; Result&lt;Db&gt; {
+    self.open_writer().ok_or(GraphError::ReadOnlyShardStorage)
+}
+</code></pre>
+
+  <p>The <code>Writer</code> / <code>Reader</code> distinction did not disappear — it moved to the
+  <em>snapshot</em> level (<code>GraphStorageSnapshot::Writer</code> / <code>Reader</code>, Chapter
+  2) — while <em>who may write</em> is now governed by the shard's <code>write_authority</code> and
+  the lazy <span class="concept" data-concept="writer-promotion">promotion</span> in Section 1.6.</p>
+
+  <h2>The behavior is split by concern</h2>
+
+  <p><span class="concept" data-concept="graphshard">GraphShard</span> is one struct, but its
+  methods are spread across the <code>shard/</code> module so that each file holds one concern. The
+  module simply lists them:</p>
+
+  <pre><code>// src/shard.rs:3-10
+mod lifecycle;
+mod maintenance;
+mod query;
+#[cfg(feature = "opencypher")]
+mod query_optimizer;
+#[cfg(feature = "graphblas")]
+pub(crate) mod topology_tail;
+mod write;
+</code></pre>
+
+  <ul>
+    <li><code>lifecycle.rs</code>: opening, closing, format-version checks, and <em>promoting</em> a
+      reader shard to a writer on demand (Section 1.6).</li>
+    <li><code>write.rs</code>: everything that mutates (the write chapter).</li>
+    <li><code>query.rs</code>: everything that reads and answers queries (the read chapter).</li>
+    <li><code>query_optimizer.rs</code>: choosing how to run a query using stored statistics.</li>
+    <li><code>topology_tail.rs</code>: overlaying edges written <em>since</em> the current index
+      generation onto reads, so a query sees a consistent picture even when the indexer lags
+      (Section 1.7).</li>
+    <li><code>maintenance.rs</code>: background upkeep, including the garbage collection in the
+      delete chapter.</li>
+  </ul>
+
+  <p>Each file has its own <code>impl GraphShard { ... }</code> block. Rust allows a type's methods
+  to be defined in several <code>impl</code> blocks across files, and TurboLay uses that to keep
+  each file focused. When you look for a method, pick the file by concern.</p>
+
+  <h2>From a client name to storage keys</h2>
+
+  <p>A client does not know about cells or epochs. It connects and names a database. The server
+  turns that name into a concrete target, and the target carries the <code>cell_id</code> that
+  every storage key needs. This resolution is worth following closely because it connects the
+  outward identity (Chapter 0, Section 0.9) to the storage keys (Section 0.6).</p>
+
+  <p>The target is a scope plus a cell id:</p>
+
+  <pre><code>// src/client/service.rs:38-42
+pub struct ClientQueryTarget {
+    pub scope: GraphScope,
+    pub cell_id: String,
+}
+</code></pre>
+
+  <p>The mapping from a database name to a target goes through a trait, so a deployment can plug in
+  its own policy:</p>
+
+  <pre><code>// src/client/service.rs:52-54
+pub trait ClientDatabaseResolver: Send + Sync {
+    fn resolve_database(&amp;self, database: Option&lt;&amp;str&gt;) -&gt; Result&lt;ClientQueryTarget&gt;;
+}
+</code></pre>
+
+  <p>Two implementations ship. The simpler one is a static table from name to target, with an
+  optional default name used when the client does not specify one:</p>
+
+  <pre><code>// src/client/service.rs:96-124 (abridged)
+impl ClientDatabaseResolver for StaticClientDatabaseResolver {
+    fn resolve_database(&amp;self, database: Option&lt;&amp;str&gt;) -&gt; Result&lt;ClientQueryTarget&gt; {
+        let database = match database {
+            Some(database) =&gt; validate_database_name(database.to_string())?,
+            None =&gt; self.default_database.clone().ok_or_else(|| /* no default */ )?,
+        };
+        self.targets.get(&amp;database).cloned().ok_or_else(|| /* unknown database */ )
+    }
+}
+</code></pre>
+
+  <p>A single-graph deployment wires exactly one name to one target with <code>single</code>:</p>
+
+  <pre><code>// src/client/service.rs:88-93
+pub fn single(database: impl Into&lt;String&gt;, target: ClientQueryTarget) -&gt; Result&lt;Self&gt; {
+    let database = validate_database_name(database.into())?;
+    Self::new()
+        .with_database(database.clone(), target)?
+        .with_default_database(database)
+}
+</code></pre>
+
+  <p>A static table has a hard limit, though: every tenant it can serve must be known when the
+  process starts. Adding a tenant means editing configuration and restarting. So the deployable
+  binary wires the <em>other</em> implementation,
+  <code>HierarchicalClientDatabaseResolver</code> (<code>src/bin/graph-node.rs:90</code>), which
+  does not hold a table at all. It holds one base database name and one root target, and it
+  <em>derives</em> the rest from the name the client sent
+  (<code>src/client/service.rs:61-64</code>):</p>
+
+  <pre><code>pub struct HierarchicalClientDatabaseResolver {
+    base_database: String,
+    root_target: ClientQueryTarget,
+}
+</code></pre>
+
+  <p>The trick is that the database name carries the tenant path inside it. A scoped name is four
+  dot-separated parts — the base name, a version marker, a tenant id, and a sub-tenant id — and
+  <code>scoped_database_name</code> (<code>src/client/service.rs:75-90</code>) is the constructor
+  clients use to build one. <code>SCOPED_DATABASE_VERSION</code> is the literal
+  <code>"scope1"</code> (<code>src/client/service.rs:58</code>), and a client with no sub-tenant
+  gets the sentinel <code>_</code>:</p>
+
+  <pre><code>validate_database_name(format!(
+    "{}.{}.{tenant}.{sub_tenant}",
+    self.base_database, SCOPED_DATABASE_VERSION
+))
+</code></pre>
+
+  <p>Tenant ids come from the outside world, so they cannot be dropped into a name unchecked: a
+  tenant called <code>acme.corp</code> would add a dot and break the parse, and a namespace segment
+  has its own validation rules besides. <code>encode_database_scope_id</code>
+  (<code>src/client/service.rs:130-140</code>) rejects empty and control characters outright, then
+  base64url-encodes (no padding) so that any surviving string is a single valid
+  <code>NamespaceId</code>.</p>
+
+  <p>Resolution is the same journey run backwards (<code>src/client/service.rs:92-127</code>). A
+  name equal to the base database resolves to the root target unchanged — that is the un-scoped,
+  single-tenant case, and it is why an existing client that knows nothing about tenants keeps
+  working. Any other name must carry the <code>&lt;base&gt;.scope1.</code> prefix; the resolver
+  strips it, splits the remainder on its single dot, decodes both halves, and descends from the
+  root target's namespace:</p>
+
+  <pre><code>let mut namespace = self.root_target.scope.namespace
+    .child(NamespaceId::new(tenant)?)?;
+if sub_tenant != "_" {
+    namespace = namespace.child(NamespaceId::new(/* decoded sub-tenant */)?)?;
+}
+ClientQueryTarget::new(
+    GraphScope::new(namespace, self.root_target.scope.graph_id.clone()),
+    self.root_target.cell_id.clone(),
+)
+</code></pre>
+
+  <p>The graph id and the cell id are inherited from the root target; only the namespace path
+  deepens. So a tenant is one level below the deployment root, a sub-tenant one level below that,
+  and the cell id — the thing that actually prefixes storage keys — is the same for all of them.
+  Tenants are separated by <em>namespace</em>, not by cell.</p>
+
+  <p>So the full journey of a request name is a chain of translations:</p>
+
+  <figure>
+    <div class="tb-widget" id="w-name-resolution"></div>
+    <figcaption>Fig. 1.2 — Name resolution: the client picks a database name, the resolver maps it
+      to a scope and a cell id, and the cell id becomes the storage-key prefix. The client never
+      sees cell ids or epochs.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Step a request name down to storage keys — scoped and un-scoped<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Step the chain and each translation lights up in turn: the resolver maps the incoming
+      name to a <code>ClientQueryTarget</code>, the target's <code>cell_id</code> becomes the
+      <code>cell/&lt;cell_id&gt;/</code> prefix, and the key builders in <code>keys.rs</code> turn
+      that prefix into concrete SlateDB keys. Flip between the <em>un-scoped</em> name
+      (<code>"analytics"</code>, resolving straight to the root target) and the <em>scoped</em> name
+      (<code>"analytics.scope1.YWNtZQ._"</code>) and watch what changes: the namespace deepens by
+      one tenant level, but the <code>cell_id</code> at the bottom stays identical. Tenants are
+      told apart by the namespace above the cell, never by the cell itself.</p>
+    </div>
+  </details>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Keeping the name-to-cell mapping behind a trait means the same engine serves a single local
+    graph in a test and a multi-tenant fleet in production without changing the query path. A test
+    wires <code>StaticClientDatabaseResolver::single</code> and gets one name pointing at one
+    target. The deployable binary wires <code>HierarchicalClientDatabaseResolver</code> over the
+    one scope its environment names, and every tenant beneath that scope becomes reachable <em>by
+    name alone</em> — no table entry, no configuration change, no restart. That property is what
+    makes the dynamic scope runtime in the next section worth having: a resolver that had to be
+    told about a tenant in advance would give the runtime nothing to open on demand.</p>
+  </div>
+
+  <h2>One process, or a cluster</h2>
+
+  <p>Everything so far describes a single shard. TurboLay also runs as a cluster, and the cluster
+  is <em>symmetric</em>: there is no controller node, no leases, and no failover loop. Every data
+  node runs the same <code>graph-node</code> binary and holds a <code>RoutedGraphCluster</code>.
+  What changed with the graph-kernel resync is the ownership model: a node no longer owns a
+  <em>disjoint slice</em> of the cells. Instead every node opens <em>every</em> cell in a shared
+  directory as a reader, and any node allowed to write <em>lazily</em> opens a cached writer for a
+  cell the first time it writes it.</p>
+
+  <p><code>GraphCluster</code> is the simplest container: one scope, several shards held in a map
+  keyed by cell id, with no distribution at all. It is what the indexer opens (Section 1.8):</p>
+
+  <pre><code>// src/engine.rs:68-71
+pub struct GraphCluster {
+    scope: GraphScope,
+    shards: BTreeMap&lt;String, GraphShard&gt;,
+}
+</code></pre>
+
+  <p><code>RoutedGraphCluster</code> adds the fleet view. It carries the node's own id, the
+  <span class="concept" data-concept="object-store-node-directory">ObjectStoreNodeDirectory</span>
+  shared by the whole fleet, the shards this node holds open, and a single <code>promotable</code>
+  flag saying whether this node may become a writer. There is no placement map, no per-cell owner,
+  no leases, and no control-plane handles:</p>
+
+  <pre><code>// src/engine.rs:78-89
+pub struct ObjectStoreNodeDirectory {
+    cells: BTreeSet&lt;String&gt;,
+    nodes: BTreeSet&lt;String&gt;,
+}
+
+pub struct RoutedGraphCluster {
+    scope: GraphScope,
+    local_node_id: String,
+    directory: ObjectStoreNodeDirectory,
+    shards: BTreeMap&lt;String, Arc&lt;GraphShard&gt;&gt;,
+    promotable: bool,
+}
+</code></pre>
+
+  <div class="callout term">
+    <span class="callout-title">Term — ObjectStoreNodeDirectory</span>
+    <p>A serializable directory of the fleet: the set of <code>cells</code> that exist and the set
+    of <code>nodes</code> that participate. It replaced <code>ShardPlacement</code>. Crucially it
+    does <em>not</em> map a cell to an owner — it just lists what exists. At open time a node
+    validates that it is in <code>nodes</code>, then opens a shard for <em>every</em> cell in
+    <code>cells</code> (<code>src/engine/cluster.rs</code>, <code>open_at_path</code>). Every node
+    therefore materializes every cell as a reader; there is no ownership to negotiate and no
+    failover, because there is nothing to fail over.</p>
+  </div>
+
+  <p>Because every node holds every cell, routing a <em>read</em> is trivial: any node can serve it
+  locally. A <em>write</em> is the only asymmetry. Writes are gated by the <code>promotable</code>
+  flag and, on a promotable node, lazily promote a cached SlateDB writer for the target cell before
+  mutating:</p>
+
+  <pre><code>// src/engine/cluster.rs:375-396 (abridged)
+pub(crate) async fn ensure_local_writer(&amp;self, cell_id: &amp;str) -&gt; Result&lt;()&gt; {
+    if !self.promotable {
+        return Err(GraphError::WriteRequiresWriter { operation: "routed_write", cell_id: ... });
+    }
+    let shard = self.shards.get(cell_id).ok_or(GraphError::UnknownShard { ... })?;
+    shard.promote_to_writer(cell_id, "routed_write").await
+}
+
+pub async fn write_edge(&amp;self, mutation: EdgeMutation) -&gt; Result&lt;CommitResult&gt; {
+    let shard = self.shard(&amp;mutation.cell_id)?;
+    self.ensure_local_writer(&amp;mutation.cell_id).await?;   // lazily opens the writer
+    shard.write_edge(mutation).await
+}
+</code></pre>
+
+  <p>Single-writer safety does not come from a placement table; it rests on the sole SlateDB writer
+  handle plus SlateDB's own <span class="concept" data-concept="fencing">manifest fencing</span>. A
+  second node that tries to promote the same cell is fenced at the storage layer, so
+  <code>promotable</code> can be true on more than one node without corrupting a cell — at most one
+  promotion wins. The old <code>graph-controller</code> binary and its controller loop no longer
+  exist.</p>
+
+  <figure>
+    <div class="tb-widget" id="w-cluster-topology"></div>
+    <figcaption>Fig. 1.3 — Cluster topology after the resync: data nodes are identical
+      <code>graph-node</code> processes that all read every cell over the shared object store, and a
+      write lazily promotes that node to the cell's single writer. A separate, stateless
+      <code>graph-indexer</code> builds the durable <span class="concept" data-concept="csc">CSC</span>
+      index generations off to the side (Section 1.8). All parties share one
+      <code>ObjectStoreNodeDirectory</code>; there is no controller and no static per-cell
+      owner.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Route a read, promote a writer, watch a second promotion get fenced<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Press <em>Route a read</em> and either data node lights up: every node opens every cell, so
+      any of them can answer locally — there is no owner to route to. Press <em>Write cell 1 via
+      A</em> and node A lazily promotes the single SlateDB writer for that cell. Now press <em>B
+      promotes cell 1</em>: B is <code>promotable</code> too, so it may try — but SlateDB's manifest
+      fencing stamps A's writer as the current epoch, and B's attempt is fenced at the storage
+      layer. At most one promotion survives, and no lock, lease, or owner map was consulted to make
+      that true.</p>
+    </div>
+  </details>
+
+  <h3>Many scopes in one process</h3>
+
+  <p>Both containers so far fix their scope when they open. <code>GraphCluster</code> stores a
+  <code>scope</code> field; <code>RoutedGraphCluster</code> stores one too. That is fine as long as
+  a process serves one graph. But the previous section left a loose end:
+  <code>HierarchicalClientDatabaseResolver</code> will happily resolve
+  <code>analytics.scope1.YWNtZQ._</code> into a namespace nobody has ever mentioned to the process
+  before. Something has to open that scope, and it cannot be something that was configured at
+  startup, because at startup the tenant did not exist.</p>
+
+  <p>That something is the third and outermost container,
+  <span class="concept" data-concept="scoped-cluster">ScopedRoutedGraphCluster</span>. It is what
+  <code>graph-node</code> actually constructs (<code>src/bin/graph-node.rs:44</code>) and what the
+  query service is handed as its <code>QueryCellClient</code>. Where <code>RoutedGraphCluster</code>
+  holds shards, this holds <em><code>RoutedGraphCluster</code>s</em>, keyed by scope
+  (<code>src/engine.rs:101-115</code>):</p>
+
+  <pre><code>pub struct ScopedRoutedGraphCluster {
+    base_path: String,
+    root_namespace: NamespacePath,
+    graph_id: GraphId,
+    local_node_id: String,
+    directory: ObjectStoreNodeDirectory,
+    object_store: Arc&lt;dyn ObjectStore&gt;,
+    scope_directory: ObjectStoreGraphScopeDirectory,
+    options: GraphOpenOptions,
+    memory: GraphMemoryConfig,
+    max_open_scopes: usize,
+    access_clock: AtomicU64,
+    clusters: tokio::sync::Mutex&lt;BTreeMap&lt;GraphScope, ScopedRoutedClusterEntry&gt;&gt;,
+}
+</code></pre>
+
+  <p>Read the last four fields together and the design is already visible: it is an LRU cache of
+  open graphs. <code>clusters</code> is the map, <code>access_clock</code> is a monotonic counter
+  that stands in for time, <code>max_open_scopes</code> is the capacity, and each entry records the
+  <code>last_used</code> tick. Note what the struct stores instead of a scope: a
+  <code>root_namespace</code> and a <code>graph_id</code>. It does not serve <em>one</em> scope; it
+  serves one <em>subtree</em> of scopes.</p>
+
+  <p>Construction does no I/O at all (<code>src/engine/cluster.rs:762-810</code>). It validates that
+  the local node appears in the directory, rejects a <code>max_open_scopes</code> of zero with
+  <code>AdmissionRejected</code>, builds the scope directory handle, and returns. Every scope is
+  opened later, on the first request that names it.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Graph scope directory</span>
+    <p><span class="concept" data-concept="graph-scope-directory">ObjectStoreGraphScopeDirectory</span>
+    (<code>src/engine/scope_directory.rs</code>) is the durable record of which scopes exist.
+    Opening a scope writes a small marker object under a registry prefix; <code>list</code>
+    (<code>:54</code>) enumerates the markers and decodes a <code>GraphScope</code> back out of each
+    path. <code>register</code> (<code>:40</code>) writes with <code>PutMode::Create</code> and
+    treats <code>AlreadyExists</code> as success, so it is
+    <span class="concept" data-concept="idempotency">idempotent</span> — two nodes racing to serve
+    the same new tenant both succeed. It is a discovery aid, not an authority: nothing consults it
+    to decide whether a request is allowed.</p>
+  </div>
+
+  <p>The registry is deliberately trivial on disk — a tree of empty marker objects named
+  <code>__scope__</code>, one per scope, whose <em>path</em> is the data:</p>
+
+  <pre><code>&lt;base&gt;/_graph_scopes/v1/&lt;graph-id&gt;/&lt;root-namespace&gt;/
+    &lt;encoded-tenant&gt;/&lt;encoded-subtenant&gt;/__scope__
+</code></pre>
+
+  <p>The encoded segments are exactly the base64url components from the database name in Section
+  1.5, which is why the round trip works: a name produces a namespace, a namespace produces a
+  marker path, and a <code>LIST</code> over the prefix produces the namespaces back. Discovery
+  therefore costs one object-store listing and needs no catalog service, no database, and nothing
+  writable in the control path.</p>
+
+  <p>The graph data itself lives on a separate path, and the contrast is the point:</p>
+
+  <pre><code>&lt;base&gt;/namespaces/&lt;tenant&gt;/subnamespaces/&lt;subtenant&gt;/…/graphs/&lt;graph-id&gt;/&lt;cell-id&gt;/
+</code></pre>
+
+  <p>The cell id sits at the <em>bottom</em>, below the whole namespace path. That is the
+  storage-level statement of what Section 1.5 said about resolution: every tenant has the same
+  cells, and it is the namespace prefix above them that keeps two tenants apart. Each
+  <code>(namespace path, graph, cell)</code> is an independent SlateDB database, so tenants get
+  independent <span class="concept" data-concept="wal">WAL</span>,
+  <span class="concept" data-concept="snapshot-isolation">snapshots</span>, writer
+  <span class="concept" data-concept="fencing">fencing</span> and index generations without the
+  engine doing anything special — the isolation is the path.</p>
+
+  <p>Everything interesting happens in one function, <code>cluster_for_scope</code>
+  (<code>src/engine/cluster.rs:847-907</code>), which every query goes through. It has four jobs, in
+  order:</p>
+
+  <ol>
+    <li><em>Confine.</em> <code>validate_scope</code> (<code>:816-828</code>) rejects the request
+      unless the scope's graph id matches and its namespace is a descendant of
+      <code>root_namespace</code>. Anything else is a <code>GraphError::GraphScopeMismatch</code>.
+      This runs before the map is even locked, and it is the reason a resolver bug cannot make one
+      tenant read another's storage: the runtime refuses scopes outside the subtree it was built
+      for.</li>
+    <li><em>Serve a hit.</em> If the scope is already open, bump its <code>last_used</code> to the
+      current tick and return the shared handle.</li>
+    <li><em>Make room.</em> If the map is full, evict — but only an entry that nobody is
+      holding.</li>
+    <li><em>Open a miss.</em> Open a <code>RoutedGraphCluster</code> for the scope, register the
+      scope in the directory, and insert it.</li>
+  </ol>
+
+  <p>The eviction rule is the subtle part, and it is worth reading in the original:</p>
+
+  <pre><code>let candidate = clusters
+    .iter()
+    .filter(|(_, entry)| Arc::strong_count(&amp;entry.cluster) == 1)
+    .min_by_key(|(_, entry)| entry.last_used)
+    .map(|(scope, _)| scope.clone())
+    .ok_or(GraphError::AdmissionRejected {
+        operation: "open_graph_scopes", ...
+    })?;
+</code></pre>
+
+  <p>The <code>strong_count == 1</code> filter means: the map's own reference is the only one left,
+  so no query is currently executing against this cluster. Evicting it closes a
+  <code>RoutedGraphCluster</code>, which closes its shards, which drops any SlateDB writer handle
+  the node had promoted for a cell in that scope. Doing that underneath a running write would be a
+  bug, so the filter makes it impossible — an in-use scope is simply not a candidate.</p>
+
+  <p>That leaves an honest failure mode, and the code chooses it deliberately. If all
+  <code>max_open_scopes</code> entries are in use, there is no candidate, and the request fails with
+  <code>AdmissionRejected</code> rather than waiting for a slot. A node under scope pressure sheds
+  load; it does not queue.</p>
+
+  <p>If the open succeeds but registering the scope fails, the freshly opened cluster is closed
+  again before the error propagates (<code>:893-898</code>), so a failed request leaves nothing
+  half-open behind.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>The obvious alternative is to open every scope in the directory at startup and keep them all.
+    That fails on cost, not on correctness: each open scope is a live SlateDB instance with its own
+    memtables, its own block-cache share and its own file handles, so "one tenant, one open graph"
+    turns tenant count into a memory bill whether or not anybody is querying. Bounding the count and
+    evicting the coldest idle scope means a node's footprint tracks its <em>active</em> tenants
+    instead of its <em>registered</em> ones. The price is the first query for a cold tenant paying
+    an open, and a hard ceiling on how many tenants one node can serve at once —
+    <code>GRAPH_MAX_OPEN_SCOPES</code>, default 8 (<code>src/bin/graph_node/config.rs:181</code>).</p>
+  </div>
+
+  <p>Because scopes come and go, two more things become per-scope rather than global. The local
+  SlateDB cache budget is divided across the capacity and each scope gets its own cache directory,
+  which the caching chapter covers in its multi-tenancy section. And runtime metrics grow a scope
+  dimension — <code>local_shard_runtime_metrics</code> (<code>:922-944</code>) walks every loaded
+  cluster and tags each shard's metrics with the scope it came from
+  (<code>src/engine.rs:126-130</code>):</p>
+
+  <pre><code>pub struct ScopedGraphShardRuntimeMetrics {
+    pub scope: GraphScope,
+    pub shard: GraphShardRuntimeMetrics,
+}
+</code></pre>
+
+  <p>Two smaller accessors, <code>loaded_scopes</code> and <code>loaded_clusters</code>
+  (<code>:909-920</code>), expose the current contents of the map. The node's index-discovery loop
+  uses <code>loaded_clusters</code> to sweep exactly the scopes that are open, rather than trying to
+  enumerate all of them. <code>close</code> (<code>:946-967</code>) takes the map, closes each
+  cluster, and reports any that were still in use rather than pretending shutdown was clean.</p>
+
+  <h2>Traversal acceleration: index generations</h2>
+
+  <p>The engine answers multi-hop traversals directly from the
+  <span class="concept" data-concept="adjacency">adjacency</span> keys, but for large, stable
+  neighborhoods that is expensive to redo on every query. TurboLay's one acceleration mechanism is
+  the <em><span class="concept" data-concept="index-generation">index generation</span></em>: a
+  durable, immutable, content-addressed image of one cell's adjacency for one edge type — a
+  <span class="concept" data-concept="graphblas">GraphBLAS</span>
+  <span class="concept" data-concept="csc">CSC</span> matrix plus a manifest — written to the object
+  store and hydrated into memory on demand. There are no supernodes, posting chunks, or
+  reachability caches; this is the whole of it. What changed with the resync is <em>who</em> builds
+  it (a separate process, Section 1.8) and that it is now an immutable generation rather than a
+  mutable, per-node-refreshed artifact.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Index generation</span>
+    <p>A durable snapshot of one cell's adjacency for one edge type, built at a fixed storage
+    <span class="concept" data-concept="sequence-number">sequence</span>
+    (<code>base_sequence</code>) and identified by the SHA-256 of its CSC payload
+    (<code>generation</code>). It is a cache of structure, not a source of truth: canonical edges
+    still live in the adjacency keys, and any edges written <em>after</em> <code>base_sequence</code>
+    are supplied at query time by the
+    <span class="concept" data-concept="wal-tail-overlay">WAL-tail overlay</span> laid over the
+    generation.</p>
+  </div>
+
+  <pre><code>// src/engine/index_store.rs:11-20
+pub struct GraphIndexGeneration {
+    pub cell_id: String,
+    pub edge_type: String,
+    pub base_sequence: StorageSequence,  // the snapshot it was built at
+    pub last_wal_id: u64,                // last WAL entry folded in
+    pub edge_count: u64,
+    pub checksum: u64,
+    pub generation: String,              // sha256 hex of the CSC payload
+}
+</code></pre>
+
+  <p>Four steps move a generation through its life cycle. All the durable logic lives in
+  <code>engine/index_store.rs</code>; the read-time overlay lives in
+  <code>shard/topology_tail.rs</code>:</p>
+
+  <ul>
+    <li><em>Discover</em> — <code>dirty_graph_index_edge_types(cell_id)</code> scans the "dirty"
+      matrix edge-type markers written by the write path and returns each dirty
+      <code>(edge_type, sequence)</code>.</li>
+    <li><em>Build &amp; publish</em> — <code>build_graph_index(cell_id, edge_type)</code> takes an
+      artifact-build permit, snapshots at the current <code>base_sequence</code>, folds the
+      canonical adjacency into a GraphBLAS CSC matrix, checksums it, names the generation by its
+      SHA-256, and publishes the manifest with a compare-and-set retry loop
+      (<code>INDEX_PUBLISH_ATTEMPTS = 8</code>). Publication is atomic: a reader sees either the old
+      generation or the new one, never a torn write.</li>
+    <li><em>Hydrate &amp; overlay</em> — <code>matrix_cache.rs</code> is read-through: on a miss it
+      hydrates the current generation's CSC into the shard's matrix caches (taking the
+      <code>matrix_compilation_gate</code> for the compiled form). Because a read pins a sequence
+      that may be <em>ahead</em> of the generation's <code>base_sequence</code>,
+      <code>topology_tail_since</code> replays the WAL entries written since the generation and
+      overlays them, so the answer reflects the pinned read even when the indexer lags.</li>
+    <li><em>Collect</em> — <code>gc_graph_index_generations(cell_id, edge_type, retain_previous)</code>
+      lists the generations under the prefix and deletes those older than the current one beyond the
+      retained count.</li>
+  </ul>
+
+  <figure>
+    <div class="tb-widget" id="w-index-lifecycle"></div>
+    <figcaption>Fig. 1.4 — The index-generation life cycle: writes only mark edge-types dirty, a
+      separate <code>graph-indexer</code> process (Section 1.8) builds and publishes an immutable,
+      content-addressed CSC generation, and a read hydrates the current generation and overlays the
+      WAL tail written since it — so the object store stays the single source of truth, with
+      <code>gc_graph_index_generations</code> pruning superseded base sequences off to the
+      side.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Walk a generation from dirty marker to hydrated read<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Step the pipeline and each stage activates in order. A write only drops a <em>dirty
+      marker</em> — it never builds anything. The separate <code>graph-indexer</code> picks that up,
+      snapshots at a <code>base_sequence</code>, folds the adjacency into a GraphBLAS CSC matrix, and
+      publishes an immutable generation named by the SHA-256 of its payload. A read then hydrates
+      that generation and lays the <span class="concept" data-concept="wal-tail-overlay">WAL tail</span>
+      — the edges written since <code>base_sequence</code> — on top, so the pinned read is correct
+      even while the indexer lags. Off to the side, GC prunes generations older than the retained
+      count. The object store stays the single source of truth throughout.</p>
+    </div>
+  </details>
+
+  <p>The matrix caches are keyed by <code>(cell_id, edge_type, base_sequence)</code> and, unlike the
+  per-read result caches, are <em>not</em> invalidated by a write. Their <code>base_sequence</code>
+  deliberately lags the current read sequence: a read hydrates the current generation and overlays
+  any newer edges from the WAL tail at query time. So a fresh write does not evict a generation — it
+  simply adds a few overlay edges — and stale generations are removed only by a newer generation
+  superseding them or by GC pruning them. By default the hydrated-adjacency cache is off
+  (<code>max_matrix_adjacencies = 0</code>); only the compiled GraphBLAS matrix is cached.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Decoupling the durable generation's sequence from the read sequence is what lets acceleration
+    stay cheap under a steady write load. If the matrix cache were keyed by the exact read sequence,
+    every write would invalidate it and force a rebuild. Instead the generation is rebuilt
+    out-of-process on a timer, and reads pay only for the small WAL-tail overlay since the generation
+    was built. Making the generation immutable and content-addressed also means a half-written build
+    can never be observed — a reader only ever adopts a fully published manifest.</p>
+  </div>
+
+  <h2>The out-of-process indexer</h2>
+
+  <p>Building an index generation is CPU- and memory-heavy, and it does not need the front doors or
+  service discovery. So it was pulled out of the data node entirely into a second binary,
+  <code>graph-indexer</code>, built with the lean <code>indexer-runtime</code> feature (Section
+  1.1). Nothing on the read/write path builds generations anymore; the data node only
+  <em>consumes</em> them.</p>
+
+  <p><code>graph-indexer</code> is a small loop. It reads its configuration from the environment —
+  the data path, the cells to index, a poll interval (<code>GRAPH_INDEXER_INTERVAL_MS</code>,
+  default 5000), how many previous generations to retain
+  (<code>GRAPH_INDEXER_RETAIN_PREVIOUS</code>, default 1), and an admin address
+  (<code>GRAPH_INDEXER_ADMIN_ADDR</code>, default <code>0.0.0.0:9091</code>) — and exposes an admin
+  HTTP server with <code>/livez</code>, <code>/readyz</code>, and a Prometheus <code>/metrics</code>
+  endpoint.</p>
+
+  <p>The environment names one root scope, but the indexer does not index only that scope. Data
+  nodes create tenant scopes on demand (Section 1.6), and those scopes need index generations too.
+  So each cycle begins by asking the scope directory what exists
+  (<code>src/bin/graph-indexer.rs:132</code>) and then works through the answer:</p>
+
+  <pre><code>let scopes = scope_directory.list().await?;
+for scope in scopes {
+    if !scope_has_data(data_path, &amp;scope, cells, &amp;object_store).await? {
+        continue;
+    }
+    let cluster = GraphCluster::open_cells_scoped(/* … */).await;
+    run_index_cycle(&amp;cluster, cells, retain_previous, metrics).await;
+    cluster.close().await;
+}
+</code></pre>
+
+  <p><code>scope_has_data</code> (<code>:167-187</code>) is a cheap guard: it lists the object store
+  under each cell's prefix for that scope and skips the scope entirely if nothing is there. A
+  registered scope that was never written to costs one listing, not a database open.</p>
+
+  <p>Note that the cluster is opened and closed <em>inside</em> the loop, once per scope per cycle.
+  Where the data node caches open scopes and evicts them under a capacity bound, the indexer keeps
+  nothing between cycles. It can afford that because no client is waiting on it — an extra open
+  every five seconds is invisible in a background builder, and holding nothing open means the
+  indexer's memory does not grow with the tenant count at all. Failures are collected per scope
+  rather than aborting the sweep, so one broken tenant does not stop the others from being
+  indexed.</p>
+
+  <p>Within each opened scope, for every cell:</p>
+
+  <ol>
+    <li><code>refresh_storage_sequence</code> to catch up the reader to the latest durable
+      write;</li>
+    <li><code>dirty_graph_index_edge_types</code> to find which edge types have drifted;</li>
+    <li>for each dirty edge type, compare the current generation's <code>base_sequence</code>
+      against the dirty sequence and, if the generation is stale, <code>build_graph_index</code> to
+      publish a fresh one;</li>
+    <li><code>gc_graph_index_generations</code> to prune superseded generations beyond the retained
+      count.</li>
+  </ol>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Separating the builder from the data node is compute–compute separation: index building can be
+    scaled, scheduled, and rate-limited independently of query serving, and a runaway build cannot
+    starve reads on a data node. Because a generation is immutable and published atomically, the
+    indexer can run as several replicas or be restarted mid-build without a data node ever seeing a
+    partial index — the worst case is simply that the current generation lags, which the WAL-tail
+    overlay already covers.</p>
+  </div>
+
+  <p>In Kubernetes this is a literal deployment split: the data node runs as a
+  <code>StatefulSet</code> (<code>charts/turbolay/templates/node-statefulset.yaml</code>) while the
+  indexer runs as a stateless <code>Deployment</code>
+  (<code>charts/turbolay/templates/indexer-deployment.yaml</code>) with its own
+  <code>indexer.replicaCount</code>, poll interval, and retention, all defaulted in
+  <code>values.yaml</code>.</p>
+
+  <h2>Concurrency: gates and write lanes</h2>
+
+  <p>Two mechanisms keep a busy node from tearing itself apart, and both were visible on the
+  <span class="concept" data-concept="graphshard">GraphShard</span> struct.</p>
+
+  <p>The gates (Section 1.3) bound how many heavy operations of each kind run at once. The
+  <span class="concept" data-concept="write-lanes">write lanes</span> solve a different problem:
+  throughput of small writes. Rather than one lock over all writes, TurboLay spreads writes across a
+  fixed number of lanes:</p>
+
+  <pre><code>// src/lib.rs:178
+pub(crate) const GRAPH_WRITE_LANES: usize = 64;
+</code></pre>
+
+  <p><code>writer_lanes: Vec&lt;Mutex&lt;()&gt;&gt;</code> on the shard holds those 64 lightweight
+  locks. A write picks a lane (by hashing what it touches), so two writes to unrelated vertices take
+  different lanes and proceed in parallel, while two writes that could conflict take the same lane
+  and serialize. The write chapter shows the lane selection in detail.</p>
+
+  <h2>How a request travels, end to end</h2>
+
+  <p>Pulling the chapter together, here is the path of one client query, with pointers to where each
+  step is covered in depth:</p>
+
+  <ol>
+    <li>A driver connects over <em><span class="concept" data-concept="bolt">Bolt</span></em> or
+      <em>HTTPS</em> and authenticates. The server layer is <code>client/bolt.rs</code> or
+      <code>client/http.rs</code> (read chapter).</li>
+    <li>The driver names a <em>database</em>. <code>ClientDatabaseResolver</code> turns it into a
+      <code>ClientQueryTarget</code> carrying the <code>GraphScope</code> and <code>cell_id</code>
+      (Section 1.5).</li>
+    <li>In a cluster, <em>any</em> node can serve the read, because every node opens every cell in
+      the shared <code>ObjectStoreNodeDirectory</code> (Section 1.6). There is no owner to route
+      to.</li>
+    <li>The <code>ClientQueryService</code> opens a
+      <em><span class="concept" data-concept="snapshot-isolation">SlateDB snapshot</span></em> to pin
+      the read, parses the <em><span class="concept" data-concept="cypher">Cypher</span></em> into
+      the engine's plan (<code>query/opencypher.rs</code>), and runs it against the local
+      <code>GraphShard</code> (<code>shard/query.rs</code>). This is the whole read chapter.</li>
+    <li>For a write, the node must be <code>promotable</code>: it <em>lazily opens (and caches) a
+      SlateDB writer</em> for the cell, refreshes its <em>SlateDB manifest
+      <span class="concept" data-concept="fencing">fence</span></em>, then commits through a
+      <em>write batch</em> that advances the storage sequence and updates the edge, adjacency, index,
+      and <span class="concept" data-concept="degree">degree</span> keys. This is the write
+      chapter.</li>
+    <li>A delete <em>hard-removes</em> the relationship rows and <em>soft-deletes</em> the structural
+      edge at a new sequence; later a background pass on the <em>gc gate</em> physically removes
+      superseded data. This is the delete chapter.</li>
+    <li>Throughout, the <em>caches</em> on the shard absorb repeated work: per-read caches keyed by
+      the read sequence (a write advances the sequence, so the next read simply misses), and matrix
+      caches keyed by a deliberately lagging generation <code>base_sequence</code> with the WAL tail
+      overlaid. This is the caching chapter.</li>
+  </ol>
+
+  <p>With the shape of the system in place, the next chapter follows a read from the Bolt socket all
+  the way down to the adjacency keys and back.</p>
+
+  <nav class="tb-chapnav">
+    <a class="prev" href="00-foundations.html"><span class="cn-dir">‹ Prev</span><br><span class="cn-title">Foundations</span></a>
+    <a class="next" href="02-read-path.html"><span class="cn-dir">Next ›</span><br><span class="cn-title">The Read Path</span></a>
+  </nav>
+</main>
+
+<script src="../assets/glossary.js"></script>
+<script>
+/* Page-local glossary extensions — TurboLay nouns introduced in this chapter. */
+window.TB_GLOSSARY = Object.assign(window.TB_GLOSSARY || {}, {
+  "cargo-feature": {
+    title: "Cargo feature",
+    html: `<p>A named, optional slice of a crate. Code guarded by <code>#[cfg(feature = "x")]</code> compiles only when feature <code>x</code> is on, and features can depend on other features, so turning one on can pull in a whole stack.</p><p>TurboLay is one crate whose features form a tower: from a no-feature embedded engine up through <code>opencypher</code>, <code>query-transport</code>, the front doors, and finally <code>server-runtime</code> — the full data node.</p>`
+  },
+  "graphshard": {
+    title: "GraphShard",
+    html: `<p>The central engine type. One <code>GraphShard</code> is one open handle to one <span class="concept" data-concept="cell">cell</span>'s data on the object store, plus everything needed to read and write it: the <span class="concept" data-concept="slatedb">SlateDB</span> storage handle, the limits and policies, the concurrency <span class="concept" data-concept="semaphore">gates</span>, the write authority, and all the in-memory caches.</p><p>Its methods are spread across the <code>shard/</code> module — one file per concern — but it is a single struct. Nearly every operation is a method on it.</p>`
+  },
+  "graphstore": {
+    title: "GraphStore",
+    html: `<p>The small storage handle a <span class="concept" data-concept="graphshard">GraphShard</span> owns (from Chapter 0). It holds the <span class="concept" data-concept="object-store">object-store</span> handle and store path, and opens its <span class="concept" data-concept="slatedb">SlateDB</span> writer and reader <em>lazily</em>, caching each.</p><p><code>writer()</code> returns the cached writer or fails with <code>ReadOnlyShardStorage</code> — so a node that was never promoted to write still cannot.</p>`
+  },
+  "object-store-node-directory": {
+    title: "ObjectStoreNodeDirectory",
+    html: `<p>A serializable directory of the fleet: the set of <code>cells</code> that exist and the set of <code>nodes</code> that participate. It replaced <code>ShardPlacement</code> and, crucially, does <em>not</em> map a cell to an owner — it only lists what exists.</p><p>Every node opens a reader for <em>every</em> listed cell, so there is nothing to route and nothing to fail over. Single-writer safety comes from <span class="concept" data-concept="fencing">fencing</span>, not from this directory.</p>`
+  },
+  "graph-scope-directory": {
+    title: "Graph scope directory",
+    html: `<p><code>ObjectStoreGraphScopeDirectory</code> — the durable record of which graph scopes exist. Opening a scope writes a tiny <code>__scope__</code> marker object whose <em>path</em> is the data; <code>list</code> enumerates the markers and decodes a <code>GraphScope</code> from each path.</p><p><code>register</code> uses <code>PutMode::Create</code> and treats <code>AlreadyExists</code> as success, so it is <span class="concept" data-concept="idempotency">idempotent</span>. It is a discovery aid, not an authority — nothing consults it to decide whether a request is allowed.</p>`
+  },
+  "scoped-cluster": {
+    title: "ScopedRoutedGraphCluster",
+    html: `<p>The outermost container <code>graph-node</code> constructs. It is an LRU cache of open graphs: a map of <code>RoutedGraphCluster</code>s keyed by scope, a monotonic <code>access_clock</code>, a <code>max_open_scopes</code> capacity, and a per-entry <code>last_used</code> tick.</p><p>It serves a whole <em>subtree</em> of scopes rather than one, opening each on the first request that names it and evicting the coldest idle one (never an in-use one) when the map is full.</p>`
+  },
+  "write-lanes": {
+    title: "Write lanes",
+    html: `<p>A fixed array of 64 lightweight <code>Mutex&lt;()&gt;</code> locks on the shard (<code>GRAPH_WRITE_LANES = 64</code>). A write hashes what it touches to pick a lane, so writes to unrelated vertices take different lanes and run in parallel, while writes that could conflict share a lane and serialize.</p><p>It replaces a single global write lock, trading a coarse bottleneck for fine-grained per-lane contention.</p>`
+  },
+  "bolt": {
+    title: "Bolt",
+    html: `<p>Neo4j's binary client wire protocol, one of TurboLay's two public front doors (the other is HTTPS). A driver connects over Bolt, authenticates, and names a database.</p><p>The client layer (<code>client/bolt.rs</code>) turns that name into a <span class="concept" data-concept="cell">cell</span>-bearing <code>ClientQueryTarget</code> via the <code>ClientDatabaseResolver</code>, then runs the <span class="concept" data-concept="cypher">Cypher</span> against the local shard.</p>`
+  }
+});
+</script>
+<script src="../assets/textbook.js"></script>
+<script>
+/* ============================================================================
+   Interactive widgets for "Architecture". Each builds inline SVG via
+   createElementNS, reads colors from CSS vars, and re-renders on theme toggle.
+   ============================================================================ */
+(function () {
+  var NS = "http://www.w3.org/2000/svg";
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  function el(n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; }
+  function mk(label, cls) { var b = document.createElement("button"); b.className = "tb-btn" + (cls ? " " + cls : ""); b.textContent = label; return b; }
+  function txt(x, y, t, anchor, size, weight, fill) {
+    var e = el("text", { x: x, y: y, "text-anchor": anchor || "middle", class: "wnode-label" });
+    if (size) e.setAttribute("font-size", size);
+    if (weight) e.setAttribute("font-weight", weight);
+    if (fill) e.setAttribute("fill", fill);
+    e.textContent = t; return e;
+  }
+  function rect(x, y, w, h, fill, stroke, dash) {
+    return el("rect", { x: x, y: y, width: w, height: h, rx: 6, fill: fill, stroke: stroke, "stroke-width": 1.2, "stroke-dasharray": dash || "none", class: "wnode" });
+  }
+  function arrowDefs(svg, color) {
+    var defs = el("defs", {});
+    var m = el("marker", { id: "arw-" + Math.random().toString(36).slice(2, 7), viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    m.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: color }));
+    defs.appendChild(m); svg.appendChild(defs);
+    return "url(#" + m.getAttribute("id") + ")";
+  }
+  function onTheme(fn) {
+    window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", fn);
+    var t = document.querySelector(".tb-theme-toggle");
+    if (t) t.addEventListener("click", function () { setTimeout(fn, 0); });
+  }
+
+  /* -------------------------------------------------------------------------
+     Widget 1 — the feature tower. Pick a build target; its slice lights up.
+     ------------------------------------------------------------------------- */
+  TB.widget("w-feature-tower", function (mount) {
+    var levels = [
+      { t: "server-runtime → graph-node", s: "both front doors · GraphBLAS · discovery", c: "--ok" },
+      { t: "public-client-protocols = bolt-server + http-api", s: "the two public front doors", c: "--info" },
+      { t: "client-api (shared ClientQueryService)", s: "", c: "--info" },
+      { t: "query-transport (wire protocol · auth · quotas)", s: "", c: "--info" },
+      { t: "opencypher (Cypher parser + planner)", s: "", c: "--warn" },
+      { t: "default (embedded engine: model · keys · codec · shard · storage)", s: "", c: "--border" },
+      { t: "indexer-runtime → graph-indexer (lean, separate)", s: "admin HTTP + engine · no front doors", c: "--purple" }
+    ];
+    var builds = {
+      node:    { label: "graph-node",     inc: [0, 1, 2, 3, 4, 5], note: "server-runtime turns on the whole tower — every layer from default up." },
+      example: { label: "example server", inc: [1, 2, 3, 4, 5],    note: "the examples/ servers build with bolt-server: the Bolt front door over the shared client-api and engine (no server-runtime extras)." },
+      indexer: { label: "graph-indexer",  inc: [6, 5],             note: "indexer-runtime is off the tower: only the embedded engine plus a lean admin HTTP surface — no front doors, no GraphBLAS, no discovery." }
+    };
+    var pick = null;
+
+    var wrap = document.createElement("div");
+    var controls = document.createElement("div"); controls.className = "tb-controls";
+    var bN = mk("graph-node", "primary"), bE = mk("example server", ""), bI = mk("graph-indexer", ""), bR = mk("Reset", "");
+    controls.append(bN, bE, bI, bR);
+    var svg = el("svg", { viewBox: "0 0 480 268", width: "100%", style: "max-width:480px;display:block;margin:0 auto" });
+    var readout = document.createElement("div");
+    readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.6em;color:var(--muted)";
+    wrap.append(controls, svg, readout); mount.appendChild(wrap);
+
+    function render() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var inc = pick ? builds[pick].inc : null;
+      for (var i = 0; i < levels.length; i++) {
+        var lv = levels[i];
+        var y = i < 6 ? 12 + i * 32 : 12 + 6 * 32 + 18; // gap before the off-tower indexer row
+        var on = inc ? inc.indexOf(i) !== -1 : true;
+        var stroke = css(lv.c === "--border" ? "--border" : lv.c);
+        var softVar = lv.c === "--border" ? "--surface-soft" : lv.c + "-soft";
+        var fill = on ? css(softVar) : css("--surface");
+        var g = el("g", { class: "wnode" + (on ? "" : " wdim") });
+        g.appendChild(rect(20, y, 440, 26, fill, stroke, i === 6 ? "5 4" : null));
+        g.appendChild(txt(30, y + 12, lv.t, "start", 10.5, "700", css("--ink")));
+        if (lv.s) g.appendChild(txt(30, y + 22, lv.s, "start", 8.5, null, css("--muted")));
+        svg.appendChild(g);
+      }
+      // "off the tower" marker for indexer
+      svg.appendChild(txt(240, 12 + 6 * 32 + 12, "— not part of the tower —", "middle", 8.5, "700", css("--purple")));
+      readout.textContent = pick ? builds[pick].note : "A build is a contiguous slice — everything from some level down. Pick a target to see its slice.";
+      bN.classList.toggle("primary", pick === "node");
+      bE.classList.toggle("primary", pick === "example");
+      bI.classList.toggle("primary", pick === "indexer");
+    }
+    bN.onclick = function () { pick = "node"; render(); };
+    bE.onclick = function () { pick = "example"; render(); };
+    bI.onclick = function () { pick = "indexer"; render(); };
+    bR.onclick = function () { pick = null; render(); };
+    render(); onTheme(render);
+  });
+
+  /* -------------------------------------------------------------------------
+     Widget 2 — name resolution chain. Step it; toggle scoped vs un-scoped.
+     ------------------------------------------------------------------------- */
+  TB.widget("w-name-resolution", function (mount) {
+    var scoped = false, step = 0; // 0..3 reveal
+    function nodes() {
+      return [
+        { t: scoped ? '"analytics.scope1.YWNtZQ._"' : '"analytics"', s: "Bolt db field / HTTPS x-graph-namespace", c: "--info" },
+        { t: "ClientQueryTarget { scope, cell_id }", s: scoped ? "namespace = root › acme" : "namespace = root (unchanged)", c: "--info" },
+        { t: "cell_prefix(cell_id) = cell/<cell_id>/", s: "same cell_id for every tenant", c: "--info" },
+        { t: "concrete storage keys in SlateDB", s: "built by keys.rs", c: "--ok" }
+      ];
+    }
+    var edgeLabels = ["ClientDatabaseResolver::resolve_database", "cell_id", "key builders in keys.rs"];
+
+    var wrap = document.createElement("div");
+    var controls = document.createElement("div"); controls.className = "tb-controls";
+    var bStep = mk("Step ▶", "primary"), bReset = mk("Reset", "");
+    var lbl = document.createElement("label");
+    var cb = document.createElement("input"); cb.type = "checkbox";
+    lbl.append(cb, document.createTextNode(" scoped (multi-tenant) name"));
+    controls.append(bStep, bReset, lbl);
+    var svg = el("svg", { viewBox: "0 0 420 280", width: "100%", style: "max-width:420px;display:block;margin:0 auto" });
+    var readout = document.createElement("div");
+    readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.6em;color:var(--muted)";
+    wrap.append(controls, svg, readout); mount.appendChild(wrap);
+
+    function render() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var arw = arrowDefs(svg, css("--muted"));
+      var ns = nodes();
+      for (var i = 0; i < ns.length; i++) {
+        var y = 14 + i * 66;
+        var on = i <= step;
+        var softVar = ns[i].c + "-soft";
+        var g = el("g", { class: "wnode" + (on ? " wflash" : " wdim") });
+        g.appendChild(rect(40, y, 340, 44, on ? css(softVar) : css("--surface"), css(ns[i].c)));
+        g.appendChild(txt(210, y + 19, ns[i].t, "middle", 10.5, "700", css("--ink")));
+        g.appendChild(txt(210, y + 34, ns[i].s, "middle", 8.5, null, css("--muted")));
+        svg.appendChild(g);
+        if (i < ns.length - 1) {
+          var y2 = y + 44, y3 = y + 66;
+          var active = i < step;
+          svg.appendChild(el("path", { d: "M210 " + y2 + " L210 " + y3, stroke: active ? css("--primary") : css("--muted"), "stroke-width": active ? 1.8 : 1.2, fill: "none", "marker-end": arw }));
+          svg.appendChild(txt(214, (y2 + y3) / 2 + 3, edgeLabels[i], "start", 7.5, null, css("--muted")));
+        }
+      }
+      var msgs = [
+        "The client sends a database name — nothing about cells or epochs.",
+        "The resolver maps the name to a scope + cell_id. " + (scoped ? "The scoped name deepened the namespace by one tenant level." : "The un-scoped name resolves straight to the root target."),
+        "The cell_id becomes the storage-key prefix — identical across tenants.",
+        "keys.rs turns the prefix into concrete SlateDB keys. The cell_id is the same whether the name was scoped or not."
+      ];
+      readout.textContent = msgs[step];
+      bStep.disabled = step >= ns.length - 1;
+    }
+    bStep.onclick = function () { if (step < 3) step++; render(); };
+    bReset.onclick = function () { step = 0; render(); };
+    cb.onchange = function () { scoped = cb.checked; step = 0; render(); };
+    render(); onTheme(render);
+  });
+
+  /* -------------------------------------------------------------------------
+     Widget 3 — cluster topology. Route reads; promote a writer; get fenced.
+     ------------------------------------------------------------------------- */
+  TB.widget("w-cluster-topology", function (mount) {
+    var mode = "idle"; // idle | read | writeA | fenceB
+    var wrap = document.createElement("div");
+    var controls = document.createElement("div"); controls.className = "tb-controls";
+    var bRead = mk("Route a read", ""), bWrite = mk("Write cell 1 via A", "primary"),
+        bFence = mk("B promotes cell 1", "danger"), bReset = mk("Reset", "");
+    controls.append(bRead, bWrite, bFence, bReset);
+    var svg = el("svg", { viewBox: "0 0 460 260", width: "100%", style: "max-width:460px;display:block;margin:0 auto" });
+    var readout = document.createElement("div");
+    readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.6em;color:var(--muted)";
+    wrap.append(controls, svg, readout); mount.appendChild(wrap);
+
+    function nodeBox(x, label, sub, active, badge, color) {
+      var g = el("g", { class: "wnode" + (active ? " wflash" : "") });
+      g.appendChild(rect(x, 16, 120, 60, active ? css(color + "-soft") : css("--surface"), css(color)));
+      g.appendChild(txt(x + 60, 38, label, "middle", 11, "700", css("--ink")));
+      g.appendChild(txt(x + 60, 54, sub, "middle", 8.5, null, css("--muted")));
+      if (badge) g.appendChild(txt(x + 60, 68, badge, "middle", 8.5, "700", css(badge.indexOf("fenced") >= 0 ? "--bad" : "--ok")));
+      return g;
+    }
+    function render() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var arw = arrowDefs(svg, css("--muted"));
+      var readAll = mode === "read";
+      var aWriter = mode === "writeA" || mode === "fenceB";
+      // nodes
+      svg.appendChild(nodeBox(20, "graph-node A", "reads all cells", readAll || aWriter, aWriter ? "writer · cell 1" : (readAll ? "serving read" : ""), "--info"));
+      svg.appendChild(nodeBox(170, "graph-node B", "reads all cells", readAll || mode === "fenceB", mode === "fenceB" ? "fenced ✕" : (readAll ? "serving read" : ""), mode === "fenceB" ? "--bad" : "--info"));
+      svg.appendChild(nodeBox(320, "graph-indexer", "builds CSC", false, "", "--purple"));
+      // object store
+      svg.appendChild(rect(60, 168, 340, 62, css("--ok-soft"), css("--ok")));
+      svg.appendChild(txt(230, 192, "Object store — durable graph data + CSC index generations", "middle", 10, "700", css("--ink")));
+      svg.appendChild(txt(230, 210, "one shared ObjectStoreNodeDirectory · no controller", "middle", 8.5, null, css("--muted")));
+      // edges node->OS
+      function link(x, active, color, dash) {
+        svg.appendChild(el("path", { d: "M" + x + " 76 L" + x + " 168", stroke: active ? css(color) : css("--muted"), "stroke-width": active ? 1.9 : 1.2, fill: "none", "stroke-dasharray": dash || "none", "marker-end": arw }));
+      }
+      link(80, readAll, "--info");
+      link(230, readAll, "--info");
+      link(380, false, "--purple");
+      // writer / fence overlay to cell 1 (node A + B)
+      if (aWriter) svg.appendChild(txt(80, 130, "promotes writer", "middle", 8.5, "700", css("--ok")));
+      if (mode === "fenceB") {
+        svg.appendChild(el("path", { d: "M230 76 L230 168", stroke: css("--bad"), "stroke-width": 1.9, fill: "none", "stroke-dasharray": "5 4", "marker-end": arw }));
+        svg.appendChild(txt(268, 130, "fenced", "middle", 8.5, "700", css("--bad")));
+      }
+      var msgs = {
+        idle: "Two identical graph-node processes over one object store, plus a separate indexer. Try routing a read or a write.",
+        read: "Every node opens every cell, so ANY node answers a read locally. There is no owner to route to.",
+        writeA: "The write routes to A; A is promotable, so it lazily opens the single SlateDB writer for cell 1 — its first write promotes it.",
+        fenceB: "B is promotable too and may attempt cell 1 — but SlateDB manifest fencing already stamped A's writer epoch. B is fenced at the storage layer. At most one promotion wins; no lock or lease was needed."
+      };
+      readout.textContent = msgs[mode];
+      bFence.disabled = mode !== "writeA";
+    }
+    bRead.onclick = function () { mode = "read"; render(); };
+    bWrite.onclick = function () { mode = "writeA"; render(); };
+    bFence.onclick = function () { mode = "fenceB"; render(); };
+    bReset.onclick = function () { mode = "idle"; render(); };
+    render(); onTheme(render);
+  });
+
+  /* -------------------------------------------------------------------------
+     Widget 4 — index-generation life cycle. Step the pipeline.
+     ------------------------------------------------------------------------- */
+  TB.widget("w-index-lifecycle", function (mount) {
+    var step = 0; // 0..4 reveal main stages; GC branch shows at step>=3
+    var stages = [
+      { t: "writes →", s: "dirty markers", c: "--border" },
+      { t: "graph-indexer", s: "separate process", c: "--info" },
+      { t: "build_graph_index", s: "→ publish manifest", c: "--border" },
+      { t: "immutable generation", s: "GraphBLAS CSC + manifest", c: "--purple" },
+      { t: "hydrate + WAL-tail", s: "overlay (read)", c: "--ok" }
+    ];
+    var wrap = document.createElement("div");
+    var controls = document.createElement("div"); controls.className = "tb-controls";
+    var bStep = mk("Step ▶", "primary"), bReset = mk("Reset", "");
+    controls.append(bStep, bReset);
+    var svg = el("svg", { viewBox: "0 0 480 210", width: "100%", style: "max-width:480px;display:block;margin:0 auto" });
+    var readout = document.createElement("div");
+    readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.8em;color:var(--muted)";
+    wrap.append(controls, svg, readout); mount.appendChild(wrap);
+
+    function render() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var arw = arrowDefs(svg, css("--muted"));
+      var bw = 86, gap = 12, x0 = 8, y = 40;
+      for (var i = 0; i < stages.length; i++) {
+        var x = x0 + i * (bw + gap);
+        var on = i <= step;
+        var softVar = stages[i].c === "--border" ? "--surface-soft" : stages[i].c + "-soft";
+        var g = el("g", { class: "wnode" + (on ? " wflash" : " wdim") });
+        g.appendChild(rect(x, y, bw, 52, on ? css(softVar) : css("--surface"), css(stages[i].c)));
+        g.appendChild(txt(x + bw / 2, y + 22, stages[i].t, "middle", 9, "700", css("--ink")));
+        g.appendChild(txt(x + bw / 2, y + 36, stages[i].s, "middle", 8, null, css("--muted")));
+        svg.appendChild(g);
+        if (i < stages.length - 1) {
+          var active = i < step;
+          var ex = x + bw, ex2 = x + bw + gap;
+          svg.appendChild(el("path", { d: "M" + ex + " " + (y + 26) + " L" + ex2 + " " + (y + 26), stroke: active ? css("--primary") : css("--muted"), "stroke-width": active ? 1.9 : 1.2, fill: "none", "marker-end": arw }));
+        }
+      }
+      // GC branch below the generation box (stage index 3)
+      var gx = x0 + 3 * (bw + gap);
+      var gcOn = step >= 3;
+      var gg = el("g", { class: "wnode" + (gcOn ? "" : " wdim") });
+      gg.appendChild(el("path", { d: "M" + (gx + bw / 2) + " " + (y + 52) + " L" + (gx + bw / 2) + " " + (y + 92), stroke: css("--muted"), "stroke-width": 1.2, fill: "none", "stroke-dasharray": "4 3", "marker-end": arw }));
+      gg.appendChild(rect(gx - 14, y + 92, bw + 28, 40, gcOn ? css("--warn-soft") : css("--surface"), css("--warn")));
+      gg.appendChild(txt(gx + bw / 2, y + 110, "gc_graph_index_generations", "middle", 8, "700", css("--ink")));
+      gg.appendChild(txt(gx + bw / 2, y + 123, "prunes old base sequences", "middle", 7.5, null, css("--muted")));
+      svg.appendChild(gg);
+      svg.appendChild(txt(240, 18, "the object store stays the single source of truth", "middle", 8.5, "700", css("--muted")));
+      var msgs = [
+        "A write only drops a dirty edge-type marker. It builds nothing on the write path.",
+        "The separate graph-indexer process (Section 1.8) picks up the dirty marker on its poll cycle.",
+        "build_graph_index snapshots at a base_sequence, folds adjacency into a GraphBLAS CSC matrix, and publishes the manifest atomically (compare-and-set).",
+        "The generation is immutable and content-addressed (SHA-256 of the CSC). GC prunes generations older than the retained count off to the side.",
+        "A read hydrates the current generation and overlays the WAL tail written since base_sequence — so a lagging index still serves a correct, pinned read."
+      ];
+      readout.textContent = msgs[step];
+      bStep.disabled = step >= stages.length - 1;
+    }
+    bStep.onclick = function () { if (step < 4) step++; render(); };
+    bReset.onclick = function () { step = 0; render(); };
+    render(); onTheme(render);
+  });
+})();
+</script>
