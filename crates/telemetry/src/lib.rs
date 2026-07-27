@@ -38,12 +38,13 @@
 //! | Module | Contents |
 //! |---|---|
 //! | [`config`] | [`ServiceIdentity`], [`TelemetryConfig`], environment resolution |
-//! | [`semconv`] | the `turbolay.*` attribute registry |
+//! | [`semconv`] | the attribute registry, and which keys may be metric labels |
 //! | [`redact`] | the field denylist and the visitor that applies it |
 //! | [`propagate`] | W3C `traceparent`, with no OTel dependency |
 //! | [`error_class`] | the `error.class` vocabulary and [`Outcome`] |
 //! | [`layers`] | subscriber assembly |
-//! | `otlp` | exporter wiring — `otlp` feature only |
+//! | `otlp` | exporter wiring, including the meter provider — `otlp` feature only |
+//! | `meter` | observable histogram families — `otlp` feature only |
 //! | `sampling` | the head sampler — `otlp` feature only |
 //!
 //! # Status
@@ -86,6 +87,8 @@ pub mod semconv;
 
 #[cfg(feature = "otlp")]
 pub mod bridge;
+#[cfg(feature = "otlp")]
+pub mod meter;
 #[cfg(feature = "otlp")]
 pub mod otlp;
 #[cfg(feature = "otlp")]
