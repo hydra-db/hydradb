@@ -15,13 +15,25 @@
 //! whose names it rejects — `db.client.operation.duration.bucket` being fine is
 //! not something to take on faith.
 //!
-//! No collector and no network: a `PushMetricExporter` implemented here
-//! captures the `ResourceMetrics` a forced flush produces.
+//! A `PushMetricExporter` implemented here captures the `ResourceMetrics` a
+//! forced flush produces, with no collector and no network.
+//!
+//! The last two tests do use a socket, deliberately. Everything above them
+//! proves the *rendering* is right; they prove the pipeline is **connected** —
+//! that a series recorded through the handle
+//! [`turbolay_telemetry::TelemetryGuard::providers`] returns actually leaves the
+//! process as OTLP. That is a different claim, and it is the one that was false
+//! for two commits while every rendering test passed: the meter provider was
+//! built, held and unreachable. A test that constructs an `SdkMeterProvider`
+//! itself can never catch that, because constructing one is precisely the step
+//! production code was not doing.
 
 #![cfg(feature = "otlp")]
 
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
@@ -30,7 +42,11 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
 
 use opentelemetry::metrics::MeterProvider as _;
 use turbolay_telemetry::meter::{HistogramSpec, HistogramUnit, ObservableHistogram, LE_INFINITY};
-use turbolay_telemetry::semconv::{LE, L_CELL_ID};
+use turbolay_telemetry::semconv::{
+    DB_OPERATION_READ, DB_OPERATION_WRITE, DB_SYSTEM_NEO4J, LE, L_CELL_ID, L_DB_OPERATION_NAME,
+    L_DB_SYSTEM_NAME,
+};
+use turbolay_telemetry::{ServiceIdentity, TelemetryConfig};
 
 /// One exported series, flattened to what the assertions are about.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -38,6 +54,7 @@ struct Series {
     metric: String,
     unit: String,
     cell_id: Option<String>,
+    operation: Option<String>,
     le: Option<String>,
     value: u64,
 }
@@ -71,6 +88,7 @@ impl PushMetricExporter for Capture {
                         metric: metric.name().to_string(),
                         unit: metric.unit().to_string(),
                         cell_id: lookup(&attributes, L_CELL_ID.key()),
+                        operation: lookup(&attributes, L_DB_OPERATION_NAME.key()),
                         le: lookup(&attributes, LE),
                         value,
                     });
@@ -234,4 +252,321 @@ fn an_unrecorded_histogram_exports_nothing() {
     );
 
     provider.shutdown().expect("shutdown");
+}
+
+/// The read/write split reaches the exporter as **one instrument name and two
+/// series**, told apart by `db.operation.name`.
+///
+/// This is the property `db.client.operation.duration.read` / `….write` existed
+/// as a workaround for. It is worth an exporter-level test rather than an
+/// observation-vector one because the failure it guards against is *silent
+/// collapse*: two series recorded under one instrument name with no
+/// distinguishing attribute do not error, do not warn and do not duplicate —
+/// they merge, and the merged number looks entirely plausible. Only counting
+/// what an exporter received can tell the difference.
+#[test]
+fn read_and_write_share_one_instrument_and_stay_two_series() {
+    let capture = Capture::default();
+    let reader = PeriodicReader::builder(capture.clone())
+        .with_interval(Duration::from_secs(3_600))
+        .build();
+    let provider = SdkMeterProvider::builder().with_reader(reader).build();
+    let meter = provider.meter("turbolay.test");
+
+    let histogram = ObservableHistogram::register(
+        &meter,
+        HistogramSpec {
+            name: "db.client.operation.duration",
+            description: "client query latency",
+            unit: HistogramUnit::Seconds,
+        },
+        &BOUNDS,
+    )
+    .expect("the kernel ladder is ascending");
+
+    let mut reads = [0u64; 18];
+    reads[0] = 5;
+    let mut writes = [0u64; 18];
+    writes[17] = 2;
+
+    histogram
+        .record_snapshot(
+            &[
+                (L_DB_SYSTEM_NAME, DB_SYSTEM_NEO4J),
+                (L_DB_OPERATION_NAME, DB_OPERATION_READ),
+            ],
+            &reads,
+            400,
+        )
+        .expect("18 counts for 17 bounds");
+    histogram
+        .record_snapshot(
+            &[
+                (L_DB_SYSTEM_NAME, DB_SYSTEM_NEO4J),
+                (L_DB_OPERATION_NAME, DB_OPERATION_WRITE),
+            ],
+            &writes,
+            90_000_000,
+        )
+        .expect("18 counts for 17 bounds");
+
+    provider.force_flush().expect("flush");
+    let captured = capture.0.lock().expect("capture lock").clone();
+
+    let names: Vec<&str> = {
+        let mut names: Vec<&str> = captured
+            .iter()
+            .map(|series| series.metric.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    };
+    assert_eq!(
+        names,
+        vec![
+            "db.client.operation.duration.bucket",
+            "db.client.operation.duration.count",
+            "db.client.operation.duration.sum",
+        ],
+        "the split must not reappear as a name suffix"
+    );
+
+    let counts: Vec<&Series> = captured
+        .iter()
+        .filter(|series| series.metric == "db.client.operation.duration.count")
+        .collect();
+    assert_eq!(
+        counts.len(),
+        2,
+        "two populations, two series: {captured:#?}"
+    );
+    let count_of = |operation: &str| {
+        counts
+            .iter()
+            .find(|series| series.operation.as_deref() == Some(operation))
+            .unwrap_or_else(|| panic!("no {operation} series in {counts:#?}"))
+            .value
+    };
+    assert_eq!(count_of(DB_OPERATION_READ), 5);
+    assert_eq!(count_of(DB_OPERATION_WRITE), 2);
+
+    // 36 bucket series, not 18: the `le` dimension multiplies the operation
+    // dimension rather than replacing it.
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|series| series.metric == "db.client.operation.duration.bucket")
+            .count(),
+        36
+    );
+
+    provider.shutdown().expect("shutdown");
+}
+
+/// Every request the stand-in collector received: request path and raw body.
+type CapturedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// A minimal HTTP sink standing in for a collector, capturing what was POSTed.
+///
+/// Closes each connection after answering so the exporter cannot keep one alive
+/// and leave the last body unread in a socket buffer at assertion time.
+fn spawn_collector() -> (String, CapturedRequests) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let endpoint = format!("http://{}", listener.local_addr().expect("bound"));
+    let captured: CapturedRequests = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&captured);
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let Ok(peer) = stream.try_clone() else {
+                continue;
+            };
+            let mut reader = BufReader::new(peer);
+
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                continue;
+            }
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+
+            let mut length = 0usize;
+            loop {
+                let mut header = String::new();
+                match reader.read_line(&mut header) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                if header == "\r\n" || header == "\n" {
+                    break;
+                }
+                let lowered = header.to_ascii_lowercase();
+                if let Some(value) = lowered.strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap_or(0);
+                }
+            }
+
+            let mut body = vec![0u8; length];
+            if reader.read_exact(&mut body).is_err() {
+                body.clear();
+            }
+            sink.lock().expect("sink lock").push((path, body));
+
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\n\
+                  content-type: application/x-protobuf\r\n\
+                  content-length: 0\r\n\
+                  connection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+        }
+    });
+
+    (endpoint, captured)
+}
+
+fn contains(haystack: &[u8], needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// **The end-to-end claim.** A histogram registered against the meter
+/// `TelemetryGuard::providers()` hands out leaves the process as an OTLP
+/// `/v1/metrics` request.
+///
+/// Every other test in this file builds its own `SdkMeterProvider`, which is
+/// exactly the step production code was missing — so none of them could fail
+/// while the metrics path was unreachable, and none of them did. This one goes
+/// through `turbolay_telemetry::init`, so it exercises the accessor, the
+/// `PeriodicReader`'s own OS thread, the blocking HTTP client that thread
+/// requires, and the endpoint composition in `otlp::build`. If any one of those
+/// is wrong, nothing arrives.
+///
+/// The body is checked as bytes rather than decoded: protobuf encodes strings
+/// literally, so the instrument name and the label key are substrings of the
+/// frame, and asserting on them needs no `prost` dependency in a test whose
+/// point is that the wire format is not the thing under test.
+#[test]
+fn a_metric_recorded_through_the_guards_meter_reaches_an_otlp_exporter() {
+    let (endpoint, captured) = spawn_collector();
+
+    let mut config = TelemetryConfig::new(ServiceIdentity::GraphNode);
+    config.otlp_endpoint = Some(endpoint);
+    // Short, so the periodic path is the one that fires and the test does not
+    // rest on shutdown's final collection alone.
+    config.metric_export_interval = Duration::from_millis(200);
+    config.export_timeout = Duration::from_secs(5);
+
+    let guard = turbolay_telemetry::init(config).expect("telemetry installs");
+    let histogram = {
+        let providers = guard
+            .providers()
+            .expect("an endpoint must produce providers");
+        ObservableHistogram::register(
+            &providers.meter("turbolay.graph_node"),
+            HistogramSpec {
+                name: "db.client.operation.duration",
+                description: "client query latency",
+                unit: HistogramUnit::Seconds,
+            },
+            &BOUNDS,
+        )
+        .expect("the kernel ladder is ascending")
+    };
+
+    let mut reads = [0u64; 18];
+    reads[1] = 3;
+    histogram
+        .record_snapshot(
+            &[
+                (L_DB_SYSTEM_NAME, DB_SYSTEM_NEO4J),
+                (L_DB_OPERATION_NAME, DB_OPERATION_READ),
+            ],
+            &reads,
+            600,
+        )
+        .expect("18 counts for 17 bounds");
+    let mut writes = [0u64; 18];
+    writes[16] = 1;
+    histogram
+        .record_snapshot(
+            &[
+                (L_DB_SYSTEM_NAME, DB_SYSTEM_NEO4J),
+                (L_DB_OPERATION_NAME, DB_OPERATION_WRITE),
+            ],
+            &writes,
+            25_000_000,
+        )
+        .expect("18 counts for 17 bounds");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let body = loop {
+        let found = captured
+            .lock()
+            .expect("sink lock")
+            .iter()
+            .find(|(path, body)| {
+                path.ends_with("/v1/metrics")
+                    && contains(body, "db.client.operation.duration.bucket")
+            })
+            .map(|(_, body)| body.clone());
+        if let Some(body) = found {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no OTLP /v1/metrics request carried the instrument; captured {:?}",
+            captured
+                .lock()
+                .expect("sink lock")
+                .iter()
+                .map(|(path, body)| (path.clone(), body.len()))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    guard.shutdown();
+
+    assert!(
+        contains(&body, "db.client.operation.duration.sum"),
+        "the sum instrument did not reach the exporter"
+    );
+    assert!(
+        contains(&body, "db.client.operation.duration.count"),
+        "the count instrument did not reach the exporter"
+    );
+    assert!(
+        contains(&body, L_DB_OPERATION_NAME.key()),
+        "the label that keeps read and write apart did not reach the exporter"
+    );
+    assert!(
+        contains(&body, DB_OPERATION_READ) && contains(&body, DB_OPERATION_WRITE),
+        "only one of the two operations reached the exporter"
+    );
+    assert!(
+        contains(&body, LE),
+        "the bucket bound label did not reach the exporter"
+    );
+    // The deliberate semconv non-conformance, asserted rather than described:
+    // `db.namespace` is required-if-applicable and it is applicable — the
+    // namespace is `turbolay.scope`, which is the unbounded tenant root the
+    // label registry exists to keep off metrics. Its absence is the design.
+    assert!(
+        !contains(&body, "db.namespace"),
+        "db.namespace reached the exporter; its only value is the unbounded scope"
+    );
+    assert!(
+        !contains(&body, "turbolay.scope"),
+        "the tenant root reached a metric label"
+    );
 }
