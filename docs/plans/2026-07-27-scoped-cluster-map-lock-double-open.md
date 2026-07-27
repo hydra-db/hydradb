@@ -1,9 +1,10 @@
 ---
 title: The scoped-cluster map lock and the double-open race
-status: draft-for-review
+status: step-3-complete
 date: 2026-07-27
 branch: Turbolay-V3.5
 base_commit: 8d7e939
+head_commit: 653896f
 tags:
   - concurrency
   - scoped-clusters
@@ -360,7 +361,7 @@ queue behind the close; and a second `cluster_for_scope` for the *closing* scope
 polled once and observed `Pending`, proving the tombstone holds it off. Plus:
 `ScopedRoutedGraphCluster::close()` still drains cleanly afterwards.
 
-### Step 3 — stop the collector pinning every scope
+### Step 3 — stop the collector pinning every scope — **done, `653896f`**
 
 `local_shard_runtime_metrics` and `loaded_clusters` should collect
 `Weak<RoutedGraphCluster>` under the lock and upgrade one at a time, dropping
@@ -382,6 +383,26 @@ collection future parked mid-flight (one cache mutex held, `poll!` once, as in
 `08e78df`) and shows `cluster_for_scope` for scope N+1 still succeeding rather
 than returning `AdmissionRejected`. Against the current code it returns the
 error, which is the regression the test exists to pin.
+
+**Met.** `a_parked_metrics_collection_does_not_block_opening_a_new_scope` at
+`max_open_scopes = 3` holds one shard's `matrix_artifact_cache`, `poll!`s the
+collection once, asserts it is pending, and opens a fourth scope. Reverting only
+the `Arc::downgrade` in `local_shard_runtime_metrics` makes it fail with
+`AdmissionRejected { operation: "open_graph_scopes", actual: 4, limit: 3 }`, so
+the test demonstrably pins the regression rather than passing either way. It also
+asserts the completed collection returns two rows rather than three, which pins
+the other half of the contract: a scope evicted mid-collection is a skip, not an
+error and not a row.
+
+`a_held_loaded_clusters_snapshot_does_not_block_opening_a_new_scope` covers the
+wider window. `loaded_clusters` returns `Weak` rather than `Arc` so the
+index-discovery loop cannot reintroduce the bug by collecting the upgrades into a
+`Vec`; temporarily doing exactly that reproduces the same error at
+`max_open_scopes = 2`.
+
+The window is shrunk, not closed, and both doc comments say so: the scope being
+read is still un-evictable, and closing that needs the in-use count this step
+declined to build.
 
 ### Step 4 — amend the OTel plan — **done, 2026-07-27**
 
