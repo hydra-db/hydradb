@@ -22,11 +22,12 @@ use crate::query::opencypher::{
     parse_opencypher_unwind_batch, OpenCypherQueryAccess, ParsedUnwindBatchKind,
 };
 use crate::{
-    validate_component, EdgeMetadata, GraphError, GraphId, GraphScope, NamespaceId, NamespacePath,
-    QueryBatchEdge, QueryBatchOperation, QueryBatchRelationship, QueryBatchRelationshipMerge,
-    QueryBatchVertex, QueryCancellationToken, QueryColumn, QueryContext, QueryCursorToken,
-    QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow, Result, StorageSequence,
-    VertexMetadata, VertexPropertyValue,
+    validate_component, AtomicDurationHistogram, DurationHistogramSnapshot, EdgeMetadata,
+    GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryBatchEdge,
+    QueryBatchOperation, QueryBatchRelationship, QueryBatchRelationshipMerge, QueryBatchVertex,
+    QueryCancellationToken, QueryColumn, QueryContext, QueryCursorToken, QueryParameterValue,
+    QueryResultPage, QueryResultSet, QueryRow, Result, StorageSequence, VertexMetadata,
+    VertexPropertyValue,
 };
 use tracing::Instrument as _;
 
@@ -648,7 +649,18 @@ pub struct ClientQueryMetricsSnapshot {
     pub backpressure_waits: u64,
     pub prepare_requests: u64,
     pub prepare_duration_us: u64,
+    /// Total microseconds across both latency histograms below.
+    ///
+    /// Retained so nothing that read the old sum has to change. It is derived
+    /// rather than stored: every execution is recorded into exactly one of the
+    /// two histograms, so their sums add up to the previous value exactly.
     pub execution_duration_us: u64,
+    /// End-to-end execution of a read, from the authorization check to the
+    /// assembled first page — including the server-cursor start.
+    pub read_latency: DurationHistogramSnapshot,
+    /// End-to-end execution of a mutation, which is a different distribution
+    /// entirely: it carries a commit, and it can never be served from a cursor.
+    pub write_latency: DurationHistogramSnapshot,
 }
 
 #[derive(Default)]
@@ -663,11 +675,20 @@ struct ClientQueryMetrics {
     backpressure_waits: AtomicU64,
     prepare_requests: AtomicU64,
     prepare_duration_us: AtomicU64,
-    execution_duration_us: AtomicU64,
+    // One sum fed two structurally different populations before this. Every
+    // execution funnels through `execute_prepared_page_inner`, which already
+    // knows the `QueryTransportAction` and threw it away, so a mutation's
+    // commit path and a page served out of a warm server cursor landed in one
+    // distribution. Splitting on the action costs nothing and is the whole
+    // reason a percentile out of these is worth reading.
+    read_latency: AtomicDurationHistogram,
+    write_latency: AtomicDurationHistogram,
 }
 
 impl ClientQueryMetrics {
     fn snapshot(&self) -> ClientQueryMetricsSnapshot {
+        let read_latency = self.read_latency.snapshot();
+        let write_latency = self.write_latency.snapshot();
         ClientQueryMetricsSnapshot {
             queries_started: self.queries_started.load(Ordering::Relaxed),
             queries_completed: self.queries_completed.load(Ordering::Relaxed),
@@ -679,7 +700,26 @@ impl ClientQueryMetrics {
             backpressure_waits: self.backpressure_waits.load(Ordering::Relaxed),
             prepare_requests: self.prepare_requests.load(Ordering::Relaxed),
             prepare_duration_us: self.prepare_duration_us.load(Ordering::Relaxed),
-            execution_duration_us: self.execution_duration_us.load(Ordering::Relaxed),
+            execution_duration_us: read_latency.sum_us.saturating_add(write_latency.sum_us),
+            read_latency,
+            write_latency,
+        }
+    }
+
+    /// Route one execution's elapsed time to the histogram for its action.
+    ///
+    /// Only `Read` and `Write` can reach an execution: the action comes from
+    /// `authorize_query`, which maps a two-variant access classification.
+    /// `Cancel` and `Admin` authorize control frames, which never run a query.
+    /// They are spelled out rather than matched with `_` so that adding a
+    /// variant is a compile error here instead of a silent misfiling, and they
+    /// fold into reads so that the two sums stay total over every observation.
+    fn record_execution(&self, action: QueryTransportAction, elapsed: Duration) {
+        match action {
+            QueryTransportAction::Write => self.write_latency.record(elapsed),
+            QueryTransportAction::Read
+            | QueryTransportAction::Cancel
+            | QueryTransportAction::Admin => self.read_latency.record(elapsed),
         }
     }
 }
@@ -1268,14 +1308,9 @@ impl ClientQueryService {
                 .unwrap_or(0),
             result.is_ok(),
         );
-        self.inner.metrics.execution_duration_us.fetch_add(
-            execution_started
-                .elapsed()
-                .as_micros()
-                .try_into()
-                .unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        self.inner
+            .metrics
+            .record_execution(action, execution_started.elapsed());
         result
     }
 

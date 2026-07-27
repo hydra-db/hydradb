@@ -873,3 +873,69 @@ async fn timeout_keeps_admission_owned_until_non_cooperative_work_stops() {
     assert!(started.elapsed() >= Duration::from_millis(25));
     assert_eq!(service.active_query_count().await, 0);
 }
+
+/// `execution_duration_us` stopped being stored and is now the sum of the two
+/// histograms, so the thing worth pinning is that its *value* did not move.
+/// The inputs deliberately straddle the ladder: below the 100 µs floor, exactly
+/// on a bound (`le` is inclusive), mid-bucket, and past the 30 s overflow.
+#[test]
+fn derived_execution_duration_is_bit_exact_over_the_recorded_durations() {
+    const READS_US: [u64; 4] = [37, 100, 4_321, 40_000_000];
+    const WRITES_US: [u64; 3] = [250, 999_999, 12_345_678];
+
+    let metrics = ClientQueryMetrics::default();
+    for micros in READS_US {
+        metrics.record_execution(QueryTransportAction::Read, Duration::from_micros(micros));
+    }
+    for micros in WRITES_US {
+        metrics.record_execution(QueryTransportAction::Write, Duration::from_micros(micros));
+    }
+
+    let snapshot = metrics.snapshot();
+    let expected: u64 = READS_US.iter().chain(WRITES_US.iter()).sum();
+    assert_eq!(snapshot.execution_duration_us, expected);
+    // The same equality stated the other way round, so a regression that
+    // reintroduced a separate counter fails here rather than drifting quietly.
+    assert_eq!(
+        snapshot.read_latency.sum_us + snapshot.write_latency.sum_us,
+        snapshot.execution_duration_us
+    );
+    assert_eq!(snapshot.read_latency.count(), READS_US.len() as u64);
+    assert_eq!(snapshot.write_latency.count(), WRITES_US.len() as u64);
+}
+
+/// The point of the split: a mutation's commit path and a read must not share
+/// one distribution. Under the old single counter both counts would read 2.
+#[test]
+fn a_read_and_a_write_land_in_different_histograms() {
+    let metrics = ClientQueryMetrics::default();
+    metrics.record_execution(QueryTransportAction::Read, Duration::from_micros(1_000));
+    metrics.record_execution(
+        QueryTransportAction::Write,
+        Duration::from_micros(5_000_000),
+    );
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.read_latency.count(), 1);
+    assert_eq!(snapshot.read_latency.sum_us, 1_000);
+    assert_eq!(snapshot.write_latency.count(), 1);
+    assert_eq!(snapshot.write_latency.sum_us, 5_000_000);
+
+    // Neither observation appears in the other's buckets, which is the claim
+    // the counts alone only imply.
+    let read_bucket = snapshot
+        .read_latency
+        .bucket_counts
+        .iter()
+        .position(|count| *count > 0)
+        .unwrap();
+    let write_bucket = snapshot
+        .write_latency
+        .bucket_counts
+        .iter()
+        .position(|count| *count > 0)
+        .unwrap();
+    assert_ne!(read_bucket, write_bucket);
+    assert_eq!(snapshot.write_latency.bucket_counts[read_bucket], 0);
+    assert_eq!(snapshot.read_latency.bucket_counts[write_bucket], 0);
+}
