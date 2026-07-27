@@ -1,0 +1,400 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::{StorageSequence, VertexId};
+
+pub type RelationshipId = u64;
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphRepairReport {
+    pub cell_id: String,
+    pub edge_type: String,
+    pub read_epoch: StorageSequence,
+    pub live_edges: u64,
+    pub degree_mismatches: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphExportDigest {
+    pub cell_id: String,
+    pub edge_type: String,
+    pub read_epoch: StorageSequence,
+    pub live_edges: u64,
+    pub edge_checksum: u64,
+    pub out_degree_checksum: u64,
+    pub in_degree_checksum: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphCorrectnessReport {
+    pub cell_id: String,
+    pub edge_type: String,
+    pub read_epoch: StorageSequence,
+    pub digest: GraphExportDigest,
+    pub canonical_edges: u64,
+    pub out_index_edges: u64,
+    pub in_index_edges: u64,
+    pub degree_counters: u64,
+    pub relationship_records: u64,
+    pub relationship_count_counters: u64,
+    pub relationship_property_indexes: u64,
+    pub matrix_edges_checked: u64,
+    pub traversal_roots_checked: u64,
+    pub mismatch_count: u64,
+    pub mismatch_samples: Vec<String>,
+}
+
+impl GraphCorrectnessReport {
+    pub fn is_clean(&self) -> bool {
+        self.mismatch_count == 0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EdgeMutation {
+    pub cell_id: String,
+    pub edge_type: String,
+    pub src: VertexId,
+    pub dst: VertexId,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EdgeRecord {
+    pub cell_id: String,
+    pub edge_type: String,
+    pub src: VertexId,
+    pub dst: VertexId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NeighborBatchEntry {
+    pub vertex: VertexId,
+    pub neighbors: Vec<VertexId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EdgeExistenceBatchEntry {
+    pub src: VertexId,
+    pub dst: VertexId,
+    pub exists: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationshipMutation {
+    pub cell_id: String,
+    pub edge_type: String,
+    pub src: VertexId,
+    pub dst: VertexId,
+    pub relationship_id: RelationshipId,
+    pub metadata: EdgeMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationshipRecord {
+    pub cell_id: String,
+    pub edge_type: String,
+    pub src: VertexId,
+    pub dst: VertexId,
+    pub relationship_id: RelationshipId,
+    pub metadata: EdgeMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationshipCreateResult {
+    pub epoch: StorageSequence,
+    pub relationship_id: RelationshipId,
+    pub structural_edge_inserted: bool,
+    pub already_created: bool,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueryFloat(pub f64);
+
+impl PartialEq for QueryFloat {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for QueryFloat {}
+
+impl PartialOrd for QueryFloat {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueryFloat {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum VertexPropertyValue {
+    Integer(u64),
+    SignedInteger(i64),
+    Bool(bool),
+    Float(QueryFloat),
+    String(String),
+}
+
+impl VertexPropertyValue {
+    pub fn from_i64(value: i64) -> Self {
+        match u64::try_from(value) {
+            Ok(value) => Self::Integer(value),
+            Err(_) => Self::SignedInteger(value),
+        }
+    }
+
+    #[cfg_attr(
+        not(any(feature = "json-properties", feature = "opencypher")),
+        allow(dead_code)
+    )]
+    pub(crate) fn exact_u64_from_f64(value: f64) -> Option<u64> {
+        const U64_EXCLUSIVE_UPPER: f64 = 18446744073709551616.0;
+        if !value.is_finite()
+            || !(0.0..U64_EXCLUSIVE_UPPER).contains(&value)
+            || value.fract() != 0.0
+        {
+            return None;
+        }
+        let integer = value as u64;
+        ((integer as f64) == value).then_some(integer)
+    }
+
+    #[cfg_attr(
+        not(any(feature = "json-properties", feature = "opencypher")),
+        allow(dead_code)
+    )]
+    pub(crate) fn exact_i64_from_f64(value: f64) -> Option<i64> {
+        const I64_INCLUSIVE_LOWER: f64 = -9223372036854775808.0;
+        const I64_EXCLUSIVE_UPPER: f64 = 9223372036854775808.0;
+        if !value.is_finite()
+            || !(I64_INCLUSIVE_LOWER..I64_EXCLUSIVE_UPPER).contains(&value)
+            || value.fract() != 0.0
+        {
+            return None;
+        }
+        let integer = value as i64;
+        ((integer as f64) == value).then_some(integer)
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn exact_f64_from_u64(value: u64) -> Option<f64> {
+        let float = value as f64;
+        (Self::exact_u64_from_f64(float) == Some(value)).then_some(float)
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn exact_f64_from_i64(value: i64) -> Option<f64> {
+        let float = value as f64;
+        (Self::exact_i64_from_f64(float) == Some(value)).then_some(float)
+    }
+
+    #[cfg(feature = "json-properties")]
+    pub fn from_json_value(value: &serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Bool(value) => Self::Bool(*value),
+            serde_json::Value::Number(value) => {
+                if let Some(value) = value.as_u64() {
+                    Self::Integer(value)
+                } else if let Some(value) = value.as_i64() {
+                    Self::from_i64(value)
+                } else if let Some(value) = value.as_f64() {
+                    Self::exact_u64_from_f64(value)
+                        .map(Self::Integer)
+                        .or_else(|| Self::exact_i64_from_f64(value).map(Self::from_i64))
+                        .unwrap_or(Self::Float(QueryFloat(value)))
+                } else {
+                    Self::String(value.to_string())
+                }
+            }
+            serde_json::Value::String(value) => Self::String(value.clone()),
+            serde_json::Value::Null
+            | serde_json::Value::Array(_)
+            | serde_json::Value::Object(_) => Self::String(value.to_string()),
+        }
+    }
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VertexMetadata {
+    pub labels: BTreeSet<String>,
+    pub properties: BTreeMap<String, VertexPropertyValue>,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EdgeMetadata {
+    pub properties: BTreeMap<String, VertexPropertyValue>,
+}
+
+impl EdgeMetadata {
+    pub fn with_property(mut self, name: impl Into<String>, value: VertexPropertyValue) -> Self {
+        self.properties.insert(name.into(), value);
+        self
+    }
+}
+
+impl VertexMetadata {
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.labels.insert(label.into());
+        self
+    }
+
+    pub fn with_property(mut self, name: impl Into<String>, value: VertexPropertyValue) -> Self {
+        self.properties.insert(name.into(), value);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OutEdgeSegment {
+    pub(crate) cell_id: String,
+    pub(crate) edge_type: String,
+    pub(crate) src: VertexId,
+    pub(crate) storage_sequence: StorageSequence,
+    pub(crate) destinations: Vec<VertexId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitResult {
+    pub epoch: StorageSequence,
+    pub already_existed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeleteResult {
+    pub epoch: StorageSequence,
+    pub deleted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EdgeDeleteBatchResult {
+    pub start_epoch: StorageSequence,
+    pub end_epoch: StorageSequence,
+    pub deleted: u64,
+    pub already_deleted: u64,
+    pub results: Vec<DeleteResult>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VertexDeleteResult {
+    pub epoch: StorageSequence,
+    pub vertex_deleted: bool,
+    pub incident_edges_deleted: u64,
+    pub relationships_deleted: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphCellDropResult {
+    pub marker_epoch: StorageSequence,
+    pub deleted_keys: u64,
+    pub batches: u64,
+    pub already_dropped: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SegmentCompactionResult {
+    pub compacted_through_epoch: StorageSequence,
+    pub source_segments: u64,
+    pub deleted_segment_keys: u64,
+    pub deleted_tombstone_keys: u64,
+    pub input_edges: u64,
+    pub output_edges: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BulkImportResult {
+    pub start_epoch: StorageSequence,
+    pub end_epoch: StorageSequence,
+    pub inserted: u64,
+    pub already_existed: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationshipImportResult {
+    pub start_epoch: StorageSequence,
+    pub end_epoch: StorageSequence,
+    pub relationships_inserted: u64,
+    pub relationships_already_existed: u64,
+    pub structural_edges_inserted: u64,
+    pub structural_edges_already_existed: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BulkImportOptions {
+    pub duplicate_policy: BulkImportDuplicatePolicy,
+}
+
+impl BulkImportOptions {
+    pub fn trusted_append() -> Self {
+        Self {
+            duplicate_policy: BulkImportDuplicatePolicy::TrustNoExisting,
+        }
+    }
+
+    pub fn checked_batch_append() -> Self {
+        Self {
+            duplicate_policy: BulkImportDuplicatePolicy::CheckExisting,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BulkImportDuplicatePolicy {
+    #[default]
+    CheckExisting,
+    TrustNoExisting,
+}
+
+impl BulkImportDuplicatePolicy {
+    pub(crate) fn check_existing(self) -> bool {
+        matches!(self, Self::CheckExisting)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EdgeMutationBatchResult {
+    pub start_epoch: StorageSequence,
+    pub end_epoch: StorageSequence,
+    pub inserted: u64,
+    pub already_existed: u64,
+    pub results: Vec<CommitResult>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EdgeIngestOptions {
+    pub batch_size: usize,
+}
+
+impl Default for EdgeIngestOptions {
+    fn default() -> Self {
+        Self { batch_size: 1_024 }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EdgeIngestResult {
+    pub start_epoch: StorageSequence,
+    pub end_epoch: StorageSequence,
+    pub inserted: u64,
+    pub already_existed: u64,
+    pub batches: u64,
+    pub mutations: u64,
+}

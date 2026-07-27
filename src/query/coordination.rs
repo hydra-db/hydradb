@@ -1,0 +1,4905 @@
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "query-transport")]
+use std::future::Future;
+#[cfg(feature = "query-transport")]
+use std::net::SocketAddr;
+#[cfg(feature = "query-transport")]
+use std::panic::AssertUnwindSafe;
+#[cfg(feature = "query-transport")]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+#[cfg(feature = "query-transport-tls")]
+use std::sync::RwLock;
+#[cfg(feature = "query-transport")]
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+#[cfg(feature = "query-service-discovery")]
+use base64::Engine;
+use futures::future::join_all;
+#[cfg(feature = "query-transport")]
+use futures::FutureExt;
+#[cfg(feature = "query-transport")]
+use sha2::{Digest, Sha256};
+#[cfg(feature = "query-transport")]
+use subtle::ConstantTimeEq;
+#[cfg(feature = "query-transport")]
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(feature = "query-transport")]
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(feature = "query-transport")]
+use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
+#[cfg(feature = "query-transport")]
+use tokio::task::{JoinHandle, JoinSet};
+#[cfg(feature = "query-transport-tls")]
+use tokio_rustls::rustls::{
+    pki_types::ServerName, ClientConfig as RustlsClientConfig, ServerConfig as RustlsServerConfig,
+};
+#[cfg(feature = "query-transport-tls")]
+use tokio_rustls::{TlsAcceptor, TlsConnector};
+#[cfg(feature = "query-transport")]
+use tracing::Instrument as _;
+
+#[cfg(feature = "query-transport")]
+use crate::QueryCancellationToken;
+use crate::{
+    validate_component, GraphError, ObjectStoreNodeDirectory, QueryContext, QueryCursorToken,
+    QueryResultPage, QueryResultSet, QueryRow, QueryValue, Result, RoutedGraphCluster,
+};
+#[cfg(feature = "query-transport")]
+use crate::{
+    AtomicDurationHistogram, DurationHistogramSnapshot, GraphId, GraphScope, NamespacePath,
+};
+
+#[cfg(feature = "query-transport")]
+// This is the first production wire contract. Pre-production frame versions are
+// intentionally unsupported; future changes must preserve version 1 during rollouts.
+const QUERY_TRANSPORT_VERSION: u16 = 1;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_MAX_FRAME_BYTES: usize = 1 << 20;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_TIMEOUT_MS: u64 = 30_000;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_MAX_CONNECTIONS: usize = 256;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_MAX_REQUESTS_PER_CONNECTION: usize = 1_024;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_IDLE_TIMEOUT_MS: u64 = 30_000;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_GRACEFUL_SHUTDOWN_MS: u64 = 30_000;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_MAX_IDLE_CONNECTIONS: usize = 16;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_CLIENT_MAX_CONNECTIONS: usize = 128;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_CLIENT_MAX_CONTROL_CONNECTIONS: usize = 8;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_RESERVED_CONTROL_CONNECTIONS: usize = 8;
+#[cfg(feature = "query-transport")]
+const DEFAULT_QUERY_TRANSPORT_MAX_CONNECTION_AGE_MS: u64 = 300_000;
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone)]
+pub struct QueryTransportClientConfig {
+    pub max_frame_bytes: usize,
+    pub timeout: Duration,
+    pub bearer_token: Option<QueryTransportSecret>,
+    pub max_retries: usize,
+    pub max_idle_connections: usize,
+    pub max_connections: usize,
+    pub max_control_connections: usize,
+    pub max_connection_age: Duration,
+    pub allow_plaintext: bool,
+    #[cfg(feature = "query-transport-tls")]
+    pub tls_server_name: Option<String>,
+    #[cfg(feature = "query-transport-tls")]
+    pub tls_config: Option<Arc<RustlsClientConfig>>,
+    #[cfg(feature = "query-transport-tls")]
+    pub tls_config_provider: Option<Arc<dyn QueryTransportTlsClientConfigProvider>>,
+}
+
+#[cfg(feature = "query-transport")]
+impl Default for QueryTransportClientConfig {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: DEFAULT_QUERY_TRANSPORT_MAX_FRAME_BYTES,
+            timeout: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_TIMEOUT_MS),
+            bearer_token: None,
+            max_retries: 0,
+            max_idle_connections: DEFAULT_QUERY_TRANSPORT_MAX_IDLE_CONNECTIONS,
+            max_connections: DEFAULT_QUERY_TRANSPORT_CLIENT_MAX_CONNECTIONS,
+            max_control_connections: DEFAULT_QUERY_TRANSPORT_CLIENT_MAX_CONTROL_CONNECTIONS,
+            max_connection_age: Duration::from_millis(
+                DEFAULT_QUERY_TRANSPORT_MAX_CONNECTION_AGE_MS,
+            ),
+            allow_plaintext: false,
+            #[cfg(feature = "query-transport-tls")]
+            tls_server_name: None,
+            #[cfg(feature = "query-transport-tls")]
+            tls_config: None,
+            #[cfg(feature = "query-transport-tls")]
+            tls_config_provider: None,
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Eq, PartialEq)]
+pub struct QueryTransportSecret {
+    value: Arc<str>,
+    valid: bool,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportSecret {
+    pub fn try_new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "QueryTransport",
+                feature: "bearer token cannot be empty".to_string(),
+            });
+        }
+        Ok(Self {
+            value: Arc::from(value),
+            valid: true,
+        })
+    }
+
+    pub fn new(value: impl Into<String>) -> Self {
+        let value = value.into();
+        Self::try_new(value).unwrap_or_else(|_| Self {
+            value: Arc::from(""),
+            valid: false,
+        })
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.value
+    }
+
+    fn is_valid(&self) -> bool {
+        self.valid
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl std::fmt::Debug for QueryTransportSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QueryTransportSecret(REDACTED)")
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl From<String> for QueryTransportSecret {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl From<&str> for QueryTransportSecret {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportClientConfig {
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.bearer_token = QueryTransportSecret::try_new(token).ok();
+        self
+    }
+
+    pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = max_frame_bytes;
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    pub fn with_max_idle_connections(mut self, max_idle_connections: usize) -> Self {
+        self.max_idle_connections = max_idle_connections;
+        self
+    }
+
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections.max(1);
+        self
+    }
+
+    pub fn with_max_control_connections(mut self, max_control_connections: usize) -> Self {
+        self.max_control_connections = max_control_connections.max(1);
+        self
+    }
+
+    pub fn with_max_connection_age(mut self, max_connection_age: Duration) -> Self {
+        self.max_connection_age = max_connection_age;
+        self
+    }
+
+    pub fn insecure_allow_plaintext(mut self) -> Self {
+        self.allow_plaintext = true;
+        self
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_tls(
+        mut self,
+        server_name: impl Into<String>,
+        config: Arc<RustlsClientConfig>,
+    ) -> Self {
+        self.tls_server_name = Some(server_name.into());
+        self.tls_config = Some(config);
+        self.tls_config_provider = None;
+        self
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_tls_provider(
+        mut self,
+        server_name: impl Into<String>,
+        provider: Arc<dyn QueryTransportTlsClientConfigProvider>,
+    ) -> Self {
+        self.tls_server_name = Some(server_name.into());
+        self.tls_config = None;
+        self.tls_config_provider = Some(provider);
+        self
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.max_frame_bytes < 2 {
+            return transport_config_error("max_frame_bytes must be at least 2");
+        }
+        if self.timeout.is_zero() {
+            return transport_config_error("client timeout must be greater than zero");
+        }
+        if self.max_connection_age.is_zero() {
+            return transport_config_error("max_connection_age must be greater than zero");
+        }
+        if self.max_connections == 0 || self.max_control_connections == 0 {
+            return transport_config_error(
+                "client connection and control-connection limits must be greater than zero",
+            );
+        }
+        #[cfg(feature = "query-transport-tls")]
+        {
+            if self.tls_config.is_some() && self.tls_config_provider.is_some() {
+                return transport_config_error(
+                    "set either a static TLS config or a TLS provider, not both",
+                );
+            }
+            let has_tls = self.tls_config.is_some() || self.tls_config_provider.is_some();
+            let missing_server_name = match self.tls_server_name.as_deref() {
+                Some(server_name) => server_name.is_empty(),
+                None => true,
+            };
+            if has_tls && missing_server_name {
+                return transport_config_error("TLS requires a non-empty server name");
+            }
+            if !has_tls && self.tls_server_name.is_some() {
+                return transport_config_error("TLS server name was set without a TLS config");
+            }
+            if self.bearer_token.is_some() && !has_tls && !self.allow_plaintext {
+                return transport_config_error(
+                    "bearer authentication requires TLS unless plaintext is explicitly allowed",
+                );
+            }
+        }
+        #[cfg(not(feature = "query-transport-tls"))]
+        if self.bearer_token.is_some() && !self.allow_plaintext {
+            return transport_config_error(
+                "bearer authentication requires TLS unless plaintext is explicitly allowed",
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone)]
+pub enum QueryTransportAuthPolicy {
+    RejectAll,
+    BearerToken(QueryTransportSecret),
+    BearerTokens(Vec<QueryTransportSecret>),
+    #[cfg(feature = "query-transport-tls")]
+    MtlsPeerFingerprint {
+        allowed_fingerprints: BTreeSet<String>,
+        bearer_token: Option<QueryTransportSecret>,
+    },
+    InsecureAllowAll,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportAuthPolicy {
+    fn authenticate(
+        &self,
+        auth: &QueryTransportAuth,
+        _identity: &QueryTransportConnectionIdentity,
+    ) -> Option<QueryTransportPrincipal> {
+        match self {
+            Self::RejectAll => None,
+            Self::BearerToken(required) => {
+                let supplied = auth.bearer_token.as_deref()?;
+                (required.is_valid() && constant_time_secret_eq(supplied, required.expose_secret()))
+                    .then(|| QueryTransportPrincipal::bearer(required.expose_secret()))
+            }
+            Self::BearerTokens(required_tokens) => {
+                let supplied = auth.bearer_token.as_deref()?;
+                let mut matched = None;
+                for required in required_tokens {
+                    if required.is_valid()
+                        && constant_time_secret_eq(supplied, required.expose_secret())
+                    {
+                        matched = Some(QueryTransportPrincipal::bearer(required.expose_secret()));
+                    }
+                }
+                matched
+            }
+            #[cfg(feature = "query-transport-tls")]
+            Self::MtlsPeerFingerprint {
+                allowed_fingerprints,
+                bearer_token,
+            } => {
+                let bearer_ok = match bearer_token {
+                    Some(required) => match auth.bearer_token.as_deref() {
+                        Some(supplied) => {
+                            required.is_valid()
+                                && constant_time_secret_eq(supplied, required.expose_secret())
+                        }
+                        None => false,
+                    },
+                    None => true,
+                };
+                if !bearer_ok {
+                    return None;
+                }
+                let authorized = _identity
+                    .tls_peer_fingerprints
+                    .iter()
+                    .any(|fingerprint| allowed_fingerprints.contains(fingerprint));
+                authorized
+                    .then_some(_identity.tls_peer_leaf_fingerprint.as_deref())
+                    .flatten()
+                    .map(QueryTransportPrincipal::mtls)
+            }
+            Self::InsecureAllowAll => Some(QueryTransportPrincipal::insecure()),
+        }
+    }
+
+    #[cfg(feature = "client-api")]
+    pub(crate) fn authenticate_client(
+        &self,
+        bearer_token: Option<&str>,
+        identity: &QueryTransportConnectionIdentity,
+    ) -> Option<QueryTransportPrincipal> {
+        self.authenticate(
+            &QueryTransportAuth {
+                bearer_token: bearer_token.map(str::to_string),
+            },
+            identity,
+        )
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct QueryTransportPrincipal(String);
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportPrincipal {
+    fn bearer(token: &str) -> Self {
+        Self(format!(
+            "bearer:sha256:{}",
+            lowercase_hex(&Sha256::digest(token.as_bytes()))
+        ))
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    fn mtls(fingerprint: &str) -> Self {
+        Self(format!("mtls:{fingerprint}"))
+    }
+
+    fn insecure() -> Self {
+        Self("insecure".to_string())
+    }
+
+    pub fn from_bearer_token(token: impl Into<String>) -> Result<Self> {
+        let secret = QueryTransportSecret::try_new(token)?;
+        Ok(Self::bearer(secret.expose_secret()))
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn from_mtls_peer_fingerprint(fingerprint: impl Into<String>) -> Result<Self> {
+        let fingerprints =
+            normalized_sha256_fingerprints([fingerprint.into()]).ok_or_else(|| {
+                GraphError::UnsupportedQuery {
+                    dialect: "QueryTransport",
+                    feature: "mTLS principal requires a canonical sha256 fingerprint".to_string(),
+                }
+            })?;
+        let fingerprint =
+            fingerprints
+                .into_iter()
+                .next()
+                .ok_or_else(|| GraphError::UnsupportedQuery {
+                    dialect: "QueryTransport",
+                    feature: "mTLS principal requires a fingerprint".to_string(),
+                })?;
+        Ok(Self::mtls(&fingerprint))
+    }
+
+    pub fn insecure_principal() -> Self {
+        Self::insecure()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn error_label(&self) -> &'static str {
+        if self.0.starts_with("bearer:") {
+            "bearer principal"
+        } else if self.0.starts_with("mtls:") {
+            "mTLS principal"
+        } else {
+            "unauthenticated principal"
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum QueryTransportAction {
+    Read,
+    Write,
+    Cancel,
+    Admin,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportAction {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Cancel => "cancel queries in",
+            Self::Admin => "administer",
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryTransportScopeGrant {
+    namespace: NamespacePath,
+    graph_id: Option<GraphId>,
+    include_descendants: bool,
+    actions: BTreeSet<QueryTransportAction>,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportScopeGrant {
+    pub fn graph(
+        scope: GraphScope,
+        actions: impl IntoIterator<Item = QueryTransportAction>,
+    ) -> Self {
+        Self {
+            namespace: scope.namespace,
+            graph_id: Some(scope.graph_id),
+            include_descendants: false,
+            actions: actions.into_iter().collect(),
+        }
+    }
+
+    pub fn namespace(
+        namespace: NamespacePath,
+        include_descendants: bool,
+        actions: impl IntoIterator<Item = QueryTransportAction>,
+    ) -> Self {
+        Self {
+            namespace,
+            graph_id: None,
+            include_descendants,
+            actions: actions.into_iter().collect(),
+        }
+    }
+
+    pub fn graph_namespace(
+        namespace: NamespacePath,
+        graph_id: GraphId,
+        include_descendants: bool,
+        actions: impl IntoIterator<Item = QueryTransportAction>,
+    ) -> Self {
+        Self {
+            namespace,
+            graph_id: Some(graph_id),
+            include_descendants,
+            actions: actions.into_iter().collect(),
+        }
+    }
+
+    pub fn read_graph(scope: GraphScope) -> Self {
+        Self::graph(
+            scope,
+            [QueryTransportAction::Read, QueryTransportAction::Cancel],
+        )
+    }
+
+    pub fn read_namespace(namespace: NamespacePath, include_descendants: bool) -> Self {
+        Self::namespace(
+            namespace,
+            include_descendants,
+            [QueryTransportAction::Read, QueryTransportAction::Cancel],
+        )
+    }
+
+    fn allows(&self, scope: &GraphScope, action: QueryTransportAction) -> bool {
+        let namespace_allowed = if self.include_descendants {
+            scope.namespace.is_descendant_of(&self.namespace)
+        } else {
+            scope.namespace == self.namespace
+        };
+        let graph_allowed = match &self.graph_id {
+            Some(graph_id) => graph_id == &scope.graph_id,
+            None => true,
+        };
+        namespace_allowed && graph_allowed && self.actions.contains(&action)
+    }
+}
+
+#[cfg(feature = "query-transport")]
+pub trait QueryTransportScopeAuthorizer: Send + Sync {
+    fn authorize(
+        &self,
+        principal: &QueryTransportPrincipal,
+        scope: &GraphScope,
+        action: QueryTransportAction,
+    ) -> bool;
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Default)]
+pub struct StaticQueryTransportScopeAuthorizer {
+    grants: BTreeMap<QueryTransportPrincipal, Vec<QueryTransportScopeGrant>>,
+}
+
+#[cfg(feature = "query-transport")]
+impl StaticQueryTransportScopeAuthorizer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn grant(&mut self, principal: QueryTransportPrincipal, grant: QueryTransportScopeGrant) {
+        self.grants.entry(principal).or_default().push(grant);
+    }
+
+    pub fn with_grant(
+        mut self,
+        principal: QueryTransportPrincipal,
+        grant: QueryTransportScopeGrant,
+    ) -> Self {
+        self.grant(principal, grant);
+        self
+    }
+
+    pub fn with_bearer_grant(
+        self,
+        token: impl Into<String>,
+        grant: QueryTransportScopeGrant,
+    ) -> Result<Self> {
+        Ok(self.with_grant(QueryTransportPrincipal::from_bearer_token(token)?, grant))
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_mtls_grant(
+        self,
+        fingerprint: impl Into<String>,
+        grant: QueryTransportScopeGrant,
+    ) -> Result<Self> {
+        Ok(self.with_grant(
+            QueryTransportPrincipal::from_mtls_peer_fingerprint(fingerprint)?,
+            grant,
+        ))
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportScopeAuthorizer for StaticQueryTransportScopeAuthorizer {
+    fn authorize(
+        &self,
+        principal: &QueryTransportPrincipal,
+        scope: &GraphScope,
+        action: QueryTransportAction,
+    ) -> bool {
+        self.grants
+            .get(principal)
+            .is_some_and(|grants| grants.iter().any(|grant| grant.allows(scope, action)))
+    }
+}
+
+#[cfg(feature = "query-transport")]
+struct DefaultQueryTransportScopeAuthorizer;
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportScopeAuthorizer for DefaultQueryTransportScopeAuthorizer {
+    fn authorize(
+        &self,
+        _principal: &QueryTransportPrincipal,
+        scope: &GraphScope,
+        _action: QueryTransportAction,
+    ) -> bool {
+        scope.is_default()
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueryTransportNamespaceQuotas {
+    max_concurrent_queries: BTreeMap<NamespacePath, usize>,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportNamespaceQuotas {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_query_limit(mut self, namespace: NamespacePath, max_concurrent: usize) -> Self {
+        self.max_concurrent_queries
+            .insert(namespace, max_concurrent);
+        self
+    }
+
+    pub fn query_limit(&self, namespace: &NamespacePath) -> Option<usize> {
+        self.max_concurrent_queries.get(namespace).copied()
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self
+            .max_concurrent_queries
+            .values()
+            .any(|limit| *limit == 0)
+        {
+            return transport_config_error(
+                "namespace query concurrency limits must be greater than zero",
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn gates(&self) -> BTreeMap<NamespacePath, Arc<Semaphore>> {
+        self.max_concurrent_queries
+            .iter()
+            .map(|(namespace, limit)| (namespace.clone(), Arc::new(Semaphore::new(*limit))))
+            .collect()
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryTransportCancellationPrincipal(QueryTransportPrincipal);
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportCancellationPrincipal {
+    pub fn bearer_token(token: impl Into<String>) -> Result<Self> {
+        let secret = QueryTransportSecret::try_new(token)?;
+        Ok(Self(QueryTransportPrincipal::bearer(
+            secret.expose_secret(),
+        )))
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn mtls_peer_fingerprint(fingerprint: impl Into<String>) -> Result<Self> {
+        let fingerprints =
+            normalized_sha256_fingerprints([fingerprint.into()]).ok_or_else(|| {
+                GraphError::UnsupportedQuery {
+                    dialect: "QueryTransport",
+                    feature: "mTLS cancellation principal requires a canonical sha256 fingerprint"
+                        .to_string(),
+                }
+            })?;
+        let fingerprint =
+            fingerprints
+                .into_iter()
+                .next()
+                .ok_or_else(|| GraphError::UnsupportedQuery {
+                    dialect: "QueryTransport",
+                    feature: "mTLS cancellation principal requires a fingerprint".to_string(),
+                })?;
+        Ok(Self(QueryTransportPrincipal::mtls(&fingerprint)))
+    }
+
+    pub fn insecure() -> Self {
+        Self(QueryTransportPrincipal::insecure())
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn constant_time_secret_eq(left: &str, right: &str) -> bool {
+    let left = Sha256::digest(left.as_bytes());
+    let right = Sha256::digest(right.as_bytes());
+    left.as_slice().ct_eq(right.as_slice()).into()
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueryTransportConnectionIdentity {
+    #[cfg(feature = "query-transport-tls")]
+    pub tls_peer_fingerprints: BTreeSet<String>,
+    #[cfg(feature = "query-transport-tls")]
+    pub tls_peer_leaf_fingerprint: Option<String>,
+}
+
+#[cfg(feature = "query-transport-tls")]
+pub trait QueryTransportTlsServerConfigProvider: Send + Sync {
+    fn current_server_config(&self) -> Result<Arc<RustlsServerConfig>>;
+
+    fn generation(&self) -> u64 {
+        0
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+pub trait QueryTransportTlsClientConfigProvider: Send + Sync {
+    fn current_client_config(&self) -> Result<Arc<RustlsClientConfig>>;
+
+    fn generation(&self) -> u64 {
+        0
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+pub struct StaticQueryTransportTlsServerConfigProvider {
+    config: Arc<RustlsServerConfig>,
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl StaticQueryTransportTlsServerConfigProvider {
+    pub fn new(config: Arc<RustlsServerConfig>) -> Self {
+        Self { config }
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl QueryTransportTlsServerConfigProvider for StaticQueryTransportTlsServerConfigProvider {
+    fn current_server_config(&self) -> Result<Arc<RustlsServerConfig>> {
+        Ok(Arc::clone(&self.config))
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+pub struct StaticQueryTransportTlsClientConfigProvider {
+    config: Arc<RustlsClientConfig>,
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl StaticQueryTransportTlsClientConfigProvider {
+    pub fn new(config: Arc<RustlsClientConfig>) -> Self {
+        Self { config }
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl QueryTransportTlsClientConfigProvider for StaticQueryTransportTlsClientConfigProvider {
+    fn current_client_config(&self) -> Result<Arc<RustlsClientConfig>> {
+        Ok(Arc::clone(&self.config))
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+pub struct ReloadableQueryTransportTlsServerConfigProvider {
+    config: RwLock<Arc<RustlsServerConfig>>,
+    generation: AtomicU64,
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl ReloadableQueryTransportTlsServerConfigProvider {
+    pub fn new(config: Arc<RustlsServerConfig>) -> Self {
+        Self {
+            config: RwLock::new(config),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    pub fn rotate(&self, config: Arc<RustlsServerConfig>) -> Result<()> {
+        let mut guard = self.config.write().map_err(|_| GraphError::CorruptValue {
+            key: "query/transport/tls/server_config".to_string(),
+            reason: "TLS server config lock is poisoned".to_string(),
+        })?;
+        *guard = config;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl QueryTransportTlsServerConfigProvider for ReloadableQueryTransportTlsServerConfigProvider {
+    fn current_server_config(&self) -> Result<Arc<RustlsServerConfig>> {
+        let guard = self.config.read().map_err(|_| GraphError::CorruptValue {
+            key: "query/transport/tls/server_config".to_string(),
+            reason: "TLS server config lock is poisoned".to_string(),
+        })?;
+        Ok(Arc::clone(&guard))
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+pub struct ReloadableQueryTransportTlsClientConfigProvider {
+    config: RwLock<Arc<RustlsClientConfig>>,
+    generation: AtomicU64,
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl ReloadableQueryTransportTlsClientConfigProvider {
+    pub fn new(config: Arc<RustlsClientConfig>) -> Self {
+        Self {
+            config: RwLock::new(config),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    pub fn rotate(&self, config: Arc<RustlsClientConfig>) -> Result<()> {
+        let mut guard = self.config.write().map_err(|_| GraphError::CorruptValue {
+            key: "query/transport/tls/client_config".to_string(),
+            reason: "TLS client config lock is poisoned".to_string(),
+        })?;
+        *guard = config;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+impl QueryTransportTlsClientConfigProvider for ReloadableQueryTransportTlsClientConfigProvider {
+    fn current_client_config(&self) -> Result<Arc<RustlsClientConfig>> {
+        let guard = self.config.read().map_err(|_| GraphError::CorruptValue {
+            key: "query/transport/tls/client_config".to_string(),
+            reason: "TLS client config lock is poisoned".to_string(),
+        })?;
+        Ok(Arc::clone(&guard))
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone)]
+pub struct QueryTransportServerConfig {
+    pub max_frame_bytes: usize,
+    pub auth_policy: QueryTransportAuthPolicy,
+    pub scope_authorizer: Arc<dyn QueryTransportScopeAuthorizer>,
+    pub namespace_quotas: QueryTransportNamespaceQuotas,
+    pub max_concurrent_requests: usize,
+    pub max_connections: usize,
+    pub reserved_control_connections: usize,
+    pub max_requests_per_connection: usize,
+    pub max_connection_age: Duration,
+    pub handshake_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub write_timeout: Duration,
+    pub graceful_shutdown_timeout: Duration,
+    pub allow_plaintext: bool,
+    pub slow_query_log_threshold: Option<Duration>,
+    #[cfg(feature = "query-transport-tls")]
+    pub tls_config: Option<Arc<RustlsServerConfig>>,
+    #[cfg(feature = "query-transport-tls")]
+    pub tls_config_provider: Option<Arc<dyn QueryTransportTlsServerConfigProvider>>,
+}
+
+#[cfg(feature = "query-transport")]
+impl Default for QueryTransportServerConfig {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: DEFAULT_QUERY_TRANSPORT_MAX_FRAME_BYTES,
+            auth_policy: QueryTransportAuthPolicy::RejectAll,
+            scope_authorizer: Arc::new(DefaultQueryTransportScopeAuthorizer),
+            namespace_quotas: QueryTransportNamespaceQuotas::default(),
+            max_concurrent_requests: 128,
+            max_connections: DEFAULT_QUERY_TRANSPORT_MAX_CONNECTIONS,
+            reserved_control_connections: DEFAULT_QUERY_TRANSPORT_RESERVED_CONTROL_CONNECTIONS,
+            max_requests_per_connection: DEFAULT_QUERY_TRANSPORT_MAX_REQUESTS_PER_CONNECTION,
+            max_connection_age: Duration::from_millis(
+                DEFAULT_QUERY_TRANSPORT_MAX_CONNECTION_AGE_MS,
+            ),
+            handshake_timeout: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_HANDSHAKE_TIMEOUT_MS),
+            idle_timeout: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_IDLE_TIMEOUT_MS),
+            write_timeout: Duration::from_millis(DEFAULT_QUERY_TRANSPORT_TIMEOUT_MS),
+            graceful_shutdown_timeout: Duration::from_millis(
+                DEFAULT_QUERY_TRANSPORT_GRACEFUL_SHUTDOWN_MS,
+            ),
+            allow_plaintext: false,
+            slow_query_log_threshold: Some(Duration::from_millis(500)),
+            #[cfg(feature = "query-transport-tls")]
+            tls_config: None,
+            #[cfg(feature = "query-transport-tls")]
+            tls_config_provider: None,
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportServerConfig {
+    pub fn with_required_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_policy = match QueryTransportSecret::try_new(token) {
+            Ok(secret) => QueryTransportAuthPolicy::BearerToken(secret),
+            Err(_) => QueryTransportAuthPolicy::RejectAll,
+        };
+        self
+    }
+
+    pub fn with_required_bearer_tokens(mut self, tokens: impl IntoIterator<Item = String>) -> Self {
+        let tokens: Result<Vec<_>> = tokens
+            .into_iter()
+            .map(QueryTransportSecret::try_new)
+            .collect();
+        self.auth_policy = match tokens {
+            Ok(tokens) if !tokens.is_empty() => QueryTransportAuthPolicy::BearerTokens(tokens),
+            _ => QueryTransportAuthPolicy::RejectAll,
+        };
+        self
+    }
+
+    pub fn insecure_allow_unauthenticated(mut self) -> Self {
+        self.auth_policy = QueryTransportAuthPolicy::InsecureAllowAll;
+        self.allow_plaintext = true;
+        self
+    }
+
+    pub fn insecure_allow_plaintext(mut self) -> Self {
+        self.allow_plaintext = true;
+        self
+    }
+
+    pub fn with_scope_authorizer(
+        mut self,
+        authorizer: Arc<dyn QueryTransportScopeAuthorizer>,
+    ) -> Self {
+        self.scope_authorizer = authorizer;
+        self
+    }
+
+    pub fn with_namespace_quotas(mut self, quotas: QueryTransportNamespaceQuotas) -> Self {
+        self.namespace_quotas = quotas;
+        self
+    }
+
+    pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = max_frame_bytes;
+        self
+    }
+
+    pub fn with_max_concurrent_requests(mut self, max_concurrent_requests: usize) -> Self {
+        self.max_concurrent_requests = max_concurrent_requests.max(1);
+        self
+    }
+
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections.max(1);
+        self
+    }
+
+    pub fn with_reserved_control_connections(
+        mut self,
+        reserved_control_connections: usize,
+    ) -> Self {
+        self.reserved_control_connections = reserved_control_connections.max(1);
+        self
+    }
+
+    pub fn with_max_requests_per_connection(mut self, max_requests_per_connection: usize) -> Self {
+        self.max_requests_per_connection = max_requests_per_connection.max(1);
+        self
+    }
+
+    pub fn with_max_connection_age(mut self, max_connection_age: Duration) -> Self {
+        self.max_connection_age = max_connection_age;
+        self
+    }
+
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
+    }
+
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
+    pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout;
+        self
+    }
+
+    pub fn with_graceful_shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.graceful_shutdown_timeout = timeout;
+        self
+    }
+
+    pub fn with_slow_query_log_threshold(mut self, threshold: Option<Duration>) -> Self {
+        self.slow_query_log_threshold = threshold;
+        self
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_tls(mut self, config: Arc<RustlsServerConfig>) -> Self {
+        self.tls_config = Some(config);
+        self.tls_config_provider = None;
+        self
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_tls_provider(
+        mut self,
+        provider: Arc<dyn QueryTransportTlsServerConfigProvider>,
+    ) -> Self {
+        self.tls_config = None;
+        self.tls_config_provider = Some(provider);
+        self
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_required_mtls_fingerprints(
+        mut self,
+        allowed_fingerprints: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.auth_policy = normalized_sha256_fingerprints(allowed_fingerprints).map_or(
+            QueryTransportAuthPolicy::RejectAll,
+            |allowed_fingerprints| QueryTransportAuthPolicy::MtlsPeerFingerprint {
+                allowed_fingerprints,
+                bearer_token: None,
+            },
+        );
+        self
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_required_mtls_fingerprints_and_bearer(
+        mut self,
+        allowed_fingerprints: impl IntoIterator<Item = String>,
+        token: impl Into<String>,
+    ) -> Self {
+        self.auth_policy = match QueryTransportSecret::try_new(token) {
+            Ok(secret) => normalized_sha256_fingerprints(allowed_fingerprints).map_or(
+                QueryTransportAuthPolicy::RejectAll,
+                |allowed_fingerprints| QueryTransportAuthPolicy::MtlsPeerFingerprint {
+                    allowed_fingerprints,
+                    bearer_token: Some(secret),
+                },
+            ),
+            Err(_) => QueryTransportAuthPolicy::RejectAll,
+        };
+        self
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.namespace_quotas.validate()?;
+        if self.max_frame_bytes < 2 {
+            return transport_config_error("max_frame_bytes must be at least 2");
+        }
+        if self.max_connections == 0
+            || self.reserved_control_connections == 0
+            || self.max_concurrent_requests == 0
+        {
+            return transport_config_error(
+                "connection, reserved control-connection, and request limits must be greater than zero",
+            );
+        }
+        if self.max_requests_per_connection == 0 {
+            return transport_config_error("max_requests_per_connection must be greater than zero");
+        }
+        if self.handshake_timeout.is_zero()
+            || self.max_connection_age.is_zero()
+            || self.idle_timeout.is_zero()
+            || self.write_timeout.is_zero()
+            || self.graceful_shutdown_timeout.is_zero()
+        {
+            return transport_config_error("transport timeouts must be greater than zero");
+        }
+        #[cfg(feature = "query-transport-tls")]
+        let tls_configured = self.tls_config.is_some() || self.tls_config_provider.is_some();
+        #[cfg(not(feature = "query-transport-tls"))]
+        let tls_configured = false;
+
+        #[cfg(feature = "query-transport-tls")]
+        if self.tls_config.is_some() && self.tls_config_provider.is_some() {
+            return transport_config_error(
+                "set either a static TLS config or a TLS provider, not both",
+            );
+        }
+
+        match &self.auth_policy {
+            QueryTransportAuthPolicy::BearerToken(secret) if !secret.is_valid() => {
+                return transport_config_error("bearer token cannot be empty");
+            }
+            QueryTransportAuthPolicy::BearerTokens(tokens)
+                if tokens.is_empty() || tokens.iter().any(|secret| !secret.is_valid()) =>
+            {
+                return transport_config_error(
+                    "bearer token list must be non-empty and cannot contain empty tokens",
+                );
+            }
+            #[cfg(feature = "query-transport-tls")]
+            QueryTransportAuthPolicy::MtlsPeerFingerprint {
+                allowed_fingerprints,
+                bearer_token,
+            } => {
+                let normalized =
+                    normalized_sha256_fingerprints(allowed_fingerprints.iter().cloned());
+                if normalized.as_ref() != Some(allowed_fingerprints) {
+                    return transport_config_error(
+                        "mTLS fingerprints must be canonical sha256 values",
+                    );
+                }
+                if bearer_token
+                    .as_ref()
+                    .is_some_and(|secret| !secret.is_valid())
+                {
+                    return transport_config_error("bearer token cannot be empty");
+                }
+            }
+            _ => {}
+        }
+
+        if !tls_configured
+            && !self.allow_plaintext
+            && !matches!(self.auth_policy, QueryTransportAuthPolicy::RejectAll)
+        {
+            return transport_config_error(
+                "authenticated query transport requires TLS unless plaintext is explicitly allowed",
+            );
+        }
+        #[cfg(feature = "query-transport-tls")]
+        if matches!(
+            self.auth_policy,
+            QueryTransportAuthPolicy::MtlsPeerFingerprint { .. }
+        ) && !tls_configured
+        {
+            return transport_config_error("mTLS authentication requires a TLS server config");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "query-transport-tls")]
+fn normalized_sha256_fingerprints(
+    fingerprints: impl IntoIterator<Item = String>,
+) -> Option<BTreeSet<String>> {
+    let mut normalized = BTreeSet::new();
+    for fingerprint in fingerprints {
+        let fingerprint = fingerprint.trim().to_ascii_lowercase();
+        let digest = fingerprint.strip_prefix("sha256:")?;
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        normalized.insert(format!("sha256:{digest}"));
+    }
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueryTransportMetricsSnapshot {
+    pub requests_started: u64,
+    pub requests_completed: u64,
+    pub requests_failed: u64,
+    pub auth_failures: u64,
+    pub namespace_access_denials: u64,
+    pub namespace_quota_waits: u64,
+    pub cancellations: u64,
+    pub cancelled_rejections: u64,
+    pub slow_queries: u64,
+    pub backpressure_waits: u64,
+    pub client_retries: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    /// Total microseconds across both latency histograms below.
+    ///
+    /// Retained so nothing that read the old sum has to change. It is derived
+    /// rather than stored: on a client instance only `rpc_latency` is ever
+    /// recorded and on a server instance only `serve_latency` is, so the sum
+    /// reproduces the previous value exactly on both sides.
+    pub remote_latency_us: u64,
+    /// Client-side RPC round-trip, including the connection wait and the
+    /// timeout. Populated only on a [`QueryTransportClient`]'s metrics.
+    pub rpc_latency: DurationHistogramSnapshot,
+    /// Server-side executor time. Populated only on a transport runtime's
+    /// metrics -- and despite the old field's name, nothing about it is remote.
+    ///
+    /// The cumulative count at the 500ms bound and the `slow_queries` counter
+    /// measure the same event, so the two are reconcilable by construction.
+    pub serve_latency: DurationHistogramSnapshot,
+    pub connections_accepted: u64,
+    pub connections_active: u64,
+    pub connections_rejected: u64,
+    pub connections_created: u64,
+    pub connections_reused: u64,
+    pub client_connection_waits: u64,
+    pub handshake_failures: u64,
+    pub idle_timeouts: u64,
+    pub forced_shutdowns: u64,
+}
+
+#[cfg(feature = "query-transport")]
+crate::core::metrics::snapshot_fields!(QueryTransportMetricsSnapshot {
+    counters {
+        requests_started,
+        requests_completed,
+        requests_failed,
+        auth_failures,
+        namespace_access_denials,
+        namespace_quota_waits,
+        cancellations,
+        cancelled_rejections,
+        slow_queries,
+        backpressure_waits,
+        client_retries,
+        bytes_sent,
+        bytes_received,
+        remote_latency_us,
+        connections_accepted,
+        connections_active,
+        connections_rejected,
+        connections_created,
+        connections_reused,
+        client_connection_waits,
+        handshake_failures,
+        idle_timeouts,
+        forced_shutdowns,
+    }
+    histograms {
+        rpc_latency,
+        serve_latency,
+    }
+});
+
+#[cfg(feature = "query-transport")]
+#[derive(Default)]
+struct QueryTransportMetrics {
+    requests_started: AtomicU64,
+    requests_completed: AtomicU64,
+    requests_failed: AtomicU64,
+    auth_failures: AtomicU64,
+    namespace_access_denials: AtomicU64,
+    namespace_quota_waits: AtomicU64,
+    cancellations: AtomicU64,
+    cancelled_rejections: AtomicU64,
+    slow_queries: AtomicU64,
+    backpressure_waits: AtomicU64,
+    client_retries: AtomicU64,
+    bytes_sent: AtomicU64,
+    bytes_received: AtomicU64,
+    // One field fed two structurally different measurements before this: the
+    // client's RPC round-trip and the server's executor time. They never mix
+    // inside one process, but they mean different things under one name, so
+    // the histogram conversion is the moment to separate them.
+    rpc_latency: AtomicDurationHistogram,
+    serve_latency: AtomicDurationHistogram,
+    connections_accepted: AtomicU64,
+    connections_active: AtomicU64,
+    connections_rejected: AtomicU64,
+    connections_created: AtomicU64,
+    connections_reused: AtomicU64,
+    client_connection_waits: AtomicU64,
+    handshake_failures: AtomicU64,
+    idle_timeouts: AtomicU64,
+    forced_shutdowns: AtomicU64,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportMetrics {
+    fn snapshot(&self) -> QueryTransportMetricsSnapshot {
+        let rpc_latency = self.rpc_latency.snapshot();
+        let serve_latency = self.serve_latency.snapshot();
+        QueryTransportMetricsSnapshot {
+            requests_started: self.requests_started.load(Ordering::Relaxed),
+            requests_completed: self.requests_completed.load(Ordering::Relaxed),
+            requests_failed: self.requests_failed.load(Ordering::Relaxed),
+            auth_failures: self.auth_failures.load(Ordering::Relaxed),
+            namespace_access_denials: self.namespace_access_denials.load(Ordering::Relaxed),
+            namespace_quota_waits: self.namespace_quota_waits.load(Ordering::Relaxed),
+            cancellations: self.cancellations.load(Ordering::Relaxed),
+            cancelled_rejections: self.cancelled_rejections.load(Ordering::Relaxed),
+            slow_queries: self.slow_queries.load(Ordering::Relaxed),
+            backpressure_waits: self.backpressure_waits.load(Ordering::Relaxed),
+            client_retries: self.client_retries.load(Ordering::Relaxed),
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+            bytes_received: self.bytes_received.load(Ordering::Relaxed),
+            remote_latency_us: rpc_latency.sum_us.saturating_add(serve_latency.sum_us),
+            rpc_latency,
+            serve_latency,
+            connections_accepted: self.connections_accepted.load(Ordering::Relaxed),
+            connections_active: self.connections_active.load(Ordering::Relaxed),
+            connections_rejected: self.connections_rejected.load(Ordering::Relaxed),
+            connections_created: self.connections_created.load(Ordering::Relaxed),
+            connections_reused: self.connections_reused.load(Ordering::Relaxed),
+            client_connection_waits: self.client_connection_waits.load(Ordering::Relaxed),
+            handshake_failures: self.handshake_failures.load(Ordering::Relaxed),
+            idle_timeouts: self.idle_timeouts.load(Ordering::Relaxed),
+            forced_shutdowns: self.forced_shutdowns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone)]
+pub struct QueryServiceEndpoint {
+    pub node_id: String,
+    pub addr: SocketAddr,
+    pub client_config: QueryTransportClientConfig,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryServiceEndpoint {
+    pub fn new(node_id: impl Into<String>, addr: SocketAddr) -> Self {
+        Self {
+            node_id: node_id.into(),
+            addr,
+            client_config: QueryTransportClientConfig::default(),
+        }
+    }
+
+    pub fn with_client_config(mut self, client_config: QueryTransportClientConfig) -> Self {
+        self.client_config = client_config;
+        self
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Default)]
+pub struct QueryServiceDirectory {
+    endpoints: BTreeMap<String, QueryServiceEndpoint>,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryServiceDirectory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, endpoint: QueryServiceEndpoint) -> Result<()> {
+        validate_component("node_id", &endpoint.node_id)?;
+        self.endpoints.insert(endpoint.node_id.clone(), endpoint);
+        Ok(())
+    }
+
+    pub fn with_endpoint(mut self, endpoint: QueryServiceEndpoint) -> Result<Self> {
+        self.insert(endpoint)?;
+        Ok(self)
+    }
+
+    pub fn endpoint(&self, node_id: &str) -> Option<&QueryServiceEndpoint> {
+        self.endpoints.get(node_id)
+    }
+
+    pub fn endpoints(&self) -> impl Iterator<Item = &QueryServiceEndpoint> {
+        self.endpoints.values()
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[async_trait]
+pub trait QueryServiceDiscovery: Send + Sync {
+    async fn resolve_query_services(&self) -> Result<QueryServiceDirectory>;
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone)]
+pub struct StaticQueryServiceDiscovery {
+    directory: QueryServiceDirectory,
+}
+
+#[cfg(feature = "query-transport")]
+impl StaticQueryServiceDiscovery {
+    pub fn new(directory: QueryServiceDirectory) -> Self {
+        Self { directory }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[async_trait]
+impl QueryServiceDiscovery for StaticQueryServiceDiscovery {
+    async fn resolve_query_services(&self) -> Result<QueryServiceDirectory> {
+        Ok(self.directory.clone())
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[derive(Clone)]
+pub struct KubernetesQueryServiceDiscovery {
+    api_server: String,
+    namespace: String,
+    label_selector: String,
+    port_name: Option<String>,
+    bearer_token: Option<QueryTransportSecret>,
+    client_config: QueryTransportClientConfig,
+    http: reqwest::Client,
+}
+
+#[cfg(feature = "query-service-discovery")]
+impl KubernetesQueryServiceDiscovery {
+    pub fn new(
+        api_server: impl Into<String>,
+        namespace: impl Into<String>,
+        label_selector: impl Into<String>,
+    ) -> Self {
+        Self {
+            api_server: api_server.into().trim_end_matches('/').to_string(),
+            namespace: namespace.into(),
+            label_selector: label_selector.into(),
+            port_name: None,
+            bearer_token: None,
+            client_config: QueryTransportClientConfig::default(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    pub fn with_port_name(mut self, port_name: impl Into<String>) -> Self {
+        self.port_name = Some(port_name.into());
+        self
+    }
+
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.bearer_token = QueryTransportSecret::try_new(token).ok();
+        self
+    }
+
+    pub fn with_client_config(mut self, client_config: QueryTransportClientConfig) -> Self {
+        self.client_config = client_config;
+        self
+    }
+
+    pub fn directory_from_endpointslices_json(
+        value: &serde_json::Value,
+        port_name: Option<&str>,
+        client_config: QueryTransportClientConfig,
+    ) -> Result<QueryServiceDirectory> {
+        parse_kubernetes_endpointslices(value, port_name, client_config)
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[async_trait]
+impl QueryServiceDiscovery for KubernetesQueryServiceDiscovery {
+    async fn resolve_query_services(&self) -> Result<QueryServiceDirectory> {
+        let url = format!(
+            "{}/apis/discovery.k8s.io/v1/namespaces/{}/endpointslices",
+            self.api_server, self.namespace
+        );
+        let mut request = self
+            .http
+            .get(url)
+            .query(&[("labelSelector", self.label_selector.as_str())]);
+        if let Some(token) = &self.bearer_token {
+            request = request.bearer_auth(token.expose_secret());
+        }
+        let value = request
+            .send()
+            .await
+            .map_err(|err| service_discovery_error("kubernetes/send", err))?
+            .error_for_status()
+            .map_err(|err| service_discovery_error("kubernetes/status", err))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|err| service_discovery_error("kubernetes/decode", err))?;
+        parse_kubernetes_endpointslices(
+            &value,
+            self.port_name.as_deref(),
+            self.client_config.clone(),
+        )
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[derive(Clone)]
+pub struct ConsulQueryServiceDiscovery {
+    base_url: String,
+    service_name: String,
+    token: Option<QueryTransportSecret>,
+    client_config: QueryTransportClientConfig,
+    http: reqwest::Client,
+}
+
+#[cfg(feature = "query-service-discovery")]
+impl ConsulQueryServiceDiscovery {
+    pub fn new(base_url: impl Into<String>, service_name: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            service_name: service_name.into(),
+            token: None,
+            client_config: QueryTransportClientConfig::default(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = QueryTransportSecret::try_new(token).ok();
+        self
+    }
+
+    pub fn with_client_config(mut self, client_config: QueryTransportClientConfig) -> Self {
+        self.client_config = client_config;
+        self
+    }
+
+    pub fn directory_from_health_service_json(
+        value: &serde_json::Value,
+        client_config: QueryTransportClientConfig,
+    ) -> Result<QueryServiceDirectory> {
+        parse_consul_health_service(value, client_config)
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[async_trait]
+impl QueryServiceDiscovery for ConsulQueryServiceDiscovery {
+    async fn resolve_query_services(&self) -> Result<QueryServiceDirectory> {
+        let url = format!("{}/v1/health/service/{}", self.base_url, self.service_name);
+        let mut request = self.http.get(url).query(&[("passing", "1")]);
+        if let Some(token) = &self.token {
+            request = request.header("X-Consul-Token", token.expose_secret());
+        }
+        let value = request
+            .send()
+            .await
+            .map_err(|err| service_discovery_error("consul/send", err))?
+            .error_for_status()
+            .map_err(|err| service_discovery_error("consul/status", err))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|err| service_discovery_error("consul/decode", err))?;
+        parse_consul_health_service(&value, self.client_config.clone())
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[derive(Clone)]
+pub struct EtcdQueryServiceDiscovery {
+    endpoint: String,
+    prefix: String,
+    token: Option<QueryTransportSecret>,
+    client_config: QueryTransportClientConfig,
+    http: reqwest::Client,
+}
+
+#[cfg(feature = "query-service-discovery")]
+impl EtcdQueryServiceDiscovery {
+    pub fn new(endpoint: impl Into<String>, prefix: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into().trim_end_matches('/').to_string(),
+            prefix: prefix.into(),
+            token: None,
+            client_config: QueryTransportClientConfig::default(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = QueryTransportSecret::try_new(token).ok();
+        self
+    }
+
+    pub fn with_client_config(mut self, client_config: QueryTransportClientConfig) -> Self {
+        self.client_config = client_config;
+        self
+    }
+
+    pub fn directory_from_range_json(
+        value: &serde_json::Value,
+        client_config: QueryTransportClientConfig,
+    ) -> Result<QueryServiceDirectory> {
+        parse_etcd_query_services(value, client_config)
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[async_trait]
+impl QueryServiceDiscovery for EtcdQueryServiceDiscovery {
+    async fn resolve_query_services(&self) -> Result<QueryServiceDirectory> {
+        let key = base64::engine::general_purpose::STANDARD.encode(self.prefix.as_bytes());
+        let range_end =
+            base64::engine::general_purpose::STANDARD.encode(etcd_prefix_end(&self.prefix));
+        let body = serde_json::json!({ "key": key, "range_end": range_end });
+        let mut request = self
+            .http
+            .post(format!("{}/v3/kv/range", self.endpoint))
+            .json(&body);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token.expose_secret());
+        }
+        let value = request
+            .send()
+            .await
+            .map_err(|err| service_discovery_error("etcd/send", err))?
+            .error_for_status()
+            .map_err(|err| service_discovery_error("etcd/status", err))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|err| service_discovery_error("etcd/decode", err))?;
+        parse_etcd_query_services(&value, self.client_config.clone())
+    }
+}
+
+#[async_trait]
+pub trait QueryCellClient: Send + Sync {
+    async fn execute_cypher_rows(
+        &self,
+        context: QueryContext,
+        query: &str,
+    ) -> Result<QueryResultSet>;
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage>;
+
+    async fn execute_batch(
+        &self,
+        _context: QueryContext,
+        _operation: crate::QueryBatchOperation,
+    ) -> Result<QueryResultSet> {
+        Err(GraphError::UnsupportedQuery {
+            dialect: "QueryCellClient",
+            feature: "batch execution is not implemented by this query client".to_string(),
+        })
+    }
+
+    async fn execute_batch_page(
+        &self,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        paginate_query_batch_result(
+            self.execute_batch(context, operation).await?,
+            cursor,
+            page_size,
+        )
+    }
+
+    async fn current_storage_sequence(
+        &self,
+        _scope: &crate::GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<crate::StorageSequence>> {
+        Ok(None)
+    }
+
+    async fn wait_for_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+        _minimum: crate::StorageSequence,
+    ) -> Result<Option<crate::StorageSequence>> {
+        self.current_storage_sequence(scope, cell_id).await
+    }
+
+    async fn refresh_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+    ) -> Result<Option<crate::StorageSequence>> {
+        self.current_storage_sequence(scope, cell_id).await
+    }
+}
+
+fn paginate_query_batch_result(
+    result: QueryResultSet,
+    cursor: Option<QueryCursorToken>,
+    page_size: usize,
+) -> Result<QueryResultPage> {
+    if page_size == 0 {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "QueryCellClient",
+            feature: "batch page size must be greater than zero".to_string(),
+        });
+    }
+    let raw_offset = cursor.map_or(0, |cursor| cursor.offset);
+    let offset = usize::try_from(raw_offset).map_err(|_| GraphError::AdmissionRejected {
+        operation: "query_batch_cursor_offset",
+        actual: raw_offset,
+        limit: usize::MAX as u64,
+    })?;
+    if offset > result.rows.len() {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "QueryCellClient",
+            feature: "batch cursor offset exceeds result length".to_string(),
+        });
+    }
+    let end = offset.saturating_add(page_size).min(result.rows.len());
+    let next_cursor = (end < result.rows.len()).then(|| QueryCursorToken::new(end as u64));
+    Ok(QueryResultPage::new(
+        result.columns,
+        result.rows[offset..end].to_vec(),
+        next_cursor,
+    ))
+}
+
+#[cfg(feature = "query-transport")]
+trait QueryTransportIo: AsyncRead + AsyncWrite + Send + Unpin {}
+
+#[cfg(feature = "query-transport")]
+impl<T> QueryTransportIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
+
+#[cfg(feature = "query-transport")]
+struct PooledQueryTransportConnection {
+    io: Box<dyn QueryTransportIo>,
+    created_at: Instant,
+    tls_generation: u64,
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone)]
+pub struct TcpQueryCellClient {
+    addr: SocketAddr,
+    config: QueryTransportClientConfig,
+    metrics: Arc<QueryTransportMetrics>,
+    pool: Arc<Mutex<Vec<PooledQueryTransportConnection>>>,
+    connection_gate: Arc<Semaphore>,
+    control_connection_gate: Arc<Semaphore>,
+}
+
+#[cfg(feature = "query-transport")]
+impl TcpQueryCellClient {
+    pub fn new(addr: SocketAddr) -> Self {
+        Self::with_config(addr, QueryTransportClientConfig::default())
+    }
+
+    pub fn with_config(addr: SocketAddr, config: QueryTransportClientConfig) -> Self {
+        let max_connections = config.max_connections.max(1);
+        let max_control_connections = config.max_control_connections.max(1);
+        Self {
+            addr,
+            config,
+            metrics: Arc::new(QueryTransportMetrics::default()),
+            pool: Arc::new(Mutex::new(Vec::new())),
+            connection_gate: Arc::new(Semaphore::new(max_connections)),
+            control_connection_gate: Arc::new(Semaphore::new(max_control_connections)),
+        }
+    }
+
+    pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
+        self.config.max_frame_bytes = max_frame_bytes;
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.config.timeout = timeout;
+        self
+    }
+
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.config.bearer_token = QueryTransportSecret::try_new(token).ok();
+        self
+    }
+
+    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.config.max_retries = max_retries;
+        self
+    }
+
+    pub fn with_max_idle_connections(mut self, max_idle_connections: usize) -> Self {
+        self.config.max_idle_connections = max_idle_connections;
+        self
+    }
+
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.config.max_connections = max_connections.max(1);
+        self.connection_gate = Arc::new(Semaphore::new(self.config.max_connections));
+        self
+    }
+
+    pub fn with_max_control_connections(mut self, max_control_connections: usize) -> Self {
+        self.config.max_control_connections = max_control_connections.max(1);
+        self.control_connection_gate =
+            Arc::new(Semaphore::new(self.config.max_control_connections));
+        self
+    }
+
+    pub fn with_max_connection_age(mut self, max_connection_age: Duration) -> Self {
+        self.config.max_connection_age = max_connection_age;
+        self
+    }
+
+    pub fn insecure_allow_plaintext(mut self) -> Self {
+        self.config.allow_plaintext = true;
+        self
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_tls(
+        mut self,
+        server_name: impl Into<String>,
+        config: Arc<RustlsClientConfig>,
+    ) -> Self {
+        self.config.tls_server_name = Some(server_name.into());
+        self.config.tls_config = Some(config);
+        self.config.tls_config_provider = None;
+        self.pool = Arc::new(Mutex::new(Vec::new()));
+        self
+    }
+
+    #[cfg(feature = "query-transport-tls")]
+    pub fn with_tls_provider(
+        mut self,
+        server_name: impl Into<String>,
+        provider: Arc<dyn QueryTransportTlsClientConfigProvider>,
+    ) -> Self {
+        self.config.tls_server_name = Some(server_name.into());
+        self.config.tls_config = None;
+        self.config.tls_config_provider = Some(provider);
+        self.pool = Arc::new(Mutex::new(Vec::new()));
+        self
+    }
+
+    pub fn metrics(&self) -> QueryTransportMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    pub async fn clear_idle_connections(&self) {
+        self.pool.lock().await.clear();
+    }
+
+    pub async fn idle_connection_count(&self) -> usize {
+        self.pool.lock().await.len()
+    }
+}
+
+#[cfg(feature = "query-transport")]
+pub struct TcpQueryServer {
+    local_addr: SocketAddr,
+    stop_tx: watch::Sender<bool>,
+    task: JoinHandle<Result<()>>,
+    metrics: Arc<QueryTransportMetrics>,
+    lifecycle: Arc<Mutex<QueryTransportLifecycle>>,
+}
+
+#[cfg(feature = "query-transport")]
+struct QueryTransportServerRuntime {
+    config: QueryTransportServerConfig,
+    metrics: Arc<QueryTransportMetrics>,
+    lifecycle: Arc<Mutex<QueryTransportLifecycle>>,
+    request_gate: Arc<Semaphore>,
+    namespace_query_gates: BTreeMap<NamespacePath, Arc<Semaphore>>,
+    connection_gate: Arc<Semaphore>,
+    control_connection_gate: Arc<Semaphore>,
+}
+
+#[cfg(feature = "query-transport")]
+struct QueryTransportConnectionAdmission {
+    _permit: OwnedSemaphorePermit,
+    control_only: bool,
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Default)]
+struct QueryTransportLifecycle {
+    next_token: QueryLifecycleToken,
+    queries: BTreeMap<QueryLifecycleKey, QueryLifecycleEntry>,
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct QueryLifecycleKey {
+    principal: QueryTransportPrincipal,
+    scope: GraphScope,
+    query_id: String,
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryLifecycleKey {
+    fn new(
+        principal: QueryTransportPrincipal,
+        scope: GraphScope,
+        query_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            principal,
+            scope,
+            query_id: query_id.into(),
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+type QueryLifecycleToken = u64;
+
+#[cfg(feature = "query-transport")]
+struct QueryLifecycleEntry {
+    token: QueryLifecycleToken,
+    state: QueryLifecycleState,
+    cancellation_token: QueryCancellationToken,
+}
+
+#[cfg(feature = "query-transport")]
+struct ActiveQueryTransportConnection {
+    metrics: Arc<QueryTransportMetrics>,
+}
+
+#[cfg(feature = "query-transport")]
+impl ActiveQueryTransportConnection {
+    fn new(metrics: Arc<QueryTransportMetrics>) -> Self {
+        metrics.connections_active.fetch_add(1, Ordering::Relaxed);
+        Self { metrics }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl Drop for ActiveQueryTransportConnection {
+    fn drop(&mut self) {
+        self.metrics
+            .connections_active
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum QueryLifecycleState {
+    Queued,
+    Running,
+    Cancelled,
+}
+
+#[cfg(feature = "query-transport")]
+impl TcpQueryServer {
+    pub async fn bind(addr: SocketAddr, client: Arc<dyn QueryCellClient>) -> Result<Self> {
+        Self::bind_with_config(addr, client, QueryTransportServerConfig::default()).await
+    }
+
+    pub async fn bind_with_max_frame_bytes(
+        addr: SocketAddr,
+        client: Arc<dyn QueryCellClient>,
+        max_frame_bytes: usize,
+    ) -> Result<Self> {
+        Self::bind_with_config(
+            addr,
+            client,
+            QueryTransportServerConfig::default().with_max_frame_bytes(max_frame_bytes),
+        )
+        .await
+    }
+
+    pub async fn bind_with_config(
+        addr: SocketAddr,
+        client: Arc<dyn QueryCellClient>,
+        config: QueryTransportServerConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|err| transport_error("bind", err))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|err| transport_error("local_addr", err))?;
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let metrics = Arc::new(QueryTransportMetrics::default());
+        let lifecycle = Arc::new(Mutex::new(QueryTransportLifecycle::default()));
+        let max_concurrent_requests = config.max_concurrent_requests.max(1);
+        let max_connections = config.max_connections.max(1);
+        let reserved_control_connections = config.reserved_control_connections.max(1);
+        let namespace_query_gates = config.namespace_quotas.gates();
+        let graceful_shutdown_timeout = config.graceful_shutdown_timeout;
+        let runtime = Arc::new(QueryTransportServerRuntime {
+            config,
+            metrics: Arc::clone(&metrics),
+            lifecycle: Arc::clone(&lifecycle),
+            request_gate: Arc::new(Semaphore::new(max_concurrent_requests)),
+            namespace_query_gates,
+            connection_gate: Arc::new(Semaphore::new(max_connections)),
+            control_connection_gate: Arc::new(Semaphore::new(reserved_control_connections)),
+        });
+        let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            loop {
+                tokio::select! {
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.map_err(|err| transport_error("accept", err))?;
+                        if let Err(err) = stream.set_nodelay(true) {
+                            tracing::warn!(
+                                target: "slatedb_graph_kernel",
+                                error = %err,
+                                "query transport failed to configure accepted socket"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                        let admission = match Arc::clone(&runtime.connection_gate).try_acquire_owned() {
+                            Ok(permit) => QueryTransportConnectionAdmission {
+                                _permit: permit,
+                                control_only: false,
+                            },
+                            Err(_) => match Arc::clone(&runtime.control_connection_gate).try_acquire_owned() {
+                                Ok(permit) => QueryTransportConnectionAdmission {
+                                    _permit: permit,
+                                    control_only: true,
+                                },
+                                Err(_) => {
+                                    runtime.metrics.connections_rejected.fetch_add(1, Ordering::Relaxed);
+                                    drop(stream);
+                                    continue;
+                                }
+                            },
+                        };
+                        runtime.metrics.connections_accepted.fetch_add(1, Ordering::Relaxed);
+                        let client = Arc::clone(&client);
+                        let runtime = Arc::clone(&runtime);
+                        let connection_stop_rx = stop_rx.clone();
+                        connections.spawn(async move {
+                            let control_only = admission.control_only;
+                            let _admission = admission;
+                            let _active_connection =
+                                ActiveQueryTransportConnection::new(Arc::clone(&runtime.metrics));
+                            if let Err(err) = serve_query_transport_stream(
+                                stream,
+                                client,
+                                runtime,
+                                connection_stop_rx,
+                                control_only,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    target: "slatedb_graph_kernel",
+                                    error = %err,
+                                    "query transport connection failed"
+                                );
+                            }
+                        });
+                    }
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Err(err)) = joined {
+                            tracing::warn!(
+                                target: "slatedb_graph_kernel",
+                                error = %err,
+                                "query transport connection task failed"
+                            );
+                        }
+                    }
+                }
+            }
+            let graceful_drain = async {
+                while let Some(joined) = connections.join_next().await {
+                    if let Err(err) = joined {
+                        if !err.is_cancelled() {
+                            tracing::warn!(
+                                target: "slatedb_graph_kernel",
+                                error = %err,
+                                "query transport connection task failed during shutdown"
+                            );
+                        }
+                    }
+                }
+            };
+            if tokio::time::timeout(graceful_shutdown_timeout, graceful_drain)
+                .await
+                .is_err()
+            {
+                runtime
+                    .metrics
+                    .forced_shutdowns
+                    .fetch_add(1, Ordering::Relaxed);
+                connections.abort_all();
+                while let Some(joined) = connections.join_next().await {
+                    if let Err(err) = joined {
+                        if !err.is_cancelled() {
+                            tracing::warn!(
+                                target: "slatedb_graph_kernel",
+                                error = %err,
+                                "query transport connection task failed during forced shutdown"
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+        Ok(Self {
+            local_addr,
+            stop_tx,
+            task,
+            metrics,
+            lifecycle,
+        })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn metrics(&self) -> QueryTransportMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    pub async fn cancel_query(&self, query_id: impl Into<String>) -> Result<()> {
+        self.cancel_query_in_scope(GraphScope::default(), query_id)
+            .await
+    }
+
+    pub async fn cancel_query_in_scope(
+        &self,
+        scope: GraphScope,
+        query_id: impl Into<String>,
+    ) -> Result<()> {
+        self.cancel_query_for_principal_in_scope(
+            QueryTransportCancellationPrincipal::insecure(),
+            scope,
+            query_id,
+        )
+        .await
+    }
+
+    pub async fn cancel_query_for_principal(
+        &self,
+        principal: QueryTransportCancellationPrincipal,
+        query_id: impl Into<String>,
+    ) -> Result<()> {
+        self.cancel_query_for_principal_in_scope(principal, GraphScope::default(), query_id)
+            .await
+    }
+
+    pub async fn cancel_query_for_principal_in_scope(
+        &self,
+        principal: QueryTransportCancellationPrincipal,
+        scope: GraphScope,
+        query_id: impl Into<String>,
+    ) -> Result<()> {
+        let query_id = query_id.into();
+        validate_component("query_id", &query_id)?;
+        let lifecycle_key = QueryLifecycleKey::new(principal.0, scope, &query_id);
+        let mut lifecycle = self.lifecycle.lock().await;
+        cancel_query_lifecycle_entry(&mut lifecycle, &self.metrics, &lifecycle_key)
+    }
+
+    pub async fn stop(self) -> Result<()> {
+        let _ = self.stop_tx.send(true);
+        match self.task.await {
+            Ok(result) => result,
+            Err(err) => Err(GraphError::CorruptValue {
+                key: "query/transport/server".to_string(),
+                reason: format!("query transport server task failed: {err}"),
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[async_trait]
+impl QueryCellClient for TcpQueryCellClient {
+    async fn execute_cypher_rows(
+        &self,
+        context: QueryContext,
+        query: &str,
+    ) -> Result<QueryResultSet> {
+        let request = QueryTransportRequest::Rows {
+            version: QUERY_TRANSPORT_VERSION,
+            auth: self.auth(),
+            context,
+            query: query.to_string(),
+            traceparent: crate::core::trace_context::current_traceparent(),
+        };
+        match self.send(request).await? {
+            QueryTransportResponse::Rows { result } => Ok(result),
+            QueryTransportResponse::Page { .. } => Err(transport_protocol_error(
+                "query/transport/rows",
+                "server returned page response for rows request",
+            )),
+            QueryTransportResponse::Cancelled => Err(transport_protocol_error(
+                "query/transport/rows",
+                "server returned cancel response for rows request",
+            )),
+            QueryTransportResponse::Error { message } => {
+                Err(transport_remote_error("query/transport/rows", message))
+            }
+        }
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let request = QueryTransportRequest::Page {
+            version: QUERY_TRANSPORT_VERSION,
+            auth: self.auth(),
+            context,
+            query: query.to_string(),
+            cursor,
+            page_size,
+            traceparent: crate::core::trace_context::current_traceparent(),
+        };
+        match self.send(request).await? {
+            QueryTransportResponse::Page { result } => Ok(result),
+            QueryTransportResponse::Rows { .. } => Err(transport_protocol_error(
+                "query/transport/page",
+                "server returned rows response for page request",
+            )),
+            QueryTransportResponse::Cancelled => Err(transport_protocol_error(
+                "query/transport/page",
+                "server returned cancel response for page request",
+            )),
+            QueryTransportResponse::Error { message } => {
+                Err(transport_remote_error("query/transport/page", message))
+            }
+        }
+    }
+
+    async fn execute_batch(
+        &self,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+    ) -> Result<QueryResultSet> {
+        let request = QueryTransportRequest::Batch {
+            version: QUERY_TRANSPORT_VERSION,
+            auth: self.auth(),
+            context,
+            operation,
+            traceparent: crate::core::trace_context::current_traceparent(),
+        };
+        match self.send(request).await? {
+            QueryTransportResponse::Rows { result } => Ok(result),
+            QueryTransportResponse::Page { .. } => Err(transport_protocol_error(
+                "query/transport/batch",
+                "server returned page response for batch request",
+            )),
+            QueryTransportResponse::Cancelled => Err(transport_protocol_error(
+                "query/transport/batch",
+                "server returned cancel response for batch request",
+            )),
+            QueryTransportResponse::Error { message } => {
+                Err(transport_remote_error("query/transport/batch", message))
+            }
+        }
+    }
+
+    async fn execute_batch_page(
+        &self,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let request = QueryTransportRequest::BatchPage {
+            version: QUERY_TRANSPORT_VERSION,
+            auth: self.auth(),
+            context,
+            operation,
+            cursor,
+            page_size,
+            traceparent: crate::core::trace_context::current_traceparent(),
+        };
+        match self.send(request).await? {
+            QueryTransportResponse::Page { result } => Ok(result),
+            QueryTransportResponse::Rows { .. } => Err(transport_protocol_error(
+                "query/transport/batch_page",
+                "server returned rows response for batch page request",
+            )),
+            QueryTransportResponse::Cancelled => Err(transport_protocol_error(
+                "query/transport/batch_page",
+                "server returned cancel response for batch page request",
+            )),
+            QueryTransportResponse::Error { message } => Err(transport_remote_error(
+                "query/transport/batch_page",
+                message,
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl TcpQueryCellClient {
+    pub fn stream_cypher_rows(
+        &self,
+        context: QueryContext,
+        query: impl Into<String>,
+        page_size: usize,
+    ) -> TcpQueryRowStream {
+        TcpQueryRowStream {
+            client: self.clone(),
+            context,
+            query: query.into(),
+            page_size,
+            cursor: None,
+            done: false,
+            buffered_rows: Vec::new(),
+            columns: None,
+        }
+    }
+
+    pub async fn cancel_query(&self, query_id: impl Into<String>) -> Result<()> {
+        self.cancel_query_in_scope(GraphScope::default(), query_id)
+            .await
+    }
+
+    pub async fn cancel_query_in_scope(
+        &self,
+        scope: GraphScope,
+        query_id: impl Into<String>,
+    ) -> Result<()> {
+        let query_id = query_id.into();
+        validate_component("query_id", &query_id)?;
+        let request = QueryTransportRequest::Cancel {
+            version: QUERY_TRANSPORT_VERSION,
+            auth: self.auth(),
+            scope,
+            query_id,
+            traceparent: crate::core::trace_context::current_traceparent(),
+        };
+        match self.send_control(request).await? {
+            QueryTransportResponse::Cancelled => Ok(()),
+            QueryTransportResponse::Rows { .. } | QueryTransportResponse::Page { .. } => {
+                Err(transport_protocol_error(
+                    "query/transport/cancel",
+                    "server returned query data for cancel request",
+                ))
+            }
+            QueryTransportResponse::Error { message } => {
+                Err(transport_remote_error("query/transport/cancel", message))
+            }
+        }
+    }
+
+    fn auth(&self) -> QueryTransportAuth {
+        QueryTransportAuth {
+            bearer_token: self
+                .config
+                .bearer_token
+                .as_ref()
+                .filter(|secret| secret.is_valid())
+                .map(|secret| secret.expose_secret().to_string()),
+        }
+    }
+
+    async fn send(&self, request: QueryTransportRequest) -> Result<QueryTransportResponse> {
+        let started = std::time::Instant::now();
+        let result = match tokio::time::timeout(self.config.timeout, self.send_once(&request)).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(query_transport_client_timeout(self.config.timeout)),
+        };
+        let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.metrics.rpc_latency.record_micros(elapsed_us);
+        result
+    }
+
+    async fn send_control(&self, request: QueryTransportRequest) -> Result<QueryTransportResponse> {
+        let started = std::time::Instant::now();
+        let result =
+            match tokio::time::timeout(self.config.timeout, self.send_control_once(&request)).await
+            {
+                Ok(result) => result,
+                Err(_) => Err(query_transport_client_timeout(self.config.timeout)),
+            };
+        let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.metrics.rpc_latency.record_micros(elapsed_us);
+        result
+    }
+
+    async fn send_once(&self, request: &QueryTransportRequest) -> Result<QueryTransportResponse> {
+        self.config.validate()?;
+        let _connection_permit = match Arc::clone(&self.connection_gate).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.metrics
+                    .client_connection_waits
+                    .fetch_add(1, Ordering::Relaxed);
+                Arc::clone(&self.connection_gate)
+                    .acquire_owned()
+                    .await
+                    .map_err(|err| GraphError::CorruptValue {
+                        key: "query/transport/client_connections".to_string(),
+                        reason: err.to_string(),
+                    })?
+            }
+        };
+        let mut connection = match self.take_idle_connection().await {
+            Some(connection) => {
+                self.metrics
+                    .connections_reused
+                    .fetch_add(1, Ordering::Relaxed);
+                connection
+            }
+            None => self.open_connection_with_retries().await?,
+        };
+        let decoded = self.send_on_io(&mut *connection.io, request).await?;
+        if !decoded.close_connection {
+            self.recycle_connection(connection).await;
+        }
+        Ok(decoded.response)
+    }
+
+    async fn send_control_once(
+        &self,
+        request: &QueryTransportRequest,
+    ) -> Result<QueryTransportResponse> {
+        self.config.validate()?;
+        let _control_permit = Arc::clone(&self.control_connection_gate)
+            .acquire_owned()
+            .await
+            .map_err(|err| GraphError::CorruptValue {
+                key: "query/transport/client_control_connections".to_string(),
+                reason: err.to_string(),
+            })?;
+        let mut connection = self.open_connection_with_retries().await?;
+        let decoded = self.send_on_io(&mut *connection.io, request).await?;
+        Ok(decoded.response)
+    }
+
+    async fn open_connection_with_retries(&self) -> Result<PooledQueryTransportConnection> {
+        let attempts = self.config.max_retries.saturating_add(1);
+        let mut last_err = None;
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                self.metrics.client_retries.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+            match self.open_connection().await {
+                Ok(connection) => return Ok(connection),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            transport_protocol_error("query/transport/connect", "no connection attempts")
+        }))
+    }
+
+    async fn open_connection(&self) -> Result<PooledQueryTransportConnection> {
+        let stream = TcpStream::connect(self.addr)
+            .await
+            .map_err(|err| transport_error("connect", err))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|err| transport_error("set_nodelay", err))?;
+        self.metrics
+            .connections_created
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "query-transport-tls")]
+        {
+            let tls_config = if let Some(provider) = &self.config.tls_config_provider {
+                Some(provider.current_client_config()?)
+            } else {
+                self.config.tls_config.clone()
+            };
+            if let Some(tls_config) = tls_config {
+                let server_name = self.config.tls_server_name.clone().ok_or_else(|| {
+                    transport_protocol_error("query/transport/tls", "missing TLS server name")
+                })?;
+                let server_name =
+                    ServerName::try_from(server_name).map_err(|err| GraphError::CorruptValue {
+                        key: "query/transport/tls/server_name".to_string(),
+                        reason: err.to_string(),
+                    })?;
+                let stream = TlsConnector::from(tls_config)
+                    .connect(server_name, stream)
+                    .await
+                    .map_err(|err| transport_error("tls_connect", err))?;
+                return Ok(PooledQueryTransportConnection {
+                    io: Box::new(stream),
+                    created_at: Instant::now(),
+                    tls_generation: self.current_tls_generation(),
+                });
+            }
+        }
+
+        Ok(PooledQueryTransportConnection {
+            io: Box::new(stream),
+            created_at: Instant::now(),
+            tls_generation: self.current_tls_generation(),
+        })
+    }
+
+    async fn take_idle_connection(&self) -> Option<PooledQueryTransportConnection> {
+        let mut pool = self.pool.lock().await;
+        while let Some(connection) = pool.pop() {
+            if connection.created_at.elapsed() < self.config.max_connection_age
+                && connection.tls_generation == self.current_tls_generation()
+            {
+                return Some(connection);
+            }
+        }
+        None
+    }
+
+    async fn recycle_connection(&self, connection: PooledQueryTransportConnection) {
+        if self.config.max_idle_connections == 0
+            || connection.created_at.elapsed() >= self.config.max_connection_age
+            || connection.tls_generation != self.current_tls_generation()
+        {
+            return;
+        }
+        let mut pool = self.pool.lock().await;
+        if pool.len() < self.config.max_idle_connections {
+            pool.push(connection);
+        }
+    }
+
+    fn current_tls_generation(&self) -> u64 {
+        #[cfg(feature = "query-transport-tls")]
+        if let Some(provider) = &self.config.tls_config_provider {
+            return provider.generation();
+        }
+        0
+    }
+
+    async fn send_on_io<S>(
+        &self,
+        stream: &mut S,
+        request: &QueryTransportRequest,
+    ) -> Result<DecodedQueryTransportResponse>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    {
+        write_query_transport_frame(stream, request, self.config.max_frame_bytes, &self.metrics)
+            .await?;
+        let frame =
+            read_query_transport_frame(stream, self.config.max_frame_bytes, &self.metrics).await?;
+        let frame: QueryTransportResponseFrame =
+            serde_json::from_slice(&frame).map_err(|err| transport_json_error("decode", err))?;
+        Ok(DecodedQueryTransportResponse {
+            response: frame.response,
+            close_connection: frame.close_connection,
+        })
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn query_transport_client_timeout(timeout: Duration) -> GraphError {
+    let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+    GraphError::QueryTimeout {
+        operation: "query_transport",
+        elapsed_ms: timeout_ms,
+        limit_ms: timeout_ms,
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone)]
+pub struct TcpQueryRowStream {
+    client: TcpQueryCellClient,
+    context: QueryContext,
+    query: String,
+    page_size: usize,
+    cursor: Option<QueryCursorToken>,
+    done: bool,
+    buffered_rows: Vec<QueryRow>,
+    columns: Option<Vec<crate::QueryColumn>>,
+}
+
+#[cfg(feature = "query-transport")]
+impl TcpQueryRowStream {
+    pub async fn next_page(&mut self) -> Result<Option<QueryResultPage>> {
+        if self.done {
+            return Ok(None);
+        }
+        let page = self
+            .client
+            .execute_cypher_rows_page(
+                self.context.clone(),
+                &self.query,
+                self.cursor,
+                self.page_size,
+            )
+            .await?;
+        self.cursor = page.next_cursor;
+        self.done = self.cursor.is_none();
+        Ok(Some(page))
+    }
+
+    pub async fn next_row(&mut self) -> Result<Option<QueryRow>> {
+        loop {
+            if let Some(row) = self.buffered_rows.pop() {
+                return Ok(Some(row));
+            }
+            let Some(page) = self.next_page().await? else {
+                return Ok(None);
+            };
+            if self.columns.is_none() {
+                self.columns = Some(page.columns.clone());
+            }
+            self.buffered_rows = page.rows;
+            self.buffered_rows.reverse();
+        }
+    }
+
+    pub fn columns(&self) -> Option<&[crate::QueryColumn]> {
+        self.columns.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistributedQueryPageRequest {
+    pub context: QueryContext,
+    pub cursor: Option<QueryCursorToken>,
+}
+
+impl DistributedQueryPageRequest {
+    pub fn new(context: QueryContext, cursor: Option<QueryCursorToken>) -> Self {
+        Self { context, cursor }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistributedQueryLeg {
+    pub name: String,
+    pub context: QueryContext,
+    pub query: String,
+    pub estimated_rows: Option<u64>,
+}
+
+impl DistributedQueryLeg {
+    pub fn new(
+        name: impl Into<String>,
+        context: QueryContext,
+        query: impl Into<String>,
+    ) -> Result<Self> {
+        let name = name.into();
+        validate_component("query_leg", &name)?;
+        Ok(Self {
+            name,
+            context,
+            query: query.into(),
+            estimated_rows: None,
+        })
+    }
+
+    pub fn with_estimated_rows(mut self, estimated_rows: u64) -> Self {
+        self.estimated_rows = Some(estimated_rows);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistributedQueryJoin {
+    pub left_leg: String,
+    pub right_leg: String,
+    pub left_column: String,
+    pub right_column: String,
+}
+
+impl DistributedQueryJoin {
+    pub fn inner(
+        left_leg: impl Into<String>,
+        left_column: impl Into<String>,
+        right_leg: impl Into<String>,
+        right_column: impl Into<String>,
+    ) -> Self {
+        Self {
+            left_leg: left_leg.into(),
+            right_leg: right_leg.into(),
+            left_column: left_column.into(),
+            right_column: right_column.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DistributedQueryMerge {
+    UnionAll,
+    InnerJoin(DistributedQueryJoin),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistributedQueryPlan {
+    pub legs: Vec<DistributedQueryLeg>,
+    pub merge: DistributedQueryMerge,
+}
+
+impl DistributedQueryPlan {
+    pub fn union_all(legs: Vec<DistributedQueryLeg>) -> Self {
+        Self {
+            legs,
+            merge: DistributedQueryMerge::UnionAll,
+        }
+    }
+
+    pub fn inner_join(legs: Vec<DistributedQueryLeg>, join: DistributedQueryJoin) -> Self {
+        Self {
+            legs,
+            merge: DistributedQueryMerge::InnerJoin(join),
+        }
+    }
+
+    pub fn optimized_for_costs(mut self) -> Self {
+        if !matches!(self.merge, DistributedQueryMerge::InnerJoin(_)) {
+            return self;
+        }
+        self.legs.sort_by_key(|leg| {
+            (
+                leg.estimated_rows.unwrap_or(u64::MAX),
+                leg.context.cell_id.clone(),
+                leg.name.clone(),
+            )
+        });
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistributedQueryPlanResult {
+    pub leg_results: BTreeMap<String, QueryResultSet>,
+    pub merged: QueryResultSet,
+}
+
+pub struct DistributedQueryCoordinator {
+    directory: ObjectStoreNodeDirectory,
+    clients: BTreeMap<String, Arc<dyn QueryCellClient>>,
+}
+
+impl DistributedQueryCoordinator {
+    pub fn new(directory: ObjectStoreNodeDirectory) -> Self {
+        Self {
+            directory,
+            clients: BTreeMap::new(),
+        }
+    }
+
+    pub fn register_client(
+        &mut self,
+        node_id: impl Into<String>,
+        client: Arc<dyn QueryCellClient>,
+    ) -> Result<()> {
+        let node_id = node_id.into();
+        validate_component("node_id", &node_id)?;
+        self.clients.insert(node_id, client);
+        Ok(())
+    }
+
+    pub fn with_client(
+        mut self,
+        node_id: impl Into<String>,
+        client: Arc<dyn QueryCellClient>,
+    ) -> Result<Self> {
+        self.register_client(node_id, client)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "query-transport")]
+    pub fn from_service_directory(
+        nodes: ObjectStoreNodeDirectory,
+        services: &QueryServiceDirectory,
+    ) -> Result<Self> {
+        let mut coordinator = Self::new(nodes.clone());
+        for node_id in nodes.node_ids() {
+            let endpoint = services
+                .endpoint(node_id)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: format!("query/service/{node_id}"),
+                    reason: format!("missing service-discovery endpoint for node {node_id}"),
+                })?;
+            coordinator.register_client(
+                node_id.to_string(),
+                Arc::new(TcpQueryCellClient::with_config(
+                    endpoint.addr,
+                    endpoint.client_config.clone(),
+                )),
+            )?;
+        }
+        Ok(coordinator)
+    }
+
+    #[cfg(feature = "query-transport")]
+    pub async fn from_service_discovery(
+        nodes: ObjectStoreNodeDirectory,
+        discovery: &dyn QueryServiceDiscovery,
+    ) -> Result<Self> {
+        let services = discovery.resolve_query_services().await?;
+        Self::from_service_directory(nodes, &services)
+    }
+
+    pub async fn execute_cypher_rows_many(
+        &self,
+        contexts: impl IntoIterator<Item = QueryContext>,
+        query: &str,
+    ) -> Result<BTreeMap<String, QueryResultSet>> {
+        let query = Arc::new(query.to_string());
+        let mut seen = BTreeSet::new();
+        let mut jobs = Vec::new();
+        for context in contexts {
+            let cell_id = checked_unique_cell(&mut seen, &context.cell_id)?;
+            let client = self.client_for_cell(&cell_id)?;
+            let query = Arc::clone(&query);
+            jobs.push(async move {
+                let result = client.execute_cypher_rows(context, query.as_str()).await;
+                (cell_id, result)
+            });
+        }
+
+        let mut result_sets = BTreeMap::new();
+        for (cell_id, result) in join_all(jobs).await {
+            result_sets.insert(cell_id, result?);
+        }
+        Ok(result_sets)
+    }
+
+    pub async fn execute_cypher_rows_pages(
+        &self,
+        requests: impl IntoIterator<Item = DistributedQueryPageRequest>,
+        query: &str,
+        page_size: usize,
+    ) -> Result<BTreeMap<String, QueryResultPage>> {
+        let query = Arc::new(query.to_string());
+        let mut seen = BTreeSet::new();
+        let mut jobs = Vec::new();
+        for request in requests {
+            let cell_id = checked_unique_cell(&mut seen, &request.context.cell_id)?;
+            let client = self.client_for_cell(&cell_id)?;
+            let query = Arc::clone(&query);
+            jobs.push(async move {
+                let result = client
+                    .execute_cypher_rows_page(
+                        request.context,
+                        query.as_str(),
+                        request.cursor,
+                        page_size,
+                    )
+                    .await;
+                (cell_id, result)
+            });
+        }
+
+        let mut pages = BTreeMap::new();
+        for (cell_id, result) in join_all(jobs).await {
+            pages.insert(cell_id, result?);
+        }
+        Ok(pages)
+    }
+
+    pub async fn execute_distributed_query_plan(
+        &self,
+        plan: DistributedQueryPlan,
+    ) -> Result<DistributedQueryPlanResult> {
+        let plan = if matches!(&plan.merge, DistributedQueryMerge::InnerJoin(_)) {
+            plan.optimized_for_costs()
+        } else {
+            plan
+        };
+        if plan.legs.is_empty() {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "DistributedQuery",
+                feature: "distributed query plan requires at least one leg".to_string(),
+            });
+        }
+        let leg_order = plan
+            .legs
+            .iter()
+            .map(|leg| leg.name.clone())
+            .collect::<Vec<_>>();
+        let mut seen_leg_names = BTreeSet::new();
+        let mut jobs = Vec::new();
+        for leg in plan.legs {
+            if !seen_leg_names.insert(leg.name.clone()) {
+                return Err(GraphError::CorruptValue {
+                    key: format!("query/leg/{}", leg.name),
+                    reason: "duplicate distributed query leg".to_string(),
+                });
+            }
+            let cell_id = leg.context.cell_id.clone();
+            let client = self.client_for_cell(&cell_id)?;
+            jobs.push(async move {
+                let result = client
+                    .execute_cypher_rows(leg.context, leg.query.as_str())
+                    .await;
+                (leg.name, result)
+            });
+        }
+
+        let mut leg_results = BTreeMap::new();
+        for (leg_name, result) in join_all(jobs).await {
+            leg_results.insert(leg_name, result?);
+        }
+        let merged = match plan.merge {
+            DistributedQueryMerge::UnionAll => {
+                merge_distributed_union_all(&leg_results, &leg_order)?
+            }
+            DistributedQueryMerge::InnerJoin(join) => {
+                merge_distributed_inner_join(&leg_results, &join)?
+            }
+        };
+        Ok(DistributedQueryPlanResult {
+            leg_results,
+            merged,
+        })
+    }
+
+    fn client_for_cell(&self, cell_id: &str) -> Result<Arc<dyn QueryCellClient>> {
+        if !self.directory.contains_cell(cell_id)? {
+            return Err(GraphError::UnknownShard {
+                cell_id: cell_id.to_string(),
+            });
+        }
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in cell_id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let index = usize::try_from(hash % self.clients.len().max(1) as u64).unwrap_or(0);
+        self.clients
+            .values()
+            .nth(index)
+            .cloned()
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: format!("query/cell/{cell_id}"),
+                reason: "no query nodes are registered".to_string(),
+            })
+    }
+}
+
+fn merge_distributed_union_all(
+    leg_results: &BTreeMap<String, QueryResultSet>,
+    leg_order: &[String],
+) -> Result<QueryResultSet> {
+    let Some(first_leg) = leg_order.first() else {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "DistributedQuery",
+            feature: "cannot merge an empty distributed result".to_string(),
+        });
+    };
+    let first = leg_results
+        .get(first_leg)
+        .ok_or_else(|| missing_distributed_leg(first_leg))?;
+    let columns = first.columns.clone();
+    let mut rows = first.rows.clone();
+    for leg_name in leg_order.iter().skip(1) {
+        let result = leg_results
+            .get(leg_name)
+            .ok_or_else(|| missing_distributed_leg(leg_name))?;
+        if result.columns != columns {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "DistributedQuery",
+                feature: format!("UNION ALL leg {leg_name} returned different columns"),
+            });
+        }
+        rows.extend(result.rows.clone());
+    }
+    Ok(QueryResultSet::new(columns, rows))
+}
+
+fn merge_distributed_inner_join(
+    leg_results: &BTreeMap<String, QueryResultSet>,
+    join: &DistributedQueryJoin,
+) -> Result<QueryResultSet> {
+    let left = leg_results
+        .get(&join.left_leg)
+        .ok_or_else(|| missing_distributed_leg(&join.left_leg))?;
+    let right = leg_results
+        .get(&join.right_leg)
+        .ok_or_else(|| missing_distributed_leg(&join.right_leg))?;
+    let left_idx = column_index(left, &join.left_column)?;
+    let right_idx = column_index(right, &join.right_column)?;
+
+    let mut columns = left
+        .columns
+        .iter()
+        .map(|column| crate::QueryColumn::new(format!("{}.{}", join.left_leg, column.name)))
+        .collect::<Vec<_>>();
+    columns.extend(
+        right
+            .columns
+            .iter()
+            .map(|column| crate::QueryColumn::new(format!("{}.{}", join.right_leg, column.name))),
+    );
+
+    let mut rows = Vec::new();
+    if right.rows.len() <= left.rows.len() {
+        let mut right_by_key = BTreeMap::<QueryValue, Vec<&QueryRow>>::new();
+        for row in &right.rows {
+            let Some(key) = row.values.get(right_idx).cloned() else {
+                return Err(GraphError::CorruptValue {
+                    key: format!("query/leg/{}", join.right_leg),
+                    reason: "right row is missing join column".to_string(),
+                });
+            };
+            right_by_key.entry(key).or_default().push(row);
+        }
+
+        for left_row in &left.rows {
+            let Some(key) = left_row.values.get(left_idx) else {
+                return Err(GraphError::CorruptValue {
+                    key: format!("query/leg/{}", join.left_leg),
+                    reason: "left row is missing join column".to_string(),
+                });
+            };
+            if let Some(right_rows) = right_by_key.get(key) {
+                for right_row in right_rows {
+                    let mut values = left_row.values.clone();
+                    values.extend(right_row.values.clone());
+                    rows.push(QueryRow::new(values));
+                }
+            }
+        }
+    } else {
+        let mut left_by_key = BTreeMap::<QueryValue, Vec<&QueryRow>>::new();
+        for row in &left.rows {
+            let Some(key) = row.values.get(left_idx).cloned() else {
+                return Err(GraphError::CorruptValue {
+                    key: format!("query/leg/{}", join.left_leg),
+                    reason: "left row is missing join column".to_string(),
+                });
+            };
+            left_by_key.entry(key).or_default().push(row);
+        }
+
+        for right_row in &right.rows {
+            let Some(key) = right_row.values.get(right_idx) else {
+                return Err(GraphError::CorruptValue {
+                    key: format!("query/leg/{}", join.right_leg),
+                    reason: "right row is missing join column".to_string(),
+                });
+            };
+            if let Some(left_rows) = left_by_key.get(key) {
+                for left_row in left_rows {
+                    let mut values = left_row.values.clone();
+                    values.extend(right_row.values.clone());
+                    rows.push(QueryRow::new(values));
+                }
+            }
+        }
+    }
+    Ok(QueryResultSet::new(columns, rows))
+}
+
+fn missing_distributed_leg(leg_name: &str) -> GraphError {
+    GraphError::CorruptValue {
+        key: format!("query/leg/{leg_name}"),
+        reason: "distributed query join references a missing leg".to_string(),
+    }
+}
+
+fn column_index(result: &QueryResultSet, column: &str) -> Result<usize> {
+    result
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == column)
+        .ok_or_else(|| GraphError::UnsupportedQuery {
+            dialect: "DistributedQuery",
+            feature: format!("join column {column} is not present in result set"),
+        })
+}
+
+#[async_trait]
+impl QueryCellClient for RoutedGraphCluster {
+    async fn execute_cypher_rows(
+        &self,
+        context: QueryContext,
+        query: &str,
+    ) -> Result<QueryResultSet> {
+        if routed_client_query_is_mutation(&context, query)? {
+            return match RoutedGraphCluster::execute_cypher(self, context, query).await? {
+                crate::QueryOutput::Mutation(_) | crate::QueryOutput::Write(_) => {
+                    Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+                }
+                output => Err(GraphError::CorruptValue {
+                    key: "query/client/mutation_output".to_string(),
+                    reason: format!("mutation query returned non-mutation output {output:?}"),
+                }),
+            };
+        }
+        RoutedGraphCluster::execute_cypher_rows(self, context, query).await
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        if routed_client_query_is_mutation(&context, query)? {
+            if cursor.is_some() {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "ClientProtocol",
+                    feature: "mutation queries cannot continue from a result cursor".to_string(),
+                });
+            }
+            return match RoutedGraphCluster::execute_cypher(self, context, query).await? {
+                crate::QueryOutput::Mutation(_) | crate::QueryOutput::Write(_) => {
+                    Ok(QueryResultPage::new(Vec::new(), Vec::new(), None))
+                }
+                output => Err(GraphError::CorruptValue {
+                    key: "query/client/mutation_page_output".to_string(),
+                    reason: format!("mutation query returned non-mutation output {output:?}"),
+                }),
+            };
+        }
+        RoutedGraphCluster::execute_cypher_rows_page(self, context, query, cursor, page_size).await
+    }
+
+    async fn execute_batch(
+        &self,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+    ) -> Result<QueryResultSet> {
+        if &context.scope != self.scope() {
+            return Err(GraphError::GraphScopeMismatch {
+                expected: self.scope().to_string(),
+                actual: context.scope.to_string(),
+            });
+        }
+        let shard = self.shard(&context.cell_id)?;
+        match operation {
+            crate::QueryBatchOperation::OutNeighbors {
+                edge_type,
+                sources,
+                source_column,
+                destination_column,
+            } => {
+                let snapshot = match context.read_epoch {
+                    Some(read_epoch) => shard.snapshot_at(&context.cell_id, read_epoch).await?,
+                    None => {
+                        shard
+                            .snapshot_for_query(&context.cell_id, context.uses_refreshed_reader())
+                            .await?
+                    }
+                };
+                let read_epoch = snapshot.read_epoch();
+                let storage_sequence = snapshot
+                    .storage_sequence()
+                    .expect("all graph snapshots pin a SlateDB sequence");
+                let entries = crate::GraphStore::scope_snapshot(
+                    Arc::clone(&snapshot.storage_snapshot),
+                    shard.out_neighbors_batch_at_with_cancellation(
+                        &context.cell_id,
+                        &edge_type,
+                        sources,
+                        read_epoch,
+                        context.cancellation_token.clone(),
+                    ),
+                )
+                .await?;
+                let row_count = entries
+                    .iter()
+                    .map(|entry| entry.neighbors.len())
+                    .sum::<usize>();
+                crate::codec::ensure_limit(
+                    "query_batch_result_rows",
+                    row_count as u64,
+                    shard.limits.max_query_result_vertices as u64,
+                )?;
+                let mut rows = Vec::with_capacity(row_count);
+                let mut result_bytes = 0_u64;
+                for entry in entries {
+                    if context
+                        .cancellation_token
+                        .as_ref()
+                        .is_some_and(crate::QueryCancellationToken::is_cancelled)
+                    {
+                        return Err(GraphError::QueryTimeout {
+                            operation: "query_cancelled",
+                            elapsed_ms: 0,
+                            limit_ms: 0,
+                        });
+                    }
+                    for destination in entry.neighbors {
+                        let row = QueryRow::new(vec![
+                            QueryValue::VertexId(entry.vertex),
+                            QueryValue::VertexId(destination),
+                        ]);
+                        result_bytes = result_bytes.saturating_add(row.estimated_resident_bytes());
+                        if let Some(limit) = context.max_result_bytes {
+                            crate::codec::ensure_limit(
+                                "client_cursor_buffer_bytes",
+                                result_bytes,
+                                limit,
+                            )?;
+                        }
+                        rows.push(row);
+                    }
+                }
+                Ok(
+                    QueryResultSet::new(vec![source_column, destination_column], rows)
+                        .with_read_epoch(read_epoch)
+                        .with_storage_sequence(storage_sequence),
+                )
+            }
+            crate::QueryBatchOperation::CreateEdges { edge_type, edges } => {
+                self.ensure_local_writer(&context.cell_id).await?;
+                let mutations =
+                    edges
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, edge)| crate::EdgeMutation {
+                            cell_id: context.cell_id.clone(),
+                            edge_type: edge_type.clone(),
+                            src: edge.src,
+                            dst: edge.dst,
+                            idempotency_key: format!(
+                                "{}.unwind-create.{index:020}",
+                                context.idempotency_key
+                            ),
+                        });
+                shard
+                    .write_edge_mutations_batch(&context.cell_id, mutations)
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::CreateEdgesBetweenLabeledVertices {
+                edge_type,
+                edges,
+                source_label,
+                destination_label,
+            } => {
+                self.ensure_local_writer(&context.cell_id).await?;
+                let mutations =
+                    edges
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, edge)| crate::EdgeMutation {
+                            cell_id: context.cell_id.clone(),
+                            edge_type: edge_type.clone(),
+                            src: edge.src,
+                            dst: edge.dst,
+                            idempotency_key: format!(
+                                "{}.unwind-create-matched.{index:020}",
+                                context.idempotency_key
+                            ),
+                        });
+                shard
+                    .write_edge_mutations_batch_between_labeled_vertices(
+                        &context.cell_id,
+                        mutations,
+                        &source_label,
+                        &destination_label,
+                    )
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::UpsertVertices { vertices } => {
+                self.ensure_local_writer(&context.cell_id).await?;
+                shard
+                    .merge_vertex_metadata_batch(
+                        &context.cell_id,
+                        vertices
+                            .into_iter()
+                            .map(|vertex| (vertex.vertex, vertex.metadata)),
+                    )
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::CreateRelationshipsBetweenLabeledVertices {
+                edge_type,
+                relationships,
+                source_label,
+                destination_label,
+            } => {
+                self.ensure_local_writer(&context.cell_id).await?;
+                shard
+                    .create_relationships_batch_between_labeled_vertices(
+                        &context.cell_id,
+                        &edge_type,
+                        relationships
+                            .into_iter()
+                            .map(|relationship| crate::RelationshipMutation {
+                                cell_id: context.cell_id.clone(),
+                                edge_type: edge_type.clone(),
+                                src: relationship.src,
+                                dst: relationship.dst,
+                                relationship_id: 0,
+                                metadata: relationship.metadata,
+                            }),
+                        &format!("{}.unwind-relationship-create", context.idempotency_key),
+                        &source_label,
+                        &destination_label,
+                    )
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices {
+                edge_type,
+                relationships,
+                source_label,
+                destination_label,
+            } => {
+                self.ensure_local_writer(&context.cell_id).await?;
+                shard
+                    .merge_relationships_batch_between_labeled_vertices(
+                        &context.cell_id,
+                        &edge_type,
+                        relationships.into_iter().map(|relationship| {
+                            let mut metadata = relationship.metadata;
+                            metadata.properties.insert(
+                                "id".to_string(),
+                                crate::VertexPropertyValue::Integer(relationship.relationship_id),
+                            );
+                            crate::RelationshipMutation {
+                                cell_id: context.cell_id.clone(),
+                                edge_type: edge_type.clone(),
+                                src: relationship.src,
+                                dst: relationship.dst,
+                                relationship_id: relationship.relationship_id,
+                                metadata,
+                            }
+                        }),
+                        &format!("{}.unwind-relationship-merge", context.idempotency_key),
+                        &source_label,
+                        &destination_label,
+                    )
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::DeleteEdges { edge_type, edges } => {
+                self.ensure_local_writer(&context.cell_id).await?;
+                let mutations =
+                    edges
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, edge)| crate::EdgeMutation {
+                            cell_id: context.cell_id.clone(),
+                            edge_type: edge_type.clone(),
+                            src: edge.src,
+                            dst: edge.dst,
+                            idempotency_key: format!(
+                                "{}.unwind-delete.{index:020}",
+                                context.idempotency_key
+                            ),
+                        });
+                shard
+                    .delete_edge_mutations_batch(&context.cell_id, mutations)
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::DeleteVertices { vertices, detach } => {
+                self.ensure_local_writer(&context.cell_id).await?;
+                for (index, vertex) in vertices.into_iter().enumerate() {
+                    if context
+                        .cancellation_token
+                        .as_ref()
+                        .is_some_and(crate::QueryCancellationToken::is_cancelled)
+                    {
+                        return Err(GraphError::QueryTimeout {
+                            operation: "query_cancelled",
+                            elapsed_ms: 0,
+                            limit_ms: 0,
+                        });
+                    }
+                    let idempotency_key = format!(
+                        "{}.unwind-delete-vertex.{index:020}.{vertex}",
+                        context.idempotency_key
+                    );
+                    if detach {
+                        shard
+                            .detach_delete_vertex(&context.cell_id, vertex, &idempotency_key)
+                            .await?;
+                    } else {
+                        shard
+                            .delete_vertex(&context.cell_id, vertex, &idempotency_key)
+                            .await?;
+                    }
+                }
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::DeleteRelationshipsByProperty {
+                edge_type,
+                property,
+                values,
+            } => {
+                self.ensure_local_writer(&context.cell_id).await?;
+                shard
+                    .delete_relationships_by_property_values_batch(
+                        &context, &edge_type, &property, values,
+                    )
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+        }
+    }
+
+    async fn current_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+    ) -> Result<Option<crate::StorageSequence>> {
+        if scope != self.scope() {
+            return Err(GraphError::GraphScopeMismatch {
+                expected: self.scope().to_string(),
+                actual: scope.to_string(),
+            });
+        }
+        Ok(Some(
+            self.shard(cell_id)?
+                .current_storage_sequence(cell_id)
+                .await?,
+        ))
+    }
+
+    async fn wait_for_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+        minimum: crate::StorageSequence,
+    ) -> Result<Option<crate::StorageSequence>> {
+        if scope != self.scope() {
+            return Err(GraphError::GraphScopeMismatch {
+                expected: self.scope().to_string(),
+                actual: scope.to_string(),
+            });
+        }
+        Ok(Some(
+            self.shard(cell_id)?
+                .wait_for_storage_sequence(cell_id, minimum)
+                .await?,
+        ))
+    }
+
+    async fn refresh_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+    ) -> Result<Option<crate::StorageSequence>> {
+        if scope != self.scope() {
+            return Err(GraphError::GraphScopeMismatch {
+                expected: self.scope().to_string(),
+                actual: scope.to_string(),
+            });
+        }
+        Ok(Some(
+            self.shard(cell_id)?
+                .refresh_storage_sequence(cell_id)
+                .await?,
+        ))
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[async_trait]
+impl QueryCellClient for crate::ScopedRoutedGraphCluster {
+    async fn execute_cypher_rows(
+        &self,
+        context: QueryContext,
+        query: &str,
+    ) -> Result<QueryResultSet> {
+        let cluster = if routed_client_query_is_mutation(&context, query)? {
+            self.cluster_for_scope_write(&context.scope, &context.cell_id)
+                .await?
+        } else {
+            self.cluster_for_scope(&context.scope).await?
+        };
+        QueryCellClient::execute_cypher_rows(cluster.as_ref(), context, query).await
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let cluster = if routed_client_query_is_mutation(&context, query)? {
+            self.cluster_for_scope_write(&context.scope, &context.cell_id)
+                .await?
+        } else {
+            self.cluster_for_scope(&context.scope).await?
+        };
+        QueryCellClient::execute_cypher_rows_page(
+            cluster.as_ref(),
+            context,
+            query,
+            cursor,
+            page_size,
+        )
+        .await
+    }
+
+    async fn execute_batch(
+        &self,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+    ) -> Result<QueryResultSet> {
+        let cluster = if operation.is_write() {
+            self.cluster_for_scope_write(&context.scope, &context.cell_id)
+                .await?
+        } else {
+            self.cluster_for_scope(&context.scope).await?
+        };
+        QueryCellClient::execute_batch(cluster.as_ref(), context, operation).await
+    }
+
+    async fn current_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+    ) -> Result<Option<crate::StorageSequence>> {
+        let cluster = self.cluster_for_scope(scope).await?;
+        QueryCellClient::current_storage_sequence(cluster.as_ref(), scope, cell_id).await
+    }
+
+    async fn wait_for_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+        minimum: crate::StorageSequence,
+    ) -> Result<Option<crate::StorageSequence>> {
+        let cluster = self.cluster_for_scope(scope).await?;
+        QueryCellClient::wait_for_storage_sequence(cluster.as_ref(), scope, cell_id, minimum).await
+    }
+
+    async fn refresh_storage_sequence(
+        &self,
+        scope: &crate::GraphScope,
+        cell_id: &str,
+    ) -> Result<Option<crate::StorageSequence>> {
+        let cluster = self.cluster_for_scope(scope).await?;
+        QueryCellClient::refresh_storage_sequence(cluster.as_ref(), scope, cell_id).await
+    }
+}
+
+fn routed_client_query_is_mutation(context: &QueryContext, query: &str) -> Result<bool> {
+    let _ = context;
+    Ok(matches!(
+        crate::query::opencypher::classify_opencypher_query_access(query)?,
+        crate::query::opencypher::OpenCypherQueryAccess::Write
+    ))
+}
+
+fn checked_unique_cell(seen: &mut BTreeSet<String>, cell_id: &str) -> Result<String> {
+    validate_component("cell_id", cell_id)?;
+    if !seen.insert(cell_id.to_string()) {
+        return Err(GraphError::CorruptValue {
+            key: format!("query/cell/{cell_id}"),
+            reason: "duplicate cell in distributed query request".to_string(),
+        });
+    }
+    Ok(cell_id.to_string())
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn parse_kubernetes_endpointslices(
+    value: &serde_json::Value,
+    port_name: Option<&str>,
+    client_config: QueryTransportClientConfig,
+) -> Result<QueryServiceDirectory> {
+    let mut directory = QueryServiceDirectory::new();
+    let items = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| service_discovery_format_error("kubernetes", "items array is missing"))?;
+    for item in items {
+        let port = select_kubernetes_port(item, port_name)?;
+        let Some(endpoints) = item.get("endpoints").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for endpoint in endpoints {
+            if endpoint
+                .pointer("/conditions/ready")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                continue;
+            }
+            let Some(address) = endpoint
+                .get("addresses")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|addresses| addresses.first())
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let node_id = endpoint
+                .get("hostname")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    endpoint
+                        .pointer("/targetRef/name")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or(address);
+            directory.insert(
+                QueryServiceEndpoint::new(
+                    discovery_node_id(node_id),
+                    socket_addr_from_host_port("kubernetes", address, port)?,
+                )
+                .with_client_config(client_config.clone()),
+            )?;
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn select_kubernetes_port(item: &serde_json::Value, port_name: Option<&str>) -> Result<u16> {
+    let ports = item
+        .get("ports")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| service_discovery_format_error("kubernetes", "ports array is missing"))?;
+    let selected = match port_name {
+        Some(port_name) => ports
+            .iter()
+            .find(|port| port.get("name").and_then(serde_json::Value::as_str) == Some(port_name)),
+        None => ports.first(),
+    }
+    .ok_or_else(|| service_discovery_format_error("kubernetes", "matching port is missing"))?;
+    u16_from_json_field("kubernetes", selected, "port")
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn parse_consul_health_service(
+    value: &serde_json::Value,
+    client_config: QueryTransportClientConfig,
+) -> Result<QueryServiceDirectory> {
+    let mut directory = QueryServiceDirectory::new();
+    let services = value.as_array().ok_or_else(|| {
+        service_discovery_format_error("consul", "health service array is missing")
+    })?;
+    for item in services {
+        let service = item
+            .get("Service")
+            .ok_or_else(|| service_discovery_format_error("consul", "Service object is missing"))?;
+        let node = item.get("Node");
+        let node_id = service
+            .get("ID")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| service.get("Service").and_then(serde_json::Value::as_str))
+            .ok_or_else(|| service_discovery_format_error("consul", "Service.ID is missing"))?;
+        let address = service
+            .get("Address")
+            .and_then(serde_json::Value::as_str)
+            .filter(|address| !address.is_empty())
+            .or_else(|| {
+                node.and_then(|node| node.get("Address"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .ok_or_else(|| {
+                service_discovery_format_error("consul", "service address is missing")
+            })?;
+        let port = u16_from_json_field("consul", service, "Port")?;
+        directory.insert(
+            QueryServiceEndpoint::new(
+                discovery_node_id(node_id),
+                socket_addr_from_host_port("consul", address, port)?,
+            )
+            .with_client_config(client_config.clone()),
+        )?;
+    }
+    Ok(directory)
+}
+
+#[cfg(feature = "query-service-discovery")]
+#[derive(serde::Deserialize)]
+struct EtcdQueryServiceRecord {
+    node_id: String,
+    address: String,
+    port: u16,
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn parse_etcd_query_services(
+    value: &serde_json::Value,
+    client_config: QueryTransportClientConfig,
+) -> Result<QueryServiceDirectory> {
+    let mut directory = QueryServiceDirectory::new();
+    let Some(kvs) = value.get("kvs").and_then(serde_json::Value::as_array) else {
+        return Ok(directory);
+    };
+    for kv in kvs {
+        let encoded = kv
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| service_discovery_format_error("etcd", "kv value is missing"))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|err| service_discovery_error("etcd/base64", err))?;
+        let record: EtcdQueryServiceRecord = serde_json::from_slice(&bytes)
+            .map_err(|err| service_discovery_error("etcd/record", err))?;
+        directory.insert(
+            QueryServiceEndpoint::new(
+                discovery_node_id(&record.node_id),
+                socket_addr_from_host_port("etcd", &record.address, record.port)?,
+            )
+            .with_client_config(client_config.clone()),
+        )?;
+    }
+    Ok(directory)
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn etcd_prefix_end(prefix: &str) -> Vec<u8> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    for idx in (0..bytes.len()).rev() {
+        if bytes[idx] != 0xff {
+            bytes[idx] = bytes[idx].saturating_add(1);
+            bytes.truncate(idx + 1);
+            return bytes;
+        }
+    }
+    vec![0]
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn socket_addr_from_host_port(provider: &'static str, host: &str, port: u16) -> Result<SocketAddr> {
+    let raw = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    raw.parse().map_err(|err| GraphError::CorruptValue {
+        key: format!("query/service_discovery/{provider}/address"),
+        reason: format!("invalid endpoint address {raw}: {err}"),
+    })
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn u16_from_json_field(
+    provider: &'static str,
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<u16> {
+    let raw = value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| service_discovery_format_error(provider, &format!("{field} is missing")))?;
+    u16::try_from(raw)
+        .map_err(|_| service_discovery_format_error(provider, &format!("{field} is out of range")))
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn discovery_node_id(raw: &str) -> String {
+    raw.bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.') {
+                byte as char
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn service_discovery_format_error(provider: &'static str, reason: &str) -> GraphError {
+    GraphError::CorruptValue {
+        key: format!("query/service_discovery/{provider}"),
+        reason: reason.to_string(),
+    }
+}
+
+#[cfg(feature = "query-service-discovery")]
+fn service_discovery_error(provider: &'static str, err: impl std::fmt::Display) -> GraphError {
+    GraphError::CorruptValue {
+        key: format!("query/service_discovery/{provider}"),
+        reason: err.to_string(),
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct QueryTransportAuth {
+    bearer_token: Option<String>,
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum QueryTransportRequest {
+    Rows {
+        version: u16,
+        auth: QueryTransportAuth,
+        context: QueryContext,
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
+    },
+    Page {
+        version: u16,
+        auth: QueryTransportAuth,
+        context: QueryContext,
+        query: String,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
+    },
+    Batch {
+        version: u16,
+        auth: QueryTransportAuth,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
+    },
+    BatchPage {
+        version: u16,
+        auth: QueryTransportAuth,
+        context: QueryContext,
+        operation: crate::QueryBatchOperation,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
+    },
+    Cancel {
+        version: u16,
+        auth: QueryTransportAuth,
+        scope: GraphScope,
+        query_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
+    },
+}
+
+#[cfg(feature = "query-transport")]
+impl QueryTransportRequest {
+    fn is_cancel(&self) -> bool {
+        matches!(self, Self::Cancel { .. })
+    }
+
+    /// The caller's trace context, if it sent one.
+    ///
+    /// Read once at the serve boundary rather than in each of the five arms, so
+    /// there is a single place where an inbound trace context is adopted and a
+    /// single place to audit.
+    fn traceparent(&self) -> Option<&str> {
+        match self {
+            Self::Rows { traceparent, .. }
+            | Self::Page { traceparent, .. }
+            | Self::Batch { traceparent, .. }
+            | Self::BatchPage { traceparent, .. }
+            | Self::Cancel { traceparent, .. } => traceparent.as_deref(),
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum QueryTransportResponse {
+    Rows { result: QueryResultSet },
+    Page { result: QueryResultPage },
+    Cancelled,
+    Error { message: String },
+}
+
+#[cfg(feature = "query-transport")]
+#[derive(serde::Deserialize, serde::Serialize)]
+struct QueryTransportResponseFrame {
+    response: QueryTransportResponse,
+    close_connection: bool,
+}
+
+#[cfg(feature = "query-transport")]
+struct DecodedQueryTransportResponse {
+    response: QueryTransportResponse,
+    close_connection: bool,
+}
+
+#[cfg(feature = "query-transport")]
+async fn serve_query_transport_stream(
+    stream: TcpStream,
+    client: Arc<dyn QueryCellClient>,
+    runtime: Arc<QueryTransportServerRuntime>,
+    shutdown: watch::Receiver<bool>,
+    control_only: bool,
+) -> Result<()> {
+    #[cfg(feature = "query-transport-tls")]
+    {
+        let tls_config = if let Some(provider) = &runtime.config.tls_config_provider {
+            Some(provider.current_server_config()?)
+        } else {
+            runtime.config.tls_config.clone()
+        };
+        if let Some(tls_config) = tls_config {
+            let acceptor = TlsAcceptor::from(tls_config);
+            let handshake =
+                tokio::time::timeout(runtime.config.handshake_timeout, acceptor.accept(stream));
+            let mut handshake_shutdown = shutdown.clone();
+            let handshake = tokio::select! {
+                changed = handshake_shutdown.changed() => {
+                    let _ = changed;
+                    return Ok(());
+                }
+                handshake = handshake => handshake,
+            };
+            let mut stream = match handshake {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(err)) => {
+                    runtime
+                        .metrics
+                        .handshake_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(transport_error("tls_accept", err));
+                }
+                Err(_) => {
+                    runtime
+                        .metrics
+                        .handshake_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(transport_timeout_error(
+                        "tls_handshake",
+                        runtime.config.handshake_timeout,
+                    ));
+                }
+            };
+            let identity = query_transport_tls_identity(&stream);
+            return serve_query_transport_io(
+                &mut stream,
+                client,
+                runtime,
+                identity,
+                shutdown,
+                control_only,
+            )
+            .await;
+        }
+    }
+
+    let mut stream = stream;
+    serve_query_transport_io(
+        &mut stream,
+        client,
+        runtime,
+        QueryTransportConnectionIdentity::default(),
+        shutdown,
+        control_only,
+    )
+    .await
+}
+
+#[cfg(feature = "query-transport-tls")]
+fn query_transport_tls_identity<S>(
+    stream: &tokio_rustls::server::TlsStream<S>,
+) -> QueryTransportConnectionIdentity {
+    let mut identity = QueryTransportConnectionIdentity::default();
+    let (_, connection) = stream.get_ref();
+    if let Some(certs) = connection.peer_certificates() {
+        for (index, cert) in certs.iter().enumerate() {
+            let digest = Sha256::digest(cert.as_ref());
+            let fingerprint = format!("sha256:{}", lowercase_hex(&digest));
+            if index == 0 {
+                identity.tls_peer_leaf_fingerprint = Some(fingerprint.clone());
+            }
+            identity.tls_peer_fingerprints.insert(fingerprint);
+        }
+    }
+    identity
+}
+
+#[cfg(feature = "query-transport")]
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+#[cfg(feature = "query-transport")]
+async fn serve_query_transport_io<S>(
+    stream: &mut S,
+    client: Arc<dyn QueryCellClient>,
+    runtime: Arc<QueryTransportServerRuntime>,
+    identity: QueryTransportConnectionIdentity,
+    mut shutdown: watch::Receiver<bool>,
+    control_only: bool,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut read_buffer = Vec::new();
+    let connection_started = Instant::now();
+    for request_index in 0..runtime.config.max_requests_per_connection {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let read = read_optional_query_transport_frame(
+            stream,
+            runtime.config.max_frame_bytes,
+            &runtime.metrics,
+            &mut read_buffer,
+        );
+        let frame = tokio::select! {
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return Ok(());
+            }
+            frame = tokio::time::timeout(runtime.config.idle_timeout, read) => {
+                match frame {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        runtime.metrics.idle_timeouts.fetch_add(1, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        let Some(frame) = frame else {
+            return Ok(());
+        };
+        let response = match serde_json::from_slice::<QueryTransportRequest>(&frame) {
+            Ok(request) => {
+                if control_only && !request.is_cancel() {
+                    QueryTransportResponse::Error {
+                        message: "connection is reserved for query cancellation".to_string(),
+                    }
+                } else {
+                    execute_query_transport_request(
+                        Arc::clone(&client),
+                        request,
+                        Arc::clone(&runtime),
+                        identity.clone(),
+                    )
+                    .await
+                }
+            }
+            Err(err) => QueryTransportResponse::Error {
+                message: format!("invalid query transport request: {err}"),
+            },
+        };
+        let close_connection = control_only
+            || request_index + 1 >= runtime.config.max_requests_per_connection
+            || connection_started.elapsed() >= runtime.config.max_connection_age;
+        let wire_response = QueryTransportResponseFrame {
+            response,
+            close_connection,
+        };
+        match tokio::time::timeout(
+            runtime.config.write_timeout,
+            write_query_transport_frame(
+                stream,
+                &wire_response,
+                runtime.config.max_frame_bytes,
+                &runtime.metrics,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(transport_timeout_error(
+                    "frame_write",
+                    runtime.config.write_timeout,
+                ));
+            }
+        }
+        if close_connection {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "query-transport")]
+async fn execute_query_transport_request(
+    client: Arc<dyn QueryCellClient>,
+    request: QueryTransportRequest,
+    runtime: Arc<QueryTransportServerRuntime>,
+    identity: QueryTransportConnectionIdentity,
+) -> QueryTransportResponse {
+    // The join point for a distributed query. Without it each node starts its
+    // own trace and a query fanned across three nodes is three unrelated
+    // traces, none of which shows the fan-out that explains its latency.
+    //
+    // Adopted here, once, rather than in each of the five arms below: there is
+    // one place an inbound trace context enters this process, which is also the
+    // only place worth auditing when asking whether a peer can influence our
+    // telemetry. It cannot do more than name a trace — see
+    // `core::trace_context`.
+    let span = tracing::info_span!("query.transport_serve");
+    crate::core::trace_context::adopt_remote_parent(&span, request.traceparent());
+    execute_query_transport_request_inner(client, request, runtime, identity)
+        .instrument(span)
+        .await
+}
+
+#[cfg(feature = "query-transport")]
+async fn execute_query_transport_request_inner(
+    client: Arc<dyn QueryCellClient>,
+    request: QueryTransportRequest,
+    runtime: Arc<QueryTransportServerRuntime>,
+    identity: QueryTransportConnectionIdentity,
+) -> QueryTransportResponse {
+    match request {
+        QueryTransportRequest::Rows {
+            version,
+            auth,
+            context,
+            query,
+            ..
+        } => {
+            if !query_transport_version_supported(version) {
+                return transport_version_error(version);
+            }
+            let principal = match authenticate_query_transport(&runtime, &auth, &identity) {
+                Ok(principal) => principal,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            let action = match classify_query_transport_action(&query) {
+                Ok(action) => action,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            if let Err(err) =
+                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
+            {
+                return transport_error_response(&runtime, err);
+            }
+            let query_id = context.idempotency_key.clone();
+            let lifecycle_key = QueryLifecycleKey::new(principal, context.scope.clone(), &query_id);
+            match execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
+                client.execute_cypher_rows(
+                    context.with_cancellation_token(cancellation_token),
+                    &query,
+                )
+            })
+            .await
+            {
+                Ok(result) => QueryTransportResponse::Rows { result },
+                Err(err) => transport_error_response(&runtime, err),
+            }
+        }
+        QueryTransportRequest::Page {
+            version,
+            auth,
+            context,
+            query,
+            cursor,
+            page_size,
+            ..
+        } => {
+            if !query_transport_version_supported(version) {
+                return transport_version_error(version);
+            }
+            let principal = match authenticate_query_transport(&runtime, &auth, &identity) {
+                Ok(principal) => principal,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            let action = match classify_query_transport_action(&query) {
+                Ok(action) => action,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            if let Err(err) =
+                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
+            {
+                return transport_error_response(&runtime, err);
+            }
+            if action == QueryTransportAction::Write {
+                return transport_error_response(
+                    &runtime,
+                    GraphError::UnsupportedQuery {
+                        dialect: "QueryTransport",
+                        feature: "mutation queries cannot use paged row execution".to_string(),
+                    },
+                );
+            }
+            let query_id = context.idempotency_key.clone();
+            let lifecycle_key = QueryLifecycleKey::new(principal, context.scope.clone(), &query_id);
+            match execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
+                client.execute_cypher_rows_page(
+                    context.with_cancellation_token(cancellation_token),
+                    &query,
+                    cursor,
+                    page_size,
+                )
+            })
+            .await
+            {
+                Ok(result) => QueryTransportResponse::Page { result },
+                Err(err) => transport_error_response(&runtime, err),
+            }
+        }
+        QueryTransportRequest::Batch {
+            version,
+            auth,
+            context,
+            operation,
+            ..
+        } => {
+            if !query_transport_version_supported(version) {
+                return transport_version_error(version);
+            }
+            let principal = match authenticate_query_transport(&runtime, &auth, &identity) {
+                Ok(principal) => principal,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            let action = if operation.is_write() {
+                QueryTransportAction::Write
+            } else {
+                QueryTransportAction::Read
+            };
+            if let Err(err) =
+                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
+            {
+                return transport_error_response(&runtime, err);
+            }
+            let query_id = context.idempotency_key.clone();
+            let lifecycle_key = QueryLifecycleKey::new(principal, context.scope.clone(), &query_id);
+            match execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
+                client.execute_batch(
+                    context.with_cancellation_token(cancellation_token),
+                    operation,
+                )
+            })
+            .await
+            {
+                Ok(result) => QueryTransportResponse::Rows { result },
+                Err(err) => transport_error_response(&runtime, err),
+            }
+        }
+        QueryTransportRequest::BatchPage {
+            version,
+            auth,
+            context,
+            operation,
+            cursor,
+            page_size,
+            ..
+        } => {
+            if !query_transport_version_supported(version) {
+                return transport_version_error(version);
+            }
+            let principal = match authenticate_query_transport(&runtime, &auth, &identity) {
+                Ok(principal) => principal,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            if operation.is_write() && cursor.is_some() {
+                return transport_error_response(
+                    &runtime,
+                    GraphError::UnsupportedQuery {
+                        dialect: "QueryTransport",
+                        feature: "mutation batches cannot continue from a result cursor"
+                            .to_string(),
+                    },
+                );
+            }
+            let action = if operation.is_write() {
+                QueryTransportAction::Write
+            } else {
+                QueryTransportAction::Read
+            };
+            if let Err(err) =
+                authorize_query_transport_scope(&runtime, &principal, &context.scope, action)
+            {
+                return transport_error_response(&runtime, err);
+            }
+            let query_id = context.idempotency_key.clone();
+            let lifecycle_key = QueryLifecycleKey::new(principal, context.scope.clone(), &query_id);
+            let result = if action == QueryTransportAction::Write {
+                execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| async {
+                    let result = client
+                        .execute_batch(
+                            context.with_cancellation_token(cancellation_token),
+                            operation,
+                        )
+                        .await?;
+                    paginate_query_batch_result(result, None, page_size)
+                })
+                .await
+            } else {
+                execute_metered_query(&runtime, &lifecycle_key, |cancellation_token| {
+                    client.execute_batch_page(
+                        context.with_cancellation_token(cancellation_token),
+                        operation,
+                        cursor,
+                        page_size,
+                    )
+                })
+                .await
+            };
+            match result {
+                Ok(result) => QueryTransportResponse::Page { result },
+                Err(err) => transport_error_response(&runtime, err),
+            }
+        }
+        QueryTransportRequest::Cancel {
+            version,
+            auth,
+            scope,
+            query_id,
+            ..
+        } => {
+            if !query_transport_version_supported(version) {
+                return transport_version_error(version);
+            }
+            let principal = match authenticate_query_transport(&runtime, &auth, &identity) {
+                Ok(principal) => principal,
+                Err(err) => return transport_error_response(&runtime, err),
+            };
+            if let Err(err) = authorize_query_transport_scope(
+                &runtime,
+                &principal,
+                &scope,
+                QueryTransportAction::Cancel,
+            ) {
+                return transport_error_response(&runtime, err);
+            }
+            let lifecycle_key = QueryLifecycleKey::new(principal, scope, &query_id);
+            match cancel_active_query(&runtime, &lifecycle_key).await {
+                Ok(()) => QueryTransportResponse::Cancelled,
+                Err(err) => transport_error_response(&runtime, err),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn transport_version_error(version: u16) -> QueryTransportResponse {
+    QueryTransportResponse::Error {
+        message: format!(
+            "unsupported query transport version {version}; expected {QUERY_TRANSPORT_VERSION}"
+        ),
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn query_transport_version_supported(version: u16) -> bool {
+    version == QUERY_TRANSPORT_VERSION
+}
+
+#[cfg(feature = "query-transport")]
+fn classify_query_transport_action(query: &str) -> Result<QueryTransportAction> {
+    match crate::query::opencypher::classify_opencypher_query_access(query)? {
+        crate::query::opencypher::OpenCypherQueryAccess::Read => Ok(QueryTransportAction::Read),
+        crate::query::opencypher::OpenCypherQueryAccess::Write => Ok(QueryTransportAction::Write),
+    }
+}
+
+#[cfg(feature = "query-transport")]
+async fn execute_metered_query<F, Fut, T>(
+    runtime: &Arc<QueryTransportServerRuntime>,
+    lifecycle_key: &QueryLifecycleKey,
+    execute: F,
+) -> Result<T>
+where
+    F: FnOnce(QueryCancellationToken) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let (lifecycle_token, cancellation_token) =
+        begin_query_lifecycle(runtime, lifecycle_key).await?;
+    let result = async {
+        let _namespace_permits = acquire_namespace_query_permits(
+            runtime,
+            &lifecycle_key.scope.namespace,
+            &cancellation_token,
+        )
+        .await?;
+        let _permit = acquire_query_transport_permit(runtime, &cancellation_token).await?;
+        activate_query_lifecycle(runtime, lifecycle_key, lifecycle_token).await?;
+        ensure_query_not_cancelled(runtime, lifecycle_key, lifecycle_token).await?;
+        runtime
+            .metrics
+            .requests_started
+            .fetch_add(1, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let result = match AssertUnwindSafe(execute(cancellation_token))
+            .catch_unwind()
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(GraphError::CorruptValue {
+                key: "query/transport/executor".to_string(),
+                reason: "query executor panicked".to_string(),
+            }),
+        };
+        let elapsed = started.elapsed();
+        runtime.metrics.serve_latency.record(elapsed);
+        let is_slow_query = match runtime.config.slow_query_log_threshold {
+            Some(threshold) => elapsed >= threshold,
+            None => false,
+        };
+        if is_slow_query {
+            runtime.metrics.slow_queries.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "slatedb_graph_kernel",
+                query_id = lifecycle_key.query_id,
+                elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+                "slow query transport request"
+            );
+        }
+        result
+    }
+    .await;
+    let result = match finish_query_lifecycle(runtime, lifecycle_key, lifecycle_token).await {
+        QueryLifecycleFinish::Cancelled => Err(cancelled_query_error()),
+        QueryLifecycleFinish::NotCancelled | QueryLifecycleFinish::NotOwned => result,
+    };
+    match &result {
+        Ok(_) => runtime
+            .metrics
+            .requests_completed
+            .fetch_add(1, Ordering::Relaxed),
+        Err(_) => runtime
+            .metrics
+            .requests_failed
+            .fetch_add(1, Ordering::Relaxed),
+    };
+    result
+}
+
+#[cfg(feature = "query-transport")]
+async fn begin_query_lifecycle(
+    runtime: &QueryTransportServerRuntime,
+    lifecycle_key: &QueryLifecycleKey,
+) -> Result<(QueryLifecycleToken, QueryCancellationToken)> {
+    let mut lifecycle = runtime.lifecycle.lock().await;
+    if lifecycle.queries.contains_key(lifecycle_key) {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "QueryTransport",
+            feature: format!("query id {} is already active", lifecycle_key.query_id),
+        });
+    }
+    let token = lifecycle.next_token;
+    lifecycle.next_token = lifecycle.next_token.wrapping_add(1);
+    let cancellation_token = QueryCancellationToken::new();
+    lifecycle.queries.insert(
+        lifecycle_key.clone(),
+        QueryLifecycleEntry {
+            token,
+            state: QueryLifecycleState::Queued,
+            cancellation_token: cancellation_token.clone(),
+        },
+    );
+    Ok((token, cancellation_token))
+}
+
+#[cfg(feature = "query-transport")]
+async fn activate_query_lifecycle(
+    runtime: &QueryTransportServerRuntime,
+    lifecycle_key: &QueryLifecycleKey,
+    token: QueryLifecycleToken,
+) -> Result<()> {
+    let mut lifecycle = runtime.lifecycle.lock().await;
+    let Some(entry) = lifecycle.queries.get_mut(lifecycle_key) else {
+        return Err(cancelled_query_error());
+    };
+    if entry.token != token {
+        return Err(cancelled_query_error());
+    }
+    if entry.state == QueryLifecycleState::Cancelled {
+        return Err(cancelled_query_error());
+    }
+    entry.state = QueryLifecycleState::Running;
+    Ok(())
+}
+
+#[cfg(feature = "query-transport")]
+async fn finish_query_lifecycle(
+    runtime: &QueryTransportServerRuntime,
+    lifecycle_key: &QueryLifecycleKey,
+    token: QueryLifecycleToken,
+) -> QueryLifecycleFinish {
+    let mut lifecycle = runtime.lifecycle.lock().await;
+    let Some(entry) = lifecycle.queries.get(lifecycle_key) else {
+        return QueryLifecycleFinish::NotOwned;
+    };
+    if entry.token != token {
+        return QueryLifecycleFinish::NotOwned;
+    }
+    let state = entry.state;
+    lifecycle.queries.remove(lifecycle_key);
+    match state {
+        QueryLifecycleState::Cancelled => {
+            runtime
+                .metrics
+                .cancelled_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            QueryLifecycleFinish::Cancelled
+        }
+        QueryLifecycleState::Queued | QueryLifecycleState::Running => {
+            QueryLifecycleFinish::NotCancelled
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+enum QueryLifecycleFinish {
+    Cancelled,
+    NotCancelled,
+    NotOwned,
+}
+
+#[cfg(feature = "query-transport")]
+async fn cancel_active_query(
+    runtime: &QueryTransportServerRuntime,
+    lifecycle_key: &QueryLifecycleKey,
+) -> Result<()> {
+    validate_component("query_id", &lifecycle_key.query_id)?;
+    let mut lifecycle = runtime.lifecycle.lock().await;
+    cancel_query_lifecycle_entry(&mut lifecycle, &runtime.metrics, lifecycle_key)
+}
+
+#[cfg(feature = "query-transport")]
+fn cancel_query_lifecycle_entry(
+    lifecycle: &mut QueryTransportLifecycle,
+    metrics: &QueryTransportMetrics,
+    lifecycle_key: &QueryLifecycleKey,
+) -> Result<()> {
+    let Some(entry) = lifecycle.queries.get(lifecycle_key) else {
+        return Err(inactive_query_cancel_error(&lifecycle_key.query_id));
+    };
+    let queued = entry.state == QueryLifecycleState::Queued;
+    if queued {
+        if let Some(entry) = lifecycle.queries.remove(lifecycle_key) {
+            entry.cancellation_token.cancel();
+        }
+        metrics.cancelled_rejections.fetch_add(1, Ordering::Relaxed);
+    } else if let Some(entry) = lifecycle.queries.get_mut(lifecycle_key) {
+        entry.cancellation_token.cancel();
+        entry.state = QueryLifecycleState::Cancelled;
+    }
+    metrics.cancellations.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+#[cfg(feature = "query-transport")]
+async fn acquire_query_transport_permit(
+    runtime: &Arc<QueryTransportServerRuntime>,
+    cancellation_token: &QueryCancellationToken,
+) -> Result<OwnedSemaphorePermit> {
+    match Arc::clone(&runtime.request_gate).try_acquire_owned() {
+        Ok(permit) => Ok(permit),
+        Err(_) => {
+            runtime
+                .metrics
+                .backpressure_waits
+                .fetch_add(1, Ordering::Relaxed);
+            tokio::select! {
+                permit = Arc::clone(&runtime.request_gate).acquire_owned() => {
+                    permit.map_err(|err| GraphError::CorruptValue {
+                        key: "query/transport/backpressure".to_string(),
+                        reason: err.to_string(),
+                    })
+                }
+                _ = cancellation_token.cancelled() => Err(cancelled_query_error()),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+async fn acquire_namespace_query_permits(
+    runtime: &Arc<QueryTransportServerRuntime>,
+    namespace: &NamespacePath,
+    cancellation_token: &QueryCancellationToken,
+) -> Result<Vec<OwnedSemaphorePermit>> {
+    let mut permits = Vec::new();
+    for ancestor in namespace.ancestors_inclusive().rev() {
+        let Some(gate) = runtime.namespace_query_gates.get(&ancestor) else {
+            continue;
+        };
+        let permit = match Arc::clone(gate).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                runtime
+                    .metrics
+                    .namespace_quota_waits
+                    .fetch_add(1, Ordering::Relaxed);
+                tokio::select! {
+                    permit = Arc::clone(gate).acquire_owned() => {
+                        permit.map_err(|err| GraphError::CorruptValue {
+                            key: format!("query/transport/namespace_quota/{ancestor}"),
+                            reason: err.to_string(),
+                        })?
+                    }
+                    _ = cancellation_token.cancelled() => return Err(cancelled_query_error()),
+                }
+            }
+        };
+        permits.push(permit);
+    }
+    Ok(permits)
+}
+
+#[cfg(feature = "query-transport")]
+async fn ensure_query_not_cancelled(
+    runtime: &QueryTransportServerRuntime,
+    lifecycle_key: &QueryLifecycleKey,
+    token: QueryLifecycleToken,
+) -> Result<()> {
+    let lifecycle = runtime.lifecycle.lock().await;
+    let Some(entry) = lifecycle.queries.get(lifecycle_key) else {
+        return Err(cancelled_query_error());
+    };
+    if entry.token != token || entry.state == QueryLifecycleState::Cancelled {
+        return Err(cancelled_query_error());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "query-transport")]
+fn cancelled_query_error() -> GraphError {
+    GraphError::QueryTimeout {
+        operation: "query_transport_cancelled",
+        elapsed_ms: 0,
+        limit_ms: 0,
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn inactive_query_cancel_error(query_id: &str) -> GraphError {
+    GraphError::UnsupportedQuery {
+        dialect: "QueryTransport",
+        feature: format!("no active query with id {query_id} was cancelled"),
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn authenticate_query_transport(
+    runtime: &QueryTransportServerRuntime,
+    auth: &QueryTransportAuth,
+    identity: &QueryTransportConnectionIdentity,
+) -> Result<QueryTransportPrincipal> {
+    if let Some(principal) = runtime.config.auth_policy.authenticate(auth, identity) {
+        return Ok(principal);
+    }
+    runtime
+        .metrics
+        .auth_failures
+        .fetch_add(1, Ordering::Relaxed);
+    Err(GraphError::UnsupportedQuery {
+        dialect: "QueryTransport",
+        feature: "unauthorized query transport request".to_string(),
+    })
+}
+
+#[cfg(feature = "query-transport")]
+fn authorize_query_transport_scope(
+    runtime: &QueryTransportServerRuntime,
+    principal: &QueryTransportPrincipal,
+    scope: &GraphScope,
+    action: QueryTransportAction,
+) -> Result<()> {
+    if runtime
+        .config
+        .scope_authorizer
+        .authorize(principal, scope, action)
+        || (action != QueryTransportAction::Admin
+            && runtime.config.scope_authorizer.authorize(
+                principal,
+                scope,
+                QueryTransportAction::Admin,
+            ))
+    {
+        return Ok(());
+    }
+    runtime
+        .metrics
+        .namespace_access_denials
+        .fetch_add(1, Ordering::Relaxed);
+    Err(GraphError::GraphScopeAccessDenied {
+        principal: principal.error_label().to_string(),
+        action: action.as_str(),
+        scope: scope.to_string(),
+    })
+}
+
+#[cfg(feature = "query-transport")]
+fn transport_error_response(
+    runtime: &QueryTransportServerRuntime,
+    err: GraphError,
+) -> QueryTransportResponse {
+    runtime
+        .metrics
+        .requests_failed
+        .fetch_add(1, Ordering::Relaxed);
+    let message = match &err {
+        GraphError::AdmissionRejected { .. }
+        | GraphError::GraphScopeAccessDenied { .. }
+        | GraphError::MissingQueryParameter { .. }
+        | GraphError::QueryParse { .. }
+        | GraphError::QueryTimeout { .. }
+        | GraphError::UnsupportedQuery { .. } => err.to_string(),
+        _ => {
+            tracing::warn!(
+                target: "slatedb_graph_kernel",
+                error = %err,
+                "query transport suppressed internal error details"
+            );
+            "internal query execution error".to_string()
+        }
+    };
+    QueryTransportResponse::Error { message }
+}
+
+#[cfg(feature = "query-transport")]
+async fn write_query_transport_frame<S, T>(
+    stream: &mut S,
+    message: &T,
+    max_frame_bytes: usize,
+    metrics: &QueryTransportMetrics,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin + ?Sized,
+    T: serde::Serialize,
+{
+    let mut bytes =
+        serde_json::to_vec(message).map_err(|err| transport_json_error("encode", err))?;
+    if bytes.len() >= max_frame_bytes {
+        return Err(GraphError::AdmissionRejected {
+            operation: "query_transport_frame",
+            actual: bytes.len() as u64,
+            limit: max_frame_bytes as u64,
+        });
+    }
+    bytes.push(b'\n');
+    metrics
+        .bytes_sent
+        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    stream
+        .write_all(&bytes)
+        .await
+        .map_err(|err| transport_error("write", err))
+}
+
+#[cfg(feature = "query-transport")]
+async fn read_query_transport_frame<S>(
+    stream: &mut S,
+    max_frame_bytes: usize,
+    metrics: &QueryTransportMetrics,
+) -> Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
+    let mut read_buffer = Vec::new();
+    read_optional_query_transport_frame(stream, max_frame_bytes, metrics, &mut read_buffer)
+        .await?
+        .ok_or_else(|| {
+            transport_protocol_error(
+                "query/transport/frame",
+                "connection closed before a response frame",
+            )
+        })
+}
+
+#[cfg(feature = "query-transport")]
+async fn read_optional_query_transport_frame<S>(
+    stream: &mut S,
+    max_frame_bytes: usize,
+    metrics: &QueryTransportMetrics,
+    read_buffer: &mut Vec<u8>,
+) -> Result<Option<Vec<u8>>>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
+    let mut buf = [0_u8; 4096];
+    loop {
+        if let Some(newline) = read_buffer.iter().position(|byte| *byte == b'\n') {
+            if newline >= max_frame_bytes {
+                return Err(GraphError::AdmissionRejected {
+                    operation: "query_transport_frame",
+                    actual: newline as u64,
+                    limit: max_frame_bytes as u64,
+                });
+            }
+            let mut frame: Vec<u8> = read_buffer.drain(..=newline).collect();
+            frame.pop();
+            if frame.is_empty() {
+                return Err(transport_protocol_error(
+                    "query/transport/frame",
+                    "empty query transport frame",
+                ));
+            }
+            metrics
+                .bytes_received
+                .fetch_add((frame.len() + 1) as u64, Ordering::Relaxed);
+            return Ok(Some(frame));
+        }
+        if read_buffer.len() >= max_frame_bytes {
+            return Err(GraphError::AdmissionRejected {
+                operation: "query_transport_frame",
+                actual: read_buffer.len() as u64,
+                limit: max_frame_bytes as u64,
+            });
+        }
+        let read = stream
+            .read(&mut buf)
+            .await
+            .map_err(|err| transport_error("read", err))?;
+        if read == 0 {
+            if read_buffer.is_empty() {
+                return Ok(None);
+            }
+            return Err(transport_protocol_error(
+                "query/transport/frame",
+                "connection closed before the frame delimiter",
+            ));
+        }
+        read_buffer.extend_from_slice(&buf[..read]);
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn transport_error(operation: &'static str, err: std::io::Error) -> GraphError {
+    GraphError::CorruptValue {
+        key: format!("query/transport/{operation}"),
+        reason: err.to_string(),
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn transport_config_error(reason: &str) -> Result<()> {
+    Err(GraphError::UnsafeDurabilityConfig {
+        operation: "query_transport_config",
+        reason: reason.to_string(),
+    })
+}
+
+#[cfg(feature = "query-transport")]
+fn transport_timeout_error(operation: &'static str, timeout: Duration) -> GraphError {
+    let limit_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+    GraphError::QueryTimeout {
+        operation,
+        elapsed_ms: limit_ms,
+        limit_ms,
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn transport_json_error(operation: &'static str, err: serde_json::Error) -> GraphError {
+    GraphError::CorruptValue {
+        key: format!("query/transport/{operation}"),
+        reason: err.to_string(),
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn transport_protocol_error(key: &str, reason: &str) -> GraphError {
+    GraphError::CorruptValue {
+        key: key.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+#[cfg(feature = "query-transport")]
+fn transport_remote_error(key: &str, message: String) -> GraphError {
+    GraphError::UnsupportedQuery {
+        dialect: "QueryTransport",
+        feature: format!("{key}: {message}"),
+    }
+}
+
+#[cfg(all(test, feature = "query-transport"))]
+mod scope_grant_tests {
+    use super::*;
+    use crate::NamespaceId;
+
+    #[test]
+    fn graph_namespace_grant_restricts_descendants_to_one_graph_id() {
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let tenant = root
+            .child(NamespaceId::new("tenant-a").unwrap())
+            .unwrap()
+            .child(NamespaceId::new("collection-a").unwrap())
+            .unwrap();
+        let grant = QueryTransportScopeGrant::graph_namespace(
+            root,
+            GraphId::new("hydradb").unwrap(),
+            true,
+            [QueryTransportAction::Read, QueryTransportAction::Write],
+        );
+
+        assert!(grant.allows(
+            &GraphScope::new(tenant.clone(), GraphId::new("hydradb").unwrap()),
+            QueryTransportAction::Write,
+        ));
+        assert!(!grant.allows(
+            &GraphScope::new(tenant, GraphId::new("other").unwrap()),
+            QueryTransportAction::Read,
+        ));
+    }
+}

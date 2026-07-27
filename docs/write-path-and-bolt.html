@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turbolay — Write Sharding &amp; Bolt Read/Write Path</title>
+<style>
+  :root {
+    --bg:#0d0f16; --panel:#151824; --panel2:#1c2030; --ink:#e9ecf4; --muted:#9aa4b8;
+    --line:#2a3145; --accent:#7aa2f7; --accent2:#bb9af7;
+    --write:#f7768e; --read:#9ece6a; --warn:#e0af68; --cyan:#7dcfff;
+    --pre:#0f1220; --node:#1b2032; --nodeb:#323a52;
+    --shadow: 0 6px 22px rgba(0,0,0,.35);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:#eef1f6; --panel:#ffffff; --panel2:#eff2f8; --ink:#181b22; --muted:#59637a;
+      --line:#d6dce8; --accent:#2f5fd0; --accent2:#7b53c7;
+      --write:#c0344d; --read:#3c8a2c; --warn:#8a5f14; --cyan:#1f7fa8;
+      --pre:#f3f5fa; --node:#f6f8fc; --nodeb:#d2dae8;
+      --shadow: 0 6px 18px rgba(30,50,90,.10);
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; padding:36px 18px 90px; }
+  .wrap { max-width:1040px; margin:0 auto; }
+  h1 { font-size:28px; margin:0 0 6px; letter-spacing:-.02em; }
+  h2 { font-size:21px; margin:52px 0 6px; }
+  .hrule { height:3px; width:64px; border-radius:3px; background:linear-gradient(90deg,var(--accent),var(--accent2)); margin:0 0 18px; }
+  h3 { font-size:12.5px; margin:30px 0 12px; color:var(--muted); text-transform:uppercase; letter-spacing:.09em; font-weight:700; }
+  p { margin:10px 0; }
+  .lead { color:var(--muted); font-size:16px; }
+  code { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:.85em;
+    background:var(--panel2); padding:1px 6px; border-radius:5px; }
+  .ref { color:var(--accent); font-family:ui-monospace,monospace; font-size:.8em; white-space:nowrap; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:20px 22px; margin:16px 0; box-shadow:var(--shadow); }
+
+  /* ---- generic vertical flow ---- */
+  .flow { display:flex; flex-direction:column; align-items:stretch; gap:0; margin:8px 0; }
+  .node { position:relative; background:var(--node); border:1px solid var(--nodeb); border-radius:12px;
+    padding:13px 16px; box-shadow:var(--shadow); }
+  .node .t { font-weight:700; font-size:14px; display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+  .node .d { color:var(--muted); font-size:13px; margin-top:4px; }
+  .node .d code { font-size:12px; }
+  .conn { height:26px; width:2px; background:var(--nodeb); margin:0 auto; position:relative; }
+  .conn::after { content:""; position:absolute; bottom:-1px; left:50%; transform:translateX(-50%);
+    border:6px solid transparent; border-top-color:var(--nodeb); }
+  .conn.lbl::before { content:attr(data-l); position:absolute; left:12px; top:50%; transform:translateY(-50%);
+    white-space:nowrap; font-size:11px; color:var(--muted); font-family:ui-monospace,monospace; }
+  .node.accent { border-color:var(--accent); }
+  .node.read { border-color:var(--read); }
+  .node.write { border-color:var(--write); }
+  .node.store { border-color:var(--cyan); background:linear-gradient(180deg,color-mix(in srgb,var(--cyan) 12%,transparent),transparent); }
+
+  .dot { width:9px; height:9px; border-radius:50%; flex:0 0 auto; }
+  .dot.r{background:var(--read);} .dot.w{background:var(--write);} .dot.a{background:var(--accent);} .dot.c{background:var(--cyan);}
+
+  .tag { display:inline-block; font-size:10.5px; font-weight:800; padding:2px 8px; border-radius:999px; letter-spacing:.03em; font-family:ui-monospace,monospace; }
+  .tag.w{ color:var(--write); border:1px solid var(--write); background:color-mix(in srgb,var(--write) 15%,transparent);}
+  .tag.r{ color:var(--read); border:1px solid var(--read); background:color-mix(in srgb,var(--read) 15%,transparent);}
+  .tag.a{ color:var(--accent); border:1px solid var(--accent); background:color-mix(in srgb,var(--accent) 15%,transparent);}
+  .tag.c{ color:var(--cyan); border:1px solid var(--cyan); background:color-mix(in srgb,var(--cyan) 15%,transparent);}
+
+  /* ---- write address anatomy ---- */
+  .addr { display:flex; flex-wrap:wrap; align-items:stretch; gap:10px; margin:6px 0 2px; }
+  .scopebox { flex:1 1 340px; border:2px dashed var(--accent); border-radius:12px; padding:10px 12px 12px; position:relative; }
+  .scopebox .cap { position:absolute; top:-10px; left:14px; background:var(--panel); padding:0 8px; font-size:11px; font-weight:800; color:var(--accent); letter-spacing:.06em; }
+  .scopebox .row { display:flex; gap:10px; flex-wrap:wrap; }
+  .chip { flex:1 1 120px; background:var(--node); border:1px solid var(--nodeb); border-radius:9px; padding:9px 11px; }
+  .chip .k { font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); font-weight:700;}
+  .chip .v { font-family:ui-monospace,monospace; font-size:13px; margin-top:3px; }
+  .plus { align-self:center; font-size:22px; color:var(--muted); font-weight:300; }
+  .cellbox { flex:0 0 auto; align-self:center; background:color-mix(in srgb,var(--write) 14%,transparent);
+    border:2px solid var(--write); border-radius:12px; padding:10px 16px; text-align:center; }
+  .cellbox .k{ font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--write); font-weight:800;}
+  .cellbox .v{ font-family:ui-monospace,monospace; font-size:15px; font-weight:700; margin-top:3px;}
+
+  /* ---- S3 tree ---- */
+  .tree { font-family:ui-monospace,"SF Mono",Menlo,monospace; font-size:13px; line-height:1.9; background:var(--pre);
+    border:1px solid var(--line); border-radius:12px; padding:16px 18px; overflow-x:auto; }
+  .tree .lvl0{ color:var(--muted); }
+  .tree .ns{ color:var(--accent); }
+  .tree .sub{ color:var(--accent2); }
+  .tree .leaf{ color:var(--cyan); font-weight:700; }
+  .tree .cmt{ color:var(--muted); }
+  .tree .db{ display:inline-block; margin-left:8px; font-size:10.5px; padding:1px 7px; border-radius:999px;
+    border:1px solid var(--cyan); color:var(--cyan); background:color-mix(in srgb,var(--cyan) 12%,transparent); font-weight:700;}
+
+  /* ---- tenant lanes ---- */
+  .lanes { display:grid; grid-template-columns:1fr auto 1fr auto 1fr; gap:0 10px; align-items:center; margin:6px 0; }
+  .lane { background:var(--node); border:1px solid var(--nodeb); border-radius:10px; padding:10px 12px; font-family:ui-monospace,monospace; font-size:12.5px; }
+  .lane .top{ color:var(--ink); font-weight:700; }
+  .lane .mid{ color:var(--muted); font-size:11.5px; margin-top:2px; }
+  .arrowr { color:var(--muted); font-size:18px; text-align:center; }
+  .lanes .converge { grid-column:1 / -1; margin-top:12px; display:flex; justify-content:center; }
+  .same { border:2px solid var(--write); border-radius:10px; padding:8px 14px; background:color-mix(in srgb,var(--write) 12%,transparent);
+    font-family:ui-monospace,monospace; font-size:12.5px; text-align:center; }
+  .same b{ color:var(--write); }
+
+  /* ---- state machine ---- */
+  .fsm { display:flex; align-items:center; flex-wrap:wrap; gap:6px; margin:10px 0; }
+  .state { background:var(--node); border:1.5px solid var(--nodeb); border-radius:10px; padding:9px 13px; text-align:center; min-width:96px; }
+  .state.s{ border-color:var(--accent); }
+  .state.stream{ border-color:var(--read); }
+  .state.fail{ border-color:var(--write); }
+  .state .nm{ font-weight:800; font-size:13px; }
+  .state .sm{ font-size:10.5px; color:var(--muted); margin-top:2px; font-family:ui-monospace,monospace;}
+  .edge { display:flex; flex-direction:column; align-items:center; color:var(--muted); min-width:70px; }
+  .edge .msg{ font-size:10.5px; font-family:ui-monospace,monospace; color:var(--accent);}
+  .edge .ar{ font-size:20px; line-height:1; }
+
+  /* ---- dual read/write ---- */
+  .dual { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:8px 0; }
+  .col { border:1px solid var(--line); border-radius:14px; padding:6px 14px 16px; background:var(--panel); }
+  .col.readc{ border-top:4px solid var(--read); }
+  .col.writec{ border-top:4px solid var(--write); }
+  .col h4 { margin:14px 0 6px; font-size:15px; display:flex; align-items:center; gap:8px; }
+  .step { position:relative; padding:9px 12px; margin:0; background:var(--node); border:1px solid var(--nodeb); border-radius:10px; font-size:13px; }
+  .step .s2{ color:var(--muted); font-size:11.5px; margin-top:2px; }
+  .vt { height:18px; width:2px; margin:0 auto; }
+  .vt.r{ background:var(--read);} .vt.w{ background:var(--write);}
+  .col.readc .step{ border-left:3px solid color-mix(in srgb,var(--read) 55%,var(--nodeb)); }
+  .col.writec .step{ border-left:3px solid color-mix(in srgb,var(--write) 55%,var(--nodeb)); }
+
+  .callout { border-left:4px solid var(--warn); background:color-mix(in srgb,var(--warn) 11%,transparent); padding:13px 16px; border-radius:0 10px 10px 0; margin:16px 0; }
+  .callout.w{ border-color:var(--write); background:color-mix(in srgb,var(--write) 10%,transparent); }
+  .callout.k{ border-color:var(--accent); background:color-mix(in srgb,var(--accent) 10%,transparent); }
+
+  table { border-collapse:collapse; width:100%; margin:14px 0; font-size:13px; }
+  th,td{ text-align:left; padding:9px 11px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th{ color:var(--muted); font-weight:700; font-size:11.5px; text-transform:uppercase; letter-spacing:.05em;}
+  thead th.rh{ color:var(--read);} thead th.wh{ color:var(--write);}
+  .foot{ color:var(--muted); font-size:12.5px; margin-top:44px; }
+
+  @media (max-width:720px){
+    .dual{ grid-template-columns:1fr; }
+    .lanes{ grid-template-columns:1fr; }
+    .lanes .arrowr{ transform:rotate(90deg); }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Turbolay — Write Sharding &amp; the Bolt Read/Write Path</h1>
+<div class="hrule"></div>
+<p class="lead">How a write finds its shard, and how the Bolt server drives reads and writes end-to-end. Every step is anchored to a source line.</p>
+
+<!-- ================= PART 1 ================= -->
+<h2>Part 1 · Which shard does a write go to?</h2>
+<div class="hrule"></div>
+<p><strong>There is no hash-based routing on writes.</strong> A write is <em>explicitly addressed</em> by <code>(scope, cell_id)</code>. The caller carries the shard identity; the server does an exact-string map lookup — never a hash of the payload.</p>
+
+<h3>The address of every write</h3>
+<div class="card">
+  <div class="addr">
+    <div class="scopebox">
+      <span class="cap">GraphScope</span>
+      <div class="row">
+        <div class="chip"><div class="k">namespace path</div><div class="v">acme / eu / …</div></div>
+        <div class="chip"><div class="k">graph_id</div><div class="v">social</div></div>
+      </div>
+    </div>
+    <div class="plus">+</div>
+    <div class="cellbox"><div class="k">cell_id</div><div class="v">cell-0</div><div style="font-size:10.5px;color:var(--muted);margin-top:3px">the shard</div></div>
+  </div>
+  <p style="margin:14px 0 0;color:var(--muted);font-size:13px">Every mutation literally carries the shard id — supplied by the caller. <span class="ref">src/core/model.rs:51</span></p>
+</div>
+
+<h3>Routing = a map lookup, not a hash</h3>
+<div class="flow">
+  <div class="node write">
+    <div class="t"><span class="dot w"></span>EdgeMutation { cell_id, edge_type, src, dst, idempotency_key }</div>
+    <div class="d">Caller names the destination shard up front.</div>
+  </div>
+  <div class="conn lbl" data-l="self.shard(&cell_id)"></div>
+  <div class="node accent">
+    <div class="t"><span class="dot a"></span>RoutedGraphCluster · BTreeMap&lt;String, Arc&lt;GraphShard&gt;&gt;.get()</div>
+    <div class="d">Exact-string lookup. Miss ⇒ <code>GraphError::UnknownShard</code>. <span class="ref">cluster.rs:392</span></div>
+  </div>
+  <div class="conn lbl" data-l="ensure_local_writer"></div>
+  <div class="node">
+    <div class="t"><span class="dot a"></span>promote_to_writer(cell_id)</div>
+    <div class="d">SlateDB writer fence is the authority. <span class="ref">cluster.rs:375</span></div>
+  </div>
+  <div class="conn"></div>
+  <div class="node store">
+    <div class="t"><span class="dot c"></span>this cell's SlateDB — commit</div>
+    <div class="d">Cells are statically declared via <code>GRAPH_CELLS</code> (default <code>cell-0</code>), never created on demand. <span class="ref">config.rs:76</span></div>
+  </div>
+</div>
+
+<div class="callout k">
+<strong>The only hash in the whole write path is <em>not</em> routing.</strong> <code>writer_lane_index(cell_id)</code> FNV-1a hashes the cell id into 1 of <strong>64 in-process mutexes</strong> so concurrent writes to <em>different</em> cells don't serialize on one lock. It never picks a destination. <span class="ref">codec.rs:1338 · lib.rs:181</span>
+</div>
+
+<h3>Scope → object-store prefix → one SlateDB per shard</h3>
+<div class="tree">
+<span class="lvl0">s3://bucket/base/</span><br>
+&nbsp;&nbsp;<span class="ns">namespaces/acme/</span> <span class="cmt"># tenant</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;graphs/social/<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="leaf">cell-0/</span> <span class="db">SlateDB #1</span> <span class="cmt"># own WAL · own fence · own epoch</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="leaf">cell-1/</span> <span class="db">SlateDB #2</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;<span class="sub">subnamespaces/eu/</span> <span class="cmt"># sub-tenant</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;graphs/social/<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="leaf">cell-0/</span> <span class="db">SlateDB #3</span> <span class="cmt"># completely separate database</span>
+</div>
+<p style="color:var(--muted);font-size:13px;margin-top:8px">Different scope = different prefix = different SlateDB = different shard. Nothing shared. <span class="ref">namespace.rs:243 · cluster.rs:294</span></p>
+
+<h3>Do all writes to the same tenant / sub-tenant hit the same shard?</h3>
+<p><strong>Yes, as currently wired.</strong> Each tenant/sub gets its own scope &amp; cluster, but the Bolt resolver reuses the same cell <em>name</em> verbatim.</p>
+<div class="card">
+  <div class="lanes">
+    <div class="lane"><div class="top">acme / eu</div><div class="mid">graph=social</div></div>
+    <div class="arrowr">→</div>
+    <div class="lane"><div class="top">scope A</div><div class="mid">cluster A</div></div>
+    <div class="arrowr">→</div>
+    <div class="lane"><div class="top">cell-0</div><div class="mid">SlateDB A</div></div>
+
+    <div class="lane"><div class="top">acme / us</div><div class="mid">graph=social</div></div>
+    <div class="arrowr">→</div>
+    <div class="lane"><div class="top">scope B</div><div class="mid">cluster B</div></div>
+    <div class="arrowr">→</div>
+    <div class="lane"><div class="top">cell-0</div><div class="mid">SlateDB B</div></div>
+
+    <div class="lane"><div class="top">zeta</div><div class="mid">graph=social</div></div>
+    <div class="arrowr">→</div>
+    <div class="lane"><div class="top">scope C</div><div class="mid">cluster C</div></div>
+    <div class="arrowr">→</div>
+    <div class="lane"><div class="top">cell-0</div><div class="mid">SlateDB C</div></div>
+
+    <div class="converge">
+      <div class="same">scope differs per tenant/sub &nbsp;·&nbsp; <b>cell_id is the SAME literal name</b> (reused from root_target) <span class="ref">service.rs:114</span></div>
+    </div>
+  </div>
+</div>
+<p style="color:var(--muted);font-size:13px">Cross-scope traffic is rejected outright by <code>ensure_query_scope</code>. <span class="ref">cluster.rs:743</span></p>
+
+<div class="callout w">
+<strong>Consequence.</strong> Multi-cell fan-out exists in the engine but is <em>unreachable over Bolt</em>. Set <code>GRAPH_CELLS=cell-0,cell-1</code> and both SlateDBs open — but the Bolt resolver only ever emits <code>root_target.cell_id</code>, so <code>cell-1</code> gets zero writes. Only <strong>HTTP</strong> (<code>cell_id</code> is a body field, <span class="ref">http.rs:284</span>) and the <strong>direct Rust API</strong> can address a second cell. A tenant's write ceiling is currently <em>one shard's</em> throughput. Splitting a hot tenant across cells needs a routing function (e.g. <code>hash(src) % cells</code>) that doesn't exist yet — and it isn't free: cells are independent SlateDBs with independent fences, so an edge whose endpoints hash to different cells has no atomic home. The design sidesteps this by making the <em>tenant</em> the unit of sharding.
+</div>
+
+<!-- ================= PART 2 ================= -->
+<h2>Part 2 · The Bolt protocol path</h2>
+<div class="hrule"></div>
+<p class="lead">Server <code>src/client/bolt.rs</code> · wire <code>bolt/wire.rs</code> · routing <code>bolt/routing.rs</code> · engine glue <code>client/service.rs</code></p>
+
+<h3>Connection state machine</h3>
+<div class="card">
+  <div class="fsm">
+    <div class="state s"><div class="nm">Negotiation</div><div class="sm">handshake</div></div>
+    <div class="edge"><span class="ar">→</span><span class="msg">HELLO</span></div>
+    <div class="state s"><div class="nm">Authentication</div><div class="sm">LOGON {auth}</div></div>
+    <div class="edge"><span class="ar">→</span><span class="msg">SUCCESS</span></div>
+    <div class="state s"><div class="nm">Ready</div><div class="sm">idle</div></div>
+    <div class="edge"><span class="ar">→</span><span class="msg">RUN</span></div>
+    <div class="state stream"><div class="nm">Streaming</div><div class="sm">PULL → RECORD*</div></div>
+  </div>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;align-items:center">
+    <div class="edge" style="min-width:auto"><span class="ar" style="color:var(--read)">↺</span></div>
+    <span style="font-size:12.5px;color:var(--muted)">Streaming/Ready <b>RESET</b> or <b>PULL</b> summary → back to Ready · any error → <span style="color:var(--write);font-weight:700">Failed</span> (only RESET/GOODBYE accepted)</span>
+  </div>
+  <p style="margin:12px 0 0;color:var(--muted);font-size:12.5px"><span class="ref">bolt.rs:661</span> · handshake: 20-byte preamble <code>0x6060B017</code> + 4 version proposals (or manifest v1) <span class="ref">wire.rs:15</span></p>
+</div>
+
+<div style="display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 2px">
+  <span class="tag a">HELLO → server, connection_id, hints · bolt.rs:711</span>
+  <span class="tag a">LOGON → service.authenticate() · bolt.rs:732</span>
+  <span class="tag a">ROUTE → routing table · routing.rs:40</span>
+  <span class="tag w">BEGIN / COMMIT / ROLLBACK → unsupported (auto-commit only) · bolt.rs:1008</span>
+</div>
+
+<h3>RUN — how read vs write is decided</h3>
+<p>Classification comes from the <strong>query text</strong>, not the Bolt <code>mode:"r"/"w"</code> hint (that hint is only validated, <span class="ref">bolt.rs:1201</span>).</p>
+<div class="flow">
+  <div class="node accent"><div class="t"><span class="dot a"></span>RUN { query, parameters, extra }</div></div>
+  <div class="conn lbl" data-l="prepare_bolt_run · bolt.rs:1095"></div>
+  <div class="node"><div class="t">resolve_database(name) → ClientQueryTarget { scope, cell_id }</div>
+    <div class="d">also applies tx_timeout, consistency (causal|strong), bookmarks</div></div>
+  <div class="conn lbl" data-l="prepare_page_request · service.rs:1130"></div>
+  <div class="node"><div class="t">classify_opencypher_query_access(query) → <span class="tag r">Read</span> / <span class="tag w">Write</span></div>
+    <div class="d">then authorize_scope(session, scope, action) <span class="ref">service.rs:1451</span></div></div>
+  <div class="conn"></div>
+  <div class="node read"><div class="t"><span class="dot r"></span>SUCCESS { fields, t_first, db } → state = Streaming</div>
+    <div class="d">PendingBoltResult stashed for the coming PULL <span class="ref">bolt.rs:817</span></div></div>
+</div>
+
+<h3>Read vs write — the split at PULL</h3>
+<div class="dual">
+  <!-- READ -->
+  <div class="col readc">
+    <h4><span class="dot r"></span>Read path <span class="tag r">action = Read</span></h4>
+    <div class="step">PULL {n} → <b>consume_bolt_records</b><div class="s2">paged loop · bolt.rs:1283</div></div>
+    <div class="vt r"></div>
+    <div class="step">refresh_strong_read<div class="s2">if consistency=Strong, refresh durable frontier first · service.rs:1487</div></div>
+    <div class="vt r"></div>
+    <div class="step">validate_bookmark<div class="s2">if bookmark sent: WAIT until storage_sequence ≥ epoch (causal) · service.rs:826</div></div>
+    <div class="vt r"></div>
+    <div class="step">read_epoch = None → <b>latest committed snapshot</b><div class="s2">engine.execute_cypher_rows(context, query)</div></div>
+    <div class="vt r"></div>
+    <div class="step">mint bookmark from storage_sequence<div class="s2">service.rs:1512</div></div>
+    <div class="vt r"></div>
+    <div class="step">rows → ServerMessage::Record<div class="s2">bolt.rs:1304</div></div>
+    <div class="vt r"></div>
+    <div class="step">SUCCESS { has_more, bookmark }<div class="s2">next PULL fetches the next cursor page · bolt.rs:1373</div></div>
+  </div>
+  <!-- WRITE -->
+  <div class="col writec">
+    <h4><span class="dot w"></span>Write path <span class="tag w">action = Write</span></h4>
+    <div class="step">PULL {n} <div class="s2">mutation still streams; yields no rows</div></div>
+    <div class="vt w"></div>
+    <div class="step">execute_batch / cypher mutation<div class="s2">coordination.rs:3160</div></div>
+    <div class="vt w"></div>
+    <div class="step"><b>ensure_local_writer(cell_id)</b> → promote_to_writer<div class="s2">SlateDB writer FENCE is authority · cluster.rs:375</div></div>
+    <div class="vt w"></div>
+    <div class="step">writer_lane(cell_id).lock() — 1 of 64 mutexes<div class="s2">write.rs:43</div></div>
+    <div class="vt w"></div>
+    <div class="step">serializable SlateDB txn + retry on conflict<div class="s2">validate_write_fence_txn rejects dropped cells · write.rs:44</div></div>
+    <div class="vt w"></div>
+    <div class="step">bookmark_after = current_storage_sequence<div class="s2">service.rs:1512</div></div>
+    <div class="vt w"></div>
+    <div class="step">SUCCESS { has_more:false, bookmark }<div class="s2">client sends it next to read-its-own-write</div></div>
+  </div>
+</div>
+
+<h3>Side by side</h3>
+<table>
+  <thead><tr><th>Stage</th><th class="rh">Read</th><th class="wh">Write</th></tr></thead>
+  <tbody>
+    <tr><td>Classified by</td><td colspan="2"><code>classify_opencypher_query_access(query)</code> — from text, not the <code>mode</code> hint</td></tr>
+    <tr><td>Shard selection</td><td colspan="2">exact lookup on <code>(scope, cell_id)</code> from resolved database — identical for both</td></tr>
+    <tr><td>SlateDB role</td><td>reader snapshot (any node)</td><td><code>promote_to_writer</code> — fenced, single writer</td></tr>
+    <tr><td>Epoch</td><td><code>read_epoch = None</code> → latest committed (or bookmark-gated)</td><td>commits, advances storage sequence</td></tr>
+    <tr><td>Concurrency guard</td><td>snapshot isolation (lock-free)</td><td><code>writer_lane</code> mutex + serializable txn + retries</td></tr>
+    <tr><td>Idempotency</td><td>n/a</td><td><code>idempotency_key</code> per mutation</td></tr>
+    <tr><td>Output</td><td>RECORD* + bookmark</td><td>no rows + bookmark</td></tr>
+    <tr><td>Transactions</td><td colspan="2">auto-commit only; BEGIN/COMMIT rejected</td></tr>
+  </tbody>
+</table>
+
+<div class="callout k">
+<strong>Key takeaway.</strong> Bolt never routes by data. It resolves the database name to <code>(scope, cell_id)</code>, classifies the query as read or write by parsing it, then either takes a lock-free reader snapshot or promotes the single fenced SlateDB writer for that one cell. Sharding is entirely a function of <em>which database (tenant) you connected to</em>.
+</div>
+
+<p class="foot">Generated from source at branch <code>Turbolay-V3-vishal</code>. Open locally: <code>docs/write-path-and-bolt.html</code></p>
+
+</div>
+</body>
+</html>

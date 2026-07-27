@@ -1,0 +1,371 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Graph Has Cells · TurboLay Conceptual Guide</title>
+<link rel="stylesheet" href="../assets/textbook.css">
+
+<div class="tb-progress"></div>
+
+<header class="tb-header">
+  <a class="tb-home" href="../index.html">Turbo<span>Lay</span> · Interactive</a>
+  <span class="tb-crumb">A Conceptual Guide</span>
+  <span class="tb-crumb">The Architecture</span>
+  <span class="tb-spacer"></span>
+  <button class="tb-theme-toggle" type="button">☾ Dark</button>
+</header>
+
+<main class="tb-main">
+  <div class="tb-chapter-kicker">Chapter 1 · The Architecture</div>
+  <h1>A Graph Has Cells</h1>
+
+  <p>One giant graph path gives every writer the same contention point and every
+  query the same failure domain. TurboLay instead gives the graph an addressable
+  unit small enough to move: a <strong>cell</strong>.</p>
+
+  <div class="boxeq">
+    <strong>A cell is the unit of storage path, storage sequence, and write authority.</strong>
+  </div>
+
+  <h2>The path is part of the boundary</h2>
+
+  <p><code>GraphCluster</code> opens a <span class="concept" data-concept="cell">cell</span> at <code>base_path/cell_id</code> (<code>src/engine/cluster.rs</code>).
+  That path is a separate <span class="concept" data-concept="slatedb">SlateDB</span> database over the shared <span class="concept" data-concept="object-store">object store</span>: its own
+  <span class="concept" data-concept="manifest">manifest</span>, its own <span class="concept" data-concept="wal">write-ahead log</span>, its own compacted <span class="concept" data-concept="sst">SSTs</span>, and therefore its own
+  <span class="concept" data-concept="sequence-number">sequence numbers</span> and its own writer <span class="concept" data-concept="fencing">fencing</span>. Two cells share the bucket and
+  nothing else.</p>
+
+  <figure>
+    <div class="tb-table-wrap">
+      <table>
+        <thead>
+          <tr><th>Object-store path</th><th>Durable state at that path</th><th>Role on a node that opened it</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>graph/reddit-home</code></td><td>manifest, WAL, SSTs</td><td>reader; writer only after promotion</td></tr>
+          <tr><td><code>graph/reddit-ads</code></td><td>manifest, WAL, SSTs</td><td>reader; writer only after promotion</td></tr>
+          <tr><td><code>graph/archive</code></td><td>manifest, WAL, SSTs</td><td>reader; writer only after promotion</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <figcaption>Tab. 1.1 — Each cell is an independent SlateDB database under the shared base path, so
+      a cell's log, snapshots, and fencing belong to it alone; the local role is the same
+      on every node, because every node opens every cell.</figcaption>
+  </figure>
+
+  <p>The term matters. The current APIs consistently carry <code>cell_id</code>; they do not
+  implement a general tenant or namespace abstraction above it. An embedding
+  service may decide that one tenant owns one cell, several cells, or a whole
+  base path. The kernel does not make that policy choice.</p>
+
+  <h2>Every node opens every cell; only the write is asymmetric</h2>
+
+  <p>Where a cell lives is not a routing decision, because nothing routes. The fleet
+  view is a plain object-store <strong>directory</strong>: <span class="concept" data-concept="node-directory"><code>ObjectStoreNodeDirectory</code> { cells,
+  nodes }</span> (<code>src/engine.rs</code>), two sorted sets of names. It records what <em>exists</em> —
+  which cell ids belong to this graph, which node ids belong to the fleet — and
+  records nothing at all about who owns what. There is no owner map, no lease, no
+  revoked-cell list, and no control-plane process holding any of it.</p>
+
+  <p><code>open_at_path</code> (<code>src/engine/cluster.rs</code>) turns that directory into a running
+  node in two steps. First it refuses to start when the local node id is absent
+  from the directory's node set, returning <code>GraphError::CorruptValue</code> on the key
+  <code>directory/node/&lt;node_id&gt;</code> with the reason "local node is not present in the
+  object-store node directory". Then it iterates every entry of <code>directory.cells()</code>
+  and opens a <code>GraphShard</code> at <code>base_path/&lt;cell_id&gt;</code> for each one. There is no owned
+  subset to select: <code>local_cells</code> on the resulting <code>RoutedGraphCluster</code> returns
+  every cell the directory lists.</p>
+
+  <p>The consequence is worth stating plainly. Any node can serve any read for any
+  cell, so a read needs no ownership lookup before it can begin.</p>
+
+  <figure>
+    <div class="tb-widget" id="w-symmetric-cells"></div>
+    <figcaption>Fig. 1.1 — The directory on the left lists what exists, not who owns it, so all three nodes
+      open the same cells and any of them can serve any read; only one cell of the three is drawn,
+      and the other two look identical. The single asymmetry is on the right: <code>node-a</code> has promoted
+      a SlateDB writer, <code>node-b</code> may promote one later, <code>node-c</code> is refused with
+      <code>WriteRequiresWriter</code>, and it is SlateDB's manifest fencing — not an owner record — that
+      keeps two promotions from both committing (<code>src/engine/cluster.rs</code>, <code>src/core/state.rs</code>).</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Play with it: flip <code>promotable</code>, race two writers, watch fencing pick one<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Every node in the widget above opens the <em>same</em> cell, so press <em>Read from all</em> and all
+      three answer — no ownership lookup runs first. The write is the only asymmetry, and it turns on a
+      single <span class="concept" data-concept="writer-promotion"><code>promotable</code></span> boolean. Give a node a write and, if it is not promotable, the shard
+      refuses immediately with <code>WriteRequiresWriter</code>. If it is promotable, it lazily promotes that
+      cell's SlateDB writer — and any writer another node was holding is <span class="concept" data-concept="fencing">fenced</span> at its next manifest
+      refresh. Make two nodes promotable and hand each a write in turn: they may both <em>try</em>, but only
+      the latest promotion survives, because SlateDB's own manifest — not an owner record TurboLay keeps —
+      decides the loser.</p>
+    </div>
+  </details>
+
+  <p>The write is the only place the fleet is not symmetric, and it is decided by one
+  boolean. A <code>RoutedGraphCluster</code> carries a single <span class="concept" data-concept="writer-promotion"><code>promotable</code></span> flag (<code>src/engine.rs</code>).
+  <code>ensure_local_writer</code> (<code>src/engine/cluster.rs</code>) refuses immediately with
+  <code>GraphError::WriteRequiresWriter</code> when that flag is false; when it is true, the
+  shard lazily promotes a cached SlateDB writer for the addressed cell. Nothing
+  about that decision is per-cell, and nothing about it is written down durably.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Writer promotion</span>
+    <p>A node does not open a SlateDB writer for a cell when it starts; it opens a
+    reader. The first write routed to a promotable node promotes that cell's
+    handle — <code>promote_to_writer</code> (<code>src/shard/lifecycle.rs</code>) calls
+    <code>GraphStore::promote_writer</code> (<code>src/core/state.rs</code>), which opens the database
+    under a gate and caches the handle. Promotion is lazy, per cell, and leaves no
+    record anywhere else in the system.</p>
+  </div>
+
+  <p>So what stops two promoted writers from both committing? Three tiers, none of
+  which is a lock TurboLay holds:</p>
+
+  <ol>
+    <li><strong>Authority.</strong> <code>ensure_write_authority</code> (<code>src/shard/lifecycle.rs</code>) matches on
+    <span class="concept" data-concept="write-authority"><code>GraphWriteAuthority</code> { ReadOnly, Promotable, Writer }</span> (<code>src/core/state.rs</code>).
+    <code>ReadOnly</code> is refused with <code>WriteRequiresWriter</code>; the other two fall through to
+    the SlateDB writer handle.</li>
+    <li><strong>SlateDB manifest fencing.</strong> <code>refresh_writer_fence</code> (<code>src/core/state.rs</code>) calls
+    <code>writer.refresh_manifest()</code>, and <code>acquire_local_write_guard</code>
+    (<code>src/shard/lifecycle.rs</code>) invokes it before every local write. If SlateDB
+    answers with a <code>Closed(Fenced)</code> close reason, the shard drops its cached writer
+    handle and the error propagates to the caller. A newer writer <span class="concept" data-concept="fencing">fences</span> an older
+    one through SlateDB's own <span class="concept" data-concept="manifest">manifest</span>.</li>
+    <li><strong>The serializable-snapshot transaction.</strong> <code>write_edge</code> (<code>src/shard/write.rs</code>)
+    takes no lock at all: an authority check, a write permit, a per-cell writer-lane
+    mutex, then a retry loop over one <span class="concept" data-concept="serializable">serializable-snapshot transaction</span>.</li>
+  </ol>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Because fencing lives in the storage layer, <code>promotable</code> can safely be true on
+    more than one node at once. Two nodes may race to promote; at most one of them
+    can go on committing, because SlateDB fences the loser at its next manifest
+    refresh. That is why TurboLay needs no owner map, no lease renewal, and no
+    <span class="concept" data-concept="consensus">control plane</span> to be safe — the only thing an operator has to get right is the
+    directory listing, and getting it wrong stops a node from starting rather than
+    corrupting a cell.</p>
+  </div>
+
+  <h2>What cell isolation buys</h2>
+
+  <ul>
+    <li>Every node reads every cell, so read capacity grows by adding nodes and no read
+    pays for an ownership lookup.</li>
+    <li>Each cell has its own log, its own <span class="concept" data-concept="snapshot-isolation">snapshots</span>, and its own fencing, so a writer
+    that loses its fence loses it for that cell alone.</li>
+    <li>Maintenance, <span class="concept" data-concept="index-generation">index generations</span>, snapshots, and GC all progress per cell.</li>
+    <li>A query that spans cells is still bounded <span class="concept" data-concept="scatter-gather">scatter/gather</span> over cells with a
+    coordinator merge — but there is no owner to resolve before the legs can run.</li>
+  </ul>
+
+  <p>What it does <em>not</em> buy is a transaction across cells. No <span class="concept" data-concept="two-phase-commit">two-phase commit</span> or
+  cross-cell constraint protocol exists. That limitation becomes clear when we
+  walk one write in the next chapter, which makes the cell-local transaction the
+  visibility boundary.</p>
+
+  <nav class="tb-chapnav">
+    <a class="prev" href="intro-00-replaceable-compute.html"><span class="cn-dir">‹ Prev</span><br><span class="cn-title">The Compute Node Can Disappear</span></a>
+    <a class="next" href="intro-02-one-cell-one-write-boundary.html"><span class="cn-dir">Next ›</span><br><span class="cn-title">One Cell, One Write Boundary</span></a>
+  </nav>
+</main>
+
+<script src="../assets/glossary.js"></script>
+<script>
+/* Page-local concepts: not in the shared glossary, defined here for this chapter. */
+window.TB_GLOSSARY = Object.assign(window.TB_GLOSSARY || {}, {
+  "node-directory": {
+    title: "Object-store node directory",
+    html: "<p><code>ObjectStoreNodeDirectory</code> is a plain object-store record holding two sorted sets: which <span class=\"concept\" data-concept=\"cell\">cell</span> ids belong to this graph and which node ids belong to the fleet. It records only what <em>exists</em> — never who owns what.</p><p>There is no owner map, no lease, and no control plane behind it. Getting the listing wrong stops a node from starting rather than corrupting a cell, because a node refuses to boot if its own id is absent from the node set.</p>"
+  },
+  "write-authority": {
+    title: "Write authority",
+    html: "<p><code>GraphWriteAuthority</code> is the three-state verdict a shard computes before a write: <code>ReadOnly</code>, <code>Promotable</code>, or <code>Writer</code>. <code>ReadOnly</code> is refused with <code>WriteRequiresWriter</code>; the other two fall through to a SlateDB writer handle.</p><p>Only the single <span class=\"concept\" data-concept=\"writer-promotion\">promotable</span> boolean separates a node that may write from one that may not — and <span class=\"concept\" data-concept=\"fencing\">fencing</span>, not this verdict, decides which promoted writer actually survives.</p>"
+  }
+});
+</script>
+<script src="../assets/textbook.js"></script>
+<script>
+/* Widget: symmetric cells — every node reads; only a promotable node may promote a
+   writer, and SlateDB manifest fencing lets at most one promotion survive. */
+TB.widget("w-symmetric-cells", function (mount) {
+  var NS = "http://www.w3.org/2000/svg";
+  function el(n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+  // model
+  var nodes = [
+    { id: "node-a", promotable: true },
+    { id: "node-b", promotable: true },
+    { id: "node-c", promotable: false }
+  ];
+  var writer = "node-a";  // who currently holds the promoted, un-fenced writer
+  var fenced = null;      // node just fenced (for a transient flash)
+  var lastRead = false;
+
+  var wrap = document.createElement("div");
+
+  // per-node controls
+  var rows = document.createElement("div");
+  rows.style.cssText = "display:flex;flex-direction:column;gap:0.4rem;margin-bottom:0.7rem";
+  var checkboxes = {};
+  nodes.forEach(function (nd) {
+    var row = document.createElement("div");
+    row.className = "tb-controls";
+    row.style.marginBottom = "0";
+    var lab = document.createElement("label");
+    var cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = nd.promotable;
+    checkboxes[nd.id] = cb;
+    lab.append(cb, document.createTextNode(" " + nd.id + " promotable"));
+    cb.onchange = function () {
+      nd.promotable = cb.checked;
+      if (!cb.checked && writer === nd.id) writer = null; // a demoted node cannot stay the writer
+      fenced = null; lastRead = false; render();
+    };
+    var btn = mk("Attempt write", "");
+    btn.onclick = function () { attemptWrite(nd.id); };
+    row.append(lab, btn);
+    rows.appendChild(row);
+  });
+
+  // global controls
+  var globals = document.createElement("div");
+  globals.className = "tb-controls";
+  var btnRead = mk("Read from all", "primary");
+  var btnReset = mk("Reset", "");
+  btnRead.onclick = function () { fenced = null; lastRead = true; render(); };
+  btnReset.onclick = function () {
+    nodes[0].promotable = true; nodes[1].promotable = true; nodes[2].promotable = false;
+    checkboxes["node-a"].checked = true; checkboxes["node-b"].checked = true; checkboxes["node-c"].checked = false;
+    writer = "node-a"; fenced = null; lastRead = false; render();
+  };
+  globals.append(btnRead, btnReset);
+
+  var svg = el("svg", { viewBox: "0 0 520 300", width: "100%", style: "max-width:520px;display:block;margin:0 auto" });
+  var readout = document.createElement("div");
+  readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:3em;color:var(--muted)";
+
+  wrap.append(rows, globals, svg, readout);
+  mount.appendChild(wrap);
+
+  function mk(l, c) { var b = document.createElement("button"); b.className = "tb-btn" + (c ? " " + c : ""); b.textContent = l; return b; }
+
+  function attemptWrite(id) {
+    lastRead = false; fenced = null;
+    var nd = nodes.filter(function (n) { return n.id === id; })[0];
+    if (!nd.promotable) {
+      readout.innerHTML = "<strong style='color:var(--bad)'>" + id + " refused:</strong> <code>WriteRequiresWriter</code>. Its authority is <code>ReadOnly</code> — the <code>promotable</code> flag is false, so it never opens a SlateDB writer.";
+      render();
+      return;
+    }
+    // promotable: it promotes; any older writer is fenced at its next manifest refresh
+    if (writer && writer !== id) fenced = writer;
+    writer = id;
+    var msg = "<strong style='color:var(--ok)'>" + id + " promoted</strong> its SlateDB writer for <code>graph/reddit-home</code> and committed.";
+    if (fenced) msg += " The previous writer <strong>" + fenced + "</strong> is <strong style='color:var(--bad)'>fenced</strong> at its next manifest refresh — SlateDB's manifest, not an owner record, drops it.";
+    readout.innerHTML = msg;
+    render();
+  }
+
+  function box(x, y, w, h, fill, stroke, dash, cls) {
+    return el("rect", { x: x, y: y, width: w, height: h, rx: 6, fill: fill, stroke: stroke, "stroke-width": 1.3, "stroke-dasharray": dash || "none", class: cls || "wnode" });
+  }
+  function label(x, y, t, size, weight, fill) {
+    var e = el("text", { x: x, y: y, "text-anchor": "middle", class: "wnode-label" });
+    if (size) e.setAttribute("font-size", size);
+    if (weight) e.setAttribute("font-weight", weight);
+    if (fill) e.setAttribute("fill", fill);
+    e.textContent = t; return e;
+  }
+
+  var NPOS = { "node-a": 20, "node-b": 118, "node-c": 216 };
+
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var mut = css("--muted"), ok = css("--ok"), bad = css("--bad");
+
+    // arrow marker defs
+    var defs = el("defs", {});
+    ["arw", "arwok", "arwbad"].forEach(function (nm) {
+      var col = nm === "arwok" ? ok : (nm === "arwbad" ? bad : mut);
+      var m = el("marker", { id: nm, viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+      m.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: col }));
+      defs.appendChild(m);
+    });
+    svg.appendChild(defs);
+
+    // directory (left)
+    var gD = el("g", {});
+    gD.appendChild(box(10, 112, 152, 84, css("--info-soft"), css("--info")));
+    gD.appendChild(label(86, 132, "ObjectStoreNodeDirectory", 8.5, "700"));
+    gD.appendChild(label(86, 148, "cells: home · ads · archive", 8.5));
+    gD.appendChild(label(86, 162, "nodes: a · b · c", 8.5));
+    gD.appendChild(label(86, 180, "every node opens all three", 8, null, mut));
+    svg.appendChild(gD);
+
+    // cell (right)
+    var gC = el("g", {});
+    gC.appendChild(box(378, 108, 132, 92, css("--purple-soft"), css("--purple")));
+    gC.appendChild(label(444, 132, "graph/reddit-home", 8.5, "700"));
+    gC.appendChild(label(444, 148, "one SlateDB database", 8.5));
+    gC.appendChild(label(444, 164, "manifest fencing", 8.5));
+    gC.appendChild(label(444, 178, "admits one writer", 8.5));
+    svg.appendChild(gC);
+
+    // nodes (middle) + edges
+    nodes.forEach(function (nd) {
+      var y = NPOS[nd.id];
+      var isWriter = writer === nd.id;
+      var isFenced = fenced === nd.id;
+      var fill, stroke;
+      if (isFenced) { fill = css("--bad-soft"); stroke = bad; }
+      else if (isWriter) { fill = css("--ok-soft"); stroke = ok; }
+      else { fill = css("--surface-soft"); stroke = css("--border"); }
+
+      var g = el("g", { class: "wnode" + (isFenced ? " wflash" : (isWriter ? " wflash" : "")) });
+      g.appendChild(box(200, y, 150, 66, fill, stroke, nd.promotable ? null : "5 4"));
+      g.appendChild(label(275, y + 22, nd.id, 11, "700"));
+      var line2 = isFenced ? "fenced — writer dropped"
+        : isWriter ? "promoted writer"
+        : nd.promotable ? "promotable · reader today"
+        : "not promotable";
+      g.appendChild(label(275, y + 40, line2, 9, null, isFenced ? bad : (isWriter ? ok : mut)));
+      g.appendChild(label(275, y + 55, nd.promotable ? "serves reads" : "serves reads (writes refused)", 8, null, mut));
+      svg.appendChild(g);
+
+      // directory -> node
+      var midY = y + 33;
+      svg.appendChild(el("path", { d: "M162 154 L200 " + midY, stroke: mut, "stroke-width": 1.2, fill: "none", "marker-end": "url(#arw)" }));
+
+      // node -> cell
+      var reading = lastRead;
+      var col, mkr, txt, dash;
+      if (isWriter) { col = ok; mkr = "url(#arwok)"; txt = "writes"; dash = null; }
+      else if (isFenced) { col = bad; mkr = "url(#arwbad)"; txt = "reads only (fenced)"; dash = "4 3"; }
+      else if (nd.promotable) { col = mut; mkr = "url(#arw)"; txt = "reads · may promote"; dash = null; }
+      else { col = mut; mkr = "url(#arw)"; txt = "reads only"; dash = null; }
+      svg.appendChild(el("path", { d: "M350 " + midY + " L378 154", stroke: col, "stroke-width": isWriter ? 1.8 : 1.2, fill: "none", "marker-end": mkr, "stroke-dasharray": dash || "none" }));
+      svg.appendChild(label(364, midY + (y < 100 ? -4 : (y > 200 ? 12 : -4)), txt, 7.5, null, col));
+      if (reading) {
+        var g2 = el("g", { class: "wflash" });
+        g2.appendChild(label(275, y + 66 + 4, "✓ read served", 8, "700", ok));
+        svg.appendChild(g2);
+      }
+    });
+
+    // default readout
+    if (lastRead) {
+      readout.innerHTML = "<strong style='color:var(--ok)'>All three nodes served the read.</strong> A read needs no ownership lookup — the directory lists what exists, not who owns it.";
+    } else if (!readout.innerHTML) {
+      readout.innerHTML = "Any node can serve any read for <code>graph/reddit-home</code>. The write is the only asymmetry — try one on each node.";
+    }
+  }
+
+  render();
+  readout.innerHTML = "Any node can serve any read for <code>graph/reddit-home</code>. The write is the only asymmetry — try one on each node.";
+  window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+  document.querySelector(".tb-theme-toggle").addEventListener("click", function () { setTimeout(render, 0); });
+});
+</script>

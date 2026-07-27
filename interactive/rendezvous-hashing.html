@@ -1,0 +1,2391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rendezvous hashing — every machine computes the same owner</title>
+<style>
+  :root {
+    --ground: #eef1f5;
+    --surface: #fbfcfd;
+    --surface-2: #e7ecf3;
+    --ink: #16202e;
+    --ink-2: #4d5c72;
+    --ink-3: #7c8ba1;
+    --rule: #c8d2de;
+    --rule-soft: #dbe3ec;
+    --accent: #1e4fd8;
+    --accent-soft: #dfe6fb;
+    --crit: #a3231c;
+    --crit-soft: #f7e2e0;
+    --high: #97621b;
+    --high-soft: #f8ecd9;
+    --med: #2b6079;
+    --med-soft: #dcecf3;
+    --ok: #106b4e;
+    --ok-soft: #dbefe6;
+
+    --m0: #1e4fd8; --m1: #a3231c; --m2: #106b4e;  --m3: #97621b;
+    --m4: #6c3fa8; --m5: #2b6079; --m6: #b0367a;  --m7: #5c6b1c;
+    --m8: #0f7b8a; --m9: #8a4a12; --m10: #3f4c9b; --m11: #7a1f4f;
+
+    --font-display: -apple-system, BlinkMacSystemFont, "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+    --font-body: "Iowan Old Style", Charter, "Bitstream Charter", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+    --font-mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+    --measure: 68ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0b1626;
+      --surface: #111e31;
+      --surface-2: #16263c;
+      --ink: #dce7f5;
+      --ink-2: #93a8c4;
+      --ink-3: #6a7f9c;
+      --rule: #24374f;
+      --rule-soft: #1b2c42;
+      --accent: #7ba5ff;
+      --accent-soft: #17294a;
+      --crit: #ff8478;
+      --crit-soft: #3a1d1d;
+      --high: #e5b46a;
+      --high-soft: #3a2e18;
+      --med: #6fb8d6;
+      --med-soft: #16303d;
+      --ok: #56cfa1;
+      --ok-soft: #12332a;
+
+      --m0: #7ba5ff; --m1: #ff8478; --m2: #56cfa1;  --m3: #e5b46a;
+      --m4: #b992f0; --m5: #6fb8d6; --m6: #f087bd;  --m7: #b6c56a;
+      --m8: #5fd3dd; --m9: #d8a26b; --m10: #9aa8f5; --m11: #e79ac0;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0b1626;
+    --surface: #111e31;
+    --surface-2: #16263c;
+    --ink: #dce7f5;
+    --ink-2: #93a8c4;
+    --ink-3: #6a7f9c;
+    --rule: #24374f;
+    --rule-soft: #1b2c42;
+    --accent: #7ba5ff;
+    --accent-soft: #17294a;
+    --crit: #ff8478;
+    --crit-soft: #3a1d1d;
+    --high: #e5b46a;
+    --high-soft: #3a2e18;
+    --med: #6fb8d6;
+    --med-soft: #16303d;
+    --ok: #56cfa1;
+    --ok-soft: #12332a;
+
+    --m0: #7ba5ff; --m1: #ff8478; --m2: #56cfa1;  --m3: #e5b46a;
+    --m4: #b992f0; --m5: #6fb8d6; --m6: #f087bd;  --m7: #b6c56a;
+    --m8: #5fd3dd; --m9: #d8a26b; --m10: #9aa8f5; --m11: #e79ac0;
+  }
+
+  :root[data-theme="light"] {
+    --ground: #eef1f5;
+    --surface: #fbfcfd;
+    --surface-2: #e7ecf3;
+    --ink: #16202e;
+    --ink-2: #4d5c72;
+    --ink-3: #7c8ba1;
+    --rule: #c8d2de;
+    --rule-soft: #dbe3ec;
+    --accent: #1e4fd8;
+    --accent-soft: #dfe6fb;
+    --crit: #a3231c;
+    --crit-soft: #f7e2e0;
+    --high: #97621b;
+    --high-soft: #f8ecd9;
+    --med: #2b6079;
+    --med-soft: #dcecf3;
+    --ok: #106b4e;
+    --ok-soft: #dbefe6;
+
+    --m0: #1e4fd8; --m1: #a3231c; --m2: #106b4e;  --m3: #97621b;
+    --m4: #6c3fa8; --m5: #2b6079; --m6: #b0367a;  --m7: #5c6b1c;
+    --m8: #0f7b8a; --m9: #8a4a12; --m10: #3f4c9b; --m11: #7a1f4f;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  .page {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 24px 96px;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0 48px;
+  }
+
+  @media (min-width: 1080px) {
+    .page { grid-template-columns: 190px minmax(0, 1fr); }
+  }
+
+  .masthead {
+    grid-column: 1 / -1;
+    border-bottom: 2px solid var(--ink);
+    padding: 56px 0 26px;
+    margin-bottom: 40px;
+  }
+
+  .docmeta {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 22px;
+    margin-bottom: 26px;
+  }
+
+  .docmeta b { color: var(--ink-2); font-weight: 500; }
+
+  h1 {
+    font-family: var(--font-display);
+    font-size: clamp(2.1rem, 5.4vw, 3.5rem);
+    font-weight: 700;
+    letter-spacing: -.032em;
+    line-height: 1.02;
+    margin: 0 0 .45em;
+    text-wrap: balance;
+    max-width: 20ch;
+  }
+
+  h1 .thin { font-weight: 300; color: var(--ink-2); display: block; font-size: .52em; line-height: 1.2; margin-top: .3em; }
+
+  .standfirst {
+    font-size: 1.16rem;
+    color: var(--ink-2);
+    max-width: 60ch;
+    margin: 0;
+    line-height: 1.55;
+  }
+
+  .spine { display: none; }
+
+  @media (min-width: 1080px) {
+    .spine {
+      display: block;
+      position: sticky;
+      top: 0;
+      align-self: start;
+      padding-top: 6px;
+      max-height: 100vh;
+      overflow-y: auto;
+    }
+  }
+
+  .spine ol { list-style: none; margin: 0; padding: 0; }
+
+  .spine a {
+    display: grid;
+    grid-template-columns: 2.2em 1fr;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.4;
+    letter-spacing: .02em;
+    color: var(--ink-3);
+    text-decoration: none;
+    padding: 7px 0 7px 10px;
+    border-left: 2px solid var(--rule-soft);
+    transition: color .15s, border-color .15s;
+  }
+
+  .spine a:hover, .spine a:focus-visible { color: var(--accent); border-left-color: var(--accent); }
+  .spine a .n { font-variant-numeric: tabular-nums; color: var(--ink-3); }
+  .spine .wmark { color: var(--accent); }
+
+  .body { min-width: 0; }
+  .body > * { max-width: var(--measure); }
+  .body > .wide { max-width: none; }
+
+  section { margin: 0 0 68px; }
+
+  h2 {
+    font-family: var(--font-display);
+    font-size: 1.62rem;
+    font-weight: 650;
+    letter-spacing: -.02em;
+    line-height: 1.18;
+    margin: 0 0 .2em;
+    text-wrap: balance;
+  }
+
+  h3 {
+    font-family: var(--font-display);
+    font-size: 1.06rem;
+    font-weight: 650;
+    letter-spacing: -.008em;
+    margin: 2.1em 0 .5em;
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .eyebrow::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
+
+  p { margin: 0 0 1.05em; }
+  .lede { font-size: 1.06rem; color: var(--ink-2); margin-bottom: 1.6em; }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  code, .mono { font-family: var(--font-mono); font-size: .86em; }
+
+  p code, li code, td code, th code, dd code, .rtext code, .kv code, .term-body code {
+    background: var(--surface-2);
+    border: 1px solid var(--rule-soft);
+    border-radius: 3px;
+    padding: .08em .34em;
+    white-space: nowrap;
+  }
+
+  ul, ol { margin: 0 0 1.05em; padding-left: 1.3em; }
+  li { margin-bottom: .4em; }
+
+  /* ---- term definitions ---- */
+
+  .term {
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--med);
+    padding: 12px 18px;
+    margin: 20px 0;
+  }
+
+  .term .tk {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--med);
+    display: block;
+    margin-bottom: 4px;
+  }
+
+  .term-body { font-size: .95rem; color: var(--ink-2); }
+  .term-body p:last-child { margin-bottom: 0; }
+  .term-body b { color: var(--ink); }
+
+  /* ---- tables ---- */
+
+  .tablewrap {
+    overflow-x: auto;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    margin: 26px 0;
+  }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+
+  thead th {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+
+  tbody tr:last-child td { border-bottom: none; }
+  td.m, th.m { font-family: var(--font-mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  td.note { font-family: var(--font-body); font-size: 14px; color: var(--ink-2); }
+
+  .caption {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--ink-3);
+    margin: -14px 0 30px;
+    letter-spacing: .01em;
+  }
+
+  /* ---- code / rule blocks ---- */
+
+  pre.listing {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.62;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--rule);
+    color: var(--ink-2);
+    padding: 14px 16px;
+    margin: 22px 0;
+    overflow-x: auto;
+  }
+
+  pre.listing b { color: var(--ink); font-weight: 600; }
+  pre.listing i { font-style: normal; color: var(--crit); }
+  pre.listing u { text-decoration: none; color: var(--accent); }
+  pre.listing.rust { border-left-color: var(--accent); }
+  pre.listing.bad { border-left-color: var(--crit); }
+
+  .rule-box {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.6;
+    background: var(--accent-soft);
+    color: var(--ink);
+    padding: 12px 14px;
+    border-radius: 2px;
+    margin: 20px 0;
+    overflow-x: auto;
+  }
+
+  .rule-box .lbl {
+    display: block;
+    font-size: 10px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 6px;
+  }
+
+  /* ---- cost / comparison cards ---- */
+
+  .keeps { display: grid; gap: 2px; margin: 24px 0; }
+
+  .keep {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 14px;
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--high);
+    padding: 13px 18px;
+    align-items: baseline;
+  }
+
+  .keep[data-v="ok"] { border-left-color: var(--ok); }
+
+  .keep .kk {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--high);
+    white-space: nowrap;
+  }
+
+  .keep[data-v="ok"] .kk { color: var(--ok); }
+  .keep .kv { font-size: .95rem; }
+
+  /* ---- widgets ---- */
+
+  .widget {
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    margin: 28px 0 34px;
+    padding: 0;
+  }
+
+  .widget-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px 14px;
+    padding: 13px 20px 12px;
+    border-bottom: 1px solid var(--rule-soft);
+    background: var(--surface-2);
+  }
+
+  .widget-id {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .widget-title {
+    font-family: var(--font-display);
+    font-size: .96rem;
+    font-weight: 650;
+    letter-spacing: -.008em;
+    color: var(--ink);
+  }
+
+  .widget-body { padding: 20px; }
+
+  .widget-cap {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.55;
+    color: var(--ink-3);
+    border-top: 1px solid var(--rule-soft);
+    padding: 12px 20px 14px;
+    letter-spacing: .01em;
+  }
+
+  .widget-cap b { color: var(--ink-2); font-weight: 600; }
+
+  .ctlbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    margin-bottom: 16px;
+  }
+
+  .ctlbar + .ctlbar { margin-top: -6px; }
+
+  .btn {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .02em;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 6px 11px;
+    cursor: pointer;
+    transition: color .12s, border-color .12s, background .12s;
+  }
+
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .btn.danger:hover { border-color: var(--crit); color: var(--crit); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+
+  .ctl-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  .field {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 6px 9px;
+    min-width: 0;
+  }
+
+  .field:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  input[type="range"] { accent-color: var(--accent); vertical-align: middle; max-width: 190px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+  .nodechip {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    padding: 5px 10px;
+    border-radius: 2px;
+    border: 1px solid var(--ok);
+    background: var(--ok-soft);
+    color: var(--ok);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+  }
+
+  .nodechip .sw { width: 9px; height: 9px; border-radius: 1px; display: inline-block; background: var(--rule); }
+
+  .nodechip[aria-pressed="false"] {
+    border-color: var(--rule);
+    background: var(--surface-2);
+    color: var(--ink-3);
+    text-decoration: line-through;
+  }
+
+  .nodechip[aria-pressed="false"] .sw { opacity: .25; }
+  .nodechip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .readout {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    background: var(--surface-2);
+    border-radius: 2px;
+    padding: 10px 13px;
+    margin-top: 14px;
+  }
+
+  .readout b { color: var(--ink); font-weight: 600; }
+  .readout .good { color: var(--ok); }
+  .readout .bad { color: var(--crit); }
+  .readout .warn { color: var(--high); }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 2px;
+    margin: 14px 0 0;
+  }
+
+  .stat { background: var(--surface-2); padding: 9px 12px; }
+
+  .stat .sk {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: .11em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin-bottom: 2px;
+  }
+
+  .stat .sv {
+    font-family: var(--font-mono);
+    font-size: 17px;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    line-height: 1.2;
+  }
+
+  .stat[data-tone="crit"] .sv { color: var(--crit); }
+  .stat[data-tone="ok"] .sv { color: var(--ok); }
+  .stat[data-tone="accent"] .sv { color: var(--accent); }
+  .stat .su { font-size: 11px; color: var(--ink-3); }
+
+  /* ---- item grids ---- */
+
+  .two { display: grid; grid-template-columns: 1fr; gap: 18px; }
+  @media (min-width: 700px) { .two { grid-template-columns: 1fr 1fr; } }
+
+  .panel { border: 1px solid var(--rule-soft); background: var(--ground); padding: 12px 14px 14px; }
+
+  .panel-h {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin-bottom: 9px;
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .panel-h .pv { font-variant-numeric: tabular-nums; }
+  .panel[data-tone="crit"] .panel-h .pv { color: var(--crit); }
+  .panel[data-tone="ok"] .panel-h .pv { color: var(--ok); }
+
+  .grid { display: flex; flex-wrap: wrap; gap: 2px; }
+
+  .sq {
+    width: 11px;
+    height: 11px;
+    border-radius: 1px;
+    background: var(--rule);
+    transition: opacity .25s;
+  }
+
+  .grid.marked .sq { opacity: .2; }
+  .grid.marked .sq.moved { opacity: 1; box-shadow: 0 0 0 1px var(--ink); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 10px; }
+
+  .legend span {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--ink-3);
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .legend i { width: 9px; height: 9px; border-radius: 1px; display: inline-block; }
+
+  /* ---- score table ---- */
+
+  .scoretbl { width: 100%; border-collapse: collapse; font-size: 12px; font-family: var(--font-mono); }
+  .scoretbl th { font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); font-weight: 500; padding: 6px 10px; background: var(--surface-2); border-bottom: 1px solid var(--rule); text-align: left; }
+  .scoretbl td { padding: 6px 10px; border-bottom: 1px solid var(--rule-soft); vertical-align: middle; }
+  .scoretbl tr.dead td { color: var(--ink-3); text-decoration: line-through; }
+  .scoretbl tr.win td { background: var(--ok-soft); color: var(--ok); font-weight: 600; }
+  .scoretbl tr.win td.bar-td { background: var(--ok-soft); }
+  .scoretbl tr.rep td { background: var(--accent-soft); color: var(--accent); }
+  .scoretbl tr.rep td.bar-td { background: var(--accent-soft); }
+  .scoretbl td.bar-td { width: 30%; padding: 4px 10px; }
+  .scoretbl .bar { height: 8px; background: var(--rule); display: block; border-radius: 1px; }
+  .scoretbl tr.win .bar { background: var(--ok); }
+  .scoretbl tr.rep .bar { background: var(--accent); }
+  .scoretbl tr.dead .bar { background: var(--rule-soft); }
+
+  /* ---- histogram ---- */
+
+  .hbars { display: grid; gap: 3px; margin-top: 4px; }
+
+  .hbar {
+    display: grid;
+    grid-template-columns: 8.5em 1fr 5.4em;
+    gap: 10px;
+    align-items: center;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--ink-2);
+  }
+
+  .hbar .track { background: var(--surface-2); height: 15px; position: relative; overflow: hidden; }
+  .hbar .fill { height: 100%; display: block; }
+  .hbar .ideal { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--ink-3); }
+  .hbar .num { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); }
+
+  /* ---- golden lamps ---- */
+
+  .lamps { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 14px; }
+
+  .lamp {
+    flex: 1 1 220px;
+    background: var(--surface-2);
+    padding: 11px 14px;
+    display: flex;
+    align-items: center;
+    gap: 11px;
+  }
+
+  .lamp .bulb { width: 13px; height: 13px; border-radius: 50%; background: var(--rule); flex: none; }
+  .lamp[data-on="ok"] .bulb { background: var(--ok); }
+  .lamp[data-on="crit"] .bulb { background: var(--crit); }
+  .lamp .lk { font-family: var(--font-mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); display: block; }
+  .lamp .lv { font-family: var(--font-mono); font-size: 12px; color: var(--ink); }
+  .lamp[data-on="ok"] .lv { color: var(--ok); }
+  .lamp[data-on="crit"] .lv { color: var(--crit); }
+
+  /* ---- SVG for static fallbacks ---- */
+
+  .wsvg { display: block; width: 100%; height: auto; overflow: visible; }
+  .wsvg text { font-family: var(--font-mono); font-size: 10px; fill: var(--ink-2); }
+  .wsvg .t-strong { fill: var(--ink); font-weight: 600; }
+  .wsvg .t-dim { fill: var(--ink-3); font-size: 9px; }
+  .wsvg .t-ok { fill: var(--ok); }
+  .wsvg .t-crit { fill: var(--crit); }
+  .wsvg .box { fill: var(--surface-2); stroke: var(--rule); stroke-width: 1; }
+  .wsvg .box.ok { fill: var(--ok-soft); stroke: var(--ok); }
+  .wsvg .box.crit { fill: var(--crit-soft); stroke: var(--crit); }
+
+  .static-fallback { border: 1px dashed var(--rule); padding: 16px; }
+  .static-note { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-3); margin: 10px 0 0; }
+
+  .handoff {
+    border-top: 2px solid var(--ink);
+    padding-top: 26px;
+    margin-top: 76px;
+    grid-column: 1 / -1;
+  }
+
+  .handoff h2 { font-size: 1.28rem; }
+  .handoff p { max-width: var(--measure); }
+
+  .themetoggle {
+    position: fixed;
+    top: 14px;
+    right: 14px;
+    z-index: 10;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 6px 10px;
+    cursor: pointer;
+    transition: color .15s, border-color .15s;
+  }
+
+  .themetoggle:hover { color: var(--accent); border-color: var(--accent); }
+  .themetoggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  @media print { .themetoggle { display: none; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem("turbolay-theme");
+      if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) {}
+  })();
+</script>
+</head>
+<body>
+
+<button class="themetoggle" type="button">Dark</button>
+
+<div class="page">
+
+  <header class="masthead">
+    <div class="docmeta">
+      <span><b>repo</b> turbolay</span>
+      <span><b>branch</b> Turbolay-V3.5</span>
+      <span><b>kind</b> concept &mdash; one idea, taught</span>
+      <span><b>prereq</b> none</span>
+      <span><b>see also</b> write-routing-placement.html</span>
+    </div>
+    <h1>Rendezvous hashing<span class="thin">every machine computes the same owner, from nothing but the question itself</span></h1>
+    <p class="standfirst">
+      Also called <em>highest random weight</em>, or HRW. It answers one question &mdash;
+      which machine handles this item &mdash; and it answers it identically on every
+      machine, with no coordinator, no stored table, and no messages. This page explains
+      what it is, why the property that makes it valuable is the one you should care about,
+      and where it is the wrong tool.
+    </p>
+  </header>
+
+  <nav class="spine" aria-label="Sections">
+    <ol>
+      <li><a href="#problem"><span class="n">A</span><span>The question</span></a></li>
+      <li><a href="#modulo"><span class="n">B</span><span>hash mod N <span class="wmark">W1</span></span></a></li>
+      <li><a href="#idea"><span class="n">C</span><span>The idea <span class="wmark">W2</span></span></a></li>
+      <li><a href="#disruption"><span class="n">D</span><span>Minimal disruption <span class="wmark">W3</span></span></a></li>
+      <li><a href="#ranking"><span class="n">E</span><span>The ranking <span class="wmark">W4</span></span></a></li>
+      <li><a href="#costs"><span class="n">F</span><span>The costs <span class="wmark">W5</span></span></a></li>
+      <li><a href="#versus"><span class="n">G</span><span>vs consistent hashing</span></a></li>
+      <li><a href="#here"><span class="n">H</span><span>Here</span></a></li>
+    </ol>
+  </nav>
+
+  <main class="body">
+
+    <section id="problem">
+      <p class="eyebrow">A &mdash; the question</p>
+      <h2>Several machines, many items, and nobody in charge</h2>
+      <p class="lede">
+        Every problem rendezvous hashing solves has the same shape. Fix that shape first;
+        the mechanism takes one line once you have it.
+      </p>
+
+      <p>
+        You have a set of <b>machines</b> &mdash; processes, servers, pods, it does not matter
+        which &mdash; and a much larger set of <b>items</b>. An item is anything that needs
+        exactly one machine responsible for it: a cache key, a shard, a partition, a database
+        whose writes must be serialised. Each machine must be able to answer <em>which machine
+        handles this item?</em> and every machine must give the same answer.
+      </p>
+
+      <p>
+        The constraints are what make this interesting. There is no coordinator to ask. There
+        is no election. There is no shared database holding the assignment, and the machines
+        do not send each other messages to agree. Each one works it out alone, from what it
+        already knows, and they still agree.
+      </p>
+
+      <div class="term">
+        <span class="tk">term &mdash; coordinator</span>
+        <div class="term-body">
+          <p>
+            A separate service that owns the assignment and hands it out &mdash; ZooKeeper,
+            etcd, a placement driver, a leader-elected controller. It works, and it is
+            frequently the right answer. It is also a service you now run: another process to
+            deploy and upgrade, another thing that has to fail over, another quorum to keep
+            healthy, and another source of truth that can disagree with the one you already
+            had. Every lookup either crosses the network to it or reads a cache of it that can
+            be stale.
+          </p>
+        </div>
+      </div>
+
+      <p>
+        Avoiding the coordinator is not about elegance. It is about not adding a distributed
+        system to the inside of your distributed system. If the answer can be <em>computed</em>
+        from inputs both sides already hold, no agreement protocol is required, because there
+        is nothing to agree about.
+      </p>
+
+      <div class="rule-box">
+        <span class="lbl">what we want</span>
+        owner(item) &mdash; a pure function of the item and the current machine list.<br>
+        Same inputs, same output, on every machine, with no communication.
+      </div>
+
+      <p>
+        Two inputs, then. The item, which the caller has. And the list of live machines, which
+        every machine can obtain some other way &mdash; from configuration, from a service
+        registry, from a directory of heartbeat records. Getting that list consistent is a
+        real problem and it is <em>not</em> the problem on this page. Assume it for now.
+      </p>
+    </section>
+
+    <section id="modulo">
+      <p class="eyebrow">B &mdash; the obvious answer</p>
+      <h2><code>hash(item) % N</code>, and the reason it does not survive contact</h2>
+
+      <p>
+        The first idea anyone has is the right first idea. Hash the item to a number, take that
+        number modulo the machine count, and use the result as an index into the machine list.
+      </p>
+
+      <div class="term">
+        <span class="tk">term &mdash; hash function</span>
+        <div class="term-body">
+          <p>
+            A function turning a string of bytes into a fixed-size number, such that similar
+            inputs give unrelated outputs and the outputs are spread evenly across the range.
+            No cryptography is needed here &mdash; nobody is attacking the placement &mdash; so
+            this page, like the repo, uses <b>FNV-1a 64</b>: a five-line loop of xor and
+            multiply producing a 64-bit value.
+          </p>
+        </div>
+      </div>
+
+      <pre class="listing bad">index = fnv1a64(item) % N
+owner = machines[index]</pre>
+
+      <p>
+        It is fast, it needs no state, and it distributes evenly. It is also correct only while
+        <code>N</code> never changes, and <code>N</code> is the machine count, so it changes
+        every time a machine is added, removed, restarted, or declared dead.
+      </p>
+
+      <p>
+        The damage is worse than intuition suggests. Going from three machines to four, you
+        might hope a quarter of the items move &mdash; the new machine's fair share. What
+        actually happens is that an item keeps its owner only when
+        <code>h % 3 == h % 4</code>, which holds for 3 of every 12 residues. <b>Three quarters
+        of all items relocate.</b> Nothing about the surviving machines changed, and yet almost
+        everything moved.
+      </p>
+
+      <p>
+        Relocation is not free. Depending on the system, a moved item means a cache miss, a
+        re-replicated shard, a rebuilt index, or a database reopened by a different writer.
+        Moving 75% of the fleet's items because one machine joined is disqualifying on its own.
+      </p>
+
+      <div class="widget wide" id="w1">
+        <div class="widget-head">
+          <span class="widget-id">W1</span>
+          <span class="widget-title">Modulo vs rendezvous &mdash; what fraction moved when the fleet last changed</span>
+        </div>
+        <div class="widget-body">
+          <div class="w1-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 700 210" role="img" aria-label="Going from three machines to four relocates 75 percent of items under modulo and 25 percent under rendezvous">
+              <text class="t-strong" x="12" y="18">3 machines &rarr; 4 machines, 240 items</text>
+              <rect class="box crit" x="12" y="34" width="676" height="62" rx="2"></rect>
+              <text class="t-strong" x="26" y="56">hash(item) % N</text>
+              <rect x="26" y="66" width="478" height="14" fill="var(--crit)"></rect>
+              <rect x="504" y="66" width="162" height="14" fill="var(--rule)"></rect>
+              <text class="t-crit" x="500" y="56">179 of 240 relocated &mdash; 74.6%</text>
+              <rect class="box ok" x="12" y="110" width="676" height="62" rx="2"></rect>
+              <text class="t-strong" x="26" y="132">rendezvous</text>
+              <rect x="26" y="142" width="160" height="14" fill="var(--ok)"></rect>
+              <rect x="186" y="142" width="480" height="14" fill="var(--rule)"></rect>
+              <text class="t-ok" x="500" y="132">60 of 240 relocated &mdash; 25.0%, the minimum</text>
+              <text class="t-dim" x="12" y="196">Static fallback values. The live widget computes both figures from the actual hash.</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript for the live comparison.</p>
+          </div>
+          <div class="w1-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> press <b>3 &rarr; 4 machines</b>. Under modulo almost every square lights
+          up as moved; under rendezvous only the new machine's share does. Then drag the slider
+          one machine at a time: the modulo figure stays pinned near the top of its range, while
+          <b>moved with no cause</b> &mdash; items that changed hands between two machines that
+          both survived &mdash; stays at zero for rendezvous, in either direction. Both figures
+          are counted item by item from the same hash the rest of this page uses; nothing here is
+          a stated result.
+        </p>
+      </div>
+    </section>
+
+    <section id="idea">
+      <p class="eyebrow">C &mdash; the idea</p>
+      <h2>Score every pair, take the highest</h2>
+      <p class="lede">
+        One sentence, and it is the whole mechanism.
+      </p>
+
+      <div class="rule-box">
+        <span class="lbl">rendezvous hashing</span>
+        owner(item) = the machine m maximising H(item &Vert; m), over the live machines.
+      </div>
+
+      <p>
+        The inversion is the point. Modulo hashes the <em>item</em> and then maps the result
+        onto a machine, so the mapping depends on how many machines there are. Rendezvous
+        hashes the <em>pair</em>: it computes a score for this item against machine A, another
+        against machine B, another against machine C, sorts those scores descending, and takes
+        the top. The item's own hash is never mapped anywhere, so the machine count never
+        enters the calculation.
+      </p>
+
+      <p>
+        The name comes from that: the item and its machine meet at the highest score, and both
+        sides can find the meeting point independently. "Highest random weight" describes the
+        same thing from the other end &mdash; each machine is assigned a pseudorandom weight
+        for this particular item, and the highest weight wins.
+      </p>
+
+      <p>
+        Count the machinery. There is no ring. There are no virtual nodes. There is no stored
+        assignment, no table to replicate, no invalidation, no bootstrap, no migration
+        procedure for the mapping itself. The score is recomputed from scratch on every lookup,
+        and the answer is the same on every machine because it is a pure function of two things
+        both already have. State that cannot exist cannot be stale.
+      </p>
+
+      <p>
+        Ties need one rule, or two machines could each believe they won. Break them by machine
+        identifier ascending &mdash; a total order every machine can evaluate locally. With
+        64-bit scores a tie is vanishingly rare, which is exactly why it must be handled: a
+        bug that fires once a year is worse than one that fires daily.
+      </p>
+
+      <h3>What this page actually computes</h3>
+
+      <p>
+        Every score below is a real FNV-1a 64 hash, evaluated in your browser with
+        <code>BigInt</code>, using the same key layout the repo froze in
+        <code>crates/placement/src/hash.rs</code>:
+      </p>
+
+      <pre class="listing rust">score(scope, cell, node) = <b>fnv1a64</b>(scope &Vert; 0x00 &Vert; cell_id &Vert; 0x00 &Vert; node_id)
+rank                     = descending by score, ties broken by node_id ascending
+owner                    = rank[0], or none when no machine is live</pre>
+
+      <p>
+        The vocabulary maps directly: a <b>cell</b> is the item, a <b>node</b> is the machine,
+        and <b>scope</b> is a namespace prefix that keeps two graphs from sharing a placement.
+        The <code>0x00</code> bytes are separators, and they are load-bearing: without them
+        <code>("ab", "c")</code> and <code>("a", "bc")</code> would produce identical keys and
+        two different items could share an owner by accident.
+      </p>
+
+      <div class="widget wide" id="w2">
+        <div class="widget-head">
+          <span class="widget-id">W2</span>
+          <span class="widget-title">The score table for one item &mdash; and the golden-value self-check</span>
+        </div>
+        <div class="widget-body">
+          <div class="w2-static static-fallback">
+            <div class="tablewrap" style="margin:0">
+              <table class="scoretbl">
+                <thead>
+                  <tr><th>rank</th><th>machine</th><th>score (FNV-1a 64)</th><th>verdict</th></tr>
+                </thead>
+                <tbody>
+                  <tr class="win"><td>1</td><td>graph-node-1</td><td>0x39ffe4dd3cc7a1b1</td><td>OWNER</td></tr>
+                  <tr><td>2</td><td>graph-node-0</td><td>0x39ffe3dd3cc79ffe</td><td>not the owner</td></tr>
+                  <tr><td>3</td><td>graph-node-3</td><td>0x39ffe2dd3cc79e4b</td><td>not the owner</td></tr>
+                  <tr><td>4</td><td>graph-node-2</td><td>0x39ffe1dd3cc79c98</td><td>not the owner</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="static-note">
+              Static fallback for <code>scope=acme/graphs/social</code>,
+              <code>cell=cell-b</code>. Enable JavaScript to type your own item and watch the
+              ranking recompute.
+            </p>
+          </div>
+          <div class="w2-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> change the cell from <code>cell-a</code> to <code>cell-b</code>. The
+          winner changes, and it is not the lexically first machine &mdash; nothing about
+          machine names orders the result. Change the scope to
+          <code>acme/graphs/other</code> and the whole ranking reshuffles, which is why the
+          scope string is frozen too. The four lamps underneath recompute the values pinned by
+          the Rust test <code>scores_are_frozen</code>; all four must read MATCH.
+        </p>
+      </div>
+    </section>
+
+    <section id="disruption">
+      <p class="eyebrow">D &mdash; the property that matters</p>
+      <h2>Remove a machine and only its own items move</h2>
+      <p class="lede">
+        This is the reason to use rendezvous hashing. Everything else about it is convenience.
+      </p>
+
+      <p>
+        Kill one machine out of six. Its items have to go somewhere &mdash; that is unavoidable,
+        their owner is gone. What is not obvious is that <em>nothing else moves at all</em>. Not
+        approximately nothing; exactly nothing. Every item owned by a surviving machine is still
+        owned by the same surviving machine.
+      </p>
+
+      <p>
+        The reason is worth understanding rather than memorising, because it tells you when the
+        property holds and when it does not.
+      </p>
+
+      <p>
+        Each machine's score for an item is computed from the item and <em>that machine alone</em>.
+        Machine C's score does not read machine B's identifier, or the machine count, or the
+        position of anything in a list. So deleting machine B from the live set cannot change
+        any other machine's score by even one bit. The scores are the same numbers they were
+        before; the only difference is that one of them is no longer in the running.
+      </p>
+
+      <p>
+        Take a sorted list of unchanged numbers and delete one entry. Everything above the
+        deleted entry keeps its position. Everything below moves up exactly one place. So an
+        item whose winner is still alive still has the same winner &mdash; its top score was not
+        the one removed. An item whose winner is gone gets the machine that was already in
+        second place. No other item is affected, and no third machine ever learns that anything
+        happened.
+      </p>
+
+      <div class="rule-box">
+        <span class="lbl">the intuition in one line</span>
+        Scores are independent, so removing a machine deletes one row from a sorted list<br>
+        and reorders nothing. Second place becomes first. That is the entire disturbance.
+      </div>
+
+      <p>
+        Adding a machine is the mirror image. The newcomer computes a score for every item and
+        wins the ones where that score happens to be the highest &mdash; roughly a
+        <code>1/N</code> share &mdash; and loses every other item to whoever already held it.
+        Both directions move the theoretical minimum number of items, which is what
+        <b>minimal disruption</b> means.
+      </p>
+
+      <p>
+        The repo asserts this directly rather than trusting it, in
+        <code>removing_a_node_preserves_the_order_of_the_rest</code>. The test deliberately uses
+        <code>cell-b</code>, because for <code>cell-a</code> the ranking happens to come out in
+        lexical machine order &mdash; a test written against that would pass even if the
+        implementation ignored the scores entirely.
+      </p>
+
+      <div class="widget wide" id="w3">
+        <div class="widget-head">
+          <span class="widget-id">W3</span>
+          <span class="widget-title">Kill a machine &mdash; and count what else moved</span>
+        </div>
+        <div class="widget-body">
+          <div class="w3-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 700 190" role="img" aria-label="Killing one machine of six moves one sixth of items under rendezvous and five sixths under modulo">
+              <text class="t-strong" x="12" y="18">6 machines &rarr; 5 machines, 150 items</text>
+              <rect class="box ok" x="12" y="32" width="676" height="60" rx="2"></rect>
+              <text class="t-strong" x="26" y="54">rendezvous</text>
+              <rect x="26" y="64" width="81" height="14" fill="var(--ok)"></rect>
+              <rect x="107" y="64" width="559" height="14" fill="var(--rule)"></rect>
+              <text class="t-ok" x="330" y="54">19 of 150 &mdash; exactly the dead machine's items, nothing else</text>
+              <rect class="box crit" x="12" y="106" width="676" height="60" rx="2"></rect>
+              <text class="t-strong" x="26" y="128">hash(item) % live_count</text>
+              <rect x="26" y="138" width="576" height="14" fill="var(--crit)"></rect>
+              <rect x="602" y="138" width="64" height="14" fill="var(--rule)"></rect>
+              <text class="t-crit" x="330" y="128">135 of 150 &mdash; 90%, most of them for no reason at all</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript to kill machines yourself.</p>
+          </div>
+          <div class="w3-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> click any machine chip to kill it. The grid dims every item that stayed
+          put and leaves the moved ones bright, so "only these moved" is one glance. The readout
+          splits the moved items into two counts: those whose owner was the machine you killed,
+          and those that moved for any other reason. The second count is <b>0</b>, every time,
+          and the modulo panel beside it shows what the same failure costs without rendezvous.
+        </p>
+      </div>
+    </section>
+
+    <section id="ranking">
+      <p class="eyebrow">E &mdash; what falls out for free</p>
+      <h2>The output is a ranking, not a winner</h2>
+
+      <p>
+        Scoring every machine produces a total order over all of them, and taking the top is one
+        thing you can do with it. Everything else the order gives you costs no extra design.
+      </p>
+
+      <p>
+        <b>Second place is the failover target.</b> Not a target you nominated and have to keep
+        in sync &mdash; it is what the machine will actually become when the current owner
+        disappears, because that is what the argmax returns over the remaining set. The standby
+        can be told it is the standby without anyone maintaining a standby table.
+      </p>
+
+      <p>
+        <b>The top K are the K replicas.</b> Need three copies of every item? Take the first
+        three of the ranking. Every machine computes the same three, in the same order, and when
+        one of them dies the surviving two keep their places while the machine ranked fourth
+        joins the set. A replication scheme with no replication metadata.
+      </p>
+
+      <div class="term">
+        <span class="tk">term &mdash; replica</span>
+        <div class="term-body">
+          <p>
+            A machine holding a copy of an item, so the item survives losing one machine.
+            Systems usually keep <b>K</b> of them and need every participant to agree on which
+            K, which normally means storing and distributing that decision. Under rendezvous it
+            is a prefix of a computed list.
+          </p>
+        </div>
+      </div>
+
+      <p>
+        A hash ring gives you this too, by walking clockwise, but the walk is a deliberate
+        construction with its own edge cases &mdash; a replica set must skip repeated
+        machines, and with virtual nodes the same machine appears at many ring positions. The
+        rendezvous ranking has each machine exactly once, in order, by construction.
+      </p>
+
+      <div class="widget wide" id="w4">
+        <div class="widget-head">
+          <span class="widget-id">W4</span>
+          <span class="widget-title">Top-K replicas from the same ranking</span>
+        </div>
+        <div class="widget-body">
+          <div class="w4-static static-fallback">
+            <div class="tablewrap" style="margin:0">
+              <table class="scoretbl">
+                <thead>
+                  <tr><th>rank</th><th>machine</th><th>role at K = 3</th></tr>
+                </thead>
+                <tbody>
+                  <tr class="win"><td>1</td><td>graph-node-1</td><td>PRIMARY</td></tr>
+                  <tr class="rep"><td>2</td><td>graph-node-0</td><td>REPLICA 1</td></tr>
+                  <tr class="rep"><td>3</td><td>graph-node-3</td><td>REPLICA 2</td></tr>
+                  <tr><td>4</td><td>graph-node-2</td><td>spare</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="static-note">
+              Static fallback for <code>cell-b</code> at K = 3. Enable JavaScript to change K
+              and fail the primary.
+            </p>
+          </div>
+          <div class="w4-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> set K to 3, then press <b>fail the primary</b>. Replica 1 is promoted,
+          replica 2 keeps its slot, and exactly one new machine enters the set at the bottom.
+          The readout counts how many of the previous K survived the change &mdash; it is always
+          K minus one, and it is not enforced anywhere in the code. It is a consequence of the
+          scores being independent.
+        </p>
+      </div>
+    </section>
+
+    <section id="costs">
+      <p class="eyebrow">F &mdash; the costs</p>
+      <h2>Five honest weaknesses</h2>
+      <p class="lede">
+        None of these are fatal, and all five are real. Two of them decide whether rendezvous is
+        appropriate for a given system at all, and one of them is visible in this repo's own
+        numbers.
+      </p>
+
+      <div class="keeps">
+        <div class="keep">
+          <span class="kk">O(N) per lookup</span>
+          <span class="kv">
+            Every lookup scores every machine. A hash ring answers in <b>O(log N)</b> with a
+            binary search over sorted ring positions; rendezvous is a linear scan. At ten
+            machines that is ten hashes of a short string &mdash; irrelevant, and the absence of
+            a ring to build and maintain is worth more than the difference. At a thousand
+            machines it is a thousand hashes on every lookup and the trade has reversed. Salting
+            the ranking into a two-level tree recovers <b>O(log N)</b>, at the cost of the
+            simplicity that motivated the choice.
+          </span>
+        </div>
+        <div class="keep">
+          <span class="kk">balance is statistical</span>
+          <span class="kv">
+            Each item picks its winner independently, so machine loads follow a binomial
+            distribution, not an even split. With a well-mixing hash the relative spread shrinks
+            as the square root of the item count &mdash; a fraction of a percent over a hundred
+            thousand items, but over twenty items across five machines one machine routinely
+            holds twice its share. If items are few, or a few items carry most of the load, the
+            distribution is visibly lumpy and rendezvous does not promise otherwise.
+          </span>
+        </div>
+        <div class="keep">
+          <span class="kk">balance is only as good as the hash</span>
+          <span class="kv">
+            The statistical argument above assumes the score function <em>mixes</em>: that
+            changing one byte of the key scrambles the whole output. FNV-1a does not, and it
+            shows. Machine ids <code>graph-node-0</code> through <code>graph-node-5</code> differ
+            only in the final byte, and FNV-1a folds that byte in with one multiply, so all six
+            scores agree in their top 21 bits and the winner is decided by three low bits of the
+            key hash. Eight equally likely patterns cannot divide evenly among six machines, so
+            two of them win exactly twice as often as the other four &mdash; a <b>2:1 ratio that
+            does not shrink at any item count</b>, because it is not sampling noise. Naming the
+            machines so they differ throughout reduces it to about 1.5:1; it does not remove it.
+            W5 measures both. This is a property of the hash, not of rendezvous, and it is the
+            argument for scoring with a function that actually avalanches.
+          </span>
+        </div>
+        <div class="keep">
+          <span class="kk">machines are assumed equal</span>
+          <span class="kv">
+            Plain rendezvous gives every machine the same expected share. A fleet with a machine
+            twice the size of the others needs <b>weighted rendezvous</b>, which transforms the
+            score before comparing so that expected share tracks capacity. It preserves minimal
+            disruption and it is a well-understood extension &mdash; but it is an extension, with
+            its own formula to get right and freeze. It is not free.
+          </span>
+        </div>
+        <div class="keep">
+          <span class="kk">the hash is a wire format</span>
+          <span class="kv">
+            This is the one that bites. Two machines running different versions of the scoring
+            function, or feeding it bytes assembled differently, compute different owners &mdash;
+            and then disagree about who owns an item. That is precisely the failure the whole
+            scheme exists to prevent, reintroduced by an ordinary refactor. The function, the
+            byte layout of its key, and the tie-break are a <b>frozen wire format</b>, and they
+            have to be treated with the same care as a serialised message on the network.
+          </span>
+        </div>
+      </div>
+
+      <p>
+        The last one is why this repo pins four golden hash values in a test rather than merely
+        asserting properties. A property test proves the ranking is deterministic <em>within one
+        build</em>. Pinned hex proves it is the same ranking as last release's build, which is
+        the version running on the pod next to yours during a rolling upgrade. Note what else
+        gets frozen by implication: the scope string is produced by a <code>Display</code>
+        implementation elsewhere in the codebase, so changing that format string reshuffles
+        every item in the fleet.
+      </p>
+
+      <div class="widget wide" id="w5">
+        <div class="widget-head">
+          <span class="widget-id">W5</span>
+          <span class="widget-title">Distribution &mdash; and what a weak hash does to it</span>
+        </div>
+        <div class="widget-body">
+          <div class="w5-static static-fallback">
+            <svg class="wsvg" viewBox="0 0 700 176" role="img" aria-label="With graph-node-N names two machines of six win twice as often at any item count; with distinct names the counts are near even">
+              <text class="t-strong" x="12" y="16">6000 items, 6 machines, ids graph-node-0..5</text>
+              <rect x="12" y="26" width="75" height="11" fill="var(--m0)"></rect><text x="95" y="35">753</text>
+              <rect x="12" y="41" width="75" height="11" fill="var(--m1)"></rect><text x="95" y="50">749</text>
+              <rect x="12" y="56" width="75" height="11" fill="var(--m2)"></rect><text x="95" y="65">749</text>
+              <rect x="12" y="71" width="75" height="11" fill="var(--m3)"></rect><text x="95" y="80">747</text>
+              <rect x="12" y="86" width="150" height="11" fill="var(--m4)"></rect><text x="170" y="95">1498</text>
+              <rect x="12" y="101" width="150" height="11" fill="var(--m5)"></rect><text x="170" y="110">1504</text>
+              <text class="t-crit" x="12" y="130">1:1:1:1:2:2 &mdash; eight hash patterns split over six machines</text>
+              <text class="t-strong" x="360" y="16">6000 items, 6 machines, ids differing throughout</text>
+              <rect x="360" y="26" width="106" height="11" fill="var(--m0)"></rect><text x="474" y="35">1059</text>
+              <rect x="360" y="41" width="116" height="11" fill="var(--m1)"></rect><text x="484" y="50">1163</text>
+              <rect x="360" y="56" width="114" height="11" fill="var(--m2)"></rect><text x="482" y="65">1136</text>
+              <rect x="360" y="71" width="113" height="11" fill="var(--m3)"></rect><text x="481" y="80">1126</text>
+              <rect x="360" y="86" width="77" height="11" fill="var(--m4)"></rect><text x="445" y="95">772</text>
+              <rect x="360" y="101" width="74" height="11" fill="var(--m5)"></rect><text x="442" y="110">744</text>
+              <text class="t-ok" x="360" y="130">better &mdash; about 1.5:1 busiest to emptiest, but it also stops improving</text>
+              <text class="t-dim" x="12" y="160">Static fallback values, measured. The live widget recomputes them.</text>
+            </svg>
+            <p class="static-note">Static fallback. Enable JavaScript for the computed histogram.</p>
+          </div>
+          <div class="w5-live" hidden></div>
+        </div>
+        <p class="widget-cap">
+          <b>Try:</b> start at 20 items over 6 machines &mdash; the busiest machine holds several
+          times the emptiest, which is ordinary sampling noise and shrinks as you add items. Drag
+          items to a thousand and watch it stop shrinking around 1.5:1 rather than reaching even.
+          Now switch the ids to <code>graph-node-N</code> and it locks at exactly 2:1, unchanged
+          at any item count. Neither residue is randomness; both are FNV-1a failing to spread the
+          machine id across the whole 64 bits. Every count is tallied from the real hash, which is
+          why the page can show you this rather than assert balance it does not have.
+        </p>
+      </div>
+    </section>
+
+    <section id="versus">
+      <p class="eyebrow">G &mdash; the neighbour</p>
+      <h2>Where this sits next to consistent hashing</h2>
+
+      <p>
+        Consistent hashing is the other standard answer to the same question, and it solves it
+        well. Both give minimal disruption; the difference is what you build and what you pay.
+      </p>
+
+      <div class="term">
+        <span class="tk">term &mdash; consistent hashing</span>
+        <div class="term-body">
+          <p>
+            Hash both machines and items onto one circular number space. An item is owned by the
+            first machine found walking clockwise from the item's position. Removing a machine
+            hands its arc to the next machine clockwise and leaves every other arc untouched
+            &mdash; the same minimal-disruption property, reached differently.
+          </p>
+          <p>
+            With one position per machine the arcs come out very uneven, so real implementations
+            place each machine at many positions &mdash; <b>virtual nodes</b>, typically 100 to
+            500 each. That fixes balance and is the source of most of the mechanism: the ring is
+            a sorted structure you build, hold in memory, and update on every membership change.
+          </p>
+        </div>
+      </div>
+
+      <div class="tablewrap wide">
+        <table>
+          <thead>
+            <tr><th></th><th>rendezvous</th><th>consistent hashing</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="m">lookup cost</td>
+              <td class="note">O(N) &mdash; one hash per machine</td>
+              <td class="note">O(log V) &mdash; binary search over V ring positions</td>
+            </tr>
+            <tr>
+              <td class="m">state held</td>
+              <td class="note">none; the machine list, which you needed anyway</td>
+              <td class="note">the ring: V sorted positions, rebuilt or patched on change</td>
+            </tr>
+            <tr>
+              <td class="m">balance</td>
+              <td class="note">statistical, no tuning parameter</td>
+              <td class="note">statistical, tuned by the virtual-node count</td>
+            </tr>
+            <tr>
+              <td class="m">disruption on change</td>
+              <td class="note">minimal</td>
+              <td class="note">minimal</td>
+            </tr>
+            <tr>
+              <td class="m">ranking / replicas</td>
+              <td class="note">a full ordering, free</td>
+              <td class="note">clockwise walk, skipping repeats of the same machine</td>
+            </tr>
+            <tr>
+              <td class="m">weighting</td>
+              <td class="note">a real extension to the score function</td>
+              <td class="note">give the machine more virtual nodes</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        Neither is strictly better. Consistent hashing earns its ring at large machine counts and
+        weights naturally. Rendezvous wins when the fleet is small enough that O(N) is noise,
+        when you want a ranking rather than a winner, and when having no structure to build,
+        store, and invalidate is worth more than the asymptotics &mdash; which is most often the
+        case at tens of machines rather than thousands.
+      </p>
+    </section>
+
+    <section id="here">
+      <p class="eyebrow">H &mdash; in this repo</p>
+      <h2>What it is used for here</h2>
+
+      <p>
+        Turbolay uses rendezvous hashing to decide which graph-node is the writer for a cell. The
+        item is a <code>(scope, cell)</code> pair, the machines are the nodes whose heartbeat
+        records are fresh, and the owner is the highest-scoring live node. A node that is not the
+        computed owner declines to promote itself, which is what stopped three nodes from taking
+        turns fencing each other out of one database. The implementation is
+        <code>crates/placement/src/hash.rs</code>; the choice of scheme, the liveness rules it
+        depends on, and the limits of what it guarantees are in
+        <a href="write-routing-placement.html">write-routing-placement.html</a>.
+      </p>
+    </section>
+
+  </main>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ------------------------------------------------------------------ theme */
+
+  var root = document.documentElement;
+  var themeBtn = document.querySelector(".themetoggle");
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+
+  function currentTheme() {
+    return root.getAttribute("data-theme") || (media.matches ? "dark" : "light");
+  }
+
+  function labelTheme() {
+    var next = currentTheme() === "dark" ? "Light" : "Dark";
+    themeBtn.textContent = next;
+    themeBtn.setAttribute("aria-label", "Switch to " + next.toLowerCase() + " theme");
+  }
+
+  themeBtn.addEventListener("click", function () {
+    var next = currentTheme() === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("turbolay-theme", next); } catch (e) {}
+    labelTheme();
+  });
+
+  media.addEventListener("change", labelTheme);
+  labelTheme();
+
+  /* ------------------------------------------------------- shared utilities */
+
+  function h(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+
+  function button(label, cls) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn" + (cls ? " " + cls : "");
+    b.textContent = label;
+    return b;
+  }
+
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  function stat(key, tone) {
+    var d = h("div", "stat");
+    if (tone) d.setAttribute("data-tone", tone);
+    d.appendChild(h("span", "sk", key));
+    var v = h("span", "sv", "—");
+    d.appendChild(v);
+    d.valueNode = v;
+    return d;
+  }
+
+  function slider(labelText, min, max, val, step, unit, onInput) {
+    var wrap = h("span", "ctlbar");
+    wrap.style.margin = "0";
+    wrap.appendChild(h("span", "ctl-label", labelText));
+    var r = document.createElement("input");
+    r.type = "range";
+    r.min = min; r.max = max; r.value = val; r.step = step;
+    r.setAttribute("aria-label", labelText);
+    var out = h("span", "ctl-label", val + unit);
+    out.style.minWidth = "4.2em";
+    r.addEventListener("input", function () {
+      out.textContent = r.value + unit;
+      onInput(parseInt(r.value, 10));
+    });
+    wrap.appendChild(r);
+    wrap.appendChild(out);
+    wrap.rangeNode = r;
+    wrap.outNode = out;
+    return wrap;
+  }
+
+  function textField(labelText, value, size, onInput) {
+    var wrap = h("span", "ctlbar");
+    wrap.style.margin = "0";
+    wrap.appendChild(h("span", "ctl-label", labelText));
+    var i = document.createElement("input");
+    i.type = "text";
+    i.className = "field";
+    i.size = size;
+    i.value = value;
+    i.setAttribute("aria-label", labelText);
+    i.addEventListener("input", function () { onInput(i.value); });
+    wrap.appendChild(i);
+    wrap.inputNode = i;
+    return wrap;
+  }
+
+  function activate(id, staticSel, liveSel) {
+    var wrap = document.getElementById(id);
+    if (!wrap) return null;
+    var st = wrap.querySelector(staticSel);
+    var live = wrap.querySelector(liveSel);
+    if (!st || !live) return null;
+    st.hidden = true;
+    live.hidden = false;
+    return live;
+  }
+
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+
+  function pct(part, whole) {
+    if (!whole) return "0.0%";
+    return (100 * part / whole).toFixed(1) + "%";
+  }
+
+  /* ------------------------------------------------------ the frozen hash */
+  /* FNV-1a 64 over scope ++ 0x00 ++ cell_id ++ 0x00 ++ node_id.
+     Mirrors crates/placement/src/hash.rs exactly, in BigInt.
+     NUL is written as an escape, never as a literal byte in the source: an
+     HTML parser replaces a literal 0x00 with U+FFFD and breaks every hash. */
+
+  var MASK64 = 0xFFFFFFFFFFFFFFFFn;
+  var FNV_OFFSET = 0xcbf29ce484222325n;
+  var FNV_PRIME = 0x100000001b3n;
+  var encoder = new TextEncoder();
+  var NUL = "\u0000";   /* the 0x00 separator, written as an escape */
+
+  function fnv1a64(str) {
+    var hsh = FNV_OFFSET;
+    var bytes = encoder.encode(str);
+    for (var i = 0; i < bytes.length; i++) {
+      hsh ^= BigInt(bytes[i]);
+      hsh = (hsh * FNV_PRIME) & MASK64;
+    }
+    return hsh;
+  }
+
+  function score(scope, cellId, nodeId) {
+    return fnv1a64(scope + NUL + cellId + NUL + nodeId);
+  }
+
+  function rank(scope, cellId, live) {
+    return live.slice().sort(function (a, b) {
+      var sa = score(scope, cellId, a);
+      var sb = score(scope, cellId, b);
+      if (sa < sb) return 1;
+      if (sa > sb) return -1;
+      return a < b ? -1 : (a > b ? 1 : 0);
+    });
+  }
+
+  function owner(scope, cellId, live) {
+    var r = rank(scope, cellId, live);
+    return r.length ? r[0] : null;
+  }
+
+  function hex64(v) {
+    return "0x" + v.toString(16).padStart(16, "0");
+  }
+
+  /* -------------------------------------------------- naming and palettes */
+
+  var SCOPE = "acme/graphs/social";
+  var PALETTE = 12;
+
+  function machineName(i) { return "graph-node-" + i; }
+
+  function machines(n) {
+    var out = [];
+    for (var i = 0; i < n; i++) out.push(machineName(i));
+    return out;
+  }
+
+  function itemName(i) {
+    var s = String(i);
+    while (s.length < 3) s = "0" + s;
+    return "cell-" + s;
+  }
+
+  function colorFor(idx) { return "var(--m" + (idx % PALETTE) + ")"; }
+
+  /* Index of the rendezvous winner among machines(n). Ties -> lower name. */
+  function rvIndex(scope, item, ms) {
+    var best = 0;
+    var bs = score(scope, item, ms[0]);
+    for (var i = 1; i < ms.length; i++) {
+      var s2 = score(scope, item, ms[i]);
+      if (s2 > bs || (s2 === bs && ms[i] < ms[best])) { bs = s2; best = i; }
+    }
+    return best;
+  }
+
+  /* Index of the modulo winner: hash of the item key alone, mod machine count. */
+  function modIndex(scope, item, count) {
+    return Number(fnv1a64(scope + NUL + item) % BigInt(count));
+  }
+
+  function makeGrid(count) {
+    var g = h("div", "grid");
+    var squares = [];
+    for (var i = 0; i < count; i++) {
+      var sq = h("div", "sq");
+      g.appendChild(sq);
+      squares.push(sq);
+    }
+    g.squares = squares;
+    return g;
+  }
+
+  function paintGrid(grid, ownerIdx, movedFlags) {
+    for (var i = 0; i < grid.squares.length; i++) {
+      var sq = grid.squares[i];
+      sq.style.background = colorFor(ownerIdx[i]);
+      if (movedFlags && movedFlags[i]) sq.classList.add("moved");
+      else sq.classList.remove("moved");
+    }
+    if (movedFlags) grid.classList.add("marked");
+    else grid.classList.remove("marked");
+  }
+
+  function legendFor(n, mount) {
+    clear(mount);
+    for (var i = 0; i < n; i++) {
+      var sp = h("span");
+      var sw = h("i");
+      sw.style.background = colorFor(i);
+      sp.appendChild(sw);
+      sp.appendChild(document.createTextNode(machineName(i)));
+      mount.appendChild(sp);
+    }
+  }
+
+  /* ==================================================================== W1
+     Modulo vs rendezvous. Both owner maps are recomputed from the real hash
+     on every change, and the relocation counts are counted item by item. */
+
+  (function w1() {
+    var mount = activate("w1", ".w1-static", ".w1-live");
+    if (!mount) return;
+
+    var ITEM_COUNT = 240;
+    var items = [];
+    for (var i = 0; i < ITEM_COUNT; i++) items.push(itemName(i));
+
+    var st = { n: 3, prev: 3 };
+
+    function ownersMod(n) {
+      return items.map(function (it) { return modIndex(SCOPE, it, n); });
+    }
+
+    function ownersRv(n) {
+      var ms = machines(n);
+      return items.map(function (it) { return rvIndex(SCOPE, it, ms); });
+    }
+
+    var bar = h("div", "ctlbar");
+    var sl = slider("machines", 1, 12, st.n, 1, "", function (v) {
+      st.prev = st.n;
+      st.n = v;
+      render(true);
+    });
+    bar.appendChild(sl);
+
+    var preset = button("3 → 4 machines");
+    preset.addEventListener("click", function () {
+      st.prev = 3;
+      st.n = 4;
+      sl.rangeNode.value = "4";
+      sl.outNode.textContent = "4";
+      render(true);
+    });
+    bar.appendChild(preset);
+
+    var reset = button("reset to 3");
+    reset.addEventListener("click", function () {
+      st.prev = 3;
+      st.n = 3;
+      sl.rangeNode.value = "3";
+      sl.outNode.textContent = "3";
+      render(false);
+    });
+    bar.appendChild(reset);
+    mount.appendChild(bar);
+
+    var two = h("div", "two");
+
+    var pMod = h("div", "panel");
+    pMod.setAttribute("data-tone", "crit");
+    var hMod = h("div", "panel-h");
+    hMod.appendChild(h("span", null, "hash(item) % N"));
+    var vMod = h("span", "pv", "—");
+    hMod.appendChild(vMod);
+    pMod.appendChild(hMod);
+    var gMod = makeGrid(ITEM_COUNT);
+    pMod.appendChild(gMod);
+    two.appendChild(pMod);
+
+    var pRv = h("div", "panel");
+    pRv.setAttribute("data-tone", "ok");
+    var hRv = h("div", "panel-h");
+    hRv.appendChild(h("span", null, "rendezvous"));
+    var vRv = h("span", "pv", "—");
+    hRv.appendChild(vRv);
+    pRv.appendChild(hRv);
+    var gRv = makeGrid(ITEM_COUNT);
+    pRv.appendChild(gRv);
+    two.appendChild(pRv);
+
+    mount.appendChild(two);
+
+    var legend = h("div", "legend");
+    mount.appendChild(legend);
+
+    var stats = h("div", "stats");
+    var sMod = stat("modulo relocated", "crit");
+    var sRv = stat("rendezvous relocated", "ok");
+    var sUnexp = stat("moved with no cause", "accent");
+    var sWaste = stat("modulo overshoot");
+    [sMod, sRv, sUnexp, sWaste].forEach(function (x) { stats.appendChild(x); });
+    mount.appendChild(stats);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    function countMoved(a, b) {
+      var c = 0;
+      for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) c++;
+      return c;
+    }
+
+    function movedFlags(a, b) {
+      var f = [];
+      for (var i = 0; i < a.length; i++) f.push(a[i] !== b[i]);
+      return f;
+    }
+
+    function render(mark) {
+      var prevMod = ownersMod(st.prev);
+      var prevRv = ownersRv(st.prev);
+      var nowMod = ownersMod(st.n);
+      var nowRv = ownersRv(st.n);
+
+      var changed = st.prev !== st.n;
+      var fMod = (mark && changed) ? movedFlags(prevMod, nowMod) : null;
+      var fRv = (mark && changed) ? movedFlags(prevRv, nowRv) : null;
+
+      paintGrid(gMod, nowMod, fMod);
+      paintGrid(gRv, nowRv, fRv);
+      legendFor(st.n, legend);
+
+      var movedMod = countMoved(prevMod, nowMod);
+      var movedRv = countMoved(prevRv, nowRv);
+
+      /* An item is only allowed to move for one of two reasons: its old owner
+         left the fleet, or a machine that did not exist before now outscores
+         it. Anything else is a move between two machines that both survived,
+         and rendezvous must never produce one. */
+      var unexplained = 0;
+      if (changed) {
+        for (var j = 0; j < ITEM_COUNT; j++) {
+          if (prevRv[j] === nowRv[j]) continue;
+          if (prevRv[j] < st.n && nowRv[j] < st.prev) unexplained++;
+        }
+      }
+
+      /* The share an even fleet would move: the newcomers' share when growing,
+         the departers' share when shrinking. */
+      var evenShare;
+      if (st.n > st.prev) evenShare = ITEM_COUNT * (st.n - st.prev) / st.n;
+      else if (st.n < st.prev) evenShare = ITEM_COUNT * (st.prev - st.n) / st.prev;
+      else evenShare = 0;
+
+      vMod.textContent = changed ? movedMod + " moved" : "steady";
+      vRv.textContent = changed ? movedRv + " moved" : "steady";
+
+      sMod.valueNode.textContent = changed ? pct(movedMod, ITEM_COUNT) : "—";
+      sRv.valueNode.textContent = changed ? pct(movedRv, ITEM_COUNT) : "—";
+      sUnexp.valueNode.textContent = changed ? String(unexplained) : "—";
+      sWaste.valueNode.textContent = (changed && movedRv > 0)
+        ? (movedMod / movedRv).toFixed(1) + "×"
+        : "—";
+
+      var msg;
+      if (!changed) {
+        msg = "<b>" + st.n + " machines, " + ITEM_COUNT + " items.</b> Move the slider to change the " +
+          "fleet size; both panels then highlight exactly the items whose owner changed and dim the rest.";
+      } else {
+        msg = "<b>" + st.prev + " → " + st.n + " machines.</b> " +
+          "Modulo relocated <b class='bad'>" + movedMod + "</b> of " + ITEM_COUNT + " items (" +
+          pct(movedMod, ITEM_COUNT) + "). Rendezvous relocated <b class='good'>" + movedRv +
+          "</b> (" + pct(movedRv, ITEM_COUNT) + "); an evenly loaded fleet would have to move " +
+          Math.round(evenShare) + " (" + pct(evenShare, ITEM_COUNT) + ").";
+        msg += "<br>Items that changed hands between two machines that both survived: <b class='" +
+          (unexplained === 0 ? "good" : "bad") + "'>" + unexplained + "</b>. " +
+          "Under rendezvous every move has a cause — a machine left, or a new machine won the item. " +
+          "Modulo's extra " + Math.max(0, movedMod - movedRv) + " moves have neither.";
+        msg += "<br>Every figure here is counted item by item from the FNV-1a 64 hash, not read from a table.";
+      }
+      note.innerHTML = msg;
+    }
+
+    render(false);
+  })();
+
+  /* ==================================================================== W2
+     The score table for one item, plus the golden-value self-check. */
+
+  (function w2() {
+    var mount = activate("w2", ".w2-static", ".w2-live");
+    if (!mount) return;
+
+    var st = { scope: SCOPE, cell: "cell-b", n: 4 };
+
+    var bar1 = h("div", "ctlbar");
+    bar1.appendChild(textField("scope", st.scope, 22, function (v) { st.scope = v; render(); }));
+    bar1.appendChild(textField("item (cell)", st.cell, 10, function (v) { st.cell = v; render(); }));
+    mount.appendChild(bar1);
+
+    var bar2 = h("div", "ctlbar");
+    bar2.appendChild(slider("machines", 2, 10, st.n, 1, "", function (v) { st.n = v; render(); }));
+    mount.appendChild(bar2);
+
+    var tblWrap = h("div", "tablewrap");
+    tblWrap.style.margin = "0";
+    var tbl = document.createElement("table");
+    tbl.className = "scoretbl";
+    var thead = document.createElement("thead");
+    var hr = document.createElement("tr");
+    ["rank", "machine", "score (FNV-1a 64)", "relative magnitude", "verdict"].forEach(function (k) {
+      var th = document.createElement("th");
+      th.textContent = k;
+      hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+    tbl.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    tbl.appendChild(tbody);
+    tblWrap.appendChild(tbl);
+    mount.appendChild(tblWrap);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    /* -- golden self-check strip -- */
+
+    var GOLDEN = [
+      ["acme/graphs/social", "cell-a", "graph-node-0", "0xf0dc2317deb297c5"],
+      ["acme/graphs/social", "cell-a", "graph-node-1", "0xf0dc2217deb29612"],
+      ["acme/graphs/social", "cell-b", "graph-node-0", "0x39ffe3dd3cc79ffe"],
+      ["acme/graphs/other", "cell-a", "graph-node-0", "0xc15e57802a479f04"]
+    ];
+
+    var lamps = h("div", "lamps");
+    var allMatch = true;
+    GOLDEN.forEach(function (g) {
+      var got = hex64(score(g[0], g[1], g[2]));
+      var ok = got === g[3];
+      if (!ok) allMatch = false;
+      var l = h("div", "lamp");
+      l.setAttribute("data-on", ok ? "ok" : "crit");
+      l.appendChild(h("span", "bulb"));
+      var txt = h("div");
+      txt.appendChild(h("span", "lk", g[1] + " / " + g[2].replace("graph-node-", "node ") + " / " + g[0].split("/").pop()));
+      txt.appendChild(h("span", "lv", (ok ? "MATCH  " : "DIVERGED  ") + got));
+      l.appendChild(txt);
+      lamps.appendChild(l);
+    });
+    mount.appendChild(lamps);
+
+    var goldNote = h("div", "readout");
+    goldNote.innerHTML = allMatch
+      ? "<b class='good'>All four pinned values reproduce.</b> These are the constants asserted by " +
+        "<b>scores_are_frozen</b> in crates/placement/src/hash.rs. This page and the Rust test agree " +
+        "byte for byte — which is the property that keeps two versions of the same fleet from " +
+        "splitting into two views of who owns an item."
+      : "<b class='bad'>Divergence.</b> This page and the pinned test values disagree, which is exactly " +
+        "the failure a frozen wire format exists to prevent.";
+    mount.appendChild(goldNote);
+
+    var TWO64 = Math.pow(2, 64);
+
+    function render() {
+      var ms = machines(st.n);
+      var ranked = rank(st.scope, st.cell, ms);
+      var win = ranked[0];
+
+      clear(tbody);
+      ranked.forEach(function (n, i) {
+        var tr = document.createElement("tr");
+        if (n === win) tr.className = "win";
+        var sc = score(st.scope, st.cell, n);
+        [String(i + 1), n, hex64(sc)].forEach(function (v) {
+          var td = document.createElement("td");
+          td.textContent = v;
+          tr.appendChild(td);
+        });
+        var barTd = document.createElement("td");
+        barTd.className = "bar-td";
+        var b = h("span", "bar");
+        b.style.width = Math.max(2, (Number(sc) / TWO64) * 100).toFixed(2) + "%";
+        barTd.appendChild(b);
+        tr.appendChild(barTd);
+        var vt = document.createElement("td");
+        vt.textContent = n === win ? "OWNER" : (i === 1 ? "next in line" : "not the owner");
+        tr.appendChild(vt);
+        tbody.appendChild(tr);
+      });
+
+      var lexFirst = ms.slice().sort()[0];
+      note.innerHTML = "<b>owner(" + escapeHtml(st.scope) + ", " + escapeHtml(st.cell) +
+        ") = <span class='good'>" + escapeHtml(win) + "</span></b>" +
+        "<br>" + st.n + " machines scored, sorted descending, ties broken by machine name ascending." +
+        "<br>The winner is " + (win === lexFirst
+          ? "<span class='warn'>also the lexically first machine here — a coincidence of this item, not a rule</span>"
+          : "not the lexically first machine; names carry no weight in the ordering") + ".";
+    }
+
+    render();
+  })();
+
+  /* ==================================================================== W3
+     Kill a machine. Counts the items that moved and splits them into
+     "owned by a machine you killed" and "moved for any other reason". */
+
+  (function w3() {
+    var mount = activate("w3", ".w3-static", ".w3-live");
+    if (!mount) return;
+
+    var N = 6;
+    var ITEM_COUNT = 150;
+    var items = [];
+    for (var i = 0; i < ITEM_COUNT; i++) items.push(itemName(i));
+
+    var all = machines(N);
+    var dead = {};
+    all.forEach(function (m) { dead[m] = false; });
+
+    var prevRv = null;
+    var prevMod = null;
+    var lastChanged = null;
+
+    function liveList() {
+      return all.filter(function (m) { return !dead[m]; });
+    }
+
+    function ownersRv(live) {
+      if (!live.length) return items.map(function () { return -1; });
+      return items.map(function (it) { return all.indexOf(live[rvIndex(SCOPE, it, live)]); });
+    }
+
+    function ownersMod(live) {
+      if (!live.length) return items.map(function () { return -1; });
+      return items.map(function (it) { return all.indexOf(live[modIndex(SCOPE, it, live.length)]); });
+    }
+
+    var bar = h("div", "ctlbar");
+    bar.appendChild(h("span", "ctl-label", "machines"));
+    var chips = h("div", "chips");
+    var chipEls = {};
+    all.forEach(function (m, idx) {
+      var c = document.createElement("button");
+      c.type = "button";
+      c.className = "nodechip";
+      c.setAttribute("aria-pressed", "true");
+      var sw = h("i", "sw");
+      sw.style.background = colorFor(idx);
+      c.appendChild(sw);
+      c.appendChild(document.createTextNode(m));
+      c.addEventListener("click", function () {
+        dead[m] = !dead[m];
+        c.setAttribute("aria-pressed", dead[m] ? "false" : "true");
+        lastChanged = m;
+        render();
+      });
+      chipEls[m] = c;
+      chips.appendChild(c);
+    });
+    bar.appendChild(chips);
+    mount.appendChild(bar);
+
+    var bar2 = h("div", "ctlbar");
+    var restore = button("restore all");
+    restore.addEventListener("click", function () {
+      all.forEach(function (m) {
+        dead[m] = false;
+        chipEls[m].setAttribute("aria-pressed", "true");
+      });
+      lastChanged = null;
+      render();
+    });
+    bar2.appendChild(restore);
+    mount.appendChild(bar2);
+
+    var two = h("div", "two");
+
+    var pRv = h("div", "panel");
+    pRv.setAttribute("data-tone", "ok");
+    var hRv = h("div", "panel-h");
+    hRv.appendChild(h("span", null, "rendezvous"));
+    var vRv = h("span", "pv", "—");
+    hRv.appendChild(vRv);
+    pRv.appendChild(hRv);
+    var gRv = makeGrid(ITEM_COUNT);
+    pRv.appendChild(gRv);
+    two.appendChild(pRv);
+
+    var pMod = h("div", "panel");
+    pMod.setAttribute("data-tone", "crit");
+    var hMod = h("div", "panel-h");
+    hMod.appendChild(h("span", null, "hash(item) % live_count"));
+    var vMod = h("span", "pv", "—");
+    hMod.appendChild(vMod);
+    pMod.appendChild(hMod);
+    var gMod = makeGrid(ITEM_COUNT);
+    pMod.appendChild(gMod);
+    two.appendChild(pMod);
+
+    mount.appendChild(two);
+
+    var stats = h("div", "stats");
+    var sMovedRv = stat("rendezvous moved", "ok");
+    var sOrphan = stat("were the dead machine's");
+    var sCollateral = stat("moved for other reasons", "accent");
+    var sMovedMod = stat("modulo moved", "crit");
+    [sMovedRv, sOrphan, sCollateral, sMovedMod].forEach(function (x) { stats.appendChild(x); });
+    mount.appendChild(stats);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    function render() {
+      var live = liveList();
+      var nowRv = ownersRv(live);
+      var nowMod = ownersMod(live);
+
+      var fRv = null, fMod = null;
+      var movedRv = 0, movedMod = 0, orphan = 0, collateral = 0;
+
+      if (prevRv) {
+        fRv = []; fMod = [];
+        for (var i = 0; i < ITEM_COUNT; i++) {
+          var mv = prevRv[i] !== nowRv[i];
+          fRv.push(mv);
+          if (mv) {
+            movedRv++;
+            var was = prevRv[i] >= 0 ? all[prevRv[i]] : null;
+            if (was === null || dead[was]) orphan++;
+            else collateral++;
+          }
+          var mv2 = prevMod[i] !== nowMod[i];
+          fMod.push(mv2);
+          if (mv2) movedMod++;
+        }
+      }
+
+      paintGrid(gRv, nowRv.map(function (x) { return x < 0 ? 0 : x; }), fRv);
+      paintGrid(gMod, nowMod.map(function (x) { return x < 0 ? 0 : x; }), fMod);
+
+      vRv.textContent = prevRv ? movedRv + " moved" : "baseline";
+      vMod.textContent = prevRv ? movedMod + " moved" : "baseline";
+
+      sMovedRv.valueNode.textContent = prevRv ? pct(movedRv, ITEM_COUNT) : "—";
+      sOrphan.valueNode.textContent = prevRv ? String(orphan) : "—";
+      sCollateral.valueNode.textContent = prevRv ? String(collateral) : "—";
+      sMovedMod.valueNode.textContent = prevRv ? pct(movedMod, ITEM_COUNT) : "—";
+
+      var msg;
+      if (!live.length) {
+        msg = "<b>No machine is live.</b> There is no owner to compute — the argmax over an " +
+          "empty set is undefined, and the repo's <code>owner()</code> returns none rather than " +
+          "inventing one.";
+      } else if (!prevRv) {
+        msg = "<b>Baseline: " + live.length + " machines, " + ITEM_COUNT + " items.</b> " +
+          "Click a machine chip to kill it.";
+      } else {
+        msg = "<b>" + (lastChanged ? (dead[lastChanged] ? "Killed " : "Restored ") + lastChanged : "Fleet restored") +
+          ".</b> Live: " + live.length + " of " + N + ".";
+        msg += "<br>Rendezvous moved <b class='good'>" + movedRv + "</b> of " + ITEM_COUNT +
+          " items. Of those, <b>" + orphan + "</b> had no surviving owner and had to move; " +
+          "<b class='" + (collateral === 0 ? "good" : "bad") + "'>" + collateral +
+          "</b> moved for any other reason.";
+        msg += "<br>The same change under <code>hash % live_count</code> moved <b class='bad'>" +
+          movedMod + "</b> items (" + pct(movedMod, ITEM_COUNT) + ").";
+      }
+      note.innerHTML = msg;
+
+      prevRv = nowRv;
+      prevMod = nowMod;
+    }
+
+    render();
+  })();
+
+  /* ==================================================================== W4
+     Top-K replicas, driven by the same ranking as W2. */
+
+  (function w4() {
+    var mount = activate("w4", ".w4-static", ".w4-live");
+    if (!mount) return;
+
+    var N = 6;
+    var all = machines(N);
+    var st = { cell: "cell-b", k: 3, dead: {} };
+    all.forEach(function (m) { st.dead[m] = false; });
+    var previousSet = null;
+    var lastEvent = null;
+
+    var bar = h("div", "ctlbar");
+    bar.appendChild(textField("item (cell)", st.cell, 10, function (v) {
+      st.cell = v;
+      previousSet = null;
+      lastEvent = null;
+      render();
+    }));
+    bar.appendChild(slider("K", 1, 5, st.k, 1, "", function (v) {
+      st.k = v;
+      previousSet = null;
+      lastEvent = null;
+      render();
+    }));
+    mount.appendChild(bar);
+
+    var bar2 = h("div", "ctlbar");
+    var failBtn = button("fail the primary", "danger");
+    failBtn.addEventListener("click", function () {
+      var live = all.filter(function (m) { return !st.dead[m]; });
+      if (live.length <= 1) return;
+      var r = rank(SCOPE, st.cell, live);
+      previousSet = r.slice(0, st.k);
+      st.dead[r[0]] = true;
+      lastEvent = r[0];
+      render();
+    });
+    bar2.appendChild(failBtn);
+
+    var restore = button("restore all");
+    restore.addEventListener("click", function () {
+      all.forEach(function (m) { st.dead[m] = false; });
+      previousSet = null;
+      lastEvent = null;
+      render();
+    });
+    bar2.appendChild(restore);
+    mount.appendChild(bar2);
+
+    var tblWrap = h("div", "tablewrap");
+    tblWrap.style.margin = "0";
+    var tbl = document.createElement("table");
+    tbl.className = "scoretbl";
+    var thead = document.createElement("thead");
+    var hr = document.createElement("tr");
+    ["rank", "machine", "score", "role", "state"].forEach(function (k) {
+      var th = document.createElement("th");
+      th.textContent = k;
+      hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+    tbl.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    tbl.appendChild(tbody);
+    tblWrap.appendChild(tbl);
+    mount.appendChild(tblWrap);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    function render() {
+      var live = all.filter(function (m) { return !st.dead[m]; });
+      var ranked = rank(SCOPE, st.cell, live);
+      var replicaSet = ranked.slice(0, st.k);
+      var fullOrder = rank(SCOPE, st.cell, all);
+
+      clear(tbody);
+      fullOrder.forEach(function (m) {
+        var tr = document.createElement("tr");
+        var isDead = st.dead[m];
+        var pos = ranked.indexOf(m);
+        if (isDead) tr.className = "dead";
+        else if (pos === 0) tr.className = "win";
+        else if (pos > 0 && pos < st.k) tr.className = "rep";
+
+        var role;
+        if (isDead) role = "—";
+        else if (pos === 0) role = "PRIMARY";
+        else if (pos < st.k) role = "REPLICA " + pos;
+        else role = "spare";
+
+        [isDead ? "—" : String(pos + 1), m, hex64(score(SCOPE, st.cell, m)), role,
+          isDead ? "failed" : "live"].forEach(function (v) {
+          var td = document.createElement("td");
+          td.textContent = v;
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+
+      var msg = "<b>K = " + st.k + "</b> — replica set: " +
+        (replicaSet.length ? replicaSet.join(", ") : "none, no machine is live") + ".";
+      if (previousSet && lastEvent) {
+        var kept = replicaSet.filter(function (m) { return previousSet.indexOf(m) >= 0; });
+        var joined = replicaSet.filter(function (m) { return previousSet.indexOf(m) < 0; });
+        msg += "<br><b>" + lastEvent + " failed.</b> <b class='good'>" + kept.length +
+          "</b> of the previous " + previousSet.length + " replicas kept their place" +
+          (joined.length ? "; <b class='warn'>" + joined.join(", ") + "</b> joined at the bottom" : "") + ".";
+        msg += "<br>Nothing enforces that. It is what independent scores over a shrinking set do.";
+      } else {
+        msg += "<br>The primary is the top of the ranking; the replicas are the rest of the prefix. " +
+          "Press <b>fail the primary</b> to watch the prefix shift by exactly one.";
+      }
+      note.innerHTML = msg;
+
+      failBtn.disabled = live.length <= 1;
+    }
+
+    render();
+  })();
+
+  /* ==================================================================== W5
+     Distribution histogram. Counts are computed, not modelled. */
+
+  (function w5() {
+    var mount = activate("w5", ".w5-static", ".w5-live");
+    if (!mount) return;
+
+    /* Two naming schemes over the same machines. The first is the repo's, where
+       ids differ only in a trailing digit; the second gives ids that differ
+       throughout. Nothing else about the computation changes. */
+    var TREES = ["alder", "birch", "cedar", "dogwood", "elm", "fir",
+                 "ginkgo", "hazel", "ironwood", "juniper", "katsura", "larch"];
+
+    var st = { items: 24, machinesN: 6, distinct: true };
+    var pending = false;
+
+    function fleet() {
+      return st.distinct ? TREES.slice(0, st.machinesN) : machines(st.machinesN);
+    }
+
+    var bar = h("div", "ctlbar");
+    bar.appendChild(slider("items", 6, 1200, st.items, 2, "", function (v) {
+      st.items = v;
+      schedule();
+    }));
+    bar.appendChild(slider("machines", 2, 12, st.machinesN, 1, "", function (v) {
+      st.machinesN = v;
+      schedule();
+    }));
+    mount.appendChild(bar);
+
+    var bar2 = h("div", "ctlbar");
+    bar2.appendChild(h("span", "ctl-label", "machine ids"));
+    var nameBtn = button("distinct names");
+    nameBtn.setAttribute("aria-pressed", "true");
+    var repoBtn = button("graph-node-N");
+    repoBtn.setAttribute("aria-pressed", "false");
+    function setNaming(distinct) {
+      st.distinct = distinct;
+      nameBtn.setAttribute("aria-pressed", distinct ? "true" : "false");
+      repoBtn.setAttribute("aria-pressed", distinct ? "false" : "true");
+      schedule();
+    }
+    nameBtn.addEventListener("click", function () { setNaming(true); });
+    repoBtn.addEventListener("click", function () { setNaming(false); });
+    bar2.appendChild(nameBtn);
+    bar2.appendChild(repoBtn);
+    mount.appendChild(bar2);
+
+    var bars = h("div", "hbars");
+    mount.appendChild(bars);
+
+    var stats = h("div", "stats");
+    var sIdeal = stat("even share", "accent");
+    var sMax = stat("busiest machine", "crit");
+    var sMin = stat("emptiest machine", "ok");
+    var sSpread = stat("busiest / emptiest");
+    [sIdeal, sMax, sMin, sSpread].forEach(function (x) { stats.appendChild(x); });
+    mount.appendChild(stats);
+
+    var note = h("div", "readout");
+    mount.appendChild(note);
+
+    function schedule() {
+      if (pending) return;
+      pending = true;
+      window.requestAnimationFrame(function () {
+        pending = false;
+        render();
+      });
+    }
+
+    function render() {
+      var ms = fleet();
+      var counts = new Array(st.machinesN).fill(0);
+      for (var i = 0; i < st.items; i++) {
+        counts[rvIndex(SCOPE, itemName(i), ms)]++;
+      }
+
+      var max = Math.max.apply(null, counts);
+      var min = Math.min.apply(null, counts);
+      var ideal = st.items / st.machinesN;
+
+      clear(bars);
+      counts.forEach(function (c, idx) {
+        var row = h("div", "hbar");
+        row.appendChild(h("span", null, ms[idx]));
+        var track = h("div", "track");
+        var fill = h("span", "fill");
+        fill.style.width = max ? (100 * c / max).toFixed(2) + "%" : "0%";
+        fill.style.background = colorFor(idx);
+        track.appendChild(fill);
+        var mark = h("span", "ideal");
+        mark.style.left = max ? (100 * ideal / max).toFixed(2) + "%" : "0%";
+        track.appendChild(mark);
+        row.appendChild(track);
+        var num = h("span", "num", String(c));
+        row.appendChild(num);
+        bars.appendChild(row);
+      });
+
+      sIdeal.valueNode.textContent = ideal.toFixed(1);
+      sMax.valueNode.textContent = String(max);
+      sMin.valueNode.textContent = String(min);
+      sSpread.valueNode.textContent = min > 0 ? (max / min).toFixed(2) + "×" : "∞";
+
+      var overshoot = ideal > 0 ? (100 * (max - ideal) / ideal) : 0;
+      var ratio = min > 0 ? max / min : Infinity;
+      var perMachine = st.items / st.machinesN;
+
+      var msg = "<b>" + st.items + " items over " + st.machinesN + " machines, ids " +
+        (st.distinct ? "differing throughout" : "differing only in a trailing digit") + ".</b> " +
+        "Even share would be " + ideal.toFixed(1) + " each. The busiest machine holds " + max +
+        " — <b class='" + (overshoot > 25 ? "bad" : "good") + "'>" +
+        (overshoot >= 0 ? "+" : "") + overshoot.toFixed(1) + "%</b> against even, and the " +
+        "busiest-to-emptiest ratio is <b>" + (min > 0 ? ratio.toFixed(2) + ":1" : "unbounded — a machine holds nothing") +
+        "</b>. The thin line in each bar marks the even share.";
+
+      if (perMachine < 40) {
+        msg += "<br><span class='warn'>Few items per machine.</span> Most of this spread is " +
+          "ordinary sampling noise — independent draws, not a defect — and it shrinks as you add " +
+          "items. It is why a system with few items should not lean on statistical balance at all.";
+      } else if (!st.distinct) {
+        msg += "<br><span class='bad'>Systematic skew, and adding items will not fix it.</span> All " +
+          st.machinesN + " ids share every byte but the last, so their scores agree in the high " +
+          "bits and the winner is decided by a few low bits of the key hash. That is a small fixed " +
+          "number of equally likely patterns divided among " + st.machinesN + " machines: unless " +
+          "the count divides them evenly, some machines win twice as often, forever.";
+      } else {
+        msg += "<br><span class='warn'>Sampling noise is small at this item count, and the spread " +
+          "has stopped shrinking.</span> What is left is not randomness — it is FNV-1a failing to " +
+          "spread the machine id across all 64 bits. Rendezvous converges on even only with a hash " +
+          "that avalanches; this one does not.";
+      }
+      note.innerHTML = msg;
+    }
+
+    render();
+  })();
+
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,301 @@
+{
+  "$schema": "http://json-schema.org/schema#",
+  "type": "object",
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "digest": {
+          "type": "string",
+          "pattern": "^$|^sha256:[0-9a-f]{64}$"
+        },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] },
+        "pullSecrets": { "type": "array" }
+      }
+    },
+    "objectStore": {
+      "type": "object",
+      "required": ["cloudProvider", "aws"],
+      "properties": {
+        "cloudProvider": { "type": "string", "minLength": 1 },
+        "aws": {
+          "type": "object",
+          "required": ["bucketName", "region"],
+          "properties": {
+            "bucketName": { "type": "string", "minLength": 1 },
+            "region": { "type": "string", "minLength": 1 },
+            "allowHttp": { "type": "boolean" },
+            "endpoint": { "type": "string" },
+            "endpointEgressTo": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/networkPolicyPeer" }
+            }
+          }
+        }
+      }
+    },
+    "graph": {
+      "type": "object",
+      "required": ["namespace", "graphId", "database", "cells", "dataPath"],
+      "properties": {
+        "namespace": { "type": "string", "minLength": 1 },
+        "graphId": { "type": "string", "minLength": 1 },
+        "database": { "type": "string", "minLength": 1 },
+        "cells": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "dataPath": { "type": "string", "minLength": 1 }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "properties": {
+        "existingSecret": { "type": "string" },
+        "secretKey": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "create": { "type": "boolean" },
+        "token": { "type": "string", "pattern": "^$|^.{32,}$" },
+        "preserveGeneratedToken": { "type": "boolean" },
+        "externalSecret": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "targetSecretName": { "type": "string" },
+            "refreshInterval": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "properties": {
+        "public": {
+          "type": "object",
+          "required": ["enabled", "secretName"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "secretName": { "type": "string" },
+            "additionalDnsNames": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "trustBundle": {
+              "type": "object",
+              "required": ["enabled", "sourceSecretKey", "namespaceSelector"],
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "name": { "type": "string" },
+                "sourceSecretName": { "type": "string" },
+                "sourceSecretKey": { "type": "string", "minLength": 1 },
+                "namespaceSelector": { "type": "object" }
+              }
+            }
+          }
+        },
+        "certManager": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "node": { "$ref": "#/definitions/workload" },
+    "indexer": { "$ref": "#/definitions/indexerWorkload" },
+    "service": {
+      "type": "object",
+      "properties": {
+        "advertisedBoltAddress": { "type": "string" },
+        "bolt": { "$ref": "#/definitions/service" },
+        "https": { "$ref": "#/definitions/service" },
+        "adminPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "clientIngressFrom": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/networkPolicyPeer" }
+        },
+        "httpsEgressTo": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/networkPolicyPeer" }
+        },
+        "monitoringNamespaceSelector": { "$ref": "#/definitions/labelSelector" },
+        "additionalEgress": { "type": "array" }
+      }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "properties": { "enabled": { "type": "boolean" } }
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "rustLog": { "type": "string" },
+        "maxOpenScopes": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "maxConcurrentQueries": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxQueryScanEdges": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxQueryRuntimeMs": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxServerCursors": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "maxCursorBufferBytes": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "cursorTtlMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "maxBoltConnections": { "$ref": "#/definitions/unsignedDecimal" },
+        "defaultPageSize": { "$ref": "#/definitions/unsignedDecimal" },
+        "gracefulShutdownMs": { "$ref": "#/definitions/unsignedDecimal" },
+        "l0SstSizeBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxUnflushedBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxWalFlushesBeforeL0Flush": { "$ref": "#/definitions/unsignedDecimal" },
+        "l0FlushParallelism": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxMatrixAdjacencies": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxMatrixAdjacencyBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxGraphblasMatrices": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxGraphblasBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxRelationshipRowsBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxSourceRelationshipRowsBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxRelationshipPropertyRowsBytes": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxConcurrentHydrations": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxConcurrentMatrixCompilations": { "$ref": "#/definitions/unsignedDecimal" },
+        "indexDiscoveryIntervalMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "trimMemoryAfterHydration": { "type": "boolean" }
+      }
+    },
+    "extraObjects": { "type": "array" }
+  },
+  "required": ["image", "objectStore", "graph", "auth", "tls", "node", "indexer", "service"],
+  "definitions": {
+    "workload": {
+      "type": "object",
+      "required": ["replicaCount", "cache", "resources"],
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "resources": { "type": "object" },
+        "cache": {
+          "type": "object",
+          "required": ["type", "memoryLimitBytes", "emptyDir", "persistentVolume"],
+          "properties": {
+            "type": { "enum": ["emptyDir", "persistentVolume"] },
+            "memoryLimitBytes": { "$ref": "#/definitions/unsignedDecimal" },
+            "emptyDir": { "type": "object" },
+            "persistentVolume": { "type": "object" }
+          }
+        }
+      }
+    },
+    "indexerWorkload": {
+      "type": "object",
+      "required": ["enabled", "replicaCount", "intervalMs", "retainPreviousGenerations", "resources", "serviceAccount"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "replicaCount": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "intervalMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "retainPreviousGenerations": { "$ref": "#/definitions/unsignedDecimal" },
+        "resources": { "type": "object" },
+        "serviceAccount": { "type": "object" },
+        "podAnnotations": { "type": "object" },
+        "podLabels": { "type": "object" },
+        "priorityClassName": { "type": "string" },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
+        "affinity": { "type": "object" },
+        "topologySpreadConstraints": { "type": "array" },
+        "tolerations": { "type": "array" },
+        "nodeSelector": { "type": "object" },
+        "extraEnv": { "type": "array" }
+      }
+    },
+    "service": {
+      "type": "object",
+      "required": ["type", "port"],
+      "properties": {
+        "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "annotations": { "type": "object" },
+        "loadBalancerSourceRanges": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "labelSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "matchLabels": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "type": "string" }
+        },
+        "matchExpressions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "object", "minProperties": 1 }
+        }
+      },
+      "anyOf": [
+        { "required": ["matchLabels"] },
+        { "required": ["matchExpressions"] }
+      ]
+    },
+    "networkPolicyPeer": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "ipBlock": {
+          "type": "object",
+          "required": ["cidr"],
+          "additionalProperties": false,
+          "properties": {
+            "cidr": { "type": "string", "minLength": 1 },
+            "except": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "namespaceSelector": { "$ref": "#/definitions/labelSelector" },
+        "podSelector": { "$ref": "#/definitions/labelSelector" }
+      },
+      "anyOf": [
+        { "required": ["ipBlock"] },
+        { "required": ["namespaceSelector"] },
+        { "required": ["podSelector"] }
+      ]
+    },
+    "unsignedDecimal": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        }
+      ]
+    },
+    "positiveUnsignedDecimal": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        {
+          "type": "string",
+          "pattern": "^0*[1-9][0-9]*$"
+        }
+      ]
+    }
+  }
+}

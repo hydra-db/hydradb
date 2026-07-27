@@ -1,0 +1,196 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "turbolay.fullname" . }}-node
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  serviceName: {{ include "turbolay.fullname" . }}-node-headless
+  replicas: {{ .Values.node.replicaCount }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: {{ .Values.node.updateStrategy }}
+  selector:
+    matchLabels:
+      {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 8 }}
+        {{- with .Values.node.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/runtime-config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        secret.reloader.stakater.com/reload: {{ printf "%s,%s" (include "turbolay.authSecretName" .) (include "turbolay.publicTlsSecretName" .) | quote }}
+        {{- with .Values.node.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "turbolay.nodeServiceAccountName" . }}
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: {{ .Values.node.terminationGracePeriodSeconds }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.node.affinity }}
+      affinity:
+        {{- toYaml .Values.node.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 20 }}
+      {{- end }}
+      {{- if .Values.node.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.node.topologySpreadConstraints | nindent 8 }}
+      {{- else }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "turbolay.componentLabels" (dict "root" . "component" "node") | nindent 14 }}
+      {{- end }}
+      containers:
+        - name: graph-node
+          image: {{ include "turbolay.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "turbolay.fullname" . }}-runtime
+          env:
+            - name: GRAPH_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- with .Values.node.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: bolt
+              containerPort: 7687
+            - name: https
+              containerPort: 8443
+            - name: admin
+              containerPort: 9090
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: admin
+            failureThreshold: 60
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
+          resources:
+            {{- toYaml .Values.node.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/slatedb
+            - name: tmp
+              mountPath: /tmp
+            - name: auth
+              mountPath: /var/run/secrets/turbolay
+              readOnly: true
+            {{- if .Values.tls.public.enabled }}
+            - name: public-tls
+              mountPath: /var/run/secrets/turbolay/public
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if eq .Values.node.cache.type "emptyDir" }}
+        - name: cache
+          emptyDir:
+            {{- with .Values.node.cache.emptyDir.medium }}
+            medium: {{ . | quote }}
+            {{- end }}
+            sizeLimit: {{ .Values.node.cache.emptyDir.sizeLimit }}
+        {{- end }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.node.tmpSizeLimit }}
+        - name: auth
+          secret:
+            secretName: {{ include "turbolay.authSecretName" . }}
+            items:
+              - key: {{ .Values.auth.secretKey }}
+                path: {{ .Values.auth.secretKey }}
+        {{- if .Values.tls.public.enabled }}
+        - name: public-tls
+          secret:
+            secretName: {{ include "turbolay.publicTlsSecretName" . }}
+        {{- end }}
+  {{- if eq .Values.node.cache.type "persistentVolume" }}
+  volumeClaimTemplates:
+    - metadata:
+        name: cache
+        {{- with .Values.node.cache.persistentVolume.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.node.cache.persistentVolume.accessModes | nindent 10 }}
+        {{- with .Values.node.cache.persistentVolume.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.node.cache.persistentVolume.size }}
+  {{- end }}

@@ -1,0 +1,44 @@
+objectStore:
+  aws:
+    bucketName: graph-development
+    region: us-east-1
+    allowHttp: true
+    endpoint: http://minio.minio.svc.cluster.local:9000
+    endpointEgressTo:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: minio
+
+auth:
+  token: development-only-token-with-at-least-32-characters
+
+tls:
+  public:
+    enabled: false
+
+node:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  cache:
+    memoryLimitBytes: 268435456
+    emptyDir:
+      sizeLimit: 2Gi
+
+networkPolicy:
+  # Adjust this to the private CIDR used by the cluster's Kubernetes API endpoint.
+  httpsEgressTo:
+    - ipBlock:
+        cidr: 10.0.0.0/8
+
+podDisruptionBudget:
+  enabled: false
+
+service:
+  bolt:
+    type: NodePort

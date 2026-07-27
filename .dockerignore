@@ -1,0 +1,10 @@
+.git
+.cargo/config.toml
+.github
+.idea
+.vscode
+target
+*.csv
+*.log
+*.svg
+*.txt

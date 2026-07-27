@@ -1,0 +1,240 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Compute Node Can Disappear · TurboLay Conceptual Guide</title>
+<link rel="stylesheet" href="../assets/textbook.css">
+
+<div class="tb-progress"></div>
+
+<header class="tb-header">
+  <a class="tb-home" href="../index.html">Turbo<span>Lay</span> · Interactive</a>
+  <span class="tb-crumb">A Conceptual Guide</span>
+  <span class="tb-crumb">The Architecture</span>
+  <span class="tb-spacer"></span>
+  <button class="tb-theme-toggle" type="button">☾ Dark</button>
+</header>
+
+<main class="tb-main">
+  <div class="tb-chapter-kicker">Chapter 0 · The Architecture</div>
+  <h1>The Compute Node Can Disappear</h1>
+
+  <p>A graph server has just failed. Its memory is gone. Its local SSD may be gone.
+  The replacement process starts with an empty <span class="concept" data-concept="heap">heap</span> and an empty
+  <span class="concept" data-concept="heap">cache</span>. What must still exist for the graph to be the same graph?</p>
+
+  <p>TurboLay answers with a hard boundary: the <span class="concept" data-concept="object-store">object store</span> holds durable
+  truth; the compute node holds ways to reach it quickly.</p>
+
+  <div class="boxeq">
+    <strong>The graph survives the machine. Memory and local disk make it faster, but
+    they do not make it true.</strong>
+  </div>
+
+  <figure>
+    <div class="tb-widget" id="w-replaceable"></div>
+    <figcaption>Fig. 0.1 — Memory and local disk make the graph faster, not true: a replacement node
+      rebuilds the same logical state from the same object-store path.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Play with it: kill the node, watch the graph survive<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>The widget above is the whole chapter in one gesture. Node <strong>A</strong> is serving reads and
+      holds the writer role. Press <em>Kill node A</em> and everything in its box — heap, warm caches,
+      in-flight work — vanishes. Press <em>Start replacement A′</em> and a cold process re-opens the
+      <em>same</em> object-store path. The edges, epochs, and index generations flow back up from
+      <span class="concept" data-concept="slatedb">SlateDB</span>; the graph it serves is byte-for-byte the same one.
+      Notice what the crash actually cost: cache warmth and in-flight work, never a fact.</p>
+    </div>
+  </details>
+
+  <p>Read the picture top-down. The two compute nodes are interchangeable: when node A
+  dies, node A′ starts with a cold heap and re-opens the <em>same</em> object-store path, so
+  the graph it serves is identical. The crash costs cache warmth and in-flight work,
+  never a fact.</p>
+
+  <h2>The one-sentence architecture</h2>
+
+  <p>TurboLay is an object-store-backed graph kernel that partitions a graph into
+  <span class="concept" data-concept="cell">cells</span>, admits at most one writer per cell — a guarantee SlateDB's own manifest
+  <span class="concept" data-concept="fencing">fencing</span> enforces, not a lock TurboLay holds — and accelerates snapshot reads
+  with durable <span class="concept" data-concept="index-generation">index generations</span> plus disposable compute-local caches.</p>
+
+  <p>That sentence has four load-bearing nouns:</p>
+
+  <ul>
+    <li><strong>Object store</strong> — the durable home of <span class="concept" data-concept="slatedb">SlateDB</span> state.</li>
+    <li><strong>Cell</strong> — the unit of storage path and write ownership.</li>
+    <li><strong>Epoch</strong> — the version named by a mutation or a snapshot read; concretely, a
+      <span class="concept" data-concept="sequence-number">SlateDB storage sequence number</span>.</li>
+    <li><strong>Index generation</strong> — derived query structure, immutable and rebuilt out of
+      process, built from canonical edges alone.</li>
+  </ul>
+
+  <figure>
+    <div class="tb-table-wrap">
+      <table>
+        <thead><tr><th>Clients</th><th>Compute</th><th>Durable storage</th></tr></thead>
+        <tbody>
+          <tr><td><span class="concept" data-concept="cypher">Cypher</span> and graph APIs</td><td>parser, planner, traversal</td><td>SlateDB on S3</td></tr>
+          <tr><td>query legs</td><td>matrix and <span class="concept" data-concept="graphblas">GraphBLAS</span> caches</td><td>edges, epochs, index generations</td></tr>
+          <tr><td>writes</td><td>writer lanes and writer promotion</td><td>manifest fencing, idempotency</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <figcaption>Tab. 0.1 — The object store owns durable state; compute owns execution and acceleration.</figcaption>
+  </figure>
+
+  <h2>Two cache layers, neither authoritative</h2>
+
+  <p>SlateDB can place fetched object-store data in a local disk cache. Above it,
+  <code>GraphShard</code> maintains graph-aware memory caches: matrix artifacts, hydrated
+  <span class="concept" data-concept="adjacency">adjacency</span>, compiled GraphBLAS matrices, parsed row queries, and relationship-row
+  caches (relationship, source-relationship, and relationship-property rows)
+  (<code>src/core/state.rs</code>).</p>
+
+  <p>A cache miss costs work. It does not change the answer. A replacement node can
+  open the same object-store path and hydrate the same logical state. Tests such
+  as <code>reopened_reader_sees_data_from_object_store</code> (<code>src/tests.rs</code>) exercise that
+  replacement boundary: a fresh shard opens the same object-store path and serves
+  the same edges from an empty heap and cache.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Replaceable compute</span>
+    <p>“Replaceable compute” is more accurate than “stateless compute.” An active
+    process holds a writer role, a promoted SlateDB writer handle, semaphores,
+    parsed plans, and hydrated matrices. Those are runtime state, but none is the
+    sole durable copy of the graph. Losing the writer handle is the interesting
+    case, and it is still not a durability event: a replacement node promotes its
+    own writer, and SlateDB's <span class="concept" data-concept="fencing">manifest fencing</span> is what stops the old one from
+    committing afterwards.</p>
+  </div>
+
+  <h2>Not a separate storage service</h2>
+
+  <p>The physical boundary is real, but the software boundary is intentionally
+  unfinished. <code>GraphShard</code> directly owns a <code>slatedb::Db</code>, an object-store handle,
+  and its query caches. Query code calls the shard's SlateDB-backed accessors.
+  There is no independent storage RPC service and no <code>QueryStorage</code> trait.</p>
+
+  <p>So the honest claim is:</p>
+
+  <div class="callout built">
+    <span class="callout-title">Built boundary</span>
+    <p>Object-store-backed durable state with replaceable compute is built.
+    Independently swappable storage and compute services are not.</p>
+  </div>
+
+  <p>The next chapter names the unit that makes replacement and ownership tractable:
+  the cell.</p>
+
+  <nav class="tb-chapnav">
+    <a class="prev disabled" href="#"><span class="cn-dir">Prev</span><br><span class="cn-title">—</span></a>
+    <a class="next" href="intro-01-cells-and-placement.html"><span class="cn-dir">Next ›</span><br><span class="cn-title">A Graph Has Cells</span></a>
+  </nav>
+</main>
+
+<script src="../assets/glossary.js"></script>
+<script src="../assets/textbook.js"></script>
+<script>
+/* Widget: replaceable compute — kill node A, rehydrate A′ from the object store. */
+TB.widget("w-replaceable", function (mount) {
+  var NS = "http://www.w3.org/2000/svg";
+  function el(n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+  var state = 0; // 0 = A alive, 1 = A dead, 2 = A' hydrated
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div");
+  controls.className = "tb-controls";
+  var btnKill = mk("Kill node A", "danger");
+  var btnStart = mk("Start replacement A′", "primary");
+  var btnReset = mk("Reset", "");
+  btnStart.disabled = true;
+  controls.append(btnKill, btnStart, btnReset);
+
+  var svg = el("svg", { viewBox: "0 0 460 260", width: "100%", style: "max-width:460px;display:block;margin:0 auto" });
+  var readout = document.createElement("div");
+  readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.4em;color:var(--muted)";
+
+  wrap.append(controls, svg, readout);
+  mount.appendChild(wrap);
+
+  function mk(label, cls) { var b = document.createElement("button"); b.className = "tb-btn" + (cls ? " " + cls : ""); b.textContent = label; return b; }
+  function box(x, y, w, h, fill, stroke, dash) {
+    return el("rect", { x: x, y: y, width: w, height: h, rx: 6, fill: fill, stroke: stroke, "stroke-width": 1.2, "stroke-dasharray": dash || "none", class: "wnode" });
+  }
+  function label(x, y, t, anchor, size, weight) {
+    var e = el("text", { x: x, y: y, "text-anchor": anchor || "middle", class: "wnode-label" });
+    if (size) e.setAttribute("font-size", size);
+    if (weight) e.setAttribute("font-weight", weight);
+    e.textContent = t; return e;
+  }
+
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var soft = state === 1 ? css("--bad-soft") : css("--ok-soft");
+    var stA = state === 1 ? css("--bad") : css("--ok");
+
+    // node A
+    var gA = el("g", { class: "wnode" + (state >= 1 ? " wdim" : "") });
+    gA.appendChild(box(20, 20, 180, 70, soft, stA, state >= 1 ? "5 4" : null));
+    gA.appendChild(label(110, 44, state >= 1 ? "graph-node A — gone" : "graph-node A", "middle", 12, "700"));
+    gA.appendChild(label(110, 62, "heap · caches · writer role", "middle", 10));
+    gA.appendChild(label(110, 78, state >= 1 ? "(memory + local disk lost)" : "serving reads + writes", "middle", 9));
+    svg.appendChild(gA);
+
+    // node A'
+    var showAp = state >= 2;
+    var gAp = el("g", { class: "wnode" + (showAp ? " wflash" : " wdim") });
+    var apFill = showAp ? css("--ok-soft") : css("--surface-soft");
+    var apStroke = showAp ? css("--ok") : css("--border");
+    gAp.appendChild(box(260, 20, 180, 70, apFill, apStroke));
+    gAp.appendChild(label(350, 40, "graph-node A′ (replacement)", "middle", 11, "700"));
+    gAp.appendChild(label(350, 58, showAp ? "warm again · same graph" : "empty heap · cold cache", "middle", 10));
+    gAp.appendChild(label(350, 76, showAp ? "promoted its own writer" : "waiting to start", "middle", 9));
+    svg.appendChild(gAp);
+
+    // object store
+    var gOS = el("g", {});
+    gOS.appendChild(box(80, 170, 300, 66, css("--purple-soft"), css("--purple")));
+    gOS.appendChild(label(230, 196, "Object store (SlateDB)", "middle", 12, "700"));
+    gOS.appendChild(label(230, 214, "edges · epochs · index generations · manifests", "middle", 9.5));
+    gOS.appendChild(label(230, 228, "durable truth — survives every crash", "middle", 9));
+    svg.appendChild(gOS);
+
+    // edges
+    var mut = css("--muted");
+    // A -> OS (gone when dead)
+    var e1 = el("path", { d: "M110 90 L180 170", stroke: state >= 1 ? css("--bad") : mut, "stroke-width": 1.4, fill: "none", "stroke-dasharray": state >= 1 ? "5 4" : "none", "marker-end": "url(#arw)" });
+    svg.appendChild(e1);
+    if (state >= 1) svg.appendChild(label(120, 140, "gone", "middle", 9));
+    // OS -> A' (rehydrate)
+    if (state >= 2) {
+      var e2 = el("path", { d: "M300 170 L350 90", stroke: css("--ok"), "stroke-width": 1.8, fill: "none", "marker-end": "url(#arw)", class: "wflash" });
+      svg.appendChild(e2);
+      svg.appendChild(label(360, 140, "re-hydrate", "start", 9));
+    }
+
+    var defs = el("defs", {});
+    var mk2 = el("marker", { id: "arw", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    mk2.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: mut }));
+    defs.appendChild(mk2); svg.appendChild(defs);
+
+    // readout
+    if (state === 0) readout.innerHTML = "Node A is live: it holds the heap, warm caches, and the writer role.";
+    else if (state === 1) readout.innerHTML = "<strong style='color:var(--bad)'>Lost:</strong> cache warmth · in-flight work · writer handle.  <strong style='color:var(--ok)'>Safe:</strong> every edge, epoch and index generation — they live in the object store.";
+    else readout.innerHTML = "<strong style='color:var(--ok)'>A′ serves the identical graph</strong> from a cold start. The crash cost speed, never a fact.";
+
+    btnKill.disabled = state !== 0;
+    btnStart.disabled = state !== 1;
+  }
+
+  btnKill.onclick = function () { state = 1; render(); };
+  btnStart.onclick = function () { state = 2; render(); };
+  btnReset.onclick = function () { state = 0; render(); };
+  render();
+  // re-render on theme change so colors track the palette
+  window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+  document.querySelector(".tb-theme-toggle").addEventListener("click", function () { setTimeout(render, 0); });
+});
+</script>

@@ -1,0 +1,978 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Write Path · Inside TurboLay</title>
+<link rel="stylesheet" href="../assets/textbook.css">
+<style>
+  /* Source-location caption printed under each Rust excerpt (from Typst #srcblock titles). */
+  .tb-srccap { margin: -0.6rem 0 1.1rem; font-size: 0.78rem; color: var(--muted); text-align: right; }
+  .tb-srccap code { font-size: 0.78rem; background: none; }
+</style>
+
+<div class="tb-progress"></div>
+
+<header class="tb-header">
+  <a class="tb-home" href="../index.html">Turbo<span>Lay</span> · Interactive</a>
+  <span class="tb-crumb">Inside TurboLay</span>
+  <span class="tb-spacer"></span>
+  <button class="tb-theme-toggle" type="button">☾ Dark</button>
+</header>
+
+<main class="tb-main">
+  <div class="tb-chapter-kicker">Chapter 3 · Inside TurboLay</div>
+  <h1>The Write Path</h1>
+
+  <p>The read chapter consumed a read <span class="concept" data-concept="epoch">epoch</span> as if it already existed. This chapter shows where it
+  comes from. A write to TurboLay is not a single <code>put</code>. It is a guarded sequence: confirm this
+  node is allowed to write, take a global permit and a per-<span class="concept" data-concept="cell">cell</span> lane, re-read <span class="concept" data-concept="slatedb">SlateDB</span>'s <span class="concept" data-concept="manifest">manifest</span>
+  to confirm this process is still the writer, open a <span class="concept" data-concept="serializable">serializable transaction</span>, check the cell is
+  not being dropped, check the write has not already happened, write the edge and every index key
+  it implies, and commit atomically to the <span class="concept" data-concept="object-store">object store</span>. We follow that sequence for one edge,
+  then widen to batches, lanes, and idempotency.</p>
+
+  <p>The main file is <code>src/shard/write.rs</code>, 5,108 lines. The single-writer machinery lives in
+  <code>src/core/state.rs</code> and <code>src/shard/lifecycle.rs</code>; the key vocabulary it writes into is
+  <code>src/keys.rs</code>, 316 lines.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>One thing this chapter does <em>not</em> describe is a queue. An earlier edition of TurboLay split a
+    write into an append to a mutation log and a later background materialization, and stamped
+    every change into an outbox of delta rows for readers to replay. None of that survives: the
+    key builders (<code>last_epoch</code>, <code>mutation_log_*</code>, <code>outbox*</code>, <code>delta_*</code>) and the functions
+    (<code>append_edge_mutation_log</code>, <code>materialize_edge_mutation_log</code>) are gone from the tree. A write
+    is committed once, in one transaction, and the only asynchronous work it schedules is a
+    single dirty flag per edge type. If you remember a two-phase write here, that memory is of a
+    system that no longer exists.</p>
+  </div>
+
+  <h2>The shape of every write</h2>
+
+  <p>Every foreground <span class="concept" data-concept="mutation">mutation</span>, whether it writes one edge or a thousand, passes through the same
+  nested layers. Keep this envelope in mind; the sections below open each layer in turn.</p>
+
+  <figure>
+    <div class="tb-widget" id="w-envelope"></div>
+    <figcaption>Fig. 3.1 — The write envelope, top to bottom as <code>write_edge</code> (<code>src/shard/write.rs:2354-2384</code>)
+      and <code>write_edge_txn</code> (<code>:2386-2392</code>) execute it. Layers 1 to 3 decide whether and when this
+      process may proceed, layer 5 asks SlateDB's manifest whether this process is still the
+      legitimate writer, and layer 6 makes the change atomic. Notice that no layer takes a lock
+      in the object store: nothing here waits on a peer.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Step through the envelope, layer by layer<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Walk the six layers with <em>Next</em> and <em>Prev</em>. Layers 1–3 (the blue band) are throughput
+      and policy: authority, the global permit, the per-cell lane. Layer 4 (amber) is the retry loop
+      itself. Layer 5 (purple) is the only cross-process check — <code>refresh_writer_fence</code> asks
+      <span class="concept" data-concept="slatedb">SlateDB</span> whether this process is still the writer. Layer 6 (green) is the atomic
+      commit. Press <em>Simulate conflict</em> at the commit step to see the <span class="concept" data-concept="serializable">serializable</span>
+      transaction abort and the loop retry from layer 5 — never from a fenced handle.</p>
+    </div>
+  </details>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Mutation</span>
+    <p>A single graph change: add an edge, delete an edge, create a relationship, set metadata.
+    TurboLay represents the common case as an <code>EdgeMutation</code> (<code>src/core/model.rs:52-58</code>), which
+    carries the cell id, edge type, source and destination vertex ids, and an idempotency key
+    (Section 3.8).</p>
+  </div>
+
+  <h2>Write entry points</h2>
+
+  <p>The public mutating methods on <code>GraphShard</code> all live in <code>write.rs</code>. The ones you will meet
+  most often:</p>
+
+  <ul>
+    <li><code>write_edge</code> (<code>write.rs:2354</code>): the primary single-edge upsert. This is what a <span class="concept" data-concept="cypher">Cypher</span> <code>MERGE</code>
+      of an edge becomes.</li>
+    <li><code>create_relationship</code> (<code>write.rs:1783</code>): create a relationship (a Cypher <code>CREATE</code>), with its
+      own id and properties. Variants add vertex metadata (<code>:1797</code>) or full metadata (<code>:1812</code>).</li>
+    <li><code>delete_edge</code> (<code>write.rs:3184</code>) and <code>delete_relationship</code> (<code>write.rs:2197</code>).</li>
+    <li><code>write_edge_mutations_batch</code> (<code>write.rs:3635</code>): the primary atomic multi-edge batch.</li>
+    <li><code>ingest_edge_mutations</code> (<code>write.rs:3738</code>): chunks a large stream into batches, bounded by
+      <code>max_bulk_import_edges</code>.</li>
+    <li><code>bulk_import_edges</code> (<code>write.rs:3432</code>) and <code>bulk_append_edges_trusted</code> (<code>write.rs:3449</code>):
+      high-volume import paths.</li>
+  </ul>
+
+  <p>A Cypher write reaches these from the query layer. <code>execute_opencypher</code>
+  (<code>src/shard/query.rs:228</code>) parses the statement as a mutation; a patternless <code>MERGE</code>/<code>CREATE</code>
+  is dispatched by <code>execute_patternless_mutation</code> (<code>query.rs:1280</code>), which maps a single edge
+  <code>MERGE</code> to <code>write_edge</code>, a single <code>CREATE</code> to <code>create_relationship</code>, and multiple creates to a
+  batch. The idempotency key is derived deterministically from the query context:</p>
+
+  <pre><code>idempotency_key: format!(
+    "{}.merge.{}.{}.{}",
+    context.idempotency_key, edge_type, src, dst
+),</code></pre>
+  <p class="tb-srccap"><code>src/shard/query.rs:1434-1437</code></p>
+
+  <p>so the same logical query retried produces the same key. The <code>CREATE</code> path builds the same
+  shape with a <code>.create.</code> infix and a zero-padded ordinal (<code>query.rs:1340-1343</code>).</p>
+
+  <h2>The single-writer guarantee</h2>
+
+  <p>Chapter 0 said only one writer per cell may exist, and named the mechanism that enforces it:
+  SlateDB <span class="concept" data-concept="fencing">manifest fencing</span>. TurboLay does not rest the promise on that one mechanism alone.
+  Three independent things line up behind every commit — the node's <em>write authority</em>, the
+  <em>manifest fence</em> checked immediately before the transaction, and the <em>serializable transaction</em>
+  itself — and a write that satisfies all three cannot race another writer.</p>
+
+  <p>The three are not redundant. They answer three different questions, and each is blind to the
+  other two: <em>may this node write at all?</em>, <em>is this process still the writer as of right now?</em>,
+  and <em>did anything this write depends on change underneath it?</em></p>
+
+  <figure>
+    <div class="tb-widget" id="w-tiers"></div>
+    <figcaption>Fig. 3.2 — The three tiers behind single-writer atomicity, nested from the outermost policy
+      check to the innermost commit. There is no cell write lock, no owner token, and no lease:
+      the middle tier is SlateDB's own manifest, which invalidates a superseded writer rather
+      than asking it to stand down, and the innermost serializable commit is what makes the
+      multi-key edge write atomic within the cell.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Click a tier to see the failure it defends against<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>The tiers nest: Tier 1 (write authority) is the outer box, Tier 3 (the serializable commit) is
+      the innermost. Click each ring to see the exact failure it stops — a read-only node writing at
+      all, a superseded writer process, or a concurrent change to what was read. Only the middle
+      tier, SlateDB's <span class="concept" data-concept="fencing">manifest fencing</span>, can adjudicate between two live processes;
+      the other two are blind to peers.</p>
+    </div>
+  </details>
+
+  <h3>Tier 1: write authority</h3>
+
+  <p>Before anything else, <code>ensure_write_authority</code> checks that this node is allowed to write at
+  all. The <span class="concept" data-concept="write-authority">authority</span> is a property of how the shard was opened, and it has three levels, not two:</p>
+
+  <pre><code>pub(crate) enum GraphWriteAuthority {
+    ReadOnly,
+    Promotable,
+    Writer,
+}</code></pre>
+  <p class="tb-srccap"><code>src/core/state.rs:472-476</code></p>
+
+  <p>A <code>ReadOnly</code> shard can never write; the call fails immediately with
+  <code>GraphError::WriteRequiresWriter</code>. <code>Promotable</code> and <code>Writer</code> both fall through to the same
+  call, which resolves the role the only way that actually matters:</p>
+
+  <pre><code>pub(crate) fn ensure_write_authority(
+    &amp;self,
+    cell_id: &amp;str,
+    operation: &amp;'static str,
+) -&gt; Result&lt;()&gt; {
+    match &amp;self.write_authority {
+        GraphWriteAuthority::ReadOnly =&gt; Err(GraphError::WriteRequiresWriter {
+            operation,
+            cell_id: cell_id.to_string(),
+        }),
+        GraphWriteAuthority::Promotable | GraphWriteAuthority::Writer =&gt; {
+            self.db.writer().map(|_| ())
+        }
+    }
+}</code></pre>
+  <p class="tb-srccap"><code>src/shard/lifecycle.rs:404-418</code></p>
+
+  <p><code>self.db.writer()</code> returns the cached SlateDB writer handle, or
+  <code>GraphError::ReadOnlyShardStorage</code> if none has been opened (<code>src/core/state.rs:183-185</code>). Note
+  what the two live variants have in common and where they differ. Both are <em>permitted</em> to write;
+  the difference is only whether a writer handle has been opened yet. That is why the <code>match</code> arm
+  is shared: authority is policy, and the handle is a resource.</p>
+
+  <p>One more check rides inside the transaction. <code>validate_write_fence_txn</code> — despite the
+  historical name, not a token fence — first refuses to touch a cell that is being dropped, then
+  re-confirms authority:</p>
+
+  <pre><code>pub(crate) async fn validate_write_fence_txn(
+    &amp;self, txn: &amp;DbTransaction, cell_id: &amp;str, operation: &amp;'static str,
+) -&gt; Result&lt;()&gt; {
+    if operation != "drop_cell" {
+        let drop_marker = keys::cell_drop_marker(cell_id);
+        let pending_drop_marker = keys::cell_drop_pending_marker(cell_id);
+        if read_txn_remote(txn, &amp;drop_marker).await?.is_some()
+            || read_txn_remote(txn, &amp;pending_drop_marker).await?.is_some()
+        {
+            return Err(GraphError::CellDropped { operation, cell_id: cell_id.to_string() });
+        }
+    }
+    self.ensure_write_authority(cell_id, operation)
+}</code></pre>
+  <p class="tb-srccap"><code>src/shard/lifecycle.rs:436-455</code></p>
+
+  <p>It is a drop-guard, not an ownership arbiter. <code>read_txn_remote</code> calls <code>txn.mark_read(...)</code>
+  before it reads (<code>src/codec.rs:3-8</code>), so the drop markers <em>participate in conflict detection</em>
+  (Section 3.4). A concurrent <code>drop_cell</code> that commits first therefore forces this write to abort
+  rather than resurrect a cell someone is tearing down. The non-transactional sibling,
+  <code>validate_write_fence</code> (<code>src/shard/lifecycle.rs:457-470</code>), refreshes the manifest fence and then
+  runs the same check inside a throwaway transaction; maintenance paths use it as a precondition.</p>
+
+  <h3>Tier 2: SlateDB manifest fencing and writer promotion</h3>
+
+  <p>Write authority says this node <em>may</em> write. It cannot say whether some <em>other</em> process has since
+  opened the same cell and taken the writer role away. That question is answered one layer down,
+  and TurboLay does not answer it itself.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — SlateDB manifest fencing</span>
+    <p>SlateDB records the current writer's identity in its own <span class="concept" data-concept="manifest">manifest</span> in the object store. Opening
+    a new writer advances that record, which <em>fences</em> every earlier writer: the superseded handle
+    is not asked to stand down and is not notified, it is simply invalidated, and its next
+    operation fails with <code>Closed(Fenced)</code>. The guarantee holds without a clock and without the
+    fenced process being responsive, because it is enforced where the write lands rather than by
+    agreement beforehand. TurboLay stores no lock object, no owner token, and no TTL of its own.</p>
+  </div>
+
+  <p>The whole of TurboLay's participation is one method that asks SlateDB to re-read the manifest,
+  and reacts to being fenced by throwing away the handle it can no longer use:</p>
+
+  <pre><code>pub(crate) async fn refresh_writer_fence(&amp;self) -&gt; Result&lt;()&gt; {
+    let _open_guard = self.inner.writer_open_gate.lock().await;
+    let writer = self.open_writer().ok_or(GraphError::ReadOnlyShardStorage)?;
+    match writer.refresh_manifest().await {
+        Ok(()) =&gt; Ok(()),
+        Err(err) if matches!(err.kind(), ErrorKind::Closed(CloseReason::Fenced)) =&gt; {
+            *self.inner.writer.write()... = None;
+            Err(err.into())
+        }
+        Err(err) =&gt; Err(err.into()),
+    }
+}</code></pre>
+  <p class="tb-srccap"><code>src/core/state.rs:187-203</code></p>
+
+  <p>Dropping the cached handle is the entire local response. There is nothing to release and no
+  state to unwind, because this node never held anything a peer needs handed back. The error
+  propagates to the caller as a failed write.</p>
+
+  <p>That method is called from exactly the place the old cell write lock used to be taken: the
+  guard acquired immediately before the transaction opens.</p>
+
+  <pre><code>pub(crate) async fn acquire_local_write_guard(
+    &amp;self, cell_id: &amp;str, operation: &amp;'static str,
+) -&gt; Result&lt;LocalWriteGuard&gt; {
+    validate_component("cell_id", cell_id)?;
+    validate_component("operation", operation)?;
+    let guard = LocalWriteGuard::new(Arc::clone(&amp;self.local_write_guard).lock_owned().await);
+    self.db.refresh_writer_fence().await?;
+    Ok(guard)
+}</code></pre>
+  <p class="tb-srccap"><code>src/shard/lifecycle.rs:253-262</code></p>
+
+  <p>Two things happen there, and it is worth separating them. The <code>local_write_guard</code> mutex
+  serializes mutating work <em>within this process</em> — one write body at a time, whatever cell it
+  targets. The <code>refresh_writer_fence</code> call is the cross-process check, and it is the one that
+  carries correctness. <code>write_edge_txn</code> takes the guard, runs the body, and hands it to
+  <code>finish_local_write</code> (<code>src/core/state.rs:509-512</code>), whose only remaining job is to drop it:</p>
+
+  <pre><code>pub(crate) async fn write_edge_txn(&amp;self, mutation: &amp;EdgeMutation) -&gt; Result&lt;CommitResult&gt; {
+    let lock = self
+        .acquire_local_write_guard(&amp;mutation.cell_id, "write_edge")
+        .await?;
+    let result = self.write_edge_txn_locked(mutation).await;
+    finish_local_write(lock, result).await
+}</code></pre>
+  <p class="tb-srccap"><code>src/shard/write.rs:2386-2392</code></p>
+
+  <p><code>LocalWriteGuard::renew</code> and <code>::release</code> are both <code>Ok(())</code> with no body
+  (<code>src/core/state.rs:501-507</code>). They are the vestigial shape of a lease that no longer exists,
+  kept only so the call sites did not have to change; there is nothing to renew because nothing
+  expires.</p>
+
+  <p>The other half of tier 2 is how a node that is merely <code>Promotable</code> acquires the writer role in
+  the first place. It does so lazily, on demand:</p>
+
+  <pre><code>pub(crate) async fn promote_to_writer(
+    &amp;self, cell_id: &amp;str, operation: &amp;'static str,
+) -&gt; Result&lt;()&gt; {
+    validate_component("cell_id", cell_id)?;
+    if matches!(&amp;self.write_authority, GraphWriteAuthority::ReadOnly) {
+        return Err(GraphError::WriteRequiresWriter { operation, cell_id: cell_id.to_string() });
+    }
+    self.db.promote_writer().await?;
+    Ok(())
+}</code></pre>
+  <p class="tb-srccap"><code>src/shard/lifecycle.rs:420-434</code></p>
+
+  <p><code>GraphStore::promote_writer</code> (<code>src/core/state.rs:204-227</code>) is a double-checked open: it returns
+  <code>Ok(false)</code> immediately if a writer is already cached, takes <code>writer_open_gate</code>, checks again,
+  and only then calls <code>open_graph_db</code> and caches the handle. Many concurrent requests to promote
+  therefore produce exactly one open database, and the return value tells the caller whether <em>it</em>
+  was the one that did the opening.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Writer promotion</span>
+    <p>The act of a <code>Promotable</code> node opening a SlateDB writer for a cell it was until then only
+    reading. <span class="concept" data-concept="writer-promotion">Promotion</span> needs no coordination with the previous writer and sends it no message:
+    opening the database advances the manifest, and that alone fences whoever held it before. The
+    loser learns of its demotion the next time it touches storage, not before.</p>
+  </div>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>The mechanism this replaced was an object-store lock: a record naming the owner, with a TTL,
+    taken by compare-and-set and released on completion. It failed for the reason every
+    lease-based lock fails. An owner that pauses longer than its lease — a long garbage-collection
+    pause, a stalled network call — is never <em>told</em> it has lost ownership. It wakes up believing
+    it still holds the lock and writes, while a second process that watched the lease expire has
+    legitimately taken over. Both are convinced they are the writer, which is exactly the state
+    the lock existed to prevent. Manifest fencing does not have that failure mode, because the
+    paused process is not trusted to notice anything: its writes are rejected at the storage layer
+    whether or not it has realised it was superseded.</p>
+  </div>
+
+  <h3>Tier 3: the serializable transaction</h3>
+
+  <p>The third guarantee is the transaction itself. Every write runs as one SlateDB transaction at
+  <span class="concept" data-concept="serializable">serializable-snapshot isolation</span>, and every key it reads through <code>read_txn_remote</code> — the drop
+  markers, the idempotency record, the <span class="concept" data-concept="degree">degree</span> counters, the existing edge row — is marked as read
+  and participates in conflict detection. If any of them changed under the write before it
+  commits, the commit is rejected and the write retries. The next section opens this layer in
+  full.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>The three tiers cover gaps the others cannot. Write authority (Tier 1) is a local policy
+    decision and is worth nothing against a peer, but it makes a misconfigured read-only node fail
+    loudly and immediately rather than at commit time. Manifest fencing (Tier 2) is the only tier
+    that can adjudicate between two processes, and it needs neither of the others to be correct.
+    The serializable transaction (Tier 3) is blind to processes entirely but is the only tier that
+    can see <em>what</em> was read: it is what makes the multi-key fan-out of Section 3.6 atomic, and
+    what stops a write from committing on top of a cell someone dropped a moment ago. Correctness
+    against a competing writer rests on Tier 2; correctness of the write's own contents rests on
+    Tier 3; Tier 1 is there so the common misconfiguration produces a clear error.</p>
+  </div>
+
+  <h2>The transaction and the retry loop</h2>
+
+  <p>Inside the guard, the actual change runs as one SlateDB transaction.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Serializable snapshot isolation</span>
+    <p>A transaction guarantee: the transaction sees a consistent <span class="concept" data-concept="snapshot-isolation">snapshot</span>, and if any key it read
+    was changed by another committed transaction before it commits, its own commit is rejected.
+    It is optimistic, meaning it does not lock rows up front; it detects conflicts at commit time
+    and aborts. TurboLay opens every write transaction at this level and marks every key it reads
+    so the drop-guard check, the idempotency probe, and the counter reads all participate.</p>
+  </div>
+
+  <p>The transaction is opened on the writer handle and immediately runs the drop-guard:</p>
+
+  <pre><code>let txn = self
+    .db
+    .writer()?
+    .begin(IsolationLevel::SerializableSnapshot)
+    .await?;
+self.validate_write_fence_txn(&amp;txn, &amp;mutation.cell_id, operation)
+    .await?;</code></pre>
+  <p class="tb-srccap"><code>src/shard/write.rs:2551-2557</code></p>
+
+  <p>and is committed by <code>commit_txn_strict</code>, which forwards the <code>await_durable</code> flag into SlateDB's
+  <code>WriteOptions</code> (<code>src/codec.rs:137-160</code>).</p>
+
+  <p>Because a serializable transaction can abort under contention, the public method wraps it in a
+  bounded retry loop. This is <code>write_edge</code> in full, and it is the template every writer follows:</p>
+
+  <pre><code>pub async fn write_edge(&amp;self, mutation: EdgeMutation) -&gt; Result&lt;CommitResult&gt; {
+    validate_component("cell_id", &amp;mutation.cell_id)?;
+    validate_component("edge_type", &amp;mutation.edge_type)?;
+    validate_component("idempotency_key", &amp;mutation.idempotency_key)?;
+    self.ensure_write_authority(&amp;mutation.cell_id, "write_edge")?;
+
+    let _permit = self.acquire_graph_write_permit("write_edge").await?;
+    let _writer = self.writer_lane(&amp;mutation.cell_id).lock().await;
+    for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+        match self.write_edge_txn(&amp;mutation).await {
+            Err(err)
+                if is_retryable_write_conflict(&amp;err)
+                    &amp;&amp; attempt + 1 &lt; GRAPH_TXN_MAX_RETRIES =&gt;
+            {
+                /* self.operation_metrics.write_retries += 1 */
+                tokio::task::yield_now().await;
+            }
+            Ok(result) =&gt; {
+                /* self.operation_metrics.write_commits += 1 */
+                return Ok(result);
+            }
+            result =&gt; return result,
+        }
+    }
+    Err(GraphError::RetryExhausted {
+        operation: "graph transaction",
+        attempts: GRAPH_TXN_MAX_RETRIES,
+    })
+}</code></pre>
+  <p class="tb-srccap"><code>src/shard/write.rs:2354-2384 (abridged)</code></p>
+
+  <p>Read that against the envelope figure: authority, permit, lane, retry — and no lock anywhere.
+  Authority is checked once, up front, so a <code>ReadOnly</code> shard fails before it ever takes a permit.</p>
+
+  <p>Inside the loop, only some errors are worth retrying, and the predicate is now a single
+  <code>matches!</code>:</p>
+
+  <pre><code>pub(crate) fn is_retryable_write_conflict(err: &amp;GraphError) -&gt; bool {
+    matches!(err, GraphError::Slate(err)
+        if matches!(err.kind(), ErrorKind::Transaction | ErrorKind::Invalid))
+}</code></pre>
+  <p class="tb-srccap"><code>src/core/state.rs:514-516</code></p>
+
+  <p>Two SlateDB error kinds, and nothing else. There is no <code>CellWriteConflict</code> variant to retry on —
+  that error was removed with the lock it described. Note in particular what is <em>not</em> retryable:
+  <code>ErrorKind::Closed(CloseReason::Fenced)</code>. Being fenced is not contention, it is a change of
+  management, and retrying would be an attempt to write with a handle SlateDB has already
+  invalidated. Every other error — a validation failure, a dropped cell, a missing writer role —
+  falls through the <code>match</code>'s catch-all arm and returns immediately, because retrying a write that
+  is invalid or not permitted is pointless.</p>
+
+  <h2>Where the epoch comes from</h2>
+
+  <p>The epoch is the version stamp the whole read path depends on. In an earlier edition, allocating
+  it was a step in the write: read a <code>last_epoch</code> counter, add one, write it back. That counter no
+  longer exists — <code>keys::last_epoch</code> was removed along with the rest of the delta machinery — and
+  neither does the step. The write does not allocate an epoch at all. It <em>reads</em> one, off the
+  transaction:</p>
+
+  <pre><code>let current_epoch = txn.seqnum();</code></pre>
+  <p class="tb-srccap"><code>src/shard/write.rs:2564</code></p>
+
+  <p>That single line appears at the top of essentially every transaction body in the file — sixteen
+  sites, including <code>write.rs:643</code> in the vertex-metadata path, <code>:1909</code> in the relationship create,
+  and <code>:3253</code> in the delete. It is SlateDB's own <span class="concept" data-concept="sequence-number">sequence number</span> for the snapshot the transaction
+  is reading at: a <code>StorageSequence</code>, the one and only sequence in the system (Chapter 0,
+  Section 0.7).</p>
+
+  <p>The epoch a write <em>returns</em> is that number plus one — the sequence its own commit will land at:</p>
+
+  <pre><code>let epoch = current_epoch
+    .checked_add(1)
+    .ok_or_else(|| GraphError::CorruptValue {
+        key: "storage_sequence".to_string(),
+        reason: "epoch overflow".to_string(),
+    })?;
+let result = CommitResult {
+    epoch,
+    already_existed: existing_edge_epoch.is_some(),
+};</code></pre>
+  <p class="tb-srccap"><code>src/shard/write.rs:2615-2624</code></p>
+
+  <p>Notice the <code>key:</code> field of that error. It is the literal string <code>"storage_sequence"</code>, not a key
+  name, because there is no key to name. The same arithmetic appears inside
+  <code>commit_txn_strict_with_sequence</code> (<code>src/codec.rs:143-153</code>), which computes the committed
+  sequence the same way and hands it back to callers that need it.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Deriving the epoch instead of allocating it removes an entire class of problem. A counter key
+    is a key every concurrent write must read and write, which makes it the hottest conflict point
+    in the cell — two writes that touch unrelated vertices still collide on it, and every one of
+    those collisions costs a serializable abort and a retry. A <code>txn.seqnum()</code> is free, is already
+    consistent with the snapshot the transaction is reading, and cannot disagree with the sequence
+    the commit actually lands at. It also removes the possibility of the counter and the data
+    disagreeing after a partial failure, because there is no longer anything that could disagree.</p>
+  </div>
+
+  <p>Three consequences are worth stating explicitly.</p>
+
+  <p>First, a redundant write does not move the version. If the edge already exists and no metadata
+  changed, the write commits the idempotency record and returns <code>CommitResult { epoch:
+  existing_epoch, already_existed: true }</code> without taking the <code>checked_add</code> path at all
+  (<code>write.rs:2600-2612</code>). Second, "the epoch of an existing edge" is not stored on the edge:
+  <code>edge_epoch_at_txn</code> (<code>src/codec.rs:34-53</code>) returns the <em>read</em> epoch for a live <span class="concept" data-concept="adjacency">adjacency</span> row,
+  and only a segment-resident edge carries a sequence of its own. The <code>EdgeRecord</code> has no epoch
+  field (Chapter 0, Section 0.5). Third, a batch does not need to reserve a contiguous run of
+  epochs, because it never allocated them: every edge in one batch transaction shares the one
+  sequence that transaction commits at.</p>
+
+  <p>Relationship creates do still allocate from a real counter, but it is an identity counter, not a
+  clock: <code>cell/&lt;cell_id&gt;/meta/last_relationship_id</code> (<code>src/keys.rs:19-21</code>), read, incremented past
+  any id already in use, and written back in the same transaction (<code>write.rs:1926-1968</code>).</p>
+
+  <h2>What keys a single edge write touches</h2>
+
+  <p>Here is the payoff. When <code>write_edge</code> inserts a genuinely new edge, it writes this exact set of
+  keys, in one transaction (<code>src/shard/write.rs:2665-2708</code>):</p>
+
+  <pre><code>mark_adjacency_dirty_txn(&amp;txn, cell, et, epoch)?;                  // matrix_dirty + adjacency_generation
+let out_degree = read_counter_txn(&amp;txn, &amp;out_degree_key).await? + 1;
+// ... in_degree likewise, only if the reverse index is enabled ...
+txn.put(keys::out_edge(cell, et, src, dst).as_bytes(), &amp;edge_value)?;
+if self.writes_reverse_index() {
+    txn.put(keys::in_edge(cell, et, dst, src).as_bytes(), &amp;edge_value)?;
+}
+txn.put(out_degree_key.as_bytes(), encode_u64(out_degree))?;
+if let Some((in_degree_key, in_degree)) = in_degree {
+    txn.put(in_degree_key.as_bytes(), encode_u64(in_degree))?;
+}
+txn.put(idem_key.as_bytes(), encode_commit_idempotency(mutation, &amp;result))?;
+commit_txn_strict(txn, self.await_durable_writes).await?;</code></pre>
+  <p class="tb-srccap"><code>src/shard/write.rs:2665-2707 (abridged)</code></p>
+
+  <p>Laid out, one logical edge fans out into a handful of physical keys, each serving a different
+  read:</p>
+
+  <figure>
+    <div class="tb-table-wrap">
+      <table>
+        <thead>
+          <tr><th>Key builder</th><th>Shape</th><th>Read it serves</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>out_edge</code> (<code>keys.rs:43</code>)</td><td><code>.../e/out/{et}/{src}/{dst}</code></td><td>scan a vertex's outgoing neighbors</td></tr>
+          <tr><td><code>in_edge</code> (<code>keys.rs:47</code>)</td><td><code>.../e/in/{et}/{dst}/{src}</code></td><td>scan a vertex's incoming neighbors; written only when the reverse index is enabled</td></tr>
+          <tr><td><code>degree_out</code> (<code>keys.rs:158</code>)<br><code>degree_in</code> (<code>keys.rs:162</code>)</td><td><code>.../cnt/out/{et}/{src}</code><br><code>.../cnt/in/{et}/{dst}</code></td><td>read a vertex's degree without scanning it</td></tr>
+          <tr><td><code>matrix_dirty</code> (<code>keys.rs:27</code>)</td><td><code>.../meta/matrix_dirty/{et}</code></td><td>tells the out-of-process indexer this edge type has drifted</td></tr>
+          <tr><td><code>adjacency_generation</code> (<code>keys.rs:31</code>)</td><td><code>.../meta/adjacency_generation/{et}</code></td><td>the sequence at which this edge type last changed</td></tr>
+          <tr><td><code>idempotency</code> (<code>keys.rs:35</code>)</td><td><code>.../idem/{op}/{key}</code></td><td>detect and short-circuit a retried write</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <figcaption>Tab. 3.1 — Every key one new-edge <code>write_edge</code> transaction writes. There is no <code>last_epoch</code>
+      key because the epoch is read from the transaction (Section 3.5), and no <code>outbox</code> or delta
+      key because the delta subsystem was removed; what took their place is the two-byte-cheap
+      dirty marker in the fourth row.</figcaption>
+  </figure>
+
+  <p>The two markers in the middle of that table are the whole of what a write hands to asynchronous
+  work, and they are written together by one small helper:</p>
+
+  <pre><code>fn mark_adjacency_dirty_txn(
+    txn: &amp;DbTransaction,
+    cell_id: &amp;str,
+    edge_type: &amp;str,
+    epoch: StorageSequence,
+) -&gt; Result&lt;()&gt; {
+    txn.put(
+        keys::matrix_dirty(cell_id, edge_type).as_bytes(),
+        encode_u64(epoch),
+    )?;
+    txn.put(
+        keys::adjacency_generation(cell_id, edge_type).as_bytes(),
+        encode_u64(epoch),
+    )?;
+    Ok(())
+}</code></pre>
+  <p class="tb-srccap"><code>src/shard/write.rs:5002-5017</code></p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Dirty marker</span>
+    <p>A single key per <code>(cell, edge type)</code> holding the sequence at which that edge type last
+    changed: <code>cell/&lt;cell_id&gt;/meta/matrix_dirty/&lt;edge_type&gt;</code> (<code>src/keys.rs:23-29</code>). It is a
+    <em>flag</em>, not a log. It carries no history, so nothing accumulates and nothing has to be
+    garbage-collected; overwriting it a million times leaves one key. The out-of-process indexer
+    scans the <code>matrix_dirty/</code> prefix with <code>dirty_graph_index_edge_types</code>
+    (<code>src/engine/index_store.rs:23-45</code>) to decide which edge types need a fresh <span class="concept" data-concept="index-generation">index generation</span>.</p>
+  </div>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>This is the load-bearing difference between this edition and the last one. The old write wrote
+    an <code>outbox</code> row <em>per edge</em>, plus two scoped delta index rows, so that readers could replay
+    history forward from a matrix artifact's base epoch. That made every write more expensive,
+    made the read path a merge, and created a body of data whose only purpose was to be collected
+    later. The dirty marker does the same job — <em>tell someone this changed</em> — in one key that is
+    overwritten rather than appended, and the reader closes the residual gap between an index
+    generation's <code>base_sequence</code> and its read epoch with the <span class="concept" data-concept="wal-tail-overlay">WAL-tail overlay</span> instead
+    (Chapter 1, Section 1.7; the read chapter has the mechanism).</p>
+  </div>
+
+  <figure>
+    <div class="tb-widget" id="w-fanout"></div>
+    <figcaption>Fig. 3.3 — One edge, a handful of keys, one transaction: all of them commit atomically, so a
+      reader never sees an adjacency entry without its matching degree count, and the indexer
+      never sees a dirty marker for a change that did not land. The purple marker is the only
+      output consumed by another process.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Hover the keys one <code>write_edge</code> commits<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>One <code>write_edge</code> transaction (amber) fans out into four groups of physical keys, and every one
+      of them lands in the same atomic commit. Hover or tap each key node to see the read it serves.
+      The purple <code>meta/matrix_dirty</code> marker is the only output consumed by another process — the
+      out-of-process indexer reads it later to decide which edge types need a fresh index generation.</p>
+    </div>
+  </details>
+
+  <p>A relationship create adds more on top of the structural edge keys: the <code>rel/...</code> record, a
+  <code>rel_id/...</code> pointer back to it, a <code>rel_count/...</code> counter, and the relationship-property
+  indexes (<code>src/shard/write.rs:2037-2062</code>). A delete does the mirror image — it removes the
+  adjacency rows, decrements the degree counters, hard-deletes the relationships riding on the
+  edge, and marks the edge type dirty at the new sequence (<code>write.rs:3299-3310</code>). For an edge that
+  lives only inside a compacted adjacency segment rather than as an <code>e/out</code> row, the delete
+  instead writes a segment tombstone. The delete chapter takes that apart.</p>
+
+  <h2>Write lanes and concurrency</h2>
+
+  <p>Two mechanisms from Chapter 1 keep writes from colliding inside one process. Neither is a
+  correctness device; both exist for throughput.</p>
+
+  <p>The 64 <span class="concept" data-concept="write-lane">write lanes</span> (<code>GRAPH_WRITE_LANES</code>, <code>src/lib.rs:178</code>) are plain mutexes. A write picks its
+  lane by hashing the cell id, so all writes to one cell take the same lane and serialize, while
+  writes to different cells run in parallel:</p>
+
+  <pre><code>pub(crate) fn writer_lane_index(cell_id: &amp;str) -&gt; usize {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;      // FNV-1a offset basis
+    for byte in cell_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash as usize) % GRAPH_WRITE_LANES
+}</code></pre>
+  <p class="tb-srccap"><code>src/codec.rs:1338-1345</code></p>
+
+  <p>The shard-side lookup is a single line: <code>writer_lane</code> indexes
+  <code>self.writer_lanes</code> with that <span class="concept" data-concept="fnv-hash">hash</span> (<code>src/shard/lifecycle.rs:249-251</code>).</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Serializing same-cell writes in memory, before they reach the transaction, is what keeps
+    SlateDB serialization aborts rare. Two writes to the same cell would very likely conflict at
+    commit, so the lane makes them queue cheaply on a mutex instead of both doing the work and one
+    of them aborting and retrying. Writes to different cells never share a lane, so unrelated
+    tenants do not slow each other down. Be clear about what this is <em>not</em>: a lane says nothing
+    about which process may write. Two processes each hold their own set of 64 lanes and neither
+    can see the other's. Only Tier 2 arbitrates between them.</p>
+  </div>
+
+  <p>Above the lanes sits <code>graph_write_gate</code>, a <span class="concept" data-concept="semaphore">semaphore</span> that bounds the total number of writes in
+  flight across all cells. <code>acquire_graph_write_permit</code> (<code>src/shard/lifecycle.rs:351-360</code>)
+  increments a <code>write_attempts</code> metric and then waits on it via <code>acquire_operation_permit</code>
+  (<code>:385-402</code>), which counts a <code>backpressure_waits</code> whenever the gate is already exhausted. The
+  order is always permit first, then lane lock, so a flood of writes waits on the global gate
+  rather than piling up while holding lane mutexes.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Backpressure</span>
+    <p>Slowing down producers when the system is saturated, rather than accepting unbounded work and
+    falling over. TurboLay's write gate is <span class="concept" data-concept="backpressure">backpressure</span>: when the permit limit is reached, new
+    writes wait, and the wait is counted as a metric so operators can see the system is at its
+    write ceiling.</p>
+  </div>
+
+  <h2>Durability and idempotency</h2>
+
+  <p>Two properties make writes safe to retry and safe to trust.</p>
+
+  <p><strong>Durability.</strong> The <code>await_durable_writes</code> flag, set from the open options, is threaded into every
+  commit through <code>commit_txn_strict</code> (<code>src/codec.rs:137-141</code>), which passes it to
+  <code>commit_txn_strict_with_sequence</code> where it becomes SlateDB's <code>WriteOptions { await_durable }</code>
+  (<code>:143-160</code>). When it is on, the commit does not return until the data has reached the object
+  store durably — which is what makes the returned epoch safe to hand a client as a bookmark
+  (Chapter 0, Section 0.8). Reads inside a write transaction go through <code>read_txn_remote</code>
+  (<code>src/codec.rs:3-8</code>), which uses the <code>Remote</code> durability filter, so a writer reads its own
+  already-durable state and never unflushed data.</p>
+
+  <p><strong>Idempotency.</strong> Every mutation carries an <span class="concept" data-concept="idempotency">idempotency</span> key, and the transaction probes for a prior
+  result under <code>cell/&lt;cell_id&gt;/idem/&lt;operation&gt;/&lt;key&gt;</code> (<code>keys::idempotency</code>, <code>src/keys.rs:35-37</code>)
+  as its first read after the drop-guard. If it is present, the write decodes and returns the
+  stored result without re-applying anything (<code>write.rs:2560-2562</code>).</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Idempotency key</span>
+    <p>A caller-supplied identifier for a logical write. TurboLay records, per key, that the write
+    already happened and what it returned. A retry with the same key is detected and returns the
+    original result instead of applying the change twice. This is what makes the retry loop of
+    Section 3.4 and at-least-once delivery from an upstream ingestion pipeline safe: the same edge
+    can be submitted many times and land once.</p>
+  </div>
+
+  <p>The receipt is written in the same transaction as the data — it is the last <code>put</code> before
+  <code>commit_txn_strict</code> in the excerpt above — so it is impossible to apply the change without also
+  recording that it happened, or to record it without applying the change. Different write paths
+  use different operation namespaces, which keeps their receipts from colliding: <code>create</code>,
+  <code>delete</code>, <code>vertex-delete</code>, <code>bulk-import</code>, <code>segment-import</code>, and <code>relationship-import</code> all appear
+  as the <code>&lt;operation&gt;</code> component in <code>write.rs</code>. A batch additionally rejects duplicate keys within
+  itself before it starts.</p>
+
+  <h2>Recap: one edge, one transaction</h2>
+
+  <p>Follow one <code>MERGE</code> edge through the whole chapter:</p>
+
+  <ol>
+    <li><code>write_edge</code> validates its arguments and calls <code>ensure_write_authority</code>: a <code>ReadOnly</code> node
+      fails here, a <code>Promotable</code> or <code>Writer</code> node continues.</li>
+    <li>It takes a global write permit, then the cell's write lane. Both are throughput devices.</li>
+    <li>It enters a retry loop, up to 32 attempts.</li>
+    <li>Each attempt takes the local write guard, which asks SlateDB to refresh the manifest. If this
+      process has been fenced by a newer writer, the cached handle is dropped and the write fails —
+      it is not retried, because being fenced is not contention.</li>
+    <li>It opens a serializable transaction, confirms the cell is not being dropped, and re-checks
+      authority. Both drop markers are marked as read, so a concurrent <code>drop_cell</code> aborts this write.</li>
+    <li>It reads the idempotency receipt and returns the stored result if this write already happened.</li>
+    <li>It reads <code>txn.seqnum()</code> as the current epoch and derives the commit epoch as that plus one. It
+      allocates nothing and writes no counter.</li>
+    <li>It writes the adjacency rows, the degree counters, the <code>matrix_dirty</code> and
+      <code>adjacency_generation</code> markers, and the idempotency receipt.</li>
+    <li>It commits atomically, waiting for object-store durability, and drops the guard.</li>
+  </ol>
+
+  <p>The epoch it returns is a <code>StorageSequence</code> — the same number a reader pins as its read epoch,
+  and the same number a client carries forward in a bookmark. That is where write and read meet:
+  not at a delta stream, but at a single sequence. The one thing the write leaves behind for
+  someone else is a dirty marker, which the out-of-process indexer (Chapter 1, Section 1.8) turns
+  into a fresh index generation on its own schedule.</p>
+
+  <p>The next chapter follows the other kind of change, a delete, and the garbage collection that
+  eventually removes the tombstones and superseded generations this one creates.</p>
+
+  <nav class="tb-chapnav">
+    <a class="prev" href="02-read-path.html"><span class="cn-dir">‹ Prev</span><br><span class="cn-title">The Read Path</span></a>
+    <a class="next" href="04-delete-path.html"><span class="cn-dir">Next ›</span><br><span class="cn-title">The Delete Path</span></a>
+  </nav>
+</main>
+
+<script src="../assets/glossary.js"></script>
+<script>
+/* Page-local glossary entries — concepts introduced in this chapter. */
+window.TB_GLOSSARY = Object.assign(window.TB_GLOSSARY || {}, {
+  "mutation": {
+    title: "Mutation",
+    html: "<p>A single graph change — add an edge, delete an edge, create a relationship, set metadata. The common case is an <code>EdgeMutation</code> carrying the <span class=\"concept\" data-concept=\"cell\">cell</span> id, edge type, source and destination vertex ids, and an <span class=\"concept\" data-concept=\"idempotency\">idempotency key</span>.</p>"
+  },
+  "write-authority": {
+    title: "Write authority",
+    html: "<p>A property of how a shard was opened, with three levels: <code>ReadOnly</code> (never writes), <code>Promotable</code> (may open a writer on demand), and <code>Writer</code> (already holds one). It is Tier 1 of the single-writer guarantee — a local policy check, worthless against a peer, but it makes a misconfigured read-only node fail loudly and immediately.</p>"
+  },
+  "write-lane": {
+    title: "Write lane",
+    html: "<p>One of 64 in-process mutexes (<code>GRAPH_WRITE_LANES</code>). A write picks its lane by <span class=\"concept\" data-concept=\"fnv-hash\">hashing</span> the cell id, so all writes to one cell serialize on the same lane while writes to different cells run in parallel. A throughput device only — it keeps <span class=\"concept\" data-concept=\"serializable\">serializable</span> aborts rare and says nothing about which process may write.</p>"
+  },
+  "dirty-marker": {
+    title: "Dirty marker",
+    html: "<p>A single key per <code>(cell, edge type)</code> holding the sequence at which that edge type last changed (<code>meta/matrix_dirty/&lt;edge_type&gt;</code>). A <em>flag</em>, not a log: it carries no history, so overwriting it a million times leaves one key. The out-of-process indexer scans the prefix to decide which edge types need a fresh <span class=\"concept\" data-concept=\"index-generation\">index generation</span>.</p>"
+  },
+  "backpressure": {
+    title: "Backpressure",
+    html: "<p>Slowing producers when the system is saturated instead of accepting unbounded work and falling over. TurboLay's <code>graph_write_gate</code> is a <span class=\"concept\" data-concept=\"semaphore\">semaphore</span>: when the permit limit is reached, new writes wait, and the wait is counted as a metric so operators can see the write ceiling.</p>"
+  }
+});
+</script>
+<script src="../assets/textbook.js"></script>
+<script>
+/* ---- shared widget helpers ------------------------------------------------ */
+(function () {
+  var NS = "http://www.w3.org/2000/svg";
+  window.__tbEl = function (n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; };
+  window.__tbCss = function (v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); };
+  window.__tbOnTheme = function (fn) {
+    window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", fn);
+    var t = document.querySelector(".tb-theme-toggle");
+    if (t) t.addEventListener("click", function () { setTimeout(fn, 0); });
+  };
+})();
+
+/* Widget 1: the write envelope as a six-layer stepper with retry. */
+TB.widget("w-envelope", function (mount) {
+  var el = window.__tbEl, css = window.__tbCss;
+  var LAYERS = [
+    { t: "1. validate + ensure_write_authority", s: "may this node write?", band: "info",
+      d: "Argument validation, then the Tier-1 policy check. A ReadOnly shard fails here, before it ever takes a permit." },
+    { t: "2. acquire_graph_write_permit", s: "global write semaphore", band: "info",
+      d: "A permit off the global write gate bounds total writes in flight across all cells. This is backpressure, not correctness." },
+    { t: "3. writer_lane(cell).lock()", s: "one of 64 in-process mutexes", band: "info",
+      d: "The cell id is hashed to a lane, so same-cell writes serialize cheaply in memory rather than colliding at commit." },
+    { t: "4. retry loop — GRAPH_TXN_MAX_RETRIES = 32", s: "bounded, up to 32 attempts", band: "warn",
+      d: "Because a serializable transaction can abort under contention, layers 5-6 run inside a bounded retry loop." },
+    { t: "5. acquire_local_write_guard → refresh_writer_fence", s: "am I still the writer?", band: "purple",
+      d: "The only cross-process check: SlateDB re-reads the manifest. If this process was fenced, the handle is dropped and the write fails — never retried." },
+    { t: "6. begin → validate_write_fence_txn → reads/puts → commit_txn_strict", s: "atomic commit", band: "ok",
+      d: "One serializable transaction: drop-guard, idempotency probe, epoch read, the key fan-out, and an atomic commit to the object store." }
+  ];
+  var step = 0, conflicted = false;
+
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div");
+  controls.className = "tb-controls";
+  function mk(t, c) { var b = document.createElement("button"); b.className = "tb-btn" + (c ? " " + c : ""); b.textContent = t; return b; }
+  var bPrev = mk("‹ Prev", ""), bNext = mk("Next ›", "primary"),
+      bConf = mk("Simulate conflict", "danger"), bReset = mk("Reset", "");
+  controls.append(bPrev, bNext, bConf, bReset);
+
+  var svg = el("svg", { viewBox: "0 0 460 320", width: "100%", style: "max-width:460px;display:block;margin:0 auto" });
+  var readout = document.createElement("div");
+  readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:3.4em;color:var(--muted)";
+  wrap.append(controls, svg, readout);
+  mount.appendChild(wrap);
+
+  function bandSoft(b) { return css("--" + b + "-soft"); }
+  function bandStroke(b) { return css("--" + b); }
+
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var mut = css("--muted");
+    for (var i = 0; i < LAYERS.length; i++) {
+      var y = 12 + i * 50, L = LAYERS[i], active = i === step;
+      var g = el("g", {});
+      g.appendChild(el("rect", {
+        x: 20, y: y, width: 420, height: 40, rx: 6,
+        fill: active ? bandSoft(L.band) : css("--surface-soft"),
+        stroke: active ? bandStroke(L.band) : css("--border"),
+        "stroke-width": active ? 2 : 1,
+        "stroke-dasharray": (i === 3 ? "5 4" : "none"),
+        opacity: (i < step || (i === step)) ? 1 : 0.5
+      }));
+      var tt = el("text", { x: 32, y: y + 18, "font-size": 10.5, "font-weight": active ? "700" : "500", fill: css("--text") });
+      tt.textContent = L.t; g.appendChild(tt);
+      var st = el("text", { x: 32, y: y + 32, "font-size": 9, "font-style": "italic", fill: mut });
+      st.textContent = L.s; g.appendChild(st);
+      // down arrow between layers
+      if (i < LAYERS.length - 1) {
+        g.appendChild(el("path", { d: "M230 " + (y + 40) + " L230 " + (y + 50), stroke: mut, "stroke-width": 1.3, "marker-end": "url(#arwE)" }));
+      }
+      svg.appendChild(g);
+    }
+    if (conflicted) {
+      // retry arc from layer 6 back to layer 5
+      svg.appendChild(el("path", {
+        d: "M440 " + (12 + 5 * 50 + 20) + " C 470 " + (12 + 5 * 50) + " 470 " + (12 + 4 * 50 + 40) + " 442 " + (12 + 4 * 50 + 20),
+        stroke: css("--warn"), "stroke-width": 1.8, fill: "none", "marker-end": "url(#arwR)"
+      }));
+      var rt = el("text", { x: 452, y: 12 + 5 * 50, "font-size": 8.5, "text-anchor": "end", fill: css("--warn") });
+      rt.textContent = "retry"; svg.appendChild(rt);
+    }
+    var defs = el("defs", {});
+    [["arwE", mut], ["arwR", css("--warn")]].forEach(function (p) {
+      var m = el("marker", { id: p[0], viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+      m.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: p[1] })); defs.appendChild(m);
+    });
+    svg.appendChild(defs);
+
+    var L = LAYERS[step];
+    readout.innerHTML = "<strong>" + L.t + "</strong> — " + L.d +
+      (conflicted && step === 5 ? " <strong style='color:var(--warn)'>Conflict:</strong> the commit aborted; the loop retries from layer 5." : "");
+
+    bPrev.disabled = step === 0;
+    bNext.disabled = step === LAYERS.length - 1 && !conflicted;
+    bConf.disabled = step !== 5 || conflicted;
+  }
+
+  bPrev.onclick = function () { if (step > 0) { step--; conflicted = false; render(); } };
+  bNext.onclick = function () { if (step < LAYERS.length - 1) { step++; conflicted = false; render(); } };
+  bConf.onclick = function () { conflicted = true; step = 5; render(); setTimeout(function () { step = 4; render(); }, 700); };
+  bReset.onclick = function () { step = 0; conflicted = false; render(); };
+  render();
+  window.__tbOnTheme(render);
+});
+
+/* Widget 2: three nested tiers of the single-writer guarantee. */
+TB.widget("w-tiers", function (mount) {
+  var el = window.__tbEl, css = window.__tbCss;
+  var TIERS = [
+    { key: "text", soft: "surface", stroke: "border",
+      title: "Tier 1 · write authority", sub: "ReadOnly / Promotable / Writer",
+      defend: "defends against a read-only node writing at all" },
+    { key: "purple", soft: "purple", stroke: "purple",
+      title: "Tier 2 · SlateDB manifest fencing", sub: "refresh_manifest() · no lock, no lease",
+      defend: "defends against a superseded writer process" },
+    { key: "ok", soft: "ok", stroke: "ok",
+      title: "Tier 3 · serializable txn", sub: "drop-guard · conflict detection · commit",
+      defend: "defends against a concurrent change to what was read" }
+  ];
+  var sel = -1;
+
+  var wrap = document.createElement("div");
+  var svg = el("svg", { viewBox: "0 0 460 300", width: "100%", style: "max-width:460px;display:block;margin:0 auto" });
+  var readout = document.createElement("div");
+  readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.6em;color:var(--muted)";
+  wrap.append(svg, readout);
+  mount.appendChild(wrap);
+
+  // outer -> inner box geometry
+  var BOX = [
+    { x: 30, y: 20, w: 400, h: 260 },
+    { x: 78, y: 66, w: 304, h: 168 },
+    { x: 130, y: 104, w: 200, h: 92 }
+  ];
+
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    for (var i = 0; i < TIERS.length; i++) {
+      var T = TIERS[i], B = BOX[i], on = sel === i;
+      var g = el("g", { style: "cursor:pointer" });
+      g.appendChild(el("rect", {
+        x: B.x, y: B.y, width: B.w, height: B.h, rx: 6,
+        fill: css("--" + T.soft + "-soft"),
+        stroke: css("--" + T.stroke),
+        "stroke-width": on ? 2.4 : 1.1,
+        opacity: sel === -1 || on ? 1 : 0.55
+      }));
+      var tt = el("text", { x: B.x + B.w / 2, y: B.y + 20, "text-anchor": "middle", "font-size": 11, "font-weight": "700", fill: css("--text") });
+      tt.textContent = T.title; g.appendChild(tt);
+      var st = el("text", { x: B.x + B.w / 2, y: B.y + 36, "text-anchor": "middle", "font-size": 9, fill: (i === 2 ? css("--ok") : css("--muted")) });
+      st.textContent = T.sub; g.appendChild(st);
+      (function (idx) { g.addEventListener("click", function () { sel = sel === idx ? -1 : idx; render(); }); })(i);
+      svg.appendChild(g);
+    }
+    if (sel === -1) readout.innerHTML = "Three tiers, nested from outer policy to inner commit. <strong>Click a ring</strong> to see the failure it stops.";
+    else readout.innerHTML = "<strong style='color:var(--" + TIERS[sel].stroke + ")'>" + TIERS[sel].title + "</strong> — " + TIERS[sel].defend + ".";
+  }
+  render();
+  window.__tbOnTheme(render);
+});
+
+/* Widget 3: the key fan-out of one write_edge transaction. */
+TB.widget("w-fanout", function (mount) {
+  var el = window.__tbEl, css = window.__tbCss;
+  var KEYS = [
+    { x: 40,  label: "e/out, e/in", sub: "adjacency", band: "info",
+      serves: "scan a vertex's outgoing / incoming neighbors (in only when the reverse index is enabled)" },
+    { x: 160, label: "cnt/out, cnt/in", sub: "degree", band: "info",
+      serves: "read a vertex's degree without scanning its neighbor set" },
+    { x: 280, label: "meta/matrix_dirty", sub: "dirty marker", band: "purple",
+      serves: "the ONLY output consumed by another process: the out-of-process indexer reads it to pick edge types needing a fresh index generation" },
+    { x: 400, label: "idem", sub: "idempotency receipt", band: "ok",
+      serves: "detect and short-circuit a retried write — the last put before commit" }
+  ];
+  var hi = -1;
+
+  var wrap = document.createElement("div");
+  var svg = el("svg", { viewBox: "0 0 480 240", width: "100%", style: "max-width:480px;display:block;margin:0 auto" });
+  var readout = document.createElement("div");
+  readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.8em;color:var(--muted)";
+  wrap.append(svg, readout);
+  mount.appendChild(wrap);
+
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var mut = css("--muted");
+    // source txn node
+    var srcX = 130, srcY = 20, srcW = 200;
+    svg.appendChild(el("rect", { x: srcX, y: srcY, width: srcW, height: 40, rx: 6, fill: css("--warn-soft"), stroke: css("--warn"), "stroke-width": 1.4 }));
+    var stt = el("text", { x: srcX + srcW / 2, y: srcY + 24, "text-anchor": "middle", "font-size": 11, "font-weight": "700", fill: css("--text") });
+    stt.textContent = "one write_edge transaction"; svg.appendChild(stt);
+
+    // defs arrow
+    var defs = el("defs", {});
+    var m = el("marker", { id: "arwF", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    m.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: mut })); defs.appendChild(m); svg.appendChild(defs);
+
+    for (var i = 0; i < KEYS.length; i++) {
+      var K = KEYS[i], on = hi === i, kx = K.x, ky = 140, kw = 92, kh = 54;
+      // edge from txn to key
+      svg.appendChild(el("path", { d: "M" + (srcX + srcW / 2) + " " + (srcY + 40) + " L" + (kx + kw / 2) + " " + ky, stroke: on ? css("--" + K.band) : mut, "stroke-width": on ? 1.9 : 1.2, fill: "none", "marker-end": "url(#arwF)" }));
+      var g = el("g", { style: "cursor:pointer" });
+      g.appendChild(el("rect", { x: kx, y: ky, width: kw, height: kh, rx: 6, fill: css("--" + K.band + "-soft"), stroke: css("--" + K.band), "stroke-width": on ? 2.4 : 1, opacity: hi === -1 || on ? 1 : 0.6 }));
+      var lt = el("text", { x: kx + kw / 2, y: ky + 22, "text-anchor": "middle", "font-size": 9.5, "font-weight": "700", fill: css("--text") });
+      lt.textContent = K.label; g.appendChild(lt);
+      var lst = el("text", { x: kx + kw / 2, y: ky + 38, "text-anchor": "middle", "font-size": 8.5, fill: css("--muted") });
+      lst.textContent = K.sub; g.appendChild(lst);
+      (function (idx) {
+        g.addEventListener("mouseenter", function () { hi = idx; render(); });
+        g.addEventListener("mouseleave", function () { hi = -1; render(); });
+        g.addEventListener("click", function () { hi = idx; render(); });
+      })(i);
+      svg.appendChild(g);
+    }
+    // indexer note
+    var nt = el("text", { x: 326, y: 224, "text-anchor": "middle", "font-size": 8, "font-style": "italic", fill: css("--muted") });
+    nt.textContent = "matrix_dirty → read later by the indexer"; svg.appendChild(nt);
+
+    if (hi === -1) readout.innerHTML = "All four groups commit in one atomic transaction. <strong>Hover a key</strong> to see the read it serves.";
+    else readout.innerHTML = "<strong style='color:var(--" + KEYS[hi].band + ")'>" + KEYS[hi].label + "</strong> — " + KEYS[hi].serves + ".";
+  }
+  render();
+  window.__tbOnTheme(render);
+});
+</script>

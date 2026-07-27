@@ -1,0 +1,1763 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Read Path · Inside TurboLay</title>
+<link rel="stylesheet" href="../assets/textbook.css">
+<style>
+  .tb-src-cap { font-family: var(--sans); font-size: 0.72rem; font-weight: 700; color: var(--muted); margin: 1.3rem 0 0.15rem; letter-spacing: 0.02em; }
+  .tb-src-cap code { background: none; padding: 0; font-size: inherit; color: var(--muted); }
+  .tb-src-cap + pre { margin-top: 0; }
+  ol.tb-steps { padding-left: 1.3rem; }
+  ol.tb-steps > li { margin: 0.5rem 0; }
+</style>
+
+<div class="tb-progress"></div>
+
+<header class="tb-header">
+  <a class="tb-home" href="../index.html">Turbo<span>Lay</span> · Interactive</a>
+  <span class="tb-crumb">Inside TurboLay</span>
+  <span class="tb-crumb">The Read Path</span>
+  <span class="tb-spacer"></span>
+  <button class="tb-theme-toggle" type="button">☾ Dark</button>
+</header>
+
+<main class="tb-main">
+  <div class="tb-chapter-kicker">Chapter 2 · Inside TurboLay</div>
+  <h1>The Read Path</h1>
+
+  <p>This chapter follows one read from the moment a driver sends a query to the moment rows come
+  back. It is the longest chapter because reading is where most of the engine's code lives:
+  <code>src/shard/query.rs</code> alone is 8389 lines. We take it in stages and quote the real functions at
+  each step.</p>
+
+  <p>Keep one idea in mind the whole way through, because it is the thread that ties the chapter
+  together: a read is bound to a single <span class="concept" data-concept="slatedb">SlateDB</span> <span class="concept" data-concept="snapshot-isolation">snapshot</span> when it reaches the shard, the snapshot's
+  own <span class="concept" data-concept="sequence-number">sequence number</span> is read straight back out of it, and that one number — the <span class="concept" data-concept="read-epoch">read epoch</span> of
+  Section 0.7 — is carried into every storage access, every index decision, and every cache key.
+  There is exactly one sequence type in the system, <code>StorageSequence</code> (<code>src/lib.rs:138-140</code>), so
+  "the epoch" and "the storage snapshot" are never two things that have to be reconciled. They are
+  the same number, and the code says so by passing it twice.</p>
+
+  <p>That single-axis design is what makes the rest of the chapter tractable. It also creates two
+  questions a snapshot alone cannot answer, and each gets its own section: <em>which</em> snapshot a
+  client is entitled to (Section 2.4, causal and strong reads), and what to do when a precomputed
+  index was built at an older sequence than the one the read pinned (Section 2.8, the <span class="concept" data-concept="wal-tail-overlay">WAL-tail
+  overlay</span>).</p>
+
+  <h2>The journey of a read</h2>
+
+  <p>Before the detail, here is the whole path. Each box is a stage, and each has its own section
+  below.</p>
+
+  <figure>
+    <div class="tb-widget" id="w-journey"></div>
+    <figcaption>Fig. 2.1 — The read path end to end: each box is a stage with its own section below. The amber
+      stage is where the read epoch is pinned and every later stage inherits it; the purple stage
+      is the acceleration layer, which is the only place a read consults something other than the
+      canonical keys; the green stage is what the client receives.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Walk the pipeline stage by stage<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Press <em>Step</em> to move the highlight down the pipeline. Each stage names the section that
+      dissects it. Watch the colour change at the fourth box: that amber stage is where the read
+      <span class="concept" data-concept="read-epoch">epoch</span> is pinned, and every box below inherits the same number. The purple box is the
+      only place a read touches an accelerator instead of the canonical keys, and the green box is
+      what the client actually receives.</p>
+    </div>
+  </details>
+
+  <p>The overall call chain in code is:</p>
+
+  <p>Bolt <code>RUN</code>/<code>PULL</code> or HTTP <code>POST</code> → <code>ClientQueryService::execute_rows</code> / <code>execute_page</code>
+  → <code>QueryCellClient::execute_cypher_rows{,_page}</code> →
+  <code>GraphShard::execute_opencypher_rows{,_page}</code> → pin a snapshot → parse
+  → optimize → execute → assemble <code>QueryResultSet</code>.</p>
+
+  <h2>Entry: Bolt and HTTPS</h2>
+
+  <p>A read enters through one of the two front doors from Chapter 1.</p>
+
+  <p>The Bolt server is a state machine, <code>run_bolt_protocol</code> (<code>src/client/bolt.rs:646</code>), that reacts
+  to <code>(state, message)</code> pairs. A <code>RUN</code> message (a query) is accepted only in the <code>Ready</code> state. It
+  prepares the request, replies with the result column names, and moves to <code>Streaming</code>, where
+  <code>PULL</code> messages pull rows back. The step that turns the wire message into an engine request is
+  <code>prepare_bolt_run</code>, and that is where the database name becomes a concrete target — and where a
+  driver's bookmarks become an engine bookmark:</p>
+
+  <div class="tb-src-cap"><code>src/client/bolt.rs:1103-1120</code></div>
+<pre><code>let database = selected_bolt_database(session, context, &amp;extra)?;
+let target = context
+    .database_resolver
+    .resolve_database(Some(&amp;database))
+    .map_err(graph_error_to_bolt)?;
+// ...
+let mut request =
+    bolt_query_request(target.clone(), query_id.clone(), query, parameters, &amp;extra)?;
+// ...
+if let Some(bookmark) = highest_matching_bookmark(&amp;target, bolt_bookmarks_from_extra(&amp;extra)?)? {
+    request = request.after_bookmark(bookmark);
+}</code></pre>
+
+  <p>This is the resolution chain from Chapter 1, Section 1.5, happening for real: the Bolt <code>db</code> field
+  goes through <code>ClientDatabaseResolver</code> and comes out as a <code>ClientQueryTarget</code> carrying the scope
+  and <span class="concept" data-concept="cell">cell</span> id. The bookmark handling on the last two lines is standard Neo4j driver behaviour —
+  drivers already collect bookmarks from every response and resend them — so TurboLay gets
+  read-your-writes from an unmodified driver. Section 2.4 takes that apart.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Auto-commit query</span>
+    <p>A query that is its own transaction: it runs and commits by itself, with no surrounding
+    <code>BEGIN</code> / <code>COMMIT</code>. TurboLay only supports auto-commit queries. An explicit transaction is
+    refused.</p>
+  </div>
+
+  <p>The refusal is explicit. In the <code>Ready</code> state a <code>Begin</code>, <code>Commit</code>, or <code>Rollback</code> message fails
+  the connection immediately:</p>
+
+  <div class="tb-src-cap"><code>src/client/bolt.rs:1006-1012</code></div>
+<pre><code>(
+    BoltState::Ready,
+    ClientMessage::Begin { .. } | ClientMessage::Commit | ClientMessage::Rollback,
+) =&gt; {
+    send_bolt_failure(&amp;mut writer, &amp;explicit_transactions_unsupported()).await?;
+    state = BoltState::Failed;
+}</code></pre>
+
+  <p>The HTTPS door is simpler. The router binds <code>POST /v1/graphs/{graph_id}/query</code> to
+  <code>execute_query</code> (<code>src/client/http.rs</code>), which authenticates, builds the target, converts the JSON
+  parameters, and calls the same service method the Bolt path uses. It reads an optional
+  <code>consistency</code> and an optional <code>bookmark</code> from the body, but a <code>read_epoch</code> in the body is
+  <em>rejected</em>, not honoured:</p>
+
+  <div class="tb-src-cap"><code>src/client/http.rs:466-481</code></div>
+<pre><code>if let Some(consistency) = body.consistency {
+    request = request.with_consistency(consistency);
+}
+if body.read_epoch.is_some() {
+    return Err(HttpApiError::from_graph(GraphError::UnsupportedQuery {
+        dialect: "HTTP",
+        feature: "read_epoch is not a storage snapshot selector; use bookmark for causal reads"
+            .to_string(),
+    }));
+}
+if let Some(bookmark) = body.bookmark {
+    request = request
+        .after_bookmark(ClientBookmark::parse(&amp;bookmark).map_err(HttpApiError::from_graph)?);
+}</code></pre>
+
+  <p>Both doors therefore offer a client exactly the same two knobs — a consistency level and a
+  bookmark — and neither offers a way to name a snapshot directly. Both converge on
+  <code>ClientQueryService</code>.</p>
+
+  <h2>The service layer</h2>
+
+  <div class="callout term">
+    <span class="callout-title">Term — ClientQueryService</span>
+    <p>The shared layer behind both front doors. It does everything that is common to a query
+    regardless of protocol: validate the request, decide whether it reads or writes, check the
+    caller is allowed, refuse any client-supplied epoch, honour bookmarks and consistency levels,
+    enforce quotas and timeouts, register a cancellation handle, and hand the query to the cell's
+    shard. It does <em>not</em> pin the read epoch itself; that happens down in the shard.</p>
+  </div>
+
+  <p>The full-result entry point is <code>execute_rows</code> (<code>src/client/service.rs:776</code>); the paged entry
+  point is <code>execute_page</code> (<code>:871</code>), used by both Bolt <code>PULL</code> and HTTPS streaming. <code>execute_rows</code>
+  runs a fixed sequence: refuse a client epoch, validate the request, normalize the runtime limit,
+  authorize, resolve any <code>UNWIND</code> batch, register a cancellation token, then run the body under a
+  timeout and concurrency permits.</p>
+
+  <p>Three of those steps decide the whole character of the read.</p>
+
+  <p><strong>Read or write.</strong> The service parses the query, classifies its access, and authorizes the caller
+  for that action on that scope in one step:</p>
+
+  <div class="tb-src-cap"><code>src/client/service.rs:1339-1350</code></div>
+<pre><code>fn authorize_query(
+    &amp;self, session: &amp;ClientQuerySession, request: &amp;ClientQueryRequest,
+) -&gt; Result&lt;QueryTransportAction&gt; {
+    let action = match classify_opencypher_query_access(&amp;request.query)? {
+        OpenCypherQueryAccess::Read =&gt; QueryTransportAction::Read,
+        OpenCypherQueryAccess::Write =&gt; QueryTransportAction::Write,
+    };
+    self.authorize_scope(session, &amp;request.target.scope, action)?;
+    Ok(action)
+}</code></pre>
+
+  <p><code>classify_opencypher_query_access</code> (<code>src/query/opencypher.rs:306</code>) parses the query and looks for
+  write clauses; if it finds any it is a write, otherwise a read. The classification matters twice
+  below: only a read gets its epoch cleared, and only a read may ask for strong consistency.</p>
+
+  <p><strong>No client epochs.</strong> A client may not hand in a <code>read_epoch</code>, and the refusal is the very first
+  statement in <code>execute_rows</code>:</p>
+
+  <div class="tb-src-cap"><code>src/client/service.rs:781-787</code></div>
+<pre><code>if request.read_epoch.is_some() {
+    return Err(GraphError::UnsupportedQuery {
+        dialect: "ClientProtocol",
+        feature: "historical graph epochs are not client query snapshots; use a bookmark for causal reads"
+            .to_string(),
+    });
+}</code></pre>
+
+  <p><code>execute_page</code> carries the same guard, but only when there is no cursor (<code>:871-878</code>): a
+  continuation page is a different situation, and Section 2.10 explains why it does not need one.</p>
+
+  <p><strong>Clear the epoch and let the shard choose.</strong> For a read the service does the opposite of pinning.
+  It builds a <code>QueryContext</code>, forces <code>read_epoch</code> to <code>None</code>, runs the query, and then reads back
+  out of the result <em>which</em> snapshot the shard actually used:</p>
+
+  <div class="tb-src-cap"><code>src/client/service.rs:824-851 (abridged)</code></div>
+<pre><code>self.validate_bookmark(&amp;request).await?;
+self.refresh_strong_read(&amp;request, action).await?;
+let mut context = query_context(&amp;request, scalar_parameters.clone(), cancellation_token.clone());
+if action == QueryTransportAction::Read {
+    context.read_epoch = None;
+    context.max_result_bytes = Some(self.inner.config.max_cursor_buffer_bytes);
+}
+let result = /* execute_batch / execute_cypher_rows */;
+let read_epoch = result_read_epoch(&amp;result, action)?;
+let storage_sequence = result_storage_sequence(&amp;result, action)?;
+let bookmark = self.bookmark_after(&amp;request, action, storage_sequence).await?;</code></pre>
+
+  <p><code>result_read_epoch</code> and <code>result_storage_sequence</code> (<code>src/client/service.rs:1627-1656</code>) pull the two
+  fields off the returned <code>QueryResultSet</code> and <em>fail loudly</em> — <code>CorruptValue</code> — if a read came back
+  without them. A read that cannot say which snapshot answered it is treated as a bug, not as a
+  missing optional. <code>bookmark_after</code> (<code>:1405-1418</code>) then mints the <span class="concept" data-concept="bookmark">bookmark</span> the client will carry
+  to its next request.</p>
+
+  <p>The request the shard finally receives is a <code>QueryContext</code> whose epoch field is <code>None</code> and whose
+  sequence type is the only one there is:</p>
+
+  <div class="tb-src-cap"><code>src/query/algebra.rs:166-182</code></div>
+<pre><code>pub struct QueryContext {
+    pub scope: GraphScope,
+    pub cell_id: String,
+    pub idempotency_key: String,
+    pub read_epoch: Option&lt;StorageSequence&gt;,
+    pub result_window: QueryWindow,
+    pub parameters: BTreeMap&lt;String, VertexPropertyValue&gt;,
+    pub max_runtime_ms: Option&lt;u64&gt;,
+    pub max_result_bytes: Option&lt;u64&gt;,
+    refreshed_reader: bool,
+    // cancellation_token, validated_read ...
+}</code></pre>
+
+  <p>Two private fields do the real work. <code>refreshed_reader</code> is the one bit a strong read sets
+  (Section 2.4). <code>validated_read</code> is where the pin ends up: it records the cell, the epoch, and the
+  storage snapshot that justifies it, and it is written only by
+  <code>with_validated_storage_read_epoch</code> (<code>src/query/algebra.rs:258-270</code>) and read back through
+  <code>validated_read_epoch</code> (<code>:273</code>) and <code>validated_storage_sequence</code> (<code>:282</code>). Because
+  <code>validated_read_epoch</code> re-checks that the recorded cell and epoch still match the context, an
+  epoch that was set some other way cannot masquerade as a validated one.</p>
+
+  <p><strong>The pin the service skipped happens here.</strong> The shard's entry point refuses an unvalidated epoch
+  outright, then, when the epoch is <code>None</code>, opens one SlateDB snapshot, takes its sequence, binds
+  the two together, and scopes the whole query under it:</p>
+
+  <div class="tb-src-cap"><code>src/shard/query.rs:450-479 (abridged)</code></div>
+<pre><code>if context.read_epoch.is_some() &amp;&amp; context.validated_read_epoch().is_none() {
+    return Err(GraphError::UnsupportedQuery {
+        dialect: "OpenCypher",
+        feature: "historical graph epochs are not storage snapshots; execute against a current SlateDB snapshot"
+            .to_string(),
+    });
+}
+let result = if context.read_epoch.is_none() {
+    let snapshot = if context.uses_refreshed_reader() {
+        self.db.reader_snapshot().await
+    } else {
+        self.db.snapshot().await
+    };
+    match snapshot {
+        Ok(snapshot) =&gt; {
+            let read_epoch = snapshot.seq();
+            let context = context.with_validated_storage_read_epoch(read_epoch, read_epoch);
+            GraphStore::scope_snapshot(
+                snapshot,
+                self.execute_parsed_opencypher_rows_inner(context, query),
+            )
+            .await
+        }
+        Err(err) =&gt; Err(err),
+    }</code></pre>
+
+  <p>Four details in that fragment carry the design.</p>
+
+  <ol class="tb-steps">
+    <li><code>snapshot.seq()</code> is where the epoch comes from. The engine never allocates one, never
+      increments one, and never reads a "current epoch" key — no such key exists.</li>
+    <li><code>with_validated_storage_read_epoch(read_epoch, read_epoch)</code> passes the same number twice, once
+      as the epoch the query runs at and once as the storage snapshot that justifies it. They are the
+      same number because there is only one sequence.</li>
+    <li>The branch on <code>uses_refreshed_reader()</code> is the entire runtime cost of strong consistency:
+      <code>db.reader_snapshot()</code> (<code>src/core/state.rs:337-343</code>) always opens a fresh reader snapshot,
+      whereas <code>db.snapshot()</code> (<code>:318-334</code>) will happily reuse a snapshot already installed in
+      task-local state, or the writer's own.</li>
+    <li><code>GraphStore::scope_snapshot</code> (<code>src/core/state.rs:376-383</code>) installs the snapshot in a task-local
+      so every <code>get</code> and <code>scan</code> deeper in the call stack is served from it without threading a handle
+      through every function. That task-local is also why the <em>nested</em> <code>db.snapshot()</code> calls you will
+      meet in Section 2.11 return the same snapshot rather than a newer one.</li>
+  </ol>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Refusing a client-supplied epoch looks unhelpful until you ask what honouring one would mean. A
+    <code>StorageSequence</code> from the past names a SlateDB snapshot that may already have been compacted
+    away; serving it would require either retaining every version forever or quietly answering from
+    some other state. TurboLay declines both. What clients actually want in practice is not time
+    travel but a <em>floor</em> — "at least as fresh as what I already saw" — and a floor is cheap to
+    honour and always satisfiable by waiting. That is the bookmark, and it is the next section.</p>
+  </div>
+
+  <figure>
+    <div class="tb-widget" id="w-one-snapshot"></div>
+    <figcaption>Fig. 2.2 — One read, one snapshot, one number: the client may name a floor but never a snapshot;
+      the service clears the epoch; the shard opens a single SlateDB snapshot, takes its sequence
+      <em>S</em>, and binds <em>S</em> as both the read epoch and the storage snapshot that justifies
+      it. The dotted region is the part of the query that runs inside <code>scope_snapshot</code>, and the
+      same <em>S</em> leaves again as the client's next bookmark.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Open a snapshot and watch <em>S</em> propagate<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Press <em>Open snapshot</em>. The shard takes the snapshot's sequence as the number <em>S</em>, and the
+      same <em>S</em> lights up in every place that inherits it: every canonical key read at <em>S</em>, every
+      <span class="concept" data-concept="index-generation">index generation</span> judged against <em>S</em>, every content cache keyed on <em>S</em>. The dotted
+      region is what runs inside <code>scope_snapshot</code>. When the read returns, the very same <em>S</em>
+      leaves as the client's next bookmark. Press <em>New read</em> to pin a fresher snapshot and see a
+      new number flow through.</p>
+    </div>
+  </details>
+
+  <h2>Causal reads and bookmarks</h2>
+
+  <p>A snapshot makes one query coherent with itself. It says nothing about how two <em>consecutive</em>
+  queries relate, and that gap is where the most common surprise in a distributed database lives.
+  Chapter 0, Section 0.8 named the two levels; this section is the mechanism.</p>
+
+  <p>The failure is easy to reproduce. Every node in a TurboLay cluster opens every cell as a reader
+  (Section 1.6), and a reader's view of the object store advances only when it refreshes. So a
+  client can write an edge on node A, be told the write is durable, send its next query to node B,
+  and have node B pin a snapshot that predates the write. Nothing is corrupt. The second read is
+  simply <em>earlier</em> than the first write, and no amount of snapshot discipline inside that one query
+  can fix it.</p>
+
+  <p>The blunt fix — make every read refresh to the newest durable state — is correct and expensive:
+  it turns every read into a round trip to the object store whether the client needed it or not.
+  TurboLay instead names two levels and defaults to the cheap one:</p>
+
+  <div class="tb-src-cap"><code>src/client/service.rs:269-273</code></div>
+<pre><code>pub enum ClientReadConsistency {
+    #[default]
+    Causal,
+    Strong,
+}</code></pre>
+
+  <p>The level is chosen per request with <code>with_consistency</code> (<code>:328-331</code>) or the <code>strong()</code> shortcut
+  (<code>:333-336</code>), and both front doors expose it: HTTPS as a <code>consistency</code> body field
+  (<code>src/client/http.rs:466-468</code>), Bolt as either a <code>consistency</code> key in the <code>RUN</code> metadata or
+  <code>turbolay.consistency</code> inside <code>tx_metadata</code>, with a protocol error if the two disagree
+  (<code>src/client/bolt.rs:1156-1180</code>).</p>
+
+  <h3>The bookmark</h3>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Bookmark</span>
+    <p>An opaque token naming a point in one cell's history that the client has already observed. A
+    <code>ClientBookmark</code> is a query target plus a <code>StorageSequence</code>, encoded as a printable string so it
+    can travel through a driver that knows nothing about TurboLay. Sending one with a request means:
+    <em>do not answer me from a state older than this.</em></p>
+  </div>
+
+  <div class="tb-src-cap"><code>src/client/service.rs:130-148</code></div>
+<pre><code>pub struct ClientBookmark {
+    pub target: ClientQueryTarget,
+    pub epoch: StorageSequence,
+}
+
+impl ClientBookmark {
+    pub fn encode(&amp;self) -&gt; String {
+        format!(
+            "sgk:1:{}:{}:{}:{}",
+            hex_encode(self.target.scope.namespace.to_string().as_bytes()),
+            hex_encode(self.target.scope.graph_id.as_str().as_bytes()),
+            hex_encode(self.target.cell_id.as_bytes()),
+            self.epoch
+        )
+    }
+}</code></pre>
+
+  <p>The encoding is worth a second look because it is doing more than carrying a number. Hex-encoding
+  the namespace, graph id, and cell id makes the token self-describing and unambiguous under a
+  <code>:</code> separator, and the leading <code>sgk:1:</code> is a version tag. The consequence is that a bookmark is
+  <em>bound to one cell</em>: presenting it against a different target is rejected rather than reinterpreted
+  (<code>validate_bookmark</code>, <code>src/client/service.rs:1367-1378</code>, raises <code>GraphScopeMismatch</code>), and the Bolt
+  door rejects it at the protocol level with Neo4j's own
+  <code>Neo.ClientError.Transaction.InvalidBookmark</code> (<code>src/client/bolt/values.rs:16-21</code>).</p>
+
+  <p>The client never constructs one. Every read result carries a fresh bookmark back out:</p>
+
+  <div class="tb-src-cap"><code>src/client/service.rs:340-345</code></div>
+<pre><code>pub struct ClientQueryResult {
+    pub query_id: String,
+    pub result: QueryResultSet,
+    pub read_epoch: Option&lt;StorageSequence&gt;,
+    pub bookmark: Option&lt;ClientBookmark&gt;,
+}</code></pre>
+
+  <p>and <code>bookmark_after</code> (<code>src/client/service.rs:1405-1418</code>) mints it from the sequence the read
+  actually used, or — for a <em>write</em>, which reports no read epoch — from the cell's current durable
+  sequence:</p>
+
+  <div class="tb-src-cap"><code>src/client/service.rs:1405-1418</code></div>
+<pre><code>async fn bookmark_after(
+    &amp;self, request: &amp;ClientQueryRequest, action: QueryTransportAction,
+    read_storage_sequence: Option&lt;StorageSequence&gt;,
+) -&gt; Result&lt;Option&lt;ClientBookmark&gt;&gt; {
+    let sequence = if action == QueryTransportAction::Read {
+        read_storage_sequence
+    } else {
+        self.inner.client
+            .current_storage_sequence(&amp;request.target.scope, &amp;request.target.cell_id).await?
+    };
+    Ok(sequence.map(|sequence| ClientBookmark::new(request.target.clone(), sequence)))
+}</code></pre>
+
+  <p>That write branch is the load-bearing one. It is what makes <em>read-your-writes</em> work: the client's
+  <code>CREATE</code> returns a bookmark naming the sequence at which the write is durable, and the next read
+  carrying that bookmark cannot be served from anything older. A Bolt driver holding several
+  bookmarks sends them all, and <code>highest_matching_bookmark</code> (<code>src/client/bolt/values.rs:9-30</code>) keeps
+  the largest epoch after checking every one belongs to this target.</p>
+
+  <h3>Honouring a causal read</h3>
+
+  <p>A <span class="concept" data-concept="causal-read">causal read</span> waits for the cell to reach the bookmark's sequence, and refuses rather than
+  silently serving something older:</p>
+
+  <div class="tb-src-cap"><code>src/client/service.rs:719-741</code></div>
+<pre><code>pub async fn ensure_bookmark(&amp;self, bookmark: &amp;ClientBookmark) -&gt; Result&lt;()&gt; {
+    let current_sequence = self.inner.client
+        .wait_for_storage_sequence(
+            &amp;bookmark.target.scope, &amp;bookmark.target.cell_id, bookmark.epoch,
+        ).await?
+        .ok_or_else(|| GraphError::UnsupportedQuery {
+            dialect: "ClientProtocol",
+            feature: "backend cannot prove bookmark durability".to_string(),
+        })?;
+    if current_sequence &lt; bookmark.epoch {
+        return Err(GraphError::SnapshotAhead { /* cell_id, read_epoch, current_epoch */ });
+    }
+    Ok(())
+}</code></pre>
+
+  <p>The waiting is real, bounded, and happens in the shard. <code>wait_for_storage_sequence</code>
+  (<code>src/shard/lifecycle.rs:590-617</code>) checks the durable sequence, returns immediately if it already
+  meets the floor, and otherwise polls <code>refresh_durable_reader</code> every 10 ms until the query's own
+  runtime limit (default 30 s) expires, at which point it raises <span class="concept" data-concept="snapshot-ahead"><code>SnapshotAhead</code></span>:</p>
+
+  <div class="tb-src-cap"><code>src/shard/lifecycle.rs:596-616 (abridged)</code></div>
+<pre><code>let current = self.db.durable_sequence().await?;
+if current &gt;= minimum { return Ok(current); }
+let deadline = std::time::Instant::now() + Duration::from_millis(
+    self.limits.max_query_runtime_ms.unwrap_or(30_000).max(1));
+loop {
+    let current = self.db.refresh_durable_reader().await?;
+    if current &gt;= minimum { return Ok(current); }
+    if std::time::Instant::now() &gt;= deadline {
+        return Err(GraphError::SnapshotAhead { /* ... */ });
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+}</code></pre>
+
+  <p>Note the shape of the fast path: when the reader is already caught up — which is the common case
+  — <code>ensure_bookmark</code> costs one in-memory read of <code>writer.status().durable_seq</code> or
+  <code>reader.status().durable_seq</code> (<code>src/core/state.rs:346-351</code>) and no object-store traffic at all.
+  Causal consistency is free when it is already satisfied. It only costs something when it is
+  actually doing work.</p>
+
+  <h3>Honouring a strong read</h3>
+
+  <p>A <span class="concept" data-concept="strong-read">strong read</span> does not wait for a number the client supplied; it goes and finds the current one:</p>
+
+  <div class="tb-src-cap"><code>src/client/service.rs:1380-1402 (abridged)</code></div>
+<pre><code>async fn refresh_strong_read(
+    &amp;self, request: &amp;ClientQueryRequest, action: QueryTransportAction,
+) -&gt; Result&lt;()&gt; {
+    if request.consistency != ClientReadConsistency::Strong { return Ok(()); }
+    if action != QueryTransportAction::Read {
+        return Err(GraphError::UnsupportedQuery {
+            dialect: "ClientProtocol",
+            feature: "strong consistency applies only to read queries".to_string(),
+        });
+    }
+    self.inner.client
+        .refresh_storage_sequence(&amp;request.target.scope, &amp;request.target.cell_id).await?
+        .ok_or_else(|| /* backend cannot refresh the latest durable SlateDB frontier */)?;
+    Ok(())
+}</code></pre>
+
+  <p>Three things happen there. Strong is a no-op unless asked for, so the branch costs nothing on the
+  default path. A strong <em>write</em> is rejected as meaningless rather than quietly ignored — a write
+  establishes its own point in the sequence, so asking it to be strongly consistent is a category
+  error. And <code>refresh_storage_sequence</code> (<code>src/shard/lifecycle.rs:583-588</code>) calls
+  <code>refresh_durable_reader</code> (<code>src/core/state.rs:353-357</code>), which forces the <code>DbReader</code> to re-read
+  the object store and pick up everything committed by any writer, anywhere.</p>
+
+  <p>Refreshing the reader is only half of it, because the query has not started yet and might still
+  pin a stale snapshot. The other half is one bit set on the context:</p>
+
+  <div class="tb-src-cap"><code>src/client/service.rs:1659-1678 (abridged)</code></div>
+<pre><code>fn query_context(/* ... */) -&gt; QueryContext {
+    let mut context = QueryContext::new(&amp;request.target.cell_id, &amp;request.query_id)
+        // scope, parameters, cancellation token ...
+    if request.consistency == ClientReadConsistency::Strong {
+        context = context.with_refreshed_reader();
+    }
+    context
+}</code></pre>
+
+  <p><code>with_refreshed_reader</code> (<code>src/query/algebra.rs:242-246</code>) sets the private <code>refreshed_reader</code> flag,
+  and <code>uses_refreshed_reader</code> (<code>:248</code>) is read in exactly one place: the snapshot branch in
+  Section 2.3. That is how the request-level word "strong" becomes the storage-level choice of
+  <code>db.reader_snapshot()</code> over <code>db.snapshot()</code> — and, in particular, how it defeats the task-local
+  snapshot reuse inside <code>db.snapshot()</code> that would otherwise hand back a snapshot pinned earlier in
+  the same task.</p>
+
+  <figure>
+    <div class="tb-widget" id="w-causal"></div>
+    <figcaption>Fig. 2.3 — A causal read across two nodes: the write returns a bookmark naming the sequence
+      <em>S</em> at which it became durable, and the follow-up read on a different node blocks in
+      <code>ensure_bookmark</code> until its own reader has caught up to <em>S</em> before pinning a snapshot.
+      Had node B already been at or past <em>S</em> the amber step would have been a single in-memory
+      comparison with no object-store traffic; had it never caught up within the query's runtime
+      limit, the read would have failed with <code>SnapshotAhead</code> rather than returning stale rows.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Run the read-your-writes handshake, with and without a lagging reader<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Step through the handshake: the <code>CREATE</code> on node A commits durable at <em>S</em> and hands the
+      client a bookmark naming <em>S</em>; the client sends its next <code>MATCH</code> to node B carrying that
+      bookmark. Toggle <em>Node B already caught up?</em> to switch between the two shapes. When B is
+      behind, <code>ensure_bookmark</code> refreshes and re-checks (the amber step) before pinning a snapshot
+      at ≥ <em>S</em>; when B is already caught up, that step collapses to a single in-memory comparison
+      with no object-store traffic.</p>
+    </div>
+  </details>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Causal is the default because it matches what users actually complain about. Almost every
+    grievance filed against "eventual consistency" is really a grievance about read-your-writes:
+    people are untroubled by not seeing a stranger's edit and very troubled by not seeing their own.
+    A bookmark buys read-your-writes for the price of a short string on the wire and, in the common
+    case, zero coordination. Strong stays available for the genuinely different requirement — <em>see
+    everyone's</em> writes — and charges for itself at the point of use, in one extra reader refresh,
+    rather than taxing every read in the system.</p>
+  </div>
+
+  <div class="callout term">
+    <span class="callout-title">Term — SnapshotAhead</span>
+    <p>The error raised when a required sequence is ahead of what the cell can prove durable: by
+    <code>ensure_bookmark</code> when a bookmark cannot be reached within the query's runtime limit
+    (<code>src/client/service.rs:731-737</code>), and by <code>wait_for_storage_sequence</code> when the polling deadline
+    expires (<code>src/shard/lifecycle.rs:610-615</code>). It is a <em>timeout on catching up</em>, not a claim that
+    the client is wrong, and retrying it is reasonable.</p>
+  </div>
+
+  <h2>Parsing Cypher into the engine's plan</h2>
+
+  <p>The shard turns the query string into the engine's own plan type before doing anything with
+  storage. The entry function is <code>parse_opencypher_row_query_with_parameters</code>:</p>
+
+  <div class="tb-src-cap"><code>src/query/opencypher.rs:267-272</code></div>
+<pre><code>pub fn parse_opencypher_row_query_with_parameters(
+    query: &amp;str,
+    parameters: &amp;BTreeMap&lt;String, VertexPropertyValue&gt;,
+) -&gt; Result&lt;ParsedRowQuery&gt; {
+    with_parsed_cypher(query, |parsed| parsed.lower_row_query(parameters))
+}</code></pre>
+
+  <p><code>with_parsed_cypher</code> (<code>src/query/opencypher.rs:315</code>) runs a C parser (<code>libcypher-parser</code>, reached
+  through FFI) to get a raw syntax tree — reusing one from a thread-local cache of <code>ParsedCypher</code>
+  values when it can — and hands that tree to the closure. The closure, <code>lower_row_query</code>, is
+  TurboLay's own work: it walks the tree and lowers it into <code>ParsedRowQuery</code>, rejecting anything the
+  engine does not implement. The sibling entry points (<code>lower_mutation_query</code>, <code>query_access</code>) go
+  through the same <code>with_parsed_cypher</code> wrapper, so they all share one parse.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Lowering</span>
+    <p>Translating a general syntax tree into a smaller, stricter internal form that the engine knows
+    how to run. TurboLay's lowering is where unsupported Cypher is turned away, so the execution
+    code below it can assume a narrow, well-formed plan.</p>
+  </div>
+
+  <p><code>ParsedRowQuery</code> is that internal form. It is a flat description of one row query: the patterns to
+  match, an optional filter, the projections to return, ordering, a result window, and the output
+  column names:</p>
+
+  <div class="tb-src-cap"><code>src/query/opencypher.rs:23-35</code></div>
+<pre><code>pub struct ParsedRowQuery {
+    pub patterns: Vec&lt;RowPattern&gt;,
+    pub pattern_groups: Vec&lt;RowMatchGroup&gt;,
+    pub union_arms: Vec&lt;ParsedRowQuery&gt;,
+    pub union_all: bool,
+    pub predicate: Option&lt;RowPredicate&gt;,
+    pub projections: Vec&lt;RowProjection&gt;,
+    pub order_by: Vec&lt;RowSort&gt;,
+    pub window: QueryWindow,
+    pub columns: Vec&lt;QueryColumn&gt;,
+    pub distinct: bool,
+}</code></pre>
+
+  <p>The supporting types are small closed enums, all in <code>opencypher.rs</code>. A <code>RowPattern</code> is either a
+  <code>Node</code> or an <code>Edge</code> (<code>:117</code>). A <code>RowEdgePattern</code> (<code>:130</code>) carries an optional
+  <code>hop_range: Option&lt;(u8, u8)&gt;</code>, which is how a bounded variable-length path such as
+  <code>-[:RELATES*1..3]-</code> is represented; the traversal section returns to it. A <code>RowProjection</code> is a
+  <code>NodeId</code>, a <code>Property</code>, <code>CountAll</code>, or an <code>Aggregate</code> (<code>:148</code>), and <code>RowAggregateFunction</code> is
+  <code>Count</code>, <code>Sum</code>, <code>Avg</code>, or <code>Collect</code> (<code>:164</code>). A <code>RowPredicate</code> is a tree of <code>Compare</code>, <code>And</code>,
+  <code>Or</code>, and <code>Not</code> (<code>:231</code>).</p>
+
+  <p><strong>The parse cache.</strong> Parsing is pure work that depends only on the query text, so TurboLay caches
+  the parsed form, but only when the query has no parameters (a parameterized query is cheap to
+  re-lower and the parameter values must be folded in):</p>
+
+  <div class="tb-src-cap"><code>src/shard/query.rs:414-442 (abridged)</code></div>
+<pre><code>async fn parsed_opencypher_row_query(
+    &amp;self, cell_id: &amp;str, query: &amp;str,
+    parameters: &amp;BTreeMap&lt;String, VertexPropertyValue&gt;,
+) -&gt; Result&lt;ParsedRowQuery&gt; {
+    if !parameters.is_empty() {
+        return parse_opencypher_row_query_with_parameters(query, parameters);
+    }
+    let key = ParsedRowQueryCacheKey::new(query);
+    if let Some(parsed) = self.parsed_row_query_cache.lock().await.get(&amp;key) {
+        self.cache_metrics.record_hit(GraphCacheKind::ParsedRowQuery);
+        return Ok(parsed);
+    }
+    self.cache_metrics.record_miss(GraphCacheKind::ParsedRowQuery);
+    let parsed = parse_opencypher_row_query_with_parameters(query, parameters)?;
+    self.parsed_row_query_cache.lock().await.insert(
+        key, parsed.clone(), cell_id.to_string(), false, &amp;self.cache_metrics,
+    );
+    Ok(parsed)
+}</code></pre>
+
+  <p>This cache key holds only the query string. It is the one read cache that does not carry an epoch,
+  because a parse result does not depend on graph contents.</p>
+
+  <h2>The optimizer</h2>
+
+  <p>Before scanning, the engine chooses how to reach each pattern. For row queries the choice is made
+  lazily as patterns are matched, not as a separate up-front pass. The decision function is
+  <code>best_row_edge_access</code> (<code>src/shard/query_optimizer.rs:459</code>), wrapped by
+  <code>best_row_edge_access_with_stats</code> (<code>:369</code>), which returns a <code>RowQueryAccess</code> describing the
+  cheapest way to satisfy one edge pattern.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Access path</span>
+    <p>The concrete method chosen to satisfy a pattern. For an edge, the choices include expanding from
+    a known source using the outgoing <span class="concept" data-concept="adjacency">adjacency</span> index, expanding backward using the incoming index,
+    checking a single edge's existence, using an edge-property index, walking a variable-length
+    range, or, as a last resort, scanning every edge of that type.</p>
+  </div>
+
+  <p>The choice is cost-based. Each candidate is given an estimated cardinality (how many rows it will
+  produce), and the engine picks the smallest, breaking ties by a fixed priority. The estimates come
+  from persisted statistics:</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Query statistics (qstats)</span>
+    <p>Counts the engine keeps about the graph so the optimizer can guess selectivity: how many edges
+    of a type exist, how many distinct values a property has, how common the most common value is.
+    They are stored in the cell under <code>cell/&lt;id&gt;/qstats/…</code> (as <code>QueryStatsRecord</code>) and refreshed by
+    a background job. If a statistic is stale, its cost estimate is inflated so the optimizer treats
+    it with suspicion.</p>
+  </div>
+
+  <p><code>query_stats_estimate</code> (<code>src/shard/query_optimizer.rs:579</code>) reads a <code>QueryStatsRecord</code> and
+  <code>stats_record_cost_estimate</code> (<code>:623</code>) multiplies the estimate by four when the record is stale. A
+  <code>QueryStatsRecord</code> (<code>src/query/algebra.rs:393</code>) holds <code>count</code>, <code>read_epoch</code>, <code>refreshed_at_ms</code>,
+  <code>distinct_values</code>, <code>total_values</code>, and <code>most_common_count</code>, and offers an <code>equality_estimate()</code>
+  for the selectivity of a property equality. Note that its <code>read_epoch</code> field is a
+  <code>StorageSequence</code> like every other epoch in the system: a statistic records the snapshot it was
+  computed against, which is exactly what makes "is this stale?" a well-posed question.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Statistics are stored per cell and stamped with the sequence they were computed at, rather than
+    recomputed per query, because the graph lives on a remote object store where counting is
+    expensive. Inflating stale estimates is a safety valve: a wrong-but-cheap-looking plan is worse
+    than a plan the optimizer already distrusts, so staleness pushes the optimizer toward more
+    conservative access paths.</p>
+  </div>
+
+  <h2>Execution: from a pattern to a scan</h2>
+
+  <p>Execution begins at <code>execute_opencypher_rows</code> (<code>src/shard/query.rs:262</code>), which ties parse and run
+  together, and lands in <code>execute_parsed_opencypher_rows</code> — the snapshot-pinning function from
+  Section 2.3. Inside the snapshot, <code>execute_parsed_opencypher_rows_inner</code> (<code>:506</code>) sets up the
+  guard rails and resolves the epoch one last time:</p>
+
+  <div class="tb-src-cap"><code>src/shard/query.rs:512-521</code></div>
+<pre><code>let budget = QueryBudget::new(
+    context.max_runtime_ms.or(self.limits.max_query_runtime_ms),
+    context.cancellation_token.clone(),
+)
+.with_max_result_bytes(context.max_result_bytes);
+budget.check("cypher_rows")?;
+let storage_sequence = context.validated_storage_sequence();
+let read_epoch = self.query_read_epoch(&amp;context).await?;</code></pre>
+
+  <div class="callout term">
+    <span class="callout-title">Term — QueryBudget</span>
+    <p>The per-query guard that every deep loop consults. It carries the runtime deadline, the
+    cancellation token, and the result-byte ceiling, and <code>budget.check("…")</code> is called with a
+    named site — <code>cypher_edge_sources</code>, <code>graph_index_wal_entry</code>, <code>query_out_neighbors_scan</code> — so
+    that a query killed by its budget says <em>where</em> it was killed. Passing the budget explicitly,
+    rather than checking a global, is why an expensive traversal can be aborted mid-expansion.</p>
+  </div>
+
+  <p><code>query_read_epoch</code> (<code>:1821-1826</code>) is deliberately trivial: it returns the validated epoch if there
+  is one, and otherwise falls back to <code>current_epoch</code>. It does no validation of its own — the
+  rejection already happened at the entry point, and the <em>plan</em>-level check lives in
+  <code>validate_executable_query_plan</code> (<code>:1797-1818</code>), which raises <code>SnapshotAhead</code> for an epoch beyond
+  the cell's current sequence and rejects any other mismatch with <em>"stale query plans are not pinned
+  SlateDB snapshots"</em>. And <code>current_epoch</code> (<code>:5983-5987</code>) is now a one-liner that says the whole
+  story of the resync:</p>
+
+  <div class="tb-src-cap"><code>src/shard/query.rs:5983-5987</code></div>
+<pre><code>pub async fn current_epoch(&amp;self, cell_id: &amp;str) -&gt; Result&lt;StorageSequence&gt; {
+    validate_component("cell_id", cell_id)?;
+    self.ensure_cell_readable(cell_id, "current_epoch").await?;
+    Ok(self.db.snapshot().await?.seq())
+}</code></pre>
+
+  <p>"The current epoch of a cell" is not a stored value that anyone maintains. It is whatever sequence
+  a snapshot opened right now reports.</p>
+
+  <p>From there the query routes to the union path or to <code>execute_single_opencypher_rows</code> (<code>:599</code>),
+  which tries four fast paths in order — the graph-kernel traversal path (Section 2.11), a
+  source-relationship-id path, a relationship-count path, and a relationship-rows path — before
+  falling back to generic pattern matching. We follow the generic path, because the fast paths are
+  specializations of it.</p>
+
+  <p>Generic matching is <code>match_row_patterns</code> (<code>:2628</code>), which for each edge pattern with a known source
+  scans that source's neighbours. This is the exact point where the graph model becomes storage
+  access:</p>
+
+  <div class="tb-src-cap"><code>src/shard/query.rs:3296-3307</code></div>
+<pre><code>for src in sources {
+    budget.check("cypher_edge_sources")?;
+    let neighbors = self
+        .out_neighbors_at_for_query(cell_id, &amp;edge.edge_type, src, read_epoch, budget)
+        .await?;
+    scanned_edges = scanned_edges.saturating_add(neighbors.len() as u64);
+    self.ensure_query_scan_edges("cypher_edge_neighbor_scan", scanned_edges)?;
+    for dst in neighbors {
+        self.push_matching_edge_row(edge, src, dst, &amp;mut state).await?;
+    }
+}</code></pre>
+
+  <p><code>out_neighbors_at_for_query</code> (<code>:5689-5711</code>) is the representative neighbour scan, and it is
+  strikingly plain — it asks for every edge of the type as of the read epoch and keeps the ones
+  leaving <code>src</code>:</p>
+
+  <div class="tb-src-cap"><code>src/shard/query.rs:5689-5711 (abridged)</code></div>
+<pre><code>async fn out_neighbors_at_for_query(
+    &amp;self, cell_id: &amp;str, edge_type: &amp;str, src: VertexId,
+    read_epoch: StorageSequence, budget: &amp;QueryBudget,
+) -&gt; Result&lt;Vec&lt;VertexId&gt;&gt; {
+    let mut neighbors = Vec::new();
+    for edge in self.edges_at_with_budget(cell_id, edge_type, read_epoch, Some(budget)).await? {
+        budget.check("query_out_neighbors_scan")?;
+        if edge.src == src { neighbors.push(edge.dst); }
+    }
+    neighbors.sort_unstable();
+    Ok(neighbors)
+}</code></pre>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Filtering an all-edges list down to one source looks wasteful, and it is: this path is
+    Θ of the number of edges of the type, per source vertex, not Θ of the source's
+    <span class="concept" data-concept="degree">degree</span>. It is honest to say so. The generic row path exists to be <em>correct for every pattern
+    shape</em>, and the shapes that matter for performance — anchored traversals with a hop range,
+    relationship lookups, counts — are intercepted by the fast paths in
+    <code>execute_single_opencypher_rows</code> before they ever reach here. The budget is what keeps the
+    general case from running away: <code>max_query_scan_edges</code> is enforced inside the scan, so a query
+    that would degenerate is rejected rather than served slowly.</p>
+  </div>
+
+  <p>The reverse direction uses <code>in_neighbors_at_for_query</code> (<code>:5935</code>), and a pattern with no bound
+  endpoint falls back to a full edge scan. All of them build their keys from the functions in
+  <code>keys.rs</code> (<code>out_prefix</code>, <code>in_prefix</code>, <code>out_edge</code>, and so on from Chapter 0, Section 0.6) and read
+  them through two thin wrappers in <code>src/shard/maintenance.rs</code>: <code>read_remote</code> for a point <code>get</code>, and
+  <code>scan_remote_prefix</code> for a prefix <code>scan</code>. Those wrappers set the storage read options, including the <span class="concept" data-concept="durability-filter">durability filter</span>:</p>
+
+  <div class="tb-src-cap"><code>src/codec.rs:162-174</code></div>
+<pre><code>pub(crate) fn remote_read_options() -&gt; ReadOptions {
+    ReadOptions { durability_filter: DurabilityLevel::Remote, ..Default::default() }
+}
+
+pub(crate) fn remote_scan_options() -&gt; ScanOptions {
+    ScanOptions::default()
+        .with_durability_filter(DurabilityLevel::Remote)
+        .with_cache_blocks(false)
+}</code></pre>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Durability filter</span>
+    <p>A read option that tells SlateDB which data is allowed to satisfy the read. <code>Remote</code> means only
+    data that has reached the object store durably counts; data still sitting in a local memtable is
+    ignored. TurboLay reads at <code>Remote</code> so that every reader, including a read-only <code>DbReader</code> on
+    another machine, sees the same durable snapshot — which is also what makes the durable sequence
+    a meaningful thing for a bookmark to name.</p>
+  </div>
+
+  <h2>Index generations and the WAL-tail overlay</h2>
+
+  <p>Everything so far reads canonical keys under the pinned snapshot. Nothing needs reconciling,
+  because the snapshot <em>is</em> the version. This section is about the one place where that is not the
+  whole story: traversal acceleration, where the engine consults a precomputed structure that was
+  built at some <em>earlier</em> sequence and must be reconciled with the sequence the read pinned.</p>
+
+  <p>First, what the generic path does, so the contrast is clear. <code>edges_at_with_budget</code>
+  (<code>src/shard/query.rs:6022-6056</code>) delegates to <code>canonical_adjacency_at</code>
+  (<code>src/engine/artifact_build.rs:534-549</code>) and flattens the result:</p>
+
+  <div class="tb-src-cap"><code>src/shard/query.rs:6022-6042 (abridged)</code></div>
+<pre><code>async fn edges_at_with_budget(
+    &amp;self, cell_id: &amp;str, edge_type: &amp;str,
+    read_epoch: StorageSequence, budget: Option&lt;&amp;QueryBudget&gt;,
+) -&gt; Result&lt;Vec&lt;EdgeRecord&gt;&gt; {
+    self.ensure_cell_readable(cell_id, "edges_at").await?;
+    let adjacency = self.canonical_adjacency_at(cell_id, edge_type, read_epoch).await?;
+    let mut edges = Vec::new();
+    for (src, destinations) in adjacency {
+        for dst in destinations {
+            edges.push(EdgeRecord { cell_id: /* .. */, edge_type: /* .. */, src, dst });
+            /* ensure_limit("query_edges_at_canonical", …, max_query_scan_edges) */
+        }
+    }
+    Ok(edges)
+}</code></pre>
+
+  <p><code>canonical_adjacency_at</code> in turn calls <code>current_matrix_rows</code>
+  (<code>src/engine/artifact_build.rs:488-532</code>), which scans the <code>e/out/&lt;type&gt;/</code> adjacency prefix, then
+  scans the compacted <code>seg/out/&lt;type&gt;/</code> segments, dropping any segment whose <code>storage_sequence</code>
+  exceeds the read epoch and any destination covered by an <code>seg/tomb/out/</code> tombstone at or before
+  it. There is no artifact, no index, and nothing to overlay: this is the canonical truth, read
+  under the snapshot. <code>EdgeRecord</code> itself carries no sequence field — when an edge became visible is
+  a property of the snapshot you read it through, not of the row (Chapter 0, Section 0.5).</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>A previous edition of this book described reading as a <em>two-layer merge</em>: a compacted base plus
+    a replay of delta records in <code>(base, read]</code>, applying <code>Plus</code> as an insert and <code>Minus</code> as a
+    remove. That subsystem — the delta log, the outbox, the mutation log, <code>DeltaKind</code>, and the delta
+    GC watermark — was deleted wholesale in the graph-kernel resync. Nothing replays a log at read
+    time. If you remember TurboLay working that way, that memory is of a system that no longer
+    exists; the mechanism below is what took its place, and it differs in kind, not just in detail.</p>
+  </div>
+
+  <h3>The gap the overlay closes</h3>
+
+  <p>Section 1.7 introduced the <em>index generation</em>: an immutable, content-addressed <span class="concept" data-concept="graphblas">GraphBLAS</span> <span class="concept" data-concept="csc">CSC</span> image
+  of one cell's adjacency for one edge type, built out-of-process and published to the object store.</p>
+
+  <div class="tb-src-cap"><code>src/engine/index_store.rs:11-20</code></div>
+<pre><code>pub struct GraphIndexGeneration {
+    pub cell_id: String,
+    pub edge_type: String,
+    pub base_sequence: StorageSequence,  // the snapshot it was built at
+    pub last_wal_id: u64,                // last WAL entry folded in
+    pub edge_count: u64,
+    pub checksum: u64,
+    pub generation: String,              // sha256 hex of the CSC payload
+}</code></pre>
+
+  <p>A generation is built at <code>base_sequence</code> <em>B</em>. A read pins <code>read_epoch</code> <em>S</em>. Because the
+  indexer runs on a timer in a separate process (default <code>GRAPH_INDEXER_INTERVAL_MS=5000</code>), <em>S</em>
+  is normally <em>ahead</em> of <em>B</em>, and everything written in between is invisible to the generation.
+  Serving the traversal from the generation alone would silently answer an older question than the
+  one the client asked.</p>
+
+  <p>Three responses are possible and TurboLay uses all three, in order of preference: if the gap is
+  empty, use the generation directly; if the gap is small and readable, close it exactly; if it
+  cannot be closed, do not use the generation at all.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — WAL-tail overlay</span>
+    <p>The set of edges whose existence changed between an index generation's <code>base_sequence</code> and the
+    read epoch, computed by reading the SlateDB <span class="concept" data-concept="wal">write-ahead-log</span> files written since the generation
+    and then resolving each affected pair against the pinned snapshot. It is applied <em>on top of</em> the
+    compiled matrix during expansion, so a traversal answers at the read epoch even though the
+    matrix it walks was built earlier. It is a <em>repair</em>, not a source of truth: the snapshot decides
+    what is true, and the WAL only says where to look.</p>
+  </div>
+
+  <figure>
+    <div class="tb-widget" id="w-overlay"></div>
+    <figcaption>Fig. 2.4 — The WAL-tail overlay: the compiled matrix answers as of the generation's base sequence
+      <em>B</em>, and the WAL files written since <em>B</em> are read only to learn <em>which</em> vertex pairs
+      might have changed. Each such pair is then resolved against the snapshot pinned at <em>S</em>,
+      so the overlay records a plain exists/does-not-exist verdict and the expansion answers at
+      <em>S</em>. The dashed branch is the honest degradation: if those WAL files have already been
+      compacted away, <code>topology_tail_since</code> returns <code>Unavailable</code> and the query abandons the
+      accelerated path entirely rather than answering from a stale matrix.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Build the overlay one step at a time — including the "WAL gone" fallback<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>The compiled matrix answers at <em>B</em>. Press <em>Step</em> to (1) read the WAL tail and collect the
+      affected <code>(src, dst)</code> pairs, (2) resolve each pair against the snapshot pinned at <em>S</em> — the
+      WAL only says <em>where</em> to look, the snapshot says <em>what is true</em> — and (3) apply the overlay so
+      the answer is now at <em>S</em>. A <code>true</code> adds the edge, a <code>false</code> removes it; an edge added and
+      removed in the interval simply resolves to <code>false</code>. Toggle <em>WAL files still present?</em> off to
+      see the degradation path: <code>topology_tail_since</code> returns <code>Unavailable</code> and the query falls back
+      to reading adjacency straight from the snapshot.</p>
+    </div>
+  </details>
+
+  <h3><code>topology_tail_since</code>, line by line</h3>
+
+  <p>The whole mechanism is one function, <code>src/shard/topology_tail.rs:28-96</code>. It is worth reading in
+  four pieces, because each is a distinct decision.</p>
+
+  <p><strong>Piece one: the three ways to answer without reading anything.</strong></p>
+
+  <div class="tb-src-cap"><code>src/shard/topology_tail.rs:28-44</code></div>
+<pre><code>pub(crate) async fn topology_tail_since(
+    &amp;self,
+    generation: &amp;crate::GraphIndexGeneration,
+    snapshot: &amp;GraphStorageSnapshot,
+    read_sequence: StorageSequence,
+    budget: &amp;QueryBudget,
+) -&gt; Result&lt;GraphTopologyTail&gt; {
+    if snapshot.seq() != read_sequence {
+        return Ok(GraphTopologyTail::Unavailable);
+    }
+    if generation.base_sequence &gt;= read_sequence {
+        return Ok(GraphTopologyTail::Complete(GraphTopologyOverlay::default()));
+    }
+    let last_wal_id = self.db.last_durable_wal_id().await?;
+    if generation.last_wal_id &gt;= last_wal_id {
+        return Ok(GraphTopologyTail::Complete(GraphTopologyOverlay::default()));
+    }</code></pre>
+
+  <p>The first guard is a consistency check, not an optimization: the overlay is only meaningful
+  against the very snapshot the read pinned, so if the snapshot handed in disagrees with the read
+  sequence the function declines rather than guessing. The second and third are the happy paths — a
+  generation already at or past the read, or one that has already folded in every durable WAL file —
+  and both return an <em>empty</em> overlay, which is a positive answer meaning "nothing changed", not a
+  failure.</p>
+
+  <p><strong>Piece two: read the WAL tail, and give up cleanly if you cannot.</strong></p>
+
+  <div class="tb-src-cap"><code>src/shard/topology_tail.rs:46-60</code></div>
+<pre><code>let mut affected = BTreeSet::new();
+let wal_reader = self.db.wal_reader();
+for wal_id in generation.last_wal_id.saturating_add(1)..=last_wal_id {
+    budget.check("graph_index_wal_file")?;
+    let mut entries = match wal_reader.get(wal_id).iterator().await {
+        Ok(entries) =&gt; entries,
+        Err(error) =&gt; {
+            tracing::debug!(
+                wal_id, error = %error,
+                "graph index WAL tail is unavailable; using snapshot adjacency"
+            );
+            return Ok(GraphTopologyTail::Unavailable);
+        }
+    };</code></pre>
+
+  <p>WAL files are garbage-collected by SlateDB once they are compacted into <span class="concept" data-concept="sst">SSTs</span>. If the indexer has
+  fallen far enough behind that the files it would need are gone, the read cannot reconstruct the
+  tail. <code>Unavailable</code> is the honest answer, and the log line says exactly what will happen instead.
+  This degradation path is a designed behaviour, not a bug to be hidden: correctness never depends
+  on the WAL being present, only performance does.</p>
+
+  <p><strong>Piece three: the WAL is a change-detector, not a value source.</strong></p>
+
+  <div class="tb-src-cap"><code>src/shard/topology_tail.rs:61-79 (abridged)</code></div>
+<pre><code>while let Some(entry) = entries.next().await? {
+    budget.check("graph_index_wal_entry")?;
+    if entry.seq &lt;= generation.base_sequence || entry.seq &gt; read_sequence {
+        continue;
+    }
+    collect_topology_entry(
+        &amp;entry.key, &amp;entry.value,
+        &amp;generation.cell_id, &amp;generation.edge_type, &amp;mut affected,
+    )?;
+    ensure_limit(
+        "graph_index_wal_affected_edges",
+        affected.len() as u64, self.limits.max_query_scan_edges,
+    )?;
+}</code></pre>
+
+  <p>Entries outside <code>(base_sequence, read_sequence]</code> are skipped, so the overlay is bounded by the
+  same interval on both ends. <code>collect_topology_entry</code> (<code>:98-137</code>) then recognizes exactly three key
+  shapes and, crucially, records only the <code>(src, dst)</code> <em>pair</em>, never the value:</p>
+
+  <ul>
+    <li><code>cell/&lt;id&gt;/e/out/&lt;type&gt;/&lt;src&gt;/&lt;dst&gt;</code> — a direct adjacency write;</li>
+    <li><code>cell/&lt;id&gt;/seg/tomb/out/&lt;type&gt;/&lt;src&gt;/&lt;dst&gt;</code> — a segment tombstone;</li>
+    <li><code>cell/&lt;id&gt;/seg/out/&lt;type&gt;/…</code> — a compacted segment, whose decoded <code>destinations</code> all become
+      affected pairs.</li>
+  </ul>
+
+  <p>Keys belonging to another cell or another edge type fall through the match arms and are ignored.</p>
+
+  <p><strong>Piece four: resolve every affected pair against the snapshot.</strong></p>
+
+  <div class="tb-src-cap"><code>src/shard/topology_tail.rs:81-96</code></div>
+<pre><code>let mut overlay = GraphTopologyOverlay::default();
+for (src, dst) in affected {
+    budget.check("graph_index_wal_resolve_edge")?;
+    let exists = self
+        .edge_exists_in_storage_snapshot(
+            snapshot, &amp;generation.cell_id, &amp;generation.edge_type, src, dst, read_sequence,
+        )
+        .await?;
+    overlay.set(src, dst, exists);
+}
+Ok(GraphTopologyTail::Complete(overlay))</code></pre>
+
+  <p>This is the design's central move, and it is what makes the overlay so much simpler than a delta
+  log. The WAL is used only to answer <em>which pairs might have changed</em>. The truth about each one is
+  then read from the pinned snapshot, which already resolves the whole history — creations,
+  deletions, segment compaction, re-creation — to a single boolean. An edge added and removed inside
+  the interval resolves to <code>false</code> with no ordering logic; a pair touched five times costs one
+  lookup. The overlay is a <code>BTreeMap&lt;VertexId, BTreeMap&lt;VertexId, bool&gt;&gt;</code>
+  (<code>src/shard/topology_tail.rs:5-7</code>), and a <code>true</code> means "add this edge to the matrix's answer",
+  a <code>false</code> means "remove it".</p>
+
+  <h3>Expanding through the overlay</h3>
+
+  <p>The overlay is not merged into the matrix — that would mean rebuilding it. It is applied during
+  expansion, one hop at a time, by <code>expand_range_with_overlay</code>
+  (<code>src/shard/topology_tail.rs:140-197</code>). Each hop expands the frontier through the compiled
+  GraphBLAS matrix, then patches the result: destinations marked <code>true</code> are inserted, and a
+  destination marked <code>false</code> is removed <em>only if no other vertex in the frontier still reaches it</em> —
+  a check that consults the overlay first and falls back to
+  <code>compiled_graphblas_contains_edge</code> for pairs the overlay says nothing about. Getting that second
+  condition right is what stops one deleted edge from wrongly pruning a vertex that remains
+  reachable by another.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>Compare the two designs on the same question: <em>what does a read pay per write that landed after
+    the acceleration structure was built?</em> Under a delta log it paid a replay — ordered, per-edge,
+    and growing with the number of changes, with a garbage-collection watermark to keep the log from
+    growing without bound, and a whole class of bugs around a reader whose base had been collected.
+    Under the overlay it pays one point lookup per <em>distinct pair touched</em>, against a snapshot it
+    already holds open, with no ordering, no log to retain, and no watermark. The cost is a
+    dependency on SlateDB's WAL still being present — and when it is not, the answer is a clean
+    <code>Unavailable</code> and a fallback, rather than a wrong answer.</p>
+  </div>
+
+  <h2>WHERE and RETURN</h2>
+
+  <p>Once patterns produce candidate rows (each row a set of bound vertices with hydrated properties),
+  the filter and the projection run over them.</p>
+
+  <p>The filter is <code>row_predicate_matches</code> (<code>src/shard/query.rs:7485</code>), a direct recursive walk of the
+  <code>RowPredicate</code> tree:</p>
+
+  <div class="tb-src-cap"><code>src/shard/query.rs:7485-7509 (shape)</code></div>
+<pre><code>RowPredicate::Compare { left, op, right } =&gt;
+    compare_row_values(eval_row_expression(row, left)?, *op, eval_row_expression(row, right)?)?,
+RowPredicate::And(l, r) =&gt; matches(l) &amp;&amp; matches(r),
+RowPredicate::Or(l, r)  =&gt; matches(l) || matches(r),
+RowPredicate::Not(inner) =&gt; !matches(inner),</code></pre>
+
+  <p><code>eval_row_expression</code> (<code>:7511</code>) resolves each side to a <code>NodeId</code>, a <code>Property</code>, or a <code>Literal</code>. A
+  property that is not present resolves to a "missing" value, which makes any comparison against it
+  false.</p>
+
+  <p>The projection has two modes. Without aggregates, <code>project_binding_row</code> (<code>:7628</code>) maps each
+  <code>RowProjection</code> straight to a <code>QueryValue</code> (a node id becomes <code>QueryValue::VertexId</code>, a property
+  becomes <code>QueryValue::Property</code>, absent becomes <code>QueryValue::Null</code>). With aggregates,
+  <code>aggregate_projected_rows</code> (<code>:7816</code>) groups rows by the non-aggregate projections (the group key is
+  the vector of those <code>QueryValue</code>s) and folds each group through an accumulator: <code>CountAll</code>,
+  <code>CountExpression</code>, <code>Sum</code>, <code>Avg</code>, or <code>Collect</code>.</p>
+
+  <p>Both run entirely in memory over rows already produced. Neither touches storage, which is why
+  neither needs the read epoch.</p>
+
+  <h2>Assembling and paging the result</h2>
+
+  <p>The terminal step is <code>finish_projected_rows</code> (<code>src/shard/query.rs:4353</code>): it applies <code>DISTINCT</code>
+  deduplication, then <code>ORDER BY</code>, then the <code>SKIP</code> / <code>LIMIT</code> window, enforcing the configured maximum
+  result size along the way, and returns a <code>QueryResultSet</code>.</p>
+
+  <p>The result types were introduced in Chapter 1; here they are the actual output:</p>
+
+  <div class="tb-src-cap"><code>src/query/algebra.rs:549-614 (abridged)</code></div>
+<pre><code>pub enum QueryValue {
+    Null, VertexId(VertexId), Count(u64), Bool(bool),
+    Float(QueryFloat), Property(VertexPropertyValue), List(Vec&lt;QueryValue&gt;),
+}
+pub struct QueryRow { pub values: Vec&lt;QueryValue&gt; }
+pub struct QueryResultSet {
+    pub columns: Vec&lt;QueryColumn&gt;,
+    pub rows: Vec&lt;QueryRow&gt;,
+    pub read_epoch: Option&lt;StorageSequence&gt;,
+    pub storage_sequence: Option&lt;StorageSequence&gt;,
+}</code></pre>
+
+  <p>Those last two fields are how the shard reports back which snapshot answered — the values
+  <code>result_read_epoch</code> and <code>result_storage_sequence</code> in Section 2.3 insist on, and the seed of the
+  client's next bookmark. They are stamped at the end of
+  <code>execute_parsed_opencypher_rows_inner</code> (<code>src/shard/query.rs:542-546</code>) with
+  <code>result.with_read_epoch(read_epoch)</code> and <code>with_storage_sequence(sequence)</code>.</p>
+
+  <p><strong>Paging is buffered, not re-executed.</strong> This is worth being precise about, because the obvious
+  design — re-run the query at a pinned epoch for each page — is not what happens. On the first
+  page of a read, <code>execute_prepared_page</code> clears the epoch exactly like <code>execute_rows</code> does, executes
+  the <em>complete</em> query under one snapshot, and hands the whole result set to <code>start_server_cursor</code>:</p>
+
+  <div class="tb-src-cap"><code>src/client/service.rs:940-967 (abridged)</code></div>
+<pre><code>if action == QueryTransportAction::Read {
+    // The client-visible topology watermark is not a
+    // storage snapshot selector. Shard execution creates
+    // one SlateDB DbSnapshot for this complete result.
+    context.read_epoch = None;
+    context.max_result_bytes = Some(self.inner.config.max_cursor_buffer_bytes);
+    self.refresh_strong_read(&amp;request, action).await?;
+    let result = /* execute the whole query */;
+    let read_epoch = result_read_epoch(&amp;result, action)?;
+    let storage_sequence = result_storage_sequence(&amp;result, action)?;
+    let bookmark = self.bookmark_after(&amp;request, action, storage_sequence).await?;
+    return self
+        .start_server_cursor(session, &amp;request, result, read_epoch, bookmark, page_size)
+        .await;
+}</code></pre>
+
+  <p>Every subsequent <code>PULL</code> goes to <code>continue_server_cursor</code> (<code>:1171</code>), which finds the buffered cursor
+  by token, re-checks that it belongs to this session, target, query text, and parameters, and slices
+  off the next page. So a cursor is trivially snapshot-stable: there is only ever one execution, and
+  the pages are slices of its output. The costs are equally explicit — the whole result is resident
+  in memory, bounded by <code>max_cursor_buffer_bytes</code> (checked against the running total in
+  <code>start_server_cursor</code>, <code>:1108-1119</code>), and cursors expire. That is also why <code>execute_page</code> only
+  refuses a client <code>read_epoch</code> when there is <em>no</em> cursor: a continuation is not choosing a snapshot,
+  it is reading from one that was already chosen.</p>
+
+  <p>The Bolt server drives paging with <code>PULL</code>, turning each <code>QueryValue</code> into the matching Bolt wire
+  value on the way out; the HTTPS server drives the same cursor for its NDJSON streaming response.</p>
+
+  <h2>Traversal: multi-hop reads</h2>
+
+  <p>A bounded variable-length pattern such as <code>MATCH (a)-[:RELATES*1..3]-&gt;(b)</code> cannot be answered by
+  one adjacency scan. These reads take a separate path built around a <span class="concept" data-concept="sparse-matrix">sparse-matrix</span> kernel, and it
+  is here — and only here — that the index generation and the WAL-tail overlay of Section 2.8 are
+  used.</p>
+
+  <p>A row query is eligible for the traversal path only when it is a single anchored edge pattern with
+  a hop range and a shape the <span class="concept" data-concept="sparse-kernel">kernel</span> can answer. <code>graph_kernel_row_query_request</code>
+  (<code>src/shard/query.rs:6410</code>) recognizes that shape and <code>try_execute_graph_kernel_row_query</code> (<code>:690</code>)
+  dispatches to one of the <span class="concept" data-concept="reachability">reachability</span> functions; if the shape does not match, it returns <code>None</code>
+  and the generic path of Section 2.7 takes over.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Reachability</span>
+    <p>The set of vertices you can reach from a starting vertex by following a given edge type between
+    a minimum and maximum number of hops. It is computed by breadth-first expansion: start with the
+    source, take all neighbours, take their neighbours, and so on, up to the hop limit, collecting
+    everything seen at or after the minimum hop count.</p>
+  </div>
+
+  <p><code>reachable_vertices_in_hop_range_at</code> (<code>src/shard/query.rs:4843-4881</code>) is the representative
+  function, and it is a two-way choice, not a three-way one:</p>
+
+  <div class="tb-src-cap"><code>src/shard/query.rs:4852-4880 (abridged)</code></div>
+<pre><code>let (min_hops, max_hops) = self.validate_reachable_hop_request(
+    "cypher_match_reachable", cell_id, edge_type, hop_range,
+)?;
+if let Some(result) = self
+    .reachable_vertices_with_compiled_graph_kernel(
+        cell_id, edge_type, src, hop_range, read_epoch, budget,
+    )
+    .await?
+{
+    return Ok(result);
+}
+let traversal = self
+    .reachable_from_storage_frontier(
+        cell_id, edge_type, src, (min_hops, max_hops), read_epoch, budget,
+    )
+    .await?;
+self.operation_metrics.query_rust_sparse_fallbacks.fetch_add(1, Ordering::Relaxed);
+Ok((traversal.vertices, traversal.edge_visits))</code></pre>
+
+  <p>Either the compiled path can serve this read, or it cannot — and the fallback is a plain
+  frontier BFS straight over the snapshot, counted in a metric so you can see how often the
+  acceleration is missing.</p>
+
+  <p><strong>The accelerated path.</strong> <code>reachable_vertices_with_compiled_graph_kernel</code> (<code>:5008-5060</code>) finds the
+  newest artifact at or before the read epoch with <code>latest_matrix_artifact</code>
+  (<code>src/engine/artifact_build.rs:578</code>, which itself is now a thin adapter over
+  <code>discover_graph_index</code>), then asks <code>compiled_graphblas_query_snapshot</code> (<code>:5249-5335</code>) for a
+  compiled matrix and, if needed, an overlay. That function is where all the conditions live:</p>
+
+  <ol class="tb-steps">
+    <li>Look up the generation for this <code>(cell, edge type, base epoch)</code> with
+      <code>graph_index_generation_at</code>; if there is none, fall through to the plain compiled-matrix lookup.</li>
+    <li>Open a snapshot and bail out immediately if <code>storage_snapshot.seq() != read_epoch</code> — under
+      <code>scope_snapshot</code> this returns the query's own pinned snapshot, so a mismatch means something is
+      out of step and the accelerated path declines.</li>
+    <li>Hydrate the compiled matrix with <code>cached_graphblas_matrix</code> (<code>src/engine/matrix_cache.rs:47</code>),
+      which on a miss loads the CSC payload through <code>graphblas_csc</code> (<code>src/engine/matrix_cache.rs:211</code>),
+      verifies its checksum against the manifest, and compiles it.</li>
+    <li>If <code>generation.base_sequence &gt;= read_epoch</code>, return the matrix with no overlay.</li>
+    <li>Otherwise call <code>topology_tail_since</code>. <code>Complete(overlay)</code> returns the matrix plus the overlay;
+      <code>Unavailable</code> returns <code>None</code>, which sends the caller to the storage-frontier fallback.</li>
+  </ol>
+
+  <p>There is one more wrinkle worth knowing, because it explains a retry loop that otherwise looks
+  odd. If the overlay grows past <code>max_query_scan_edges</code> the tail fails with
+  <code>AdmissionRejected { operation: "graph_index_wal_affected_edges", .. }</code>; rather than giving up,
+  the code calls <code>discover_graph_index</code> once to see whether the indexer has since published a
+  <em>newer</em> generation — one whose base sequence is closer to the read — and retries with it. The loop
+  runs at most twice, which the code asserts with an <code>unreachable!</code> on the third pass. A lagging
+  indexer therefore degrades to "try the fresher index, then fall back", never to a hang.</p>
+
+  <div class="callout term">
+    <span class="callout-title">Term — Sparse kernel</span>
+    <p>The component that does the breadth-first expansion. "Sparse" because a graph's adjacency,
+    written as a matrix, is almost all zeros, so it is stored and traversed as lists of neighbours
+    rather than a dense grid. TurboLay has two backends: a pure-Rust one and one that calls the
+    SuiteSparse GraphBLAS C library when the <code>graphblas</code> feature is on.</p>
+  </div>
+
+  <div class="tb-src-cap"><code>src/sparse_kernel.rs:14-18</code></div>
+<pre><code>pub enum SparseKernelBackend {
+    RustSparse,
+    SuiteSparseGraphBlas,
+}</code></pre>
+
+  <p>The compiled path always reports <code>SuiteSparseGraphBlas</code>; <code>expand_range_with_overlay</code> says so
+  explicitly when it builds its <code>SparseTraversal</code> (<code>src/shard/topology_tail.rs:192-196</code>). The
+  fallback reports <code>RustSparse</code>.</p>
+
+  <p><strong>The fallback path.</strong> <code>reachable_from_storage_frontier</code> (<code>src/shard/query.rs:4883-4934</code>) is a plain
+  frontier BFS with no precomputation at all. It opens a snapshot, and for each hop asks
+  <code>out_neighbors_in_storage_snapshot</code> (<code>:123</code>) for each frontier vertex — a prefix scan of that
+  vertex's <code>e/out/</code> keys, plus its segments minus its tombstones, all read from the snapshot — while
+  enforcing three separate limits: <code>max_query_scan_edges</code> on edges visited,
+  <code>max_query_intermediate_rows</code> on the frontier size, and <code>max_query_result_vertices</code> on the
+  accumulated result. It is slower than the matrix path by a wide margin, and it is always correct,
+  which is the right way round.</p>
+
+  <figure>
+    <div class="tb-widget" id="w-traversal"></div>
+    <figcaption>Fig. 2.5 — How a multi-hop read picks its engine: with an index generation whose base sequence
+      already equals the pinned read <em>S</em> the expansion is pure sparse-matrix multiplication;
+      with an older generation the WAL tail is turned into an overlay and applied hop by hop; and
+      with no usable generation — or a WAL tail that can no longer be read — the dashed path leads
+      to a plain breadth-first search over the snapshot's own adjacency keys, which is slower but
+      needs nothing precomputed.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Pick a scenario and watch the engine choose its path<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>Choose one of the three situations a multi-hop read can land in. When a generation's base
+      sequence already equals the pinned read <em>S</em>, the read is pure GraphBLAS with no overlay.
+      When the generation is older but the WAL tail is readable, the overlay is built and applied
+      hop by hop. When there is no usable generation, or the WAL files are gone, the read declines
+      the accelerated path entirely and falls back to <code>reachable_from_storage_frontier</code> — a plain
+      BFS over the snapshot's adjacency keys.</p>
+    </div>
+  </details>
+
+  <h2>Read-side caching, in brief</h2>
+
+  <p>A read consults several caches on the shard, and Chapter 5 covers their internals and their
+  bounds. The single fact that matters for correctness here is that every cache key which depends
+  on graph contents embeds a <code>StorageSequence</code>, and there are exactly two regimes.</p>
+
+  <div class="tb-src-cap"><code>src/lib.rs:144-149</code></div>
+<pre><code>pub(crate) struct MatrixCacheKey {
+    pub(crate) cell_id: String,
+    pub(crate) edge_type: String,
+    pub(crate) base_epoch: StorageSequence,
+}</code></pre>
+
+  <p><strong>Per-read caches</strong> — the relationship-rows and relationship-property-rows caches — embed the
+  <code>read_epoch</code> itself. A cached entry from one epoch can never be served to a read at a different
+  epoch, so a write advances the sequence and the next read simply misses; nothing is ever
+  invalidated, and the LRU ages the dead entry out.</p>
+
+  <p><strong>Matrix caches</strong> — the hydrated adjacency and the compiled GraphBLAS matrix — key on a
+  <code>base_epoch</code> that <em>deliberately lags</em> the read epoch, because that is the generation's
+  <code>base_sequence</code>. A write does not invalidate them, and it must not: if it did, every write would
+  force a rebuild of the acceleration structure. The lag is closed at read time by the WAL-tail
+  overlay of Section 2.8.</p>
+
+  <p>The parsed-query cache from Section 2.5 is the only content cache with no sequence in its key,
+  because a parse result does not depend on graph contents at all.</p>
+
+  <h2>Recap: the one-sequence invariant</h2>
+
+  <p>Trace the sequence through the chapter and the read path becomes one idea.</p>
+
+  <ol class="tb-steps">
+    <li><strong>The client cannot name a snapshot.</strong> Both front doors refuse a <code>read_epoch</code>
+      (<code>src/client/http.rs:469-475</code>, <code>src/client/service.rs:781-787</code>). What a client may supply is a
+      <em>floor</em> (a bookmark) or a <em>level</em> (<code>Causal</code> / <code>Strong</code>).</li>
+    <li><strong>The service clears the epoch and enforces the floor.</strong> <code>context.read_epoch = None</code>
+      (<code>service.rs:832</code>), after <code>validate_bookmark</code> has waited for the cell to reach the bookmark
+      (<code>:1367</code>, <code>:719</code>) and <code>refresh_strong_read</code> has refreshed the reader if the request asked for it
+      (<code>:1380</code>).</li>
+    <li><strong>The shard pins it.</strong> One SlateDB snapshot — <code>reader_snapshot()</code> for a strong read,
+      <code>snapshot()</code> otherwise — <code>read_epoch = snapshot.seq()</code>, then
+      <code>with_validated_storage_read_epoch(read_epoch, read_epoch)</code> and <code>scope_snapshot</code>
+      (<code>query.rs:461-476</code>). The same number is the epoch and the storage sequence, because there is
+      only one sequence type in the system (<code>src/lib.rs:138-140</code>).</li>
+    <li><strong>Every canonical read inherits it.</strong> Adjacency scans, segments, and tombstones are all read
+      through the pinned snapshot, and <code>EdgeRecord</code> carries no sequence of its own because visibility
+      is a property of the snapshot, not of the row.</li>
+    <li><strong>The one lagging structure is repaired, not trusted.</strong> An index generation built at <em>B</em> is
+      reconciled to the read at <em>S</em> by <code>topology_tail_since</code>
+      (<code>src/shard/topology_tail.rs:28-96</code>), which uses the WAL only to find changed pairs and the
+      snapshot to decide their truth — or returns <code>Unavailable</code> and steps aside.</li>
+    <li><strong>Every content-dependent cache key embeds a sequence</strong>, either the read epoch or the
+      generation's base sequence.</li>
+    <li><strong>The sequence leaves again as a bookmark</strong>, so the client's next read has a floor
+      (<code>bookmark_after</code>, <code>service.rs:1405-1418</code>).</li>
+  </ol>
+
+  <p>The result is that a read presents one consistent snapshot across adjacency keys, segments, index
+  generations, traversal kernels, and caches, no matter what writers are doing at the same time —
+  and that "as of when?" has exactly one answer, all the way down.</p>
+
+  <p>The next chapter turns to those writers, and to the question this chapter has quietly assumed away:
+  how a sequence advances in the first place, and what guarantees only one process may advance it.</p>
+
+  <nav class="tb-chapnav">
+    <a class="prev" href="01-architecture.html"><span class="cn-dir">‹ Prev</span><br><span class="cn-title">Architecture</span></a>
+    <a class="next" href="03-write-path.html"><span class="cn-dir">Next ›</span><br><span class="cn-title">The Write Path</span></a>
+  </nav>
+</main>
+
+<script src="../assets/glossary.js"></script>
+<script>
+/* Page-local glossary entries for Chapter 2 — read-path nouns not in the shared set. */
+window.TB_GLOSSARY = Object.assign(window.TB_GLOSSARY || {}, {
+  "read-epoch": {
+    title: "Read epoch",
+    html: "<p>The single <span class=\"concept\" data-concept=\"sequence-number\">storage sequence number</span> a read is bound to. When a query reaches the shard it opens one <span class=\"concept\" data-concept=\"slatedb\">SlateDB</span> snapshot, reads the snapshot's own sequence back out, and carries that number — the read epoch — into every storage access, index decision, and cache key.</p><p>Because there is only one sequence type in the system, the read epoch and the storage snapshot are literally the same number, passed twice.</p>"
+  },
+  "bookmark": {
+    title: "Bookmark",
+    html: "<p>An opaque token naming a point in one <span class=\"concept\" data-concept=\"cell\">cell</span>'s history the client has already observed: a query target plus a <span class=\"concept\" data-concept=\"sequence-number\">StorageSequence</span>, encoded as a printable string that survives an unmodified Neo4j driver. Sending one means <em>do not answer me from a state older than this</em>.</p><p>It is a <em>floor</em>, not a snapshot selector — which is what buys read-your-writes for the price of a short string on the wire.</p>"
+  },
+  "causal-read": {
+    title: "Causal read",
+    html: "<p>TurboLay's default consistency level. A causal read <em>waits</em> for the cell to reach the <span class=\"concept\" data-concept=\"bookmark\">bookmark</span>'s sequence before pinning a snapshot, and raises <span class=\"concept\" data-concept=\"snapshot-ahead\">SnapshotAhead</span> rather than serve anything older.</p><p>It is free when already satisfied — one in-memory comparison, no object-store traffic — and only costs a refresh when the local reader is genuinely behind. It guarantees read-your-writes, not see-everyone's-writes.</p>"
+  },
+  "strong-read": {
+    title: "Strong read",
+    html: "<p>The opt-in consistency level that sees <em>everyone's</em> writes. Instead of waiting for a client-supplied floor, a strong read forces the <code>DbReader</code> to re-read the object store (<code>refresh_storage_sequence</code>) and sets a bit so the shard opens a fresh <code>reader_snapshot()</code> rather than reuse a task-local one.</p><p>It charges for itself at the point of use — one extra reader refresh — rather than taxing every read. A strong <em>write</em> is rejected as a category error.</p>"
+  },
+  "durability-filter": {
+    title: "Durability filter",
+    html: "<p>A SlateDB read option that says which data may satisfy a read. <span class=\"concept\" data-concept=\"object-store\">Remote</span> means only data that has reached the object store durably counts; data still in a local memtable is ignored.</p><p>TurboLay reads at <code>Remote</code> so every reader — including a read-only <code>DbReader</code> on another machine — sees the same durable snapshot, which is what makes the durable sequence meaningful for a <span class=\"concept\" data-concept=\"bookmark\">bookmark</span> to name.</p>"
+  },
+  "snapshot-ahead": {
+    title: "SnapshotAhead",
+    html: "<p>The error raised when a required sequence is ahead of what the <span class=\"concept\" data-concept=\"cell\">cell</span> can prove durable — a <span class=\"concept\" data-concept=\"bookmark\">bookmark</span> that cannot be reached within the query's runtime limit, or a polling deadline that expires.</p><p>It is a <em>timeout on catching up</em>, not a claim that the client is wrong, so retrying it is reasonable.</p>"
+  },
+  "reachability": {
+    title: "Reachability",
+    html: "<p>The set of vertices reachable from a start vertex by following one edge type between a minimum and maximum number of hops. Computed by breadth-first expansion: take the source's neighbours, then their neighbours, up to the hop limit, keeping everything seen at or after the minimum.</p><p>Multi-hop patterns like <code>-[:RELATES*1..3]-&gt;</code> take a separate traversal path — the only place the <span class=\"concept\" data-concept=\"index-generation\">index generation</span> and <span class=\"concept\" data-concept=\"wal-tail-overlay\">overlay</span> are used.</p>"
+  },
+  "sparse-kernel": {
+    title: "Sparse kernel",
+    html: "<p>The component that runs the breadth-first expansion. \"Sparse\" because a graph's <span class=\"concept\" data-concept=\"adjacency\">adjacency</span> matrix is almost all zeros, so it is traversed as neighbour lists, not a dense grid.</p><p>TurboLay has two backends: <code>RustSparse</code> (the pure-Rust fallback) and <code>SuiteSparseGraphBlas</code> (the compiled <span class=\"concept\" data-concept=\"graphblas\">GraphBLAS</span> path used when the <code>graphblas</code> feature is on).</p>"
+  }
+});
+</script>
+<script src="../assets/textbook.js"></script>
+<script>
+/* ======================================================================
+   Chapter 2 — The Read Path : interactive widgets
+   Every fletcher diagram in the source becomes an inline-SVG widget that
+   reads colours from CSS custom properties and re-renders on theme flip.
+   ====================================================================== */
+(function () {
+  var NS = "http://www.w3.org/2000/svg";
+  window.__tbEl = function (n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; };
+  window.__tbCss = function (v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); };
+  window.__tbBtn = function (label, cls) { var b = document.createElement("button"); b.className = "tb-btn" + (cls ? " " + cls : ""); b.textContent = label; return b; };
+  window.__tbOnTheme = function (fn) {
+    window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", fn);
+    var t = document.querySelector(".tb-theme-toggle");
+    if (t) t.addEventListener("click", function () { setTimeout(fn, 0); });
+  };
+  window.__tbText = function (x, y, t, anchor, size, weight, fill) {
+    var e = __tbEl("text", { x: x, y: y, "text-anchor": anchor || "middle", class: "wnode-label" });
+    if (size) e.setAttribute("font-size", size);
+    if (weight) e.setAttribute("font-weight", weight);
+    if (fill) e.setAttribute("fill", fill);
+    e.textContent = t; return e;
+  };
+  window.__tbBox = function (x, y, w, h, fill, stroke, dash) {
+    return __tbEl("rect", { x: x, y: y, width: w, height: h, rx: 6, fill: fill, stroke: stroke, "stroke-width": 1.2, "stroke-dasharray": dash || "none" });
+  };
+  /* wrap a long string into <=n-char lines on word boundaries */
+  window.__tbWrap = function (s, n) {
+    var words = s.split(" "), lines = [], cur = "";
+    for (var i = 0; i < words.length; i++) {
+      if ((cur + " " + words[i]).trim().length > n) { if (cur) lines.push(cur); cur = words[i]; }
+      else cur = (cur + " " + words[i]).trim();
+    }
+    if (cur) lines.push(cur);
+    return lines;
+  };
+})();
+
+/* ---------------------------------------------------------------- Fig 2.1 */
+TB.widget("w-journey", function (mount) {
+  var stages = [
+    { t: "driver sends Bolt RUN/PULL or HTTPS POST", s: "2.2", c: "info" },
+    { t: "ClientQueryService: authorize, classify read/write, refuse client epochs", s: "2.3", c: "info" },
+    { t: "honour the bookmark, or refresh for a strong read", s: "2.4", c: "info" },
+    { t: "parse Cypher into ParsedRowQuery; optimize", s: "2.5 / 2.6", c: "info" },
+    { t: "shard pins one SlateDB snapshot; patterns become scans", s: "2.7", c: "warn" },
+    { t: "index generation + WAL-tail overlay, or traversal kernel", s: "2.8 / 2.11", c: "purple" },
+    { t: "apply WHERE / RETURN, build QueryResultSet, page back", s: "2.9 / 2.10", c: "ok" }
+  ];
+  var notes = [
+    "The two front doors from Chapter 1. Either offers just two knobs: a consistency level and a bookmark.",
+    "The shared service layer validates, classifies, authorizes, and refuses any client-supplied epoch. It does not pin the epoch.",
+    "A causal read waits for the bookmark's floor; a strong read refreshes the reader to the newest durable state.",
+    "The Cypher text is lowered into ParsedRowQuery; the optimizer chooses an access path per pattern, cost-based.",
+    "THE PIN. One SlateDB snapshot is opened; read_epoch = snapshot.seq(). Every stage below inherits this one number S.",
+    "The only place a read consults something other than canonical keys: the compiled matrix plus the WAL-tail overlay, or a BFS.",
+    "WHERE and RETURN run in memory; the result is assembled, stamped with S, and paged back with a fresh bookmark."
+  ];
+  var step = -1;
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div"); controls.className = "tb-controls";
+  var bStep = __tbBtn("Step ▶", "primary"), bReset = __tbBtn("Reset", "");
+  controls.append(bStep, bReset);
+  var svg = __tbEl("svg", { viewBox: "0 0 520 300", width: "100%", style: "max-width:520px;display:block;margin:0 auto" });
+  var read = document.createElement("div");
+  read.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:3em;color:var(--muted)";
+  wrap.append(controls, svg, read); mount.appendChild(wrap);
+
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var y = 8, h = 34, gap = 6;
+    for (var i = 0; i < stages.length; i++) {
+      var on = i === step;
+      var soft = __tbCss("--" + stages[i].c + "-soft"), col = __tbCss("--" + stages[i].c);
+      var g = __tbEl("g", { class: "wnode" + (step >= 0 && !on ? " wdim" : "") });
+      g.appendChild(__tbBox(20, y, 480, h, on ? soft : __tbCss("--surface-soft"), on ? col : __tbCss("--border"), null));
+      g.appendChild(__tbText(30, y + 15, stages[i].t, "start", 10.5, on ? "700" : "500"));
+      g.appendChild(__tbText(30, y + 28, "Section " + stages[i].s, "start", 8.5, "400", __tbCss("--muted")));
+      svg.appendChild(g);
+      if (i < stages.length - 1) {
+        var mid = 260;
+        svg.appendChild(__tbEl("path", { d: "M" + mid + " " + (y + h) + " L" + mid + " " + (y + h + gap), stroke: __tbCss("--muted"), "stroke-width": 1.3, fill: "none" }));
+      }
+      y += h + gap;
+    }
+    read.innerHTML = step < 0 ? "Press <strong>Step</strong> to walk the read from the front door to the returned rows." : "<strong>Stage " + (step + 1) + ".</strong> " + notes[step];
+    bStep.textContent = step >= stages.length - 1 ? "Done" : "Step ▶";
+    bStep.disabled = step >= stages.length - 1;
+  }
+  bStep.onclick = function () { if (step < stages.length - 1) { step++; render(); } };
+  bReset.onclick = function () { step = -1; render(); };
+  render(); __tbOnTheme(render);
+});
+
+/* ---------------------------------------------------------------- Fig 2.2 */
+TB.widget("w-one-snapshot", function (mount) {
+  var S = 0, opened = false;
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div"); controls.className = "tb-controls";
+  var bOpen = __tbBtn("Open snapshot", "primary"), bNew = __tbBtn("New read", ""), bReset = __tbBtn("Reset", "");
+  bNew.disabled = true;
+  controls.append(bOpen, bNew, bReset);
+  var svg = __tbEl("svg", { viewBox: "0 0 460 340", width: "100%", style: "max-width:460px;display:block;margin:0 auto" });
+  var read = document.createElement("div");
+  read.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:2.6em;color:var(--muted)";
+  wrap.append(controls, svg, read); mount.appendChild(wrap);
+
+  function node(y, h, txt, fill, stroke, w) {
+    var x = (460 - w) / 2;
+    var g = __tbEl("g", {});
+    g.appendChild(__tbBox(x, y, w, h, fill, stroke));
+    var lines = txt;
+    for (var i = 0; i < lines.length; i++) g.appendChild(__tbText(230, y + 16 + i * 13, lines[i], "middle", 9.5, i === 0 ? "700" : "400"));
+    svg.appendChild(g); return { x: x, y: y, w: w, h: h };
+  }
+  function arrow(y1, y2, lbl) {
+    svg.appendChild(__tbEl("path", { d: "M230 " + y1 + " L230 " + y2, stroke: __tbCss("--muted"), "stroke-width": 1.3, fill: "none", "marker-end": "url(#ja)" }));
+    if (lbl) svg.appendChild(__tbText(238, (y1 + y2) / 2 + 3, lbl, "start", 7.5, "400", __tbCss("--muted")));
+  }
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var defs = __tbEl("defs", {});
+    var m = __tbEl("marker", { id: "ja", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    m.appendChild(__tbEl("path", { d: "M0 0 L10 5 L0 10 z", fill: __tbCss("--muted") })); defs.appendChild(m); svg.appendChild(defs);
+    var sfx = opened ? " S = " + S : "";
+    node(8, 34, ["client request", "bookmark + consistency, never an epoch"], __tbCss("--surface-soft"), __tbCss("--border"), 300);
+    arrow(42, 58);
+    node(58, 34, ["service: refuse read_epoch", "set context.read_epoch = None"], __tbCss("--surface-soft"), __tbCss("--border"), 320);
+    arrow(92, 108);
+    node(108, 34, ["shard opens one snapshot", opened ? "read_epoch = snapshot.seq() = " + S : "read_epoch = snapshot.seq()"], __tbCss("--info-soft"), __tbCss("--info"), 320);
+    arrow(142, 168, opened ? "with_validated_storage_read_epoch(" + S + "," + S + ")" : "with_validated_storage_read_epoch(S,S)");
+    // scope box (dotted)
+    if (opened) svg.appendChild(__tbEl("rect", { x: 40, y: 100, width: 380, height: 128, rx: 8, fill: "none", stroke: __tbCss("--muted"), "stroke-dasharray": "3 3" }));
+    var lit = opened ? __tbCss("--ok-soft") : __tbCss("--surface-soft"), lst = opened ? __tbCss("--ok") : __tbCss("--border");
+    var g = __tbEl("g", { class: opened ? "wflash" : "" });
+    g.appendChild(__tbBox(80, 168, 300, 52, lit, lst));
+    g.appendChild(__tbText(230, 184, "every canonical key read at" + (opened ? " S=" + S : " S"), "middle", 9, opened ? "700" : "400"));
+    g.appendChild(__tbText(230, 198, "every index generation judged against" + (opened ? " S=" + S : " S"), "middle", 9, opened ? "700" : "400"));
+    g.appendChild(__tbText(230, 212, "every content cache keyed on" + (opened ? " S=" + S : " S"), "middle", 9, opened ? "700" : "400"));
+    svg.appendChild(g);
+    if (opened) svg.appendChild(__tbText(48, 118, "scoped under one snapshot", "start", 7.5, "400", __tbCss("--muted")));
+    arrow(220, 250, opened ? "result_storage_sequence → " + S : "result_storage_sequence");
+    node(250, 34, ["rows + a bookmark naming" + (opened ? " S = " + S : " S"), ""], __tbCss("--surface-soft"), __tbCss("--border"), 320);
+    read.innerHTML = !opened
+      ? "The client named a floor and a level, never a snapshot. Press <strong>Open snapshot</strong> to let the shard pin one."
+      : "<strong>S = " + S + "</strong> is the snapshot's own sequence. The same number is the read epoch, judges every index, keys every cache, and leaves again as the next bookmark.";
+    bOpen.disabled = opened; bNew.disabled = !opened;
+  }
+  bOpen.onclick = function () { opened = true; S = 1040 + Math.floor(Math.random() * 900); render(); };
+  bNew.onclick = function () { S += 1 + Math.floor(Math.random() * 60); render(); };
+  bReset.onclick = function () { opened = false; S = 0; render(); };
+  render(); __tbOnTheme(render);
+});
+
+/* ---------------------------------------------------------------- Fig 2.3 */
+TB.widget("w-causal", function (mount) {
+  var step = -1, caught = false;
+  var lanes = ["Client", "node A (writer)", "node B (reader)"];
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div"); controls.className = "tb-controls";
+  var bStep = __tbBtn("Step ▶", "primary"), bReset = __tbBtn("Reset", "");
+  var lab = document.createElement("label");
+  var cb = document.createElement("input"); cb.type = "checkbox";
+  lab.append(cb, document.createTextNode(" Node B already caught up?"));
+  controls.append(bStep, bReset, lab);
+  var svg = __tbEl("svg", { viewBox: "0 0 460 300", width: "100%", style: "max-width:460px;display:block;margin:0 auto" });
+  var read = document.createElement("div");
+  read.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:3em;color:var(--muted)";
+  wrap.append(controls, svg, read); mount.appendChild(wrap);
+  var lx = [70, 230, 390];
+
+  // events: [afterStep visible index]
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var defs = __tbEl("defs", {});
+    var m = __tbEl("marker", { id: "ca", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    m.appendChild(__tbEl("path", { d: "M0 0 L10 5 L0 10 z", fill: __tbCss("--muted") })); defs.appendChild(m); svg.appendChild(defs);
+    for (var i = 0; i < 3; i++) {
+      svg.appendChild(__tbText(lx[i], 20, lanes[i], "middle", 9.5, "700"));
+      svg.appendChild(__tbEl("path", { d: "M" + lx[i] + " 28 L" + lx[i] + " 288", stroke: __tbCss("--border"), "stroke-width": 1, fill: "none", "stroke-dasharray": "2 3" }));
+    }
+    function edge(y, a, b, lbl, col) {
+      svg.appendChild(__tbEl("path", { d: "M" + lx[a] + " " + y + " L" + lx[b] + " " + y, stroke: col || __tbCss("--muted"), "stroke-width": col ? 1.6 : 1.3, fill: "none", "marker-end": "url(#ca)" }));
+      svg.appendChild(__tbText((lx[a] + lx[b]) / 2, y - 5, lbl, "middle", 7.5, "400", __tbCss("--muted")));
+    }
+    function badge(x, y, txt, fill, stroke) {
+      var lines = __tbWrap(txt, 20), h = 12 + lines.length * 11;
+      var g = __tbEl("g", { class: "wflash" });
+      g.appendChild(__tbBox(x - 62, y, 124, h, fill, stroke));
+      for (var i = 0; i < lines.length; i++) g.appendChild(__tbText(x, y + 14 + i * 11, lines[i], "middle", 8, "400"));
+      svg.appendChild(g);
+    }
+    if (step >= 0) edge(48, 0, 1, "CREATE edge", __tbCss("--muted"));
+    if (step >= 1) badge(lx[1], 60, "commit durable at S", __tbCss("--ok-soft"), __tbCss("--ok"));
+    if (step >= 2) edge(110, 1, 0, "bookmark S", __tbCss("--muted"));
+    if (step >= 3) edge(135, 0, 2, "MATCH + bookmark S", __tbCss("--muted"));
+    if (step >= 4) {
+      if (caught) badge(lx[2], 150, "durable seq ≥ S: one in-memory compare, no I/O", __tbCss("--ok-soft"), __tbCss("--ok"));
+      else badge(lx[2], 150, "ensure_bookmark: durable seq < S, so refresh and re-check", __tbCss("--warn-soft"), __tbCss("--warn"));
+    }
+    if (step >= 5) badge(lx[2], 218, "pin snapshot at ≥ S; the write is visible", __tbCss("--ok-soft"), __tbCss("--ok"));
+    if (step >= 6) svg.appendChild(__tbEl("path", { d: "M" + lx[2] + " 278 L" + lx[0] + " 278", stroke: __tbCss("--ok"), "stroke-width": 1.6, fill: "none", "marker-end": "url(#ca)" })), svg.appendChild(__tbText((lx[0] + lx[2]) / 2, 273, "rows + bookmark ≥ S", "middle", 7.5, "400", __tbCss("--muted")));
+
+    var msgs = [
+      "The client writes an edge to node A, the writer for this cell.",
+      "Node A commits the edge durable at sequence S.",
+      "The write returns a bookmark naming S — read-your-writes rides on this.",
+      "The client sends its next MATCH to a different node, B, carrying bookmark S.",
+      caught ? "Node B is already at or past S: ensure_bookmark is a single in-memory comparison, no object-store traffic." : "Node B's reader is behind S. ensure_bookmark refreshes the durable reader and re-checks (bounded by the query's runtime limit).",
+      "B pins a snapshot at ≥ S, so the client's own write is visible.",
+      "Rows return with a fresh bookmark ≥ S — the floor for the next read."
+    ];
+    read.innerHTML = step < 0 ? "Press <strong>Step</strong> to run the read-your-writes handshake across two nodes." : "<strong>Step " + (step + 1) + ".</strong> " + msgs[step];
+    bStep.textContent = step >= 6 ? "Done" : "Step ▶"; bStep.disabled = step >= 6;
+  }
+  bStep.onclick = function () { if (step < 6) { step++; render(); } };
+  bReset.onclick = function () { step = -1; render(); };
+  cb.onchange = function () { caught = cb.checked; render(); };
+  render(); __tbOnTheme(render);
+});
+
+/* ---------------------------------------------------------------- Fig 2.4 */
+TB.widget("w-overlay", function (mount) {
+  // affected pairs discovered from the WAL tail, with their truth @S
+  var pairs = [
+    { s: 1, d: 4, exists: true,  note: "new edge 1→4" },
+    { s: 2, d: 5, exists: false, note: "added then removed in (B,S]" },
+    { s: 3, d: 6, exists: true,  note: "segment-compacted, still present" }
+  ];
+  var step = 0, walOk = true; // 0 matrix@B, 1 wal tail, 2 resolve, 3 overlay applied
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div"); controls.className = "tb-controls";
+  var bStep = __tbBtn("Step ▶", "primary"), bReset = __tbBtn("Reset", "");
+  var lab = document.createElement("label");
+  var cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = true;
+  lab.append(cb, document.createTextNode(" WAL files still present?"));
+  controls.append(bStep, bReset, lab);
+  var svg = __tbEl("svg", { viewBox: "0 0 500 300", width: "100%", style: "max-width:500px;display:block;margin:0 auto" });
+  var read = document.createElement("div");
+  read.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:3.2em;color:var(--muted)";
+  wrap.append(controls, svg, read); mount.appendChild(wrap);
+
+  function panel(x, y, w, h, title, fill, stroke, dim) {
+    var g = __tbEl("g", { class: dim ? "wdim" : "" });
+    g.appendChild(__tbBox(x, y, w, h, fill, stroke));
+    g.appendChild(__tbText(x + w / 2, y + 15, title, "middle", 9.5, "700"));
+    svg.appendChild(g); return g;
+  }
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var defs = __tbEl("defs", {});
+    var m = __tbEl("marker", { id: "oa", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    m.appendChild(__tbEl("path", { d: "M0 0 L10 5 L0 10 z", fill: __tbCss("--muted") })); defs.appendChild(m); svg.appendChild(defs);
+
+    // left: compiled matrix @B
+    var g1 = panel(14, 20, 150, 90, "compiled matrix @ B", __tbCss("--info-soft"), __tbCss("--info"), false);
+    g1.appendChild(__tbText(89, 40, "hydrated CSC image", "middle", 8, "400", __tbCss("--muted")));
+    g1.appendChild(__tbText(89, 56, "answers as of base", "middle", 8, "400", __tbCss("--muted")));
+    g1.appendChild(__tbText(89, 72, "sequence B", "middle", 8, "400", __tbCss("--muted")));
+
+    if (!walOk) {
+      // degraded path
+      panel(180, 20, 150, 90, "WAL files gone", "none", __tbCss("--bad"), false);
+      svg.appendChild(__tbText(255, 55, "topology_tail_since", "middle", 8, "400", __tbCss("--bad")));
+      svg.appendChild(__tbText(255, 68, "→ Unavailable", "middle", 9, "700", __tbCss("--bad")));
+      var gf = panel(346, 20, 140, 90, "snapshot adjacency", __tbCss("--surface-soft"), __tbCss("--border"), false);
+      gf.appendChild(__tbText(416, 55, "BFS straight over", "middle", 8, "400", __tbCss("--muted")));
+      gf.appendChild(__tbText(416, 68, "the pinned snapshot", "middle", 8, "400", __tbCss("--muted")));
+      svg.appendChild(__tbEl("path", { d: "M330 65 L344 65", stroke: __tbCss("--bad"), "stroke-width": 1.4, fill: "none", "stroke-dasharray": "4 3", "marker-end": "url(#oa)" }));
+      read.innerHTML = "<strong style='color:var(--bad)'>WAL gone.</strong> The tail cannot be reconstructed, so <code>topology_tail_since</code> returns <code>Unavailable</code> and the read falls back to a plain BFS over the snapshot — slower, always correct.";
+      bStep.disabled = true; bStep.textContent = "Step ▶";
+      return;
+    }
+
+    // middle: WAL tail (step>=1)
+    var gm = panel(180, 20, 150, 130, "WAL tail (B, S]", __tbCss("--warn-soft"), __tbCss("--warn"), step < 1);
+    for (var i = 0; i < pairs.length; i++) {
+      var yy = 42 + i * 22, p = pairs[i];
+      var show = step >= 1;
+      gm.appendChild(__tbText(255, yy, show ? ("pair (" + p.s + "," + p.d + ")") : "· · ·", "middle", 9, "600"));
+      if (step >= 2) {
+        var col = p.exists ? __tbCss("--ok") : __tbCss("--bad");
+        gm.appendChild(__tbText(300, yy, p.exists ? "✓" : "✗", "middle", 11, "700", col));
+      }
+    }
+    if (step >= 2) gm.appendChild(__tbText(255, 138, "resolved @ S from snapshot", "middle", 7.5, "400", __tbCss("--muted")));
+
+    // right: answer @S (step>=3)
+    var g3 = panel(346, 20, 140, 130, step >= 3 ? "answer @ S" : "answer", step >= 3 ? __tbCss("--ok-soft") : __tbCss("--surface-soft"), step >= 3 ? __tbCss("--ok") : __tbCss("--border"), step < 3);
+    if (step >= 3) {
+      var yy2 = 42;
+      g3.appendChild(__tbText(416, yy2, "matrix rows @ B", "middle", 8, "400", __tbCss("--muted"))); yy2 += 18;
+      for (var j = 0; j < pairs.length; j++) {
+        var pp = pairs[j], c2 = pp.exists ? __tbCss("--ok") : __tbCss("--bad");
+        g3.appendChild(__tbText(416, yy2, (pp.exists ? "+ add " : "− remove ") + "(" + pp.s + "," + pp.d + ")", "middle", 8.5, "600", c2)); yy2 += 16;
+      }
+      g3.appendChild(__tbText(416, yy2 + 4, "= topology @ S", "middle", 8, "700", __tbCss("--ok")));
+    }
+
+    // arrows
+    svg.appendChild(__tbEl("path", { d: "M164 65 L178 65", stroke: __tbCss("--muted"), "stroke-width": 1.3, fill: "none", "marker-end": "url(#oa)" }));
+    if (step >= 3) svg.appendChild(__tbEl("path", { d: "M330 85 L344 85", stroke: __tbCss("--muted"), "stroke-width": 1.3, fill: "none", "marker-end": "url(#oa)" }));
+
+    var msgs = [
+      "The compiled matrix answers as of the generation's base sequence B. Everything written after B is invisible to it — press Step.",
+      "Read the WAL files written since B and collect the affected (src, dst) pairs. The WAL only says WHERE something changed.",
+      "Resolve each pair against the snapshot pinned at S. The snapshot decides truth: ✓ exists, ✗ does not — no ordering, one lookup per pair.",
+      "Apply the overlay to the matrix's answer during expansion: true adds the edge, false removes it. The traversal now answers at S."
+    ];
+    read.innerHTML = "<strong>Step " + (step + 1) + " / 4.</strong> " + msgs[step];
+    bStep.textContent = step >= 3 ? "Replay" : "Step ▶"; bStep.disabled = false;
+  }
+  bStep.onclick = function () { if (step >= 3) step = 0; else step++; render(); };
+  bReset.onclick = function () { step = 0; render(); };
+  cb.onchange = function () { walOk = cb.checked; step = 0; render(); };
+  render(); __tbOnTheme(render);
+});
+
+/* ---------------------------------------------------------------- Fig 2.5 */
+TB.widget("w-traversal", function (mount) {
+  var scen = 0;
+  var scenarios = [
+    { name: "generation base = S", path: "matrix", desc: "The index generation's base sequence already equals the pinned read S. The expansion is pure GraphBLAS sparse-matrix multiplication — no overlay needed." },
+    { name: "older generation, WAL readable", path: "overlay", desc: "The generation is older than S but the WAL tail is present. topology_tail_since builds an overlay and expand_range_with_overlay applies it hop by hop." },
+    { name: "no generation, or WAL gone", path: "bfs", desc: "There is no usable generation, or the WAL files it would need are gone. topology_tail_since returns Unavailable and the read falls back to reachable_from_storage_frontier — a plain BFS over the snapshot." }
+  ];
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div"); controls.className = "tb-controls";
+  var sel = document.createElement("select");
+  sel.style.cssText = "font-family:var(--sans);font-size:0.83rem;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--ink)";
+  scenarios.forEach(function (s, i) { var o = document.createElement("option"); o.value = i; o.textContent = s.name; sel.appendChild(o); });
+  var labEl = document.createElement("label"); labEl.append(document.createTextNode("Scenario: "), sel);
+  controls.append(labEl);
+  var svg = __tbEl("svg", { viewBox: "0 0 500 260", width: "100%", style: "max-width:500px;display:block;margin:0 auto" });
+  var read = document.createElement("div");
+  read.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:3em;color:var(--muted)";
+  wrap.append(controls, svg, read); mount.appendChild(wrap);
+
+  function nd(x, y, w, h, txt, fill, stroke, on, dash) {
+    var g = __tbEl("g", { class: on ? "wflash" : "wdim" });
+    g.appendChild(__tbBox(x, y, w, h, on ? fill : __tbCss("--surface-soft"), on ? stroke : __tbCss("--border"), dash));
+    var lines = __tbWrap(txt, 22);
+    for (var i = 0; i < lines.length; i++) g.appendChild(__tbText(x + w / 2, y + h / 2 - (lines.length - 1) * 6 + i * 12 + 3, lines[i], "middle", 8.5, on ? "700" : "500"));
+    svg.appendChild(g); return { x: x, y: y, w: w, h: h };
+  }
+  function arw(x1, y1, x2, y2, on, dash, col) {
+    svg.appendChild(__tbEl("path", { d: "M" + x1 + " " + y1 + " L" + x2 + " " + y2, stroke: on ? (col || __tbCss("--muted")) : __tbCss("--border"), "stroke-width": on ? 1.6 : 1, fill: "none", "stroke-dasharray": dash || "none", "marker-end": "url(#ta)", opacity: on ? 1 : 0.4 }));
+  }
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var defs = __tbEl("defs", {});
+    var m = __tbEl("marker", { id: "ta", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    m.appendChild(__tbEl("path", { d: "M0 0 L10 5 L0 10 z", fill: __tbCss("--muted") })); defs.appendChild(m); svg.appendChild(defs);
+    var p = scenarios[scen].path;
+    // request
+    nd(14, 100, 120, 48, "reachability request pinned at S", __tbCss("--info-soft"), __tbCss("--info"), true);
+    // decision
+    nd(160, 100, 120, 48, "index generation at B ≤ S?", __tbCss("--warn-soft"), __tbCss("--warn"), true);
+    arw(134, 124, 158, 124, true);
+    // top: overlay branch
+    nd(310, 20, 120, 48, "WAL tail after B → overlay", __tbCss("--purple-soft"), __tbCss("--purple"), p === "overlay");
+    nd(310, 92, 176, 48, "GraphBLAS expansion + overlay per hop", __tbCss("--ok-soft"), __tbCss("--ok"), p === "overlay");
+    // middle: no overlay branch
+    nd(310, 92, 176, 48, "GraphBLAS expansion, no overlay", __tbCss("--ok-soft"), __tbCss("--ok"), p === "matrix");
+    // bottom: bfs
+    nd(300, 168, 190, 44, "reachable_from_storage_frontier: BFS over snapshot", __tbCss("--surface-soft"), __tbCss("--border"), p === "bfs", "4 3");
+
+    arw(280, 110, 370, 68, p === "overlay", null, __tbCss("--purple"));   // to overlay top
+    arw(370, 68, 370, 90, p === "overlay", null, __tbCss("--purple"));
+    arw(280, 124, 308, 116, p === "matrix", null, __tbCss("--ok"));       // to no-overlay
+    arw(280, 138, 300, 180, p === "bfs", "4 3", __tbCss("--bad"));         // to bfs
+
+    read.innerHTML = "<strong>" + scenarios[scen].name + ".</strong> " + scenarios[scen].desc;
+  }
+  sel.onchange = function () { scen = +sel.value; render(); };
+  render(); __tbOnTheme(render);
+});
+</script>

@@ -1,0 +1,21 @@
+{{- if .Values.tls.public.trustBundle.enabled }}
+apiVersion: trust.cert-manager.io/v1alpha1
+kind: Bundle
+metadata:
+  name: {{ default (printf "%s-public-ca" (include "turbolay.fullname" .)) .Values.tls.public.trustBundle.name }}
+  labels:
+    {{- include "turbolay.labels" . | nindent 4 }}
+spec:
+  sources:
+    - secret:
+        name: {{ default (include "turbolay.publicTlsSecretName" .) .Values.tls.public.trustBundle.sourceSecretName }}
+        key: {{ .Values.tls.public.trustBundle.sourceSecretKey }}
+  target:
+    configMap:
+      key: ca.crt
+      metadata:
+        labels:
+          app.kubernetes.io/component: turbolay-client-trust
+    namespaceSelector:
+      {{- toYaml .Values.tls.public.trustBundle.namespaceSelector | nindent 6 }}
+{{- end }}

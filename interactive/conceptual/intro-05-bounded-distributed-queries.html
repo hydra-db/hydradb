@@ -1,0 +1,386 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Distribution with Edges Around It · TurboLay Conceptual Guide</title>
+<link rel="stylesheet" href="../assets/textbook.css">
+
+<div class="tb-progress"></div>
+
+<header class="tb-header">
+  <a class="tb-home" href="../index.html">Turbo<span>Lay</span> · Interactive</a>
+  <span class="tb-crumb">A Conceptual Guide</span>
+  <span class="tb-crumb">The Architecture</span>
+  <span class="tb-spacer"></span>
+  <button class="tb-theme-toggle" type="button">☾ Dark</button>
+</header>
+
+<main class="tb-main">
+  <div class="tb-chapter-kicker">Chapter 5 · The Architecture</div>
+  <h1>Distribution with Edges Around It</h1>
+
+  <p>“Distributed query support” can mean anything from two <span class="concept" data-concept="rpc">RPCs</span> to a global
+  optimizer with repartition joins. TurboLay implements a useful, deliberately
+  bounded middle: dispatch known query legs to nodes, execute them concurrently,
+  then merge their rows at a coordinator.</p>
+
+  <div class="boxeq">
+    <strong>Distributed query = caller-named <span class="concept" data-concept="cell">cell</span> legs + concurrent execution + a
+    bounded coordinator merge.</strong>
+  </div>
+
+  <h2>The caller supplies the legs</h2>
+
+  <p><code>DistributedQueryPlan</code> contains named legs (<code>src/query/coordination.rs</code>). Each leg
+  carries its own <code>QueryContext</code>, <span class="concept" data-concept="cell">cell</span> ID, <span class="concept" data-concept="cypher">Cypher</span> string, and optional row estimate.
+  The coordinator picks a registered <code>QueryCellClient</code> for each leg and launches them
+  all with <code>join_all</code>.</p>
+
+  <p>The interesting part is how it picks. <code>client_for_cell</code> first checks that the cell
+  <em>exists</em> in the <span class="concept" data-concept="object-store">object-store</span> node directory — an unknown cell is <code>UnknownShard</code> —
+  and then chooses a client by <span class="concept" data-concept="fnv-hash">hashing the cell id</span>:</p>
+
+  <pre><code>let mut hash = 0xcbf29ce484222325_u64;
+for byte in cell_id.as_bytes() {
+    hash ^= u64::from(*byte);
+    hash = hash.wrapping_mul(0x100000001b3);
+}
+let index = usize::try_from(hash % self.clients.len().max(1) as u64).unwrap_or(0);
+self.clients.values().nth(index)</code></pre>
+
+  <p>That looks like a placement hash, and it is worth being precise about why it is not.
+  The hash does not discover who <em>owns</em> the cell, because nobody does: every node in
+  the directory opened every cell, so any registered client can answer this leg
+  correctly. The hash exists so that the same cell tends to land on the same node
+  across queries, which keeps that node's caches warm. It is cache affinity, not
+  correctness authority — send the leg to the “wrong” node and you get the same rows,
+  slightly slower.</p>
+
+  <div class="callout why">
+    <span class="callout-title">Why</span>
+    <p>This is the payoff of having no owner map. A routing table that decides
+    <em>correctness</em> has to be consistent, agreed upon, and updated under failure — that
+    is a <span class="concept" data-concept="consensus">consensus</span> problem, and it is how the deleted <code>ShardPlacement</code> design pulled a
+    control plane into the read path. A routing hint that only decides <em>which cache is
+    warm</em> can be stale, disagreed upon, or wrong, and the worst outcome is a slower
+    query. Demoting routing from authority to hint is what let the coordinator become
+    this small.</p>
+  </div>
+
+  <figure>
+    <div class="tb-table-wrap">
+      <table>
+        <tbody>
+          <tr><td>coordinator</td><td><code>→</code></td><td>node A / cell A</td><td><code>→</code></td><td>leg A rows</td></tr>
+          <tr><td></td><td><code>→</code></td><td>node B / cell B</td><td><code>→</code></td><td>leg B rows</td></tr>
+          <tr><td>merge</td><td><code>←</code></td><td>UNION ALL or inner join</td><td><code>←</code></td><td>named leg results</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <figcaption>Tab. 5.1 — The coordinator routes explicit cell legs and merges their returned rows.</figcaption>
+  </figure>
+
+  <figure>
+    <div class="tb-widget" id="w-scatter"></div>
+    <figcaption>Fig. 5.1 — The coordinator dispatches caller-named cell legs to nodes that can all serve
+      them, runs the legs concurrently, and merges the returned rows — no owner lookup, no
+      global planner, and no global snapshot.</figcaption>
+  </figure>
+
+  <details class="tb-expand">
+    <summary>Play with it: scatter the legs, mis-route on purpose, try a write<span class="tb-expand-tag">Interactive</span></summary>
+    <div class="tb-expand-body">
+      <p>The widget above is the chapter's shape in one gesture. Press <em>Dispatch reads</em> and both
+      legs leave the coordinator at once — that is <code>join_all</code>, so the whole query costs the
+      slower leg, not their sum — and their rows land in one <span class="concept" data-concept="union-all">UNION ALL</span> merge. Flip
+      <em>Mis-route leg A</em> to send it to the node the <span class="concept" data-concept="fnv-hash">FNV cell→node hash</span> did
+      <em>not</em> pick: you get the <strong>same rows</strong>, just a colder cache and a slower leg — proof
+      the hash is a cache hint, never correctness authority. Then press <em>Try a write</em>: a mutating
+      leg cannot fan out. It has to reach a node that is <span class="concept" data-concept="writer-promotion">promotable</span> for that
+      cell, which promotes a <span class="concept" data-concept="slatedb">SlateDB</span> writer locally, so writes stay on one node
+      while reads spread across all of them.</p>
+    </div>
+  </details>
+
+  <p>Read it left to right. The coordinator does not plan the split — the caller already
+  named the legs — so all it does is choose a node per leg, run the legs concurrently,
+  and merge what comes back. There is no global planner and no global snapshot anywhere
+  in the picture. Writes are the exception that proves the shape: a leg that mutates has
+  to reach a node that is <span class="concept" data-concept="writer-promotion">promotable</span> for that cell, so writes do not fan out.</p>
+
+  <p>Clients may be in-process implementations — <code>RoutedGraphCluster</code> itself
+  implements <code>QueryCellClient</code> — or, with the <code>query-transport</code> feature, <span class="concept" data-concept="tcp-transport">TCP
+  clients</span> (<code>TcpQueryCellClient</code>). <span class="concept" data-concept="bearer-auth">Bearer authentication</span> ships with that base
+  transport; TLS (<code>query-transport-tls</code>) and HTTP <span class="concept" data-concept="service-discovery">service-discovery</span> adapters
+  (<code>query-service-discovery</code>) are separate features that extend it without
+  changing the leg interface.</p>
+
+  <h2>The merge vocabulary is intentionally small</h2>
+
+  <p>The coordinator currently supports:</p>
+
+  <ul>
+    <li>executing the same query over many cell contexts;</li>
+    <li>paged requests per cell;</li>
+    <li><span class="concept" data-concept="union-all">UNION ALL</span> over named leg results;</li>
+    <li>one coordinator-side <span class="concept" data-concept="inner-join">inner join</span> shape;</li>
+    <li>cost ordering of inner-join legs by estimated rows.</li>
+  </ul>
+
+  <p>This is enough for explicit <span class="concept" data-concept="scatter-gather">scatter/gather</span> plans. It is not an arbitrary
+  distributed Cypher compiler. It does not repartition intermediate rows,
+  push distributed aggregates, or choose cell boundaries from a single global
+  Cypher statement.</p>
+
+  <div class="callout status">
+    <span class="callout-title">Known review finding</span>
+    <p>The coordinator-side <span class="concept" data-concept="inner-join">inner-join</span> merger
+    keys its build and probe maps on <code>QueryValue</code> directly, and <code>QueryValue::Null</code>
+    is an ordinary map key. Two <code>NULL</code> join keys therefore compare equal and can
+    produce spurious joined rows; a correct inner join would skip null keys on both
+    the build and probe sides. No test currently pins this behaviour, so avoid
+    coordinator inner joins on nullable keys.</p>
+  </div>
+
+  <h2>Reads distribute further than writes</h2>
+
+  <p>The query transport exposes cell reads. A write stays on the node that handles it:
+  that node must be <span class="concept" data-concept="writer-promotion">promotable</span> for the cell, and it promotes a <span class="concept" data-concept="slatedb">SlateDB</span> writer locally
+  before mutating. Uniqueness of that writer is SlateDB's <span class="concept" data-concept="manifest">manifest</span> <span class="concept" data-concept="fencing">fencing</span>, not a lock
+  record. There is no automatic remote write forwarder and no transaction spanning
+  cells.</p>
+
+  <p>That asymmetry is the whole reason reads distribute further than writes. A read is
+  servable by every node because every node opened every cell, so the coordinator is
+  free to pick any of them. A write has to reach a node willing to become the writer,
+  and only one such promotion can survive per cell.</p>
+
+  <div class="callout built">
+    <span class="callout-title">Built boundary</span>
+    <p>Distributed reads are directory-aware and
+    concurrent — any node can serve any cell, and the coordinator's choice is a cache
+    hint. Writes are independently sharded per cell and fenced by SlateDB's manifest.
+    Neither implies a global distributed snapshot or multi-cell atomic commit.</p>
+  </div>
+
+  <h2>The production boundary</h2>
+
+  <p>This repository is a kernel/library. A production service must still supply
+  deployment control, placement rollout policy, failover orchestration, tenant
+  quotas, observability export, secret rotation, and long S3 fault/latency soaks.
+  The architecture contains the mechanisms those systems drive; it is not itself
+  the complete hosted database.</p>
+
+  <nav class="tb-chapnav">
+    <a class="prev" href="intro-04-from-cypher-to-roaring.html"><span class="cn-dir">‹ Prev</span><br><span class="cn-title">From Cypher to Roaring Rows</span></a>
+    <a class="next" href="detail-01-roaring-matrix-rows.html"><span class="cn-dir">Next ›</span><br><span class="cn-title">Roaring Matrix Rows</span></a>
+  </nav>
+</main>
+
+<script src="../assets/glossary.js"></script>
+<script>
+/* Page-local concepts for Chapter 5 — distributed transport vocabulary. */
+window.TB_GLOSSARY = Object.assign({}, window.TB_GLOSSARY, {
+  "rpc": {
+    title: "RPC (Remote Procedure Call)",
+    html: "<p>Calling a function that runs on another machine as if it were local: the caller sends arguments over the network, the remote node executes, and a result comes back. It hides the wire, but not the latency or the possibility of failure.</p><p>TurboLay's query legs are RPC-shaped — a coordinator asks a remote node to run a named leg — but the surface is deliberately tiny, not a general distributed runtime.</p>"
+  },
+  "tcp-transport": {
+    title: "TCP transport",
+    html: "<p>With the <code>query-transport</code> feature, a <code>QueryCellClient</code> can be a <code>TcpQueryCellClient</code> that reaches another node over a TCP connection instead of an in-process call. TCP gives an ordered, reliable byte stream; the leg interface is identical either way.</p>"
+  },
+  "bearer-auth": {
+    title: "Bearer authentication",
+    html: "<p>An access-control scheme where each request carries a secret token — the “bearer” of the token is trusted. The base query transport ships bearer auth so a node will only run legs for callers presenting a valid token.</p>"
+  },
+  "inner-join": {
+    title: "Inner join",
+    html: "<p>Combining two row sets by matching a shared key, keeping only rows that have a partner on both sides — rows with no match are dropped. The coordinator supports exactly one inner-join shape, built by hashing one side (the build side) and probing it with the other.</p><p>Its known hazard: a <code>NULL</code> key should match nothing, but here two <code>NULL</code>s compare equal and can join spuriously.</p>"
+  },
+  "union-all": {
+    title: "UNION ALL",
+    html: "<p>Concatenating the rows of several result sets into one, keeping duplicates (unlike plain <code>UNION</code>, which removes them). It is the cheapest merge in the coordinator's vocabulary: no matching, no dedup — just gather every leg's rows into one stream.</p>"
+  },
+  "service-discovery": {
+    title: "Service discovery",
+    html: "<p>The mechanism by which a client finds the current network address of a service that may move or scale. TurboLay ships an HTTP service-discovery adapter (<code>query-service-discovery</code>) as an optional feature layered on the base transport, without changing the leg interface.</p>"
+  }
+});
+</script>
+<script src="../assets/textbook.js"></script>
+<script>
+/* Widget: bounded scatter/gather — dispatch caller-named cell legs, mis-route to
+   prove the FNV hash is only a cache hint, and watch a write refuse to fan out. */
+TB.widget("w-scatter", function (mount) {
+  var NS = "http://www.w3.org/2000/svg";
+  function el(n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  function mk(label, cls) { var b = document.createElement("button"); b.className = "tb-btn" + (cls ? " " + cls : ""); b.textContent = label; return b; }
+
+  // Hash hint: cell A is "warm" on node 1, cell B on node 2.
+  var misA = false;      // route leg A to the wrong (colder) node
+  var mode = "read";     // "read" | "write"
+  var phase = "idle";    // "idle" | "running" | "done"
+  var progA = 0, progB = 0, anim = null;
+
+  var wrap = document.createElement("div");
+  var controls = document.createElement("div");
+  controls.className = "tb-controls";
+  var btnRead = mk("Dispatch reads", "primary");
+  var btnMis = mk("Mis-route leg A", "");
+  var btnWrite = mk("Try a write", "");
+  var btnReset = mk("Reset", "");
+  controls.append(btnRead, btnMis, btnWrite, btnReset);
+
+  var svg = el("svg", { viewBox: "0 0 480 300", width: "100%", style: "max-width:480px;display:block;margin:0 auto" });
+  var readout = document.createElement("div");
+  readout.style.cssText = "font-size:0.82rem;margin-top:0.6rem;min-height:3.2em;color:var(--muted)";
+
+  wrap.append(controls, svg, readout);
+  mount.appendChild(wrap);
+
+  function box(x, y, w, h, fill, stroke, dash) {
+    return el("rect", { x: x, y: y, width: w, height: h, rx: 6, fill: fill, stroke: stroke, "stroke-width": 1.2, "stroke-dasharray": dash || "none" });
+  }
+  function label(x, y, t, anchor, size, weight, fill) {
+    var e = el("text", { x: x, y: y, "text-anchor": anchor || "middle", class: "wnode-label" });
+    if (size) e.setAttribute("font-size", size);
+    if (weight) e.setAttribute("font-weight", weight);
+    if (fill) e.setAttribute("fill", fill);
+    e.textContent = t; return e;
+  }
+  // leg A goes to node 1 by default; mis-route sends it to node 2.
+  function nodeForA() { return misA ? 2 : 1; }
+
+  function render() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var mut = css("--muted"), purple = css("--purple"), purpleSoft = css("--purple-soft");
+    var ok = css("--ok"), okSoft = css("--ok-soft"), info = css("--info"), infoSoft = css("--info-soft");
+    var surf = css("--surface-soft"), border = css("--border");
+
+    var defs = el("defs", {});
+    var m = el("marker", { id: "arw5", viewBox: "0 0 10 10", refX: "8", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    m.appendChild(el("path", { d: "M0 0 L10 5 L0 10 z", fill: mut }));
+    defs.appendChild(m); svg.appendChild(defs);
+
+    // coordinator
+    var gC = el("g", {});
+    gC.appendChild(box(16, 116, 108, 66, surf, border));
+    gC.appendChild(label(70, 142, "coordinator", "middle", 11, "700"));
+    gC.appendChild(label(70, 160, mode === "read" ? "scatter legs" : "route write", "middle", 9));
+    gC.appendChild(label(70, 174, "join_all", "middle", 9));
+    svg.appendChild(gC);
+
+    // node 1 (cell A home) and node 2 (cell B home)
+    var aHere = nodeForA();
+    function drawNode(idx, x, y, warmCell, running) {
+      var g = el("g", {});
+      var st = running ? ok : purple, fl = running ? okSoft : purpleSoft;
+      g.appendChild(box(x, y, 150, 62, fl, st));
+      g.appendChild(label(x + 75, y + 22, "node " + idx, "middle", 11, "700"));
+      g.appendChild(label(x + 75, y + 39, "opened every cell", "middle", 8.5));
+      g.appendChild(label(x + 75, y + 52, "warm cache: cell " + warmCell, "middle", 8.5, null, mut));
+      svg.appendChild(g);
+    }
+    var run1 = phase !== "idle" && (aHere === 1);
+    var run2 = phase !== "idle" && (mode === "read" ? true : false);
+    drawNode(1, 200, 20, "A", run1);
+    drawNode(2, 200, 158, "B", phase !== "idle" && (aHere === 2 || mode === "read"));
+
+    // merge / write-lands box on the right
+    if (mode === "read") {
+      var gM = el("g", {});
+      var mFill = phase === "done" ? okSoft : surf, mSt = phase === "done" ? ok : border;
+      gM.appendChild(box(360, 116, 104, 66, mFill, mSt));
+      gM.appendChild(label(412, 142, "merge", "middle", 11, "700"));
+      gM.appendChild(label(412, 160, "UNION ALL", "middle", 9));
+      gM.appendChild(label(412, 174, phase === "done" ? "12 rows" : "named legs", "middle", 9, null, mut));
+      svg.appendChild(gM);
+    } else {
+      var gW = el("g", {});
+      gW.appendChild(box(354, 108, 116, 84, infoSoft, info));
+      gW.appendChild(label(412, 132, "write stays local", "middle", 10, "700"));
+      gW.appendChild(label(412, 150, "reach a promotable", "middle", 8.5));
+      gW.appendChild(label(412, 162, "node · promote a", "middle", 8.5));
+      gW.appendChild(label(412, 174, "SlateDB writer", "middle", 8.5));
+      gW.appendChild(label(412, 186, "no fan-out", "middle", 8.5, "700", info));
+      svg.appendChild(gW);
+    }
+
+    // dispatch edges: coordinator -> nodes
+    function edge(d, active, dashed, lbl, lx, ly) {
+      svg.appendChild(el("path", { d: d, stroke: active ? ok : mut, "stroke-width": active ? 1.9 : 1.3, fill: "none", "stroke-dasharray": dashed ? "5 4" : "none", "marker-end": "url(#arw5)" }));
+      if (lbl) svg.appendChild(label(lx, ly, lbl, "middle", 8, null, mut));
+    }
+    // leg A -> its node
+    var aTargetY = aHere === 1 ? 51 : 189;
+    edge("M124 140 L200 " + aTargetY, run1 || (aHere === 2 && phase !== "idle"), misA, "leg A" + (misA ? " (mis-routed)" : " (hint)"), 150, aHere === 1 ? 92 : 128);
+    // leg B -> node 2 (only in read mode)
+    if (mode === "read") {
+      edge("M124 158 L200 189", phase !== "idle", false, "leg B", 150, 205);
+    }
+
+    // merge edges: nodes -> merge (read only, after done)
+    if (mode === "read") {
+      edge("M350 51 L360 130", phase === "done", false, null);
+      edge("M350 189 L360 168", phase === "done", false, null);
+    } else {
+      // write: coordinator -> the one promotable node
+      edge("M350 51 L354 140", phase !== "idle", false, "one writer", 372, 96);
+    }
+
+    // concurrency progress bars under coordinator
+    if (phase !== "idle") {
+      function bar(y, p, lbl) {
+        svg.appendChild(box(16, y, 108, 8, surf, border));
+        svg.appendChild(el("rect", { x: 16, y: y, width: 108 * p, height: 8, rx: 3, fill: ok }));
+        svg.appendChild(label(16, y - 3, lbl, "start", 8, null, mut));
+      }
+      bar(216, progA, "leg A");
+      if (mode === "read") bar(240, progB, "leg B");
+    }
+
+    // readout
+    if (phase === "idle" && mode === "read") {
+      readout.innerHTML = "Reads scatter to any node — every node opened every cell. The FNV hash sends <strong>leg A → node 1</strong>, <strong>leg B → node 2</strong> so their caches stay warm. Press <em>Dispatch reads</em>.";
+    } else if (phase === "running") {
+      readout.innerHTML = "<strong>join_all:</strong> both legs run concurrently — the query costs the slower leg, not the sum.";
+    } else if (phase === "done" && mode === "read") {
+      readout.innerHTML = misA
+        ? "<strong style='color:var(--ok)'>Same 12 rows</strong> — but leg A hit <strong>node 2</strong>, a cold cache, so it ran slower. The hash is a cache hint, never correctness authority."
+        : "<strong style='color:var(--ok)'>12 rows merged</strong> via UNION ALL. Both legs hit their warm node; no owner lookup, no global snapshot.";
+    } else if (mode === "write") {
+      readout.innerHTML = "<strong style='color:var(--info)'>A write does not fan out.</strong> It must reach a node that is <em>promotable</em> for the cell, which promotes a SlateDB writer locally. Only one such promotion survives per cell — fenced by the manifest.";
+    }
+
+    btnRead.disabled = phase === "running" || mode === "write";
+    btnMis.disabled = phase === "running";
+    btnMis.textContent = misA ? "Route leg A to warm node" : "Mis-route leg A";
+    btnWrite.textContent = mode === "write" ? "Back to reads" : "Try a write";
+  }
+
+  function dispatch() {
+    if (phase === "running") return;
+    phase = "running"; progA = 0; progB = 0;
+    var durA = (nodeForA() === 1 ? 900 : 1500); // mis-routed leg A is slower (cold cache)
+    var durB = 900;
+    var t0 = performance.now();
+    if (anim) cancelAnimationFrame(anim);
+    (function step(now) {
+      var dt = now - t0;
+      progA = Math.min(1, dt / durA);
+      progB = Math.min(1, dt / durB);
+      render();
+      if (progA < 1 || progB < 1) { anim = requestAnimationFrame(step); }
+      else { phase = "done"; render(); }
+    })(t0);
+  }
+
+  btnRead.onclick = dispatch;
+  btnMis.onclick = function () { misA = !misA; phase = "idle"; render(); };
+  btnWrite.onclick = function () { mode = mode === "write" ? "read" : "write"; phase = "idle"; render(); };
+  btnReset.onclick = function () { misA = false; mode = "read"; phase = "idle"; if (anim) cancelAnimationFrame(anim); render(); };
+
+  render();
+  window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+  document.querySelector(".tb-theme-toggle").addEventListener("click", function () { setTimeout(render, 0); });
+});
+</script>
