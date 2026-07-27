@@ -18,7 +18,13 @@ COPY . .
 
 FROM build-base AS builder
 
-RUN cargo build --locked --release --features server-runtime,indexer-runtime \
+# `otlp` is off by default in Cargo.toml, and every OTLP path — the trace
+# bridge, the log appender, the observable-counter registration — compiles to an
+# inert stub without it. Omitting it here produced an image whose OTLP export
+# was absent rather than misconfigured: no error, no endpoint, nothing on the
+# wire. It must stay on this line for OTEL_EXPORTER_OTLP_ENDPOINT to mean
+# anything at runtime.
+RUN cargo build --locked --release --features server-runtime,indexer-runtime,otlp \
       --bin graph-node --bin graph-indexer && \
     strip target/release/graph-node target/release/graph-indexer
 
