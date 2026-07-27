@@ -4,28 +4,52 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod tests;
 
 use crate::engine;
-use crate::{AtomicDurationHistogram, DurationHistogramSnapshot, SparseKernelBackend};
+use crate::{AtomicDurationHistogram, DurationHistogramSnapshot, GraphError, SparseKernelBackend};
+
+/// One counter per [`GraphError`] class, indexed by
+/// [`GraphError::class_index`].
+///
+/// An array and not a map: the vocabulary is closed and ten long, so the label
+/// lookup is an index rather than a hash, and the length is
+/// [`GraphError::CLASS_COUNT`] so that a class added to the vocabulary widens
+/// every counter that is dimensioned by one.
+pub(crate) type ErrorClassCounters = [AtomicU64; GraphError::CLASS_COUNT];
+
+/// Read a whole per-class counter array into its snapshot form.
+///
+/// The loads are individually relaxed and the array is therefore not a
+/// consistent cut — the same property every other counter on these snapshots
+/// has, and for the same reason: these are monotone counters read for rates.
+pub(crate) fn load_class_counters(counters: &ErrorClassCounters) -> [u64; GraphError::CLASS_COUNT] {
+    std::array::from_fn(|index| counters[index].load(Ordering::Relaxed))
+}
 
 /// Enumerate a metrics snapshot's fields, keyed by the **Rust identifier**.
 ///
-/// Generates `counter_fields()` and `histogram_fields()` on `$ty`. The key is
-/// the identifier and nothing else: a Prometheus `graph_*` name and an OTel
-/// `db.*`/`turbolay.*` name are exposition vocabulary, and neither may appear
-/// in this crate. The binaries hold the name tables, which is also where the
-/// test that the two exports cannot disagree about a name belongs.
+/// Generates `counter_fields()`, `histogram_fields()` and
+/// `class_counter_fields()` on `$ty`. The key is the identifier and nothing
+/// else: a Prometheus `graph_*` name and an OTel `db.*`/`turbolay.*` name are
+/// exposition vocabulary, and neither may appear in this crate. The binaries
+/// hold the name tables, which is also where the test that the two exports
+/// cannot disagree about a name belongs.
 ///
 /// The destructuring pattern is deliberately **exhaustive** — no `..` arm. Add
-/// a field to the snapshot struct and both accessors stop compiling until it is
-/// classified as a counter or as a histogram, which is what turns "adding a
-/// counter must not silently reach one export and not the other" from a review
-/// comment into a build failure. The binary's
+/// a field to the snapshot struct and every accessor stops compiling until it is
+/// classified as a counter, a histogram or a per-class counter, which is what
+/// turns "adding a counter must not silently reach one export and not the other"
+/// from a review comment into a build failure. The binary's
 /// `every_histogram_field_reaches_both_exports` picks up where this leaves off:
 /// this macro proves the field is *enumerated*, that test proves it is *named*.
+///
+/// The `class_counters` block is optional, and only because making it mandatory
+/// would be a mechanical edit to every existing call site rather than because
+/// omitting it is a different thing from writing it empty.
 macro_rules! snapshot_fields {
     (
         $ty:ident {
             counters { $($counter:ident),* $(,)? }
             histograms { $($histogram:ident),* $(,)? }
+            $(class_counters { $($class_counter:ident),* $(,)? })?
         }
     ) => {
         impl $ty {
@@ -36,6 +60,7 @@ macro_rules! snapshot_fields {
                 let Self {
                     $($counter,)*
                     $($histogram: _,)*
+                    $($($class_counter: _,)*)?
                 } = self;
                 [$((stringify!($counter), *$counter),)*].into_iter()
             }
@@ -50,8 +75,42 @@ macro_rules! snapshot_fields {
                 let Self {
                     $($counter: _,)*
                     $($histogram,)*
+                    $($($class_counter: _,)*)?
                 } = self;
                 [$((stringify!($histogram), $histogram),)*].into_iter()
+            }
+
+            /// Every counter dimensioned by [`crate::GraphError::class`], as
+            /// `(field, class, count)` triples: one row per field per class, in
+            /// declaration order and then in [`crate::GraphError::CLASSES`]
+            /// order.
+            ///
+            /// Flattened rather than handed over as an array because the class
+            /// name is the label value an export needs, and pairing it with its
+            /// count here is the one place that pairing can be got wrong. The
+            /// export layer sees rows, not offsets.
+            pub fn class_counter_fields(
+                &self,
+            ) -> impl Iterator<Item = (&'static str, &'static str, u64)> + '_ {
+                // Exhaustive on purpose; see the macro's documentation.
+                let Self {
+                    $($counter: _,)*
+                    $($histogram: _,)*
+                    $($($class_counter,)*)?
+                } = self;
+                [$($((stringify!($class_counter), $class_counter),)*)?]
+                    .into_iter()
+                    .flat_map(
+                        |(field, counts): (
+                            &'static str,
+                            &[u64; $crate::GraphError::CLASS_COUNT],
+                        )| {
+                            $crate::GraphError::CLASSES
+                                .into_iter()
+                                .zip(counts.iter().copied())
+                                .map(move |(class, count)| (field, class, count))
+                        },
+                    )
             }
         }
     };
@@ -175,6 +234,15 @@ pub struct GraphOperationalMetricsSnapshot {
     pub query_rows_started: u64,
     pub query_rows_completed: u64,
     pub query_rows_failed: u64,
+    /// The same failures as [`Self::query_rows_failed`], split by
+    /// [`crate::GraphError::class`] and indexed by
+    /// [`crate::GraphError::class_index`].
+    ///
+    /// Total by construction, not by convention: both are incremented by the
+    /// same call, so the array sums to the scalar and a dashboard can use one to
+    /// check the other. Enumerate it with
+    /// [`Self::class_counter_fields`] rather than by offset.
+    pub query_rows_failed_by_class: [u64; GraphError::CLASS_COUNT],
     pub query_rows_returned: u64,
     /// Total microseconds spent in the row-query path.
     ///
@@ -238,6 +306,9 @@ snapshot_fields!(GraphOperationalMetricsSnapshot {
     histograms {
         query_rows_latency,
     }
+    class_counters {
+        query_rows_failed_by_class,
+    }
 });
 
 #[derive(Default)]
@@ -266,6 +337,7 @@ pub(crate) struct GraphOperationalMetrics {
     pub(crate) query_rows_started: AtomicU64,
     pub(crate) query_rows_completed: AtomicU64,
     pub(crate) query_rows_failed: AtomicU64,
+    pub(crate) query_rows_failed_by_class: ErrorClassCounters,
     pub(crate) query_rows_returned: AtomicU64,
     // Replaces the `query_rows_duration_us` sum. The snapshot field of that
     // name survives, derived from this histogram's `sum_us`, so the only thing
@@ -283,6 +355,18 @@ pub(crate) struct GraphOperationalMetrics {
 }
 
 impl GraphOperationalMetrics {
+    /// Count one failed row query, both in total and under its error class.
+    ///
+    /// One call rather than two `fetch_add`s at each site, so the scalar and the
+    /// array cannot disagree about how many failures there were — the sum over
+    /// classes is the total by construction. Gated because both callers are, and
+    /// every path to them runs through `opencypher`.
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn record_query_rows_failure(&self, error: &GraphError) {
+        self.query_rows_failed.fetch_add(1, Ordering::Relaxed);
+        self.query_rows_failed_by_class[error.class_index()].fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn snapshot(&self) -> GraphOperationalMetricsSnapshot {
         let query_rows_latency = self.query_rows_latency.snapshot();
         GraphOperationalMetricsSnapshot {
@@ -310,6 +394,7 @@ impl GraphOperationalMetrics {
             query_rows_started: self.query_rows_started.load(Ordering::Relaxed),
             query_rows_completed: self.query_rows_completed.load(Ordering::Relaxed),
             query_rows_failed: self.query_rows_failed.load(Ordering::Relaxed),
+            query_rows_failed_by_class: load_class_counters(&self.query_rows_failed_by_class),
             query_rows_returned: self.query_rows_returned.load(Ordering::Relaxed),
             query_rows_duration_us: query_rows_latency.sum_us,
             query_rows_latency,

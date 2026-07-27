@@ -320,7 +320,7 @@ impl GraphShard {
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    self.record_streaming_query_rows_failure(started);
+                    self.record_streaming_query_rows_failure(started, &err);
                     return Err(err);
                 }
             }
@@ -340,7 +340,7 @@ impl GraphShard {
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    self.record_streaming_query_rows_failure(started);
+                    self.record_streaming_query_rows_failure(started, &err);
                     return Err(err);
                 }
             }
@@ -532,9 +532,7 @@ impl GraphShard {
                 }
             }
             Err(err) => {
-                self.operation_metrics
-                    .query_rows_failed
-                    .fetch_add(1, Ordering::Relaxed);
+                self.operation_metrics.record_query_rows_failure(err);
                 span.record("error.class", err.class());
                 span.record("turbolay.sampling.tail_keep", "error");
             }
@@ -4734,13 +4732,11 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    fn record_streaming_query_rows_failure(&self, started: std::time::Instant) {
+    fn record_streaming_query_rows_failure(&self, started: std::time::Instant, error: &GraphError) {
         self.operation_metrics
             .query_rows_started
             .fetch_add(1, Ordering::Relaxed);
-        self.operation_metrics
-            .query_rows_failed
-            .fetch_add(1, Ordering::Relaxed);
+        self.operation_metrics.record_query_rows_failure(error);
         self.operation_metrics
             .query_rows_latency
             .record(started.elapsed());

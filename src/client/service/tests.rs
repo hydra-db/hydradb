@@ -939,3 +939,72 @@ fn a_read_and_a_write_land_in_different_histograms() {
     assert_eq!(snapshot.write_latency.bucket_counts[read_bucket], 0);
     assert_eq!(snapshot.read_latency.bucket_counts[write_bucket], 0);
 }
+
+/// Each of the ten classes lands in its own slot on the client's counter too,
+/// and in no other. The mapping is `GraphError::class_index` in both places, so
+/// this and the shard's copy of it are checking the same taxonomy from the two
+/// structs that carry it.
+#[test]
+fn client_query_failures_land_in_their_own_class_slot() {
+    for (index, error) in GraphError::one_per_class().into_iter().enumerate() {
+        let metrics = ClientQueryMetrics::default();
+        metrics.record_result(0, Some(&error));
+        let snapshot = metrics.snapshot();
+
+        let expected: [u64; GraphError::CLASS_COUNT] =
+            std::array::from_fn(|slot| u64::from(slot == index));
+        assert_eq!(
+            snapshot.queries_failed_by_class,
+            expected,
+            "{} landed outside its own slot",
+            error.class()
+        );
+        assert_eq!(snapshot.queries_failed, 1);
+    }
+}
+
+/// A success dimensions nothing: it must not reach the per-class array at all.
+/// The array counts failures, and a completion counted as a class would put a
+/// non-error into an error-rate panel.
+#[test]
+fn a_completed_query_touches_no_class_slot() {
+    let metrics = ClientQueryMetrics::default();
+    metrics.record_result(7, None);
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.queries_completed, 1);
+    assert_eq!(snapshot.rows_returned, 7);
+    assert_eq!(snapshot.queries_failed, 0);
+    assert_eq!(
+        snapshot.queries_failed_by_class,
+        [0; GraphError::CLASS_COUNT]
+    );
+}
+
+/// The per-class rows the export layer will read, and the total they must add
+/// up to. `class_counter_fields` is the only enumeration of this field; an
+/// export that reached for the array by offset instead is the failure mode the
+/// flattened rows exist to prevent.
+#[test]
+fn client_class_counter_rows_sum_to_the_undimensioned_total() {
+    let metrics = ClientQueryMetrics::default();
+    let errors = GraphError::one_per_class();
+    metrics.record_result(0, Some(&errors[GraphError::CLASS_FENCING]));
+    metrics.record_result(0, Some(&errors[GraphError::CLASS_FENCING]));
+    metrics.record_result(0, Some(&errors[GraphError::CLASS_STORAGE]));
+
+    let snapshot = metrics.snapshot();
+    let rows: Vec<(&'static str, &'static str, u64)> = snapshot.class_counter_fields().collect();
+
+    assert_eq!(rows.len(), GraphError::CLASS_COUNT);
+    let nonzero: Vec<(&'static str, u64)> = rows
+        .iter()
+        .filter(|(_, _, count)| *count > 0)
+        .map(|(_, class, count)| (*class, *count))
+        .collect();
+    assert_eq!(nonzero, vec![("fencing", 2), ("storage", 1)]);
+    assert_eq!(
+        rows.iter().map(|(_, _, count)| count).sum::<u64>(),
+        snapshot.queries_failed
+    );
+}
