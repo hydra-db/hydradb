@@ -42,6 +42,14 @@ check:
 check-examples:
     cargo check --locked --examples
 
+# BROKEN, and known: the `graphblas` cargo feature was deleted by the sparse-
+# kernel consolidation, so the four recipes that pass `--features graphblas` —
+# check-examples-graphblas, check-examples-native, test-graphblas, test-native —
+# all fail with "the package 'slatedb-graph-kernel' does not contain this
+# feature: graphblas", and all four are in `ci`, so `just ci` cannot pass either.
+# Deferred on purpose; see "Open items" in
+# docs/plans/2026-07-25-sparse-kernel-backend-consolidation.md.
+
 # Check examples with GraphBLAS enabled.
 check-examples-graphblas:
     cargo check --locked --examples --features graphblas

@@ -27,6 +27,16 @@ decision) and §1.10 (percentiles, H1–H3) — the latter being what §1.5's
 falsified is listed in "What the code audit falsified" below and also corrected
 in place; nothing that still holds has been removed.
 
+**Reconciled 2026-07-27 against `8f150b2`.** The amendment above was committed
+(`f9a4aaf`) before the BUG-3 fix landed. The fix split `turbolay.sampling.force`
+into a head key and a new tail key, and driving the real sampling path corrected
+two things this document had asserted from a code read. BUG-3's entry below now
+records what actually shipped; §1.3, §1.7, §1.8 and §3's candidates 1 and 2 are
+corrected in place. The short version: the head-sampling decision is taken at a
+span's **first entry**, not at creation, and full-scan spans are still
+ratio-sampled — by design, and now waiting on a collector policy rather than on
+code.
+
 Goal: finish the observability story that `docs/plans/2026-07-26-otel-telemetry-crate.md`
 started, by taking the four things it deferred and deciding them — metrics
 first, because it is the one with a trap in it.
@@ -126,7 +136,9 @@ them.
   traceparent bridge that shipped in `1a28d92`, after this plan's §2 was
   written. §2 now has to say why it does not serve the manifest hop.
 - `crates/telemetry/src/sampling.rs:66-74` — `is_always_sampled`, and the
-  reason §3's candidate 2 was wrong about full-scan spans being kept.
+  reason §3's candidate 2 was wrong about full-scan spans being kept. Now
+  `:124-143` after the BUG-3 fix (`8f150b2`), which also deleted the
+  `turbolay.query.full_scan` arm this function used to read.
 - `src/core/cache.rs:237` — `resident_bytes` is already O(1), which strikes
   §5's proposed remedy for the cache gauges before it is written.
 - `src/shard/lifecycle.rs:285-330` — the two gauge functions, read for their
@@ -193,10 +205,10 @@ share a cause that has nothing to do with the cache gauges.
 
 **BUG-3 — `SAMPLING_FORCE` never fires.** `is_always_sampled`
 (`crates/telemetry/src/sampling.rs:66-74`) reads `turbolay.sampling.force` and
-`turbolay.query.full_scan` from the attributes present **at span start**. All
-seven sites that set them do so by post-creation `span.record`, having declared
-the field `tracing::field::Empty` at creation:
-`src/query/opencypher.rs:353`, `src/client/service.rs:1923`,
+`turbolay.query.full_scan` from the attributes present when the sampling
+decision is taken. All seven sites that set them do so by `span.record` **after
+entering the span**, having declared the field `tracing::field::Empty` at
+creation: `src/query/opencypher.rs:353`, `src/client/service.rs:1923`,
 `src/shard/query_optimizer.rs:963` and `:1047`, `src/shard/query.rs:540`,
 `:5333`, `:5409`; `turbolay.query.full_scan` likewise (recorded at
 `query_optimizer.rs:959`, `Empty` at `:1061`).
@@ -209,20 +221,63 @@ they hand attributes directly to `should_sample` and never exercise the
 `field::Empty` + `record` path; the regression test must reproduce the real
 path or it will pass against the bug.
 
-**Being fixed alongside this amendment.** This is the same class of mistake the
-prior plan's implementation record already contains — "`span.record()` destroyed
-the fields set at span creation" — and it is the second time the deferred-
-attribute pattern has broken something downstream of span creation. That is
-worth generalising: *anything that reads span attributes before the span
-completes is reading the creation-time set, not the recorded set.* The sampler
-is a head sampler; a decision made at head cannot see a field recorded later,
-by construction. Making `sampling.force` work at all means either setting it at
-creation or moving the decision to the collector's tail sampler.
+**Fixed in `8f150b2`, and driving the real path corrected this entry twice.**
 
-BUG-3 is load-bearing for two claims in this document. §1.7's consolation prize
+*The decision is taken lazily at a span's **first entry**, not at creation.*
+This paragraph originally said "at span start", which is imprecise in the one
+direction that matters: `span.record` **before** first entry does reach the
+sampler, because it still lands in the builder. `client_root_span`
+(`src/client/service.rs:1979-2026`) already depends on that — `correlation_id`,
+`caller.step` and `runtime_limit_ms` are declared `Empty` and recorded before
+the span is ever entered, and they are visible to `should_sample`. So the rule
+is an *entry-ordering* trap, not a flat prohibition on `record`, which is
+precisely why the fix is a new key rather than a reordering: a reordering would
+work and then silently stop working the next time a call site moved a line.
+
+*Hoisting the attribute to creation time would have fixed **zero** of the seven
+sites, not some of them.* At all seven the value does not exist until after the
+work has run, and most sit on child spans (`query.plan`, `query.execute`,
+`write.bookmark`, `artifact.lookup`, `storage.wal_tail`) where the sampler
+defers to the parent entirely — so even a perfectly timed force would have been
+a second no-op behind the first.
+
+The keep-intent at those sites is therefore a **tail** decision, permanently,
+and the fix splits one key into two:
+
+| Key | Reachability |
+|---|---|
+| `turbolay.sampling.force` | head sampler; **creation-time and root-only**, both limits now documented at `semconv.rs:174-192` and `sampling.rs:33-60` |
+| `turbolay.sampling.tail_keep` | new (`semconv.rs:194-214`); carries a reason — `SAMPLING_TAIL_KEEP_ERROR` = `error`, `SAMPLING_TAIL_KEEP_FULL_SCAN` = `full_scan` — so the collector can retain the two at different rates. Inert in this process |
+
+All seven sites now record `tail_keep`; none records `force`.
+
+`is_always_sampled` **no longer honours `turbolay.query.full_scan` at all**, and
+that removal is deliberate rather than incidental. It was dead twice over, and
+reviving it by hoisting the field would be worse than the dead code: full scans
+are not rare in an analytics workload, so the configured ratio would silently
+become 100% for a whole class of query. A sampler must not key off a *data*
+attribute; `sampling.force` exists for no purpose but to say "keep this", which
+is why it is the only thing read.
+
+**What this hands to deployment.** `tail_keep` does nothing until a collector
+runs a `tail_sampling` processor keyed on it; the YAML is in the sampling module
+docs (`sampling.rs:62-89`). One consequence is documented rather than hidden: a
+trace the *head* sampler dropped never reaches the collector, so the tail policy
+can only rescue what the head kept. Run the head at ratio 1.0 if error coverage
+matters more than export bandwidth.
+
+This is the same class of mistake the prior plan's implementation record already
+contains — "`span.record()` destroyed the fields set at span creation" — and it
+is the second time the deferred-attribute pattern has broken something
+downstream of span creation. The generalisation, stated precisely this time:
+*anything that reads a span's attributes at head is reading the set present when
+the span was first entered, not the set recorded during it.*
+
+BUG-3 was load-bearing for two claims in this document. §1.7's consolation prize
 ("filter the traces on the same attribute") and §3's candidate 2 ("sampling is
-handled, so this rate is exact") are both false until it is fixed. Both are
-corrected in place below.
+handled, so this rate is exact") were both false while it stood. Both are
+corrected in place below — and both remain contingent, because the code fix
+moves the decision to the collector rather than making it here.
 
 ### The structural correction to §1.5
 
@@ -242,7 +297,9 @@ all**. The consequence is written into §1.5 and designed around in §1.10.
   so the partition test §1.4 proposes would fail on the day it was written.
   The seven unclassified keys are `PLACEMENT_STATE`, `PLACEMENT_PREVIOUS_STATE`,
   `PLACEMENT_LIVE_NODES`, `WRITER_REOPEN_DELAY_MS`, `WRITER_REOPEN_CAP_MS`,
-  `CONSISTENCY` and `WRITER_RETRIES`. §1.3 now places them.
+  `CONSISTENCY` and `WRITER_RETRIES`. §1.3 now places them. **32 as of
+  `8f150b2`**, which added `SAMPLING_TAIL_KEEP` to `ALL_TURBOLAY_KEYS`; §1.3
+  places it span-only alongside `SAMPLING_FORCE`, so the partition holds.
 - **`error.class` is not in `ALL_TURBOLAY_KEYS`.** It is not `turbolay.`-
   namespaced (`semconv.rs:172`), and neither is `db.system.name` (`:182`). The
   proposed test iterates `ALL_TURBOLAY_KEYS`, so it would silently never
@@ -394,7 +451,7 @@ doc comment is wrong on this point and §1.4 fixes it.
 
 ### `writer.fence_refresh` is on the write path, not off it
 
-`crates/telemetry/src/sampling.rs:38-43` lists `writer.fence_refresh` among the
+`crates/telemetry/src/sampling.rs:38-43` (now `:97-102`) lists `writer.fence_refresh` among the
 spans that are "low-volume and high-value" and always sampled. `refresh_writer_fence`
 (`src/core/state.rs:395`) is called from exactly two places —
 `acquire_local_write_guard` (`src/shard/lifecycle.rs:262`) and
@@ -402,7 +459,7 @@ spans that are "low-volume and high-value" and always sampled. `refresh_writer_f
 sites. It runs once per write, not once per incident.
 
 The always-sample rule only fires for spans with no valid parent
-(`sampling.rs:115-130`), so under a `client.mutate` root the parent decides and
+(`sampling.rs:115-130`, now `:183-195`), so under a `client.mutate` root the parent decides and
 nothing is over-sampled. But the *span* is high-volume, and it matters for §3:
 the ping-pong alert cannot be "fence refreshes are happening". The
 distinguishing fields — `turbolay.writer.last_promoted_by` and its two
@@ -515,7 +572,7 @@ after.
 | `turbolay.read_epoch`, `turbolay.commit_epoch`, `turbolay.base_sequence`, `turbolay.writer.epoch`, `turbolay.writer.last_promoted_epoch`, `turbolay.writer.last_promoted_at` | monotonic. A new value on every write or every tick |
 | `turbolay.generation` | a SHA-256 hex digest, `src/engine/index_store.rs:129`. A new value on every rebuild |
 | `turbolay.query.rows_estimated`, `turbolay.query.rows_returned` | measurements. They are what a histogram *records*, not what it is keyed by |
-| `turbolay.sampling.force` | a sampler control, meaningless to a meter |
+| `turbolay.sampling.force`, `turbolay.sampling.tail_keep` | sampler controls, meaningless to a meter. Two keys since `8f150b2`: the first is the head sampler's, creation-time and root-only; the second is the collector's tail-sampling input and is inert in-process. See BUG-3 |
 
 **Two that need a decision rather than a rule.**
 
@@ -859,7 +916,7 @@ source, not by reading the changelog.
 
 **And the sampler would undercut them anyway.** An exemplar is a pointer to a
 trace. `crates/telemetry/src/sampling.rs` head-samples at 5%, and its own
-module docs (`:1-31`) explain that keeping error traces is a *tail* decision
+module docs (`:1-31`, now `:1-89`) explain that keeping error traces is a *tail* decision
 belonging in the collector. So an exemplar recorded on a slow-query data point
 would, 95% of the time, point at a trace that was dropped at head — a link that
 404s. Making exemplars useful means near-100% head sampling plus collector-side
@@ -872,24 +929,42 @@ them *and* the sampling story from §3's baseline week is settled. Until then,
 span gives the same navigation — see the spike, filter the traces on the same
 attribute — without a pointer that can dangle.
 
-**With one caveat that BUG-3 introduces.** That consolation prize assumes the
-full-scan spans are actually in the backend to be filtered. They are not: the
-sampler never sees `turbolay.query.full_scan`, because it is recorded after
-span creation and `is_always_sampled` reads the creation-time attribute set
-(`sampling.rs:66-74`). Today a full-scanning query's spans are ratio-sampled
-at 5% like everything else, so "filter the traces on the same attribute"
-returns one in twenty. The navigation story here is contingent on the BUG-3 fix
-landing first, which is why it is first in the sequencing.
+**With one caveat that BUG-3 introduces, and that the fix moved rather than
+removed.** That consolation prize assumes the full-scan spans are actually in
+the backend to be filtered. They were not: the sampler never saw
+`turbolay.query.full_scan`, because it is recorded after the span is entered
+and `is_always_sampled` is handed the attributes present when the span is
+**first entered** (`sampling.rs:66-74`, now `:124-143`). A full-scanning query's spans were
+ratio-sampled at 5% like everything else, so "filter the traces on the same
+attribute" returned one in twenty.
+
+`8f150b2` did **not** make that rate exact, and deliberately so. Reviving the
+`full_scan` arm was rejected outright — a sampler keying off a data attribute
+would silently turn the configured ratio into 100% for a class of query that is
+common in an analytics workload — so `is_always_sampled` no longer reads
+`turbolay.query.full_scan` at all. Instead the planner records
+`turbolay.sampling.tail_keep = full_scan`, which is the collector's input. The
+navigation story is therefore contingent on **deployment** running the
+`tail_sampling` policy (`sampling.rs:62-89`), and on the head ratio being high
+enough that the traces the tail policy wants still reach it. At ratio 0.05 the
+tail policy can only rescue the one in twenty the head already kept.
 
 ### 1.8 Sequencing
 
 **Two steps come before M1, and neither is a metrics step.**
 
-**BUG-3, the sampler fix, first.** It is the smallest change here and the most
-load-bearing: §1.7's navigation story, §3's candidate 2 and every "read it off
-the traces" fallback in this document are false while it stands. Fixing it also
-changes what the staging week will show, so doing it after the baseline would
-mean taking the baseline twice.
+**BUG-3, the sampler fix, first. Done — `8f150b2`.** It was the smallest change
+here and the most load-bearing: §1.7's navigation story, §3's candidate 2 and
+every "read it off the traces" fallback in this document were false while it
+stood. Fixing it also changes what the staging week will show, so doing it after
+the baseline would have meant taking the baseline twice.
+
+**But it discharged the code half only.** The fix routes post-hoc keep-intent to
+`turbolay.sampling.tail_keep`, which nothing in this process acts on. Until the
+collector runs the `tail_sampling` policy (`sampling.rs:62-89`), error and
+full-scan traces are still ratio-sampled exactly as before — so the baseline week
+must not start until that policy is deployed, or it will be a baseline of the
+old behaviour under a new attribute name.
 
 **BUG-1, the guard scoping, second.** M2 is explicitly the step that measures
 collection cost against read-path latency; measuring it with the convoy present
@@ -903,7 +978,9 @@ standalone counters. Doing M1 first means writing that field list and that test
 against a shape H1 immediately amends, so both get written twice and the second
 writing is a merge rather than a decision.
 
-The full order is: **BUG-3 → BUG-1 → H1 → M1 → H2 → M2 → M3 → H3.**
+The full order is: **BUG-3 → BUG-1 → H1 → M1 → H2 → M2 → M3 → H3.** BUG-3 landed
+in `8f150b2` and BUG-1 was fixed in the working tree at the amendment; H1 is next,
+with the collector `tail_sampling` policy as a deployment task running alongside.
 
 **Step M1 — the meter provider and the operational counters.** Add
 `"metrics"` to `opentelemetry-otlp` in the root `Cargo.toml`; add
@@ -1374,21 +1451,36 @@ recorded **only in the fence arm** (`src/core/state.rs:426-442`). Every other
 against "fence refresh spans" instead of "fence refresh spans with
 `last_promoted_by` set" is measuring write throughput.
 
-**Second trap: sampling.** With no client parent the span is always sampled
-(`sampling.rs:43`); under a `client.mutate` root the parent decides at 5%
-(`:115-130`). A distinct-count over a 5% sample systematically *under*-reports
-distinct values. Either force full sampling for spans carrying
-`last_promoted_by`, or accept that the alert detects sustained ping-pong and
-not a single exchange — and write which one it is into the alert description.
+**Second trap: sampling.** With no client parent the span is always sampled by
+name (`ALWAYS_SAMPLE_SPANS`, `sampling.rs:43`, now `:102`); under a
+`client.mutate` root the parent decides at 5% (`:115-130`, now `:183-195`). A
+distinct-count over a 5% sample systematically *under*-reports distinct values.
+Either force full sampling for spans carrying `last_promoted_by`, or accept that
+the alert detects sustained ping-pong and not a single exchange — and write which
+one it is into the alert description.
 
-BUG-3 narrows that choice. "Force full sampling" cannot be done by setting
-`turbolay.sampling.force` from the fence arm, because `last_promoted_by` is
-known only *after* the span has started and the head sampler has already
-decided. Forcing these spans means either deciding at creation — before the
-fence arm is known, so it would force every `writer.fence_refresh` span, which
-is one per write — or moving the decision to a collector-side tail sampler
-keyed on the attribute. The second is the right answer and it is a deployment
-change, not a code change.
+BUG-3 narrows that choice, and `8f150b2` settles it. To be exact about the
+starting point: **nothing on the fence path sets a sampling attribute at all.**
+The fence arm (`src/core/state.rs:426-442`) records `turbolay.writer.epoch` and
+`error.class` and nothing else; there is no `turbolay.sampling.force` site there,
+none in `src/shard/lifecycle.rs`, and after `8f150b2` no `tail_keep` site either.
+An earlier draft of this paragraph read as though such a site existed and was
+ineffective. It does not exist.
+
+What BUG-3 rules out is *adding* one. `turbolay.sampling.force` is now documented
+as creation-time-and-root-only (`semconv.rs:174-192`), and `last_promoted_by` is
+known only after the fence arm is taken — by which point the span has been
+entered and the decision made. Hoisting the force to creation time is worse, not
+better: the fence arm is not known there, so it would force *every*
+`writer.fence_refresh` span, which is one per write. And under a `client.mutate`
+root the span is a child, where the sampler defers to the parent and the force
+attribute is not consulted at all.
+
+So the remedy is a collector-side `tail_sampling` policy keyed on the attribute —
+a deployment change, not a code change. If a code change is wanted alongside it,
+it is one line recording `turbolay.sampling.tail_keep` in the fence arm, which is
+the key the collector policy already reads; it is not in scope here and is not
+what makes the alert work.
 
 **Baseline needed.** Fence events per cell per hour under normal operation,
 and how many of those carry a `last_promoted_by` that differs from the local
@@ -1413,35 +1505,55 @@ existing shape means a tenant grew into the problem. Both are changes; neither
 is a threshold on the absolute number, because some applications legitimately
 full-scan small collections and will do so forever.
 
-**Sampling is not handled, and this was the plan's worst error.** The original
-text read: "`RowQueryPlanSummary::record` sets `turbolay.sampling.force` when
-`full_scan` is true (`src/shard/query_optimizer.rs:960-963`), and the head
-sampler honours it (`sampling.rs:72-74`). Full-scan spans are kept at 100%, so
-this rate is exact rather than scaled." Every sentence of that is true in
-isolation and the conclusion is false. The sampler does contain the code; it
-never runs on these spans. `is_always_sampled` (`sampling.rs:66-74`) inspects
-the attributes present **at span creation**, and both `sampling.force` and
-`query.full_scan` are declared `tracing::field::Empty` at creation and filled
-by `span.record` afterwards — at all seven sites. See BUG-3.
+**Sampling is not handled in-process, and this was the plan's worst error.** The
+original text read: "`RowQueryPlanSummary::record` sets
+`turbolay.sampling.force` when `full_scan` is true
+(`src/shard/query_optimizer.rs:960-963`), and the head sampler honours it
+(`sampling.rs:72-74`). Full-scan spans are kept at 100%, so this rate is exact
+rather than scaled." Every sentence of that is true in isolation and the
+conclusion is false. The sampler did contain the code; it never ran on these
+spans. `is_always_sampled` (`sampling.rs:66-74`) is handed the attributes present
+when the span is **first entered**, and both `sampling.force` and
+`query.full_scan` are declared `tracing::field::Empty` at creation and filled by
+`span.record` after entry — at all seven sites. See BUG-3.
 
-So full-scan spans are ratio-sampled at 5% like everything else, and the rate
-this candidate is built on is scaled by an unknown factor, not exact. Two
-consequences:
+**What `8f150b2` changed, and what it did not.** `RowQueryPlanSummary::record`
+now writes `turbolay.sampling.tail_keep = full_scan`
+(`src/shard/query_optimizer.rs:960-966`) instead of `sampling.force`, and
+`is_always_sampled` no longer reads `turbolay.query.full_scan` at all. That
+second half is the load-bearing one for this candidate: the fix deliberately
+declined to make full-scan spans force a keep. A sampler that keys off a data
+attribute couples retention volume to the workload, and full scans are not rare
+in an analytics workload, so the configured ratio would quietly become 100% for a
+whole class of query.
 
-- Candidate 2 cannot ship before the BUG-3 fix. Not "would be better after" —
+So full-scan spans are *still* ratio-sampled at 5%, and the rate this candidate
+is built on is *still* scaled by an unknown factor, until the collector-side
+`tail_sampling` policy is deployed (`sampling.rs:62-89`). Three consequences:
+
+- Candidate 2 cannot ship on the code fix alone. Not "would be better after" —
   the alert would be counting one full scan in twenty and calling it the rate.
-- The claim that candidates 1 and 2 need *different* correction factors is,
-  today, wrong in an ironic direction: they need the *same* one, because
-  neither is force-sampled. It becomes true once BUG-3 is fixed, and at that
-  point the warning about mixing them on one dashboard applies exactly as
-  written.
+  What it now waits on is a deployment change, not a code change.
+- Even with the policy deployed, the tail sampler can only rescue traces the
+  head kept. At head ratio 0.05 the rate is still scaled; it becomes exact only
+  at a head ratio near 1.0.
+- The claim that candidates 1 and 2 need *different* correction factors remains
+  wrong in the same ironic direction: they need the *same* one, because neither
+  is force-sampled and neither ever will be. It becomes true only once the two
+  are separated by *collector* policy — `tail_keep` carries a reason (`error` vs
+  `full_scan`) precisely so they can be, at which point the warning about mixing
+  them on one dashboard applies exactly as written.
 
 This is worth dwelling on because of how it was missed. The code was read, the
 sampler was read, and the two were read separately. Nothing short of following
 the attribute from `record` to `should_sample` would have caught it — which is
-also why the existing unit tests pass: they hand attributes directly to
-`should_sample` and never construct a span. The regression test must go through
-a real span with a real `record`, or it will pass against the bug.
+also why the existing unit tests passed: they hand attributes directly to
+`should_sample` and never construct a span. The regression tests added by
+`8f150b2` go through a real subscriber and assert on what a `SpanProcessor`
+receives (`crates/telemetry/tests/head_sampling.rs`), and one of them drives the
+real `RowQueryPlanSummary::record` in production's create-empty/enter/record
+order (`src/shard/query_optimizer.rs:1181`). Both were verified failing against
+the unfixed code.
 
 **Better as a metric than an alert.** §1.3 puts `query.full_scan` on the safe-label
 list precisely so `rate(query_rows_started{full_scan="true"})` exists. Alert on
