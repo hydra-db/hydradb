@@ -56,6 +56,13 @@ pub use core::config::{
     DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
 };
 pub use core::error::{GraphError, Result};
+// Widen this as H1 converts the client and shard duration counters; today the
+// transport histograms are the only consumer.
+#[cfg(feature = "query-transport")]
+pub(crate) use core::histogram::AtomicDurationHistogram;
+pub use core::histogram::{
+    DurationHistogramSnapshot, DURATION_BUCKET_BOUNDS_US, DURATION_BUCKET_COUNT,
+};
 pub use core::metrics::{
     GraphCacheKind, GraphCacheMetricsSnapshot, GraphCachePolicy, GraphOperationalMetricsSnapshot,
 };

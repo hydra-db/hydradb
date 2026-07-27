@@ -47,7 +47,9 @@ use crate::{
     QueryResultPage, QueryResultSet, QueryRow, QueryValue, Result, RoutedGraphCluster,
 };
 #[cfg(feature = "query-transport")]
-use crate::{GraphId, GraphScope, NamespacePath};
+use crate::{
+    AtomicDurationHistogram, DurationHistogramSnapshot, GraphId, GraphScope, NamespacePath,
+};
 
 #[cfg(feature = "query-transport")]
 // This is the first production wire contract. Pre-production frame versions are
@@ -1208,7 +1210,22 @@ pub struct QueryTransportMetricsSnapshot {
     pub client_retries: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    /// Total microseconds across both latency histograms below.
+    ///
+    /// Retained so nothing that read the old sum has to change. It is derived
+    /// rather than stored: on a client instance only `rpc_latency` is ever
+    /// recorded and on a server instance only `serve_latency` is, so the sum
+    /// reproduces the previous value exactly on both sides.
     pub remote_latency_us: u64,
+    /// Client-side RPC round-trip, including the connection wait and the
+    /// timeout. Populated only on a [`QueryTransportClient`]'s metrics.
+    pub rpc_latency: DurationHistogramSnapshot,
+    /// Server-side executor time. Populated only on a transport runtime's
+    /// metrics -- and despite the old field's name, nothing about it is remote.
+    ///
+    /// The cumulative count at the 500ms bound and the `slow_queries` counter
+    /// measure the same event, so the two are reconcilable by construction.
+    pub serve_latency: DurationHistogramSnapshot,
     pub connections_accepted: u64,
     pub connections_active: u64,
     pub connections_rejected: u64,
@@ -1236,7 +1253,12 @@ struct QueryTransportMetrics {
     client_retries: AtomicU64,
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
-    remote_latency_us: AtomicU64,
+    // One field fed two structurally different measurements before this: the
+    // client's RPC round-trip and the server's executor time. They never mix
+    // inside one process, but they mean different things under one name, so
+    // the histogram conversion is the moment to separate them.
+    rpc_latency: AtomicDurationHistogram,
+    serve_latency: AtomicDurationHistogram,
     connections_accepted: AtomicU64,
     connections_active: AtomicU64,
     connections_rejected: AtomicU64,
@@ -1251,6 +1273,8 @@ struct QueryTransportMetrics {
 #[cfg(feature = "query-transport")]
 impl QueryTransportMetrics {
     fn snapshot(&self) -> QueryTransportMetricsSnapshot {
+        let rpc_latency = self.rpc_latency.snapshot();
+        let serve_latency = self.serve_latency.snapshot();
         QueryTransportMetricsSnapshot {
             requests_started: self.requests_started.load(Ordering::Relaxed),
             requests_completed: self.requests_completed.load(Ordering::Relaxed),
@@ -1265,7 +1289,9 @@ impl QueryTransportMetrics {
             client_retries: self.client_retries.load(Ordering::Relaxed),
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
-            remote_latency_us: self.remote_latency_us.load(Ordering::Relaxed),
+            remote_latency_us: rpc_latency.sum_us.saturating_add(serve_latency.sum_us),
+            rpc_latency,
+            serve_latency,
             connections_accepted: self.connections_accepted.load(Ordering::Relaxed),
             connections_active: self.connections_active.load(Ordering::Relaxed),
             connections_rejected: self.connections_rejected.load(Ordering::Relaxed),
@@ -2327,9 +2353,7 @@ impl TcpQueryCellClient {
             Err(_) => Err(query_transport_client_timeout(self.config.timeout)),
         };
         let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        self.metrics
-            .remote_latency_us
-            .fetch_add(elapsed_us, Ordering::Relaxed);
+        self.metrics.rpc_latency.record_micros(elapsed_us);
         result
     }
 
@@ -2342,9 +2366,7 @@ impl TcpQueryCellClient {
                 Err(_) => Err(query_transport_client_timeout(self.config.timeout)),
             };
         let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        self.metrics
-            .remote_latency_us
-            .fetch_add(elapsed_us, Ordering::Relaxed);
+        self.metrics.rpc_latency.record_micros(elapsed_us);
         result
     }
 
@@ -4342,10 +4364,7 @@ where
             }),
         };
         let elapsed = started.elapsed();
-        runtime.metrics.remote_latency_us.fetch_add(
-            elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
-            Ordering::Relaxed,
-        );
+        runtime.metrics.serve_latency.record(elapsed);
         let is_slow_query = match runtime.config.slow_query_log_threshold {
             Some(threshold) => elapsed >= threshold,
             None => false,
