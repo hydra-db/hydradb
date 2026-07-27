@@ -958,9 +958,12 @@ impl RowQueryPlanSummary {
         span.record("turbolay.query.rows_estimated", self.rows_estimated);
         span.record("turbolay.query.full_scan", self.full_scan);
         if self.full_scan {
-            // The head sampler cannot see a span's attributes after the fact,
-            // so the keep decision has to be visible as a field.
-            span.record("turbolay.sampling.force", true);
+            // Not a head-sampling decision and cannot be made into one: the
+            // verdict does not exist until the planner has run, and `query.plan`
+            // is a child of `client.query`, whose fate was settled when the
+            // request arrived. This marks the trace for the collector's tail
+            // sampler — see `turbolay_telemetry::sampling`.
+            span.record("turbolay.sampling.tail_keep", "full_scan");
         }
 
         let elapsed_ms = elapsed.as_millis() as u64;
@@ -1044,7 +1047,7 @@ fn optimizer_pass_label(pass: &RowQueryOptimizerPass) -> &'static str {
 #[cfg(feature = "opencypher")]
 fn record_plan_error(span: &tracing::Span, err: &GraphError) {
     span.record("error.class", err.class());
-    span.record("turbolay.sampling.force", true);
+    span.record("turbolay.sampling.tail_keep", "error");
 }
 
 /// The `query.plan` span, with every recorded field declared empty up front —
@@ -1059,7 +1062,7 @@ fn query_plan_span(cell_id: &str, read_epoch: StorageSequence) -> tracing::Span 
         turbolay.query.optimizer_passes = tracing::field::Empty,
         turbolay.query.rows_estimated = tracing::field::Empty,
         turbolay.query.full_scan = tracing::field::Empty,
-        turbolay.sampling.force = tracing::field::Empty,
+        turbolay.sampling.tail_keep = tracing::field::Empty,
         error.class = tracing::field::Empty,
     )
 }
@@ -1116,6 +1119,96 @@ mod tests {
         )]);
         assert!(!indexed.full_scan);
         assert_eq!(indexed.optimizer_passes(), "UtilizeEdgeIndex");
+    }
+
+    /// A `tracing` subscriber that remembers which span fields were filled in
+    /// after the span was created, and with what.
+    ///
+    /// Hand-rolled against the `tracing` facade rather than built on
+    /// `tracing-subscriber`, which is deliberately not a dependency of this
+    /// library — see the note on it in the root manifest. Only the four methods
+    /// the trait requires and `record` do anything.
+    struct RecordedFields(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    impl tracing::field::Visit for RecordedFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .lock()
+                .expect("field capture mutex is not poisoned")
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0
+                .lock()
+                .expect("field capture mutex is not poisoned")
+                .push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    impl tracing::Subscriber for RecordedFields {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            values.record(&mut RecordedFields(self.0.clone()));
+        }
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// The full-scan alarm must reach the span as the *tail* sampling marker.
+    ///
+    /// This drives the real function, on the real `query.plan` span, in the
+    /// order production uses: the span is created with the field empty, entered,
+    /// and only then filled in. That ordering is precisely why the head sampler
+    /// cannot act on it — it decided when the span started — so recording
+    /// `turbolay.sampling.force` here would be a silent no-op dressed up as a
+    /// guarantee. The marker the collector's tail sampler reads is the one that
+    /// can still change the outcome, and it is the one that has to be here.
+    #[test]
+    fn a_full_scan_plan_marks_the_trace_for_the_tail_sampler() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = RecordedFields(captured.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = query_plan_span("cell-7", 42);
+            let entered = span.enter();
+            RowQueryPlanSummary::from_patterns(&[plan_pattern(
+                RowQueryAccess::AllVertexScan,
+                Vec::new(),
+            )])
+            .record(&span, "cell-7", std::time::Duration::from_millis(1));
+            drop(entered);
+        });
+
+        let recorded = captured
+            .lock()
+            .expect("field capture mutex is not poisoned");
+        assert!(
+            recorded
+                .iter()
+                .any(|(name, value)| name == "turbolay.sampling.tail_keep" && value == "full_scan"),
+            "the full-scan alarm did not mark the trace for the tail sampler: {recorded:?}"
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|(name, _)| name == "turbolay.sampling.force"),
+            "the head-sampling key was recorded after the span started, where \
+             it can never be read: {recorded:?}"
+        );
     }
 
     #[test]

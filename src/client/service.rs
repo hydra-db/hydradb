@@ -889,7 +889,7 @@ impl ClientQueryService {
             turbolay.read_epoch = bookmark.epoch,
             observed_epoch = tracing::field::Empty,
             error.class = tracing::field::Empty,
-            turbolay.sampling.force = tracing::field::Empty,
+            turbolay.sampling.tail_keep = tracing::field::Empty,
         );
         let outcome = async {
             let current_sequence = self
@@ -1701,7 +1701,7 @@ impl ClientQueryService {
                 turbolay.cell_id = %request.target.cell_id,
                 turbolay.commit_epoch = tracing::field::Empty,
                 error.class = tracing::field::Empty,
-                turbolay.sampling.force = tracing::field::Empty,
+                turbolay.sampling.tail_keep = tracing::field::Empty,
             );
             let sequence = self
                 .inner
@@ -1918,9 +1918,12 @@ impl ClientQueryService {
 /// question and the one an operator asks first.
 fn record_span_error(span: &tracing::Span, err: &GraphError) {
     span.record("error.class", err.class());
-    // A head sampler decides before the span closes, so the keep decision has
-    // to be a field it can see rather than a status it cannot.
-    span.record("turbolay.sampling.force", true);
+    // The head sampler decided this trace's fate when the root span started,
+    // which was before this request could possibly be known to fail, so nothing
+    // recorded here can change it. The marker is for the collector's tail
+    // sampler, which buffers the whole trace and *can* — see
+    // `turbolay_telemetry::sampling` for the policy that deployment owes us.
+    span.record("turbolay.sampling.tail_keep", "error");
 }
 
 /// The trace root for one client request.
@@ -1969,7 +1972,7 @@ pub(crate) fn client_root_span(
                 turbolay.query.rows_returned = tracing::field::Empty,
                 runtime_limit_ms = tracing::field::Empty,
                 error.class = tracing::field::Empty,
-                turbolay.sampling.force = tracing::field::Empty,
+                turbolay.sampling.tail_keep = tracing::field::Empty,
             )
         };
     }
