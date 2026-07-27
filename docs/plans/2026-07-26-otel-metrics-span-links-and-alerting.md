@@ -1,10 +1,10 @@
 ---
 title: OTel metrics, span links and trace-driven alerting
-status: step-h2-complete
+status: step-h3-complete
 date: 2026-07-26
 branch: Turbolay-V3.5
 base_commit: 6255ca3
-head_commit: aa53595
+head_commit: 9cd10f2
 tags:
   - observability
   - opentelemetry
@@ -55,7 +55,8 @@ order is unchanged and H2 is next.**
 **Corrected 2026-07-27 against `aa53595`, and the export path is now decided.**
 H2 landed (`8d7e939`, with its build break and its unreachable half fixed in
 `aa53595`) and M1 is complete (`68efadf` built the provider; `aa53595` made it
-reachable and fed it). **H3 is the only histogram step outstanding.** Four
+reachable and fed it). **H3 is the only histogram step outstanding** — it landed
+later the same day in `4a84dcd`; see the amendment below. Four
 things changed that are not step bookkeeping:
 
 - **Prometheus scraping `/metrics` is the decided consumer of metrics.** That is
@@ -76,6 +77,39 @@ BUG-2 is also corrected here and in §5.5, from
 `docs/plans/2026-07-27-scoped-cluster-map-lock-double-open.md` (`0b9eb31`),
 which investigated it and found the premise does not hold — and found a worse,
 unfiled bug that **this document's own collection path causes**.
+
+**Amended 2026-07-27 against `9cd10f2`. Every step of §1.8's sequence is done,
+and BUG-4 is fixed.** M2 landed in `1d66650`, M3 in `6c95764`, H3 in `4a84dcd`
+(`docs/runbooks/duration-histograms.md`), and BUG-4 — the collector pinning every
+scope against eviction, and the prerequisite for M2's measurement half — in
+`653896f`. Three further things, none of them step bookkeeping:
+
+- **Writing the H3 runbook against the tree rather than against this document
+  falsified three of its claims.** The stated worst-case quantile error was
+  self-inconsistent (§1.10); the shard histogram is not summed across scopes and
+  so does not have the falling-sum problem (§1.10); and the ladder is not in the
+  module §1.10's body names. All three are corrected in place, and the runbook's
+  last section records them so the two documents are not read against each other.
+- **The `TransportOnly` fields are now a type rather than three prose comments**
+  (`9cd10f2`). `QueryTransportMetricsSnapshot`'s counters and the
+  `rpc_latency`/`serve_latency` histograms reach neither export because
+  `graph-node` holds no transport snapshot; that is now `FieldSource`,
+  `CounterSource::field_source` and `TRANSPORT_ONLY_COUNTERS`, with tests. If a
+  source ever appears, a test says so rather than the series silently staying
+  empty. One consequence this document had not drawn: **`slow_queries` is
+  therefore exported nowhere**, so the 500 ms rung's whole purpose — reconciling
+  the mass above it against that counter (§1.10, H2's "done when") — is not
+  performable on a `graph-node` scrape today.
+- **The observable-counter wrapper exists** (`9cd10f2`), so wiring counters to
+  the meter is a wiring task rather than a design one. Under the decided export
+  path it stays the lower-value half; `/metrics` already carries all 67.
+
+**And a fifth recipe gap, outside this document's scope but found by it**
+(`6ba2511`): nothing executed the indexer's tests. `clippy-runtime` lints
+`indexer-runtime` and `check-all-features` builds it, so `ci` compiled the
+indexer binary's seven tests every run and never ran one — five of which pin the
+`/metrics` rendering, and two of which are M3's own cell/edge-type coverage from
+`6c95764`. The newest metrics work was the least-executed code in the tree.
 
 Goal: finish the observability story that `docs/plans/2026-07-26-otel-telemetry-crate.md`
 started, by taking the four things it deferred and deciding them — metrics
@@ -1307,17 +1341,29 @@ writing is a merge rather than a decision.
 The full order is: **BUG-3 → BUG-1 → H1 → M1 → H2 → M2 → M3 → H3.** BUG-3 landed
 in `8f150b2`, BUG-1 in `08e78df`, H1 across `3c2728a`/`5d97fb8`/`fbdfca3`/
 `1037a0c`, M1 in `68efadf` + `aa53595`, and H2 in `8d7e939` + `aa53595`.
-**M2 is next. H3 is the only histogram step outstanding**, and the collector
-`tail_sampling` policy is still outstanding as a deployment task running
-alongside.
+**M2 landed in `1d66650`, M3 in `6c95764`, and H3 in `4a84dcd` — every step of
+the sequence is now done.** The collector `tail_sampling` policy remains
+outstanding as a deployment task, and it is the last thing standing between this
+work and a meaningful baseline week.
 
-**And BUG-4 is now a prerequisite for M2**, not a neighbour of it. The collector
-retaining cluster `Arc`s can turn a scrape into `AdmissionRejected` for a
-new-scope query (see BUG-4 above); measuring M2's collection cost against
-read-path p99 while that stands would measure a latency question on a path that
-is failing outright. It is also the only item in this document that moves an
-error rate rather than a percentile, so it wins on its own merits regardless of
-sequencing.
+**BUG-4 was a prerequisite for M2**, not a neighbour of it, and it is **fixed —
+`653896f`.** The collector retaining cluster `Arc`s could turn a scrape into
+`AdmissionRejected` for a new-scope query (see BUG-4 above); measuring M2's
+collection cost against read-path p99 while that stood would have measured a
+latency question on a path that was failing outright. It was also the only item
+in this document that moves an error rate rather than a percentile, so it won on
+its own merits regardless of sequencing.
+
+Two notes on how it landed, because both bear on M2's remaining measurement
+half. The window is **shrunk, not closed**: the scope currently being read is
+still un-evictable, and closing that needs an in-use count separate from the
+`Arc` count — more machinery than the residual risk justifies at
+`max_open_scopes = 8` and a 60s interval, and both doc comments say so rather
+than implying the race is gone. And `loaded_clusters` now returns
+`Weak<RoutedGraphCluster>` rather than `Arc`, specifically so the index-discovery
+loop cannot reintroduce the bug by collecting the upgrades into a `Vec` — that
+loop holds its handles across per-cell object-store I/O, so its window was the
+wider of the two.
 
 **The export path decision, and what it re-points.** Prometheus scraping
 `/metrics` is the decided consumer. M2 and M3 below were written as
@@ -1797,17 +1843,32 @@ counter over the same window. **Not yet checked in staging** — the code half i
 done and the staging half is a deployment task, in the same shape as BUG-3's
 collector policy.
 
-**Step H3 — the runbook and the dashboards. The only histogram step
-outstanding.** Deliberately last, and a real
+**Step H3 — the runbook and the dashboards. Done — `4a84dcd`,
+`docs/runbooks/duration-histograms.md`.** Deliberately last, and a real
 step rather than a documentation afterthought, because every failure mode of a
 bucket histogram is a *misuse* failure and the misuses are predictable.
+
+New `docs/runbooks/`, no date prefix: a runbook is a living document and a date
+in the filename would read as stale on sight, which is the opposite of what the
+`docs/plans/` convention is for. Writing it against the tree rather than against
+this document turned up three places where this document is wrong, corrected
+below and recorded in the runbook's last section so the two are not read against
+each other.
 
 **Done when** the runbook states, in these terms:
 
 - **The quantile is an estimate.** Worst-case relative error is about
-  (bucket ratio − 1), which for this ladder is 20–30% in practice. It answers
+  (bucket ratio − 1), ~~which for this ladder is 20–30% in practice~~ **which
+  for this ladder is 100–150%, not 20–30%.** Those two clauses were
+  inconsistent: the shipped rungs are 2× and 2.5× with a 3× at the top
+  (10 s → 30 s), so (ratio − 1) cannot be 20–30%. The bound and the typical case
+  are two separate claims and the runbook states them separately — worst case is
+  the bucket width, typical is a few tens of percent when mass is spread through
+  a bucket rather than piled at one end. It answers
   "is p99 10 ms or 100 ms" and "did it move 2×". It does **not** answer "did
   p99 go from 42 ms to 47 ms", and an alert phrased that way will be noise.
+  None of the operational conclusions move, which is presumably how the
+  discrepancy survived four amendment rounds.
 - **Do not average p99s across nodes.** Summing the bucket families and then
   applying `histogram_quantile` is correct; averaging per-node p99s is
   arithmetically meaningless. Nothing in the pipeline prevents the second, so
@@ -1820,6 +1881,24 @@ bucket histogram is a *misuse* failure and the misuses are predictable.
   independent relaxed `fetch_add`s, so a snapshot taken between them
   undercounts the sum by at most the number of observations in flight. `count`
   is derived from the buckets, so `_count` and `le="+Inf"` never skew.
+
+**And a correction this step forced: the shard histogram is not summed across
+scopes.** §1.4's per-cell shape argument — that a series is summed over every
+scope open on the node, so a scope closing makes the sum *fall* and `rate()`
+reads that as a reset — is true of the per-cell **counter** families and not of
+`graph_query_rows_duration_microseconds`. `8d7e939` gave that histogram the same
+`{scope, cell_id}` labels as the counters it sits beside, making it the **sixth**
+member of the fixed scope-labelled list rather than a per-cell sum;
+`only_the_pre_existing_families_carry_a_scope_label` (`admin.rs:1442-1461`) pins
+the list at six. It therefore goes **stale** when a scope closes, not falling,
+and a reopened cell restarts its buckets from zero, which `rate()` handles
+correctly. `increase()` across a reopen still undercounts. The runbook
+distinguishes the two behaviours; this document previously conflated them.
+
+The other drift the runbook records: the ladder lives in
+`src/core/histogram.rs` as `AtomicDurationHistogram`, not in
+`src/core/metrics.rs` as `DurationHistogram`. §1.10's H1 divergence list already
+said so; the body of §1.10 did not, and a reader greps the body.
 
 **Revisit trigger, falsifiable.** The first time an alert of the form "p99 rose
 more than X% week-over-week" fires on bucket-boundary noise, or fails to fire on
@@ -2414,10 +2493,22 @@ is `Arc::strong_count == 1` (`:1197`). At `max_open_scopes` a scrape therefore
 makes every open scope un-evictable, and a query for a new scope returns
 `AdmissionRejected` — a hard client error, not a stall. `loaded_clusters`
 (`:1256`) has the same shape and the index-discovery loop holds its clones
-across real I/O, so its window is wider still. **Not fixed**; the fix is
-`Weak` plus upgrade-one-at-a-time, step 3 of the same plan. It is a
-**prerequisite for M2** rather than a neighbour of it: measuring collection cost
-against read-path p99 on a path that can fail outright measures the wrong thing.
+across real I/O, so its window is wider still. ~~**Not fixed**~~ **Fixed —
+`653896f`**, by `Weak` plus upgrade-one-at-a-time, step 3 of the same plan. It
+was a **prerequisite for M2** rather than a neighbour of it: measuring collection
+cost against read-path p99 on a path that can fail outright measures the wrong
+thing.
+
+The test is the part worth keeping: at `max_open_scopes = 3` with three scopes
+open, hold one shard's `matrix_artifact_cache`, `poll!` the collection once so it
+is parked inside the first cluster, and open a fourth scope. Reverting only the
+`Arc::downgrade` in `local_shard_runtime_metrics` makes it fail with
+`AdmissionRejected { operation: "open_graph_scopes", actual: 4, limit: 3 }` — the
+bug reproduced as a client-visible error, from a scrape, with no timer and no
+second task so it cannot flake. It also asserts the completed collection has two
+rows rather than three, pinning "a scope evicted mid-collection is a skip, not a
+row". Steps 1 and 2 of that plan — pin that the promotable open does no I/O, and
+move the eviction close out of the critical section — remain unimplemented.
 Full detail in the BUG-4 entry above.
 
 **The `/metrics` `scope` label** (§6). Reopened by the export-path decision, and
@@ -2428,6 +2519,29 @@ because §6 is a scope statement and this is a decision.
 and has no consumer under a pull-only export path. Not urgent — it costs
 nothing when no endpoint is configured — but it should end as an explicit keep
 or an explicit delete rather than as something nobody looked at again.
+
+**Everything still open at `9cd10f2`, in one list**, since the step sequence no
+longer carries any of it:
+
+1. **The collector `tail_sampling` policy** — a deployment task, and the one that
+   gates a meaningful baseline week. Until it runs, error and full-scan traces are
+   ratio-sampled exactly as they were before BUG-3, under a new attribute name.
+2. **The `/metrics` `scope` label**, and the series-budget measurement owed with
+   it. Six families carry it, 34 series per `(scope, cell)`, so ~27,200 per node
+   at 100 tenants and 8 cells. M2 itself added 495 series per node, flat in tenant
+   count — the pre-existing scope-labelled families are the whole cardinality risk.
+3. **M2's measurement half** — p99 of `query.execute` unchanged in staging with
+   the collector on. Unblocked now that BUG-4 is fixed; not yet done.
+4. **The OTLP interval task's keep-or-delete**, above.
+5. **`slow_queries` and the transport counters reach no export**, so the 500 ms
+   rung's reconciliation cannot be performed. Pinned as `TransportOnly` in
+   `9cd10f2` rather than fixed, because `graph-node` holds no transport snapshot.
+6. **Counters through the meter** — the wrapper exists, no binary registers one.
+   Lower-value half by the export-path decision.
+7. **The `#[instrument]` migration** (~85 sites, `skip_all` plus explicit
+   `fields(...)` mandatory). Deliberately deferred, not forgotten.
+8. **Steps 1 and 2 of the scoped-cluster plan** — pin that the promotable open
+   does no I/O; move the eviction close out of the critical section.
 
 ## 6. Explicitly out of scope
 
