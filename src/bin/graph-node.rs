@@ -455,7 +455,19 @@ fn start_index_discovery(
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         loop {
+            // `loaded_clusters` hands back `Weak`s, and they must be upgraded one
+            // at a time with each `Arc` dropped before the next. Collecting the
+            // upgrades into a `Vec` first would pin every open scope for the whole
+            // sweep, and because eviction only considers entries with
+            // `Arc::strong_count == 1`, that made a query for a not-yet-open scope
+            // fail with `AdmissionRejected` at `max_open_scopes` — this loop does
+            // real object-store I/O per cell, so the window was wide.
             for cluster in node.loaded_clusters().await {
+                // Gone means the scope was evicted since the snapshot. Skip it;
+                // the next sweep sees whatever is open then.
+                let Some(cluster) = cluster.upgrade() else {
+                    continue;
+                };
                 for cell_id in &cells {
                     let shard = cluster.shard(cell_id)?;
                     match shard.dirty_graph_index_edge_types(cell_id).await {
