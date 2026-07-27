@@ -1253,25 +1253,70 @@ impl ScopedRoutedGraphCluster {
         self.clusters.lock().await.keys().cloned().collect()
     }
 
-    pub async fn loaded_clusters(&self) -> Vec<Arc<RoutedGraphCluster>> {
+    /// Non-owning handles to every open scope's cluster.
+    ///
+    /// `Weak`, and the return type is the whole point. Eviction's candidate
+    /// filter is `Arc::strong_count(&entry.cluster) == 1` (see
+    /// `cluster_for_scope`), so a strong clone a caller keeps makes that scope
+    /// un-evictable for as long as it keeps it — and at `max_open_scopes` a
+    /// query for a not-yet-open scope then fails with `AdmissionRejected`
+    /// rather than waiting. The index-discovery loop iterated a `Vec` of strong
+    /// clones across per-cell object-store I/O, which turned a background
+    /// interval task into a client-visible error rate.
+    ///
+    /// Callers must upgrade **one at a time** and drop each `Arc` before
+    /// upgrading the next. An upgrade returning `None` means the scope was
+    /// evicted since the snapshot, which is a skip, not an error.
+    ///
+    /// This shrinks the un-evictable window rather than eliminating it: while a
+    /// caller holds one upgraded `Arc`, that one scope is still un-evictable.
+    /// Closing the window entirely needs an in-use count separate from the
+    /// `Arc` count, which is more machinery than the residual risk justifies.
+    pub async fn loaded_clusters(&self) -> Vec<std::sync::Weak<RoutedGraphCluster>> {
         self.clusters
             .lock()
             .await
             .values()
-            .map(|entry| Arc::clone(&entry.cluster))
+            .map(|entry| Arc::downgrade(&entry.cluster))
             .collect()
     }
 
+    /// Per-scope shard runtime metrics, collected one scope at a time.
+    ///
+    /// The `clusters` mutex is taken only to snapshot the map, and what is
+    /// snapshotted is `Weak` rather than `Arc` deliberately. Eviction's
+    /// candidate filter is `Arc::strong_count(&entry.cluster) == 1`, so
+    /// retaining a strong clone of every open scope for the length of the
+    /// collection — which is what this did — made *every* scope un-evictable
+    /// for that whole span. At `max_open_scopes` a query for a not-yet-open
+    /// scope then found no eviction candidate and got
+    /// `AdmissionRejected { operation: "open_graph_scopes", .. }` straight back:
+    /// a hard client error with no retry and no wait, produced by a scrape.
+    ///
+    /// Upgrading one at a time and dropping each `Arc` before the next
+    /// **shrinks** that window from "every open scope, for the whole
+    /// collection" to "one scope, for one cluster's worth of cache-lock reads".
+    /// It does not eliminate it — the scope currently being read is still
+    /// un-evictable. Eliminating it needs an explicit in-use count separate
+    /// from the `Arc` count, which is more machinery than the residual risk
+    /// justifies at `max_open_scopes = 8` and a 60s export interval.
+    ///
+    /// A `Weak` that fails to upgrade means the scope was evicted between the
+    /// snapshot and its turn. That is a skip, not an error: the metrics are
+    /// advisory and a closed scope has nothing left to report.
     pub async fn local_shard_runtime_metrics(&self) -> Vec<ScopedGraphShardRuntimeMetrics> {
         let clusters = self
             .clusters
             .lock()
             .await
             .iter()
-            .map(|(scope, entry)| (scope.clone(), Arc::clone(&entry.cluster)))
+            .map(|(scope, entry)| (scope.clone(), Arc::downgrade(&entry.cluster)))
             .collect::<Vec<_>>();
         let mut metrics = Vec::new();
         for (scope, cluster) in clusters {
+            let Some(cluster) = cluster.upgrade() else {
+                continue;
+            };
             metrics.extend(
                 cluster
                     .local_shard_runtime_metrics()
@@ -1282,6 +1327,8 @@ impl ScopedRoutedGraphCluster {
                         shard,
                     }),
             );
+            // `cluster` drops here, before the next upgrade, so at most one
+            // scope is pinned at a time.
         }
         metrics
     }
@@ -1375,6 +1422,164 @@ mod scoped_cluster_tests {
             .object_store_cache_dir
             .unwrap()
             .ends_with("production/tenant-a/graphs/hydradb"));
+    }
+
+    /// A runtime whose scope map is exactly `max_open_scopes` deep, so the next
+    /// miss must evict, and eviction only considers entries nobody else holds.
+    fn runtime_at_capacity(base_path: &str, max_open_scopes: usize) -> ScopedRoutedGraphCluster {
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        ScopedRoutedGraphCluster::new(
+            base_path,
+            root,
+            GraphId::new("hydradb").unwrap(),
+            "node-a",
+            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
+            PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
+            Arc::new(InMemory::new()),
+            GraphOpenOptions::default(),
+            GraphMemoryConfig::default(),
+            max_open_scopes,
+        )
+        .unwrap()
+    }
+
+    fn tenant_scope(runtime: &ScopedRoutedGraphCluster, tenant: &str) -> GraphScope {
+        GraphScope::new(
+            runtime
+                .root_scope()
+                .namespace
+                .child(NamespaceId::new(tenant).unwrap())
+                .unwrap(),
+            runtime.root_scope().graph_id,
+        )
+    }
+
+    /// Fill the map to `max_open_scopes`, returning the scopes in map order.
+    ///
+    /// The returned `Arc`s are dropped, so every entry is back to
+    /// `strong_count == 1` and therefore an eviction candidate. Anything that
+    /// makes them un-evictable afterwards is the thing under test.
+    async fn open_scopes_to_capacity(
+        runtime: &ScopedRoutedGraphCluster,
+        tenants: &[&str],
+    ) -> Vec<GraphScope> {
+        let mut scopes = Vec::new();
+        for tenant in tenants {
+            let scope = tenant_scope(runtime, tenant);
+            drop(
+                runtime
+                    .cluster_for_scope(&scope)
+                    .await
+                    .expect("scope opens"),
+            );
+            scopes.push(scope);
+        }
+        assert_eq!(runtime.loaded_scopes().await.len(), tenants.len());
+        scopes
+    }
+
+    /// A metrics collection in flight must not make every open scope
+    /// un-evictable.
+    ///
+    /// The collector snapshots the `clusters` map and then reads each cluster's
+    /// cache gauges outside the map lock. Snapshotting `Arc`s rather than
+    /// `Weak`s meant it held a strong reference to *every* open scope for the
+    /// whole collection, and eviction's candidate filter is
+    /// `Arc::strong_count(&entry.cluster) == 1` — so at `max_open_scopes` a
+    /// query for a not-yet-open scope found no candidate and got
+    /// `AdmissionRejected` back. A scrape moving a client-visible failure rate.
+    ///
+    /// Driven by hand in the style of `08e78df`: hold one shard's first cache
+    /// mutex, poll the collection exactly once so it is suspended partway
+    /// through the *first* cluster, and then open a new scope. No second task
+    /// and no timer, so it cannot flake.
+    #[tokio::test]
+    async fn a_parked_metrics_collection_does_not_block_opening_a_new_scope() {
+        let runtime = runtime_at_capacity("graph/parked-metrics", 3);
+        let scopes = open_scopes_to_capacity(&runtime, &["tenant-a", "tenant-b", "tenant-c"]).await;
+
+        // Park the collection on the first scope in map order. Holding the lock
+        // needs the cluster alive, so this scope is pinned by the test itself --
+        // which is the point: the other two must still be evictable.
+        let first = runtime
+            .cluster_for_scope(&scopes[0])
+            .await
+            .expect("the first scope is open");
+        let blocker = first
+            .shard("cell-0")
+            .expect("the directory has one cell")
+            .matrix_artifact_cache
+            .lock()
+            .await;
+
+        let mut collection = std::pin::pin!(runtime.local_shard_runtime_metrics());
+        assert!(
+            futures::poll!(collection.as_mut()).is_pending(),
+            "the held matrix_artifact_cache lock should have parked the collection \
+             inside the first cluster"
+        );
+
+        let fresh = tenant_scope(&runtime, "tenant-d");
+        let opened = runtime.cluster_for_scope(&fresh).await;
+        assert!(
+            opened.is_ok(),
+            "a collection parked on one scope must leave the others evictable; \
+             opening a new scope failed with {:?}",
+            opened.err()
+        );
+        drop(opened);
+
+        drop(blocker);
+        drop(first);
+        let metrics = collection.await;
+        // tenant-b was the least recently used evictable entry, so it went to make
+        // room for tenant-d. Its `Weak` no longer upgrades, and the collection
+        // skips it rather than failing: one shard each for tenant-a and tenant-c.
+        assert_eq!(
+            metrics.len(),
+            2,
+            "a scope evicted mid-collection is a skip, not an error, and not a row"
+        );
+
+        runtime.close().await.expect("the runtime drains");
+    }
+
+    /// `loaded_clusters` must hand back non-owning handles.
+    ///
+    /// Same failure as above with a wider window: the index-discovery loop holds
+    /// its snapshot across `dirty_graph_index_edge_types` and
+    /// `discover_graph_index` per cell, both of which do object-store I/O. While
+    /// the snapshot was `Vec<Arc<..>>`, merely holding it blocked every eviction.
+    #[tokio::test]
+    async fn a_held_loaded_clusters_snapshot_does_not_block_opening_a_new_scope() {
+        let runtime = runtime_at_capacity("graph/loaded-clusters", 2);
+        open_scopes_to_capacity(&runtime, &["tenant-a", "tenant-b"]).await;
+
+        let snapshot = runtime.loaded_clusters().await;
+        assert_eq!(snapshot.len(), 2);
+
+        let fresh = tenant_scope(&runtime, "tenant-c");
+        let opened = runtime.cluster_for_scope(&fresh).await;
+        assert!(
+            opened.is_ok(),
+            "holding a loaded_clusters snapshot must not pin the open scopes; \
+             opening a new scope failed with {:?}",
+            opened.err()
+        );
+        drop(opened);
+
+        // One scope was evicted to make room, so one handle no longer upgrades.
+        // That is the skip the consumer has to tolerate.
+        let live = snapshot
+            .iter()
+            .filter(|weak| weak.upgrade().is_some())
+            .count();
+        assert_eq!(
+            live, 1,
+            "exactly one of the two snapshotted scopes survived"
+        );
+
+        runtime.close().await.expect("the runtime drains");
     }
 }
 
