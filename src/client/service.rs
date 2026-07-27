@@ -663,6 +663,26 @@ pub struct ClientQueryMetricsSnapshot {
     pub write_latency: DurationHistogramSnapshot,
 }
 
+crate::core::metrics::snapshot_fields!(ClientQueryMetricsSnapshot {
+    counters {
+        queries_started,
+        queries_completed,
+        queries_failed,
+        rows_returned,
+        auth_failures,
+        scope_denials,
+        cancellations,
+        backpressure_waits,
+        prepare_requests,
+        prepare_duration_us,
+        execution_duration_us,
+    }
+    histograms {
+        read_latency,
+        write_latency,
+    }
+});
+
 #[derive(Default)]
 struct ClientQueryMetrics {
     queries_started: AtomicU64,
