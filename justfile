@@ -86,6 +86,14 @@ test-placement:
     cargo clippy --locked --all-targets -p turbolay-placement -- -D warnings
     cargo test --locked -p turbolay-placement
 
+# The telemetry crate's OTLP-only modules — the sampler, the exporter wiring and
+# the log bridge — are behind an off-by-default feature, so neither `just check`
+# nor `just test` reaches them. Without `--features otlp` the sampler is not even
+# compiled.
+test-telemetry:
+    cargo clippy --locked --all-targets -p turbolay-telemetry --features otlp -- -D warnings
+    cargo test --locked -p turbolay-telemetry --features otlp
+
 # Verify native libraries required by Rust FFI crates.
 native-check:
     #!/usr/bin/env bash
@@ -100,7 +108,7 @@ native-check:
     fi
 
 # Run the local CI-equivalent check set.
-ci: native-check fmt-check check test-placement test test-opencypher test-graphblas test-native test-chaos test-server-runtime check-examples check-examples-native check-examples-chaos
+ci: native-check fmt-check check test-placement test-telemetry test test-opencypher test-graphblas test-native test-chaos test-server-runtime check-examples check-examples-native check-examples-chaos
 
 # Run the local object-store smoke test.
 smoke:
