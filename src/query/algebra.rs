@@ -642,7 +642,14 @@ impl QueryResultSet {
         self
     }
 
-    #[cfg(any(feature = "bolt-server", feature = "http-api"))]
+    // `client-api`, not the two wire protocols above it. The only caller is
+    // `ClientQueryService::start_server_cursor`, which charges a materialised
+    // result against `max_cursor_buffer_bytes` before it hands out a cursor —
+    // server-side cursors are a `client-api` concept, and Bolt and HTTP inherit
+    // them rather than owning them. Gating on `bolt-server`/`http-api` compiled
+    // only because nothing built `client-api` on its own; `--features client-api`
+    // alone failed E0599 here.
+    #[cfg(feature = "client-api")]
     pub(crate) fn estimated_resident_bytes(&self) -> u64 {
         self.rows.iter().fold(0_u64, |total, row| {
             total.saturating_add(row.estimated_resident_bytes())
