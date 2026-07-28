@@ -275,6 +275,32 @@ impl tracing::field::Visit for JsonFieldVisitor {
     }
 }
 
+/// Span fields lifted to the top level of the line, and the key each takes
+/// there.
+///
+/// The log collector maps a line's **root** keys onto warehouse columns by
+/// name, and `cortex.cortex_logs_v2` has a `tenant_id` and a `sub_tenant_id`
+/// column waiting for exactly these. Nothing in that pipeline lifts a nested
+/// key: a value under `fields`, or inside the `spans` array below, is bucketed
+/// whole into an opaque attributes blob and the column stays null. So the two
+/// identities are hoisted out of the enclosing request span onto every line
+/// emitted while it is open.
+///
+/// Which is the point, and not merely a plumbing convenience. Tenancy is a
+/// property of the *request*, not of the one line that happened to mention it,
+/// so it is recorded once where the request is understood — see
+/// `client_root_span` in the kernel — and every planner warning, admission
+/// refusal and error logged underneath inherits it without knowing it exists.
+///
+/// The base64 spellings (`turbolay.tenant.scope_id`) are deliberately not
+/// promoted. They have no column, they are what `turbolay.scope` already spells
+/// out on the span, and a root key with no column is copied into the attributes
+/// map on every single line.
+const PROMOTED_SPAN_FIELDS: &[(&str, &str)] = &[
+    ("turbolay.tenant_id", "tenant_id"),
+    ("turbolay.sub_tenant_id", "sub_tenant_id"),
+];
+
 /// The JSON event format.
 ///
 /// Every line carries `binary` and `service`, which is what makes a shared log
@@ -364,12 +390,35 @@ where
             serde_json::Value::String(meta.target().to_string()),
         );
 
+        // Trace correlation, top-level rather than under `fields`, because the
+        // log collector reads these two keys by name to fill the OTLP
+        // `logRecord`'s dedicated `traceId`/`spanId` — the fields a backend's
+        // log-to-trace deep link resolves against. Absent, not zero, when no
+        // trace is active: a zero id is a *valid-looking* id that resolves to
+        // nothing, which is worse to debug than a missing key.
+        #[cfg(feature = "otlp")]
+        if let Some((trace_id, span_id)) = crate::bridge::current_trace_ids() {
+            line.insert("trace_id".to_string(), serde_json::Value::String(trace_id));
+            line.insert("span_id".to_string(), serde_json::Value::String(span_id));
+        }
+
         // Event fields, redacted. This is the path the built-in JSON formatter
         // bypasses.
         let mut visitor = JsonFieldVisitor::default();
         let mut redacting = RedactingVisitor::new(&mut visitor);
         event.record(&mut redacting);
         let mut fields = visitor.into_map();
+
+        // An event that names one of the promoted fields itself outranks the
+        // span stack: it is the more specific statement, and the only reason to
+        // write it on an event is to correct what the span says.
+        let mut event_promoted = serde_json::Map::new();
+        for (field, column) in PROMOTED_SPAN_FIELDS {
+            if let Some(value) = fields.get(*field) {
+                event_promoted.insert((*column).to_string(), value.clone());
+            }
+        }
+        let mut promoted = serde_json::Map::new();
 
         // `message` is just another field to `tracing`; promoting it to the top
         // level is what makes the line readable in a log viewer.
@@ -397,6 +446,15 @@ where
                             serde_json::from_str::<serde_json::Value>(formatted.fields.as_str())
                         {
                             for (key, value) in parsed {
+                                // Walking root-first means the innermost span
+                                // writes last and wins, which is what a nested
+                                // scope should do.
+                                if let Some((_, column)) = PROMOTED_SPAN_FIELDS
+                                    .iter()
+                                    .find(|(field, _)| *field == key.as_str())
+                                {
+                                    promoted.insert((*column).to_string(), value.clone());
+                                }
                                 entry.insert(key, value);
                             }
                         }
@@ -408,6 +466,8 @@ where
                 line.insert("spans".to_string(), serde_json::Value::Array(spans));
             }
         }
+        promoted.extend(event_promoted);
+        line.extend(promoted);
 
         let rendered =
             serde_json::to_string(&serde_json::Value::Object(line)).map_err(|_| fmt::Error)?;
@@ -480,6 +540,18 @@ mod tests {
         assert_eq!(lines[0]["fields"]["cell_id"], "cell-7");
     }
 
+    /// With no tracer installed there is no trace to name, and the two keys
+    /// must be *absent* rather than present and zero. A zero id looks valid to
+    /// the log collector, which would lift it into the OTLP `logRecord` and
+    /// produce a deep link to a trace that cannot exist. `tests/log_trace_ids.rs`
+    /// covers the other half — that a real tracer does populate them.
+    #[test]
+    fn no_active_trace_emits_no_trace_ids() {
+        let lines = capture_json(ServiceIdentity::GraphNode, || tracing::info!("up"));
+        assert!(lines[0].get("trace_id").is_none());
+        assert!(lines[0].get("span_id").is_none());
+    }
+
     /// The two binaries must be separable by field, not by message text.
     #[test]
     fn the_two_binaries_are_distinguishable() {
@@ -521,6 +593,59 @@ mod tests {
         assert_eq!(lines[0]["spans"][0]["token"], crate::redact::REDACTED);
         assert_eq!(lines[0]["spans"][0]["cell_id"], "c9");
         assert_eq!(lines[0]["spans"][0]["name"], "client.query");
+    }
+
+    /// The whole reason the promotion exists: a line logged deep inside a
+    /// request, by code that has never heard of a tenant, still names one at
+    /// the top level where the warehouse's column mapping can see it.
+    #[test]
+    fn tenancy_is_promoted_from_the_enclosing_span_to_the_line_root() {
+        let lines = capture_json(ServiceIdentity::GraphNode, || {
+            let request = tracing::info_span!(
+                "client.query",
+                turbolay.tenant_id = "l3c4v6lu2w",
+                turbolay.sub_tenant_id = "[Gmail]/All Mail",
+                turbolay.tenant.scope_id = "bDNjNHY2bHUydw",
+            );
+            let _request = request.enter();
+            let plan = tracing::info_span!("query.plan");
+            let _plan = plan.enter();
+            tracing::warn!(turbolay.query.full_scan = true, "unindexed access path");
+        });
+        assert_eq!(lines[0]["tenant_id"], "l3c4v6lu2w");
+        assert_eq!(lines[0]["sub_tenant_id"], "[Gmail]/All Mail");
+        // The base64 spelling stays on the span. It has no column, and a root
+        // key with no column is copied into the attributes map on every line.
+        assert!(lines[0].get("tenant.scope_id").is_none());
+        assert_eq!(
+            lines[0]["spans"][0]["turbolay.tenant.scope_id"],
+            "bDNjNHY2bHUydw"
+        );
+    }
+
+    /// Outside a request there is no tenant, and the keys must be absent rather
+    /// than blank: `tenant_id = ""` is a value the warehouse stores and nobody
+    /// can then tell from a tenant that genuinely reported nothing.
+    #[test]
+    fn a_line_outside_any_request_carries_no_tenancy() {
+        let lines = capture_json(ServiceIdentity::GraphNode, || {
+            tracing::info!("cell writer fence refreshed");
+        });
+        assert!(lines[0].get("tenant_id").is_none());
+        assert!(lines[0].get("sub_tenant_id").is_none());
+    }
+
+    /// A sub-tenant is optional — a tenant-level database resolves to a scope
+    /// with no third namespace segment — and its absence must not suppress the
+    /// tenant that *is* known.
+    #[test]
+    fn a_tenant_without_a_sub_tenant_still_promotes() {
+        let lines = capture_json(ServiceIdentity::GraphNode, || {
+            let span = tracing::info_span!("client.query", turbolay.tenant_id = "l3c4v6lu2w");
+            span.in_scope(|| tracing::info!("executing"));
+        });
+        assert_eq!(lines[0]["tenant_id"], "l3c4v6lu2w");
+        assert!(lines[0].get("sub_tenant_id").is_none());
     }
 
     #[test]

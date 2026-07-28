@@ -165,6 +165,121 @@ fn unknown_graph_database(database: &str) -> GraphError {
     }
 }
 
+/// One tenancy segment of a [`GraphScope`], in both the form the scope stores
+/// and the form everything outside Turbolay uses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScopeTenant {
+    /// The segment verbatim — URL-safe unpadded base64, as
+    /// [`encode_database_scope_id`] wrote it. This is the spelling that also
+    /// appears in the `scope` metric label and in the object-store prefix, so
+    /// it is what joins a log line to a metric series or to an S3 path.
+    pub scope_id: String,
+    /// The decoded identity: the tenant id the rest of the platform knows, or
+    /// the sub-tenant's own name. Falls back to [`Self::scope_id`] unchanged
+    /// when the segment is not base64 this crate produced — a hand-built scope
+    /// or a [`StaticClientDatabaseResolver`] target carries a literal name, and
+    /// the literal name *is* the identity there.
+    pub id: String,
+}
+
+/// The tenant and sub-tenant a [`GraphScope`] names.
+///
+/// [`HierarchicalClientDatabaseResolver`] writes exactly one layout — the
+/// process's root namespace, then the tenant, then an optional sub-tenant — so
+/// both identities are positional and can be read back from a bare scope
+/// without the resolver that produced it. That is what makes this usable from
+/// [`client_root_span`], which holds a [`ClientQueryRequest`] and nothing else,
+/// and from the Bolt page spans, which hold even less.
+///
+/// A root namespace deeper than one segment would shift both positions. None is
+/// configured: `GRAPH_NAMESPACE` is a single segment in `charts/turbolay`, in
+/// `scripts/deploy_single_node_k3s.sh` and in `scripts/runtime_smoke.sh`, and
+/// the HTTP `x-graph-namespace` header carries the same three-segment path Bolt
+/// encodes into its database name. A deeper root does not misreport a tenant as
+/// some *other* tenant — it reports a namespace segment that is not one — but
+/// it is the assumption to revisit first if these fields ever look wrong.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ScopeTenancy {
+    pub tenant: Option<ScopeTenant>,
+    pub sub_tenant: Option<ScopeTenant>,
+}
+
+impl ScopeTenancy {
+    pub(crate) fn from_scope(scope: &GraphScope) -> Self {
+        let segments = scope.namespace.segments();
+        Self {
+            tenant: segments.get(1).map(ScopeTenant::from_segment),
+            sub_tenant: segments.get(2).map(ScopeTenant::from_segment),
+        }
+    }
+}
+
+impl ScopeTenant {
+    fn from_segment(segment: &NamespaceId) -> Self {
+        let scope_id = segment.as_str().to_string();
+        let id = decode_scope_id(&scope_id).unwrap_or_else(|| scope_id.clone());
+        Self { scope_id, id }
+    }
+}
+
+/// Decode a scope segment written by [`encode_database_scope_id`].
+///
+/// `None` — never a panic, never an error — for anything else.
+///
+/// The round-trip check is the canonicality test
+/// [`canonical_database_component`] applies on the resolution path, and it is
+/// necessary but *not* sufficient here. That function is deciding whether a
+/// segment came from the encoder, having already been told by the database
+/// prefix that it should have; this one is deciding the same question with no
+/// such promise, and short literals answer it wrongly. `acme` is canonical
+/// base64 for two well-formed UTF-8 code points, so a round-trip check alone
+/// reports the namespace `acme` as a tenant named `iʮ` — a nonsense value in
+/// the warehouse's `tenant_id` column, which is strictly worse than leaving the
+/// segment as it was found.
+///
+/// So the decoded value must additionally be printable ASCII: the same rule
+/// [`sanitize_caller_metadata`] applies to every other caller-supplied string
+/// that becomes a log field. It rejects `acme` and accepts every id and
+/// sub-tenant name the platform issues. The cost is a genuinely non-ASCII
+/// sub-tenant name — a mailbox label in Japanese — reported by its base64
+/// spelling instead; nothing is lost, since that spelling is what
+/// `turbolay.sub_tenant.scope_id` carries in every case anyway.
+fn decode_scope_id(encoded: &str) -> Option<String> {
+    let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    let value = String::from_utf8(bytes).ok()?;
+    if value.is_empty()
+        || !value.chars().all(|ch| ch.is_ascii_graphic() || ch == ' ')
+        || URL_SAFE_NO_PAD.encode(value.as_bytes()) != encoded
+    {
+        return None;
+    }
+    Some(value)
+}
+
+/// Record the tenancy of `scope` on `span`.
+///
+/// The four fields are declared `tracing::field::Empty` at each span's creation
+/// and filled here, because a scope with no tenancy must leave them *absent*
+/// rather than blank: `tenant_id = ""` is a value the log warehouse will
+/// happily store in a column nobody can then distinguish from a tenant that
+/// genuinely reported nothing.
+///
+/// Both spellings go on the span. The decoded id is the one that joins to every
+/// other system's `tenant_id`; the base64 one is the one that joins to the
+/// `scope` metric label and to the object-store prefix, and it is not derivable
+/// from the decoded value in the fallback case above.
+pub(crate) fn record_scope_tenancy(span: &tracing::Span, scope: &GraphScope) {
+    let tenancy = ScopeTenancy::from_scope(scope);
+    if let Some(tenant) = &tenancy.tenant {
+        span.record("turbolay.tenant_id", tenant.id.as_str());
+        span.record("turbolay.tenant.scope_id", tenant.scope_id.as_str());
+    }
+    if let Some(sub_tenant) = &tenancy.sub_tenant {
+        span.record("turbolay.sub_tenant_id", sub_tenant.id.as_str());
+        span.record("turbolay.sub_tenant.scope_id", sub_tenant.scope_id.as_str());
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct StaticClientDatabaseResolver {
     targets: BTreeMap<String, ClientQueryTarget>,
@@ -2054,6 +2169,10 @@ pub(crate) fn client_root_span(
                 db.system.name = "neo4j",
                 turbolay.scope = %request.target.scope,
                 turbolay.cell_id = %request.target.cell_id,
+                turbolay.tenant_id = tracing::field::Empty,
+                turbolay.tenant.scope_id = tracing::field::Empty,
+                turbolay.sub_tenant_id = tracing::field::Empty,
+                turbolay.sub_tenant.scope_id = tracing::field::Empty,
                 turbolay.query.fingerprint = %fingerprint,
                 turbolay.consistency = ?request.consistency,
                 turbolay.correlation_id = tracing::field::Empty,
@@ -2071,6 +2190,12 @@ pub(crate) fn client_root_span(
     } else {
         root_span!("client.query")
     };
+    // The tenancy goes on the root and nowhere else, so that every line logged
+    // under this request — planner warnings, admission refusals, the error the
+    // query dies of — is attributable to a customer without any call site
+    // knowing there is a customer. `turbolay.scope` above already contains both
+    // segments, but only as one opaque path a warehouse cannot split.
+    record_scope_tenancy(&span, &request.target.scope);
     // Absent rather than empty: a blank correlation id is indistinguishable
     // from one that failed validation, and both would join to nothing.
     if let Some(correlation_id) = &request.correlation_id {

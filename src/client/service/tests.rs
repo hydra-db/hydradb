@@ -84,6 +84,93 @@ fn hierarchical_database_resolver_rejects_malformed_or_unsafe_scopes() {
         .is_err());
 }
 
+/// The tenancy read back from a scope must be the tenancy that went in, for the
+/// exact scope shape the resolver writes — including the sub-tenant that
+/// decodes to something a human wrote, which is the case the log warehouse
+/// exists to make searchable.
+#[test]
+fn scope_tenancy_reads_back_what_the_resolver_encoded() {
+    let resolver = HierarchicalClientDatabaseResolver::new(
+        "hydradb",
+        ClientQueryTarget::new(
+            GraphScope::new(
+                NamespacePath::root(NamespaceId::new("staging").unwrap()),
+                GraphId::new("hydradb").unwrap(),
+            ),
+            "cell-0",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let database = resolver
+        .scoped_database_name("l3c4v6lu2w", Some("[Gmail]/All Mail"))
+        .unwrap();
+    let scope = resolver.resolve_database(Some(&database)).unwrap().scope;
+    assert_eq!(
+        scope.to_string(),
+        "staging/bDNjNHY2bHUydw/W0dtYWlsXS9BbGwgTWFpbA/graphs/hydradb"
+    );
+
+    let tenancy = ScopeTenancy::from_scope(&scope);
+    let tenant = tenancy.tenant.expect("the tenant segment is present");
+    assert_eq!(tenant.id, "l3c4v6lu2w");
+    assert_eq!(tenant.scope_id, "bDNjNHY2bHUydw");
+    let sub_tenant = tenancy
+        .sub_tenant
+        .expect("the sub-tenant segment is present");
+    assert_eq!(sub_tenant.id, "[Gmail]/All Mail");
+    assert_eq!(sub_tenant.scope_id, "W0dtYWlsXS9BbGwgTWFpbA");
+}
+
+/// A tenant-level database has no third segment, and the default scope has
+/// neither. Both must report absence rather than a blank identity, which is
+/// what keeps an empty `tenant_id` out of the warehouse column.
+#[test]
+fn scope_tenancy_reports_absence_rather_than_a_blank_identity() {
+    let resolver = HierarchicalClientDatabaseResolver::new(
+        "default",
+        ClientQueryTarget::new(GraphScope::default(), "cell-0").unwrap(),
+    )
+    .unwrap();
+    let database = resolver.scoped_database_name("l3c4v6lu2w", None).unwrap();
+    let scope = resolver.resolve_database(Some(&database)).unwrap().scope;
+    let tenancy = ScopeTenancy::from_scope(&scope);
+    assert_eq!(
+        tenancy.tenant.map(|tenant| tenant.id),
+        Some("l3c4v6lu2w".to_string())
+    );
+    assert!(tenancy.sub_tenant.is_none());
+
+    let root = ScopeTenancy::from_scope(&GraphScope::default());
+    assert_eq!(root, ScopeTenancy::default());
+}
+
+/// A scope built by hand — a static resolver's target, a test, the HTTP
+/// `x-graph-namespace` header used literally — carries plain names, not base64.
+/// Those are already the identity and must pass through unchanged.
+///
+/// `acme` is the case that makes this more than a formality: it is canonical
+/// URL-safe base64 for two well-formed UTF-8 code points, so a round-trip check
+/// alone would report the tenant as `iʮ`. See `decode_scope_id`.
+#[test]
+fn a_literal_namespace_segment_is_its_own_identity() {
+    for segment in ["acme", "search", "tenant-with-a-longer-name"] {
+        let scope = GraphScope::new(
+            NamespacePath::new([
+                NamespaceId::new("staging").unwrap(),
+                NamespaceId::new(segment).unwrap(),
+            ])
+            .unwrap(),
+            GraphId::new("social").unwrap(),
+        );
+        let tenant = ScopeTenancy::from_scope(&scope)
+            .tenant
+            .expect("the tenant segment is present");
+        assert_eq!(tenant.id, segment, "{segment} was decoded rather than kept");
+        assert_eq!(tenant.scope_id, segment);
+    }
+}
+
 struct SnapshotEpochClient;
 
 struct ConsistencyTestClient {
