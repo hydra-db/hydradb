@@ -94,6 +94,16 @@ pub struct TelemetryConfig {
     pub otlp_headers: Vec<(String, String)>,
     /// OTLP wire encoding.
     pub otlp_protocol: OtlpProtocol,
+    /// Whether the OTLP *log* pipeline is installed.
+    ///
+    /// Separate from [`Self::otlp_endpoint`] because logs are the one signal
+    /// that has a second, independent route out of the pod. In Kubernetes the
+    /// stdout JSON lines are collected by the Vector DaemonSet, which parses
+    /// them and dual-writes to ClickHouse and the OTLP collectors — so with
+    /// this on, every line reaches the backend *twice*, once from here and once
+    /// from Vector. Traces and metrics have no such second path and are not
+    /// affected by this flag.
+    pub otlp_logs: bool,
     /// Head sampling ratio for traces with no forced-keep reason.
     pub sample_ratio: f64,
     /// Export batch timeout.
@@ -141,6 +151,7 @@ impl TelemetryConfig {
             otlp_endpoint: None,
             otlp_headers: Vec::new(),
             otlp_protocol: OtlpProtocol::default(),
+            otlp_logs: true,
             sample_ratio: Self::DEFAULT_SAMPLE_RATIO,
             export_timeout: Duration::from_secs(10),
             metric_export_interval: Self::DEFAULT_METRIC_EXPORT_INTERVAL,
@@ -195,6 +206,17 @@ impl TelemetryConfig {
             .and_then(OtlpProtocol::parse)
         {
             config.otlp_protocol = protocol;
+        }
+
+        // `OTEL_LOGS_EXPORTER` is the OTel-defined per-signal selector, and
+        // `none` is its defined value for "install no exporter for this
+        // signal". Only that exact value disables the pipeline: an unrecognised
+        // spelling (`console`, a typo) leaves logs exporting, because silently
+        // dropping a signal is a worse failure than exporting one the operator
+        // meant to route elsewhere. In Kubernetes this is set to `none` and
+        // Vector carries the stdout lines instead — see `otlp_logs`.
+        if let Some(value) = get("OTEL_LOGS_EXPORTER") {
+            config.otlp_logs = !value.trim().eq_ignore_ascii_case("none");
         }
 
         // An unparseable or out-of-range ratio falls back to the default rather
@@ -298,6 +320,50 @@ mod tests {
             env_from(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "   ")]),
         );
         assert!(!config.otlp_enabled());
+    }
+
+    /// The Kubernetes setting. Logs go out on stdout for Vector to collect, so
+    /// the OTLP log pipeline is off — but the endpoint is still set, and traces
+    /// and metrics must keep using it.
+    #[test]
+    fn logs_exporter_none_disables_logs_alone() {
+        let config = TelemetryConfig::from_env_with(
+            ServiceIdentity::GraphNode,
+            env_from(&[
+                (
+                    "OTEL_EXPORTER_OTLP_ENDPOINT",
+                    "http://otel-gateway.observability.svc.cluster.local:4318",
+                ),
+                ("OTEL_LOGS_EXPORTER", "none"),
+            ]),
+        );
+        assert!(!config.otlp_logs);
+        assert!(config.otlp_enabled(), "traces and metrics still export");
+    }
+
+    /// Logs export by default: an operator who sets an endpoint and nothing
+    /// else gets all three signals, which is what a bare `docker run` against a
+    /// local collector should do.
+    #[test]
+    fn logs_export_unless_turned_off() {
+        let unset = TelemetryConfig::from_env_with(ServiceIdentity::GraphNode, env_from(&[]));
+        assert!(unset.otlp_logs);
+
+        // Only the exact OTel-defined `none` disables the signal. An
+        // unrecognised value leaves logs exporting rather than silently
+        // dropping them, because a typo that removes a signal is far harder to
+        // notice than one that leaves it on.
+        for value in ["otlp", "console", "NONE ", " none"] {
+            let config = TelemetryConfig::from_env_with(
+                ServiceIdentity::GraphNode,
+                env_from(&[("OTEL_LOGS_EXPORTER", value)]),
+            );
+            assert_eq!(
+                config.otlp_logs,
+                !value.trim().eq_ignore_ascii_case("none"),
+                "OTEL_LOGS_EXPORTER={value:?}"
+            );
+        }
     }
 
     #[test]
