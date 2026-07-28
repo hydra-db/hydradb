@@ -12,6 +12,14 @@
 //!   `trace_id` and `span_id`, so clicking from a log line to its trace works
 //!   on day one.
 //!
+//!   This one is **conditional** on [`TelemetryConfig::otlp_logs`], and is off
+//!   in Kubernetes. Logs are the only signal with a second route out of the
+//!   pod: the Vector DaemonSet reads the stdout JSON lines and dual-writes them
+//!   to ClickHouse and the OTLP collectors, so leaving this on delivers every
+//!   line to the backend twice. The `trace_id`/`span_id` stamping that made the
+//!   deep link work is reproduced on the stdout side by [`crate::layers`], and
+//!   Vector lifts those two fields into the OTLP `logRecord`.
+//!
 //! The third is not:
 //!
 //! - **Metrics**, via an [`SdkMeterProvider`] with a `PeriodicReader`. Nothing
@@ -60,7 +68,9 @@ use crate::TelemetryError;
 /// a caller does — hence [`Providers::meter`].
 pub struct Providers {
     tracer: SdkTracerProvider,
-    logger: SdkLoggerProvider,
+    /// `None` when [`TelemetryConfig::otlp_logs`] is off — the Kubernetes
+    /// configuration, where Vector carries the stdout lines instead.
+    logger: Option<SdkLoggerProvider>,
     meter: SdkMeterProvider,
 }
 
@@ -83,8 +93,10 @@ impl Providers {
         if let Err(error) = self.tracer.shutdown() {
             eprintln!("turbolay-telemetry: tracer shutdown failed: {error}");
         }
-        if let Err(error) = self.logger.shutdown() {
-            eprintln!("turbolay-telemetry: logger shutdown failed: {error}");
+        if let Some(logger) = self.logger {
+            if let Err(error) = logger.shutdown() {
+                eprintln!("turbolay-telemetry: logger shutdown failed: {error}");
+            }
         }
         // The meter goes last for a reason: its shutdown runs one final
         // collection, and an observable callback that reads a snapshot the rest
@@ -143,18 +155,10 @@ where
         .build()
         .map_err(|error| TelemetryError::Exporter(error.to_string()))?;
 
-    let log_exporter = opentelemetry_otlp::LogExporter::builder()
-        .with_http()
-        .with_endpoint(format!("{}/v1/logs", endpoint.trim_end_matches('/')))
-        .with_headers(headers.clone())
-        .with_timeout(config.export_timeout)
-        .build()
-        .map_err(|error| TelemetryError::Exporter(error.to_string()))?;
-
     let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
         .with_endpoint(format!("{}/v1/metrics", endpoint.trim_end_matches('/')))
-        .with_headers(headers)
+        .with_headers(headers.clone())
         .with_timeout(config.export_timeout)
         .build()
         .map_err(|error| TelemetryError::Exporter(error.to_string()))?;
@@ -170,10 +174,28 @@ where
         ))
         .build();
 
-    let logger_provider = SdkLoggerProvider::builder()
-        .with_resource(resource.clone())
-        .with_batch_exporter(log_exporter)
-        .build();
+    // The one conditional pipeline. Building the exporter inside the branch
+    // matters as much as skipping the provider: `LogExporter::build` is what
+    // constructs the HTTP client and resolves the endpoint, so with logs off
+    // nothing here touches `/v1/logs` at all.
+    let logger_provider = if config.otlp_logs {
+        let log_exporter = opentelemetry_otlp::LogExporter::builder()
+            .with_http()
+            .with_endpoint(format!("{}/v1/logs", endpoint.trim_end_matches('/')))
+            .with_headers(headers)
+            .with_timeout(config.export_timeout)
+            .build()
+            .map_err(|error| TelemetryError::Exporter(error.to_string()))?;
+
+        Some(
+            SdkLoggerProvider::builder()
+                .with_resource(resource.clone())
+                .with_batch_exporter(log_exporter)
+                .build(),
+        )
+    } else {
+        None
+    };
 
     // `PeriodicReader` — not the `rt-tokio` variant — because it runs the
     // collection on its own OS thread, which is what every observable callback
@@ -193,9 +215,11 @@ where
 
     let tracer = tracer_provider.tracer("turbolay");
     let trace_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-    let log_layer = OpenTelemetryTracingBridge::new(&logger_provider);
 
-    let layers: OtlpLayers<S> = vec![Box::new(trace_layer), Box::new(log_layer)];
+    let mut layers: OtlpLayers<S> = vec![Box::new(trace_layer)];
+    if let Some(provider) = logger_provider.as_ref() {
+        layers.push(Box::new(OpenTelemetryTracingBridge::new(provider)));
+    }
 
     Ok((
         layers,
@@ -396,6 +420,29 @@ mod tests {
         // The meter is reachable, which is the whole point of holding it: unlike
         // traces and logs, nothing reaches the metrics pipeline through the
         // subscriber.
+        let _meter = providers.meter("turbolay.test");
+        providers.shutdown();
+    }
+
+    /// The Kubernetes configuration: traces and metrics export, logs do not,
+    /// because Vector already carries the stdout lines. The assertion that
+    /// matters is the *layer count* — a logger provider that exists but is
+    /// never bridged into the subscriber would still pass a check on
+    /// `providers`, while silently costing nothing and doing nothing.
+    #[test]
+    fn logs_off_drops_the_appender_but_keeps_traces_and_metrics() {
+        let mut config = TelemetryConfig::new(ServiceIdentity::GraphNode);
+        config.otlp_endpoint = Some("http://127.0.0.1:1".to_string());
+        config.otlp_logs = false;
+        config.export_timeout = Duration::from_millis(50);
+        config.metric_export_interval = Duration::from_secs(3_600);
+
+        let (layers, providers) =
+            build::<tracing_subscriber::Registry>(&config).expect("exporters must build");
+        assert_eq!(layers.len(), 1, "the trace bridge alone");
+
+        let providers = providers.expect("an endpoint means providers");
+        assert!(providers.logger.is_none(), "no log pipeline was built");
         let _meter = providers.meter("turbolay.test");
         providers.shutdown();
     }
