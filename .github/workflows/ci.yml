@@ -222,6 +222,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # Every step below is compile-bound, and without this the job rebuilt all
+      # 398 locked dependencies on every run. `save-if` keeps only main writing
+      # the entry: pull requests get their own branch-scoped cache otherwise,
+      # and those accumulate against the repository's 10 GiB Actions cache
+      # budget until they evict the entry that the next main build needs.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install native dependencies
         run: |
           sudo apt-get update
@@ -292,6 +301,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Separate entry from the `test` job: rust-cache keys on runner OS and
+      # architecture, so a macOS target directory can never restore onto Linux.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-default
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install native dependencies
         run: brew install suite-sparse
       - name: Clippy default feature set
