@@ -9,8 +9,8 @@ jobs:
   helm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         with:
           version: v3.17.3
       - name: Validate single-node deployment script
@@ -218,8 +218,8 @@ jobs:
     env:
       RUST_MIN_STACK: 8388608
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch @ 2026-07-29
         with:
           components: rustfmt, clippy
       # Every step below is compile-bound, and without this the job rebuilt all
@@ -227,7 +227,7 @@ jobs:
       # the entry: pull requests get their own branch-scoped cache otherwise,
       # and those accumulate against the repository's 10 GiB Actions cache
       # budget until they evict the entry that the next main build needs.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
           shared-key: linux-test
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -297,13 +297,13 @@ jobs:
     env:
       RUST_MIN_STACK: 8388608
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch @ 2026-07-29
         with:
           components: clippy
       # Separate entry from the `test` job: rust-cache keys on runner OS and
       # architecture, so a macOS target directory can never restore onto Linux.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
           shared-key: macos-default
           save-if: ${{ github.ref == 'refs/heads/main' }}
