@@ -22,16 +22,29 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # This job's `cargo run` compiled the whole opencypher feature set from
+      # scratch every time. `save-if` restricts writes to main for the same
+      # cache-budget reason as ci.yml.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opencypher-tck
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Deliberately outside `target/`: rust-cache saves the target directory,
+      # so a corpus checkout parked in there would be packed into the cache
+      # entry on every run.
       - name: Checkout official openCypher corpus
         run: |
-          git clone --depth 1 https://github.com/opencypher/openCypher.git target/openCypher
+          git clone --depth 1 https://github.com/opencypher/openCypher.git "${RUNNER_TEMP}/openCypher"
 
       - name: Generate compatibility report
         run: |
-          cargo run --features opencypher --example opencypher_tck_report -- target/openCypher/tck/features > target/opencypher-tck-compatibility.json
+          cargo run --features opencypher --example opencypher_tck_report -- \
+            "${RUNNER_TEMP}/openCypher/tck/features" \
+            > "${RUNNER_TEMP}/opencypher-tck-compatibility.json"
 
       - name: Upload compatibility report
         uses: actions/upload-artifact@v4
         with:
           name: opencypher-tck-compatibility
-          path: target/opencypher-tck-compatibility.json
+          path: ${{ runner.temp }}/opencypher-tck-compatibility.json
