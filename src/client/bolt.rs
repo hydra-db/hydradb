@@ -852,22 +852,39 @@ async fn run_bolt_protocol(
                 // with the right error; there is nothing useful to say about it
                 // twice.
                 let inbound_traceparent = bolt_traceparent(&extra).ok().flatten();
-                let (authenticated, database, request) =
-                    match prepare_bolt_run(&mut session, &context, query, parameters, extra) {
-                        Ok(prepared) => prepared,
-                        Err(error) => {
-                            send_bolt_failure(&mut writer, &error).await?;
-                            state = BoltState::Failed;
-                            continue;
-                        }
-                    };
+                // Opened before anything can reject the request, and from the
+                // `db` name alone, so that a RUN which never becomes a
+                // statement is still attributed to the tenant that sent it.
+                let run_span = bolt_run_span(&session, &context, &extra);
+                crate::core::trace_context::adopt_remote_parent(
+                    &run_span,
+                    inbound_traceparent.as_deref(),
+                );
+                let (authenticated, database, request) = match run_span
+                    .in_scope(|| prepare_bolt_run(&mut session, &context, query, parameters, extra))
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        run_span.in_scope(|| {
+                            tracing::warn!(target: "slatedb_graph_kernel", error = %error, "Bolt RUN rejected");
+                        });
+                        send_bolt_failure(&mut writer, &error).await?;
+                        state = BoltState::Failed;
+                        continue;
+                    }
+                };
                 let prepared = match context
                     .service
                     .prepare_page_request(&authenticated, request, config.prefetch_rows)
+                    .instrument(run_span.clone())
                     .await
                 {
                     Ok(prepared) => prepared,
                     Err(error) => {
+                        run_span.record("error.class", error.class());
+                        run_span.in_scope(|| {
+                            tracing::warn!(target: "slatedb_graph_kernel", error = %error, "Bolt RUN preparation failed");
+                        });
                         send_bolt_failure(&mut writer, &graph_error_to_bolt(error)).await?;
                         state = BoltState::Failed;
                         continue;
@@ -1074,19 +1091,28 @@ async fn run_bolt_protocol(
                 ClientMessage::Route {
                     bookmarks, extra, ..
                 },
-            ) => match prepare_bolt_route(&session, &context, bookmarks, &extra).await {
-                Ok(routing_table) => {
-                    send_bolt_success(
-                        &mut writer,
-                        BoltDict::from([("rt".to_string(), BoltValue::Dict(routing_table))]),
-                    )
-                    .await?;
+            ) => {
+                let route_span = bolt_route_span(&session, &context, &extra);
+                match prepare_bolt_route(&session, &context, bookmarks, &extra)
+                    .instrument(route_span.clone())
+                    .await
+                {
+                    Ok(routing_table) => {
+                        send_bolt_success(
+                            &mut writer,
+                            BoltDict::from([("rt".to_string(), BoltValue::Dict(routing_table))]),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        route_span.in_scope(|| {
+                            tracing::warn!(target: "slatedb_graph_kernel", error = %error, "Bolt ROUTE rejected");
+                        });
+                        send_bolt_failure(&mut writer, &error).await?;
+                        state = BoltState::Failed;
+                    }
                 }
-                Err(error) => {
-                    send_bolt_failure(&mut writer, &error).await?;
-                    state = BoltState::Failed;
-                }
-            },
+            }
             (BoltState::Ready, ClientMessage::Telemetry { .. }) => {
                 send_bolt_success(&mut writer, BoltDict::new()).await?;
             }
@@ -1177,6 +1203,90 @@ fn selected_bolt_database(
             .clone()
             .unwrap_or_else(|| context.default_database.clone())),
     }
+}
+
+/// The fields every Bolt ingress span carries before its request is understood.
+///
+/// A macro rather than a function because `tracing` builds each span's metadata
+/// into a `static`, so the name has to be a literal at the call site — the same
+/// constraint `client_root_span` works around with `root_span!`.
+macro_rules! bolt_ingress_span {
+    ($name:literal) => {
+        tracing::info_span!(
+            target: "slatedb_graph_kernel",
+            $name,
+            turbolay.scope = tracing::field::Empty,
+            turbolay.cell_id = tracing::field::Empty,
+            turbolay.tenant_id = tracing::field::Empty,
+            turbolay.tenant.scope_id = tracing::field::Empty,
+            turbolay.sub_tenant_id = tracing::field::Empty,
+            turbolay.sub_tenant.scope_id = tracing::field::Empty,
+            error.class = tracing::field::Empty,
+        )
+    };
+}
+
+/// Fill an ingress span from the database the message names.
+///
+/// The database is resolved here a second time — the preparation that follows
+/// resolves the same one — and every failure is swallowed. This span exists to
+/// attribute a rejection to a tenant; it must never *be* the rejection, and the
+/// real error arrives a line later with its own message. A malformed `db`
+/// simply leaves the fields absent, which is the honest answer: there is no
+/// tenant to name.
+fn record_bolt_ingress_scope(
+    span: &tracing::Span,
+    session: &BoltProtocolSession,
+    context: &BoltConnectionContext,
+    extra: &BoltDict,
+) {
+    let Ok(database) = selected_bolt_database(session, context, extra) else {
+        return;
+    };
+    let Ok(target) = context.database_resolver.resolve_database(Some(&database)) else {
+        return;
+    };
+    span.record("turbolay.scope", tracing::field::display(&target.scope));
+    span.record("turbolay.cell_id", target.cell_id.as_str());
+    crate::client::service::record_scope_tenancy(span, &target.scope);
+}
+
+/// The span a RUN is prepared under.
+///
+/// `client.query` cannot cover this: it needs a parsed request, and the two
+/// steps that produce one — [`prepare_bolt_run`] and
+/// `ClientQueryService::prepare_page_request` — are also the two that reject a
+/// query for an unknown database, a denied scope or a syntax error. Those
+/// rejections are exactly the lines an operator wants attributed to a customer,
+/// and before this span they carried no tenancy and, for every error class Bolt
+/// translates by hand, were not logged at all.
+///
+/// It is deliberately short: it closes as soon as the statement is prepared,
+/// and `client.query` takes over as the root of the statement's own trace.
+fn bolt_run_span(
+    session: &BoltProtocolSession,
+    context: &BoltConnectionContext,
+    extra: &BoltDict,
+) -> tracing::Span {
+    let span = bolt_ingress_span!("bolt.run");
+    record_bolt_ingress_scope(&span, session, context, extra);
+    span
+}
+
+/// The span a ROUTE is served under.
+///
+/// ROUTE never runs a query, so it opens no `client.query` and would otherwise
+/// have no tenancy anywhere. It is also the message a driver sends *first* and
+/// the one that fails when a tenant's grant is wrong, so a forbidden ROUTE with
+/// no tenant on it is a support ticket with nothing to grep for.
+fn bolt_route_span(
+    session: &BoltProtocolSession,
+    context: &BoltConnectionContext,
+    extra: &BoltDict,
+) -> tracing::Span {
+    let span = bolt_ingress_span!("bolt.route");
+    record_bolt_ingress_scope(&span, session, context, extra);
+    span
 }
 
 fn prepare_bolt_run(
@@ -1531,6 +1641,10 @@ where
             parent: &pending.statement_span,
             "query.page",
             turbolay.scope = %scope,
+            turbolay.tenant_id = tracing::field::Empty,
+            turbolay.tenant.scope_id = tracing::field::Empty,
+            turbolay.sub_tenant_id = tracing::field::Empty,
+            turbolay.sub_tenant.scope_id = tracing::field::Empty,
             turbolay.correlation_id = tracing::field::Empty,
             turbolay.caller.step = tracing::field::Empty,
             turbolay.read_epoch = tracing::field::Empty,
@@ -1540,6 +1654,11 @@ where
             fetch_size,
             remaining_runtime_ms = tracing::field::Empty,
         );
+        // Repeated from the statement span rather than inherited from it: a
+        // PULL that arrives long after its RUN is read on its own in a trace
+        // backend, and `turbolay.scope` two lines up is repeated for the same
+        // reason.
+        crate::client::service::record_scope_tenancy(&page_span, &scope);
         if let Some(correlation_id) = pending.prepared.request.correlation_id.as_deref() {
             page_span.record("turbolay.correlation_id", correlation_id);
         }

@@ -53,6 +53,71 @@ pub fn current_traceparent() -> Option<String> {
     Some(traceparent.to_string())
 }
 
+/// The active trace and span ids, lower-case hex, for the stdout log line.
+///
+/// `None` when no OTel context is active — no tracer installed, or an event
+/// emitted outside any span — so the two keys are simply absent from the line
+/// rather than present and zero.
+///
+/// # Why the stdout formatter needs this at all
+///
+/// It is the same stamping [`OpenTelemetryTracingBridge`] does for free on the
+/// OTLP log record, reproduced on the path that is *not* the OTLP log record.
+/// With [`TelemetryConfig::otlp_logs`] off — the Kubernetes configuration —
+/// stdout is the only route logs take out of the pod, and Vector's `prep_otlp`
+/// remap reads exactly these two keys to populate the OTLP `logRecord`'s
+/// `traceId`/`spanId`. Those dedicated fields, not log attributes, are what the
+/// backend's log-to-trace deep link resolves against; without them the jump
+/// from a log line to its trace stops working.
+///
+/// Sampling is deliberately not consulted. An unsampled span still has a valid
+/// trace id, and two log lines carrying the same one are correlatable with each
+/// other whether or not the trace itself was kept — which is the same trade
+/// [`current_traceparent`] makes one function up, and the same one the OTLP
+/// appender was already making.
+///
+/// # Why this reads the OTel context and not `Span::current()`
+///
+/// The obvious implementation is [`current_traceparent`]'s — take
+/// `tracing::Span::current()` and ask it for its context — and it returns
+/// `None` every single time from the only caller that matters.
+///
+/// `Span::current()` resolves through `tracing`'s *dispatcher*, and the
+/// dispatcher refuses to re-enter: while a subscriber is already handling a
+/// callback, `get_default` hands back the no-op dispatch instead of the real
+/// one, so that a subscriber which itself logs cannot recurse forever. The
+/// caller here is an event formatter, which runs inside exactly that callback.
+/// The span it wants is on the stack a few frames down, and the dispatcher will
+/// not name it — the result is `Span::none()`, an empty context and an invalid
+/// span context, with no error anywhere.
+///
+/// `opentelemetry::Context::current()` is a different thread-local entirely,
+/// owned by the OTel SDK and unaware of `tracing`'s re-entrancy rules.
+/// `tracing-opentelemetry` attaches to it on `on_enter` (its `context_activation`
+/// setting, on by default), which is also how `opentelemetry-appender-tracing`
+/// stamps its own log records — so this reads the same source the OTLP appender
+/// did, and agrees with it by construction rather than by coincidence.
+///
+/// The consequence worth knowing: this reports the *entered* span. An event
+/// aimed at a span that was never entered — `info!(parent: &span, …)` — has no
+/// active OTel context and gets no ids. That matches what the OTLP appender did
+/// before it was switched off, so it is not a change in behaviour.
+///
+/// [`OpenTelemetryTracingBridge`]: opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge
+/// [`TelemetryConfig::otlp_logs`]: crate::TelemetryConfig::otlp_logs
+pub fn current_trace_ids() -> Option<(String, String)> {
+    let context = Context::current();
+    let span = context.span();
+    let span_context = span.span_context();
+    if !span_context.is_valid() {
+        return None;
+    }
+    Some((
+        span_context.trace_id().to_string(),
+        span_context.span_id().to_string(),
+    ))
+}
+
 /// Make `span` a child of the remote trace named by `traceparent`.
 ///
 /// A malformed value is ignored. This is the boundary where a peer's bytes
