@@ -47,10 +47,16 @@ jobs:
           push: false
           platforms: linux/amd64
           tags: turbolay-pr:${{ github.sha }}
-          cache-from: |
-            type=gha,scope=turbolay-linux-amd64
-            type=gha,scope=turbolay-pr-${{ github.event.pull_request.number }}
-          cache-to: type=gha,scope=turbolay-pr-${{ github.event.pull_request.number }},mode=max
+          # Read-only against the scope that main publishes, and deliberately
+          # no `cache-to`. A per-pull-request scope wrote a fresh ~620 MiB blob
+          # on every build; against the repository's 10 GiB Actions cache
+          # budget those entries evicted `turbolay-linux-amd64` itself, so main
+          # kept rebuilding cold to keep a cache that only ever served one pull
+          # request. Nothing is lost by dropping the write: `Dockerfile:17`
+          # copies the source tree above the `cargo build` layer, so a second
+          # push to the same branch could never have reused the first one's
+          # compile anyway.
+          cache-from: type=gha,scope=turbolay-linux-amd64
           provenance: false
           sbom: false
 
