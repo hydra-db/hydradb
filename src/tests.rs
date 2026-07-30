@@ -10105,8 +10105,25 @@ async fn cypher_detach_delete_node_cascades_edges_and_metadata() {
 }
 
 #[cfg(feature = "opencypher")]
-#[tokio::test]
-async fn cypher_relationship_properties_are_indexed_mutable_and_snapshot_safe() {
+#[test]
+fn cypher_relationship_properties_are_indexed_mutable_and_snapshot_safe() {
+    std::thread::Builder::new()
+        .name("cypher-relationship-properties".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(cypher_relationship_properties_case());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+async fn cypher_relationship_properties_case() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
         "graph/cypher-relationship-properties",
