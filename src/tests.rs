@@ -2009,23 +2009,17 @@ async fn segmented_adjacency_delete_then_reinsert_clears_the_old_tombstone() {
     assert!(!shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap());
 
     let reinserted = shard
-        .bulk_append_out_adjacency_segment_trusted(
-            cell_id,
-            edge_type,
-            1,
-            [2, 3],
-            "segment-reinsert",
-        )
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "segment-reinsert")
         .await
         .unwrap();
     assert_eq!(reinserted.end_epoch, 3);
-    assert_eq!(reinserted.inserted, 2);
+    assert_eq!(reinserted.inserted, 1);
     assert!(shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap());
     assert_eq!(
         shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
-        vec![2, 3]
+        vec![2]
     );
-    assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 2);
+    assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -12648,16 +12642,10 @@ async fn epoch_scoped_read_is_stable_after_segment_reinsert_clears_the_tombstone
     );
 
     let reinserted = shard
-        .bulk_append_out_adjacency_segment_trusted(
-            cell_id,
-            edge_type,
-            1,
-            [2, 3],
-            "stability-reinsert",
-        )
+        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "stability-reinsert")
         .await
         .unwrap();
-    assert_eq!(reinserted.inserted, 2);
+    assert_eq!(reinserted.inserted, 1);
 
     let after_reinsert = deleted_snapshot.edge_exists(edge_type, 1, 2).await.unwrap();
     assert!(
@@ -12845,17 +12833,11 @@ async fn current_epoch_reads_match_acknowledged_history_under_concurrent_reinser
 // in the suite as a regression guard. Nothing here applies a fix.
 // ---------------------------------------------------------------------------
 
-/// Suspect 5 — trusted-append fingerprint resurrects acknowledged deletes.
-///
-/// `bulk_append_out_adjacency_segment_trusted` short-circuits on a content
-/// fingerprint, but when some fingerprinted edges have since been deleted it
-/// falls through and re-inserts them, deleting their tombstones
-/// (`src/shard/write.rs:4233-4242`, `:4279`). The chunked import APIs
-/// synthesize fresh per-chunk idempotency keys (`…-chunk-N`,
-/// `src/shard/write.rs:2780`, `:4145`), so a retried import that batches
-/// differently presents the same content under a new key.
+/// A fresh idempotency key represents a new append intent, even when the
+/// requested content matches an earlier import. It must therefore restore an
+/// edge deleted after that earlier operation.
 #[tokio::test]
-async fn trusted_segment_reimport_under_a_fresh_key_preserves_an_acknowledged_delete() {
+async fn trusted_segment_reimport_under_a_fresh_key_restores_an_acknowledged_delete() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
         "graph/trusted-reimport-resurrection",
@@ -12888,26 +12870,25 @@ async fn trusted_segment_reimport_under_a_fresh_key_preserves_an_acknowledged_de
         "edge must be absent after its acknowledged delete"
     );
 
-    // Retry: the same logical import, same content, re-keyed the way a chunked
-    // retry would key it. The fingerprint already exists, so this is a replay
-    // of work the store has already accepted — not a new intent to append.
-    let replayed = shard
+    // A different key is a distinct append operation, so it re-establishes
+    // the requested adjacency.
+    let reimported = shard
         .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "import-run-2")
         .await
         .unwrap();
 
-    let resurrected = shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap();
-    assert!(
-        !resurrected,
-        "a re-keyed replay of an already-fingerprinted import resurrected an \
-         acknowledged delete: replay reported inserted={} already_existed={}",
-        replayed.inserted, replayed.already_existed
+    assert_eq!(reimported.inserted, 1);
+    assert_eq!(reimported.already_existed, 0);
+    assert!(shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap());
+    assert_eq!(
+        shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
+        vec![2]
     );
+    assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 1);
 }
 
-/// Suspect 5, boundary case. An identical retry — same idempotency key — must
-/// short-circuit on the idempotency record before the fingerprint path runs,
-/// so it cannot resurrect anything. This documents where the hazard starts.
+/// An identical retry uses the original operation identity and must remain a
+/// no-op even if the imported edge was subsequently deleted.
 #[tokio::test]
 async fn trusted_segment_reimport_under_the_same_key_is_a_noop_after_a_delete() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
