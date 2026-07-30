@@ -1051,16 +1051,6 @@ async fn batch_reads_scope_work_to_requested_vertices() {
         .await
         .unwrap();
     let read_epoch = shard.current_epoch("reddit-home").await.unwrap();
-    shard
-        .write_edge(typed_mutation(
-            "reddit-home",
-            "FOLLOWS",
-            9_999,
-            8_888,
-            "scoped-after-snapshot",
-        ))
-        .await
-        .unwrap();
 
     assert_eq!(
         shard
@@ -2019,17 +2009,23 @@ async fn segmented_adjacency_delete_then_reinsert_clears_the_old_tombstone() {
     assert!(!shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap());
 
     let reinserted = shard
-        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "segment-reinsert")
+        .bulk_append_out_adjacency_segment_trusted(
+            cell_id,
+            edge_type,
+            1,
+            [2, 3],
+            "segment-reinsert",
+        )
         .await
         .unwrap();
     assert_eq!(reinserted.end_epoch, 3);
-    assert_eq!(reinserted.inserted, 1);
+    assert_eq!(reinserted.inserted, 2);
     assert!(shard.edge_exists(cell_id, edge_type, 1, 2).await.unwrap());
     assert_eq!(
         shard.out_neighbors(cell_id, edge_type, 1).await.unwrap(),
-        vec![2]
+        vec![2, 3]
     );
-    assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 1);
+    assert_eq!(shard.out_degree(cell_id, edge_type, 1).await.unwrap(), 2);
 }
 
 #[tokio::test]
@@ -2537,7 +2533,12 @@ async fn delete_edge_updates_canonical_snapshot_idempotently() {
     );
     assert_eq!(
         shard
-            .out_neighbors_at("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 1, 3)
+            .out_neighbors_at(
+                "reddit-home",
+                "USER_SUBSCRIBED_TO_SUBREDDIT",
+                1,
+                shard.current_epoch("reddit-home").await.unwrap(),
+            )
             .await
             .unwrap(),
         vec![3]
@@ -2759,6 +2760,32 @@ async fn current_snapshot_uses_one_slatedb_storage_sequence() {
             .unwrap(),
         vec![20, 30]
     );
+    shard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn current_snapshot_preserves_point_edge_across_delete() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/slatedb-snapshot-point-delete", object_store).await;
+
+    shard
+        .write_edge(mutation(10, 20, "snapshot-point-create"))
+        .await
+        .unwrap();
+    let snapshot = shard.snapshot("reddit-home").await.unwrap();
+    shard
+        .delete_edge(mutation(10, 20, "snapshot-point-delete"))
+        .await
+        .unwrap();
+
+    assert!(snapshot
+        .edge_exists("USER_SUBSCRIBED_TO_SUBREDDIT", 10, 20)
+        .await
+        .unwrap());
+    assert!(!shard
+        .edge_exists("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 10, 20)
+        .await
+        .unwrap());
     shard.close().await.unwrap();
 }
 
@@ -11515,6 +11542,127 @@ async fn cypher_edge_match_uses_edge_property_index_before_endpoint_expansion() 
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_relationship_where_disjunction_uses_edge_property_index() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-edge-predicate-index-plan",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for (idx, (src, dst, chunk_id, superseded_by)) in [
+        (1, 10, "chunk-a", ""),
+        (2, 20, "chunk-z", ""),
+        (3, 30, "chunk-b", "newer"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "resume".to_string(),
+                edge_type: "RELATES".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-edge-predicate-index-plan-{idx}"),
+            })
+            .await
+            .unwrap();
+        shard
+            .set_edge_metadata(
+                "resume",
+                "RELATES",
+                src,
+                dst,
+                EdgeMetadata::default()
+                    .with_property(
+                        "chunk_id",
+                        VertexPropertyValue::String(chunk_id.to_string()),
+                    )
+                    .with_property(
+                        "superseded_by",
+                        VertexPropertyValue::String(superseded_by.to_string()),
+                    )
+                    .with_property(
+                        "relationship_id",
+                        VertexPropertyValue::String(format!("relationship-{idx}")),
+                    ),
+            )
+            .await
+            .unwrap();
+    }
+
+    let query = "MATCH (s)-[r:RELATES]->(o) \
+                 WHERE (r.chunk_id = $chunk_id_0 OR r.chunk_id = $chunk_id_1 \
+                        OR r.chunk_id = $chunk_id_2 OR r.chunk_id = $chunk_id_3 \
+                        OR r.chunk_id = $chunk_id_4 OR r.chunk_id = $chunk_id_5) \
+                   AND r.superseded_by = $current_marker \
+                 RETURN r.relationship_id AS rid";
+    let context = QueryContext::new("resume", "cypher-edge-predicate-index-plan-read")
+        .with_parameter(
+            "chunk_id_0",
+            VertexPropertyValue::String("chunk-a".to_string()),
+        )
+        .with_parameter(
+            "chunk_id_1",
+            VertexPropertyValue::String("chunk-b".to_string()),
+        )
+        .with_parameter(
+            "chunk_id_2",
+            VertexPropertyValue::String("chunk-c".to_string()),
+        )
+        .with_parameter(
+            "chunk_id_3",
+            VertexPropertyValue::String("chunk-d".to_string()),
+        )
+        .with_parameter(
+            "chunk_id_4",
+            VertexPropertyValue::String("chunk-e".to_string()),
+        )
+        .with_parameter(
+            "chunk_id_5",
+            VertexPropertyValue::String("chunk-f".to_string()),
+        )
+        .with_parameter("current_marker", VertexPropertyValue::String(String::new()));
+
+    let plan = shard
+        .explain_opencypher_rows(context.clone(), query)
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.groups[0].patterns[0].access,
+        RowQueryAccess::EdgePropertyIndex {
+            edge_type: "RELATES".to_string(),
+            property: "chunk_id".to_string(),
+        }
+    );
+    assert!(!plan.groups[0].patterns[0]
+        .optimizer_passes
+        .contains(&RowQueryOptimizerPass::FullScanFallback));
+
+    let rows = shard.execute_cypher_rows(context, query).await.unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("rid")],
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::String("relationship-0".to_string()),
+            )])],
+        )
+    );
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_edge_property_queries_reject_graph_epoch_replay() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-edge-property-index-snapshot", object_store).await;
@@ -12464,7 +12612,6 @@ async fn graphblas_empty_cache_reader_uses_persisted_csc_artifact() {
 }
 
 #[tokio::test]
-#[ignore = "BFG-009 repro: fails until epoch-scoped reads stop composing over unpinned live state"]
 async fn epoch_scoped_read_is_stable_after_segment_reinsert_clears_the_tombstone() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
@@ -12493,35 +12640,41 @@ async fn epoch_scoped_read_is_stable_after_segment_reinsert_clears_the_tombstone
     assert!(deleted.deleted);
     let deleted_epoch = deleted.epoch;
 
-    let before_reinsert = shard
-        .edge_exists_at(cell_id, edge_type, 1, 2, deleted_epoch)
-        .await
-        .unwrap();
+    let deleted_snapshot = shard.snapshot_at(cell_id, deleted_epoch).await.unwrap();
+    let before_reinsert = deleted_snapshot.edge_exists(edge_type, 1, 2).await.unwrap();
     assert!(
         !before_reinsert,
         "edge must be absent at its acknowledged delete epoch {deleted_epoch}"
     );
 
     let reinserted = shard
-        .bulk_append_out_adjacency_segment_trusted(cell_id, edge_type, 1, [2], "stability-reinsert")
+        .bulk_append_out_adjacency_segment_trusted(
+            cell_id,
+            edge_type,
+            1,
+            [2, 3],
+            "stability-reinsert",
+        )
         .await
         .unwrap();
-    assert_eq!(reinserted.inserted, 1);
+    assert_eq!(reinserted.inserted, 2);
 
-    let after_reinsert = shard
-        .edge_exists_at(cell_id, edge_type, 1, 2, deleted_epoch)
-        .await
-        .unwrap();
+    let after_reinsert = deleted_snapshot.edge_exists(edge_type, 1, 2).await.unwrap();
     assert!(
         !after_reinsert,
         "read at epoch {deleted_epoch} changed its answer after an unrelated later \
          re-insert: the acknowledged delete at epoch {deleted_epoch} has been \
          retroactively erased"
     );
+    assert!(matches!(
+        shard
+            .edge_exists_at(cell_id, edge_type, 1, 2, deleted_epoch)
+            .await,
+        Err(GraphError::UnsupportedQuery { .. })
+    ));
 }
 
 #[tokio::test]
-#[ignore = "BFG-009 repro: fails until the point-edge branch is epoch-filtered or snapshot-pinned"]
 async fn epoch_scoped_read_excludes_edges_committed_after_the_requested_epoch() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
@@ -12542,6 +12695,7 @@ async fn epoch_scoped_read_excludes_edges_committed_after_the_requested_epoch() 
         .await
         .unwrap();
     assert_eq!(first.end_epoch, 1);
+    let first_snapshot = shard.snapshot_at(cell_id, first.end_epoch).await.unwrap();
 
     let second = shard
         .write_edge(typed_mutation(cell_id, edge_type, 1, 3, "future-point"))
@@ -12549,10 +12703,7 @@ async fn epoch_scoped_read_excludes_edges_committed_after_the_requested_epoch() 
         .unwrap();
     assert_eq!(second.epoch, 2);
 
-    let at_first_epoch = shard
-        .out_neighbors_at(cell_id, edge_type, 1, first.end_epoch)
-        .await
-        .unwrap();
+    let at_first_epoch = first_snapshot.out_neighbors(edge_type, 1).await.unwrap();
     assert_eq!(
         at_first_epoch,
         vec![2],
@@ -12560,10 +12711,15 @@ async fn epoch_scoped_read_excludes_edges_committed_after_the_requested_epoch() 
         first.end_epoch,
         second.epoch
     );
+    assert!(matches!(
+        shard
+            .out_neighbors_at(cell_id, edge_type, 1, first.end_epoch)
+            .await,
+        Err(GraphError::UnsupportedQuery { .. })
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "BFG-009 repro: fails until reads pin the snapshot matching their derived read_epoch"]
 async fn current_epoch_reads_match_acknowledged_history_under_concurrent_reinserts() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = Arc::new(
@@ -12612,41 +12768,54 @@ async fn current_epoch_reads_match_acknowledged_history_under_concurrent_reinser
                     .await
                     .unwrap();
                 assert!(deleted.deleted, "cycle {cycle} delete must apply");
+                assert_eq!(
+                    shard.current_epoch(cell_id).await.unwrap(),
+                    deleted.epoch,
+                    "cycle {cycle} delete result must name its committed storage sequence"
+                );
                 history.lock().unwrap().insert(deleted.epoch, false);
                 let reinserted = shard
-                    .bulk_append_out_adjacency_segment_trusted(
+                    .write_edge(typed_mutation(
                         cell_id,
                         edge_type,
                         1,
-                        [2],
+                        2,
                         &format!("race-reinsert-{cycle}"),
-                    )
+                    ))
                     .await
                     .unwrap();
-                assert_eq!(reinserted.inserted, 1, "cycle {cycle} reinsert must apply");
-                history.lock().unwrap().insert(reinserted.end_epoch, true);
+                assert!(
+                    !reinserted.already_existed,
+                    "cycle {cycle} reinsert must apply"
+                );
+                assert_eq!(
+                    shard.current_epoch(cell_id).await.unwrap(),
+                    reinserted.epoch,
+                    "cycle {cycle} reinsert result must name its committed storage sequence"
+                );
+                history.lock().unwrap().insert(reinserted.epoch, true);
                 cycle += 1;
             }
         })
     };
 
     let mut anomalies = Vec::new();
-    for _ in 0..4000 {
-        let read_epoch = shard.current_epoch(cell_id).await.unwrap();
-        let observed = shard
-            .edge_exists_at(cell_id, edge_type, 1, 2, read_epoch)
-            .await
-            .unwrap();
-        let expected = {
+    for _ in 0..4_000 {
+        let snapshot = shard.snapshot(cell_id).await.unwrap();
+        let read_epoch = snapshot.read_epoch();
+        let observed = snapshot.edge_exists(edge_type, 1, 2).await.unwrap();
+        let (covered, expected) = {
             let history = history.lock().unwrap();
-            history
-                .range(..=read_epoch)
-                .next_back()
-                .map(|(_, exists)| *exists)
+            (
+                history.contains_key(&read_epoch),
+                history
+                    .range(..=read_epoch)
+                    .next_back()
+                    .map(|(_, exists)| *exists),
+            )
         };
         // Only judge when the acknowledged history already covers read_epoch:
         // the op that committed read_epoch must itself be recorded.
-        let covered = history.lock().unwrap().contains_key(&read_epoch);
         if covered {
             if let Some(expected) = expected {
                 if observed != expected {
@@ -12686,7 +12855,6 @@ async fn current_epoch_reads_match_acknowledged_history_under_concurrent_reinser
 /// `src/shard/write.rs:2780`, `:4145`), so a retried import that batches
 /// differently presents the same content under a new key.
 #[tokio::test]
-#[ignore = "suspect-5 repro: fails while a re-keyed trusted re-import undoes an acknowledged delete"]
 async fn trusted_segment_reimport_under_a_fresh_key_preserves_an_acknowledged_delete() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(
@@ -12940,7 +13108,6 @@ async fn compiled_graph_index_generation_never_exceeds_the_read_epoch() {
 /// This drives the create → modify → delete interleaving through the public
 /// cypher kernel path and compares against the storage ground truth.
 #[tokio::test]
-#[ignore = "suspect-2 repro: fails while the WAL-tail overlay misses commits inside the generation's own WAL file"]
 async fn compiled_traversal_reflects_writes_committed_after_the_graph_index_generation() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/wal-tail-visibility-hole", object_store).await;
@@ -13071,7 +13238,6 @@ async fn compiled_traversal_reflects_writes_committed_after_the_graph_index_gene
 /// (`src/shard/topology_tail.rs:48`), so any commit that lands in WAL file `L`
 /// itself is in neither the compiled base nor the tail.
 #[tokio::test]
-#[ignore = "suspect-2 repro: fails while a reader-built generation skips commits inside its own WAL file"]
 async fn reader_built_generation_tail_covers_commits_in_its_own_wal_file() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let placement = ObjectStoreNodeDirectory::new(["cell-a"], ["node-a", "node-b"]).unwrap();

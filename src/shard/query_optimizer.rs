@@ -1,6 +1,9 @@
 use super::*;
 
 #[cfg(feature = "opencypher")]
+use super::query::row_predicate_relationship_property_constraint;
+
+#[cfg(feature = "opencypher")]
 use tracing::Instrument as _;
 
 #[cfg(feature = "opencypher")]
@@ -163,7 +166,7 @@ impl GraphShard {
             )
             .await?;
 
-            let optimized_patterns = self
+            let mut optimized_patterns = self
                 .optimize_row_pattern_plans_with_stats(
                     cell_id,
                     &group.patterns,
@@ -171,6 +174,13 @@ impl GraphShard {
                     &available_bindings,
                 )
                 .await?;
+            self.apply_relationship_predicate_index_plan(
+                cell_id,
+                read_epoch,
+                group.predicate.as_ref(),
+                &mut optimized_patterns,
+            )
+            .await?;
             let mut plan = row_query_plan_group(&group, &optimized_patterns);
             plan.optimizer_passes
                 .push(RowQueryOptimizerPass::PreserveOptionalBoundary);
@@ -255,6 +265,76 @@ impl GraphShard {
             available_bindings.extend(row_match_group_bindings(&original_group));
             output.push(group);
         }
+        Ok(())
+    }
+
+    async fn apply_relationship_predicate_index_plan(
+        &self,
+        cell_id: &str,
+        read_epoch: StorageSequence,
+        predicate: Option<&RowPredicate>,
+        patterns: &mut [OptimizedRowPattern],
+    ) -> Result<()> {
+        let Some(constraint) = predicate.and_then(row_predicate_relationship_property_constraint)
+        else {
+            return Ok(());
+        };
+        if read_epoch != self.current_epoch(cell_id).await? {
+            return Ok(());
+        }
+        let Some(pattern) = patterns.iter_mut().find(|pattern| {
+            matches!(
+                (&pattern.pattern, &pattern.plan.access),
+                (
+                    RowPattern::Edge(edge),
+                    RowQueryAccess::FullEdgeScan { .. }
+                ) if edge.binding.as_deref() == Some(constraint.binding.as_str())
+                    && edge.hop_range.is_none()
+                    && edge.properties.is_empty()
+            )
+        }) else {
+            return Ok(());
+        };
+        let RowPattern::Edge(edge) = &pattern.pattern else {
+            return Ok(());
+        };
+
+        let mut estimate = 0_u64;
+        for value in &constraint.values {
+            let encoded = encode_vertex_property_value_key(value);
+            estimate = estimate.saturating_add(
+                self.query_stats_estimate(
+                    cell_id,
+                    &keys::query_stats_edge_property(
+                        cell_id,
+                        &edge.edge_type,
+                        &constraint.property,
+                        &encoded,
+                    ),
+                    Some(&keys::query_stats_edge_property_histogram(
+                        cell_id,
+                        &edge.edge_type,
+                        &constraint.property,
+                    )),
+                    16,
+                )
+                .await?
+                .unwrap_or(16),
+            );
+        }
+        pattern.plan.access = RowQueryAccess::EdgePropertyIndex {
+            edge_type: edge.edge_type.clone(),
+            property: constraint.property,
+        };
+        pattern.plan.estimated_cardinality = estimate.max(1);
+        pattern
+            .plan
+            .optimizer_passes
+            .retain(|pass| !matches!(pass, RowQueryOptimizerPass::FullScanFallback));
+        pattern
+            .plan
+            .optimizer_passes
+            .push(RowQueryOptimizerPass::UtilizeEdgeIndex);
         Ok(())
     }
 

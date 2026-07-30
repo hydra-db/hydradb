@@ -50,18 +50,26 @@ impl<'a> GraphSnapshot<'a> {
             .await
     }
 
+    pub async fn in_neighbors(&self, edge_type: &str, dst: VertexId) -> Result<Vec<VertexId>> {
+        self.shard
+            .in_neighbors_in_storage_snapshot(
+                self.storage_snapshot.as_ref(),
+                &self.cell_id,
+                edge_type,
+                dst,
+            )
+            .await
+    }
+
     pub async fn out_degree(&self, edge_type: &str, src: VertexId) -> Result<u64> {
-        Ok(self
-            .shard
-            .out_neighbors_in_storage_snapshot(
+        self.shard
+            .out_degree_in_storage_snapshot(
                 self.storage_snapshot.as_ref(),
                 &self.cell_id,
                 edge_type,
                 src,
-                self.read_epoch,
             )
-            .await?
-            .len() as u64)
+            .await
     }
 
     pub async fn matrix_reachable(

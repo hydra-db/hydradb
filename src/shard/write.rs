@@ -4449,19 +4449,19 @@ impl GraphShard {
         let fingerprint_key = segment_import_fingerprint_key(cell_id, edge_type, src, fingerprint);
         let fingerprint_result = read_txn_remote(&txn, &fingerprint_key).await?;
 
+        if let Some(value) = fingerprint_result {
+            let result =
+                decode_bulk_import_fingerprint_idempotency(&fingerprint_key, fingerprint, &value)?;
+            txn.put(
+                idem_key.as_bytes(),
+                encode_bulk_import_idempotency(idempotency_key, fingerprint, &result),
+            )?;
+            commit_txn_strict(txn, self.await_durable_writes).await?;
+            return Ok(result);
+        }
         let current_epoch = txn.seqnum();
         let existing =
             out_neighbors_for_src_txn(&txn, cell_id, edge_type, src, current_epoch).await?;
-        if let Some(value) = fingerprint_result {
-            let all_edges_still_exist = dsts.iter().all(|dst| existing.contains(dst));
-            if all_edges_still_exist {
-                return decode_bulk_import_fingerprint_idempotency(
-                    &fingerprint_key,
-                    fingerprint,
-                    &value,
-                );
-            }
-        }
         let inserted_dsts: Vec<_> = dsts
             .iter()
             .copied()

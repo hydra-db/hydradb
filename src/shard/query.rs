@@ -188,7 +188,26 @@ impl GraphShard {
         Ok(neighbors.into_iter().collect())
     }
 
-    async fn in_neighbors_in_storage_snapshot(
+    pub(crate) async fn out_degree_in_storage_snapshot(
+        &self,
+        snapshot: &GraphStorageSnapshot,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+    ) -> Result<u64> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+        let key = keys::degree_out(cell_id, edge_type, src);
+        match snapshot
+            .get_with_options(key.as_bytes(), &remote_read_options())
+            .await?
+        {
+            Some(value) => decode_u64(&key, &value),
+            None => Ok(0),
+        }
+    }
+
+    pub(crate) async fn in_neighbors_in_storage_snapshot(
         &self,
         snapshot: &GraphStorageSnapshot,
         cell_id: &str,
@@ -302,72 +321,29 @@ impl GraphShard {
                 .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters)
                 .await?;
             let context = merge_opencypher_window(context, opencypher_outer_window(&parsed))?;
-            let cursor_offset = cursor.map_or(0, |cursor| cursor.offset);
-
-            let started = std::time::Instant::now();
-            match self
-                .try_execute_graph_kernel_opencypher_rows_page(
-                    &context,
-                    &parsed,
-                    cursor_offset,
-                    page_size,
-                )
-                .await
-            {
-                Ok(Some(page)) => {
-                    self.record_streaming_query_rows_success(page.rows.len(), started);
-                    return Ok(page);
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    self.record_streaming_query_rows_failure(started, &err);
-                    return Err(err);
-                }
+            if context.read_epoch.is_some() && context.validated_read_epoch().is_none() {
+                return Err(GraphError::UnsupportedQuery {
+                    dialect: "OpenCypher",
+                    feature: "historical graph epochs are not storage snapshots; execute against a current SlateDB snapshot"
+                        .to_string(),
+                });
             }
-
-            match self
-                .try_execute_streaming_opencypher_rows_page(
-                    &context,
-                    &parsed,
-                    cursor_offset,
-                    page_size,
+            if context.read_epoch.is_none() {
+                let snapshot = if context.uses_refreshed_reader() {
+                    self.db.reader_snapshot().await?
+                } else {
+                    self.db.snapshot().await?
+                };
+                let read_epoch = snapshot.seq();
+                let context = context.with_validated_storage_read_epoch(read_epoch, read_epoch);
+                return GraphStore::scope_snapshot(
+                    snapshot,
+                    self.execute_parsed_opencypher_rows_page(context, parsed, cursor, page_size),
                 )
-                .await
-            {
-                Ok(Some(page)) => {
-                    self.record_streaming_query_rows_success(page.rows.len(), started);
-                    return Ok(page);
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    self.record_streaming_query_rows_failure(started, &err);
-                    return Err(err);
-                }
+                .await;
             }
-
-            let mut parsed = parsed;
-            let context = self.query_page_context(context, cursor_offset, page_size)?;
-            parsed.window = QueryWindow::default();
-            let mut result_set = self.execute_parsed_opencypher_rows(context, parsed).await?;
-            let next_cursor = if result_set.rows.len() > page_size {
-                result_set.rows.truncate(page_size);
-                Some(QueryCursorToken::new(
-                    cursor_offset.checked_add(page_size as u64).ok_or_else(|| {
-                        GraphError::AdmissionRejected {
-                            operation: "query_cursor_offset",
-                            actual: u64::MAX,
-                            limit: u64::MAX - 1,
-                        }
-                    })?,
-                ))
-            } else {
-                None
-            };
-            Ok(QueryResultPage::new(
-                result_set.columns,
-                result_set.rows,
-                next_cursor,
-            ))
+            self.execute_parsed_opencypher_rows_page(context, parsed, cursor, page_size)
+                .await
         }
         #[cfg(not(feature = "opencypher"))]
         {
@@ -377,6 +353,75 @@ impl GraphShard {
                 feature: "enable the opencypher Cargo feature to parse Cypher".to_string(),
             })
         }
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn execute_parsed_opencypher_rows_page(
+        &self,
+        context: QueryContext,
+        mut parsed: ParsedRowQuery,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let cursor_offset = cursor.map_or(0, |cursor| cursor.offset);
+        let started = std::time::Instant::now();
+        match self
+            .try_execute_graph_kernel_opencypher_rows_page(
+                &context,
+                &parsed,
+                cursor_offset,
+                page_size,
+            )
+            .await
+        {
+            Ok(Some(page)) => {
+                self.record_streaming_query_rows_success(page.rows.len(), started);
+                return Ok(page);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.record_streaming_query_rows_failure(started, &err);
+                return Err(err);
+            }
+        }
+
+        match self
+            .try_execute_streaming_opencypher_rows_page(&context, &parsed, cursor_offset, page_size)
+            .await
+        {
+            Ok(Some(page)) => {
+                self.record_streaming_query_rows_success(page.rows.len(), started);
+                return Ok(page);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.record_streaming_query_rows_failure(started, &err);
+                return Err(err);
+            }
+        }
+
+        let context = self.query_page_context(context, cursor_offset, page_size)?;
+        parsed.window = QueryWindow::default();
+        let mut result_set = self.execute_parsed_opencypher_rows(context, parsed).await?;
+        let next_cursor = if result_set.rows.len() > page_size {
+            result_set.rows.truncate(page_size);
+            Some(QueryCursorToken::new(
+                cursor_offset.checked_add(page_size as u64).ok_or_else(|| {
+                    GraphError::AdmissionRejected {
+                        operation: "query_cursor_offset",
+                        actual: u64::MAX,
+                        limit: u64::MAX - 1,
+                    }
+                })?,
+            ))
+        } else {
+            None
+        };
+        Ok(QueryResultPage::new(
+            result_set.columns,
+            result_set.rows,
+            next_cursor,
+        ))
     }
 
     pub async fn execute_query_statement(
@@ -2717,12 +2762,18 @@ impl GraphShard {
 
             let mut group_rows = Vec::new();
             for row in rows {
-                let initial_rows = match self
+                let initial_rows = if let Some(seed_rows) = self
+                    .relationship_predicate_seed_rows(cell_id, group, read_epoch, budget, &row)
+                    .await?
+                {
+                    seed_rows
+                } else if let Some(seed_rows) = self
                     .prefix_predicate_seed_rows(cell_id, group, read_epoch, budget, &row)
                     .await?
                 {
-                    Some(seed_rows) => seed_rows,
-                    None => vec![row.clone()],
+                    seed_rows
+                } else {
+                    vec![row.clone()]
                 };
                 let mut matches = self
                     .match_row_patterns_from_rows(
@@ -2766,6 +2817,90 @@ impl GraphShard {
             }
         }
         Ok(rows)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn relationship_predicate_seed_rows(
+        &self,
+        cell_id: &str,
+        group: &RowMatchGroup,
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+        input: &BindingRow,
+    ) -> Result<Option<Vec<BindingRow>>> {
+        let Some(constraint) = group
+            .predicate
+            .as_ref()
+            .and_then(row_predicate_relationship_property_constraint)
+        else {
+            return Ok(None);
+        };
+        if input.relationships.contains_key(&constraint.binding)
+            || read_epoch != self.current_epoch(cell_id).await?
+        {
+            return Ok(None);
+        }
+        let Some(edge) = group.patterns.iter().find_map(|pattern| match pattern {
+            RowPattern::Edge(edge)
+                if edge.binding.as_deref() == Some(constraint.binding.as_str())
+                    && edge.hop_range.is_none()
+                    && edge.properties.is_empty() =>
+            {
+                Some(edge)
+            }
+            RowPattern::Node(_) | RowPattern::Edge(_) => None,
+        }) else {
+            return Ok(None);
+        };
+
+        let mut pairs = BTreeSet::new();
+        for value in &constraint.values {
+            for pair in self
+                .scan_edge_property_index_at(
+                    cell_id,
+                    &edge.edge_type,
+                    &constraint.property,
+                    value,
+                    read_epoch,
+                    budget,
+                )
+                .await?
+            {
+                pairs.insert(pair);
+                self.ensure_query_index_candidates(
+                    "cypher_edge_predicate_index_candidates",
+                    pairs.len(),
+                )?;
+            }
+        }
+
+        let mut candidates = Vec::new();
+        let mut metadata_cache = BTreeMap::new();
+        let mut edge_metadata_cache = BTreeMap::new();
+        {
+            let mut state = EdgeRowMatchState {
+                cell_id,
+                read_epoch,
+                rows: &mut candidates,
+                metadata_cache: &mut metadata_cache,
+                edge_metadata_cache: &mut edge_metadata_cache,
+                budget,
+            };
+            for (src, dst) in pairs {
+                budget.check("cypher_edge_predicate_index_rows")?;
+                self.push_matching_edge_row(edge, src, dst, &mut state)
+                    .await?;
+            }
+        }
+
+        let mut rows = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            budget.check("cypher_edge_predicate_index_join")?;
+            if let Some(joined) = input.join(&candidate) {
+                self.push_binding_row(&mut rows, joined, "cypher_edge_predicate_index_seed_rows")?;
+            }
+        }
+        Ok(Some(rows))
     }
 
     #[cfg(feature = "opencypher")]
@@ -5467,15 +5602,10 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         self.ensure_cell_readable(cell_id, "edge_exists").await?;
-        let key = keys::out_edge(cell_id, edge_type, src, dst);
-        if self.read_remote(&key).await?.is_some() {
-            return Ok(true);
-        }
-        let read_epoch = self.current_epoch(cell_id).await?;
-        Ok(self
-            .out_segment_edge_record_at(cell_id, edge_type, src, dst, read_epoch)
+        self.snapshot(cell_id)
             .await?
-            .is_some())
+            .edge_exists(edge_type, src, dst)
+            .await
     }
 
     pub async fn out_neighbors(
@@ -5487,30 +5617,10 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         self.ensure_cell_readable(cell_id, "out_neighbors").await?;
-        let prefix = keys::out_prefix(cell_id, edge_type, src);
-        let mut iter = self.scan_remote_prefix(&prefix).await?;
-        let mut neighbors = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let record = decode_edge_record(&key, &kv.value)?;
-            neighbors.push(record.dst);
-        }
-        let read_epoch = self.current_epoch(cell_id).await?;
-        let tombstones = self
-            .scan_out_segment_tombstones_for_src_at(cell_id, edge_type, src, read_epoch, None)
-            .await?;
-        neighbors.extend(
-            self.scan_out_segments_for_src_at(cell_id, edge_type, src, read_epoch, None)
-                .await?
-                .into_iter()
-                .filter(|(sequence, edge)| {
-                    segment_edge_visible(*sequence, tombstones.get(&edge.dst).copied())
-                })
-                .map(|(_, edge)| edge.dst),
-        );
-        neighbors.sort_unstable();
-        neighbors.dedup();
-        Ok(neighbors)
+        self.snapshot(cell_id)
+            .await?
+            .out_neighbors(edge_type, src)
+            .await
     }
 
     pub async fn out_neighbors_batch(
@@ -5558,14 +5668,7 @@ impl GraphShard {
         }
 
         let budget = QueryBudget::new(self.limits.max_query_runtime_ms, cancellation_token);
-        let current_epoch = self.current_epoch(cell_id).await?;
-        if read_epoch > current_epoch {
-            return Err(GraphError::SnapshotAhead {
-                cell_id: cell_id.to_string(),
-                read_epoch,
-                current_epoch,
-            });
-        }
+        let snapshot = self.snapshot_at(cell_id, read_epoch).await?;
         let requested: BTreeSet<_> = sources.iter().copied().collect();
         let mut by_source = requested
             .iter()
@@ -5574,18 +5677,9 @@ impl GraphShard {
             .collect::<BTreeMap<_, _>>();
         let mut scanned_edges = 0_u64;
 
-        let snapshot = self.db.snapshot().await?;
         for source in requested.iter().copied() {
             budget.check("out_neighbors_batch_snapshot_source")?;
-            let neighbors = self
-                .out_neighbors_in_storage_snapshot(
-                    snapshot.as_ref(),
-                    cell_id,
-                    edge_type,
-                    source,
-                    read_epoch,
-                )
-                .await?;
+            let neighbors = snapshot.out_neighbors(edge_type, source).await?;
             scanned_edges = scanned_edges.saturating_add(neighbors.len() as u64);
             ensure_limit(
                 "out_neighbors_batch_scanned_edges",
@@ -5657,14 +5751,7 @@ impl GraphShard {
         }
 
         let budget = QueryBudget::new(self.limits.max_query_runtime_ms, cancellation_token);
-        let current_epoch = self.current_epoch(cell_id).await?;
-        if read_epoch > current_epoch {
-            return Err(GraphError::SnapshotAhead {
-                cell_id: cell_id.to_string(),
-                read_epoch,
-                current_epoch,
-            });
-        }
+        let snapshot = self.snapshot_at(cell_id, read_epoch).await?;
         let requested: BTreeSet<_> = destinations.iter().copied().collect();
         let mut by_destination = requested
             .iter()
@@ -5673,18 +5760,10 @@ impl GraphShard {
             .collect::<BTreeMap<_, _>>();
         let mut scanned_edges = 0_u64;
 
-        let snapshot = self.db.snapshot().await?;
         if self.writes_reverse_index() {
             for destination in requested.iter().copied() {
                 budget.check("in_neighbors_batch_snapshot_destination")?;
-                let neighbors = self
-                    .in_neighbors_in_storage_snapshot(
-                        snapshot.as_ref(),
-                        cell_id,
-                        edge_type,
-                        destination,
-                    )
-                    .await?;
+                let neighbors = snapshot.in_neighbors(edge_type, destination).await?;
                 scanned_edges = scanned_edges.saturating_add(neighbors.len() as u64);
                 ensure_limit(
                     "in_neighbors_batch_scanned_edges",
@@ -5759,29 +5838,11 @@ impl GraphShard {
             return Ok(Vec::new());
         }
         let budget = QueryBudget::new(self.limits.max_query_runtime_ms, None);
-        let current_epoch = self.current_epoch(cell_id).await?;
-        if read_epoch > current_epoch {
-            return Err(GraphError::SnapshotAhead {
-                cell_id: cell_id.to_string(),
-                read_epoch,
-                current_epoch,
-            });
-        }
-        let snapshot = self.db.snapshot().await?;
+        let snapshot = self.snapshot_at(cell_id, read_epoch).await?;
         let mut live = BTreeSet::new();
         for (src, dst) in edges.iter().copied().collect::<BTreeSet<_>>() {
             budget.check("edge_exists_batch_snapshot_point")?;
-            if self
-                .edge_exists_in_storage_snapshot(
-                    snapshot.as_ref(),
-                    cell_id,
-                    edge_type,
-                    src,
-                    dst,
-                    read_epoch,
-                )
-                .await?
-            {
+            if snapshot.edge_exists(edge_type, src, dst).await? {
                 live.insert((src, dst));
             }
         }
@@ -5899,43 +5960,6 @@ impl GraphShard {
         Ok((epoch <= read_epoch).then_some(epoch))
     }
 
-    async fn scan_out_segment_tombstones_for_src_at(
-        &self,
-        cell_id: &str,
-        edge_type: &str,
-        src: VertexId,
-        read_epoch: StorageSequence,
-        budget: Option<&QueryBudget>,
-    ) -> Result<BTreeMap<VertexId, StorageSequence>> {
-        let prefix = keys::out_segment_tombstone_src_prefix(cell_id, edge_type, src);
-        let mut iter = self.scan_remote_prefix(&prefix).await?;
-        let mut tombstones = BTreeMap::new();
-        while let Some(kv) = iter.next().await? {
-            check_optional_query_budget(budget, "query_out_segment_tombstone_scan")?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (key_cell_id, key_edge_type, key_src, dst) =
-                parse_out_edge_segment_tombstone_key(&key)?;
-            if key_cell_id != cell_id || key_edge_type != edge_type || key_src != src {
-                return Err(GraphError::CorruptValue {
-                    key,
-                    reason: "segment tombstone identity does not match scan prefix".to_string(),
-                });
-            }
-            let epoch = decode_u64(&key, &kv.value)?;
-            if epoch <= read_epoch {
-                tombstones.insert(dst, epoch);
-                if budget.is_some() {
-                    ensure_limit(
-                        "query_out_segment_tombstones",
-                        tombstones.len() as u64,
-                        self.limits.max_query_scan_edges,
-                    )?;
-                }
-            }
-        }
-        Ok(tombstones)
-    }
-
     async fn out_segment_tombstones_at(
         &self,
         cell_id: &str,
@@ -6001,9 +6025,23 @@ impl GraphShard {
         edge_type: &str,
         dst: VertexId,
     ) -> Result<Vec<VertexId>> {
-        let read_epoch = self.current_epoch(cell_id).await?;
-        self.in_neighbors_at(cell_id, edge_type, dst, read_epoch)
-            .await
+        let snapshot = self.snapshot(cell_id).await?;
+        if self.writes_reverse_index() {
+            return snapshot.in_neighbors(edge_type, dst).await;
+        }
+        let read_epoch = snapshot.read_epoch();
+        GraphStore::scope_snapshot(Arc::clone(&snapshot.storage_snapshot), async move {
+            let mut neighbors: Vec<_> = self
+                .edges_at(cell_id, edge_type, read_epoch)
+                .await?
+                .into_iter()
+                .filter_map(|edge| (edge.dst == dst).then_some(edge.src))
+                .collect();
+            neighbors.sort_unstable();
+            neighbors.dedup();
+            Ok(neighbors)
+        })
+        .await
     }
 
     pub async fn in_neighbors_at(
@@ -6015,8 +6053,11 @@ impl GraphShard {
     ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        let current_epoch = self.current_epoch(cell_id).await?;
-        if !self.writes_reverse_index() || read_epoch != current_epoch {
+        let snapshot = self.snapshot_at(cell_id, read_epoch).await?;
+        if self.writes_reverse_index() {
+            return snapshot.in_neighbors(edge_type, dst).await;
+        }
+        GraphStore::scope_snapshot(Arc::clone(&snapshot.storage_snapshot), async move {
             let mut neighbors: Vec<_> = self
                 .edges_at(cell_id, edge_type, read_epoch)
                 .await?
@@ -6025,19 +6066,9 @@ impl GraphShard {
                 .collect();
             neighbors.sort_unstable();
             neighbors.dedup();
-            return Ok(neighbors);
-        }
-        let prefix = keys::in_prefix(cell_id, edge_type, dst);
-        let mut iter = self.scan_remote_prefix(&prefix).await?;
-        let mut neighbors = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let record = decode_edge_record(&key, &kv.value)?;
-            neighbors.push(record.src);
-        }
-        neighbors.sort_unstable();
-        neighbors.dedup();
-        Ok(neighbors)
+            Ok(neighbors)
+        })
+        .await
     }
 
     #[cfg(feature = "opencypher")]
@@ -6085,7 +6116,9 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         self.ensure_cell_readable(cell_id, "out_degree").await?;
-        self.read_counter(&keys::degree_out(cell_id, edge_type, src))
+        self.snapshot(cell_id)
+            .await?
+            .out_degree(edge_type, src)
             .await
     }
 
@@ -6139,30 +6172,57 @@ impl GraphShard {
         validate_component("edge_type", edge_type)?;
         self.ensure_cell_readable(cell_id, "edges_at").await?;
         check_optional_query_budget(budget, "query_edges_at")?;
-        let adjacency = self
-            .canonical_adjacency_at(cell_id, edge_type, read_epoch)
-            .await?;
-        let mut edges = Vec::new();
-        for (src, destinations) in adjacency {
-            check_optional_query_budget(budget, "query_edges_at_adjacency")?;
-            for dst in destinations {
-                check_optional_query_budget(budget, "query_edges_at_adjacency_edge")?;
-                edges.push(EdgeRecord {
-                    cell_id: cell_id.to_string(),
-                    edge_type: edge_type.to_string(),
-                    src,
-                    dst,
-                });
-                if budget.is_some() {
-                    ensure_limit(
-                        "query_edges_at_canonical",
-                        edges.len() as u64,
-                        self.limits.max_query_scan_edges,
-                    )?;
+        let snapshot = self.snapshot_at(cell_id, read_epoch).await?;
+        self.edges_in_snapshot_at_topology(&snapshot, edge_type, read_epoch, budget)
+            .await
+    }
+
+    pub(crate) async fn edges_in_current_snapshot_at_topology(
+        &self,
+        snapshot: &GraphSnapshot<'_>,
+        edge_type: &str,
+        topology_sequence: StorageSequence,
+    ) -> Result<Vec<EdgeRecord>> {
+        validate_component("edge_type", edge_type)?;
+        self.edges_in_snapshot_at_topology(snapshot, edge_type, topology_sequence, None)
+            .await
+    }
+
+    async fn edges_in_snapshot_at_topology(
+        &self,
+        snapshot: &GraphSnapshot<'_>,
+        edge_type: &str,
+        topology_sequence: StorageSequence,
+        budget: Option<&QueryBudget>,
+    ) -> Result<Vec<EdgeRecord>> {
+        let cell_id = snapshot.cell_id();
+        GraphStore::scope_snapshot(Arc::clone(&snapshot.storage_snapshot), async move {
+            let adjacency = self
+                .canonical_adjacency_at(cell_id, edge_type, topology_sequence)
+                .await?;
+            let mut edges = Vec::new();
+            for (src, destinations) in adjacency {
+                check_optional_query_budget(budget, "query_edges_at_adjacency")?;
+                for dst in destinations {
+                    check_optional_query_budget(budget, "query_edges_at_adjacency_edge")?;
+                    edges.push(EdgeRecord {
+                        cell_id: cell_id.to_string(),
+                        edge_type: edge_type.to_string(),
+                        src,
+                        dst,
+                    });
+                    if budget.is_some() {
+                        ensure_limit(
+                            "query_edges_at_canonical",
+                            edges.len() as u64,
+                            self.limits.max_query_scan_edges,
+                        )?;
+                    }
                 }
             }
-        }
-        Ok(edges)
+            Ok(edges)
+        })
+        .await
     }
 
     pub async fn validate_cell_edge_type(
@@ -7613,6 +7673,64 @@ fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<b
             row_predicate_matches(row, left)? || row_predicate_matches(row, right)?
         }
         RowPredicate::Not(inner) => !row_predicate_matches(row, inner)?,
+    })
+}
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RowPredicateRelationshipPropertyConstraint {
+    pub(super) binding: String,
+    pub(super) property: String,
+    pub(super) values: Vec<VertexPropertyValue>,
+}
+
+#[cfg(feature = "opencypher")]
+pub(super) fn row_predicate_relationship_property_constraint(
+    predicate: &RowPredicate,
+) -> Option<RowPredicateRelationshipPropertyConstraint> {
+    match predicate {
+        RowPredicate::Compare {
+            left,
+            op: RowComparisonOp::Eq,
+            right,
+        } => row_property_literal_equality(left, right)
+            .or_else(|| row_property_literal_equality(right, left)),
+        RowPredicate::And(left, right) => row_predicate_relationship_property_constraint(left)
+            .or_else(|| row_predicate_relationship_property_constraint(right)),
+        RowPredicate::Or(left, right) => {
+            let mut left = row_predicate_relationship_property_constraint(left)?;
+            let right = row_predicate_relationship_property_constraint(right)?;
+            if left.binding != right.binding || left.property != right.property {
+                return None;
+            }
+            for value in right.values {
+                if !left.values.contains(&value) {
+                    left.values.push(value);
+                }
+            }
+            Some(left)
+        }
+        RowPredicate::Compare { .. } | RowPredicate::StartsWith { .. } | RowPredicate::Not(_) => {
+            None
+        }
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn row_property_literal_equality(
+    property_expression: &RowExpression,
+    literal_expression: &RowExpression,
+) -> Option<RowPredicateRelationshipPropertyConstraint> {
+    let RowExpression::Property { binding, property } = property_expression else {
+        return None;
+    };
+    let RowExpression::Literal(value) = literal_expression else {
+        return None;
+    };
+    Some(RowPredicateRelationshipPropertyConstraint {
+        binding: binding.clone(),
+        property: property.clone(),
+        values: vec![value.clone()],
     })
 }
 
