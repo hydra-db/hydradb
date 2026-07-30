@@ -12,11 +12,10 @@ brew_prefix := if os() == "macos" { shell("brew --prefix 2>/dev/null || echo /op
 export BINDGEN_EXTRA_CLANG_ARGS := env_var_or_default("BINDGEN_EXTRA_CLANG_ARGS", if os() == "macos" { "-I" + brew_prefix + "/include" } else { "" })
 export LIBRARY_PATH := env_var_or_default("LIBRARY_PATH", if os() == "macos" { brew_prefix + "/lib" } else { "" })
 
-# Every platform, and matching `ci.yml`'s OpenCypher test jobs exactly. Without
-# it `cypher_relationship_properties_are_indexed_mutable_and_snapshot_safe`
-# overflows the 2 MiB default test-thread stack and aborts the whole run with
-# SIGABRT, which reads like a crash in the code rather than a missing knob.
-export RUST_MIN_STACK := env_var_or_default("RUST_MIN_STACK", "8388608")
+# OpenCypher's async query futures exceed the 2 MiB default test-thread stack.
+# Keep enough headroom for different compiler profiles and platforms so the
+# suite reports assertion failures rather than aborting with SIGABRT.
+export RUST_MIN_STACK := env_var_or_default("RUST_MIN_STACK", "33554432")
 
 # Show available recipes.
 default:
