@@ -48,7 +48,32 @@ impl GraphShard {
                 )
                 .await;
         }
-        let edges = self.edges_at(cell_id, edge_type, base_epoch).await?;
+        let snapshot = self.snapshot(cell_id).await?;
+        if base_epoch > snapshot.read_epoch() {
+            return Err(GraphError::SnapshotAhead {
+                cell_id: cell_id.to_string(),
+                read_epoch: base_epoch,
+                current_epoch: snapshot.read_epoch(),
+            });
+        }
+        let generation_key = keys::adjacency_generation(cell_id, edge_type);
+        let adjacency_generation = GraphStore::scope_snapshot(
+            Arc::clone(&snapshot.storage_snapshot),
+            self.read_counter(&generation_key),
+        )
+        .await?;
+        if adjacency_generation > base_epoch {
+            return Err(GraphError::SnapshotChanged {
+                operation: "build_matrix_tiles",
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                read_epoch: base_epoch,
+                current_epoch: adjacency_generation,
+            });
+        }
+        let edges = self
+            .edges_in_current_snapshot_at_topology(&snapshot, edge_type, base_epoch)
+            .await?;
         ensure_limit(
             "build_matrix_tiles_edges",
             edges.len() as u64,
