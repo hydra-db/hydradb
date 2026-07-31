@@ -176,10 +176,15 @@ runtime:
 
 podDisruptionBudget:
   enabled: true
+  # maxUnavailable (when set) takes precedence over minAvailable per component.
+  # Prefer maxUnavailable: 1 for the quorum DB so only one member is voluntarily
+  # disrupted at a time (majority preserved during drains/upgrades).
   node:
     minAvailable: 1
+    maxUnavailable: null
   indexer:
     minAvailable: 1
+    maxUnavailable: null
 
 networkPolicy:
   enabled: true
