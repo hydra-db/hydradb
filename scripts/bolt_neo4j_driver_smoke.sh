@@ -7,7 +7,8 @@ export BOLT_COMPAT_ADDR="${BOLT_COMPAT_ADDR:-127.0.0.1:17687}"
 export BOLT_COMPAT_URI="bolt://${BOLT_COMPAT_ADDR}"
 export BOLT_ROUTING_COMPAT_URI="neo4j://${BOLT_COMPAT_ADDR}"
 
-cargo run --locked --features bolt-server --example bolt_compat_server > /tmp/sgk-bolt-compat.log 2>&1 &
+cargo build --locked --features bolt-server --example bolt_compat_server
+"${CARGO_TARGET_DIR:-target}/debug/examples/bolt_compat_server" > /tmp/sgk-bolt-compat.log 2>&1 &
 server_pid=$!
 cleanup() {
   kill "$server_pid" 2>/dev/null || true
