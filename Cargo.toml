@@ -61,7 +61,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
-slatedb = { git = "https://github.com/usecortex/slatedb.git", rev = "3b6fce59ccd11b7cb07e6a766efd28c70891f06b", default-features = false, features = ["aws", "foyer"] }
+slatedb = { git = "https://github.com/usecortex/slatedb.git", rev = "c77509a2370af3cd58e3cfa751513bdb9638d16a", default-features = false, features = ["aws", "foyer"] }
 subtle = "2"
 tempfile = "3"
 thiserror = "2"
