@@ -7,7 +7,11 @@ metadata:
     {{- include "turbolay.labels" . | nindent 4 }}
     app.kubernetes.io/component: node
 spec:
+  {{- if ne .Values.podDisruptionBudget.node.maxUnavailable nil }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.node.maxUnavailable }}
+  {{- else }}
   minAvailable: {{ .Values.podDisruptionBudget.node.minAvailable }}
+  {{- end }}
   unhealthyPodEvictionPolicy: AlwaysAllow
   selector:
     matchLabels:
@@ -23,7 +27,11 @@ metadata:
     {{- include "turbolay.labels" . | nindent 4 }}
     app.kubernetes.io/component: indexer
 spec:
+  {{- if ne .Values.podDisruptionBudget.indexer.maxUnavailable nil }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.indexer.maxUnavailable }}
+  {{- else }}
   minAvailable: {{ .Values.podDisruptionBudget.indexer.minAvailable }}
+  {{- end }}
   unhealthyPodEvictionPolicy: AlwaysAllow
   selector:
     matchLabels:
