@@ -96,6 +96,17 @@ jobs:
             --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             > /tmp/turbolay-digest-image.yaml
           grep -q 'image: 525753068359.dkr.ecr.us-east-1.amazonaws.com/staging/turbolay@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' /tmp/turbolay-digest-image.yaml
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set podDisruptionBudget.node.maxUnavailable=0 \
+            --set podDisruptionBudget.indexer.maxUnavailable=0 \
+            --show-only templates/poddisruptionbudgets.yaml > /tmp/turbolay-zero-disruptions.yaml
+          test "$(grep -c '^  maxUnavailable: 0$' /tmp/turbolay-zero-disruptions.yaml)" -eq 2
+          if grep -q '^  minAvailable:' /tmp/turbolay-zero-disruptions.yaml; then
+            echo "explicit zero maxUnavailable fell back to minAvailable"
+            exit 1
+          fi
           grep -q 'port: 9000' /tmp/turbolay-development.yaml
           grep -q 'app.kubernetes.io/component: helm-test' /tmp/turbolay-development.yaml
           helm template turbolay charts/turbolay \
