@@ -767,7 +767,7 @@ impl GraphStore {
             return Ok(snapshot);
         }
         if let Some(writer) = self.readable_writer() {
-            match writer.snapshot().await {
+            match writer.durable_snapshot().await {
                 Ok(snapshot) => return Ok(Arc::new(GraphStorageSnapshot::Writer(snapshot))),
                 Err(error) if self.recover_closed_writer_error(&error) => {}
                 Err(error) => return Err(error.into()),

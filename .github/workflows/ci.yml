@@ -208,15 +208,13 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    # `cypher_relationship_properties_are_indexed_mutable_and_snapshot_safe`
-    # overflows the 2 MiB default test-thread stack and aborts the whole test
-    # binary with SIGABRT, which reads like a crash in the code rather than a
-    # missing knob. It is reachable from every feature set that compiles the
-    # Cypher engine -- not only the two OpenCypher steps that used to set this
-    # per-step -- so it belongs to the job. `justfile` exports the same value
-    # for every recipe on every platform, which is why `just ci` never saw it.
+    # OpenCypher's async query futures exceed the 2 MiB default test-thread
+    # stack. Use enough headroom for different compiler profiles and runners,
+    # and keep the large feature matrix from filling the runner with
+    # incremental artifacts.
     env:
-      RUST_MIN_STACK: 8388608
+      CARGO_INCREMENTAL: 0
+      RUST_MIN_STACK: 33554432
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -291,11 +289,10 @@ jobs:
 
   macos-default:
     runs-on: macos-latest
-    # Same knob as the `test` job. This job's feature sets do not reach the
-    # offending test today, but the stack limit is not platform-specific --
-    # it reproduces identically on macOS -- so the two jobs stay in step.
+    # Keep local and CI compilation behavior consistent across platforms.
     env:
-      RUST_MIN_STACK: 8388608
+      CARGO_INCREMENTAL: 0
+      RUST_MIN_STACK: 33554432
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -994,36 +994,6 @@ pub(crate) fn decode_relationship_create_idempotency(
     })
 }
 
-pub(crate) fn decode_bulk_import_fingerprint_idempotency(
-    key: &str,
-    fingerprint: u64,
-    value: &[u8],
-) -> Result<BulkImportResult> {
-    let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
-        key: key.to_string(),
-        reason: err.to_string(),
-    })?;
-    let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 7 || parts[0] != "bulk_import1" {
-        return Err(GraphError::CorruptValue {
-            key: key.to_string(),
-            reason: "expected bulk_import1 record with 7 fields".to_string(),
-        });
-    }
-    if parse_u64(key, parts[5], "fingerprint")? != fingerprint {
-        return Err(GraphError::IdempotencyConflict {
-            operation: "bulk-import-fingerprint",
-            idempotency_key: format!("{fingerprint:020}"),
-        });
-    }
-    Ok(BulkImportResult {
-        start_epoch: parse_u64(key, parts[1], "start_epoch")?,
-        end_epoch: parse_u64(key, parts[2], "end_epoch")?,
-        inserted: parse_u64(key, parts[3], "inserted")?,
-        already_existed: parse_u64(key, parts[4], "already_existed")?,
-    })
-}
-
 pub(crate) fn decode_delete_idempotency(
     key: &str,
     mutation: &EdgeMutation,
@@ -1320,19 +1290,6 @@ pub(crate) fn bulk_import_chunk_order(src: VertexId, dst: VertexId) -> u64 {
 
 pub(crate) fn segment_compaction_idempotency_operation(edge_type: &str, src: VertexId) -> String {
     format!("segment-compact-{edge_type}-{src:020}")
-}
-
-pub(crate) fn segment_import_fingerprint_key(
-    cell_id: &str,
-    edge_type: &str,
-    src: VertexId,
-    fingerprint: u64,
-) -> String {
-    keys::idempotency(
-        cell_id,
-        &format!("segment-import-fp-{edge_type}-{src:020}"),
-        &format!("{fingerprint:020}"),
-    )
 }
 
 pub(crate) fn writer_lane_index(cell_id: &str) -> usize {

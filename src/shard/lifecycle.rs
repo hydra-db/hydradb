@@ -707,7 +707,8 @@ impl GraphShard {
         read_epoch: StorageSequence,
     ) -> Result<GraphSnapshot<'_>> {
         validate_component("cell_id", cell_id)?;
-        let current_epoch = self.current_epoch(cell_id).await?;
+        let storage_snapshot = self.db.snapshot().await?;
+        let current_epoch = storage_snapshot.seq();
         if read_epoch > current_epoch {
             return Err(GraphError::SnapshotAhead {
                 cell_id: cell_id.to_string(),
@@ -725,7 +726,7 @@ impl GraphShard {
             shard: self,
             cell_id: cell_id.to_string(),
             read_epoch,
-            storage_snapshot: self.db.snapshot().await?,
+            storage_snapshot,
         })
     }
 }
