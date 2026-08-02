@@ -511,7 +511,11 @@ cluster per scope. For each cell it refreshes its durable reader, reads the mark
 `base_sequence` at or beyond the marker. For the rest it calls `build_graph_index`, which pins a
 durable snapshot, takes `base_sequence` and `last_wal_id` from it, materializes the canonical
 adjacency, encodes one CSC matrix, hashes it, writes the generation object with `PutMode::Create`,
-and advances the `current` manifest with a compare-and-swap that refuses to move backwards. Older
+and advances the `current` manifest with a compare-and-swap that refuses to move backwards. (Under
+`GRAPH_INDEXER_BUILD_MODE=incremental`, large edge types take a cheaper route to the same
+publication: `build_graph_index_auto` decodes the previous generation, applies the WAL-tail delta
+written since it, and re-encodes — falling back to the full scan whenever the patch cannot
+proceed.) Older
 generations are then pruned by `gc_graph_index_generations` down to `GRAPH_INDEXER_RETAIN_PREVIOUS`
 (default 1).
 
