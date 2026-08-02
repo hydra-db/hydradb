@@ -827,8 +827,15 @@ pub struct GraphIndexGeneration {
       artifact-build permit, snapshots at the current <code>base_sequence</code>, folds the
       canonical adjacency into a GraphBLAS CSC matrix, checksums it, names the generation by its
       SHA-256, and publishes the manifest with a compare-and-set retry loop
-      (<code>INDEX_PUBLISH_ATTEMPTS = 8</code>). Publication is atomic: a reader sees either the old
-      generation or the new one, never a torn write.</li>
+      (<code>INDEX_PUBLISH_ATTEMPTS = 8</code>). Under
+      <code>GRAPH_INDEXER_BUILD_MODE=incremental</code> the indexer calls
+      <code>build_graph_index_auto</code> instead, which patches the <em>previous</em> generation
+      rather than re-folding the whole adjacency: it decodes the previous CSC, asks
+      <code>topology_tail_since</code> for the final-state <code>(src, dst, exists)</code> delta
+      written since that generation, applies it, and re-encodes — declining back to the full scan
+      whenever it cannot proceed (no previous generation, the WAL tail no longer available, or the
+      tail oversized). Both paths publish identically, and publication is atomic: a reader sees
+      either the old generation or the new one, never a torn write.</li>
     <li><em>Hydrate &amp; overlay</em> — <code>matrix_cache.rs</code> is read-through: on a miss it
       hydrates the current generation's CSC into the shard's matrix caches (taking the
       <code>matrix_compilation_gate</code> for the compiled form). Because a read pins a sequence
@@ -893,7 +900,10 @@ pub struct GraphIndexGeneration {
   <p><code>graph-indexer</code> is a small loop. It reads its configuration from the environment —
   the data path, the cells to index, a poll interval (<code>GRAPH_INDEXER_INTERVAL_MS</code>,
   default 5000), how many previous generations to retain
-  (<code>GRAPH_INDEXER_RETAIN_PREVIOUS</code>, default 1), and an admin address
+  (<code>GRAPH_INDEXER_RETAIN_PREVIOUS</code>, default 1), a build mode
+  (<code>GRAPH_INDEXER_BUILD_MODE</code>, <code>full</code> or <code>incremental</code>, default
+  <code>full</code>), the incremental size floor
+  (<code>GRAPH_INDEXER_INCREMENTAL_MIN_EDGES</code>, default 250000), and an admin address
   (<code>GRAPH_INDEXER_ADMIN_ADDR</code>, default <code>0.0.0.0:9091</code>) — and exposes an admin
   HTTP server with <code>/livez</code>, <code>/readyz</code>, and a Prometheus <code>/metrics</code>
   endpoint.</p>
@@ -933,11 +943,27 @@ for scope in scopes {
       write;</li>
     <li><code>dirty_graph_index_edge_types</code> to find which edge types have drifted;</li>
     <li>for each dirty edge type, compare the current generation's <code>base_sequence</code>
-      against the dirty sequence and, if the generation is stale, <code>build_graph_index</code> to
-      publish a fresh one;</li>
+      against the dirty sequence and, if the generation is stale, publish a fresh one — the full
+      scan by default, or, in incremental mode and at or above the size floor, the WAL-tail patch
+      (<code>build_graph_index_auto</code>), which falls back to the full scan when it cannot
+      proceed;</li>
     <li><code>gc_graph_index_generations</code> to prune superseded generations beyond the retained
       count.</li>
   </ol>
+
+  <p>The build in step 3 has two shapes. The default is the full scan: every dirty edge type
+  re-reads the whole canonical adjacency, however small the change that dirtied it. In incremental
+  mode the indexer patches the previous generation with the WAL tail instead, so the work tracks
+  the delta rather than the graph — at a million edges and a hundred changed per cycle, that is a
+  ten-thousand-fold drop in edges touched per build. The size floor exists because small graphs
+  invert the trade: a graph that fits the block cache full-scans at memory speed, while the
+  incremental path still decodes and re-encodes the whole previous CSC payload, so below
+  <code>GRAPH_INDEXER_INCREMENTAL_MIN_EDGES</code> the indexer deliberately keeps the full path.
+  Three Prometheus counters keep the choice observable:
+  <code>graph_indexer_full_build_edges</code> and
+  <code>graph_indexer_incremental_delta_edges</code> count the work each path actually did, and
+  <code>graph_indexer_incremental_fallbacks</code> counts every time the incremental path declined
+  and the full scan ran in its place.</p>
 
   <div class="callout why">
     <span class="callout-title">Why</span>
