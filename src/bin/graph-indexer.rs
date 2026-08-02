@@ -375,9 +375,6 @@ impl IndexerMetrics {
         });
     }
 
-    // TODO(soham): called from the `build_graph_index_auto` match once the
-    // incremental builder is wired in — see the build site below.
-    #[allow(dead_code)]
     fn record_incremental_delta_edges(&self, cell_id: &str, edge_type: &str, delta_edges: u64) {
         self.dimension(cell_id, edge_type, |counters| {
             counters.incremental_delta_edges =
@@ -385,8 +382,6 @@ impl IndexerMetrics {
         });
     }
 
-    // TODO(soham): as above.
-    #[allow(dead_code)]
     fn record_incremental_fallback(&self, cell_id: &str, edge_type: &str) {
         self.dimension(cell_id, edge_type, |counters| {
             counters.incremental_fallbacks = counters.incremental_fallbacks.saturating_add(1);
