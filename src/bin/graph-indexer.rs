@@ -439,6 +439,14 @@ async fn main() -> RuntimeResult<()> {
     }
     let retain_previous = env_value("GRAPH_INDEXER_RETAIN_PREVIOUS", "1").parse::<usize>()?;
     let build_mode = IndexBuildMode::from_env()?;
+    // Below this many edges the incremental path loses: the full scan rides
+    // the block cache while the incremental build pays real object-store
+    // round trips (previous payload GET, WAL tail GETs, per-edge resolution
+    // reads). Measured in `examples/incremental_index_bench.rs` against
+    // MinIO: a 200k-edge graph rebuilt 2x faster full, a 1M-edge graph 3.8x
+    // faster incrementally. Tune per deployment cache size.
+    let incremental_min_edges =
+        env_value("GRAPH_INDEXER_INCREMENTAL_MIN_EDGES", "250000").parse::<u64>()?;
     let admin_addr = env_value("GRAPH_INDEXER_ADMIN_ADDR", "0.0.0.0:9091").parse::<SocketAddr>()?;
 
     let metrics = Arc::new(IndexerMetrics::default());
@@ -458,6 +466,7 @@ async fn main() -> RuntimeResult<()> {
         scope = %root_scope,
         ?cells,
         build_mode = build_mode.as_str(),
+        incremental_min_edges,
         "graph indexer started"
     );
 
@@ -484,6 +493,7 @@ async fn main() -> RuntimeResult<()> {
             Arc::clone(&object_store),
             retain_previous,
             build_mode,
+            incremental_min_edges,
             &metrics,
         )
         .instrument(cycle_span.clone())
@@ -567,6 +577,7 @@ async fn main() -> RuntimeResult<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_registered_scopes_cycle(
     data_path: &str,
     scope_directory: &ObjectStoreGraphScopeDirectory,
@@ -574,6 +585,7 @@ async fn run_registered_scopes_cycle(
     object_store: Arc<dyn slatedb::object_store::ObjectStore>,
     retain_previous: usize,
     build_mode: IndexBuildMode,
+    incremental_min_edges: u64,
     metrics: &IndexerMetrics,
 ) -> Result<(), CycleFailures> {
     let mut failures = CycleFailures::default();
@@ -701,6 +713,7 @@ async fn run_registered_scopes_cycle(
             cells,
             retain_previous,
             build_mode,
+            incremental_min_edges,
             metrics,
         )
         .instrument(scope_span.clone())
@@ -766,6 +779,7 @@ async fn run_index_cycle(
     cells: &[String],
     retain_previous: usize,
     build_mode: IndexBuildMode,
+    incremental_min_edges: u64,
     metrics: &IndexerMetrics,
 ) -> Result<(), CycleFailures> {
     let mut failures = CycleFailures::default();
@@ -959,27 +973,32 @@ async fn run_index_cycle(
                 error.class = Empty,
             );
 
+            // The size floor: below `incremental_min_edges` the full scan
+            // rides the block cache while the incremental path pays real
+            // object-store round trips, so a small graph rebuilds faster the
+            // old way (`examples/incremental_index_bench.rs` has the
+            // numbers). A floor skip is a deliberate policy choice, not an
+            // incremental attempt that declined — it records as a plain full
+            // build and leaves the fallback counter alone.
+            let attempt_incremental = build_mode == IndexBuildMode::Incremental
+                && current
+                    .as_ref()
+                    .is_some_and(|generation| generation.edge_count >= incremental_min_edges);
             let outcome: Result<(GraphIndexGeneration, GraphIndexBuildPath), GraphError> =
-                match build_mode {
-                    IndexBuildMode::Full => shard
+                if attempt_incremental {
+                    shard
+                        .build_graph_index_auto(cell_id, &edge_type)
+                        .instrument(build_span.clone())
+                        .await
+                } else {
+                    shard
                         .build_graph_index(cell_id, &edge_type)
                         .instrument(build_span.clone())
                         .await
                         .map(|generated| {
                             let edge_count = generated.edge_count;
-                            (
-                                generated,
-                                GraphIndexBuildPath::Full {
-                                    edges: (edge_count),
-                                },
-                            )
-                        }),
-                    IndexBuildMode::Incremental => {
-                        shard
-                            .build_graph_index_auto(cell_id, &edge_type)
-                            .instrument(build_span.clone())
-                            .await
-                    }
+                            (generated, GraphIndexBuildPath::Full { edges: edge_count })
+                        })
                 };
             let generation = match outcome {
                 Ok((generation, build_path)) => {
@@ -991,7 +1010,7 @@ async fn run_index_cycle(
                     match build_path {
                         GraphIndexBuildPath::Full { edges } => {
                             metrics.record_full_build_edges(cell_id, &edge_type, edges);
-                            if build_mode == IndexBuildMode::Incremental {
+                            if attempt_incremental {
                                 metrics.record_incremental_fallback(cell_id, &edge_type);
                             }
                         }
@@ -1433,6 +1452,7 @@ mod tests {
             Arc::clone(&object_store),
             1,
             IndexBuildMode::Full,
+            250_000,
             &metrics,
         )
         .await
@@ -1468,6 +1488,7 @@ mod tests {
             Arc::clone(&object_store),
             1,
             IndexBuildMode::Full,
+            250_000,
             &metrics,
         )
         .await
