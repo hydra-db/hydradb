@@ -13681,7 +13681,10 @@ async fn incremental_graph_index_matches_full_rebuild() {
     match path {
         crate::GraphIndexBuildPath::Incremental { delta_edges } => {
             // 2->4 added, 3->5 added, 2->3 deleted.
-            assert_eq!(delta_edges, 3, "the overlay must carry exactly the changed edges");
+            assert_eq!(
+                delta_edges, 3,
+                "the overlay must carry exactly the changed edges"
+            );
         }
         other => panic!("expected an incremental build, got {other:?}"),
     }
@@ -13694,7 +13697,10 @@ async fn incremental_graph_index_matches_full_rebuild() {
         "both builds must observe the same durable sequence for the oracle to apply"
     );
     // The oracle: byte-identical payloads, therefore identical content ids.
-    assert_eq!(incremental.checksum, full.checksum, "CSC checksums must match");
+    assert_eq!(
+        incremental.checksum, full.checksum,
+        "CSC checksums must match"
+    );
     assert_eq!(incremental.edge_count, full.edge_count);
     assert_eq!(
         incremental.generation, full.generation,
