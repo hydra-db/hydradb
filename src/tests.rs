@@ -13831,3 +13831,66 @@ async fn oversized_wal_tail_declines_the_incremental_build() {
     );
     assert_eq!(generation.edge_count, 4);
 }
+
+/// A writer snapshot carries no WAL position of its own (`state.rs`), and
+/// before the pre-pin capture in `build_graph_index` a writer-built
+/// generation published `last_wal_id = 0`. The zero silently turned every
+/// later WAL tail into a walk of the entire WAL history: correct while every
+/// file still exists, but SlateDB's WAL GC (60s retention past the compacted
+/// boundary) eventually punches holes in that range, after which both the
+/// incremental build and the read-path overlay decline to full scans
+/// forever. Found by the 5M-edge MinIO stress run, where every incremental
+/// cycle fell back for exactly this reason.
+#[tokio::test]
+async fn writer_built_generations_record_the_wal_position() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer("graph/writer-wal-position", object_store)
+        .await
+        .unwrap();
+    let cell_id = "reddit-home";
+    let edge_type = "CHAIN";
+
+    shard
+        .write_edge(typed_mutation(
+            cell_id,
+            edge_type,
+            1,
+            2,
+            "wal-position-seed",
+        ))
+        .await
+        .unwrap();
+    let full = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+    assert!(
+        full.last_wal_id > 0,
+        "a durable write precedes this build, so the generation must record a \
+         real WAL position, got {}",
+        full.last_wal_id
+    );
+
+    // The incremental path stamps the same field, and a correct position on
+    // the previous generation is exactly what lets it read a short tail here
+    // instead of the whole history.
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 2, 3, "wal-position-add"))
+        .await
+        .unwrap();
+    let (incremental, path) = shard
+        .build_graph_index_incremental(cell_id, edge_type)
+        .await
+        .unwrap()
+        .expect("a one-edge tail on a fresh store is buildable");
+    assert!(
+        matches!(
+            path,
+            crate::GraphIndexBuildPath::Incremental { delta_edges: 1 }
+        ),
+        "expected a one-edge incremental build, got {path:?}"
+    );
+    assert!(
+        incremental.last_wal_id >= full.last_wal_id,
+        "the WAL position must never move backwards: {} < {}",
+        incremental.last_wal_id,
+        full.last_wal_id
+    );
+}
