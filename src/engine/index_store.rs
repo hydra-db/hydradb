@@ -194,10 +194,6 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
 
-        // ── STEP 0 (done for you): identical admission + snapshot discipline
-        // to the full build above. Same permit gate, same durable refresh,
-        // same `base_sequence`/`last_wal_id` bookkeeping — the manifest this
-        // publishes must be indistinguishable from a full build's.
         let _permit = self
             .acquire_artifact_build_permit("build_graph_index_incremental")
             .await?;
@@ -206,9 +202,6 @@ impl GraphShard {
         let base_sequence = snapshot.seq();
         let last_wal_id = snapshot.last_wal_id().unwrap_or(0);
 
-        // ── STEP 1 (done for you): load the previously published generation.
-        // No previous generation → nothing to patch → caller does a full
-        // build. Already-current generation → nothing to do at all.
         let Some(previous) = self.current_graph_index(cell_id, edge_type).await? else {
             return Ok(None);
         };
@@ -216,27 +209,23 @@ impl GraphShard {
             return Ok(Some((previous, GraphIndexBuildPath::Current)));
         }
 
-        // ── STEP 2 (yours): compute the WAL-tail delta.
-        //
-        // Make the exact call the read path makes at
-        // `src/shard/query.rs:5525` (and the test at `src/tests.rs:13196`):
-        //
-        //     self.topology_tail_since(&previous, snapshot.as_ref(),
-        //                              base_sequence, &budget)
-        //
-        // with `let budget = crate::shard::QueryBudget::new(None, None);`
-        // (no runtime cap — the WAL entry/edge limits inside
-        // `topology_tail_since` still apply).
-        //
-        // Then `match` the result:
-        //   crate::shard::topology_tail::GraphTopologyTail::Unavailable
-        //       => return Ok(None),          // WAL collected → full rebuild
-        //   crate::shard::topology_tail::GraphTopologyTail::Complete(overlay)
-        //       => keep `overlay` and continue.
-        //
-        // Rust book: ch 6 (enums + match), ch 9 (`?` and Result).
-        let overlay: crate::shard::topology_tail::GraphTopologyOverlay =
-            todo!("STEP 2: WAL-tail delta via topology_tail_since");
+        // The WAL tail is the exact delta the read path computes per query in
+        // `topology_tail_since` (`src/shard/query.rs:5525`) and then discards;
+        // here it is computed once and folded into the published index. No
+        // runtime budget — the WAL entry/edge limits inside the call still
+        // apply. `Unavailable` means a WAL file spanning the gap was already
+        // collected, so the delta is unrecoverable and the caller must run a
+        // full rebuild instead.
+        let budget = crate::shard::QueryBudget::new(None, None);
+        let overlay = match self
+            .topology_tail_since(&previous, snapshot.as_ref(), base_sequence, &budget)
+            .await?
+        {
+            crate::shard::topology_tail::GraphTopologyTail::Complete(overlay) => overlay,
+            crate::shard::topology_tail::GraphTopologyTail::Unavailable => {
+                return Ok(None);
+            }
+        };
 
         // ── STEP 3 (yours): decode the previous generation back into an
         // adjacency map.
