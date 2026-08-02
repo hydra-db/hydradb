@@ -227,19 +227,14 @@ impl GraphShard {
             }
         };
 
-        // ── STEP 3 (yours): decode the previous generation back into an
-        // adjacency map.
-        //
-        //     self.graph_index_csc(&previous).await?   → Option<GraphBlasCsc>
-        //         (None → payload already GC'd → return Ok(None))
-        //     csc.to_adjacency()?                      → Adjacency
-        //         (src/sparse_kernel/mod.rs:93; Adjacency is
-        //          BTreeMap<VertexId, BTreeSet<VertexId>>)
-        //
-        // Rust book: ch 8 (collections), ch 6 (Option patterns).
+        // Reconstruct the adjacency the previous generation encodes. `None`
+        // means the CSC payload behind the manifest was already collected by
+        // GC — there is nothing to patch, so decline to the full rebuild.
         let mut adjacency: crate::sparse_kernel::Adjacency =
-            todo!("STEP 3: previous CSC → adjacency");
-
+            match self.graph_index_csc(&previous).await? {
+                Some(csc) => csc.to_adjacency()?,
+                None => return Ok(None),
+            };
         // ── STEP 4 (yours): patch the adjacency with the overlay.
         //
         // `overlay.entries()` yields `(src, dst, exists)`:
