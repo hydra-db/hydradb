@@ -28,7 +28,7 @@ use std::time::Instant;
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 use slatedb_graph_kernel::{
-    object_store_from_env, EdgeMutation, GraphIndexBuildPath, GraphShard, Result,
+    object_store_from_env, EdgeMutation, GraphIndexBuildPath, GraphLimits, GraphShard, Result,
 };
 
 const CELL: &str = "bench-cell";
@@ -63,9 +63,17 @@ async fn main() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock before unix epoch")
         .as_millis();
-    let shard = GraphShard::open_standalone_writer(
+    // The default artifact-build cap (10M edges) sits exactly at the scales
+    // this harness probes; raise it so 10M+ runs measure the build paths
+    // rather than the admission limit.
+    let limits = GraphLimits {
+        max_artifact_build_edges: 50_000_000,
+        ..GraphLimits::default()
+    };
+    let shard = GraphShard::open_standalone_writer_with_limits(
         format!("bench/incremental-index-{run_id}").as_str(),
         store,
+        limits,
     )
     .await?;
 
