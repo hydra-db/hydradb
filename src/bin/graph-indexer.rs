@@ -443,6 +443,7 @@ async fn main() -> RuntimeResult<()> {
         return Err("GRAPH_INDEXER_INTERVAL_MS must be greater than zero".into());
     }
     let retain_previous = env_value("GRAPH_INDEXER_RETAIN_PREVIOUS", "1").parse::<usize>()?;
+    let build_mode = IndexBuildMode::from_env()?;
     let admin_addr = env_value("GRAPH_INDEXER_ADMIN_ADDR", "0.0.0.0:9091").parse::<SocketAddr>()?;
 
     let metrics = Arc::new(IndexerMetrics::default());
@@ -458,7 +459,12 @@ async fn main() -> RuntimeResult<()> {
         Arc::clone(&object_store),
     );
     let mut shutdown = Box::pin(shutdown_signal());
-    tracing::info!(scope = %root_scope, ?cells, "graph indexer started");
+    tracing::info!(
+        scope = %root_scope,
+        ?cells,
+        build_mode = build_mode.as_str(),
+        "graph indexer started"
+    );
 
     // Mirrors `metrics.ready`, which was stored `true` above. Kept alongside so
     // the readiness *transition* can be detected without re-reading an atomic
@@ -482,6 +488,7 @@ async fn main() -> RuntimeResult<()> {
             &cells,
             Arc::clone(&object_store),
             retain_previous,
+            build_mode,
             &metrics,
         )
         .instrument(cycle_span.clone())
@@ -571,6 +578,7 @@ async fn run_registered_scopes_cycle(
     cells: &[String],
     object_store: Arc<dyn slatedb::object_store::ObjectStore>,
     retain_previous: usize,
+    build_mode: IndexBuildMode,
     metrics: &IndexerMetrics,
 ) -> Result<(), CycleFailures> {
     let mut failures = CycleFailures::default();
@@ -692,9 +700,16 @@ async fn run_registered_scopes_cycle(
         let mut scope_failed = false;
         // Instrumenting the call rather than parenting a span by hand is what
         // makes every `index.cell` below a child of this scope.
-        if let Err(inner) = run_index_cycle(&cluster, &scope_name, cells, retain_previous, metrics)
-            .instrument(scope_span.clone())
-            .await
+        if let Err(inner) = run_index_cycle(
+            &cluster,
+            &scope_name,
+            cells,
+            retain_previous,
+            build_mode,
+            metrics,
+        )
+        .instrument(scope_span.clone())
+        .await
         {
             scope_failed = true;
             failures.absorb(inner);
@@ -755,6 +770,7 @@ async fn run_index_cycle(
     scope: &str,
     cells: &[String],
     retain_previous: usize,
+    build_mode: IndexBuildMode,
     metrics: &IndexerMetrics,
 ) -> Result<(), CycleFailures> {
     let mut failures = CycleFailures::default();
@@ -943,28 +959,37 @@ async fn run_index_cycle(
                 turbolay.generation = Empty,
                 turbolay.base_sequence = Empty,
                 edge_count = Empty,
+                build_mode = Empty,
                 turbolay.outcome = Empty,
                 error.class = Empty,
             );
+            // The kill switch. `Full` is the default and runs exactly the code
+            // that ran before incremental builds existed, so deploying this
+            // binary changes nothing until an operator opts in with
+            // `GRAPH_INDEXER_BUILD_MODE=incremental`.
+            //
             // TODO(soham): once `build_graph_index_incremental` is implemented
             // and `incremental_graph_index_matches_full_rebuild` passes,
-            // replace this call with `build_graph_index_auto(cell_id,
-            // &edge_type)` and match on the returned `GraphIndexBuildPath`:
+            // change the `Incremental` arm to call
+            // `shard.build_graph_index_auto(cell_id, &edge_type)` and record
+            // by the returned `GraphIndexBuildPath`:
             //     Full { edges }              => record_full_build_edges(..)
             //                                    + record_incremental_fallback(..)
             //     Incremental { delta_edges } => record_incremental_delta_edges(..)
             //     Current                     => nothing
-            // Do NOT wire it in before the test passes: the skeleton's
-            // `todo!()` panics at runtime and would take the indexer down.
-            let generation = match shard
-                .build_graph_index(cell_id, &edge_type)
-                .instrument(build_span.clone())
-                .await
-            {
+            // Until then both arms run the full build, so setting the variable
+            // is safe: the skeleton's `todo!()` would panic the indexer.
+            let build = match build_mode {
+                IndexBuildMode::Full | IndexBuildMode::Incremental => {
+                    shard.build_graph_index(cell_id, &edge_type)
+                }
+            };
+            let generation = match build.instrument(build_span.clone()).await {
                 Ok(generation) => {
                     build_span.record(semconv::GENERATION, generation.generation.as_str());
                     build_span.record(semconv::BASE_SEQUENCE, generation.base_sequence);
                     build_span.record("edge_count", generation.edge_count);
+                    build_span.record("build_mode", build_mode.as_str());
                     // The "before" half of the impact number: every edge in
                     // the published generation was scanned to build it.
                     metrics.record_full_build_edges(cell_id, &edge_type, generation.edge_count);
@@ -1278,6 +1303,53 @@ fn env_value(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
+/// How a cycle builds a dirty edge type's index, set by
+/// `GRAPH_INDEXER_BUILD_MODE`.
+///
+/// A kill switch rather than a permanent knob. The incremental path patches
+/// the previous generation with the WAL-tail delta instead of rescanning
+/// canonical storage; it defaults to off so deploying this binary changes
+/// nothing, and an operator who sees trouble sets the variable back to
+/// `full` and restarts rather than rolling back a release.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum IndexBuildMode {
+    /// Always rescan canonical storage. The behaviour before incremental
+    /// builds existed, and the default.
+    #[default]
+    Full,
+    /// Try the delta path, fall back to a full rebuild whenever it declines.
+    Incremental,
+}
+
+impl IndexBuildMode {
+    const VAR: &'static str = "GRAPH_INDEXER_BUILD_MODE";
+
+    fn from_env() -> RuntimeResult<Self> {
+        Self::parse(&env_value(Self::VAR, "full"))
+    }
+
+    /// Split from [`Self::from_env`] so the accepted spellings are testable
+    /// without mutating process environment, which no parallel test may do.
+    fn parse(value: &str) -> RuntimeResult<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" => Ok(Self::Full),
+            "incremental" => Ok(Self::Incremental),
+            other => Err(format!(
+                "{} must be `full` or `incremental`, got `{other}`",
+                Self::VAR
+            )
+            .into()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+        }
+    }
+}
+
 async fn shutdown_signal() -> RuntimeResult<()> {
     #[cfg(unix)]
     {
@@ -1299,6 +1371,28 @@ mod tests {
     use slatedb_graph_kernel::EdgeMutation;
 
     use super::*;
+
+    /// The kill switch defaults to the pre-existing behaviour, and refuses a
+    /// spelling it does not understand rather than silently choosing one — an
+    /// operator who typos `incremenal` during an incident must be told, not
+    /// quietly left on the other path.
+    #[test]
+    fn index_build_mode_parses_known_spellings_and_rejects_the_rest() {
+        assert_eq!(IndexBuildMode::default(), IndexBuildMode::Full);
+        assert_eq!(IndexBuildMode::parse("full").unwrap(), IndexBuildMode::Full);
+        assert_eq!(
+            IndexBuildMode::parse("  Incremental ").unwrap(),
+            IndexBuildMode::Incremental,
+            "case and surrounding whitespace must not change the meaning"
+        );
+        let error = IndexBuildMode::parse("incremenal")
+            .expect_err("a misspelling must not resolve to a mode")
+            .to_string();
+        assert!(
+            error.contains(IndexBuildMode::VAR) && error.contains("incremenal"),
+            "the error must name the variable and the offending value: {error}"
+        );
+    }
 
     #[tokio::test]
     async fn indexer_discovers_registered_scopes_and_ignores_empty_ones() {
@@ -1327,6 +1421,7 @@ mod tests {
             &["cell-0".to_string()],
             Arc::clone(&object_store),
             1,
+            IndexBuildMode::Full,
             &metrics,
         )
         .await
@@ -1361,6 +1456,7 @@ mod tests {
             &["cell-0".to_string()],
             Arc::clone(&object_store),
             1,
+            IndexBuildMode::Full,
             &metrics,
         )
         .await
