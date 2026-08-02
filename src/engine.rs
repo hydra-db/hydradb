@@ -219,7 +219,7 @@ mod matrix_cache;
 mod traversal;
 mod verify;
 
-pub use index_store::GraphIndexGeneration;
+pub use index_store::{GraphIndexBuildPath, GraphIndexGeneration};
 
 pub fn local_object_store(path: impl AsRef<std::path::Path>) -> Result<Arc<dyn ObjectStore>> {
     Ok(Arc::new(LocalFileSystem::new_with_prefix(path.as_ref())?) as Arc<dyn ObjectStore>)

@@ -95,7 +95,8 @@ pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
 pub use engine::ScopedRoutedGraphCluster;
 pub use engine::{
     local_object_store, object_store_from_env, ArtifactGcResult, BenchmarkResult, CellOwnership,
-    GraphCluster, GraphIndexGeneration, GraphShardRuntimeMetrics, MatrixArtifact,
+    GraphCluster, GraphIndexBuildPath, GraphIndexGeneration, GraphShardRuntimeMetrics,
+    MatrixArtifact,
     MatrixTraversalResult, ObjectStoreGraphScopeDirectory, ObjectStoreNodeDirectory,
     PlacementConfig, PlacementRefreshHandle, PlacementView, RoutedGraphCluster,
     ScopedGraphShardRuntimeMetrics, TraversalBackend,

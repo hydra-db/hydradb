@@ -244,7 +244,7 @@ const MAX_DIMENSIONS: usize = 512;
 const OVERFLOW_LABEL: &str = "__overflow__";
 
 /// How many series each `{cell_id, edge_type}` pair costs.
-const DIMENSIONED_FAMILIES: usize = 3;
+const DIMENSIONED_FAMILIES: usize = 6;
 
 /// The three counters that carry `{cell_id, edge_type}`.
 ///
@@ -258,6 +258,19 @@ struct DimensionedCounters {
     generations_published: u64,
     generation_failures: u64,
     generations_deleted: u64,
+    /// Edges scanned + encoded by full rebuilds. Before the incremental
+    /// builder lands this is the total work the indexer does; after, it is
+    /// the cost of fallbacks only. The before/after impact of the
+    /// incremental index build is `rate(graph_indexer_full_build_edges)`
+    /// dropping to (nearly) zero while
+    /// `rate(graph_indexer_incremental_delta_edges)` tracks actual churn.
+    full_build_edges: u64,
+    /// Changed edges applied by incremental builds — the only work the
+    /// delta path performs.
+    incremental_delta_edges: u64,
+    /// Incremental attempts that declined (no previous generation, WAL tail
+    /// collected, payload missing) and fell back to a full rebuild.
+    incremental_fallbacks: u64,
 }
 
 impl DimensionedCounters {
@@ -268,11 +281,20 @@ impl DimensionedCounters {
             generations_published,
             generation_failures,
             generations_deleted,
+            full_build_edges,
+            incremental_delta_edges,
+            incremental_fallbacks,
         } = *self;
         [
             ("graph_indexer_generations_published", generations_published),
             ("graph_indexer_generation_failures", generation_failures),
             ("graph_indexer_generations_deleted", generations_deleted),
+            ("graph_indexer_full_build_edges", full_build_edges),
+            (
+                "graph_indexer_incremental_delta_edges",
+                incremental_delta_edges,
+            ),
+            ("graph_indexer_incremental_fallbacks", incremental_fallbacks),
         ]
     }
 }
@@ -344,6 +366,30 @@ impl IndexerMetrics {
     fn record_generations_deleted(&self, cell_id: &str, edge_type: &str, deleted: u64) {
         self.dimension(cell_id, edge_type, |counters| {
             counters.generations_deleted = counters.generations_deleted.saturating_add(deleted);
+        });
+    }
+
+    fn record_full_build_edges(&self, cell_id: &str, edge_type: &str, edges: u64) {
+        self.dimension(cell_id, edge_type, |counters| {
+            counters.full_build_edges = counters.full_build_edges.saturating_add(edges);
+        });
+    }
+
+    // TODO(soham): called from the `build_graph_index_auto` match once the
+    // incremental builder is wired in — see the build site below.
+    #[allow(dead_code)]
+    fn record_incremental_delta_edges(&self, cell_id: &str, edge_type: &str, delta_edges: u64) {
+        self.dimension(cell_id, edge_type, |counters| {
+            counters.incremental_delta_edges =
+                counters.incremental_delta_edges.saturating_add(delta_edges);
+        });
+    }
+
+    // TODO(soham): as above.
+    #[allow(dead_code)]
+    fn record_incremental_fallback(&self, cell_id: &str, edge_type: &str) {
+        self.dimension(cell_id, edge_type, |counters| {
+            counters.incremental_fallbacks = counters.incremental_fallbacks.saturating_add(1);
         });
     }
 
@@ -900,6 +946,16 @@ async fn run_index_cycle(
                 turbolay.outcome = Empty,
                 error.class = Empty,
             );
+            // TODO(soham): once `build_graph_index_incremental` is implemented
+            // and `incremental_graph_index_matches_full_rebuild` passes,
+            // replace this call with `build_graph_index_auto(cell_id,
+            // &edge_type)` and match on the returned `GraphIndexBuildPath`:
+            //     Full { edges }              => record_full_build_edges(..)
+            //                                    + record_incremental_fallback(..)
+            //     Incremental { delta_edges } => record_incremental_delta_edges(..)
+            //     Current                     => nothing
+            // Do NOT wire it in before the test passes: the skeleton's
+            // `todo!()` panics at runtime and would take the indexer down.
             let generation = match shard
                 .build_graph_index(cell_id, &edge_type)
                 .instrument(build_span.clone())
@@ -909,6 +965,9 @@ async fn run_index_cycle(
                     build_span.record(semconv::GENERATION, generation.generation.as_str());
                     build_span.record(semconv::BASE_SEQUENCE, generation.base_sequence);
                     build_span.record("edge_count", generation.edge_count);
+                    // The "before" half of the impact number: every edge in
+                    // the published generation was scanned to build it.
+                    metrics.record_full_build_edges(cell_id, &edge_type, generation.edge_count);
                     record_success(&build_span);
                     generation
                 }
@@ -1314,6 +1373,11 @@ mod tests {
                     generations_published: 1,
                     generation_failures: 0,
                     generations_deleted: 0,
+                    // One edge (1 -> 2) in the published generation, scanned
+                    // by the full build that produced it.
+                    full_build_edges: 1,
+                    incremental_delta_edges: 0,
+                    incremental_fallbacks: 0,
                 },
             )]),
             "the publish should be attributed to the cell and edge type that produced it",
@@ -1462,6 +1526,9 @@ mod tests {
                 generations_published: 64,
                 generation_failures: 0,
                 generations_deleted: 0,
+                full_build_edges: 0,
+                incremental_delta_edges: 0,
+                incremental_fallbacks: 0,
             },
         );
         assert_eq!(
