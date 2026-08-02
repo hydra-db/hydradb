@@ -14,8 +14,8 @@ use axum::Router;
 use futures::StreamExt;
 use slatedb::object_store::path::Path;
 use slatedb_graph_kernel::{
-    object_store_from_env, GraphCluster, GraphError, GraphId, GraphScope, NamespaceId,
-    NamespacePath, ObjectStoreGraphScopeDirectory,
+    object_store_from_env, GraphCluster, GraphError, GraphId, GraphIndexBuildPath,
+    GraphIndexGeneration, GraphScope, NamespaceId, NamespacePath, ObjectStoreGraphScopeDirectory,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -963,36 +963,52 @@ async fn run_index_cycle(
                 turbolay.outcome = Empty,
                 error.class = Empty,
             );
-            // The kill switch. `Full` is the default and runs exactly the code
-            // that ran before incremental builds existed, so deploying this
-            // binary changes nothing until an operator opts in with
-            // `GRAPH_INDEXER_BUILD_MODE=incremental`.
-            //
-            // TODO(soham): once `build_graph_index_incremental` is implemented
-            // and `incremental_graph_index_matches_full_rebuild` passes,
-            // change the `Incremental` arm to call
-            // `shard.build_graph_index_auto(cell_id, &edge_type)` and record
-            // by the returned `GraphIndexBuildPath`:
-            //     Full { edges }              => record_full_build_edges(..)
-            //                                    + record_incremental_fallback(..)
-            //     Incremental { delta_edges } => record_incremental_delta_edges(..)
-            //     Current                     => nothing
-            // Until then both arms run the full build, so setting the variable
-            // is safe: the skeleton's `todo!()` would panic the indexer.
-            let build = match build_mode {
-                IndexBuildMode::Full | IndexBuildMode::Incremental => {
-                    shard.build_graph_index(cell_id, &edge_type)
-                }
-            };
-            let generation = match build.instrument(build_span.clone()).await {
-                Ok(generation) => {
+
+            let outcome: Result<(GraphIndexGeneration, GraphIndexBuildPath), GraphError> =
+                match build_mode {
+                    IndexBuildMode::Full => shard
+                        .build_graph_index(cell_id, &edge_type)
+                        .instrument(build_span.clone())
+                        .await
+                        .map(|generated| {
+                            let edge_count = generated.edge_count;
+                            (
+                                generated,
+                                GraphIndexBuildPath::Full {
+                                    edges: (edge_count),
+                                },
+                            )
+                        }),
+                    IndexBuildMode::Incremental => {
+                        shard
+                            .build_graph_index_auto(cell_id, &edge_type)
+                            .instrument(build_span.clone())
+                            .await
+                    }
+                };
+            let generation = match outcome {
+                Ok((generation, build_path)) => {
                     build_span.record(semconv::GENERATION, generation.generation.as_str());
                     build_span.record(semconv::BASE_SEQUENCE, generation.base_sequence);
                     build_span.record("edge_count", generation.edge_count);
                     build_span.record("build_mode", build_mode.as_str());
-                    // The "before" half of the impact number: every edge in
-                    // the published generation was scanned to build it.
-                    metrics.record_full_build_edges(cell_id, &edge_type, generation.edge_count);
+
+                    match build_path {
+                        GraphIndexBuildPath::Full { edges } => {
+                            metrics.record_full_build_edges(cell_id, &edge_type, edges);
+                            if build_mode == IndexBuildMode::Incremental {
+                                metrics.record_incremental_fallback(cell_id, &edge_type);
+                            }
+                        }
+                        GraphIndexBuildPath::Incremental { delta_edges } => {
+                            metrics.record_incremental_delta_edges(
+                                cell_id,
+                                &edge_type,
+                                delta_edges,
+                            );
+                        }
+                        GraphIndexBuildPath::Current => {}
+                    }
                     record_success(&build_span);
                     generation
                 }
@@ -1492,13 +1508,13 @@ mod tests {
         reader.close().await.unwrap();
     }
 
-    /// The eleven series a scrape sees when nothing has been indexed yet.
+    /// The fourteen series a scrape sees when nothing has been indexed yet.
     ///
     /// Pinned in full rather than probed, because the point of this change is
     /// that the process-global half did *not* move: `ready` through
     /// `open_failures` and `last_success_ms` keep their exact names, their
-    /// absence of labels and their positions, and the three families that
-    /// gained labels still declare a `# TYPE` line with no samples under it.
+    /// absence of labels and their positions, and the six families that carry
+    /// labels still declare a `# TYPE` line with no samples under it.
     #[test]
     fn an_idle_indexer_declares_every_family() {
         let metrics = IndexerMetrics::default();
@@ -1521,6 +1537,9 @@ mod tests {
                 "# TYPE graph_indexer_generations_published counter\n",
                 "# TYPE graph_indexer_generation_failures counter\n",
                 "# TYPE graph_indexer_generations_deleted counter\n",
+                "# TYPE graph_indexer_full_build_edges counter\n",
+                "# TYPE graph_indexer_incremental_delta_edges counter\n",
+                "# TYPE graph_indexer_incremental_fallbacks counter\n",
                 "# TYPE graph_indexer_dimensions gauge\n",
                 "graph_indexer_dimensions 0\n",
                 "# TYPE graph_indexer_last_success_ms gauge\n",
