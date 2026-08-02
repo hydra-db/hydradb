@@ -143,8 +143,8 @@ check-examples-chaos:
     cargo check --locked --examples --features chaos-harness
 
 # Run default library tests.
-test:
-    cargo test --locked --lib
+test *args:
+    cargo test --locked --lib {{args}}
 
 # Run library tests with OpenCypher enabled.
 test-opencypher:
