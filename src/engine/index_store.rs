@@ -216,10 +216,24 @@ impl GraphShard {
         // collected, so the delta is unrecoverable and the caller must run a
         // full rebuild instead.
         let budget = crate::shard::QueryBudget::new(None, None);
-        let overlay = match self
+        let tail = match self
             .topology_tail_since(&previous, snapshot.as_ref(), base_sequence, &budget)
-            .await?
+            .await
         {
+            Ok(tail) => tail,
+            // A delta exceeding `max_query_scan_edges` is an admission
+            // verdict, not a failure — the read path treats the same error as
+            // an expected outcome and recovers (`src/shard/query.rs:5546`).
+            // Decline so the caller falls back to the full rebuild, whose
+            // scan is governed by `max_artifact_build_edges` instead; every
+            // other error still propagates.
+            Err(GraphError::AdmissionRejected {
+                operation: "graph_index_wal_affected_edges",
+                ..
+            }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let overlay = match tail {
             crate::shard::topology_tail::GraphTopologyTail::Complete(overlay) => overlay,
             crate::shard::topology_tail::GraphTopologyTail::Unavailable => {
                 return Ok(None);

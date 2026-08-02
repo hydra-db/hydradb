@@ -13764,3 +13764,70 @@ async fn incremental_graph_index_matches_full_rebuild() {
          comparison was laundered: {at_sequence:?}"
     );
 }
+
+/// A WAL tail larger than `max_query_scan_edges` must make the incremental
+/// build *decline* — `Ok(None)`, the same verdict as a collected WAL — not
+/// fail. `topology_tail_since` raises `AdmissionRejected` for it because on
+/// the read path an oversized overlay is an expected admission outcome
+/// (`src/shard/query.rs` recovers from exactly this error), and the full
+/// rebuild the caller falls back to is governed by the much larger
+/// `max_artifact_build_edges`. Propagating it instead would fail the whole
+/// indexer cycle on precisely the graphs that most need the fallback.
+#[tokio::test]
+async fn oversized_wal_tail_declines_the_incremental_build() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let limits = GraphLimits {
+        max_query_scan_edges: 2,
+        ..GraphLimits::default()
+    };
+    let shard = GraphShard::open_standalone_writer_with_limits(
+        "graph/incremental-index-oversized-tail",
+        object_store,
+        limits,
+    )
+    .await
+    .unwrap();
+    let cell_id = "reddit-home";
+    let edge_type = "CHAIN";
+
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 1, 2, "oversized-seed"))
+        .await
+        .unwrap();
+    shard.build_graph_index(cell_id, edge_type).await.unwrap();
+
+    // Three affected edges since the baseline, against a scan limit of two.
+    for (idx, (src, dst)) in [(2_u64, 3_u64), (3, 4), (4, 5)].into_iter().enumerate() {
+        shard
+            .write_edge(typed_mutation(
+                cell_id,
+                edge_type,
+                src,
+                dst,
+                &format!("oversized-add-{idx}"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let declined = shard
+        .build_graph_index_incremental(cell_id, edge_type)
+        .await
+        .expect("an oversized tail is a decline, not an error");
+    assert!(
+        declined.is_none(),
+        "the incremental build must fall back rather than absorb an \
+         oversized tail"
+    );
+
+    // And the fallback the decline promises must actually work end to end.
+    let (generation, path) = shard
+        .build_graph_index_auto(cell_id, edge_type)
+        .await
+        .unwrap();
+    assert!(
+        matches!(path, crate::GraphIndexBuildPath::Full { .. }),
+        "auto must have taken the full path, got {path:?}"
+    );
+    assert_eq!(generation.edge_count, 4);
+}
