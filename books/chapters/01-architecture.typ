@@ -691,9 +691,10 @@ Four steps move a generation through its life cycle. All the durable logic lives
   which patches the *previous* generation rather than re-folding the whole adjacency: it decodes
   the previous CSC, asks `topology_tail_since` for the final-state `(src, dst, exists)` delta
   written since that generation, applies it, and re-encodes — declining back to the full scan
-  whenever it cannot proceed (no previous generation, the WAL tail no longer available, or the
-  tail oversized). Both paths publish identically, and publication is atomic: a reader sees
-  either the old generation or the new one, never a torn write.
+  whenever it cannot proceed (no previous generation, the previous generation's CSC payload
+  missing from the store, the WAL tail no longer available, or the tail oversized). Both paths
+  publish identically, and publication is atomic: a reader sees either the old generation or
+  the new one, never a torn write.
 - *Hydrate & overlay* — `matrix_cache.rs` is read-through: on a miss it hydrates the current
   generation's CSC into the shard's matrix caches (taking the `matrix_compilation_gate` for the
   compiled form). Because a read pins a sequence that may be *ahead* of the generation's
