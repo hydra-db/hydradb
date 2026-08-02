@@ -125,9 +125,19 @@ impl GraphShard {
             .acquire_artifact_build_permit("build_graph_index")
             .await?;
         self.db.refresh_durable_reader().await?;
+        // A writer snapshot carries no WAL position (`state.rs`), and a
+        // generation published with `last_wal_id = 0` forces every later tail
+        // to walk the entire WAL history — which GC may have partially
+        // collected. Capture the durable WAL id *before* pinning the
+        // snapshot: every entry durable in files at or below it commits
+        // before the snapshot pins its sequence, so the tail invariant (no
+        // entry with seq > base_sequence in files <= last_wal_id) holds; at
+        // worst the tail re-reads a few recent files whose entries the
+        // sequence guard skips.
+        let durable_wal_id = self.db.last_durable_wal_id().await?;
         let snapshot = self.db.snapshot().await?;
         let base_sequence = snapshot.seq();
-        let last_wal_id = snapshot.last_wal_id().unwrap_or(0);
+        let last_wal_id = snapshot.last_wal_id().unwrap_or(durable_wal_id);
         let adjacency = GraphStore::scope_snapshot(snapshot, async {
             self.canonical_adjacency_at(cell_id, edge_type, base_sequence)
                 .await
@@ -197,9 +207,12 @@ impl GraphShard {
             .acquire_artifact_build_permit("build_graph_index_incremental")
             .await?;
         self.db.refresh_durable_reader().await?;
+        // Same pre-pin capture as the full build above, and for the same
+        // reason: a writer snapshot has no WAL position of its own.
+        let durable_wal_id = self.db.last_durable_wal_id().await?;
         let snapshot = self.db.snapshot().await?;
         let base_sequence = snapshot.seq();
-        let last_wal_id = snapshot.last_wal_id().unwrap_or(0);
+        let last_wal_id = snapshot.last_wal_id().unwrap_or(durable_wal_id);
 
         let Some(previous) = self.current_graph_index(cell_id, edge_type).await? else {
             return Ok(None);
