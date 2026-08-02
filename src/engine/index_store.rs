@@ -282,10 +282,6 @@ impl GraphShard {
             generation,
         };
 
-        // ── STEP 6 (done for you): publish through the same CAS path as the
-        // full build — monotonicity guard and generation cache come for free.
-        // `delta_edges` is the impact counter: the work this build actually
-        // did, vs the `edge_count` a full rebuild would have scanned.
         let delta_edges = overlay.entries().count() as u64;
         let published = self.publish_graph_index(&manifest, payload).await?;
         self.graph_index_generations.lock().await.insert(
@@ -301,9 +297,7 @@ impl GraphShard {
     /// Incremental-first entry point for the indexer loop
     /// (`src/bin/graph-indexer.rs:904` calls `build_graph_index` today):
     /// try the delta path, fall back to the full rebuild whenever it
-    /// declines. Wire this into the indexer as the final step — after the
-    /// equivalence test passes — so the exported counters record which path
-    /// ran and how much work it did.
+    /// declines.
     pub async fn build_graph_index_auto(
         &self,
         cell_id: &str,
