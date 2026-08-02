@@ -178,14 +178,13 @@ impl GraphShard {
     /// back to the full rebuild.
     ///
     /// Correctness oracle: generations are content-addressed
-    /// (`generation = sha256(payload)` above), so a finished implementation
-    /// must produce a byte-identical payload — and therefore an identical
-    /// generation id — to a full rebuild taken at the same snapshot. The
-    /// ignored test `incremental_graph_index_matches_full_rebuild` in
-    /// `src/tests.rs` asserts exactly that; un-ignore it once the steps below
-    /// are filled in.
-    // TODO(soham): remove this `allow` once every `todo!()` below is replaced.
-    #[allow(unused_variables, unreachable_code, clippy::diverging_sub_expression)]
+    /// (`generation = sha256(payload)` above), so this build must produce a
+    /// byte-identical payload — and therefore an identical generation id — to
+    /// a full rebuild taken at the same snapshot.
+    /// `incremental_graph_index_matches_full_rebuild` in `src/tests.rs`
+    /// asserts exactly that, comparing the payload objects on the store
+    /// rather than the published manifests, which publish arbitration would
+    /// launder.
     pub async fn build_graph_index_incremental(
         &self,
         cell_id: &str,
@@ -235,37 +234,53 @@ impl GraphShard {
                 Some(csc) => csc.to_adjacency()?,
                 None => return Ok(None),
             };
-        // ── STEP 4 (yours): patch the adjacency with the overlay.
-        //
-        // `overlay.entries()` yields `(src, dst, exists)`:
-        //     exists == true  → insert `dst` into `adjacency[src]`
-        //                       (hint: the `entry(..).or_default()` API)
-        //     exists == false → remove `dst` from `adjacency[src]`
-        //
-        // ⚠ Normalization gotcha: the full build only materializes sources
-        // that still have at least one destination (they come from a scan of
-        // records that exist). If a removal empties a source's set, remove
-        // the source key too — otherwise the CSC vertex dictionary differs
-        // from a full rebuild's and STEP 6's checksum equality fails. The
-        // test catches this; try leaving it out once and watch it fail.
-        //
-        // Rust book: ch 8 (entry API), ch 13 (iterators).
-        todo!("STEP 4: apply overlay deltas to adjacency");
+        // Apply the overlay. Entries are resolved final states, not
+        // operations, so order does not matter and re-application is
+        // idempotent. A removal that empties a source must drop the source
+        // key itself: the full build's `normalize` only materializes sources
+        // with at least one destination, and the CSC vertex dictionary is
+        // sources ∪ destinations, so a stale empty source changes the encoded
+        // payload — and therefore the content-addressed generation id — even
+        // though no edge differs.
+        for (src, dst, exists) in overlay.entries() {
+            if exists {
+                adjacency.entry(src).or_default().insert(dst);
+            } else {
+                let emptied = match adjacency.get_mut(&src) {
+                    Some(destinations) => {
+                        destinations.remove(&dst);
+                        destinations.is_empty()
+                    }
+                    None => false,
+                };
+                if emptied {
+                    adjacency.remove(&src);
+                }
+            }
+        }
 
-        // ── STEP 5 (yours): re-encode, mirroring the full build above
-        // line-for-line — same functions, same order:
-        //
-        //     let csc = graphblas_csc_from_adjacency(&adjacency)?;
-        //     let edge_count = csc.indices.len() as u64;
-        //     ensure_limit("build_graph_index_edges", edge_count,
-        //                  self.limits.max_artifact_build_edges)?;
-        //     let checksum = graphblas_csc_checksum(&csc);
-        //     let payload = encode_graph_index_csc(base_sequence, last_wal_id,
-        //                                          checksum, &csc);
-        //     let generation = sha256_hex(&payload);
-        //     ... assemble GraphIndexGeneration { .. } exactly as above.
-        let (manifest, payload): (GraphIndexGeneration, Vec<u8>) =
-            todo!("STEP 5: encode the new generation");
+        // Re-encode exactly as the full build above — same functions, same
+        // order — so an identical adjacency yields an identical payload and
+        // therefore an identical content-addressed generation id.
+        let csc = graphblas_csc_from_adjacency(&adjacency)?;
+        let edge_count = csc.indices.len() as u64;
+        ensure_limit(
+            "build_graph_index_edges",
+            edge_count,
+            self.limits.max_artifact_build_edges,
+        )?;
+        let checksum = graphblas_csc_checksum(&csc);
+        let payload = encode_graph_index_csc(base_sequence, last_wal_id, checksum, &csc);
+        let generation = sha256_hex(&payload);
+        let manifest = GraphIndexGeneration {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            base_sequence,
+            last_wal_id,
+            edge_count,
+            checksum,
+            generation,
+        };
 
         // ── STEP 6 (done for you): publish through the same CAS path as the
         // full build — monotonicity guard and generation cache come for free.

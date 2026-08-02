@@ -13617,23 +13617,37 @@ async fn reader_holding_a_gc_deleted_index_generation_sees_a_clean_miss_not_lost
 /// (`src/engine/index_store.rs`), and the payload deterministically encodes
 /// `base_sequence`, `last_wal_id`, the checksum, and the CSC. Two builds taken
 /// at the same durable sequence therefore agree on every byte of the published
-/// index state if and only if their generation ids are equal — no invariant
+/// index state if and only if their payload hashes are equal — no invariant
 /// has to be argued, only compared. The same property is what makes the
 /// main-vs-branch state-equivalence check in the guide test-independent.
 ///
-/// TODO(soham): remove the `#[ignore]` once every `todo!()` in
-/// `build_graph_index_incremental` is filled in.
+/// The comparison must be made against the payload *objects*, not the
+/// returned manifests: `publish_graph_index` returns the already-current
+/// manifest to any same-`(base_sequence, last_wal_id)` proposal, so whichever
+/// build runs second has its own generation id laundered into the first's and
+/// the manifest assertions become vacuously true. The final assertion — one
+/// `.csc` object at the shared base sequence — is the part that can actually
+/// fail when the builds disagree.
+///
 #[tokio::test]
-#[ignore = "scaffold: un-ignore after implementing build_graph_index_incremental"]
 async fn incremental_graph_index_matches_full_rebuild() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let shard = open_test_shard("graph/incremental-index-equivalence", object_store).await;
+    let shard = open_test_shard(
+        "graph/incremental-index-equivalence",
+        Arc::clone(&object_store),
+    )
+    .await;
     let cell_id = "reddit-home";
     let edge_type = "CHAIN";
 
-    // Seed 1 -> 2 -> 3 and publish a real full generation as the baseline the
-    // incremental build will patch.
-    for (idx, (src, dst)) in [(1_u64, 2_u64), (2, 3)].into_iter().enumerate() {
+    // Seed 1 -> 2 -> 3 plus an isolated 7 -> 8, and publish a real full
+    // generation as the baseline the incremental build will patch. The
+    // isolated edge exists to be deleted: removing it empties source 7
+    // entirely, which is the case that catches an incremental build leaving
+    // an empty source key behind — the CSC vertex dictionary is sources ∪
+    // destinations (`graphblas_vertices_from_adjacency`), so a stale `7: {}`
+    // changes the encoded bytes even though no edge differs.
+    for (idx, (src, dst)) in [(1_u64, 2_u64), (2, 3), (7, 8)].into_iter().enumerate() {
         shard
             .write_edge(EdgeMutation {
                 cell_id: cell_id.to_string(),
@@ -13667,6 +13681,17 @@ async fn incremental_graph_index_matches_full_rebuild() {
         .await
         .unwrap();
     assert!(deleted.deleted, "the delete must be acknowledged");
+    let deleted = shard
+        .delete_edge(typed_mutation(
+            cell_id,
+            edge_type,
+            7,
+            8,
+            "incr-delete-isolated",
+        ))
+        .await
+        .unwrap();
+    assert!(deleted.deleted, "the isolated delete must be acknowledged");
 
     // Incremental first (it patches `baseline`), then a full rebuild at the
     // same durable sequence. Publishing the same content twice is fine — the
@@ -13680,9 +13705,9 @@ async fn incremental_graph_index_matches_full_rebuild() {
 
     match path {
         crate::GraphIndexBuildPath::Incremental { delta_edges } => {
-            // 2->4 added, 3->5 added, 2->3 deleted.
+            // 2->4 added, 3->5 added, 2->3 deleted, 7->8 deleted.
             assert_eq!(
-                delta_edges, 3,
+                delta_edges, 4,
                 "the overlay must carry exactly the changed edges"
             );
         }
@@ -13705,5 +13730,37 @@ async fn incremental_graph_index_matches_full_rebuild() {
     assert_eq!(
         incremental.generation, full.generation,
         "content-addressed generation ids must be byte-for-byte equal"
+    );
+
+    // The manifest comparison above is necessary but NOT sufficient: whichever
+    // build publishes second proposes the same `(base_sequence, last_wal_id)`
+    // pair as the first, so `publish_graph_index`'s monotonicity guard returns
+    // the already-current manifest and the second build's own generation id is
+    // never seen — two disagreeing builds would still compare equal. The
+    // payload objects are immune to that laundering: each build content-
+    // addresses its payload *before* manifest arbitration, so disagreeing
+    // builds leave two `.csc` objects at the same base sequence. Exactly one
+    // may exist.
+    let generations_prefix = slatedb::object_store::path::Path::from(format!(
+        "graph/incremental-index-equivalence/_graph_index/{cell_id}/{edge_type}/generations"
+    ));
+    let sequence_prefix = format!("{:020}-", incremental.base_sequence);
+    let mut listing = object_store.list(Some(&generations_prefix));
+    let mut at_sequence = Vec::new();
+    while let Some(meta) = listing.next().await {
+        let location = meta.unwrap().location;
+        if location
+            .filename()
+            .is_some_and(|name| name.starts_with(&sequence_prefix))
+        {
+            at_sequence.push(location);
+        }
+    }
+    assert_eq!(
+        at_sequence.len(),
+        1,
+        "both builds must produce one identical payload; two objects at the \
+         same base sequence mean the builds disagreed and the manifest \
+         comparison was laundered: {at_sequence:?}"
     );
 }
