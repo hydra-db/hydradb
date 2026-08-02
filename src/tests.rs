@@ -13610,3 +13610,94 @@ async fn reader_holding_a_gc_deleted_index_generation_sees_a_clean_miss_not_lost
     indexer.close().await.unwrap();
     writer.close().await.unwrap();
 }
+
+/// Equivalence check for `GraphShard::build_graph_index_incremental`.
+///
+/// The oracle is content addressing: `generation = sha256(payload)`
+/// (`src/engine/index_store.rs`), and the payload deterministically encodes
+/// `base_sequence`, `last_wal_id`, the checksum, and the CSC. Two builds taken
+/// at the same durable sequence therefore agree on every byte of the published
+/// index state if and only if their generation ids are equal — no invariant
+/// has to be argued, only compared. The same property is what makes the
+/// main-vs-branch state-equivalence check in the guide test-independent.
+///
+/// TODO(soham): remove the `#[ignore]` once every `todo!()` in
+/// `build_graph_index_incremental` is filled in.
+#[tokio::test]
+#[ignore = "scaffold: un-ignore after implementing build_graph_index_incremental"]
+async fn incremental_graph_index_matches_full_rebuild() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/incremental-index-equivalence", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "CHAIN";
+
+    // Seed 1 -> 2 -> 3 and publish a real full generation as the baseline the
+    // incremental build will patch.
+    for (idx, (src, dst)) in [(1_u64, 2_u64), (2, 3)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: format!("incr-seed-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+    let baseline = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+
+    // Mutate strictly after the baseline: add 2 -> 4 and 3 -> 5, delete
+    // 2 -> 3. All three land in WAL files beyond `baseline.last_wal_id`, so
+    // the tail overlay must carry exactly these deltas.
+    for (idx, (src, dst)) in [(2_u64, 4_u64), (3, 5)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: format!("incr-add-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+    let deleted = shard
+        .delete_edge(typed_mutation(cell_id, edge_type, 2, 3, "incr-delete"))
+        .await
+        .unwrap();
+    assert!(deleted.deleted, "the delete must be acknowledged");
+
+    // Incremental first (it patches `baseline`), then a full rebuild at the
+    // same durable sequence. Publishing the same content twice is fine — the
+    // concurrent-indexer test above already relies on that.
+    let (incremental, path) = shard
+        .build_graph_index_incremental(cell_id, edge_type)
+        .await
+        .unwrap()
+        .expect("baseline exists and the WAL tail is available in-memory");
+    let full = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+
+    match path {
+        crate::GraphIndexBuildPath::Incremental { delta_edges } => {
+            // 2->4 added, 3->5 added, 2->3 deleted.
+            assert_eq!(delta_edges, 3, "the overlay must carry exactly the changed edges");
+        }
+        other => panic!("expected an incremental build, got {other:?}"),
+    }
+    assert!(
+        incremental.base_sequence > baseline.base_sequence,
+        "the incremental build must advance past the baseline"
+    );
+    assert_eq!(
+        incremental.base_sequence, full.base_sequence,
+        "both builds must observe the same durable sequence for the oracle to apply"
+    );
+    // The oracle: byte-identical payloads, therefore identical content ids.
+    assert_eq!(incremental.checksum, full.checksum, "CSC checksums must match");
+    assert_eq!(incremental.edge_count, full.edge_count);
+    assert_eq!(
+        incremental.generation, full.generation,
+        "content-addressed generation ids must be byte-for-byte equal"
+    );
+}

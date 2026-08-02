@@ -19,6 +19,22 @@ pub struct GraphIndexGeneration {
     pub generation: String,
 }
 
+/// Which path produced a generation and how much work it did. The indexer
+/// exports these as Prometheus counters, so "the graph previously scanned N
+/// edges per cycle, now it applies M delta edges" is a dashboard query, not
+/// an anecdote.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphIndexBuildPath {
+    /// Full canonical scan and re-encode: `edges` is the total edge count of
+    /// the published generation — every one of them was scanned from storage.
+    Full { edges: u64 },
+    /// WAL-tail patch of the previous generation: `delta_edges` is the number
+    /// of changed edges actually applied — the only work performed.
+    Incremental { delta_edges: u64 },
+    /// The published generation already covers the current sequence; no work.
+    Current,
+}
+
 impl GraphShard {
     pub async fn dirty_graph_index_edge_types(
         &self,
@@ -142,6 +158,167 @@ impl GraphShard {
             published.clone(),
         );
         Ok(published)
+    }
+
+    /// Incremental variant of [`GraphShard::build_graph_index`]: instead of
+    /// re-scanning every canonical record for the edge type (the full build's
+    /// `canonical_adjacency_at` above), load the previously published CSC
+    /// generation and patch it with the WAL tail — the exact delta the read
+    /// path already computes in `topology_tail_since`
+    /// (`src/shard/topology_tail.rs:41`) and then throws away.
+    ///
+    /// On success returns the generation together with a
+    /// [`GraphIndexBuildPath`] carrying the work counters (delta edges
+    /// applied vs total edges scanned) that the indexer exports to
+    /// Prometheus — the before/after impact number IS this counter.
+    ///
+    /// Returns `Ok(None)` whenever an incremental build is not possible (no
+    /// previous generation, generation payload missing, WAL tail unavailable
+    /// because SlateDB already collected those WAL files); the caller falls
+    /// back to the full rebuild.
+    ///
+    /// Correctness oracle: generations are content-addressed
+    /// (`generation = sha256(payload)` above), so a finished implementation
+    /// must produce a byte-identical payload — and therefore an identical
+    /// generation id — to a full rebuild taken at the same snapshot. The
+    /// ignored test `incremental_graph_index_matches_full_rebuild` in
+    /// `src/tests.rs` asserts exactly that; un-ignore it once the steps below
+    /// are filled in.
+    // TODO(soham): remove this `allow` once every `todo!()` below is replaced.
+    #[allow(unused_variables, unreachable_code, clippy::diverging_sub_expression)]
+    pub async fn build_graph_index_incremental(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+    ) -> Result<Option<(GraphIndexGeneration, GraphIndexBuildPath)>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+
+        // ── STEP 0 (done for you): identical admission + snapshot discipline
+        // to the full build above. Same permit gate, same durable refresh,
+        // same `base_sequence`/`last_wal_id` bookkeeping — the manifest this
+        // publishes must be indistinguishable from a full build's.
+        let _permit = self
+            .acquire_artifact_build_permit("build_graph_index_incremental")
+            .await?;
+        self.db.refresh_durable_reader().await?;
+        let snapshot = self.db.snapshot().await?;
+        let base_sequence = snapshot.seq();
+        let last_wal_id = snapshot.last_wal_id().unwrap_or(0);
+
+        // ── STEP 1 (done for you): load the previously published generation.
+        // No previous generation → nothing to patch → caller does a full
+        // build. Already-current generation → nothing to do at all.
+        let Some(previous) = self.current_graph_index(cell_id, edge_type).await? else {
+            return Ok(None);
+        };
+        if previous.base_sequence >= base_sequence {
+            return Ok(Some((previous, GraphIndexBuildPath::Current)));
+        }
+
+        // ── STEP 2 (yours): compute the WAL-tail delta.
+        //
+        // Make the exact call the read path makes at
+        // `src/shard/query.rs:5525` (and the test at `src/tests.rs:13196`):
+        //
+        //     self.topology_tail_since(&previous, snapshot.as_ref(),
+        //                              base_sequence, &budget)
+        //
+        // with `let budget = crate::shard::QueryBudget::new(None, None);`
+        // (no runtime cap — the WAL entry/edge limits inside
+        // `topology_tail_since` still apply).
+        //
+        // Then `match` the result:
+        //   crate::shard::topology_tail::GraphTopologyTail::Unavailable
+        //       => return Ok(None),          // WAL collected → full rebuild
+        //   crate::shard::topology_tail::GraphTopologyTail::Complete(overlay)
+        //       => keep `overlay` and continue.
+        //
+        // Rust book: ch 6 (enums + match), ch 9 (`?` and Result).
+        let overlay: crate::shard::topology_tail::GraphTopologyOverlay =
+            todo!("STEP 2: WAL-tail delta via topology_tail_since");
+
+        // ── STEP 3 (yours): decode the previous generation back into an
+        // adjacency map.
+        //
+        //     self.graph_index_csc(&previous).await?   → Option<GraphBlasCsc>
+        //         (None → payload already GC'd → return Ok(None))
+        //     csc.to_adjacency()?                      → Adjacency
+        //         (src/sparse_kernel/mod.rs:93; Adjacency is
+        //          BTreeMap<VertexId, BTreeSet<VertexId>>)
+        //
+        // Rust book: ch 8 (collections), ch 6 (Option patterns).
+        let mut adjacency: crate::sparse_kernel::Adjacency =
+            todo!("STEP 3: previous CSC → adjacency");
+
+        // ── STEP 4 (yours): patch the adjacency with the overlay.
+        //
+        // `overlay.entries()` yields `(src, dst, exists)`:
+        //     exists == true  → insert `dst` into `adjacency[src]`
+        //                       (hint: the `entry(..).or_default()` API)
+        //     exists == false → remove `dst` from `adjacency[src]`
+        //
+        // ⚠ Normalization gotcha: the full build only materializes sources
+        // that still have at least one destination (they come from a scan of
+        // records that exist). If a removal empties a source's set, remove
+        // the source key too — otherwise the CSC vertex dictionary differs
+        // from a full rebuild's and STEP 6's checksum equality fails. The
+        // test catches this; try leaving it out once and watch it fail.
+        //
+        // Rust book: ch 8 (entry API), ch 13 (iterators).
+        todo!("STEP 4: apply overlay deltas to adjacency");
+
+        // ── STEP 5 (yours): re-encode, mirroring the full build above
+        // line-for-line — same functions, same order:
+        //
+        //     let csc = graphblas_csc_from_adjacency(&adjacency)?;
+        //     let edge_count = csc.indices.len() as u64;
+        //     ensure_limit("build_graph_index_edges", edge_count,
+        //                  self.limits.max_artifact_build_edges)?;
+        //     let checksum = graphblas_csc_checksum(&csc);
+        //     let payload = encode_graph_index_csc(base_sequence, last_wal_id,
+        //                                          checksum, &csc);
+        //     let generation = sha256_hex(&payload);
+        //     ... assemble GraphIndexGeneration { .. } exactly as above.
+        let (manifest, payload): (GraphIndexGeneration, Vec<u8>) =
+            todo!("STEP 5: encode the new generation");
+
+        // ── STEP 6 (done for you): publish through the same CAS path as the
+        // full build — monotonicity guard and generation cache come for free.
+        // `delta_edges` is the impact counter: the work this build actually
+        // did, vs the `edge_count` a full rebuild would have scanned.
+        let delta_edges = overlay.entries().count() as u64;
+        let published = self.publish_graph_index(&manifest, payload).await?;
+        self.graph_index_generations.lock().await.insert(
+            MatrixCacheKey::new(cell_id, edge_type, published.base_sequence),
+            published.clone(),
+        );
+        Ok(Some((
+            published,
+            GraphIndexBuildPath::Incremental { delta_edges },
+        )))
+    }
+
+    /// Incremental-first entry point for the indexer loop
+    /// (`src/bin/graph-indexer.rs:904` calls `build_graph_index` today):
+    /// try the delta path, fall back to the full rebuild whenever it
+    /// declines. Wire this into the indexer as the final step — after the
+    /// equivalence test passes — so the exported counters record which path
+    /// ran and how much work it did.
+    pub async fn build_graph_index_auto(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+    ) -> Result<(GraphIndexGeneration, GraphIndexBuildPath)> {
+        if let Some(result) = self
+            .build_graph_index_incremental(cell_id, edge_type)
+            .await?
+        {
+            return Ok(result);
+        }
+        let generation = self.build_graph_index(cell_id, edge_type).await?;
+        let edges = generation.edge_count;
+        Ok((generation, GraphIndexBuildPath::Full { edges }))
     }
 
     pub(crate) async fn graph_index_csc(
