@@ -833,9 +833,10 @@ pub struct GraphIndexGeneration {
       rather than re-folding the whole adjacency: it decodes the previous CSC, asks
       <code>topology_tail_since</code> for the final-state <code>(src, dst, exists)</code> delta
       written since that generation, applies it, and re-encodes — declining back to the full scan
-      whenever it cannot proceed (no previous generation, the WAL tail no longer available, or the
-      tail oversized). Both paths publish identically, and publication is atomic: a reader sees
-      either the old generation or the new one, never a torn write.</li>
+      whenever it cannot proceed (no previous generation, the previous generation's CSC payload
+      missing from the store, the WAL tail no longer available, or the tail oversized). Both paths
+      publish identically, and publication is atomic: a reader sees either the old generation or
+      the new one, never a torn write.</li>
     <li><em>Hydrate &amp; overlay</em> — <code>matrix_cache.rs</code> is read-through: on a miss it
       hydrates the current generation's CSC into the shard's matrix caches (taking the
       <code>matrix_compilation_gate</code> for the compiled form). Because a read pins a sequence
