@@ -28,10 +28,24 @@ pub enum GraphError {
     },
     #[error("corrupt value at {key}: {reason}")]
     CorruptValue { key: String, reason: String },
-    #[error("idempotency key conflict for {operation} request key {idempotency_key}")]
+    /// A request reused an idempotency key that the store already resolved to a
+    /// different outcome.
+    ///
+    /// `reason` names *which* check failed, and it is the whole point of the
+    /// variant carrying three fields instead of two. The operation and the key
+    /// together say only "these two requests disagreed"; they cannot say
+    /// whether a replayed key found a stored record for a different payload
+    /// (the caller is minting keys that collide) or whether an identity the
+    /// payload carries is already bound to something else (the caller is
+    /// minting *ids* that collide). Those are different bugs on the caller's
+    /// side with different fixes. Bolt exposes the complete message as a
+    /// non-retryable `Neo.ClientError.Transaction.Invalid`, so callers can stop
+    /// retrying and diagnose the failed check directly.
+    #[error("idempotency key conflict for {operation} request key {idempotency_key}: {reason}")]
     IdempotencyConflict {
         operation: &'static str,
         idempotency_key: String,
+        reason: &'static str,
     },
     #[error(
         "control metadata conflict at {key}: expected generation {expected_generation:?}, actual generation {actual_generation:?}"
