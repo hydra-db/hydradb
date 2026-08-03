@@ -13610,3 +13610,287 @@ async fn reader_holding_a_gc_deleted_index_generation_sees_a_clean_miss_not_lost
     indexer.close().await.unwrap();
     writer.close().await.unwrap();
 }
+
+/// Equivalence check for `GraphShard::build_graph_index_incremental`.
+///
+/// The oracle is content addressing: `generation = sha256(payload)`
+/// (`src/engine/index_store.rs`), and the payload deterministically encodes
+/// `base_sequence`, `last_wal_id`, the checksum, and the CSC. Two builds taken
+/// at the same durable sequence therefore agree on every byte of the published
+/// index state if and only if their payload hashes are equal — no invariant
+/// has to be argued, only compared. The same property is what makes the
+/// main-vs-branch state-equivalence check in the guide test-independent.
+///
+/// The comparison must be made against the payload *objects*, not the
+/// returned manifests: `publish_graph_index` returns the already-current
+/// manifest to any same-`(base_sequence, last_wal_id)` proposal, so whichever
+/// build runs second has its own generation id laundered into the first's and
+/// the manifest assertions become vacuously true. The final assertion — one
+/// `.csc` object at the shared base sequence — is the part that can actually
+/// fail when the builds disagree.
+///
+#[tokio::test]
+async fn incremental_graph_index_matches_full_rebuild() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard(
+        "graph/incremental-index-equivalence",
+        Arc::clone(&object_store),
+    )
+    .await;
+    let cell_id = "reddit-home";
+    let edge_type = "CHAIN";
+
+    // Seed 1 -> 2 -> 3 plus an isolated 7 -> 8, and publish a real full
+    // generation as the baseline the incremental build will patch. The
+    // isolated edge exists to be deleted: removing it empties source 7
+    // entirely, which is the case that catches an incremental build leaving
+    // an empty source key behind — the CSC vertex dictionary is sources ∪
+    // destinations (`graphblas_vertices_from_adjacency`), so a stale `7: {}`
+    // changes the encoded bytes even though no edge differs.
+    for (idx, (src, dst)) in [(1_u64, 2_u64), (2, 3), (7, 8)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: format!("incr-seed-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+    let baseline = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+
+    // Mutate strictly after the baseline: add 2 -> 4 and 3 -> 5, delete
+    // 2 -> 3. All three land in WAL files beyond `baseline.last_wal_id`, so
+    // the tail overlay must carry exactly these deltas.
+    for (idx, (src, dst)) in [(2_u64, 4_u64), (3, 5)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: cell_id.to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: format!("incr-add-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+    let deleted = shard
+        .delete_edge(typed_mutation(cell_id, edge_type, 2, 3, "incr-delete"))
+        .await
+        .unwrap();
+    assert!(deleted.deleted, "the delete must be acknowledged");
+    let deleted = shard
+        .delete_edge(typed_mutation(
+            cell_id,
+            edge_type,
+            7,
+            8,
+            "incr-delete-isolated",
+        ))
+        .await
+        .unwrap();
+    assert!(deleted.deleted, "the isolated delete must be acknowledged");
+
+    // Incremental first (it patches `baseline`), then a full rebuild at the
+    // same durable sequence. Publishing the same content twice is fine — the
+    // concurrent-indexer test above already relies on that.
+    let (incremental, path) = shard
+        .build_graph_index_incremental(cell_id, edge_type)
+        .await
+        .unwrap()
+        .expect("baseline exists and the WAL tail is available in-memory");
+    let full = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+
+    match path {
+        crate::GraphIndexBuildPath::Incremental { delta_edges } => {
+            // 2->4 added, 3->5 added, 2->3 deleted, 7->8 deleted.
+            assert_eq!(
+                delta_edges, 4,
+                "the overlay must carry exactly the changed edges"
+            );
+        }
+        other => panic!("expected an incremental build, got {other:?}"),
+    }
+    assert!(
+        incremental.base_sequence > baseline.base_sequence,
+        "the incremental build must advance past the baseline"
+    );
+    assert_eq!(
+        incremental.base_sequence, full.base_sequence,
+        "both builds must observe the same durable sequence for the oracle to apply"
+    );
+    // The oracle: byte-identical payloads, therefore identical content ids.
+    assert_eq!(
+        incremental.checksum, full.checksum,
+        "CSC checksums must match"
+    );
+    assert_eq!(incremental.edge_count, full.edge_count);
+    assert_eq!(
+        incremental.generation, full.generation,
+        "content-addressed generation ids must be byte-for-byte equal"
+    );
+
+    // The manifest comparison above is necessary but NOT sufficient: whichever
+    // build publishes second proposes the same `(base_sequence, last_wal_id)`
+    // pair as the first, so `publish_graph_index`'s monotonicity guard returns
+    // the already-current manifest and the second build's own generation id is
+    // never seen — two disagreeing builds would still compare equal. The
+    // payload objects are immune to that laundering: each build content-
+    // addresses its payload *before* manifest arbitration, so disagreeing
+    // builds leave two `.csc` objects at the same base sequence. Exactly one
+    // may exist.
+    let generations_prefix = slatedb::object_store::path::Path::from(format!(
+        "graph/incremental-index-equivalence/_graph_index/{cell_id}/{edge_type}/generations"
+    ));
+    let sequence_prefix = format!("{:020}-", incremental.base_sequence);
+    let mut listing = object_store.list(Some(&generations_prefix));
+    let mut at_sequence = Vec::new();
+    while let Some(meta) = listing.next().await {
+        let location = meta.unwrap().location;
+        if location
+            .filename()
+            .is_some_and(|name| name.starts_with(&sequence_prefix))
+        {
+            at_sequence.push(location);
+        }
+    }
+    assert_eq!(
+        at_sequence.len(),
+        1,
+        "both builds must produce one identical payload; two objects at the \
+         same base sequence mean the builds disagreed and the manifest \
+         comparison was laundered: {at_sequence:?}"
+    );
+}
+
+/// A WAL tail larger than `max_query_scan_edges` must make the incremental
+/// build *decline* — `Ok(None)`, the same verdict as a collected WAL — not
+/// fail. `topology_tail_since` raises `AdmissionRejected` for it because on
+/// the read path an oversized overlay is an expected admission outcome
+/// (`src/shard/query.rs` recovers from exactly this error), and the full
+/// rebuild the caller falls back to is governed by the much larger
+/// `max_artifact_build_edges`. Propagating it instead would fail the whole
+/// indexer cycle on precisely the graphs that most need the fallback.
+#[tokio::test]
+async fn oversized_wal_tail_declines_the_incremental_build() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let limits = GraphLimits {
+        max_query_scan_edges: 2,
+        ..GraphLimits::default()
+    };
+    let shard = GraphShard::open_standalone_writer_with_limits(
+        "graph/incremental-index-oversized-tail",
+        object_store,
+        limits,
+    )
+    .await
+    .unwrap();
+    let cell_id = "reddit-home";
+    let edge_type = "CHAIN";
+
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 1, 2, "oversized-seed"))
+        .await
+        .unwrap();
+    shard.build_graph_index(cell_id, edge_type).await.unwrap();
+
+    // Three affected edges since the baseline, against a scan limit of two.
+    for (idx, (src, dst)) in [(2_u64, 3_u64), (3, 4), (4, 5)].into_iter().enumerate() {
+        shard
+            .write_edge(typed_mutation(
+                cell_id,
+                edge_type,
+                src,
+                dst,
+                &format!("oversized-add-{idx}"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let declined = shard
+        .build_graph_index_incremental(cell_id, edge_type)
+        .await
+        .expect("an oversized tail is a decline, not an error");
+    assert!(
+        declined.is_none(),
+        "the incremental build must fall back rather than absorb an \
+         oversized tail"
+    );
+
+    // And the fallback the decline promises must actually work end to end.
+    let (generation, path) = shard
+        .build_graph_index_auto(cell_id, edge_type)
+        .await
+        .unwrap();
+    assert!(
+        matches!(path, crate::GraphIndexBuildPath::Full { .. }),
+        "auto must have taken the full path, got {path:?}"
+    );
+    assert_eq!(generation.edge_count, 4);
+}
+
+/// A writer snapshot carries no WAL position of its own (`state.rs`), and
+/// before the pre-pin capture in `build_graph_index` a writer-built
+/// generation published `last_wal_id = 0`. The zero silently turned every
+/// later WAL tail into a walk of the entire WAL history: correct while every
+/// file still exists, but SlateDB's WAL GC (60s retention past the compacted
+/// boundary) eventually punches holes in that range, after which both the
+/// incremental build and the read-path overlay decline to full scans
+/// forever. Found by the 5M-edge MinIO stress run, where every incremental
+/// cycle fell back for exactly this reason.
+#[tokio::test]
+async fn writer_built_generations_record_the_wal_position() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer("graph/writer-wal-position", object_store)
+        .await
+        .unwrap();
+    let cell_id = "reddit-home";
+    let edge_type = "CHAIN";
+
+    shard
+        .write_edge(typed_mutation(
+            cell_id,
+            edge_type,
+            1,
+            2,
+            "wal-position-seed",
+        ))
+        .await
+        .unwrap();
+    let full = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+    assert!(
+        full.last_wal_id > 0,
+        "a durable write precedes this build, so the generation must record a \
+         real WAL position, got {}",
+        full.last_wal_id
+    );
+
+    // The incremental path stamps the same field, and a correct position on
+    // the previous generation is exactly what lets it read a short tail here
+    // instead of the whole history.
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 2, 3, "wal-position-add"))
+        .await
+        .unwrap();
+    let (incremental, path) = shard
+        .build_graph_index_incremental(cell_id, edge_type)
+        .await
+        .unwrap()
+        .expect("a one-edge tail on a fresh store is buildable");
+    assert!(
+        matches!(
+            path,
+            crate::GraphIndexBuildPath::Incremental { delta_edges: 1 }
+        ),
+        "expected a one-edge incremental build, got {path:?}"
+    );
+    assert!(
+        incremental.last_wal_id >= full.last_wal_id,
+        "the WAL position must never move backwards: {} < {}",
+        incremental.last_wal_id,
+        full.last_wal_id
+    );
+}

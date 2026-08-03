@@ -106,6 +106,13 @@ indexer:
   replicaCount: 1
   intervalMs: 5000
   retainPreviousGenerations: 1
+  # "full" preserves the pre-incremental behavior. Set "incremental" after
+  # validating the workload; unavailable or oversized WAL tails still fall
+  # back to a full rebuild.
+  buildMode: full
+  # Small indexes can be cheaper to rebuild from the block cache. Incremental
+  # mode uses the full path below this current-generation edge count.
+  incrementalMinEdges: 250000
   serviceAccount:
     create: true
     name: ""

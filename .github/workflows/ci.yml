@@ -52,6 +52,16 @@ jobs:
           grep -q 'name: turbolay-indexer-metrics' /tmp/turbolay-custom-auth.yaml
           grep -q 'GRAPH_INDEX_DISCOVERY_INTERVAL_MS: "5000"' /tmp/turbolay-custom-auth.yaml
           grep -q 'GRAPH_INDEXER_RETAIN_PREVIOUS: "1"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_BUILD_MODE: "full"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_INCREMENTAL_MIN_EDGES: "250000"' /tmp/turbolay-custom-auth.yaml
+          helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set indexer.buildMode=incremental \
+            --set indexer.incrementalMinEdges=1000000 \
+            --show-only templates/configmap.yaml > /tmp/turbolay-incremental-indexer.yaml
+          grep -q 'GRAPH_INDEXER_BUILD_MODE: "incremental"' /tmp/turbolay-incremental-indexer.yaml
+          grep -q 'GRAPH_INDEXER_INCREMENTAL_MIN_EDGES: "1000000"' /tmp/turbolay-incremental-indexer.yaml
           if grep -q 'GRAPH_MATRIX_REFRESH_' /tmp/turbolay-custom-auth.yaml; then
             echo "query-node matrix refresh configuration is still rendered"
             exit 1

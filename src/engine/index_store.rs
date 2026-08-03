@@ -19,6 +19,22 @@ pub struct GraphIndexGeneration {
     pub generation: String,
 }
 
+/// Which path produced a generation and how much work it did. The indexer
+/// exports these as Prometheus counters, so "the graph previously scanned N
+/// edges per cycle, now it applies M delta edges" is a dashboard query, not
+/// an anecdote.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphIndexBuildPath {
+    /// Full canonical scan and re-encode: `edges` is the total edge count of
+    /// the published generation — every one of them was scanned from storage.
+    Full { edges: u64 },
+    /// WAL-tail patch of the previous generation: `delta_edges` is the number
+    /// of changed edges actually applied — the only work performed.
+    Incremental { delta_edges: u64 },
+    /// The published generation already covers the current sequence; no work.
+    Current,
+}
+
 impl GraphShard {
     pub async fn dirty_graph_index_edge_types(
         &self,
@@ -109,9 +125,19 @@ impl GraphShard {
             .acquire_artifact_build_permit("build_graph_index")
             .await?;
         self.db.refresh_durable_reader().await?;
+        // A writer snapshot carries no WAL position (`state.rs`), and a
+        // generation published with `last_wal_id = 0` forces every later tail
+        // to walk the entire WAL history — which GC may have partially
+        // collected. Capture the durable WAL id *before* pinning the
+        // snapshot: every entry durable in files at or below it commits
+        // before the snapshot pins its sequence, so the tail invariant (no
+        // entry with seq > base_sequence in files <= last_wal_id) holds; at
+        // worst the tail re-reads a few recent files whose entries the
+        // sequence guard skips.
+        let durable_wal_id = self.db.last_durable_wal_id().await?;
         let snapshot = self.db.snapshot().await?;
         let base_sequence = snapshot.seq();
-        let last_wal_id = snapshot.last_wal_id().unwrap_or(0);
+        let last_wal_id = snapshot.last_wal_id().unwrap_or(durable_wal_id);
         let adjacency = GraphStore::scope_snapshot(snapshot, async {
             self.canonical_adjacency_at(cell_id, edge_type, base_sequence)
                 .await
@@ -142,6 +168,177 @@ impl GraphShard {
             published.clone(),
         );
         Ok(published)
+    }
+
+    /// Incremental variant of [`GraphShard::build_graph_index`]: instead of
+    /// re-scanning every canonical record for the edge type (the full build's
+    /// `canonical_adjacency_at` above), load the previously published CSC
+    /// generation and patch it with the WAL tail — the exact delta the read
+    /// path already computes in `topology_tail_since`
+    /// (`src/shard/topology_tail.rs:41`) and then throws away.
+    ///
+    /// On success returns the generation together with a
+    /// [`GraphIndexBuildPath`] carrying the work counters (delta edges
+    /// applied vs total edges scanned) that the indexer exports to
+    /// Prometheus — the before/after impact number IS this counter.
+    ///
+    /// Returns `Ok(None)` whenever an incremental build is not possible (no
+    /// previous generation, generation payload missing, WAL tail unavailable
+    /// because SlateDB already collected those WAL files); the caller falls
+    /// back to the full rebuild.
+    ///
+    /// Correctness oracle: generations are content-addressed
+    /// (`generation = sha256(payload)` above), so this build must produce a
+    /// byte-identical payload — and therefore an identical generation id — to
+    /// a full rebuild taken at the same snapshot.
+    /// `incremental_graph_index_matches_full_rebuild` in `src/tests.rs`
+    /// asserts exactly that, comparing the payload objects on the store
+    /// rather than the published manifests, which publish arbitration would
+    /// launder.
+    pub async fn build_graph_index_incremental(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+    ) -> Result<Option<(GraphIndexGeneration, GraphIndexBuildPath)>> {
+        validate_component("cell_id", cell_id)?;
+        validate_component("edge_type", edge_type)?;
+
+        let _permit = self
+            .acquire_artifact_build_permit("build_graph_index_incremental")
+            .await?;
+        self.db.refresh_durable_reader().await?;
+        // Same pre-pin capture as the full build above, and for the same
+        // reason: a writer snapshot has no WAL position of its own.
+        let durable_wal_id = self.db.last_durable_wal_id().await?;
+        let snapshot = self.db.snapshot().await?;
+        let base_sequence = snapshot.seq();
+        let last_wal_id = snapshot.last_wal_id().unwrap_or(durable_wal_id);
+
+        let Some(previous) = self.current_graph_index(cell_id, edge_type).await? else {
+            return Ok(None);
+        };
+        if previous.base_sequence >= base_sequence {
+            return Ok(Some((previous, GraphIndexBuildPath::Current)));
+        }
+
+        // The WAL tail is the exact delta the read path computes per query in
+        // `topology_tail_since` (`src/shard/query.rs:5525`) and then discards;
+        // here it is computed once and folded into the published index. No
+        // runtime budget — the WAL entry/edge limits inside the call still
+        // apply. `Unavailable` means a WAL file spanning the gap was already
+        // collected, so the delta is unrecoverable and the caller must run a
+        // full rebuild instead.
+        let budget = crate::shard::QueryBudget::new(None, None);
+        let tail = match self
+            .topology_tail_since(&previous, snapshot.as_ref(), base_sequence, &budget)
+            .await
+        {
+            Ok(tail) => tail,
+            // A delta exceeding `max_query_scan_edges` is an admission
+            // verdict, not a failure — the read path treats the same error as
+            // an expected outcome and recovers (`src/shard/query.rs:5546`).
+            // Decline so the caller falls back to the full rebuild, whose
+            // scan is governed by `max_artifact_build_edges` instead; every
+            // other error still propagates.
+            Err(GraphError::AdmissionRejected {
+                operation: "graph_index_wal_affected_edges",
+                ..
+            }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let overlay = match tail {
+            crate::shard::topology_tail::GraphTopologyTail::Complete(overlay) => overlay,
+            crate::shard::topology_tail::GraphTopologyTail::Unavailable => {
+                return Ok(None);
+            }
+        };
+
+        // Reconstruct the adjacency the previous generation encodes. `None`
+        // means the CSC payload behind the manifest was already collected by
+        // GC — there is nothing to patch, so decline to the full rebuild.
+        let mut adjacency: crate::sparse_kernel::Adjacency =
+            match self.graph_index_csc(&previous).await? {
+                Some(csc) => csc.to_adjacency()?,
+                None => return Ok(None),
+            };
+        // Apply the overlay. Entries are resolved final states, not
+        // operations, so order does not matter and re-application is
+        // idempotent. A removal that empties a source must drop the source
+        // key itself: the full build's `normalize` only materializes sources
+        // with at least one destination, and the CSC vertex dictionary is
+        // sources ∪ destinations, so a stale empty source changes the encoded
+        // payload — and therefore the content-addressed generation id — even
+        // though no edge differs.
+        for (src, dst, exists) in overlay.entries() {
+            if exists {
+                adjacency.entry(src).or_default().insert(dst);
+            } else {
+                let emptied = match adjacency.get_mut(&src) {
+                    Some(destinations) => {
+                        destinations.remove(&dst);
+                        destinations.is_empty()
+                    }
+                    None => false,
+                };
+                if emptied {
+                    adjacency.remove(&src);
+                }
+            }
+        }
+
+        // Re-encode exactly as the full build above — same functions, same
+        // order — so an identical adjacency yields an identical payload and
+        // therefore an identical content-addressed generation id.
+        let csc = graphblas_csc_from_adjacency(&adjacency)?;
+        let edge_count = csc.indices.len() as u64;
+        ensure_limit(
+            "build_graph_index_edges",
+            edge_count,
+            self.limits.max_artifact_build_edges,
+        )?;
+        let checksum = graphblas_csc_checksum(&csc);
+        let payload = encode_graph_index_csc(base_sequence, last_wal_id, checksum, &csc);
+        let generation = sha256_hex(&payload);
+        let manifest = GraphIndexGeneration {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            base_sequence,
+            last_wal_id,
+            edge_count,
+            checksum,
+            generation,
+        };
+
+        let delta_edges = overlay.entries().count() as u64;
+        let published = self.publish_graph_index(&manifest, payload).await?;
+        self.graph_index_generations.lock().await.insert(
+            MatrixCacheKey::new(cell_id, edge_type, published.base_sequence),
+            published.clone(),
+        );
+        Ok(Some((
+            published,
+            GraphIndexBuildPath::Incremental { delta_edges },
+        )))
+    }
+
+    /// Incremental-first entry point for the indexer loop
+    /// (`src/bin/graph-indexer.rs:904` calls `build_graph_index` today):
+    /// try the delta path, fall back to the full rebuild whenever it
+    /// declines.
+    pub async fn build_graph_index_auto(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+    ) -> Result<(GraphIndexGeneration, GraphIndexBuildPath)> {
+        if let Some(result) = self
+            .build_graph_index_incremental(cell_id, edge_type)
+            .await?
+        {
+            return Ok(result);
+        }
+        let generation = self.build_graph_index(cell_id, edge_type).await?;
+        let edges = generation.edge_count;
+        Ok((generation, GraphIndexBuildPath::Full { edges }))
     }
 
     pub(crate) async fn graph_index_csc(

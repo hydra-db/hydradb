@@ -14,8 +14,8 @@ use axum::Router;
 use futures::StreamExt;
 use slatedb::object_store::path::Path;
 use slatedb_graph_kernel::{
-    object_store_from_env, GraphCluster, GraphError, GraphId, GraphScope, NamespaceId,
-    NamespacePath, ObjectStoreGraphScopeDirectory,
+    object_store_from_env, GraphCluster, GraphError, GraphId, GraphIndexBuildPath,
+    GraphIndexGeneration, GraphScope, NamespaceId, NamespacePath, ObjectStoreGraphScopeDirectory,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -244,7 +244,7 @@ const MAX_DIMENSIONS: usize = 512;
 const OVERFLOW_LABEL: &str = "__overflow__";
 
 /// How many series each `{cell_id, edge_type}` pair costs.
-const DIMENSIONED_FAMILIES: usize = 3;
+const DIMENSIONED_FAMILIES: usize = 6;
 
 /// The three counters that carry `{cell_id, edge_type}`.
 ///
@@ -258,6 +258,19 @@ struct DimensionedCounters {
     generations_published: u64,
     generation_failures: u64,
     generations_deleted: u64,
+    /// Edges scanned + encoded by full rebuilds. Before the incremental
+    /// builder lands this is the total work the indexer does; after, it is
+    /// the cost of fallbacks only. The before/after impact of the
+    /// incremental index build is `rate(graph_indexer_full_build_edges)`
+    /// dropping to (nearly) zero while
+    /// `rate(graph_indexer_incremental_delta_edges)` tracks actual churn.
+    full_build_edges: u64,
+    /// Changed edges applied by incremental builds — the only work the
+    /// delta path performs.
+    incremental_delta_edges: u64,
+    /// Incremental attempts that declined (no previous generation, WAL tail
+    /// collected, payload missing) and fell back to a full rebuild.
+    incremental_fallbacks: u64,
 }
 
 impl DimensionedCounters {
@@ -268,11 +281,20 @@ impl DimensionedCounters {
             generations_published,
             generation_failures,
             generations_deleted,
+            full_build_edges,
+            incremental_delta_edges,
+            incremental_fallbacks,
         } = *self;
         [
             ("graph_indexer_generations_published", generations_published),
             ("graph_indexer_generation_failures", generation_failures),
             ("graph_indexer_generations_deleted", generations_deleted),
+            ("graph_indexer_full_build_edges", full_build_edges),
+            (
+                "graph_indexer_incremental_delta_edges",
+                incremental_delta_edges,
+            ),
+            ("graph_indexer_incremental_fallbacks", incremental_fallbacks),
         ]
     }
 }
@@ -347,6 +369,25 @@ impl IndexerMetrics {
         });
     }
 
+    fn record_full_build_edges(&self, cell_id: &str, edge_type: &str, edges: u64) {
+        self.dimension(cell_id, edge_type, |counters| {
+            counters.full_build_edges = counters.full_build_edges.saturating_add(edges);
+        });
+    }
+
+    fn record_incremental_delta_edges(&self, cell_id: &str, edge_type: &str, delta_edges: u64) {
+        self.dimension(cell_id, edge_type, |counters| {
+            counters.incremental_delta_edges =
+                counters.incremental_delta_edges.saturating_add(delta_edges);
+        });
+    }
+
+    fn record_incremental_fallback(&self, cell_id: &str, edge_type: &str) {
+        self.dimension(cell_id, edge_type, |counters| {
+            counters.incremental_fallbacks = counters.incremental_fallbacks.saturating_add(1);
+        });
+    }
+
     fn dimensioned_snapshot(&self) -> BTreeMap<(String, String), DimensionedCounters> {
         self.lock_dimensioned().clone()
     }
@@ -397,6 +438,15 @@ async fn main() -> RuntimeResult<()> {
         return Err("GRAPH_INDEXER_INTERVAL_MS must be greater than zero".into());
     }
     let retain_previous = env_value("GRAPH_INDEXER_RETAIN_PREVIOUS", "1").parse::<usize>()?;
+    let build_mode = IndexBuildMode::from_env()?;
+    // Below this many edges the incremental path loses: the full scan rides
+    // the block cache while the incremental build pays real object-store
+    // round trips (previous payload GET, WAL tail GETs, per-edge resolution
+    // reads). Measured in `examples/incremental_index_bench.rs` against
+    // MinIO: a 200k-edge graph rebuilt 2x faster full, a 1M-edge graph 3.8x
+    // faster incrementally. Tune per deployment cache size.
+    let incremental_min_edges =
+        env_value("GRAPH_INDEXER_INCREMENTAL_MIN_EDGES", "250000").parse::<u64>()?;
     let admin_addr = env_value("GRAPH_INDEXER_ADMIN_ADDR", "0.0.0.0:9091").parse::<SocketAddr>()?;
 
     let metrics = Arc::new(IndexerMetrics::default());
@@ -412,7 +462,13 @@ async fn main() -> RuntimeResult<()> {
         Arc::clone(&object_store),
     );
     let mut shutdown = Box::pin(shutdown_signal());
-    tracing::info!(scope = %root_scope, ?cells, "graph indexer started");
+    tracing::info!(
+        scope = %root_scope,
+        ?cells,
+        build_mode = build_mode.as_str(),
+        incremental_min_edges,
+        "graph indexer started"
+    );
 
     // Mirrors `metrics.ready`, which was stored `true` above. Kept alongside so
     // the readiness *transition* can be detected without re-reading an atomic
@@ -436,6 +492,8 @@ async fn main() -> RuntimeResult<()> {
             &cells,
             Arc::clone(&object_store),
             retain_previous,
+            build_mode,
+            incremental_min_edges,
             &metrics,
         )
         .instrument(cycle_span.clone())
@@ -519,12 +577,15 @@ async fn main() -> RuntimeResult<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_registered_scopes_cycle(
     data_path: &str,
     scope_directory: &ObjectStoreGraphScopeDirectory,
     cells: &[String],
     object_store: Arc<dyn slatedb::object_store::ObjectStore>,
     retain_previous: usize,
+    build_mode: IndexBuildMode,
+    incremental_min_edges: u64,
     metrics: &IndexerMetrics,
 ) -> Result<(), CycleFailures> {
     let mut failures = CycleFailures::default();
@@ -646,9 +707,17 @@ async fn run_registered_scopes_cycle(
         let mut scope_failed = false;
         // Instrumenting the call rather than parenting a span by hand is what
         // makes every `index.cell` below a child of this scope.
-        if let Err(inner) = run_index_cycle(&cluster, &scope_name, cells, retain_previous, metrics)
-            .instrument(scope_span.clone())
-            .await
+        if let Err(inner) = run_index_cycle(
+            &cluster,
+            &scope_name,
+            cells,
+            retain_previous,
+            build_mode,
+            incremental_min_edges,
+            metrics,
+        )
+        .instrument(scope_span.clone())
+        .await
         {
             scope_failed = true;
             failures.absorb(inner);
@@ -709,6 +778,8 @@ async fn run_index_cycle(
     scope: &str,
     cells: &[String],
     retain_previous: usize,
+    build_mode: IndexBuildMode,
+    incremental_min_edges: u64,
     metrics: &IndexerMetrics,
 ) -> Result<(), CycleFailures> {
     let mut failures = CycleFailures::default();
@@ -897,18 +968,61 @@ async fn run_index_cycle(
                 turbolay.generation = Empty,
                 turbolay.base_sequence = Empty,
                 edge_count = Empty,
+                build_mode = Empty,
                 turbolay.outcome = Empty,
                 error.class = Empty,
             );
-            let generation = match shard
-                .build_graph_index(cell_id, &edge_type)
-                .instrument(build_span.clone())
-                .await
-            {
-                Ok(generation) => {
+
+            // The size floor: below `incremental_min_edges` the full scan
+            // rides the block cache while the incremental path pays real
+            // object-store round trips, so a small graph rebuilds faster the
+            // old way (`examples/incremental_index_bench.rs` has the
+            // numbers). A floor skip is a deliberate policy choice, not an
+            // incremental attempt that declined — it records as a plain full
+            // build and leaves the fallback counter alone.
+            let attempt_incremental = build_mode == IndexBuildMode::Incremental
+                && current
+                    .as_ref()
+                    .is_some_and(|generation| generation.edge_count >= incremental_min_edges);
+            let outcome: Result<(GraphIndexGeneration, GraphIndexBuildPath), GraphError> =
+                if attempt_incremental {
+                    shard
+                        .build_graph_index_auto(cell_id, &edge_type)
+                        .instrument(build_span.clone())
+                        .await
+                } else {
+                    shard
+                        .build_graph_index(cell_id, &edge_type)
+                        .instrument(build_span.clone())
+                        .await
+                        .map(|generated| {
+                            let edge_count = generated.edge_count;
+                            (generated, GraphIndexBuildPath::Full { edges: edge_count })
+                        })
+                };
+            let generation = match outcome {
+                Ok((generation, build_path)) => {
                     build_span.record(semconv::GENERATION, generation.generation.as_str());
                     build_span.record(semconv::BASE_SEQUENCE, generation.base_sequence);
                     build_span.record("edge_count", generation.edge_count);
+                    build_span.record("build_mode", build_mode.as_str());
+
+                    match build_path {
+                        GraphIndexBuildPath::Full { edges } => {
+                            metrics.record_full_build_edges(cell_id, &edge_type, edges);
+                            if attempt_incremental {
+                                metrics.record_incremental_fallback(cell_id, &edge_type);
+                            }
+                        }
+                        GraphIndexBuildPath::Incremental { delta_edges } => {
+                            metrics.record_incremental_delta_edges(
+                                cell_id,
+                                &edge_type,
+                                delta_edges,
+                            );
+                        }
+                        GraphIndexBuildPath::Current => {}
+                    }
                     record_success(&build_span);
                     generation
                 }
@@ -1219,6 +1333,53 @@ fn env_value(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
+/// How a cycle builds a dirty edge type's index, set by
+/// `GRAPH_INDEXER_BUILD_MODE`.
+///
+/// A kill switch rather than a permanent knob. The incremental path patches
+/// the previous generation with the WAL-tail delta instead of rescanning
+/// canonical storage; it defaults to off so deploying this binary changes
+/// nothing, and an operator who sees trouble sets the variable back to
+/// `full` and restarts rather than rolling back a release.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum IndexBuildMode {
+    /// Always rescan canonical storage. The behaviour before incremental
+    /// builds existed, and the default.
+    #[default]
+    Full,
+    /// Try the delta path, fall back to a full rebuild whenever it declines.
+    Incremental,
+}
+
+impl IndexBuildMode {
+    const VAR: &'static str = "GRAPH_INDEXER_BUILD_MODE";
+
+    fn from_env() -> RuntimeResult<Self> {
+        Self::parse(&env_value(Self::VAR, "full"))
+    }
+
+    /// Split from [`Self::from_env`] so the accepted spellings are testable
+    /// without mutating process environment, which no parallel test may do.
+    fn parse(value: &str) -> RuntimeResult<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" => Ok(Self::Full),
+            "incremental" => Ok(Self::Incremental),
+            other => Err(format!(
+                "{} must be `full` or `incremental`, got `{other}`",
+                Self::VAR
+            )
+            .into()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+        }
+    }
+}
+
 async fn shutdown_signal() -> RuntimeResult<()> {
     #[cfg(unix)]
     {
@@ -1240,6 +1401,28 @@ mod tests {
     use slatedb_graph_kernel::EdgeMutation;
 
     use super::*;
+
+    /// The kill switch defaults to the pre-existing behaviour, and refuses a
+    /// spelling it does not understand rather than silently choosing one — an
+    /// operator who typos `incremenal` during an incident must be told, not
+    /// quietly left on the other path.
+    #[test]
+    fn index_build_mode_parses_known_spellings_and_rejects_the_rest() {
+        assert_eq!(IndexBuildMode::default(), IndexBuildMode::Full);
+        assert_eq!(IndexBuildMode::parse("full").unwrap(), IndexBuildMode::Full);
+        assert_eq!(
+            IndexBuildMode::parse("  Incremental ").unwrap(),
+            IndexBuildMode::Incremental,
+            "case and surrounding whitespace must not change the meaning"
+        );
+        let error = IndexBuildMode::parse("incremenal")
+            .expect_err("a misspelling must not resolve to a mode")
+            .to_string();
+        assert!(
+            error.contains(IndexBuildMode::VAR) && error.contains("incremenal"),
+            "the error must name the variable and the offending value: {error}"
+        );
+    }
 
     #[tokio::test]
     async fn indexer_discovers_registered_scopes_and_ignores_empty_ones() {
@@ -1268,6 +1451,8 @@ mod tests {
             &["cell-0".to_string()],
             Arc::clone(&object_store),
             1,
+            IndexBuildMode::Full,
+            250_000,
             &metrics,
         )
         .await
@@ -1302,6 +1487,8 @@ mod tests {
             &["cell-0".to_string()],
             Arc::clone(&object_store),
             1,
+            IndexBuildMode::Full,
+            250_000,
             &metrics,
         )
         .await
@@ -1314,6 +1501,11 @@ mod tests {
                     generations_published: 1,
                     generation_failures: 0,
                     generations_deleted: 0,
+                    // One edge (1 -> 2) in the published generation, scanned
+                    // by the full build that produced it.
+                    full_build_edges: 1,
+                    incremental_delta_edges: 0,
+                    incremental_fallbacks: 0,
                 },
             )]),
             "the publish should be attributed to the cell and edge type that produced it",
@@ -1332,13 +1524,13 @@ mod tests {
         reader.close().await.unwrap();
     }
 
-    /// The eleven series a scrape sees when nothing has been indexed yet.
+    /// The fourteen series a scrape sees when nothing has been indexed yet.
     ///
     /// Pinned in full rather than probed, because the point of this change is
     /// that the process-global half did *not* move: `ready` through
     /// `open_failures` and `last_success_ms` keep their exact names, their
-    /// absence of labels and their positions, and the three families that
-    /// gained labels still declare a `# TYPE` line with no samples under it.
+    /// absence of labels and their positions, and the six families that carry
+    /// labels still declare a `# TYPE` line with no samples under it.
     #[test]
     fn an_idle_indexer_declares_every_family() {
         let metrics = IndexerMetrics::default();
@@ -1361,6 +1553,9 @@ mod tests {
                 "# TYPE graph_indexer_generations_published counter\n",
                 "# TYPE graph_indexer_generation_failures counter\n",
                 "# TYPE graph_indexer_generations_deleted counter\n",
+                "# TYPE graph_indexer_full_build_edges counter\n",
+                "# TYPE graph_indexer_incremental_delta_edges counter\n",
+                "# TYPE graph_indexer_incremental_fallbacks counter\n",
                 "# TYPE graph_indexer_dimensions gauge\n",
                 "graph_indexer_dimensions 0\n",
                 "# TYPE graph_indexer_last_success_ms gauge\n",
@@ -1462,6 +1657,9 @@ mod tests {
                 generations_published: 64,
                 generation_failures: 0,
                 generations_deleted: 0,
+                full_build_edges: 0,
+                incremental_delta_edges: 0,
+                incremental_fallbacks: 0,
             },
         );
         assert_eq!(

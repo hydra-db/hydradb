@@ -23,6 +23,20 @@ impl GraphTopologyOverlay {
             .copied()
     }
 
+    /// Flat iteration over every `(src, dst, exists)` delta in the overlay.
+    ///
+    /// The read path consumes the overlay through point lookups
+    /// (`expand_range_with_overlay` below); the incremental index builder in
+    /// `src/engine/index_store.rs` instead needs to walk every delta once to
+    /// patch a decoded CSC adjacency, which is what this exposes.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (VertexId, VertexId, bool)> + '_ {
+        self.states.iter().flat_map(|(src, destinations)| {
+            destinations
+                .iter()
+                .map(move |(dst, exists)| (*src, *dst, *exists))
+        })
+    }
+
     /// Test-only introspection. The WAL-tail overlay is otherwise only
     /// observable through a compiled GraphBLAS traversal, which needs the
     /// SuiteSparse C kernel; these let a repro assert on the overlay directly.
