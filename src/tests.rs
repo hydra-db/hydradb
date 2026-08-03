@@ -1776,7 +1776,8 @@ async fn bulk_import_edges_writes_normal_indexes_and_idempotency() {
         conflict,
         GraphError::IdempotencyConflict {
             operation: "bulk-import",
-            ref idempotency_key
+            ref idempotency_key,
+            reason: "this key already stored a result for a different payload"
         } if idempotency_key == "bulk-1"
     ));
 
@@ -2331,7 +2332,8 @@ async fn write_edge_mutations_batch_rejects_idempotency_reuse_for_different_edge
         conflict,
         GraphError::IdempotencyConflict {
             operation: "create",
-            ref idempotency_key
+            ref idempotency_key,
+            reason: "this key already stored a result for a different edge"
         } if idempotency_key == "edge-batch-conflict"
     ));
 
@@ -2349,7 +2351,8 @@ async fn write_edge_mutations_batch_rejects_idempotency_reuse_for_different_edge
         duplicate_in_batch,
         GraphError::IdempotencyConflict {
             operation: "create",
-            ref idempotency_key
+            ref idempotency_key,
+            reason: "the same key appears twice in one batch"
         } if idempotency_key == "edge-batch-duplicate"
     ));
 }
@@ -2461,7 +2464,8 @@ async fn idempotency_keys_are_bound_to_the_original_edge() {
         create_err,
         GraphError::IdempotencyConflict {
             operation: "create",
-            ref idempotency_key
+            ref idempotency_key,
+            reason: "this key already stored a result for a different edge"
         } if idempotency_key == "create-conflict"
     ));
 
@@ -2477,7 +2481,8 @@ async fn idempotency_keys_are_bound_to_the_original_edge() {
         delete_err,
         GraphError::IdempotencyConflict {
             operation: "delete",
-            ref idempotency_key
+            ref idempotency_key,
+            reason: "this key already stored a result for a different edge"
         } if idempotency_key == "delete-conflict"
     ));
 }
@@ -2663,7 +2668,8 @@ async fn delete_edge_mutations_batch_rejects_duplicate_edge_identities() {
         err,
         GraphError::IdempotencyConflict {
             operation: "delete",
-            idempotency_key
+            idempotency_key,
+            reason: "two keys in one batch delete the same edge"
         } if idempotency_key.contains("delete-batch-duplicate-a")
             && idempotency_key.contains("delete-batch-duplicate-b")
     ));

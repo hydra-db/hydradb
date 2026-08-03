@@ -1678,9 +1678,33 @@ impl GraphShard {
                     || existing.dst != requested.dst
                     || existing.relationship_id != requested.relationship_id
                 {
+                    // This conflict is about the *payload's* identity, not the
+                    // request key: the relationship id the caller sent already
+                    // resolves to another edge. It reaches the log with the
+                    // same `IdempotencyConflict` display as a replayed request
+                    // key does, and the two have opposite fixes — so the pair
+                    // that disagreed is logged here, where both are in hand.
+                    // Every field is an id or a type name, never user data.
+                    tracing::warn!(
+                        target: "slatedb_graph_kernel",
+                        idempotency_key,
+                        existing.cell_id = %existing.cell_id,
+                        existing.edge_type = %existing.edge_type,
+                        existing.src = existing.src,
+                        existing.dst = existing.dst,
+                        existing.relationship_id = existing.relationship_id,
+                        requested.cell_id = %requested.cell_id,
+                        requested.edge_type = %requested.edge_type,
+                        requested.src = requested.src,
+                        requested.dst = requested.dst,
+                        requested.relationship_id = requested.relationship_id,
+                        "relationship import rejected: relationship id is bound to a different edge",
+                    );
                     return Err(GraphError::IdempotencyConflict {
                         operation: "relationship-import",
                         idempotency_key: idempotency_key.to_string(),
+                        reason: "the relationship id in the payload is already bound to a \
+                                 different edge",
                     });
                 }
                 if existing.metadata != requested.metadata {
@@ -1688,6 +1712,8 @@ impl GraphShard {
                         return Err(GraphError::IdempotencyConflict {
                             operation: "relationship-import",
                             idempotency_key: idempotency_key.to_string(),
+                            reason: "the relationship exists with different properties and this \
+                                     operation does not update them",
                         });
                     }
                     let next_metadata =
@@ -4068,6 +4094,7 @@ impl GraphShard {
                 return Err(GraphError::IdempotencyConflict {
                     operation: "create",
                     idempotency_key: mutation.idempotency_key.clone(),
+                    reason: "the same key appears twice in one batch",
                 });
             }
         }
@@ -4704,6 +4731,7 @@ fn validate_unique_delete_mutation_identities(mutations: &[EdgeMutation]) -> Res
             return Err(GraphError::IdempotencyConflict {
                 operation: "delete",
                 idempotency_key: format!("{first_key},{}", mutation.idempotency_key),
+                reason: "two keys in one batch delete the same edge",
             });
         }
     }
@@ -4846,7 +4874,13 @@ fn coalesce_relationship_imports(
             Some(existing) if existing != &relationship => {
                 return Err(GraphError::IdempotencyConflict {
                     operation: "relationship-import",
+                    // Not the request key — this check runs before the request
+                    // key is in scope, so the id that collided stands in for it.
+                    // The reason says so, because a key shaped like a padded
+                    // integer otherwise reads as a truncated request key.
                     idempotency_key: format!("{:020}", relationship.relationship_id),
+                    reason: "the batch carries this relationship id twice with different \
+                             endpoints or properties (key shown is the relationship id)",
                 });
             }
             Some(_) => {}
