@@ -30,8 +30,18 @@ canonical-adjacency scan for every dirty edge type, however small the change.
 
 ¹ Measured before the `last_wal_id` fix (`d4ae154`): those incremental builds silently walked
 the entire WAL directory every cycle (see the bug section below), so the incremental times are
-*overstated* and the true speedups are higher — the post-fix 5M incremental (2.4 s) already
-undercuts the pre-fix 2M number (5.5 s). Post-fix reruns pending.
+*overstated* and the true speedups are higher. Post-fix reruns (run later under noticeably
+noisier host conditions — full-build times swung up to 6x between cycles, so treat the
+absolute times cautiously and the ratios as indicative):
+
+| edges | object store | previous: full rebuild | current: incremental | wall speedup |
+|------:|:-------------|-----------------------:|---------------------:|:------------:|
+| 1M    | MinIO (post-fix rerun) | 39,563 ms avg  | 1,866 ms avg         | **21.2x**    |
+| 2M    | MinIO (post-fix rerun) | 51,942 ms avg  | 3,830 ms avg         | **13.6x**    |
+
+The shape matches the clean 5M post-fix run: with the tail finally spanning only the files
+written since the previous generation, the incremental build's cost is nearly flat in graph
+size while the full scan grows with it.
 
 Two shapes fall out of the table:
 
