@@ -520,7 +520,11 @@ self.graphblas_cache.lock().await.retain(/* same predicate */);</code></pre>
   <code>base_sequence</code> at or beyond the marker. For the rest it calls <code>build_graph_index</code>, which pins a
   durable <span class="concept" data-concept="snapshot-isolation">snapshot</span>, takes <code>base_sequence</code> and <code>last_wal_id</code> from it, materializes the canonical
   adjacency, encodes one CSC matrix, hashes it, writes the generation object with <code>PutMode::Create</code>,
-  and advances the <code>current</code> manifest with a compare-and-swap that refuses to move backwards. Older
+  and advances the <code>current</code> manifest with a compare-and-swap that refuses to move backwards. (Under
+  <code>GRAPH_INDEXER_BUILD_MODE=incremental</code>, large edge types take a cheaper route to the same
+  publication: <code>build_graph_index_auto</code> decodes the previous generation, applies the WAL-tail delta
+  written since it, and re-encodes — falling back to the full scan whenever the patch cannot
+  proceed.) Older
   generations are then pruned by <code>gc_graph_index_generations</code> down to <code>GRAPH_INDEXER_RETAIN_PREVIOUS</code>
   (default 1).</p>
 
@@ -676,7 +680,7 @@ window.TB_GLOSSARY = Object.assign(window.TB_GLOSSARY || {}, {
   },
   "indexer-process": {
     title: "Out-of-process indexer",
-    html: "<p><code>graph-indexer</code>, a separate binary that never writes graph data and never serves queries. On its own clock (default every 5 s) it reads the dirty markers a write left behind, rebuilds each cell's <span class=\"concept\" data-concept=\"index-generation\">index generation</span> from a pinned <span class=\"concept\" data-concept=\"snapshot-isolation\">snapshot</span>, publishes it with a compare-and-swap, and prunes old generations. Its independent clock is exactly why the matrix caches key on a lagging <span class=\"concept\" data-concept=\"base-epoch\">base</span>.</p>"
+    html: "<p><code>graph-indexer</code>, a separate binary that never writes graph data and never serves queries. On its own clock (default every 5 s) it reads the dirty markers a write left behind, rebuilds each cell's <span class=\"concept\" data-concept=\"index-generation\">index generation</span> from a pinned <span class=\"concept\" data-concept=\"snapshot-isolation\">snapshot</span> — or, in incremental mode, patches the previous generation with the WAL-tail delta written since it — publishes it with a compare-and-swap, and prunes old generations. Its independent clock is exactly why the matrix caches key on a lagging <span class=\"concept\" data-concept=\"base-epoch\">base</span>.</p>"
   }
 });
 </script>
