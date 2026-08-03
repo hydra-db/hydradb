@@ -1538,6 +1538,23 @@ fn a_write_to_a_non_owner_maps_to_the_not_a_leader_code_with_the_owner_hint() {
     }
 }
 
+#[test]
+fn an_idempotency_conflict_is_visible_and_non_retryable_to_bolt_clients() {
+    let error = graph_error_to_bolt(GraphError::IdempotencyConflict {
+        operation: "relationship-import",
+        idempotency_key: "caller-operation-42".to_string(),
+    });
+
+    match error {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.ClientError.Transaction.Invalid");
+            assert!(message.contains("relationship-import"));
+            assert!(message.contains("caller-operation-42"));
+        }
+        other => panic!("expected a non-retryable Neo client error, got {other:?}"),
+    }
+}
+
 /// Touch point (a): `WRITE` is the rendezvous owner's address — the same answer
 /// `ensure_local_writer` enforces — while `READ` and `ROUTE` still name the
 /// whole live fleet.
