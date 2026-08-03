@@ -3271,7 +3271,10 @@ impl QueryCellClient for RoutedGraphCluster {
                     .await?;
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
-            crate::QueryBatchOperation::UpsertVertices { vertices } => {
+            crate::QueryBatchOperation::UpsertVertices {
+                vertices,
+                merge_policy,
+            } => {
                 self.ensure_local_writer(&context.cell_id).await?;
                 shard
                     .merge_vertex_metadata_batch(
@@ -3279,6 +3282,7 @@ impl QueryCellClient for RoutedGraphCluster {
                         vertices
                             .into_iter()
                             .map(|vertex| (vertex.vertex, vertex.metadata)),
+                        merge_policy.as_ref(),
                     )
                     .await?;
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
@@ -3316,6 +3320,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 relationships,
                 source_label,
                 destination_label,
+                merge_policy,
             } => {
                 self.ensure_local_writer(&context.cell_id).await?;
                 shard
@@ -3338,8 +3343,8 @@ impl QueryCellClient for RoutedGraphCluster {
                             }
                         }),
                         &format!("{}.unwind-relationship-merge", context.idempotency_key),
-                        &source_label,
-                        &destination_label,
+                        (&source_label, &destination_label),
+                        merge_policy.as_ref(),
                     )
                     .await?;
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))

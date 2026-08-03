@@ -25,10 +25,10 @@ use crate::query::opencypher::{
 use crate::{
     validate_component, AtomicDurationHistogram, DurationHistogramSnapshot, EdgeMetadata,
     GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryBatchEdge,
-    QueryBatchOperation, QueryBatchRelationship, QueryBatchRelationshipMerge, QueryBatchVertex,
-    QueryCancellationToken, QueryColumn, QueryContext, QueryCursorToken, QueryParameterValue,
-    QueryResultPage, QueryResultSet, QueryRow, Result, StorageSequence, VertexMetadata,
-    VertexPropertyValue,
+    QueryBatchMergePolicy, QueryBatchOperation, QueryBatchRelationship,
+    QueryBatchRelationshipMerge, QueryBatchVertex, QueryCancellationToken, QueryColumn,
+    QueryContext, QueryCursorToken, QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow,
+    Result, StorageSequence, VertexMetadata, VertexPropertyValue,
 };
 use tracing::Instrument as _;
 
@@ -2497,6 +2497,8 @@ fn resolve_unwind_batch(
             label,
             vertex_field,
             property_fields,
+            update_if_newer_by,
+            create_only_properties,
         } => Ok(QueryBatchOperation::UpsertVertices {
             vertices: rows
                 .iter()
@@ -2514,6 +2516,10 @@ fn resolve_unwind_batch(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
+            merge_policy: update_if_newer_by.map(|update_if_newer_by| QueryBatchMergePolicy {
+                update_if_newer_by,
+                create_only_properties,
+            }),
         }),
         ParsedUnwindBatchKind::CreateRelationshipsBetweenLabeledVertices {
             edge_type,
@@ -2561,6 +2567,8 @@ fn resolve_unwind_batch(
             property_fields,
             source_label,
             destination_label,
+            update_if_newer_by,
+            create_only_properties,
         } => Ok(
             QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices {
                 edge_type,
@@ -2588,6 +2596,10 @@ fn resolve_unwind_batch(
                     .collect::<Result<Vec<_>>>()?,
                 source_label,
                 destination_label,
+                merge_policy: update_if_newer_by.map(|update_if_newer_by| QueryBatchMergePolicy {
+                    update_if_newer_by,
+                    create_only_properties,
+                }),
             },
         ),
     }

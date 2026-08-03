@@ -118,6 +118,7 @@ struct RelationshipImportOptions<'a> {
     endpoint_labels: Option<(&'a str, &'a str)>,
     create_always: bool,
     update_existing_metadata: bool,
+    merge_policy: Option<&'a QueryBatchMergePolicy>,
     operation: &'static str,
 }
 
@@ -227,6 +228,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         updates: impl IntoIterator<Item = (VertexId, VertexMetadata)>,
+        merge_policy: Option<&QueryBatchMergePolicy>,
     ) -> Result<usize> {
         validate_component("cell_id", cell_id)?;
         self.ensure_write_authority(cell_id, "merge_vertex_metadata_batch")?;
@@ -248,7 +250,7 @@ impl GraphShard {
             let _writer = self.writer_lane(cell_id).lock().await;
             for attempt in 0..GRAPH_TXN_MAX_RETRIES {
                 match self
-                    .merge_vertex_metadata_batch_txn(cell_id, updates.clone())
+                    .merge_vertex_metadata_batch_txn(cell_id, updates.clone(), merge_policy)
                     .await
                 {
                     Err(err)
@@ -391,12 +393,13 @@ impl GraphShard {
         &self,
         cell_id: &str,
         updates: Vec<(VertexId, VertexMetadata)>,
+        merge_policy: Option<&QueryBatchMergePolicy>,
     ) -> Result<usize> {
         let lock = self
             .acquire_local_write_guard(cell_id, "merge_vertex_metadata_batch")
             .await?;
         let result = self
-            .merge_vertex_metadata_batch_txn_locked(cell_id, updates)
+            .merge_vertex_metadata_batch_txn_locked(cell_id, updates, merge_policy)
             .await;
         finish_local_write(lock, result).await
     }
@@ -440,6 +443,7 @@ impl GraphShard {
         &self,
         cell_id: &str,
         updates: Vec<(VertexId, VertexMetadata)>,
+        merge_policy: Option<&QueryBatchMergePolicy>,
     ) -> Result<usize> {
         let txn = self
             .db
@@ -449,12 +453,26 @@ impl GraphShard {
         self.validate_write_fence_txn(&txn, cell_id, "merge_vertex_metadata_batch")
             .await?;
         let mut changed = Vec::new();
-        for (vertex_id, patch) in updates {
+        for (vertex_id, mut patch) in updates {
             let vertex_key = keys::vertex(cell_id, vertex_id);
-            let previous = match read_txn_remote(&txn, &vertex_key).await? {
-                Some(value) => decode_vertex_metadata(&vertex_key, &value)?,
-                None => VertexMetadata::default(),
+            let (previous, existed) = match read_txn_remote(&txn, &vertex_key).await? {
+                Some(value) => (decode_vertex_metadata(&vertex_key, &value)?, true),
+                None => (VertexMetadata::default(), false),
             };
+            if existed {
+                if let Some(policy) = merge_policy {
+                    let Some(properties) = guarded_metadata_patch(
+                        &previous.properties,
+                        patch.properties,
+                        policy,
+                        &vertex_key,
+                    )?
+                    else {
+                        continue;
+                    };
+                    patch.properties = properties;
+                }
+            }
             let mut merged = previous.clone();
             merged.labels.extend(patch.labels);
             merged.properties.extend(patch.properties);
@@ -1170,6 +1188,7 @@ impl GraphShard {
                 endpoint_labels: None,
                 create_always: false,
                 update_existing_metadata: false,
+                merge_policy: None,
                 operation: "import_relationships_batch",
             },
         )
@@ -1197,6 +1216,7 @@ impl GraphShard {
                 endpoint_labels: Some((source_label, destination_label)),
                 create_always: true,
                 update_existing_metadata: false,
+                merge_policy: None,
                 operation: "create_relationships_batch_between_labeled_vertices",
             },
         )
@@ -1210,9 +1230,10 @@ impl GraphShard {
         edge_type: &str,
         relationships: impl IntoIterator<Item = RelationshipMutation>,
         idempotency_key: &str,
-        source_label: &str,
-        destination_label: &str,
+        endpoint_labels: (&str, &str),
+        merge_policy: Option<&QueryBatchMergePolicy>,
     ) -> Result<RelationshipImportResult> {
+        let (source_label, destination_label) = endpoint_labels;
         validate_component("source_label", source_label)?;
         validate_component("destination_label", destination_label)?;
         self.import_relationships_batch_with_endpoint_labels(
@@ -1224,6 +1245,7 @@ impl GraphShard {
                 endpoint_labels: Some((source_label, destination_label)),
                 create_always: false,
                 update_existing_metadata: true,
+                merge_policy,
                 operation: "merge_relationships_batch_between_labeled_vertices",
             },
         )
@@ -1716,8 +1738,23 @@ impl GraphShard {
                                      operation does not update them",
                         });
                     }
+                    let mut requested_metadata = requested.metadata.clone();
+                    if let Some(policy) = options.merge_policy {
+                        let Some(properties) = guarded_metadata_patch(
+                            &existing.metadata.properties,
+                            requested_metadata.properties,
+                            policy,
+                            &rel_key,
+                        )?
+                        else {
+                            relationships_already_existed =
+                                relationships_already_existed.saturating_add(1);
+                            continue;
+                        };
+                        requested_metadata.properties = properties;
+                    }
                     let next_metadata =
-                        merge_edge_metadata(&existing.metadata, &requested.metadata);
+                        merge_edge_metadata(&existing.metadata, &requested_metadata);
                     if next_metadata != existing.metadata {
                         let previous_metadata = existing.metadata.clone();
                         let mut updated = existing;
@@ -4902,6 +4939,142 @@ fn merge_vertex_metadata(previous: &VertexMetadata, requested: &VertexMetadata) 
             .map(|(property, value)| (property.clone(), value.clone())),
     );
     next
+}
+
+fn guarded_metadata_patch(
+    previous: &BTreeMap<String, VertexPropertyValue>,
+    mut requested: BTreeMap<String, VertexPropertyValue>,
+    policy: &QueryBatchMergePolicy,
+    key: &str,
+) -> Result<Option<BTreeMap<String, VertexPropertyValue>>> {
+    for property in &policy.create_only_properties {
+        requested.remove(property);
+    }
+    let Some(previous_guard) = previous.get(&policy.update_if_newer_by) else {
+        return Ok(Some(requested));
+    };
+    let requested_guard =
+        requested
+            .get(&policy.update_if_newer_by)
+            .ok_or_else(|| GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!(
+                    "guarded merge is missing incoming property {}",
+                    policy.update_if_newer_by
+                ),
+            })?;
+    let ordering = match (previous_guard, requested_guard) {
+        (VertexPropertyValue::Integer(left), VertexPropertyValue::Integer(right)) => {
+            left.cmp(right)
+        }
+        (VertexPropertyValue::SignedInteger(left), VertexPropertyValue::SignedInteger(right)) => {
+            left.cmp(right)
+        }
+        (VertexPropertyValue::Float(left), VertexPropertyValue::Float(right)) => left.cmp(right),
+        (VertexPropertyValue::String(left), VertexPropertyValue::String(right)) => left.cmp(right),
+        _ => {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: format!(
+                    "guarded merge property {} must have matching ordered scalar types",
+                    policy.update_if_newer_by
+                ),
+            });
+        }
+    };
+    if ordering == std::cmp::Ordering::Greater {
+        return Ok(None);
+    }
+    Ok(Some(requested))
+}
+
+#[cfg(test)]
+mod guarded_metadata_patch_tests {
+    use super::*;
+
+    fn policy() -> QueryBatchMergePolicy {
+        QueryBatchMergePolicy {
+            update_if_newer_by: "updated_at".to_string(),
+            create_only_properties: BTreeSet::from(["created_at".to_string()]),
+        }
+    }
+
+    #[test]
+    fn rejects_an_older_patch() {
+        let previous = BTreeMap::from([(
+            "updated_at".to_string(),
+            VertexPropertyValue::String("2026-08-03T11:00:00+00:00".to_string()),
+        )]);
+        let requested = BTreeMap::from([(
+            "updated_at".to_string(),
+            VertexPropertyValue::String("2026-08-03T10:00:00+00:00".to_string()),
+        )]);
+
+        assert!(
+            guarded_metadata_patch(&previous, requested, &policy(), "vertex/1")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn accepts_a_newer_patch_without_replacing_create_only_properties() {
+        let previous = BTreeMap::from([
+            (
+                "created_at".to_string(),
+                VertexPropertyValue::String("2026-08-03T09:00:00+00:00".to_string()),
+            ),
+            (
+                "updated_at".to_string(),
+                VertexPropertyValue::String("2026-08-03T10:00:00+00:00".to_string()),
+            ),
+        ]);
+        let requested = BTreeMap::from([
+            (
+                "created_at".to_string(),
+                VertexPropertyValue::String("2026-08-03T11:00:00+00:00".to_string()),
+            ),
+            (
+                "updated_at".to_string(),
+                VertexPropertyValue::String("2026-08-03T11:00:00+00:00".to_string()),
+            ),
+        ]);
+
+        let patch = guarded_metadata_patch(&previous, requested, &policy(), "vertex/1")
+            .unwrap()
+            .unwrap();
+        assert!(!patch.contains_key("created_at"));
+        assert_eq!(
+            patch.get("updated_at"),
+            Some(&VertexPropertyValue::String(
+                "2026-08-03T11:00:00+00:00".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn preserves_create_only_properties_when_an_existing_record_lacks_the_guard() {
+        let previous = BTreeMap::from([(
+            "created_at".to_string(),
+            VertexPropertyValue::String("2026-08-03T09:00:00+00:00".to_string()),
+        )]);
+        let requested = BTreeMap::from([
+            (
+                "created_at".to_string(),
+                VertexPropertyValue::String("2026-08-03T11:00:00+00:00".to_string()),
+            ),
+            (
+                "updated_at".to_string(),
+                VertexPropertyValue::String("2026-08-03T11:00:00+00:00".to_string()),
+            ),
+        ]);
+
+        let patch = guarded_metadata_patch(&previous, requested, &policy(), "vertex/1")
+            .unwrap()
+            .unwrap();
+        assert!(!patch.contains_key("created_at"));
+        assert!(patch.contains_key("updated_at"));
+    }
 }
 
 fn merge_edge_metadata(previous: &EdgeMetadata, requested: &EdgeMetadata) -> EdgeMetadata {
