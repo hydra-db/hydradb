@@ -73,6 +73,16 @@ pub struct QueryBatchRelationshipMerge {
     derive(serde::Deserialize, serde::Serialize)
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryBatchMergePolicy {
+    pub update_if_newer_by: String,
+    pub create_only_properties: std::collections::BTreeSet<String>,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryBatchOperation {
     OutNeighbors {
         edge_type: String,
@@ -105,6 +115,7 @@ pub enum QueryBatchOperation {
     },
     UpsertVertices {
         vertices: Vec<QueryBatchVertex>,
+        merge_policy: Option<QueryBatchMergePolicy>,
     },
     CreateRelationshipsBetweenLabeledVertices {
         edge_type: String,
@@ -117,6 +128,7 @@ pub enum QueryBatchOperation {
         relationships: Vec<QueryBatchRelationshipMerge>,
         source_label: String,
         destination_label: String,
+        merge_policy: Option<QueryBatchMergePolicy>,
     },
 }
 
@@ -143,7 +155,7 @@ impl QueryBatchOperation {
             | Self::DeleteEdges { edges, .. } => edges.len(),
             Self::DeleteVertices { vertices, .. } => vertices.len(),
             Self::DeleteRelationshipsByProperty { values, .. } => values.len(),
-            Self::UpsertVertices { vertices } => vertices.len(),
+            Self::UpsertVertices { vertices, .. } => vertices.len(),
             Self::CreateRelationshipsBetweenLabeledVertices { relationships, .. } => {
                 relationships.len()
             }
