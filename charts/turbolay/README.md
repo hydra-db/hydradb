@@ -109,6 +109,12 @@ reconstructible hydrated/compiled copies. The indexer retains
 publish; generation keys carry their durable sequence so cleanup uses object
 listing rather than downloading large artifacts.
 
+indexer.buildMode defaults to full. Set it to incremental to patch the previous
+CSC generation from the durable WAL tail instead of rescanning the entire
+canonical adjacency. indexer.incrementalMinEdges keeps smaller indexes on the
+full path, and any unavailable or oversized tail safely falls back to a full
+rebuild.
+
 The development example references an existing MinIO Service only to exercise
 the S3-compatible path without AWS. The chart does not install MinIO, and the
 EKS example leaves the custom endpoint unset so production uses AWS S3 directly.
