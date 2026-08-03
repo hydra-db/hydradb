@@ -20,11 +20,18 @@ canonical-adjacency scan for every dirty edge type, however small the change.
 | 200k  | in-memory    | 254 ms                 | 176 ms               | 1.4x         | 100 vs 200k (2,005x fewer) |
 | 200k  | MinIO        | 263 ms                 | 520 ms               | **0.5x — slower** | 100 vs 200k (2,003x fewer) |
 | 1M    | in-memory    | 1,346 ms               | 914 ms               | 1.5x         | 100 vs 1M (10,003x fewer) |
-| 1M    | MinIO        | 10,458 ms              | 2,747 ms             | **3.8x**     | 100 vs 1M (10,003x fewer) |
+| 1M    | MinIO        | 10,458 ms              | 2,747 ms¹            | **3.8x**¹    | 100 vs 1M (10,003x fewer) |
 | 2M    | in-memory    | 2,862 ms               | 1,918 ms             | 1.5x         | 100 vs 2M (20,002x fewer) |
-| 2M    | MinIO        | 23,404 ms              | 5,550 ms             | **4.2x**     | 100 vs 2M (20,002x fewer) |
+| 2M    | MinIO        | 23,404 ms              | 5,550 ms¹            | **4.2x**¹    | 100 vs 2M (20,002x fewer) |
 | 5M    | in-memory    | 7,699 ms               | 5,560 ms             | 1.4x         | 100 vs 5M (50,002x fewer) |
-| 5M    | MinIO        | ~74,000 ms             | *fell back to full*  | —            | see WAL-retention finding below |
+| 5M    | MinIO (post-fix) | 62,395 ms          | 2,372 ms             | **26.3x**    | 100 vs 5M (50,002x fewer) |
+| 10M   | MinIO        | TBD                    | TBD                  | TBD          | TBD |
+| 10M   | in-memory    | TBD                    | TBD                  | TBD          | TBD |
+
+¹ Measured before the `last_wal_id` fix (`d4ae154`): those incremental builds silently walked
+the entire WAL directory every cycle (see the bug section below), so the incremental times are
+*overstated* and the true speedups are higher — the post-fix 5M incremental (2.4 s) already
+undercuts the pre-fix 2M number (5.5 s). Post-fix reruns pending.
 
 Two shapes fall out of the table:
 
@@ -137,34 +144,58 @@ previous behavior.
 Totals: incremental 16,681 ms vs full 23,097 ms (1.4x); 300 delta edges vs 15,000,588 scanned
 (50,002x fewer).
 
-### 5,000,000 edges — MinIO (3 cycles) — the WAL-retention finding
+### 5,000,000 edges — MinIO — the bug this run found (fixed in `d4ae154`)
 
-At this scale the incremental path **never ran**: `build_graph_index_auto` declined to the full
-path on all three cycles (baseline full build: 74.3 s; each cycle's full build ~60-75 s). The
-fallback itself is the designed behavior — correctness was never at risk, and in the indexer
-binary these cycles would surface as `graph_indexer_incremental_fallbacks` increments — but the
-*reason* is an operational interaction worth pinning down:
+On the first 5M MinIO run the incremental path **never engaged**: all three cycles declined to
+the full path (~60–75 s each). Root-causing it against the still-intact bucket found a real
+bug, not a tuning problem:
 
-SlateDB's WAL garbage collector retains WAL files for only **60 seconds** past the compacted
-boundary by default (`min_age = "60s"` in the upstream GC options — versus 86,400 s for every
-other object class). The incremental build needs the unbroken WAL chain
-`previous.last_wal_id + 1 ..= current`; `topology_tail_since` returns `Unavailable` the moment
-any file in that range has been collected. At 5M edges on MinIO, a full build takes ~74 s —
-longer than the WAL retention — so by the time each incremental attempt ran, the head of its
-tail chain was already collected, and the decline became self-sustaining: every fallback full
-build out-lasted the retention window again.
+The published manifest read `base_sequence=506, last_wal_id=0`. A **writer** snapshot carries
+no WAL position (`GraphStorageSnapshot::last_wal_id` returns `None` for the `Writer` arm), and
+both build paths fell back to `.unwrap_or(0)` — so every generation built through a writer
+handle recorded WAL position **zero**. A zero makes every later tail span the *entire* WAL
+history (`1..=current`, ~507 files here). That is silently correct while every file still
+exists — which is exactly why all in-memory tests and the smaller MinIO runs passed — but
+SlateDB's WAL GC retains WAL files for only 60 s past the compacted boundary
+(`min_age = "60s"` upstream), and by 5M scale it had collected most of the seed-era files (61
+of ~507 remained). One hole in the range and `topology_tail_since` correctly reports
+`Unavailable`, so the incremental build declined every cycle. The read-path overlay pays the
+same price on writer-built generations.
 
-This did not bite at 2M (full build 22 s < 60 s) and would not bite a steadily-polling indexer
-(default 5 s interval keeps the chain fresh). The exposure is: an edge type whose builds are
-spaced longer than the WAL retention — indexer downtime, a very bursty tenant, or a first
-build after enabling incremental mode at a scale where the full build itself exceeds 60 s.
-The system degrades to exactly the old behavior and says so in the fallback counter.
+The fix (`d4ae154`): capture `db.last_durable_wal_id()` *before* pinning the snapshot and use
+it when the snapshot carries no position. The order makes it sound — every entry durable in
+files at or below the captured id commits before the snapshot pins its sequence, so no entry
+with `seq > base_sequence` can live in a file `<= last_wal_id`. Generations already published
+with 0 self-heal: their next build falls back to full once and records a real position. A
+regression test (`writer_built_generations_record_the_wal_position`) pins the invariant and
+fails against the old code. The production indexer opens reader handles, whose snapshots carry
+a correct atomically-paired position, so it was never affected.
 
-**Mitigation for deployments running incremental mode at large scale:** raise SlateDB's WAL GC
-`min_age` above the worst-case full-build time plus the poll interval (e.g. 300 s). The graph
-kernel does not currently expose that knob through `GraphStorageConfig` — exposing it is a
-small follow-up. The phase-2 direction (delta-shaped generations diffing against the previous
-*payload* rather than the WAL) would remove the dependency on WAL retention entirely.
+Residual (and much smaller) WAL-retention exposure after the fix: if the gap between two
+builds of one edge type exceeds the WAL retention window (indexer downtime, a dormant-then-
+bursty tenant), the chain since the previous generation can still lose a file — the build
+falls back to full once, records a fresh position, and the chain resets. Worth a config knob
+for `min_age` in a follow-up; the phase-2 direction (delta-shaped generations diffing against
+the previous *payload*) removes the WAL dependency entirely.
+
+### 5,000,000 edges — MinIO, post-fix (3 cycles)
+
+With the fix, the same configuration that could never take the incremental path now runs it on
+every cycle — and because the tail is finally just the files written since the previous
+generation (two per cycle) instead of the whole directory, the incremental build is close to
+scale-flat:
+
+| cycle | delta_edges | full_edges | incr_ms | full_ms | speedup |
+|------:|------------:|-----------:|--------:|--------:|--------:|
+| 0 | 100 | 5,000,098 | 2,365 | 62,539 | 26.4x |
+| 1 | 100 | 5,000,196 | 2,351 | 62,351 | 26.5x |
+| 2 | 100 | 5,000,294 | 2,401 | 62,295 | 25.9x |
+
+Totals: incremental 7,117 ms vs full 187,185 ms (**26.3x**); 300 delta edges vs 15,000,588
+scanned (50,002x fewer). Baseline full build: 62.9 s — the per-cycle price of the previous
+behavior at this scale.
+
+### 10,000,000 edges — TBD (runs in progress)
 
 ## What bounds the incremental path
 
