@@ -36,6 +36,8 @@ data:
   GRAPH_INDEX_DISCOVERY_INTERVAL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.indexDiscoveryIntervalMs | quote }}
   GRAPH_INDEXER_INTERVAL_MS: {{ include "turbolay.decimalInteger" .Values.indexer.intervalMs | quote }}
   GRAPH_INDEXER_RETAIN_PREVIOUS: {{ include "turbolay.decimalInteger" .Values.indexer.retainPreviousGenerations | quote }}
+  GRAPH_INDEXER_BUILD_MODE: {{ .Values.indexer.buildMode | quote }}
+  GRAPH_INDEXER_INCREMENTAL_MIN_EDGES: {{ include "turbolay.decimalInteger" .Values.indexer.incrementalMinEdges | quote }}
   GRAPH_INDEXER_ADMIN_ADDR: "0.0.0.0:9091"
   GRAPH_BOLT_ADDR: 0.0.0.0:7687
   GRAPH_HTTP_ADDR: 0.0.0.0:8443

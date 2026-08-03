@@ -196,12 +196,14 @@
     },
     "indexerWorkload": {
       "type": "object",
-      "required": ["enabled", "replicaCount", "intervalMs", "retainPreviousGenerations", "resources", "serviceAccount"],
+      "required": ["enabled", "replicaCount", "intervalMs", "retainPreviousGenerations", "buildMode", "incrementalMinEdges", "resources", "serviceAccount"],
       "properties": {
         "enabled": { "type": "boolean" },
         "replicaCount": { "type": "integer", "minimum": 1, "maximum": 100 },
         "intervalMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "retainPreviousGenerations": { "$ref": "#/definitions/unsignedDecimal" },
+        "buildMode": { "enum": ["full", "incremental"] },
+        "incrementalMinEdges": { "$ref": "#/definitions/unsignedDecimal" },
         "resources": { "type": "object" },
         "serviceAccount": { "type": "object" },
         "podAnnotations": { "type": "object" },
