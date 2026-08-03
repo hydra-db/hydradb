@@ -686,8 +686,15 @@ Four steps move a generation through its life cycle. All the durable logic lives
 - *Build & publish* — `build_graph_index(cell_id, edge_type)` takes an artifact-build permit,
   snapshots at the current `base_sequence`, folds the canonical adjacency into a GraphBLAS CSC
   matrix, checksums it, names the generation by its SHA-256, and publishes the manifest with a
-  compare-and-set retry loop (`INDEX_PUBLISH_ATTEMPTS = 8`). Publication is atomic: a reader
-  sees either the old generation or the new one, never a torn write.
+  compare-and-set retry loop (`INDEX_PUBLISH_ATTEMPTS = 8`). Under
+  `GRAPH_INDEXER_BUILD_MODE=incremental` the indexer calls `build_graph_index_auto` instead,
+  which patches the *previous* generation rather than re-folding the whole adjacency: it decodes
+  the previous CSC, asks `topology_tail_since` for the final-state `(src, dst, exists)` delta
+  written since that generation, applies it, and re-encodes — declining back to the full scan
+  whenever it cannot proceed (no previous generation, the previous generation's CSC payload
+  missing from the store, the WAL tail no longer available, or the tail oversized). Both paths
+  publish identically, and publication is atomic: a reader sees either the old generation or
+  the new one, never a torn write.
 - *Hydrate & overlay* — `matrix_cache.rs` is read-through: on a miss it hydrates the current
   generation's CSC into the shard's matrix caches (taking the `matrix_compilation_gate` for the
   compiled form). Because a read pins a sequence that may be *ahead* of the generation's
@@ -749,8 +756,10 @@ read/write path builds generations anymore; the data node only *consumes* them.
 
 `graph-indexer` is a small loop. It reads its configuration from the environment — the data
 path, the cells to index, a poll interval (`GRAPH_INDEXER_INTERVAL_MS`, default 5000), how many
-previous generations to retain (`GRAPH_INDEXER_RETAIN_PREVIOUS`, default 1), and an admin
-address (`GRAPH_INDEXER_ADMIN_ADDR`, default `0.0.0.0:9091`) — and exposes an admin HTTP server
+previous generations to retain (`GRAPH_INDEXER_RETAIN_PREVIOUS`, default 1), a build mode
+(`GRAPH_INDEXER_BUILD_MODE`, `full` or `incremental`, default `full`), the incremental size
+floor (`GRAPH_INDEXER_INCREMENTAL_MIN_EDGES`, default 250000), and an admin address
+(`GRAPH_INDEXER_ADMIN_ADDR`, default `0.0.0.0:9091`) — and exposes an admin HTTP server
 with `/livez`, `/readyz`, and a Prometheus `/metrics` endpoint.
 
 The environment names one root scope, but the indexer does not index only that scope. Data
@@ -787,8 +796,23 @@ Within each opened scope, for every cell:
 + `refresh_storage_sequence` to catch up the reader to the latest durable write;
 + `dirty_graph_index_edge_types` to find which edge types have drifted;
 + for each dirty edge type, compare the current generation's `base_sequence` against the dirty
-  sequence and, if the generation is stale, `build_graph_index` to publish a fresh one;
+  sequence and, if the generation is stale, publish a fresh one — the full scan by default, or,
+  in incremental mode and at or above the size floor, the WAL-tail patch
+  (`build_graph_index_auto`), which falls back to the full scan when it cannot proceed;
 + `gc_graph_index_generations` to prune superseded generations beyond the retained count.
+
+The build in step 3 has two shapes. The default is the full scan: every dirty edge type
+re-reads the whole canonical adjacency, however small the change that dirtied it. In
+incremental mode the indexer patches the previous generation with the WAL tail instead, so the
+work tracks the delta rather than the graph — at a million edges and a hundred changed per
+cycle, that is a ten-thousand-fold drop in edges touched per build. The size floor exists
+because small graphs invert the trade: a graph that fits the block cache full-scans at memory
+speed, while the incremental path still decodes and re-encodes the whole previous CSC payload,
+so below `GRAPH_INDEXER_INCREMENTAL_MIN_EDGES` the indexer deliberately keeps the full path.
+Three Prometheus counters keep the choice observable: `graph_indexer_full_build_edges` and
+`graph_indexer_incremental_delta_edges` count the work each path actually did, and
+`graph_indexer_incremental_fallbacks` counts every time the incremental path declined and the
+full scan ran in its place.
 
 #custom-box(title: [Why], icon: "tip")[
   Separating the builder from the data node is compute–compute separation: index building can
