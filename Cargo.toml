@@ -70,6 +70,7 @@ tokio-rustls = "0.26"
 tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+ulid = "1"
 
 [package]
 name = "slatedb-graph-kernel"
@@ -205,6 +206,7 @@ subtle = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
 turbolay-placement = { path = "crates/placement" }
+ulid = { workspace = true }
 # Optional, because only `src/bin/` uses it: the library half of this package
 # emits through the plain `tracing` facade and must keep compiling — and
 # testing — with no subscriber crate in sight. `server-runtime` and

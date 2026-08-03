@@ -2827,6 +2827,7 @@ dependencies = [
  "tracing-subscriber",
  "turbolay-placement",
  "turbolay-telemetry",
+ "ulid",
 ]
 
 [[package]]

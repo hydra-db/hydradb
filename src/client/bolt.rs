@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
+use ulid::Ulid;
 
 use tracing::Instrument;
 
@@ -62,6 +63,7 @@ const DEFAULT_BOLT_PREFETCH_ROWS: usize = 256;
 const DEFAULT_BOLT_MAX_PIPELINED_MESSAGES: usize = 8;
 const MAX_BOLT_PIPELINE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 const BOLT_MAX_PACKSTREAM_DEPTH: usize = 32;
+const MAX_BOLT_MUTATION_IDEMPOTENCY_KEY_LEN: usize = 128;
 
 static NEXT_BOLT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1331,6 +1333,13 @@ fn bolt_query_request(
         .collect::<std::result::Result<BTreeMap<_, _>, BoltError>>()?;
     let mut request =
         ClientQueryRequest::new(target, query_id, query).with_query_parameters(parameters);
+    request = match bolt_mutation_idempotency_key(extra)? {
+        Some(caller_key) => request.with_mutation_idempotency_key(caller_key),
+        None => request.with_server_generated_mutation_idempotency_key(format!(
+            "bolt-mutation-v1-{}",
+            Ulid::new()
+        )),
+    };
     match extra.get("tx_timeout") {
         Some(BoltValue::Integer(timeout_ms)) => {
             request = request.with_timeout_ms(u64::try_from(*timeout_ms).map_err(|_| {
@@ -1370,19 +1379,22 @@ const TX_METADATA_CORRELATION_ID: &str = "turbolay.correlation_id";
 /// a multi-step workflow issued this query.
 const TX_METADATA_CALLER_STEP: &str = "turbolay.caller.step";
 
+/// Optional caller-owned mutation identity. A caller that retries the same
+/// logical write must preserve this value across attempts. When absent, Bolt
+/// generates a globally unique identity for this RUN request.
+const TX_METADATA_IDEMPOTENCY_KEY: &str = "turbolay.idempotency_key";
+
 /// Every `tx_metadata` key Turbolay reads.
 ///
-/// The dict arrives from any Bolt client and everything taken out of it becomes
-/// a span attribute and a log field, so the read is an allowlist rather than a
-/// pass-through: an unrecognised key is dropped, never forwarded.
-///
-/// `traceparent` is the W3C Trace Context header, added by Step 5b. It is the
-/// last key this channel is expected to carry; anything else needs the same
-/// argument made again from scratch.
+/// The dict arrives from any Bolt client, so each recognized value has a
+/// dedicated parser and an unrecognized key is dropped rather than forwarded.
+/// Correlation fields become telemetry, traceparent sets remote trace context,
+/// and the idempotency key controls durable write deduplication.
 const TX_METADATA_ALLOWLIST: &[&str] = &[
     TX_METADATA_CONSISTENCY,
     TX_METADATA_CORRELATION_ID,
     TX_METADATA_CALLER_STEP,
+    TX_METADATA_IDEMPOTENCY_KEY,
     TX_METADATA_TRACEPARENT,
 ];
 
@@ -1446,6 +1458,34 @@ fn bolt_caller_metadata(extra: &BoltDict) -> std::result::Result<BoltCallerMetad
         correlation_id: allowlisted_caller_value(metadata, TX_METADATA_CORRELATION_ID),
         caller_step: allowlisted_caller_value(metadata, TX_METADATA_CALLER_STEP),
     })
+}
+
+fn bolt_mutation_idempotency_key(
+    extra: &BoltDict,
+) -> std::result::Result<Option<String>, BoltError> {
+    let Some(metadata) = bolt_tx_metadata(extra)? else {
+        return Ok(None);
+    };
+    let Some(value) = metadata.get(TX_METADATA_IDEMPOTENCY_KEY) else {
+        return Ok(None);
+    };
+    let BoltValue::String(value) = value else {
+        return Err(BoltError::Query {
+            code: "Neo.ClientError.Statement.TypeError".to_string(),
+            message: format!("{TX_METADATA_IDEMPOTENCY_KEY} must be a string"),
+        });
+    };
+    if value.len() > MAX_BOLT_MUTATION_IDEMPOTENCY_KEY_LEN
+        || crate::validate_component("mutation_idempotency_key", value).is_err()
+    {
+        return Err(BoltError::Query {
+            code: "Neo.ClientError.Statement.ArgumentError".to_string(),
+            message: format!(
+                "{TX_METADATA_IDEMPOTENCY_KEY} must be 1-{MAX_BOLT_MUTATION_IDEMPOTENCY_KEY_LEN} ASCII letters, digits, '.', '_' or '-'"
+            ),
+        });
+    }
+    Ok(Some(format!("bolt-caller-v1-{value}")))
 }
 
 /// The caller's W3C trace context, if it sent a well-formed one.
@@ -1917,6 +1957,78 @@ mod caller_metadata_tests {
 
     fn string(value: &str) -> BoltValue {
         BoltValue::String(value.to_string())
+    }
+
+    fn request(extra: BoltDict) -> ClientQueryRequest {
+        bolt_query_request(
+            ClientQueryTarget::new(GraphScope::default(), "cell-0").unwrap(),
+            "bolt-2-query-459".to_string(),
+            "RETURN 1".to_string(),
+            BoltDict::new(),
+            &extra,
+        )
+        .expect("valid Bolt request")
+    }
+
+    #[test]
+    fn reused_process_local_query_ids_get_distinct_durable_mutation_ids() {
+        let first = request(BoltDict::new());
+        let second = request(BoltDict::new());
+
+        assert_eq!(first.query_id, second.query_id);
+        let first_key = first
+            .mutation_idempotency_key()
+            .expect("Bolt always assigns a mutation key");
+        let second_key = second
+            .mutation_idempotency_key()
+            .expect("Bolt always assigns a mutation key");
+        assert_ne!(first_key, second_key);
+        for key in [first_key, second_key] {
+            let encoded = key
+                .strip_prefix("bolt-mutation-v1-")
+                .expect("generated keys use the versioned namespace");
+            encoded
+                .parse::<Ulid>()
+                .expect("generated key contains a ULID");
+        }
+    }
+
+    #[test]
+    fn caller_mutation_id_is_stable_across_bolt_retries() {
+        let extra = tx_metadata([(
+            TX_METADATA_IDEMPOTENCY_KEY,
+            string("graph-sink-activity-8-attempt-1"),
+        )]);
+        let first = request(extra.clone());
+        let second = request(extra);
+
+        assert_eq!(
+            first.mutation_idempotency_key(),
+            Some("bolt-caller-v1-graph-sink-activity-8-attempt-1")
+        );
+        assert_eq!(
+            first.mutation_idempotency_key(),
+            second.mutation_idempotency_key()
+        );
+    }
+
+    #[test]
+    fn invalid_caller_mutation_ids_are_rejected_instead_of_silently_rekeyed() {
+        for value in ["", "contains spaces", "contains/slash"] {
+            let error = request_result(tx_metadata([(TX_METADATA_IDEMPOTENCY_KEY, string(value))]))
+                .expect_err("invalid mutation id must fail the request");
+            assert!(matches!(error, BoltError::Query { .. }));
+        }
+    }
+
+    fn request_result(extra: BoltDict) -> std::result::Result<ClientQueryRequest, BoltError> {
+        bolt_query_request(
+            ClientQueryTarget::new(GraphScope::default(), "cell-0").unwrap(),
+            "bolt-2-query-459".to_string(),
+            "RETURN 1".to_string(),
+            BoltDict::new(),
+            &extra,
+        )
     }
 
     #[test]
