@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use futures::FutureExt;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::query::coordination::{
@@ -473,8 +474,28 @@ impl ClientQuerySession {
 }
 
 #[derive(Clone, Debug)]
+enum ClientMutationIdempotencyKey {
+    /// Minted by this server and therefore globally unique without a caller
+    /// namespace.
+    ServerGenerated(String),
+    /// Chosen by an authenticated caller and scoped to that principal before
+    /// it enters the cell's durable idempotency namespace.
+    CallerSupplied(String),
+}
+
+impl ClientMutationIdempotencyKey {
+    fn value(&self) -> &str {
+        match self {
+            Self::ServerGenerated(value) | Self::CallerSupplied(value) => value,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ClientQueryRequest {
     pub target: ClientQueryTarget,
+    /// Ephemeral request handle used for cancellation, cursor ownership, and
+    /// response correlation. It is not a durable mutation identity.
     pub query_id: String,
     pub query: String,
     pub parameters: BTreeMap<String, QueryParameterValue>,
@@ -482,6 +503,12 @@ pub struct ClientQueryRequest {
     pub max_runtime_ms: Option<u64>,
     pub bookmark: Option<ClientBookmark>,
     pub consistency: ClientReadConsistency,
+    /// Stable identity for durable mutation deduplication, including whether
+    /// the server or an authenticated caller chose it. Caller-owned values are
+    /// principal-scoped by `query_context`; generated values already carry
+    /// global uniqueness. Other transports retain the historical query-id
+    /// fallback when this field is absent.
+    mutation_idempotency_key: Option<ClientMutationIdempotencyKey>,
     /// Caller-supplied request identifier, carried through from Bolt
     /// `tx_metadata` (`turbolay.correlation_id`). It exists so a Turbolay span
     /// and the caller's own log line share a field; Turbolay never mints one,
@@ -541,6 +568,7 @@ impl ClientQueryRequest {
             max_runtime_ms: None,
             bookmark: None,
             consistency: ClientReadConsistency::Causal,
+            mutation_idempotency_key: None,
             correlation_id: None,
             caller_step: None,
         }
@@ -589,6 +617,34 @@ impl ClientQueryRequest {
     pub fn strong(mut self) -> Self {
         self.consistency = ClientReadConsistency::Strong;
         self
+    }
+
+    /// Attach a caller-owned retry identity. The service binds this value to
+    /// the authenticated principal before using it for durable deduplication.
+    pub fn with_mutation_idempotency_key(
+        mut self,
+        mutation_idempotency_key: impl Into<String>,
+    ) -> Self {
+        self.mutation_idempotency_key = Some(ClientMutationIdempotencyKey::CallerSupplied(
+            mutation_idempotency_key.into(),
+        ));
+        self
+    }
+
+    pub(crate) fn with_server_generated_mutation_idempotency_key(
+        mut self,
+        mutation_idempotency_key: impl Into<String>,
+    ) -> Self {
+        self.mutation_idempotency_key = Some(ClientMutationIdempotencyKey::ServerGenerated(
+            mutation_idempotency_key.into(),
+        ));
+        self
+    }
+
+    pub(crate) fn mutation_idempotency_key(&self) -> Option<&str> {
+        self.mutation_idempotency_key
+            .as_ref()
+            .map(ClientMutationIdempotencyKey::value)
     }
 
     /// Attach the caller's correlation id. Invalid values are dropped rather
@@ -1243,6 +1299,7 @@ impl ClientQueryService {
                     self.validate_bookmark(&request).await?;
                     self.refresh_strong_read(&request, action).await?;
                     let mut context = query_context(
+                        session,
                         &request,
                         scalar_parameters.clone(),
                         cancellation_token.clone(),
@@ -1408,6 +1465,7 @@ impl ClientQueryService {
                             .await;
                     }
                     let mut context = query_context(
+                        session,
                         &request,
                         scalar_parameters.clone(),
                         cancellation_token.clone(),
@@ -1777,6 +1835,9 @@ impl ClientQueryService {
     ) -> Result<()> {
         validate_component("cell_id", &request.target.cell_id)?;
         validate_component("query_id", &request.query_id)?;
+        if let Some(mutation_idempotency_key) = request.mutation_idempotency_key() {
+            validate_component("mutation_idempotency_key", mutation_idempotency_key)?;
+        }
         if request.query.is_empty() {
             return Err(GraphError::QueryParse {
                 dialect: "OpenCypher",
@@ -2276,11 +2337,19 @@ fn result_storage_sequence(
 }
 
 fn query_context(
+    session: &ClientQuerySession,
     request: &ClientQueryRequest,
     parameters: BTreeMap<String, VertexPropertyValue>,
     cancellation_token: QueryCancellationToken,
 ) -> QueryContext {
-    let mut context = QueryContext::new(&request.target.cell_id, &request.query_id)
+    let mutation_idempotency_key = match request.mutation_idempotency_key.as_ref() {
+        Some(ClientMutationIdempotencyKey::ServerGenerated(value)) => value.clone(),
+        Some(ClientMutationIdempotencyKey::CallerSupplied(value)) => {
+            principal_scoped_mutation_idempotency_key(session.principal(), value)
+        }
+        None => request.query_id.clone(),
+    };
+    let mut context = QueryContext::new(&request.target.cell_id, mutation_idempotency_key)
         .in_scope(request.target.scope.clone())
         .with_parameters(parameters)
         .with_cancellation_token(cancellation_token);
@@ -2294,6 +2363,21 @@ fn query_context(
         context = context.with_refreshed_reader();
     }
     context
+}
+
+fn principal_scoped_mutation_idempotency_key(
+    principal: &QueryTransportPrincipal,
+    caller_key: &str,
+) -> String {
+    // QueryTransportPrincipal already contains only a one-way bearer-token hash
+    // or an mTLS certificate fingerprint. Hash it once more so the durable key
+    // reveals neither principal kind nor identifier while remaining stable on
+    // every node and after process restarts.
+    let principal_digest = Sha256::digest(principal.as_str().as_bytes());
+    format!(
+        "principal-v1-{}-{caller_key}",
+        URL_SAFE_NO_PAD.encode(principal_digest)
+    )
 }
 
 fn scalar_query_parameters(

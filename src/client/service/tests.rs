@@ -352,6 +352,91 @@ fn target() -> ClientQueryTarget {
     ClientQueryTarget::new(GraphScope::default(), "cell-a").unwrap()
 }
 
+fn session(token: &str) -> ClientQuerySession {
+    ClientQuerySession {
+        principal: QueryTransportPrincipal::from_bearer_token(token).unwrap(),
+    }
+}
+
+#[test]
+fn query_context_separates_mutation_identity_from_the_query_handle() {
+    let request = ClientQueryRequest::new(
+        target(),
+        "bolt-2-query-459",
+        "UNWIND $rows AS row RETURN row",
+    )
+    .with_server_generated_mutation_idempotency_key("bolt-mutation-v1-01K00000000000000000000000");
+
+    let context = query_context(
+        &session("caller-a"),
+        &request,
+        BTreeMap::new(),
+        QueryCancellationToken::new(),
+    );
+
+    assert_eq!(request.query_id, "bolt-2-query-459");
+    assert_eq!(
+        context.idempotency_key,
+        "bolt-mutation-v1-01K00000000000000000000000"
+    );
+}
+
+#[test]
+fn query_context_keeps_the_legacy_fallback_for_non_bolt_callers() {
+    let request = ClientQueryRequest::new(target(), "transport-request-7", "RETURN 1");
+    let context = query_context(
+        &session("caller-a"),
+        &request,
+        BTreeMap::new(),
+        QueryCancellationToken::new(),
+    );
+
+    assert_eq!(context.idempotency_key, "transport-request-7");
+}
+
+#[test]
+fn caller_mutation_identity_is_stable_within_one_principal() {
+    let request = ClientQueryRequest::new(target(), "query-1", "RETURN 1")
+        .with_mutation_idempotency_key("bolt-caller-v1-retry-42");
+
+    let first = query_context(
+        &session("caller-a"),
+        &request,
+        BTreeMap::new(),
+        QueryCancellationToken::new(),
+    );
+    let second = query_context(
+        &session("caller-a"),
+        &request,
+        BTreeMap::new(),
+        QueryCancellationToken::new(),
+    );
+
+    assert_eq!(first.idempotency_key, second.idempotency_key);
+    assert!(first.idempotency_key.ends_with("-bolt-caller-v1-retry-42"));
+}
+
+#[test]
+fn identical_caller_mutation_ids_are_isolated_between_principals() {
+    let request = ClientQueryRequest::new(target(), "query-1", "RETURN 1")
+        .with_mutation_idempotency_key("bolt-caller-v1-retry-42");
+
+    let first = query_context(
+        &session("caller-a"),
+        &request,
+        BTreeMap::new(),
+        QueryCancellationToken::new(),
+    );
+    let second = query_context(
+        &session("caller-b"),
+        &request,
+        BTreeMap::new(),
+        QueryCancellationToken::new(),
+    );
+
+    assert_ne!(first.idempotency_key, second.idempotency_key);
+}
+
 fn service() -> ClientQueryService {
     let authorizer = StaticQueryTransportScopeAuthorizer::new()
         .with_bearer_grant(
