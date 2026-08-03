@@ -209,6 +209,7 @@ pub(crate) fn validate_edge_mutations_for_cell(
             return Err(GraphError::IdempotencyConflict {
                 operation: "create",
                 idempotency_key: mutation.idempotency_key.clone(),
+                reason: "the same key appears twice in one batch",
             });
         }
     }
@@ -680,6 +681,7 @@ pub(crate) fn decode_segment_compaction_idempotency(
         return Err(GraphError::IdempotencyConflict {
             operation: "segment-compact",
             idempotency_key: idempotency_key.to_string(),
+            reason: "the stored record names a different key",
         });
     }
     let recorded_epoch = parse_u64(key, parts[1], "compacted_through_epoch")?;
@@ -687,6 +689,7 @@ pub(crate) fn decode_segment_compaction_idempotency(
         return Err(GraphError::IdempotencyConflict {
             operation: "segment-compact",
             idempotency_key: idempotency_key.to_string(),
+            reason: "a stored result for this key compacted through a different epoch",
         });
     }
     Ok(SegmentCompactionResult {
@@ -907,10 +910,18 @@ pub(crate) fn decode_bulk_import_idempotency(
             reason: "expected bulk_import1 record with 7 fields".to_string(),
         });
     }
-    if parts[6] != idempotency_key || parse_u64(key, parts[5], "fingerprint")? != fingerprint {
+    if parts[6] != idempotency_key {
         return Err(GraphError::IdempotencyConflict {
             operation: "bulk-import",
             idempotency_key: idempotency_key.to_string(),
+            reason: "the stored record names a different key",
+        });
+    }
+    if parse_u64(key, parts[5], "fingerprint")? != fingerprint {
+        return Err(GraphError::IdempotencyConflict {
+            operation: "bulk-import",
+            idempotency_key: idempotency_key.to_string(),
+            reason: "this key already stored a result for a different payload",
         });
     }
     Ok(BulkImportResult {
@@ -938,10 +949,24 @@ pub(crate) fn decode_relationship_import_idempotency(
             reason: "expected relationship_import1 record with 9 fields".to_string(),
         });
     }
-    if parts[8] != idempotency_key || parse_u64(key, parts[7], "fingerprint")? != fingerprint {
+    // Split from one `||` into two arms so the reason can name which half
+    // failed. The second is the signature of a caller whose keys are not
+    // derived from what it is writing: the key replayed, a stored result came
+    // back, and it was produced by a different set of relationships. The first
+    // cannot happen through `keys::idempotency` — that path *is* the key — so
+    // it means the slot holds another request's record.
+    if parts[8] != idempotency_key {
         return Err(GraphError::IdempotencyConflict {
             operation: "relationship-import",
             idempotency_key: idempotency_key.to_string(),
+            reason: "the stored record names a different key",
+        });
+    }
+    if parse_u64(key, parts[7], "fingerprint")? != fingerprint {
+        return Err(GraphError::IdempotencyConflict {
+            operation: "relationship-import",
+            idempotency_key: idempotency_key.to_string(),
+            reason: "this key already stored a result for a different payload",
         });
     }
     Ok(RelationshipImportResult {
@@ -984,6 +1009,7 @@ pub(crate) fn decode_relationship_create_idempotency(
         return Err(GraphError::IdempotencyConflict {
             operation: "relationship-create",
             idempotency_key: mutation.idempotency_key.clone(),
+            reason: "this key already stored a result for a different edge or payload",
         });
     }
     Ok(RelationshipCreateResult {
@@ -1044,6 +1070,7 @@ pub(crate) fn decode_relationship_delete_idempotency(
         return Err(GraphError::IdempotencyConflict {
             operation: "relationship-delete",
             idempotency_key: mutation.idempotency_key.clone(),
+            reason: "this key already stored a result for a different relationship",
         });
     }
     Ok(DeleteResult {
@@ -1074,6 +1101,7 @@ pub(crate) fn decode_vertex_delete_idempotency(
         return Err(GraphError::IdempotencyConflict {
             operation: "vertex-delete",
             idempotency_key: idempotency_key.to_string(),
+            reason: "this key already stored a result for a different vertex",
         });
     }
     Ok(VertexDeleteResult {
@@ -1105,6 +1133,7 @@ pub(crate) fn decode_cell_drop_idempotency(
         return Err(GraphError::IdempotencyConflict {
             operation: "cell-drop",
             idempotency_key: idempotency_key.to_string(),
+            reason: "this key already stored a result for a different cell",
         });
     }
     Ok(GraphCellDropResult {
@@ -1159,6 +1188,7 @@ pub(crate) fn ensure_idempotent_edge(
         return Err(GraphError::IdempotencyConflict {
             operation,
             idempotency_key: mutation.idempotency_key.clone(),
+            reason: "this key already stored a result for a different edge",
         });
     }
     Ok(())
