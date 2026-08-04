@@ -13,6 +13,7 @@ use crate::{
 type AstNode = sys::cypher_astnode_t;
 
 const PARSED_CYPHER_THREAD_CACHE_CAPACITY: usize = 32;
+const MAX_TOP_LEVEL_UNION_ARMS: usize = 256;
 #[cfg(feature = "client-api")]
 const UPDATE_IF_NEWER_MARKER: &str = "__turbolay_update_if_newer_by";
 #[cfg(feature = "client-api")]
@@ -276,6 +277,13 @@ pub fn parse_opencypher_row_query_with_parameters(
     query: &str,
     parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<ParsedRowQuery> {
+    if query_might_contain_union(query) {
+        if let Some(union) = split_top_level_union(query)? {
+            return with_parsed_cypher_union(query, &union, |arms, union_all| {
+                lower_independently_parsed_union_arms(arms, union_all, parameters)
+            });
+        }
+    }
     with_parsed_cypher(query, |parsed| parsed.lower_row_query(parameters))
 }
 
@@ -312,6 +320,18 @@ fn starts_with_non_unwind_clause(query: &str) -> bool {
 }
 
 pub(crate) fn classify_opencypher_query_access(query: &str) -> Result<OpenCypherQueryAccess> {
+    if query_might_contain_union(query) {
+        if let Some(union) = split_top_level_union(query)? {
+            return with_parsed_cypher_union(query, &union, |arms, _| {
+                for arm in arms {
+                    if arm.query_access()? != OpenCypherQueryAccess::Read {
+                        return unsupported("UNION only supports read queries");
+                    }
+                }
+                Ok(OpenCypherQueryAccess::Read)
+            });
+        }
+    }
     with_parsed_cypher(query, ParsedCypher::query_access)
 }
 
@@ -324,9 +344,228 @@ struct ParsedCypherEntry {
     fingerprint: String,
 }
 
+struct ParsedCypherUnionEntry {
+    query: String,
+    arms: Vec<ParsedCypher>,
+    union_all: bool,
+    fingerprint: String,
+}
+
 #[derive(Default)]
 struct ParsedCypherThreadCache {
     entries: VecDeque<ParsedCypherEntry>,
+}
+
+#[derive(Default)]
+struct ParsedCypherUnionThreadCache {
+    entries: VecDeque<ParsedCypherUnionEntry>,
+}
+
+thread_local! {
+    static PARSED_CYPHER_UNION_THREAD_CACHE: RefCell<ParsedCypherUnionThreadCache> =
+        RefCell::new(ParsedCypherUnionThreadCache::default());
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TopLevelUnion<'a> {
+    arms: Vec<&'a str>,
+    union_all: bool,
+}
+
+#[inline]
+fn query_might_contain_union(query: &str) -> bool {
+    query.as_bytes().windows(5).any(|window| {
+        window[0].eq_ignore_ascii_case(&b'U')
+            && window[1].eq_ignore_ascii_case(&b'N')
+            && window[2].eq_ignore_ascii_case(&b'I')
+            && window[3].eq_ignore_ascii_case(&b'O')
+            && window[4].eq_ignore_ascii_case(&b'N')
+    })
+}
+
+// libcypher-parser rejects otherwise valid statements once detailed path
+// projections are repeated across enough UNION arms. Segment only lexical
+// top-level separators, then let libcypher-parser validate every complete arm.
+fn split_top_level_union(query: &str) -> Result<Option<TopLevelUnion<'_>>> {
+    let bytes = query.as_bytes();
+    let mut separators = Vec::new();
+    let mut delimiters = Vec::new();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' | b'`' => {
+                index = skip_quoted_cypher_token(bytes, index);
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index = skip_line_comment(bytes, index + 2);
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index = skip_block_comment(bytes, index + 2);
+            }
+            b'(' | b'[' | b'{' => {
+                delimiters.push(bytes[index]);
+                index += 1;
+            }
+            b')' | b']' | b'}' => {
+                if delimiters.last().is_some_and(|open| {
+                    matches!(
+                        (*open, bytes[index]),
+                        (b'(', b')') | (b'[', b']') | (b'{', b'}')
+                    )
+                }) {
+                    delimiters.pop();
+                }
+                index += 1;
+            }
+            current if delimiters.is_empty() && is_cypher_identifier_start(current) => {
+                let end = scan_cypher_identifier(bytes, index);
+                if query[index..end].eq_ignore_ascii_case("UNION")
+                    && is_union_separator_token(bytes, index, end)
+                {
+                    let mut separator_end = end;
+                    let next = skip_cypher_trivia(bytes, end);
+                    let union_all = if bytes
+                        .get(next)
+                        .is_some_and(|value| is_cypher_identifier_start(*value))
+                    {
+                        let next_end = scan_cypher_identifier(bytes, next);
+                        if query[next..next_end].eq_ignore_ascii_case("ALL") {
+                            separator_end = next_end;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    separators.push((index, separator_end, union_all));
+                    if separators.len() >= MAX_TOP_LEVEL_UNION_ARMS {
+                        return unsupported(format!(
+                            "UNION exceeds the {MAX_TOP_LEVEL_UNION_ARMS}-arm query limit"
+                        ));
+                    }
+                    index = separator_end;
+                } else {
+                    index = end;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+
+    if separators.is_empty() {
+        return Ok(None);
+    }
+    let union_all = separators[0].2;
+    if separators.iter().any(|separator| separator.2 != union_all) {
+        return unsupported("mixing UNION and UNION ALL is not executable in Query engine");
+    }
+
+    let mut arms = Vec::with_capacity(separators.len() + 1);
+    let mut start = 0;
+    for (separator_start, separator_end, _) in separators {
+        let arm = query[start..separator_start].trim();
+        if arm.is_empty() {
+            return Err(parse_error("UNION requires a query before it"));
+        }
+        arms.push(arm);
+        start = separator_end;
+    }
+    let final_arm = query[start..].trim();
+    if final_arm.is_empty() {
+        return Err(parse_error("UNION requires a query after it"));
+    }
+    arms.push(final_arm);
+    Ok(Some(TopLevelUnion { arms, union_all }))
+}
+
+fn is_union_separator_token(bytes: &[u8], start: usize, end: usize) -> bool {
+    let previous = bytes[..start]
+        .iter()
+        .rev()
+        .copied()
+        .find(|value| !value.is_ascii_whitespace());
+    let next = bytes[end..]
+        .iter()
+        .copied()
+        .find(|value| !value.is_ascii_whitespace());
+    !previous.is_some_and(|value| matches!(value, b'$' | b'.' | b':')) && next != Some(b'.')
+}
+
+fn is_cypher_identifier_start(value: u8) -> bool {
+    value.is_ascii_alphabetic() || value == b'_'
+}
+
+fn is_cypher_identifier_continue(value: u8) -> bool {
+    is_cypher_identifier_start(value) || value.is_ascii_digit()
+}
+
+fn scan_cypher_identifier(bytes: &[u8], mut index: usize) -> usize {
+    while bytes
+        .get(index)
+        .is_some_and(|value| is_cypher_identifier_continue(*value))
+    {
+        index += 1;
+    }
+    index
+}
+
+fn skip_quoted_cypher_token(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[index] == quote {
+            if bytes.get(index + 1) == Some(&quote) {
+                index += 2;
+                continue;
+            }
+            return index + 1;
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
+fn skip_line_comment(bytes: &[u8], mut index: usize) -> usize {
+    while bytes.get(index).is_some_and(|value| *value != b'\n') {
+        index += 1;
+    }
+    index
+}
+
+fn skip_block_comment(bytes: &[u8], mut index: usize) -> usize {
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+            return index + 2;
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
+fn skip_cypher_trivia(bytes: &[u8], mut index: usize) -> usize {
+    loop {
+        while bytes
+            .get(index)
+            .is_some_and(|value| value.is_ascii_whitespace())
+        {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'/') {
+            index = skip_line_comment(bytes, index + 2);
+            continue;
+        }
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+            index = skip_block_comment(bytes, index + 2);
+            continue;
+        }
+        return index;
+    }
 }
 
 fn with_parsed_cypher<T>(
@@ -382,6 +621,60 @@ fn with_parsed_cypher<T>(
     })
 }
 
+fn with_parsed_cypher_union<T>(
+    query: &str,
+    union: &TopLevelUnion<'_>,
+    operation: impl FnOnce(&[ParsedCypher], bool) -> Result<T>,
+) -> Result<T> {
+    let span = tracing::info_span!(
+        "query.parse",
+        turbolay.query.fingerprint = tracing::field::Empty,
+        parse_cache_hit = tracing::field::Empty,
+        error.class = tracing::field::Empty,
+        turbolay.sampling.tail_keep = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    // Cache by the original statement so segmentation does not turn one hot
+    // batched query into a parse-cache entry for every arm.
+    PARSED_CYPHER_UNION_THREAD_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(index) = cache.entries.iter().position(|entry| entry.query == query) {
+            let entry = cache
+                .entries
+                .remove(index)
+                .expect("cached Cypher UNION entry exists at the located index");
+            cache.entries.push_front(entry);
+            span.record("parse_cache_hit", true);
+        } else {
+            let mut parsed_arms = Vec::with_capacity(union.arms.len());
+            for arm in &union.arms {
+                match ParsedCypher::parse(arm) {
+                    Ok(parsed) => parsed_arms.push(parsed),
+                    Err(err) => {
+                        span.record("error.class", err.class());
+                        span.record("turbolay.sampling.tail_keep", "error");
+                        return Err(err);
+                    }
+                }
+            }
+            cache.entries.push_front(ParsedCypherUnionEntry {
+                query: query.to_string(),
+                arms: parsed_arms,
+                union_all: union.union_all,
+                fingerprint: query_shape_fingerprint(query),
+            });
+            cache.entries.truncate(PARSED_CYPHER_THREAD_CACHE_CAPACITY);
+            span.record("parse_cache_hit", false);
+        }
+        let entry = cache
+            .entries
+            .front()
+            .expect("parsed Cypher UNION cache contains the requested query");
+        span.record("turbolay.query.fingerprint", entry.fingerprint.as_str());
+        operation(&entry.arms, entry.union_all)
+    })
+}
+
 /// The stable identity of a query *shape*, for `turbolay.query.fingerprint`.
 ///
 /// Nothing existing substitutes for this. `ClientQueryRequest::query_id` is
@@ -403,6 +696,18 @@ fn with_parsed_cypher<T>(
 // a library with no service in front of it.
 #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
 pub(crate) fn opencypher_query_fingerprint(query: &str) -> String {
+    if query_might_contain_union(query) {
+        if let Some(fingerprint) = PARSED_CYPHER_UNION_THREAD_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .entries
+                .iter()
+                .find(|entry| entry.query == query)
+                .map(|entry| entry.fingerprint.clone())
+        }) {
+            return fingerprint;
+        }
+    }
     PARSED_CYPHER_THREAD_CACHE.with(|cache| {
         if let Some(entry) = cache
             .borrow()
@@ -1839,6 +2144,32 @@ fn lower_row_union_query_clauses(
         return unsupported("UNION requires at least two query arms");
     }
 
+    combine_parsed_union_arms(arms, union_all.unwrap_or(false))
+}
+
+fn lower_independently_parsed_union_arms(
+    parsed_arms: &[ParsedCypher],
+    union_all: bool,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<ParsedRowQuery> {
+    let mut arms = Vec::with_capacity(parsed_arms.len());
+    for parsed in parsed_arms {
+        let arm = parsed.lower_row_query(parameters)?;
+        if !arm.union_arms.is_empty() {
+            return unsupported("nested UNION queries are not executable in Query engine");
+        }
+        arms.push(arm);
+    }
+    combine_parsed_union_arms(arms, union_all)
+}
+
+fn combine_parsed_union_arms(
+    mut arms: Vec<ParsedRowQuery>,
+    union_all: bool,
+) -> Result<ParsedRowQuery> {
+    if arms.len() < 2 {
+        return unsupported("UNION requires at least two query arms");
+    }
     let columns = arms[0].columns.clone();
     for arm in &arms {
         if arm.columns != columns {
@@ -1847,7 +2178,7 @@ fn lower_row_union_query_clauses(
     }
 
     let mut first = arms.remove(0);
-    first.union_all = union_all.unwrap_or(false);
+    first.union_all = union_all;
     first.union_arms = arms;
     Ok(first)
 }
@@ -3974,6 +4305,111 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(mismatch, GraphError::UnsupportedQuery { .. }));
+    }
+
+    #[test]
+    fn lowers_large_union_path_arms_independently() {
+        fn path_arm(parameter: &str) -> String {
+            let mut query =
+                format!("MATCH (n0:Entity{{name:${parameter},tenant_id:$t,sub_tenant_id:$u}})");
+            for hop in 0..3 {
+                query.push_str(&format!(
+                    "-[r{hop}:RELATES]->(n{}:Entity{{tenant_id:$t,sub_tenant_id:$u}})",
+                    hop + 1
+                ));
+            }
+            let mut projections = Vec::new();
+            for node in 0..=3 {
+                for (index, property) in ["name", "type", "identifier", "entity_id", "namespace"]
+                    .iter()
+                    .enumerate()
+                {
+                    if node == 0 && *property == "name" {
+                        projections.push("n0.name".to_string());
+                    } else {
+                        projections.push(format!(
+                            "n{node}.{property} AS n{node}{}",
+                            char::from(b'a' + u8::try_from(index).unwrap())
+                        ));
+                    }
+                }
+            }
+            for hop in 0..3 {
+                for (index, property) in [
+                    "canonical_relation",
+                    "raw_relation",
+                    "chunk_id",
+                    "relationship_id",
+                    "timestamp",
+                    "metadata",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    projections.push(format!(
+                        "r{hop}.{property} AS r{hop}{}",
+                        char::from(b'a' + u8::try_from(index).unwrap())
+                    ));
+                }
+            }
+            query.push_str(" RETURN ");
+            query.push_str(&projections.join(","));
+            query.push_str(" LIMIT 50");
+            query
+        }
+
+        let mut parameters = BTreeMap::from([
+            (
+                "t".to_string(),
+                VertexPropertyValue::String("tenant".to_string()),
+            ),
+            (
+                "u".to_string(),
+                VertexPropertyValue::String("collection".to_string()),
+            ),
+        ]);
+        let mut arms = Vec::new();
+        for index in 0..10 {
+            let parameter = format!("batch_value_{index}");
+            parameters.insert(
+                parameter.clone(),
+                VertexPropertyValue::String(format!("entity-{index}")),
+            );
+            arms.push(path_arm(&parameter));
+        }
+        let query = arms.join(" UNION ALL ");
+
+        let parsed = parse_opencypher_row_query_with_parameters(&query, &parameters).unwrap();
+        assert!(parsed.union_all);
+        assert_eq!(parsed.union_arms.len(), 9);
+        assert_eq!(parsed.columns.len(), 38);
+        assert_eq!(
+            classify_opencypher_query_access(&query).unwrap(),
+            OpenCypherQueryAccess::Read
+        );
+    }
+
+    #[test]
+    fn top_level_union_splitter_ignores_nested_and_quoted_tokens() {
+        let query = "MATCH (n {text: 'UNION ALL', `UNION`: 1}) RETURN n.id AS id \
+                     UNION /* separator */ ALL \
+                     MATCH (m {text: \"UNION\"}) RETURN m.id AS id";
+        let union = split_top_level_union(query).unwrap().unwrap();
+        assert!(union.union_all);
+        assert_eq!(union.arms.len(), 2);
+        assert!(union.arms[0].contains("'UNION ALL'"));
+        assert!(union.arms[1].contains("\"UNION\""));
+
+        assert!(
+            split_top_level_union("CALL { RETURN 1 UNION ALL RETURN 2 } RETURN 3")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            split_top_level_union("MATCH (n) WHERE n.union = $union RETURN n.union AS value")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
