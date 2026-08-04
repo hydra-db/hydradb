@@ -37,6 +37,20 @@ impl GraphTopologyOverlay {
         })
     }
 
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn apply_in_neighbors(&self, dst: VertexId, neighbors: &mut BTreeSet<VertexId>) {
+        for (src, destinations) in &self.states {
+            let Some(exists) = destinations.get(&dst) else {
+                continue;
+            };
+            if *exists {
+                neighbors.insert(*src);
+            } else {
+                neighbors.remove(src);
+            }
+        }
+    }
+
     /// Test-only introspection. The WAL-tail overlay is otherwise only
     /// observable through a compiled GraphBLAS traversal, which needs the
     /// SuiteSparse C kernel; these let a repro assert on the overlay directly.

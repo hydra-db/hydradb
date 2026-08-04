@@ -109,10 +109,10 @@ pub use query::algebra::{
     QueryBatchOperation, QueryBatchRelationship, QueryBatchRelationshipMerge, QueryBatchVertex,
     QueryCancellationToken, QueryCardinalityStatsKind, QueryCardinalityStatsRefresh, QueryColumn,
     QueryContext, QueryCursorToken, QueryMutationResult, QueryOutput, QueryParameterValue,
-    QueryPlan, QueryPlanner, QueryResultPage, QueryResultSet, QueryRow, QueryStatement,
-    QueryStatsHistogramRefresh, QueryStatsRecord, QueryStatsRefreshKind, QueryStatsRefreshResult,
-    QueryStatsRefreshSpec, QueryValue, QueryWindow, RowQueryAccess, RowQueryOptimizerPass,
-    RowQueryPlan, RowQueryPlanGroup, RowQueryPlanPattern,
+    QueryPath, QueryPathNode, QueryPathRelationship, QueryPlan, QueryPlanner, QueryResultPage,
+    QueryResultSet, QueryRow, QueryStatement, QueryStatsHistogramRefresh, QueryStatsRecord,
+    QueryStatsRefreshKind, QueryStatsRefreshResult, QueryStatsRefreshSpec, QueryValue, QueryWindow,
+    RowQueryAccess, RowQueryOptimizerPass, RowQueryPlan, RowQueryPlanGroup, RowQueryPlanPattern,
 };
 #[cfg(feature = "query-service-discovery")]
 pub use query::coordination::{

@@ -305,7 +305,7 @@ pub(crate) fn parse_opencypher_unwind_batch(query: &str) -> Result<Option<Parsed
 #[cfg(feature = "client-api")]
 fn starts_with_non_unwind_clause(query: &str) -> bool {
     const NON_UNWIND_CLAUSES: &[&str] = &[
-        "CREATE", "MATCH", "MERGE", "OPTIONAL", "REMOVE", "RETURN", "SET", "WITH",
+        "CALL", "CREATE", "MATCH", "MERGE", "OPTIONAL", "REMOVE", "RETURN", "SET", "WITH",
     ];
     let query = query.trim_start();
     NON_UNWIND_CLAUSES.iter().any(|keyword| {
@@ -320,6 +320,9 @@ fn starts_with_non_unwind_clause(query: &str) -> bool {
 }
 
 pub(crate) fn classify_opencypher_query_access(query: &str) -> Result<OpenCypherQueryAccess> {
+    if super::path_procedure::is_native_path_procedure(query) {
+        return Ok(OpenCypherQueryAccess::Read);
+    }
     if query_might_contain_union(query) {
         if let Some(union) = split_top_level_union(query)? {
             return with_parsed_cypher_union(query, &union, |arms, _| {
