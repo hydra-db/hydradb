@@ -78,6 +78,28 @@ pub struct QueryBatchMergePolicy {
     pub create_only_properties: std::collections::BTreeSet<String>,
 }
 
+impl QueryBatchMergePolicy {
+    pub fn validate(&self) -> Result<()> {
+        validate_component("property", &self.update_if_newer_by)?;
+        for property in &self.create_only_properties {
+            validate_component("property", property)?;
+        }
+        if self
+            .create_only_properties
+            .contains(&self.update_if_newer_by)
+        {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "QueryBatch",
+                feature: format!(
+                    "update guard {} cannot also be create-only",
+                    self.update_if_newer_by
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[cfg_attr(
     feature = "query-transport",
     derive(serde::Deserialize, serde::Serialize)
