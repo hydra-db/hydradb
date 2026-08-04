@@ -52,9 +52,9 @@ use crate::{
 };
 
 #[cfg(feature = "query-transport")]
-// This is the first production wire contract. Pre-production frame versions are
-// intentionally unsupported; future changes must preserve version 1 during rollouts.
-const QUERY_TRANSPORT_VERSION: u16 = 1;
+// Turbolay is pre-production, so incompatible peers fail closed instead of
+// negotiating or silently dropping semantics during a rolling deployment.
+const QUERY_TRANSPORT_VERSION: u16 = 2;
 #[cfg(feature = "query-transport")]
 const DEFAULT_QUERY_TRANSPORT_MAX_FRAME_BYTES: usize = 1 << 20;
 #[cfg(feature = "query-transport")]

@@ -115,10 +115,6 @@ pub enum QueryBatchOperation {
     },
     UpsertVertices {
         vertices: Vec<QueryBatchVertex>,
-        #[cfg_attr(
-            feature = "query-transport",
-            serde(default, skip_serializing_if = "Option::is_none")
-        )]
         merge_policy: Option<QueryBatchMergePolicy>,
     },
     CreateRelationshipsBetweenLabeledVertices {
@@ -132,67 +128,8 @@ pub enum QueryBatchOperation {
         relationships: Vec<QueryBatchRelationshipMerge>,
         source_label: String,
         destination_label: String,
-        #[cfg_attr(
-            feature = "query-transport",
-            serde(default, skip_serializing_if = "Option::is_none")
-        )]
         merge_policy: Option<QueryBatchMergePolicy>,
     },
-}
-
-#[cfg(all(test, feature = "query-transport"))]
-mod transport_compatibility_tests {
-    use super::*;
-
-    #[test]
-    fn version_one_vertex_upsert_without_merge_policy_defaults_to_none() {
-        let operation: QueryBatchOperation = serde_json::from_value(serde_json::json!({
-            "UpsertVertices": {
-                "vertices": []
-            }
-        }))
-        .unwrap();
-
-        assert!(matches!(
-            operation,
-            QueryBatchOperation::UpsertVertices {
-                merge_policy: None,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn version_one_relationship_merge_without_policy_defaults_to_none() {
-        let operation: QueryBatchOperation = serde_json::from_value(serde_json::json!({
-            "MergeRelationshipsBetweenLabeledVertices": {
-                "edge_type": "RELATES",
-                "relationships": [],
-                "source_label": "Entity",
-                "destination_label": "Entity"
-            }
-        }))
-        .unwrap();
-
-        assert!(matches!(
-            operation,
-            QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices {
-                merge_policy: None,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn absent_merge_policy_is_omitted_from_the_version_one_wire_shape() {
-        let encoded = serde_json::to_value(QueryBatchOperation::UpsertVertices {
-            vertices: Vec::new(),
-            merge_policy: None,
-        })
-        .unwrap();
-
-        assert!(encoded["UpsertVertices"].get("merge_policy").is_none());
-    }
 }
 
 impl QueryBatchOperation {
