@@ -2860,6 +2860,12 @@ impl GraphShard {
         let mut relationships = self
             .relationships_for_edge_at(cell_id, edge_type, src, dst, read_epoch, budget)
             .await?;
+        if relationships
+            .iter()
+            .any(|(relationship, _)| relationship.relationship_id.is_some())
+        {
+            relationships.retain(|(relationship, _)| relationship.relationship_id.is_some());
+        }
         relationships.sort_by_key(|(relationship, _)| relationship.relationship_id);
         Ok(relationships
             .into_iter()
