@@ -4616,16 +4616,17 @@ fn test_transport_rows_response() -> serde_json::Value {
 
 #[cfg(feature = "query-transport")]
 #[tokio::test]
-async fn tcp_query_transport_guarded_batch_does_not_downgrade_for_version_one_server() {
+async fn tcp_query_transport_guarded_batch_uses_a_distinct_wire_operation() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let version_one_server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut reader = tokio::io::BufReader::new(stream);
         let request = test_read_transport_json(&mut reader).await;
-        assert_eq!(request["version"].as_u64(), Some(2));
+        assert_eq!(request["version"].as_u64(), Some(1));
         assert_eq!(
-            request["operation"]["UpsertVertices"]["merge_policy"]["update_if_newer_by"].as_str(),
+            request["operation"]["GuardedUpsertVertices"]["merge_policy"]["update_if_newer_by"]
+                .as_str(),
             Some("updated_at")
         );
         test_write_transport_json(
@@ -4633,7 +4634,7 @@ async fn tcp_query_transport_guarded_batch_does_not_downgrade_for_version_one_se
             &serde_json::json!({
                 "response": {
                     "kind": "error",
-                    "message": "unsupported query transport version 2; expected 1",
+                    "message": "unknown batch operation GuardedUpsertVertices",
                 },
                 "close_connection": true,
             }),
@@ -4645,12 +4646,12 @@ async fn tcp_query_transport_guarded_batch_does_not_downgrade_for_version_one_se
     let result = client
         .execute_batch(
             QueryContext::new("reddit-home", "strict-version-client"),
-            QueryBatchOperation::UpsertVertices {
+            QueryBatchOperation::GuardedUpsertVertices {
                 vertices: Vec::new(),
-                merge_policy: Some(QueryBatchMergePolicy {
+                merge_policy: QueryBatchMergePolicy {
                     update_if_newer_by: "updated_at".to_string(),
                     create_only_properties: std::collections::BTreeSet::new(),
-                }),
+                },
             },
         )
         .await
@@ -4663,7 +4664,7 @@ async fn tcp_query_transport_guarded_batch_does_not_downgrade_for_version_one_se
 
 #[cfg(feature = "query-transport")]
 #[tokio::test]
-async fn tcp_query_transport_server_rejects_version_one_batch_before_dispatch() {
+async fn tcp_query_transport_server_rejects_obsolete_client_version() {
     struct StaticQueryClient;
 
     #[async_trait::async_trait]
@@ -4703,14 +4704,11 @@ async fn tcp_query_transport_server_rejects_version_one_batch_before_dispatch() 
         .unwrap();
     let mut reader = tokio::io::BufReader::new(stream);
     let request = serde_json::json!({
-        "kind": "batch",
-        "version": 1,
+        "kind": "rows",
+        "version": 2,
         "auth": { "bearer_token": null },
         "context": QueryContext::new("reddit-home", "obsolete-version-client"),
-        "operation": QueryBatchOperation::UpsertVertices {
-            vertices: Vec::new(),
-            merge_policy: None,
-        },
+        "query": "MATCH (u {id: 1}) RETURN u.id",
     });
     test_write_transport_json(&mut reader, &request).await;
     let response = test_read_transport_json(&mut reader).await;
@@ -4718,7 +4716,7 @@ async fn tcp_query_transport_server_rejects_version_one_batch_before_dispatch() 
     assert!(response["response"]["message"]
         .as_str()
         .unwrap()
-        .contains("expected 2"));
+        .contains("expected 1"));
     server.stop().await.unwrap();
 }
 

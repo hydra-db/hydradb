@@ -115,7 +115,10 @@ pub enum QueryBatchOperation {
     },
     UpsertVertices {
         vertices: Vec<QueryBatchVertex>,
-        merge_policy: Option<QueryBatchMergePolicy>,
+    },
+    GuardedUpsertVertices {
+        vertices: Vec<QueryBatchVertex>,
+        merge_policy: QueryBatchMergePolicy,
     },
     CreateRelationshipsBetweenLabeledVertices {
         edge_type: String,
@@ -128,8 +131,52 @@ pub enum QueryBatchOperation {
         relationships: Vec<QueryBatchRelationshipMerge>,
         source_label: String,
         destination_label: String,
-        merge_policy: Option<QueryBatchMergePolicy>,
     },
+    GuardedMergeRelationshipsBetweenLabeledVertices {
+        edge_type: String,
+        relationships: Vec<QueryBatchRelationshipMerge>,
+        source_label: String,
+        destination_label: String,
+        merge_policy: QueryBatchMergePolicy,
+    },
+}
+
+#[cfg(all(test, feature = "query-transport"))]
+mod guarded_transport_schema_tests {
+    use super::*;
+
+    #[derive(serde::Deserialize)]
+    enum OriginalBatchOperation {
+        UpsertVertices { vertices: Vec<QueryBatchVertex> },
+    }
+
+    #[test]
+    fn original_peer_still_decodes_an_ordinary_upsert() {
+        let encoded = serde_json::to_value(QueryBatchOperation::UpsertVertices {
+            vertices: Vec::new(),
+        })
+        .unwrap();
+        let decoded: OriginalBatchOperation = serde_json::from_value(encoded).unwrap();
+
+        assert!(matches!(
+            decoded,
+            OriginalBatchOperation::UpsertVertices { vertices } if vertices.is_empty()
+        ));
+    }
+
+    #[test]
+    fn original_peer_rejects_a_guarded_upsert_as_an_unknown_operation() {
+        let encoded = serde_json::to_value(QueryBatchOperation::GuardedUpsertVertices {
+            vertices: Vec::new(),
+            merge_policy: QueryBatchMergePolicy {
+                update_if_newer_by: "updated_at".to_string(),
+                create_only_properties: std::collections::BTreeSet::new(),
+            },
+        })
+        .unwrap();
+
+        assert!(serde_json::from_value::<OriginalBatchOperation>(encoded).is_err());
+    }
 }
 
 impl QueryBatchOperation {
@@ -142,8 +189,10 @@ impl QueryBatchOperation {
                 | Self::DeleteVertices { .. }
                 | Self::DeleteRelationshipsByProperty { .. }
                 | Self::UpsertVertices { .. }
+                | Self::GuardedUpsertVertices { .. }
                 | Self::CreateRelationshipsBetweenLabeledVertices { .. }
                 | Self::MergeRelationshipsBetweenLabeledVertices { .. }
+                | Self::GuardedMergeRelationshipsBetweenLabeledVertices { .. }
         )
     }
 
@@ -155,11 +204,14 @@ impl QueryBatchOperation {
             | Self::DeleteEdges { edges, .. } => edges.len(),
             Self::DeleteVertices { vertices, .. } => vertices.len(),
             Self::DeleteRelationshipsByProperty { values, .. } => values.len(),
-            Self::UpsertVertices { vertices, .. } => vertices.len(),
+            Self::UpsertVertices { vertices } | Self::GuardedUpsertVertices { vertices, .. } => {
+                vertices.len()
+            }
             Self::CreateRelationshipsBetweenLabeledVertices { relationships, .. } => {
                 relationships.len()
             }
-            Self::MergeRelationshipsBetweenLabeledVertices { relationships, .. } => {
+            Self::MergeRelationshipsBetweenLabeledVertices { relationships, .. }
+            | Self::GuardedMergeRelationshipsBetweenLabeledVertices { relationships, .. } => {
                 relationships.len()
             }
         }

@@ -52,9 +52,10 @@ use crate::{
 };
 
 #[cfg(feature = "query-transport")]
-// Turbolay is pre-production, so incompatible peers fail closed instead of
-// negotiating or silently dropping semantics during a rolling deployment.
-const QUERY_TRANSPORT_VERSION: u16 = 2;
+// Guarded writes use distinct batch-operation variants. An older peer can
+// continue serving the unchanged protocol but cannot deserialize and silently
+// downgrade a guarded operation it does not understand.
+const QUERY_TRANSPORT_VERSION: u16 = 1;
 #[cfg(feature = "query-transport")]
 const DEFAULT_QUERY_TRANSPORT_MAX_FRAME_BYTES: usize = 1 << 20;
 #[cfg(feature = "query-transport")]
@@ -3271,7 +3272,20 @@ impl QueryCellClient for RoutedGraphCluster {
                     .await?;
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
-            crate::QueryBatchOperation::UpsertVertices {
+            crate::QueryBatchOperation::UpsertVertices { vertices } => {
+                self.ensure_local_writer(&context.cell_id).await?;
+                shard
+                    .merge_vertex_metadata_batch(
+                        &context.cell_id,
+                        vertices
+                            .into_iter()
+                            .map(|vertex| (vertex.vertex, vertex.metadata)),
+                        None,
+                    )
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::GuardedUpsertVertices {
                 vertices,
                 merge_policy,
             } => {
@@ -3282,7 +3296,7 @@ impl QueryCellClient for RoutedGraphCluster {
                         vertices
                             .into_iter()
                             .map(|vertex| (vertex.vertex, vertex.metadata)),
-                        merge_policy.as_ref(),
+                        Some(&merge_policy),
                     )
                     .await?;
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
@@ -3320,6 +3334,39 @@ impl QueryCellClient for RoutedGraphCluster {
                 relationships,
                 source_label,
                 destination_label,
+            } => {
+                self.ensure_local_writer(&context.cell_id).await?;
+                shard
+                    .merge_relationships_batch_between_labeled_vertices(
+                        &context.cell_id,
+                        &edge_type,
+                        relationships.into_iter().map(|relationship| {
+                            let mut metadata = relationship.metadata;
+                            metadata.properties.insert(
+                                "id".to_string(),
+                                crate::VertexPropertyValue::Integer(relationship.relationship_id),
+                            );
+                            crate::RelationshipMutation {
+                                cell_id: context.cell_id.clone(),
+                                edge_type: edge_type.clone(),
+                                src: relationship.src,
+                                dst: relationship.dst,
+                                relationship_id: relationship.relationship_id,
+                                metadata,
+                            }
+                        }),
+                        &format!("{}.unwind-relationship-merge", context.idempotency_key),
+                        (&source_label, &destination_label),
+                        None,
+                    )
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
+            crate::QueryBatchOperation::GuardedMergeRelationshipsBetweenLabeledVertices {
+                edge_type,
+                relationships,
+                source_label,
+                destination_label,
                 merge_policy,
             } => {
                 self.ensure_local_writer(&context.cell_id).await?;
@@ -3344,7 +3391,7 @@ impl QueryCellClient for RoutedGraphCluster {
                         }),
                         &format!("{}.unwind-relationship-merge", context.idempotency_key),
                         (&source_label, &destination_label),
-                        merge_policy.as_ref(),
+                        Some(&merge_policy),
                     )
                     .await?;
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
