@@ -223,6 +223,8 @@ impl GraphShard {
                 tenant_quota,
                 memory.max_relationship_property_rows_bytes,
             )),
+            #[cfg(feature = "opencypher")]
+            native_path_page_cursors: Mutex::new(Default::default()),
         })
     }
 

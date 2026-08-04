@@ -338,20 +338,12 @@ impl GraphShard {
                 &context.parameters,
                 self.limits.max_traversal_hops,
             )? {
-                let offset = cursor.map_or(0, |cursor| cursor.offset);
-                let mut result =
-                    Box::pin(self.execute_native_path_rows(context, procedure)).await?;
-                let start = usize::try_from(offset)
-                    .unwrap_or(usize::MAX)
-                    .min(result.rows.len());
-                let end = start.saturating_add(page_size).min(result.rows.len());
-                let next_cursor = (end < result.rows.len())
-                    .then(|| QueryCursorToken::new(offset.saturating_add(page_size as u64)));
-                return Ok(QueryResultPage::new(
-                    result.columns,
-                    result.rows.drain(start..end).collect(),
-                    next_cursor,
-                ));
+                return Box::pin(
+                    self.execute_native_path_rows_page(
+                        context, query, procedure, cursor, page_size,
+                    ),
+                )
+                .await;
             }
             let parsed = self
                 .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters)
@@ -2856,7 +2848,7 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    pub(crate) async fn native_path_relationship_at(
+    pub(crate) async fn native_path_relationships_at(
         &self,
         cell_id: &str,
         edge_type: &str,
@@ -2864,15 +2856,15 @@ impl GraphShard {
         dst: VertexId,
         read_epoch: StorageSequence,
         budget: &QueryBudget,
-    ) -> Result<(Option<RelationshipId>, EdgeMetadata)> {
+    ) -> Result<Vec<(Option<RelationshipId>, EdgeMetadata)>> {
         let mut relationships = self
             .relationships_for_edge_at(cell_id, edge_type, src, dst, read_epoch, budget)
             .await?;
         relationships.sort_by_key(|(relationship, _)| relationship.relationship_id);
-        Ok(relationships.into_iter().next().map_or(
-            (None, EdgeMetadata::default()),
-            |(relationship, metadata)| (relationship.relationship_id, metadata),
-        ))
+        Ok(relationships
+            .into_iter()
+            .map(|(relationship, metadata)| (relationship.relationship_id, metadata))
+            .collect())
     }
 
     #[cfg(feature = "opencypher")]
