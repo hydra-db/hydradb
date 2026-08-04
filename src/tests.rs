@@ -531,6 +531,347 @@ async fn cypher_graphblas_applies_wal_tail_after_edge_changes() {
     writer.close().await.unwrap();
 }
 
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn native_sp_paths_uses_one_pinned_graphblas_snapshot_with_wal_tail() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/native-sp-paths-pinned-tail";
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+    for (index, (src, dst)) in [(1, 2), (2, 3), (1, 4)].into_iter().enumerate() {
+        writer
+            .write_edge(typed_mutation(
+                "cell-a",
+                "CHAIN",
+                src,
+                dst,
+                &format!("native-path-base-{index}"),
+            ))
+            .await
+            .unwrap();
+    }
+    let indexer = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    indexer.refresh_storage_sequence("cell-a").await.unwrap();
+    indexer.build_graph_index("cell-a", "CHAIN").await.unwrap();
+
+    writer
+        .write_edge(typed_mutation(
+            "cell-a",
+            "CHAIN",
+            3,
+            5,
+            "native-path-tail-add",
+        ))
+        .await
+        .unwrap();
+    writer
+        .delete_edge(typed_mutation(
+            "cell-a",
+            "CHAIN",
+            1,
+            4,
+            "native-path-tail-delete",
+        ))
+        .await
+        .unwrap();
+
+    let reader = GraphShard::open(path, object_store).await.unwrap();
+    reader.refresh_storage_sequence("cell-a").await.unwrap();
+    let result = reader
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-sp-paths"),
+            "CALL algo.SPpaths({sourceNode: 5, targetNode: 1, relTypes: ['CHAIN'], \
+             maxLen: 4, relDirection: 'both', pathCount: 1}) \
+             YIELD path, pathWeight, pathCost RETURN path, pathWeight, pathCost",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.columns.len(), 3);
+    assert_eq!(result.rows.len(), 1);
+    let QueryValue::Path(path) = &result.rows[0].values[0] else {
+        panic!("native procedure must return a Bolt-compatible path value");
+    };
+    assert_eq!(
+        path.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+        vec![5, 3, 2, 1]
+    );
+    assert_eq!(
+        path.relationships
+            .iter()
+            .map(|relationship| (relationship.src, relationship.dst))
+            .collect::<Vec<_>>(),
+        vec![(3, 5), (2, 3), (1, 2)]
+    );
+    assert_eq!(result.rows[0].values[1], QueryValue::Count(3));
+    assert_eq!(result.rows[0].values[2], QueryValue::Count(0));
+    let metrics = reader.graph_operational_metrics();
+    assert_eq!(metrics.query_graphblas_artifact_snapshots, 1);
+    assert_eq!(metrics.query_rust_sparse_fallbacks, 0);
+
+    reader.close().await.unwrap();
+    indexer.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn native_sp_paths_honors_weight_cost_and_parameterized_limits() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/native-sp-paths-weighted", object_store).await;
+    for (index, query) in [
+        "CREATE (a {id: 1})-[:ROUTE {weight: 1, cost: 5}]->(b {id: 2})",
+        "CREATE (a {id: 2})-[:ROUTE {weight: 1, cost: 5}]->(b {id: 4})",
+        "CREATE (a {id: 1})-[:ROUTE {weight: 2, cost: 1}]->(b {id: 3})",
+        "CREATE (a {id: 3})-[:ROUTE {weight: 2, cost: 1}]->(b {id: 4})",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .execute_cypher(
+                QueryContext::new("cell-a", format!("native-weighted-create-{index}")),
+                query,
+            )
+            .await
+            .unwrap();
+    }
+    shard.build_graph_index("cell-a", "ROUTE").await.unwrap();
+
+    let result = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-weighted-read").with_parameters(BTreeMap::from([
+                ("source".to_string(), VertexPropertyValue::Integer(1)),
+                ("target".to_string(), VertexPropertyValue::Integer(4)),
+                ("max_len".to_string(), VertexPropertyValue::Integer(3)),
+                (
+                    "weight_property".to_string(),
+                    VertexPropertyValue::String("weight".to_string()),
+                ),
+                ("max_cost".to_string(), VertexPropertyValue::Integer(5)),
+                ("path_count".to_string(), VertexPropertyValue::Integer(1)),
+            ])),
+            "CALL algo.SPpaths({sourceNode: $source, targetNode: $target, \
+             relTypes: ['ROUTE'], maxLen: $max_len, weightProp: $weight_property, \
+             costProp: 'cost', maxCost: $max_cost, pathCount: $path_count}) \
+             YIELD path, pathWeight, pathCost RETURN path, pathWeight, pathCost",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.rows.len(), 1);
+    let QueryValue::Path(path) = &result.rows[0].values[0] else {
+        panic!("weighted procedure must return a path");
+    };
+    assert_eq!(
+        path.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+        vec![1, 3, 4]
+    );
+    assert_eq!(result.rows[0].values[1], QueryValue::Count(4));
+    assert_eq!(result.rows[0].values[2], QueryValue::Count(2));
+
+    let single_source = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-single-source-read"),
+            "CALL algo.SSpaths({sourceNode: 1, relTypes: ['ROUTE'], maxLen: 1, \
+             relDirection: 'outgoing', pathCount: 10}) \
+             YIELD path RETURN path",
+        )
+        .await
+        .unwrap();
+    assert_eq!(single_source.rows.len(), 2);
+    assert_eq!(
+        single_source
+            .rows
+            .iter()
+            .map(|row| match &row.values[0] {
+                QueryValue::Path(path) => path.nodes[1].id,
+                value => panic!("single-source procedure returned {value:?}"),
+            })
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn native_sp_paths_preserves_parallel_relationship_identity_and_scores() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/native-sp-paths-parallel", object_store).await;
+    for (index, query) in [
+        "CREATE (a {id: 1})-[:ROUTE {weight: 9}]->(b {id: 2})",
+        "CREATE (a {id: 1})-[:ROUTE {weight: 1, cost: 10}]->(b {id: 2})",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .execute_cypher(
+                QueryContext::new("cell-a", format!("native-parallel-create-{index}")),
+                query,
+            )
+            .await
+            .unwrap();
+    }
+    shard
+        .set_edge_metadata(
+            "cell-a",
+            "ROUTE",
+            1,
+            2,
+            EdgeMetadata::default()
+                .with_property("weight", VertexPropertyValue::Integer(100))
+                .with_property("cost", VertexPropertyValue::Integer(90))
+                .with_property(
+                    "shared",
+                    VertexPropertyValue::String("structural".to_string()),
+                ),
+        )
+        .await
+        .unwrap();
+    shard.build_graph_index("cell-a", "ROUTE").await.unwrap();
+
+    let result = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-parallel-read"),
+            "CALL algo.SPpaths({sourceNode: 1, targetNode: 2, relTypes: ['ROUTE'], \
+             maxLen: 1, weightProp: 'weight', costProp: 'cost', pathCount: 3}) \
+             YIELD path, pathWeight, pathCost RETURN path, pathWeight, pathCost",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.rows.len(), 2);
+    let relationship_ids = result
+        .rows
+        .iter()
+        .map(|row| match &row.values[0] {
+            QueryValue::Path(path) => path.relationships[0]
+                .id
+                .expect("parallel relationship path must retain its identity"),
+            value => panic!("native procedure returned {value:?}"),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(relationship_ids.len(), 2);
+    for row in &result.rows {
+        let QueryValue::Path(path) = &row.values[0] else {
+            panic!("native procedure must return paths");
+        };
+        assert_eq!(
+            path.relationships[0].properties.get("shared"),
+            Some(&VertexPropertyValue::String("structural".to_string()))
+        );
+    }
+    assert_eq!(result.rows[0].values[1], QueryValue::Count(1));
+    assert_eq!(result.rows[0].values[2], QueryValue::Count(10));
+    assert_eq!(result.rows[1].values[1], QueryValue::Count(9));
+    assert_eq!(result.rows[1].values[2], QueryValue::Count(90));
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn native_path_pages_remain_on_the_first_page_snapshot() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/native-path-page-snapshot", object_store).await;
+    for (index, dst) in [2, 3, 4].into_iter().enumerate() {
+        shard
+            .write_edge(typed_mutation(
+                "cell-a",
+                "ROUTE",
+                1,
+                dst,
+                &format!("native-page-seed-{index}"),
+            ))
+            .await
+            .unwrap();
+    }
+    let query = "CALL algo.SSpaths({sourceNode: 1, relTypes: ['ROUTE'], maxLen: 1, \
+                 pathCount: 10}) YIELD path RETURN path";
+    let first = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("cell-a", "native-page-first"),
+            query,
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(native_path_target(&first.rows[0]), 2);
+    let cursor = first.next_cursor.expect("three rows require another page");
+
+    shard
+        .delete_edge(typed_mutation(
+            "cell-a",
+            "ROUTE",
+            1,
+            3,
+            "native-page-delete",
+        ))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation(
+            "cell-a",
+            "ROUTE",
+            1,
+            0,
+            "native-page-insert",
+        ))
+        .await
+        .unwrap();
+
+    let second = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("cell-a", "native-page-second"),
+            query,
+            Some(cursor),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(native_path_target(&second.rows[0]), 3);
+    let cursor = second.next_cursor.expect("one original row remains");
+    let third = shard
+        .execute_cypher_rows_page(
+            QueryContext::new("cell-a", "native-page-third"),
+            query,
+            Some(cursor),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(native_path_target(&third.rows[0]), 4);
+    assert!(third.next_cursor.is_none());
+
+    let current = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "native-page-current"), query)
+        .await
+        .unwrap();
+    assert_eq!(
+        current
+            .rows
+            .iter()
+            .map(native_path_target)
+            .collect::<Vec<_>>(),
+        vec![0, 2, 4]
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+fn native_path_target(row: &QueryRow) -> VertexId {
+    match &row.values[0] {
+        QueryValue::Path(path) => path.nodes.last().expect("path has a target").id,
+        value => panic!("native procedure returned {value:?}"),
+    }
+}
+
 #[tokio::test]
 async fn graphblas_wal_tail_resolves_edges_at_the_pinned_snapshot() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

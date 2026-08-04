@@ -4,10 +4,10 @@ use super::*;
 use crate::{
     ClientQueryServiceConfig, ObjectStoreNodeDirectory, PlacementConfig, PlacementView,
     QueryCellClient, QueryColumn, QueryContext, QueryCursorToken, QueryFloat, QueryParameterValue,
-    QueryResultPage, QueryResultSet, QueryRow, QueryTransportAction, QueryTransportScopeGrant,
-    QueryValue, RoutedGraphCluster, StaticClientDatabaseResolver,
-    StaticQueryTransportScopeAuthorizer, StaticQueryTransportTlsServerConfigProvider,
-    VertexPropertyValue,
+    QueryPath, QueryPathNode, QueryPathRelationship, QueryResultPage, QueryResultSet, QueryRow,
+    QueryTransportAction, QueryTransportScopeGrant, QueryValue, RoutedGraphCluster,
+    StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer,
+    StaticQueryTransportTlsServerConfigProvider, VertexPropertyValue,
 };
 use boltr::chunk::{ChunkReader, ChunkWriter};
 use boltr::client::BoltSession;
@@ -266,6 +266,39 @@ fn bolt_value_conversion_rejects_unsigned_overflow() {
         .unwrap(),
         BoltValue::Integer(-1)
     );
+}
+
+#[test]
+fn bolt_path_conversion_preserves_incoming_relationship_direction() {
+    let value = query_value_to_bolt(&QueryValue::Path(Box::new(QueryPath {
+        nodes: vec![
+            QueryPathNode {
+                id: 2,
+                labels: vec!["Entity".to_string()],
+                properties: BTreeMap::new(),
+            },
+            QueryPathNode {
+                id: 1,
+                labels: vec!["Entity".to_string()],
+                properties: BTreeMap::new(),
+            },
+        ],
+        relationships: vec![QueryPathRelationship {
+            id: Some(9),
+            edge_type: "RELATES".to_string(),
+            src: 1,
+            dst: 2,
+            properties: BTreeMap::new(),
+        }],
+    })))
+    .unwrap();
+    let BoltValue::Path(path) = value else {
+        panic!("path query value must encode as a Bolt path");
+    };
+    assert_eq!(path.indices, vec![-1, 1]);
+    assert_eq!(path.rels[0].id, 9);
+    assert_eq!(path.nodes[0].id, 2);
+    assert_eq!(path.nodes[1].id, 1);
 }
 
 #[test]

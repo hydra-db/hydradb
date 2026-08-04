@@ -143,6 +143,14 @@ fn format_query_value(value: &QueryValue) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        QueryValue::Path(path) => format!(
+            "path({})",
+            path.nodes
+                .iter()
+                .map(|node| node.id.to_string())
+                .collect::<Vec<_>>()
+                .join(" -> ")
+        ),
     }
 }
 
