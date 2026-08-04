@@ -231,6 +231,9 @@ impl GraphShard {
         merge_policy: Option<&QueryBatchMergePolicy>,
     ) -> Result<usize> {
         validate_component("cell_id", cell_id)?;
+        if let Some(policy) = merge_policy {
+            policy.validate()?;
+        }
         self.ensure_write_authority(cell_id, "merge_vertex_metadata_batch")?;
         let updates = coalesce_vertex_metadata_updates(updates)?;
         if updates.is_empty() {
@@ -1263,6 +1266,9 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         validate_component("idempotency_key", idempotency_key)?;
+        if let Some(policy) = options.merge_policy {
+            policy.validate()?;
+        }
         self.ensure_write_authority(cell_id, options.operation)?;
 
         let mut relationships = if options.create_always {
@@ -4947,23 +4953,24 @@ fn guarded_metadata_patch(
     policy: &QueryBatchMergePolicy,
     key: &str,
 ) -> Result<Option<BTreeMap<String, VertexPropertyValue>>> {
+    policy.validate()?;
+    let requested_guard = requested
+        .get(&policy.update_if_newer_by)
+        .cloned()
+        .ok_or_else(|| GraphError::UnsupportedQuery {
+            dialect: "QueryBatch",
+            feature: format!(
+                "guarded merge is missing incoming property {}",
+                policy.update_if_newer_by
+            ),
+        })?;
     for property in &policy.create_only_properties {
         requested.remove(property);
     }
     let Some(previous_guard) = previous.get(&policy.update_if_newer_by) else {
         return Ok(Some(requested));
     };
-    let requested_guard =
-        requested
-            .get(&policy.update_if_newer_by)
-            .ok_or_else(|| GraphError::CorruptValue {
-                key: key.to_string(),
-                reason: format!(
-                    "guarded merge is missing incoming property {}",
-                    policy.update_if_newer_by
-                ),
-            })?;
-    let ordering = match (previous_guard, requested_guard) {
+    let ordering = match (previous_guard, &requested_guard) {
         (VertexPropertyValue::Integer(left), VertexPropertyValue::Integer(right)) => {
             left.cmp(right)
         }
@@ -5080,6 +5087,40 @@ mod guarded_metadata_patch_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn rejects_a_guard_that_is_also_create_only() {
+        let overlapping_policy = QueryBatchMergePolicy {
+            update_if_newer_by: "updated_at".to_string(),
+            create_only_properties: BTreeSet::from(["updated_at".to_string()]),
+        };
+        let previous = BTreeMap::from([(
+            "updated_at".to_string(),
+            VertexPropertyValue::String("2026-08-03T10:00:00+00:00".to_string()),
+        )]);
+        let requested = BTreeMap::from([(
+            "updated_at".to_string(),
+            VertexPropertyValue::String("2026-08-03T11:00:00+00:00".to_string()),
+        )]);
+
+        assert!(matches!(
+            guarded_metadata_patch(&previous, requested, &overlapping_policy, "vertex/1"),
+            Err(GraphError::UnsupportedQuery { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_patch_without_its_guard_even_when_the_record_has_no_guard() {
+        let requested = BTreeMap::from([(
+            "name".to_string(),
+            VertexPropertyValue::String("new name".to_string()),
+        )]);
+
+        assert!(matches!(
+            guarded_metadata_patch(&BTreeMap::new(), requested, &policy(), "vertex/1"),
+            Err(GraphError::UnsupportedQuery { .. })
+        ));
     }
 
     #[test]
