@@ -2499,8 +2499,8 @@ fn resolve_unwind_batch(
             property_fields,
             update_if_newer_by,
             create_only_properties,
-        } => Ok(QueryBatchOperation::UpsertVertices {
-            vertices: rows
+        } => {
+            let vertices = rows
                 .iter()
                 .enumerate()
                 .map(|(index, row)| {
@@ -2515,12 +2515,18 @@ fn resolve_unwind_batch(
                         metadata,
                     })
                 })
-                .collect::<Result<Vec<_>>>()?,
-            merge_policy: update_if_newer_by.map(|update_if_newer_by| QueryBatchMergePolicy {
-                update_if_newer_by,
-                create_only_properties,
-            }),
-        }),
+                .collect::<Result<Vec<_>>>()?;
+            Ok(match update_if_newer_by {
+                Some(update_if_newer_by) => QueryBatchOperation::GuardedUpsertVertices {
+                    vertices,
+                    merge_policy: QueryBatchMergePolicy {
+                        update_if_newer_by,
+                        create_only_properties,
+                    },
+                },
+                None => QueryBatchOperation::UpsertVertices { vertices },
+            })
+        }
         ParsedUnwindBatchKind::CreateRelationshipsBetweenLabeledVertices {
             edge_type,
             source_field,
@@ -2569,39 +2575,46 @@ fn resolve_unwind_batch(
             destination_label,
             update_if_newer_by,
             create_only_properties,
-        } => Ok(
-            QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices {
-                edge_type,
-                relationships: rows
-                    .iter()
-                    .enumerate()
-                    .map(|(index, row)| {
-                        let mut metadata = EdgeMetadata::default();
-                        for (property, field) in &property_fields {
-                            metadata
-                                .properties
-                                .insert(property.clone(), unwind_row_scalar(row, index, field)?);
-                        }
-                        Ok(QueryBatchRelationshipMerge {
-                            src: unwind_row_vertex_id(row, index, &source_field)?,
-                            dst: unwind_row_vertex_id(row, index, &destination_field)?,
-                            relationship_id: unwind_row_vertex_id(
-                                row,
-                                index,
-                                &relationship_id_field,
-                            )?,
-                            metadata,
-                        })
+        } => {
+            let relationships = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let mut metadata = EdgeMetadata::default();
+                    for (property, field) in &property_fields {
+                        metadata
+                            .properties
+                            .insert(property.clone(), unwind_row_scalar(row, index, field)?);
+                    }
+                    Ok(QueryBatchRelationshipMerge {
+                        src: unwind_row_vertex_id(row, index, &source_field)?,
+                        dst: unwind_row_vertex_id(row, index, &destination_field)?,
+                        relationship_id: unwind_row_vertex_id(row, index, &relationship_id_field)?,
+                        metadata,
                     })
-                    .collect::<Result<Vec<_>>>()?,
-                source_label,
-                destination_label,
-                merge_policy: update_if_newer_by.map(|update_if_newer_by| QueryBatchMergePolicy {
-                    update_if_newer_by,
-                    create_only_properties,
-                }),
-            },
-        ),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(match update_if_newer_by {
+                Some(update_if_newer_by) => {
+                    QueryBatchOperation::GuardedMergeRelationshipsBetweenLabeledVertices {
+                        edge_type,
+                        relationships,
+                        source_label,
+                        destination_label,
+                        merge_policy: QueryBatchMergePolicy {
+                            update_if_newer_by,
+                            create_only_properties,
+                        },
+                    }
+                }
+                None => QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices {
+                    edge_type,
+                    relationships,
+                    source_label,
+                    destination_label,
+                },
+            })
+        }
     }
 }
 
@@ -2689,8 +2702,10 @@ fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> 
         | QueryBatchOperation::DeleteVertices { .. }
         | QueryBatchOperation::DeleteRelationshipsByProperty { .. }
         | QueryBatchOperation::UpsertVertices { .. }
+        | QueryBatchOperation::GuardedUpsertVertices { .. }
         | QueryBatchOperation::CreateRelationshipsBetweenLabeledVertices { .. }
-        | QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices { .. } => Vec::new(),
+        | QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices { .. }
+        | QueryBatchOperation::GuardedMergeRelationshipsBetweenLabeledVertices { .. } => Vec::new(),
     }
 }
 
