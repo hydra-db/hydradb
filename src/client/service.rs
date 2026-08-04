@@ -25,10 +25,10 @@ use crate::query::opencypher::{
 use crate::{
     validate_component, AtomicDurationHistogram, DurationHistogramSnapshot, EdgeMetadata,
     GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryBatchEdge,
-    QueryBatchOperation, QueryBatchRelationship, QueryBatchRelationshipMerge, QueryBatchVertex,
-    QueryCancellationToken, QueryColumn, QueryContext, QueryCursorToken, QueryParameterValue,
-    QueryResultPage, QueryResultSet, QueryRow, Result, StorageSequence, VertexMetadata,
-    VertexPropertyValue,
+    QueryBatchMergePolicy, QueryBatchOperation, QueryBatchRelationship,
+    QueryBatchRelationshipMerge, QueryBatchVertex, QueryCancellationToken, QueryColumn,
+    QueryContext, QueryCursorToken, QueryParameterValue, QueryResultPage, QueryResultSet, QueryRow,
+    Result, StorageSequence, VertexMetadata, VertexPropertyValue,
 };
 use tracing::Instrument as _;
 
@@ -2497,8 +2497,10 @@ fn resolve_unwind_batch(
             label,
             vertex_field,
             property_fields,
-        } => Ok(QueryBatchOperation::UpsertVertices {
-            vertices: rows
+            update_if_newer_by,
+            create_only_properties,
+        } => {
+            let vertices = rows
                 .iter()
                 .enumerate()
                 .map(|(index, row)| {
@@ -2513,8 +2515,18 @@ fn resolve_unwind_batch(
                         metadata,
                     })
                 })
-                .collect::<Result<Vec<_>>>()?,
-        }),
+                .collect::<Result<Vec<_>>>()?;
+            Ok(match update_if_newer_by {
+                Some(update_if_newer_by) => QueryBatchOperation::GuardedUpsertVertices {
+                    vertices,
+                    merge_policy: QueryBatchMergePolicy {
+                        update_if_newer_by,
+                        create_only_properties,
+                    },
+                },
+                None => QueryBatchOperation::UpsertVertices { vertices },
+            })
+        }
         ParsedUnwindBatchKind::CreateRelationshipsBetweenLabeledVertices {
             edge_type,
             source_field,
@@ -2561,35 +2573,48 @@ fn resolve_unwind_batch(
             property_fields,
             source_label,
             destination_label,
-        } => Ok(
-            QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices {
-                edge_type,
-                relationships: rows
-                    .iter()
-                    .enumerate()
-                    .map(|(index, row)| {
-                        let mut metadata = EdgeMetadata::default();
-                        for (property, field) in &property_fields {
-                            metadata
-                                .properties
-                                .insert(property.clone(), unwind_row_scalar(row, index, field)?);
-                        }
-                        Ok(QueryBatchRelationshipMerge {
-                            src: unwind_row_vertex_id(row, index, &source_field)?,
-                            dst: unwind_row_vertex_id(row, index, &destination_field)?,
-                            relationship_id: unwind_row_vertex_id(
-                                row,
-                                index,
-                                &relationship_id_field,
-                            )?,
-                            metadata,
-                        })
+            update_if_newer_by,
+            create_only_properties,
+        } => {
+            let relationships = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let mut metadata = EdgeMetadata::default();
+                    for (property, field) in &property_fields {
+                        metadata
+                            .properties
+                            .insert(property.clone(), unwind_row_scalar(row, index, field)?);
+                    }
+                    Ok(QueryBatchRelationshipMerge {
+                        src: unwind_row_vertex_id(row, index, &source_field)?,
+                        dst: unwind_row_vertex_id(row, index, &destination_field)?,
+                        relationship_id: unwind_row_vertex_id(row, index, &relationship_id_field)?,
+                        metadata,
                     })
-                    .collect::<Result<Vec<_>>>()?,
-                source_label,
-                destination_label,
-            },
-        ),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(match update_if_newer_by {
+                Some(update_if_newer_by) => {
+                    QueryBatchOperation::GuardedMergeRelationshipsBetweenLabeledVertices {
+                        edge_type,
+                        relationships,
+                        source_label,
+                        destination_label,
+                        merge_policy: QueryBatchMergePolicy {
+                            update_if_newer_by,
+                            create_only_properties,
+                        },
+                    }
+                }
+                None => QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices {
+                    edge_type,
+                    relationships,
+                    source_label,
+                    destination_label,
+                },
+            })
+        }
     }
 }
 
@@ -2677,8 +2702,10 @@ fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> 
         | QueryBatchOperation::DeleteVertices { .. }
         | QueryBatchOperation::DeleteRelationshipsByProperty { .. }
         | QueryBatchOperation::UpsertVertices { .. }
+        | QueryBatchOperation::GuardedUpsertVertices { .. }
         | QueryBatchOperation::CreateRelationshipsBetweenLabeledVertices { .. }
-        | QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices { .. } => Vec::new(),
+        | QueryBatchOperation::MergeRelationshipsBetweenLabeledVertices { .. }
+        | QueryBatchOperation::GuardedMergeRelationshipsBetweenLabeledVertices { .. } => Vec::new(),
     }
 }
 

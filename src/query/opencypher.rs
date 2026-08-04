@@ -13,6 +13,10 @@ use crate::{
 type AstNode = sys::cypher_astnode_t;
 
 const PARSED_CYPHER_THREAD_CACHE_CAPACITY: usize = 32;
+#[cfg(feature = "client-api")]
+const UPDATE_IF_NEWER_MARKER: &str = "__turbolay_update_if_newer_by";
+#[cfg(feature = "client-api")]
+const CREATE_ONLY_MARKER_PREFIX: &str = "__turbolay_create_only_";
 
 thread_local! {
     static PARSED_CYPHER_THREAD_CACHE: RefCell<ParsedCypherThreadCache> =
@@ -86,6 +90,8 @@ pub(crate) enum ParsedUnwindBatchKind {
         label: String,
         vertex_field: String,
         property_fields: BTreeMap<String, String>,
+        update_if_newer_by: Option<String>,
+        create_only_properties: BTreeSet<String>,
     },
     CreateRelationshipsBetweenLabeledVertices {
         edge_type: String,
@@ -104,6 +110,8 @@ pub(crate) enum ParsedUnwindBatchKind {
         property_fields: BTreeMap<String, String>,
         source_label: String,
         destination_label: String,
+        update_if_newer_by: Option<String>,
+        create_only_properties: BTreeSet<String>,
     },
 }
 
@@ -676,6 +684,8 @@ impl ParsedCypher {
                         label: template.label,
                         vertex_field: template.vertex_field,
                         property_fields: template.property_fields,
+                        update_if_newer_by: template.update_if_newer_by,
+                        create_only_properties: template.create_only_properties,
                     },
                 }));
             }
@@ -773,6 +783,8 @@ impl ParsedCypher {
                         property_fields: template.property_fields,
                         source_label: template.source_label,
                         destination_label: template.destination_label,
+                        update_if_newer_by: template.update_if_newer_by,
+                        create_only_properties: template.create_only_properties,
                     },
                 }));
             }
@@ -1104,6 +1116,8 @@ struct UnwindBoundEdgeCreateTemplate {
     relationship_id_field: Option<String>,
     relationship_binding: Option<String>,
     property_fields: BTreeMap<String, String>,
+    update_if_newer_by: Option<String>,
+    create_only_properties: BTreeSet<String>,
 }
 
 #[cfg(feature = "client-api")]
@@ -1111,6 +1125,8 @@ struct UnwindVertexUpsertTemplate {
     label: String,
     vertex_field: String,
     property_fields: BTreeMap<String, String>,
+    update_if_newer_by: Option<String>,
+    create_only_properties: BTreeSet<String>,
 }
 
 #[cfg(feature = "client-api")]
@@ -1149,6 +1165,8 @@ fn unwind_vertex_upsert_template(
         ensure_instance(set_clause, sys::CYPHER_AST_SET, "UNWIND vertex SET")?;
         let mut label = None;
         let mut property_fields = BTreeMap::new();
+        let mut update_if_newer_by = None;
+        let mut create_only_properties = BTreeSet::new();
         for index in 0..sys::cypher_ast_set_nitems(set_clause) {
             let item = checked_node(sys::cypher_ast_set_get_item(set_clause, index))?;
             if is_instance(item, sys::CYPHER_AST_SET_LABELS) {
@@ -1188,6 +1206,23 @@ fn unwind_vertex_upsert_template(
                 if binding != unwind_alias {
                     return unsupported("UNWIND vertex SET value references the wrong row alias");
                 }
+                if property == UPDATE_IF_NEWER_MARKER {
+                    if update_if_newer_by.replace(field).is_some() {
+                        return unsupported("UNWIND vertex SET repeats the update guard");
+                    }
+                    continue;
+                }
+                if let Some(create_only_property) = property.strip_prefix(CREATE_ONLY_MARKER_PREFIX)
+                {
+                    validate_component("property", create_only_property)?;
+                    if field != create_only_property {
+                        return unsupported(
+                            "UNWIND vertex create-only marker must read the same row field",
+                        );
+                    }
+                    create_only_properties.insert(create_only_property.to_string());
+                    continue;
+                }
                 if property_fields.insert(property.clone(), field).is_some() {
                     return unsupported(format!("UNWIND vertex SET repeats property {property}"));
                 }
@@ -1195,12 +1230,20 @@ fn unwind_vertex_upsert_template(
             }
             return unsupported("UNWIND vertex upsert supports SET labels and properties only");
         }
+        validate_merge_policy(
+            &property_fields,
+            update_if_newer_by.as_deref(),
+            &create_only_properties,
+            "vertex",
+        )?;
         Ok(UnwindVertexUpsertTemplate {
             label: label.ok_or_else(|| {
                 unsupported_value("UNWIND vertex upsert requires exactly one SET label")
             })?,
             vertex_field,
             property_fields,
+            update_if_newer_by,
+            create_only_properties,
         })
     }
 }
@@ -1274,18 +1317,27 @@ fn unwind_bound_edge_merge_template(
                 "UNWIND relationship MERGE pattern matches only id; apply properties with SET",
             );
         }
-        template.property_fields = match set_clause {
-            Some(set_clause) => unwind_relationship_set_fields(
+        if let Some(set_clause) = set_clause {
+            let fields = unwind_relationship_set_fields(
                 set_clause,
                 template.relationship_binding.as_deref().ok_or_else(|| {
                     unsupported_value("UNWIND relationship MERGE SET requires a binding")
                 })?,
                 unwind_alias,
-            )?,
-            None => BTreeMap::new(),
-        };
+            )?;
+            template.property_fields = fields.property_fields;
+            template.update_if_newer_by = fields.update_if_newer_by;
+            template.create_only_properties = fields.create_only_properties;
+        }
         Ok(template)
     }
+}
+
+#[cfg(feature = "client-api")]
+struct UnwindRelationshipSetFields {
+    property_fields: BTreeMap<String, String>,
+    update_if_newer_by: Option<String>,
+    create_only_properties: BTreeSet<String>,
 }
 
 #[cfg(feature = "client-api")]
@@ -1293,10 +1345,12 @@ fn unwind_relationship_set_fields(
     set_clause: *const AstNode,
     relationship_binding: &str,
     unwind_alias: &str,
-) -> Result<BTreeMap<String, String>> {
+) -> Result<UnwindRelationshipSetFields> {
     unsafe {
         ensure_instance(set_clause, sys::CYPHER_AST_SET, "UNWIND relationship SET")?;
         let mut property_fields = BTreeMap::new();
+        let mut update_if_newer_by = None;
+        let mut create_only_properties = BTreeSet::new();
         for index in 0..sys::cypher_ast_set_nitems(set_clause) {
             let item = checked_node(sys::cypher_ast_set_get_item(set_clause, index))?;
             if !is_instance(item, sys::CYPHER_AST_SET_PROPERTY) {
@@ -1320,14 +1374,74 @@ fn unwind_relationship_set_fields(
             if binding != unwind_alias {
                 return unsupported("UNWIND relationship SET references the wrong row alias");
             }
+            if property == UPDATE_IF_NEWER_MARKER {
+                if update_if_newer_by.replace(field).is_some() {
+                    return unsupported("UNWIND relationship SET repeats the update guard");
+                }
+                continue;
+            }
+            if let Some(create_only_property) = property.strip_prefix(CREATE_ONLY_MARKER_PREFIX) {
+                validate_component("property", create_only_property)?;
+                if field != create_only_property {
+                    return unsupported(
+                        "UNWIND relationship create-only marker must read the same row field",
+                    );
+                }
+                create_only_properties.insert(create_only_property.to_string());
+                continue;
+            }
             if property_fields.insert(property.clone(), field).is_some() {
                 return unsupported(format!(
                     "UNWIND relationship SET repeats property {property}"
                 ));
             }
         }
-        Ok(property_fields)
+        validate_merge_policy(
+            &property_fields,
+            update_if_newer_by.as_deref(),
+            &create_only_properties,
+            "relationship",
+        )?;
+        Ok(UnwindRelationshipSetFields {
+            property_fields,
+            update_if_newer_by,
+            create_only_properties,
+        })
     }
+}
+
+#[cfg(feature = "client-api")]
+fn validate_merge_policy(
+    property_fields: &BTreeMap<String, String>,
+    update_if_newer_by: Option<&str>,
+    create_only_properties: &BTreeSet<String>,
+    kind: &str,
+) -> Result<()> {
+    if update_if_newer_by.is_none() && !create_only_properties.is_empty() {
+        return unsupported(format!(
+            "UNWIND {kind} create-only markers require an update guard"
+        ));
+    }
+    if let Some(guard) = update_if_newer_by {
+        if create_only_properties.contains(guard) {
+            return unsupported(format!(
+                "UNWIND {kind} update guard cannot also be create-only"
+            ));
+        }
+        if property_fields.get(guard).map(String::as_str) != Some(guard) {
+            return unsupported(format!(
+                "UNWIND {kind} update guard must name a property assigned from the same row field"
+            ));
+        }
+    }
+    for property in create_only_properties {
+        if property_fields.get(property).map(String::as_str) != Some(property.as_str()) {
+            return unsupported(format!(
+                "UNWIND {kind} create-only marker must name a property assigned from the same row field"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "client-api")]
@@ -1470,6 +1584,8 @@ fn unwind_bound_edge_path_template(
                 relationship_id_field,
                 relationship_binding,
                 property_fields,
+                update_if_newer_by: None,
+                create_only_properties: BTreeSet::new(),
             }),
             sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(UnwindBoundEdgeCreateTemplate {
                 edge_type,
@@ -1480,6 +1596,8 @@ fn unwind_bound_edge_path_template(
                 relationship_id_field,
                 relationship_binding,
                 property_fields,
+                update_if_newer_by: None,
+                create_only_properties: BTreeSet::new(),
             }),
             sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => unsupported(format!(
                 "UNWIND MATCH {operation} does not support undirected relationships"
@@ -3461,8 +3579,50 @@ mod tests {
                     ("active".to_string(), "active".to_string()),
                     ("source_id".to_string(), "source_id".to_string()),
                 ]),
+                update_if_newer_by: None,
+                create_only_properties: BTreeSet::new(),
             }
         );
+    }
+
+    #[cfg(feature = "client-api")]
+    #[test]
+    fn lowers_guarded_unwind_vertex_upsert_batch() {
+        let parsed = parse_opencypher_unwind_batch(
+            "UNWIND $rows AS row MERGE (n {id: row.vertex}) SET n:Source, \
+             n.created_at = row.created_at, n.updated_at = row.updated_at, \
+             n.__turbolay_update_if_newer_by = row.updated_at, \
+             n.__turbolay_create_only_created_at = row.created_at",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            parsed.kind,
+            ParsedUnwindBatchKind::UpsertVertices {
+                label: "Source".to_string(),
+                vertex_field: "vertex".to_string(),
+                property_fields: BTreeMap::from([
+                    ("created_at".to_string(), "created_at".to_string()),
+                    ("updated_at".to_string(), "updated_at".to_string()),
+                ]),
+                update_if_newer_by: Some("updated_at".to_string()),
+                create_only_properties: BTreeSet::from(["created_at".to_string()]),
+            }
+        );
+    }
+
+    #[cfg(feature = "client-api")]
+    #[test]
+    fn rejects_a_guard_that_is_also_create_only() {
+        let error = parse_opencypher_unwind_batch(
+            "UNWIND $rows AS row MERGE (n {id: row.vertex}) SET n:Source, \
+             n.updated_at = row.updated_at, \
+             n.__turbolay_update_if_newer_by = row.updated_at, \
+             n.__turbolay_create_only_updated_at = row.updated_at",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cannot also be create-only"));
     }
 
     #[cfg(feature = "client-api")]
@@ -3508,6 +3668,39 @@ mod tests {
 
     #[cfg(feature = "client-api")]
     #[test]
+    fn lowers_guarded_unwind_relationship_merge_batch() {
+        let parsed = parse_opencypher_unwind_batch(
+            "UNWIND $rows AS row \
+             MATCH (s:Entity {id: row.source_vertex}), \
+                   (d:Entity {id: row.destination_vertex}) \
+             MERGE (s)-[r:RELATES {id: row.relationship_vertex}]->(d) \
+             SET r.timestamp = row.timestamp, r.valid_from = row.valid_from, \
+                 r.__turbolay_update_if_newer_by = row.timestamp, \
+                 r.__turbolay_create_only_valid_from = row.valid_from",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            parsed.kind,
+            ParsedUnwindBatchKind::MergeRelationshipsBetweenLabeledVertices {
+                edge_type: "RELATES".to_string(),
+                source_field: "source_vertex".to_string(),
+                destination_field: "destination_vertex".to_string(),
+                relationship_id_field: "relationship_vertex".to_string(),
+                property_fields: BTreeMap::from([
+                    ("timestamp".to_string(), "timestamp".to_string()),
+                    ("valid_from".to_string(), "valid_from".to_string()),
+                ]),
+                source_label: "Entity".to_string(),
+                destination_label: "Entity".to_string(),
+                update_if_newer_by: Some("timestamp".to_string()),
+                create_only_properties: BTreeSet::from(["valid_from".to_string()]),
+            }
+        );
+    }
+
+    #[cfg(feature = "client-api")]
+    #[test]
     fn lowers_unwind_relationship_merge_batch() {
         let parsed = parse_opencypher_unwind_batch(
             "UNWIND $rows AS row \
@@ -3532,6 +3725,8 @@ mod tests {
                 ]),
                 source_label: "Entity".to_string(),
                 destination_label: "Entity".to_string(),
+                update_if_newer_by: None,
+                create_only_properties: BTreeSet::new(),
             }
         );
     }
