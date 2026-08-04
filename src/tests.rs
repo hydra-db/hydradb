@@ -716,13 +716,25 @@ async fn native_sp_paths_preserves_parallel_relationship_identity_and_scores() {
             .await
             .unwrap();
     }
+    shard
+        .set_edge_metadata(
+            "cell-a",
+            "ROUTE",
+            1,
+            2,
+            EdgeMetadata::default()
+                .with_property("weight", VertexPropertyValue::Integer(100))
+                .with_property("cost", VertexPropertyValue::Integer(1_000)),
+        )
+        .await
+        .unwrap();
     shard.build_graph_index("cell-a", "ROUTE").await.unwrap();
 
     let result = shard
         .execute_cypher_rows(
             QueryContext::new("cell-a", "native-parallel-read"),
             "CALL algo.SPpaths({sourceNode: 1, targetNode: 2, relTypes: ['ROUTE'], \
-             maxLen: 1, weightProp: 'weight', costProp: 'cost', pathCount: 2}) \
+             maxLen: 1, weightProp: 'weight', costProp: 'cost', pathCount: 3}) \
              YIELD path, pathWeight, pathCost RETURN path, pathWeight, pathCost",
         )
         .await
