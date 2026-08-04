@@ -339,6 +339,14 @@ pub(crate) fn compiled_graphblas_in_neighbors(
     compiled.in_neighbors(vertex)
 }
 
+#[cfg(feature = "opencypher")]
+pub(crate) fn compiled_graphblas_out_neighbors(
+    compiled: &CompiledGraphBlasMatrix,
+    vertex: VertexId,
+) -> Vec<VertexId> {
+    compiled.out_neighbors(vertex)
+}
+
 pub(crate) fn expand_range_compiled_graphblas(
     compiled: &CompiledGraphBlasMatrix,
     adjacency: &Adjacency,

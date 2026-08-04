@@ -753,6 +753,11 @@ impl CompiledGraphBlasMatrix {
             .neighbors(vertex)
     }
 
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn out_neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
+        self.canonical_out.neighbors(vertex)
+    }
+
     pub(crate) fn expand_range(
         &self,
         adjacency: &Adjacency,
