@@ -4616,20 +4616,25 @@ fn test_transport_rows_response() -> serde_json::Value {
 
 #[cfg(feature = "query-transport")]
 #[tokio::test]
-async fn tcp_query_transport_client_rejects_obsolete_server_version() {
+async fn tcp_query_transport_guarded_batch_uses_a_distinct_wire_operation() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let version_two_server = tokio::spawn(async move {
+    let version_one_server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut reader = tokio::io::BufReader::new(stream);
         let request = test_read_transport_json(&mut reader).await;
         assert_eq!(request["version"].as_u64(), Some(1));
+        assert_eq!(
+            request["operation"]["GuardedUpsertVertices"]["merge_policy"]["update_if_newer_by"]
+                .as_str(),
+            Some("updated_at")
+        );
         test_write_transport_json(
             &mut reader,
             &serde_json::json!({
                 "response": {
                     "kind": "error",
-                    "message": "unsupported query transport version 1; expected 2",
+                    "message": "unknown batch operation GuardedUpsertVertices",
                 },
                 "close_connection": true,
             }),
@@ -4639,16 +4644,22 @@ async fn tcp_query_transport_client_rejects_obsolete_server_version() {
 
     let client = TcpQueryCellClient::new(addr).with_timeout(std::time::Duration::from_secs(2));
     let result = client
-        .execute_cypher_rows(
+        .execute_batch(
             QueryContext::new("reddit-home", "strict-version-client"),
-            "MATCH (u {id: 1}) RETURN u.id",
+            QueryBatchOperation::GuardedUpsertVertices {
+                vertices: Vec::new(),
+                merge_policy: QueryBatchMergePolicy {
+                    update_if_newer_by: "updated_at".to_string(),
+                    create_only_properties: std::collections::BTreeSet::new(),
+                },
+            },
         )
         .await
         .unwrap_err();
     assert!(matches!(result, GraphError::UnsupportedQuery { .. }));
     assert_eq!(client.metrics().connections_created, 1);
     assert_eq!(client.metrics().client_retries, 0);
-    version_two_server.await.unwrap();
+    version_one_server.await.unwrap();
 }
 
 #[cfg(feature = "query-transport")]
