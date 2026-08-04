@@ -13,7 +13,9 @@ use crate::{
 type AstNode = sys::cypher_astnode_t;
 
 const PARSED_CYPHER_THREAD_CACHE_CAPACITY: usize = 32;
+#[cfg(feature = "client-api")]
 const UPDATE_IF_NEWER_MARKER: &str = "__turbolay_update_if_newer_by";
+#[cfg(feature = "client-api")]
 const CREATE_ONLY_MARKER_PREFIX: &str = "__turbolay_create_only_";
 
 thread_local! {
