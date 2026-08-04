@@ -1,8 +1,10 @@
 use boltr::error::BoltError;
-use boltr::types::BoltValue;
+use boltr::types::{BoltDict, BoltNode, BoltPath, BoltUnboundRelationship, BoltValue};
 
 use super::{ClientBookmark, ClientQueryTarget};
-use crate::{GraphError, QueryFloat, QueryParameterValue, QueryValue, VertexPropertyValue};
+use crate::{
+    GraphError, QueryFloat, QueryParameterValue, QueryPath, QueryValue, VertexPropertyValue,
+};
 
 const MAX_QUERY_PARAMETER_DEPTH: usize = 16;
 
@@ -107,7 +109,89 @@ pub(super) fn query_value_to_bolt(value: &QueryValue) -> std::result::Result<Bol
             .map(query_value_to_bolt)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map(BoltValue::List),
+        QueryValue::Path(path) => query_path_to_bolt(path).map(BoltValue::Path),
     }
+}
+
+fn query_path_to_bolt(path: &QueryPath) -> std::result::Result<BoltPath, BoltError> {
+    if path.nodes.len() != path.relationships.len().saturating_add(1) {
+        return Err(BoltError::Backend(
+            "native path node and relationship counts are inconsistent".to_string(),
+        ));
+    }
+    let nodes = path
+        .nodes
+        .iter()
+        .map(|node| {
+            let id = i64::try_from(node.id).map_err(|_| bolt_integer_overflow(node.id))?;
+            Ok(BoltNode {
+                id,
+                labels: node.labels.clone(),
+                properties: property_map_to_bolt(&node.properties)?,
+                element_id: node.id.to_string(),
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, BoltError>>()?;
+    let relationships = path
+        .relationships
+        .iter()
+        .enumerate()
+        .map(|(index, relationship)| {
+            let id = match relationship.id {
+                Some(id) => i64::try_from(id).map_err(|_| bolt_integer_overflow(id))?,
+                None => -1_i64.saturating_sub(index as i64),
+            };
+            Ok(BoltUnboundRelationship {
+                id,
+                rel_type: relationship.edge_type.clone(),
+                properties: property_map_to_bolt(&relationship.properties)?,
+                element_id: relationship.id.map_or_else(
+                    || {
+                        format!(
+                            "structural:{}:{}:{}",
+                            relationship.edge_type, relationship.src, relationship.dst
+                        )
+                    },
+                    |id| id.to_string(),
+                ),
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, BoltError>>()?;
+    let mut indices = Vec::with_capacity(path.relationships.len().saturating_mul(2));
+    for (index, relationship) in path.relationships.iter().enumerate() {
+        let from = path.nodes[index].id;
+        let to = path.nodes[index + 1].id;
+        let relationship_index = i64::try_from(index + 1).map_err(|_| {
+            BoltError::Backend("native path contains too many relationships for Bolt".to_string())
+        })?;
+        let signed_index = if relationship.src == from && relationship.dst == to {
+            relationship_index
+        } else if relationship.src == to && relationship.dst == from {
+            -relationship_index
+        } else {
+            return Err(BoltError::Backend(
+                "native path relationship does not connect adjacent nodes".to_string(),
+            ));
+        };
+        indices.push(signed_index);
+        indices.push(i64::try_from(index + 1).map_err(|_| {
+            BoltError::Backend("native path contains too many nodes for Bolt".to_string())
+        })?);
+    }
+    Ok(BoltPath {
+        nodes,
+        rels: relationships,
+        indices,
+    })
+}
+
+fn property_map_to_bolt(
+    properties: &std::collections::BTreeMap<String, VertexPropertyValue>,
+) -> std::result::Result<BoltDict, BoltError> {
+    properties
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), property_value_to_bolt(value)?)))
+        .collect()
 }
 
 fn property_value_to_bolt(

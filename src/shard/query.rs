@@ -258,6 +258,15 @@ impl GraphShard {
     ) -> Result<QueryOutput> {
         #[cfg(feature = "opencypher")]
         {
+            if let Some(procedure) = crate::query::path_procedure::parse_native_path_procedure(
+                query,
+                &context.parameters,
+                self.limits.max_traversal_hops,
+            )? {
+                return Box::pin(self.execute_native_path_rows(context, procedure))
+                    .await
+                    .map(QueryOutput::Rows);
+            }
             if let Some(parsed) =
                 parse_opencypher_mutation_query_with_parameters(query, &context.parameters)?
             {
@@ -292,6 +301,13 @@ impl GraphShard {
     ) -> Result<QueryResultSet> {
         #[cfg(feature = "opencypher")]
         {
+            if let Some(procedure) = crate::query::path_procedure::parse_native_path_procedure(
+                query,
+                &context.parameters,
+                self.limits.max_traversal_hops,
+            )? {
+                return Box::pin(self.execute_native_path_rows(context, procedure)).await;
+            }
             let parsed = self
                 .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters)
                 .await?;
@@ -317,6 +333,26 @@ impl GraphShard {
     ) -> Result<QueryResultPage> {
         #[cfg(feature = "opencypher")]
         {
+            if let Some(procedure) = crate::query::path_procedure::parse_native_path_procedure(
+                query,
+                &context.parameters,
+                self.limits.max_traversal_hops,
+            )? {
+                let offset = cursor.map_or(0, |cursor| cursor.offset);
+                let mut result =
+                    Box::pin(self.execute_native_path_rows(context, procedure)).await?;
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(result.rows.len());
+                let end = start.saturating_add(page_size).min(result.rows.len());
+                let next_cursor = (end < result.rows.len())
+                    .then(|| QueryCursorToken::new(offset.saturating_add(page_size as u64)));
+                return Ok(QueryResultPage::new(
+                    result.columns,
+                    result.rows.drain(start..end).collect(),
+                    next_cursor,
+                ));
+            }
             let parsed = self
                 .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters)
                 .await?;
@@ -2820,6 +2856,26 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
+    pub(crate) async fn native_path_relationship_at(
+        &self,
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        dst: VertexId,
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+    ) -> Result<(Option<RelationshipId>, EdgeMetadata)> {
+        let mut relationships = self
+            .relationships_for_edge_at(cell_id, edge_type, src, dst, read_epoch, budget)
+            .await?;
+        relationships.sort_by_key(|(relationship, _)| relationship.relationship_id);
+        Ok(relationships.into_iter().next().map_or(
+            (None, EdgeMetadata::default()),
+            |(relationship, metadata)| (relationship.relationship_id, metadata),
+        ))
+    }
+
+    #[cfg(feature = "opencypher")]
     async fn relationship_predicate_seed_rows(
         &self,
         cell_id: &str,
@@ -3731,7 +3787,7 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    async fn vertex_metadata_at(
+    pub(crate) async fn vertex_metadata_at(
         &self,
         cell_id: &str,
         vertex_id: VertexId,
@@ -5426,7 +5482,7 @@ impl GraphShard {
     /// The indexer records the same `cell_id` and `base_sequence` on the span
     /// that produced the artifact, so the join is a backend query rather than
     /// two log files and a clock.
-    async fn traced_latest_matrix_artifact(
+    pub(crate) async fn traced_latest_matrix_artifact(
         &self,
         cell_id: &str,
         edge_type: &str,
@@ -5583,7 +5639,7 @@ impl GraphShard {
             .map(|compiled| (compiled, None, false)))
     }
 
-    fn record_graphblas_snapshot(&self, rebuilt: bool) {
+    pub(crate) fn record_graphblas_snapshot(&self, rebuilt: bool) {
         let counter = if rebuilt {
             &self.operation_metrics.query_graphblas_rebuilt_snapshots
         } else {
@@ -6303,13 +6359,13 @@ impl QueryBudget {
     }
 
     #[cfg(feature = "opencypher")]
-    fn with_max_result_bytes(mut self, max_result_bytes: Option<u64>) -> Self {
+    pub(crate) fn with_max_result_bytes(mut self, max_result_bytes: Option<u64>) -> Self {
         self.max_result_bytes = max_result_bytes;
         self
     }
 
     #[cfg(feature = "opencypher")]
-    fn account_result_row(&self, row: &QueryRow) -> Result<()> {
+    pub(crate) fn account_result_row(&self, row: &QueryRow) -> Result<()> {
         let Some(limit) = self.max_result_bytes else {
             return Ok(());
         };
@@ -8430,6 +8486,7 @@ fn compare_query_values(left: &QueryValue, right: &QueryValue) -> std::cmp::Orde
             }
             left.len().cmp(&right.len())
         }
+        (QueryValue::Path(left), QueryValue::Path(right)) => left.cmp(right),
         (QueryValue::Bool(left), QueryValue::Bool(right)) => left.cmp(right),
         _ => query_value_rank(left).cmp(&query_value_rank(right)),
     }
@@ -8458,6 +8515,7 @@ fn query_value_rank(value: &QueryValue) -> u8 {
         QueryValue::Float(_) => 3,
         QueryValue::Property(value) => 4 + vertex_property_rank(value),
         QueryValue::List(_) => 8,
+        QueryValue::Path(_) => 9,
         QueryValue::Null => u8::MAX,
     }
 }

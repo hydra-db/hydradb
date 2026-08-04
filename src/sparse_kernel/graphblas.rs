@@ -160,6 +160,8 @@ struct Descriptor(GrBDescriptor);
 
 pub(crate) struct CompiledGraphBlasMatrix {
     canonical_out: CompiledCompactCscMatrix,
+    #[cfg(feature = "opencypher")]
+    canonical_in: OnceLock<CompiledCompactCscMatrix>,
     // Resolved once by the constructor and never re-read from configuration.
     kernel: SparseKernelBackend,
     replicas: Vec<Mutex<CompiledGraphBlasMatrixInner>>,
@@ -283,6 +285,42 @@ impl CompiledCompactCscMatrix {
         };
         self.neighbor_range(src_ordinal)
             .any(|index| self.neighbor(index) == dst_ordinal)
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
+        let Some(ordinal) = self.ordinal(vertex) else {
+            return Vec::new();
+        };
+        self.neighbor_range(ordinal)
+            .map(|index| self.vertices[self.neighbor(index)])
+            .collect()
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn transpose(&self) -> Self {
+        let dimension = self.dimension();
+        let mut pointers = vec![0_u64; dimension + 1];
+        for index in 0..self.indices.len() {
+            pointers[self.neighbor(index) + 1] += 1;
+        }
+        for index in 1..pointers.len() {
+            pointers[index] += pointers[index - 1];
+        }
+        let mut indices = vec![0_u64; self.indices.len()];
+        let mut offsets = pointers[..dimension].to_vec();
+        for src in 0..dimension {
+            for index in self.neighbor_range(src) {
+                let dst = self.neighbor(index);
+                indices[offsets[dst] as usize] = src as u64;
+                offsets[dst] += 1;
+            }
+        }
+        Self {
+            vertices: self.vertices.clone(),
+            pointers: CompactOrdinalVec::from_u64(pointers),
+            indices: CompactOrdinalVec::from_u64(indices),
+        }
     }
 
     fn start_ordinals(&self, starts: &[VertexId]) -> Vec<usize> {
@@ -553,6 +591,17 @@ fn compiled_kernel(requested: SparseKernelBackend) -> SparseKernelBackend {
     }
 }
 
+fn compact_csc_query_bytes(one_orientation_bytes: usize) -> usize {
+    #[cfg(feature = "opencypher")]
+    {
+        one_orientation_bytes.saturating_mul(2)
+    }
+    #[cfg(not(feature = "opencypher"))]
+    {
+        one_orientation_bytes
+    }
+}
+
 impl CompiledGraphBlasMatrix {
     pub(crate) fn new(adjacency: &Adjacency, kernel: SparseKernelBackend) -> Result<Self> {
         let csc = graphblas_csc_from_adjacency(adjacency)?;
@@ -566,11 +615,17 @@ impl CompiledGraphBlasMatrix {
         if kernel == SparseKernelBackend::CompactCsc {
             return Ok(Self {
                 canonical_out,
+                #[cfg(feature = "opencypher")]
+                canonical_in: OnceLock::new(),
                 kernel,
                 replicas: Vec::new(),
                 next_replica: AtomicUsize::new(0),
                 edge_count: csc.indices.len(),
-                estimated_resident_bytes: compact_csc_resident_bytes(csc),
+                // Reserve both orientations in cache accounting. The reverse
+                // CSC is allocated lazily, but allowing it to appear outside
+                // the cache budget would make an incoming-path workload break
+                // the configured resident-memory bound.
+                estimated_resident_bytes: compact_csc_query_bytes(compact_csc_resident_bytes(csc)),
             });
         }
         init()?;
@@ -585,12 +640,14 @@ impl CompiledGraphBlasMatrix {
         }
         Ok(Self {
             canonical_out,
+            #[cfg(feature = "opencypher")]
+            canonical_in: OnceLock::new(),
             kernel,
             replicas,
             next_replica: AtomicUsize::new(0),
             edge_count: csc.indices.len(),
             estimated_resident_bytes: native_graphblas_resident_bytes(csc, replica_count)
-                .saturating_add(compact_csc_resident_bytes(csc)),
+                .saturating_add(compact_csc_query_bytes(compact_csc_resident_bytes(csc))),
         })
     }
 
@@ -606,11 +663,13 @@ impl CompiledGraphBlasMatrix {
             let edge_count = canonical_out.indices.len();
             return Ok(Self {
                 canonical_out,
+                #[cfg(feature = "opencypher")]
+                canonical_in: OnceLock::new(),
                 kernel,
                 replicas: Vec::new(),
                 next_replica: AtomicUsize::new(0),
                 edge_count,
-                estimated_resident_bytes: compact_bytes,
+                estimated_resident_bytes: compact_csc_query_bytes(compact_bytes),
             });
         }
         Self::new_from_csc(&csc, kernel)
@@ -643,11 +702,13 @@ impl CompiledGraphBlasMatrix {
             let edge_count = canonical_out.indices.len();
             return Ok(Self {
                 canonical_out,
+                #[cfg(feature = "opencypher")]
+                canonical_in: OnceLock::new(),
                 kernel,
                 replicas: Vec::new(),
                 next_replica: AtomicUsize::new(0),
                 edge_count,
-                estimated_resident_bytes: one_orientation_bytes,
+                estimated_resident_bytes: compact_csc_query_bytes(one_orientation_bytes),
             });
         }
         let csc = GraphBlasCsc {
@@ -683,6 +744,13 @@ impl CompiledGraphBlasMatrix {
 
     pub(crate) fn contains_edge(&self, src: VertexId, dst: VertexId) -> bool {
         self.canonical_out.contains_edge(src, dst)
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn in_neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
+        self.canonical_in
+            .get_or_init(|| self.canonical_out.transpose())
+            .neighbors(vertex)
     }
 
     pub(crate) fn expand_range(

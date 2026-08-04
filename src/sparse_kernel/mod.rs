@@ -331,6 +331,14 @@ pub(crate) fn compiled_graphblas_contains_edge(
     compiled.contains_edge(src, dst)
 }
 
+#[cfg(feature = "opencypher")]
+pub(crate) fn compiled_graphblas_in_neighbors(
+    compiled: &CompiledGraphBlasMatrix,
+    vertex: VertexId,
+) -> Vec<VertexId> {
+    compiled.in_neighbors(vertex)
+}
+
 pub(crate) fn expand_range_compiled_graphblas(
     compiled: &CompiledGraphBlasMatrix,
     adjacency: &Adjacency,
