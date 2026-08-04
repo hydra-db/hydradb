@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use tracing::Instrument as _;
 
-use super::topology_tail::{expand_range_with_overlay, GraphTopologyOverlay};
+use super::topology_tail::GraphTopologyOverlay;
 use super::*;
 use crate::query::path_procedure::{
     NativePathDirection, NativePathProcedure, NativePathProcedureKind, NativePathProjection,
@@ -345,18 +345,14 @@ impl GraphShard {
             if direction != NativePathDirection::Incoming {
                 let neighbors = match &topology.source {
                     PathTopologySource::Compiled { matrix, overlay } => {
+                        let mut neighbors =
+                            crate::sparse_kernel::compiled_graphblas_out_neighbors(matrix, vertex)
+                                .into_iter()
+                                .collect::<BTreeSet<_>>();
                         if let Some(overlay) = overlay {
-                            expand_range_with_overlay(matrix, overlay, &[vertex], 1, 1)?.vertices
-                        } else {
-                            crate::sparse_kernel::expand_range_compiled_graphblas(
-                                matrix,
-                                &BTreeMap::new(),
-                                &[vertex],
-                                1,
-                                1,
-                            )?
-                            .vertices
+                            overlay.apply_out_neighbors(vertex, &mut neighbors);
                         }
+                        neighbors.into_iter().collect()
                     }
                     PathTopologySource::Storage => {
                         self.out_neighbors_in_storage_snapshot(
