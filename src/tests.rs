@@ -702,7 +702,7 @@ async fn native_sp_paths_preserves_parallel_relationship_identity_and_scores() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/native-sp-paths-parallel", object_store).await;
     for (index, query) in [
-        "CREATE (a {id: 1})-[:ROUTE {weight: 9, cost: 90}]->(b {id: 2})",
+        "CREATE (a {id: 1})-[:ROUTE {weight: 9}]->(b {id: 2})",
         "CREATE (a {id: 1})-[:ROUTE {weight: 1, cost: 10}]->(b {id: 2})",
     ]
     .into_iter()
@@ -724,7 +724,11 @@ async fn native_sp_paths_preserves_parallel_relationship_identity_and_scores() {
             2,
             EdgeMetadata::default()
                 .with_property("weight", VertexPropertyValue::Integer(100))
-                .with_property("cost", VertexPropertyValue::Integer(1_000)),
+                .with_property("cost", VertexPropertyValue::Integer(90))
+                .with_property(
+                    "shared",
+                    VertexPropertyValue::String("structural".to_string()),
+                ),
         )
         .await
         .unwrap();
@@ -752,6 +756,15 @@ async fn native_sp_paths_preserves_parallel_relationship_identity_and_scores() {
         })
         .collect::<BTreeSet<_>>();
     assert_eq!(relationship_ids.len(), 2);
+    for row in &result.rows {
+        let QueryValue::Path(path) = &row.values[0] else {
+            panic!("native procedure must return paths");
+        };
+        assert_eq!(
+            path.relationships[0].properties.get("shared"),
+            Some(&VertexPropertyValue::String("structural".to_string()))
+        );
+    }
     assert_eq!(result.rows[0].values[1], QueryValue::Count(1));
     assert_eq!(result.rows[0].values[2], QueryValue::Count(10));
     assert_eq!(result.rows[1].values[1], QueryValue::Count(9));

@@ -2860,11 +2860,28 @@ impl GraphShard {
         let mut relationships = self
             .relationships_for_edge_at(cell_id, edge_type, src, dst, read_epoch, budget)
             .await?;
-        if relationships
-            .iter()
-            .any(|(relationship, _)| relationship.relationship_id.is_some())
-        {
-            relationships.retain(|(relationship, _)| relationship.relationship_id.is_some());
+        let structural_metadata = relationships.iter().find_map(|(relationship, metadata)| {
+            relationship
+                .relationship_id
+                .is_none()
+                .then(|| metadata.clone())
+        });
+        if let Some(structural_metadata) = structural_metadata {
+            if relationships
+                .iter()
+                .any(|(relationship, _)| relationship.relationship_id.is_some())
+            {
+                relationships = relationships
+                    .into_iter()
+                    .filter_map(|(relationship, metadata)| {
+                        relationship.relationship_id.map(|_| {
+                            let mut merged = structural_metadata.clone();
+                            merged.properties.extend(metadata.properties);
+                            (relationship, merged)
+                        })
+                    })
+                    .collect();
+            }
         }
         relationships.sort_by_key(|(relationship, _)| relationship.relationship_id);
         Ok(relationships
