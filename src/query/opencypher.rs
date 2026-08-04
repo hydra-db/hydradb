@@ -1421,6 +1421,11 @@ fn validate_merge_policy(
         ));
     }
     if let Some(guard) = update_if_newer_by {
+        if create_only_properties.contains(guard) {
+            return unsupported(format!(
+                "UNWIND {kind} update guard cannot also be create-only"
+            ));
+        }
         if property_fields.get(guard).map(String::as_str) != Some(guard) {
             return unsupported(format!(
                 "UNWIND {kind} update guard must name a property assigned from the same row field"
@@ -3602,6 +3607,20 @@ mod tests {
                 create_only_properties: BTreeSet::from(["created_at".to_string()]),
             }
         );
+    }
+
+    #[cfg(feature = "client-api")]
+    #[test]
+    fn rejects_a_guard_that_is_also_create_only() {
+        let error = parse_opencypher_unwind_batch(
+            "UNWIND $rows AS row MERGE (n {id: row.vertex}) SET n:Source, \
+             n.updated_at = row.updated_at, \
+             n.__turbolay_update_if_newer_by = row.updated_at, \
+             n.__turbolay_create_only_updated_at = row.updated_at",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cannot also be create-only"));
     }
 
     #[cfg(feature = "client-api")]

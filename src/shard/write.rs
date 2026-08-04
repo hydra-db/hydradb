@@ -4982,7 +4982,7 @@ fn guarded_metadata_patch(
             });
         }
     };
-    if ordering == std::cmp::Ordering::Greater {
+    if ordering != std::cmp::Ordering::Less {
         return Ok(None);
     }
     Ok(Some(requested))
@@ -5049,6 +5049,36 @@ mod guarded_metadata_patch_tests {
             Some(&VertexPropertyValue::String(
                 "2026-08-03T11:00:00+00:00".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn rejects_an_equal_version_patch() {
+        let previous = BTreeMap::from([
+            (
+                "name".to_string(),
+                VertexPropertyValue::String("current".to_string()),
+            ),
+            (
+                "updated_at".to_string(),
+                VertexPropertyValue::String("2026-08-03T10:00:00+00:00".to_string()),
+            ),
+        ]);
+        let requested = BTreeMap::from([
+            (
+                "name".to_string(),
+                VertexPropertyValue::String("conflicting replay".to_string()),
+            ),
+            (
+                "updated_at".to_string(),
+                VertexPropertyValue::String("2026-08-03T10:00:00+00:00".to_string()),
+            ),
+        ]);
+
+        assert!(
+            guarded_metadata_patch(&previous, requested, &policy(), "vertex/1")
+                .unwrap()
+                .is_none()
         );
     }
 
