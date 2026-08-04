@@ -29,9 +29,40 @@ tokio::task_local! {
 }
 #[cfg(feature = "opencypher")]
 use crate::{
-    ParsedRowQueryCacheKey, RelationshipPropertyRowsCacheKey, RelationshipRowsCacheKey,
-    RelationshipRowsCacheValue, SourceRelationshipRowsCacheKey, VertexId,
+    GraphScope, ParsedRowQueryCacheKey, QueryColumn, QueryRow, RelationshipPropertyRowsCacheKey,
+    RelationshipRowsCacheKey, RelationshipRowsCacheValue, SourceRelationshipRowsCacheKey, VertexId,
+    VertexPropertyValue,
 };
+
+#[cfg(feature = "opencypher")]
+pub(crate) struct NativePathPageCursor {
+    pub(crate) scope: GraphScope,
+    pub(crate) cell_id: String,
+    pub(crate) query: String,
+    pub(crate) parameters: std::collections::BTreeMap<String, VertexPropertyValue>,
+    pub(crate) columns: Vec<QueryColumn>,
+    pub(crate) rows: std::collections::VecDeque<QueryRow>,
+    pub(crate) expires_at: Instant,
+    pub(crate) resident_bytes: u64,
+}
+
+#[cfg(feature = "opencypher")]
+pub(crate) struct NativePathPageCursorStore {
+    pub(crate) next_id: u64,
+    pub(crate) resident_bytes: u64,
+    pub(crate) cursors: std::collections::BTreeMap<u64, NativePathPageCursor>,
+}
+
+#[cfg(feature = "opencypher")]
+impl Default for NativePathPageCursorStore {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            resident_bytes: 0,
+            cursors: std::collections::BTreeMap::new(),
+        }
+    }
+}
 
 pub struct GraphShard {
     pub(crate) db: GraphStore,
@@ -69,6 +100,8 @@ pub struct GraphShard {
     #[cfg(feature = "opencypher")]
     pub(crate) relationship_property_rows_cache:
         Mutex<BoundedGraphCache<RelationshipPropertyRowsCacheKey, RelationshipRowsCacheValue>>,
+    #[cfg(feature = "opencypher")]
+    pub(crate) native_path_page_cursors: Mutex<NativePathPageCursorStore>,
 }
 
 #[derive(Clone)]

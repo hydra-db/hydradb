@@ -8,8 +8,13 @@ use crate::query::path_procedure::{
     NativePathDirection, NativePathProcedure, NativePathProcedureKind, NativePathProjection,
 };
 use crate::{
-    QueryPath, QueryPathNode, QueryPathRelationship, QueryResultSet, QueryRow, QueryValue,
+    QueryCursorToken, QueryPath, QueryPathNode, QueryPathRelationship, QueryResultPage,
+    QueryResultSet, QueryRow, QueryValue,
 };
+
+const MAX_NATIVE_PATH_PAGE_CURSORS: usize = 1_024;
+const MAX_NATIVE_PATH_PAGE_CURSOR_BYTES: u64 = 64 * 1024 * 1024;
+const NATIVE_PATH_PAGE_CURSOR_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 enum PathTopologySource {
     Compiled {
@@ -29,6 +34,7 @@ struct PathEdge {
     edge_type: String,
     src: VertexId,
     dst: VertexId,
+    relationship_id: Option<RelationshipId>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +54,134 @@ struct NativePathRead<'a> {
 }
 
 impl GraphShard {
+    pub(crate) async fn execute_native_path_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        procedure: NativePathProcedure,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        if page_size == 0 {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "native path page size must be greater than zero".to_string(),
+            });
+        }
+        if let Some(cursor) = cursor {
+            return self
+                .continue_native_path_page(&context, query, cursor, page_size)
+                .await;
+        }
+
+        let scope = context.scope.clone();
+        let cell_id = context.cell_id.clone();
+        let parameters = context.parameters.clone();
+        let result = self.execute_native_path_rows(context, procedure).await?;
+        let QueryResultSet {
+            columns,
+            rows,
+            read_epoch: _,
+            storage_sequence: _,
+        } = result;
+        let mut rows = VecDeque::from(rows);
+        let page_rows = take_native_path_page_rows(&mut rows, page_size);
+        if rows.is_empty() {
+            return Ok(QueryResultPage::new(columns, page_rows, None));
+        }
+
+        let resident_bytes = native_path_rows_resident_bytes(&rows);
+        if resident_bytes > MAX_NATIVE_PATH_PAGE_CURSOR_BYTES {
+            return Err(GraphError::AdmissionRejected {
+                operation: "native_path_cursor_bytes",
+                actual: resident_bytes,
+                limit: MAX_NATIVE_PATH_PAGE_CURSOR_BYTES,
+            });
+        }
+        let mut store = self.native_path_page_cursors.lock().await;
+        purge_native_path_page_cursors(&mut store);
+        if store.cursors.len() >= MAX_NATIVE_PATH_PAGE_CURSORS {
+            return Err(GraphError::AdmissionRejected {
+                operation: "native_path_cursors",
+                actual: store.cursors.len().saturating_add(1) as u64,
+                limit: MAX_NATIVE_PATH_PAGE_CURSORS as u64,
+            });
+        }
+        let next_bytes = store.resident_bytes.saturating_add(resident_bytes);
+        if next_bytes > MAX_NATIVE_PATH_PAGE_CURSOR_BYTES {
+            return Err(GraphError::AdmissionRejected {
+                operation: "native_path_cursor_bytes",
+                actual: next_bytes,
+                limit: MAX_NATIVE_PATH_PAGE_CURSOR_BYTES,
+            });
+        }
+        let cursor_id = next_native_path_page_cursor_id(&mut store)?;
+        store.cursors.insert(
+            cursor_id,
+            crate::core::state::NativePathPageCursor {
+                scope,
+                cell_id,
+                query: query.to_string(),
+                parameters,
+                columns: columns.clone(),
+                rows,
+                expires_at: std::time::Instant::now() + NATIVE_PATH_PAGE_CURSOR_TTL,
+                resident_bytes,
+            },
+        );
+        store.resident_bytes = next_bytes;
+        Ok(QueryResultPage::new(
+            columns,
+            page_rows,
+            Some(QueryCursorToken::new(cursor_id)),
+        ))
+    }
+
+    async fn continue_native_path_page(
+        &self,
+        context: &QueryContext,
+        query: &str,
+        cursor: QueryCursorToken,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let mut store = self.native_path_page_cursors.lock().await;
+        purge_native_path_page_cursors(&mut store);
+        let Some(stored) = store.cursors.get(&cursor.offset) else {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "native path cursor is unknown or expired".to_string(),
+            });
+        };
+        if stored.scope != context.scope
+            || stored.cell_id != context.cell_id
+            || stored.query != query
+            || stored.parameters != context.parameters
+        {
+            return Err(GraphError::UnsupportedQuery {
+                dialect: "OpenCypher",
+                feature: "native path cursor does not belong to this query".to_string(),
+            });
+        }
+
+        let mut stored = store
+            .cursors
+            .remove(&cursor.offset)
+            .expect("native path cursor was checked while holding its lock");
+        store.resident_bytes = store.resident_bytes.saturating_sub(stored.resident_bytes);
+        let rows = take_native_path_page_rows(&mut stored.rows, page_size);
+        let columns = stored.columns.clone();
+        let next_cursor = if stored.rows.is_empty() {
+            None
+        } else {
+            stored.resident_bytes = native_path_rows_resident_bytes(&stored.rows);
+            stored.expires_at = std::time::Instant::now() + NATIVE_PATH_PAGE_CURSOR_TTL;
+            store.resident_bytes = store.resident_bytes.saturating_add(stored.resident_bytes);
+            store.cursors.insert(cursor.offset, stored);
+            Some(cursor)
+        };
+        Ok(QueryResultPage::new(columns, rows, next_cursor))
+    }
+
     pub(crate) async fn execute_native_path_rows(
         &self,
         context: QueryContext,
@@ -177,15 +311,15 @@ impl GraphShard {
             &budget,
         )?;
         let mut relationship_cache = BTreeMap::new();
-        self.score_native_paths(
-            &context.cell_id,
-            read_epoch,
-            &procedure,
-            &mut candidates,
-            &mut relationship_cache,
-            &budget,
-        )
-        .await?;
+        candidates = self
+            .expand_native_path_relationships(
+                read,
+                candidates,
+                &mut relationship_cache,
+                self.limits.max_query_intermediate_rows,
+            )
+            .await?;
+        self.score_native_paths(&procedure, &mut candidates, &relationship_cache, &budget)?;
         select_native_paths(&procedure, &mut candidates);
         if candidates.len() > self.limits.max_query_result_vertices {
             return Err(GraphError::AdmissionRejected {
@@ -205,7 +339,7 @@ impl GraphShard {
                     candidate.nodes.as_slice(),
                     candidate.edges.as_slice(),
                     &mut vertex_cache,
-                    &mut relationship_cache,
+                    &relationship_cache,
                 )
                 .await?;
             let values = procedure
@@ -369,6 +503,7 @@ impl GraphShard {
                     edge_type: topology.edge_type.clone(),
                     src: vertex,
                     dst,
+                    relationship_id: None,
                 }));
             }
             if direction != NativePathDirection::Outgoing {
@@ -397,19 +532,92 @@ impl GraphShard {
                     edge_type: topology.edge_type.clone(),
                     src,
                     dst: vertex,
+                    relationship_id: None,
                 }));
             }
         }
         Ok(edges.into_iter().collect())
     }
 
-    async fn score_native_paths(
+    async fn expand_native_path_relationships(
         &self,
-        cell_id: &str,
-        read_epoch: StorageSequence,
+        read: NativePathRead<'_>,
+        candidates: Vec<CandidatePath>,
+        relationship_cache: &mut BTreeMap<PathEdge, EdgeMetadata>,
+        max_candidates: usize,
+    ) -> Result<Vec<CandidatePath>> {
+        let mut choices_cache = BTreeMap::<PathEdge, Vec<PathEdge>>::new();
+        let mut expanded = Vec::new();
+        for candidate in candidates {
+            let mut edge_variants = vec![Vec::with_capacity(candidate.edges.len())];
+            for structural_edge in &candidate.edges {
+                if !choices_cache.contains_key(structural_edge) {
+                    let relationships = self
+                        .native_path_relationships_at(
+                            read.cell_id,
+                            &structural_edge.edge_type,
+                            structural_edge.src,
+                            structural_edge.dst,
+                            read.read_epoch,
+                            read.budget,
+                        )
+                        .await?;
+                    let mut choices = Vec::with_capacity(relationships.len());
+                    for (relationship_id, metadata) in relationships {
+                        let edge = PathEdge {
+                            relationship_id,
+                            ..structural_edge.clone()
+                        };
+                        relationship_cache.insert(edge.clone(), metadata);
+                        choices.push(edge);
+                    }
+                    choices_cache.insert(structural_edge.clone(), choices);
+                }
+                let choices = choices_cache
+                    .get(structural_edge)
+                    .expect("relationship choices were inserted");
+                let product_size = edge_variants.len().saturating_mul(choices.len());
+                if expanded.len().saturating_add(product_size) > max_candidates {
+                    return Err(GraphError::AdmissionRejected {
+                        operation: "native_path_parallel_candidates",
+                        actual: expanded.len().saturating_add(product_size) as u64,
+                        limit: max_candidates as u64,
+                    });
+                }
+                let mut next_variants = Vec::with_capacity(product_size);
+                for variant in edge_variants {
+                    for choice in choices {
+                        let mut next = variant.clone();
+                        next.push(choice.clone());
+                        next_variants.push(next);
+                    }
+                }
+                edge_variants = next_variants;
+            }
+            for edges in edge_variants {
+                if expanded.len() >= max_candidates {
+                    return Err(GraphError::AdmissionRejected {
+                        operation: "native_path_parallel_candidates",
+                        actual: expanded.len().saturating_add(1) as u64,
+                        limit: max_candidates as u64,
+                    });
+                }
+                expanded.push(CandidatePath {
+                    nodes: candidate.nodes.clone(),
+                    edges,
+                    weight: 0.0,
+                    cost: 0.0,
+                });
+            }
+        }
+        Ok(expanded)
+    }
+
+    fn score_native_paths(
+        &self,
         procedure: &NativePathProcedure,
         candidates: &mut [CandidatePath],
-        relationship_cache: &mut BTreeMap<PathEdge, (Option<RelationshipId>, EdgeMetadata)>,
+        relationship_cache: &BTreeMap<PathEdge, EdgeMetadata>,
         budget: &QueryBudget,
     ) -> Result<()> {
         for candidate in candidates {
@@ -419,26 +627,17 @@ impl GraphShard {
             for edge in &candidate.edges {
                 let relationship =
                     if procedure.weight_property.is_some() || procedure.cost_property.is_some() {
-                        Some(
-                            self.native_path_relationship_cached(
-                                cell_id,
-                                read_epoch,
-                                edge,
-                                relationship_cache,
-                                budget,
-                            )
-                            .await?,
-                        )
+                        Some(native_path_relationship_cached(edge, relationship_cache)?)
                     } else {
                         None
                     };
-                weight += relationship.map_or(1.0, |(_, metadata)| {
+                weight += relationship.map_or(1.0, |metadata| {
                     procedure
                         .weight_property
                         .as_deref()
                         .map_or(1.0, |property| numeric_property(metadata, property, 1.0))
                 });
-                cost += relationship.map_or(0.0, |(_, metadata)| {
+                cost += relationship.map_or(0.0, |metadata| {
                     procedure
                         .cost_property
                         .as_deref()
@@ -451,37 +650,13 @@ impl GraphShard {
         Ok(())
     }
 
-    async fn native_path_relationship_cached<'a>(
-        &self,
-        cell_id: &str,
-        read_epoch: StorageSequence,
-        edge: &PathEdge,
-        cache: &'a mut BTreeMap<PathEdge, (Option<RelationshipId>, EdgeMetadata)>,
-        budget: &QueryBudget,
-    ) -> Result<&'a (Option<RelationshipId>, EdgeMetadata)> {
-        if !cache.contains_key(edge) {
-            let relationship = self
-                .native_path_relationship_at(
-                    cell_id,
-                    &edge.edge_type,
-                    edge.src,
-                    edge.dst,
-                    read_epoch,
-                    budget,
-                )
-                .await?;
-            cache.insert(edge.clone(), relationship);
-        }
-        Ok(cache.get(edge).expect("path relationship was inserted"))
-    }
-
     async fn hydrate_native_path(
         &self,
         read: NativePathRead<'_>,
         nodes: &[VertexId],
         edges: &[PathEdge],
         vertex_cache: &mut BTreeMap<VertexId, VertexMetadata>,
-        relationship_cache: &mut BTreeMap<PathEdge, (Option<RelationshipId>, EdgeMetadata)>,
+        relationship_cache: &BTreeMap<PathEdge, EdgeMetadata>,
     ) -> Result<QueryPath> {
         let mut path_nodes = Vec::with_capacity(nodes.len());
         for vertex in nodes {
@@ -502,17 +677,9 @@ impl GraphShard {
         }
         let mut path_relationships = Vec::with_capacity(edges.len());
         for edge in edges {
-            let (relationship_id, metadata) = self
-                .native_path_relationship_cached(
-                    read.cell_id,
-                    read.read_epoch,
-                    edge,
-                    relationship_cache,
-                    read.budget,
-                )
-                .await?;
+            let metadata = native_path_relationship_cached(edge, relationship_cache)?;
             path_relationships.push(QueryPathRelationship {
-                id: *relationship_id,
+                id: edge.relationship_id,
                 edge_type: edge.edge_type.clone(),
                 src: edge.src,
                 dst: edge.dst,
@@ -524,6 +691,61 @@ impl GraphShard {
             relationships: path_relationships,
         })
     }
+}
+
+fn take_native_path_page_rows(rows: &mut VecDeque<QueryRow>, page_size: usize) -> Vec<QueryRow> {
+    let take = page_size.min(rows.len());
+    rows.drain(..take).collect()
+}
+
+fn native_path_rows_resident_bytes(rows: &VecDeque<QueryRow>) -> u64 {
+    rows.iter().fold(0_u64, |total, row| {
+        total.saturating_add(row.estimated_resident_bytes())
+    })
+}
+
+fn purge_native_path_page_cursors(store: &mut crate::core::state::NativePathPageCursorStore) {
+    let now = std::time::Instant::now();
+    let mut released = 0_u64;
+    store.cursors.retain(|_, cursor| {
+        let retain = cursor.expires_at > now;
+        if !retain {
+            released = released.saturating_add(cursor.resident_bytes);
+        }
+        retain
+    });
+    store.resident_bytes = store.resident_bytes.saturating_sub(released);
+}
+
+fn next_native_path_page_cursor_id(
+    store: &mut crate::core::state::NativePathPageCursorStore,
+) -> Result<u64> {
+    for _ in 0..=MAX_NATIVE_PATH_PAGE_CURSORS {
+        let candidate = store.next_id.max(1);
+        store.next_id = candidate.wrapping_add(1).max(1);
+        if !store.cursors.contains_key(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(GraphError::AdmissionRejected {
+        operation: "native_path_cursor_ids",
+        actual: store.cursors.len().saturating_add(1) as u64,
+        limit: MAX_NATIVE_PATH_PAGE_CURSORS as u64,
+    })
+}
+
+fn native_path_relationship_cached<'a>(
+    edge: &PathEdge,
+    cache: &'a BTreeMap<PathEdge, EdgeMetadata>,
+) -> Result<&'a EdgeMetadata> {
+    cache.get(edge).ok_or_else(|| GraphError::CorruptValue {
+        key: format!(
+            "native-path/{}/{}/{}/{:?}",
+            edge.edge_type, edge.src, edge.dst, edge.relationship_id
+        ),
+        reason: "enumerated relationship metadata is missing from the pinned snapshot cache"
+            .to_string(),
+    })
 }
 
 fn enumerate_candidate_paths(
@@ -765,6 +987,7 @@ mod tests {
             edge_type: "RELATES".to_string(),
             src,
             dst,
+            relationship_id: None,
         }
     }
 
