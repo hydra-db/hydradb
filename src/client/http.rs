@@ -24,8 +24,8 @@ use super::service::{
 };
 use crate::{
     GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryCursorToken, QueryFloat,
-    QueryParameterValue, QueryTransportConnectionIdentity, QueryTransportTlsServerConfigProvider,
-    QueryValue, Result, VertexPropertyValue,
+    QueryParameterValue, QueryPath, QueryTransportConnectionIdentity,
+    QueryTransportTlsServerConfigProvider, QueryValue, Result, VertexPropertyValue,
 };
 
 const GRAPH_NAMESPACE_HEADER: &str = "x-graph-namespace";
@@ -322,6 +322,7 @@ enum HttpQueryValue {
     Boolean(bool),
     String(String),
     List(Vec<HttpQueryValue>),
+    Path(QueryPath),
 }
 
 #[derive(Serialize)]
@@ -758,6 +759,7 @@ fn http_query_value(value: &QueryValue) -> Result<HttpQueryValue> {
             .map(http_query_value)
             .collect::<Result<Vec<_>>>()
             .map(HttpQueryValue::List),
+        QueryValue::Path(path) => Ok(HttpQueryValue::Path(path.as_ref().clone())),
     }
 }
 

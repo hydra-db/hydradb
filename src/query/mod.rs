@@ -5,3 +5,5 @@ pub(crate) mod coordination;
 pub(crate) mod corpus;
 #[cfg(feature = "opencypher")]
 pub(crate) mod opencypher;
+#[cfg(feature = "opencypher")]
+pub(crate) mod path_procedure;

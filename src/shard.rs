@@ -2,6 +2,8 @@ use super::*;
 
 mod lifecycle;
 mod maintenance;
+#[cfg(feature = "opencypher")]
+mod path_procedure;
 mod query;
 #[cfg(feature = "opencypher")]
 mod query_optimizer;

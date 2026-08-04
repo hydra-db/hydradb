@@ -12,6 +12,40 @@ use crate::{
     feature = "query-transport",
     derive(serde::Deserialize, serde::Serialize)
 )]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct QueryPathNode {
+    pub id: VertexId,
+    pub labels: Vec<String>,
+    pub properties: BTreeMap<String, VertexPropertyValue>,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct QueryPathRelationship {
+    pub id: Option<RelationshipId>,
+    pub edge_type: String,
+    pub src: VertexId,
+    pub dst: VertexId,
+    pub properties: BTreeMap<String, VertexPropertyValue>,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct QueryPath {
+    pub nodes: Vec<QueryPathNode>,
+    pub relationships: Vec<QueryPathRelationship>,
+}
+
+#[cfg_attr(
+    feature = "query-transport",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryParameterValue {
     Scalar(VertexPropertyValue),
@@ -640,6 +674,7 @@ pub enum QueryValue {
     Float(QueryFloat),
     Property(VertexPropertyValue),
     List(Vec<QueryValue>),
+    Path(Box<QueryPath>),
 }
 
 #[cfg_attr(
@@ -677,6 +712,7 @@ impl QueryValue {
             Self::List(values) => values.iter().fold(inline, |total, value| {
                 total.saturating_add(value.estimated_resident_bytes())
             }),
+            Self::Path(path) => path.estimated_resident_bytes(),
             Self::Null
             | Self::VertexId(_)
             | Self::Count(_)
@@ -685,6 +721,38 @@ impl QueryValue {
             | Self::Property(_) => inline,
         }
     }
+}
+
+#[cfg(feature = "opencypher")]
+impl QueryPath {
+    fn estimated_resident_bytes(&self) -> u64 {
+        let node_bytes = self.nodes.iter().fold(0_u64, |total, node| {
+            total
+                .saturating_add(std::mem::size_of::<QueryPathNode>() as u64)
+                .saturating_add(node.labels.iter().map(|label| label.len() as u64).sum())
+                .saturating_add(property_map_resident_bytes(&node.properties))
+        });
+        self.relationships
+            .iter()
+            .fold(node_bytes, |total, relationship| {
+                total
+                    .saturating_add(std::mem::size_of::<QueryPathRelationship>() as u64)
+                    .saturating_add(relationship.edge_type.len() as u64)
+                    .saturating_add(property_map_resident_bytes(&relationship.properties))
+            })
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn property_map_resident_bytes(properties: &BTreeMap<String, VertexPropertyValue>) -> u64 {
+    properties.iter().fold(0_u64, |total, (key, value)| {
+        total
+            .saturating_add(key.len() as u64)
+            .saturating_add(match value {
+                VertexPropertyValue::String(value) => value.len() as u64,
+                _ => std::mem::size_of::<VertexPropertyValue>() as u64,
+            })
+    })
 }
 
 #[cfg_attr(
