@@ -289,20 +289,34 @@ impl GraphShard {
             }
         }
 
+        // Resolving each affected pair is a point read against the snapshot —
+        // a cold block is an object-store round trip, so this loop is
+        // request-bound exactly like the file walk above and parallelized the
+        // same way. Reads against a pinned snapshot commute; the overlay is
+        // keyed by (src, dst), so arrival order cannot change the result.
         let mut overlay = GraphTopologyOverlay::default();
-        for (src, dst) in affected {
-            budget.check("graph_index_wal_resolve_edge")?;
-            let exists = self
-                .edge_exists_in_storage_snapshot(
-                    snapshot,
-                    &generation.cell_id,
-                    &generation.edge_type,
-                    src,
-                    dst,
-                    read_sequence,
-                )
-                .await?;
-            overlay.set(src, dst, exists);
+        {
+            let resolves = futures::stream::iter(affected.iter().copied())
+                .map(|(src, dst)| async move {
+                    budget.check("graph_index_wal_resolve_edge")?;
+                    let exists = self
+                        .edge_exists_in_storage_snapshot(
+                            snapshot,
+                            &generation.cell_id,
+                            &generation.edge_type,
+                            src,
+                            dst,
+                            read_sequence,
+                        )
+                        .await?;
+                    Ok::<_, crate::GraphError>((src, dst, exists))
+                })
+                .buffered(wal_tail_fetch_concurrency());
+            let mut resolves = std::pin::pin!(resolves);
+            while let Some(resolved) = resolves.next().await {
+                let (src, dst, exists) = resolved?;
+                overlay.set(src, dst, exists);
+            }
         }
         Ok(GraphTopologyTail::Complete(overlay))
     }
