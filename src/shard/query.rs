@@ -5003,7 +5003,7 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    fn ensure_query_index_candidates(
+    pub(super) fn ensure_query_index_candidates(
         &self,
         operation: &'static str,
         candidates: usize,

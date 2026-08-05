@@ -6,6 +6,7 @@ use crate::{GraphError, QueryColumn, QueryFloat, Result, VertexId, VertexPropert
 pub(crate) enum NativePathProcedureKind {
     SinglePair,
     SingleSource,
+    MultiSource,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +21,13 @@ pub(crate) enum NativePathProjection {
     Path,
     Weight,
     Cost,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativePathNodeSelector {
+    pub(crate) label: String,
+    pub(crate) property: String,
+    pub(crate) values: Vec<String>,
 }
 
 impl NativePathProjection {
@@ -37,6 +45,10 @@ pub(crate) struct NativePathProcedure {
     pub(crate) kind: NativePathProcedureKind,
     pub(crate) source: VertexId,
     pub(crate) target: Option<VertexId>,
+    pub(crate) source_selector: Option<NativePathNodeSelector>,
+    pub(crate) target_selector: Option<NativePathNodeSelector>,
+    pub(crate) pairwise: bool,
+    pub(crate) fair_relationship_variants: bool,
     pub(crate) rel_types: Vec<String>,
     pub(crate) direction: NativePathDirection,
     pub(crate) max_len: u8,
@@ -44,6 +56,7 @@ pub(crate) struct NativePathProcedure {
     pub(crate) cost_property: Option<String>,
     pub(crate) max_cost: Option<QueryFloat>,
     pub(crate) path_count: u64,
+    pub(crate) result_limit: Option<u64>,
     pub(crate) projections: Vec<NativePathProjection>,
 }
 
@@ -75,6 +88,8 @@ pub(crate) fn parse_native_path_procedure(
         NativePathProcedureKind::SinglePair
     } else if procedure.eq_ignore_ascii_case("SSpaths") {
         NativePathProcedureKind::SingleSource
+    } else if procedure.eq_ignore_ascii_case("MSpaths") {
+        NativePathProcedureKind::MultiSource
     } else {
         return Ok(None);
     };
@@ -93,14 +108,32 @@ pub(crate) fn parse_native_path_procedure(
         }
     }
 
-    let source = required_vertex(&config, "sourceNode", parameters)?;
-    let target = optional_vertex(&config, "targetNode", parameters)?;
-    if kind == NativePathProcedureKind::SinglePair && target.is_none() {
-        return path_parse_error("algo.SPpaths requires targetNode");
-    }
-    if kind == NativePathProcedureKind::SingleSource && target.is_some() {
-        return path_parse_error("algo.SSpaths does not accept targetNode");
-    }
+    let (source, target, source_selector, target_selector, pairwise) = match kind {
+        NativePathProcedureKind::SinglePair => {
+            let source = required_vertex(&config, "sourceNode", parameters)?;
+            let target = optional_vertex(&config, "targetNode", parameters)?;
+            if target.is_none() {
+                return path_parse_error("algo.SPpaths requires targetNode");
+            }
+            (source, target, None, None, false)
+        }
+        NativePathProcedureKind::SingleSource => {
+            let source = required_vertex(&config, "sourceNode", parameters)?;
+            if optional_vertex(&config, "targetNode", parameters)?.is_some() {
+                return path_parse_error("algo.SSpaths does not accept targetNode");
+            }
+            (source, None, None, None, false)
+        }
+        NativePathProcedureKind::MultiSource => {
+            let source_selector = required_selector(&config, "source")?;
+            let target_selector = optional_selector(&config, "target", &source_selector)?;
+            let pairwise = config_bool(&config, "pairwise")?.unwrap_or(false);
+            if pairwise && target_selector.is_none() {
+                return path_parse_error("algo.MSpaths pairwise mode requires targetValues");
+            }
+            (0, None, Some(source_selector), target_selector, pairwise)
+        }
+    };
     let rel_types =
         config_string_list(&config, "relTypes")?.ok_or_else(|| GraphError::UnsupportedQuery {
             dialect: "OpenCypher",
@@ -132,9 +165,27 @@ pub(crate) fn parse_native_path_procedure(
         });
     }
     let path_count = config_u64(&config, "pathCount", parameters)?.unwrap_or(1);
+    let result_limit = config_u64(&config, "resultLimit", parameters)?;
+    if result_limit == Some(0) {
+        return path_parse_error("resultLimit must be greater than zero");
+    }
     let weight_property = config_string(&config, "weightProp", parameters)?;
     let cost_property = config_string(&config, "costProp", parameters)?;
     let max_cost = config_number(&config, "maxCost", parameters)?.map(QueryFloat);
+    let fair_relationship_variants =
+        config_bool(&config, "fairRelationshipVariants")?.unwrap_or(false);
+    if fair_relationship_variants && (kind != NativePathProcedureKind::MultiSource || !pairwise) {
+        return path_parse_error(
+            "fairRelationshipVariants is only supported by pairwise algo.MSpaths",
+        );
+    }
+    if fair_relationship_variants
+        && (weight_property.is_some() || cost_property.is_some() || max_cost.is_some())
+    {
+        return path_parse_error(
+            "fairRelationshipVariants requires an unweighted pairwise algo.MSpaths query",
+        );
+    }
     let known = [
         "sourceNode",
         "targetNode",
@@ -145,14 +196,52 @@ pub(crate) fn parse_native_path_procedure(
         "costProp",
         "maxCost",
         "pathCount",
+        "resultLimit",
+        "sourceLabel",
+        "sourceProperty",
+        "sourceValues",
+        "targetLabel",
+        "targetProperty",
+        "targetValues",
+        "pairwise",
+        "fairRelationshipVariants",
     ];
     if let Some(unknown) = config.keys().find(|key| !known.contains(&key.as_str())) {
         return path_parse_error(format!("unknown native path option {unknown}"));
+    }
+    let multi_source_options = [
+        "sourceLabel",
+        "sourceProperty",
+        "sourceValues",
+        "targetLabel",
+        "targetProperty",
+        "targetValues",
+        "pairwise",
+        "fairRelationshipVariants",
+    ];
+    if kind != NativePathProcedureKind::MultiSource {
+        if let Some(option) = multi_source_options
+            .iter()
+            .find(|option| config.contains_key(**option))
+        {
+            return path_parse_error(format!("{option} is only supported by algo.MSpaths"));
+        }
+    } else if let Some(option) = ["sourceNode", "targetNode"]
+        .iter()
+        .find(|option| config.contains_key(**option))
+    {
+        return path_parse_error(format!(
+            "{option} is not supported by algo.MSpaths; use indexed selectors"
+        ));
     }
     Ok(Some(NativePathProcedure {
         kind,
         source,
         target,
+        source_selector,
+        target_selector,
+        pairwise,
+        fair_relationship_variants,
         rel_types,
         direction,
         max_len: max_len as u8,
@@ -160,8 +249,98 @@ pub(crate) fn parse_native_path_procedure(
         cost_property,
         max_cost,
         path_count,
+        result_limit,
         projections,
     }))
+}
+
+fn required_selector(
+    config: &BTreeMap<String, ConfigValue>,
+    prefix: &str,
+) -> Result<NativePathNodeSelector> {
+    optional_selector_parts(config, prefix, None)?.ok_or_else(|| {
+        GraphError::MissingQueryParameter {
+            dialect: "OpenCypher",
+            name: format!("{prefix}Values"),
+        }
+    })
+}
+
+fn optional_selector(
+    config: &BTreeMap<String, ConfigValue>,
+    prefix: &str,
+    defaults: &NativePathNodeSelector,
+) -> Result<Option<NativePathNodeSelector>> {
+    optional_selector_parts(config, prefix, Some(defaults))
+}
+
+fn optional_selector_parts(
+    config: &BTreeMap<String, ConfigValue>,
+    prefix: &str,
+    defaults: Option<&NativePathNodeSelector>,
+) -> Result<Option<NativePathNodeSelector>> {
+    let values_key = format!("{prefix}Values");
+    let Some(values) = config_string_list(config, &values_key)? else {
+        let label_key = format!("{prefix}Label");
+        let property_key = format!("{prefix}Property");
+        if config.contains_key(&label_key) || config.contains_key(&property_key) {
+            return path_parse_error(format!(
+                "{values_key} is required when {prefix}Label or {prefix}Property is set"
+            ));
+        }
+        return Ok(None);
+    };
+    if values.is_empty() {
+        return path_parse_error(format!("{values_key} must not be empty"));
+    }
+    if values.iter().any(|value| value.is_empty()) {
+        return path_parse_error(format!("{values_key} must not contain empty strings"));
+    }
+    let label_key = format!("{prefix}Label");
+    let property_key = format!("{prefix}Property");
+    let label = config_literal_string(config, &label_key)?
+        .or_else(|| defaults.map(|selector| selector.label.clone()))
+        .ok_or_else(|| GraphError::MissingQueryParameter {
+            dialect: "OpenCypher",
+            name: label_key,
+        })?;
+    let property = config_literal_string(config, &property_key)?
+        .or_else(|| defaults.map(|selector| selector.property.clone()))
+        .ok_or_else(|| GraphError::MissingQueryParameter {
+            dialect: "OpenCypher",
+            name: property_key,
+        })?;
+    crate::validate_component("label", &label)?;
+    crate::validate_component("property", &property)?;
+    Ok(Some(NativePathNodeSelector {
+        label,
+        property,
+        values,
+    }))
+}
+
+fn config_literal_string(
+    config: &BTreeMap<String, ConfigValue>,
+    key: &str,
+) -> Result<Option<String>> {
+    match config.get(key) {
+        None | Some(ConfigValue::Null) => Ok(None),
+        Some(ConfigValue::String(value)) => Ok(Some(value.clone())),
+        Some(_) => path_parse_error(format!("{key} must be a string literal")),
+    }
+}
+
+fn config_bool(config: &BTreeMap<String, ConfigValue>, key: &str) -> Result<Option<bool>> {
+    match config.get(key) {
+        None | Some(ConfigValue::Null) => Ok(None),
+        Some(ConfigValue::Identifier(value)) if value.eq_ignore_ascii_case("true") => {
+            Ok(Some(true))
+        }
+        Some(ConfigValue::Identifier(value)) if value.eq_ignore_ascii_case("false") => {
+            Ok(Some(false))
+        }
+        Some(_) => path_parse_error(format!("{key} must be true or false")),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -172,6 +351,7 @@ enum ConfigValue {
     String(String),
     Parameter(String),
     List(Vec<ConfigValue>),
+    Identifier(String),
 }
 
 fn required_vertex(
@@ -373,6 +553,7 @@ impl Parser {
     fn value(&mut self) -> Result<ConfigValue> {
         match self.next()? {
             Token::Identifier(value) if value.eq_ignore_ascii_case("null") => Ok(ConfigValue::Null),
+            Token::Identifier(value) => Ok(ConfigValue::Identifier(value)),
             Token::Parameter(value) => Ok(ConfigValue::Parameter(value)),
             Token::String(value) => Ok(ConfigValue::String(value)),
             Token::Integer(value) => Ok(ConfigValue::Integer(value)),
@@ -626,10 +807,66 @@ mod tests {
         assert_eq!(parsed.kind, NativePathProcedureKind::SinglePair);
         assert_eq!(parsed.source, 7);
         assert_eq!(parsed.target, Some(11));
+        assert!(parsed.source_selector.is_none());
+        assert!(parsed.target_selector.is_none());
         assert_eq!(parsed.rel_types, vec!["RELATES"]);
         assert_eq!(parsed.direction, NativePathDirection::Both);
         assert_eq!(parsed.max_len, 3);
         assert_eq!(parsed.path_count, 2);
+    }
+
+    #[test]
+    fn parses_multi_source_native_path_call() {
+        let parsed = parse_native_path_procedure(
+            "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', sourceValues: ['alpha', 'beta'], targetValues: ['alpha', 'beta'], pairwise: true, relTypes: ['RELATES'], maxLen: 3, relDirection: 'both', pathCount: 5, fairRelationshipVariants: true, resultLimit: 100}) YIELD path RETURN path",
+            &BTreeMap::new(),
+            10,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.kind, NativePathProcedureKind::MultiSource);
+        assert!(parsed.pairwise);
+        assert!(parsed.fair_relationship_variants);
+        assert_eq!(parsed.path_count, 5);
+        assert_eq!(parsed.result_limit, Some(100));
+        assert_eq!(
+            parsed.source_selector,
+            Some(NativePathNodeSelector {
+                label: "Entity".to_string(),
+                property: "name".to_string(),
+                values: vec!["alpha".to_string(), "beta".to_string()],
+            })
+        );
+        assert_eq!(
+            parsed.target_selector,
+            Some(NativePathNodeSelector {
+                label: "Entity".to_string(),
+                property: "name".to_string(),
+                values: vec!["alpha".to_string(), "beta".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_multi_source_options_on_scalar_procedures() {
+        let error = parse_native_path_procedure(
+            "CALL algo.SSpaths({sourceNode: 7, sourceValues: ['alpha'], relTypes: ['RELATES']}) YIELD path RETURN path",
+            &BTreeMap::new(),
+            10,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("only supported by algo.MSpaths"));
+    }
+
+    #[test]
+    fn rejects_partial_multi_source_target_selector() {
+        let error = parse_native_path_procedure(
+            "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', sourceValues: ['alpha'], targetLabel: 'Entity', relTypes: ['RELATES']}) YIELD path RETURN path",
+            &BTreeMap::new(),
+            10,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("targetValues is required"));
     }
 
     #[test]

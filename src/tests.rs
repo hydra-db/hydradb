@@ -698,6 +698,188 @@ async fn native_sp_paths_honors_weight_cost_and_parameterized_limits() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn native_ms_paths_resolves_indexed_sources_in_one_pinned_snapshot() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/native-ms-paths", object_store).await;
+    for (index, query) in [
+        "CREATE (a:Entity {id: 1, name: 'alpha', entity_id: 'a'})-[:RELATES {relationship_id: 'ab'}]->(b:Entity {id: 2, name: 'beta', entity_id: 'b'})",
+        "CREATE (a:Entity {id: 1, name: 'alpha', entity_id: 'a'})-[:RELATES {relationship_id: 'ab-2'}]->(b:Entity {id: 2, name: 'beta', entity_id: 'b'})",
+        "CREATE (a:Entity {id: 2, name: 'beta', entity_id: 'b'})-[:RELATES {relationship_id: 'bc'}]->(b:Entity {id: 3, name: 'gamma', entity_id: 'c'})",
+        "CREATE (a:Other {id: 4, name: 'alpha', entity_id: 'wrong-label'})-[:IGNORED]->(b:Entity {id: 1, name: 'alpha', entity_id: 'a'})",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .execute_cypher(
+                QueryContext::new("cell-a", format!("native-ms-create-{index}")),
+                query,
+            )
+            .await
+            .unwrap();
+    }
+    shard.build_graph_index("cell-a", "RELATES").await.unwrap();
+    let pinned_snapshot = shard.db.snapshot().await.unwrap();
+    let before = shard.graph_operational_metrics();
+
+    let result = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-ms-read"),
+            "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', \
+             sourceValues: ['alpha', 'beta', 'gamma'], targetValues: ['alpha', 'beta', 'gamma'], \
+             pairwise: true, relTypes: ['RELATES'], maxLen: 2, relDirection: 'both', \
+             pathCount: 1, fairRelationshipVariants: true, resultLimit: 10}) \
+             YIELD path RETURN path",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.rows.len(), 5);
+    let endpoints = result
+        .rows
+        .iter()
+        .map(|row| match &row.values[0] {
+            QueryValue::Path(path) => {
+                let first = path.nodes.first().expect("path source").id;
+                let last = path.nodes.last().expect("path target").id;
+                (first.min(last), first.max(last))
+            }
+            value => panic!("multi-source procedure returned {value:?}"),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(endpoints, BTreeSet::from([(1, 2), (1, 3), (2, 3)]));
+    let direct_relationships = result
+        .rows
+        .iter()
+        .filter_map(|row| match &row.values[0] {
+            QueryValue::Path(path)
+                if path.nodes.first().map(|node| node.id) == Some(1)
+                    && path.nodes.last().map(|node| node.id) == Some(2) =>
+            {
+                path.relationships[0].properties.get("relationship_id")
+            }
+            _ => None,
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        direct_relationships,
+        BTreeSet::from([
+            VertexPropertyValue::String("ab".to_string()),
+            VertexPropertyValue::String("ab-2".to_string()),
+        ]),
+        "MSpaths must preserve relationship-distinct paths"
+    );
+    assert!(result.rows.iter().all(|row| match &row.values[0] {
+        QueryValue::Path(path) => path.nodes.iter().all(|node| node.id != 4),
+        _ => false,
+    }));
+    let after = shard.graph_operational_metrics();
+    assert_eq!(
+        after
+            .query_graphblas_artifact_snapshots
+            .saturating_sub(before.query_graphblas_artifact_snapshots),
+        1,
+        "one batched procedure should load one compiled topology snapshot"
+    );
+
+    shard
+        .set_vertex_metadata(
+            "cell-a",
+            1,
+            VertexMetadata::default()
+                .with_label("Entity")
+                .with_property("id", VertexPropertyValue::Integer(1))
+                .with_property(
+                    "name",
+                    VertexPropertyValue::String("renamed-alpha".to_string()),
+                )
+                .with_property("entity_id", VertexPropertyValue::String("a".to_string())),
+        )
+        .await
+        .unwrap();
+    let historical = crate::GraphStore::scope_snapshot(
+        pinned_snapshot,
+        shard.execute_cypher_rows(
+            QueryContext::new("cell-a", "native-ms-historical-selector"),
+            "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', \
+             sourceValues: ['alpha'], targetValues: ['beta'], pairwise: false, \
+             relTypes: ['RELATES'], maxLen: 1, relDirection: 'both', pathCount: 1, \
+             resultLimit: 10}) YIELD path RETURN path",
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        historical.rows.len(),
+        1,
+        "selector discovery must use the same pinned snapshot as traversal"
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn native_ms_paths_fairly_budgets_parallel_variants_across_structures() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/native-ms-paths-fair-variants", object_store).await;
+    for (index, query) in [
+        "CREATE (a:Entity {id: 1, name: 'alpha', entity_id: 'a'})-[:RELATES {relationship_id: 'ab-1'}]->(b:Entity {id: 2, name: 'beta', entity_id: 'b'})",
+        "CREATE (a:Entity {id: 1, name: 'alpha', entity_id: 'a'})-[:RELATES {relationship_id: 'ab-2'}]->(b:Entity {id: 2, name: 'beta', entity_id: 'b'})",
+        "CREATE (a:Entity {id: 1, name: 'alpha', entity_id: 'a'})-[:RELATES {relationship_id: 'ab-3'}]->(b:Entity {id: 2, name: 'beta', entity_id: 'b'})",
+        "CREATE (a:Entity {id: 1, name: 'alpha', entity_id: 'a'})-[:RELATES {relationship_id: 'ab-4'}]->(b:Entity {id: 2, name: 'beta', entity_id: 'b'})",
+        "CREATE (a:Entity {id: 2, name: 'beta', entity_id: 'b'})-[:RELATES {relationship_id: 'bc'}]->(b:Entity {id: 3, name: 'gamma', entity_id: 'c'})",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .execute_cypher(
+                QueryContext::new("cell-a", format!("native-ms-fair-create-{index}")),
+                query,
+            )
+            .await
+            .unwrap();
+    }
+    shard.build_graph_index("cell-a", "RELATES").await.unwrap();
+
+    let result = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-ms-fair-read"),
+            "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', \
+             sourceValues: ['alpha', 'beta', 'gamma'], targetValues: ['alpha', 'beta', 'gamma'], \
+             pairwise: true, relTypes: ['RELATES'], maxLen: 1, relDirection: 'both', \
+             pathCount: 1, fairRelationshipVariants: true, resultLimit: 3}) \
+             YIELD path RETURN path",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.rows.len(), 3);
+    let endpoints = result
+        .rows
+        .iter()
+        .map(|row| match &row.values[0] {
+            QueryValue::Path(path) => {
+                let first = path.nodes.first().expect("path source").id;
+                let last = path.nodes.last().expect("path target").id;
+                (first.min(last), first.max(last))
+            }
+            value => panic!("multi-source procedure returned {value:?}"),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        endpoints,
+        BTreeSet::from([(1, 2), (2, 3)]),
+        "one dense pair must not consume the complete native result budget"
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn native_sp_paths_preserves_parallel_relationship_identity_and_scores() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/native-sp-paths-parallel", object_store).await;
