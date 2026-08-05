@@ -60,6 +60,20 @@ pub(crate) struct NativePathProcedure {
     pub(crate) projections: Vec<NativePathProjection>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeMultiReadOperation {
+    pub(crate) name: String,
+    pub(crate) query: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeMultiReadProcedure {
+    pub(crate) operations: Vec<NativeMultiReadOperation>,
+}
+
+const MAX_NATIVE_MULTI_READ_OPERATIONS: usize = 16;
+const MAX_NATIVE_MULTI_READ_QUERY_BYTES: usize = 256 * 1024;
+
 struct ParsedNativePathCall {
     kind: NativePathProcedureKind,
     config: BTreeMap<String, ConfigValue>,
@@ -237,6 +251,116 @@ pub(crate) fn parse_native_path_procedure(
     }))
 }
 
+pub(crate) fn parse_native_multi_read_procedure(
+    query: &str,
+) -> Result<Option<NativeMultiReadProcedure>> {
+    let query = query.trim_start();
+    if !query
+        .to_ascii_lowercase()
+        .strip_prefix("call")
+        .is_some_and(|rest| rest.trim_start().starts_with("algo.multiread"))
+    {
+        return Ok(None);
+    }
+    let mut parser = Parser::new(query)?;
+    parser.keyword("CALL")?;
+    parser.identifier_eq("algo")?;
+    parser.token(Token::Dot)?;
+    if !parser.identifier()?.eq_ignore_ascii_case("MultiRead") {
+        return Ok(None);
+    }
+    parser.token(Token::LeftParen)?;
+    let config = parser.config()?;
+    parser.token(Token::RightParen)?;
+    parser.keyword("YIELD")?;
+    let yielded = parser.identifiers()?;
+    parser.keyword("RETURN")?;
+    let returned = parser.identifiers()?;
+    parser.optional(Token::Semicolon);
+    parser.end()?;
+
+    let expected = ["operation", "columns", "values"];
+    if yielded.len() != expected.len()
+        || returned.len() != expected.len()
+        || !expected
+            .iter()
+            .all(|name| yielded.iter().any(|value| value.eq_ignore_ascii_case(name)))
+        || returned
+            .iter()
+            .zip(expected)
+            .any(|(actual, expected)| !actual.eq_ignore_ascii_case(expected))
+    {
+        return path_parse_error(
+            "algo.MultiRead must YIELD operation, columns, values RETURN operation, columns, values",
+        );
+    }
+    if let Some(unknown) = config.keys().find(|key| key.as_str() != "operations") {
+        return path_parse_error(format!("unknown algo.MultiRead option {unknown}"));
+    }
+    let operations = match config.get("operations") {
+        Some(ConfigValue::List(operations)) if !operations.is_empty() => operations,
+        Some(_) => return path_parse_error("algo.MultiRead operations must be a non-empty list"),
+        None => {
+            return Err(GraphError::MissingQueryParameter {
+                dialect: "OpenCypher",
+                name: "operations".to_string(),
+            })
+        }
+    };
+    if operations.len() > MAX_NATIVE_MULTI_READ_OPERATIONS {
+        return Err(GraphError::AdmissionRejected {
+            operation: "native_multi_read_operations",
+            actual: operations.len() as u64,
+            limit: MAX_NATIVE_MULTI_READ_OPERATIONS as u64,
+        });
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let mut parsed = Vec::with_capacity(operations.len());
+    let mut query_bytes = 0_usize;
+    for operation in operations {
+        let ConfigValue::Map(operation) = operation else {
+            return path_parse_error("algo.MultiRead operations must contain maps");
+        };
+        if let Some(unknown) = operation
+            .keys()
+            .find(|key| !["name", "query"].contains(&key.as_str()))
+        {
+            return path_parse_error(format!("unknown algo.MultiRead operation field {unknown}"));
+        }
+        let name = match operation.get("name") {
+            Some(ConfigValue::String(value)) if !value.is_empty() => value.clone(),
+            _ => {
+                return path_parse_error("algo.MultiRead operation name must be a non-empty string")
+            }
+        };
+        crate::validate_component("multi_read_operation", &name)?;
+        if !names.insert(name.clone()) {
+            return path_parse_error(format!("duplicate algo.MultiRead operation {name}"));
+        }
+        let operation_query = match operation.get("query") {
+            Some(ConfigValue::String(value)) if !value.trim().is_empty() => value.clone(),
+            _ => {
+                return path_parse_error(
+                    "algo.MultiRead operation query must be a non-empty string",
+                )
+            }
+        };
+        query_bytes = query_bytes.saturating_add(operation_query.len());
+        parsed.push(NativeMultiReadOperation {
+            name,
+            query: operation_query,
+        });
+    }
+    if query_bytes > MAX_NATIVE_MULTI_READ_QUERY_BYTES {
+        return Err(GraphError::AdmissionRejected {
+            operation: "native_multi_read_query_bytes",
+            actual: query_bytes as u64,
+            limit: MAX_NATIVE_MULTI_READ_QUERY_BYTES as u64,
+        });
+    }
+    Ok(Some(NativeMultiReadProcedure { operations: parsed }))
+}
+
 #[cfg(feature = "client-api")]
 pub(crate) fn parse_native_path_procedure_columns(query: &str) -> Result<Option<Vec<QueryColumn>>> {
     Ok(parse_native_path_call(query)?.map(|parsed| {
@@ -384,6 +508,7 @@ enum ConfigValue {
     String(String),
     Parameter(String),
     List(Vec<ConfigValue>),
+    Map(BTreeMap<String, ConfigValue>),
     Identifier(String),
 }
 
@@ -604,7 +729,37 @@ impl Parser {
                     self.token(Token::Comma)?;
                 }
             }
+            Token::LeftBrace => self.config_after_left_brace().map(ConfigValue::Map),
             token => path_parse_error(format!("unexpected native path value {token:?}")),
+        }
+    }
+
+    fn config_after_left_brace(&mut self) -> Result<BTreeMap<String, ConfigValue>> {
+        let mut values = BTreeMap::new();
+        if self.optional(Token::RightBrace) {
+            return Ok(values);
+        }
+        loop {
+            let key = self.identifier()?;
+            self.token(Token::Colon)?;
+            let value = self.value()?;
+            if values.insert(key.clone(), value).is_some() {
+                return path_parse_error(format!("duplicate native option {key}"));
+            }
+            if self.optional(Token::RightBrace) {
+                return Ok(values);
+            }
+            self.token(Token::Comma)?;
+        }
+    }
+
+    fn identifiers(&mut self) -> Result<Vec<String>> {
+        let mut values = Vec::new();
+        loop {
+            values.push(self.identifier()?);
+            if !self.optional(Token::Comma) {
+                return Ok(values);
+            }
         }
     }
 
@@ -911,5 +1066,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, GraphError::AdmissionRejected { .. }));
+    }
+
+    #[test]
+    fn parses_bounded_native_multi_read() {
+        let parsed = parse_native_multi_read_procedure(
+            r#"CALL algo.MultiRead({operations: [
+                {name: 'vertices', query: 'MATCH (n) RETURN n.id AS id'},
+                {name: 'count', query: 'MATCH (n) RETURN count(n) AS count'}
+            ]}) YIELD operation, columns, values RETURN operation, columns, values"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.operations.len(), 2);
+        assert_eq!(parsed.operations[0].name, "vertices");
+        assert!(parsed.operations[1].query.contains("count(n)"));
+    }
+
+    #[test]
+    fn rejects_duplicate_multi_read_operation_names() {
+        let error = parse_native_multi_read_procedure(
+            r#"CALL algo.MultiRead({operations: [
+                {name: 'same', query: 'MATCH (n) RETURN n.id AS id'},
+                {name: 'same', query: 'MATCH (n) RETURN count(n) AS count'}
+            ]}) YIELD operation, columns, values RETURN operation, columns, values"#,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("duplicate algo.MultiRead operation"));
     }
 }

@@ -821,6 +821,63 @@ async fn native_ms_paths_resolves_indexed_sources_in_one_pinned_snapshot() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn native_multi_read_executes_tagged_reads_in_one_snapshot() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/native-multi-read", object_store).await;
+    shard
+        .execute_cypher(
+            QueryContext::new("cell-a", "native-multi-create"),
+            "CREATE (a:Entity {id: 1, name: 'alpha', entity_id: 'a'})-[:RELATES {relationship_id: 'ab'}]->(b:Entity {id: 2, name: 'beta', entity_id: 'b'})",
+        )
+        .await
+        .unwrap();
+    shard.build_graph_index("cell-a", "RELATES").await.unwrap();
+
+    let result = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-multi-read"),
+            r#"CALL algo.MultiRead({operations: [
+                {name: 'lookup', query: "MATCH (n:Entity {name: 'alpha'}) RETURN n.entity_id AS entity_id"},
+                {name: 'paths', query: "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', sourceValues: ['alpha', 'beta'], targetValues: ['alpha', 'beta'], pairwise: true, relTypes: ['RELATES'], maxLen: 1, relDirection: 'both', pathCount: 1, resultLimit: 5}) YIELD path RETURN path"}
+            ]}) YIELD operation, columns, values RETURN operation, columns, values"#,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.columns,
+        vec![
+            QueryColumn::new("operation"),
+            QueryColumn::new("columns"),
+            QueryColumn::new("values"),
+        ]
+    );
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(
+        result.rows[0].values[0],
+        QueryValue::Property(VertexPropertyValue::String("lookup".to_string()))
+    );
+    assert!(matches!(
+        &result.rows[1].values[2],
+        QueryValue::List(values) if matches!(values.first(), Some(QueryValue::Path(_)))
+    ));
+    assert!(result.read_epoch.is_some());
+    assert_eq!(result.read_epoch, result.storage_sequence);
+
+    let error = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-multi-write-reject"),
+            r#"CALL algo.MultiRead({operations: [{name: 'write', query: 'CREATE (n {id: 3})'}]}) YIELD operation, columns, values RETURN operation, columns, values"#,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("must be read-only"));
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn native_ms_paths_fairly_budgets_parallel_variants_across_structures() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/native-ms-paths-fair-variants", object_store).await;

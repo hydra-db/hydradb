@@ -258,6 +258,9 @@ impl GraphShard {
     ) -> Result<QueryOutput> {
         #[cfg(feature = "opencypher")]
         {
+            if let Some(future) = self.native_multi_read_rows_if_present(context.clone(), query)? {
+                return future.await.map(QueryOutput::Rows);
+            }
             if let Some(procedure) = crate::query::path_procedure::parse_native_path_procedure(
                 query,
                 &context.parameters,
@@ -301,6 +304,9 @@ impl GraphShard {
     ) -> Result<QueryResultSet> {
         #[cfg(feature = "opencypher")]
         {
+            if let Some(future) = self.native_multi_read_rows_if_present(context.clone(), query)? {
+                return future.await;
+            }
             if let Some(procedure) = crate::query::path_procedure::parse_native_path_procedure(
                 query,
                 &context.parameters,
@@ -333,6 +339,21 @@ impl GraphShard {
     ) -> Result<QueryResultPage> {
         #[cfg(feature = "opencypher")]
         {
+            if cursor.is_none() {
+                if let Some(future) =
+                    self.native_multi_read_rows_if_present(context.clone(), query)?
+                {
+                    let result = future.await?;
+                    if result.rows.len() > page_size {
+                        return Err(GraphError::AdmissionRejected {
+                            operation: "native_multi_read_page_size",
+                            actual: result.rows.len() as u64,
+                            limit: page_size as u64,
+                        });
+                    }
+                    return Ok(QueryResultPage::new(result.columns, result.rows, None));
+                }
+            }
             if let Some(procedure) = crate::query::path_procedure::parse_native_path_procedure(
                 query,
                 &context.parameters,
@@ -492,7 +513,7 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    async fn parsed_opencypher_row_query(
+    pub(super) async fn parsed_opencypher_row_query(
         &self,
         cell_id: &str,
         query: &str,
@@ -537,7 +558,7 @@ impl GraphShard {
             turbolay.sampling.tail_keep = tracing::field::Empty,
         )
     )]
-    async fn execute_parsed_opencypher_rows(
+    pub(super) async fn execute_parsed_opencypher_rows(
         &self,
         context: QueryContext,
         query: ParsedRowQuery,
@@ -614,7 +635,7 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    async fn execute_parsed_opencypher_rows_inner(
+    pub(super) async fn execute_parsed_opencypher_rows_inner(
         &self,
         context: QueryContext,
         query: ParsedRowQuery,
@@ -7093,7 +7114,10 @@ fn query_result_set_to_output(parsed: &ParsedRowQuery, result_set: QueryResultSe
 }
 
 #[cfg(feature = "opencypher")]
-fn merge_opencypher_window(context: QueryContext, window: QueryWindow) -> Result<QueryContext> {
+pub(super) fn merge_opencypher_window(
+    context: QueryContext,
+    window: QueryWindow,
+) -> Result<QueryContext> {
     if window.is_default() {
         return Ok(context);
     }
@@ -7107,7 +7131,7 @@ fn merge_opencypher_window(context: QueryContext, window: QueryWindow) -> Result
 }
 
 #[cfg(feature = "opencypher")]
-fn opencypher_outer_window(query: &ParsedRowQuery) -> QueryWindow {
+pub(super) fn opencypher_outer_window(query: &ParsedRowQuery) -> QueryWindow {
     if query.union_arms.is_empty() {
         query.window
     } else {

@@ -22,7 +22,9 @@ use crate::query::opencypher::{
     parse_opencypher_mutation_query_with_parameters, parse_opencypher_row_query_with_parameters,
     parse_opencypher_unwind_batch, OpenCypherQueryAccess, ParsedUnwindBatchKind,
 };
-use crate::query::path_procedure::parse_native_path_procedure_columns;
+use crate::query::path_procedure::{
+    parse_native_multi_read_procedure, parse_native_path_procedure_columns,
+};
 use crate::{
     validate_component, AtomicDurationHistogram, DurationHistogramSnapshot, EdgeMetadata,
     GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryBatchEdge,
@@ -1571,14 +1573,22 @@ impl ClientQueryService {
         } else {
             match action {
                 QueryTransportAction::Read => {
-                    match parse_native_path_procedure_columns(&request.query)? {
-                        Some(columns) => columns,
-                        None => {
-                            parse_opencypher_row_query_with_parameters(
-                                &request.query,
-                                &scalar_parameters,
-                            )?
-                            .columns
+                    if parse_native_multi_read_procedure(&request.query)?.is_some() {
+                        vec![
+                            QueryColumn::new("operation"),
+                            QueryColumn::new("columns"),
+                            QueryColumn::new("values"),
+                        ]
+                    } else {
+                        match parse_native_path_procedure_columns(&request.query)? {
+                            Some(columns) => columns,
+                            None => {
+                                parse_opencypher_row_query_with_parameters(
+                                    &request.query,
+                                    &scalar_parameters,
+                                )?
+                                .columns
+                            }
                         }
                     }
                 }
