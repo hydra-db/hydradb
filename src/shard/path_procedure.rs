@@ -426,28 +426,38 @@ impl GraphShard {
         let mut vertices = BTreeSet::new();
         for value in &selector.values {
             read.budget.check("native_path_selector")?;
-            for vertex in self
-                .scan_vertex_property_index_at(
-                    read.cell_id,
-                    &selector.property,
-                    &VertexPropertyValue::String(value.clone()),
-                    read.read_epoch,
-                    read.budget,
-                )
-                .await?
-            {
-                let metadata = self
-                    .vertex_metadata_at(read.cell_id, vertex, read.read_epoch, read.budget)
-                    .await?;
+            let property_value = VertexPropertyValue::String(value.clone());
+            let encoded = encode_vertex_property_value_key(&property_value);
+            let prefix =
+                keys::vertex_property_index_prefix(read.cell_id, &selector.property, &encoded);
+            let mut candidates = read
+                .snapshot
+                .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
+                .await?;
+            while let Some(kv) = candidates.next().await? {
+                read.budget.check("native_path_selector")?;
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let vertex = decode_u64(&key, &kv.value)?;
+                let metadata_key = keys::vertex(read.cell_id, vertex);
+                let metadata = match read
+                    .snapshot
+                    .get_with_options(metadata_key.as_bytes(), &remote_read_options())
+                    .await?
+                {
+                    Some(value) => decode_vertex_metadata(&metadata_key, &value)?,
+                    None => VertexMetadata::default(),
+                };
                 if metadata.labels.contains(&selector.label)
-                    && metadata.properties.get(&selector.property)
-                        == Some(&VertexPropertyValue::String(value.clone()))
+                    && metadata.properties.get(&selector.property) == Some(&property_value)
                 {
                     vertices.insert(vertex);
+                    self.ensure_query_index_candidates(
+                        "native_path_selector_candidates",
+                        vertices.len(),
+                    )?;
                 }
             }
         }
-        self.ensure_query_index_candidates("native_path_selector_candidates", vertices.len())?;
         Ok(vertices.into_iter().collect())
     }
 

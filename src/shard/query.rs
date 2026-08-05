@@ -4477,7 +4477,7 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    pub(super) async fn scan_vertex_property_index_at(
+    async fn scan_vertex_property_index_at(
         &self,
         cell_id: &str,
         property: &str,
