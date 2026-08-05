@@ -22,6 +22,7 @@ textbooks: no tooltips, and they carry their own inline styles rather than
 | One Cell, One Writer | `write-routing-problem.html` | why a write cannot reach the correct single-writer node today |
 | Routing the Write | `write-routing-solutions.html` | four ways to place the writer, scored — TiDB/TiKV and sleet as reference |
 | Placing the Writer | `write-routing-placement.html` | the landed fix — rendezvous hashing, heartbeat liveness, the don't-promote rule, and why the duel is bounded rather than prevented. Five interactive SVG widgets (W1–W5), self-contained |
+| Requests, Not Bytes | `incremental-build-cost.html` | why the incremental index build inverted on staging — request-bound vs data-bound cost anatomy, measured ledger, why the read path never noticed, break-even calculator widget, and the L0–L3 fix ladder with implementation sketches |
 
 ## The interactive layer (after the [interactive-textbook skill](https://github.com/alharkan7/skills))
 

@@ -1,0 +1,603 @@
+!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Requests, Not Bytes — why the incremental index build inverted</title>
+<style>
+  :root {
+    --bg: #faf9f7;
+    --ink: #1f2427;
+    --muted: #5b6670;
+    --accent: #0e6e66;
+    --accent-soft: #0e6e6614;
+    --rule: #d8d5d0;
+    --card: #ffffff;
+    --bad: #b3403a;
+    --bad-soft: #b3403a12;
+    --good: #2e6e40;
+    --good-soft: #2e6e4012;
+    --mono-bg: #f0efec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16191c;
+      --ink: #e4e1db;
+      --muted: #9aa4ad;
+      --accent: #4fc3b8;
+      --accent-soft: #4fc3b81a;
+      --rule: #32383d;
+      --card: #1d2125;
+      --bad: #e07a74;
+      --bad-soft: #e07a7418;
+      --good: #7dc58f;
+      --good-soft: #7dc58f16;
+      --mono-bg: #23282d;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #faf9f7; --ink: #1f2427; --muted: #5b6670; --accent: #0e6e66;
+    --accent-soft: #0e6e6614; --rule: #d8d5d0; --card: #ffffff;
+    --bad: #b3403a; --bad-soft: #b3403a12; --good: #2e6e40; --good-soft: #2e6e4012;
+    --mono-bg: #f0efec;
+  }
+  :root[data-theme="dark"] {
+    --bg: #16191c; --ink: #e4e1db; --muted: #9aa4ad; --accent: #4fc3b8;
+    --accent-soft: #4fc3b81a; --rule: #32383d; --card: #1d2125;
+    --bad: #e07a74; --bad-soft: #e07a7418; --good: #7dc58f; --good-soft: #7dc58f16;
+    --mono-bg: #23282d;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 17px/1.65 Charter, Georgia, 'Times New Roman', serif;
+  }
+  main { max-width: 46rem; margin: 0 auto; padding: 3rem 1.25rem 6rem; }
+  header.doc { border-bottom: 2px solid var(--ink); padding-bottom: 1.4rem; margin-bottom: 2.5rem; }
+  .eyebrow {
+    font: 600 0.72rem/1 system-ui, sans-serif; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 0.9rem;
+  }
+  h1 {
+    font-size: 2.1rem; line-height: 1.15; margin: 0 0 0.8rem;
+    letter-spacing: -0.01em; text-wrap: balance;
+  }
+  .dek { color: var(--muted); font-size: 1.05rem; margin: 0; max-width: 40rem; }
+  .meta { font: 0.78rem/1.6 system-ui, sans-serif; color: var(--muted); margin-top: 1rem; }
+  h2 {
+    font-size: 1.35rem; margin: 3rem 0 0.9rem; letter-spacing: -0.005em;
+    text-wrap: balance;
+  }
+  h2 .no { color: var(--accent); font-variant-numeric: tabular-nums; margin-right: 0.45rem; }
+  h3 { font-size: 1.02rem; margin: 1.8rem 0 0.5rem; }
+  p { margin: 0 0 1.05rem; }
+  code, pre {
+    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 0.86em;
+  }
+  code { background: var(--mono-bg); padding: 0.1em 0.35em; border-radius: 4px; }
+  pre {
+    background: var(--mono-bg); border: 1px solid var(--rule); border-radius: 8px;
+    padding: 0.9rem 1.1rem; overflow-x: auto; line-height: 1.55; margin: 0 0 1.05rem;
+  }
+  pre code { background: none; padding: 0; }
+  .scroll { overflow-x: auto; margin: 0 0 1.05rem; }
+  table {
+    border-collapse: collapse; width: 100%;
+    font: 0.85rem/1.5 system-ui, sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
+  th {
+    text-align: left; font-size: 0.72rem; letter-spacing: 0.07em; text-transform: uppercase;
+    color: var(--muted); border-bottom: 2px solid var(--ink); padding: 0.4rem 0.9rem 0.4rem 0;
+  }
+  td { border-bottom: 1px solid var(--rule); padding: 0.5rem 0.9rem 0.5rem 0; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  .num { text-align: right; }
+  th.num { text-align: right; }
+  .callout {
+    border-left: 3px solid var(--accent); background: var(--accent-soft);
+    padding: 0.9rem 1.15rem; border-radius: 0 8px 8px 0; margin: 1.4rem 0;
+  }
+  .callout.bad { border-color: var(--bad); background: var(--bad-soft); }
+  .callout p:last-child { margin-bottom: 0; }
+  .ledger { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1.4rem 0; }
+  @media (max-width: 620px) { .ledger { grid-template-columns: 1fr; } }
+  .ledger .col {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 1rem 1.15rem;
+  }
+  .ledger h4 {
+    margin: 0 0 0.6rem; font: 600 0.78rem/1.3 system-ui, sans-serif;
+    letter-spacing: 0.08em; text-transform: uppercase;
+  }
+  .ledger .col.full h4 { color: var(--good); }
+  .ledger .col.incr h4 { color: var(--bad); }
+  .ledger ul { margin: 0; padding-left: 1.1rem; font-size: 0.92rem; }
+  .ledger li { margin-bottom: 0.35rem; }
+  .ledger .sum {
+    margin-top: 0.7rem; padding-top: 0.6rem; border-top: 1px dashed var(--rule);
+    font: 600 0.95rem/1.4 system-ui, sans-serif;
+  }
+  .full .sum { color: var(--good); }
+  .incr .sum { color: var(--bad); }
+  .diagram {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 1.1rem 1.2rem; margin: 1.4rem 0; overflow-x: auto;
+  }
+  .diagram pre { background: none; border: none; padding: 0; margin: 0; font-size: 0.78rem; }
+  .diagram figcaption {
+    font: 0.78rem/1.5 system-ui, sans-serif; color: var(--muted);
+    margin-top: 0.8rem; border-top: 1px solid var(--rule); padding-top: 0.6rem;
+  }
+  .k { color: var(--accent); font-weight: 600; }
+  .b { color: var(--bad); font-weight: 600; }
+  .g { color: var(--good); font-weight: 600; }
+  /* calculator */
+  .calc {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 1.2rem 1.3rem; margin: 1.6rem 0; font-family: system-ui, sans-serif;
+  }
+  .calc h4 { margin: 0 0 1rem; font-size: 0.95rem; }
+  .calc .row { display: flex; align-items: center; gap: 0.8rem; margin-bottom: 0.7rem; flex-wrap: wrap; }
+  .calc label { font-size: 0.83rem; width: 17rem; color: var(--muted); }
+  .calc input[type=range] { flex: 1; min-width: 8rem; accent-color: var(--accent); }
+  .calc output {
+    font-variant-numeric: tabular-nums; font-size: 0.85rem; width: 6.2rem;
+    text-align: right; font-weight: 600;
+  }
+  .calc .verdict {
+    margin-top: 1rem; padding-top: 0.9rem; border-top: 1px solid var(--rule);
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.8rem; text-align: center;
+  }
+  @media (max-width: 620px) { .calc .verdict { grid-template-columns: 1fr; } }
+  .calc .verdict > div { border-radius: 8px; padding: 0.7rem 0.5rem; }
+  .calc .verdict .label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+  .calc .verdict .val { font-size: 1.25rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .calc .vfull { background: var(--good-soft); }
+  .calc .vfull .val { color: var(--good); }
+  .calc .vincr { background: var(--bad-soft); }
+  .calc .vincr .val { color: var(--bad); }
+  .calc .vwin { background: var(--accent-soft); }
+  .calc .vwin .val { color: var(--accent); font-size: 1.02rem; padding-top: 0.2rem; }
+  .fixes { counter-reset: fix; }
+  .fix {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 1.05rem 1.2rem; margin-bottom: 1rem;
+  }
+  .fix h4 { margin: 0 0 0.45rem; font-size: 1rem; }
+  .fix h4 .lvl {
+    display: inline-block; font: 700 0.7rem/1 system-ui, sans-serif; color: var(--accent);
+    background: var(--accent-soft); border-radius: 999px; padding: 0.3em 0.7em;
+    margin-right: 0.55rem; letter-spacing: 0.05em; vertical-align: 0.12em;
+  }
+  .fix p { font-size: 0.95rem; }
+  .fix p:last-child { margin-bottom: 0; }
+  .fix .tag { font: 0.75rem/1.4 system-ui, sans-serif; color: var(--muted); }
+  a { color: var(--accent); }
+  .footnote { font-size: 0.85rem; color: var(--muted); border-top: 1px solid var(--rule); margin-top: 3rem; padding-top: 1rem; }
+</style>
+</head>
+<body>
+<main>
+<header class="doc">
+  <p class="eyebrow">TurboLay design note</p>
+  <h1>Requests, Not Bytes</h1>
+  <p class="dek">Why loading a 100&#8239;k-edge delta got slower than scanning the whole
+  1&#8239;M-edge graph — a cost anatomy of the incremental index build, measured on
+  staging, and the design that restores the bet.</p>
+  <p class="meta">2026-08-05 · staging incident analysis · companion to
+  <code>docs/benchmarks/2026-08-03-incremental-index-build.md</code> · code refs at
+  <code>src/shard/topology_tail.rs:75</code>, <code>src/engine/index_store.rs</code></p>
+</header>
+
+<h2><span class="no">1</span>The bet, and the assumption smuggled inside it</h2>
+<p>The incremental build banks on one inequality: the change set is always far smaller
+than the graph. A million-edge graph gets a hundred thousand new edges in a busy
+half hour; touching 100&#8239;k things must beat touching 1&#8239;M things. The bet is
+correct — <em>as a statement about work per item</em>. The 5&#8239;M-edge benchmark proved
+the apply-and-re-encode side handily: 26× faster than a full rebuild.</p>
+<p>The smuggled assumption is in the word <em>loading</em>. It reads as
+&ldquo;cost&nbsp;∝&nbsp;items&rdquo;. But nothing in a storage system charges you per item.
+You are charged per <strong>request</strong>, and a request costs the same
+~50&#8239;ms against S3 whether it returns one useful edge or forty thousand. So the real
+inequality that decides the winner is:</p>
+<div class="callout">
+<p><strong>items ÷ items-per-request</strong> is what you pay — not items.
+The full scan gets its 1&#8239;M edges at ~40&#8239;k useful edges per request. The tail walk gets
+its delta at <em>~0.01 useful edges per request</em>. That is a six-orders-of-magnitude
+per-item handicap, and it flips the bet.</p>
+</div>
+
+<h2><span class="no">2</span>Where each copy of the truth lives</h2>
+<p>The same edges exist in three shapes, and the shapes — not the counts — set the price.</p>
+<figure class="diagram">
+<pre>
+S3, per scope+cell database
+┌──────────────────────────────────────────────────────────────────────┐
+│ <span class="g">SHAPE A — current state (compacted SSTs + L0)</span>                        │
+│   sorted by key, packed ~thousands of edges per block, a few big     │
+│   files · read in bulk, block-cached locally after first touch       │
+│                                                                      │
+│ <span class="b">SHAPE B — history (the WAL)</span>                                          │
+│   one tiny file per ~100 ms of write activity · time-ordered, so     │
+│   one edge type's changes are shredded across ALL of them,           │
+│   interleaved with every other edge type, property write and tomb    │
+│                                                                      │
+│ SHAPE C — the published index (CSC payload + manifest)               │
+└──────────────────────────────────────────────────────────────────────┘
+        │                                    │
+        │ replay once per visit,             │ re-download per build,
+        │ bounded span (writer ckpt → now)   │ unbounded span (prev gen → now),
+        ▼                                    ▼ once per edge type — <span class="b">×8</span>
+┌───────────────────────────┐      ┌───────────────────────────┐
+│ <span class="g">reader RAM + block cache</span>  │      │ <span class="b">topology_tail_since walk</span>  │
+│ merged key→value state    │      │ serial GET per WAL file   │
+│ (history discarded!)      │      │ (topology_tail.rs:75)     │
+└───────────┬───────────────┘      └───────────┬───────────────┘
+            │ full build scans this            │ incremental build waits on this
+            ▼                                  ▼
+      <span class="g">cost ∝ graph size</span>                <span class="b">cost ∝ write activity × RTT</span>
+</pre>
+<figcaption>Both builds run in the indexer against the same scope database. The full
+build's data source is Shape A via local state; the incremental build's <em>delta
+derivation</em> is chained to Shape B in S3. Note what the reader does with the WAL it
+replays: it folds entries into current state and <em>discards the history</em> — which is
+the only part the incremental build needed.</figcaption>
+</figure>
+<p>Three consequences fall out of Shape B being the delta source:</p>
+<p><strong>The delta is never stored as &ldquo;100&#8239;k edges you can load.&rdquo;</strong>
+It is stored as <em>N</em> tiny files where <em>N</em> counts <em>write flushes</em>, not
+edges. A tenant trickling 200 edges over 20 minutes produces ~2,000 files; a bulk load
+writing 100&#8239;k edges in 10 seconds produces ~100. Same delta size, 20× different price.
+Write <em>pattern</em>, not write volume, sets the cost.</p>
+<p><strong>The walk is serial.</strong> <code>topology_tail.rs:75</code> awaits each file
+before requesting the next: <code>span × RTT</code> wall-clock, no overlap.</p>
+<p><strong>The walk repeats.</strong> All 8 edge types share one database, the
+per-edge-type filter runs <em>after</em> download, and nothing remembers the walk between
+builds. The same file is downloaded by the reader's replay, then up to 8 more times by
+builds — 9 purchases of the same bytes, 8 discarded.</p>
+
+<h2><span class="no">3</span>The measured ledger (staging, Aug 4–5)</h2>
+<p>Same scope, same snapshot, same 1–3&#8239;k-edge graphs. Every number below is measured,
+not modeled.<sup>1</sup></p>
+<div class="ledger">
+  <div class="col full">
+    <h4>Full build · ~1 s</h4>
+    <ul>
+      <li>refresh reader — replays only <em>new</em> WAL since the writer's checkpoint; bounded, shared</li>
+      <li>pin snapshot — free</li>
+      <li>scan adjacency from RAM/block cache — <strong>zero S3 in the loop</strong></li>
+      <li>encode CSC, publish — milliseconds</li>
+    </ul>
+    <p class="sum">cost ∝ graph size · ~12&#8239;µs per edge at 5&#8239;M-edge scale</p>
+  </div>
+  <div class="col incr">
+    <h4>Incremental build · 27–302 s</h4>
+    <ul>
+      <li>same refresh + snapshot — same price</li>
+      <li>fetch previous CSC payload — 1 GET, cheap</li>
+      <li><strong>tail walk: 100–10,000 serial GETs</strong> at 40–80&#8239;ms each</li>
+      <li>apply 4–25 delta edges, re-encode — milliseconds</li>
+    </ul>
+    <p class="sum">cost ∝ WAL files since last build · ~10 s per <em>delta</em> edge</p>
+  </div>
+</div>
+<div class="scroll">
+<table>
+  <thead><tr>
+    <th>WAL files since previous build</th><th class="num">builds</th>
+    <th class="num">avg build</th><th class="num">max build</th><th class="num">graph size</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>11 – 100</td><td class="num">87</td><td class="num">3.6 s</td><td class="num">9.6 s</td><td class="num">~700 edges</td></tr>
+    <tr><td>101 – 1,000</td><td class="num">140</td><td class="num">32 s</td><td class="num">112 s</td><td class="num">~1,100 edges</td></tr>
+    <tr><td>1,000 – 10,000</td><td class="num">62</td><td class="num">149 s</td><td class="num">274 s</td><td class="num">~1,000 edges</td></tr>
+    <tr><td>&gt; 10,000</td><td class="num">2</td><td class="num">191 s</td><td class="num">302 s</td><td class="num">~2,700 edges</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Build time tracks the file count and is indifferent to graph size — the signature of a
+request-bound, not data-bound, workload. The slope, ~50&#8239;ms per file, is one S3
+round-trip.</p>
+
+<h2><span class="no">4</span>The request arithmetic, priced</h2>
+<p>A reasonable first analogy: <em>&ldquo;both paths hit S3; the full path just makes ~10×
+fewer GET calls and takes ~100× more data per call.&rdquo;</em> The direction is right;
+the magnitude is not even close — and the gap is not one number but three multiplied
+together: <strong>request count × useful payload × amortization</strong>.</p>
+<div class="scroll">
+<table>
+  <thead><tr>
+    <th>per build of one edge type</th><th class="num">S3 requests</th>
+    <th>payload per request</th><th class="num">useful edges / request</th><th>paid again next build?</th>
+  </tr></thead>
+  <tbody>
+    <tr><td><strong>Full, steady state</strong> (reader warm within the visit)</td>
+      <td class="num">~0 in the scan loop</td><td>— (RAM + block cache)</td>
+      <td class="num">∞, effectively</td><td>—</td></tr>
+    <tr><td><strong>Full, cold open</strong> (manifest + bounded replay + SST blocks)</td>
+      <td class="num">tens</td><td>large, densely packed — thousands of edges per fetch</td>
+      <td class="num">~10³–10⁴</td><td><span class="g">no</span> — cached for every edge type &amp; build in the visit</td></tr>
+    <tr><td><strong>Incremental tail walk</strong> (staging, measured)</td>
+      <td class="num">100 – 10,000</td><td>a few KB, mostly irrelevant entries</td>
+      <td class="num"><strong>0.002 – 0.1</strong></td><td><span class="b">yes</span> — uncached, repeated per edge type, per build</td></tr>
+  </tbody>
+</table>
+</div>
+<p>So it is not &ldquo;10× fewer calls at 100× the data.&rdquo; It is <em>tens</em> of
+amortized calls at ~10&#8239;⁴ useful edges each, versus <em>thousands</em> of unamortized calls
+at ~10&#8239;⁻² useful edges each — a per-edge price gap of six to eight orders of magnitude.</p>
+<div class="callout bad">
+<p><strong>And the &ldquo;worst case that will never happen&rdquo; happened — and was
+undershot.</strong> The intuitive worst case is one request per delta edge (a tenant
+trickling one edge per ~100&#8239;ms flush: 100&#8239;k edges → 100&#8239;k files → 100&#8239;k GETs). Staging
+measured <em>worse than one request per edge, routinely</em>: builds paid 2,000 requests
+to recover 15-edge deltas — 0.0075 useful edges per request. Two reasons: WAL files
+interleave all 8 edge types plus vertex/property writes, so most files contain
+<em>zero</em> entries for the edge type being built; and each of the 8 edge types re-walks
+the same files, dividing the useful yield again. The sub-worst case is the
+<em>common</em> case.</p>
+</div>
+
+<h2><span class="no">5</span>Two feedback loops made it worse every day</h2>
+<p><strong>Loop 1 — staleness compounds.</strong> Slow builds stretch the indexer cycle
+(7 min → 15–40 min). A longer cycle means more WAL accumulates before the next visit,
+which means a longer walk, which stretches the cycle further. Average build: 27 s on
+Aug 4, 48 s on Aug 5.</p>
+<p><strong>Loop 2 — the fleet grew under it.</strong> Registered scopes went from ~110 to
+~300 in four days, and the cycle visits every scope serially at 3–4 s each (open reader,
+establish checkpoint via manifest CAS, check dirty, close, delete checkpoint) — ~20
+minutes of fixed overhead per cycle before any build runs. Not caused by the incremental
+change, but it multiplies Loop&nbsp;1 by delaying every revisit.</p>
+<div class="callout bad">
+<p>The design hole in one sentence: the builder declines the incremental path when the
+delta is <em>unavailable</em> (a WAL file was garbage-collected) but never when it is
+merely <em>ruinously expensive</em> — it has a correctness gate and no cost gate, so it
+grinds through 10,000 round-trips to discover 15 edges rather than falling back to a
+1-second scan.</p>
+</div>
+
+<h2><span class="no">6</span>Why the read path never noticed</h2>
+<p>The obvious objection: queries use the <em>same</em> tail walk
+(<code>shard/query.rs:5525</code> calls the very same <code>topology_tail_since</code>) to
+overlay freshness onto a compiled matrix. If the walk is ruinous, reads should have been
+screaming for months. They weren't — and the reason is the design lesson of this whole
+incident, so it deserves its own anatomy.</p>
+<p>First, the objection's premise is right about one thing: <em>everyone loads data
+eventually</em>. A cold read pays the manifest, the bounded replay, and SST block fetches
+— the same cold-open tens-of-requests the full build pays. The difference is
+<em>which shape</em> each consumer <strong>depends on</strong>. Every read route
+terminates in Shape&nbsp;A — bulk, packed, cached, amortized. No read route
+<em>requires</em> Shape&nbsp;B. Reads sample the shredded history opportunistically, and
+every gate on the way out fails <em>toward</em> Shape&nbsp;A:</p>
+<div class="scroll">
+<table>
+  <thead><tr>
+    <th>gate on the matrix + overlay route</th><th>where</th><th>on failure</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>1 · Sparse-kernel policy is <code>Adjacency</code> — compiled route disabled
+      wholesale</td><td><code>matrix_cache.rs:52</code></td>
+      <td>snapshot scan (Shape&nbsp;A)</td></tr>
+    <tr><td>2 · No compiled matrix cached or hydratable for the current generation</td>
+      <td><code>query.rs:5492</code></td><td>snapshot scan (Shape&nbsp;A)</td></tr>
+    <tr><td>3 · Generation already covers the read epoch — the common case when the
+      indexer keeps up</td><td><code>topology_tail.rs:65</code></td>
+      <td>empty overlay, zero walk</td></tr>
+    <tr><td>4 · Walk under way but a file is missing (GC) or the query deadline
+      (<code>QueryBudget</code>, checked per file) fires</td>
+      <td><code>topology_tail.rs:76,85</code></td>
+      <td>abort mid-walk → snapshot scan (Shape&nbsp;A)</td></tr>
+  </tbody>
+</table>
+</div>
+<p>So the read path and the incremental builder are not &ldquo;the same code, different
+luck.&rdquo; They are the same <em>walk</em> under opposite <em>contracts</em>: for a read
+the walk is an optional accelerator with an abort lever and a cheap, always-correct
+fallback standing behind it; for the builder it was the primary data source with no abort
+lever for cost — only for correctness. The builder was the only caller in the system
+<em>required</em> to finish the walk.</p>
+<p>Staging evidence that the gates, not luck, did the work: 16,500 <code>query.execute</code>
+spans over three days averaging 118&#8239;ms with p99 2.5&#8239;s, and <strong>zero</strong>
+<code>storage.wal_tail</code> spans from the nodes in seven days — the span is
+tail-sampled away unless it errors, and none errored. Which is also the uncomfortable
+part: reads were <em>silently</em> fine. If they had been quietly aborting expensive
+walks every query, the telemetry would look identical. That observability hole is a
+first-class deliverable of the fix (§8), not a footnote.</p>
+<div class="callout">
+<p><strong>The transferable lesson:</strong> any consumer of Shape&nbsp;B must either
+hold a stateful position in it (the reader's replay marker) or hold an exit to
+Shape&nbsp;A priced in advance (the read path's gates). The incremental builder shipped
+with neither — it held a <em>stateless</em> position and an exit that only opened on
+missing data, never on cost.</p>
+</div>
+
+<h2><span class="no">7</span>Feel the crossover</h2>
+<p>Incremental wins iff <code>walk cost &lt; full-scan cost</code>, i.e.
+<code>(files ÷ concurrency) × RTT &nbsp;&lt;&nbsp; edges × scan-rate</code>. Drag the
+sliders — defaults match a staging burst; set edges to 1&#8239;M and files to 18,000 to see
+your 100&#8239;k-in-30-min example.</p>
+<div class="calc" id="calc">
+  <h4>Break-even calculator</h4>
+  <div class="row"><label>Graph size (edges)</label>
+    <input type="range" id="c-edges" min="3" max="7.5" step="0.05" value="6">
+    <output id="o-edges"></output></div>
+  <div class="row"><label>WAL files since last build</label>
+    <input type="range" id="c-files" min="1" max="4.5" step="0.05" value="3.3">
+    <output id="o-files"></output></div>
+  <div class="row"><label>S3 round-trip (ms)</label>
+    <input type="range" id="c-rtt" min="1" max="80" step="1" value="50">
+    <output id="o-rtt"></output></div>
+  <div class="row"><label>Walk concurrency</label>
+    <input type="range" id="c-conc" min="0" max="5" step="1" value="0">
+    <output id="o-conc"></output></div>
+  <div class="row"><label>Edge types sharing one walk</label>
+    <input type="range" id="c-share" min="1" max="8" step="7" value="1">
+    <output id="o-share"></output></div>
+  <div class="verdict">
+    <div class="vfull"><div class="label">full scan</div><div class="val" id="v-full"></div></div>
+    <div class="vincr"><div class="label">incremental (per edge type)</div><div class="val" id="v-incr"></div></div>
+    <div class="vwin"><div class="label">verdict</div><div class="val" id="v-win"></div></div>
+  </div>
+</div>
+<p>Three things to notice while dragging. Concurrency divides the walk but never changes
+its <em>class</em> — at 18,000 files even 32-way still pays 560 sequential rounds.
+The RTT slider is why the MinIO benchmark (RTT ≈ 1&#8239;ms) missed this completely.
+And no slider setting can beat a delta source whose cost is
+<em>zero extra requests</em> — which is what Level&nbsp;2 below builds.</p>
+
+<h2><span class="no">8</span>The fix: make delta derivation obey the bet</h2>
+<p>The invariant to enforce, mechanically: <strong>the incremental path must never cost
+more than the full path — it estimates its derivation cost up front and forfeits when it
+would lose.</strong> Then, separately, shrink the derivation cost until forfeits are rare.</p>
+<div class="fixes">
+  <div class="fix">
+    <h4><span class="lvl">L0</span>Cost gate — the missing decline</h4>
+    <p>The builder already knows the span for free:
+    <code>durable_wal_id − generation.last_wal_id</code>. If
+    <code>span × RTT<sub>est</sub> &gt; full-scan<sub>est</sub></code>, decline → full
+    build → re-base. Extends the existing decline-not-guess design from correctness to
+    cost; restores the invariant <em>by construction</em>, with everything else purely
+    improving the win rate.</p>
+    <p>Lands at the top of the incremental branch in
+    <code>index_store.rs</code>, before any S3 work:</p>
+    <pre><code>let span = durable_wal_id.saturating_sub(previous.last_wal_id);
+if span &gt; max_tail_files {          // v1: static knob,
+    return self.build_full(..,       // GRAPH_INDEXER_MAX_TAIL_FILES
+        DeclineReason::TailTooExpensive).await;
+}</code></pre>
+    <p>The decline increments the existing fallback counter with a new
+    <code>reason</code> label, so the dashboard separates &ldquo;chain broken&rdquo; from
+    &ldquo;chain too long&rdquo; — today's 98-fallback panel can't tell them apart.</p>
+    <p class="tag">size: small · one PR with L1 · new decline reason on the fallback counter</p>
+  </div>
+  <div class="fix">
+    <h4><span class="lvl">L1</span>One walk, shared and concurrent</h4>
+    <p>Walk the span <em>once per scope-cell per cycle</em>, collecting affected keys for
+    all 8 edge types in a single pass (the per-type filter is a per-key string match —
+    trivially widened), fetching 16–32 files concurrently. Turns 8 × 100 s into ~6 s for
+    a 2,000-file span: a ~130× wall-clock win that changes no interface. The class stays
+    O(write activity) — L0 remains the backstop.</p>
+    <p>Mechanically: a sibling of <code>topology_tail_since</code> in
+    <code>topology_tail.rs</code> returning
+    <code>BTreeMap&lt;EdgeType, GraphTopologyOverlay&gt;</code>;
+    <code>collect_topology_entry</code> already parses the edge type out of the key, so
+    the filter widens from <code>== edge_type</code> to <code>∈ registered set</code>.
+    Fetches go through <code>futures::stream::iter(ids).map(get).buffer_unordered(N)</code>;
+    per-file iterators drain as they arrive; the per-entry sequence guards
+    (<code>seq ≤ base</code>, <code>seq &gt; read</code>) are unchanged — note the base
+    sequence differs per edge type's generation, so the shared walk keeps entries down to
+    the <em>oldest</em> base among dirty types and each type's overlay applies its own
+    guard. One subtlety: a missing file now declines <em>all</em> edge types sharing the
+    walk — which is the same outcome they'd each reach alone.</p>
+    <p class="tag">size: small-medium · same PR as L0</p>
+  </div>
+  <div class="fix">
+    <h4><span class="lvl">L2</span>Capture history where it already flows</h4>
+    <p>The reader's replay downloads every WAL file exactly once, at exactly the right
+    moment — then discards the history. Tee it instead: during replay, append topology
+    change events <code>(edge_type, src, dst, seq)</code> to a small per-scope changelog
+    the builder keeps. Delta derivation becomes a RAM lookup — zero additional S3, cost
+    ∝ delta size, the bet honored by construction.</p>
+    <p>Shape of the hook, on our SlateDB fork (we own the pin):</p>
+    <pre><code>// fork: DbReaderOptions grows an observer the replay loop invokes
+pub trait WalReplayObserver: Send + Sync {
+    fn entry(&amp;self, wal_id: u64, key: &amp;[u8], value: &amp;ValueDeletable, seq: u64);
+}
+// kernel: observer feeds a per-scope ring keyed by seq, recording
+// (edge_type, src, dst) via the same parser as collect_topology_entry.
+// Builder asks: changelog.entries_since(base_seq)
+//   → Some(delta)  if base_seq ≥ changelog.low_water  → apply, done, 0 GETs
+//   → None         otherwise                          → L0 decline → full build</code></pre>
+    <p>The changelog knows its own coverage (<code>low_water</code> = the seq where its
+    history begins), so correctness is a range check, not a hope. Memory is bounded by
+    ring size; overflow just raises <code>low_water</code> — degrading to a decline,
+    never to a wrong answer. The remaining requirement is that the changelog
+    <em>outlive the visit</em>, which points at keeping hot scopes open across cycles
+    (LRU) — the same lifecycle change that dissolves Loop&nbsp;2's 20 minutes of
+    open/close churn. After restart or eviction: L0 declines once, re-bases, resumes.
+    Same self-healing shape as the GC fallback.</p>
+    <p class="tag">size: medium, own design round · fixes both fires with one lifecycle change</p>
+  </div>
+  <div class="fix">
+    <h4><span class="lvl">L3</span>Delta-shaped generations</h4>
+    <p>The builder publishes deltas alongside periodic full generations; readers compose.
+    No consumer depends on WAL retention or replay at all. The endgame — already the
+    phase-2 plan — and unblocked, not replaced, by L0–L2.</p>
+    <p class="tag">size: large · phase 2</p>
+  </div>
+</div>
+
+<h2><span class="no">9</span>Open questions for discussion</h2>
+<p><strong>Where does the changelog live?</strong> In the builder (fork exposes a replay
+callback; kernel stays generic) or inside the fork's reader itself (reusable by the read
+path's overlay too — which today re-derives the same tail per query and survives only by
+falling back)? The second is more invasive but pays twice.</p>
+<p><strong>Keep-open LRU sizing.</strong> ~300 scopes and growing; a reader holds
+memory + a checkpoint. What's the residency budget — and should
+dirtiness (cheap S3 list) gate <em>visiting</em> at all, so quiet scopes cost nothing?</p>
+<p><strong>L0's estimator.</strong> Static file-count threshold (simple, one knob) vs
+measured EWMA of per-file RTT and per-edge scan rate (self-tuning, more moving parts)?</p>
+<p><strong>Observability debt.</strong> A <code>build_duration_seconds</code> histogram
+labeled by path, a counter for declined-for-cost, and keeping (not sampling away) the
+read path's declined-tail spans — this failure mode was invisible by construction; the
+next one shouldn't be.</p>
+
+<p class="footnote"><sup>1</sup> Sources: SigNoz traces
+(<code>artifact.build</code>, <code>artifact.publish</code> spans, Aug 1–5), Prometheus
+<code>graph_indexer_*</code> counters, indexer pod logs, staging cluster
+<code>turbolay-staging</code>. WAL-span buckets join each build's duration to
+<code>last_wal_id</code> deltas between consecutive publishes of the same scope and edge
+type. Pre-deploy baselines from Aug 1–2 full-only operation. Benchmark comparison:
+<code>docs/benchmarks/2026-08-03-incremental-index-build.md</code>.</p>
+</main>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var edges = $('c-edges'), files = $('c-files'), rtt = $('c-rtt'),
+      conc = $('c-conc'), share = $('c-share');
+  function fmtN(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(n >= 3e6 ? 0 : 1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(n >= 10e3 ? 0 : 1) + 'k';
+    return String(Math.round(n));
+  }
+  function fmtS(s) {
+    if (s >= 60) return (s / 60).toFixed(1) + ' min';
+    if (s >= 1) return s.toFixed(1) + ' s';
+    return (s * 1000).toFixed(0) + ' ms';
+  }
+  function update() {
+    var E = Math.pow(10, parseFloat(edges.value));
+    var F = Math.round(Math.pow(10, parseFloat(files.value)));
+    var R = parseFloat(rtt.value) / 1000;
+    var C = Math.pow(2, parseInt(conc.value, 10));
+    var S = parseInt(share.value, 10);
+    $('o-edges').textContent = fmtN(E);
+    $('o-files').textContent = fmtN(F);
+    $('o-rtt').textContent = rtt.value + ' ms';
+    $('o-conc').textContent = C + '×';
+    $('o-share').textContent = S === 1 ? 'none' : 'all 8';
+    // full: fixed ~0.5s overhead + 12µs/edge (measured at 5M scale)
+    var full = 0.5 + E * 12e-6;
+    // incremental: fixed ~0.2s + walk, amortized across sharing edge types
+    var walk = (F / C) * R / S;
+    var incr = 0.2 + walk;
+    $('v-full').textContent = fmtS(full);
+    $('v-incr').textContent = fmtS(incr);
+    var win = $('v-win');
+    if (incr < full) {
+      win.textContent = 'incremental wins ' + (full / incr).toFixed(1) + '×';
+    } else {
+      win.textContent = 'FULL wins ' + (incr / full).toFixed(1) + '× — decline!';
+    }
+  }
+  [edges, files, rtt, conc, share].forEach(function (el) {
+    el.addEventListener('input', update);
+  });
+  update();
+})();
+</script>
+</body>
+</html>
