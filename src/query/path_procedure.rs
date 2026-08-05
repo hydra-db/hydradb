@@ -48,6 +48,7 @@ pub(crate) struct NativePathProcedure {
     pub(crate) source_selector: Option<NativePathNodeSelector>,
     pub(crate) target_selector: Option<NativePathNodeSelector>,
     pub(crate) pairwise: bool,
+    pub(crate) all_relationship_variants: bool,
     pub(crate) rel_types: Vec<String>,
     pub(crate) direction: NativePathDirection,
     pub(crate) max_len: u8,
@@ -171,6 +172,20 @@ pub(crate) fn parse_native_path_procedure(
     let weight_property = config_string(&config, "weightProp", parameters)?;
     let cost_property = config_string(&config, "costProp", parameters)?;
     let max_cost = config_number(&config, "maxCost", parameters)?.map(QueryFloat);
+    let all_relationship_variants =
+        config_bool(&config, "allRelationshipVariants")?.unwrap_or(false);
+    if all_relationship_variants && (kind != NativePathProcedureKind::MultiSource || !pairwise) {
+        return path_parse_error(
+            "allRelationshipVariants is only supported by pairwise algo.MSpaths",
+        );
+    }
+    if all_relationship_variants
+        && (weight_property.is_some() || cost_property.is_some() || max_cost.is_some())
+    {
+        return path_parse_error(
+            "allRelationshipVariants requires an unweighted pairwise algo.MSpaths query",
+        );
+    }
     let known = [
         "sourceNode",
         "targetNode",
@@ -189,6 +204,7 @@ pub(crate) fn parse_native_path_procedure(
         "targetProperty",
         "targetValues",
         "pairwise",
+        "allRelationshipVariants",
     ];
     if let Some(unknown) = config.keys().find(|key| !known.contains(&key.as_str())) {
         return path_parse_error(format!("unknown native path option {unknown}"));
@@ -201,6 +217,7 @@ pub(crate) fn parse_native_path_procedure(
         "targetProperty",
         "targetValues",
         "pairwise",
+        "allRelationshipVariants",
     ];
     if kind != NativePathProcedureKind::MultiSource {
         if let Some(option) = multi_source_options
@@ -224,6 +241,7 @@ pub(crate) fn parse_native_path_procedure(
         source_selector,
         target_selector,
         pairwise,
+        all_relationship_variants,
         rel_types,
         direction,
         max_len: max_len as u8,
@@ -800,7 +818,7 @@ mod tests {
     #[test]
     fn parses_multi_source_native_path_call() {
         let parsed = parse_native_path_procedure(
-            "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', sourceValues: ['alpha', 'beta'], targetValues: ['alpha', 'beta'], pairwise: true, relTypes: ['RELATES'], maxLen: 3, relDirection: 'both', pathCount: 5, resultLimit: 100}) YIELD path RETURN path",
+            "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', sourceValues: ['alpha', 'beta'], targetValues: ['alpha', 'beta'], pairwise: true, relTypes: ['RELATES'], maxLen: 3, relDirection: 'both', pathCount: 5, allRelationshipVariants: true, resultLimit: 100}) YIELD path RETURN path",
             &BTreeMap::new(),
             10,
         )
@@ -808,6 +826,7 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.kind, NativePathProcedureKind::MultiSource);
         assert!(parsed.pairwise);
+        assert!(parsed.all_relationship_variants);
         assert_eq!(parsed.path_count, 5);
         assert_eq!(parsed.result_limit, Some(100));
         assert_eq!(

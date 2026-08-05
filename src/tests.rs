@@ -728,7 +728,8 @@ async fn native_ms_paths_resolves_indexed_sources_in_one_pinned_snapshot() {
             "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', \
              sourceValues: ['alpha', 'beta', 'gamma'], targetValues: ['alpha', 'beta', 'gamma'], \
              pairwise: true, relTypes: ['RELATES'], maxLen: 2, relDirection: 'both', \
-             pathCount: 5, resultLimit: 10}) YIELD path RETURN path",
+             pathCount: 1, allRelationshipVariants: true, resultLimit: 10}) \
+             YIELD path RETURN path",
         )
         .await
         .unwrap();
