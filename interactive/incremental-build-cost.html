@@ -530,7 +530,60 @@ pub trait WalReplayObserver: Send + Sync {
   </div>
 </div>
 
-<h2><span class="no">9</span>Open questions for discussion</h2>
+<h2><span class="no">9</span>Landed: L0 + L1, measured on real S3</h2>
+<p>Branch <code>feat/wal-tail-cost-gate</code> implements the first two rungs
+(commit <code>80b922d</code>): the cost gate
+(<code>GraphLimits::max_wal_tail_files</code>, default 4096,
+<code>GRAPH_INDEXER_MAX_TAIL_FILES</code> in the indexer), the 16-way concurrent
+fetch (<code>GRAPH_WAL_TAIL_FETCH_CONCURRENCY</code>; <code>1</code> reproduces
+the old serial walk), and the per-shard parsed-file cache
+(<code>WalTailFileCache</code>) that lets the 8 edge types share one span's
+downloads. Declines log their reason at info. Two new regression tests pin the
+behavior: a span over the cap declines to a correct full rebuild, and the second
+edge type's walk downloads nothing.</p>
+<p>Measured against <strong>real AWS S3</strong> (bucket
+<code>hydradb-local-turbolay</code>, us-east-1) with
+<code>examples/wal_tail_trickle_bench.rs</code>, which manufactures the staging
+shape: 100&#8239;k seeded edges per type, then 500 single-edge commits per type —
+each its own WAL flush — before one build walks the span.</p>
+<div class="scroll">
+<table id="s3-results">
+  <thead><tr>
+    <th>build over the same ~1,000-file trickled span</th><th class="num">time</th><th>note</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Old serial walk (concurrency 1)</td><td class="num"><strong>&gt; 600 s, did not finish</strong></td>
+      <td>killed at the bench timeout mid-walk — the staging pathology, reproduced</td></tr>
+    <tr><td>Fixed walk (concurrency 16 + shared parse)</td><td class="num">478 s, completed</td>
+      <td>residual was ~500 <em>serial</em> cold-cache existence resolves — the next
+      bottleneck the run exposed, parallelized the same way in <code>29ba6a5</code></td></tr>
+    <tr><td>Full rebuild at the same sequence</td><td class="num">290 s</td>
+      <td>the bar both must beat</td></tr>
+    <tr><td>Later re-measure: span already collected by WAL GC</td><td class="num">312 s</td>
+      <td><strong>declined → full rebuild → correct output</strong> — the decline
+      path demonstrated end-to-end on real S3</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Two honest caveats and one controlled number. The client ran far from
+us-east-1 (~300–800 ms per request — an in-cluster indexer sees 1–5 ms), so the
+<em>absolute</em> times above are inflated ~100×; the <em>ratios and outcomes</em>
+are what transfer. And because remote absolute numbers are junk for regression
+tracking, <code>examples/tail_concurrency_probe.rs</code> re-measures the walk
+under a deterministic injected latency (<code>ThrottledStore</code>, 25 ms/GET,
+100-file span): <strong>16.8 s serial vs 4.7 s fixed</strong> — the walk itself
+parallelizes ~16×, and the remaining serial cost is SlateDB's own WAL replay
+inside reader refresh, which only the L2 work can remove.</p>
+<div class="callout">
+<p><strong>A finding the benchmark threw in for free:</strong> re-opening the
+shard over the freshly trickled span stalls in SlateDB's own WAL replay — the
+open performs the same serial file-by-file walk before the database is usable.
+The indexer's per-cycle open/close of every scope pays this too, which is more
+evidence for the keep-scopes-open LRU in L2: replay cost should be paid
+incrementally by a long-lived reader, not repeatedly by fresh opens.</p>
+</div>
+
+<h2><span class="no">10</span>Open questions for discussion</h2>
 <p><strong>Where does the changelog live?</strong> In the builder (fork exposes a replay
 callback; kernel stays generic) or inside the fork's reader itself (reusable by the read
 path's overlay too — which today re-derives the same tail per query and survives only by
