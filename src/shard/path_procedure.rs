@@ -5,7 +5,8 @@ use tracing::Instrument as _;
 use super::topology_tail::GraphTopologyOverlay;
 use super::*;
 use crate::query::path_procedure::{
-    NativePathDirection, NativePathProcedure, NativePathProcedureKind, NativePathProjection,
+    NativePathDirection, NativePathNodeSelector, NativePathProcedure, NativePathProcedureKind,
+    NativePathProjection,
 };
 use crate::{
     QueryCursorToken, QueryPath, QueryPathNode, QueryPathRelationship, QueryResultPage,
@@ -280,6 +281,16 @@ impl GraphShard {
                 limit: self.limits.max_query_result_vertices as u64,
             });
         }
+        let result_limit = procedure
+            .result_limit
+            .unwrap_or(self.limits.max_query_result_vertices as u64);
+        if result_limit > self.limits.max_query_result_vertices as u64 {
+            return Err(GraphError::AdmissionRejected {
+                operation: "native_path_result_limit",
+                actual: result_limit,
+                limit: self.limits.max_query_result_vertices as u64,
+            });
+        }
         let read_epoch = context
             .validated_read_epoch()
             .unwrap_or(self.current_epoch(&context.cell_id).await?);
@@ -301,59 +312,92 @@ impl GraphShard {
             read_epoch,
             budget: &budget,
         };
-        let adjacency = self
-            .native_path_adjacency(read, &procedure, &topologies)
-            .await?;
-        let mut candidates = enumerate_candidate_paths(
-            &procedure,
-            &adjacency,
-            self.limits.max_query_intermediate_rows,
-            &budget,
-        )?;
-        let mut relationship_cache = BTreeMap::new();
-        candidates = self
-            .expand_native_path_relationships(
+        let sources = self
+            .resolve_native_path_selector(
                 read,
-                candidates,
-                &mut relationship_cache,
-                self.limits.max_query_intermediate_rows,
+                procedure.source_selector.as_ref(),
+                procedure.source,
             )
             .await?;
-        self.score_native_paths(&procedure, &mut candidates, &relationship_cache, &budget)?;
-        select_native_paths(&procedure, &mut candidates);
-        if candidates.len() > self.limits.max_query_result_vertices {
-            return Err(GraphError::AdmissionRejected {
-                operation: "native_path_results",
-                actual: candidates.len() as u64,
-                limit: self.limits.max_query_result_vertices as u64,
-            });
-        }
-
+        let targets = match procedure.target_selector.as_ref() {
+            Some(selector) => Some(
+                self.resolve_native_path_selector(read, Some(selector), 0)
+                    .await?,
+            ),
+            None => procedure.target.map(|target| vec![target]),
+        };
+        let mut relationship_cache = BTreeMap::new();
         let mut vertex_cache = BTreeMap::new();
-        let mut rows = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            budget.check("native_path_hydrate")?;
-            let path = self
-                .hydrate_native_path(
-                    read,
-                    candidate.nodes.as_slice(),
-                    candidate.edges.as_slice(),
-                    &mut vertex_cache,
-                    &relationship_cache,
-                )
+        let mut rows = Vec::new();
+        'sources: for source in sources {
+            let mut scalar = procedure.clone();
+            scalar.source = source;
+            scalar.source_selector = None;
+            scalar.target_selector = None;
+            scalar.result_limit = None;
+            let adjacency = self
+                .native_path_adjacency(read, &scalar, &topologies)
                 .await?;
-            let values = procedure
-                .projections
-                .iter()
-                .map(|projection| match projection {
-                    NativePathProjection::Path => QueryValue::Path(Box::new(path.clone())),
-                    NativePathProjection::Weight => numeric_query_value(candidate.weight),
-                    NativePathProjection::Cost => numeric_query_value(candidate.cost),
-                })
-                .collect();
-            let row = QueryRow::new(values);
-            budget.account_result_row(&row)?;
-            rows.push(row);
+            let endpoints = targets
+                .as_ref()
+                .map(|targets| targets.iter().copied().map(Some).collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![None]);
+            for target in endpoints {
+                if target == Some(source)
+                    || procedure.pairwise && target.is_some_and(|target| source >= target)
+                {
+                    continue;
+                }
+                scalar.target = target;
+                scalar.kind = if target.is_some() {
+                    NativePathProcedureKind::SinglePair
+                } else {
+                    NativePathProcedureKind::SingleSource
+                };
+                let mut candidates = enumerate_candidate_paths(
+                    &scalar,
+                    &adjacency,
+                    self.limits.max_query_intermediate_rows,
+                    &budget,
+                )?;
+                candidates = self
+                    .expand_native_path_relationships(
+                        read,
+                        candidates,
+                        &mut relationship_cache,
+                        self.limits.max_query_intermediate_rows,
+                    )
+                    .await?;
+                self.score_native_paths(&scalar, &mut candidates, &relationship_cache, &budget)?;
+                select_native_paths(&scalar, &mut candidates);
+                for candidate in candidates {
+                    budget.check("native_path_hydrate")?;
+                    let path = self
+                        .hydrate_native_path(
+                            read,
+                            candidate.nodes.as_slice(),
+                            candidate.edges.as_slice(),
+                            &mut vertex_cache,
+                            &relationship_cache,
+                        )
+                        .await?;
+                    let values = procedure
+                        .projections
+                        .iter()
+                        .map(|projection| match projection {
+                            NativePathProjection::Path => QueryValue::Path(Box::new(path.clone())),
+                            NativePathProjection::Weight => numeric_query_value(candidate.weight),
+                            NativePathProjection::Cost => numeric_query_value(candidate.cost),
+                        })
+                        .collect();
+                    let row = QueryRow::new(values);
+                    budget.account_result_row(&row)?;
+                    rows.push(row);
+                    if rows.len() as u64 >= result_limit {
+                        break 'sources;
+                    }
+                }
+            }
         }
         let result = QueryResultSet::new(
             procedure
@@ -368,6 +412,43 @@ impl GraphShard {
             Some(sequence) => result.with_storage_sequence(sequence),
             None => result,
         })
+    }
+
+    async fn resolve_native_path_selector(
+        &self,
+        read: NativePathRead<'_>,
+        selector: Option<&NativePathNodeSelector>,
+        fallback: VertexId,
+    ) -> Result<Vec<VertexId>> {
+        let Some(selector) = selector else {
+            return Ok(vec![fallback]);
+        };
+        let mut vertices = BTreeSet::new();
+        for value in &selector.values {
+            read.budget.check("native_path_selector")?;
+            for vertex in self
+                .scan_vertex_property_index_at(
+                    read.cell_id,
+                    &selector.property,
+                    &VertexPropertyValue::String(value.clone()),
+                    read.read_epoch,
+                    read.budget,
+                )
+                .await?
+            {
+                let metadata = self
+                    .vertex_metadata_at(read.cell_id, vertex, read.read_epoch, read.budget)
+                    .await?;
+                if metadata.labels.contains(&selector.label)
+                    && metadata.properties.get(&selector.property)
+                        == Some(&VertexPropertyValue::String(value.clone()))
+                {
+                    vertices.insert(vertex);
+                }
+            }
+        }
+        self.ensure_query_index_candidates("native_path_selector_candidates", vertices.len())?;
+        Ok(vertices.into_iter().collect())
     }
 
     async fn native_path_topologies(
@@ -971,6 +1052,9 @@ mod tests {
             kind,
             source: 1,
             target,
+            source_selector: None,
+            target_selector: None,
+            pairwise: false,
             rel_types: vec!["RELATES".to_string()],
             direction: NativePathDirection::Outgoing,
             max_len: 3,
@@ -978,6 +1062,7 @@ mod tests {
             cost_property: None,
             max_cost: None,
             path_count: 1,
+            result_limit: None,
             projections: vec![NativePathProjection::Path],
         }
     }

@@ -414,9 +414,11 @@ for row in rows.rows {
 ### Native path procedures
 
 `algo.SPpaths` returns bounded paths between two vertex ids. `algo.SSpaths`
-returns bounded paths starting at one vertex id. Both execute against one
-pinned SlateDB snapshot and use the current compiled GraphBLAS CSC plus its WAL
-tail when an index is available.
+returns bounded paths starting at one vertex id. `algo.MSpaths` resolves many
+source and optional target vertices through a property index and evaluates all
+of them in one request. All three execute against one pinned SlateDB snapshot
+and use the current compiled GraphBLAS CSC plus its WAL tail when an index is
+available.
 
 ```cypher
 CALL algo.SPpaths({
@@ -442,6 +444,28 @@ weight, cost, hop-count, and deterministic topology order. Paths are simple
 and query edge, intermediate-row, result, byte, cancellation, and timeout
 budgets remain enforced. Bolt clients receive a native Bolt `PATH`, including
 the original direction of relationships traversed in either direction.
+
+Use `algo.MSpaths` to replace client-side path-query fan-out. Selector values
+must resolve through the named property index. With `pairwise: true`, duplicate
+self and symmetric source/target pairs are omitted. `pathCount` is enforced per
+source/target pair and `resultLimit` bounds the complete response.
+
+```cypher
+CALL algo.MSpaths({
+  sourceLabel: 'Entity',
+  sourceProperty: 'name',
+  sourceValues: ['alpha', 'beta', 'gamma'],
+  targetValues: ['alpha', 'beta', 'gamma'],
+  pairwise: true,
+  relTypes: ['RELATES'],
+  relDirection: 'both',
+  maxLen: 3,
+  pathCount: 5,
+  resultLimit: 100
+})
+YIELD path
+RETURN path
+```
 
 ## Public Client Protocols
 
