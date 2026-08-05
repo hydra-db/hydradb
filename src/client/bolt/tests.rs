@@ -131,6 +131,63 @@ impl QueryCellClient for PagedBoltTestClient {
     }
 }
 
+struct NativePathBoltTestClient;
+
+#[async_trait::async_trait]
+impl QueryCellClient for NativePathBoltTestClient {
+    async fn execute_cypher_rows(
+        &self,
+        _context: QueryContext,
+        _query: &str,
+    ) -> Result<QueryResultSet> {
+        Ok(QueryResultSet::new(
+            vec![QueryColumn::new("path")],
+            vec![QueryRow::new(vec![QueryValue::Path(Box::new(QueryPath {
+                nodes: vec![
+                    QueryPathNode {
+                        id: 1,
+                        labels: vec!["Entity".to_string()],
+                        properties: BTreeMap::new(),
+                    },
+                    QueryPathNode {
+                        id: 2,
+                        labels: vec!["Entity".to_string()],
+                        properties: BTreeMap::new(),
+                    },
+                ],
+                relationships: vec![QueryPathRelationship {
+                    id: Some(7),
+                    edge_type: "RELATES".to_string(),
+                    src: 1,
+                    dst: 2,
+                    properties: BTreeMap::new(),
+                }],
+            }))])],
+        )
+        .with_read_epoch(9)
+        .with_storage_sequence(9))
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let result = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(result.columns, result.rows, None))
+    }
+
+    async fn current_storage_sequence(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<u64>> {
+        Ok(Some(9))
+    }
+}
+
 struct BlockingBoltTestClient {
     started: std::sync::atomic::AtomicBool,
 }
@@ -391,6 +448,36 @@ async fn bolt_server_runs_autocommit_queries_and_rejects_fake_transactions() {
             .len(),
         1
     );
+    session.close().await.unwrap();
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn bolt_server_runs_native_path_procedure_calls() {
+    let server = ClientBoltServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        bolt_service_for(Arc::new(NativePathBoltTestClient)),
+        bolt_test_config(),
+    )
+    .await
+    .unwrap();
+    let mut session = BoltSession::connect_basic(server.local_addr(), "neo4j", "bolt-secret")
+        .await
+        .unwrap();
+    let result = session
+        .run(
+            "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', \
+             sourceValues: ['alpha', 'beta'], targetValues: ['alpha', 'beta'], \
+             pairwise: true, relTypes: ['RELATES'], maxLen: 3, \
+             relDirection: 'both', pathCount: 5, \
+             fairRelationshipVariants: true, resultLimit: 100}) \
+             YIELD path RETURN path",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.columns, vec!["path"]);
+    assert_eq!(result.records.len(), 1);
+    assert!(matches!(result.records[0].as_slice(), [BoltValue::Path(_)]));
     session.close().await.unwrap();
     server.stop().await.unwrap();
 }
