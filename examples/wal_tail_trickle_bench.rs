@@ -21,6 +21,11 @@
 //! Defaults: 100_000 seed edges per type, 500 trickle commits per type,
 //! in-memory store. The env file is the same `CLOUD_PROVIDER=aws` format the
 //! other benches take; pass one pointing at real S3 to measure real latency.
+//!
+//! Measure-only mode: `BENCH_PATH=<existing store path> BENCH_TYPE=<edge type>`
+//! skips seeding and trickling and times one build over whatever un-walked
+//! span the path already holds — for measuring the same trickled span from
+//! multiple processes (each process resolves its fetch concurrency once).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -65,6 +70,49 @@ async fn main() -> Result<()> {
         max_artifact_build_edges: 50_000_000,
         ..GraphLimits::default()
     };
+
+    if let Ok(path) = std::env::var("BENCH_PATH") {
+        let edge_type = std::env::var("BENCH_TYPE").unwrap_or_else(|_| EDGE_TYPES[0].to_string());
+        let started = Instant::now();
+        let shard =
+            GraphShard::open_standalone_writer_with_limits(path.as_str(), store, limits).await?;
+        // The open replays every WAL file past the last checkpoint — over a
+        // freshly trickled span that is itself a serial walk, so it is timed
+        // and reported apart from the build being measured.
+        println!("opened in {} ms", started.elapsed().as_millis());
+        flush();
+        let previous = shard
+            .current_graph_index(CELL, &edge_type)
+            .await?
+            .expect("measure-only mode needs a published generation to build from");
+        println!(
+            "previous generation {} at wal id {}",
+            previous.generation, previous.last_wal_id
+        );
+        flush();
+        let started = Instant::now();
+        let (generation, path_taken) = shard.build_graph_index_auto(CELL, &edge_type).await?;
+        let elapsed_ms = started.elapsed().as_millis();
+        let span = generation.last_wal_id.saturating_sub(previous.last_wal_id);
+        println!(
+            "measure-only {edge_type}: {elapsed_ms} ms over {span} wal files [{}] \
+             ({:.1} ms/file)",
+            describe(&path_taken),
+            elapsed_ms as f64 / span.max(1) as f64,
+        );
+        flush();
+        let started = Instant::now();
+        let full = shard.build_graph_index(CELL, &edge_type).await?;
+        println!(
+            "full rebuild at same seq: {} ms [{} edges]",
+            started.elapsed().as_millis(),
+            full.edge_count
+        );
+        flush();
+        shard.close().await?;
+        return Ok(());
+    }
+
     let shard = GraphShard::open_standalone_writer_with_limits(
         format!("bench/wal-tail-trickle-{run_id}").as_str(),
         store,
@@ -175,6 +223,13 @@ async fn main() -> Result<()> {
 
     shard.close().await?;
     Ok(())
+}
+
+/// Stdout is block-buffered when piped; a killed process loses whatever sat
+/// in the buffer, so each measurement line is flushed the moment it exists.
+fn flush() {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
 }
 
 fn describe(path: &GraphIndexBuildPath) -> String {
