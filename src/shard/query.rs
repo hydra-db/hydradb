@@ -4477,7 +4477,7 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    async fn scan_vertex_property_index_at(
+    pub(super) async fn scan_vertex_property_index_at(
         &self,
         cell_id: &str,
         property: &str,
@@ -5003,7 +5003,7 @@ impl GraphShard {
     }
 
     #[cfg(feature = "opencypher")]
-    fn ensure_query_index_candidates(
+    pub(super) fn ensure_query_index_candidates(
         &self,
         operation: &'static str,
         candidates: usize,
