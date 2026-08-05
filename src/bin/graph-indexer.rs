@@ -15,7 +15,8 @@ use futures::StreamExt;
 use slatedb::object_store::path::Path;
 use slatedb_graph_kernel::{
     object_store_from_env, GraphCluster, GraphError, GraphId, GraphIndexBuildPath,
-    GraphIndexGeneration, GraphScope, NamespaceId, NamespacePath, ObjectStoreGraphScopeDirectory,
+    GraphIndexGeneration, GraphLimits, GraphOpenOptions, GraphScope, NamespaceId, NamespacePath,
+    ObjectStoreGraphScopeDirectory,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -447,6 +448,25 @@ async fn main() -> RuntimeResult<()> {
     // faster incrementally. Tune per deployment cache size.
     let incremental_min_edges =
         env_value("GRAPH_INDEXER_INCREMENTAL_MIN_EDGES", "250000").parse::<u64>()?;
+    // The tail cost gate. Each WAL file in the span between the previous
+    // generation and the durable head is one object-store round trip, and the
+    // span grows with write activity, not graph size — an uncapped walk can
+    // spend minutes deriving a delta of a few edges (the staging regression
+    // behind `interactive/incremental-build-cost.html`). Past the cap the
+    // incremental attempt declines and the full rebuild runs instead, which
+    // past that point is the cheaper of the two.
+    let max_wal_tail_files = env_value(
+        "GRAPH_INDEXER_MAX_TAIL_FILES",
+        &GraphLimits::default().max_wal_tail_files.to_string(),
+    )
+    .parse::<u64>()?;
+    // `GraphOpenOptions` is `#[non_exhaustive]`: constructed from `default()`
+    // with fields assigned, per its own docs.
+    let mut open_options = GraphOpenOptions::default();
+    open_options.limits = GraphLimits {
+        max_wal_tail_files,
+        ..GraphLimits::default()
+    };
     let admin_addr = env_value("GRAPH_INDEXER_ADMIN_ADDR", "0.0.0.0:9091").parse::<SocketAddr>()?;
 
     let metrics = Arc::new(IndexerMetrics::default());
@@ -467,6 +487,7 @@ async fn main() -> RuntimeResult<()> {
         ?cells,
         build_mode = build_mode.as_str(),
         incremental_min_edges,
+        max_wal_tail_files,
         "graph indexer started"
     );
 
@@ -494,6 +515,7 @@ async fn main() -> RuntimeResult<()> {
             retain_previous,
             build_mode,
             incremental_min_edges,
+            &open_options,
             &metrics,
         )
         .instrument(cycle_span.clone())
@@ -586,6 +608,7 @@ async fn run_registered_scopes_cycle(
     retain_previous: usize,
     build_mode: IndexBuildMode,
     incremental_min_edges: u64,
+    open_options: &GraphOpenOptions,
     metrics: &IndexerMetrics,
 ) -> Result<(), CycleFailures> {
     let mut failures = CycleFailures::default();
@@ -676,11 +699,12 @@ async fn run_registered_scopes_cycle(
             turbolay.outcome = Empty,
             error.class = Empty,
         );
-        let cluster = match GraphCluster::open_cells_scoped(
+        let cluster = match GraphCluster::open_cells_scoped_with_options(
             data_path.to_string(),
             scope.clone(),
             cells.to_vec(),
             Arc::clone(&object_store),
+            open_options.clone(),
         )
         .instrument(open_span.clone())
         .await
@@ -1453,6 +1477,7 @@ mod tests {
             1,
             IndexBuildMode::Full,
             250_000,
+            &GraphOpenOptions::default(),
             &metrics,
         )
         .await
@@ -1489,6 +1514,7 @@ mod tests {
             1,
             IndexBuildMode::Full,
             250_000,
+            &GraphOpenOptions::default(),
             &metrics,
         )
         .await

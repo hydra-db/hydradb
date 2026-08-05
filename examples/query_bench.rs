@@ -869,6 +869,7 @@ fn graph_options(
             max_query_index_candidates: usize::try_from(query_rows).unwrap_or(usize::MAX),
             max_query_scan_edges: edges.saturating_mul(u64::from(max_hop).max(1)).max(1),
             max_query_runtime_ms: Some(env_u64("GRAPH_QUERY_BENCH_QUERY_TIMEOUT_MS", 120_000)),
+            ..GraphLimits::default()
         };
         options.cache = cache_dir
             .filter(|_| cache_bytes > 0)

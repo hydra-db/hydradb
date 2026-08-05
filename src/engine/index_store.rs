@@ -243,12 +243,35 @@ impl GraphShard {
             Err(GraphError::AdmissionRejected {
                 operation: "graph_index_wal_affected_edges",
                 ..
-            }) => return Ok(None),
+            }) => {
+                tracing::info!(
+                    cell_id,
+                    edge_type,
+                    reason = "delta_exceeds_scan_limit",
+                    "incremental index build declined; falling back to full rebuild"
+                );
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
         let overlay = match tail {
             crate::shard::topology_tail::GraphTopologyTail::Complete(overlay) => overlay,
             crate::shard::topology_tail::GraphTopologyTail::Unavailable => {
+                // Either a WAL file spanning the gap was collected (the delta
+                // is unrecoverable) or the span exceeded
+                // `max_wal_tail_files` (the delta is recoverable but costs
+                // more round trips than the rebuild it would save — the
+                // staging regression in
+                // `interactive/incremental-build-cost.html`). The tail logs
+                // which at debug; either way the full rebuild is the answer.
+                tracing::info!(
+                    cell_id,
+                    edge_type,
+                    wal_span = last_wal_id.saturating_sub(previous.last_wal_id),
+                    wal_span_limit = self.limits.max_wal_tail_files,
+                    reason = "wal_tail_unavailable_or_capped",
+                    "incremental index build declined; falling back to full rebuild"
+                );
                 return Ok(None);
             }
         };
@@ -259,7 +282,16 @@ impl GraphShard {
         let mut adjacency: crate::sparse_kernel::Adjacency =
             match self.graph_index_csc(&previous).await? {
                 Some(csc) => csc.to_adjacency()?,
-                None => return Ok(None),
+                None => {
+                    tracing::info!(
+                        cell_id,
+                        edge_type,
+                        generation = %previous.generation,
+                        reason = "previous_payload_missing",
+                        "incremental index build declined; falling back to full rebuild"
+                    );
+                    return Ok(None);
+                }
             };
         // Apply the overlay. Entries are resolved final states, not
         // operations, so order does not matter and re-application is
