@@ -1017,6 +1017,9 @@ fn select_native_paths(procedure: &NativePathProcedure, candidates: &mut Vec<Can
             .then_with(|| left.nodes.cmp(&right.nodes))
             .then_with(|| left.edges.cmp(&right.edges))
     });
+    if procedure.all_relationship_variants {
+        return;
+    }
     if procedure.path_count == 0 {
         if let Some(weight) = candidates.first().map(|candidate| candidate.weight) {
             candidates.retain(|candidate| candidate.weight.total_cmp(&weight).is_eq());
@@ -1065,6 +1068,7 @@ mod tests {
             source_selector: None,
             target_selector: None,
             pairwise: false,
+            all_relationship_variants: false,
             rel_types: vec!["RELATES".to_string()],
             direction: NativePathDirection::Outgoing,
             max_len: 3,

@@ -448,7 +448,10 @@ the original direction of relationships traversed in either direction.
 Use `algo.MSpaths` to replace client-side path-query fan-out. Selector values
 must resolve through the named property index. With `pairwise: true`, duplicate
 self and symmetric source/target pairs are omitted. `pathCount` is enforced per
-source/target pair and `resultLimit` bounds the complete response.
+source/target pair and `resultLimit` bounds the complete response. For
+unweighted pairwise reads, `allRelationshipVariants: true` selects up to
+`pathCount` structural paths and then returns every concrete parallel-edge
+combination for those paths within `resultLimit`.
 
 ```cypher
 CALL algo.MSpaths({
@@ -461,6 +464,7 @@ CALL algo.MSpaths({
   relDirection: 'both',
   maxLen: 3,
   pathCount: 5,
+  allRelationshipVariants: true,
   resultLimit: 100
 })
 YIELD path
