@@ -225,6 +225,7 @@ impl GraphShard {
             )),
             #[cfg(feature = "opencypher")]
             native_path_page_cursors: Mutex::new(Default::default()),
+            wal_tail_file_cache: Mutex::new(Default::default()),
         })
     }
 

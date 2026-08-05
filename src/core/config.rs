@@ -25,6 +25,16 @@ pub struct GraphLimits {
     pub max_query_index_candidates: usize,
     pub max_query_scan_edges: u64,
     pub max_query_runtime_ms: Option<u64>,
+    /// Cost cap on the WAL tail walk: the most WAL files a single
+    /// `topology_tail_since` may read. Every file is one object-store
+    /// round trip, and the span between an old index generation and the
+    /// durable head grows with write *activity* (one file per WAL flush),
+    /// not with graph size — so an uncapped walk can cost minutes to
+    /// derive a delta of a few edges. Past the cap the tail declines
+    /// (`Unavailable`), which sends the incremental index build to the
+    /// full rebuild and the read path to snapshot adjacency: both cheaper
+    /// than the walk the cap refused.
+    pub max_wal_tail_files: u64,
 }
 
 impl Default for GraphLimits {
@@ -39,6 +49,10 @@ impl Default for GraphLimits {
             max_query_index_candidates: 250_000,
             max_query_scan_edges: 1_000_000,
             max_query_runtime_ms: Some(30_000),
+            // ~4096 files at 16-way concurrency is ~13 s of tail fetches
+            // against real S3 — below a full rebuild at the scales where
+            // the incremental path is worth attempting at all.
+            max_wal_tail_files: 4_096,
         }
     }
 }

@@ -14434,3 +14434,137 @@ async fn writer_built_generations_record_the_wal_position() {
         full.last_wal_id
     );
 }
+
+/// The tail cost gate (`GraphLimits::max_wal_tail_files`): a WAL span wider
+/// than the cap must *decline* the incremental build — every file in the span
+/// is one object-store round trip, and the span scales with write activity
+/// rather than delta size, so past the cap the full rebuild is the cheaper
+/// path. With the cap at zero any new WAL at all exceeds it, which makes the
+/// decline deterministic without having to manufacture thousands of files.
+#[tokio::test]
+async fn incremental_build_declines_when_wal_span_exceeds_cap() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_limits(
+        "graph/tail-span-cap",
+        object_store,
+        GraphLimits {
+            max_wal_tail_files: 0,
+            ..GraphLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    let cell_id = "reddit-home";
+    let edge_type = "CHAIN";
+
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 1, 2, "cap-seed"))
+        .await
+        .unwrap();
+    let full = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 2, 3, "cap-add"))
+        .await
+        .unwrap();
+    let declined = shard
+        .build_graph_index_incremental(cell_id, edge_type)
+        .await
+        .unwrap();
+    assert!(
+        declined.is_none(),
+        "a span above the cap must decline, not walk"
+    );
+
+    // The decline is a routing verdict, not a failure: the auto entry point
+    // must land on a correct full rebuild.
+    let (generation, path) = shard
+        .build_graph_index_auto(cell_id, edge_type)
+        .await
+        .unwrap();
+    assert!(
+        matches!(path, crate::GraphIndexBuildPath::Full { edges: 2 }),
+        "expected the fallback full rebuild over both edges, got {path:?}"
+    );
+    assert!(
+        generation.base_sequence > full.base_sequence,
+        "the fallback must publish the newer snapshot: {} <= {}",
+        generation.base_sequence,
+        full.base_sequence
+    );
+}
+
+/// All edge types share one database, so their tail walks read the *same* WAL
+/// files. The per-shard file cache exists so the second edge type's build
+/// reuses the first's downloads: after the first incremental build parses its
+/// span, the second build over the same span must add nothing to the cache —
+/// and both builds must still patch their own edge type correctly.
+#[tokio::test]
+async fn wal_tail_file_parse_is_shared_across_edge_types() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer("graph/tail-shared-parse", object_store)
+        .await
+        .unwrap();
+    let cell_id = "reddit-home";
+
+    shard
+        .write_edge(typed_mutation(cell_id, "CHAIN", 1, 2, "shared-seed-a"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation(cell_id, "REPLIES", 1, 9, "shared-seed-b"))
+        .await
+        .unwrap();
+    shard.build_graph_index(cell_id, "CHAIN").await.unwrap();
+    shard.build_graph_index(cell_id, "REPLIES").await.unwrap();
+
+    shard
+        .write_edge(typed_mutation(cell_id, "CHAIN", 2, 3, "shared-add-a"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation(cell_id, "REPLIES", 9, 10, "shared-add-b"))
+        .await
+        .unwrap();
+
+    let (chain, chain_path) = shard
+        .build_graph_index_incremental(cell_id, "CHAIN")
+        .await
+        .unwrap()
+        .expect("a short tail on a fresh store is buildable");
+    assert!(
+        matches!(
+            chain_path,
+            crate::GraphIndexBuildPath::Incremental { delta_edges: 1 }
+        ),
+        "CHAIN sees only its own delta, got {chain_path:?}"
+    );
+    let cached_after_first = shard.test_wal_tail_cached_file_count().await;
+    assert!(
+        cached_after_first > 0,
+        "the first walk must leave its parsed files behind"
+    );
+
+    // REPLIES was published after CHAIN, so its span is a subset of the files
+    // the CHAIN walk just parsed; nothing new to fetch.
+    let (replies, replies_path) = shard
+        .build_graph_index_incremental(cell_id, "REPLIES")
+        .await
+        .unwrap()
+        .expect("the second edge type's tail is buildable from cache");
+    assert!(
+        matches!(
+            replies_path,
+            crate::GraphIndexBuildPath::Incremental { delta_edges: 1 }
+        ),
+        "REPLIES sees only its own delta, got {replies_path:?}"
+    );
+    assert_eq!(
+        shard.test_wal_tail_cached_file_count().await,
+        cached_after_first,
+        "the second walk's span is already cached; it must download nothing"
+    );
+
+    assert_eq!(chain.edge_count, 2, "CHAIN patched to two edges");
+    assert_eq!(replies.edge_count, 2, "REPLIES patched to two edges");
+}

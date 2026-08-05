@@ -1,4 +1,5 @@
 use super::*;
+use futures::StreamExt as _;
 use slatedb::ValueDeletable;
 
 #[derive(Clone, Debug, Default)]
@@ -79,6 +80,93 @@ impl GraphTopologyOverlay {
     }
 }
 
+/// One topology-affecting WAL record, parsed once per file.
+///
+/// Parsed for *every* cell and edge type in the file, not just the caller's:
+/// all edge types share one database, so a per-caller parse would re-download
+/// and re-parse the same file once per edge type. Callers filter by
+/// `cell_id`/`edge_type`/`seq` at use time.
+#[derive(Clone, Debug)]
+pub(crate) struct WalTopologyEntry {
+    pub(crate) cell_id: String,
+    pub(crate) edge_type: String,
+    pub(crate) src: VertexId,
+    pub(crate) dst: VertexId,
+    pub(crate) seq: u64,
+}
+
+/// Per-shard cache of parsed WAL files, keyed by WAL id.
+///
+/// A WAL id names an immutable object, so a cached parse never goes stale —
+/// eviction exists only to bound memory. Eviction drops the *smallest* id
+/// first: tail walks always move forward, so the oldest file is the least
+/// likely to be asked for again.
+#[derive(Default)]
+pub(crate) struct WalTailFileCache {
+    files: BTreeMap<u64, Arc<Vec<WalTopologyEntry>>>,
+    total_entries: usize,
+}
+
+/// Memory bound for [`WalTailFileCache`], in parsed entries (an entry is two
+/// small strings and three integers — the cap is single-digit MiB per shard).
+const WAL_TAIL_CACHE_MAX_ENTRIES: usize = 65_536;
+
+/// Concurrent object-store fetches per tail walk. Each WAL file is a tiny
+/// object whose cost is dominated by request latency, so the walk is
+/// round-trip-bound and parallel fetches divide wall clock almost linearly.
+pub(crate) const WAL_TAIL_FETCH_CONCURRENCY: usize = 16;
+
+/// `GRAPH_WAL_TAIL_FETCH_CONCURRENCY` overrides the default, for tuning and
+/// for A/B benchmarks (`1` reproduces the serial walk this replaced).
+/// Resolved once, on first use, so `std::env::var` stays off the tail path —
+/// the same shape as `env_default_kernel` in `sparse_kernel/mod.rs`.
+fn wal_tail_fetch_concurrency() -> usize {
+    static RESOLVED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        std::env::var("GRAPH_WAL_TAIL_FETCH_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value >= 1)
+            .unwrap_or(WAL_TAIL_FETCH_CONCURRENCY)
+    })
+}
+
+impl WalTailFileCache {
+    fn get(&self, wal_id: u64) -> Option<Arc<Vec<WalTopologyEntry>>> {
+        self.files.get(&wal_id).cloned()
+    }
+
+    fn insert(&mut self, wal_id: u64, entries: Arc<Vec<WalTopologyEntry>>) {
+        // A single file larger than the whole budget would evict everything
+        // and then exceed the cap anyway; serve it uncached instead.
+        if entries.len() > WAL_TAIL_CACHE_MAX_ENTRIES {
+            return;
+        }
+        if let Some(previous) = self.files.insert(wal_id, entries) {
+            self.total_entries = self.total_entries.saturating_sub(previous.len());
+        }
+        self.total_entries = self.total_entries.saturating_add(self.files[&wal_id].len());
+        while self.total_entries > WAL_TAIL_CACHE_MAX_ENTRIES {
+            let Some((_, evicted)) = self.files.pop_first() else {
+                break;
+            };
+            self.total_entries = self.total_entries.saturating_sub(evicted.len());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_file_count(&self) -> usize {
+        self.files.len()
+    }
+}
+
+/// A fetched file is either parsed or gone; a hard error is neither and
+/// propagates through `Result` instead.
+enum WalFileFetch {
+    Parsed(Vec<WalTopologyEntry>),
+    Unavailable,
+}
+
 impl GraphShard {
     pub(crate) async fn topology_tail_since(
         &self,
@@ -98,33 +186,101 @@ impl GraphShard {
             return Ok(GraphTopologyTail::Complete(GraphTopologyOverlay::default()));
         }
 
-        let mut affected = BTreeSet::new();
-        let wal_reader = self.db.wal_reader();
-        for wal_id in generation.last_wal_id.saturating_add(1)..=last_wal_id {
-            budget.check("graph_index_wal_file")?;
-            let mut entries = match wal_reader.get(wal_id).iterator().await {
-                Ok(entries) => entries,
-                Err(error) => {
-                    tracing::debug!(
-                        wal_id,
-                        error = %error,
-                        "graph index WAL tail is unavailable; using snapshot adjacency"
-                    );
-                    return Ok(GraphTopologyTail::Unavailable);
+        // The cost gate. The span counts object-store round trips, and it
+        // scales with write activity since the generation — not with the
+        // size of the delta, which may be a handful of edges. Past the cap,
+        // declining is cheaper than walking: the index build falls back to
+        // a full rebuild and the read path to snapshot adjacency.
+        let span = last_wal_id.saturating_sub(generation.last_wal_id);
+        if span > self.limits.max_wal_tail_files {
+            tracing::debug!(
+                span,
+                limit = self.limits.max_wal_tail_files,
+                base_wal_id = generation.last_wal_id,
+                last_wal_id,
+                "graph index WAL tail span exceeds the file cap; declining"
+            );
+            return Ok(GraphTopologyTail::Unavailable);
+        }
+
+        let wal_ids =
+            (generation.last_wal_id.saturating_add(1)..=last_wal_id).collect::<Vec<u64>>();
+        let mut files = BTreeMap::new();
+        let mut missing = Vec::new();
+        {
+            let cache = self.wal_tail_file_cache.lock().await;
+            for wal_id in &wal_ids {
+                match cache.get(*wal_id) {
+                    Some(parsed) => {
+                        files.insert(*wal_id, parsed);
+                    }
+                    None => missing.push(*wal_id),
                 }
-            };
-            while let Some(entry) = entries.next().await? {
+            }
+        }
+
+        {
+            let fetches = futures::stream::iter(missing.iter().copied())
+                .map(|wal_id| {
+                    let wal_reader = self.db.wal_reader();
+                    async move {
+                        budget.check("graph_index_wal_file")?;
+                        let mut entries = match wal_reader.get(wal_id).iterator().await {
+                            Ok(entries) => entries,
+                            Err(error) => {
+                                tracing::debug!(
+                                    wal_id,
+                                    error = %error,
+                                    "graph index WAL tail is unavailable; using snapshot adjacency"
+                                );
+                                return Ok((wal_id, WalFileFetch::Unavailable));
+                            }
+                        };
+                        let mut parsed = Vec::new();
+                        while let Some(entry) = entries.next().await? {
+                            collect_wal_topology_entry(
+                                &entry.key,
+                                &entry.value,
+                                entry.seq,
+                                &mut parsed,
+                            )?;
+                        }
+                        Ok::<_, crate::GraphError>((wal_id, WalFileFetch::Parsed(parsed)))
+                    }
+                })
+                .buffered(wal_tail_fetch_concurrency());
+            let mut fetches = std::pin::pin!(fetches);
+            while let Some(fetched) = fetches.next().await {
+                let (wal_id, fetch) = fetched?;
+                match fetch {
+                    WalFileFetch::Unavailable => return Ok(GraphTopologyTail::Unavailable),
+                    WalFileFetch::Parsed(parsed) => {
+                        files.insert(wal_id, Arc::new(parsed));
+                    }
+                }
+            }
+        }
+
+        {
+            let mut cache = self.wal_tail_file_cache.lock().await;
+            for wal_id in &missing {
+                if let Some(parsed) = files.get(wal_id) {
+                    cache.insert(*wal_id, Arc::clone(parsed));
+                }
+            }
+        }
+
+        let mut affected = BTreeSet::new();
+        for parsed in files.values() {
+            for entry in parsed.iter() {
                 budget.check("graph_index_wal_entry")?;
                 if entry.seq <= generation.base_sequence || entry.seq > read_sequence {
                     continue;
                 }
-                collect_topology_entry(
-                    &entry.key,
-                    &entry.value,
-                    &generation.cell_id,
-                    &generation.edge_type,
-                    &mut affected,
-                )?;
+                if entry.cell_id != generation.cell_id || entry.edge_type != generation.edge_type {
+                    continue;
+                }
+                affected.insert((entry.src, entry.dst));
                 ensure_limit(
                     "graph_index_wal_affected_edges",
                     affected.len() as u64,
@@ -150,40 +306,56 @@ impl GraphShard {
         }
         Ok(GraphTopologyTail::Complete(overlay))
     }
+
+    #[cfg(test)]
+    pub(crate) async fn test_wal_tail_cached_file_count(&self) -> usize {
+        self.wal_tail_file_cache.lock().await.cached_file_count()
+    }
 }
 
-fn collect_topology_entry(
+fn collect_wal_topology_entry(
     key: &[u8],
     value: &ValueDeletable,
-    cell_id: &str,
-    edge_type: &str,
-    affected: &mut BTreeSet<(VertexId, VertexId)>,
+    seq: u64,
+    parsed: &mut Vec<WalTopologyEntry>,
 ) -> Result<()> {
     let Ok(key) = std::str::from_utf8(key) else {
         return Ok(());
     };
     let fields = key.split('/').collect::<Vec<_>>();
     match fields.as_slice() {
-        ["cell", key_cell, "e", "out", key_type, src, dst]
-            if *key_cell == cell_id && *key_type == edge_type =>
-        {
-            affected.insert((parse_u64(key, src, "src")?, parse_u64(key, dst, "dst")?));
+        ["cell", cell, "e", "out", edge_type, src, dst] => {
+            parsed.push(WalTopologyEntry {
+                cell_id: (*cell).to_string(),
+                edge_type: (*edge_type).to_string(),
+                src: parse_u64(key, src, "src")?,
+                dst: parse_u64(key, dst, "dst")?,
+                seq,
+            });
         }
-        ["cell", key_cell, "seg", "tomb", "out", key_type, src, dst]
-            if *key_cell == cell_id && *key_type == edge_type =>
-        {
-            affected.insert((parse_u64(key, src, "src")?, parse_u64(key, dst, "dst")?));
+        ["cell", cell, "seg", "tomb", "out", edge_type, src, dst] => {
+            parsed.push(WalTopologyEntry {
+                cell_id: (*cell).to_string(),
+                edge_type: (*edge_type).to_string(),
+                src: parse_u64(key, src, "src")?,
+                dst: parse_u64(key, dst, "dst")?,
+                seq,
+            });
         }
-        ["cell", key_cell, "seg", "out", key_type, _, _, _]
-            if *key_cell == cell_id && *key_type == edge_type =>
-        {
+        ["cell", cell, "seg", "out", edge_type, _, _, _] => {
             if let Some(value) = value.as_bytes() {
                 let segment = decode_out_edge_segment(key, &value)?;
-                affected.extend(
+                parsed.extend(
                     segment
                         .destinations
                         .into_iter()
-                        .map(|dst| (segment.src, dst)),
+                        .map(|dst| WalTopologyEntry {
+                            cell_id: (*cell).to_string(),
+                            edge_type: (*edge_type).to_string(),
+                            src: segment.src,
+                            dst,
+                            seq,
+                        }),
                 );
             }
         }
