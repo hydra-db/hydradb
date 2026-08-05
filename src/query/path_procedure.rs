@@ -60,6 +60,12 @@ pub(crate) struct NativePathProcedure {
     pub(crate) projections: Vec<NativePathProjection>,
 }
 
+struct ParsedNativePathCall {
+    kind: NativePathProcedureKind,
+    config: BTreeMap<String, ConfigValue>,
+    projections: Vec<NativePathProjection>,
+}
+
 pub(crate) fn is_native_path_procedure(query: &str) -> bool {
     let query = query.trim_start();
     query
@@ -76,37 +82,14 @@ pub(crate) fn parse_native_path_procedure(
     parameters: &BTreeMap<String, VertexPropertyValue>,
     max_traversal_hops: u8,
 ) -> Result<Option<NativePathProcedure>> {
-    if !is_native_path_procedure(query) {
-        return Ok(None);
-    }
-    let mut parser = Parser::new(query)?;
-    parser.keyword("CALL")?;
-    parser.identifier_eq("algo")?;
-    parser.token(Token::Dot)?;
-    let procedure = parser.identifier()?;
-    let kind = if procedure.eq_ignore_ascii_case("SPpaths") {
-        NativePathProcedureKind::SinglePair
-    } else if procedure.eq_ignore_ascii_case("SSpaths") {
-        NativePathProcedureKind::SingleSource
-    } else if procedure.eq_ignore_ascii_case("MSpaths") {
-        NativePathProcedureKind::MultiSource
-    } else {
+    let Some(parsed) = parse_native_path_call(query)? else {
         return Ok(None);
     };
-    parser.token(Token::LeftParen)?;
-    let config = parser.config()?;
-    parser.token(Token::RightParen)?;
-    parser.keyword("YIELD")?;
-    let yielded = parser.projections()?;
-    parser.keyword("RETURN")?;
-    let projections = parser.projections()?;
-    parser.optional(Token::Semicolon);
-    parser.end()?;
-    for projection in &projections {
-        if !yielded.contains(projection) {
-            return path_parse_error("RETURN may only reference yielded path columns");
-        }
-    }
+    let ParsedNativePathCall {
+        kind,
+        config,
+        projections,
+    } = parsed;
 
     let (source, target, source_selector, target_selector, pairwise) = match kind {
         NativePathProcedureKind::SinglePair => {
@@ -250,6 +233,56 @@ pub(crate) fn parse_native_path_procedure(
         max_cost,
         path_count,
         result_limit,
+        projections,
+    }))
+}
+
+#[cfg(feature = "client-api")]
+pub(crate) fn parse_native_path_procedure_columns(query: &str) -> Result<Option<Vec<QueryColumn>>> {
+    Ok(parse_native_path_call(query)?.map(|parsed| {
+        parsed
+            .projections
+            .into_iter()
+            .map(NativePathProjection::column)
+            .collect()
+    }))
+}
+
+fn parse_native_path_call(query: &str) -> Result<Option<ParsedNativePathCall>> {
+    if !is_native_path_procedure(query) {
+        return Ok(None);
+    }
+    let mut parser = Parser::new(query)?;
+    parser.keyword("CALL")?;
+    parser.identifier_eq("algo")?;
+    parser.token(Token::Dot)?;
+    let procedure = parser.identifier()?;
+    let kind = if procedure.eq_ignore_ascii_case("SPpaths") {
+        NativePathProcedureKind::SinglePair
+    } else if procedure.eq_ignore_ascii_case("SSpaths") {
+        NativePathProcedureKind::SingleSource
+    } else if procedure.eq_ignore_ascii_case("MSpaths") {
+        NativePathProcedureKind::MultiSource
+    } else {
+        return Ok(None);
+    };
+    parser.token(Token::LeftParen)?;
+    let config = parser.config()?;
+    parser.token(Token::RightParen)?;
+    parser.keyword("YIELD")?;
+    let yielded = parser.projections()?;
+    parser.keyword("RETURN")?;
+    let projections = parser.projections()?;
+    parser.optional(Token::Semicolon);
+    parser.end()?;
+    for projection in &projections {
+        if !yielded.contains(projection) {
+            return path_parse_error("RETURN may only reference yielded path columns");
+        }
+    }
+    Ok(Some(ParsedNativePathCall {
+        kind,
+        config,
         projections,
     }))
 }

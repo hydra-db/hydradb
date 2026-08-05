@@ -640,6 +640,33 @@ async fn prepared_pages_reauthorize_after_scope_grant_revocation() {
 }
 
 #[tokio::test]
+async fn prepares_native_path_procedure_columns_for_bolt_execution() {
+    let service = service();
+    let session = authenticated_session(&service);
+    let prepared = service
+        .prepare_page_request(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "query-native-mspaths",
+                "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', \
+                 sourceValues: ['alpha', 'beta'], targetValues: ['alpha', 'beta'], \
+                 pairwise: true, relTypes: ['RELATES'], maxLen: 3, \
+                 relDirection: 'both', pathCount: 5, \
+                 fairRelationshipVariants: true, resultLimit: 100}) \
+                 YIELD path RETURN path",
+            ),
+            256,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(prepared.action, QueryTransportAction::Read);
+    assert_eq!(prepared.columns, vec![QueryColumn::new("path")]);
+    assert!(prepared.batch_operation.is_none());
+}
+
+#[tokio::test]
 async fn server_cursor_executes_once_and_release_invalidates_it() {
     let executions = Arc::new(AtomicU64::new(0));
     let service = cursor_service(Arc::clone(&executions), 4, 1 << 20, 1_000);
