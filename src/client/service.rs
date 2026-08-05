@@ -22,6 +22,7 @@ use crate::query::opencypher::{
     parse_opencypher_mutation_query_with_parameters, parse_opencypher_row_query_with_parameters,
     parse_opencypher_unwind_batch, OpenCypherQueryAccess, ParsedUnwindBatchKind,
 };
+use crate::query::path_procedure::parse_native_path_procedure_columns;
 use crate::{
     validate_component, AtomicDurationHistogram, DurationHistogramSnapshot, EdgeMetadata,
     GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryBatchEdge,
@@ -1570,8 +1571,16 @@ impl ClientQueryService {
         } else {
             match action {
                 QueryTransportAction::Read => {
-                    parse_opencypher_row_query_with_parameters(&request.query, &scalar_parameters)?
-                        .columns
+                    match parse_native_path_procedure_columns(&request.query)? {
+                        Some(columns) => columns,
+                        None => {
+                            parse_opencypher_row_query_with_parameters(
+                                &request.query,
+                                &scalar_parameters,
+                            )?
+                            .columns
+                        }
+                    }
                 }
                 QueryTransportAction::Write => {
                     let mutation = parse_opencypher_mutation_query_with_parameters(
