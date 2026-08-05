@@ -449,9 +449,11 @@ Use `algo.MSpaths` to replace client-side path-query fan-out. Selector values
 must resolve through the named property index. With `pairwise: true`, duplicate
 self and symmetric source/target pairs are omitted. `pathCount` is enforced per
 source/target pair and `resultLimit` bounds the complete response. For
-unweighted pairwise reads, `allRelationshipVariants: true` selects up to
+unweighted pairwise reads, `fairRelationshipVariants: true` selects up to
 `pathCount` structural paths and then returns every concrete parallel-edge
-combination for those paths within `resultLimit`.
+combination for those paths within `resultLimit`. Variants are admitted in
+round-robin structural-path order so one highly connected pair cannot consume
+the response budget before other selected paths contribute a result.
 
 ```cypher
 CALL algo.MSpaths({
@@ -464,7 +466,7 @@ CALL algo.MSpaths({
   relDirection: 'both',
   maxLen: 3,
   pathCount: 5,
-  allRelationshipVariants: true,
+  fairRelationshipVariants: true,
   resultLimit: 100
 })
 YIELD path

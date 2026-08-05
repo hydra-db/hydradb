@@ -329,6 +329,8 @@ impl GraphShard {
         let mut relationship_cache = BTreeMap::new();
         let mut vertex_cache = BTreeMap::new();
         let mut rows = Vec::new();
+        let mut relationship_variant_structures = Vec::new();
+        let result_limit_usize = usize::try_from(result_limit).unwrap_or(usize::MAX);
         'sources: for source in sources {
             let mut scalar = procedure.clone();
             scalar.source = source;
@@ -354,18 +356,28 @@ impl GraphShard {
                 } else {
                     NativePathProcedureKind::SingleSource
                 };
-                let mut candidates = enumerate_candidate_paths(
+                let candidates = enumerate_candidate_paths(
                     &scalar,
                     &adjacency,
                     self.limits.max_query_intermediate_rows,
                     &budget,
                 )?;
-                candidates = self
+                if scalar.fair_relationship_variants {
+                    for structural_path in candidates {
+                        relationship_variant_structures.push(structural_path);
+                        if relationship_variant_structures.len() >= result_limit_usize {
+                            break 'sources;
+                        }
+                    }
+                    continue;
+                }
+                let mut candidates = self
                     .expand_native_path_relationships(
                         read,
                         candidates,
                         &mut relationship_cache,
                         self.limits.max_query_intermediate_rows,
+                        false,
                     )
                     .await?;
                 self.score_native_paths(&scalar, &mut candidates, &relationship_cache, &budget)?;
@@ -397,6 +409,57 @@ impl GraphShard {
                         break 'sources;
                     }
                 }
+            }
+        }
+        if procedure.fair_relationship_variants {
+            let structure_count = relationship_variant_structures.len();
+            let base_quota = result_limit_usize.checked_div(structure_count).unwrap_or(0);
+            let remainder = result_limit_usize.checked_rem(structure_count).unwrap_or(0);
+            let mut relationship_variant_groups = Vec::with_capacity(structure_count);
+            for (index, structural_path) in relationship_variant_structures.into_iter().enumerate()
+            {
+                let quota = base_quota.saturating_add(usize::from(index < remainder));
+                let mut variants = self
+                    .expand_native_path_relationships(
+                        read,
+                        vec![structural_path],
+                        &mut relationship_cache,
+                        quota,
+                        true,
+                    )
+                    .await?;
+                self.score_native_paths(&procedure, &mut variants, &relationship_cache, &budget)?;
+                select_native_paths(&procedure, &mut variants);
+                if !variants.is_empty() {
+                    relationship_variant_groups.push(variants);
+                }
+            }
+            for candidate in fair_relationship_variant_candidates(
+                relationship_variant_groups,
+                result_limit_usize,
+            ) {
+                budget.check("native_path_hydrate")?;
+                let path = self
+                    .hydrate_native_path(
+                        read,
+                        candidate.nodes.as_slice(),
+                        candidate.edges.as_slice(),
+                        &mut vertex_cache,
+                        &relationship_cache,
+                    )
+                    .await?;
+                let values = procedure
+                    .projections
+                    .iter()
+                    .map(|projection| match projection {
+                        NativePathProjection::Path => QueryValue::Path(Box::new(path.clone())),
+                        NativePathProjection::Weight => numeric_query_value(candidate.weight),
+                        NativePathProjection::Cost => numeric_query_value(candidate.cost),
+                    })
+                    .collect();
+                let row = QueryRow::new(values);
+                budget.account_result_row(&row)?;
+                rows.push(row);
             }
         }
         let result = QueryResultSet::new(
@@ -636,6 +699,7 @@ impl GraphShard {
         candidates: Vec<CandidatePath>,
         relationship_cache: &mut BTreeMap<PathEdge, EdgeMetadata>,
         max_candidates: usize,
+        truncate_at_limit: bool,
     ) -> Result<Vec<CandidatePath>> {
         let mut choices_cache = BTreeMap::<PathEdge, Vec<PathEdge>>::new();
         let mut expanded = Vec::new();
@@ -668,16 +732,21 @@ impl GraphShard {
                     .get(structural_edge)
                     .expect("relationship choices were inserted");
                 let product_size = edge_variants.len().saturating_mul(choices.len());
-                if expanded.len().saturating_add(product_size) > max_candidates {
+                if !truncate_at_limit
+                    && expanded.len().saturating_add(product_size) > max_candidates
+                {
                     return Err(GraphError::AdmissionRejected {
                         operation: "native_path_parallel_candidates",
                         actual: expanded.len().saturating_add(product_size) as u64,
                         limit: max_candidates as u64,
                     });
                 }
-                let mut next_variants = Vec::with_capacity(product_size);
-                for variant in edge_variants {
+                let mut next_variants = Vec::with_capacity(product_size.min(max_candidates));
+                'variants: for variant in edge_variants {
                     for choice in choices {
+                        if next_variants.len() >= max_candidates {
+                            break 'variants;
+                        }
                         let mut next = variant.clone();
                         next.push(choice.clone());
                         next_variants.push(next);
@@ -687,6 +756,9 @@ impl GraphShard {
             }
             for edges in edge_variants {
                 if expanded.len() >= max_candidates {
+                    if truncate_at_limit {
+                        break;
+                    }
                     return Err(GraphError::AdmissionRejected {
                         operation: "native_path_parallel_candidates",
                         actual: expanded.len().saturating_add(1) as u64,
@@ -1017,7 +1089,7 @@ fn select_native_paths(procedure: &NativePathProcedure, candidates: &mut Vec<Can
             .then_with(|| left.nodes.cmp(&right.nodes))
             .then_with(|| left.edges.cmp(&right.edges))
     });
-    if procedure.all_relationship_variants {
+    if procedure.fair_relationship_variants {
         return;
     }
     if procedure.path_count == 0 {
@@ -1027,6 +1099,31 @@ fn select_native_paths(procedure: &NativePathProcedure, candidates: &mut Vec<Can
     } else {
         candidates.truncate(usize::try_from(procedure.path_count).unwrap_or(usize::MAX));
     }
+}
+
+fn fair_relationship_variant_candidates(
+    groups: Vec<Vec<CandidatePath>>,
+    limit: usize,
+) -> Vec<CandidatePath> {
+    let mut groups = groups.into_iter().map(VecDeque::from).collect::<Vec<_>>();
+    let mut selected = Vec::with_capacity(limit);
+    while selected.len() < limit {
+        let mut advanced = false;
+        for group in &mut groups {
+            let Some(candidate) = group.pop_front() else {
+                continue;
+            };
+            selected.push(candidate);
+            advanced = true;
+            if selected.len() >= limit {
+                break;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    selected
 }
 
 fn far_endpoint(current: VertexId, edge: &PathEdge) -> Option<VertexId> {
@@ -1068,7 +1165,7 @@ mod tests {
             source_selector: None,
             target_selector: None,
             pairwise: false,
-            all_relationship_variants: false,
+            fair_relationship_variants: false,
             rel_types: vec!["RELATES".to_string()],
             direction: NativePathDirection::Outgoing,
             max_len: 3,
