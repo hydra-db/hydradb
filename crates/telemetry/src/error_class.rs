@@ -37,8 +37,10 @@ pub enum ErrorClass {
     /// Epoch and snapshot disagreements — the BFG-007 / BFG-009 / BFG-011
     /// family.
     Freshness,
-    /// Admission control and timeouts.
+    /// Admission control refusal or saturation.
     Admission,
+    /// A request exceeded its configured execution deadline.
+    Timeout,
     /// Cypher the engine will not accept: parse failures, unsupported features,
     /// missing parameters.
     Query,
@@ -65,6 +67,7 @@ impl ErrorClass {
             Self::Fencing => "fencing",
             Self::Freshness => "freshness",
             Self::Admission => "admission",
+            Self::Timeout => "timeout",
             Self::Query => "query",
             Self::Authz => "authz",
             Self::Corruption => "corruption",
@@ -93,6 +96,7 @@ impl ErrorClass {
         Self::Fencing,
         Self::Freshness,
         Self::Admission,
+        Self::Timeout,
         Self::Query,
         Self::Authz,
         Self::Corruption,

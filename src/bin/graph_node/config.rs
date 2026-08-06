@@ -22,6 +22,7 @@ pub struct RuntimeConfig {
     pub data_path: String,
     pub data_cache_dir: PathBuf,
     pub data_cache_bytes: usize,
+    pub reader_wal_replay_concurrency: usize,
     pub l0_sst_size_bytes: usize,
     pub max_unflushed_bytes: usize,
     pub max_wal_flushes_before_l0_flush: u64,
@@ -147,6 +148,11 @@ impl RuntimeConfig {
                 "GRAPH_DATA_CACHE_BYTES",
                 8 * 1024 * 1024 * 1024,
             )?,
+            reader_wal_replay_concurrency: parse_usize(
+                &values,
+                "GRAPH_READER_WAL_REPLAY_CONCURRENCY",
+                16,
+            )?,
             l0_sst_size_bytes: parse_usize(&values, "GRAPH_L0_SST_SIZE_BYTES", 16 * 1024 * 1024)?,
             max_unflushed_bytes: parse_usize(
                 &values,
@@ -267,6 +273,7 @@ impl RuntimeConfig {
             &self.data_cache_dir,
             self.data_cache_bytes,
         );
+        options.cache.reader_wal_replay_concurrency = self.reader_wal_replay_concurrency;
         options.durability = GraphDurabilityConfig::default();
         options.cache_policy = {
             let mut cache_policy = GraphCachePolicy::default();
@@ -490,6 +497,7 @@ mod tests {
         assert_eq!(config.max_unflushed_bytes, 64 * 1024 * 1024);
         assert_eq!(config.max_concurrent_hydrations, 2);
         assert_eq!(config.max_open_scopes, 8);
+        assert_eq!(config.reader_wal_replay_concurrency, 16);
         assert_eq!(config.index_discovery_interval, Duration::from_secs(5));
         assert_eq!(config.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(config.heartbeat_timeout, Duration::from_secs(15));
@@ -516,6 +524,38 @@ mod tests {
         let config = RuntimeConfig::from_values(values).unwrap();
         assert_eq!(config.max_query_scan_edges, 64);
         assert_eq!(config.graph_open_options().limits.max_query_scan_edges, 64);
+    }
+
+    #[test]
+    fn graph_node_config_applies_reader_wal_replay_concurrency() {
+        let values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            (
+                "GRAPH_READER_WAL_REPLAY_CONCURRENCY".to_string(),
+                "32".to_string(),
+            ),
+        ]);
+        let config = RuntimeConfig::from_values(values).unwrap();
+        assert_eq!(config.reader_wal_replay_concurrency, 32);
+        assert_eq!(
+            config
+                .graph_open_options()
+                .cache
+                .reader_wal_replay_concurrency,
+            32
+        );
+
+        let invalid = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            (
+                "GRAPH_READER_WAL_REPLAY_CONCURRENCY".to_string(),
+                "0".to_string(),
+            ),
+        ]);
+        let error = RuntimeConfig::from_values(invalid).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("GRAPH_READER_WAL_REPLAY_CONCURRENCY must be greater than zero"));
     }
 
     #[test]

@@ -74,12 +74,29 @@ impl Default for GraphBackpressurePolicy {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct GraphCacheConfig {
     pub object_store_cache_dir: Option<PathBuf>,
     pub object_store_cache_bytes: Option<usize>,
     pub object_store_cache_puts: bool,
     pub preload_sst_on_startup: bool,
+    /// Number of immutable SlateDB WAL files fetched concurrently while a
+    /// reader opens or catches up. This is bounded independently per retained
+    /// graph scope.
+    pub reader_wal_replay_concurrency: usize,
+}
+
+impl Default for GraphCacheConfig {
+    fn default() -> Self {
+        Self {
+            object_store_cache_dir: None,
+            object_store_cache_bytes: None,
+            object_store_cache_puts: false,
+            preload_sst_on_startup: false,
+            reader_wal_replay_concurrency: 16,
+        }
+    }
 }
 
 impl GraphCacheConfig {
@@ -108,6 +125,7 @@ impl GraphCacheConfig {
             object_store_cache_bytes: Some(max_cache_size_bytes),
             object_store_cache_puts: true,
             preload_sst_on_startup,
+            ..Self::default()
         }
     }
 
@@ -128,6 +146,7 @@ impl GraphCacheConfig {
     }
 
     fn apply_to_reader_options(&self, options: &mut DbReaderOptions) {
+        options.wal_replay_concurrency = self.reader_wal_replay_concurrency;
         if let Some(cache_dir) = &self.object_store_cache_dir {
             options.object_store_cache_options.root_folder = Some(cache_dir.clone());
         }
@@ -401,6 +420,10 @@ mod tests {
 
     #[test]
     fn storage_memory_profiles_are_valid_and_bounded() {
+        assert_eq!(
+            GraphCacheConfig::default().reader_wal_replay_concurrency,
+            16
+        );
         let balanced = GraphStorageMemoryConfig::default();
         balanced.validate().unwrap();
         assert_eq!(balanced.l0_sst_size_bytes, 16 * 1024 * 1024);
