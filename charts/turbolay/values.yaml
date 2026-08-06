@@ -166,6 +166,9 @@ service:
 runtime:
   rustLog: info,slatedb_graph_kernel=info
   maxOpenScopes: 8
+  # Parallel immutable WAL reads used to establish or refresh a cold SlateDB
+  # reader. This bounds object-store fan-out independently for each open scope.
+  readerWalReplayConcurrency: 16
   maxConcurrentQueries: 256
   maxQueryScanEdges: 1000000
   maxQueryRuntimeMs: 30000

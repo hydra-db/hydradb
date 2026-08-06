@@ -177,6 +177,46 @@ struct ConsistencyTestClient {
     refreshes: Arc<AtomicU64>,
 }
 
+struct BlockingRefreshClient;
+
+#[async_trait]
+impl QueryCellClient for BlockingRefreshClient {
+    async fn execute_cypher_rows(
+        &self,
+        _context: QueryContext,
+        _query: &str,
+    ) -> Result<QueryResultSet> {
+        panic!("query execution must not start before the strong refresh finishes")
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let result = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(result.columns, result.rows, None))
+    }
+
+    async fn current_storage_sequence(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<StorageSequence>> {
+        Ok(Some(7))
+    }
+
+    async fn refresh_storage_sequence(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<StorageSequence>> {
+        std::future::pending().await
+    }
+}
+
 #[async_trait]
 impl QueryCellClient for ConsistencyTestClient {
     async fn execute_cypher_rows(
@@ -595,6 +635,49 @@ async fn strong_reads_refresh_storage_while_causal_reads_stay_cache_local() {
         .unwrap();
     assert_eq!(strong.result.rows[0].values, vec![QueryValue::Count(1)]);
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn strong_read_timeout_does_not_wait_for_a_blocked_storage_refresh() {
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::read_graph(GraphScope::default()),
+        )
+        .unwrap();
+    let service = ClientQueryService::new(
+        Arc::new(BlockingRefreshClient),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_max_query_runtime_ms(10),
+    )
+    .unwrap();
+    let session = authenticated_session(&service);
+
+    let started = std::time::Instant::now();
+    let error = service
+        .execute_rows(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "query-blocked-strong-refresh",
+                "MATCH (n {id: 1}) RETURN n.id",
+            )
+            .strong(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        GraphError::QueryTimeout {
+            operation: "client_query_runtime",
+            ..
+        }
+    ));
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(service.active_query_count().await, 0);
 }
 
 #[tokio::test]

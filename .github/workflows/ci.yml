@@ -83,6 +83,7 @@ jobs:
           fi
           grep -q 'Authorization: Bearer' /tmp/turbolay-custom-auth.yaml
           grep -q 'GRAPH_DATA_CACHE_BYTES: "8589934592"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_READER_WAL_REPLAY_CONCURRENCY: "16"' /tmp/turbolay-custom-auth.yaml
           if grep -Eq 'GRAPH_[A-Z0-9_]+: "[0-9]+(\.[0-9]+)?e[+-][0-9]+"' /tmp/turbolay-custom-auth.yaml; then
             echo "runtime integer was rendered in scientific notation"
             exit 1
