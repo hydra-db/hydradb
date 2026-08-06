@@ -38,6 +38,9 @@ data:
   GRAPH_INDEXER_RETAIN_PREVIOUS: {{ include "turbolay.decimalInteger" .Values.indexer.retainPreviousGenerations | quote }}
   GRAPH_INDEXER_BUILD_MODE: {{ .Values.indexer.buildMode | quote }}
   GRAPH_INDEXER_INCREMENTAL_MIN_EDGES: {{ include "turbolay.decimalInteger" .Values.indexer.incrementalMinEdges | quote }}
+  GRAPH_INDEXER_SCOPE_CONCURRENCY: {{ include "turbolay.decimalInteger" .Values.indexer.scopeConcurrency | quote }}
+  GRAPH_INDEXER_MAX_TAIL_FILES: {{ include "turbolay.decimalInteger" .Values.indexer.maxWalTailFiles | quote }}
+  GRAPH_WAL_TAIL_FETCH_CONCURRENCY: {{ include "turbolay.decimalInteger" .Values.indexer.walTailFetchConcurrency | quote }}
   GRAPH_INDEXER_ADMIN_ADDR: "0.0.0.0:9091"
   GRAPH_BOLT_ADDR: 0.0.0.0:7687
   GRAPH_HTTP_ADDR: 0.0.0.0:8443

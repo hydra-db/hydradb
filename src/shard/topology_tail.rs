@@ -85,14 +85,45 @@ impl GraphTopologyOverlay {
 /// Parsed for *every* cell and edge type in the file, not just the caller's:
 /// all edge types share one database, so a per-caller parse would re-download
 /// and re-parse the same file once per edge type. Callers filter by
-/// `cell_id`/`edge_type`/`seq` at use time.
+/// `cell_id`/`edge_type`/`seq` at use time. Corruption is retained as an entry
+/// owned by the record's cell and edge type, then raised only if that owner is
+/// requested. A malformed REPLIES record must not break a CHAIN build that
+/// happens to share its WAL file.
 #[derive(Clone, Debug)]
 pub(crate) struct WalTopologyEntry {
     pub(crate) cell_id: String,
     pub(crate) edge_type: String,
-    pub(crate) src: VertexId,
-    pub(crate) dst: VertexId,
     pub(crate) seq: u64,
+    decoded: WalTopologyEntryDecoded,
+}
+
+#[derive(Clone, Debug)]
+enum WalTopologyEntryDecoded {
+    Edge { src: VertexId, dst: VertexId },
+    Corrupt { key: String, reason: String },
+}
+
+impl WalTopologyEntry {
+    fn affected_edge_for(
+        &self,
+        generation: &crate::GraphIndexGeneration,
+        read_sequence: StorageSequence,
+    ) -> Result<Option<(VertexId, VertexId)>> {
+        if self.seq <= generation.base_sequence
+            || self.seq > read_sequence
+            || self.cell_id != generation.cell_id
+            || self.edge_type != generation.edge_type
+        {
+            return Ok(None);
+        }
+        match &self.decoded {
+            WalTopologyEntryDecoded::Edge { src, dst } => Ok(Some((*src, *dst))),
+            WalTopologyEntryDecoded::Corrupt { key, reason } => Err(GraphError::CorruptValue {
+                key: key.clone(),
+                reason: reason.clone(),
+            }),
+        }
+    }
 }
 
 /// Per-shard cache of parsed WAL files, keyed by WAL id.
@@ -243,7 +274,7 @@ impl GraphShard {
                                 &entry.value,
                                 entry.seq,
                                 &mut parsed,
-                            )?;
+                            );
                         }
                         Ok::<_, crate::GraphError>((wal_id, WalFileFetch::Parsed(parsed)))
                     }
@@ -274,13 +305,10 @@ impl GraphShard {
         for parsed in files.values() {
             for entry in parsed.iter() {
                 budget.check("graph_index_wal_entry")?;
-                if entry.seq <= generation.base_sequence || entry.seq > read_sequence {
+                let Some(edge) = entry.affected_edge_for(generation, read_sequence)? else {
                     continue;
-                }
-                if entry.cell_id != generation.cell_id || entry.edge_type != generation.edge_type {
-                    continue;
-                }
-                affected.insert((entry.src, entry.dst));
+                };
+                affected.insert(edge);
                 ensure_limit(
                     "graph_index_wal_affected_edges",
                     affected.len() as u64,
@@ -332,50 +360,81 @@ fn collect_wal_topology_entry(
     value: &ValueDeletable,
     seq: u64,
     parsed: &mut Vec<WalTopologyEntry>,
-) -> Result<()> {
+) {
     let Ok(key) = std::str::from_utf8(key) else {
-        return Ok(());
+        return;
     };
     let fields = key.split('/').collect::<Vec<_>>();
     match fields.as_slice() {
         ["cell", cell, "e", "out", edge_type, src, dst] => {
-            parsed.push(WalTopologyEntry {
-                cell_id: (*cell).to_string(),
-                edge_type: (*edge_type).to_string(),
-                src: parse_u64(key, src, "src")?,
-                dst: parse_u64(key, dst, "dst")?,
-                seq,
-            });
+            push_wal_topology_edge(parsed, cell, edge_type, key, src, dst, seq);
         }
         ["cell", cell, "seg", "tomb", "out", edge_type, src, dst] => {
-            parsed.push(WalTopologyEntry {
-                cell_id: (*cell).to_string(),
-                edge_type: (*edge_type).to_string(),
-                src: parse_u64(key, src, "src")?,
-                dst: parse_u64(key, dst, "dst")?,
-                seq,
-            });
+            push_wal_topology_edge(parsed, cell, edge_type, key, src, dst, seq);
         }
         ["cell", cell, "seg", "out", edge_type, _, _, _] => {
             if let Some(value) = value.as_bytes() {
-                let segment = decode_out_edge_segment(key, &value)?;
-                parsed.extend(
-                    segment
-                        .destinations
-                        .into_iter()
-                        .map(|dst| WalTopologyEntry {
+                match decode_out_edge_segment(key, &value) {
+                    Ok(segment) => parsed.extend(segment.destinations.into_iter().map(|dst| {
+                        WalTopologyEntry {
                             cell_id: (*cell).to_string(),
                             edge_type: (*edge_type).to_string(),
-                            src: segment.src,
-                            dst,
                             seq,
-                        }),
-                );
+                            decoded: WalTopologyEntryDecoded::Edge {
+                                src: segment.src,
+                                dst,
+                            },
+                        }
+                    })),
+                    Err(error) => {
+                        parsed.push(corrupt_wal_topology_entry(cell, edge_type, key, seq, error))
+                    }
+                }
             }
         }
         _ => {}
     }
-    Ok(())
+}
+
+fn push_wal_topology_edge(
+    parsed: &mut Vec<WalTopologyEntry>,
+    cell_id: &str,
+    edge_type: &str,
+    key: &str,
+    src: &str,
+    dst: &str,
+    seq: u64,
+) {
+    let decoded =
+        parse_u64(key, src, "src").and_then(|src| parse_u64(key, dst, "dst").map(|dst| (src, dst)));
+    parsed.push(match decoded {
+        Ok((src, dst)) => WalTopologyEntry {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            seq,
+            decoded: WalTopologyEntryDecoded::Edge { src, dst },
+        },
+        Err(error) => corrupt_wal_topology_entry(cell_id, edge_type, key, seq, error),
+    });
+}
+
+fn corrupt_wal_topology_entry(
+    cell_id: &str,
+    edge_type: &str,
+    fallback_key: &str,
+    seq: u64,
+    error: GraphError,
+) -> WalTopologyEntry {
+    let (key, reason) = match error {
+        GraphError::CorruptValue { key, reason } => (key, reason),
+        error => (fallback_key.to_string(), error.to_string()),
+    };
+    WalTopologyEntry {
+        cell_id: cell_id.to_string(),
+        edge_type: edge_type.to_string(),
+        seq,
+        decoded: WalTopologyEntryDecoded::Corrupt { key, reason },
+    }
 }
 
 pub(crate) fn expand_range_with_overlay(
@@ -436,4 +495,62 @@ pub(crate) fn expand_range_with_overlay(
         // The overlay walk runs on whichever compiled kernel the matrix baked in.
         backend: crate::sparse_kernel::compiled_graphblas_kernel(compiled),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_wal_topology_isolated_to_its_cell_and_edge_type() {
+        let mut parsed = Vec::new();
+        collect_wal_topology_entry(
+            b"cell/cell-a/e/out/CHAIN/1/2",
+            &ValueDeletable::Tombstone,
+            11,
+            &mut parsed,
+        );
+        collect_wal_topology_entry(
+            b"cell/cell-a/e/out/REPLIES/not-a-vertex/9",
+            &ValueDeletable::Tombstone,
+            12,
+            &mut parsed,
+        );
+        collect_wal_topology_entry(
+            b"cell/cell-b/e/out/CHAIN/also-bad/8",
+            &ValueDeletable::Tombstone,
+            13,
+            &mut parsed,
+        );
+
+        let generation = crate::GraphIndexGeneration {
+            cell_id: "cell-a".to_string(),
+            edge_type: "CHAIN".to_string(),
+            base_sequence: 10,
+            last_wal_id: 0,
+            edge_count: 0,
+            checksum: 0,
+            generation: "fault-isolation".to_string(),
+        };
+        let affected = parsed
+            .iter()
+            .map(|entry| entry.affected_edge_for(&generation, 13))
+            .collect::<Result<Vec<_>>>()
+            .expect("unrelated malformed records must not fail CHAIN in cell-a");
+        assert_eq!(
+            affected.into_iter().flatten().collect::<Vec<_>>(),
+            vec![(1, 2)]
+        );
+
+        let malformed_generation = crate::GraphIndexGeneration {
+            edge_type: "REPLIES".to_string(),
+            ..generation
+        };
+        let error = parsed
+            .iter()
+            .map(|entry| entry.affected_edge_for(&malformed_generation, 13))
+            .collect::<Result<Vec<_>>>()
+            .expect_err("the malformed record must still fail its owning edge type");
+        assert!(matches!(error, GraphError::CorruptValue { .. }));
+    }
 }
