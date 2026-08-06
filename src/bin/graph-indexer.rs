@@ -11,8 +11,10 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use bytes::Bytes;
 use futures::StreamExt;
 use slatedb::object_store::path::Path;
+use slatedb::object_store::{ObjectStoreExt, PutMode, UpdateVersion};
 use slatedb_graph_kernel::{
     object_store_from_env, GraphCluster, GraphError, GraphId, GraphIndexBuildPath,
     GraphIndexGeneration, GraphLimits, GraphOpenOptions, GraphScope, NamespaceId, NamespacePath,
@@ -26,6 +28,20 @@ use tracing::Instrument;
 use turbolay_telemetry::{semconv, ErrorClass, Outcome, ServiceIdentity, TelemetryConfig};
 
 type RuntimeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+const DEFAULT_SCOPE_CONCURRENCY: usize = 8;
+const MAX_SCOPE_CONCURRENCY: usize = 64;
+const MAX_SCOPE_CURSOR_BYTES: usize = 4_096;
+
+struct ScopeCursor {
+    last_scope: Option<String>,
+    update_version: Option<UpdateVersion>,
+}
+
+enum ScopeCursorAdvance {
+    Advanced(ScopeCursor),
+    LostRace,
+}
 
 /// One indexing failure, with the context that identifies it kept structured.
 ///
@@ -448,6 +464,17 @@ async fn main() -> RuntimeResult<()> {
     // faster incrementally. Tune per deployment cache size.
     let incremental_min_edges =
         env_value("GRAPH_INDEXER_INCREMENTAL_MIN_EDGES", "250000").parse::<u64>()?;
+    let scope_concurrency = env_value(
+        "GRAPH_INDEXER_SCOPE_CONCURRENCY",
+        &DEFAULT_SCOPE_CONCURRENCY.to_string(),
+    )
+    .parse::<usize>()?;
+    if !(1..=MAX_SCOPE_CONCURRENCY).contains(&scope_concurrency) {
+        return Err(format!(
+            "GRAPH_INDEXER_SCOPE_CONCURRENCY must be between 1 and {MAX_SCOPE_CONCURRENCY}"
+        )
+        .into());
+    }
     // The tail cost gate. Each WAL file in the span between the previous
     // generation and the durable head is one object-store round trip, and the
     // span grows with write activity, not graph size — an uncapped walk can
@@ -488,6 +515,7 @@ async fn main() -> RuntimeResult<()> {
         build_mode = build_mode.as_str(),
         incremental_min_edges,
         max_wal_tail_files,
+        scope_concurrency,
         "graph indexer started"
     );
 
@@ -515,6 +543,7 @@ async fn main() -> RuntimeResult<()> {
             retain_previous,
             build_mode,
             incremental_min_edges,
+            scope_concurrency,
             &open_options,
             &metrics,
         )
@@ -608,10 +637,18 @@ async fn run_registered_scopes_cycle(
     retain_previous: usize,
     build_mode: IndexBuildMode,
     incremental_min_edges: u64,
+    scope_concurrency: usize,
     open_options: &GraphOpenOptions,
     metrics: &IndexerMetrics,
 ) -> Result<(), CycleFailures> {
     let mut failures = CycleFailures::default();
+    if !(1..=MAX_SCOPE_CONCURRENCY).contains(&scope_concurrency) {
+        failures.push(IndexFailure::config(
+            "scope_scheduler",
+            format!("scope concurrency must be between 1 and {MAX_SCOPE_CONCURRENCY}"),
+        ));
+        return Err(failures);
+    }
 
     let discovery_span = tracing::info_span!(
         "index.scope_discovery",
@@ -619,7 +656,7 @@ async fn run_registered_scopes_cycle(
         turbolay.outcome = Empty,
         error.class = Empty,
     );
-    let scopes = match scope_directory
+    let mut scopes = match scope_directory
         .list()
         .instrument(discovery_span.clone())
         .await
@@ -641,7 +678,88 @@ async fn run_registered_scopes_cycle(
         }
     };
 
-    for scope in scopes {
+    if scopes.is_empty() {
+        return Ok(());
+    }
+
+    let cursor_path = scope_cursor_path(data_path, scope_directory.root_scope());
+    let mut cursor = match load_scope_cursor(&object_store, &cursor_path).await {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            let failure = IndexFailure::kernel(
+                "scope_cursor_load",
+                format!("load indexer scope cursor {cursor_path}"),
+                &error,
+            );
+            failures.push(failure);
+            return Err(failures);
+        }
+    };
+    rotate_scopes_after(&mut scopes, cursor.last_scope.as_deref());
+
+    for batch in scopes.chunks(scope_concurrency) {
+        let batch_last_scope = batch.last().map(ToString::to_string).unwrap_or_default();
+        let runs = futures::stream::iter(batch.iter().cloned())
+            .map(|scope| {
+                run_registered_scope(
+                    data_path,
+                    scope,
+                    cells,
+                    Arc::clone(&object_store),
+                    retain_previous,
+                    build_mode,
+                    incremental_min_edges,
+                    open_options,
+                    metrics,
+                )
+            })
+            .buffer_unordered(scope_concurrency);
+        let mut runs = std::pin::pin!(runs);
+        while let Some(scope_failures) = runs.next().await {
+            failures.absorb(scope_failures);
+        }
+
+        match advance_scope_cursor(&object_store, &cursor_path, cursor, &batch_last_scope).await {
+            Ok(ScopeCursorAdvance::Advanced(next)) => cursor = next,
+            Ok(ScopeCursorAdvance::LostRace) => {
+                tracing::info!(
+                    cursor = %cursor_path,
+                    last_scope = %batch_last_scope,
+                    "another indexer advanced the scope cursor"
+                );
+                // Do not overwrite the winner with a cursor based on stale
+                // progress. Rediscovery on the next cycle resumes from the
+                // winner's durable boundary.
+                break;
+            }
+            Err(error) => {
+                failures.push(IndexFailure::kernel(
+                    "scope_cursor_advance",
+                    format!("advance indexer scope cursor {cursor_path}"),
+                    &error,
+                ));
+                break;
+            }
+        }
+    }
+
+    failures.into_result()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_registered_scope(
+    data_path: &str,
+    scope: GraphScope,
+    cells: &[String],
+    object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+    retain_previous: usize,
+    build_mode: IndexBuildMode,
+    incremental_min_edges: u64,
+    open_options: &GraphOpenOptions,
+    metrics: &IndexerMetrics,
+) -> CycleFailures {
+    let mut failures = CycleFailures::default();
+    {
         let scope_name = scope.to_string();
         let scope_span = tracing::info_span!(
             "index.scope",
@@ -672,12 +790,9 @@ async fn run_registered_scopes_cycle(
                 has_data_span.record("has_data", false);
                 has_data_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
                 scope_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
-                continue;
+                return failures;
             }
             Err(error) => {
-                // This used to be a `?`, which discarded every failure already
-                // accumulated on the way here. The scan still stops — no work
-                // changes — but what stops is only the scan, not the record.
                 let failure = IndexFailure::kernel(
                     "scope_has_data",
                     format!("scan scope {scope_name}"),
@@ -687,7 +802,7 @@ async fn run_registered_scopes_cycle(
                 record_failure(&has_data_span, &failure);
                 scope_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
                 failures.push(failure);
-                break;
+                return failures;
             }
         }
 
@@ -724,7 +839,7 @@ async fn run_registered_scopes_cycle(
                 record_failure(&open_span, &failure);
                 scope_span.record(semconv::OUTCOME, Outcome::Failed.as_str());
                 failures.push(failure);
-                continue;
+                return failures;
             }
         };
 
@@ -771,8 +886,99 @@ async fn run_registered_scopes_cycle(
             record_success(&scope_span);
         }
     }
+    failures
+}
 
-    failures.into_result()
+fn scope_cursor_path(data_path: &str, root_scope: GraphScope) -> Path {
+    Path::from(format!(
+        "{data_path}/_graph_indexer/v1/{root_scope}/scope-cursor"
+    ))
+}
+
+fn rotate_scopes_after(scopes: &mut [GraphScope], last_scope: Option<&str>) {
+    if scopes.is_empty() {
+        return;
+    }
+    let Some(last_scope) = last_scope else {
+        return;
+    };
+    let Some(position) = scopes
+        .iter()
+        .position(|scope| scope.to_string() == last_scope)
+    else {
+        return;
+    };
+    let next = position.saturating_add(1) % scopes.len();
+    scopes.rotate_left(next);
+}
+
+async fn load_scope_cursor(
+    object_store: &Arc<dyn slatedb::object_store::ObjectStore>,
+    path: &Path,
+) -> slatedb_graph_kernel::Result<ScopeCursor> {
+    match object_store.get(path).await {
+        Ok(result) => {
+            let update_version = UpdateVersion {
+                e_tag: result.meta.e_tag.clone(),
+                version: result.meta.version.clone(),
+            };
+            let value = result.bytes().await?;
+            if value.len() > MAX_SCOPE_CURSOR_BYTES {
+                return Err(GraphError::CorruptValue {
+                    key: path.to_string(),
+                    reason: format!(
+                        "indexer scope cursor is {} bytes; maximum is {MAX_SCOPE_CURSOR_BYTES}",
+                        value.len()
+                    ),
+                });
+            }
+            let last_scope =
+                std::str::from_utf8(&value).map_err(|error| GraphError::CorruptValue {
+                    key: path.to_string(),
+                    reason: format!("indexer scope cursor is not UTF-8: {error}"),
+                })?;
+            Ok(ScopeCursor {
+                last_scope: Some(last_scope.to_string()),
+                update_version: Some(update_version),
+            })
+        }
+        Err(slatedb::object_store::Error::NotFound { .. }) => Ok(ScopeCursor {
+            last_scope: None,
+            update_version: None,
+        }),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn advance_scope_cursor(
+    object_store: &Arc<dyn slatedb::object_store::ObjectStore>,
+    path: &Path,
+    cursor: ScopeCursor,
+    last_scope: &str,
+) -> slatedb_graph_kernel::Result<ScopeCursorAdvance> {
+    let mode = cursor
+        .update_version
+        .map_or(PutMode::Create, PutMode::Update);
+    match object_store
+        .put_opts(
+            path,
+            Bytes::copy_from_slice(last_scope.as_bytes()).into(),
+            mode.into(),
+        )
+        .await
+    {
+        Ok(result) => Ok(ScopeCursorAdvance::Advanced(ScopeCursor {
+            last_scope: Some(last_scope.to_string()),
+            update_version: Some(UpdateVersion {
+                e_tag: result.e_tag,
+                version: result.version,
+            }),
+        })),
+        Err(slatedb::object_store::Error::AlreadyExists { .. })
+        | Err(slatedb::object_store::Error::Precondition { .. })
+        | Err(slatedb::object_store::Error::NotFound { .. }) => Ok(ScopeCursorAdvance::LostRace),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn scope_has_data(
@@ -1448,6 +1654,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scope_order_resumes_after_the_durable_cursor() {
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let graph_id = GraphId::new("hydradb").unwrap();
+        let scope = |tenant: &str| {
+            GraphScope::new(
+                root.child(NamespaceId::new(tenant).unwrap()).unwrap(),
+                graph_id.clone(),
+            )
+        };
+        let first = scope("tenant-a");
+        let second = scope("tenant-b");
+        let third = scope("tenant-c");
+        let mut scopes = vec![first.clone(), second.clone(), third.clone()];
+
+        rotate_scopes_after(&mut scopes, Some(&second.to_string()));
+
+        assert_eq!(scopes, vec![third, first, second]);
+    }
+
+    #[tokio::test]
+    async fn scope_cursor_cas_never_overwrites_another_indexer() {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
+        let path = Path::from("graph/data/_graph_indexer/test/scope-cursor");
+        let first_observer = load_scope_cursor(&object_store, &path).await.unwrap();
+        let stale_observer = load_scope_cursor(&object_store, &path).await.unwrap();
+
+        let ScopeCursorAdvance::Advanced(first_cursor) =
+            advance_scope_cursor(&object_store, &path, first_observer, "scope-a")
+                .await
+                .unwrap()
+        else {
+            panic!("the first indexer must create the cursor");
+        };
+        assert!(matches!(
+            advance_scope_cursor(&object_store, &path, stale_observer, "scope-b")
+                .await
+                .unwrap(),
+            ScopeCursorAdvance::LostRace
+        ));
+        assert_eq!(
+            load_scope_cursor(&object_store, &path)
+                .await
+                .unwrap()
+                .last_scope
+                .as_deref(),
+            Some("scope-a"),
+            "a stale indexer must not replace the winning cursor"
+        );
+
+        assert!(matches!(
+            advance_scope_cursor(&object_store, &path, first_cursor, "scope-b")
+                .await
+                .unwrap(),
+            ScopeCursorAdvance::Advanced(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn scope_scheduler_rejects_unsafe_concurrency_without_panicking() {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let directory = ObjectStoreGraphScopeDirectory::new(
+            "graph/data",
+            root,
+            GraphId::new("hydradb").unwrap(),
+            Arc::clone(&object_store),
+        );
+
+        for invalid in [0, MAX_SCOPE_CONCURRENCY + 1] {
+            let failures = run_registered_scopes_cycle(
+                "graph/data",
+                &directory,
+                &["cell-0".to_string()],
+                Arc::clone(&object_store),
+                1,
+                IndexBuildMode::Full,
+                250_000,
+                invalid,
+                &GraphOpenOptions::default(),
+                &IndexerMetrics::default(),
+            )
+            .await
+            .expect_err("unsafe concurrency must be rejected before chunking scopes");
+
+            assert_eq!(
+                failures.first().map(|failure| failure.stage),
+                Some("scope_scheduler")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn indexer_discovers_registered_scopes_and_ignores_empty_ones() {
         let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
@@ -1477,6 +1775,7 @@ mod tests {
             1,
             IndexBuildMode::Full,
             250_000,
+            1,
             &GraphOpenOptions::default(),
             &metrics,
         )
@@ -1514,6 +1813,7 @@ mod tests {
             1,
             IndexBuildMode::Full,
             250_000,
+            1,
             &GraphOpenOptions::default(),
             &metrics,
         )

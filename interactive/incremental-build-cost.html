@@ -1,4 +1,4 @@
-!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -540,7 +540,15 @@ the old serial walk), and the per-shard parsed-file cache
 (<code>WalTailFileCache</code>) that lets the 8 edge types share one span's
 downloads. Declines log their reason at info. Two new regression tests pin the
 behavior: a span over the cap declines to a correct full rebuild, and the second
-edge type's walk downloads nothing.</p>
+edge type's walk downloads nothing. A third test proves a malformed record for
+one cell or edge type cannot fail another build sharing the WAL file.</p>
+<p>The same branch now bounds the fleet-level fixed cost too. Registered scopes
+run in eight-wide batches by default, and each completed batch advances a
+CAS-protected cursor in object storage. A restart resumes after the last durable
+batch; if it stops mid-batch, that batch is replayed rather than skipped. This
+parallelizes open/check/build/close across scopes and prevents restart starvation.
+It does not keep readers open between cycles, so SlateDB replay on each fresh open
+remains the L2 opportunity described below.</p>
 <p>Measured against <strong>real AWS S3</strong> (bucket
 <code>hydradb-local-turbolay</code>, us-east-1) with
 <code>examples/wal_tail_trickle_bench.rs</code>, which manufactures the staging
