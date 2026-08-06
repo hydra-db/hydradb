@@ -13,7 +13,7 @@ pub(crate) enum GraphTopologyTail {
 }
 
 impl GraphTopologyOverlay {
-    fn set(&mut self, src: VertexId, dst: VertexId, exists: bool) {
+    pub(crate) fn set(&mut self, src: VertexId, dst: VertexId, exists: bool) {
         self.states.entry(src).or_default().insert(dst, exists);
     }
 

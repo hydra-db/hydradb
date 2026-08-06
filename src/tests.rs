@@ -14305,16 +14305,15 @@ async fn incremental_graph_index_matches_full_rebuild() {
     );
 }
 
-/// A WAL tail larger than `max_query_scan_edges` must make the incremental
-/// build *decline* — `Ok(None)`, the same verdict as a collected WAL — not
-/// fail. `topology_tail_since` raises `AdmissionRejected` for it because on
-/// the read path an oversized overlay is an expected admission outcome
-/// (`src/shard/query.rs` recovers from exactly this error), and the full
-/// rebuild the caller falls back to is governed by the much larger
-/// `max_artifact_build_edges`. Propagating it instead would fail the whole
-/// indexer cycle on precisely the graphs that most need the fallback.
+/// A delta larger than `max_query_scan_edges` used to force the WAL-tail
+/// incremental build to decline (`AdmissionRejected` from
+/// `topology_tail_since`), because the tail was priced per WAL round trip.
+/// The xlog derivation is priced per delta byte, so the same limit no longer
+/// applies to the build at all: an oversized delta is absorbed incrementally,
+/// the auto path stays incremental, and only `max_artifact_build_edges` —
+/// which governs the full rebuild identically — bounds the result.
 #[tokio::test]
-async fn oversized_wal_tail_declines_the_incremental_build() {
+async fn oversized_delta_no_longer_declines_the_incremental_build() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let limits = GraphLimits {
         max_query_scan_edges: 2,
@@ -14336,7 +14335,8 @@ async fn oversized_wal_tail_declines_the_incremental_build() {
         .unwrap();
     shard.build_graph_index(cell_id, edge_type).await.unwrap();
 
-    // Three affected edges since the baseline, against a scan limit of two.
+    // Three affected edges since the baseline, against a read-path scan
+    // limit of two — the shape that used to trip the cost gate.
     for (idx, (src, dst)) in [(2_u64, 3_u64), (3, 4), (4, 5)].into_iter().enumerate() {
         shard
             .write_edge(typed_mutation(
@@ -14350,26 +14350,25 @@ async fn oversized_wal_tail_declines_the_incremental_build() {
             .unwrap();
     }
 
-    let declined = shard
-        .build_graph_index_incremental(cell_id, edge_type)
-        .await
-        .expect("an oversized tail is a decline, not an error");
-    assert!(
-        declined.is_none(),
-        "the incremental build must fall back rather than absorb an \
-         oversized tail"
-    );
-
-    // And the fallback the decline promises must actually work end to end.
     let (generation, path) = shard
         .build_graph_index_auto(cell_id, edge_type)
         .await
         .unwrap();
-    assert!(
-        matches!(path, crate::GraphIndexBuildPath::Full { .. }),
-        "auto must have taken the full path, got {path:?}"
-    );
+    match path {
+        crate::GraphIndexBuildPath::Incremental { delta_edges } => {
+            assert_eq!(
+                delta_edges, 3,
+                "the xlog delta must carry exactly the three added edges"
+            );
+        }
+        other => panic!("auto must have stayed incremental, got {other:?}"),
+    }
     assert_eq!(generation.edge_count, 4);
+
+    // And the result must be byte-identical to a full rebuild at the same
+    // snapshot — absorbing the delta is only a win if it is also correct.
+    let full = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+    assert_eq!(generation.generation, full.generation);
 }
 
 /// A writer snapshot carries no WAL position of its own (`state.rs`), and
@@ -14435,14 +14434,14 @@ async fn writer_built_generations_record_the_wal_position() {
     );
 }
 
-/// The tail cost gate (`GraphLimits::max_wal_tail_files`): a WAL span wider
-/// than the cap must *decline* the incremental build — every file in the span
-/// is one object-store round trip, and the span scales with write activity
-/// rather than delta size, so past the cap the full rebuild is the cheaper
-/// path. With the cap at zero any new WAL at all exceeds it, which makes the
-/// decline deterministic without having to manufacture thousands of files.
+/// The WAL-tail cost gate (`GraphLimits::max_wal_tail_files`) is a read-path
+/// concern only: the builder derives its delta from the xlog and never walks
+/// WAL files, so even a cap of zero — under which the old tail-based build
+/// declined unconditionally — must leave the incremental build untouched.
+/// This is the regression's fix stated as a test: build cost no longer
+/// depends on WAL file count at all.
 #[tokio::test]
-async fn incremental_build_declines_when_wal_span_exceeds_cap() {
+async fn incremental_build_ignores_the_wal_span_cap() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_limits(
         "graph/tail-span-cap",
@@ -14467,40 +14466,35 @@ async fn incremental_build_declines_when_wal_span_exceeds_cap() {
         .write_edge(typed_mutation(cell_id, edge_type, 2, 3, "cap-add"))
         .await
         .unwrap();
-    let declined = shard
-        .build_graph_index_incremental(cell_id, edge_type)
-        .await
-        .unwrap();
-    assert!(
-        declined.is_none(),
-        "a span above the cap must decline, not walk"
-    );
-
-    // The decline is a routing verdict, not a failure: the auto entry point
-    // must land on a correct full rebuild.
     let (generation, path) = shard
         .build_graph_index_auto(cell_id, edge_type)
         .await
         .unwrap();
     assert!(
-        matches!(path, crate::GraphIndexBuildPath::Full { edges: 2 }),
-        "expected the fallback full rebuild over both edges, got {path:?}"
+        matches!(
+            path,
+            crate::GraphIndexBuildPath::Incremental { delta_edges: 1 }
+        ),
+        "the WAL span cap must not reach the xlog build, got {path:?}"
     );
+    assert_eq!(generation.edge_count, 2);
     assert!(
         generation.base_sequence > full.base_sequence,
-        "the fallback must publish the newer snapshot: {} <= {}",
+        "the incremental build must publish the newer snapshot: {} <= {}",
         generation.base_sequence,
         full.base_sequence
     );
 }
 
-/// All edge types share one database, so their tail walks read the *same* WAL
-/// files. The per-shard file cache exists so the second edge type's build
-/// reuses the first's downloads: after the first incremental build parses its
-/// span, the second build over the same span must add nothing to the cache —
-/// and both builds must still patch their own edge type correctly.
+/// All edge types share one database, and the WAL-tail walk used to make the
+/// builder re-download that shared span once per edge type — the request
+/// amplification behind the staging regression. The xlog keys each edge
+/// type's changes under its own prefix, so each incremental build scans only
+/// its own delta and the builder touches **no WAL files at all**: the
+/// per-shard WAL file cache (still used by the query-time read path) must
+/// stay empty across both builds.
 #[tokio::test]
-async fn wal_tail_file_parse_is_shared_across_edge_types() {
+async fn incremental_builds_scan_per_type_deltas_without_walking_wal() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer("graph/tail-shared-parse", object_store)
         .await
@@ -14539,19 +14533,17 @@ async fn wal_tail_file_parse_is_shared_across_edge_types() {
         ),
         "CHAIN sees only its own delta, got {chain_path:?}"
     );
-    let cached_after_first = shard.test_wal_tail_cached_file_count().await;
-    assert!(
-        cached_after_first > 0,
-        "the first walk must leave its parsed files behind"
+    assert_eq!(
+        shard.test_wal_tail_cached_file_count().await,
+        0,
+        "the xlog build must not walk WAL files at all"
     );
 
-    // REPLIES was published after CHAIN, so its span is a subset of the files
-    // the CHAIN walk just parsed; nothing new to fetch.
     let (replies, replies_path) = shard
         .build_graph_index_incremental(cell_id, "REPLIES")
         .await
         .unwrap()
-        .expect("the second edge type's tail is buildable from cache");
+        .expect("the second edge type's delta is scannable from its own prefix");
     assert!(
         matches!(
             replies_path,
@@ -14561,10 +14553,350 @@ async fn wal_tail_file_parse_is_shared_across_edge_types() {
     );
     assert_eq!(
         shard.test_wal_tail_cached_file_count().await,
-        cached_after_first,
-        "the second walk's span is already cached; it must download nothing"
+        0,
+        "neither build may touch the WAL file cache"
     );
 
     assert_eq!(chain.edge_count, 2, "CHAIN patched to two edges");
     assert_eq!(replies.edge_count, 2, "REPLIES patched to two edges");
+}
+
+/// The missed-site detector: randomized bursts over the public write APIs —
+/// single inserts, deletes of existing and absent edges, overlapping bulk
+/// imports, trusted segment appends, and a topology-preserving segment
+/// compaction — asserting after every burst that the xlog-driven incremental
+/// build produces a byte-identical payload (same content-addressed generation
+/// id) to a full rebuild at the same snapshot, across two edge types sharing
+/// one database, with a GC pass interleaved to prove retention never breaks
+/// coverage. Any mutation path that changes topology without logging its
+/// delta through `mark_topology_change_txn` breaks the hash here.
+#[tokio::test]
+async fn xlog_incremental_matches_full_over_random_mutation_mix() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    // Outbound-only policy so the mix can include trusted segment appends,
+    // which are refused under a reverse-indexing policy.
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/xlog-property-equivalence",
+        object_store,
+        GraphOpenOptions {
+            index_policy: GraphIndexPolicy::OutboundOnly,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let cell_id = "reddit-home";
+    let edge_types = ["CHAIN", "REPLIES"];
+    // The segment-append source: trusted appends bypass canonical edge keys
+    // entirely, so their xlog entries are the only trace the builder sees.
+    let segment_src = 77_u64;
+
+    // Deterministic xorshift so a failure names a reproducible seed.
+    let mut rng_state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut rng = move || {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        rng_state
+    };
+
+    let mut models: std::collections::BTreeMap<&str, BTreeSet<(u64, u64)>> =
+        edge_types.iter().map(|ty| (*ty, BTreeSet::new())).collect();
+
+    // Seed both types and publish full baselines the increments will patch.
+    for edge_type in edge_types {
+        let seed: Vec<(u64, u64)> = (0..24).map(|_| (1 + rng() % 20, 1 + rng() % 40)).collect();
+        for (src, dst) in &seed {
+            models.get_mut(edge_type).unwrap().insert((*src, *dst));
+        }
+        shard
+            .bulk_import_edges(cell_id, edge_type, seed, &format!("xlog-seed-{edge_type}"))
+            .await
+            .unwrap();
+        shard.build_graph_index(cell_id, edge_type).await.unwrap();
+    }
+
+    for round in 0..6 {
+        for edge_type in edge_types {
+            let model = models.get_mut(edge_type).unwrap();
+            // Single inserts, some duplicating existing edges (idempotent
+            // re-inserts log nothing new logically and must stay harmless).
+            for op in 0..8 {
+                let (src, dst) = (1 + rng() % 20, 1 + rng() % 40);
+                shard
+                    .write_edge(typed_mutation(
+                        cell_id,
+                        edge_type,
+                        src,
+                        dst,
+                        &format!("xlog-mix-{edge_type}-{round}-w{op}"),
+                    ))
+                    .await
+                    .unwrap();
+                model.insert((src, dst));
+            }
+            // Deletes: half aimed at live edges, half at arbitrary pairs
+            // that may not exist (an unacknowledged delete logs nothing).
+            for op in 0..4 {
+                let (src, dst) = if op % 2 == 0 && !model.is_empty() {
+                    let pick = rng() as usize % model.len();
+                    *model.iter().nth(pick).unwrap()
+                } else {
+                    (1 + rng() % 20, 1 + rng() % 40)
+                };
+                let deleted = shard
+                    .delete_edge(typed_mutation(
+                        cell_id,
+                        edge_type,
+                        src,
+                        dst,
+                        &format!("xlog-mix-{edge_type}-{round}-d{op}"),
+                    ))
+                    .await
+                    .unwrap();
+                if deleted.deleted {
+                    model.remove(&(src, dst));
+                }
+            }
+            // An overlapping bulk import every round.
+            let bulk: Vec<(u64, u64)> = (0..6).map(|_| (1 + rng() % 20, 1 + rng() % 40)).collect();
+            for (src, dst) in &bulk {
+                model.insert((*src, *dst));
+            }
+            shard
+                .bulk_import_edges(
+                    cell_id,
+                    edge_type,
+                    bulk,
+                    &format!("xlog-mix-{edge_type}-{round}-bulk"),
+                )
+                .await
+                .unwrap();
+            // Trusted segment appends on alternating rounds: these edges
+            // never touch canonical keys, so only their xlog entries and the
+            // segment values themselves carry them.
+            if round % 2 == 0 {
+                let dsts: Vec<u64> = (0..3).map(|_| 200 + rng() % 25).collect();
+                for dst in &dsts {
+                    model.insert((segment_src, *dst));
+                }
+                shard
+                    .bulk_append_out_adjacency_segment_trusted(
+                        cell_id,
+                        edge_type,
+                        segment_src,
+                        dsts,
+                        &format!("xlog-mix-{edge_type}-{round}-seg"),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let (incremental, path) = shard
+                .build_graph_index_incremental(cell_id, edge_type)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("round {round} {edge_type}: must stay incremental"));
+            assert!(
+                matches!(path, crate::GraphIndexBuildPath::Incremental { .. }),
+                "round {round} {edge_type}: expected incremental, got {path:?}"
+            );
+            let full = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+            assert_eq!(
+                incremental.base_sequence, full.base_sequence,
+                "round {round} {edge_type}: both builds must pin the same sequence"
+            );
+            assert_eq!(
+                incremental.generation, full.generation,
+                "round {round} {edge_type}: a diverging content id means a \
+                 mutation path changed topology without logging its delta"
+            );
+            assert_eq!(
+                incremental.edge_count,
+                model.len() as u64,
+                "round {round} {edge_type}: the index must match the model"
+            );
+        }
+
+        // Interleave retention mid-run: GC must reclaim consumed entries
+        // without ever breaking the next round's coverage.
+        if round == 2 {
+            for edge_type in edge_types {
+                let deleted = shard
+                    .gc_topology_changelog(cell_id, edge_type)
+                    .await
+                    .unwrap();
+                assert!(
+                    deleted > 0,
+                    "{edge_type}: three rounds of mutations must leave dead entries"
+                );
+            }
+        }
+    }
+
+    // Topology-preserving segment compaction logs nothing — the published
+    // index must be indifferent to it. Requires a matrix artifact at the
+    // compacted-through epoch, exactly like the production maintenance path.
+    let edge_type = edge_types[0];
+    let base_epoch = shard.current_epoch(cell_id).await.unwrap();
+    shard
+        .build_matrix_tiles(cell_id, edge_type, base_epoch, 4)
+        .await
+        .unwrap();
+    shard
+        .compact_out_adjacency_segments(cell_id, edge_type, segment_src, base_epoch, "xlog-compact")
+        .await
+        .unwrap();
+    let (incremental, _) = shard
+        .build_graph_index_incremental(cell_id, edge_type)
+        .await
+        .unwrap()
+        .expect("post-compaction build must stay incremental");
+    let full = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+    assert_eq!(
+        incremental.generation, full.generation,
+        "segment compaction changed the published index despite preserving topology"
+    );
+    assert_eq!(
+        incremental.edge_count,
+        models[edge_type].len() as u64,
+        "compaction must not change the edge set"
+    );
+}
+
+/// Retention lifecycle: GC reclaims exactly the consumed entries once,
+/// reports zero on an immediately repeated pass, and later builds remain
+/// incremental and byte-identical — the low-water mark never breaks coverage
+/// for a range a future build still needs.
+#[tokio::test]
+async fn xlog_gc_reclaims_consumed_entries_and_preserves_coverage() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/xlog-gc-lifecycle", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "CHAIN";
+
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 1, 2, "gc-seed"))
+        .await
+        .unwrap();
+    shard.build_graph_index(cell_id, edge_type).await.unwrap();
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 2, 3, "gc-add"))
+        .await
+        .unwrap();
+    let (generation, _) = shard
+        .build_graph_index_incremental(cell_id, edge_type)
+        .await
+        .unwrap()
+        .expect("incremental after baseline");
+
+    let deleted = shard
+        .gc_topology_changelog(cell_id, edge_type)
+        .await
+        .unwrap();
+    assert!(
+        deleted > 0,
+        "entries at or below base {} must be reclaimed",
+        generation.base_sequence
+    );
+    assert_eq!(
+        shard
+            .gc_topology_changelog(cell_id, edge_type)
+            .await
+            .unwrap(),
+        0,
+        "an immediately repeated pass has nothing left to reclaim"
+    );
+
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 3, 4, "gc-post"))
+        .await
+        .unwrap();
+    let (incremental, path) = shard
+        .build_graph_index_incremental(cell_id, edge_type)
+        .await
+        .unwrap()
+        .expect("coverage must survive GC");
+    assert!(
+        matches!(
+            path,
+            crate::GraphIndexBuildPath::Incremental { delta_edges: 1 }
+        ),
+        "got {path:?}"
+    );
+    let full = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+    assert_eq!(incremental.generation, full.generation);
+}
+
+/// A purged low-water mark (manual intervention, or a pre-xlog generation) is
+/// the `Uninitialized` bootstrap: the incremental build declines exactly
+/// once, the full rebuild re-establishes coverage through the next logged
+/// mutation, and the cycle after is incremental again.
+#[tokio::test]
+async fn xlog_purge_forces_one_bootstrap_then_recovers() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/xlog-purge-bootstrap", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "CHAIN";
+
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 1, 2, "purge-seed"))
+        .await
+        .unwrap();
+    shard.build_graph_index(cell_id, edge_type).await.unwrap();
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 2, 3, "purge-add"))
+        .await
+        .unwrap();
+
+    // Simulate a manual purge: the coverage floor disappears out from under
+    // the builder.
+    let mut batch = WriteBatch::new();
+    batch.delete(keys::xlog_low_water(cell_id, edge_type).as_bytes());
+    shard.write_strict_for_test(batch).await.unwrap();
+
+    assert!(
+        shard
+            .build_graph_index_incremental(cell_id, edge_type)
+            .await
+            .unwrap()
+            .is_none(),
+        "a missing floor must bootstrap, never guess at coverage"
+    );
+    let full = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+    assert_eq!(full.edge_count, 2, "the bootstrap full build is correct");
+
+    // The write path's floor cache still believes the floor exists — only
+    // the GC pass, which reads storage under writer authority, notices the
+    // purge and repairs the floor at the current epoch. This is the same
+    // call the indexer's cleanup step makes every cycle.
+    assert_eq!(
+        shard
+            .gc_topology_changelog(cell_id, edge_type)
+            .await
+            .unwrap(),
+        0,
+        "the repair pass reclaims nothing; it only restores the floor"
+    );
+
+    // With the floor repaired, the next mutation is covered and the build
+    // after it is incremental again.
+    shard
+        .write_edge(typed_mutation(cell_id, edge_type, 3, 4, "purge-recover"))
+        .await
+        .unwrap();
+    let (incremental, path) = shard
+        .build_graph_index_incremental(cell_id, edge_type)
+        .await
+        .unwrap()
+        .expect("coverage re-established after one bootstrap");
+    assert!(
+        matches!(
+            path,
+            crate::GraphIndexBuildPath::Incremental { delta_edges: 1 }
+        ),
+        "got {path:?}"
+    );
+    let check = shard.build_graph_index(cell_id, edge_type).await.unwrap();
+    assert_eq!(incremental.generation, check.generation);
 }

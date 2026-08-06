@@ -103,6 +103,11 @@ pub struct GraphShard {
     #[cfg(feature = "opencypher")]
     pub(crate) native_path_page_cursors: Mutex<NativePathPageCursorStore>,
     pub(crate) wal_tail_file_cache: Mutex<crate::shard::topology_tail::WalTailFileCache>,
+    /// `(cell_id, edge_type)` pairs whose xlog low-water key has been observed
+    /// present, so the write path can skip the per-transaction floor check.
+    /// Only populated after a read confirms the key exists — a pending put is
+    /// never cached, so a rolled-back transaction cannot strand the floor.
+    pub(crate) xlog_floor_ensured: StdRwLock<std::collections::HashSet<String>>,
 }
 
 #[derive(Clone)]
