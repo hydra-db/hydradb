@@ -196,6 +196,7 @@
     },
     "indexerWorkload": {
       "type": "object",
+      "$comment": "templates/validate.yaml enforces maxOpenScopes >= scopeConcurrency because JSON Schema draft-07 cannot compare sibling numeric values",
       "required": ["enabled", "replicaCount", "intervalMs", "retainPreviousGenerations", "buildMode", "incrementalMinEdges", "scopeConcurrency", "maxOpenScopes", "maxWalTailFiles", "walTailFetchConcurrency", "resources", "serviceAccount"],
       "properties": {
         "enabled": { "type": "boolean" },
