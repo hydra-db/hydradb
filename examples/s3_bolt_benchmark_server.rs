@@ -238,6 +238,7 @@ fn graph_options(fanout: u64, max_hop: u8, cache_dir: std::path::PathBuf) -> Gra
                 .unwrap_or(usize::MAX),
             max_query_scan_edges: edges.saturating_mul(2).max(1),
             max_query_runtime_ms: Some(180_000),
+            ..GraphLimits::default()
         };
         options.cache =
             GraphCacheConfig::disk_cache_without_preload(cache_dir, 2 * 1024 * 1024 * 1024);
