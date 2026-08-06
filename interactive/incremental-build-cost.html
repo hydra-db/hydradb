@@ -545,10 +545,12 @@ one cell or edge type cannot fail another build sharing the WAL file.</p>
 <p>The same branch now bounds the fleet-level fixed cost too. Registered scopes
 run in eight-wide batches by default, and each completed batch advances a
 CAS-protected cursor in object storage. A restart resumes after the last durable
-batch; if it stops mid-batch, that batch is replayed rather than skipped. This
-parallelizes open/check/build/close across scopes and prevents restart starvation.
-It does not keep readers open between cycles, so SlateDB replay on each fresh open
-remains the L2 opportunity described below.</p>
+batch; if it stops mid-batch, that batch is replayed rather than skipped. Scope
+readers remain open in a bounded LRU
+(<code>GRAPH_INDEXER_MAX_OPEN_SCOPES</code>, default 128), so a warm scope refreshes
+only newly durable WAL instead of reconstructing the same reader on every cycle.
+This parallelizes scope work, prevents restart starvation, and removes repeated
+reader-open replay from steady-state sweeps.</p>
 <p>Measured against <strong>real AWS S3</strong> (bucket
 <code>hydradb-local-turbolay</code>, us-east-1) with
 <code>examples/wal_tail_trickle_bench.rs</code>, which manufactures the staging
@@ -580,15 +582,17 @@ are what transfer. And because remote absolute numbers are junk for regression
 tracking, <code>examples/tail_concurrency_probe.rs</code> re-measures the walk
 under a deterministic injected latency (<code>ThrottledStore</code>, 25 ms/GET,
 100-file span): <strong>16.8 s serial vs 4.7 s fixed</strong> — the walk itself
-parallelizes ~16×, and the remaining serial cost is SlateDB's own WAL replay
-inside reader refresh, which only the L2 work can remove.</p>
+parallelizes ~16×. The benchmark predates the long-lived scope-reader cache, so
+its remaining reader-open replay is a cold-start cost rather than a cost paid on
+every steady-state cycle.</p>
 <div class="callout">
 <p><strong>A finding the benchmark threw in for free:</strong> re-opening the
 shard over the freshly trickled span stalls in SlateDB's own WAL replay — the
 open performs the same serial file-by-file walk before the database is usable.
-The indexer's per-cycle open/close of every scope pays this too, which is more
-evidence for the keep-scopes-open LRU in L2: replay cost should be paid
-incrementally by a long-lived reader, not repeatedly by fresh opens.</p>
+The old indexer paid this on every per-cycle scope open. The bounded keep-open
+LRU now pays it on admission and then advances the same reader incrementally.
+Eviction and process restart still make the next access cold, which is why the
+cache remains explicitly bounded and observable.</p>
 </div>
 
 <h2><span class="no">10</span>Open questions for discussion</h2>
@@ -596,9 +600,11 @@ incrementally by a long-lived reader, not repeatedly by fresh opens.</p>
 callback; kernel stays generic) or inside the fork's reader itself (reusable by the read
 path's overlay too — which today re-derives the same tail per query and survives only by
 falling back)? The second is more invasive but pays twice.</p>
-<p><strong>Keep-open LRU sizing.</strong> ~300 scopes and growing; a reader holds
-memory + a checkpoint. What's the residency budget — and should
-dirtiness (cheap S3 list) gate <em>visiting</em> at all, so quiet scopes cost nothing?</p>
+<p><strong>Keep-open LRU sizing.</strong> The default retains 128 scopes and staging
+can size the bound to its observed scope count. Reader residency is exposed by
+<code>graph_indexer_scope_cache_entries</code>, with hit, miss, eviction, and close
+failure counters. A future dirtiness gate could avoid visiting quiet scopes, but
+it is no longer required to prevent repeated full reader reconstruction.</p>
 <p><strong>L0's estimator.</strong> Static file-count threshold (simple, one knob) vs
 measured EWMA of per-file RTT and per-edge scan rate (self-tuning, more moving parts)?</p>
 <p><strong>Observability debt.</strong> A <code>build_duration_seconds</code> histogram

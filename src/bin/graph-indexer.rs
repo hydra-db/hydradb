@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,7 +21,7 @@ use slatedb_graph_kernel::{
     ObjectStoreGraphScopeDirectory,
 };
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tracing::field::Empty;
 use tracing::Instrument;
@@ -31,6 +31,8 @@ type RuntimeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const DEFAULT_SCOPE_CONCURRENCY: usize = 8;
 const MAX_SCOPE_CONCURRENCY: usize = 64;
+const DEFAULT_MAX_OPEN_SCOPES: usize = 128;
+const MAX_OPEN_SCOPES: usize = 4_096;
 const MAX_SCOPE_CURSOR_BYTES: usize = 4_096;
 
 struct ScopeCursor {
@@ -41,6 +43,240 @@ struct ScopeCursor {
 enum ScopeCursorAdvance {
     Advanced(ScopeCursor),
     LostRace,
+}
+
+struct CachedScopeCluster {
+    cluster: Arc<GraphCluster>,
+    last_used: u64,
+}
+
+/// Long-lived read-only scope handles for the indexer.
+///
+/// Opening a SlateDB reader reconstructs its durable WAL view. Closing every
+/// scope after every five-second sweep paid that reconstruction cost over and
+/// over, even when nothing changed. This cache keeps the reader and its parsed
+/// WAL state alive, while an LRU bound prevents the indexer from retaining an
+/// unbounded number of tenant scopes.
+struct IndexerScopeCache {
+    data_path: String,
+    cells: Vec<String>,
+    object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+    open_options: GraphOpenOptions,
+    max_open_scopes: usize,
+    access_clock: AtomicU64,
+    clusters: AsyncMutex<BTreeMap<GraphScope, CachedScopeCluster>>,
+    metrics: Arc<IndexerMetrics>,
+}
+
+impl IndexerScopeCache {
+    fn new(
+        data_path: String,
+        cells: Vec<String>,
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        open_options: GraphOpenOptions,
+        max_open_scopes: usize,
+        metrics: Arc<IndexerMetrics>,
+    ) -> Self {
+        Self {
+            data_path,
+            cells,
+            object_store,
+            open_options,
+            max_open_scopes,
+            access_clock: AtomicU64::new(0),
+            clusters: AsyncMutex::new(BTreeMap::new()),
+            metrics,
+        }
+    }
+
+    async fn cluster_for_scope(
+        &self,
+        scope: &GraphScope,
+    ) -> slatedb_graph_kernel::Result<Arc<GraphCluster>> {
+        let access = self.access_clock.fetch_add(1, Ordering::Relaxed) + 1;
+        {
+            let mut clusters = self.clusters.lock().await;
+            if let Some(entry) = clusters.get_mut(scope) {
+                entry.last_used = access;
+                self.metrics
+                    .scope_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(Arc::clone(&entry.cluster));
+            }
+        }
+
+        self.metrics
+            .scope_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+        let opened = Arc::new(
+            GraphCluster::open_cells_scoped_with_options(
+                self.data_path.clone(),
+                scope.clone(),
+                self.cells.clone(),
+                Arc::clone(&self.object_store),
+                self.open_options.clone(),
+            )
+            .await?,
+        );
+
+        let mut evicted = None;
+        let mut admission_error = None;
+        let selected = {
+            let mut clusters = self.clusters.lock().await;
+            if let Some(entry) = clusters.get_mut(scope) {
+                entry.last_used = access;
+                Some(Arc::clone(&entry.cluster))
+            } else {
+                if clusters.len() >= self.max_open_scopes {
+                    let candidate = clusters
+                        .iter()
+                        .filter(|(_, entry)| Arc::strong_count(&entry.cluster) == 1)
+                        .min_by_key(|(_, entry)| entry.last_used)
+                        .map(|(scope, _)| scope.clone());
+                    if let Some(candidate) = candidate {
+                        evicted = clusters.remove(&candidate).map(|entry| entry.cluster);
+                        self.metrics
+                            .scope_cache_evictions
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        admission_error = Some(GraphError::AdmissionRejected {
+                            operation: "indexer_open_scopes",
+                            actual: clusters.len().saturating_add(1) as u64,
+                            limit: self.max_open_scopes as u64,
+                        });
+                    }
+                }
+                if admission_error.is_some() {
+                    None
+                } else {
+                    clusters.insert(
+                        scope.clone(),
+                        CachedScopeCluster {
+                            cluster: Arc::clone(&opened),
+                            last_used: access,
+                        },
+                    );
+                    self.metrics
+                        .scope_cache_entries
+                        .store(clusters.len() as u64, Ordering::Release);
+                    Some(Arc::clone(&opened))
+                }
+            }
+        };
+
+        let Some(selected) = selected else {
+            if let Err(error) = opened.close().await {
+                self.record_close_failure(scope, "admission_rejected", &error);
+            }
+            return Err(admission_error.expect("admission error must accompany a rejected open"));
+        };
+
+        if !Arc::ptr_eq(&selected, &opened) {
+            if let Err(error) = opened.close().await {
+                self.record_close_failure(scope, "duplicate_open", &error);
+            }
+        }
+        if let Some(cluster) = evicted {
+            if let Err(error) = cluster.close().await {
+                self.record_close_failure(scope, "eviction", &error);
+            }
+        }
+        Ok(selected)
+    }
+
+    async fn invalidate(
+        &self,
+        scope: &GraphScope,
+        expected: &Arc<GraphCluster>,
+    ) -> slatedb_graph_kernel::Result<()> {
+        let removed = {
+            let mut clusters = self.clusters.lock().await;
+            let matches = clusters
+                .get(scope)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.cluster, expected));
+            let removed = matches.then(|| clusters.remove(scope)).flatten();
+            self.metrics
+                .scope_cache_entries
+                .store(clusters.len() as u64, Ordering::Release);
+            removed.map(|entry| entry.cluster)
+        };
+        if let Some(cluster) = removed {
+            cluster.close().await?;
+        }
+        Ok(())
+    }
+
+    async fn invalidate_scope(&self, scope: &GraphScope) -> slatedb_graph_kernel::Result<()> {
+        let removed = {
+            let mut clusters = self.clusters.lock().await;
+            let removed = clusters.remove(scope).map(|entry| entry.cluster);
+            self.metrics
+                .scope_cache_entries
+                .store(clusters.len() as u64, Ordering::Release);
+            removed
+        };
+        if let Some(cluster) = removed {
+            cluster.close().await?;
+        }
+        Ok(())
+    }
+
+    async fn retain_registered(&self, registered: &BTreeSet<GraphScope>) {
+        let removed = {
+            let mut clusters = self.clusters.lock().await;
+            let stale = clusters
+                .iter()
+                .filter(|(scope, entry)| {
+                    !registered.contains(*scope) && Arc::strong_count(&entry.cluster) == 1
+                })
+                .map(|(scope, _)| scope.clone())
+                .collect::<Vec<_>>();
+            let removed = stale
+                .into_iter()
+                .filter_map(|scope| clusters.remove(&scope).map(|entry| (scope, entry.cluster)))
+                .collect::<Vec<_>>();
+            self.metrics
+                .scope_cache_entries
+                .store(clusters.len() as u64, Ordering::Release);
+            removed
+        };
+        for (scope, cluster) in removed {
+            if let Err(error) = cluster.close().await {
+                self.record_close_failure(&scope, "scope_removed", &error);
+            }
+        }
+    }
+
+    async fn close(&self) -> slatedb_graph_kernel::Result<()> {
+        let clusters = std::mem::take(&mut *self.clusters.lock().await);
+        self.metrics.scope_cache_entries.store(0, Ordering::Release);
+        let mut failures = Vec::new();
+        for (scope, entry) in clusters {
+            if let Err(error) = entry.cluster.close().await {
+                failures.push(format!("{scope}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(GraphError::CorruptValue {
+                key: "indexer/scope-cache/close".to_string(),
+                reason: failures.join("; "),
+            })
+        }
+    }
+
+    fn record_close_failure(&self, scope: &GraphScope, reason: &str, error: &GraphError) {
+        self.metrics
+            .scope_cache_close_failures
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            turbolay.scope = %scope,
+            reason,
+            error = %error,
+            "indexer scope cache could not close reader"
+        );
+    }
 }
 
 /// One indexing failure, with the context that identifies it kept structured.
@@ -323,6 +559,11 @@ struct IndexerMetrics {
     successful_cycles: AtomicU64,
     failed_cycles: AtomicU64,
     open_failures: AtomicU64,
+    scope_cache_hits: AtomicU64,
+    scope_cache_misses: AtomicU64,
+    scope_cache_evictions: AtomicU64,
+    scope_cache_close_failures: AtomicU64,
+    scope_cache_entries: AtomicU64,
     /// `generations_published`, `generation_failures` and `generations_deleted`,
     /// keyed by `{cell_id, edge_type}`.
     ///
@@ -475,6 +716,17 @@ async fn main() -> RuntimeResult<()> {
         )
         .into());
     }
+    let max_open_scopes = env_value(
+        "GRAPH_INDEXER_MAX_OPEN_SCOPES",
+        &DEFAULT_MAX_OPEN_SCOPES.to_string(),
+    )
+    .parse::<usize>()?;
+    if !(scope_concurrency..=MAX_OPEN_SCOPES).contains(&max_open_scopes) {
+        return Err(format!(
+            "GRAPH_INDEXER_MAX_OPEN_SCOPES must be between GRAPH_INDEXER_SCOPE_CONCURRENCY ({scope_concurrency}) and {MAX_OPEN_SCOPES}"
+        )
+        .into());
+    }
     // The tail cost gate. Each WAL file in the span between the previous
     // generation and the durable head is one object-store round trip, and the
     // span grows with write activity, not graph size — an uncapped walk can
@@ -508,6 +760,14 @@ async fn main() -> RuntimeResult<()> {
         root_scope.graph_id.clone(),
         Arc::clone(&object_store),
     );
+    let scope_cache = Arc::new(IndexerScopeCache::new(
+        data_path.clone(),
+        cells.clone(),
+        Arc::clone(&object_store),
+        open_options.clone(),
+        max_open_scopes,
+        Arc::clone(&metrics),
+    ));
     let mut shutdown = Box::pin(shutdown_signal());
     tracing::info!(
         scope = %root_scope,
@@ -516,6 +776,7 @@ async fn main() -> RuntimeResult<()> {
         incremental_min_edges,
         max_wal_tail_files,
         scope_concurrency,
+        max_open_scopes,
         "graph indexer started"
     );
 
@@ -538,13 +799,12 @@ async fn main() -> RuntimeResult<()> {
         let outcome = run_registered_scopes_cycle(
             &data_path,
             &scope_directory,
-            &cells,
             Arc::clone(&object_store),
             retain_previous,
             build_mode,
             incremental_min_edges,
             scope_concurrency,
-            &open_options,
+            &scope_cache,
             &metrics,
         )
         .instrument(cycle_span.clone())
@@ -622,6 +882,7 @@ async fn main() -> RuntimeResult<()> {
         }
     }
     metrics.ready.store(false, Ordering::Release);
+    scope_cache.close().await?;
     admin.stop().await?;
     tracing::info!(scope = %root_scope, "graph indexer stopped");
     telemetry.shutdown();
@@ -632,13 +893,12 @@ async fn main() -> RuntimeResult<()> {
 async fn run_registered_scopes_cycle(
     data_path: &str,
     scope_directory: &ObjectStoreGraphScopeDirectory,
-    cells: &[String],
     object_store: Arc<dyn slatedb::object_store::ObjectStore>,
     retain_previous: usize,
     build_mode: IndexBuildMode,
     incremental_min_edges: u64,
     scope_concurrency: usize,
-    open_options: &GraphOpenOptions,
+    scope_cache: &Arc<IndexerScopeCache>,
     metrics: &IndexerMetrics,
 ) -> Result<(), CycleFailures> {
     let mut failures = CycleFailures::default();
@@ -678,6 +938,8 @@ async fn run_registered_scopes_cycle(
         }
     };
 
+    let registered = scopes.iter().cloned().collect::<BTreeSet<_>>();
+    scope_cache.retain_registered(&registered).await;
     if scopes.is_empty() {
         return Ok(());
     }
@@ -702,14 +964,11 @@ async fn run_registered_scopes_cycle(
         let runs = futures::stream::iter(batch.iter().cloned())
             .map(|scope| {
                 run_registered_scope(
-                    data_path,
                     scope,
-                    cells,
-                    Arc::clone(&object_store),
                     retain_previous,
                     build_mode,
                     incremental_min_edges,
-                    open_options,
+                    scope_cache,
                     metrics,
                 )
             })
@@ -748,14 +1007,11 @@ async fn run_registered_scopes_cycle(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_registered_scope(
-    data_path: &str,
     scope: GraphScope,
-    cells: &[String],
-    object_store: Arc<dyn slatedb::object_store::ObjectStore>,
     retain_previous: usize,
     build_mode: IndexBuildMode,
     incremental_min_edges: u64,
-    open_options: &GraphOpenOptions,
+    scope_cache: &IndexerScopeCache,
     metrics: &IndexerMetrics,
 ) -> CycleFailures {
     let mut failures = CycleFailures::default();
@@ -776,9 +1032,14 @@ async fn run_registered_scope(
             turbolay.outcome = Empty,
             error.class = Empty,
         );
-        match scope_has_data(data_path, &scope, cells, &object_store)
-            .instrument(has_data_span.clone())
-            .await
+        match scope_has_data(
+            &scope_cache.data_path,
+            &scope,
+            &scope_cache.cells,
+            &scope_cache.object_store,
+        )
+        .instrument(has_data_span.clone())
+        .await
         {
             Ok(true) => {
                 has_data_span.record("has_data", true);
@@ -790,6 +1051,16 @@ async fn run_registered_scope(
                 has_data_span.record("has_data", false);
                 has_data_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
                 scope_span.record(semconv::OUTCOME, Outcome::Skipped.as_str());
+                if let Err(error) = scope_cache.invalidate_scope(&scope).await {
+                    let failure = IndexFailure::kernel(
+                        "cluster_close",
+                        format!("close empty scope {scope_name}"),
+                        &error,
+                    )
+                    .with_scope(&scope_name);
+                    record_failure(&scope_span, &failure);
+                    failures.push(failure);
+                }
                 return failures;
             }
             Err(error) => {
@@ -810,19 +1081,14 @@ async fn run_registered_scope(
             parent: &scope_span,
             "index.cluster_open",
             turbolay.scope = %scope_name,
-            cell_count = cells.len(),
+            cell_count = scope_cache.cells.len(),
             turbolay.outcome = Empty,
             error.class = Empty,
         );
-        let cluster = match GraphCluster::open_cells_scoped_with_options(
-            data_path.to_string(),
-            scope.clone(),
-            cells.to_vec(),
-            Arc::clone(&object_store),
-            open_options.clone(),
-        )
-        .instrument(open_span.clone())
-        .await
+        let cluster = match scope_cache
+            .cluster_for_scope(&scope)
+            .instrument(open_span.clone())
+            .await
         {
             Ok(cluster) => {
                 record_success(&open_span);
@@ -849,7 +1115,7 @@ async fn run_registered_scope(
         if let Err(inner) = run_index_cycle(
             &cluster,
             &scope_name,
-            cells,
+            &scope_cache.cells,
             retain_previous,
             build_mode,
             incremental_min_edges,
@@ -862,22 +1128,17 @@ async fn run_registered_scope(
             failures.absorb(inner);
         }
 
-        let close_span = tracing::info_span!(
-            parent: &scope_span,
-            "index.cluster_close",
-            turbolay.scope = %scope_name,
-            turbolay.outcome = Empty,
-            error.class = Empty,
-        );
-        if let Err(error) = cluster.close().instrument(close_span.clone()).await {
-            let failure =
-                IndexFailure::kernel("cluster_close", format!("close scope {scope_name}"), &error)
-                    .with_scope(&scope_name);
-            record_failure(&close_span, &failure);
-            scope_failed = true;
-            failures.push(failure);
-        } else {
-            record_success(&close_span);
+        if scope_failed {
+            if let Err(error) = scope_cache.invalidate(&scope, &cluster).await {
+                let failure = IndexFailure::kernel(
+                    "cluster_close",
+                    format!("close failed scope {scope_name}"),
+                    &error,
+                )
+                .with_scope(&scope_name);
+                record_failure(&scope_span, &failure);
+                failures.push(failure);
+            }
         }
 
         if scope_failed {
@@ -1457,12 +1718,27 @@ fn render_metrics(metrics: &IndexerMetrics) -> String {
             "graph_indexer_failed_cycles {}\n",
             "# TYPE graph_indexer_open_failures counter\n",
             "graph_indexer_open_failures {}\n",
+            "# TYPE graph_indexer_scope_cache_hits counter\n",
+            "graph_indexer_scope_cache_hits {}\n",
+            "# TYPE graph_indexer_scope_cache_misses counter\n",
+            "graph_indexer_scope_cache_misses {}\n",
+            "# TYPE graph_indexer_scope_cache_evictions counter\n",
+            "graph_indexer_scope_cache_evictions {}\n",
+            "# TYPE graph_indexer_scope_cache_close_failures counter\n",
+            "graph_indexer_scope_cache_close_failures {}\n",
+            "# TYPE graph_indexer_scope_cache_entries gauge\n",
+            "graph_indexer_scope_cache_entries {}\n",
         ),
         u8::from(metrics.ready.load(Ordering::Acquire)),
         metrics.cycles.load(Ordering::Relaxed),
         metrics.successful_cycles.load(Ordering::Relaxed),
         metrics.failed_cycles.load(Ordering::Relaxed),
         metrics.open_failures.load(Ordering::Relaxed),
+        metrics.scope_cache_hits.load(Ordering::Relaxed),
+        metrics.scope_cache_misses.load(Ordering::Relaxed),
+        metrics.scope_cache_evictions.load(Ordering::Relaxed),
+        metrics.scope_cache_close_failures.load(Ordering::Relaxed),
+        metrics.scope_cache_entries.load(Ordering::Acquire),
     );
     append_dimensioned(&mut output, &metrics.dimensioned_snapshot());
     output.push_str(&format!(
@@ -1632,6 +1908,21 @@ mod tests {
 
     use super::*;
 
+    fn test_scope_cache(
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        metrics: Arc<IndexerMetrics>,
+        max_open_scopes: usize,
+    ) -> Arc<IndexerScopeCache> {
+        Arc::new(IndexerScopeCache::new(
+            "graph/data".to_string(),
+            vec!["cell-0".to_string()],
+            object_store,
+            GraphOpenOptions::default(),
+            max_open_scopes,
+            metrics,
+        ))
+    }
+
     /// The kill switch defaults to the pre-existing behaviour, and refuses a
     /// spelling it does not understand rather than silently choosing one — an
     /// operator who typos `incremenal` during an incident must be told, not
@@ -1713,6 +2004,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scope_cache_reuses_and_evicts_idle_readers() {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
+        let metrics = Arc::new(IndexerMetrics::default());
+        let cache = test_scope_cache(object_store, Arc::clone(&metrics), 1);
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let first_scope = GraphScope::new(
+            root.child(NamespaceId::new("tenant-a").unwrap()).unwrap(),
+            GraphId::new("hydradb").unwrap(),
+        );
+        let second_scope = GraphScope::new(
+            root.child(NamespaceId::new("tenant-b").unwrap()).unwrap(),
+            GraphId::new("hydradb").unwrap(),
+        );
+
+        let first = cache.cluster_for_scope(&first_scope).await.unwrap();
+        let reused = cache.cluster_for_scope(&first_scope).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+        drop(first);
+        drop(reused);
+
+        let second = cache.cluster_for_scope(&second_scope).await.unwrap();
+        drop(second);
+
+        assert_eq!(metrics.scope_cache_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.scope_cache_misses.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.scope_cache_evictions.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.scope_cache_entries.load(Ordering::Acquire), 1);
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn scope_scheduler_rejects_unsafe_concurrency_without_panicking() {
         let object_store = Arc::new(InMemory::new()) as Arc<dyn slatedb::object_store::ObjectStore>;
         let root = NamespacePath::root(NamespaceId::new("production").unwrap());
@@ -1722,19 +2044,20 @@ mod tests {
             GraphId::new("hydradb").unwrap(),
             Arc::clone(&object_store),
         );
+        let metrics = Arc::new(IndexerMetrics::default());
+        let cache = test_scope_cache(Arc::clone(&object_store), Arc::clone(&metrics), 1);
 
         for invalid in [0, MAX_SCOPE_CONCURRENCY + 1] {
             let failures = run_registered_scopes_cycle(
                 "graph/data",
                 &directory,
-                &["cell-0".to_string()],
                 Arc::clone(&object_store),
                 1,
                 IndexBuildMode::Full,
                 250_000,
                 invalid,
-                &GraphOpenOptions::default(),
-                &IndexerMetrics::default(),
+                &cache,
+                &metrics,
             )
             .await
             .expect_err("unsafe concurrency must be rejected before chunking scopes");
@@ -1765,18 +2088,18 @@ mod tests {
             Arc::clone(&object_store),
         );
         directory.register(&scope).await.unwrap();
-        let metrics = IndexerMetrics::default();
+        let metrics = Arc::new(IndexerMetrics::default());
+        let cache = test_scope_cache(Arc::clone(&object_store), Arc::clone(&metrics), 1);
 
         run_registered_scopes_cycle(
             "graph/data",
             &directory,
-            &["cell-0".to_string()],
             Arc::clone(&object_store),
             1,
             IndexBuildMode::Full,
             250_000,
             1,
-            &GraphOpenOptions::default(),
+            &cache,
             &metrics,
         )
         .await
@@ -1808,13 +2131,48 @@ mod tests {
         run_registered_scopes_cycle(
             "graph/data",
             &directory,
-            &["cell-0".to_string()],
             Arc::clone(&object_store),
             1,
             IndexBuildMode::Full,
             250_000,
             1,
-            &GraphOpenOptions::default(),
+            &cache,
+            &metrics,
+        )
+        .await
+        .unwrap();
+
+        let writer = GraphCluster::open_cells_standalone_writers_scoped(
+            "graph/data",
+            scope.clone(),
+            ["cell-0"],
+            Arc::clone(&object_store),
+        )
+        .await
+        .unwrap();
+        writer
+            .shard("cell-0")
+            .unwrap()
+            .write_edge(EdgeMutation {
+                cell_id: "cell-0".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src: 2,
+                dst: 3,
+                idempotency_key: "indexer-scope-later-write".to_string(),
+            })
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        run_registered_scopes_cycle(
+            "graph/data",
+            &directory,
+            Arc::clone(&object_store),
+            1,
+            IndexBuildMode::Full,
+            250_000,
+            1,
+            &cache,
             &metrics,
         )
         .await
@@ -1824,33 +2182,45 @@ mod tests {
             BTreeMap::from([(
                 ("cell-0".to_string(), "FOLLOWS".to_string()),
                 DimensionedCounters {
-                    generations_published: 1,
+                    generations_published: 2,
                     generation_failures: 0,
                     generations_deleted: 0,
-                    // One edge (1 -> 2) in the published generation, scanned
-                    // by the full build that produced it.
-                    full_build_edges: 1,
+                    // The warm cached reader must refresh before the second
+                    // build, so it scans one edge and then both edges.
+                    full_build_edges: 3,
                     incremental_delta_edges: 0,
                     incremental_fallbacks: 0,
                 },
             )]),
             "the publish should be attributed to the cell and edge type that produced it",
         );
+        assert_eq!(metrics.scope_cache_misses.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.scope_cache_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.scope_cache_entries.load(Ordering::Acquire), 1);
 
-        let reader = GraphCluster::open_cells_scoped("graph/data", scope, ["cell-0"], object_store)
-            .await
-            .unwrap();
-        assert!(reader
-            .shard("cell-0")
-            .unwrap()
-            .current_graph_index("cell-0", "FOLLOWS")
-            .await
-            .unwrap()
-            .is_some());
+        let reader = GraphCluster::open_cells_scoped(
+            "graph/data",
+            scope,
+            ["cell-0"],
+            Arc::clone(&object_store),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reader
+                .shard("cell-0")
+                .unwrap()
+                .current_graph_index("cell-0", "FOLLOWS")
+                .await
+                .unwrap()
+                .map(|generation| generation.edge_count),
+            Some(2)
+        );
         reader.close().await.unwrap();
+        cache.close().await.unwrap();
     }
 
-    /// The fourteen series a scrape sees when nothing has been indexed yet.
+    /// Every series a scrape sees when nothing has been indexed yet.
     ///
     /// Pinned in full rather than probed, because the point of this change is
     /// that the process-global half did *not* move: `ready` through
@@ -1876,6 +2246,16 @@ mod tests {
                 "graph_indexer_failed_cycles 0\n",
                 "# TYPE graph_indexer_open_failures counter\n",
                 "graph_indexer_open_failures 0\n",
+                "# TYPE graph_indexer_scope_cache_hits counter\n",
+                "graph_indexer_scope_cache_hits 0\n",
+                "# TYPE graph_indexer_scope_cache_misses counter\n",
+                "graph_indexer_scope_cache_misses 0\n",
+                "# TYPE graph_indexer_scope_cache_evictions counter\n",
+                "graph_indexer_scope_cache_evictions 0\n",
+                "# TYPE graph_indexer_scope_cache_close_failures counter\n",
+                "graph_indexer_scope_cache_close_failures 0\n",
+                "# TYPE graph_indexer_scope_cache_entries gauge\n",
+                "graph_indexer_scope_cache_entries 0\n",
                 "# TYPE graph_indexer_generations_published counter\n",
                 "# TYPE graph_indexer_generation_failures counter\n",
                 "# TYPE graph_indexer_generations_deleted counter\n",
