@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "query-transport")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -114,6 +114,10 @@ pub struct ScopedRoutedGraphCluster {
     max_open_scopes: usize,
     access_clock: AtomicU64,
     clusters: tokio::sync::Mutex<BTreeMap<GraphScope, ScopedRoutedClusterEntry>>,
+    scope_open_gates:
+        tokio::sync::Mutex<BTreeMap<GraphScope, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    scope_capacity_gate: tokio::sync::Mutex<()>,
+    scope_open_reservations: AtomicUsize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

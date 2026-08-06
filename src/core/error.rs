@@ -202,11 +202,12 @@ impl GraphError {
     /// The strings are the wire vocabulary and must stay identical to
     /// `turbolay_telemetry::ErrorClass::as_str` minus its `other`, which nothing
     /// in this tree constructs.
-    pub const CLASSES: [&'static str; 10] = [
+    pub const CLASSES: [&'static str; 11] = [
         "contention",
         "fencing",
         "freshness",
         "admission",
+        "timeout",
         "query",
         "authz",
         "corruption",
@@ -229,12 +230,13 @@ impl GraphError {
     pub(crate) const CLASS_FENCING: usize = 1;
     pub(crate) const CLASS_FRESHNESS: usize = 2;
     pub(crate) const CLASS_ADMISSION: usize = 3;
-    pub(crate) const CLASS_QUERY: usize = 4;
-    pub(crate) const CLASS_AUTHZ: usize = 5;
-    pub(crate) const CLASS_CORRUPTION: usize = 6;
-    pub(crate) const CLASS_CONFIG: usize = 7;
-    pub(crate) const CLASS_STORAGE: usize = 8;
-    pub(crate) const CLASS_KERNEL: usize = 9;
+    pub(crate) const CLASS_TIMEOUT: usize = 4;
+    pub(crate) const CLASS_QUERY: usize = 5;
+    pub(crate) const CLASS_AUTHZ: usize = 6;
+    pub(crate) const CLASS_CORRUPTION: usize = 7;
+    pub(crate) const CLASS_CONFIG: usize = 8;
+    pub(crate) const CLASS_STORAGE: usize = 9;
+    pub(crate) const CLASS_KERNEL: usize = 10;
 
     /// The coarse failure class recorded as the `error.class` span attribute.
     ///
@@ -297,7 +299,9 @@ impl GraphError {
             | Self::QueryStatsSnapshotChanged { .. }
             | Self::ControlWatermarkRegression { .. } => Self::CLASS_FRESHNESS,
 
-            Self::AdmissionRejected { .. } | Self::QueryTimeout { .. } => Self::CLASS_ADMISSION,
+            Self::AdmissionRejected { .. } => Self::CLASS_ADMISSION,
+
+            Self::QueryTimeout { .. } => Self::CLASS_TIMEOUT,
 
             Self::QueryParse { .. }
             | Self::UnsupportedQuery { .. }
@@ -349,6 +353,11 @@ impl GraphError {
                 operation: "test",
                 actual: 2,
                 limit: 1,
+            },
+            Self::QueryTimeout {
+                operation: "test",
+                elapsed_ms: 2,
+                limit_ms: 1,
             },
             Self::QueryParse {
                 dialect: "cypher",

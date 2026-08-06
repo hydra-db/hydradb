@@ -1,18 +1,19 @@
 use super::*;
 
-/// The ten reachable classes, written out rather than derived from
+/// The eleven reachable classes, written out rather than derived from
 /// [`GraphError::CLASSES`], so that the array and the vocabulary are two
 /// statements that can disagree instead of one that cannot be checked.
 ///
-/// Ten and not eleven: `turbolay_telemetry::ErrorClass` also has `Other`, and
+/// Eleven and not twelve: `turbolay_telemetry::ErrorClass` also has `Other`, and
 /// nothing in this tree constructs it. There is no `other` arm here and there
 /// must not be one — the whole value of the taxonomy is that an unclassified
 /// variant is a build failure rather than a bucket nobody can act on.
-const EXPECTED_CLASSES: [&str; 10] = [
+const EXPECTED_CLASSES: [&str; 11] = [
     "contention",
     "fencing",
     "freshness",
     "admission",
+    "timeout",
     "query",
     "authz",
     "corruption",
@@ -22,9 +23,9 @@ const EXPECTED_CLASSES: [&str; 10] = [
 ];
 
 #[test]
-fn the_vocabulary_is_exactly_the_ten_reachable_classes() {
+fn the_vocabulary_is_exactly_the_eleven_reachable_classes() {
     assert_eq!(GraphError::CLASSES, EXPECTED_CLASSES);
-    assert_eq!(GraphError::CLASS_COUNT, 10);
+    assert_eq!(GraphError::CLASS_COUNT, 11);
 }
 
 #[test]
@@ -59,6 +60,7 @@ fn class_constants_index_their_own_name() {
         GraphError::CLASSES[GraphError::CLASS_ADMISSION],
         "admission"
     );
+    assert_eq!(GraphError::CLASSES[GraphError::CLASS_TIMEOUT], "timeout");
     assert_eq!(GraphError::CLASSES[GraphError::CLASS_QUERY], "query");
     assert_eq!(GraphError::CLASSES[GraphError::CLASS_AUTHZ], "authz");
     assert_eq!(

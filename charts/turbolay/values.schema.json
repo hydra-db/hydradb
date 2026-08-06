@@ -143,6 +143,7 @@
       "properties": {
         "rustLog": { "type": "string" },
         "maxOpenScopes": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "readerWalReplayConcurrency": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "maxConcurrentQueries": { "$ref": "#/definitions/unsignedDecimal" },
         "maxQueryScanEdges": { "$ref": "#/definitions/unsignedDecimal" },
         "maxQueryRuntimeMs": { "$ref": "#/definitions/unsignedDecimal" },

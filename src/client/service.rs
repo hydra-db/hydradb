@@ -1298,7 +1298,8 @@ impl ClientQueryService {
                 runtime_limit_ms,
                 async {
                     self.validate_bookmark(&request).await?;
-                    self.refresh_strong_read(&request, action).await?;
+                    self.refresh_strong_read(&request, action, &cancellation_token)
+                        .await?;
                     let mut context = query_context(
                         session,
                         &request,
@@ -1479,7 +1480,8 @@ impl ClientQueryService {
                         // one SlateDB DbSnapshot for this complete result.
                         context.read_epoch = None;
                         context.max_result_bytes = Some(self.inner.config.max_cursor_buffer_bytes);
-                        self.refresh_strong_read(&request, action).await?;
+                        self.refresh_strong_read(&request, action, &cancellation_token)
+                            .await?;
                         let result = match batch_operation {
                             Some(operation) => {
                                 self.inner.client.execute_batch(context, operation).await?
@@ -1924,6 +1926,7 @@ impl ClientQueryService {
         &self,
         request: &ClientQueryRequest,
         action: QueryTransportAction,
+        cancellation_token: &QueryCancellationToken,
     ) -> Result<()> {
         if request.consistency != ClientReadConsistency::Strong {
             return Ok(());
@@ -1934,14 +1937,26 @@ impl ClientQueryService {
                 feature: "strong consistency applies only to read queries".to_string(),
             });
         }
-        self.inner
+        let span = tracing::info_span!(
+            "query.strong_refresh",
+            turbolay.scope = %request.target.scope,
+            turbolay.cell_id = %request.target.cell_id,
+            error.class = tracing::field::Empty,
+        );
+        let refresh = self
+            .inner
             .client
             .refresh_storage_sequence(&request.target.scope, &request.target.cell_id)
-            .await?
-            .ok_or_else(|| GraphError::UnsupportedQuery {
-                dialect: "ClientProtocol",
-                feature: "backend cannot refresh the latest durable SlateDB frontier".to_string(),
-            })?;
+            .instrument(span.clone());
+        tokio::pin!(refresh);
+        let sequence = tokio::select! {
+            result = &mut refresh => result.inspect_err(|error| record_span_error(&span, error))?,
+            _ = cancellation_token.cancelled() => return Err(client_query_cancelled()),
+        };
+        sequence.ok_or_else(|| GraphError::UnsupportedQuery {
+            dialect: "ClientProtocol",
+            feature: "backend cannot refresh the latest durable SlateDB frontier".to_string(),
+        })?;
         Ok(())
     }
 
