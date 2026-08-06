@@ -196,7 +196,8 @@
     },
     "indexerWorkload": {
       "type": "object",
-      "required": ["enabled", "replicaCount", "intervalMs", "retainPreviousGenerations", "buildMode", "incrementalMinEdges", "resources", "serviceAccount"],
+      "$comment": "templates/validate.yaml enforces maxOpenScopes >= scopeConcurrency because JSON Schema draft-07 cannot compare sibling numeric values",
+      "required": ["enabled", "replicaCount", "intervalMs", "retainPreviousGenerations", "buildMode", "incrementalMinEdges", "scopeConcurrency", "maxOpenScopes", "maxWalTailFiles", "walTailFetchConcurrency", "resources", "serviceAccount"],
       "properties": {
         "enabled": { "type": "boolean" },
         "replicaCount": { "type": "integer", "minimum": 1, "maximum": 100 },
@@ -204,6 +205,10 @@
         "retainPreviousGenerations": { "$ref": "#/definitions/unsignedDecimal" },
         "buildMode": { "enum": ["full", "incremental"] },
         "incrementalMinEdges": { "$ref": "#/definitions/unsignedDecimal" },
+        "scopeConcurrency": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "maxOpenScopes": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "maxWalTailFiles": { "$ref": "#/definitions/unsignedDecimal" },
+        "walTailFetchConcurrency": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "resources": { "type": "object" },
         "serviceAccount": { "type": "object" },
         "podAnnotations": { "type": "object" },

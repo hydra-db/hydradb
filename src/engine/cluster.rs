@@ -34,8 +34,25 @@ impl GraphCluster {
         cell_ids: impl IntoIterator<Item = impl Into<String>>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
+        Self::open_cells_scoped_with_options(
+            base_path,
+            scope,
+            cell_ids,
+            object_store,
+            GraphOpenOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn open_cells_scoped_with_options(
+        base_path: impl Into<String>,
+        scope: GraphScope,
+        cell_ids: impl IntoIterator<Item = impl Into<String>>,
+        object_store: Arc<dyn ObjectStore>,
+        options: GraphOpenOptions,
+    ) -> Result<Self> {
         let store_path = scope.scoped_store_path(&base_path.into());
-        Self::open_cells_at_path(store_path, scope, cell_ids, object_store, false).await
+        Self::open_cells_at_path(store_path, scope, cell_ids, object_store, false, options).await
     }
 
     pub async fn open_cells_standalone_writers(
@@ -59,7 +76,15 @@ impl GraphCluster {
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self> {
         let store_path = scope.scoped_store_path(&base_path.into());
-        Self::open_cells_at_path(store_path, scope, cell_ids, object_store, true).await
+        Self::open_cells_at_path(
+            store_path,
+            scope,
+            cell_ids,
+            object_store,
+            true,
+            GraphOpenOptions::default(),
+        )
+        .await
     }
 
     async fn open_cells_at_path(
@@ -68,6 +93,7 @@ impl GraphCluster {
         cell_ids: impl IntoIterator<Item = impl Into<String>>,
         object_store: Arc<dyn ObjectStore>,
         writable: bool,
+        options: GraphOpenOptions,
     ) -> Result<Self> {
         let cell_ids = cell_ids
             .into_iter()
@@ -80,9 +106,15 @@ impl GraphCluster {
         for cell_id in cell_ids {
             let path = format!("{base_path}/{cell_id}");
             let opened = if writable {
-                GraphShard::open_standalone_writer(path, Arc::clone(&object_store)).await
+                GraphShard::open_standalone_writer_with_options(
+                    path,
+                    Arc::clone(&object_store),
+                    options.clone(),
+                )
+                .await
             } else {
-                GraphShard::open(path, Arc::clone(&object_store)).await
+                GraphShard::open_with_options(path, Arc::clone(&object_store), options.clone())
+                    .await
             };
             let shard = match opened {
                 Ok(shard) => shard,

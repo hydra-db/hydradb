@@ -102,6 +102,7 @@ pub struct GraphShard {
         Mutex<BoundedGraphCache<RelationshipPropertyRowsCacheKey, RelationshipRowsCacheValue>>,
     #[cfg(feature = "opencypher")]
     pub(crate) native_path_page_cursors: Mutex<NativePathPageCursorStore>,
+    pub(crate) wal_tail_file_cache: Mutex<crate::shard::topology_tail::WalTailFileCache>,
 }
 
 #[derive(Clone)]

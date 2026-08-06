@@ -113,6 +113,19 @@ indexer:
   # Small indexes can be cheaper to rebuild from the block cache. Incremental
   # mode uses the full path below this current-generation edge count.
   incrementalMinEdges: 250000
+  # Number of graph scopes opened and indexed concurrently. Work is committed
+  # to a durable progress cursor in batches of this size.
+  scopeConcurrency: 8
+  # Maximum read-only scope handles retained between indexing cycles. Reusing
+  # a handle avoids replaying the same durable SlateDB WAL on every sweep.
+  # Must be at least scopeConcurrency.
+  maxOpenScopes: 128
+  # Decline an incremental build when its immutable WAL span is larger than
+  # this and use the full snapshot build instead.
+  maxWalTailFiles: 4096
+  # Concurrent immutable WAL object reads and snapshot edge resolutions used
+  # by one incremental build.
+  walTailFetchConcurrency: 16
   serviceAccount:
     create: true
     name: ""

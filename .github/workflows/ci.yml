@@ -54,6 +54,21 @@ jobs:
           grep -q 'GRAPH_INDEXER_RETAIN_PREVIOUS: "1"' /tmp/turbolay-custom-auth.yaml
           grep -q 'GRAPH_INDEXER_BUILD_MODE: "full"' /tmp/turbolay-custom-auth.yaml
           grep -q 'GRAPH_INDEXER_INCREMENTAL_MIN_EDGES: "250000"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_SCOPE_CONCURRENCY: "8"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_MAX_OPEN_SCOPES: "128"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_MAX_TAIL_FILES: "4096"' /tmp/turbolay-custom-auth.yaml
+          grep -q 'GRAPH_WAL_TAIL_FETCH_CONCURRENCY: "16"' /tmp/turbolay-custom-auth.yaml
+          if helm template turbolay charts/turbolay \
+            --namespace turbolay \
+            --values charts/turbolay/ci/ci-values.yaml \
+            --set indexer.scopeConcurrency=64 \
+            --set indexer.maxOpenScopes=1 \
+            > /tmp/turbolay-invalid-indexer-capacity.yaml 2>&1; then
+            echo "indexer reader capacity below scope concurrency was accepted"
+            exit 1
+          fi
+          grep -q 'indexer.maxOpenScopes must be greater than or equal to indexer.scopeConcurrency' \
+            /tmp/turbolay-invalid-indexer-capacity.yaml
           helm template turbolay charts/turbolay \
             --namespace turbolay \
             --values charts/turbolay/ci/ci-values.yaml \

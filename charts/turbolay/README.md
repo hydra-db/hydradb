@@ -113,7 +113,14 @@ indexer.buildMode defaults to full. Set it to incremental to patch the previous
 CSC generation from the durable WAL tail instead of rescanning the entire
 canonical adjacency. indexer.incrementalMinEdges keeps smaller indexes on the
 full path, and any unavailable or oversized tail safely falls back to a full
-rebuild.
+rebuild. `indexer.maxWalTailFiles` bounds that tail, while
+`indexer.walTailFetchConcurrency` bounds parallel immutable WAL reads and edge
+resolution. Registered scopes run in batches of `indexer.scopeConcurrency`.
+The indexer advances a CAS-protected cursor after each completed batch, so a
+restart resumes fairly and can replay at most the unfinished batch. Read-only
+scope handles remain open in a bounded LRU of `indexer.maxOpenScopes`; retained
+SlateDB readers refresh only the new durable WAL instead of replaying the whole
+tail on every cycle.
 
 The development example references an existing MinIO Service only to exercise
 the S3-compatible path without AWS. The chart does not install MinIO, and the
