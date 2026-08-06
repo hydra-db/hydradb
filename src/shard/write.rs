@@ -1868,7 +1868,8 @@ impl GraphShard {
                 dst,
             };
             let edge_value = encode_edge_record(&record);
-            mark_adjacency_dirty_txn(&txn, cell_id, edge_type, epoch)?;
+            self.mark_topology_change_txn(&txn, cell_id, edge_type, epoch, &[(src, dst, true)])
+                .await?;
             txn.put(
                 keys::out_edge(cell_id, edge_type, src, dst).as_bytes(),
                 &edge_value,
@@ -2188,7 +2189,14 @@ impl GraphShard {
                 dst: mutation.dst,
             };
             let edge_value = encode_edge_record(&record);
-            mark_adjacency_dirty_txn(&txn, &mutation.cell_id, &mutation.edge_type, epoch)?;
+            self.mark_topology_change_txn(
+                &txn,
+                &mutation.cell_id,
+                &mutation.edge_type,
+                epoch,
+                &[(mutation.src, mutation.dst, true)],
+            )
+            .await?;
             let out_degree_key =
                 keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
             let out_degree = read_counter_txn(&txn, &out_degree_key).await? + 1;
@@ -2888,7 +2896,14 @@ impl GraphShard {
             dst: mutation.dst,
         };
         let edge_value = encode_edge_record(&record);
-        mark_adjacency_dirty_txn(&txn, &mutation.cell_id, &mutation.edge_type, epoch)?;
+        self.mark_topology_change_txn(
+            &txn,
+            &mutation.cell_id,
+            &mutation.edge_type,
+            epoch,
+            &[(mutation.src, mutation.dst, true)],
+        )
+        .await?;
         let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
         let out_degree = read_counter_txn(&txn, &out_degree_key).await? + 1;
         let in_degree = if self.writes_reverse_index() {
@@ -3331,7 +3346,14 @@ impl GraphShard {
                 epoch: next_epoch,
                 deleted: true,
             };
-            mark_adjacency_dirty_txn(&txn, cell_id, &mutation.edge_type, next_epoch)?;
+            self.mark_topology_change_txn(
+                &txn,
+                cell_id,
+                &mutation.edge_type,
+                next_epoch,
+                &[(mutation.src, mutation.dst, false)],
+            )
+            .await?;
             let edge_metadata_key =
                 keys::edge_metadata(cell_id, &mutation.edge_type, mutation.src, mutation.dst);
             let previous_edge_metadata = match read_txn_remote(&txn, &edge_metadata_key).await? {
@@ -3573,7 +3595,14 @@ impl GraphShard {
                 epoch,
                 deleted: true,
             };
-            mark_adjacency_dirty_txn(&txn, &mutation.cell_id, &mutation.edge_type, epoch)?;
+            self.mark_topology_change_txn(
+                &txn,
+                &mutation.cell_id,
+                &mutation.edge_type,
+                epoch,
+                &[(mutation.src, mutation.dst, false)],
+            )
+            .await?;
             let out_degree_key =
                 keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
             let out_degree = read_counter_txn(&txn, &out_degree_key)
@@ -3628,7 +3657,14 @@ impl GraphShard {
             epoch,
             deleted: true,
         };
-        mark_adjacency_dirty_txn(&txn, &mutation.cell_id, &mutation.edge_type, epoch)?;
+        self.mark_topology_change_txn(
+            &txn,
+            &mutation.cell_id,
+            &mutation.edge_type,
+            epoch,
+            &[(mutation.src, mutation.dst, false)],
+        )
+        .await?;
 
         let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
         let out_degree = read_counter_txn(&txn, &out_degree_key)
@@ -4281,7 +4317,14 @@ impl GraphShard {
                 already_existed: false,
             };
             let edge_value = encode_edge_record(&record);
-            mark_adjacency_dirty_txn(&txn, cell_id, &mutation.edge_type, next_epoch)?;
+            self.mark_topology_change_txn(
+                &txn,
+                cell_id,
+                &mutation.edge_type,
+                next_epoch,
+                &[(mutation.src, mutation.dst, true)],
+            )
+            .await?;
             txn.put(
                 keys::out_edge(cell_id, &mutation.edge_type, mutation.src, mutation.dst).as_bytes(),
                 &edge_value,
@@ -4559,7 +4602,10 @@ impl GraphShard {
         };
 
         if inserted > 0 {
-            mark_adjacency_dirty_txn(&txn, cell_id, edge_type, end_epoch)?;
+            let changes: Vec<(VertexId, VertexId, bool)> =
+                inserted_dsts.iter().map(|dst| (src, *dst, true)).collect();
+            self.mark_topology_change_txn(&txn, cell_id, edge_type, end_epoch, &changes)
+                .await?;
             for dst in &inserted_dsts {
                 txn.delete(keys::out_segment_tombstone(cell_id, edge_type, src, *dst).as_bytes())?;
             }
@@ -4705,7 +4751,8 @@ impl GraphShard {
                 dst,
             };
             let edge_value = encode_edge_record(&record);
-            mark_adjacency_dirty_txn(&txn, cell_id, edge_type, epoch)?;
+            self.mark_topology_change_txn(&txn, cell_id, edge_type, epoch, &[(src, dst, true)])
+                .await?;
             txn.put(
                 keys::out_edge(cell_id, edge_type, src, dst).as_bytes(),
                 &edge_value,
@@ -4746,7 +4793,11 @@ impl GraphShard {
         }
         let counter_read_elapsed = counter_read_started.elapsed();
         if inserted > 0 {
-            mark_adjacency_dirty_txn(&txn, cell_id, edge_type, end_epoch)?;
+            // The per-edge loop above already logged each inserted edge to the
+            // xlog at this same epoch; this re-mark only refreshes the dirty
+            // marker, so it carries no changes.
+            self.mark_topology_change_txn(&txn, cell_id, edge_type, end_epoch, &[])
+                .await?;
         }
         txn.put(
             idem_key.as_bytes(),
@@ -5421,7 +5472,15 @@ async fn delete_structural_edge_txn(
     if read_txn_remote(txn, &edge_key).await?.is_none() {
         return Ok(());
     }
-    mark_adjacency_dirty_txn(txn, &mutation.cell_id, &mutation.edge_type, epoch)?;
+    shard
+        .mark_topology_change_txn(
+            txn,
+            &mutation.cell_id,
+            &mutation.edge_type,
+            epoch,
+            &[(mutation.src, mutation.dst, false)],
+        )
+        .await?;
     let out_degree_key = keys::degree_out(&mutation.cell_id, &mutation.edge_type, mutation.src);
     let out_degree = read_counter_txn(txn, &out_degree_key)
         .await?
@@ -5487,36 +5546,93 @@ async fn delete_structural_edge_txn(
     Ok(())
 }
 
-/// `write.index_update`: the dirty marker and adjacency generation the indexer
-/// later polls.
+/// `write.index_update`: the dirty marker, adjacency generation, and xlog
+/// entries — everything the indexer later consumes, written in the mutating
+/// transaction itself.
 ///
-/// Two in-transaction puts, so the span is nearly free — and it is the one place
-/// the write path and the indexing path name the same `(cell_id, edge_type,
-/// epoch)`. That triple is the attribute join §5 relies on to answer "did the
-/// write, the compile and the read agree on a generation", which is the
-/// BFG-006 / BFG-013 / BFG-014 question.
-fn mark_adjacency_dirty_txn(
-    txn: &DbTransaction,
-    cell_id: &str,
-    edge_type: &str,
-    epoch: StorageSequence,
-) -> Result<()> {
-    let span = tracing::info_span!(
-        "write.index_update",
-        turbolay.cell_id = %cell_id,
-        turbolay.edge_type = %edge_type,
-        turbolay.commit_epoch = epoch,
-    );
-    let _entered = span.enter();
-    txn.put(
-        keys::matrix_dirty(cell_id, edge_type).as_bytes(),
-        encode_u64(epoch),
-    )?;
-    txn.put(
-        keys::adjacency_generation(cell_id, edge_type).as_bytes(),
-        encode_u64(epoch),
-    )?;
-    Ok(())
+/// This is the changelog's chokepoint: every topology mutation site must call
+/// it, and the `changes` parameter forces each site to state, at compile
+/// time, exactly which edges changed and their existence *after* the commit.
+/// Over-logging is safe — values are final state, not operations, so a
+/// duplicate entry for the same `(src, dst)` at the same epoch is one key —
+/// but a *missed* site silently corrupts the incremental index, which is why
+/// the old delta-free signature no longer exists. Property-only updates pass
+/// an empty slice: they mark dirty but log nothing, because properties are
+/// not part of the CSC matrix.
+///
+/// The epoch stamped into the xlog key is the transaction's commit sequence,
+/// exactly — `commit_txn_strict_with_sequence` pins it and SlateDB rejects
+/// any other (`docs/plans/2026-08-05-edge-changelog-incremental-index.md`,
+/// "Correctness").
+///
+/// It is also the one place the write path and the indexing path name the
+/// same `(cell_id, edge_type, epoch)`. That triple is the attribute join §5
+/// relies on to answer "did the write, the compile and the read agree on a
+/// generation", which is the BFG-006 / BFG-013 / BFG-014 question.
+impl GraphShard {
+    pub(crate) async fn mark_topology_change_txn(
+        &self,
+        txn: &DbTransaction,
+        cell_id: &str,
+        edge_type: &str,
+        epoch: StorageSequence,
+        changes: &[(VertexId, VertexId, bool)],
+    ) -> Result<()> {
+        let span = tracing::info_span!(
+            "write.index_update",
+            turbolay.cell_id = %cell_id,
+            turbolay.edge_type = %edge_type,
+            turbolay.commit_epoch = epoch,
+            turbolay.xlog_changes = changes.len() as u64,
+        );
+        span.in_scope(|| {
+            txn.put(
+                keys::matrix_dirty(cell_id, edge_type).as_bytes(),
+                encode_u64(epoch),
+            )?;
+            txn.put(
+                keys::adjacency_generation(cell_id, edge_type).as_bytes(),
+                encode_u64(epoch),
+            )
+        })?;
+        if changes.is_empty() {
+            return Ok(());
+        }
+        // Coverage floor: the first-ever logged change for the pair sets the
+        // low-water mark to its own epoch, so the builder knows coverage
+        // begins here. The in-memory set only caches *confirmed presence* —
+        // a pending put is never cached, so a rolled-back transaction cannot
+        // strand the floor.
+        let floor_token = format!("{cell_id}/{edge_type}");
+        let ensured = self
+            .xlog_floor_ensured
+            .read()
+            .expect("xlog floor cache poisoned")
+            .contains(&floor_token);
+        if !ensured {
+            let low_key = keys::xlog_low_water(cell_id, edge_type);
+            match read_txn_remote(txn, &low_key).await? {
+                Some(_) => {
+                    self.xlog_floor_ensured
+                        .write()
+                        .expect("xlog floor cache poisoned")
+                        .insert(floor_token);
+                }
+                None => {
+                    txn.put(low_key.as_bytes(), encode_u64(epoch))?;
+                }
+            }
+        }
+        span.in_scope(|| {
+            for (src, dst, exists) in changes {
+                txn.put(
+                    keys::xlog_entry(cell_id, edge_type, epoch, *src, *dst).as_bytes(),
+                    if *exists { &[1u8][..] } else { &[0u8][..] },
+                )?;
+            }
+            Ok(())
+        })
+    }
 }
 
 async fn delete_relationships_for_structural_edge_txn(

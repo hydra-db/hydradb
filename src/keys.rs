@@ -32,6 +32,31 @@ pub fn adjacency_generation(cell_id: &str, edge_type: &str) -> String {
     format!("cell/{cell_id}/meta/adjacency_generation/{edge_type}")
 }
 
+/// One edge-changelog entry: the sequence is part of the key so entries never
+/// overwrite each other, and seq/src/dst zero-padding makes lexicographic
+/// order equal commit order. The 1-byte value is the edge's existence *after*
+/// the commit (final state, not operation), so last-in-sequence wins.
+pub fn xlog_entry(
+    cell_id: &str,
+    edge_type: &str,
+    sequence: StorageSequence,
+    src: VertexId,
+    dst: VertexId,
+) -> String {
+    format!("cell/{cell_id}/xlog/{edge_type}/{sequence:020}/{src:020}/{dst:020}")
+}
+
+pub fn xlog_type_prefix(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/xlog/{edge_type}/")
+}
+
+/// Lowest sequence whose xlog entries are still retained for the edge type —
+/// the coverage floor an incremental build checks before trusting the range
+/// scan. Written by the writer (first entry sets it, GC advances it).
+pub fn xlog_low_water(cell_id: &str, edge_type: &str) -> String {
+    format!("cell/{cell_id}/meta/xlog_low/{edge_type}")
+}
+
 pub fn idempotency(cell_id: &str, operation: &str, idempotency_key: &str) -> String {
     format!("cell/{cell_id}/idem/{operation}/{idempotency_key}")
 }
