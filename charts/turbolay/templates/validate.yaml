@@ -82,3 +82,6 @@
 {{- if and .Values.podDisruptionBudget.enabled .Values.indexer.enabled (gt (int .Values.podDisruptionBudget.indexer.minAvailable) (int .Values.indexer.replicaCount)) -}}
 {{- fail "podDisruptionBudget.indexer.minAvailable cannot exceed indexer.replicaCount" -}}
 {{- end -}}
+{{- if lt (int .Values.indexer.maxOpenScopes) (int .Values.indexer.scopeConcurrency) -}}
+{{- fail "indexer.maxOpenScopes must be greater than or equal to indexer.scopeConcurrency" -}}
+{{- end -}}
