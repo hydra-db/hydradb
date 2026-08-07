@@ -5562,8 +5562,8 @@ async fn delete_structural_edge_txn(
 ///
 /// The epoch stamped into the xlog key is the transaction's commit sequence,
 /// exactly — `commit_txn_strict_with_sequence` pins it and SlateDB rejects
-/// any other (`docs/plans/2026-08-05-edge-changelog-incremental-index.md`,
-/// "Correctness").
+/// any other (`batch_write.rs` in the pinned fork returns
+/// `InvalidSequenceNumber` for anything but the requested sequence).
 ///
 /// It is also the one place the write path and the indexing path name the
 /// same `(cell_id, edge_type, epoch)`. That triple is the attribute join §5
