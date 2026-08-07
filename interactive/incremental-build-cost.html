@@ -584,6 +584,7 @@ incrementally by a long-lived reader, not repeatedly by fresh opens.</p>
 </div>
 
 <h2><span class="no">10</span>Open questions for discussion</h2>
+<p><em>Preserved as written 2026-08-05; §11 records how each resolved.</em></p>
 <p><strong>Where does the changelog live?</strong> In the builder (fork exposes a replay
 callback; kernel stays generic) or inside the fork's reader itself (reusable by the read
 path's overlay too — which today re-derives the same tail per query and survives only by
@@ -597,6 +598,97 @@ measured EWMA of per-file RTT and per-edge scan rate (self-tuning, more moving p
 labeled by path, a counter for declined-for-cost, and keeping (not sampling away) the
 read path's declined-tail spans — this failure mode was invisible by construction; the
 next one shouldn't be.</p>
+
+<h2><span class="no">11</span>Landed: the changelog moved to commit time — the xlog</h2>
+<p>Shipped 2026-08-07 on <code>feat/xlog-incremental-index</code> (PR #25, ticket
+PRO-1469; full design and verification in
+<code>docs/plans/2026-08-05-edge-changelog-incremental-index.md</code>). §10's
+first question — where does the changelog live, the builder or the reader? —
+got a third answer that beats both: <strong>the write path itself.</strong>
+Every topology mutation writes one entry per changed edge, in its own
+transaction:</p>
+<pre><code>cell/{cell}/xlog/{edge_type}/{seq:020}/{src:020}/{dst:020}  →  0x01 exists / 0x00 deleted</code></pre>
+<p>Because the sequence and the edge are in the key, nothing overwrites; because
+seq/src/dst sort lexicographically, one edge type's changes are one contiguous
+run; and because the value is final state (last-in-sequence wins per
+<code>(src,&#8239;dst)</code>), overlay application is idempotent and crash-replay of
+an overlapping range is harmless. The entries ride the same WriteBatch → WAL
+object → memtable → SST pipeline the mutation already pays for — zero new
+files, zero new requests, ~72 bytes per change — and compaction folds them into
+the same fat SSTs the full scan reads. <strong>The delta ends up stored in
+Shape&nbsp;A</strong>: derivation is one bounded range scan, O(delta) bytes,
+independent of WAL file count, write cadence, and elapsed time.</p>
+<p>Why commit-time beats the §8-L2 replay-time hook it replaces: the changelog
+is <em>durable data</em>, not process RAM — it survives restarts, needs no
+keep-scopes-open LRU to outlive a visit, is already per edge type, and its
+sequence stamp is the pinned commit sequence the engine either honors exactly
+or rejects (<code>InvalidSequenceNumber</code>), so stamp order provably equals
+visibility order. Coverage is a range check against a low-water floor
+(<code>meta/xlog_low</code>), maintained by the writer and advanced by a
+writer-gated GC pass; a breach is a one-time bootstrap full build, never a
+wrong answer — the same decline-not-guess shape as everything else, minus the
+cost gate, because there is no cost to gate: <strong>the builder never walks
+WAL at all, so §8's L0 estimator question is moot and
+<code>max_wal_tail_files</code> is now a read-path-only knob.</strong>
+The compiler enforces capture coverage: <code>mark_adjacency_dirty_txn</code>
+became <code>mark_topology_change_txn(…, changes)</code>, all 11 mutation sites
+converted, old signature deleted — a future site that marks dirty without
+declaring its delta fails to compile, and a randomized property test
+(<code>xlog_incremental_matches_full_over_random_mutation_mix</code>) asserts
+payload-hash equality with a full rebuild after every mutation burst.</p>
+<div class="scroll">
+<table>
+  <thead><tr>
+    <th>environment · seed/type · span · delta</th>
+    <th class="num">incremental (cold / 2nd type)</th>
+    <th class="num">full, same seq</th>
+    <th class="num">vs full</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>in-memory · 20&#8239;k · 400 files · 200</td>
+      <td class="num">62 / 6 ms</td><td class="num">43 ms</td><td class="num">~1×</td></tr>
+    <tr><td>in-memory · 2&#8239;M · 1,000 files · 500</td>
+      <td class="num">413 / 367 ms</td><td class="num">2,680 ms</td><td class="num"><strong>6.5×</strong></td></tr>
+    <tr><td>MinIO · 200&#8239;k · 600 files · 300</td>
+      <td class="num">225 / 136 ms</td><td class="num">2,323 ms</td><td class="num"><strong>10–17×</strong></td></tr>
+    <tr><td>real S3 · 100&#8239;k · 500 files · 250</td>
+      <td class="num">11.6 / 6.7 s</td><td class="num">281.6 s</td><td class="num"><strong>24–42×</strong></td></tr>
+  </tbody>
+</table>
+</div>
+<p><strong>The staging replay, on real S3.</strong>
+<code>examples/staging_replay_bench.rs</code> recreates the operating loop that
+actually degraded — 8 edge types in one scope DB, an indexer cycle per round, ~215
+hot-type commits and exactly 15 edges per quiet type per cycle, each cycle's trickle
+~9 minutes of genuine elapsed time — so every quiet build faces §3's exact signature:
+a 15-edge delta under a ~330-file span it had no part in creating. Both paths ran in
+the <em>same run on the same bucket</em>: the bootstrap cycle's full builds took
+<strong>73–195&#8239;s per type, 18.3 minutes for the cycle</strong> — staging's
+regressed range, reproduced live — while cycles 1–3 built the same types
+incrementally in <strong>3–6&#8239;s each</strong> (~46&#8239;s of builds per cycle;
+the residue is the shared reader-refresh both paths pay). The same harness on MinIO
+isolates the xlog's own cost: <strong>17–28&#8239;ms</strong> per quiet type,
+0.6&#8239;s per cycle — and every cycle's content-addressed generation hash was
+byte-identical between the MinIO and S3 runs. One planned bootstrap, zero fallbacks
+after it, exact delta counts throughout, and the per-cycle full-rebuild equivalence
+probe agreed every time.</p>
+<p>Every run reported the <em>exact</em> trickled delta count with zero
+fallbacks. Compare §9: on this same bucket the serial walk could not finish a
+~1,000-file span in 10 minutes and the gated 16-way walk took 478&#8239;s —
+the xlog build is indifferent to the span entirely, including spans WAL GC has
+already collected, the failure that §9's last row could only survive by
+declining. The residual real-S3 incremental seconds are the shared
+reader-refresh replay both paths pay once per database per refresh; the
+in-memory 2&#8239;M row shows the CPU-side win (no per-edge string parsing) that
+remains after all request latency is subtracted. What is deliberately
+<em>not</em> claimed: the CSC re-encode and payload PUT are still O(graph) —
+§8's L3 (delta-shaped generations, now "Phase&nbsp;2" in the plan doc) is
+unchanged, unblocked, and fed directly by the xlog scan's output.</p>
+<p>Of §10's remaining questions: the keep-open LRU stays worthwhile purely for
+Loop&nbsp;2's open/close churn (the xlog no longer needs it for correctness);
+the estimator question dissolved with the gate; the observability items stand
+and now include the <code>artifact.xlog_gc</code> span the indexer's cleanup
+step emits.</p>
 
 <p class="footnote"><sup>1</sup> Sources: SigNoz traces
 (<code>artifact.build</code>, <code>artifact.publish</code> spans, Aug 1–5), Prometheus
