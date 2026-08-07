@@ -1301,6 +1301,7 @@ impl ScopedRoutedGraphCluster {
                 // and only then releases same-scope reopeners.
                 tokio::spawn(async move {
                     let result = cluster.close().await;
+                    drop(cluster);
                     close.release();
                     result
                 })
@@ -1677,6 +1678,67 @@ mod scoped_cluster_tests {
         }
         assert_eq!(runtime.loaded_scopes().await.len(), tenants.len());
         scopes
+    }
+
+    fn scoped_edge(key: &str) -> crate::EdgeMutation {
+        crate::EdgeMutation {
+            cell_id: "cell-0".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 1,
+            dst: 2,
+            idempotency_key: key.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn evicting_a_scope_drains_its_writer_with_an_active_reader_snapshot() {
+        let runtime = runtime_at_capacity("graph/active-reader-eviction", 1);
+        let first_scope = tenant_scope(&runtime, "tenant-first");
+        let first = runtime
+            .cluster_for_scope_write(&first_scope, "cell-0")
+            .await
+            .expect("the first scope opens for writes");
+        first
+            .write_edge(scoped_edge("first-write"))
+            .await
+            .expect("the first writer commits");
+
+        let shard = first.shard("cell-0").expect("the first shard exists");
+        let old_writer = shard.db.writer().expect("the first writer is installed");
+        let reader = shard
+            .db
+            .open_reader()
+            .await
+            .expect("the reader opens")
+            .expect("the initialized scope has a reader");
+        let snapshot = reader.snapshot().await.expect("the reader snapshot opens");
+        drop(first);
+
+        let second_scope = tenant_scope(&runtime, "tenant-second");
+        drop(
+            runtime
+                .cluster_for_scope(&second_scope)
+                .await
+                .expect("an active reader snapshot must not prevent writer retirement"),
+        );
+        assert_eq!(
+            old_writer.status().close_reason,
+            Some(slatedb::CloseReason::Clean),
+            "eviction must cleanly close the old writer before another scope can open"
+        );
+
+        drop(snapshot);
+        drop(reader);
+        let reopened = runtime
+            .cluster_for_scope_write(&first_scope, "cell-0")
+            .await
+            .expect("the evicted scope reopens for writes");
+        reopened
+            .write_edge(scoped_edge("reopened-write"))
+            .await
+            .expect("the replacement writer commits without fencing the old handle");
+        drop(reopened);
+        runtime.close().await.expect("the runtime drains");
     }
 
     #[tokio::test]
