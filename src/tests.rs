@@ -11996,6 +11996,7 @@ async fn cypher_edge_match_uses_destination_id_reverse_index_without_full_scan()
     }
 
     let pinned_snapshot = shard.db.snapshot().await.unwrap();
+    let pinned_epoch = pinned_snapshot.seq();
     shard
         .write_edge(EdgeMutation {
             cell_id: "reddit-home".to_string(),
@@ -12010,7 +12011,8 @@ async fn cypher_edge_match_uses_destination_id_reverse_index_without_full_scan()
     let rows = crate::GraphStore::scope_snapshot(
         pinned_snapshot,
         shard.execute_cypher_rows(
-            QueryContext::new("reddit-home", "cypher-dst-id-index-read"),
+            QueryContext::new("reddit-home", "cypher-dst-id-index-read")
+                .with_validated_storage_read_epoch(pinned_epoch, pinned_epoch),
             "MATCH (u)-[:FOLLOWS]->(v {id: 20}) RETURN u.id",
         ),
     )
