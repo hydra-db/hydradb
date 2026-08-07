@@ -1848,6 +1848,65 @@ mod scoped_cluster_tests {
     }
 
     #[tokio::test]
+    async fn duplicate_routed_runtimes_reject_mismatched_fence_backoff() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let make_runtime = |fence_backoff_interval| {
+            let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+            ScopedRoutedGraphCluster::new(
+                "graph/duplicate-runtime-config",
+                root,
+                GraphId::new("hydradb").unwrap(),
+                "node-a",
+                ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
+                PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
+                Arc::clone(&object_store),
+                GraphOpenOptions {
+                    fence_backoff_interval,
+                    ..GraphOpenOptions::default()
+                },
+                GraphMemoryConfig::default(),
+                16,
+            )
+            .unwrap()
+        };
+        let first_interval = Duration::from_secs(5);
+        let second_interval = Duration::from_secs(9);
+        let first_runtime = make_runtime(first_interval);
+        let second_runtime = make_runtime(second_interval);
+        let scope = tenant_scope(&first_runtime, "tenant-hot");
+
+        let first = first_runtime
+            .cluster_for_scope_write(&scope, "cell-0")
+            .await
+            .expect("the first runtime acquires the writer");
+        let error = match second_runtime
+            .cluster_for_scope_write(&scope, "cell-0")
+            .await
+        {
+            Ok(_) => panic!("a duplicate runtime must not inherit another fencing interval"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            GraphError::RoutedWriterConfigMismatch {
+                existing,
+                requested,
+                ..
+            } if existing == first_interval && requested == second_interval
+        ));
+
+        drop(first);
+        first_runtime
+            .close()
+            .await
+            .expect("the first runtime drains");
+        second_runtime
+            .close()
+            .await
+            .expect("the rejected runtime drains");
+    }
+
+    #[tokio::test]
     async fn a_cold_scope_open_does_not_lock_out_cached_scopes() {
         let runtime = runtime_at_capacity("graph/cold-open", 2);
         let hot = tenant_scope(&runtime, "tenant-hot");

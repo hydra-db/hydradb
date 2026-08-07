@@ -148,7 +148,7 @@ impl GraphShard {
             options.durability.clone(),
             options.fence_backoff_interval,
             process_writer_node_id,
-        );
+        )?;
         match &write_authority {
             GraphWriteAuthority::ReadOnly => {
                 let _ = db.open_reader().await?;

@@ -173,7 +173,7 @@ fn process_writer_state(
     object_store: &Arc<dyn ObjectStore>,
     heartbeat_interval: Duration,
     node_id: Option<&str>,
-) -> Arc<ProcessWriterState> {
+) -> Result<Arc<ProcessWriterState>> {
     let new_state = || {
         Arc::new(ProcessWriterState {
             writer: StdRwLock::new(None),
@@ -187,7 +187,7 @@ fn process_writer_state(
     let Some(node_id) = node_id else {
         let state = new_state();
         state.add_owner();
-        return state;
+        return Ok(state);
     };
     let key = ProcessWriterKey {
         object_store: Arc::as_ptr(object_store) as *const () as usize,
@@ -207,9 +207,16 @@ fn process_writer_state(
             registry.insert(key, Arc::downgrade(&state));
             state
         });
-    debug_assert_eq!(state.heartbeat_interval, heartbeat_interval);
+    if state.heartbeat_interval != heartbeat_interval {
+        return Err(GraphError::RoutedWriterConfigMismatch {
+            path: path.to_string(),
+            node_id: node_id.to_string(),
+            existing: state.heartbeat_interval,
+            requested: heartbeat_interval,
+        });
+    }
     state.add_owner();
-    state
+    Ok(state)
 }
 
 static EMPTY_GRAPH_STORE: OnceCell<Db> = OnceCell::const_new();
@@ -475,14 +482,14 @@ impl GraphStore {
         durability: GraphDurabilityConfig,
         heartbeat_interval: Duration,
         process_writer_node_id: Option<&str>,
-    ) -> Self {
+    ) -> Result<Self> {
         let writer_state = process_writer_state(
             &path,
             &object_store,
             heartbeat_interval,
             process_writer_node_id,
-        );
-        Self {
+        )?;
+        Ok(Self {
             inner: Arc::new(GraphStoreInner {
                 path,
                 object_store,
@@ -498,7 +505,7 @@ impl GraphStore {
                 reader_refresh_gate: Mutex::new(()),
                 retiring: AtomicBool::new(false),
             }),
-        }
+        })
     }
 
     fn open_writer(&self) -> Option<Db> {
