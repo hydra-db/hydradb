@@ -28,7 +28,7 @@ pub enum GraphIndexBuildPath {
     /// Full canonical scan and re-encode: `edges` is the total edge count of
     /// the published generation — every one of them was scanned from storage.
     Full { edges: u64 },
-    /// WAL-tail patch of the previous generation: `delta_edges` is the number
+    /// xlog patch of the previous generation: `delta_edges` is the number
     /// of changed edges actually applied — the only work performed.
     Incremental { delta_edges: u64 },
     /// The published generation already covers the current sequence; no work.
@@ -173,19 +173,21 @@ impl GraphShard {
     /// Incremental variant of [`GraphShard::build_graph_index`]: instead of
     /// re-scanning every canonical record for the edge type (the full build's
     /// `canonical_adjacency_at` above), load the previously published CSC
-    /// generation and patch it with the WAL tail — the exact delta the read
-    /// path already computes in `topology_tail_since`
-    /// (`src/shard/topology_tail.rs:41`) and then throws away.
+    /// generation and patch it with the delta from the xlog — the edge
+    /// changelog every topology mutation records in its own transaction
+    /// (`mark_topology_change_txn`), read back as one bounded range scan
+    /// (`xlog_delta_since` in `src/shard/xlog.rs`).
     ///
     /// On success returns the generation together with a
     /// [`GraphIndexBuildPath`] carrying the work counters (delta edges
     /// applied vs total edges scanned) that the indexer exports to
     /// Prometheus — the before/after impact number IS this counter.
     ///
-    /// Returns `Ok(None)` whenever an incremental build is not possible (no
-    /// previous generation, generation payload missing, WAL tail unavailable
-    /// because SlateDB already collected those WAL files); the caller falls
-    /// back to the full rebuild.
+    /// Returns `Ok(None)` only for one-time bootstrap conditions (no
+    /// previous generation, generation payload missing, xlog coverage not
+    /// yet established); the caller runs the full rebuild, which itself
+    /// establishes coverage for every cycle after. There is no cost-based
+    /// decline: the xlog scan is O(delta) by construction.
     ///
     /// Correctness oracle: generations are content-addressed
     /// (`generation = sha256(payload)` above), so this build must produce a
@@ -221,56 +223,48 @@ impl GraphShard {
             return Ok(Some((previous, GraphIndexBuildPath::Current)));
         }
 
-        // The WAL tail is the exact delta the read path computes per query in
-        // `topology_tail_since` (`src/shard/query.rs:5525`) and then discards;
-        // here it is computed once and folded into the published index. No
-        // runtime budget — the WAL entry/edge limits inside the call still
-        // apply. `Unavailable` means a WAL file spanning the gap was already
-        // collected, so the delta is unrecoverable and the caller must run a
-        // full rebuild instead.
-        let budget = crate::shard::QueryBudget::new(None, None);
-        let tail = match self
-            .topology_tail_since(&previous, snapshot.as_ref(), base_sequence, &budget)
-            .await
+        // The delta comes from the xlog — the edge changelog every topology
+        // mutation writes in its own transaction (`mark_topology_change_txn`)
+        // — as one bounded range scan over `(previous.base_sequence,
+        // base_sequence]`. Cost is O(delta) bytes in a handful of block
+        // reads, independent of WAL file count and write cadence, so there
+        // is no cost gate and no cost-based decline: the two non-`Complete`
+        // arms are one-time coverage bootstraps, not fallbacks
+        // (`interactive/incremental-build-cost.html` §11).
+        let overlay = match self
+            .xlog_delta_since(
+                snapshot.as_ref(),
+                &previous,
+                base_sequence,
+                cell_id,
+                edge_type,
+            )
+            .await?
         {
-            Ok(tail) => tail,
-            // A delta exceeding `max_query_scan_edges` is an admission
-            // verdict, not a failure — the read path treats the same error as
-            // an expected outcome and recovers (`src/shard/query.rs:5546`).
-            // Decline so the caller falls back to the full rebuild, whose
-            // scan is governed by `max_artifact_build_edges` instead; every
-            // other error still propagates.
-            Err(GraphError::AdmissionRejected {
-                operation: "graph_index_wal_affected_edges",
-                ..
-            }) => {
+            crate::shard::xlog::XlogDelta::Complete(overlay) => overlay,
+            crate::shard::xlog::XlogDelta::Uninitialized => {
+                // Nothing has ever been logged for this pair: the xlog was
+                // not yet deployed when the previous generation was built.
+                // One bootstrap full build establishes coverage.
                 tracing::info!(
                     cell_id,
                     edge_type,
-                    reason = "delta_exceeds_scan_limit",
-                    "incremental index build declined; falling back to full rebuild"
+                    reason = "xlog_uninitialized",
+                    "incremental index build bootstrapping; running full rebuild"
                 );
                 return Ok(None);
             }
-            Err(error) => return Err(error),
-        };
-        let overlay = match tail {
-            crate::shard::topology_tail::GraphTopologyTail::Complete(overlay) => overlay,
-            crate::shard::topology_tail::GraphTopologyTail::Unavailable => {
-                // Either a WAL file spanning the gap was collected (the delta
-                // is unrecoverable) or the span exceeded
-                // `max_wal_tail_files` (the delta is recoverable but costs
-                // more round trips than the rebuild it would save — the
-                // staging regression in
-                // `interactive/incremental-build-cost.html`). The tail logs
-                // which at debug; either way the full rebuild is the answer.
+            crate::shard::xlog::XlogDelta::CoverageGap { low_water } => {
+                // Part of the needed range is below the retention floor —
+                // first enablement or a manual purge. One bootstrap full
+                // build re-establishes coverage.
                 tracing::info!(
                     cell_id,
                     edge_type,
-                    wal_span = last_wal_id.saturating_sub(previous.last_wal_id),
-                    wal_span_limit = self.limits.max_wal_tail_files,
-                    reason = "wal_tail_unavailable_or_capped",
-                    "incremental index build declined; falling back to full rebuild"
+                    low_water,
+                    previous_base = previous.base_sequence,
+                    reason = "xlog_coverage_gap",
+                    "incremental index build bootstrapping; running full rebuild"
                 );
                 return Ok(None);
             }

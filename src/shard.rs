@@ -9,5 +9,6 @@ mod query;
 mod query_optimizer;
 pub(crate) mod topology_tail;
 mod write;
+pub(crate) mod xlog;
 
 pub(crate) use query::QueryBudget;

@@ -1633,6 +1633,50 @@ async fn run_index_cycle(
                 }
             }
 
+            // xlog retention rides the same cleanup step. Best-effort twice
+            // over: a reader-mode shard (the deployed topology) returns
+            // Ok(0) without writing — retention is then the writer node's
+            // job — and like generation GC above, a failure never fails the
+            // cycle the entries were tidying up after.
+            let xlog_gc_span = tracing::info_span!(
+                parent: &edge_span,
+                "artifact.xlog_gc",
+                turbolay.scope = %scope,
+                turbolay.cell_id = %cell_id,
+                turbolay.edge_type = %edge_type,
+                deleted = Empty,
+                turbolay.outcome = Empty,
+                error.class = Empty,
+            );
+            match shard
+                .gc_topology_changelog(cell_id, &edge_type)
+                .instrument(xlog_gc_span.clone())
+                .await
+            {
+                Ok(deleted) => {
+                    xlog_gc_span.record("deleted", deleted);
+                    xlog_gc_span.record(
+                        semconv::OUTCOME,
+                        if deleted == 0 {
+                            Outcome::Skipped.as_str()
+                        } else {
+                            Outcome::Success.as_str()
+                        },
+                    );
+                }
+                Err(error) => {
+                    let failure = IndexFailure::kernel(
+                        "artifact_xlog_gc",
+                        format!("index scope {scope}: xlog cleanup {cell_id}/{edge_type}"),
+                        &error,
+                    )
+                    .with_scope(scope)
+                    .with_cell(cell_id)
+                    .with_edge_type(&edge_type);
+                    record_failure(&xlog_gc_span, &failure);
+                }
+            }
+
             record_success(&edge_span);
             cell_built = true;
         }
