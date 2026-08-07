@@ -230,7 +230,7 @@ impl GraphShard {
         // reads, independent of WAL file count and write cadence, so there
         // is no cost gate and no cost-based decline: the two non-`Complete`
         // arms are one-time coverage bootstraps, not fallbacks
-        // (`docs/plans/2026-08-05-edge-changelog-incremental-index.md`).
+        // (`interactive/incremental-build-cost.html` §11).
         let overlay = match self
             .xlog_delta_since(
                 snapshot.as_ref(),
