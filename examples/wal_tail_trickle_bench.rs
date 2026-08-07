@@ -158,10 +158,38 @@ async fn main() -> Result<()> {
     // The trickle. One committed write per call, alternating edge types —
     // each durable commit flushes its own WAL file(s), which is exactly the
     // shape a small-batch ingestion pipeline leaves behind.
-    println!("\ntrickling {trickle} single-edge commits per type...");
+    //
+    // Staging replay: `BENCH_SPARSE_DELTA=15` caps the SECOND edge type at
+    // that many edges, spread evenly across the same elapsed window. The
+    // first type's commits keep cutting WAL files regardless (staging's
+    // background write activity), so the second type's build faces the
+    // staging signature exactly: a ~15-edge delta under a span of thousands
+    // of files it had no part in creating.
+    let sparse_delta: Option<u64> = std::env::var("BENCH_SPARSE_DELTA")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0);
+    match sparse_delta {
+        Some(sparse) => println!(
+            "\ntrickling {trickle} single-edge commits on {}, {sparse} sparse edges on {} \
+             (staging replay)...",
+            EDGE_TYPES[0], EDGE_TYPES[1]
+        ),
+        None => println!("\ntrickling {trickle} single-edge commits per type..."),
+    }
     let started = Instant::now();
+    let mut sparse_written = 0_u64;
     for index in 0..trickle {
         for (offset, edge_type) in EDGE_TYPES.iter().enumerate() {
+            if offset == 1 {
+                if let Some(sparse) = sparse_delta {
+                    let stride = trickle.div_ceil(sparse).max(1);
+                    if index % stride != 0 || sparse_written >= sparse {
+                        continue;
+                    }
+                    sparse_written += 1;
+                }
+            }
             shard
                 .write_edges_batch(
                     CELL,
@@ -175,7 +203,17 @@ async fn main() -> Result<()> {
                 .await?;
         }
     }
-    println!("trickled in {} ms", started.elapsed().as_millis());
+    if let Some(sparse) = sparse_delta {
+        println!(
+            "trickled in {} ms ({} commits on {}, {sparse_written} of {sparse} sparse on {})",
+            started.elapsed().as_millis(),
+            trickle,
+            EDGE_TYPES[0],
+            EDGE_TYPES[1],
+        );
+    } else {
+        println!("trickled in {} ms", started.elapsed().as_millis());
+    }
 
     // First incremental build: a cold walk over the whole trickled span.
     let started = Instant::now();
