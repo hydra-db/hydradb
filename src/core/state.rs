@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{
     Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, RwLock as StdRwLock, Weak,
 };
@@ -138,8 +138,8 @@ struct GraphStoreInner {
 struct ProcessWriterState {
     writer: StdRwLock<Option<Db>>,
     open_gate: Mutex<()>,
+    owners: StdMutex<usize>,
     closing: AtomicBool,
-    owners: AtomicUsize,
     heartbeat_interval: Duration,
     reopen_gate: StdMutex<WriterReopenGate>,
 }
@@ -178,15 +178,15 @@ fn process_writer_state(
         Arc::new(ProcessWriterState {
             writer: StdRwLock::new(None),
             open_gate: Mutex::new(()),
+            owners: StdMutex::new(0),
             closing: AtomicBool::new(false),
-            owners: AtomicUsize::new(0),
             heartbeat_interval,
             reopen_gate: StdMutex::new(WriterReopenGate::default()),
         })
     };
     let Some(node_id) = node_id else {
         let state = new_state();
-        state.owners.store(1, Ordering::Release);
+        state.add_owner();
         return state;
     };
     let key = ProcessWriterKey {
@@ -208,7 +208,7 @@ fn process_writer_state(
             state
         });
     debug_assert_eq!(state.heartbeat_interval, heartbeat_interval);
-    state.owners.fetch_add(1, Ordering::AcqRel);
+    state.add_owner();
     state
 }
 
@@ -327,19 +327,49 @@ impl WriterReopenGate {
 }
 
 impl ProcessWriterState {
+    fn owners(&self) -> StdMutexGuard<'_, usize> {
+        self.owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn add_owner(&self) {
+        *self.owners() += 1;
+    }
+
+    fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    fn begin_release(&self) -> bool {
+        let mut owners = self.owners();
+        *owners = owners
+            .checked_sub(1)
+            .expect("process writer owner count underflow");
+        if *owners > 0 {
+            return false;
+        }
+        // Set this while owner registration is still excluded. A new owner
+        // either joins before the decrement (making it non-final), or joins
+        // after this flag is visible and waits for the old handle to close.
+        self.closing.store(true, Ordering::Release);
+        true
+    }
+
     async fn release_owner(&self) -> Result<()> {
         let _open_guard = self.open_gate.lock().await;
-        self.closing.store(true, Ordering::Release);
+        if !self.begin_release() {
+            // Another routed store still owns this handle. Do not publish a
+            // closing transition: surviving owners must keep using the writer
+            // without a transient read-only window.
+            return Ok(());
+        }
+
         // Scope eviction normally runs this close in a detached task, but the
         // guard also makes direct cancellation recoverable: once the open gate
         // is released, a replacement may promote instead of seeing `closing`
         // forever.
         let _closing_guard = WriterClosingGuard(&self.closing);
-        let previous = self.owners.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "process writer owner count underflow");
-        if previous > 1 {
-            return Ok(());
-        }
 
         let writer = self
             .writer
@@ -472,9 +502,7 @@ impl GraphStore {
     }
 
     fn open_writer(&self) -> Option<Db> {
-        if self.inner.retiring.load(Ordering::Acquire)
-            || self.inner.writer_state.closing.load(Ordering::Acquire)
-        {
+        if self.inner.retiring.load(Ordering::Acquire) || self.inner.writer_state.is_closing() {
             return None;
         }
         self.inner
@@ -1228,6 +1256,22 @@ mod tests {
     /// them, so any origin works and none of these tests touch a real clock.
     fn origin() -> Instant {
         Instant::now()
+    }
+
+    #[test]
+    fn releasing_a_non_final_process_owner_never_hides_the_writer() {
+        let state = ProcessWriterState {
+            writer: StdRwLock::new(None),
+            open_gate: Mutex::new(()),
+            owners: StdMutex::new(2),
+            closing: AtomicBool::new(false),
+            heartbeat_interval: Duration::from_secs(5),
+            reopen_gate: StdMutex::new(WriterReopenGate::default()),
+        };
+
+        assert!(!state.begin_release());
+        assert_eq!(*state.owners(), 1);
+        assert!(!state.is_closing());
     }
 
     /// Decision 6's rules 1 and 2, which are the two that survive the write-path
