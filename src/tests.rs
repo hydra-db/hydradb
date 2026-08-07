@@ -14764,6 +14764,118 @@ async fn xlog_incremental_matches_full_over_random_mutation_mix() {
     );
 }
 
+/// Multi-tenancy: two cells share one shard, mutate concurrently, and each
+/// cell's incremental build must see exactly its own delta — never the
+/// neighbor's — with byte-identical-to-full results per cell, and one cell's
+/// xlog GC must not disturb the other's coverage. The cell id is part of the
+/// xlog key's address, so cross-cell reads are impossible by key-range
+/// construction; this test pins that as behavior rather than argument.
+#[tokio::test]
+async fn xlog_is_isolated_by_cell() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/xlog-cell-isolation", object_store).await;
+    let edge_type = "CHAIN";
+
+    for cell in ["tenant-a", "tenant-b"] {
+        shard
+            .write_edge(typed_mutation(cell, edge_type, 1, 2, "iso-seed"))
+            .await
+            .unwrap();
+        shard.build_graph_index(cell, edge_type).await.unwrap();
+    }
+
+    // Interleaved mutations: tenant-a gains two edges and loses one,
+    // tenant-b gains one — deliberately overlapping vertex ids, so only the
+    // cell in the key can tell the entries apart.
+    shard
+        .write_edge(typed_mutation("tenant-a", edge_type, 2, 3, "iso-a1"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation("tenant-b", edge_type, 2, 3, "iso-b1"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation("tenant-a", edge_type, 3, 4, "iso-a2"))
+        .await
+        .unwrap();
+    let deleted = shard
+        .delete_edge(typed_mutation("tenant-a", edge_type, 1, 2, "iso-a3"))
+        .await
+        .unwrap();
+    assert!(deleted.deleted);
+
+    let (a, a_path) = shard
+        .build_graph_index_incremental("tenant-a", edge_type)
+        .await
+        .unwrap()
+        .expect("tenant-a stays incremental");
+    assert!(
+        matches!(
+            a_path,
+            crate::GraphIndexBuildPath::Incremental { delta_edges: 3 }
+        ),
+        "tenant-a must see exactly its own three changes, got {a_path:?}"
+    );
+    // The byte-identical oracle per cell, at the same durable sequence as
+    // the incremental build it checks (no writes in between).
+    let a_full = shard
+        .build_graph_index("tenant-a", edge_type)
+        .await
+        .unwrap();
+    assert_eq!(a.generation, a_full.generation);
+    let (b, b_path) = shard
+        .build_graph_index_incremental("tenant-b", edge_type)
+        .await
+        .unwrap()
+        .expect("tenant-b stays incremental");
+    assert!(
+        matches!(
+            b_path,
+            crate::GraphIndexBuildPath::Incremental { delta_edges: 1 }
+        ),
+        "tenant-b must see exactly its own single change, got {b_path:?}"
+    );
+    let b_full = shard
+        .build_graph_index("tenant-b", edge_type)
+        .await
+        .unwrap();
+    assert_eq!(b.generation, b_full.generation);
+    assert_eq!(a.edge_count, 2, "tenant-a: 1→2 deleted, 2→3 and 3→4 added");
+    assert_eq!(b.edge_count, 2, "tenant-b: 1→2 kept, 2→3 added");
+
+    // One cell's GC must not break the other's coverage: reclaim tenant-a,
+    // then tenant-b must still build incrementally with an exact delta.
+    let reclaimed = shard
+        .gc_topology_changelog("tenant-a", edge_type)
+        .await
+        .unwrap();
+    assert!(reclaimed > 0, "tenant-a has consumed entries to reclaim");
+    shard
+        .write_edge(typed_mutation("tenant-b", edge_type, 3, 4, "iso-b2"))
+        .await
+        .unwrap();
+    let (b_after, b_after_path) = shard
+        .build_graph_index_incremental("tenant-b", edge_type)
+        .await
+        .unwrap()
+        .expect("tenant-b coverage survives tenant-a's GC");
+    assert!(
+        matches!(
+            b_after_path,
+            crate::GraphIndexBuildPath::Incremental { delta_edges: 1 }
+        ),
+        "got {b_after_path:?}"
+    );
+
+    let b_after_full = shard
+        .build_graph_index("tenant-b", edge_type)
+        .await
+        .unwrap();
+    assert_eq!(b_after.generation, b_after_full.generation);
+    assert_ne!(a.generation, b_after.generation, "cells stay distinct");
+}
+
 /// Retention lifecycle: GC reclaims exactly the consumed entries once,
 /// reports zero on an immediately repeated pass, and later builds remain
 /// incremental and byte-identical — the low-water mark never breaks coverage
