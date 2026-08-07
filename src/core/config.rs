@@ -146,7 +146,6 @@ impl GraphCacheConfig {
     }
 
     fn apply_to_reader_options(&self, options: &mut DbReaderOptions) {
-        options.wal_replay_concurrency = self.reader_wal_replay_concurrency;
         if let Some(cache_dir) = &self.object_store_cache_dir {
             options.object_store_cache_options.root_folder = Some(cache_dir.clone());
         }
@@ -409,6 +408,7 @@ pub(crate) async fn open_graph_reader(
     cache.apply_to_reader_options(&mut options);
     Ok(DbReader::builder(path, object_store)
         .with_options(options)
+        .with_wal_replay_concurrency(cache.reader_wal_replay_concurrency)
         .with_reader_mode(DbReaderMode::ManagedCheckpoint)
         .build()
         .await?)
