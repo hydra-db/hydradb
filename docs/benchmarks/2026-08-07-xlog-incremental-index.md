@@ -23,26 +23,50 @@ sharing one scope database, an indexer cycle building every type every round, an
 across the same window — so every quiet type's build faces the staging signature precisely:
 a 15-edge delta under a ~330-file WAL span it had no part in creating. The xlog GC runs each
 cycle as the indexer's cleanup step does, and one quiet type per cycle is re-verified against
-a full rebuild at the same sequence. (Run on MinIO at 25 k seed/type; see the caveat below on
-why not real S3.)
+a full rebuild at the same sequence. Run twice with identical parameters (25 k seed/type):
+once on **real S3** (`hydradb-local-turbolay`; each cycle's trickle is ~9 minutes of genuine
+elapsed time and 320 real durable commits) and once on MinIO to isolate the xlog's own cost
+from S3 request latency.
+
+**Real S3** — cycle 0 runs the old way (full builds), cycles 1–3 run the xlog path on
+identical workloads, so both columns of the before/after come from the same run:
+
+| cycle | trickle | quiet-type builds (15-edge delta) | hot type (215) | cycle total | verify | GC reclaimed |
+|------:|--------:|:----------------------------------|---------------:|------------:|:-------|-------------:|
+| 0 (bootstrap, full builds) | 9.5 min | 73–195 s each | 195 s | **18.3 min** | AGREE (full 71 s) | 200,320 (seed) |
+| 1 | 9.0 min | **5.1–6.0 s each** | 8.7 s | 2.2 min | AGREE (full 72 s) | 320 |
+| 2 | 8.9 min | **2.9–5.6 s each** | 7.5 s | 2.0 min | AGREE (full 71 s) | 320 |
+| 3 | 8.9 min | **3.0–5.4 s each** | 8.7 s | 2.0 min | AGREE (full 72 s) | 320 |
+
+The 18.3-minute full-build cycle lands inside staging's regressed 15–40-minute range —
+the "before" reproduced live. The remaining seconds in the "after" are the shared
+reader-refresh over the new WAL span, paid once per cycle by either path (the 72 s verify
+full pays it too) and amortized across all 8 edge types.
+
+**MinIO, same harness** — the xlog's own cost with request latency removed:
 
 | cycle | span | quiet-type builds (15-edge delta) | hot type (215) | full 8-type cycle | verify | GC reclaimed |
 |------:|-----:|:----------------------------------|---------------:|------------------:|:-------|-------------:|
-| 0 (bootstrap) | — | full builds, by design | full | 3.6 s | AGREE | 200,320 (seed) |
 | 1 | 328 | **17–21 ms each** | 241 ms | **0.69 s** | AGREE | 320 |
 | 2 | 328 | **18–23 ms each** | 242 ms | **0.70 s** | AGREE | 320 |
 | 3 | 328 | **17–28 ms each** | 77 ms | **0.55 s** | AGREE | 320 |
 
-Zero fallbacks after the planned bootstrap, every delta exact, every cycle byte-identical to
-full. The old path's measured cost for this shape (~50 ms per span file, from the staging
-traces) is ~16 s per quiet type per cycle — **~850× slower** than the ~19 ms above — which is
-what compounded into staging's 15–40-minute cycles. The replayed 8-type cycle runs in ~0.6 s.
+Zero fallbacks after the planned bootstrap in both runs; every delta count exact; every
+cycle byte-identical to full. **Cross-store determinism:** each cycle's content-addressed
+generation hash is identical between the MinIO and real-S3 runs (cycle-1 `dae74af53bb2`,
+cycle-2 `9beee71433f1`, cycle-3 `86e5f9d7453a`) — same graph in, same artifact out,
+regardless of object store. The old path's measured cost for this shape (~50 ms per span
+file, from the staging traces) is ~16 s per quiet type per cycle, which compounded into
+staging's 15–40-minute cycles.
 
-**Caveat, itself a finding:** attempts to run the replay at 50–100 k seed/type against real
-S3 reproducibly wedged the fork's write pipeline mid-seed — writers parked on compaction
-backpressure while the compactor loops refreshing its fenced transactional state object
-after a GC boundary write; alive-but-silent, no errors, same family as the staging indexer
-stall, now locally reproducible with stack samples. Tracked separately from the xlog work.
+**Caveat, itself a finding:** attempts to seed the replay at 50–100 k edges/type against
+real S3 reproducibly wedged the fork's write pipeline mid-seed — writers parked on
+compaction backpressure while the compactor loops refreshing its fenced transactional
+state object after a GC boundary write; alive-but-silent, no errors, same family as the
+staging indexer stall, now locally reproducible with stack samples. A pre-xlog binary
+shows the same collapse in crawl form (40–60 s per WAL file vs 3 s healthy), so the
+mechanism predates the xlog; the xlog's added write volume deepens it under sustained
+bulk load. Tracked separately from the xlog work; the replay seeds below the threshold.
 
 Every run reported `[incremental, N delta edges]` with N exactly the trickled count — zero
 fallbacks, zero declines, exact deltas. There is no cost gate left to fire:
