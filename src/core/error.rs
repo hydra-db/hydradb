@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 
 use crate::StorageSequence;
@@ -20,6 +22,15 @@ pub enum GraphError {
     UnsafeDurabilityConfig {
         operation: &'static str,
         reason: String,
+    },
+    #[error(
+        "routed writer configuration mismatch for {path} on node {node_id}: existing fence backoff {existing:?}, requested {requested:?}"
+    )]
+    RoutedWriterConfigMismatch {
+        path: String,
+        node_id: String,
+        existing: Duration,
+        requested: Duration,
     },
     #[error("invalid {component} key component: {value}")]
     InvalidKeyComponent {
@@ -316,7 +327,9 @@ impl GraphError {
             // Both are a refusal to act on how this process was configured, not
             // a failure of the operation itself: one rejects an unsafe
             // durability setting, the other a write to a shard opened read-only.
-            Self::UnsafeDurabilityConfig { .. } | Self::ReadOnlyShardStorage => Self::CLASS_CONFIG,
+            Self::UnsafeDurabilityConfig { .. }
+            | Self::RoutedWriterConfigMismatch { .. }
+            | Self::ReadOnlyShardStorage => Self::CLASS_CONFIG,
 
             Self::Slate(_) | Self::ObjectStore(_) => Self::CLASS_STORAGE,
 
