@@ -656,6 +656,16 @@ payload-hash equality with a full rebuild after every mutation burst.</p>
   </tbody>
 </table>
 </div>
+<p><strong>The staging replay.</strong> <code>examples/staging_replay_bench.rs</code>
+recreates the operating loop that actually degraded — 8 edge types in one scope DB,
+an indexer cycle per round, ~215 hot-type commits and exactly 15 edges per quiet type
+per cycle — so every quiet build faces §3's exact signature: a 15-edge delta under a
+~330-file span it had no part in creating. Result over four cycles: quiet-type builds
+of <strong>17–28 ms</strong> (the old walk's measured cost for the same shape is
+~16&#8239;s — ~850×), the full 8-type cycle in <strong>~0.6&#8239;s</strong> against
+staging's regressed 15–40 minutes, one planned bootstrap cycle then zero fallbacks,
+exact delta counts throughout, and a per-cycle full-rebuild equivalence probe agreeing
+every time.</p>
 <p>Every run reported the <em>exact</em> trickled delta count with zero
 fallbacks. Compare §9: on this same bucket the serial walk could not finish a
 ~1,000-file span in 10 minutes and the gated 16-way walk took 478&#8239;s —
