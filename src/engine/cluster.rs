@@ -1174,6 +1174,7 @@ impl ScopedRoutedGraphCluster {
             access_clock: AtomicU64::new(0),
             clusters: tokio::sync::Mutex::new(BTreeMap::new()),
             scope_open_gates: tokio::sync::Mutex::new(BTreeMap::new()),
+            scope_closures: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             scope_capacity_gate: tokio::sync::Mutex::new(()),
             scope_open_reservations: AtomicUsize::new(0),
         })
@@ -1219,98 +1220,131 @@ impl ScopedRoutedGraphCluster {
         scope: &GraphScope,
     ) -> Result<Arc<RoutedGraphCluster>> {
         self.validate_scope(scope)?;
-        let access = self.access_clock.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Some(cluster) = self.cached_scope(scope, access).await {
-            return Ok(cluster);
-        }
-
-        let scope_gate = {
-            let mut gates = self.scope_open_gates.lock().await;
-            gates.retain(|_, gate| gate.strong_count() > 0);
-            if let Some(gate) = gates.get(scope).and_then(std::sync::Weak::upgrade) {
-                gate
-            } else {
-                let gate = Arc::new(tokio::sync::Mutex::new(()));
-                gates.insert(scope.clone(), Arc::downgrade(&gate));
-                gate
+        loop {
+            let access = self.access_clock.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(cluster) = self.cached_scope(scope, access).await {
+                return Ok(cluster);
             }
-        };
-        let _scope_open_guard = scope_gate.lock().await;
-        if let Some(cluster) = self.cached_scope(scope, access).await {
-            return Ok(cluster);
-        }
 
-        // Reserve capacity without holding either lock across close/open I/O.
-        // Different cold scopes can initialize concurrently, while cached
-        // scopes only take the short map lock above.
-        let capacity_guard = self.scope_capacity_gate.lock().await;
-        if let Some(cluster) = self.cached_scope(scope, access).await {
-            return Ok(cluster);
-        }
-        let (evicted, reservation) = {
-            let mut clusters = self.clusters.lock().await;
-            let occupied = clusters
-                .len()
-                .saturating_add(self.scope_open_reservations.load(Ordering::Acquire));
-            let evicted = if occupied >= self.max_open_scopes {
-                let candidate = clusters
-                    .iter()
-                    .filter(|(_, entry)| Arc::strong_count(&entry.cluster) == 1)
-                    .min_by_key(|(_, entry)| entry.last_used)
-                    .map(|(scope, _)| scope.clone())
-                    .ok_or(GraphError::AdmissionRejected {
-                        operation: "open_graph_scopes",
-                        actual: occupied.saturating_add(1) as u64,
-                        limit: self.max_open_scopes as u64,
-                    })?;
-                let entry = clusters
-                    .remove(&candidate)
-                    .expect("selected scoped cluster must still exist");
-                Some((candidate, entry.cluster))
-            } else {
-                None
+            let scope_gate = {
+                let mut gates = self.scope_open_gates.lock().await;
+                gates.retain(|_, gate| gate.strong_count() > 0);
+                if let Some(gate) = gates.get(scope).and_then(std::sync::Weak::upgrade) {
+                    gate
+                } else {
+                    let gate = Arc::new(tokio::sync::Mutex::new(()));
+                    gates.insert(scope.clone(), Arc::downgrade(&gate));
+                    gate
+                }
             };
-            self.scope_open_reservations.fetch_add(1, Ordering::AcqRel);
-            (
-                evicted,
-                ScopedOpenReservation::new(&self.scope_open_reservations),
-            )
-        };
-        drop(capacity_guard);
-        if let Some((candidate, cluster)) = evicted {
-            let cluster = Arc::try_unwrap(cluster).map_err(|_| GraphError::CorruptValue {
-                key: format!("scoped-cluster/{candidate}"),
-                reason: "idle scoped cluster acquired a concurrent owner during eviction"
-                    .to_string(),
-            })?;
-            cluster.close().await?;
-        }
+            let scope_open_guard = scope_gate.lock().await;
+            if let Some(cluster) = self.cached_scope(scope, access).await {
+                return Ok(cluster);
+            }
 
-        let cluster = Arc::new(
-            RoutedGraphCluster::open_promotable_scoped_with_memory_options(
-                self.base_path.clone(),
+            // Reserve capacity without holding either async lock across
+            // close/open I/O. A scope removed for eviction is first published
+            // in `scope_closures`, so a concurrent reopen waits for its old
+            // SlateDB writer to finish closing rather than fencing it.
+            let capacity_guard = self.scope_capacity_gate.lock().await;
+            if let Some(cluster) = self.cached_scope(scope, access).await {
+                return Ok(cluster);
+            }
+            if let Some(mut closing) = self.scope_closure(scope) {
+                drop(capacity_guard);
+                drop(scope_open_guard);
+                let _ = closing.wait_for(|closed| *closed).await;
+                continue;
+            }
+            let (evicted, reservation) = {
+                let mut clusters = self.clusters.lock().await;
+                let occupied = clusters
+                    .len()
+                    .saturating_add(self.scope_open_reservations.load(Ordering::Acquire));
+                let evicted = if occupied >= self.max_open_scopes {
+                    let candidate = clusters
+                        .iter()
+                        .filter(|(_, entry)| Arc::strong_count(&entry.cluster) == 1)
+                        .min_by_key(|(_, entry)| entry.last_used)
+                        .map(|(scope, _)| scope.clone())
+                        .ok_or(GraphError::AdmissionRejected {
+                            operation: "open_graph_scopes",
+                            actual: occupied.saturating_add(1) as u64,
+                            limit: self.max_open_scopes as u64,
+                        })?;
+                    let entry = clusters
+                        .remove(&candidate)
+                        .expect("selected scoped cluster must still exist");
+                    let close = ScopeCloseReservation::new(
+                        Arc::clone(&self.scope_closures),
+                        candidate.clone(),
+                    );
+                    Some((candidate, entry.cluster, close))
+                } else {
+                    None
+                };
+                self.scope_open_reservations.fetch_add(1, Ordering::AcqRel);
+                (
+                    evicted,
+                    ScopedOpenReservation::new(&self.scope_open_reservations),
+                )
+            };
+            drop(capacity_guard);
+            if let Some((candidate, cluster, close)) = evicted {
+                let cluster = Arc::try_unwrap(cluster).map_err(|_| GraphError::CorruptValue {
+                    key: format!("scoped-cluster/{candidate}"),
+                    reason: "idle scoped cluster acquired a concurrent owner during eviction"
+                        .to_string(),
+                })?;
+                // Closing outlives the request that triggered eviction. If the
+                // request is cancelled, this task still drains the old writer
+                // and only then releases same-scope reopeners.
+                tokio::spawn(async move {
+                    let result = cluster.close().await;
+                    close.release();
+                    result
+                })
+                .await
+                .map_err(|error| GraphError::CorruptValue {
+                    key: format!("scoped-cluster/{candidate}"),
+                    reason: format!("scope close task failed: {error}"),
+                })??;
+            }
+
+            let cluster = Arc::new(
+                RoutedGraphCluster::open_promotable_scoped_with_memory_options(
+                    self.base_path.clone(),
+                    scope.clone(),
+                    self.local_node_id.clone(),
+                    self.directory.clone(),
+                    // Cloned, never rebuilt: every scope's cluster and the routing
+                    // provider must answer from one live set.
+                    self.placement.clone(),
+                    Arc::clone(&self.object_store),
+                    self.options_for_scope(scope),
+                    self.memory.clone(),
+                )
+                .await?,
+            );
+            let _capacity_guard = self.scope_capacity_gate.lock().await;
+            reservation.release();
+            self.clusters.lock().await.insert(
                 scope.clone(),
-                self.local_node_id.clone(),
-                self.directory.clone(),
-                // Cloned, never rebuilt: every scope's cluster and the routing
-                // provider must answer from one live set.
-                self.placement.clone(),
-                Arc::clone(&self.object_store),
-                self.options_for_scope(scope),
-                self.memory.clone(),
-            )
-            .await?,
-        );
-        let _capacity_guard = self.scope_capacity_gate.lock().await;
-        reservation.release();
-        self.clusters.lock().await.insert(
-            scope.clone(),
-            ScopedRoutedClusterEntry {
-                cluster: Arc::clone(&cluster),
-                last_used: access,
-            },
-        );
-        Ok(cluster)
+                ScopedRoutedClusterEntry {
+                    cluster: Arc::clone(&cluster),
+                    last_used: access,
+                },
+            );
+            return Ok(cluster);
+        }
+    }
+
+    fn scope_closure(&self, scope: &GraphScope) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.scope_closures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(scope)
+            .cloned()
     }
 
     async fn cached_scope(
@@ -1470,6 +1504,57 @@ impl Drop for ScopedOpenReservation<'_> {
         if self.active {
             self.counter.fetch_sub(1, Ordering::AcqRel);
         }
+    }
+}
+
+#[cfg(feature = "query-transport")]
+struct ScopeCloseReservation {
+    closures: Arc<std::sync::Mutex<BTreeMap<GraphScope, tokio::sync::watch::Receiver<bool>>>>,
+    scope: GraphScope,
+    completed: tokio::sync::watch::Sender<bool>,
+    active: bool,
+}
+
+#[cfg(feature = "query-transport")]
+impl ScopeCloseReservation {
+    fn new(
+        closures: Arc<std::sync::Mutex<BTreeMap<GraphScope, tokio::sync::watch::Receiver<bool>>>>,
+        scope: GraphScope,
+    ) -> Self {
+        let (completed, receiver) = tokio::sync::watch::channel(false);
+        closures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(scope.clone(), receiver);
+        Self {
+            closures,
+            scope,
+            completed,
+            active: true,
+        }
+    }
+
+    fn release(mut self) {
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        if !self.active {
+            return;
+        }
+        let _ = self.completed.send(true);
+        self.closures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.scope);
+        self.active = false;
+    }
+}
+
+#[cfg(feature = "query-transport")]
+impl Drop for ScopeCloseReservation {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -1647,6 +1732,46 @@ mod scoped_cluster_tests {
                 .cluster_for_scope(&scope)
                 .await
                 .expect("a later request can reopen the cancelled scope"),
+        );
+        runtime.close().await.expect("the runtime drains");
+    }
+
+    #[tokio::test]
+    async fn reopening_an_evicted_scope_waits_for_its_writer_to_close() {
+        let runtime = runtime_at_capacity("graph/closing-scope", 2);
+        let scope = tenant_scope(&runtime, "tenant-closing");
+        let close = ScopeCloseReservation::new(Arc::clone(&runtime.scope_closures), scope.clone());
+
+        let mut reopen = Box::pin(runtime.cluster_for_scope(&scope));
+        assert!(
+            futures::poll!(reopen.as_mut()).is_pending(),
+            "a scope must not reopen while its previous SlateDB writer is closing"
+        );
+        assert!(runtime.loaded_scopes().await.is_empty());
+
+        close.release();
+        drop(
+            reopen
+                .await
+                .expect("the scope reopens after its old writer has closed"),
+        );
+        runtime.close().await.expect("the runtime drains");
+    }
+
+    #[tokio::test]
+    async fn cancelled_scope_close_releases_waiting_reopeners() {
+        let runtime = runtime_at_capacity("graph/cancelled-close", 2);
+        let scope = tenant_scope(&runtime, "tenant-cancelled-close");
+        let close = ScopeCloseReservation::new(Arc::clone(&runtime.scope_closures), scope.clone());
+
+        let mut reopen = Box::pin(runtime.cluster_for_scope(&scope));
+        assert!(futures::poll!(reopen.as_mut()).is_pending());
+        drop(close);
+
+        drop(
+            reopen
+                .await
+                .expect("dropping the close reservation wakes the reopener"),
         );
         runtime.close().await.expect("the runtime drains");
     }
