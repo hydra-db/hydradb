@@ -10,8 +10,9 @@
 //! sequence order wins per `(src, dst)` and re-scanning an overlapping range
 //! after a crash is harmless.
 //!
-//! The design and its verification live in
-//! `docs/plans/2026-08-05-edge-changelog-incremental-index.md`.
+//! The design and its verification live in the cost note
+//! (`interactive/incremental-build-cost.html`, §11) and the benchmark
+//! record (`docs/benchmarks/2026-08-07-xlog-incremental-index.md`).
 
 use super::*;
 use crate::shard::topology_tail::GraphTopologyOverlay;
