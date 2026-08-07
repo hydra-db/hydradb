@@ -124,6 +124,7 @@ struct GraphStoreInner {
     cache: GraphCacheConfig,
     storage_memory: GraphStorageMemoryConfig,
     durability: GraphDurabilityConfig,
+    _writer_registry: Option<Arc<ProcessWriterRegistry>>,
     writer_state: Arc<ProcessWriterState>,
     writer_owner_active: AtomicBool,
     reader: AsyncRwLock<Option<Arc<DbReader>>>,
@@ -154,13 +155,37 @@ impl Drop for WriterClosingGuard<'_> {
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 struct ProcessWriterKey {
-    object_store: usize,
     path: String,
     node_id: String,
 }
 
-static PROCESS_WRITERS: OnceLock<StdMutex<BTreeMap<ProcessWriterKey, Weak<ProcessWriterState>>>> =
+pub(crate) struct ProcessWriterRegistry {
+    states: StdMutex<BTreeMap<ProcessWriterKey, Arc<ProcessWriterState>>>,
+}
+
+static PROCESS_WRITER_REGISTRIES: OnceLock<StdMutex<BTreeMap<usize, Weak<ProcessWriterRegistry>>>> =
     OnceLock::new();
+
+pub(crate) fn process_writer_registry(
+    object_store: &Arc<dyn ObjectStore>,
+) -> Arc<ProcessWriterRegistry> {
+    let key = Arc::as_ptr(object_store) as *const () as usize;
+    let registries = PROCESS_WRITER_REGISTRIES.get_or_init(|| StdMutex::new(BTreeMap::new()));
+    let mut registries = registries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registries.retain(|_, registry| registry.strong_count() > 0);
+    registries
+        .get(&key)
+        .and_then(Weak::upgrade)
+        .unwrap_or_else(|| {
+            let registry = Arc::new(ProcessWriterRegistry {
+                states: StdMutex::new(BTreeMap::new()),
+            });
+            registries.insert(key, Arc::downgrade(&registry));
+            registry
+        })
+}
 
 /// Return the one writer state a graph-node may own for this physical database.
 ///
@@ -170,9 +195,8 @@ static PROCESS_WRITERS: OnceLock<StdMutex<BTreeMap<ProcessWriterKey, Weak<Proces
 /// graph-node converge on one handle without sharing across simulated nodes.
 fn process_writer_state(
     path: &Path,
-    object_store: &Arc<dyn ObjectStore>,
     heartbeat_interval: Duration,
-    node_id: Option<&str>,
+    process_writer: Option<(&str, &Arc<ProcessWriterRegistry>)>,
 ) -> Result<Arc<ProcessWriterState>> {
     let new_state = || {
         Arc::new(ProcessWriterState {
@@ -184,29 +208,24 @@ fn process_writer_state(
             reopen_gate: StdMutex::new(WriterReopenGate::default()),
         })
     };
-    let Some(node_id) = node_id else {
+    let Some((node_id, registry)) = process_writer else {
         let state = new_state();
         state.add_owner();
         return Ok(state);
     };
     let key = ProcessWriterKey {
-        object_store: Arc::as_ptr(object_store) as *const () as usize,
         path: path.to_string(),
         node_id: node_id.to_string(),
     };
-    let registry = PROCESS_WRITERS.get_or_init(|| StdMutex::new(BTreeMap::new()));
-    let mut registry = registry
+    let mut states = registry
+        .states
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    registry.retain(|_, state| state.strong_count() > 0);
-    let state = registry
-        .get(&key)
-        .and_then(Weak::upgrade)
-        .unwrap_or_else(|| {
-            let state = new_state();
-            registry.insert(key, Arc::downgrade(&state));
-            state
-        });
+    let state = states.get(&key).cloned().unwrap_or_else(|| {
+        let state = new_state();
+        states.insert(key, Arc::clone(&state));
+        state
+    });
     if state.heartbeat_interval != heartbeat_interval {
         return Err(GraphError::RoutedWriterConfigMismatch {
             path: path.to_string(),
@@ -481,14 +500,16 @@ impl GraphStore {
         storage_memory: GraphStorageMemoryConfig,
         durability: GraphDurabilityConfig,
         heartbeat_interval: Duration,
-        process_writer_node_id: Option<&str>,
+        process_writer: Option<(&str, Arc<ProcessWriterRegistry>)>,
     ) -> Result<Self> {
         let writer_state = process_writer_state(
             &path,
-            &object_store,
             heartbeat_interval,
-            process_writer_node_id,
+            process_writer
+                .as_ref()
+                .map(|(node_id, registry)| (*node_id, registry)),
         )?;
+        let writer_registry = process_writer.map(|(_, registry)| registry);
         Ok(Self {
             inner: Arc::new(GraphStoreInner {
                 path,
@@ -496,6 +517,7 @@ impl GraphStore {
                 cache,
                 storage_memory,
                 durability,
+                _writer_registry: writer_registry,
                 writer_state,
                 writer_owner_active: AtomicBool::new(true),
                 reader: AsyncRwLock::new(None),
@@ -536,14 +558,18 @@ impl GraphStore {
             .writer
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if writer
+        let close_reason = writer
             .as_ref()
-            .is_some_and(|current| current.status().close_reason.is_some())
-        {
+            .and_then(|current| current.status().close_reason);
+        if let Some(close_reason) = close_reason {
             *writer = None;
             self.inner
                 .reader_refresh_generation
                 .fetch_add(1, Ordering::AcqRel);
+            if close_reason == slatedb::CloseReason::Fenced {
+                self.reopen_gate()
+                    .note_fence(Instant::now(), self.inner.writer_state.heartbeat_interval);
+            }
             return true;
         }
         false
@@ -669,8 +695,6 @@ impl GraphStore {
                     tracing::Span::current().record("turbolay.writer.epoch", epoch);
                 }
                 self.clear_closed_writer();
-                self.reopen_gate()
-                    .note_fence(Instant::now(), self.inner.writer_state.heartbeat_interval);
                 self.log_fence_attribution(lost_epoch).await;
                 let error: GraphError = err.into();
                 // `fencing` is expected, not alarming — the class is here so a

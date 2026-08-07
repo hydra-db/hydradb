@@ -17,12 +17,12 @@ use crate::sparse_kernel::{
 use crate::{
     decode_edge_record, decode_out_edge_segment, decode_relationship_record, decode_u64,
     encode_vertex_property_value_key, ensure_limit, parse_out_edge_segment_tombstone_key,
-    parse_u64, segment_edge_visible, validate_component, EdgeRecord, GraphCacheEntryCounts,
-    GraphCacheKind, GraphCacheMetricsSnapshot, GraphCacheResidentBytes, GraphCorrectnessReport,
-    GraphError, GraphExportDigest, GraphMemoryConfig, GraphOpenOptions,
+    parse_u64, process_writer_registry, segment_edge_visible, validate_component, EdgeRecord,
+    GraphCacheEntryCounts, GraphCacheKind, GraphCacheMetricsSnapshot, GraphCacheResidentBytes,
+    GraphCorrectnessReport, GraphError, GraphExportDigest, GraphMemoryConfig, GraphOpenOptions,
     GraphOperationalMetricsSnapshot, GraphScope, GraphShard, GraphStore, GraphWriteBatch,
-    GraphWriteGuard, LocalWriteGuard, MatrixAdjacency, MatrixCacheKey, RelationshipId,
-    RelationshipRecord, Result, StorageSequence, VertexId,
+    GraphWriteGuard, LocalWriteGuard, MatrixAdjacency, MatrixCacheKey, ProcessWriterRegistry,
+    RelationshipId, RelationshipRecord, Result, StorageSequence, VertexId,
 };
 #[cfg(feature = "query-transport")]
 use crate::{GraphId, NamespacePath};
@@ -108,6 +108,7 @@ pub struct ScopedRoutedGraphCluster {
     directory: ObjectStoreNodeDirectory,
     placement: PlacementView,
     object_store: Arc<dyn ObjectStore>,
+    writer_registry: Arc<ProcessWriterRegistry>,
     scope_directory: ObjectStoreGraphScopeDirectory,
     options: GraphOpenOptions,
     memory: GraphMemoryConfig,

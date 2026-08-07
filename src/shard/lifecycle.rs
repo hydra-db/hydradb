@@ -45,6 +45,7 @@ impl GraphShard {
             memory,
             GraphWriteAuthority::ReadOnly,
             None,
+            None,
         )
         .await
     }
@@ -100,6 +101,7 @@ impl GraphShard {
             memory,
             GraphWriteAuthority::Writer,
             None,
+            None,
         )
         .await
     }
@@ -110,6 +112,7 @@ impl GraphShard {
         options: GraphOpenOptions,
         memory: GraphMemoryConfig,
         local_node_id: &str,
+        writer_registry: Arc<crate::ProcessWriterRegistry>,
     ) -> Result<Self> {
         Self::open_internal(
             path,
@@ -118,6 +121,7 @@ impl GraphShard {
             memory,
             GraphWriteAuthority::Promotable,
             Some(local_node_id),
+            Some(writer_registry),
         )
         .await
     }
@@ -129,6 +133,7 @@ impl GraphShard {
         memory: GraphMemoryConfig,
         write_authority: GraphWriteAuthority,
         process_writer_node_id: Option<&str>,
+        writer_registry: Option<Arc<crate::ProcessWriterRegistry>>,
     ) -> Result<Self> {
         if !options.durability.await_durable_writes
             && !matches!(&write_authority, GraphWriteAuthority::ReadOnly)
@@ -140,6 +145,7 @@ impl GraphShard {
         }
 
         let store_path = path.into();
+        let process_writer = process_writer_node_id.zip(writer_registry);
         let db = GraphStore::lazy(
             store_path.clone(),
             Arc::clone(&object_store),
@@ -147,7 +153,7 @@ impl GraphShard {
             memory.storage.clone(),
             options.durability.clone(),
             options.fence_backoff_interval,
-            process_writer_node_id,
+            process_writer,
         )?;
         match &write_authority {
             GraphWriteAuthority::ReadOnly => {
