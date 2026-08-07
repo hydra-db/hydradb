@@ -116,6 +116,10 @@ pub struct ScopedRoutedGraphCluster {
     clusters: tokio::sync::Mutex<BTreeMap<GraphScope, ScopedRoutedClusterEntry>>,
     scope_open_gates:
         tokio::sync::Mutex<BTreeMap<GraphScope, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// Scopes removed from `clusters` whose SlateDB handles are still closing.
+    /// A reopen must wait for the stored watch receiver to become `true`, or it
+    /// can overlap the retiring writer and fence it from the same process.
+    scope_closures: Arc<std::sync::Mutex<BTreeMap<GraphScope, tokio::sync::watch::Receiver<bool>>>>,
     scope_capacity_gate: tokio::sync::Mutex<()>,
     scope_open_reservations: AtomicUsize,
 }
