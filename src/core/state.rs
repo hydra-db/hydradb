@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
@@ -129,6 +129,7 @@ struct GraphStoreInner {
     writer_open_gate: Mutex<()>,
     reader_open_gate: Mutex<()>,
     reader_refresh_gate: Mutex<()>,
+    retiring: AtomicBool,
     // How long a fenced writer waits before re-promoting: exactly one heartbeat
     // interval, so the rival has published a fresh view and stood down.
     heartbeat_interval: Duration,
@@ -137,6 +138,30 @@ struct GraphStoreInner {
 }
 
 static EMPTY_GRAPH_STORE: OnceCell<Db> = OnceCell::const_new();
+
+fn is_active_reader_snapshot_error(error: &slatedb::Error) -> bool {
+    matches!(error.kind(), ErrorKind::Invalid)
+        && error
+            .to_string()
+            .contains("cannot close database reader while snapshots are active")
+}
+
+async fn close_reader_after_snapshots(reader: Arc<DbReader>) {
+    let mut delay = Duration::from_millis(10);
+    loop {
+        tokio::time::sleep(delay).await;
+        match reader.close().await {
+            Ok(()) => return,
+            Err(error) if is_active_reader_snapshot_error(&error) => {
+                delay = (delay * 2).min(Duration::from_secs(1));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to retire SlateDB reader after snapshots drained");
+                return;
+            }
+        }
+    }
+}
 
 /// The floor of the retry ladder, and the value a fence resets it to.
 const FENCE_BACKOFF_FLOOR: Duration = Duration::from_secs(1);
@@ -308,6 +333,7 @@ impl GraphStore {
                 writer_open_gate: Mutex::new(()),
                 reader_open_gate: Mutex::new(()),
                 reader_refresh_gate: Mutex::new(()),
+                retiring: AtomicBool::new(false),
                 heartbeat_interval,
                 writer_reopen_gate: StdMutex::new(WriterReopenGate::default()),
             }),
@@ -315,6 +341,9 @@ impl GraphStore {
     }
 
     fn open_writer(&self) -> Option<Db> {
+        if self.inner.retiring.load(Ordering::Acquire) {
+            return None;
+        }
         self.inner
             .writer
             .read()
@@ -592,10 +621,16 @@ impl GraphStore {
     }
 
     pub(crate) async fn promote_writer(&self) -> Result<bool> {
+        if self.inner.retiring.load(Ordering::Acquire) {
+            return Err(GraphError::ReadOnlyShardStorage);
+        }
         if self.open_writer().is_some() {
             return Ok(false);
         }
         let _open_guard = self.inner.writer_open_gate.lock().await;
+        if self.inner.retiring.load(Ordering::Acquire) {
+            return Err(GraphError::ReadOnlyShardStorage);
+        }
         if self.open_writer().is_some() {
             return Ok(false);
         }
@@ -650,10 +685,16 @@ impl GraphStore {
     }
 
     pub(crate) async fn open_reader(&self) -> Result<Option<Arc<DbReader>>> {
+        if self.inner.retiring.load(Ordering::Acquire) {
+            return Err(GraphError::ReadOnlyShardStorage);
+        }
         if let Some(reader) = self.inner.reader.read().await.as_ref().cloned() {
             return Ok(Some(reader));
         }
         let _open_guard = self.inner.reader_open_gate.lock().await;
+        if self.inner.retiring.load(Ordering::Acquire) {
+            return Err(GraphError::ReadOnlyShardStorage);
+        }
         if let Some(reader) = self.inner.reader.read().await.as_ref().cloned() {
             return Ok(Some(reader));
         }
@@ -791,14 +832,36 @@ impl GraphStore {
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
-        let reader = self.inner.reader.read().await.as_ref().cloned();
+        self.inner.retiring.store(true, Ordering::Release);
+        let _writer_guard = self.inner.writer_open_gate.lock().await;
+        let _reader_guard = self.inner.reader_open_gate.lock().await;
+
+        let writer = self
+            .inner
+            .writer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let reader = self.inner.reader.write().await.take();
+
+        // Writer retirement is the ownership boundary. It must complete even
+        // when a detached read snapshot is still alive; otherwise reopening
+        // this scope creates a second SlateDB writer and fences the first one.
+        let writer_result = match writer {
+            Some(writer) => writer.close().await.map_err(GraphError::from),
+            None => Ok(()),
+        };
+
         if let Some(reader) = reader {
-            reader.close().await?;
+            match reader.close().await {
+                Ok(()) => {}
+                Err(error) if is_active_reader_snapshot_error(&error) => {
+                    tokio::spawn(close_reader_after_snapshots(reader));
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
-        if let Some(writer) = self.open_writer() {
-            writer.close().await?;
-        }
-        Ok(())
+        writer_result
     }
 
     pub(crate) async fn snapshot(&self) -> Result<Arc<GraphStorageSnapshot>> {
