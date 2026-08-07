@@ -12001,7 +12001,7 @@ async fn cypher_edge_match_uses_destination_id_reverse_index_without_full_scan()
             cell_id: "reddit-home".to_string(),
             edge_type: "FOLLOWS".to_string(),
             src: 4,
-            dst: 40,
+            dst: 20,
             idempotency_key: "cypher-dst-id-index-newer-write".to_string(),
         })
         .await
