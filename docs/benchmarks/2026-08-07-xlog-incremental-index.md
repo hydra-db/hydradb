@@ -15,6 +15,35 @@
 | MinIO       | 200 k     | 600              | 300   | 225 ms             | 136 ms                 | 2,323 ms       | **10× / 17×** |
 | real S3     | 100 k     | 500              | 250   | 11,578 ms          | 6,670 ms               | 281,575 ms     | **24× / 42×** |
 
+## The staging replay — the operating loop, not a one-shot build
+
+`examples/staging_replay_bench.rs` recreates what actually degraded on staging: 8 edge types
+sharing one scope database, an indexer cycle building every type every round, and per cycle
+320 single-commit writes — ~215 to one hot type, **exactly 15 edges per quiet type** spread
+across the same window — so every quiet type's build faces the staging signature precisely:
+a 15-edge delta under a ~330-file WAL span it had no part in creating. The xlog GC runs each
+cycle as the indexer's cleanup step does, and one quiet type per cycle is re-verified against
+a full rebuild at the same sequence. (Run on MinIO at 25 k seed/type; see the caveat below on
+why not real S3.)
+
+| cycle | span | quiet-type builds (15-edge delta) | hot type (215) | full 8-type cycle | verify | GC reclaimed |
+|------:|-----:|:----------------------------------|---------------:|------------------:|:-------|-------------:|
+| 0 (bootstrap) | — | full builds, by design | full | 3.6 s | AGREE | 200,320 (seed) |
+| 1 | 328 | **17–21 ms each** | 241 ms | **0.69 s** | AGREE | 320 |
+| 2 | 328 | **18–23 ms each** | 242 ms | **0.70 s** | AGREE | 320 |
+| 3 | 328 | **17–28 ms each** | 77 ms | **0.55 s** | AGREE | 320 |
+
+Zero fallbacks after the planned bootstrap, every delta exact, every cycle byte-identical to
+full. The old path's measured cost for this shape (~50 ms per span file, from the staging
+traces) is ~16 s per quiet type per cycle — **~850× slower** than the ~19 ms above — which is
+what compounded into staging's 15–40-minute cycles. The replayed 8-type cycle runs in ~0.6 s.
+
+**Caveat, itself a finding:** attempts to run the replay at 50–100 k seed/type against real
+S3 reproducibly wedged the fork's write pipeline mid-seed — writers parked on compaction
+backpressure while the compactor loops refreshing its fenced transactional state object
+after a GC boundary write; alive-but-silent, no errors, same family as the staging indexer
+stall, now locally reproducible with stack samples. Tracked separately from the xlog work.
+
 Every run reported `[incremental, N delta edges]` with N exactly the trickled count — zero
 fallbacks, zero declines, exact deltas. There is no cost gate left to fire:
 `incremental_build_ignores_the_wal_span_cap` runs with `max_wal_tail_files = 0` and stays
