@@ -369,11 +369,12 @@ impl RoutedGraphCluster {
         for cell_id in directory.cells().map(str::to_string) {
             let path = format!("{base_path}/{cell_id}");
             let opened = if promotable {
-                GraphShard::open_promotable_with_memory_options(
+                GraphShard::open_promotable_for_node_with_memory_options(
                     path,
                     Arc::clone(&object_store),
                     options.clone(),
                     memory.clone(),
+                    &local_node_id,
                 )
                 .await
             } else {
@@ -1739,6 +1740,111 @@ mod scoped_cluster_tests {
             .expect("the replacement writer commits without fencing the old handle");
         drop(reopened);
         runtime.close().await.expect("the runtime drains");
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_to_one_scope_share_one_cluster_and_writer() {
+        let runtime = runtime_at_capacity("graph/concurrent-scope-writes", 16);
+        let scope = tenant_scope(&runtime, "tenant-hot");
+
+        let clusters = futures::future::join_all(
+            (0..64).map(|_| runtime.cluster_for_scope_write(&scope, "cell-0")),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .expect("concurrent write acquisitions succeed");
+
+        let first = clusters.first().expect("at least one cluster was returned");
+        assert!(
+            clusters.iter().all(|cluster| Arc::ptr_eq(first, cluster)),
+            "one process must never construct two routed clusters for the same scope"
+        );
+        let epoch = first
+            .shard("cell-0")
+            .expect("the shard exists")
+            .db
+            .writer_epoch()
+            .expect("the shared writer is installed");
+        assert!(clusters.iter().all(|cluster| {
+            cluster
+                .shard("cell-0")
+                .ok()
+                .and_then(|shard| shard.db.writer_epoch())
+                == Some(epoch)
+        }));
+
+        drop(clusters);
+        runtime.close().await.expect("the runtime drains");
+    }
+
+    #[tokio::test]
+    async fn duplicate_routed_runtimes_share_one_process_writer() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let make_runtime = || {
+            let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+            ScopedRoutedGraphCluster::new(
+                "graph/duplicate-runtime",
+                root,
+                GraphId::new("hydradb").unwrap(),
+                "node-a",
+                ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
+                PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
+                Arc::clone(&object_store),
+                GraphOpenOptions::default(),
+                GraphMemoryConfig::default(),
+                16,
+            )
+            .unwrap()
+        };
+        let first_runtime = make_runtime();
+        let second_runtime = make_runtime();
+        let scope = tenant_scope(&first_runtime, "tenant-hot");
+
+        let first = first_runtime
+            .cluster_for_scope_write(&scope, "cell-0")
+            .await
+            .expect("the first runtime acquires the writer");
+        let first_writer = first
+            .shard("cell-0")
+            .expect("the first shard exists")
+            .db
+            .writer()
+            .expect("the first writer is installed");
+        let second = second_runtime
+            .cluster_for_scope_write(&scope, "cell-0")
+            .await
+            .expect("the duplicate runtime reuses the writer");
+
+        first_writer
+            .refresh_manifest()
+            .await
+            .expect("the duplicate runtime must not fence the first handle");
+        assert_eq!(
+            first
+                .shard("cell-0")
+                .ok()
+                .and_then(|shard| shard.db.writer_epoch()),
+            second
+                .shard("cell-0")
+                .ok()
+                .and_then(|shard| shard.db.writer_epoch())
+        );
+
+        drop(first);
+        first_runtime
+            .close()
+            .await
+            .expect("closing one runtime preserves the shared writer");
+        second
+            .write_edge(scoped_edge("second-runtime-write"))
+            .await
+            .expect("the remaining runtime can still write");
+        drop(second);
+        second_runtime
+            .close()
+            .await
+            .expect("the final runtime drains");
     }
 
     #[tokio::test]
