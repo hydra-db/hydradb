@@ -44,6 +44,7 @@ impl GraphShard {
             options,
             memory,
             GraphWriteAuthority::ReadOnly,
+            None,
         )
         .await
     }
@@ -98,15 +99,17 @@ impl GraphShard {
             options,
             memory,
             GraphWriteAuthority::Writer,
+            None,
         )
         .await
     }
 
-    pub(crate) async fn open_promotable_with_memory_options(
+    pub(crate) async fn open_promotable_for_node_with_memory_options(
         path: impl Into<Path>,
         object_store: Arc<dyn ObjectStore>,
         options: GraphOpenOptions,
         memory: GraphMemoryConfig,
+        local_node_id: &str,
     ) -> Result<Self> {
         Self::open_internal(
             path,
@@ -114,6 +117,7 @@ impl GraphShard {
             options,
             memory,
             GraphWriteAuthority::Promotable,
+            Some(local_node_id),
         )
         .await
     }
@@ -124,6 +128,7 @@ impl GraphShard {
         options: GraphOpenOptions,
         memory: GraphMemoryConfig,
         write_authority: GraphWriteAuthority,
+        process_writer_node_id: Option<&str>,
     ) -> Result<Self> {
         if !options.durability.await_durable_writes
             && !matches!(&write_authority, GraphWriteAuthority::ReadOnly)
@@ -142,6 +147,7 @@ impl GraphShard {
             memory.storage.clone(),
             options.durability.clone(),
             options.fence_backoff_interval,
+            process_writer_node_id,
         );
         match &write_authority {
             GraphWriteAuthority::ReadOnly => {

@@ -1,5 +1,8 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, RwLock as StdRwLock};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{
+    Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, RwLock as StdRwLock, Weak,
+};
 use std::time::{Duration, Instant};
 
 use slatedb::bytes::Bytes;
@@ -121,20 +124,92 @@ struct GraphStoreInner {
     cache: GraphCacheConfig,
     storage_memory: GraphStorageMemoryConfig,
     durability: GraphDurabilityConfig,
-    writer: StdRwLock<Option<Db>>,
+    writer_state: Arc<ProcessWriterState>,
+    writer_owner_active: AtomicBool,
     reader: AsyncRwLock<Option<Arc<DbReader>>>,
     // A writer loss is acknowledged only by a reader refresh from the same or a later generation.
     reader_refresh_generation: AtomicU64,
     reader_refreshed_generation: AtomicU64,
-    writer_open_gate: Mutex<()>,
     reader_open_gate: Mutex<()>,
     reader_refresh_gate: Mutex<()>,
     retiring: AtomicBool,
-    // How long a fenced writer waits before re-promoting: exactly one heartbeat
-    // interval, so the rival has published a fresh view and stood down.
+}
+
+struct ProcessWriterState {
+    writer: StdRwLock<Option<Db>>,
+    open_gate: Mutex<()>,
+    closing: AtomicBool,
+    owners: AtomicUsize,
     heartbeat_interval: Duration,
-    // Armed by a fence or a failed refresh, consulted by the promotion gate.
-    writer_reopen_gate: StdMutex<WriterReopenGate>,
+    reopen_gate: StdMutex<WriterReopenGate>,
+}
+
+struct WriterClosingGuard<'a>(&'a AtomicBool);
+
+impl Drop for WriterClosingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct ProcessWriterKey {
+    object_store: usize,
+    path: String,
+    node_id: String,
+}
+
+static PROCESS_WRITERS: OnceLock<StdMutex<BTreeMap<ProcessWriterKey, Weak<ProcessWriterState>>>> =
+    OnceLock::new();
+
+/// Return the one writer state a graph-node may own for this physical database.
+///
+/// Standalone shard opens deliberately remain independent: callers use those
+/// to model separate processes and SlateDB must still fence competing writers.
+/// Routed opens supply their node ID, so duplicate scope runtimes inside one
+/// graph-node converge on one handle without sharing across simulated nodes.
+fn process_writer_state(
+    path: &Path,
+    object_store: &Arc<dyn ObjectStore>,
+    heartbeat_interval: Duration,
+    node_id: Option<&str>,
+) -> Arc<ProcessWriterState> {
+    let new_state = || {
+        Arc::new(ProcessWriterState {
+            writer: StdRwLock::new(None),
+            open_gate: Mutex::new(()),
+            closing: AtomicBool::new(false),
+            owners: AtomicUsize::new(0),
+            heartbeat_interval,
+            reopen_gate: StdMutex::new(WriterReopenGate::default()),
+        })
+    };
+    let Some(node_id) = node_id else {
+        let state = new_state();
+        state.owners.store(1, Ordering::Release);
+        return state;
+    };
+    let key = ProcessWriterKey {
+        object_store: Arc::as_ptr(object_store) as *const () as usize,
+        path: path.to_string(),
+        node_id: node_id.to_string(),
+    };
+    let registry = PROCESS_WRITERS.get_or_init(|| StdMutex::new(BTreeMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.retain(|_, state| state.strong_count() > 0);
+    let state = registry
+        .get(&key)
+        .and_then(Weak::upgrade)
+        .unwrap_or_else(|| {
+            let state = new_state();
+            registry.insert(key, Arc::downgrade(&state));
+            state
+        });
+    debug_assert_eq!(state.heartbeat_interval, heartbeat_interval);
+    state.owners.fetch_add(1, Ordering::AcqRel);
+    state
 }
 
 static EMPTY_GRAPH_STORE: OnceCell<Db> = OnceCell::const_new();
@@ -251,6 +326,57 @@ impl WriterReopenGate {
     }
 }
 
+impl ProcessWriterState {
+    async fn release_owner(&self) -> Result<()> {
+        let _open_guard = self.open_gate.lock().await;
+        self.closing.store(true, Ordering::Release);
+        // Scope eviction normally runs this close in a detached task, but the
+        // guard also makes direct cancellation recoverable: once the open gate
+        // is released, a replacement may promote instead of seeing `closing`
+        // forever.
+        let _closing_guard = WriterClosingGuard(&self.closing);
+        let previous = self.owners.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "process writer owner count underflow");
+        if previous > 1 {
+            return Ok(());
+        }
+
+        let writer = self
+            .writer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        match writer {
+            Some(writer) => writer.close().await.map_err(GraphError::from),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for GraphStoreInner {
+    fn drop(&mut self) {
+        if !self.writer_owner_active.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let writer_state = Arc::clone(&self.writer_state);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = writer_state.release_owner().await {
+                    tracing::warn!(%error, "failed to retire dropped process writer owner");
+                }
+            });
+        } else {
+            // There is no executor capable of draining SlateDB here. Preserve
+            // the shared handle until process teardown instead of creating a
+            // replacement writer that would fence it.
+            tracing::warn!(
+                path = %self.path,
+                "dropped graph store outside a Tokio runtime; retaining process writer"
+            );
+        }
+    }
+}
+
 pub(crate) enum GraphStorageSnapshot {
     Writer(Arc<DbSnapshot>),
     Reader(Arc<DbReaderSnapshot>),
@@ -318,7 +444,14 @@ impl GraphStore {
         storage_memory: GraphStorageMemoryConfig,
         durability: GraphDurabilityConfig,
         heartbeat_interval: Duration,
+        process_writer_node_id: Option<&str>,
     ) -> Self {
+        let writer_state = process_writer_state(
+            &path,
+            &object_store,
+            heartbeat_interval,
+            process_writer_node_id,
+        );
         Self {
             inner: Arc::new(GraphStoreInner {
                 path,
@@ -326,25 +459,26 @@ impl GraphStore {
                 cache,
                 storage_memory,
                 durability,
-                writer: StdRwLock::new(None),
+                writer_state,
+                writer_owner_active: AtomicBool::new(true),
                 reader: AsyncRwLock::new(None),
                 reader_refresh_generation: AtomicU64::new(0),
                 reader_refreshed_generation: AtomicU64::new(0),
-                writer_open_gate: Mutex::new(()),
                 reader_open_gate: Mutex::new(()),
                 reader_refresh_gate: Mutex::new(()),
                 retiring: AtomicBool::new(false),
-                heartbeat_interval,
-                writer_reopen_gate: StdMutex::new(WriterReopenGate::default()),
             }),
         }
     }
 
     fn open_writer(&self) -> Option<Db> {
-        if self.inner.retiring.load(Ordering::Acquire) {
+        if self.inner.retiring.load(Ordering::Acquire)
+            || self.inner.writer_state.closing.load(Ordering::Acquire)
+        {
             return None;
         }
         self.inner
+            .writer_state
             .writer
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -363,6 +497,7 @@ impl GraphStore {
     fn clear_closed_writer(&self) -> bool {
         let mut writer = self
             .inner
+            .writer_state
             .writer
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -477,7 +612,7 @@ impl GraphStore {
 
     /// The body of [`Self::refresh_writer_fence`], running inside its span.
     async fn refresh_writer_fence_traced(&self) -> Result<()> {
-        let _open_guard = self.inner.writer_open_gate.lock().await;
+        let _open_guard = self.inner.writer_state.open_gate.lock().await;
         // No writer at all is a read-only shard, not a fenced one: waiting
         // promotes nothing, so there is no delay to arm.
         let writer = self
@@ -500,7 +635,7 @@ impl GraphStore {
                 }
                 self.clear_closed_writer();
                 self.reopen_gate()
-                    .note_fence(Instant::now(), self.inner.heartbeat_interval);
+                    .note_fence(Instant::now(), self.inner.writer_state.heartbeat_interval);
                 self.log_fence_attribution(lost_epoch).await;
                 let error: GraphError = err.into();
                 // `fencing` is expected, not alarming — the class is here so a
@@ -605,7 +740,8 @@ impl GraphStore {
 
     fn reopen_gate(&self) -> StdMutexGuard<'_, WriterReopenGate> {
         self.inner
-            .writer_reopen_gate
+            .writer_state
+            .reopen_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -627,7 +763,7 @@ impl GraphStore {
         if self.open_writer().is_some() {
             return Ok(false);
         }
-        let _open_guard = self.inner.writer_open_gate.lock().await;
+        let _open_guard = self.inner.writer_state.open_gate.lock().await;
         if self.inner.retiring.load(Ordering::Acquire) {
             return Err(GraphError::ReadOnlyShardStorage);
         }
@@ -663,6 +799,7 @@ impl GraphStore {
         .await?;
         *self
             .inner
+            .writer_state
             .writer
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(writer.clone());
@@ -833,23 +970,14 @@ impl GraphStore {
 
     pub(crate) async fn close(&self) -> Result<()> {
         self.inner.retiring.store(true, Ordering::Release);
-        let _writer_guard = self.inner.writer_open_gate.lock().await;
         let _reader_guard = self.inner.reader_open_gate.lock().await;
 
-        let writer = self
-            .inner
-            .writer
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
         let reader = self.inner.reader.write().await.take();
 
-        // Writer retirement is the ownership boundary. It must complete even
-        // when a detached read snapshot is still alive; otherwise reopening
-        // this scope creates a second SlateDB writer and fences the first one.
-        let writer_result = match writer {
-            Some(writer) => writer.close().await.map_err(GraphError::from),
-            None => Ok(()),
+        let writer_result = if self.inner.writer_owner_active.swap(false, Ordering::AcqRel) {
+            self.inner.writer_state.release_owner().await
+        } else {
+            Ok(())
         };
 
         if let Some(reader) = reader {
