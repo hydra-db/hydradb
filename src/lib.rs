@@ -85,8 +85,8 @@ pub use core::snapshot::GraphSnapshot;
 #[cfg(feature = "opencypher")]
 pub use core::state::QueryStatsRefreshHandle;
 pub(crate) use core::state::{
-    finish_local_write, is_retryable_write_conflict, GraphStorageSnapshot, GraphStore,
-    GraphWriteAuthority, GraphWriteOp, LocalWriteGuard,
+    finish_local_write, is_retryable_write_conflict, process_writer_registry, GraphStorageSnapshot,
+    GraphStore, GraphWriteAuthority, GraphWriteOp, LocalWriteGuard, ProcessWriterRegistry,
 };
 pub use core::state::{GraphCacheEntryCounts, GraphCacheResidentBytes, GraphShard};
 pub use core::trace_context::{install_trace_context_bridge, TraceContextBridge};

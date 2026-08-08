@@ -216,6 +216,7 @@ struct RoutedClusterOpenConfig {
     directory: ObjectStoreNodeDirectory,
     placement: PlacementView,
     object_store: Arc<dyn ObjectStore>,
+    writer_registry: Option<Arc<ProcessWriterRegistry>>,
     promotable: bool,
     options: GraphOpenOptions,
     memory: GraphMemoryConfig,
@@ -297,6 +298,7 @@ impl RoutedGraphCluster {
             directory,
             placement,
             object_store,
+            writer_registry: None,
             promotable: false,
             options: GraphOpenOptions::default(),
             memory: GraphMemoryConfig::default(),
@@ -315,6 +317,33 @@ impl RoutedGraphCluster {
         options: GraphOpenOptions,
         memory: GraphMemoryConfig,
     ) -> Result<Self> {
+        let writer_registry = process_writer_registry(&object_store);
+        Self::open_promotable_scoped_with_writer_registry(
+            base_path,
+            scope,
+            local_node_id,
+            directory,
+            placement,
+            object_store,
+            writer_registry,
+            options,
+            memory,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_promotable_scoped_with_writer_registry(
+        base_path: impl Into<String>,
+        scope: GraphScope,
+        local_node_id: impl Into<String>,
+        directory: ObjectStoreNodeDirectory,
+        placement: PlacementView,
+        object_store: Arc<dyn ObjectStore>,
+        writer_registry: Arc<ProcessWriterRegistry>,
+        options: GraphOpenOptions,
+        memory: GraphMemoryConfig,
+    ) -> Result<Self> {
         let base_path = scope.scoped_store_path(&base_path.into());
         Self::open_at_path(RoutedClusterOpenConfig {
             base_path,
@@ -323,6 +352,7 @@ impl RoutedGraphCluster {
             directory,
             placement,
             object_store,
+            writer_registry: Some(writer_registry),
             promotable: true,
             options,
             memory,
@@ -338,6 +368,7 @@ impl RoutedGraphCluster {
             directory,
             placement,
             object_store,
+            writer_registry,
             promotable,
             options,
             memory,
@@ -375,6 +406,11 @@ impl RoutedGraphCluster {
                     options.clone(),
                     memory.clone(),
                     &local_node_id,
+                    Arc::clone(
+                        writer_registry
+                            .as_ref()
+                            .expect("promotable cluster must retain a writer registry"),
+                    ),
                 )
                 .await
             } else {
@@ -1155,6 +1191,7 @@ impl ScopedRoutedGraphCluster {
                 limit: 1,
             });
         }
+        let writer_registry = process_writer_registry(&object_store);
         Ok(Self {
             base_path: base_path.clone(),
             root_namespace: root_namespace.clone(),
@@ -1169,6 +1206,7 @@ impl ScopedRoutedGraphCluster {
                 Arc::clone(&object_store),
             ),
             object_store,
+            writer_registry,
             options,
             memory,
             max_open_scopes,
@@ -1314,7 +1352,7 @@ impl ScopedRoutedGraphCluster {
             }
 
             let cluster = Arc::new(
-                RoutedGraphCluster::open_promotable_scoped_with_memory_options(
+                RoutedGraphCluster::open_promotable_scoped_with_writer_registry(
                     self.base_path.clone(),
                     scope.clone(),
                     self.local_node_id.clone(),
@@ -1323,6 +1361,7 @@ impl ScopedRoutedGraphCluster {
                     // provider must answer from one live set.
                     self.placement.clone(),
                     Arc::clone(&self.object_store),
+                    Arc::clone(&self.writer_registry),
                     self.options_for_scope(scope),
                     self.memory.clone(),
                 )
@@ -1739,6 +1778,43 @@ mod scoped_cluster_tests {
             .await
             .expect("the replacement writer commits without fencing the old handle");
         drop(reopened);
+        runtime.close().await.expect("the runtime drains");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_scope_eviction_reopens_one_process_writer() {
+        let runtime = runtime_at_capacity("graph/repeated-writer-eviction", 2);
+        let hot = tenant_scope(&runtime, "tenant-hot");
+
+        for round in 0..8 {
+            let hot_clusters = futures::future::join_all(
+                (0..16).map(|_| runtime.cluster_for_scope_write(&hot, "cell-0")),
+            )
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .expect("concurrent hot-scope acquisitions succeed");
+            let first = hot_clusters.first().expect("the hot scope was returned");
+            assert!(hot_clusters
+                .iter()
+                .all(|cluster| Arc::ptr_eq(first, cluster)));
+            first
+                .write_edge(scoped_edge(&format!("hot-write-{round}")))
+                .await
+                .expect("the hot writer commits without fencing itself");
+            drop(hot_clusters);
+
+            for suffix in ["a", "b"] {
+                let cold = tenant_scope(&runtime, &format!("tenant-cold-{round}-{suffix}"));
+                drop(
+                    runtime
+                        .cluster_for_scope(&cold)
+                        .await
+                        .expect("cold scope opens and advances eviction"),
+                );
+            }
+        }
+
         runtime.close().await.expect("the runtime drains");
     }
 

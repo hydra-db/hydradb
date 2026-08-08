@@ -3781,6 +3781,15 @@ async fn routed_cluster_uses_slatedb_writer_fencing() {
                 slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced)
             )
     ));
+    assert!(
+        first
+            .shard("cell-a")
+            .unwrap()
+            .db
+            .writer_reopen_delay()
+            .is_some(),
+        "a fence discovered by an ordinary write must pace the replacement writer"
+    );
 
     first
         .write_edge(typed_mutation("cell-a", "FOLLOWS", 3, 4, "recovered"))
