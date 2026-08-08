@@ -883,6 +883,35 @@ impl GraphStore {
         if self.open_writer().is_some() {
             return Ok(false);
         }
+        self.spawn_writer_promotion()
+            .await
+            .map_err(|error| GraphError::CorruptValue {
+                key: format!("{}/writer-promotion", self.inner.path),
+                reason: format!("writer promotion task failed: {error}"),
+            })?
+    }
+
+    /// Start promotion outside the requesting task's cancellation lifetime.
+    ///
+    /// Opening SlateDB starts writer background tasks before `Db::build` returns.
+    /// If a timed-out Bolt request drops that future, releasing `open_gate` lets a
+    /// later request open a second writer while the first open is still alive.
+    /// The detached task owns the complete open-and-install sequence, so dropping
+    /// its join handle cannot strand a half-open writer.
+    fn spawn_writer_promotion(&self) -> tokio::task::JoinHandle<Result<bool>> {
+        let store = self.clone();
+        tokio::spawn(
+            async move { store.promote_writer_owned().await }.instrument(tracing::Span::current()),
+        )
+    }
+
+    async fn promote_writer_owned(&self) -> Result<bool> {
+        if self.inner.retiring.load(Ordering::Acquire) {
+            return Err(GraphError::ReadOnlyShardStorage);
+        }
+        if self.open_writer().is_some() {
+            return Ok(false);
+        }
         let _open_guard = self.inner.writer_state.open_gate.lock().await;
         if self.inner.retiring.load(Ordering::Acquire) {
             return Err(GraphError::ReadOnlyShardStorage);
@@ -1427,6 +1456,56 @@ mod tests {
             .expect("the reopened owner releases cleanly");
         drop(state);
         assert_eq!(live_registry_states(&registry), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_cannot_abandon_writer_promotion() {
+        let registry = Arc::new(ProcessWriterRegistry::new());
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = GraphStore::lazy(
+            Path::from("graph/cancelled-writer-promotion"),
+            object_store,
+            GraphCacheConfig::default(),
+            GraphStorageMemoryConfig::default(),
+            GraphDurabilityConfig::default(),
+            Duration::from_secs(5),
+            Some(("node-0", registry)),
+        )
+        .expect("the routed graph store opens");
+
+        let open_guard = store.inner.writer_state.open_gate.lock().await;
+        let request_store = store.clone();
+        let request_promotion = tokio::spawn(async move { request_store.promote_writer().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&store.inner) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request starts its owned promotion task");
+        request_promotion.abort();
+        assert!(request_promotion
+            .await
+            .expect_err("the request task is cancelled")
+            .is_cancelled());
+        drop(open_guard);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.open_writer().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached promotion finishes after its caller is cancelled");
+
+        assert!(
+            !store
+                .promote_writer()
+                .await
+                .expect("the installed writer is reusable"),
+            "a later request must reuse the detached promotion's writer"
+        );
+        store.close().await.expect("the writer closes cleanly");
     }
 
     #[tokio::test(flavor = "multi_thread")]
