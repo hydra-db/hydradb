@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::AtomicBool;
 #[cfg(feature = "query-transport")]
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -89,6 +90,8 @@ pub struct RoutedGraphCluster {
     /// Who owns each cell's writer. A clone of the process-wide handle, shared
     /// with the Bolt routing provider — see `engine::placement`.
     placement: PlacementView,
+    writer_leases: Option<Arc<ObjectStoreWriterLeaseDirectory>>,
+    writer_lease_registration_active: AtomicBool,
     shards: BTreeMap<String, Arc<GraphShard>>,
     promotable: bool,
 }
@@ -108,6 +111,7 @@ pub struct ScopedRoutedGraphCluster {
     directory: ObjectStoreNodeDirectory,
     placement: PlacementView,
     object_store: Arc<dyn ObjectStore>,
+    writer_leases: Arc<ObjectStoreWriterLeaseDirectory>,
     writer_registry: Arc<ProcessWriterRegistry>,
     scope_directory: ObjectStoreGraphScopeDirectory,
     options: GraphOpenOptions,
@@ -220,10 +224,14 @@ mod cluster;
 mod index_store;
 mod placement;
 mod scope_directory;
+mod writer_lease;
 
 pub use placement::{CellOwnership, PlacementConfig, PlacementRefreshHandle, PlacementView};
 
 pub use scope_directory::ObjectStoreGraphScopeDirectory;
+pub use writer_lease::{
+    ObjectStoreWriterLeaseDirectory, WriterLeaseOwner, WriterLeaseRenewalFailure,
+};
 mod matrix_cache;
 mod traversal;
 mod verify;

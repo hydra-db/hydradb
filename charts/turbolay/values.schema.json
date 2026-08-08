@@ -170,6 +170,7 @@
         "maxConcurrentHydrations": { "$ref": "#/definitions/unsignedDecimal" },
         "maxConcurrentMatrixCompilations": { "$ref": "#/definitions/unsignedDecimal" },
         "indexDiscoveryIntervalMs": { "$ref": "#/definitions/positiveUnsignedDecimal" },
+        "writerLeaseMs": { "type": "integer", "minimum": 3000, "maximum": 300000 },
         "trimMemoryAfterHydration": { "type": "boolean" }
       }
     },

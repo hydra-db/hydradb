@@ -41,6 +41,7 @@ pub struct RuntimeConfig {
     pub index_discovery_interval: Duration,
     pub heartbeat_interval: Duration,
     pub heartbeat_timeout: Duration,
+    pub writer_lease_duration: Duration,
     pub bolt_addr: SocketAddr,
     pub http_addr: SocketAddr,
     pub admin_addr: SocketAddr,
@@ -119,6 +120,13 @@ impl RuntimeConfig {
                 heartbeat_interval.as_millis(),
                 heartbeat_timeout.as_millis(),
             ));
+        }
+        let writer_lease_duration = parse_duration(&values, "GRAPH_WRITER_LEASE_MS", 30_000)?;
+        if writer_lease_duration < Duration::from_secs(3) {
+            return invalid("GRAPH_WRITER_LEASE_MS must be at least 3000");
+        }
+        if writer_lease_duration > Duration::from_secs(300) {
+            return invalid("GRAPH_WRITER_LEASE_MS must be at most 300000");
         }
         let bolt_node_addresses = parse_node_addresses(
             &values,
@@ -215,6 +223,7 @@ impl RuntimeConfig {
             )?,
             heartbeat_interval,
             heartbeat_timeout,
+            writer_lease_duration,
             bolt_addr: parse_socket(&values, "GRAPH_BOLT_ADDR", "0.0.0.0:7687")?,
             http_addr: parse_socket(&values, "GRAPH_HTTP_ADDR", "0.0.0.0:8443")?,
             admin_addr: parse_socket(&values, "GRAPH_ADMIN_ADDR", "0.0.0.0:9090")?,
@@ -501,6 +510,7 @@ mod tests {
         assert_eq!(config.index_discovery_interval, Duration::from_secs(5));
         assert_eq!(config.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(config.heartbeat_timeout, Duration::from_secs(15));
+        assert_eq!(config.writer_lease_duration, Duration::from_secs(30));
         assert_eq!(config.bolt_authentication_timeout, Duration::from_secs(30));
         assert_eq!(config.bolt_idle_timeout, Duration::from_secs(15 * 60));
         assert_eq!(config.bolt_max_connection_age, Duration::from_secs(60 * 60));
@@ -524,6 +534,30 @@ mod tests {
         let config = RuntimeConfig::from_values(values).unwrap();
         assert_eq!(config.max_query_scan_edges, 64);
         assert_eq!(config.graph_open_options().limits.max_query_scan_edges, 64);
+    }
+
+    #[test]
+    fn graph_node_rejects_an_unsafe_writer_lease_window() {
+        let values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            ("GRAPH_WRITER_LEASE_MS".to_string(), "2999".to_string()),
+        ]);
+        let error = RuntimeConfig::from_values(values).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("GRAPH_WRITER_LEASE_MS must be at least 3000"));
+    }
+
+    #[test]
+    fn graph_node_rejects_an_excessive_writer_lease_window() {
+        let values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            ("GRAPH_WRITER_LEASE_MS".to_string(), "300001".to_string()),
+        ]);
+        let error = RuntimeConfig::from_values(values).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("GRAPH_WRITER_LEASE_MS must be at most 300000"));
     }
 
     #[test]

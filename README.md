@@ -576,8 +576,11 @@ The production data path follows SlateDB's single-writer, multi-reader model:
 
 1. Every node lazily opens a `DbReader` for every configured cell and keeps only
    disposable memory/NVMe caches locally.
-2. A write-routed node lazily opens and caches the SlateDB writer. SlateDB's
-   writer epoch and WAL barrier fence any competing or stale writer.
+2. A write-routed node must first win the cell's object-store CAS lease. The
+   lease uses S3's server timestamp and a process-unique holder ID, so separate
+   nodes and overlapping restarts cannot both authorize promotion. The winner
+   lazily opens and caches the SlateDB writer; SlateDB's writer epoch and WAL
+   barrier remain the final stale-writer fence.
 3. Every query pins one `DbSnapshot` or `DbReaderSnapshot`, so canonical records
    and indexes come from exactly one durable SlateDB storage sequence.
 4. Bookmarks are SlateDB commit sequences. A reader explicitly refreshes and
@@ -589,8 +592,9 @@ The production data path follows SlateDB's single-writer, multi-reader model:
    discovered base and overlay committed topology changes from the SlateDB WAL
    through the pinned query sequence. If the required WAL has already been
    compacted away, the query uses bounded source-scoped canonical reads.
-7. Bolt routing uses one preferred writer address as soft cache affinity and all
-   nodes as readers. It is not a correctness or ownership database.
+7. Bolt routing advertises the active lease owner for writes and all live nodes
+   as readers. Rendezvous placement selects the contender when no lease exists;
+   the durable CAS lease, not a node-local heartbeat view, grants write access.
 8. Public pagination uses bounded server-held result cursors, so continuation
    pages never replay a query or publish graph-owned retention records.
 

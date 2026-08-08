@@ -145,6 +145,14 @@ struct ProcessWriterState {
     reopen_gate: StdMutex<WriterReopenGate>,
 }
 
+struct ProcessWriterClosingGuard<'a>(&'a AtomicBool);
+
+impl Drop for ProcessWriterClosingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 struct ProcessWriterKey {
     path: String,
@@ -475,6 +483,22 @@ impl ProcessWriterState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         self.closing.store(false, Ordering::Release);
+    }
+
+    async fn retire_writer(&self) -> Result<bool> {
+        let _open_guard = self.open_gate.lock().await;
+        self.closing.store(true, Ordering::Release);
+        let _closing_guard = ProcessWriterClosingGuard(&self.closing);
+        let writer = self
+            .writer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let result = match writer {
+            Some(writer) => writer.close().await.map(|_| true).map_err(GraphError::from),
+            None => Ok(false),
+        };
+        result
     }
 }
 
@@ -889,6 +913,22 @@ impl GraphStore {
                 key: format!("{}/writer-promotion", self.inner.path),
                 reason: format!("writer promotion task failed: {error}"),
             })?
+    }
+
+    /// Close only the routed writer while keeping this shard available for reads.
+    ///
+    /// Lease loss must withdraw write authority immediately, but evicting the
+    /// whole scoped shard would also discard its reader and caches. Promotion
+    /// and retirement share `open_gate`, so a request cannot install a new
+    /// writer while the old lease holder is still closing its handle.
+    pub(crate) async fn retire_writer(&self) -> Result<bool> {
+        let retired = self.inner.writer_state.retire_writer().await?;
+        if retired {
+            self.inner
+                .reader_refresh_generation
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(retired)
     }
 
     /// Start promotion outside the requesting task's cancellation lifetime.

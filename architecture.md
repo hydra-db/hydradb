@@ -392,17 +392,19 @@ probes determine which addresses Bolt may advertise. Every ready node is a read
 candidate; one stable address is preferred for writes to preserve writer and
 cache locality.
 
-There is no proactive leader-election service. Failover is request-driven:
-another promotable query node receives a write, opens the SlateDB writer, and
-claims a newer writer epoch. Object-store CAS, the writer epoch, and the WAL
-barrier provide split-writer protection.
+There is no controller or external leader-election service. Failover is
+request-driven: rendezvous placement selects a contender, which must win a
+server-timestamped object-store CAS lease before it may open the SlateDB writer.
+The lease is renewed while the writer is held and lease loss closes that handle.
+SlateDB's writer epoch and WAL barrier remain the final split-writer protection.
 
 ## Authority Boundaries
 
 | Concern | Authoritative component |
 | --- | --- |
 | Durable graph state | SlateDB data in object storage |
-| Active writer and fencing | SlateDB writer epoch and WAL barrier |
+| Writer admission | Object-store CAS lease scoped by graph and cell |
+| Final writer fencing | SlateDB writer epoch and WAL barrier |
 | Query snapshot | Query-scoped SlateDB snapshot |
 | Causal position | SlateDB durable sequence bookmark |
 | Latest traversal index | Object-store CAS `current` pointer |
