@@ -1614,6 +1614,7 @@ async fn close_routed_shards_best_effort(shards: BTreeMap<String, Arc<GraphShard
 #[cfg(all(test, feature = "query-transport"))]
 mod scoped_cluster_tests {
     use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::prefix::PrefixStore;
 
     use super::*;
     use crate::NamespaceId;
@@ -1921,6 +1922,86 @@ mod scoped_cluster_tests {
             .close()
             .await
             .expect("the final runtime drains");
+    }
+
+    #[tokio::test]
+    async fn equivalent_object_store_handles_share_one_process_writer() {
+        let physical_store = Arc::new(InMemory::new());
+        let first_store: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(
+            Arc::clone(&physical_store),
+            "shared-physical-store",
+        ));
+        let second_store: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(
+            Arc::clone(&physical_store),
+            "shared-physical-store",
+        ));
+        assert_ne!(
+            Arc::as_ptr(&first_store) as *const () as usize,
+            Arc::as_ptr(&second_store) as *const () as usize,
+            "the regression requires distinct object-store wrappers"
+        );
+        assert_eq!(first_store.to_string(), second_store.to_string());
+
+        let make_runtime = |object_store| {
+            let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+            ScopedRoutedGraphCluster::new(
+                "graph/equivalent-object-store-handles",
+                root,
+                GraphId::new("hydradb").unwrap(),
+                "node-a",
+                ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
+                PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
+                object_store,
+                GraphOpenOptions::default(),
+                GraphMemoryConfig::default(),
+                16,
+            )
+            .unwrap()
+        };
+        let first_runtime = make_runtime(first_store);
+        let second_runtime = make_runtime(second_store);
+        let scope = tenant_scope(&first_runtime, "tenant-hot");
+
+        let first = first_runtime
+            .cluster_for_scope_write(&scope, "cell-0")
+            .await
+            .expect("the first handle acquires the writer");
+        let first_writer = first
+            .shard("cell-0")
+            .expect("the first shard exists")
+            .db
+            .writer()
+            .expect("the first writer is installed");
+        let second = second_runtime
+            .cluster_for_scope_write(&scope, "cell-0")
+            .await
+            .expect("the equivalent handle reuses the writer");
+
+        first_writer
+            .refresh_manifest()
+            .await
+            .expect("an equivalent store handle must not fence the first writer");
+        assert_eq!(
+            first
+                .shard("cell-0")
+                .ok()
+                .and_then(|shard| shard.db.writer_epoch()),
+            second
+                .shard("cell-0")
+                .ok()
+                .and_then(|shard| shard.db.writer_epoch())
+        );
+
+        drop(first);
+        first_runtime
+            .close()
+            .await
+            .expect("the first runtime closes");
+        drop(second);
+        second_runtime
+            .close()
+            .await
+            .expect("the second runtime closes");
     }
 
     #[tokio::test]
