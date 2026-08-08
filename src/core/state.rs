@@ -124,7 +124,7 @@ struct GraphStoreInner {
     cache: GraphCacheConfig,
     storage_memory: GraphStorageMemoryConfig,
     durability: GraphDurabilityConfig,
-    _writer_registry: Option<Arc<ProcessWriterRegistry>>,
+    writer_registration: Option<ProcessWriterRegistration>,
     writer_state: Arc<ProcessWriterState>,
     writer_owner_active: AtomicBool,
     reader: AsyncRwLock<Option<Arc<DbReader>>>,
@@ -161,6 +161,12 @@ struct ProcessWriterKey {
 
 pub(crate) struct ProcessWriterRegistry {
     states: StdMutex<BTreeMap<ProcessWriterKey, Arc<ProcessWriterState>>>,
+}
+
+#[derive(Clone)]
+struct ProcessWriterRegistration {
+    registry: Arc<ProcessWriterRegistry>,
+    key: ProcessWriterKey,
 }
 
 static PROCESS_WRITER_REGISTRIES: OnceLock<StdMutex<BTreeMap<usize, Weak<ProcessWriterRegistry>>>> =
@@ -236,6 +242,49 @@ fn process_writer_state(
     }
     state.add_owner();
     Ok(state)
+}
+
+impl ProcessWriterRegistration {
+    fn remove_if_idle(&self, state: &Arc<ProcessWriterState>) {
+        let mut states = self
+            .registry
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(current) = states.get(&self.key) else {
+            return;
+        };
+        if !Arc::ptr_eq(current, state) {
+            return;
+        }
+
+        // Registration takes the registry lock before incrementing owners, so
+        // no new owner can appear between this check and removal. A subsequent
+        // opener creates a fresh state only after the old writer is fully shut.
+        let no_owners = *state.owners() == 0;
+        let writer_is_closed = state
+            .writer
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none();
+        if no_owners && !state.is_closing() && writer_is_closed {
+            states.remove(&self.key);
+        }
+    }
+}
+
+async fn release_process_writer_owner(
+    state: Arc<ProcessWriterState>,
+    registration: Option<ProcessWriterRegistration>,
+) -> Result<()> {
+    let release_result = state.release_owner().await;
+    let should_remove = !matches!(release_result, Ok(false));
+    if should_remove {
+        if let Some(registration) = &registration {
+            registration.remove_if_idle(&state);
+        }
+    }
+    release_result.map(|_| ())
 }
 
 static EMPTY_GRAPH_STORE: OnceCell<Db> = OnceCell::const_new();
@@ -382,13 +431,13 @@ impl ProcessWriterState {
         true
     }
 
-    async fn release_owner(&self) -> Result<()> {
+    async fn release_owner(&self) -> Result<bool> {
         let _open_guard = self.open_gate.lock().await;
         if !self.begin_release() {
             // Another routed store still owns this handle. Do not publish a
             // closing transition: surviving owners must keep using the writer
             // without a transient read-only window.
-            return Ok(());
+            return Ok(false);
         }
 
         // Scope eviction normally runs this close in a detached task, but the
@@ -402,10 +451,10 @@ impl ProcessWriterState {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        match writer {
-            Some(writer) => writer.close().await.map_err(GraphError::from),
-            None => Ok(()),
+        if let Some(writer) = writer {
+            writer.close().await.map_err(GraphError::from)?;
         }
+        Ok(true)
     }
 }
 
@@ -415,9 +464,12 @@ impl Drop for GraphStoreInner {
             return;
         }
         let writer_state = Arc::clone(&self.writer_state);
+        let writer_registration = self.writer_registration.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                if let Err(error) = writer_state.release_owner().await {
+                if let Err(error) =
+                    release_process_writer_owner(writer_state, writer_registration).await
+                {
                     tracing::warn!(%error, "failed to retire dropped process writer owner");
                 }
             });
@@ -509,7 +561,14 @@ impl GraphStore {
                 .as_ref()
                 .map(|(node_id, registry)| (*node_id, registry)),
         )?;
-        let writer_registry = process_writer.map(|(_, registry)| registry);
+        let writer_registration =
+            process_writer.map(|(node_id, registry)| ProcessWriterRegistration {
+                key: ProcessWriterKey {
+                    path: path.to_string(),
+                    node_id: node_id.to_string(),
+                },
+                registry,
+            });
         Ok(Self {
             inner: Arc::new(GraphStoreInner {
                 path,
@@ -517,7 +576,7 @@ impl GraphStore {
                 cache,
                 storage_memory,
                 durability,
-                _writer_registry: writer_registry,
+                writer_registration,
                 writer_state,
                 writer_owner_active: AtomicBool::new(true),
                 reader: AsyncRwLock::new(None),
@@ -1034,7 +1093,11 @@ impl GraphStore {
         let reader = self.inner.reader.write().await.take();
 
         let writer_result = if self.inner.writer_owner_active.swap(false, Ordering::AcqRel) {
-            self.inner.writer_state.release_owner().await
+            release_process_writer_owner(
+                Arc::clone(&self.inner.writer_state),
+                self.inner.writer_registration.clone(),
+            )
+            .await
         } else {
             Ok(())
         };
@@ -1303,6 +1366,30 @@ mod tests {
         assert!(!state.begin_release());
         assert_eq!(*state.owners(), 1);
         assert!(!state.is_closing());
+    }
+
+    #[tokio::test]
+    async fn releasing_the_final_owner_removes_its_registry_state() {
+        let registry = Arc::new(ProcessWriterRegistry {
+            states: StdMutex::new(BTreeMap::new()),
+        });
+        let path = Path::from("graph/final-owner-removal");
+        let node_id = "node-0";
+        let state = process_writer_state(&path, Duration::from_secs(5), Some((node_id, &registry)))
+            .expect("the routed writer state is registered");
+        let registration = ProcessWriterRegistration {
+            registry: Arc::clone(&registry),
+            key: ProcessWriterKey {
+                path: path.to_string(),
+                node_id: node_id.to_string(),
+            },
+        };
+
+        assert_eq!(registry.states.lock().unwrap().len(), 1);
+        release_process_writer_owner(state, Some(registration))
+            .await
+            .expect("the final owner releases cleanly");
+        assert!(registry.states.lock().unwrap().is_empty());
     }
 
     /// Decision 6's rules 1 and 2, which are the two that survive the write-path
