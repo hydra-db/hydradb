@@ -146,14 +146,6 @@ struct ProcessWriterState {
     reopen_gate: StdMutex<WriterReopenGate>,
 }
 
-struct WriterClosingGuard<'a>(&'a AtomicBool);
-
-impl Drop for WriterClosingGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 struct ProcessWriterKey {
     path: String,
@@ -172,6 +164,29 @@ struct ProcessWriterRegistration {
 
 static PROCESS_WRITER_REGISTRIES: OnceLock<StdMutex<BTreeMap<usize, Weak<ProcessWriterRegistry>>>> =
     OnceLock::new();
+static PROCESS_WRITER_CLEANUP_RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+
+fn process_writer_cleanup_runtime() -> &'static tokio::runtime::Handle {
+    PROCESS_WRITER_CLEANUP_RUNTIME.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("turbolay-writer-cleanup".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build process writer cleanup runtime");
+                sender
+                    .send(runtime.handle().clone())
+                    .expect("publish process writer cleanup runtime");
+                runtime.block_on(std::future::pending::<()>());
+            })
+            .expect("spawn process writer cleanup thread");
+        receiver
+            .recv()
+            .expect("receive process writer cleanup runtime")
+    })
+}
 
 pub(crate) fn process_writer_registry(
     object_store: &Arc<dyn ObjectStore>,
@@ -277,18 +292,53 @@ impl ProcessWriterRegistration {
     }
 }
 
-async fn release_process_writer_owner(
+async fn finish_process_writer_owner_release(
     state: Arc<ProcessWriterState>,
     registration: Option<ProcessWriterRegistration>,
 ) -> Result<()> {
-    let release_result = state.release_owner().await;
-    let should_remove = !matches!(release_result, Ok(false));
-    if should_remove {
-        if let Some(registration) = &registration {
-            registration.remove_if_idle(&state);
-        }
+    let release_result = state.close_final_owner_writer().await;
+    if let Some(registration) = &registration {
+        registration.remove_if_idle(&state);
     }
-    release_result.map(|_| ())
+    release_result
+}
+
+async fn abandon_process_writer_after_runtime_shutdown(
+    state: Arc<ProcessWriterState>,
+    registration: Option<ProcessWriterRegistration>,
+) {
+    state.abandon_final_owner_writer().await;
+    if let Some(registration) = &registration {
+        registration.remove_if_idle(&state);
+    }
+}
+
+fn schedule_process_writer_owner_release(
+    runtime_handle: &tokio::runtime::Handle,
+    state: Arc<ProcessWriterState>,
+    registration: Option<ProcessWriterRegistration>,
+) -> tokio::sync::oneshot::Receiver<Result<()>> {
+    let release_state = Arc::clone(&state);
+    let release_registration = registration.clone();
+    let release_task = runtime_handle.spawn(async move {
+        finish_process_writer_owner_release(release_state, release_registration).await
+    });
+    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    process_writer_cleanup_runtime().spawn(async move {
+        let result = match release_task.await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "writer cleanup runtime stopped; abandoning its inactive writer handle"
+                );
+                abandon_process_writer_after_runtime_shutdown(state, registration).await;
+                Ok(())
+            }
+        };
+        let _ = result_sender.send(result);
+    });
+    result_receiver
 }
 
 static EMPTY_GRAPH_STORE: OnceCell<Db> = OnceCell::const_new();
@@ -435,30 +485,28 @@ impl ProcessWriterState {
         true
     }
 
-    async fn release_owner(&self) -> Result<bool> {
+    async fn close_final_owner_writer(&self) -> Result<()> {
         let _open_guard = self.open_gate.lock().await;
-        if !self.begin_release() {
-            // Another routed store still owns this handle. Do not publish a
-            // closing transition: surviving owners must keep using the writer
-            // without a transient read-only window.
-            return Ok(false);
-        }
-
-        // Scope eviction normally runs this close in a detached task, but the
-        // guard also makes direct cancellation recoverable: once the open gate
-        // is released, a replacement may promote instead of seeing `closing`
-        // forever.
-        let _closing_guard = WriterClosingGuard(&self.closing);
-
         let writer = self
             .writer
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        if let Some(writer) = writer {
-            writer.close().await.map_err(GraphError::from)?;
-        }
-        Ok(true)
+        let result = match writer {
+            Some(writer) => writer.close().await.map_err(GraphError::from),
+            None => Ok(()),
+        };
+        self.closing.store(false, Ordering::Release);
+        result
+    }
+
+    async fn abandon_final_owner_writer(&self) {
+        let _open_guard = self.open_gate.lock().await;
+        self.writer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.closing.store(false, Ordering::Release);
     }
 }
 
@@ -469,13 +517,14 @@ impl Drop for GraphStoreInner {
         }
         let writer_state = Arc::clone(&self.writer_state);
         let writer_registration = self.writer_registration.clone();
-        self.runtime_handle.spawn(async move {
-            if let Err(error) =
-                release_process_writer_owner(writer_state, writer_registration).await
-            {
-                tracing::warn!(%error, "failed to retire dropped process writer owner");
-            }
-        });
+        if !writer_state.begin_release() {
+            return;
+        }
+        drop(schedule_process_writer_owner_release(
+            &self.runtime_handle,
+            writer_state,
+            writer_registration,
+        ));
     }
 }
 
@@ -1089,11 +1138,22 @@ impl GraphStore {
         let reader = self.inner.reader.write().await.take();
 
         let writer_result = if self.inner.writer_owner_active.swap(false, Ordering::AcqRel) {
-            release_process_writer_owner(
-                Arc::clone(&self.inner.writer_state),
-                self.inner.writer_registration.clone(),
-            )
-            .await
+            if self.inner.writer_state.begin_release() {
+                schedule_process_writer_owner_release(
+                    &self.inner.runtime_handle,
+                    Arc::clone(&self.inner.writer_state),
+                    self.inner.writer_registration.clone(),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(GraphError::CorruptValue {
+                        key: format!("process-writer/{}", self.inner.path),
+                        reason: "writer cleanup supervisor stopped unexpectedly".to_string(),
+                    })
+                })
+            } else {
+                Ok(())
+            }
         } else {
             Ok(())
         };
@@ -1382,7 +1442,8 @@ mod tests {
         };
 
         assert_eq!(registry.states.lock().unwrap().len(), 1);
-        release_process_writer_owner(state, Some(registration))
+        assert!(state.begin_release());
+        finish_process_writer_owner_release(state, Some(registration))
             .await
             .expect("the final owner releases cleanly");
         assert!(registry.states.lock().unwrap().is_empty());
@@ -1418,7 +1479,51 @@ mod tests {
             }
         })
         .await
-        .expect("the captured runtime drains final-owner cleanup");
+        .expect("the process runtime drains final-owner cleanup");
+    }
+
+    #[test]
+    fn dropping_after_the_construction_runtime_shuts_down_still_cleans_registration() {
+        let (store, registry) = std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the construction runtime builds");
+            runtime.block_on(async {
+                let registry = Arc::new(ProcessWriterRegistry {
+                    states: StdMutex::new(BTreeMap::new()),
+                });
+                let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                let store = GraphStore::lazy(
+                    Path::from("graph/shutdown-runtime-final-drop"),
+                    object_store,
+                    GraphCacheConfig::default(),
+                    GraphStorageMemoryConfig::default(),
+                    GraphDurabilityConfig::default(),
+                    Duration::from_secs(5),
+                    Some(("node-0", Arc::clone(&registry))),
+                )
+                .expect("the routed graph store opens");
+                store
+                    .promote_writer()
+                    .await
+                    .expect("the store installs a writer");
+                (store, registry)
+            })
+        })
+        .join()
+        .expect("the construction thread exits after dropping its runtime");
+
+        assert_eq!(registry.states.lock().unwrap().len(), 1);
+        drop(store);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !registry.states.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the process cleanup runtime did not remove the final registration"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Decision 6's rules 1 and 2, which are the two that survive the write-path
