@@ -88,3 +88,6 @@
 {{- if lt (int .Values.runtime.writerLeaseMs) 3000 -}}
 {{- fail "runtime.writerLeaseMs must be at least 3000" -}}
 {{- end -}}
+{{- if gt (int .Values.runtime.writerLeaseMs) 300000 -}}
+{{- fail "runtime.writerLeaseMs must be at most 300000" -}}
+{{- end -}}

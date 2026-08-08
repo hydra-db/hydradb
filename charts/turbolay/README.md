@@ -142,8 +142,9 @@ different heartbeat views from opening competing writers. SlateDB's writer
 epoch and WAL barrier remain the final fence. This is controllerless: the nodes
 coordinate through conditional object-store writes, with no writable placement
 service in the data path. `runtime.writerLeaseMs` controls the lease window and
-nodes renew it every one third of that value. Indexer Deployments can roll, fail, or scale independently
-without blocking canonical reads or writes. While an index generation lags,
+accepts values from 3,000 through 300,000 milliseconds; nodes renew it every
+one third of that value. Indexer Deployments can roll, fail, or scale
+independently without blocking canonical reads or writes. While an index generation lags,
 query nodes combine its CSC base with the committed SlateDB WAL tail; if no
 usable generation exists, correctness falls back to bounded canonical reads.
 Tenant and subtenant scopes are discovered and opened dynamically inside the

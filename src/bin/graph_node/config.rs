@@ -125,6 +125,9 @@ impl RuntimeConfig {
         if writer_lease_duration < Duration::from_secs(3) {
             return invalid("GRAPH_WRITER_LEASE_MS must be at least 3000");
         }
+        if writer_lease_duration > Duration::from_secs(300) {
+            return invalid("GRAPH_WRITER_LEASE_MS must be at most 300000");
+        }
         let bolt_node_addresses = parse_node_addresses(
             &values,
             &value(
@@ -543,6 +546,18 @@ mod tests {
         assert!(error
             .to_string()
             .contains("GRAPH_WRITER_LEASE_MS must be at least 3000"));
+    }
+
+    #[test]
+    fn graph_node_rejects_an_excessive_writer_lease_window() {
+        let values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            ("GRAPH_WRITER_LEASE_MS".to_string(), "300001".to_string()),
+        ]);
+        let error = RuntimeConfig::from_values(values).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("GRAPH_WRITER_LEASE_MS must be at most 300000"));
     }
 
     #[test]
