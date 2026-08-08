@@ -170,6 +170,8 @@ async fn run_node(
         memory_config,
         config.max_open_scopes,
     )?);
+    let (writer_reconcile_stop, writer_reconcile_task) =
+        start_writer_ownership_reconciler(Arc::clone(&node), config.heartbeat_interval);
     let (index_discovery_stop, index_discovery_task) = start_index_discovery(
         Arc::clone(&node),
         config.cells.clone(),
@@ -333,6 +335,8 @@ async fn run_node(
     }
     let _ = index_discovery_stop.send(true);
     index_discovery_task.await??;
+    let _ = writer_reconcile_stop.send(true);
+    writer_reconcile_task.await??;
     // Before `drop(service)` and before the `try_unwrap` below: the task holds
     // a clone of both, so a collection still in flight would turn a clean
     // shutdown into "graph node still has active runtime references".
@@ -505,6 +509,43 @@ fn start_index_discovery(
                     }
                 }
                 _ = tokio::time::sleep(interval.max(Duration::from_millis(100))) => {}
+            }
+        }
+    });
+    (stop_tx, task)
+}
+
+fn start_writer_ownership_reconciler(
+    node: Arc<ScopedRoutedGraphCluster>,
+    interval: Duration,
+) -> (
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<RuntimeResult<()>>,
+) {
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(100)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        return Ok(());
+                    }
+                }
+                _ = ticker.tick() => {
+                    match node.retire_unowned_writers().await {
+                        Ok(0) => {}
+                        Ok(retired) => tracing::info!(
+                            retired_scopes = retired,
+                            "retired writers after placement ownership changed"
+                        ),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "failed to retire writers after placement ownership changed"
+                        ),
+                    }
+                }
             }
         }
     });

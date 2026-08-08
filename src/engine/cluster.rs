@@ -492,6 +492,18 @@ impl RoutedGraphCluster {
             })
     }
 
+    fn holds_unowned_writer(&self) -> bool {
+        let view = self.placement.view();
+        let scope = self.scope.to_string();
+        self.shards.iter().any(|(cell_id, shard)| {
+            shard.db.writer_epoch().is_some()
+                && !self
+                    .placement
+                    .ownership_in(&view, &scope, cell_id)
+                    .may_promote()
+        })
+    }
+
     /// The gate every routed write passes through, and the one branch that ends
     /// the writer duel.
     ///
@@ -1420,6 +1432,72 @@ impl ScopedRoutedGraphCluster {
         Ok(cluster)
     }
 
+    /// Close idle writers that the current placement view assigns to another node.
+    ///
+    /// Placement can change without another request ever reaching the previous
+    /// owner. Keeping that node's SlateDB writer open lets its background tasks
+    /// race the replacement writer indefinitely. Removing the idle scoped
+    /// cluster completes the handoff; a later read can reopen the scope, while a
+    /// write still has to pass `ensure_local_writer` against the latest view.
+    pub async fn retire_unowned_writers(&self) -> Result<usize> {
+        let _capacity_guard = self.scope_capacity_gate.lock().await;
+        let candidates = {
+            let clusters = self.clusters.lock().await;
+            clusters
+                .iter()
+                .filter(|(_, entry)| {
+                    Arc::strong_count(&entry.cluster) == 1 && entry.cluster.holds_unowned_writer()
+                })
+                .map(|(scope, _)| scope.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut retiring = Vec::with_capacity(candidates.len());
+        {
+            let mut clusters = self.clusters.lock().await;
+            for scope in candidates {
+                let Some(entry) = clusters.get(&scope) else {
+                    continue;
+                };
+                if Arc::strong_count(&entry.cluster) != 1 || !entry.cluster.holds_unowned_writer() {
+                    continue;
+                }
+                let Some(entry) = clusters.remove(&scope) else {
+                    continue;
+                };
+                let close =
+                    ScopeCloseReservation::new(Arc::clone(&self.scope_closures), scope.clone());
+                match Arc::try_unwrap(entry.cluster) {
+                    Ok(cluster) => retiring.push((scope, cluster, close)),
+                    Err(cluster) => {
+                        close.release();
+                        clusters.insert(
+                            scope,
+                            ScopedRoutedClusterEntry {
+                                cluster,
+                                last_used: entry.last_used,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        drop(_capacity_guard);
+
+        let mut retired = 0;
+        for (scope, cluster, close) in retiring {
+            let result = cluster.close().await;
+            drop(cluster);
+            close.release();
+            result.map_err(|error| GraphError::CorruptValue {
+                key: format!("scoped-cluster/{scope}/placement-retire"),
+                reason: error.to_string(),
+            })?;
+            retired += 1;
+        }
+        Ok(retired)
+    }
+
     pub async fn loaded_scopes(&self) -> Vec<GraphScope> {
         self.clusters.lock().await.keys().cloned().collect()
     }
@@ -1624,7 +1702,9 @@ async fn close_routed_shards_best_effort(shards: BTreeMap<String, Arc<GraphShard
 #[cfg(all(test, feature = "query-transport"))]
 mod scoped_cluster_tests {
     use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::path::Path;
     use slatedb::object_store::prefix::PrefixStore;
+    use turbolay_placement::heartbeat::{self, Heartbeat};
 
     use super::*;
     use crate::NamespaceId;
@@ -1827,6 +1907,179 @@ mod scoped_cluster_tests {
         }
 
         runtime.close().await.expect("the runtime drains");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_scope_churn_does_not_fence_the_hot_writer() {
+        let runtime = Arc::new(runtime_at_capacity("graph/concurrent-writer-churn", 4));
+        let hot = tenant_scope(&runtime, "tenant-hot");
+
+        let writers = (0..16).map(|worker| {
+            let runtime = Arc::clone(&runtime);
+            let hot = hot.clone();
+            tokio::spawn(async move {
+                for round in 0..32 {
+                    loop {
+                        match runtime.cluster_for_scope_write(&hot, "cell-0").await {
+                            Ok(cluster) => {
+                                cluster
+                                    .write_edge(scoped_edge(&format!(
+                                        "hot-churn-write-{worker}-{round}"
+                                    )))
+                                    .await
+                                    .expect("scope churn must not fence the hot writer");
+                                break;
+                            }
+                            Err(GraphError::AdmissionRejected { .. }) => {
+                                tokio::task::yield_now().await;
+                            }
+                            Err(error) => panic!("hot writer acquisition failed: {error}"),
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        });
+
+        let churners = (0..8).map(|worker| {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                for round in 0..64 {
+                    let scope =
+                        tenant_scope(&runtime, &format!("tenant-cold-{worker}-{}", round % 16));
+                    loop {
+                        match runtime.cluster_for_scope(&scope).await {
+                            Ok(cluster) => {
+                                drop(cluster);
+                                break;
+                            }
+                            Err(GraphError::AdmissionRejected { .. }) => {
+                                tokio::task::yield_now().await;
+                            }
+                            Err(error) => panic!("cold scope acquisition failed: {error}"),
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        });
+
+        for writer in writers {
+            writer.await.expect("writer task completes");
+        }
+        for churner in churners {
+            churner.await.expect("scope churn task completes");
+        }
+        runtime.close().await.expect("the runtime drains");
+    }
+
+    #[tokio::test]
+    async fn placement_handoff_retires_the_previous_nodes_writer() {
+        let base_path = "graph/placement-handoff";
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let config = PlacementConfig {
+            heartbeat_interval: Duration::from_millis(2),
+            heartbeat_timeout: Duration::from_millis(10),
+        };
+        let placement = PlacementView::new("node-a", ["node-a", "node-b"], config)
+            .expect("the placement view is valid");
+        let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+        let graph_id = GraphId::new("hydradb").unwrap();
+        let runtime = ScopedRoutedGraphCluster::new(
+            base_path,
+            root.clone(),
+            graph_id.clone(),
+            "node-a",
+            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a", "node-b"]).unwrap(),
+            placement.clone(),
+            Arc::clone(&store),
+            GraphOpenOptions::default(),
+            GraphMemoryConfig::default(),
+            4,
+        )
+        .unwrap();
+        let scope = (0..1_000)
+            .map(|index| tenant_scope(&runtime, &format!("tenant-{index}")))
+            .find(|scope| {
+                turbolay_placement::hash::owner(&scope.to_string(), "cell-0", &["node-a", "node-b"])
+                    == Some("node-b")
+            })
+            .expect("one test scope moves from node-a to node-b");
+
+        tokio::time::sleep(config.heartbeat_timeout * 2).await;
+        let _ = placement
+            .refresh(store.as_ref(), &Path::from(base_path))
+            .await;
+        assert_eq!(
+            placement.ownership(&scope.to_string(), "cell-0"),
+            CellOwnership::Local,
+            "without a peer heartbeat node-a owns the scope"
+        );
+        let cluster = runtime
+            .cluster_for_scope_write(&scope, "cell-0")
+            .await
+            .expect("node-a opens the initial writer");
+        cluster
+            .write_edge(scoped_edge("before-handoff"))
+            .await
+            .expect("the initial owner commits");
+        let old_writer = cluster.shard("cell-0").unwrap().db.writer().unwrap();
+        drop(cluster);
+
+        let now = Utc::now();
+        heartbeat::put_heartbeat(
+            store.as_ref(),
+            &Path::from(base_path),
+            &Heartbeat::new("node-b", "test", now, now, vec!["cell-0".to_string()]),
+        )
+        .await
+        .expect("node-b publishes its heartbeat");
+        let _ = placement
+            .refresh(store.as_ref(), &Path::from(base_path))
+            .await;
+        assert!(matches!(
+            placement.ownership(&scope.to_string(), "cell-0"),
+            CellOwnership::Remote { ref node_id } if node_id == "node-b"
+        ));
+
+        assert_eq!(runtime.retire_unowned_writers().await.unwrap(), 1);
+        assert_eq!(
+            old_writer.status().close_reason,
+            Some(slatedb::CloseReason::Clean),
+            "the previous owner must close before its background tasks can fence the replacement"
+        );
+        assert!(runtime.loaded_scopes().await.is_empty());
+
+        let replacement_placement = PlacementView::new("node-b", ["node-a", "node-b"], config)
+            .expect("the replacement placement view is valid");
+        let _ = replacement_placement
+            .refresh(store.as_ref(), &Path::from(base_path))
+            .await;
+        let replacement = ScopedRoutedGraphCluster::new(
+            base_path,
+            root,
+            graph_id,
+            "node-b",
+            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a", "node-b"]).unwrap(),
+            replacement_placement,
+            Arc::clone(&store),
+            GraphOpenOptions::default(),
+            GraphMemoryConfig::default(),
+            4,
+        )
+        .unwrap();
+        let replacement_cluster = replacement
+            .cluster_for_scope_write(&scope, "cell-0")
+            .await
+            .expect("the replacement owner opens after the old writer closes");
+        replacement_cluster
+            .write_edge(scoped_edge("after-handoff"))
+            .await
+            .expect("the replacement owner commits without another fence");
+        drop(replacement_cluster);
+
+        runtime.close().await.expect("the runtime drains");
+        replacement.close().await.expect("the replacement drains");
     }
 
     #[tokio::test]
