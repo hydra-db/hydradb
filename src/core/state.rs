@@ -124,6 +124,7 @@ struct GraphStoreInner {
     cache: GraphCacheConfig,
     storage_memory: GraphStorageMemoryConfig,
     durability: GraphDurabilityConfig,
+    runtime_handle: tokio::runtime::Handle,
     writer_registration: Option<ProcessWriterRegistration>,
     writer_state: Arc<ProcessWriterState>,
     writer_owner_active: AtomicBool,
@@ -241,6 +242,9 @@ fn process_writer_state(
         });
     }
     state.add_owner();
+    // Keep selection and owner acquisition atomic with final-owner removal.
+    // Cleanup takes this same registry lock before checking the owner count.
+    drop(states);
     Ok(state)
 }
 
@@ -465,23 +469,13 @@ impl Drop for GraphStoreInner {
         }
         let writer_state = Arc::clone(&self.writer_state);
         let writer_registration = self.writer_registration.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                if let Err(error) =
-                    release_process_writer_owner(writer_state, writer_registration).await
-                {
-                    tracing::warn!(%error, "failed to retire dropped process writer owner");
-                }
-            });
-        } else {
-            // There is no executor capable of draining SlateDB here. Preserve
-            // the shared handle until process teardown instead of creating a
-            // replacement writer that would fence it.
-            tracing::warn!(
-                path = %self.path,
-                "dropped graph store outside a Tokio runtime; retaining process writer"
-            );
-        }
+        self.runtime_handle.spawn(async move {
+            if let Err(error) =
+                release_process_writer_owner(writer_state, writer_registration).await
+            {
+                tracing::warn!(%error, "failed to retire dropped process writer owner");
+            }
+        });
     }
 }
 
@@ -554,6 +548,7 @@ impl GraphStore {
         heartbeat_interval: Duration,
         process_writer: Option<(&str, Arc<ProcessWriterRegistry>)>,
     ) -> Result<Self> {
+        let runtime_handle = tokio::runtime::Handle::current();
         let writer_state = process_writer_state(
             &path,
             heartbeat_interval,
@@ -576,6 +571,7 @@ impl GraphStore {
                 cache,
                 storage_memory,
                 durability,
+                runtime_handle,
                 writer_registration,
                 writer_state,
                 writer_owner_active: AtomicBool::new(true),
@@ -1390,6 +1386,39 @@ mod tests {
             .await
             .expect("the final owner releases cleanly");
         assert!(registry.states.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_final_owner_outside_the_runtime_still_cleans_registration() {
+        let registry = Arc::new(ProcessWriterRegistry {
+            states: StdMutex::new(BTreeMap::new()),
+        });
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = GraphStore::lazy(
+            Path::from("graph/runtime-free-final-drop"),
+            object_store,
+            GraphCacheConfig::default(),
+            GraphStorageMemoryConfig::default(),
+            GraphDurabilityConfig::default(),
+            Duration::from_secs(5),
+            Some(("node-0", Arc::clone(&registry))),
+        )
+        .expect("the routed graph store opens inside Tokio");
+        assert_eq!(registry.states.lock().unwrap().len(), 1);
+
+        std::thread::spawn(move || drop(store))
+            .join()
+            .expect("the external drop thread exits");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if registry.states.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the captured runtime drains final-owner cleanup");
     }
 
     /// Decision 6's rules 1 and 2, which are the two that survive the write-path
