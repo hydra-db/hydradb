@@ -86,9 +86,11 @@ pub use core::snapshot::GraphSnapshot;
 pub use core::state::QueryStatsRefreshHandle;
 pub(crate) use core::state::{
     finish_local_write, is_retryable_write_conflict, process_writer_registry, GraphStorageSnapshot,
-    GraphStore, GraphWriteAuthority, GraphWriteOp, LocalWriteGuard, ProcessWriterRegistry,
+    GraphStore, GraphWriteAuthority, GraphWriteOp, LocalWriteGuard,
 };
-pub use core::state::{GraphCacheEntryCounts, GraphCacheResidentBytes, GraphShard};
+pub use core::state::{
+    GraphCacheEntryCounts, GraphCacheResidentBytes, GraphShard, ProcessWriterRegistry,
+};
 pub use core::trace_context::{install_trace_context_bridge, TraceContextBridge};
 pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
 #[cfg(feature = "query-transport")]

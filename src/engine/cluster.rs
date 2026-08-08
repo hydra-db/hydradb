@@ -1219,6 +1219,16 @@ impl ScopedRoutedGraphCluster {
         })
     }
 
+    /// Use explicit writer ownership for equivalent handles to one physical store.
+    ///
+    /// Call this immediately after construction when multiple runtimes wrap the
+    /// same backend with distinct [`ObjectStore`] handles. Independent physical
+    /// stores must use distinct registries, regardless of their display strings.
+    pub fn with_writer_registry(mut self, writer_registry: Arc<ProcessWriterRegistry>) -> Self {
+        self.writer_registry = writer_registry;
+        self
+    }
+
     pub fn root_scope(&self) -> GraphScope {
         GraphScope::new(self.root_namespace.clone(), self.graph_id.clone())
     }
@@ -1942,6 +1952,7 @@ mod scoped_cluster_tests {
         );
         assert_eq!(first_store.to_string(), second_store.to_string());
 
+        let writer_registry = Arc::new(ProcessWriterRegistry::new());
         let make_runtime = |object_store| {
             let root = NamespacePath::root(NamespaceId::new("production").unwrap());
             ScopedRoutedGraphCluster::new(
@@ -1957,6 +1968,7 @@ mod scoped_cluster_tests {
                 16,
             )
             .unwrap()
+            .with_writer_registry(Arc::clone(&writer_registry))
         };
         let first_runtime = make_runtime(first_store);
         let second_runtime = make_runtime(second_store);
@@ -2002,6 +2014,61 @@ mod scoped_cluster_tests {
             .close()
             .await
             .expect("the second runtime closes");
+    }
+
+    #[tokio::test]
+    async fn equal_wrapper_displays_do_not_share_across_independent_stores() {
+        let first_store: Arc<dyn ObjectStore> =
+            Arc::new(PrefixStore::new(Arc::new(InMemory::new()), "equal-prefix"));
+        let second_store: Arc<dyn ObjectStore> =
+            Arc::new(PrefixStore::new(Arc::new(InMemory::new()), "equal-prefix"));
+        assert_eq!(first_store.to_string(), second_store.to_string());
+
+        let make_runtime = |object_store| {
+            let root = NamespacePath::root(NamespaceId::new("production").unwrap());
+            ScopedRoutedGraphCluster::new(
+                "graph/independent-object-stores",
+                root,
+                GraphId::new("hydradb").unwrap(),
+                "node-a",
+                ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
+                PlacementView::new("node-a", ["node-a"], PlacementConfig::default()).unwrap(),
+                object_store,
+                GraphOpenOptions::default(),
+                GraphMemoryConfig::default(),
+                16,
+            )
+            .unwrap()
+        };
+        let first_runtime = make_runtime(first_store);
+        let second_runtime = make_runtime(second_store);
+        assert!(!Arc::ptr_eq(
+            &first_runtime.writer_registry,
+            &second_runtime.writer_registry
+        ));
+        let scope = tenant_scope(&first_runtime, "tenant-hot");
+
+        let first = first_runtime
+            .cluster_for_scope_write(&scope, "cell-0")
+            .await
+            .expect("the first physical store acquires its writer");
+        let second = second_runtime
+            .cluster_for_scope_write(&scope, "cell-0")
+            .await
+            .expect("the independent physical store acquires its own writer");
+        first
+            .write_edge(scoped_edge("first-store-write"))
+            .await
+            .expect("the first store remains writable");
+        second
+            .write_edge(scoped_edge("second-store-write"))
+            .await
+            .expect("the second store remains writable");
+
+        drop(first);
+        first_runtime.close().await.expect("close first runtime");
+        drop(second);
+        second_runtime.close().await.expect("close second runtime");
     }
 
     #[tokio::test]

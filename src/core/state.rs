@@ -152,8 +152,27 @@ struct ProcessWriterKey {
     node_id: String,
 }
 
-pub(crate) struct ProcessWriterRegistry {
+/// Process-local writer ownership shared by routed runtimes over one physical store.
+///
+/// Reuse one registry only when every participating runtime addresses the same
+/// physical object store. Keeping the identity explicit avoids guessing backend
+/// identity from an [`ObjectStore`] wrapper's allocation or display text.
+pub struct ProcessWriterRegistry {
     states: StdMutex<BTreeMap<ProcessWriterKey, Arc<ProcessWriterState>>>,
+}
+
+impl ProcessWriterRegistry {
+    pub fn new() -> Self {
+        Self {
+            states: StdMutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+impl Default for ProcessWriterRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone)]
@@ -162,15 +181,8 @@ struct ProcessWriterRegistration {
     key: ProcessWriterKey,
 }
 
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
-enum ProcessWriterStoreKey {
-    Durable(String),
-    Instance(usize),
-}
-
-static PROCESS_WRITER_REGISTRIES: OnceLock<
-    StdMutex<BTreeMap<ProcessWriterStoreKey, Weak<ProcessWriterRegistry>>>,
-> = OnceLock::new();
+static PROCESS_WRITER_REGISTRIES: OnceLock<StdMutex<BTreeMap<usize, Weak<ProcessWriterRegistry>>>> =
+    OnceLock::new();
 static PROCESS_WRITER_CLEANUP_RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
 
 fn process_writer_cleanup_runtime() -> &'static tokio::runtime::Handle {
@@ -198,16 +210,7 @@ fn process_writer_cleanup_runtime() -> &'static tokio::runtime::Handle {
 pub(crate) fn process_writer_registry(
     object_store: &Arc<dyn ObjectStore>,
 ) -> Arc<ProcessWriterRegistry> {
-    let display = object_store.to_string();
-    let key = if display == "InMemory" {
-        // Distinct raw in-memory stores are independent physical databases even
-        // though their Display values are identical. Durable stores and store
-        // wrappers include their bucket, root, or prefix in Display, which must
-        // remain stable across independently allocated handles to that backend.
-        ProcessWriterStoreKey::Instance(Arc::as_ptr(object_store) as *const () as usize)
-    } else {
-        ProcessWriterStoreKey::Durable(display)
-    };
+    let key = Arc::as_ptr(object_store) as *const () as usize;
     let registries = PROCESS_WRITER_REGISTRIES.get_or_init(|| StdMutex::new(BTreeMap::new()));
     let mut registries = registries
         .lock()
@@ -217,9 +220,7 @@ pub(crate) fn process_writer_registry(
         .get(&key)
         .and_then(Weak::upgrade)
         .unwrap_or_else(|| {
-            let registry = Arc::new(ProcessWriterRegistry {
-                states: StdMutex::new(BTreeMap::new()),
-            });
+            let registry = Arc::new(ProcessWriterRegistry::new());
             registries.insert(key, Arc::downgrade(&registry));
             registry
         })
