@@ -61,6 +61,7 @@ pub struct ObjectStoreWriterLeaseDirectory {
     lease_duration: Duration,
     holder_id: String,
     local: Arc<StdMutex<BTreeMap<String, LocalWriterLease>>>,
+    abandoned: Arc<StdMutex<BTreeMap<String, LocalWriterLease>>>,
     scope_users: Arc<StdMutex<BTreeMap<ScopeLeaseUserKey, usize>>>,
     observed: Arc<Mutex<BTreeMap<String, ObservedWriterLease>>>,
     clock_probe: Arc<AtomicU64>,
@@ -119,6 +120,7 @@ impl ObjectStoreWriterLeaseDirectory {
             lease_duration: lease_duration.max(Duration::from_secs(1)),
             holder_id: holder_id.into(),
             local: Arc::new(StdMutex::new(BTreeMap::new())),
+            abandoned: Arc::new(StdMutex::new(BTreeMap::new())),
             scope_users: Arc::new(StdMutex::new(BTreeMap::new())),
             observed: Arc::new(Mutex::new(BTreeMap::new())),
             clock_probe: Arc::new(AtomicU64::new(0)),
@@ -156,6 +158,25 @@ impl ObjectStoreWriterLeaseDirectory {
             generation: stored.generation,
             remaining_ms,
         }))
+    }
+
+    pub(crate) fn holds_abandoned_local(
+        &self,
+        scope: &GraphScope,
+        cell_id: &str,
+        node_id: &str,
+    ) -> bool {
+        let path = self.lease_path(scope, cell_id);
+        let key = path.to_string();
+        let mut abandoned = self.abandoned();
+        let Some(lease) = abandoned.get(&key) else {
+            return false;
+        };
+        if lease.node_id == node_id && Instant::now() < lease.valid_until {
+            return true;
+        }
+        abandoned.remove(&key);
+        false
     }
 
     pub async fn acquire_or_renew(
@@ -209,6 +230,7 @@ impl ObjectStoreWriterLeaseDirectory {
                     stored.node_id == node_id && stored.holder_id == self.holder_id;
                 if remaining_ms > 0 && !owned_by_this_process {
                     self.local().remove(&cache_key);
+                    self.abandoned().remove(&cache_key);
                     return Err(GraphError::NotCellWriter {
                         cell_id: cell_id.to_string(),
                         owner: Some(stored.node_id.clone()),
@@ -284,20 +306,35 @@ impl ObjectStoreWriterLeaseDirectory {
                         write_started,
                     )
                     .await;
-                    self.local().insert(
-                        cache_key,
-                        LocalWriterLease {
+                    let lease = LocalWriterLease {
+                        scope: scope.clone(),
+                        cell_id: cell_id.to_string(),
+                        node_id: node_id.to_string(),
+                        generation,
+                        // Start the local validity window before the S3
+                        // request. A slow response must shorten our lease,
+                        // never let local authority outlive the durable
+                        // object's server-timestamped expiry.
+                        valid_until,
+                    };
+                    if force_renew {
+                        let users = self.scope_users();
+                        let key = ScopeLeaseUserKey {
                             scope: scope.clone(),
-                            cell_id: cell_id.to_string(),
                             node_id: node_id.to_string(),
-                            generation,
-                            // Start the local validity window before the S3
-                            // request. A slow response must shorten our lease,
-                            // never let local authority outlive the durable
-                            // object's server-timestamped expiry.
-                            valid_until,
-                        },
-                    );
+                        };
+                        if !users.contains_key(&key) {
+                            return Err(GraphError::NotCellWriter {
+                                cell_id: cell_id.to_string(),
+                                owner: Some(node_id.to_string()),
+                            });
+                        }
+                        self.abandoned().remove(&cache_key);
+                        self.local().insert(cache_key, lease);
+                    } else {
+                        self.abandoned().remove(&cache_key);
+                        self.local().insert(cache_key, lease);
+                    }
                     return Ok(generation);
                 }
                 Err(
@@ -384,8 +421,19 @@ impl ObjectStoreWriterLeaseDirectory {
                 .filter_map(|key| local.remove(&key))
                 .collect::<Vec<_>>()
         };
+        let abandoned_leases = {
+            let mut abandoned = self.abandoned();
+            let keys = abandoned
+                .iter()
+                .filter(|(_, lease)| lease.scope == *scope && lease.node_id == node_id)
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| abandoned.remove(&key))
+                .collect::<Vec<_>>()
+        };
         let mut failures = Vec::new();
-        for lease in leases {
+        for lease in leases.into_iter().chain(abandoned_leases) {
             if let Err(error) = self
                 .release_stored(scope, &lease.cell_id, node_id, lease.generation)
                 .await
@@ -396,6 +444,52 @@ impl ObjectStoreWriterLeaseDirectory {
         failures
     }
 
+    /// Stop renewing a scope without publishing an immediate ownership change.
+    ///
+    /// Scoped-runtime eviction is a local cache decision. Bolt clients can still
+    /// hold a routing table that names this node, so marking the durable lease as
+    /// released here creates an avoidable stale-route window. Parking the local
+    /// record outside the renewal set lets the same process resume the lease if
+    /// a cached route arrives, while an unused lease expires normally.
+    pub(crate) fn abandon_scope(&self, scope: &GraphScope, node_id: &str) {
+        let key = ScopeLeaseUserKey {
+            scope: scope.clone(),
+            node_id: node_id.to_string(),
+        };
+        let should_abandon = {
+            let mut users = self.scope_users();
+            match users.get_mut(&key) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                Some(_) => {
+                    users.remove(&key);
+                    true
+                }
+                None => true,
+            }
+        };
+        if !should_abandon {
+            return;
+        }
+        let leases = {
+            let mut local = self.local();
+            let keys = local
+                .iter()
+                .filter(|(_, lease)| lease.scope == *scope && lease.node_id == node_id)
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| local.remove(&key).map(|lease| (key, lease)))
+                .collect::<Vec<_>>()
+        };
+        let now = Instant::now();
+        let mut abandoned = self.abandoned();
+        abandoned.retain(|_, lease| now < lease.valid_until);
+        abandoned.extend(leases);
+    }
+
     pub async fn release_cell(
         &self,
         scope: &GraphScope,
@@ -403,7 +497,11 @@ impl ObjectStoreWriterLeaseDirectory {
         node_id: &str,
     ) -> Result<()> {
         let path = self.lease_path(scope, cell_id);
-        let Some(lease) = self.local().remove(path.as_ref()) else {
+        let lease = self
+            .local()
+            .remove(path.as_ref())
+            .or_else(|| self.abandoned().remove(path.as_ref()));
+        let Some(lease) = lease else {
             return Ok(());
         };
         self.release_stored(scope, cell_id, node_id, lease.generation)
@@ -423,6 +521,12 @@ impl ObjectStoreWriterLeaseDirectory {
 
     fn local(&self) -> StdMutexGuard<'_, BTreeMap<String, LocalWriterLease>> {
         self.local
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn abandoned(&self) -> StdMutexGuard<'_, BTreeMap<String, LocalWriterLease>> {
+        self.abandoned
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -831,6 +935,39 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn abandoned_scope_keeps_durable_owner_and_can_resume() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let directory = directory(store, "holder-a", Duration::from_secs(5));
+        let scope = GraphScope::default();
+        directory.register_scope(&scope, "node-a");
+        let generation = directory
+            .acquire_or_renew(&scope, "cell-0", "node-a")
+            .await
+            .unwrap();
+
+        directory.abandon_scope(&scope, "node-a");
+
+        assert!(directory.holds_abandoned_local(&scope, "cell-0", "node-a"));
+        assert_eq!(
+            directory
+                .current_owner(&scope, "cell-0")
+                .await
+                .unwrap()
+                .unwrap()
+                .node_id,
+            "node-a"
+        );
+        directory.register_scope(&scope, "node-a");
+        assert_eq!(
+            directory
+                .acquire_or_renew(&scope, "cell-0", "node-a")
+                .await
+                .unwrap(),
+            generation
+        );
     }
 
     #[tokio::test]

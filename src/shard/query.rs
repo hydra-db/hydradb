@@ -741,6 +741,13 @@ impl GraphShard {
         {
             return Ok(result);
         }
+        if let Some(result) = Box::pin(self.try_execute_ordered_string_vertex_rows_query(
+            cell_id, read_epoch, &query, window, budget,
+        ))
+        .await?
+        {
+            return Ok(result);
+        }
 
         let bindings = if query.pattern_groups.is_empty() {
             let mut bindings = self
@@ -795,6 +802,146 @@ impl GraphShard {
             window,
             budget,
         )
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn try_execute_ordered_string_vertex_rows_query(
+        &self,
+        cell_id: &str,
+        read_epoch: StorageSequence,
+        query: &ParsedRowQuery,
+        window: QueryWindow,
+        budget: &QueryBudget,
+    ) -> Result<Option<QueryResultSet>> {
+        let [RowPattern::Node(node)] = query.patterns.as_slice() else {
+            return Ok(None);
+        };
+        let Some(binding) = node.binding.as_deref() else {
+            return Ok(None);
+        };
+        let Some(first_sort) = query.order_by.first() else {
+            return Ok(None);
+        };
+        let RowSortExpression::Property {
+            binding: sort_binding,
+            property,
+        } = &first_sort.expression
+        else {
+            return Ok(None);
+        };
+        let Some(limit) = window.limit else {
+            return Ok(None);
+        };
+        let Some(predicate) = query.predicate.as_ref() else {
+            return Ok(None);
+        };
+        let simple_match_group = query.pattern_groups.is_empty()
+            || matches!(
+                query.pattern_groups.as_slice(),
+                [group]
+                    if !group.optional
+                        && group.patterns == query.patterns
+                        && group.predicate.as_ref() == query.predicate.as_ref()
+            );
+        if query.distinct
+            || !simple_match_group
+            || !query.union_arms.is_empty()
+            || row_projections_have_aggregates(&query.projections)
+            || sort_binding != binding
+            || !predicate_guarantees_string_property(predicate, binding, property)
+        {
+            return Ok(None);
+        }
+        if limit == 0 {
+            return Ok(Some(QueryResultSet::new(query.columns.clone(), Vec::new())));
+        }
+
+        let skip = usize::try_from(window.skip).map_err(|_| GraphError::AdmissionRejected {
+            operation: "query_result_skip",
+            actual: window.skip,
+            limit: usize::MAX as u64,
+        })?;
+        let required = skip
+            .checked_add(limit)
+            .ok_or(GraphError::AdmissionRejected {
+                operation: "query_result_window",
+                actual: u64::MAX,
+                limit: usize::MAX as u64,
+            })?;
+        let prefix = format!(
+            "{}s",
+            keys::vertex_property_index_property_prefix(cell_id, property)
+        );
+        let order = if first_sort.ascending {
+            slatedb::IterationOrder::Ascending
+        } else {
+            slatedb::IterationOrder::Descending
+        };
+        let mut iter = self
+            .db
+            .scan_prefix_with_options(
+                prefix.as_bytes(),
+                None,
+                &remote_scan_options().with_order(order),
+            )
+            .await?;
+        let mut projected = Vec::with_capacity(required.min(limit.saturating_mul(2)));
+        let mut scanned = 0_usize;
+        let mut boundary = None::<String>;
+        while let Some(kv) = iter.next().await? {
+            budget.check("cypher_ordered_vertex_property_index")?;
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let (_cell, indexed_property, encoded, vertex_id) =
+                parse_vertex_property_index_key(&key)?;
+            if indexed_property != *property {
+                continue;
+            }
+            if projected.len() >= required && boundary.as_deref() != Some(encoded.as_str()) {
+                break;
+            }
+            scanned = scanned.saturating_add(1);
+            self.ensure_query_index_candidates(
+                "cypher_ordered_vertex_property_candidates",
+                scanned,
+            )?;
+
+            let metadata = self
+                .vertex_metadata_at(cell_id, vertex_id, read_epoch, budget)
+                .await?;
+            if metadata
+                .properties
+                .get(property)
+                .is_none_or(|value| encode_vertex_property_value_key(value) != encoded)
+            {
+                continue;
+            }
+            let Some(mut row) = BindingRow::from_node(node, vertex_id) else {
+                continue;
+            };
+            row.metadata.insert(binding.to_string(), metadata);
+            if !row_matches_node(&row, node)? || !row_predicate_matches(&row, predicate)? {
+                continue;
+            }
+            let result_row = project_binding_row(&row, &query.projections)?;
+            let sort_keys = sort_keys_for_row(&row, &result_row, &query.columns, &query.order_by)?;
+            push_projected_query_row(&mut projected, result_row, sort_keys, budget)?;
+            self.ensure_query_intermediate_rows(
+                "cypher_ordered_vertex_property_rows",
+                projected.len(),
+            )?;
+            if projected.len() == required {
+                boundary = Some(encoded);
+            }
+        }
+
+        Ok(Some(self.finish_projected_rows(
+            query.columns.clone(),
+            projected,
+            &query.order_by,
+            false,
+            window,
+            budget,
+        )?))
     }
 
     #[cfg(feature = "opencypher")]
@@ -7749,6 +7896,34 @@ fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<b
         }
         RowPredicate::Not(inner) => !row_predicate_matches(row, inner)?,
     })
+}
+
+#[cfg(feature = "opencypher")]
+fn predicate_guarantees_string_property(
+    predicate: &RowPredicate,
+    binding: &str,
+    property: &str,
+) -> bool {
+    match predicate {
+        RowPredicate::StartsWith {
+            expression:
+                RowExpression::Property {
+                    binding: candidate_binding,
+                    property: candidate_property,
+                },
+            ..
+        } => candidate_binding == binding && candidate_property == property,
+        RowPredicate::StartsWith { .. } => false,
+        RowPredicate::And(left, right) => {
+            predicate_guarantees_string_property(left, binding, property)
+                || predicate_guarantees_string_property(right, binding, property)
+        }
+        RowPredicate::Or(left, right) => {
+            predicate_guarantees_string_property(left, binding, property)
+                && predicate_guarantees_string_property(right, binding, property)
+        }
+        RowPredicate::Compare { .. } | RowPredicate::Not(_) => false,
+    }
 }
 
 #[cfg(feature = "opencypher")]
