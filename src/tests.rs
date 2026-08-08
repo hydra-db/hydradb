@@ -3728,13 +3728,11 @@ async fn routed_cluster_readers_open_every_configured_cell() {
 }
 
 #[tokio::test]
-async fn routed_cluster_uses_slatedb_writer_fencing() {
+async fn routed_cluster_lease_prevents_cross_node_writer_fencing() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let placement = ObjectStoreNodeDirectory::new(["cell-a"], ["node-a", "node-b"]).unwrap();
-    // Two nodes, each holding a view in which it is alone — the view skew that
-    // ownership cannot resolve and SlateDB's epoch must. A shared fleet here
-    // would let only the rendezvous winner promote, and this test would stop
-    // exercising the fence at all.
+    // Two nodes each believe they are the only live node. The durable lease,
+    // rather than either process-local placement view, must remain authoritative.
     let first = RoutedGraphCluster::open_promotable_scoped_with_memory_options(
         "graph-slate-writer-fencing",
         GraphScope::default(),
@@ -3764,58 +3762,45 @@ async fn routed_cluster_uses_slatedb_writer_fencing() {
     )
     .await
     .unwrap();
-    replacement
+    let refused = replacement
         .write_edge(typed_mutation("cell-a", "FOLLOWS", 2, 3, "replacement"))
-        .await
-        .unwrap();
-
-    let stale = first
-        .write_edge(typed_mutation("cell-a", "FOLLOWS", 3, 4, "stale"))
         .await
         .unwrap_err();
     assert!(matches!(
-        stale,
-        GraphError::Slate(ref error)
-            if matches!(
-                error.kind(),
-                slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced)
-            )
+        refused,
+        GraphError::NotCellWriter {
+            ref cell_id,
+            owner: Some(ref owner),
+        } if cell_id == "cell-a" && owner == "node-b"
     ));
+
+    first
+        .write_edge(typed_mutation("cell-a", "FOLLOWS", 3, 4, "incumbent"))
+        .await
+        .unwrap();
     assert!(
         first
             .shard("cell-a")
             .unwrap()
             .db
             .writer_reopen_delay()
-            .is_some(),
-        "a fence discovered by an ordinary write must pace the replacement writer"
+            .is_none(),
+        "a refused contender must never fence or pace the incumbent writer"
     );
 
-    first
-        .write_edge(typed_mutation("cell-a", "FOLLOWS", 3, 4, "recovered"))
-        .await
-        .unwrap();
-    let replacement_stale = replacement
+    first.close().await.unwrap();
+    replacement
         .write_edge(typed_mutation(
             "cell-a",
             "FOLLOWS",
             4,
             5,
-            "replacement-stale",
+            "replacement-after-release",
         ))
         .await
-        .unwrap_err();
-    assert!(matches!(
-        replacement_stale,
-        GraphError::Slate(ref error)
-            if matches!(
-                error.kind(),
-                slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced)
-            )
-    ));
+        .unwrap();
 
-    let _ = replacement.close().await;
-    let _ = first.close().await;
+    replacement.close().await.unwrap();
 }
 
 /// The prod incident in `cell-writer-fencing-pingpong`, reproduced: three

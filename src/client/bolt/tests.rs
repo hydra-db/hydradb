@@ -2,12 +2,13 @@ use super::values::bolt_parameter_to_property;
 use super::wire::strict_decode_client_message;
 use super::*;
 use crate::{
-    ClientQueryServiceConfig, ObjectStoreNodeDirectory, PlacementConfig, PlacementView,
-    QueryCellClient, QueryColumn, QueryContext, QueryCursorToken, QueryFloat, QueryParameterValue,
-    QueryPath, QueryPathNode, QueryPathRelationship, QueryResultPage, QueryResultSet, QueryRow,
-    QueryTransportAction, QueryTransportScopeGrant, QueryValue, RoutedGraphCluster,
-    StaticClientDatabaseResolver, StaticQueryTransportScopeAuthorizer,
-    StaticQueryTransportTlsServerConfigProvider, VertexPropertyValue,
+    ClientQueryServiceConfig, ObjectStoreNodeDirectory, ObjectStoreWriterLeaseDirectory,
+    PlacementConfig, PlacementView, QueryCellClient, QueryColumn, QueryContext, QueryCursorToken,
+    QueryFloat, QueryParameterValue, QueryPath, QueryPathNode, QueryPathRelationship,
+    QueryResultPage, QueryResultSet, QueryRow, QueryTransportAction, QueryTransportScopeGrant,
+    QueryValue, RoutedGraphCluster, StaticClientDatabaseResolver,
+    StaticQueryTransportScopeAuthorizer, StaticQueryTransportTlsServerConfigProvider,
+    VertexPropertyValue,
 };
 use boltr::chunk::{ChunkReader, ChunkWriter};
 use boltr::client::BoltSession;
@@ -1714,6 +1715,45 @@ async fn object_store_routing_names_the_rendezvous_owner_for_writes() {
         .map(|(_, address)| address.clone())
         .unwrap();
     assert_eq!(routing_role(&table, "WRITE"), vec![owner_address]);
+}
+
+#[tokio::test]
+async fn object_store_routing_prefers_the_durable_lease_owner() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let leases = Arc::new(ObjectStoreWriterLeaseDirectory::with_duration_and_holder(
+        "graph/data",
+        store,
+        Duration::from_secs(5),
+        "holder-b",
+    ));
+    let scope = GraphScope::default();
+    let cell = (0..64)
+        .map(|index| format!("cell-{index}"))
+        .find(|cell| {
+            turbolay_placement::hash::owner(&scope.to_string(), cell, &["node-a", "node-b"])
+                == Some("node-a")
+        })
+        .unwrap();
+    leases
+        .acquire_or_renew(&scope, &cell, "node-b")
+        .await
+        .unwrap();
+    let provider = ObjectStoreBoltRoutingTableProvider::new(
+        [
+            ("node-a".to_string(), "10.0.0.1:7687".to_string()),
+            ("node-b".to_string(), "10.0.0.2:7687".to_string()),
+        ],
+        30,
+        test_placement_view("node-a", &["node-a", "node-b"]),
+    )
+    .unwrap()
+    .with_writer_lease_directory(leases);
+
+    let table = routing_table_for(&provider, &cell).await;
+    assert_eq!(
+        routing_role(&table, "WRITE"),
+        vec!["10.0.0.2:7687".to_string()]
+    );
 }
 
 /// The writer is resolved per cell rather than pinned to one node, which is what

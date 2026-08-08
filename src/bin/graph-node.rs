@@ -158,7 +158,7 @@ async fn run_node(
         .refresh(object_store.as_ref(), &placement_base)
         .await;
     let placement_refresh = placement.spawn_refresh(Arc::clone(&object_store), placement_base);
-    let node = Arc::new(ScopedRoutedGraphCluster::new(
+    let node = Arc::new(ScopedRoutedGraphCluster::new_with_writer_lease_duration(
         config.data_path.clone(),
         config.scope.namespace.clone(),
         config.scope.graph_id.clone(),
@@ -169,9 +169,14 @@ async fn run_node(
         open_options,
         memory_config,
         config.max_open_scopes,
+        config.writer_lease_duration,
     )?);
     let (writer_reconcile_stop, writer_reconcile_task) =
         start_writer_ownership_reconciler(Arc::clone(&node), config.heartbeat_interval);
+    let (writer_lease_stop, writer_lease_task) = start_writer_lease_reconciler(
+        Arc::clone(&node),
+        (config.writer_lease_duration / 3).max(Duration::from_secs(1)),
+    );
     let (index_discovery_stop, index_discovery_task) = start_index_discovery(
         Arc::clone(&node),
         config.cells.clone(),
@@ -242,7 +247,8 @@ async fn run_node(
         config.bolt_node_addresses.clone(),
         30,
         placement.clone(),
-    )?;
+    )?
+    .with_writer_lease_directory(node.writer_lease_directory());
     bolt_config = bolt_config.with_routing_table_provider(Arc::new(routing));
     if let Some(provider) = &tls_provider {
         bolt_config = bolt_config.with_tls_provider(Arc::clone(provider));
@@ -337,6 +343,8 @@ async fn run_node(
     index_discovery_task.await??;
     let _ = writer_reconcile_stop.send(true);
     writer_reconcile_task.await??;
+    let _ = writer_lease_stop.send(true);
+    writer_lease_task.await??;
     // Before `drop(service)` and before the `try_unwrap` below: the task holds
     // a clone of both, so a collection still in flight would turn a clean
     // shutdown into "graph node still has active runtime references".
@@ -347,6 +355,41 @@ async fn run_node(
     node.close().await?;
     tracing::info!(node_id = %config.node_id, "graph node stopped");
     Ok(())
+}
+
+fn start_writer_lease_reconciler(
+    node: Arc<ScopedRoutedGraphCluster>,
+    interval: Duration,
+) -> (
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<RuntimeResult<()>>,
+) {
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        return Ok(());
+                    }
+                }
+                _ = ticker.tick() => {
+                    for failure in node.renew_writer_leases().await {
+                        tracing::warn!(
+                            scope = %failure.scope,
+                            cell_id = %failure.cell_id,
+                            ownership_lost = failure.ownership_lost,
+                            error = %failure.error,
+                            "writer lease renewal failed"
+                        );
+                    }
+                }
+            }
+        }
+    });
+    (stop_tx, task)
 }
 
 /// Publish this node's heartbeat while it is ready, withdraw it when it is not.

@@ -34,6 +34,7 @@ data:
   GRAPH_MAX_CONCURRENT_HYDRATIONS: {{ include "turbolay.decimalInteger" .Values.runtime.maxConcurrentHydrations | quote }}
   GRAPH_MAX_CONCURRENT_MATRIX_COMPILATIONS: {{ include "turbolay.decimalInteger" .Values.runtime.maxConcurrentMatrixCompilations | quote }}
   GRAPH_INDEX_DISCOVERY_INTERVAL_MS: {{ include "turbolay.decimalInteger" .Values.runtime.indexDiscoveryIntervalMs | quote }}
+  GRAPH_WRITER_LEASE_MS: {{ include "turbolay.decimalInteger" .Values.runtime.writerLeaseMs | quote }}
   GRAPH_INDEXER_INTERVAL_MS: {{ include "turbolay.decimalInteger" .Values.indexer.intervalMs | quote }}
   GRAPH_INDEXER_RETAIN_PREVIOUS: {{ include "turbolay.decimalInteger" .Values.indexer.retainPreviousGenerations | quote }}
   GRAPH_INDEXER_BUILD_MODE: {{ .Values.indexer.buildMode | quote }}

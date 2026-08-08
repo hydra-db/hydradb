@@ -136,10 +136,13 @@ peers without a destination selector are rejected before installation.
 
 Graph nodes use ordered StatefulSet rolling updates with a disruption budget.
 Every ready Pod can serve reads through a SlateDB `DbReader`; the Bolt routing
-table advertises one stable Pod as the preferred writer to preserve cache
-locality. This preference is disposable: SlateDB's writer epoch and WAL barrier
-remain the authoritative fence. No writable controller or placement database is
-part of the data path. Indexer Deployments can roll, fail, or scale independently
+table advertises the active object-store CAS lease owner for writes. Rendezvous
+placement chooses the contender when no lease exists, while the lease prevents
+different heartbeat views from opening competing writers. SlateDB's writer
+epoch and WAL barrier remain the final fence. This is controllerless: the nodes
+coordinate through conditional object-store writes, with no writable placement
+service in the data path. `runtime.writerLeaseMs` controls the lease window and
+nodes renew it every one third of that value. Indexer Deployments can roll, fail, or scale independently
 without blocking canonical reads or writes. While an index generation lags,
 query nodes combine its CSC base with the committed SlateDB WAL tail; if no
 usable generation exists, correctness falls back to bounded canonical reads.

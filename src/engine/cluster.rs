@@ -220,6 +220,7 @@ struct RoutedClusterOpenConfig {
     promotable: bool,
     options: GraphOpenOptions,
     memory: GraphMemoryConfig,
+    writer_leases: Option<Arc<ObjectStoreWriterLeaseDirectory>>,
 }
 
 impl RoutedGraphCluster {
@@ -302,6 +303,7 @@ impl RoutedGraphCluster {
             promotable: false,
             options: GraphOpenOptions::default(),
             memory: GraphMemoryConfig::default(),
+            writer_leases: None,
         })
         .await
     }
@@ -318,6 +320,12 @@ impl RoutedGraphCluster {
         memory: GraphMemoryConfig,
     ) -> Result<Self> {
         let writer_registry = process_writer_registry(&object_store);
+        let base_path = base_path.into();
+        let writer_leases = super::writer_lease::process_writer_lease_directory(
+            base_path.clone(),
+            Arc::clone(&object_store),
+            Duration::from_secs(30),
+        );
         Self::open_promotable_scoped_with_writer_registry(
             base_path,
             scope,
@@ -326,6 +334,7 @@ impl RoutedGraphCluster {
             placement,
             object_store,
             writer_registry,
+            writer_leases,
             options,
             memory,
         )
@@ -341,6 +350,7 @@ impl RoutedGraphCluster {
         placement: PlacementView,
         object_store: Arc<dyn ObjectStore>,
         writer_registry: Arc<ProcessWriterRegistry>,
+        writer_leases: Arc<ObjectStoreWriterLeaseDirectory>,
         options: GraphOpenOptions,
         memory: GraphMemoryConfig,
     ) -> Result<Self> {
@@ -356,6 +366,7 @@ impl RoutedGraphCluster {
             promotable: true,
             options,
             memory,
+            writer_leases: Some(writer_leases),
         })
         .await
     }
@@ -372,6 +383,7 @@ impl RoutedGraphCluster {
             promotable,
             options,
             memory,
+            writer_leases,
         } = config;
         validate_component("node_id", &local_node_id)?;
         if !directory.contains_node(&local_node_id)? {
@@ -395,6 +407,9 @@ impl RoutedGraphCluster {
         }
         for cell_id in directory.cells() {
             validate_component("cell_id", cell_id)?;
+        }
+        if let Some(writer_leases) = &writer_leases {
+            writer_leases.register_scope(&scope, &local_node_id);
         }
         let mut shards = BTreeMap::new();
         for cell_id in directory.cells().map(str::to_string) {
@@ -426,6 +441,9 @@ impl RoutedGraphCluster {
                 Ok(shard) => shard,
                 Err(err) => {
                     close_routed_shards_best_effort(shards).await;
+                    if let Some(writer_leases) = &writer_leases {
+                        let _ = writer_leases.release_scope(&scope, &local_node_id).await;
+                    }
                     return Err(err);
                 }
             };
@@ -445,6 +463,8 @@ impl RoutedGraphCluster {
             local_node_id,
             directory,
             placement,
+            writer_leases,
+            writer_lease_registration_active: std::sync::atomic::AtomicBool::new(promotable),
             shards,
             promotable,
         })
@@ -493,15 +513,17 @@ impl RoutedGraphCluster {
     }
 
     #[cfg(feature = "query-transport")]
+    async fn retire_cell_writer(&self, cell_id: &str) -> Result<bool> {
+        self.shard(cell_id)?.retire_writer().await
+    }
+
+    #[cfg(feature = "query-transport")]
     fn holds_unowned_writer(&self) -> bool {
-        let view = self.placement.view();
-        let scope = self.scope.to_string();
         self.shards.iter().any(|(cell_id, shard)| {
             shard.db.writer_epoch().is_some()
-                && !self
-                    .placement
-                    .ownership_in(&view, &scope, cell_id)
-                    .may_promote()
+                && !self.writer_leases.as_ref().is_some_and(|leases| {
+                    leases.holds_valid_local(&self.scope, cell_id, &self.local_node_id)
+                })
         })
     }
 
@@ -544,6 +566,7 @@ impl RoutedGraphCluster {
             turbolay.cell_id = %cell_id,
             turbolay.node_id = %self.local_node_id,
             turbolay.writer.epoch = tracing::field::Empty,
+            turbolay.writer.lease_generation = tracing::field::Empty,
             error.class = tracing::field::Empty,
         );
         self.ensure_local_writer_traced(cell_id)
@@ -574,9 +597,26 @@ impl RoutedGraphCluster {
             })
             .inspect_err(record_error_class)?;
 
-        self.resolve_placement(cell_id)?;
-
+        let writer_leases = self
+            .writer_leases
+            .as_ref()
+            .expect("promotable routed clusters have writer leases");
+        // Placement is the stable routing preference, while the object-store
+        // lease is the authority. An existing lease holder must keep serving
+        // through a temporarily divergent heartbeat view; a node without a
+        // lease may contend only when rendezvous currently selects it.
+        if !writer_leases.holds_valid_local(&self.scope, cell_id, &self.local_node_id) {
+            self.resolve_placement(cell_id)?;
+        }
+        // Serve any local fencing backoff before acquiring durable ownership so
+        // the wait cannot consume the lease window before SlateDB opens.
         self.await_writer_reopen(shard, cell_id).await?;
+        let lease_generation = writer_leases
+            .acquire_or_renew(&self.scope, cell_id, &self.local_node_id)
+            .await
+            .inspect_err(record_error_class)?;
+        tracing::Span::current().record("turbolay.writer.lease_generation", lease_generation);
+
         // Whether this shard already held a writer, taken *before* the call.
         // `promote_to_writer` is idempotent and says nothing about which of the
         // two it did, and the difference is the whole of "after a successful
@@ -586,7 +626,35 @@ impl RoutedGraphCluster {
         // is precisely the object-store request on the write path that decision
         // 3 refuses to add.
         let already_writing = shard.db.writer_epoch().is_some();
-        shard.promote_to_writer(cell_id, "routed_write").await?;
+        if let Err(error) = shard.promote_to_writer(cell_id, "routed_write").await {
+            if let Err(release_error) = writer_leases
+                .release_cell(&self.scope, cell_id, &self.local_node_id)
+                .await
+            {
+                tracing::warn!(
+                    %release_error,
+                    %cell_id,
+                    "failed to release writer lease after SlateDB promotion failure"
+                );
+            }
+            return Err(error);
+        }
+        if !writer_leases.holds_valid_local(&self.scope, cell_id, &self.local_node_id) {
+            if let Err(error) = shard.retire_writer().await {
+                tracing::warn!(%error, %cell_id, "failed to retire writer after lease expired during promotion");
+            }
+            let error = GraphError::NotCellWriter {
+                cell_id: cell_id.to_string(),
+                owner: writer_leases
+                    .current_owner(&self.scope, cell_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|owner| owner.node_id),
+            };
+            record_error_class(&error);
+            return Err(error);
+        }
         if let Some(epoch) = shard.db.writer_epoch() {
             // The climbing value in the ping-pong query. Taken from the
             // manifest, which is the authority; the advisory record written
@@ -1163,6 +1231,20 @@ impl RoutedGraphCluster {
                 failures.push(format!("{cell_id}: {error}"));
             }
         }
+        if self
+            .writer_lease_registration_active
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            if let Some(writer_leases) = &self.writer_leases {
+                failures.extend(
+                    writer_leases
+                        .release_scope(&self.scope, &self.local_node_id)
+                        .await
+                        .into_iter()
+                        .map(|(cell_id, error)| format!("{cell_id} writer lease: {error}")),
+                );
+            }
+        }
         if failures.is_empty() {
             Ok(())
         } else {
@@ -1188,6 +1270,35 @@ impl ScopedRoutedGraphCluster {
         options: GraphOpenOptions,
         memory: GraphMemoryConfig,
         max_open_scopes: usize,
+    ) -> Result<Self> {
+        Self::new_with_writer_lease_duration(
+            base_path,
+            root_namespace,
+            graph_id,
+            local_node_id,
+            directory,
+            placement,
+            object_store,
+            options,
+            memory,
+            max_open_scopes,
+            Duration::from_secs(30),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_writer_lease_duration(
+        base_path: impl Into<String>,
+        root_namespace: NamespacePath,
+        graph_id: GraphId,
+        local_node_id: impl Into<String>,
+        directory: ObjectStoreNodeDirectory,
+        placement: PlacementView,
+        object_store: Arc<dyn ObjectStore>,
+        options: GraphOpenOptions,
+        memory: GraphMemoryConfig,
+        max_open_scopes: usize,
+        writer_lease_duration: Duration,
     ) -> Result<Self> {
         let base_path = base_path.into();
         let local_node_id = local_node_id.into();
@@ -1215,6 +1326,11 @@ impl ScopedRoutedGraphCluster {
             });
         }
         let writer_registry = process_writer_registry(&object_store);
+        let writer_leases = super::writer_lease::process_writer_lease_directory(
+            base_path.clone(),
+            Arc::clone(&object_store),
+            writer_lease_duration,
+        );
         Ok(Self {
             base_path: base_path.clone(),
             root_namespace: root_namespace.clone(),
@@ -1229,6 +1345,7 @@ impl ScopedRoutedGraphCluster {
                 Arc::clone(&object_store),
             ),
             object_store,
+            writer_leases,
             writer_registry,
             options,
             memory,
@@ -1250,6 +1367,36 @@ impl ScopedRoutedGraphCluster {
     pub fn with_writer_registry(mut self, writer_registry: Arc<ProcessWriterRegistry>) -> Self {
         self.writer_registry = writer_registry;
         self
+    }
+
+    pub fn writer_lease_directory(&self) -> Arc<ObjectStoreWriterLeaseDirectory> {
+        Arc::clone(&self.writer_leases)
+    }
+
+    /// Renew every writer lease held by this process and withdraw any writer
+    /// whose ownership can no longer be proven.
+    pub async fn renew_writer_leases(&self) -> Vec<WriterLeaseRenewalFailure> {
+        let mut failures = self.writer_leases.renew_local(&self.local_node_id).await;
+        for failure in failures.iter_mut().filter(|failure| failure.ownership_lost) {
+            let cluster = self
+                .clusters
+                .lock()
+                .await
+                .get(&failure.scope)
+                .map(|entry| Arc::clone(&entry.cluster));
+            let Some(cluster) = cluster else {
+                continue;
+            };
+            if let Err(error) = cluster.retire_cell_writer(&failure.cell_id).await {
+                tracing::error!(
+                    scope = %failure.scope,
+                    cell_id = %failure.cell_id,
+                    %error,
+                    "failed to retire writer after durable lease loss"
+                );
+            }
+        }
+        failures
     }
 
     pub fn root_scope(&self) -> GraphScope {
@@ -1395,6 +1542,7 @@ impl ScopedRoutedGraphCluster {
                     self.placement.clone(),
                     Arc::clone(&self.object_store),
                     Arc::clone(&self.writer_registry),
+                    Arc::clone(&self.writer_leases),
                     self.options_for_scope(scope),
                     self.memory.clone(),
                 )
@@ -1992,7 +2140,7 @@ mod scoped_cluster_tests {
     }
 
     #[tokio::test]
-    async fn placement_handoff_retires_the_previous_nodes_writer() {
+    async fn placement_handoff_cannot_preempt_a_live_writer_lease() {
         let base_path = "graph/placement-handoff";
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let config = PlacementConfig {
@@ -2060,6 +2208,16 @@ mod scoped_cluster_tests {
             CellOwnership::Remote { ref node_id } if node_id == "node-b"
         ));
 
+        assert_eq!(
+            runtime.retire_unowned_writers().await.unwrap(),
+            0,
+            "a divergent placement view cannot preempt the durable lease holder"
+        );
+        assert!(runtime
+            .writer_lease_directory()
+            .release_scope(&scope, "node-a")
+            .await
+            .is_empty());
         assert_eq!(runtime.retire_unowned_writers().await.unwrap(), 1);
         assert_eq!(
             old_writer.status().close_reason,
@@ -2101,7 +2259,7 @@ mod scoped_cluster_tests {
     }
 
     #[tokio::test]
-    async fn placement_reconciliation_retires_every_selected_scope() {
+    async fn lease_reconciliation_retires_every_released_scope() {
         let base_path = "graph/placement-batch-handoff";
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let config = PlacementConfig {
@@ -2162,6 +2320,18 @@ mod scoped_cluster_tests {
             .refresh(store.as_ref(), &Path::from(base_path))
             .await;
 
+        assert_eq!(
+            runtime.retire_unowned_writers().await.unwrap(),
+            0,
+            "placement alone cannot retire active lease holders"
+        );
+        for scope in &scopes {
+            assert!(runtime
+                .writer_lease_directory()
+                .release_scope(scope, "node-a")
+                .await
+                .is_empty());
+        }
         assert_eq!(runtime.retire_unowned_writers().await.unwrap(), 2);
         for writer in writers {
             assert_eq!(
@@ -2172,6 +2342,64 @@ mod scoped_cluster_tests {
         }
         assert!(runtime.loaded_scopes().await.is_empty());
         runtime.close().await.expect("the runtime drains");
+    }
+
+    #[tokio::test]
+    async fn lease_takeover_retires_the_previous_process_writer() {
+        let base_path = "graph/lease-takeover";
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let placement = PlacementView::new(
+            "node-a",
+            ["node-a"],
+            PlacementConfig {
+                heartbeat_interval: Duration::from_millis(10),
+                heartbeat_timeout: Duration::from_millis(30),
+            },
+        )
+        .unwrap();
+        let runtime = ScopedRoutedGraphCluster::new_with_writer_lease_duration(
+            base_path,
+            NamespacePath::root(NamespaceId::new("production").unwrap()),
+            GraphId::new("hydradb").unwrap(),
+            "node-a",
+            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a"]).unwrap(),
+            placement,
+            Arc::clone(&store),
+            GraphOpenOptions::default(),
+            GraphMemoryConfig::default(),
+            4,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let scope = tenant_scope(&runtime, "tenant-a");
+        let cluster = runtime
+            .cluster_for_scope_write(&scope, "cell-0")
+            .await
+            .unwrap();
+        let old_writer = cluster.shard("cell-0").unwrap().db.writer().unwrap();
+        drop(cluster);
+
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        let replacement = ObjectStoreWriterLeaseDirectory::with_duration_and_holder(
+            base_path,
+            store,
+            Duration::from_secs(1),
+            "replacement-process",
+        );
+        replacement
+            .acquire_or_renew(&scope, "cell-0", "node-b")
+            .await
+            .expect("the expired lease can move to the replacement process");
+
+        let failures = runtime.renew_writer_leases().await;
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].ownership_lost);
+        assert_eq!(
+            old_writer.status().close_reason,
+            Some(slatedb::CloseReason::Clean),
+            "losing the durable lease closes the old writer before another promotion"
+        );
+        runtime.close().await.unwrap();
     }
 
     #[tokio::test]

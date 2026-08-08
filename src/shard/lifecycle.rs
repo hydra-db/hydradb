@@ -533,6 +533,10 @@ impl GraphShard {
         .await
     }
 
+    pub(crate) async fn retire_writer(&self) -> Result<bool> {
+        self.db.retire_writer().await
+    }
+
     pub(crate) async fn validate_write_fence_txn(
         &self,
         txn: &DbTransaction,

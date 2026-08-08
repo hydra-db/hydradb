@@ -1,7 +1,8 @@
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use super::*;
-use crate::{validate_component, PlacementView};
+use crate::{validate_component, ObjectStoreWriterLeaseDirectory, PlacementView};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoltRoutingServer {
@@ -64,6 +65,7 @@ pub struct ObjectStoreBoltRoutingTableProvider {
     /// the per-caller inconsistency deleting the probe removed.
     placement: PlacementView,
     routing_ttl_secs: i64,
+    writer_leases: Option<Arc<ObjectStoreWriterLeaseDirectory>>,
 }
 
 impl ObjectStoreBoltRoutingTableProvider {
@@ -92,7 +94,16 @@ impl ObjectStoreBoltRoutingTableProvider {
             node_addresses: addresses,
             placement,
             routing_ttl_secs,
+            writer_leases: None,
         })
+    }
+
+    pub fn with_writer_lease_directory(
+        mut self,
+        writer_leases: Arc<ObjectStoreWriterLeaseDirectory>,
+    ) -> Self {
+        self.writer_leases = Some(writer_leases);
+        self
     }
 }
 
@@ -123,7 +134,19 @@ impl BoltRoutingTableProvider for ObjectStoreBoltRoutingTableProvider {
         // and produce a table naming two different fleets.
         let view = self.placement.view();
         let scope = target.scope.to_string();
-        let owner = self.placement.owner_in(&view, &scope, &target.cell_id);
+        let placement_owner = self.placement.owner_in(&view, &scope, &target.cell_id);
+        let lease_owner = match &self.writer_leases {
+            Some(writer_leases) => {
+                writer_leases
+                    .current_owner(&target.scope, &target.cell_id)
+                    .await?
+            }
+            None => None,
+        };
+        let owner = lease_owner
+            .as_ref()
+            .map(|owner| owner.node_id.clone())
+            .or(placement_owner);
         let ownership = match owner.as_deref() {
             Some(owner) if owner == self.placement.local_node_id() => "local",
             Some(_) => "remote",
@@ -142,6 +165,9 @@ impl BoltRoutingTableProvider for ObjectStoreBoltRoutingTableProvider {
             turbolay.placement.state = view.state().as_str(),
             turbolay.placement.live_nodes = view.nodes().len(),
             turbolay.placement.ownership = ownership,
+            turbolay.writer.lease_generation = lease_owner
+                .as_ref()
+                .map_or(0, |owner| owner.generation),
             error.class = tracing::field::Empty,
         );
         let _entered = span.enter();

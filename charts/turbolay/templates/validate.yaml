@@ -85,3 +85,6 @@
 {{- if lt (int .Values.indexer.maxOpenScopes) (int .Values.indexer.scopeConcurrency) -}}
 {{- fail "indexer.maxOpenScopes must be greater than or equal to indexer.scopeConcurrency" -}}
 {{- end -}}
+{{- if lt (int .Values.runtime.writerLeaseMs) 3000 -}}
+{{- fail "runtime.writerLeaseMs must be at least 3000" -}}
+{{- end -}}
