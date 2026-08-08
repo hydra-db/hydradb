@@ -813,45 +813,17 @@ impl GraphShard {
         window: QueryWindow,
         budget: &QueryBudget,
     ) -> Result<Option<QueryResultSet>> {
-        let [RowPattern::Node(node)] = query.patterns.as_slice() else {
+        let Some(spec) = ordered_string_vertex_index_spec(query, window) else {
             return Ok(None);
         };
-        let Some(binding) = node.binding.as_deref() else {
-            return Ok(None);
-        };
-        let Some(first_sort) = query.order_by.first() else {
-            return Ok(None);
-        };
-        let RowSortExpression::Property {
-            binding: sort_binding,
+        let OrderedStringVertexIndexSpec {
+            node,
+            binding,
             property,
-        } = &first_sort.expression
-        else {
-            return Ok(None);
-        };
-        let Some(limit) = window.limit else {
-            return Ok(None);
-        };
-        let Some(predicate) = query.predicate.as_ref() else {
-            return Ok(None);
-        };
-        let simple_match_group = query.pattern_groups.is_empty()
-            || matches!(
-                query.pattern_groups.as_slice(),
-                [group]
-                    if !group.optional
-                        && group.patterns == query.patterns
-                        && group.predicate.as_ref() == query.predicate.as_ref()
-            );
-        if query.distinct
-            || !simple_match_group
-            || !query.union_arms.is_empty()
-            || row_projections_have_aggregates(&query.projections)
-            || sort_binding != binding
-            || !predicate_guarantees_string_property(predicate, binding, property)
-        {
-            return Ok(None);
-        }
+            predicate,
+            ascending,
+            limit,
+        } = spec;
         if limit == 0 {
             return Ok(Some(QueryResultSet::new(query.columns.clone(), Vec::new())));
         }
@@ -872,7 +844,7 @@ impl GraphShard {
             "{}s",
             keys::vertex_property_index_property_prefix(cell_id, property)
         );
-        let order = if first_sort.ascending {
+        let order = if ascending {
             slatedb::IterationOrder::Ascending
         } else {
             slatedb::IterationOrder::Descending
@@ -7924,6 +7896,62 @@ fn predicate_guarantees_string_property(
         }
         RowPredicate::Compare { .. } | RowPredicate::Not(_) => false,
     }
+}
+
+#[cfg(feature = "opencypher")]
+pub(super) struct OrderedStringVertexIndexSpec<'a> {
+    pub(super) node: &'a RowNodePattern,
+    pub(super) binding: &'a str,
+    pub(super) property: &'a str,
+    pub(super) predicate: &'a RowPredicate,
+    pub(super) ascending: bool,
+    pub(super) limit: usize,
+}
+
+#[cfg(feature = "opencypher")]
+pub(super) fn ordered_string_vertex_index_spec<'a>(
+    query: &'a ParsedRowQuery,
+    window: QueryWindow,
+) -> Option<OrderedStringVertexIndexSpec<'a>> {
+    let [RowPattern::Node(node)] = query.patterns.as_slice() else {
+        return None;
+    };
+    let binding = node.binding.as_deref()?;
+    let first_sort = query.order_by.first()?;
+    let RowSortExpression::Property {
+        binding: sort_binding,
+        property,
+    } = &first_sort.expression
+    else {
+        return None;
+    };
+    let limit = window.limit?;
+    let predicate = query.predicate.as_ref()?;
+    let simple_match_group = query.pattern_groups.is_empty()
+        || matches!(
+            query.pattern_groups.as_slice(),
+            [group]
+                if !group.optional
+                    && group.patterns == query.patterns
+                    && group.predicate.as_ref() == query.predicate.as_ref()
+        );
+    if query.distinct
+        || !simple_match_group
+        || !query.union_arms.is_empty()
+        || row_projections_have_aggregates(&query.projections)
+        || sort_binding != binding
+        || !predicate_guarantees_string_property(predicate, binding, property)
+    {
+        return None;
+    }
+    Some(OrderedStringVertexIndexSpec {
+        node,
+        binding,
+        property,
+        predicate,
+        ascending: first_sort.ascending,
+        limit,
+    })
 }
 
 #[cfg(feature = "opencypher")]

@@ -1016,6 +1016,7 @@ pub enum RowQueryAccess {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowQueryOptimizerPass {
     UtilizeVertexIndex,
+    OrderedLimitPushdown,
     UtilizeEdgeIndex,
     CostBasedLabelScan,
     ConnectivityOrder,

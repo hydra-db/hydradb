@@ -10082,6 +10082,24 @@ async fn cypher_ordered_string_index_applies_limit_before_tenant_wide_hydration(
             ],
         )
     );
+    let plan = shard
+        .explain_opencypher_rows(
+            QueryContext::new("reddit-home", "cypher-ordered-string-limit-explain"),
+            "MATCH (e:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+             WHERE e.created_at STARTS WITH '' \
+             RETURN e.entity_id ORDER BY e.created_at DESC, e.entity_id LIMIT 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.groups[0].patterns[0].access,
+        RowQueryAccess::VertexPropertyIndex {
+            property: "created_at".to_string(),
+        }
+    );
+    assert!(plan.groups[0].patterns[0]
+        .optimizer_passes
+        .contains(&RowQueryOptimizerPass::OrderedLimitPushdown));
     shard.close().await.unwrap();
 }
 
