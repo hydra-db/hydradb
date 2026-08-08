@@ -125,7 +125,6 @@ struct GraphStoreInner {
     storage_memory: GraphStorageMemoryConfig,
     durability: GraphDurabilityConfig,
     runtime_handle: tokio::runtime::Handle,
-    writer_registration: Option<ProcessWriterRegistration>,
     writer_state: Arc<ProcessWriterState>,
     writer_owner_active: AtomicBool,
     reader: AsyncRwLock<Option<Arc<DbReader>>>,
@@ -158,7 +157,7 @@ struct ProcessWriterKey {
 /// physical object store. Keeping the identity explicit avoids guessing backend
 /// identity from an [`ObjectStore`] wrapper's allocation or display text.
 pub struct ProcessWriterRegistry {
-    states: StdMutex<BTreeMap<ProcessWriterKey, Arc<ProcessWriterState>>>,
+    states: StdMutex<BTreeMap<ProcessWriterKey, Weak<ProcessWriterState>>>,
 }
 
 impl ProcessWriterRegistry {
@@ -173,12 +172,6 @@ impl Default for ProcessWriterRegistry {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[derive(Clone)]
-struct ProcessWriterRegistration {
-    registry: Arc<ProcessWriterRegistry>,
-    key: ProcessWriterKey,
 }
 
 static PROCESS_WRITER_REGISTRIES: OnceLock<StdMutex<BTreeMap<usize, Weak<ProcessWriterRegistry>>>> =
@@ -260,9 +253,10 @@ fn process_writer_state(
         .states
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let state = states.get(&key).cloned().unwrap_or_else(|| {
+    states.retain(|_, state| state.strong_count() > 0);
+    let state = states.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
         let state = new_state();
-        states.insert(key, Arc::clone(&state));
+        states.insert(key, Arc::downgrade(&state));
         state
     });
     if state.heartbeat_interval != heartbeat_interval {
@@ -274,72 +268,29 @@ fn process_writer_state(
         });
     }
     state.add_owner();
-    // Keep selection and owner acquisition atomic with final-owner removal.
-    // Cleanup takes this same registry lock before checking the owner count.
+    // Keep selection and owner acquisition atomic. The weak entry remains
+    // upgradeable while a final-owner close is in flight because that close
+    // holds an Arc to the state. A concurrent opener therefore joins the same
+    // closing state and the same open gate instead of creating a second writer.
     drop(states);
     Ok(state)
 }
 
-impl ProcessWriterRegistration {
-    fn remove_if_idle(&self, state: &Arc<ProcessWriterState>) {
-        let mut states = self
-            .registry
-            .states
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(current) = states.get(&self.key) else {
-            return;
-        };
-        if !Arc::ptr_eq(current, state) {
-            return;
-        }
-
-        // Registration takes the registry lock before incrementing owners, so
-        // no new owner can appear between this check and removal. A subsequent
-        // opener creates a fresh state only after the old writer is fully shut.
-        let no_owners = *state.owners() == 0;
-        let writer_is_closed = state
-            .writer
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_none();
-        if no_owners && !state.is_closing() && writer_is_closed {
-            states.remove(&self.key);
-        }
-    }
+async fn finish_process_writer_owner_release(state: Arc<ProcessWriterState>) -> Result<()> {
+    state.close_final_owner_writer().await
 }
 
-async fn finish_process_writer_owner_release(
-    state: Arc<ProcessWriterState>,
-    registration: Option<ProcessWriterRegistration>,
-) -> Result<()> {
-    let release_result = state.close_final_owner_writer().await;
-    if let Some(registration) = &registration {
-        registration.remove_if_idle(&state);
-    }
-    release_result
-}
-
-async fn abandon_process_writer_after_runtime_shutdown(
-    state: Arc<ProcessWriterState>,
-    registration: Option<ProcessWriterRegistration>,
-) {
+async fn abandon_process_writer_after_runtime_shutdown(state: Arc<ProcessWriterState>) {
     state.abandon_final_owner_writer().await;
-    if let Some(registration) = &registration {
-        registration.remove_if_idle(&state);
-    }
 }
 
 fn schedule_process_writer_owner_release(
     runtime_handle: &tokio::runtime::Handle,
     state: Arc<ProcessWriterState>,
-    registration: Option<ProcessWriterRegistration>,
 ) -> tokio::sync::oneshot::Receiver<Result<()>> {
     let release_state = Arc::clone(&state);
-    let release_registration = registration.clone();
-    let release_task = runtime_handle.spawn(async move {
-        finish_process_writer_owner_release(release_state, release_registration).await
-    });
+    let release_task = runtime_handle
+        .spawn(async move { finish_process_writer_owner_release(release_state).await });
     let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
     process_writer_cleanup_runtime().spawn(async move {
         let result = match release_task.await {
@@ -349,7 +300,7 @@ fn schedule_process_writer_owner_release(
                     %error,
                     "writer cleanup runtime stopped; abandoning its inactive writer handle"
                 );
-                abandon_process_writer_after_runtime_shutdown(state, registration).await;
+                abandon_process_writer_after_runtime_shutdown(state).await;
                 Ok(())
             }
         };
@@ -533,14 +484,12 @@ impl Drop for GraphStoreInner {
             return;
         }
         let writer_state = Arc::clone(&self.writer_state);
-        let writer_registration = self.writer_registration.clone();
         if !writer_state.begin_release() {
             return;
         }
         drop(schedule_process_writer_owner_release(
             &self.runtime_handle,
             writer_state,
-            writer_registration,
         ));
     }
 }
@@ -622,14 +571,6 @@ impl GraphStore {
                 .as_ref()
                 .map(|(node_id, registry)| (*node_id, registry)),
         )?;
-        let writer_registration =
-            process_writer.map(|(node_id, registry)| ProcessWriterRegistration {
-                key: ProcessWriterKey {
-                    path: path.to_string(),
-                    node_id: node_id.to_string(),
-                },
-                registry,
-            });
         Ok(Self {
             inner: Arc::new(GraphStoreInner {
                 path,
@@ -638,7 +579,6 @@ impl GraphStore {
                 storage_memory,
                 durability,
                 runtime_handle,
-                writer_registration,
                 writer_state,
                 writer_owner_active: AtomicBool::new(true),
                 reader: AsyncRwLock::new(None),
@@ -1159,7 +1099,6 @@ impl GraphStore {
                 schedule_process_writer_owner_release(
                     &self.inner.runtime_handle,
                     Arc::clone(&self.inner.writer_state),
-                    self.inner.writer_registration.clone(),
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -1419,6 +1358,16 @@ pub(crate) fn is_retryable_write_conflict(err: &GraphError) -> bool {
 mod tests {
     use super::*;
 
+    fn live_registry_states(registry: &ProcessWriterRegistry) -> usize {
+        registry
+            .states
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|state| state.strong_count() > 0)
+            .count()
+    }
+
     /// A synthetic origin. The gate only ever compares instants and subtracts
     /// them, so any origin works and none of these tests touch a real clock.
     fn origin() -> Instant {
@@ -1442,28 +1391,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn releasing_the_final_owner_removes_its_registry_state() {
+    async fn final_owner_release_and_reopen_share_one_state_and_gate() {
         let registry = Arc::new(ProcessWriterRegistry {
             states: StdMutex::new(BTreeMap::new()),
         });
-        let path = Path::from("graph/final-owner-removal");
+        let path = Path::from("graph/final-owner-reopen");
         let node_id = "node-0";
         let state = process_writer_state(&path, Duration::from_secs(5), Some((node_id, &registry)))
             .expect("the routed writer state is registered");
-        let registration = ProcessWriterRegistration {
-            registry: Arc::clone(&registry),
-            key: ProcessWriterKey {
-                path: path.to_string(),
-                node_id: node_id.to_string(),
-            },
-        };
 
-        assert_eq!(registry.states.lock().unwrap().len(), 1);
+        let open_guard = state.open_gate.lock().await;
         assert!(state.begin_release());
-        finish_process_writer_owner_release(state, Some(registration))
+        let release_state = Arc::clone(&state);
+        let release =
+            tokio::spawn(async move { finish_process_writer_owner_release(release_state).await });
+        tokio::task::yield_now().await;
+
+        let reopened =
+            process_writer_state(&path, Duration::from_secs(5), Some((node_id, &registry)))
+                .expect("a concurrent reopen joins the closing writer state");
+        assert!(Arc::ptr_eq(&state, &reopened));
+        assert_eq!(*reopened.owners(), 1);
+
+        drop(open_guard);
+        release
             .await
+            .expect("the release task completes")
             .expect("the final owner releases cleanly");
-        assert!(registry.states.lock().unwrap().is_empty());
+        assert!(!reopened.is_closing());
+        assert_eq!(live_registry_states(&registry), 1);
+
+        assert!(reopened.begin_release());
+        finish_process_writer_owner_release(reopened)
+            .await
+            .expect("the reopened owner releases cleanly");
+        drop(state);
+        assert_eq!(live_registry_states(&registry), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1489,7 +1452,7 @@ mod tests {
             .expect("the external drop thread exits");
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if registry.states.lock().unwrap().is_empty() {
+                if live_registry_states(&registry) == 0 {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1534,7 +1497,7 @@ mod tests {
         assert_eq!(registry.states.lock().unwrap().len(), 1);
         drop(store);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !registry.states.lock().unwrap().is_empty() {
+        while live_registry_states(&registry) > 0 {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the process cleanup runtime did not remove the final registration"
