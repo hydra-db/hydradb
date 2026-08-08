@@ -1,7 +1,9 @@
 use super::*;
 
 #[cfg(feature = "opencypher")]
-use super::query::row_predicate_relationship_property_constraint;
+use super::query::{
+    ordered_string_vertex_index_spec, row_predicate_relationship_property_constraint,
+};
 
 #[cfg(feature = "opencypher")]
 use tracing::Instrument as _;
@@ -31,7 +33,7 @@ impl GraphShard {
         let span = query_plan_span(cell_id, read_epoch);
         let started = std::time::Instant::now();
         let plan = async {
-            let groups = self
+            let mut groups = self
                 .optimized_row_query_groups(
                     cell_id,
                     &query.patterns,
@@ -39,6 +41,36 @@ impl GraphShard {
                     read_epoch,
                 )
                 .await?;
+            if let Some(spec) = ordered_string_vertex_index_spec(query, query.window) {
+                let estimated = query
+                    .window
+                    .skip
+                    .saturating_add(u64::try_from(spec.limit).unwrap_or(u64::MAX))
+                    .max(1);
+                if let [group] = groups.as_mut_slice() {
+                    if let [pattern] = group.plan.patterns.as_mut_slice() {
+                        pattern.access = RowQueryAccess::VertexPropertyIndex {
+                            property: spec.property.to_string(),
+                        };
+                        pattern.estimated_cardinality = estimated;
+                        pattern.optimizer_passes.retain(|pass| {
+                            !matches!(pass, RowQueryOptimizerPass::FullScanFallback)
+                        });
+                        if !pattern
+                            .optimizer_passes
+                            .contains(&RowQueryOptimizerPass::UtilizeVertexIndex)
+                        {
+                            pattern
+                                .optimizer_passes
+                                .push(RowQueryOptimizerPass::UtilizeVertexIndex);
+                        }
+                        pattern
+                            .optimizer_passes
+                            .push(RowQueryOptimizerPass::OrderedLimitPushdown);
+                        group.plan.estimated_cardinality = estimated;
+                    }
+                }
+            }
             let mut union_arms = Vec::with_capacity(query.union_arms.len());
             for arm in &query.union_arms {
                 union_arms.push(
@@ -1110,6 +1142,7 @@ fn access_is_full_scan(access: &RowQueryAccess) -> bool {
 fn optimizer_pass_label(pass: &RowQueryOptimizerPass) -> &'static str {
     match pass {
         RowQueryOptimizerPass::UtilizeVertexIndex => "UtilizeVertexIndex",
+        RowQueryOptimizerPass::OrderedLimitPushdown => "OrderedLimitPushdown",
         RowQueryOptimizerPass::UtilizeEdgeIndex => "UtilizeEdgeIndex",
         RowQueryOptimizerPass::CostBasedLabelScan => "CostBasedLabelScan",
         RowQueryOptimizerPass::ConnectivityOrder => "ConnectivityOrder",

@@ -605,7 +605,10 @@ impl RoutedGraphCluster {
         // lease is the authority. An existing lease holder must keep serving
         // through a temporarily divergent heartbeat view; a node without a
         // lease may contend only when rendezvous currently selects it.
-        if !writer_leases.holds_valid_local(&self.scope, cell_id, &self.local_node_id) {
+        let can_resume_durable_lease =
+            writer_leases.holds_valid_local(&self.scope, cell_id, &self.local_node_id)
+                || writer_leases.holds_abandoned_local(&self.scope, cell_id, &self.local_node_id);
+        if !can_resume_durable_lease {
             self.resolve_placement(cell_id)?;
         }
         // Serve any local fencing backoff before acquiring durable ownership so
@@ -1225,6 +1228,15 @@ impl RoutedGraphCluster {
     }
 
     pub async fn close(&self) -> Result<()> {
+        self.close_with_lease_release(true).await
+    }
+
+    #[cfg(feature = "query-transport")]
+    async fn close_for_eviction(&self) -> Result<()> {
+        self.close_with_lease_release(false).await
+    }
+
+    async fn close_with_lease_release(&self, release_durable_lease: bool) -> Result<()> {
         let mut failures = Vec::new();
         for (cell_id, shard) in &self.shards {
             if let Err(error) = shard.close().await {
@@ -1236,13 +1248,17 @@ impl RoutedGraphCluster {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
             if let Some(writer_leases) = &self.writer_leases {
-                failures.extend(
-                    writer_leases
-                        .release_scope(&self.scope, &self.local_node_id)
-                        .await
-                        .into_iter()
-                        .map(|(cell_id, error)| format!("{cell_id} writer lease: {error}")),
-                );
+                if release_durable_lease {
+                    failures.extend(
+                        writer_leases
+                            .release_scope(&self.scope, &self.local_node_id)
+                            .await
+                            .into_iter()
+                            .map(|(cell_id, error)| format!("{cell_id} writer lease: {error}")),
+                    );
+                } else {
+                    writer_leases.abandon_scope(&self.scope, &self.local_node_id);
+                }
             }
         }
         if failures.is_empty() {
@@ -1519,7 +1535,7 @@ impl ScopedRoutedGraphCluster {
                 // request is cancelled, this task still drains the old writer
                 // and only then releases same-scope reopeners.
                 tokio::spawn(async move {
-                    let result = cluster.close().await;
+                    let result = cluster.close_for_eviction().await;
                     drop(cluster);
                     close.release();
                     result

@@ -10017,6 +10017,94 @@ async fn cypher_row_engine_supports_bindings_where_order_and_windows() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_ordered_string_index_applies_limit_before_tenant_wide_hydration() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-ordered-string-limit",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_index_candidates: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for vertex_id in 1..=24 {
+        let newest = vertex_id >= 21;
+        let created_at = if newest {
+            "2026-08-08T12:00:00Z".to_string()
+        } else {
+            format!("2026-08-07T00:00:{vertex_id:02}Z")
+        };
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex_id,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property("tenant_id", VertexPropertyValue::String("tenant-a".into()))
+                    .with_property("sub_tenant_id", VertexPropertyValue::String("sub-a".into()))
+                    .with_property("created_at", VertexPropertyValue::String(created_at))
+                    .with_property(
+                        "entity_id",
+                        VertexPropertyValue::String(format!("entity-{vertex_id:02}")),
+                    ),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-ordered-string-limit"),
+            "MATCH (e:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+             WHERE e.created_at STARTS WITH '' \
+             RETURN e.entity_id ORDER BY e.created_at DESC, e.entity_id LIMIT 2",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("e.entity_id")],
+            vec![
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                    "entity-21".into(),
+                ))]),
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::String(
+                    "entity-22".into(),
+                ))]),
+            ],
+        )
+    );
+    let plan = shard
+        .explain_opencypher_rows(
+            QueryContext::new("reddit-home", "cypher-ordered-string-limit-explain"),
+            "MATCH (e:Entity {tenant_id: 'tenant-a', sub_tenant_id: 'sub-a'}) \
+             WHERE e.created_at STARTS WITH '' \
+             RETURN e.entity_id ORDER BY e.created_at DESC, e.entity_id LIMIT 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.groups[0].patterns[0].access,
+        RowQueryAccess::VertexPropertyIndex {
+            property: "created_at".to_string(),
+        }
+    );
+    assert!(plan.groups[0].patterns[0]
+        .optimizer_passes
+        .contains(&RowQueryOptimizerPass::OrderedLimitPushdown));
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_variable_hops_use_the_configured_graph_kernel_backend() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-varhop-matrix-artifact", object_store).await;
