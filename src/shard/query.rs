@@ -6153,8 +6153,7 @@ impl GraphShard {
     ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        let current_epoch = self.current_epoch(cell_id).await?;
-        if !self.writes_reverse_index() || read_epoch != current_epoch {
+        if !self.writes_reverse_index() {
             let mut neighbors = Vec::new();
             for edge in self
                 .edges_at_with_budget(cell_id, edge_type, read_epoch, Some(budget))
@@ -6169,8 +6168,13 @@ impl GraphShard {
             neighbors.dedup();
             return Ok(neighbors);
         }
+
+        let snapshot = self.snapshot_at(cell_id, read_epoch).await?;
         let prefix = keys::in_prefix(cell_id, edge_type, dst);
-        let mut iter = self.scan_remote_prefix(&prefix).await?;
+        let mut iter = snapshot
+            .storage_snapshot
+            .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
+            .await?;
         let mut neighbors = Vec::new();
         while let Some(kv) = iter.next().await? {
             budget.check("query_in_neighbors_reverse_scan")?;

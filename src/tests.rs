@@ -12004,13 +12004,29 @@ async fn cypher_edge_match_uses_destination_id_reverse_index_without_full_scan()
             .unwrap();
     }
 
-    let rows = shard
-        .execute_cypher_rows(
-            QueryContext::new("reddit-home", "cypher-dst-id-index-read"),
-            "MATCH (u)-[:FOLLOWS]->(v {id: 20}) RETURN u.id",
-        )
+    let pinned_snapshot = shard.db.snapshot().await.unwrap();
+    let pinned_epoch = pinned_snapshot.seq();
+    shard
+        .write_edge(EdgeMutation {
+            cell_id: "reddit-home".to_string(),
+            edge_type: "FOLLOWS".to_string(),
+            src: 4,
+            dst: 20,
+            idempotency_key: "cypher-dst-id-index-newer-write".to_string(),
+        })
         .await
         .unwrap();
+
+    let rows = crate::GraphStore::scope_snapshot(
+        pinned_snapshot,
+        shard.execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-dst-id-index-read")
+                .with_validated_storage_read_epoch(pinned_epoch, pinned_epoch),
+            "MATCH (u)-[:FOLLOWS]->(v {id: 20}) RETURN u.id",
+        ),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         rows,
         QueryResultSet::new(

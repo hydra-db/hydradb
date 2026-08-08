@@ -347,7 +347,10 @@ impl GraphShard {
     ) -> Result<Vec<OptimizedRowPattern>> {
         let current_epoch = self.current_epoch(cell_id).await?;
         let latest_snapshot = read_epoch == current_epoch;
-        let reverse_index_available = self.writes_reverse_index() && latest_snapshot;
+        // Reverse adjacency is stored in SlateDB and can be read from the same
+        // pinned snapshot as the rest of the query. It is not limited to the
+        // latest epoch.
+        let reverse_index_available = self.writes_reverse_index();
         let mut remaining: Vec<_> = patterns
             .iter()
             .cloned()
@@ -503,7 +506,7 @@ impl GraphShard {
     ) -> Result<RowQueryAccess> {
         let current_epoch = self.current_epoch(cell_id).await?;
         let latest_snapshot = read_epoch == current_epoch;
-        let reverse_index_available = self.writes_reverse_index() && latest_snapshot;
+        let reverse_index_available = self.writes_reverse_index();
         Ok(self
             .best_row_edge_access(
                 cell_id,
