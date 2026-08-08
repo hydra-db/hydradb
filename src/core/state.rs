@@ -152,8 +152,27 @@ struct ProcessWriterKey {
     node_id: String,
 }
 
-pub(crate) struct ProcessWriterRegistry {
+/// Process-local writer ownership shared by routed runtimes over one physical store.
+///
+/// Reuse one registry only when every participating runtime addresses the same
+/// physical object store. Keeping the identity explicit avoids guessing backend
+/// identity from an [`ObjectStore`] wrapper's allocation or display text.
+pub struct ProcessWriterRegistry {
     states: StdMutex<BTreeMap<ProcessWriterKey, Arc<ProcessWriterState>>>,
+}
+
+impl ProcessWriterRegistry {
+    pub fn new() -> Self {
+        Self {
+            states: StdMutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+impl Default for ProcessWriterRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone)]
@@ -201,9 +220,7 @@ pub(crate) fn process_writer_registry(
         .get(&key)
         .and_then(Weak::upgrade)
         .unwrap_or_else(|| {
-            let registry = Arc::new(ProcessWriterRegistry {
-                states: StdMutex::new(BTreeMap::new()),
-            });
+            let registry = Arc::new(ProcessWriterRegistry::new());
             registries.insert(key, Arc::downgrade(&registry));
             registry
         })
