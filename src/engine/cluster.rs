@@ -492,6 +492,7 @@ impl RoutedGraphCluster {
             })
     }
 
+    #[cfg(feature = "query-transport")]
     fn holds_unowned_writer(&self) -> bool {
         let view = self.placement.view();
         let scope = self.scope.to_string();
@@ -1156,10 +1157,20 @@ impl RoutedGraphCluster {
     }
 
     pub async fn close(&self) -> Result<()> {
-        for shard in self.shards.values() {
-            shard.close().await?;
+        let mut failures = Vec::new();
+        for (cell_id, shard) in &self.shards {
+            if let Err(error) = shard.close().await {
+                failures.push(format!("{cell_id}: {error}"));
+            }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(GraphError::CorruptValue {
+                key: format!("routed-cluster/{}/close", self.scope),
+                reason: failures.join("; "),
+            })
+        }
     }
 }
 
@@ -1485,17 +1496,24 @@ impl ScopedRoutedGraphCluster {
         drop(_capacity_guard);
 
         let mut retired = 0;
+        let mut failures = Vec::new();
         for (scope, cluster, close) in retiring {
             let result = cluster.close().await;
             drop(cluster);
             close.release();
-            result.map_err(|error| GraphError::CorruptValue {
-                key: format!("scoped-cluster/{scope}/placement-retire"),
-                reason: error.to_string(),
-            })?;
-            retired += 1;
+            match result {
+                Ok(()) => retired += 1,
+                Err(error) => failures.push(format!("{scope}: {error}")),
+            }
         }
-        Ok(retired)
+        if failures.is_empty() {
+            Ok(retired)
+        } else {
+            Err(GraphError::CorruptValue {
+                key: "scoped-clusters/placement-retire".to_string(),
+                reason: failures.join("; "),
+            })
+        }
     }
 
     pub async fn loaded_scopes(&self) -> Vec<GraphScope> {
@@ -2080,6 +2098,80 @@ mod scoped_cluster_tests {
 
         runtime.close().await.expect("the runtime drains");
         replacement.close().await.expect("the replacement drains");
+    }
+
+    #[tokio::test]
+    async fn placement_reconciliation_retires_every_selected_scope() {
+        let base_path = "graph/placement-batch-handoff";
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let config = PlacementConfig {
+            heartbeat_interval: Duration::from_millis(2),
+            heartbeat_timeout: Duration::from_millis(10),
+        };
+        let placement = PlacementView::new("node-a", ["node-a", "node-b"], config)
+            .expect("the placement view is valid");
+        let runtime = ScopedRoutedGraphCluster::new(
+            base_path,
+            NamespacePath::root(NamespaceId::new("production").unwrap()),
+            GraphId::new("hydradb").unwrap(),
+            "node-a",
+            ObjectStoreNodeDirectory::new(["cell-0"], ["node-a", "node-b"]).unwrap(),
+            placement.clone(),
+            Arc::clone(&store),
+            GraphOpenOptions::default(),
+            GraphMemoryConfig::default(),
+            4,
+        )
+        .unwrap();
+        let scopes = (0..2_000)
+            .map(|index| tenant_scope(&runtime, &format!("tenant-{index}")))
+            .filter(|scope| {
+                turbolay_placement::hash::owner(&scope.to_string(), "cell-0", &["node-a", "node-b"])
+                    == Some("node-b")
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(scopes.len(), 2);
+
+        tokio::time::sleep(config.heartbeat_timeout * 2).await;
+        let _ = placement
+            .refresh(store.as_ref(), &Path::from(base_path))
+            .await;
+        let mut writers = Vec::new();
+        for (index, scope) in scopes.iter().enumerate() {
+            let cluster = runtime
+                .cluster_for_scope_write(scope, "cell-0")
+                .await
+                .expect("node-a opens the initial writer");
+            cluster
+                .write_edge(scoped_edge(&format!("before-batch-handoff-{index}")))
+                .await
+                .expect("the initial owner commits");
+            writers.push(cluster.shard("cell-0").unwrap().db.writer().unwrap());
+        }
+
+        let now = Utc::now();
+        heartbeat::put_heartbeat(
+            store.as_ref(),
+            &Path::from(base_path),
+            &Heartbeat::new("node-b", "test", now, now, vec!["cell-0".to_string()]),
+        )
+        .await
+        .expect("node-b publishes its heartbeat");
+        let _ = placement
+            .refresh(store.as_ref(), &Path::from(base_path))
+            .await;
+
+        assert_eq!(runtime.retire_unowned_writers().await.unwrap(), 2);
+        for writer in writers {
+            assert_eq!(
+                writer.status().close_reason,
+                Some(slatedb::CloseReason::Clean),
+                "every selected stale writer must be explicitly closed"
+            );
+        }
+        assert!(runtime.loaded_scopes().await.is_empty());
+        runtime.close().await.expect("the runtime drains");
     }
 
     #[tokio::test]
