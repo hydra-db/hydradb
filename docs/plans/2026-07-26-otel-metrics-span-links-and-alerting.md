@@ -2058,14 +2058,14 @@ and what each candidate needs before it can be an alert rather than a chart.
 
 ### The rule that governs all of them
 
-`contention` and `fencing` are **expected**.
-`ErrorClass::is_expected_under_contention`
-(`crates/telemetry/src/error_class.rs:86`) already encodes this, and
+`contention`, `routing`, and occasional `fencing` are **expected**.
+`ErrorClass::is_expected_during_normal_operation`
+(`crates/telemetry/src/error_class.rs`) already encodes this, and
 `refresh_writer_fence` records `error.class = fencing` on a path that runs once
 per write (`src/core/state.rs:441`). Retries are how the system is supposed to
-behave under concurrency. An alert on the *occurrence* of either class will
-fire on day one, be silenced by day three, and take the credibility of every
-other alert in this document with it.
+behave under concurrency and routing changes. An alert on the *occurrence* of
+any class will fire on day one, be silenced by day three, and take the
+credibility of every other alert in this document with it.
 
 So: chart the rate, alert on a **change** in the rate. Every candidate below is
 phrased that way, and the baseline is what the staging week is for.

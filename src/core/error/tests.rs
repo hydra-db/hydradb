@@ -1,16 +1,17 @@
 use super::*;
 
-/// The eleven reachable classes, written out rather than derived from
+/// The twelve reachable classes, written out rather than derived from
 /// [`GraphError::CLASSES`], so that the array and the vocabulary are two
 /// statements that can disagree instead of one that cannot be checked.
 ///
-/// Eleven and not twelve: `turbolay_telemetry::ErrorClass` also has `Other`, and
+/// Twelve and not thirteen: `turbolay_telemetry::ErrorClass` also has `Other`, and
 /// nothing in this tree constructs it. There is no `other` arm here and there
 /// must not be one — the whole value of the taxonomy is that an unclassified
 /// variant is a build failure rather than a bucket nobody can act on.
-const EXPECTED_CLASSES: [&str; 11] = [
+const EXPECTED_CLASSES: [&str; 12] = [
     "contention",
     "fencing",
+    "routing",
     "freshness",
     "admission",
     "timeout",
@@ -23,9 +24,9 @@ const EXPECTED_CLASSES: [&str; 11] = [
 ];
 
 #[test]
-fn the_vocabulary_is_exactly_the_eleven_reachable_classes() {
+fn the_vocabulary_is_exactly_the_twelve_reachable_classes() {
     assert_eq!(GraphError::CLASSES, EXPECTED_CLASSES);
-    assert_eq!(GraphError::CLASS_COUNT, 11);
+    assert_eq!(GraphError::CLASS_COUNT, 12);
 }
 
 #[test]
@@ -52,6 +53,7 @@ fn class_constants_index_their_own_name() {
         "contention"
     );
     assert_eq!(GraphError::CLASSES[GraphError::CLASS_FENCING], "fencing");
+    assert_eq!(GraphError::CLASSES[GraphError::CLASS_ROUTING], "routing");
     assert_eq!(
         GraphError::CLASSES[GraphError::CLASS_FRESHNESS],
         "freshness"
@@ -126,4 +128,29 @@ fn both_storage_variants_share_the_storage_class() {
     assert_eq!(object_store.class_index(), GraphError::CLASS_STORAGE);
     assert_eq!(slate.class_index(), GraphError::CLASS_STORAGE);
     assert_eq!(slate.class(), "storage");
+}
+
+#[test]
+fn slate_writer_fencing_is_not_reported_as_generic_storage() {
+    let error = GraphError::Slate(slatedb::Error::closed(
+        "fenced".to_string(),
+        slatedb::CloseReason::Fenced,
+    ));
+
+    assert_eq!(error.class_index(), GraphError::CLASS_FENCING);
+    assert_eq!(error.class(), "fencing");
+}
+
+#[test]
+fn wrong_node_failures_are_routing_not_fencing() {
+    let not_writer = GraphError::NotCellWriter {
+        cell_id: "cell".into(),
+        owner: Some("node-1".into()),
+    };
+    let unavailable = GraphError::RoutingUnavailable {
+        reason: "owner unknown".into(),
+    };
+
+    assert_eq!(not_writer.class(), "routing");
+    assert_eq!(unavailable.class(), "routing");
 }
