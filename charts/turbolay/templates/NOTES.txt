@@ -18,7 +18,13 @@ Read the generated Bolt password:
 {{- end }}
 
 Client configuration:
-  TURBOLAY_URI={{ ternary "bolt+s" "bolt" .Values.tls.public.enabled }}://<bolt-host>:{{ .Values.service.bolt.port }}
+  TURBOLAY_URI={{ ternary "neo4j+s" "neo4j" .Values.tls.public.enabled }}://{{ include "turbolay.fullname" . }}-bolt.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.bolt.port }}
   TURBOLAY_USER=neo4j
   TURBOLAY_PASSWORD=<client-auth-token>
   TURBOLAY_DATABASE={{ .Values.graph.database }}
+{{- if .Values.tls.public.enabled }}
+
+If the configured certificate is self-signed, use `neo4j+ssc` instead of
+`neo4j+s`. Write-capable clients must keep the `neo4j` routing scheme; direct
+`bolt` URIs bypass writer routing.
+{{- end }}
