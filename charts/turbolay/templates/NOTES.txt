@@ -18,7 +18,7 @@ Read the generated Bolt password:
 {{- end }}
 
 Client configuration:
-  TURBOLAY_URI={{ ternary "neo4j+s" "neo4j" .Values.tls.public.enabled }}://{{ include "turbolay.fullname" . }}-bolt.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.bolt.port }}
+  TURBOLAY_URI={{ ternary "neo4j+s" "neo4j" .Values.tls.public.enabled }}://{{ include "turbolay.advertisedBoltAddress" . }}
   TURBOLAY_USER=neo4j
   TURBOLAY_PASSWORD=<client-auth-token>
   TURBOLAY_DATABASE={{ .Values.graph.database }}

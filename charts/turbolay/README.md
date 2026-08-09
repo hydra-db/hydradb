@@ -101,6 +101,11 @@ them in turn: those URIs deliberately bypass routing, so every wrong-node probe
 is rejected with `NotCellWriter`. Direct StatefulSet addresses are for node
 diagnostics and targeted failure testing only.
 
+When `service.bolt.type=LoadBalancer`, set `service.advertisedBoltAddress` to
+the externally reachable `host:port` used by clients and include that hostname
+in the public certificate's DNS names. The chart uses this address in Bolt
+routing tables and in its generated client configuration.
+
 Outbound HTTPS is also denied by default. Set `networkPolicy.httpsEgressTo` to
 private peers that cover, on AWS with IRSA, the private S3 and STS endpoint
 addresses. Prefer
