@@ -115,7 +115,7 @@ impl GraphShard {
         };
         let prefix = keys::out_segment_src_prefix(cell_id, edge_type, src);
         let mut iter = snapshot
-            .scan_prefix_with_options(prefix.as_bytes(), .., &cached_remote_scan_options())
+            .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
             .await?;
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
@@ -143,10 +143,14 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         let mut neighbors = BTreeSet::new();
+        let scan_options = remote_scan_options_for_expected_items(
+            self.degree_for_cache_admission(snapshot, &keys::degree_out(cell_id, edge_type, src))
+                .await?,
+        );
 
         let prefix = keys::out_prefix(cell_id, edge_type, src);
         let mut iter = snapshot
-            .scan_prefix_with_options(prefix.as_bytes(), .., &cached_remote_scan_options())
+            .scan_prefix_with_options(prefix.as_bytes(), .., &scan_options)
             .await?;
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
@@ -155,11 +159,7 @@ impl GraphShard {
 
         let tombstone_prefix = keys::out_segment_tombstone_src_prefix(cell_id, edge_type, src);
         let mut tombstone_iter = snapshot
-            .scan_prefix_with_options(
-                tombstone_prefix.as_bytes(),
-                ..,
-                &cached_remote_scan_options(),
-            )
+            .scan_prefix_with_options(tombstone_prefix.as_bytes(), .., &remote_scan_options())
             .await?;
         let mut tombstones = BTreeMap::new();
         while let Some(kv) = tombstone_iter.next().await? {
@@ -180,7 +180,7 @@ impl GraphShard {
 
         let segment_prefix = keys::out_segment_src_prefix(cell_id, edge_type, src);
         let mut segment_iter = snapshot
-            .scan_prefix_with_options(segment_prefix.as_bytes(), .., &cached_remote_scan_options())
+            .scan_prefix_with_options(segment_prefix.as_bytes(), .., &remote_scan_options())
             .await?;
         while let Some(kv) = segment_iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
@@ -225,9 +225,13 @@ impl GraphShard {
     ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
+        let scan_options = remote_scan_options_for_expected_items(
+            self.degree_for_cache_admission(snapshot, &keys::degree_in(cell_id, edge_type, dst))
+                .await?,
+        );
         let prefix = keys::in_prefix(cell_id, edge_type, dst);
         let mut iter = snapshot
-            .scan_prefix_with_options(prefix.as_bytes(), .., &cached_remote_scan_options())
+            .scan_prefix_with_options(prefix.as_bytes(), .., &scan_options)
             .await?;
         let mut neighbors = BTreeSet::new();
         while let Some(kv) = iter.next().await? {
@@ -235,6 +239,22 @@ impl GraphShard {
             neighbors.insert(decode_edge_record(&key, &kv.value)?.src);
         }
         Ok(neighbors.into_iter().collect())
+    }
+
+    async fn degree_for_cache_admission(
+        &self,
+        snapshot: &GraphStorageSnapshot,
+        key: &str,
+    ) -> Result<u64> {
+        match snapshot
+            .get_with_options(key.as_bytes(), &remote_read_options())
+            .await?
+        {
+            Some(value) => decode_u64(key, &value),
+            // Missing counters must fail closed for cache admission. The scan
+            // remains correct; it simply cannot displace known hot blocks.
+            None => Ok(u64::MAX),
+        }
     }
 
     pub async fn execute_cypher(&self, context: QueryContext, query: &str) -> Result<QueryOutput> {
@@ -881,7 +901,7 @@ impl GraphShard {
             .scan_prefix_with_options(
                 prefix.as_bytes(),
                 None,
-                &cached_remote_scan_options().with_order(order),
+                &remote_scan_options().with_order(order),
             )
             .await?;
         let mut projected = Vec::with_capacity(required.min(limit.saturating_mul(2)));
@@ -6419,10 +6439,17 @@ impl GraphShard {
         }
 
         let snapshot = self.snapshot_at(cell_id, read_epoch).await?;
+        let scan_options = remote_scan_options_for_expected_items(
+            self.degree_for_cache_admission(
+                &snapshot.storage_snapshot,
+                &keys::degree_in(cell_id, edge_type, dst),
+            )
+            .await?,
+        );
         let prefix = keys::in_prefix(cell_id, edge_type, dst);
         let mut iter = snapshot
             .storage_snapshot
-            .scan_prefix_with_options(prefix.as_bytes(), .., &cached_remote_scan_options())
+            .scan_prefix_with_options(prefix.as_bytes(), .., &scan_options)
             .await?;
         let mut neighbors = Vec::new();
         while let Some(kv) = iter.next().await? {

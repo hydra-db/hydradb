@@ -172,15 +172,12 @@ pub(crate) fn remote_scan_options() -> ScanOptions {
         .with_cache_blocks(false)
 }
 
-pub(crate) fn cached_remote_scan_options() -> ScanOptions {
+const MAX_CACHED_REMOTE_SCAN_ITEMS: u64 = 1_024;
+
+pub(crate) fn remote_scan_options_for_expected_items(expected_items: u64) -> ScanOptions {
     ScanOptions::default()
         .with_durability_filter(DurabilityLevel::Remote)
-        // Foreground graph scans repeatedly touch the same immutable SST
-        // blocks. Caching those blocks does not weaken snapshot isolation:
-        // the pinned SlateDB snapshot still chooses which SSTs and sequence
-        // numbers are visible, while the cache only avoids fetching an
-        // already-selected immutable block from object storage again.
-        .with_cache_blocks(true)
+        .with_cache_blocks(expected_items <= MAX_CACHED_REMOTE_SCAN_ITEMS)
 }
 
 pub(crate) fn validate_component(component: &'static str, value: &str) -> Result<()> {
@@ -1545,18 +1542,16 @@ mod scan_option_tests {
     use super::*;
 
     #[test]
-    fn foreground_scans_cache_remote_blocks() {
-        let options = cached_remote_scan_options();
-
-        assert_eq!(options.durability_filter, DurabilityLevel::Remote);
-        assert!(options.cache_blocks);
-    }
-
-    #[test]
-    fn maintenance_scans_do_not_pollute_the_block_cache() {
+    fn remote_prefix_scans_do_not_pollute_the_block_cache() {
         let options = remote_scan_options();
 
         assert_eq!(options.durability_filter, DurabilityLevel::Remote);
         assert!(!options.cache_blocks);
+    }
+
+    #[test]
+    fn bounded_remote_scans_admit_only_small_working_sets() {
+        assert!(remote_scan_options_for_expected_items(1_024).cache_blocks);
+        assert!(!remote_scan_options_for_expected_items(1_025).cache_blocks);
     }
 }
