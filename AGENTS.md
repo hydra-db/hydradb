@@ -164,7 +164,7 @@ return to it, since a fresh shell starts wherever the harness puts it.
 
 ```bash
 mkdir -p /tmp/sgk-store
-echo "export REPO_ROOT=$PWD" > /tmp/sgk-env.sh
+printf 'export REPO_ROOT=%q\n' "$PWD" > /tmp/sgk-env.sh
 cat >> /tmp/sgk-env.sh <<'EOF'
 export CLOUD_PROVIDER=local        # object store: a local directory, not S3
 export LOCAL_PATH=/tmp/sgk-store   # must already exist; not created for you
