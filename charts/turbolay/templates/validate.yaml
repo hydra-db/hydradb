@@ -7,9 +7,6 @@
 {{- if and .Values.tls.certManager.enabled (not .Values.tls.public.enabled) -}}
 {{- fail "tls.certManager.enabled requires public TLS" -}}
 {{- end -}}
-{{- if and (eq .Values.service.bolt.type "LoadBalancer") (empty .Values.service.advertisedBoltAddress) -}}
-{{- fail "service.advertisedBoltAddress is required when service.bolt.type is LoadBalancer" -}}
-{{- end -}}
 {{- if ne (len .Values.graph.cells) 1 -}}
 {{- fail "graph.cells must contain exactly one cell identifier; every dynamic tenant/subtenant graph scope receives that cell independently" -}}
 {{- end -}}

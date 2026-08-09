@@ -111,25 +111,6 @@
     "indexer": { "$ref": "#/definitions/indexerWorkload" },
     "service": {
       "type": "object",
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "bolt": {
-                "properties": { "type": { "const": "LoadBalancer" } },
-                "required": ["type"]
-              }
-            },
-            "required": ["bolt"]
-          },
-          "then": {
-            "properties": {
-              "advertisedBoltAddress": { "type": "string", "minLength": 1 }
-            },
-            "required": ["advertisedBoltAddress"]
-          }
-        }
-      ],
       "properties": {
         "advertisedBoltAddress": { "type": "string" },
         "bolt": { "$ref": "#/definitions/service" },
