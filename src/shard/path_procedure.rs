@@ -1,3 +1,4 @@
+use futures::{stream, StreamExt as _, TryStreamExt as _};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use tracing::Instrument as _;
@@ -16,6 +17,7 @@ use crate::{
 const MAX_NATIVE_PATH_PAGE_CURSORS: usize = 1_024;
 const MAX_NATIVE_PATH_PAGE_CURSOR_BYTES: u64 = 64 * 1024 * 1024;
 const NATIVE_PATH_PAGE_CURSOR_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const NATIVE_PATH_HYDRATION_CONCURRENCY: usize = 16;
 
 enum PathTopologySource {
     Compiled {
@@ -327,6 +329,7 @@ impl GraphShard {
             None => procedure.target.map(|target| vec![target]),
         };
         let mut relationship_cache = BTreeMap::new();
+        let mut relationship_choices_cache = BTreeMap::new();
         let mut vertex_cache = BTreeMap::new();
         let mut rows = Vec::new();
         let mut relationship_variant_structures = Vec::new();
@@ -375,6 +378,7 @@ impl GraphShard {
                     .expand_native_path_relationships(
                         read,
                         candidates,
+                        &mut relationship_choices_cache,
                         &mut relationship_cache,
                         self.limits.max_query_intermediate_rows,
                         false,
@@ -382,6 +386,19 @@ impl GraphShard {
                     .await?;
                 self.score_native_paths(&scalar, &mut candidates, &relationship_cache, &budget)?;
                 select_native_paths(&scalar, &mut candidates);
+                candidates.truncate(result_limit_usize.saturating_sub(rows.len()));
+                let vertex_ids = candidates
+                    .iter()
+                    .flat_map(|candidate| candidate.nodes.iter().copied())
+                    .collect::<Vec<_>>();
+                self.hydrate_vertex_metadata_cache_at(
+                    read.cell_id,
+                    &vertex_ids,
+                    read.read_epoch,
+                    &mut vertex_cache,
+                    read.budget,
+                )
+                .await?;
                 for candidate in candidates {
                     budget.check("native_path_hydrate")?;
                     let path = self
@@ -423,6 +440,7 @@ impl GraphShard {
                     .expand_native_path_relationships(
                         read,
                         vec![structural_path],
+                        &mut relationship_choices_cache,
                         &mut relationship_cache,
                         quota,
                         true,
@@ -434,10 +452,23 @@ impl GraphShard {
                     relationship_variant_groups.push(variants);
                 }
             }
-            for candidate in fair_relationship_variant_candidates(
+            let candidates = fair_relationship_variant_candidates(
                 relationship_variant_groups,
                 result_limit_usize,
-            ) {
+            );
+            let vertex_ids = candidates
+                .iter()
+                .flat_map(|candidate| candidate.nodes.iter().copied())
+                .collect::<Vec<_>>();
+            self.hydrate_vertex_metadata_cache_at(
+                read.cell_id,
+                &vertex_ids,
+                read.read_epoch,
+                &mut vertex_cache,
+                read.budget,
+            )
+            .await?;
+            for candidate in candidates {
                 budget.check("native_path_hydrate")?;
                 let path = self
                     .hydrate_native_path(
@@ -487,38 +518,51 @@ impl GraphShard {
             return Ok(vec![fallback]);
         };
         let mut vertices = BTreeSet::new();
-        for value in &selector.values {
-            read.budget.check("native_path_selector")?;
-            let property_value = VertexPropertyValue::String(value.clone());
-            let encoded = encode_vertex_property_value_key(&property_value);
-            let prefix =
-                keys::vertex_property_index_prefix(read.cell_id, &selector.property, &encoded);
-            let mut candidates = read
-                .snapshot
-                .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
-                .await?;
-            while let Some(kv) = candidates.next().await? {
+        let indexed_candidates =
+            stream::iter(selector.values.iter().cloned().map(|value| async move {
                 read.budget.check("native_path_selector")?;
-                let key = String::from_utf8_lossy(&kv.key).into_owned();
-                let vertex = decode_u64(&key, &kv.value)?;
-                let metadata_key = keys::vertex(read.cell_id, vertex);
-                let metadata = match read
+                let property_value = VertexPropertyValue::String(value);
+                let encoded = encode_vertex_property_value_key(&property_value);
+                let prefix =
+                    keys::vertex_property_index_prefix(read.cell_id, &selector.property, &encoded);
+                let mut candidates = read
                     .snapshot
-                    .get_with_options(metadata_key.as_bytes(), &remote_read_options())
-                    .await?
-                {
-                    Some(value) => decode_vertex_metadata(&metadata_key, &value)?,
-                    None => VertexMetadata::default(),
-                };
-                if metadata.labels.contains(&selector.label)
-                    && metadata.properties.get(&selector.property) == Some(&property_value)
-                {
-                    vertices.insert(vertex);
-                    self.ensure_query_index_candidates(
-                        "native_path_selector_candidates",
-                        vertices.len(),
-                    )?;
+                    .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
+                    .await?;
+                let mut indexed_candidates = Vec::new();
+                while let Some(kv) = candidates.next().await? {
+                    read.budget.check("native_path_selector")?;
+                    let key = String::from_utf8_lossy(&kv.key).into_owned();
+                    let vertex = decode_u64(&key, &kv.value)?;
+                    indexed_candidates.push((vertex, property_value.clone()));
                 }
+                Ok::<_, GraphError>(indexed_candidates)
+            }))
+            .buffered(NATIVE_PATH_HYDRATION_CONCURRENCY)
+            .boxed()
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let vertex_ids = indexed_candidates
+            .iter()
+            .map(|(vertex, _)| *vertex)
+            .collect::<Vec<_>>();
+        let metadata = self
+            .vertex_metadata_batch_at(read.cell_id, &vertex_ids, read.read_epoch, read.budget)
+            .await?;
+        for ((vertex, property_value), (_, metadata)) in
+            indexed_candidates.into_iter().zip(metadata)
+        {
+            if metadata.labels.contains(&selector.label)
+                && metadata.properties.get(&selector.property) == Some(&property_value)
+                && vertices.insert(vertex)
+            {
+                self.ensure_query_index_candidates(
+                    "native_path_selector_candidates",
+                    vertices.len(),
+                )?;
             }
         }
         Ok(vertices.into_iter().collect())
@@ -697,37 +741,53 @@ impl GraphShard {
         &self,
         read: NativePathRead<'_>,
         candidates: Vec<CandidatePath>,
+        choices_cache: &mut BTreeMap<PathEdge, Vec<PathEdge>>,
         relationship_cache: &mut BTreeMap<PathEdge, EdgeMetadata>,
         max_candidates: usize,
         truncate_at_limit: bool,
     ) -> Result<Vec<CandidatePath>> {
-        let mut choices_cache = BTreeMap::<PathEdge, Vec<PathEdge>>::new();
+        let missing_edges = candidates
+            .iter()
+            .flat_map(|candidate| candidate.edges.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|edge| !choices_cache.contains_key(edge))
+            .collect::<Vec<_>>();
+        let hydrated = stream::iter(missing_edges.into_iter().map(|structural_edge| async move {
+            read.budget.check("native_path_relationship_hydration")?;
+            let relationships = self
+                .native_path_relationships_at(
+                    read.cell_id,
+                    &structural_edge.edge_type,
+                    structural_edge.src,
+                    structural_edge.dst,
+                    read.read_epoch,
+                    read.budget,
+                )
+                .await?;
+            Ok::<_, GraphError>((structural_edge, relationships))
+        }))
+        .buffered(NATIVE_PATH_HYDRATION_CONCURRENCY)
+        .boxed()
+        .try_collect::<Vec<_>>()
+        .await?;
+        for (structural_edge, relationships) in hydrated {
+            let mut choices = Vec::with_capacity(relationships.len());
+            for (relationship_id, metadata) in relationships {
+                let edge = PathEdge {
+                    relationship_id,
+                    ..structural_edge.clone()
+                };
+                relationship_cache.insert(edge.clone(), metadata);
+                choices.push(edge);
+            }
+            choices_cache.insert(structural_edge, choices);
+        }
+
         let mut expanded = Vec::new();
         for candidate in candidates {
             let mut edge_variants = vec![Vec::with_capacity(candidate.edges.len())];
             for structural_edge in &candidate.edges {
-                if !choices_cache.contains_key(structural_edge) {
-                    let relationships = self
-                        .native_path_relationships_at(
-                            read.cell_id,
-                            &structural_edge.edge_type,
-                            structural_edge.src,
-                            structural_edge.dst,
-                            read.read_epoch,
-                            read.budget,
-                        )
-                        .await?;
-                    let mut choices = Vec::with_capacity(relationships.len());
-                    for (relationship_id, metadata) in relationships {
-                        let edge = PathEdge {
-                            relationship_id,
-                            ..structural_edge.clone()
-                        };
-                        relationship_cache.insert(edge.clone(), metadata);
-                        choices.push(edge);
-                    }
-                    choices_cache.insert(structural_edge.clone(), choices);
-                }
                 let choices = choices_cache
                     .get(structural_edge)
                     .expect("relationship choices were inserted");
@@ -821,17 +881,19 @@ impl GraphShard {
         vertex_cache: &mut BTreeMap<VertexId, VertexMetadata>,
         relationship_cache: &BTreeMap<PathEdge, EdgeMetadata>,
     ) -> Result<QueryPath> {
+        self.hydrate_vertex_metadata_cache_at(
+            read.cell_id,
+            nodes,
+            read.read_epoch,
+            vertex_cache,
+            read.budget,
+        )
+        .await?;
         let mut path_nodes = Vec::with_capacity(nodes.len());
         for vertex in nodes {
-            if !vertex_cache.contains_key(vertex) {
-                let metadata = self
-                    .vertex_metadata_at(read.cell_id, *vertex, read.read_epoch, read.budget)
-                    .await?;
-                vertex_cache.insert(*vertex, metadata);
-            }
             let metadata = vertex_cache
                 .get(vertex)
-                .expect("vertex metadata was inserted");
+                .expect("vertex metadata was hydrated");
             path_nodes.push(QueryPathNode {
                 id: *vertex,
                 labels: metadata.labels.iter().cloned().collect(),

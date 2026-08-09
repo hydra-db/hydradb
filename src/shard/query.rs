@@ -1,10 +1,15 @@
 use super::topology_tail::{expand_range_with_overlay, GraphTopologyOverlay, GraphTopologyTail};
 use super::*;
 #[cfg(feature = "opencypher")]
+use futures::{stream, StreamExt as _, TryStreamExt as _};
+#[cfg(feature = "opencypher")]
 use std::sync::atomic::AtomicU64;
 #[cfg(feature = "opencypher")]
 use std::time::Duration;
 use tracing::Instrument as _;
+
+#[cfg(feature = "opencypher")]
+const QUERY_METADATA_HYDRATION_CONCURRENCY: usize = 16;
 
 async fn run_graph_compute<T, F>(
     metrics: Arc<GraphOperationalMetrics>,
@@ -860,49 +865,77 @@ impl GraphShard {
         let mut projected = Vec::with_capacity(required.min(limit.saturating_mul(2)));
         let mut scanned = 0_usize;
         let mut boundary = None::<String>;
-        while let Some(kv) = iter.next().await? {
-            budget.check("cypher_ordered_vertex_property_index")?;
-            let key = String::from_utf8_lossy(&kv.key).into_owned();
-            let (_cell, indexed_property, encoded, vertex_id) =
-                parse_vertex_property_index_key(&key)?;
-            if indexed_property != *property {
-                continue;
+        let mut exhausted = false;
+        while !exhausted {
+            let batch_capacity = if boundary.is_some() {
+                QUERY_METADATA_HYDRATION_CONCURRENCY
+            } else {
+                required
+                    .saturating_sub(projected.len())
+                    .clamp(1, QUERY_METADATA_HYDRATION_CONCURRENCY)
+            };
+            let mut candidates = Vec::with_capacity(batch_capacity);
+            while candidates.len() < batch_capacity {
+                let Some(kv) = iter.next().await? else {
+                    exhausted = true;
+                    break;
+                };
+                budget.check("cypher_ordered_vertex_property_index")?;
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let (_cell, indexed_property, encoded, vertex_id) =
+                    parse_vertex_property_index_key(&key)?;
+                if indexed_property != *property {
+                    continue;
+                }
+                if projected.len() >= required && boundary.as_deref() != Some(encoded.as_str()) {
+                    exhausted = true;
+                    break;
+                }
+                candidates.push((encoded, vertex_id));
             }
-            if projected.len() >= required && boundary.as_deref() != Some(encoded.as_str()) {
-                break;
-            }
-            scanned = scanned.saturating_add(1);
+
+            scanned = scanned.saturating_add(candidates.len());
             self.ensure_query_index_candidates(
                 "cypher_ordered_vertex_property_candidates",
                 scanned,
             )?;
-
+            let vertex_ids = candidates
+                .iter()
+                .map(|(_, vertex_id)| *vertex_id)
+                .collect::<Vec<_>>();
             let metadata = self
-                .vertex_metadata_at(cell_id, vertex_id, read_epoch, budget)
+                .vertex_metadata_batch_at(cell_id, &vertex_ids, read_epoch, budget)
                 .await?;
-            if metadata
-                .properties
-                .get(property)
-                .is_none_or(|value| encode_vertex_property_value_key(value) != encoded)
-            {
-                continue;
-            }
-            let Some(mut row) = BindingRow::from_node(node, vertex_id) else {
-                continue;
-            };
-            row.metadata.insert(binding.to_string(), metadata);
-            if !row_matches_node(&row, node)? || !row_predicate_matches(&row, predicate)? {
-                continue;
-            }
-            let result_row = project_binding_row(&row, &query.projections)?;
-            let sort_keys = sort_keys_for_row(&row, &result_row, &query.columns, &query.order_by)?;
-            push_projected_query_row(&mut projected, result_row, sort_keys, budget)?;
-            self.ensure_query_intermediate_rows(
-                "cypher_ordered_vertex_property_rows",
-                projected.len(),
-            )?;
-            if projected.len() == required {
-                boundary = Some(encoded);
+            for ((encoded, vertex_id), (_, metadata)) in candidates.into_iter().zip(metadata) {
+                if projected.len() >= required && boundary.as_deref() != Some(encoded.as_str()) {
+                    exhausted = true;
+                    break;
+                }
+                if metadata
+                    .properties
+                    .get(property)
+                    .is_none_or(|value| encode_vertex_property_value_key(value) != encoded)
+                {
+                    continue;
+                }
+                let Some(mut row) = BindingRow::from_node(node, vertex_id) else {
+                    continue;
+                };
+                row.metadata.insert(binding.to_string(), metadata);
+                if !row_matches_node(&row, node)? || !row_predicate_matches(&row, predicate)? {
+                    continue;
+                }
+                let result_row = project_binding_row(&row, &query.projections)?;
+                let sort_keys =
+                    sort_keys_for_row(&row, &result_row, &query.columns, &query.order_by)?;
+                push_projected_query_row(&mut projected, result_row, sort_keys, budget)?;
+                self.ensure_query_intermediate_rows(
+                    "cypher_ordered_vertex_property_rows",
+                    projected.len(),
+                )?;
+                if projected.len() == required {
+                    boundary = Some(encoded);
+                }
             }
         }
 
@@ -3934,6 +3967,51 @@ impl GraphShard {
             Some(value) => decode_vertex_metadata(&key, &value),
             None => Ok(VertexMetadata::default()),
         }
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn vertex_metadata_batch_at(
+        &self,
+        cell_id: &str,
+        vertex_ids: &[VertexId],
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+    ) -> Result<Vec<(VertexId, VertexMetadata)>> {
+        stream::iter(vertex_ids.iter().copied().map(|vertex_id| async move {
+            budget.check("cypher_metadata_hydration")?;
+            let metadata = self
+                .vertex_metadata_at(cell_id, vertex_id, read_epoch, budget)
+                .await?;
+            Ok::<_, GraphError>((vertex_id, metadata))
+        }))
+        .buffered(QUERY_METADATA_HYDRATION_CONCURRENCY)
+        .boxed()
+        .try_collect()
+        .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn hydrate_vertex_metadata_cache_at(
+        &self,
+        cell_id: &str,
+        vertex_ids: &[VertexId],
+        read_epoch: StorageSequence,
+        cache: &mut BTreeMap<VertexId, VertexMetadata>,
+        budget: &QueryBudget,
+    ) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        let pending = vertex_ids
+            .iter()
+            .copied()
+            .filter(|vertex_id| !cache.contains_key(vertex_id) && seen.insert(*vertex_id))
+            .collect::<Vec<_>>();
+        for (vertex_id, metadata) in self
+            .vertex_metadata_batch_at(cell_id, &pending, read_epoch, budget)
+            .await?
+        {
+            cache.insert(vertex_id, metadata);
+        }
+        Ok(())
     }
 
     #[cfg(feature = "opencypher")]
