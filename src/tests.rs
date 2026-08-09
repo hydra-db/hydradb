@@ -861,6 +861,76 @@ async fn native_sp_paths_uses_one_pinned_graphblas_snapshot_with_wal_tail() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn native_paths_charge_compiled_and_overlay_edges_to_the_scan_limit() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/native-path-overlay-scan-limit";
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+    writer
+        .write_edge(typed_mutation(
+            "cell-a",
+            "CHAIN",
+            1,
+            2,
+            "native-path-overlay-base",
+        ))
+        .await
+        .unwrap();
+
+    let indexer = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    indexer.refresh_storage_sequence("cell-a").await.unwrap();
+    indexer.build_graph_index("cell-a", "CHAIN").await.unwrap();
+
+    for (index, dst) in [3, 4].into_iter().enumerate() {
+        writer
+            .write_edge(typed_mutation(
+                "cell-a",
+                "CHAIN",
+                1,
+                dst,
+                &format!("native-path-overlay-add-{index}"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let reader = GraphShard::open_with_limits(
+        path,
+        object_store,
+        GraphLimits {
+            max_query_scan_edges: 3,
+            ..GraphLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    reader.refresh_storage_sequence("cell-a").await.unwrap();
+    let error = reader
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-path-overlay-limit"),
+            "CALL algo.SPpaths({sourceNode: 1, targetNode: 4, relTypes: ['CHAIN'], \
+             maxLen: 1, relDirection: 'outgoing', pathCount: 1}) \
+             YIELD path RETURN path",
+        )
+        .await
+        .expect_err("compiled and overlay scan work must share one admission limit");
+    assert!(matches!(
+        error,
+        GraphError::AdmissionRejected {
+            operation: "native_path_edges",
+            actual: 4,
+            limit: 3,
+        }
+    ));
+
+    reader.close().await.unwrap();
+    indexer.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn native_sp_paths_honors_weight_cost_and_parameterized_limits() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/native-sp-paths-weighted", object_store).await;

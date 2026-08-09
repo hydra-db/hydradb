@@ -914,7 +914,9 @@ impl GraphShard {
                         .into_iter()
                         .collect::<BTreeSet<_>>();
                         if let Some(overlay) = overlay {
-                            overlay.apply_out_neighbors(vertex, &mut neighbors);
+                            scanned_edges = scanned_edges.saturating_add(
+                                overlay.apply_out_neighbors(vertex, &mut neighbors),
+                            );
                         }
                         if let Some(allowed) = allowed {
                             neighbors.retain(|neighbor| allowed.contains(neighbor));
@@ -961,7 +963,8 @@ impl GraphShard {
                         .into_iter()
                         .collect::<BTreeSet<_>>();
                         if let Some(overlay) = overlay {
-                            overlay.apply_in_neighbors(vertex, &mut neighbors);
+                            scanned_edges = scanned_edges
+                                .saturating_add(overlay.apply_in_neighbors(vertex, &mut neighbors));
                         }
                         if let Some(allowed) = allowed {
                             neighbors.retain(|neighbor| allowed.contains(neighbor));
