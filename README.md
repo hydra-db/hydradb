@@ -65,7 +65,8 @@ Base build:
 
 - Rust stable 1.91 or newer
 - `pkg-config`, `cmake`, `clang`, and normal C/C++ build tools
-- Optional: `just` for recipe shortcuts
+- `just` for recipe shortcuts; required by the commands in
+  [Run Locally](#run-locally)
 
 Native query/traversal features:
 
@@ -103,19 +104,30 @@ macOS with Homebrew:
 
 ```bash
 xcode-select --install
-brew install rustup-init just cmake pkg-config llvm suite-sparse
+brew install rustup just cmake pkg-config llvm suite-sparse
 brew install cleishm/neo4j/libcypher-parser
-rustup-init
+rustup default stable
 ```
 
-Then open a new shell and make `libcypher-parser` visible:
+`libcypher-parser` is not in homebrew-core; a plain
+`brew install libcypher-parser` fails with `No available formula`. The
+fully-qualified `cleishm/neo4j/...` name adds the tap automatically.
+
+Homebrew's `rustup` formula no longer provides a `rustup-init` binary. If you
+already manage Rust with rustup, skip it — `rust-toolchain.toml` pins
+`channel = "stable"`, so any rustup-managed stable toolchain works. To install
+from scratch instead: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`.
+
+Then verify both native libraries resolve:
 
 ```bash
-export PKG_CONFIG_PATH="$(brew --prefix libcypher-parser)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-
-pkg-config --exists cypher-parser
-test -f "$(brew --prefix suite-sparse)/lib/libgraphblas.dylib"
+just native-check
 ```
+
+Silence and exit 0 mean both were found; the recipe compiles nothing. It runs
+`pkg-config --exists cypher-parser` and a `test -f` for `libgraphblas.dylib`.
+`pkg-config: command not found` means `pkg-config` itself is missing from the
+`brew install` line above.
 
 You do **not** need to export `LIBRARY_PATH` or `RUSTFLAGS="-L ..."` for
 SuiteSparse. `build.rs` resolves the GraphBLAS link-search path itself, in this
@@ -127,8 +139,8 @@ on the default linker path.
 ## Build And Test
 
 ```bash
-git clone https://github.com/usecortex/slatedb-graph-kernel.git
-cd slatedb-graph-kernel
+git clone https://github.com/usecortex/turbolay2.git
+cd turbolay2
 
 cargo test --locked --lib
 GRAPH_COMPILED_KERNEL=compact cargo test --locked --lib   # pure-Rust compiled kernel
@@ -147,6 +159,157 @@ just ci
 CI runs default and native feature checks on Ubuntu. macOS CI validates the
 default and chaos-harness feature sets, so native `opencypher,graphblas` support
 on macOS should be checked locally when those libraries are installed.
+
+## Run Locally
+
+Everything here runs one process against the local filesystem. No Docker, no
+S3, no Kubernetes. Every command below was executed end to end on macOS (arm64)
+and on a clean Ubuntu 24.04 container; the only platform difference is the two
+Homebrew paths noted below, which Linux does not need.
+
+### Configure an object store
+
+Every local harness and the node itself load their object store through
+SlateDB's environment loader, so two variables are always required:
+
+```bash
+mkdir -p /tmp/sgk-store
+export CLOUD_PROVIDER=local
+export LOCAL_PATH=/tmp/sgk-store
+```
+
+`LOCAL_PATH` must already exist; it is not created for you. Accepted
+`CLOUD_PROVIDER` values are `local`, `memory`, `aws`, `azure`, and `gcp`. These
+may also live in a `.env` file in the working directory. Without them:
+
+```text
+Error: Slate(Error { msg: "invalid environment variable CLOUD_PROVIDER value `null`", ... })
+```
+
+`null` there means the variable is absent, not that it holds the string
+`"null"`.
+
+### Smoke-test the storage kernel
+
+```bash
+just smoke
+```
+
+Prints `graph object-store smoke passed at epoch 10`. This exercises the write,
+index, and read paths in-process and exits. It does not start a server.
+
+### Run the full node with one command
+
+`scripts/runtime_smoke.sh` builds `graph-node`, starts it, drives it over both
+Bolt and HTTP, and shuts it down. It is the fastest end-to-end check that the
+runtime works on your machine.
+
+It needs the Neo4j Python driver, and both Homebrew's and Debian's Python refuse
+a bare `pip install` under PEP 668, so use a virtualenv. On Debian/Ubuntu the
+venv module is packaged separately: `apt-get install -y python3-venv`.
+
+```bash
+python3 -m venv /tmp/sgk-venv && /tmp/sgk-venv/bin/pip install neo4j
+```
+
+Scripts under `scripts/` invoke `cargo` directly and therefore do **not**
+inherit the build environment the justfile exports. Set it yourself:
+
+```bash
+export BINDGEN_EXTRA_CLANG_ARGS="-I$(brew --prefix)/include"   # macOS only
+export LIBRARY_PATH="$(brew --prefix)/lib"                     # macOS only
+export RUST_MIN_STACK=33554432                                 # every platform
+```
+
+```bash
+PYTHON=/tmp/sgk-venv/bin/python bash scripts/runtime_smoke.sh
+```
+
+Prints `runtime-smoke-ok`. The node's own log is at
+`/tmp/sgk-runtime-smoke/node.log`; read it first if the script fails.
+
+### Start a node you can connect to
+
+`runtime_smoke.sh` stops the node when it finishes. To leave one running:
+
+```bash
+ROOT=/tmp/sgk-local
+mkdir -p "$ROOT/store" "$ROOT/cache"
+printf '%s\n' 'local-dev-auth-token-32-characters-long' >"$ROOT/auth-token"
+
+export CLOUD_PROVIDER=local LOCAL_PATH="$ROOT/store"
+export GRAPH_NAMESPACE=local GRAPH_ID=default
+export GRAPH_CELL_ID=cell-0 GRAPH_CELLS=cell-0 GRAPH_DATA_PATH=data
+export GRAPH_ALLOW_PLAINTEXT=true GRAPH_AUTH_TOKEN_FILE="$ROOT/auth-token"
+export GRAPH_DATA_CACHE_BYTES=67108864 GRAPH_DATA_CACHE_DIR="$ROOT/cache"
+export GRAPH_NODE_ID=node-0
+export GRAPH_BOLT_ADDR=127.0.0.1:17687 GRAPH_ADVERTISED_BOLT_ADDR=127.0.0.1:17687
+export GRAPH_BOLT_NODE_ADDRESSES=node-0=127.0.0.1:17687
+export GRAPH_HTTP_ADDR=127.0.0.1:18443 GRAPH_ADMIN_ADDR=127.0.0.1:19091
+export RUST_MIN_STACK=33554432 RUST_LOG=info
+
+cargo build --locked --features server-runtime --bin graph-node
+target/debug/graph-node
+```
+
+The node runs in the foreground and does not return. The auth token must be at
+least 32 characters. `GRAPH_ALLOW_PLAINTEXT=true` disables the TLS requirement
+on both public adapters and is for local development only.
+
+| Endpoint | Address |
+|---|---|
+| Bolt | `127.0.0.1:17687` |
+| HTTP query API | `127.0.0.1:18443` |
+| Admin, health, metrics | `127.0.0.1:19091` |
+
+From a second shell:
+
+```bash
+curl -fsS http://127.0.0.1:19091/readyz && echo READY
+curl -fsS http://127.0.0.1:19091/metrics | grep graph_runtime_ready
+```
+
+```bash
+TOKEN=local-dev-auth-token-32-characters-long
+
+curl -fsS -X POST http://127.0.0.1:18443/v1/graphs/default/query \
+  -H "Authorization: Bearer $TOKEN" -H 'X-Graph-Namespace: local' \
+  -H 'Content-Type: application/json' \
+  --data '{"cell_id":"cell-0","query":"CREATE (a {id: 1})-[:FOLLOWS]->(b {id: 2})"}'
+
+curl -fsS -X POST http://127.0.0.1:18443/v1/graphs/default/query \
+  -H "Authorization: Bearer $TOKEN" -H 'X-Graph-Namespace: local' \
+  -H 'Content-Type: application/json' \
+  --data '{"cell_id":"cell-0","query":"MATCH (a {id: 1})-[:FOLLOWS]->(b) RETURN b.id AS id"}'
+```
+
+The second call returns `{"type":"vertex_id","value":2}`. The
+`X-Graph-Namespace` header must match `GRAPH_NAMESPACE`.
+
+Any Neo4j driver connects over Bolt:
+
+```bash
+/tmp/sgk-venv/bin/python - <<'PY'
+from neo4j import GraphDatabase
+TOKEN = "local-dev-auth-token-32-characters-long"
+with GraphDatabase.driver("bolt://127.0.0.1:17687", auth=("neo4j", TOKEN)) as d:
+    d.verify_connectivity()
+    with d.session(database="default") as s:
+        print(dict(s.run("MATCH (a {id: 1})-[:FOLLOWS]->(b) RETURN b.id AS id").single(strict=True)))
+PY
+```
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `pkg-config: command not found` | `brew install pkg-config` |
+| `No available formula with the name "libcypher-parser"` | Use the tap: `brew install cleishm/neo4j/libcypher-parser` |
+| `zsh: command not found: rustup-init` | Homebrew's `rustup` no longer ships it; use `rustup default stable` |
+| `invalid environment variable CLOUD_PROVIDER value \`null\`` | `CLOUD_PROVIDER` unset; see "Configure an object store" |
+| `wrapper.h:4:10: fatal error: 'cypher-parser.h' file not found` | `BINDGEN_EXTRA_CLANG_ARGS` unset while running a script that calls `cargo` directly |
+| Node answers `/readyz`, then aborts with `has overflowed its stack` on the first query | `RUST_MIN_STACK` unset; export `33554432` |
+| `curl: (7) Failed to connect ... port 19091` | The node is not running; `graph-node` holds the foreground, so start it in its own shell |
 
 ## Kubernetes Deployment
 
@@ -559,6 +722,10 @@ just minio-fence              # MinIO fence takeover proof
 just minio-query-bench        # MinIO query benchmark
 just minio-query-correctness  # MinIO query correctness checks
 ```
+
+The non-MinIO recipes above read their object store from the environment, so
+export `CLOUD_PROVIDER` and `LOCAL_PATH` first — see [Run Locally](#run-locally).
+The `minio-*` recipes generate their own env files and need Docker.
 
 Benchmark and correctness outputs are written under `bench-results/`.
 
