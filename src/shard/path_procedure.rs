@@ -1,5 +1,6 @@
 use futures::{stream, StreamExt as _, TryStreamExt as _};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::Instrument as _;
 
@@ -18,6 +19,7 @@ const MAX_NATIVE_PATH_PAGE_CURSORS: usize = 1_024;
 const MAX_NATIVE_PATH_PAGE_CURSOR_BYTES: u64 = 64 * 1024 * 1024;
 const NATIVE_PATH_PAGE_CURSOR_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 const NATIVE_PATH_HYDRATION_CONCURRENCY: usize = 16;
+const NATIVE_PATH_SELECTOR_HYDRATION_BATCH_SIZE: usize = 256;
 
 enum PathTopologySource {
     Compiled {
@@ -518,8 +520,10 @@ impl GraphShard {
             return Ok(vec![fallback]);
         };
         let mut vertices = BTreeSet::new();
-        let indexed_candidates =
-            stream::iter(selector.values.iter().cloned().map(|value| async move {
+        let raw_candidate_count = Arc::new(AtomicUsize::new(0));
+        let indexed_candidates = stream::iter(selector.values.iter().cloned().map(|value| {
+            let raw_candidate_count = Arc::clone(&raw_candidate_count);
+            async move {
                 read.budget.check("native_path_selector")?;
                 let property_value = VertexPropertyValue::String(value);
                 let encoded = encode_vertex_property_value_key(&property_value);
@@ -532,37 +536,33 @@ impl GraphShard {
                 let mut indexed_candidates = Vec::new();
                 while let Some(kv) = candidates.next().await? {
                     read.budget.check("native_path_selector")?;
+                    let count = raw_candidate_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    self.ensure_query_index_candidates("native_path_selector_candidates", count)?;
                     let key = String::from_utf8_lossy(&kv.key).into_owned();
                     let vertex = decode_u64(&key, &kv.value)?;
                     indexed_candidates.push((vertex, property_value.clone()));
                 }
                 Ok::<_, GraphError>(indexed_candidates)
-            }))
-            .buffered(NATIVE_PATH_HYDRATION_CONCURRENCY)
-            .boxed()
-            .try_collect::<Vec<_>>()
-            .await?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        let vertex_ids = indexed_candidates
-            .iter()
-            .map(|(vertex, _)| *vertex)
-            .collect::<Vec<_>>();
-        let metadata = self
-            .vertex_metadata_batch_at(read.cell_id, &vertex_ids, read.read_epoch, read.budget)
-            .await?;
-        for ((vertex, property_value), (_, metadata)) in
-            indexed_candidates.into_iter().zip(metadata)
-        {
-            if metadata.labels.contains(&selector.label)
-                && metadata.properties.get(&selector.property) == Some(&property_value)
-                && vertices.insert(vertex)
-            {
-                self.ensure_query_index_candidates(
-                    "native_path_selector_candidates",
-                    vertices.len(),
-                )?;
+            }
+        }))
+        .buffered(NATIVE_PATH_HYDRATION_CONCURRENCY)
+        .boxed()
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        for batch in indexed_candidates.chunks(NATIVE_PATH_SELECTOR_HYDRATION_BATCH_SIZE) {
+            let vertex_ids = batch.iter().map(|(vertex, _)| *vertex).collect::<Vec<_>>();
+            let metadata = self
+                .vertex_metadata_batch_at(read.cell_id, &vertex_ids, read.read_epoch, read.budget)
+                .await?;
+            for ((vertex, property_value), (_, metadata)) in batch.iter().zip(metadata) {
+                if metadata.labels.contains(&selector.label)
+                    && metadata.properties.get(&selector.property) == Some(property_value)
+                {
+                    vertices.insert(*vertex);
+                }
             }
         }
         Ok(vertices.into_iter().collect())

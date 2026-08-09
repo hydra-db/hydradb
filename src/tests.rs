@@ -821,6 +821,58 @@ async fn native_ms_paths_resolves_indexed_sources_in_one_pinned_snapshot() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn native_ms_paths_rejects_broad_selectors_before_metadata_hydration() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/native-ms-paths-selector-limit",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_index_candidates: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for vertex_id in [1, 2] {
+        shard
+            .set_vertex_metadata(
+                "cell-a",
+                vertex_id,
+                VertexMetadata::default()
+                    .with_label("Entity")
+                    .with_property("name", VertexPropertyValue::String("alpha".into())),
+            )
+            .await
+            .unwrap();
+    }
+
+    let error = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-ms-selector-limit"),
+            "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', \
+             sourceValues: ['alpha'], relTypes: ['RELATES'], maxLen: 1, \
+             resultLimit: 10}) YIELD path RETURN path",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GraphError::AdmissionRejected {
+            operation: "native_path_selector_candidates",
+            actual: 2,
+            limit: 1
+        }
+    ));
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn native_ms_paths_fairly_budgets_parallel_variants_across_structures() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/native-ms-paths-fair-variants", object_store).await;
