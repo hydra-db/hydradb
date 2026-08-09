@@ -10,11 +10,11 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 
+#[cfg(feature = "opencypher")]
+use super::SparseTraversalCount;
 use super::{
     graphblas_csc_from_adjacency, Adjacency, GraphBlasCsc, SparseKernelBackend, SparseTraversal,
 };
-#[cfg(feature = "opencypher")]
-use super::{SparseTraversalCount, SparseTraversalWindow};
 use crate::{GraphError, Result, VertexId};
 
 type GrBInfo = c_int;
@@ -425,56 +425,6 @@ impl CompiledCompactCscMatrix {
         })
     }
 
-    #[cfg(feature = "opencypher")]
-    fn expand_range_window(
-        &self,
-        starts: &[VertexId],
-        min_hops: u8,
-        max_hops: u8,
-        window: SparseTraversalWindow,
-    ) -> Result<SparseTraversal> {
-        let (result_seen, edge_visits) = self.expand_range_bitmap(starts, min_hops, max_hops)?;
-        let skip = usize::try_from(window.skip).map_err(|_| GraphError::SparseKernel {
-            backend: "CompactCsc",
-            reason: format!("window skip {} does not fit in usize", window.skip),
-        })?;
-        let limit = window.limit.unwrap_or(usize::MAX);
-        let mut skipped = 0_usize;
-        let mut selected = Vec::with_capacity(limit.min(1024));
-        if window.ascending {
-            for (ordinal, seen) in result_seen.into_iter().enumerate() {
-                if seen {
-                    if skipped < skip {
-                        skipped += 1;
-                        continue;
-                    }
-                    selected.push(self.vertices[ordinal]);
-                    if selected.len() == limit {
-                        break;
-                    }
-                }
-            }
-        } else {
-            for (ordinal, seen) in result_seen.into_iter().enumerate().rev() {
-                if seen {
-                    if skipped < skip {
-                        skipped += 1;
-                        continue;
-                    }
-                    selected.push(self.vertices[ordinal]);
-                    if selected.len() == limit {
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(SparseTraversal {
-            vertices: selected,
-            edge_visits,
-            backend: SparseKernelBackend::CompactCsc,
-        })
-    }
-
     fn expand_range_ordinals(
         &self,
         starts: &[VertexId],
@@ -787,24 +737,6 @@ impl CompiledGraphBlasMatrix {
         }
         let mut inner = self.lock_available_replica()?;
         expand_range_count_with_compiled(adjacency, starts, min_hops, max_hops, &mut inner)
-    }
-
-    #[cfg(feature = "opencypher")]
-    pub(crate) fn expand_range_window(
-        &self,
-        adjacency: &Adjacency,
-        starts: &[VertexId],
-        min_hops: u8,
-        max_hops: u8,
-        window: SparseTraversalWindow,
-    ) -> Result<SparseTraversal> {
-        if self.kernel == SparseKernelBackend::CompactCsc {
-            return self
-                .canonical_out
-                .expand_range_window(starts, min_hops, max_hops, window);
-        }
-        let inner = self.lock_available_replica()?;
-        expand_range_window_with_compiled(adjacency, starts, min_hops, max_hops, window, &inner)
     }
 
     #[cfg_attr(not(feature = "opencypher"), allow(dead_code))]
@@ -1157,44 +1089,6 @@ fn exact_hop_count_with_compiled(
     Ok(SparseTraversalCount {
         vertices: vector_nvals(&scratch.frontier)?,
         edge_visits,
-        backend: SparseKernelBackend::SuiteSparse,
-    })
-}
-
-#[cfg(feature = "opencypher")]
-fn expand_range_window_with_compiled(
-    _adjacency: &Adjacency,
-    starts: &[VertexId],
-    min_hops: u8,
-    max_hops: u8,
-    window: SparseTraversalWindow,
-    compiled: &CompiledGraphBlasMatrixInner,
-) -> Result<SparseTraversal> {
-    let range = range_result_vector(starts, min_hops, max_hops, compiled)?;
-    let Some(result) = range.result.as_ref() else {
-        return Ok(empty_traversal());
-    };
-    let mut ordinals = extract_ordinals(result)?;
-    ordinals.sort_unstable();
-    if !window.ascending {
-        ordinals.reverse();
-    }
-    let skip = usize::try_from(window.skip).map_err(|_| GraphError::SparseKernel {
-        backend: "SuiteSparseGraphBlas",
-        reason: format!("window skip {} does not fit in usize", window.skip),
-    })?;
-    let iter = ordinals.into_iter().skip(skip);
-    let selected: Vec<_> = match window.limit {
-        Some(limit) => iter.take(limit).collect(),
-        None => iter.collect(),
-    };
-    let mut vertices = Vec::with_capacity(selected.len());
-    for ordinal in selected {
-        vertices.push(compiled.ordinal_map.vertex(ordinal)?);
-    }
-    Ok(SparseTraversal {
-        vertices,
-        edge_visits: range.edge_visits,
         backend: SparseKernelBackend::SuiteSparse,
     })
 }

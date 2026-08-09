@@ -531,7 +531,7 @@ impl GraphShard {
                     keys::vertex_property_index_prefix(read.cell_id, &selector.property, &encoded);
                 let mut candidates = read
                     .snapshot
-                    .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
+                    .scan_prefix_with_options(prefix.as_bytes(), .., &cached_remote_scan_options())
                     .await?;
                 let mut indexed_candidates = Vec::new();
                 while let Some(kv) = candidates.next().await? {
