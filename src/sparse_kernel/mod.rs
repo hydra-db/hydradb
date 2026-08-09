@@ -347,6 +347,40 @@ pub(crate) fn compiled_graphblas_out_neighbors(
     compiled.out_neighbors(vertex)
 }
 
+#[cfg(feature = "opencypher")]
+pub(crate) fn compiled_graphblas_in_degree(
+    compiled: &CompiledGraphBlasMatrix,
+    vertex: VertexId,
+) -> u64 {
+    compiled.in_degree(vertex)
+}
+
+#[cfg(feature = "opencypher")]
+pub(crate) fn compiled_graphblas_out_degree(
+    compiled: &CompiledGraphBlasMatrix,
+    vertex: VertexId,
+) -> u64 {
+    compiled.out_degree(vertex)
+}
+
+#[cfg(feature = "opencypher")]
+pub(crate) fn compiled_graphblas_in_neighbors_intersecting(
+    compiled: &CompiledGraphBlasMatrix,
+    vertex: VertexId,
+    allowed: &BTreeSet<VertexId>,
+) -> Vec<VertexId> {
+    compiled.in_neighbors_intersecting(vertex, allowed)
+}
+
+#[cfg(feature = "opencypher")]
+pub(crate) fn compiled_graphblas_out_neighbors_intersecting(
+    compiled: &CompiledGraphBlasMatrix,
+    vertex: VertexId,
+    allowed: &BTreeSet<VertexId>,
+) -> Vec<VertexId> {
+    compiled.out_neighbors_intersecting(vertex, allowed)
+}
+
 pub(crate) fn expand_range_compiled_graphblas(
     compiled: &CompiledGraphBlasMatrix,
     adjacency: &Adjacency,

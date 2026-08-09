@@ -32,9 +32,9 @@ tokio::task_local! {
 }
 #[cfg(feature = "opencypher")]
 use crate::{
-    GraphScope, ParsedRowQueryCacheKey, QueryColumn, QueryRow, RelationshipPropertyRowsCacheKey,
-    RelationshipRowsCacheKey, RelationshipRowsCacheValue, SourceRelationshipRowsCacheKey, VertexId,
-    VertexPropertyValue,
+    GraphScope, NativePathResultCacheKey, NativePathResultCacheValue, ParsedRowQueryCacheKey,
+    QueryColumn, QueryRow, RelationshipPropertyRowsCacheKey, RelationshipRowsCacheKey,
+    RelationshipRowsCacheValue, SourceRelationshipRowsCacheKey, VertexId, VertexPropertyValue,
 };
 
 #[cfg(feature = "opencypher")]
@@ -103,6 +103,9 @@ pub struct GraphShard {
     #[cfg(feature = "opencypher")]
     pub(crate) relationship_property_rows_cache:
         Mutex<BoundedGraphCache<RelationshipPropertyRowsCacheKey, RelationshipRowsCacheValue>>,
+    #[cfg(feature = "opencypher")]
+    pub(crate) native_path_result_cache:
+        Mutex<BoundedGraphCache<NativePathResultCacheKey, NativePathResultCacheValue>>,
     #[cfg(feature = "opencypher")]
     pub(crate) native_path_page_cursors: Mutex<NativePathPageCursorStore>,
     pub(crate) wal_tail_file_cache: Mutex<crate::shard::topology_tail::WalTailFileCache>,

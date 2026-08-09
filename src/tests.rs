@@ -861,6 +861,76 @@ async fn native_sp_paths_uses_one_pinned_graphblas_snapshot_with_wal_tail() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn native_paths_charge_compiled_and_overlay_edges_to_the_scan_limit() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/native-path-overlay-scan-limit";
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+    writer
+        .write_edge(typed_mutation(
+            "cell-a",
+            "CHAIN",
+            1,
+            2,
+            "native-path-overlay-base",
+        ))
+        .await
+        .unwrap();
+
+    let indexer = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    indexer.refresh_storage_sequence("cell-a").await.unwrap();
+    indexer.build_graph_index("cell-a", "CHAIN").await.unwrap();
+
+    for (index, dst) in [3, 4].into_iter().enumerate() {
+        writer
+            .write_edge(typed_mutation(
+                "cell-a",
+                "CHAIN",
+                1,
+                dst,
+                &format!("native-path-overlay-add-{index}"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let reader = GraphShard::open_with_limits(
+        path,
+        object_store,
+        GraphLimits {
+            max_query_scan_edges: 3,
+            ..GraphLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    reader.refresh_storage_sequence("cell-a").await.unwrap();
+    let error = reader
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-path-overlay-limit"),
+            "CALL algo.SPpaths({sourceNode: 1, targetNode: 4, relTypes: ['CHAIN'], \
+             maxLen: 1, relDirection: 'outgoing', pathCount: 1}) \
+             YIELD path RETURN path",
+        )
+        .await
+        .expect_err("compiled and overlay scan work must share one admission limit");
+    assert!(matches!(
+        error,
+        GraphError::AdmissionRejected {
+            operation: "native_path_edges",
+            actual: 4,
+            limit: 3,
+        }
+    ));
+
+    reader.close().await.unwrap();
+    indexer.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn native_sp_paths_honors_weight_cost_and_parameterized_limits() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/native-sp-paths-weighted", object_store).await;
@@ -1170,6 +1240,63 @@ async fn native_ms_paths_fairly_budgets_parallel_variants_across_structures() {
         BTreeSet::from([(1, 2), (2, 3)]),
         "one dense pair must not consume the complete native result budget"
     );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn native_ms_paths_result_cache_is_invalidated_by_storage_epoch() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/native-ms-paths-result-cache", object_store).await;
+    shard
+        .execute_cypher(
+            QueryContext::new("cell-a", "native-ms-cache-create-ab"),
+            "CREATE (a:Entity {id: 1, name: 'alpha'})-[:RELATES]->(b:Entity {id: 2, name: 'beta'})",
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "cell-a",
+            3,
+            VertexMetadata::default()
+                .with_label("Entity")
+                .with_property("name", VertexPropertyValue::String("gamma".to_string())),
+        )
+        .await
+        .unwrap();
+    shard.build_graph_index("cell-a", "RELATES").await.unwrap();
+
+    let query = "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', \
+                 sourceValues: ['alpha', 'gamma'], targetValues: ['alpha', 'gamma'], \
+                 pairwise: true, relTypes: ['RELATES'], maxLen: 2, relDirection: 'outgoing', \
+                 pathCount: 1, resultLimit: 10}) YIELD path RETURN path";
+    for request_id in ["native-ms-cache-miss", "native-ms-cache-hit"] {
+        let result = shard
+            .execute_cypher_rows(QueryContext::new("cell-a", request_id), query)
+            .await
+            .unwrap();
+        assert!(result.rows.is_empty());
+    }
+    assert_eq!(shard.native_path_result_cache.lock().await.len(), 1);
+
+    shard
+        .execute_cypher(
+            QueryContext::new("cell-a", "native-ms-cache-create-bg"),
+            "CREATE (b:Entity {id: 2, name: 'beta'})-[:RELATES]->(c:Entity {id: 3, name: 'gamma'})",
+        )
+        .await
+        .unwrap();
+    let result = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-ms-cache-new-epoch"),
+            query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(shard.native_path_result_cache.lock().await.len(), 2);
 
     shard.close().await.unwrap();
 }

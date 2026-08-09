@@ -39,7 +39,11 @@ impl GraphTopologyOverlay {
     }
 
     #[cfg(feature = "opencypher")]
-    pub(crate) fn apply_in_neighbors(&self, dst: VertexId, neighbors: &mut BTreeSet<VertexId>) {
+    pub(crate) fn apply_in_neighbors(
+        &self,
+        dst: VertexId,
+        neighbors: &mut BTreeSet<VertexId>,
+    ) -> u64 {
         for (src, destinations) in &self.states {
             let Some(exists) = destinations.get(&dst) else {
                 continue;
@@ -50,12 +54,17 @@ impl GraphTopologyOverlay {
                 neighbors.remove(src);
             }
         }
+        u64::try_from(self.states.len()).unwrap_or(u64::MAX)
     }
 
     #[cfg(feature = "opencypher")]
-    pub(crate) fn apply_out_neighbors(&self, src: VertexId, neighbors: &mut BTreeSet<VertexId>) {
+    pub(crate) fn apply_out_neighbors(
+        &self,
+        src: VertexId,
+        neighbors: &mut BTreeSet<VertexId>,
+    ) -> u64 {
         let Some(destinations) = self.states.get(&src) else {
-            return;
+            return 0;
         };
         for (dst, exists) in destinations {
             if *exists {
@@ -64,6 +73,7 @@ impl GraphTopologyOverlay {
                 neighbors.remove(dst);
             }
         }
+        u64::try_from(destinations.len()).unwrap_or(u64::MAX)
     }
 
     /// Test-only introspection. The WAL-tail overlay is otherwise only
@@ -500,6 +510,24 @@ pub(crate) fn expand_range_with_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "opencypher")]
+    #[test]
+    fn neighbor_application_reports_overlay_scan_work() {
+        let mut overlay = GraphTopologyOverlay::default();
+        overlay.set(1, 10, true);
+        overlay.set(1, 11, false);
+        overlay.set(2, 10, true);
+        overlay.set(3, 99, true);
+
+        let mut outgoing = BTreeSet::from([11]);
+        assert_eq!(overlay.apply_out_neighbors(1, &mut outgoing), 2);
+        assert_eq!(outgoing, BTreeSet::from([10]));
+
+        let mut incoming = BTreeSet::new();
+        assert_eq!(overlay.apply_in_neighbors(10, &mut incoming), 3);
+        assert_eq!(incoming, BTreeSet::from([1, 2]));
+    }
 
     #[test]
     fn malformed_wal_topology_isolated_to_its_cell_and_edge_type() {
