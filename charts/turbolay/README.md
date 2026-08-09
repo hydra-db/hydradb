@@ -90,22 +90,6 @@ the HydraDB and ingestion namespaces, Pods, or CIDRs that may reach Bolt and
 HTTPS. Load balancers should be internal unless public access is explicitly
 required.
 
-Write-capable Neo4j drivers must connect to the release Bolt Service with a
-routing URI, for example
-`neo4j+s://<release>-bolt.<namespace>.svc.cluster.local:7687` or
-`neo4j+ssc://...` when using the chart's self-signed development certificate.
-The routing table then sends each scoped write to its current lease owner. Do
-not give application, migration, or benchmark clients a list of direct
-`bolt+s[c]://<release>-node-N.<release>-node-headless...` addresses and probe
-them in turn: those URIs deliberately bypass routing, so every wrong-node probe
-is rejected with `NotCellWriter`. Direct StatefulSet addresses are for node
-diagnostics and targeted failure testing only.
-
-For a stable LoadBalancer endpoint, set `service.advertisedBoltAddress` to the
-externally reachable `host:port` used by clients and include that hostname in
-the public certificate's DNS names. When it is unset, the generated Helm notes
-show commands that wait for and read the assigned LoadBalancer hostname or IP.
-
 Outbound HTTPS is also denied by default. Set `networkPolicy.httpsEgressTo` to
 private peers that cover, on AWS with IRSA, the private S3 and STS endpoint
 addresses. Prefer

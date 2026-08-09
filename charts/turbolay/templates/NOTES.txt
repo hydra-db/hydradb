@@ -18,21 +18,7 @@ Read the generated Bolt password:
 {{- end }}
 
 Client configuration:
-{{- if and (eq .Values.service.bolt.type "LoadBalancer") (empty .Values.service.advertisedBoltAddress) }}
-  TURBOLAY_BOLT_HOST=$(kubectl -n {{ .Release.Namespace }} get service {{ include "turbolay.fullname" . }}-bolt -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-  if [ -z "$TURBOLAY_BOLT_HOST" ]; then
-    TURBOLAY_BOLT_HOST=$(kubectl -n {{ .Release.Namespace }} get service {{ include "turbolay.fullname" . }}-bolt -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-  fi
-  TURBOLAY_URI={{ ternary "neo4j+s" "neo4j" .Values.tls.public.enabled }}://${TURBOLAY_BOLT_HOST}:{{ .Values.service.bolt.port }}
-{{- else }}
-  TURBOLAY_URI={{ ternary "neo4j+s" "neo4j" .Values.tls.public.enabled }}://{{ include "turbolay.advertisedBoltAddress" . }}
-{{- end }}
+  TURBOLAY_URI={{ ternary "bolt+s" "bolt" .Values.tls.public.enabled }}://<bolt-host>:{{ .Values.service.bolt.port }}
   TURBOLAY_USER=neo4j
   TURBOLAY_PASSWORD=<client-auth-token>
   TURBOLAY_DATABASE={{ .Values.graph.database }}
-{{- if .Values.tls.public.enabled }}
-
-If the configured certificate is self-signed, use `neo4j+ssc` instead of
-`neo4j+s`. Write-capable clients must keep the `neo4j` routing scheme; direct
-`bolt` URIs bypass writer routing.
-{{- end }}
