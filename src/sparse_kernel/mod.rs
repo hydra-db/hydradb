@@ -368,26 +368,6 @@ pub(crate) fn expand_range_count_compiled_graphblas(
     expand_range_count_graphblas_compiled(compiled, adjacency, starts, min_hops, max_hops)
 }
 
-#[cfg(feature = "opencypher")]
-pub(crate) fn expand_range_window_compiled_graphblas(
-    compiled: &CompiledGraphBlasMatrix,
-    adjacency: &Adjacency,
-    starts: &[VertexId],
-    min_hops: u8,
-    max_hops: u8,
-    window: SparseTraversalWindow,
-) -> Result<SparseTraversal> {
-    expand_range_window_graphblas_compiled(compiled, adjacency, starts, min_hops, max_hops, window)
-}
-
-#[cfg(feature = "opencypher")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SparseTraversalWindow {
-    pub skip: u64,
-    pub limit: Option<usize>,
-    pub ascending: bool,
-}
-
 fn expand_rust(adjacency: &Adjacency, starts: &[VertexId], hops: u8) -> SparseTraversal {
     let start_set: BTreeSet<_> = starts.iter().copied().collect();
     let mut frontier = start_set.clone();
@@ -550,18 +530,6 @@ fn expand_range_count_graphblas_compiled(
     max_hops: u8,
 ) -> Result<SparseTraversalCount> {
     compiled.expand_range_count(adjacency, starts, min_hops, max_hops)
-}
-
-#[cfg(feature = "opencypher")]
-fn expand_range_window_graphblas_compiled(
-    compiled: &CompiledGraphBlasMatrix,
-    adjacency: &Adjacency,
-    starts: &[VertexId],
-    min_hops: u8,
-    max_hops: u8,
-    window: SparseTraversalWindow,
-) -> Result<SparseTraversal> {
-    compiled.expand_range_window(adjacency, starts, min_hops, max_hops, window)
 }
 
 mod graphblas;

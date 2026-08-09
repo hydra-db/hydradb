@@ -533,6 +533,250 @@ async fn cypher_graphblas_applies_wal_tail_after_edge_changes() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_single_hop_page_slices_cached_multigraph_rows_with_wal_tail() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/cypher-single-hop-compiled-page";
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+    for (index, dst) in [2, 3, 4].into_iter().enumerate() {
+        writer
+            .write_edge(typed_mutation(
+                "cell-a",
+                "CHAIN",
+                1,
+                dst,
+                &format!("single-hop-base-{index}"),
+            ))
+            .await
+            .unwrap();
+    }
+    writer
+        .import_relationships_batch(
+            "cell-a",
+            "CHAIN",
+            [100, 101].map(|relationship_id| RelationshipMutation {
+                cell_id: "cell-a".to_string(),
+                edge_type: "CHAIN".to_string(),
+                src: 1,
+                dst: 3,
+                relationship_id,
+                metadata: EdgeMetadata::default(),
+            }),
+            "single-hop-parallel-relationships",
+        )
+        .await
+        .unwrap();
+
+    let indexer = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    indexer.refresh_storage_sequence("cell-a").await.unwrap();
+    indexer.build_graph_index("cell-a", "CHAIN").await.unwrap();
+
+    writer
+        .delete_edge(typed_mutation(
+            "cell-a",
+            "CHAIN",
+            1,
+            2,
+            "single-hop-tail-delete",
+        ))
+        .await
+        .unwrap();
+    writer
+        .write_edge(typed_mutation(
+            "cell-a",
+            "CHAIN",
+            1,
+            5,
+            "single-hop-tail-add",
+        ))
+        .await
+        .unwrap();
+
+    let reader = GraphShard::open(path, object_store).await.unwrap();
+    reader.refresh_storage_sequence("cell-a").await.unwrap();
+    let before = reader.graph_cache_metrics();
+    let query = "MATCH (u {id: 1})-[:CHAIN]->(v) RETURN v.id ORDER BY v.id";
+    let first = reader
+        .execute_cypher_rows_page(
+            QueryContext::new("cell-a", "single-hop-page-1"),
+            query,
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(3)]),
+            QueryRow::new(vec![QueryValue::VertexId(3)]),
+        ]
+    );
+    let second = reader
+        .execute_cypher_rows_page(
+            QueryContext::new("cell-a", "single-hop-page-2"),
+            query,
+            first.next_cursor,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(4)]),
+            QueryRow::new(vec![QueryValue::VertexId(5)]),
+        ]
+    );
+    assert!(second.next_cursor.is_none());
+
+    let after = reader.graph_cache_metrics();
+    assert!(
+        after.relationship_rows_hits > before.relationship_rows_hits,
+        "the second page should slice the cached source relationship rows"
+    );
+
+    reader.close().await.unwrap();
+    indexer.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_variable_length_pages_cache_reachable_sets_by_hops_and_epoch() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-variable-page-cache", object_store).await;
+    for (index, (src, dst)) in [(1, 30), (1, 10), (10, 5), (30, 40)]
+        .into_iter()
+        .enumerate()
+    {
+        shard
+            .write_edge(typed_mutation(
+                "cell-a",
+                "CHAIN",
+                src,
+                dst,
+                &format!("variable-page-base-{index}"),
+            ))
+            .await
+            .unwrap();
+    }
+    shard.build_graph_index("cell-a", "CHAIN").await.unwrap();
+
+    let query = "MATCH ({id: 1})-[:CHAIN*1..2]->(v) RETURN v.id ORDER BY v.id";
+    let before = shard.graph_cache_metrics();
+    let first = Box::pin(shard.execute_cypher_rows_page(
+        QueryContext::new("cell-a", "variable-page-first"),
+        query,
+        None,
+        2,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        first.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(5)]),
+            QueryRow::new(vec![QueryValue::VertexId(10)]),
+        ]
+    );
+    let after_first = shard.graph_cache_metrics();
+    assert!(
+        after_first.relationship_rows_misses > before.relationship_rows_misses,
+        "the first page should populate the reachable-set cache"
+    );
+
+    let second = Box::pin(shard.execute_cypher_rows_page(
+        QueryContext::new("cell-a", "variable-page-second"),
+        query,
+        first.next_cursor,
+        2,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        second.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(30)]),
+            QueryRow::new(vec![QueryValue::VertexId(40)]),
+        ]
+    );
+    assert!(second.next_cursor.is_none());
+    let after_second = shard.graph_cache_metrics();
+    assert!(
+        after_second.relationship_rows_hits > after_first.relationship_rows_hits,
+        "the second page should slice the cached reachable set"
+    );
+
+    let descending = Box::pin(shard.execute_cypher_rows_page(
+        QueryContext::new("cell-a", "variable-page-descending"),
+        "MATCH ({id: 1})-[:CHAIN*1..2]->(v) RETURN v.id ORDER BY v.id DESC",
+        None,
+        2,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        descending.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(40)]),
+            QueryRow::new(vec![QueryValue::VertexId(30)]),
+        ]
+    );
+
+    let one_hop = Box::pin(shard.execute_cypher_rows_page(
+        QueryContext::new("cell-a", "variable-page-one-hop"),
+        "MATCH ({id: 1})-[:CHAIN*1..1]->(v) RETURN v.id ORDER BY v.id",
+        None,
+        2,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        one_hop.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(10)]),
+            QueryRow::new(vec![QueryValue::VertexId(30)]),
+        ]
+    );
+
+    shard
+        .write_edge(typed_mutation(
+            "cell-a",
+            "CHAIN",
+            1,
+            2,
+            "variable-page-new-epoch",
+        ))
+        .await
+        .unwrap();
+    let after_write = Box::pin(shard.execute_cypher_rows_page(
+        QueryContext::new("cell-a", "variable-page-after-write"),
+        query,
+        None,
+        2,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        after_write.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(2)]),
+            QueryRow::new(vec![QueryValue::VertexId(5)]),
+        ]
+    );
+    let final_metrics = shard.graph_cache_metrics();
+    assert!(
+        final_metrics.relationship_rows_misses > after_second.relationship_rows_misses,
+        "a different hop range and a newer read epoch must not reuse the old result"
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn native_sp_paths_uses_one_pinned_graphblas_snapshot_with_wal_tail() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let path = "graph/native-sp-paths-pinned-tail";

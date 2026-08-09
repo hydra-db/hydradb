@@ -531,6 +531,9 @@ impl GraphShard {
                     keys::vertex_property_index_prefix(read.cell_id, &selector.property, &encoded);
                 let mut candidates = read
                     .snapshot
+                    // Selector cardinality is unknown until the prefix is consumed. Keep
+                    // broad values out of SlateDB's shared block cache; validated results
+                    // are bounded below and the snapshot still caches SST metadata.
                     .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
                     .await?;
                 let mut indexed_candidates = Vec::new();

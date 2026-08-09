@@ -172,6 +172,14 @@ pub(crate) fn remote_scan_options() -> ScanOptions {
         .with_cache_blocks(false)
 }
 
+const MAX_CACHED_REMOTE_SCAN_ITEMS: u64 = 1_024;
+
+pub(crate) fn remote_scan_options_for_expected_items(expected_items: u64) -> ScanOptions {
+    ScanOptions::default()
+        .with_durability_filter(DurabilityLevel::Remote)
+        .with_cache_blocks(expected_items <= MAX_CACHED_REMOTE_SCAN_ITEMS)
+}
+
 pub(crate) fn validate_component(component: &'static str, value: &str) -> Result<()> {
     if value.is_empty()
         || !value
@@ -1526,5 +1534,24 @@ pub(crate) fn ensure_limit(operation: &'static str, actual: u64, limit: u64) -> 
         })
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod scan_option_tests {
+    use super::*;
+
+    #[test]
+    fn remote_prefix_scans_do_not_pollute_the_block_cache() {
+        let options = remote_scan_options();
+
+        assert_eq!(options.durability_filter, DurabilityLevel::Remote);
+        assert!(!options.cache_blocks);
+    }
+
+    #[test]
+    fn bounded_remote_scans_admit_only_small_working_sets() {
+        assert!(remote_scan_options_for_expected_items(1_024).cache_blocks);
+        assert!(!remote_scan_options_for_expected_items(1_025).cache_blocks);
     }
 }

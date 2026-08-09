@@ -143,10 +143,14 @@ impl GraphShard {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
         let mut neighbors = BTreeSet::new();
+        let scan_options = remote_scan_options_for_expected_items(
+            self.degree_for_cache_admission(snapshot, &keys::degree_out(cell_id, edge_type, src))
+                .await?,
+        );
 
         let prefix = keys::out_prefix(cell_id, edge_type, src);
         let mut iter = snapshot
-            .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
+            .scan_prefix_with_options(prefix.as_bytes(), .., &scan_options)
             .await?;
         while let Some(kv) = iter.next().await? {
             let key = String::from_utf8_lossy(&kv.key).into_owned();
@@ -221,9 +225,13 @@ impl GraphShard {
     ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
+        let scan_options = remote_scan_options_for_expected_items(
+            self.degree_for_cache_admission(snapshot, &keys::degree_in(cell_id, edge_type, dst))
+                .await?,
+        );
         let prefix = keys::in_prefix(cell_id, edge_type, dst);
         let mut iter = snapshot
-            .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
+            .scan_prefix_with_options(prefix.as_bytes(), .., &scan_options)
             .await?;
         let mut neighbors = BTreeSet::new();
         while let Some(kv) = iter.next().await? {
@@ -233,8 +241,24 @@ impl GraphShard {
         Ok(neighbors.into_iter().collect())
     }
 
+    async fn degree_for_cache_admission(
+        &self,
+        snapshot: &GraphStorageSnapshot,
+        key: &str,
+    ) -> Result<u64> {
+        match snapshot
+            .get_with_options(key.as_bytes(), &remote_read_options())
+            .await?
+        {
+            Some(value) => decode_u64(key, &value),
+            // Missing counters must fail closed for cache admission. The scan
+            // remains correct; it simply cannot displace known hot blocks.
+            None => Ok(u64::MAX),
+        }
+    }
+
     pub async fn execute_cypher(&self, context: QueryContext, query: &str) -> Result<QueryOutput> {
-        self.execute_opencypher(context, query).await
+        Box::pin(self.execute_opencypher(context, query)).await
     }
 
     pub async fn execute_cypher_rows(
@@ -242,7 +266,7 @@ impl GraphShard {
         context: QueryContext,
         query: &str,
     ) -> Result<QueryResultSet> {
-        self.execute_opencypher_rows(context, query).await
+        Box::pin(self.execute_opencypher_rows(context, query)).await
     }
 
     pub async fn execute_cypher_rows_page(
@@ -252,8 +276,7 @@ impl GraphShard {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<QueryResultPage> {
-        self.execute_opencypher_rows_page(context, query, cursor, page_size)
-            .await
+        Box::pin(self.execute_opencypher_rows_page(context, query, cursor, page_size)).await
     }
 
     pub async fn execute_opencypher(
@@ -275,18 +298,16 @@ impl GraphShard {
             if let Some(parsed) =
                 parse_opencypher_mutation_query_with_parameters(query, &context.parameters)?
             {
-                let result = self
-                    .execute_parsed_opencypher_mutation(context, parsed)
-                    .await?;
+                let result =
+                    Box::pin(self.execute_parsed_opencypher_mutation(context, parsed)).await?;
                 return Ok(QueryOutput::Mutation(result));
             }
             let parsed = self
                 .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters)
                 .await?;
             let context = merge_opencypher_window(context, opencypher_outer_window(&parsed))?;
-            let result_set = self
-                .execute_parsed_opencypher_rows(context, parsed.clone())
-                .await?;
+            let result_set =
+                Box::pin(self.execute_parsed_opencypher_rows(context, parsed.clone())).await?;
             Ok(query_result_set_to_output(&parsed, result_set))
         }
         #[cfg(not(feature = "opencypher"))]
@@ -317,7 +338,7 @@ impl GraphShard {
                 .parsed_opencypher_row_query(&context.cell_id, query, &context.parameters)
                 .await?;
             let context = merge_opencypher_window(context, opencypher_outer_window(&parsed))?;
-            self.execute_parsed_opencypher_rows(context, parsed).await
+            Box::pin(self.execute_parsed_opencypher_rows(context, parsed)).await
         }
         #[cfg(not(feature = "opencypher"))]
         {
@@ -371,11 +392,15 @@ impl GraphShard {
                 let context = context.with_validated_storage_read_epoch(read_epoch, read_epoch);
                 return GraphStore::scope_snapshot(
                     snapshot,
-                    self.execute_parsed_opencypher_rows_page(context, parsed, cursor, page_size),
+                    Box::pin(
+                        self.execute_parsed_opencypher_rows_page(
+                            context, parsed, cursor, page_size,
+                        ),
+                    ),
                 )
                 .await;
             }
-            self.execute_parsed_opencypher_rows_page(context, parsed, cursor, page_size)
+            Box::pin(self.execute_parsed_opencypher_rows_page(context, parsed, cursor, page_size))
                 .await
         }
         #[cfg(not(feature = "opencypher"))]
@@ -399,13 +424,31 @@ impl GraphShard {
         let cursor_offset = cursor.map_or(0, |cursor| cursor.offset);
         let started = std::time::Instant::now();
         match self
-            .try_execute_graph_kernel_opencypher_rows_page(
+            .try_execute_source_relationship_id_rows_page(
                 &context,
                 &parsed,
                 cursor_offset,
                 page_size,
             )
             .await
+        {
+            Ok(Some(page)) => {
+                self.record_streaming_query_rows_success(page.rows.len(), started);
+                return Ok(page);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.record_streaming_query_rows_failure(started, &err);
+                return Err(err);
+            }
+        }
+        match Box::pin(self.try_execute_graph_kernel_opencypher_rows_page(
+            &context,
+            &parsed,
+            cursor_offset,
+            page_size,
+        ))
+        .await
         {
             Ok(Some(page)) => {
                 self.record_streaming_query_rows_success(page.rows.len(), started);
@@ -435,7 +478,7 @@ impl GraphShard {
 
         let context = self.query_page_context(context, cursor_offset, page_size)?;
         parsed.window = QueryWindow::default();
-        let mut result_set = self.execute_parsed_opencypher_rows(context, parsed).await?;
+        let mut result_set = Box::pin(self.execute_parsed_opencypher_rows(context, parsed)).await?;
         let next_cursor = if result_set.rows.len() > page_size {
             result_set.rows.truncate(page_size);
             Some(QueryCursorToken::new(
@@ -582,15 +625,14 @@ impl GraphShard {
                     let context = context.with_validated_storage_read_epoch(read_epoch, read_epoch);
                     GraphStore::scope_snapshot(
                         snapshot,
-                        self.execute_parsed_opencypher_rows_inner(context, query),
+                        Box::pin(self.execute_parsed_opencypher_rows_inner(context, query)),
                     )
                     .await
                 }
                 Err(err) => Err(err),
             }
         } else {
-            self.execute_parsed_opencypher_rows_inner(context, query)
-                .await
+            Box::pin(self.execute_parsed_opencypher_rows_inner(context, query)).await
         };
         self.operation_metrics
             .query_rows_latency
@@ -1175,6 +1217,79 @@ impl GraphShard {
         Ok(Some(QueryResultSet::new(
             query.columns.clone(),
             self.apply_query_row_window(rows, window)?,
+        )))
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn try_execute_source_relationship_id_rows_page(
+        &self,
+        context: &QueryContext,
+        query: &ParsedRowQuery,
+        cursor_offset: u64,
+        page_size: usize,
+    ) -> Result<Option<QueryResultPage>> {
+        let Some(edge) = source_relationship_id_rows_query_edge(query) else {
+            return Ok(None);
+        };
+        let Some(ascending) = source_relationship_id_page_order(edge, query) else {
+            return Ok(None);
+        };
+        if query.distinct {
+            return Ok(None);
+        }
+        let Some(src) = edge.src.id else {
+            return Ok(None);
+        };
+        let page_context = self.query_page_context(context.clone(), cursor_offset, page_size)?;
+        let window = page_context.result_window;
+        if window.limit == Some(0) {
+            return Ok(Some(QueryResultPage::new(
+                query.columns.clone(),
+                Vec::new(),
+                None,
+            )));
+        }
+        let read_epoch = self.query_read_epoch(context).await?;
+        let budget = QueryBudget::new(
+            context.max_runtime_ms.or(self.limits.max_query_runtime_ms),
+            context.cancellation_token.clone(),
+        );
+        budget.check("cypher_source_relationship_page")?;
+
+        let cached = self
+            .source_relationship_dsts_at(&context.cell_id, edge, src, read_epoch, &budget)
+            .await?;
+        let mut dsts = cached.as_ref().clone();
+        dsts.sort_unstable();
+        if !ascending {
+            dsts.reverse();
+        }
+        let skip = usize::try_from(window.skip).map_err(|_| GraphError::AdmissionRejected {
+            operation: "query_result_skip",
+            actual: window.skip,
+            limit: usize::MAX as u64,
+        })?;
+        let probe_limit = window.limit.unwrap_or(page_size.saturating_add(1));
+        let page_dsts = dsts
+            .into_iter()
+            .skip(skip)
+            .take(probe_limit)
+            .collect::<Vec<_>>();
+        let has_next = page_dsts.len() > page_size;
+        let page_dsts = &page_dsts[..page_dsts.len().min(page_size)];
+        let bindings =
+            source_relationship_id_bindings_from_dsts(edge, src, page_dsts, self, &budget)?;
+        let mut rows = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            budget.check("cypher_source_relationship_page_project")?;
+            let row = project_binding_row(&binding, &query.projections)?;
+            budget.account_result_row(&row)?;
+            rows.push(row);
+        }
+        Ok(Some(QueryResultPage::new(
+            query.columns.clone(),
+            rows,
+            query_next_cursor(cursor_offset, page_size, has_next)?,
         )))
     }
 
@@ -4191,6 +4306,21 @@ impl GraphShard {
         read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<Vec<BindingRow>> {
+        let cached = self
+            .source_relationship_dsts_at(cell_id, edge, src, read_epoch, budget)
+            .await?;
+        source_relationship_id_bindings_from_dsts(edge, src, cached.as_slice(), self, budget)
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn source_relationship_dsts_at(
+        &self,
+        cell_id: &str,
+        edge: &RowEdgePattern,
+        src: VertexId,
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+    ) -> Result<Arc<Vec<VertexId>>> {
         let cache_key =
             SourceRelationshipRowsCacheKey::new(cell_id, &edge.edge_type, src, read_epoch);
         if let Some(cached) = self
@@ -4201,13 +4331,7 @@ impl GraphShard {
         {
             self.cache_metrics
                 .record_hit(GraphCacheKind::RelationshipRows);
-            return source_relationship_id_bindings_from_dsts(
-                edge,
-                src,
-                cached.as_slice(),
-                self,
-                budget,
-            );
+            return Ok(cached);
         }
         self.cache_metrics
             .record_miss(GraphCacheKind::RelationshipRows);
@@ -4252,7 +4376,7 @@ impl GraphShard {
                 resident_bytes,
                 &self.cache_metrics,
             );
-        source_relationship_id_bindings_from_dsts(edge, src, cached.as_slice(), self, budget)
+        Ok(cached)
     }
 
     #[cfg(feature = "opencypher")]
@@ -4942,8 +5066,8 @@ impl GraphShard {
         if request.edge.dst.id.is_none() {
             match request.projection {
                 GraphKernelProjection::NodeId => {
-                    let (mut vertices, edge_visits) = self
-                        .reachable_vertices_window_in_hop_range_at(ReachableWindowRequest {
+                    let (mut vertices, edge_visits) = Box::pin(
+                        self.reachable_vertices_window_in_hop_range_at(ReachableWindowRequest {
                             cell_id: &context.cell_id,
                             edge_type: &request.edge.edge_type,
                             src: request.src,
@@ -4952,8 +5076,9 @@ impl GraphShard {
                             window: page_window,
                             ascending: request.ascending,
                             budget: &budget,
-                        })
-                        .await?;
+                        }),
+                    )
+                    .await?;
                     self.ensure_query_scan_edges(
                         "cypher_graph_kernel_page_window_edge_visits",
                         edge_visits,
@@ -5419,25 +5544,63 @@ impl GraphShard {
             request.edge_type,
             request.hop_range,
         )?;
-        if let Some(result) = self
-            .reachable_vertices_window_with_compiled_graph_kernel(&request)
-            .await?
+        let cache_key = SourceRelationshipRowsCacheKey::reachable(
+            request.cell_id,
+            request.edge_type,
+            request.src,
+            request.hop_range,
+            request.read_epoch,
+        );
+        if let Some(cached) = self
+            .source_relationship_rows_cache
+            .lock()
+            .await
+            .get(&cache_key)
         {
-            return Ok(result);
+            self.cache_metrics
+                .record_hit(GraphCacheKind::RelationshipRows);
+            return Ok((
+                graph_kernel_window_sorted_vertices(
+                    cached.as_slice(),
+                    request.window,
+                    request.ascending,
+                )?,
+                0,
+            ));
         }
-        let (mut vertices, edge_visits) = self
-            .reachable_vertices_in_hop_range_at(
+        self.cache_metrics
+            .record_miss(GraphCacheKind::RelationshipRows);
+
+        let (mut vertices, edge_visits) = Box::pin(self.reachable_vertices_in_hop_range_at(
+            request.cell_id,
+            request.edge_type,
+            request.src,
+            request.hop_range,
+            request.read_epoch,
+            request.budget,
+        ))
+        .await?;
+        self.ensure_query_scan_edges("cypher_graph_kernel_page_window_edge_visits", edge_visits)?;
+        graph_kernel_order_vertices(&mut vertices, true);
+        let cached = Arc::new(vertices);
+        let resident_bytes = source_relationship_rows_resident_bytes(&cache_key, &cached);
+        self.source_relationship_rows_cache
+            .lock()
+            .await
+            .insert_sized(
+                cache_key,
+                Arc::clone(&cached),
                 request.cell_id,
-                request.edge_type,
-                request.src,
-                request.hop_range,
-                request.read_epoch,
-                request.budget,
-            )
-            .await?;
-        graph_kernel_order_vertices(&mut vertices, request.ascending);
+                false,
+                resident_bytes,
+                &self.cache_metrics,
+            );
         Ok((
-            self.apply_query_window(vertices, request.window)?,
+            graph_kernel_window_sorted_vertices(
+                cached.as_slice(),
+                request.window,
+                request.ascending,
+            )?,
             edge_visits,
         ))
     }
@@ -5591,97 +5754,6 @@ impl GraphShard {
                 )
                 .await?
             };
-            Ok(Some((traversal.vertices, traversal.edge_visits)))
-        }
-    }
-
-    #[cfg(feature = "opencypher")]
-    async fn reachable_vertices_window_with_compiled_graph_kernel(
-        &self,
-        request: &ReachableWindowRequest<'_>,
-    ) -> Result<Option<(Vec<VertexId>, u64)>> {
-        let _ = request;
-        if crate::sparse_kernel::default_matrix_kernel(&self.cache_policy)
-            == SparseKernelBackend::Adjacency
-        {
-            return Ok(None);
-        }
-        {
-            let (min_hops, max_hops) = request.hop_range;
-            request
-                .budget
-                .check("cypher_graphblas_window_artifact_lookup")?;
-            let Some(artifact) = self
-                .traced_latest_matrix_artifact(
-                    request.cell_id,
-                    request.edge_type,
-                    request.read_epoch,
-                )
-                .await?
-            else {
-                return Ok(None);
-            };
-            request
-                .budget
-                .check("cypher_graphblas_window_compiled_matrix")?;
-            let Some((compiled, overlay, rebuilt)) = self
-                .compiled_graphblas_query_snapshot(
-                    request.cell_id,
-                    request.edge_type,
-                    artifact.base_epoch,
-                    request.read_epoch,
-                    request.budget,
-                )
-                .await?
-            else {
-                return Ok(None);
-            };
-            self.record_graphblas_snapshot(rebuilt);
-            let src = request.src;
-            let window = crate::sparse_kernel::SparseTraversalWindow {
-                skip: request.window.skip,
-                limit: request.window.limit,
-                ascending: request.ascending,
-            };
-            let traversal = run_graph_compute(
-                Arc::clone(&self.operation_metrics),
-                "graphblas_expand_range_window",
-                move || {
-                    if let Some(overlay) = overlay {
-                        let traversal = expand_range_with_overlay(
-                            &compiled,
-                            &overlay,
-                            &[src],
-                            min_hops,
-                            max_hops,
-                        )?;
-                        let mut vertices = traversal.vertices;
-                        graph_kernel_order_vertices(&mut vertices, window.ascending);
-                        let start = usize::try_from(window.skip)
-                            .unwrap_or(usize::MAX)
-                            .min(vertices.len());
-                        let end = window.limit.map_or(vertices.len(), |limit| {
-                            start.saturating_add(limit).min(vertices.len())
-                        });
-                        Ok(crate::sparse_kernel::SparseTraversal {
-                            vertices: vertices[start..end].to_vec(),
-                            edge_visits: traversal.edge_visits,
-                            backend: traversal.backend,
-                        })
-                    } else {
-                        let empty_adjacency = BTreeMap::new();
-                        crate::sparse_kernel::expand_range_window_compiled_graphblas(
-                            &compiled,
-                            &empty_adjacency,
-                            &[src],
-                            min_hops,
-                            max_hops,
-                            window,
-                        )
-                    }
-                },
-            )
-            .await?;
             Ok(Some((traversal.vertices, traversal.edge_visits)))
         }
     }
@@ -6367,10 +6439,17 @@ impl GraphShard {
         }
 
         let snapshot = self.snapshot_at(cell_id, read_epoch).await?;
+        let scan_options = remote_scan_options_for_expected_items(
+            self.degree_for_cache_admission(
+                &snapshot.storage_snapshot,
+                &keys::degree_in(cell_id, edge_type, dst),
+            )
+            .await?,
+        );
         let prefix = keys::in_prefix(cell_id, edge_type, dst);
         let mut iter = snapshot
             .storage_snapshot
-            .scan_prefix_with_options(prefix.as_bytes(), .., &remote_scan_options())
+            .scan_prefix_with_options(prefix.as_bytes(), .., &scan_options)
             .await?;
         let mut neighbors = Vec::new();
         while let Some(kv) = iter.next().await? {
@@ -6835,6 +6914,31 @@ fn graph_kernel_order_vertices(vertices: &mut Vec<VertexId>, ascending: bool) {
 }
 
 #[cfg(feature = "opencypher")]
+fn graph_kernel_window_sorted_vertices(
+    vertices: &[VertexId],
+    window: QueryWindow,
+    ascending: bool,
+) -> Result<Vec<VertexId>> {
+    let skip = usize::try_from(window.skip).map_err(|_| GraphError::AdmissionRejected {
+        operation: "query_result_skip",
+        actual: window.skip,
+        limit: usize::MAX as u64,
+    })?;
+    let limit = window.limit.unwrap_or(usize::MAX);
+    if ascending {
+        Ok(vertices.iter().copied().skip(skip).take(limit).collect())
+    } else {
+        Ok(vertices
+            .iter()
+            .rev()
+            .copied()
+            .skip(skip)
+            .take(limit)
+            .collect())
+    }
+}
+
+#[cfg(feature = "opencypher")]
 fn validate_query_result_window(window: QueryWindow, max_rows: usize) -> Result<()> {
     let _ = usize::try_from(window.skip).map_err(|_| GraphError::AdmissionRejected {
         operation: "query_result_skip",
@@ -6993,6 +7097,35 @@ fn source_relationship_id_order_supported(
             }),
         RowSortExpression::Property { .. } | RowSortExpression::CountAll => false,
     })
+}
+
+#[cfg(feature = "opencypher")]
+fn source_relationship_id_page_order(
+    edge: &RowEdgePattern,
+    query: &ParsedRowQuery,
+) -> Option<bool> {
+    let [sort] = query.order_by.as_slice() else {
+        return None;
+    };
+    let orders_destination = match &sort.expression {
+        RowSortExpression::NodeId { binding } => {
+            edge.dst.binding.as_deref() == Some(binding.as_str())
+        }
+        RowSortExpression::Column { name } => query
+            .columns
+            .iter()
+            .position(|column| column.name == *name)
+            .and_then(|index| query.projections.get(index))
+            .is_some_and(|projection| {
+                matches!(
+                    projection,
+                    RowProjection::NodeId { binding }
+                        if edge.dst.binding.as_deref() == Some(binding.as_str())
+                )
+            }),
+        RowSortExpression::Property { .. } | RowSortExpression::CountAll => false,
+    };
+    orders_destination.then_some(sort.ascending)
 }
 
 #[cfg(feature = "opencypher")]

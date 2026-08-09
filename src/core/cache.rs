@@ -47,6 +47,7 @@ pub(crate) struct SourceRelationshipRowsCacheKey {
     pub(crate) cell_id: String,
     pub(crate) edge_type: String,
     pub(crate) src: VertexId,
+    pub(crate) hop_range: Option<(u8, u8)>,
     pub(crate) read_epoch: StorageSequence,
 }
 
@@ -62,6 +63,23 @@ impl SourceRelationshipRowsCacheKey {
             cell_id: cell_id.to_string(),
             edge_type: edge_type.to_string(),
             src,
+            hop_range: None,
+            read_epoch,
+        }
+    }
+
+    pub(crate) fn reachable(
+        cell_id: &str,
+        edge_type: &str,
+        src: VertexId,
+        hop_range: (u8, u8),
+        read_epoch: StorageSequence,
+    ) -> Self {
+        Self {
+            cell_id: cell_id.to_string(),
+            edge_type: edge_type.to_string(),
+            src,
+            hop_range: Some(hop_range),
             read_epoch,
         }
     }
