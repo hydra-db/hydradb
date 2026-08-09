@@ -9,6 +9,16 @@ pub(crate) enum NativePathProcedureKind {
     MultiSource,
 }
 
+impl NativePathProcedureKind {
+    pub(crate) const fn procedure_name(self) -> &'static str {
+        match self {
+            Self::SinglePair => "algo.SPpaths",
+            Self::SingleSource => "algo.SSpaths",
+            Self::MultiSource => "algo.MSpaths",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativePathDirection {
     Incoming,

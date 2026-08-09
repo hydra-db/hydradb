@@ -236,6 +236,12 @@ impl GraphShard {
                 memory.max_relationship_property_rows_bytes,
             )),
             #[cfg(feature = "opencypher")]
+            native_path_result_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
+                cache_policy.max_relationship_row_sets,
+                tenant_quota,
+                memory.max_relationship_rows_bytes,
+            )),
+            #[cfg(feature = "opencypher")]
             native_path_page_cursors: Mutex::new(Default::default()),
             wal_tail_file_cache: Mutex::new(Default::default()),
             xlog_floor_ensured: std::sync::RwLock::new(std::collections::HashSet::new()),

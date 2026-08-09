@@ -1176,6 +1176,63 @@ async fn native_ms_paths_fairly_budgets_parallel_variants_across_structures() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn native_ms_paths_result_cache_is_invalidated_by_storage_epoch() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/native-ms-paths-result-cache", object_store).await;
+    shard
+        .execute_cypher(
+            QueryContext::new("cell-a", "native-ms-cache-create-ab"),
+            "CREATE (a:Entity {id: 1, name: 'alpha'})-[:RELATES]->(b:Entity {id: 2, name: 'beta'})",
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "cell-a",
+            3,
+            VertexMetadata::default()
+                .with_label("Entity")
+                .with_property("name", VertexPropertyValue::String("gamma".to_string())),
+        )
+        .await
+        .unwrap();
+    shard.build_graph_index("cell-a", "RELATES").await.unwrap();
+
+    let query = "CALL algo.MSpaths({sourceLabel: 'Entity', sourceProperty: 'name', \
+                 sourceValues: ['alpha', 'gamma'], targetValues: ['alpha', 'gamma'], \
+                 pairwise: true, relTypes: ['RELATES'], maxLen: 2, relDirection: 'outgoing', \
+                 pathCount: 1, resultLimit: 10}) YIELD path RETURN path";
+    for request_id in ["native-ms-cache-miss", "native-ms-cache-hit"] {
+        let result = shard
+            .execute_cypher_rows(QueryContext::new("cell-a", request_id), query)
+            .await
+            .unwrap();
+        assert!(result.rows.is_empty());
+    }
+    assert_eq!(shard.native_path_result_cache.lock().await.len(), 1);
+
+    shard
+        .execute_cypher(
+            QueryContext::new("cell-a", "native-ms-cache-create-bg"),
+            "CREATE (b:Entity {id: 2, name: 'beta'})-[:RELATES]->(c:Entity {id: 3, name: 'gamma'})",
+        )
+        .await
+        .unwrap();
+    let result = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-a", "native-ms-cache-new-epoch"),
+            query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(shard.native_path_result_cache.lock().await.len(), 2);
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn native_sp_paths_preserves_parallel_relationship_identity_and_scores() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/native-sp-paths-parallel", object_store).await;
