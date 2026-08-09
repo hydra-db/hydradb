@@ -213,9 +213,10 @@ impl GraphError {
     /// The strings are the wire vocabulary and must stay identical to
     /// `turbolay_telemetry::ErrorClass::as_str` minus its `other`, which nothing
     /// in this tree constructs.
-    pub const CLASSES: [&'static str; 11] = [
+    pub const CLASSES: [&'static str; 12] = [
         "contention",
         "fencing",
+        "routing",
         "freshness",
         "admission",
         "timeout",
@@ -239,15 +240,16 @@ impl GraphError {
     // against the array, which is the only place the two can disagree.
     pub(crate) const CLASS_CONTENTION: usize = 0;
     pub(crate) const CLASS_FENCING: usize = 1;
-    pub(crate) const CLASS_FRESHNESS: usize = 2;
-    pub(crate) const CLASS_ADMISSION: usize = 3;
-    pub(crate) const CLASS_TIMEOUT: usize = 4;
-    pub(crate) const CLASS_QUERY: usize = 5;
-    pub(crate) const CLASS_AUTHZ: usize = 6;
-    pub(crate) const CLASS_CORRUPTION: usize = 7;
-    pub(crate) const CLASS_CONFIG: usize = 8;
-    pub(crate) const CLASS_STORAGE: usize = 9;
-    pub(crate) const CLASS_KERNEL: usize = 10;
+    pub(crate) const CLASS_ROUTING: usize = 2;
+    pub(crate) const CLASS_FRESHNESS: usize = 3;
+    pub(crate) const CLASS_ADMISSION: usize = 4;
+    pub(crate) const CLASS_TIMEOUT: usize = 5;
+    pub(crate) const CLASS_QUERY: usize = 6;
+    pub(crate) const CLASS_AUTHZ: usize = 7;
+    pub(crate) const CLASS_CORRUPTION: usize = 8;
+    pub(crate) const CLASS_CONFIG: usize = 9;
+    pub(crate) const CLASS_STORAGE: usize = 10;
+    pub(crate) const CLASS_KERNEL: usize = 11;
 
     /// The coarse failure class recorded as the `error.class` span attribute.
     ///
@@ -266,10 +268,9 @@ impl GraphError {
     /// kernel gains no telemetry dependency, preserving the direction of the
     /// arrow that lets `cargo test` stay free of `opentelemetry-*`.
     ///
-    /// **`contention` and `fencing` are expected, not alarming.** Retries and
-    /// writer handover are how the system is supposed to behave under
-    /// concurrency. The class exists so a dashboard can chart the rate and
-    /// alert on a *change* in it, not so each occurrence pages someone.
+    /// **`contention`, `routing`, and occasional `fencing` are expected, not
+    /// individually alarming.** The classes exist so a dashboard can separate
+    /// wrong-node retries from actual writer loss and alert on changes in rate.
     pub fn class(&self) -> &'static str {
         Self::CLASSES[self.class_index()]
     }
@@ -291,18 +292,14 @@ impl GraphError {
             | Self::ControlMetadataConflict { .. }
             | Self::RetryExhausted { .. } => Self::CLASS_CONTENTION,
 
-            // `RoutingUnavailable` joins this group rather than getting one of
-            // its own: it means the caller reached a node that does not own the
-            // cell and the owner is not yet known, which is the same transient,
-            // retry-and-it-resolves shape as losing a fence. Commit 4ab2c2b
-            // made it transient rather than a syntax error for exactly that
-            // reason, and classifying it apart would split one operational
-            // question across two dashboard series.
-            Self::WriteRequiresWriter { .. }
-            | Self::NotCellWriter { .. }
+            Self::WriteRequiresWriter { .. } | Self::CellDropped { .. } => Self::CLASS_FENCING,
+
+            // These errors mean the request reached a node that cannot serve
+            // this cell. They are driver-routing outcomes, not evidence that a
+            // SlateDB writer was fenced.
+            Self::NotCellWriter { .. }
             | Self::UnknownShard { .. }
-            | Self::CellDropped { .. }
-            | Self::RoutingUnavailable { .. } => Self::CLASS_FENCING,
+            | Self::RoutingUnavailable { .. } => Self::CLASS_ROUTING,
 
             Self::SnapshotAhead { .. }
             | Self::SnapshotExpired { .. }
@@ -331,6 +328,15 @@ impl GraphError {
             | Self::RoutedWriterConfigMismatch { .. }
             | Self::ReadOnlyShardStorage => Self::CLASS_CONFIG,
 
+            Self::Slate(error)
+                if matches!(
+                    error.kind(),
+                    slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced)
+                ) =>
+            {
+                Self::CLASS_FENCING
+            }
+
             Self::Slate(_) | Self::ObjectStore(_) => Self::CLASS_STORAGE,
 
             Self::SparseKernel { .. } => Self::CLASS_KERNEL,
@@ -352,6 +358,10 @@ impl GraphError {
             Self::ConditionalWriteConflict {
                 operation: "test",
                 key: "cell/edge".into(),
+            },
+            Self::WriteRequiresWriter {
+                operation: "test",
+                cell_id: "cell".into(),
             },
             Self::NotCellWriter {
                 cell_id: "cell".into(),

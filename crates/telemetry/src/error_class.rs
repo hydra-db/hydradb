@@ -31,9 +31,13 @@ pub enum ErrorClass {
     /// Write contention: conditional-write conflicts, idempotency conflicts,
     /// exhausted retries. **Expected, not alarming** — see below.
     Contention,
-    /// Writer ownership: not the cell writer, write requires a writer, unknown
-    /// or dropped shard. **Expected, not alarming.**
+    /// Writer lifecycle: a write requires a writer, a cell was dropped, or
+    /// SlateDB closed a writer as fenced. **Expected occasionally, not alarming
+    /// per occurrence.**
     Fencing,
+    /// A request reached a node that cannot serve the selected cell. Drivers
+    /// normally recover by refreshing their routing table.
+    Routing,
     /// Epoch and snapshot disagreements — the BFG-007 / BFG-009 / BFG-011
     /// family.
     Freshness,
@@ -65,6 +69,7 @@ impl ErrorClass {
         match self {
             Self::Contention => "contention",
             Self::Fencing => "fencing",
+            Self::Routing => "routing",
             Self::Freshness => "freshness",
             Self::Admission => "admission",
             Self::Timeout => "timeout",
@@ -80,20 +85,21 @@ impl ErrorClass {
 
     /// Whether this class is part of normal operation.
     ///
-    /// Retries and fencing are how the system is *supposed* to behave under
-    /// contention. The class exists so a dashboard can chart the rate and alert
+    /// Contention retries, routing refreshes, and occasional writer handovers
+    /// are normal. The class exists so a dashboard can chart the rate and alert
     /// on a change in it — not so every occurrence pages somebody. Getting this
     /// wrong in the first week generates noise that discredits the whole
     /// effort, so the distinction is in the type rather than in a runbook
     /// nobody reads.
-    pub fn is_expected_under_contention(self) -> bool {
-        matches!(self, Self::Contention | Self::Fencing)
+    pub fn is_expected_during_normal_operation(self) -> bool {
+        matches!(self, Self::Contention | Self::Fencing | Self::Routing)
     }
 
     /// Every class, for tests and for building dashboards.
     pub const ALL: &'static [ErrorClass] = &[
         Self::Contention,
         Self::Fencing,
+        Self::Routing,
         Self::Freshness,
         Self::Admission,
         Self::Timeout,
@@ -173,13 +179,20 @@ mod tests {
     }
 
     #[test]
-    fn only_contention_and_fencing_are_expected() {
+    fn only_contention_fencing_and_routing_are_expected() {
         let expected: Vec<_> = ErrorClass::ALL
             .iter()
-            .filter(|class| class.is_expected_under_contention())
+            .filter(|class| class.is_expected_during_normal_operation())
             .copied()
             .collect();
-        assert_eq!(expected, vec![ErrorClass::Contention, ErrorClass::Fencing]);
+        assert_eq!(
+            expected,
+            vec![
+                ErrorClass::Contention,
+                ErrorClass::Fencing,
+                ErrorClass::Routing,
+            ]
+        );
     }
 
     #[test]

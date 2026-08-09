@@ -273,9 +273,11 @@ graph_query_failed_by_class{error_class="…"}
 graph_query_rows_failed_by_class{cell_id="…",error_class="…"}
 ```
 
-Ten values, from `GraphError::CLASSES`: `contention`, `fencing`, `freshness`,
-`admission`, `query`, `authz`, `corruption`, `config`, `storage`, `kernel`. The
-per-class array is total by construction against the scalar `query_rows_failed`
+Twelve values, from `GraphError::CLASSES`: `contention`, `fencing`, `routing`,
+`freshness`, `admission`, `timeout`, `query`, `authz`, `corruption`, `config`,
+`storage`, `kernel`. `routing` counts wrong-node and unavailable-route outcomes;
+`fencing` is reserved for writer lifecycle failures, including SlateDB's fenced
+close reason. The per-class array is total by construction against the scalar `query_rows_failed`
 counter, because the same call increments both, so one can be used to check the
 other.
 
