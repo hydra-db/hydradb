@@ -191,7 +191,9 @@ runtime:
   gracefulShutdownMs: 30000
   l0SstSizeBytes: 16777216
   maxUnflushedBytes: 67108864
-  maxWalFlushesBeforeL0Flush: 4096
+  # Consolidate sparse durable writes before thousands of tiny WAL objects can
+  # accumulate. At the default replay concurrency, 128 is eight replay waves.
+  maxWalFlushesBeforeL0Flush: 128
   l0FlushParallelism: 1
   maxMatrixAdjacencies: 0
   maxMatrixAdjacencyBytes: 0

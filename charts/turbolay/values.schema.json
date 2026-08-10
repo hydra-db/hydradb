@@ -158,7 +158,7 @@
         "gracefulShutdownMs": { "$ref": "#/definitions/unsignedDecimal" },
         "l0SstSizeBytes": { "$ref": "#/definitions/unsignedDecimal" },
         "maxUnflushedBytes": { "$ref": "#/definitions/unsignedDecimal" },
-        "maxWalFlushesBeforeL0Flush": { "$ref": "#/definitions/unsignedDecimal" },
+        "maxWalFlushesBeforeL0Flush": { "$ref": "#/definitions/positiveUnsignedDecimal" },
         "l0FlushParallelism": { "$ref": "#/definitions/unsignedDecimal" },
         "maxMatrixAdjacencies": { "$ref": "#/definitions/unsignedDecimal" },
         "maxMatrixAdjacencyBytes": { "$ref": "#/definitions/unsignedDecimal" },

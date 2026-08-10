@@ -139,7 +139,7 @@ impl RuntimeConfig {
                 ),
             ),
         )?;
-        Ok(Self {
+        let config = Self {
             node_id: value(&values, "GRAPH_NODE_ID", "graph-node-0"),
             scope,
             cell_id,
@@ -170,7 +170,7 @@ impl RuntimeConfig {
             max_wal_flushes_before_l0_flush: parse_u64(
                 &values,
                 "GRAPH_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH",
-                4_096,
+                GraphStorageMemoryConfig::DEFAULT_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH,
             )?,
             l0_flush_parallelism: parse_usize(&values, "GRAPH_L0_FLUSH_PARALLELISM", 1)?,
             max_matrix_adjacencies: parse_usize_allow_zero(
@@ -268,7 +268,9 @@ impl RuntimeConfig {
                 "GRAPH_GRACEFUL_SHUTDOWN_MS",
                 30_000,
             )?,
-        })
+        };
+        config.graph_memory_config().storage.validate()?;
+        Ok(config)
     }
 
     pub fn graph_open_options(&self) -> GraphOpenOptions {
@@ -504,6 +506,7 @@ mod tests {
         assert_eq!(config.cursor_ttl, Duration::from_secs(60));
         assert_eq!(config.l0_sst_size_bytes, 16 * 1024 * 1024);
         assert_eq!(config.max_unflushed_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.max_wal_flushes_before_l0_flush, 128);
         assert_eq!(config.max_concurrent_hydrations, 2);
         assert_eq!(config.max_open_scopes, 8);
         assert_eq!(config.reader_wal_replay_concurrency, 16);
@@ -523,6 +526,20 @@ mod tests {
             memory.max_relationship_property_rows_bytes,
             16 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn graph_node_rejects_unsafe_wal_flush_bounds() {
+        for value in ["0", "4097"] {
+            let values = BTreeMap::from([
+                ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+                (
+                    "GRAPH_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH".to_string(),
+                    value.to_string(),
+                ),
+            ]);
+            RuntimeConfig::from_values(values).expect_err("unsafe WAL flush bound must fail");
+        }
     }
 
     #[test]

@@ -94,3 +94,9 @@
 {{- if gt (int .Values.runtime.writerLeaseMs) 300000 -}}
 {{- fail "runtime.writerLeaseMs must be at most 300000" -}}
 {{- end -}}
+{{- if lt (int .Values.runtime.maxWalFlushesBeforeL0Flush) 1 -}}
+{{- fail "runtime.maxWalFlushesBeforeL0Flush must be at least 1" -}}
+{{- end -}}
+{{- if gt (int .Values.runtime.maxWalFlushesBeforeL0Flush) 4096 -}}
+{{- fail "runtime.maxWalFlushesBeforeL0Flush must be at most 4096" -}}
+{{- end -}}

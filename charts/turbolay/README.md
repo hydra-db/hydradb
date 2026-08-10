@@ -84,6 +84,10 @@ database name, and every scope receives its own `cell-0`, SlateDB WAL, writer
 fence, caches, and graph indexes under the shared object-store prefix. Do not
 deploy a separate release per tenant or subtenant. `runtime.maxOpenScopes`
 bounds warm scopes per query node; idle scopes are closed and reopen from S3.
+`runtime.maxWalFlushesBeforeL0Flush` bounds the number of durable WAL objects
+that a sparse scope may accumulate before SlateDB consolidates its memtable into
+L0. Keep it at or below 4,096; the default of 128 limits cold replay fan-in
+without delaying the 1 ms durable WAL acknowledgement path.
 
 Client ingress is denied by default. Set `networkPolicy.clientIngressFrom` to
 the HydraDB and ingestion namespaces, Pods, or CIDRs that may reach Bolt and

@@ -270,13 +270,18 @@ impl Default for GraphStorageMemoryConfig {
         Self {
             l0_sst_size_bytes: 16 * 1024 * 1024,
             max_unflushed_bytes: 64 * 1024 * 1024,
-            max_wal_flushes_before_l0_flush: 4_096,
+            max_wal_flushes_before_l0_flush: Self::DEFAULT_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH,
             l0_flush_parallelism: 1,
         }
     }
 }
 
 impl GraphStorageMemoryConfig {
+    /// Bounds sparse-write WAL fan-in to eight replay waves at the default
+    /// reader replay concurrency of sixteen.
+    pub const DEFAULT_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH: u64 = 128;
+    pub const MAX_WAL_FLUSHES_BEFORE_L0_FLUSH: u64 = 4_096;
+
     pub fn low_memory() -> Self {
         Self {
             l0_sst_size_bytes: 4 * 1024 * 1024,
@@ -301,10 +306,19 @@ impl GraphStorageMemoryConfig {
                 ),
             });
         }
-        if self.max_wal_flushes_before_l0_flush < 4_096 {
+        if self.max_wal_flushes_before_l0_flush == 0 {
             return Err(crate::GraphError::CorruptValue {
                 key: "storage_memory/max_wal_flushes_before_l0_flush".to_string(),
-                reason: "maximum WAL flush count must be at least 4096".to_string(),
+                reason: "maximum WAL flush count must be greater than zero".to_string(),
+            });
+        }
+        if self.max_wal_flushes_before_l0_flush > Self::MAX_WAL_FLUSHES_BEFORE_L0_FLUSH {
+            return Err(crate::GraphError::CorruptValue {
+                key: "storage_memory/max_wal_flushes_before_l0_flush".to_string(),
+                reason: format!(
+                    "maximum WAL flush count must be at most {}",
+                    Self::MAX_WAL_FLUSHES_BEFORE_L0_FLUSH
+                ),
             });
         }
         if self.l0_flush_parallelism == 0 {
@@ -428,6 +442,7 @@ mod tests {
         balanced.validate().unwrap();
         assert_eq!(balanced.l0_sst_size_bytes, 16 * 1024 * 1024);
         assert_eq!(balanced.max_unflushed_bytes, 64 * 1024 * 1024);
+        assert_eq!(balanced.max_wal_flushes_before_l0_flush, 128);
 
         let low_memory = GraphStorageMemoryConfig::low_memory();
         low_memory.validate().unwrap();
@@ -452,7 +467,13 @@ mod tests {
         assert!(config.validate().is_err());
 
         let config = GraphStorageMemoryConfig {
-            max_wal_flushes_before_l0_flush: 4_095,
+            max_wal_flushes_before_l0_flush: 0,
+            ..GraphStorageMemoryConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = GraphStorageMemoryConfig {
+            max_wal_flushes_before_l0_flush: 4_097,
             ..GraphStorageMemoryConfig::default()
         };
         assert!(config.validate().is_err());

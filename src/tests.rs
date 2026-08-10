@@ -9,6 +9,42 @@ async fn open_test_shard(path: &str, object_store: Arc<dyn ObjectStore>) -> Grap
         .unwrap()
 }
 
+#[tokio::test]
+async fn sparse_wal_flushes_reach_l0_at_the_default_count_bound() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/sparse-wal-l0-bound";
+    let shard = open_test_shard(path, Arc::clone(&object_store)).await;
+
+    for id in 0..GraphStorageMemoryConfig::DEFAULT_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH {
+        shard
+            .write_edge(typed_mutation(
+                "cell-a",
+                "SPARSE",
+                id,
+                id + 1,
+                &format!("sparse-wal-{id}"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let l0_prefix: slatedb::object_store::path::Path = format!("{path}/compacted").into();
+    let mut l0_created = false;
+    for _ in 0..100 {
+        if object_store.list(Some(&l0_prefix)).next().await.is_some() {
+            l0_created = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        l0_created,
+        "sparse durable WAL flushes must consolidate into L0 at the configured count bound"
+    );
+    shard.close().await.unwrap();
+}
+
 /// A placement view over a hand-picked fleet, for tests whose subject is not
 /// placement.
 ///
