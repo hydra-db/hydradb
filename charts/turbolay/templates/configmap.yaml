@@ -40,7 +40,9 @@ data:
   GRAPH_INDEXER_BUILD_MODE: {{ .Values.indexer.buildMode | quote }}
   GRAPH_INDEXER_INCREMENTAL_MIN_EDGES: {{ include "turbolay.decimalInteger" .Values.indexer.incrementalMinEdges | quote }}
   GRAPH_INDEXER_SCOPE_CONCURRENCY: {{ include "turbolay.decimalInteger" .Values.indexer.scopeConcurrency | quote }}
+  GRAPH_INDEXER_SCOPES_PER_CYCLE: {{ include "turbolay.decimalInteger" .Values.indexer.scopesPerCycle | quote }}
   GRAPH_INDEXER_MAX_OPEN_SCOPES: {{ include "turbolay.decimalInteger" .Values.indexer.maxOpenScopes | quote }}
+  GRAPH_INDEXER_READINESS_FAILURE_THRESHOLD: {{ include "turbolay.decimalInteger" .Values.indexer.readinessFailureThreshold | quote }}
   GRAPH_INDEXER_MAX_TAIL_FILES: {{ include "turbolay.decimalInteger" .Values.indexer.maxWalTailFiles | quote }}
   GRAPH_WAL_TAIL_FETCH_CONCURRENCY: {{ include "turbolay.decimalInteger" .Values.indexer.walTailFetchConcurrency | quote }}
   GRAPH_INDEXER_ADMIN_ADDR: "0.0.0.0:9091"
