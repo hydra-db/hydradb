@@ -115,12 +115,25 @@ canonical adjacency. indexer.incrementalMinEdges keeps smaller indexes on the
 full path, and any unavailable or oversized tail safely falls back to a full
 rebuild. `indexer.maxWalTailFiles` bounds that tail, while
 `indexer.walTailFetchConcurrency` bounds parallel immutable WAL reads and edge
-resolution. Registered scopes run in batches of `indexer.scopeConcurrency`.
-The indexer advances a CAS-protected cursor after each completed batch, so a
-restart resumes fairly and can replay at most the unfinished batch. Read-only
-scope handles remain open in a bounded LRU of `indexer.maxOpenScopes`; retained
-SlateDB readers refresh only the new durable WAL instead of replaying the whole
-tail on every cycle.
+resolution. Each scheduler pass processes at most `indexer.scopesPerCycle`
+registered scopes in batches of `indexer.scopeConcurrency`. The indexer
+advances a CAS-protected cursor after each completed fair-scan batch, so a
+restart resumes near the last durable boundary. Scopes that just published a
+generation are rechecked from a bounded hot budget; one-time idle scan readers
+are closed instead of evicting useful readers from `indexer.maxOpenScopes`.
+`indexer.readinessFailureThreshold` prevents one transient object-store error
+from making the Pod unready while repeated failed bounded cycles still remove
+it from service.
+
+`graph_indexer_last_success_ms` reports the last successful bounded scheduler
+pass. Registry-wide freshness uses `graph_indexer_last_full_sweep_ms`. Exclude
+its zero value so an indexer that has not completed its first rotation displays
+as unavailable rather than as a timestamp near the Unix epoch:
+
+```promql
+clamp_min(time() - graph_indexer_last_full_sweep_ms / 1000, 0)
+and on() (graph_indexer_last_full_sweep_ms > 0)
+```
 
 The development example references an existing MinIO Service only to exercise
 the S3-compatible path without AWS. The chart does not install MinIO, and the
