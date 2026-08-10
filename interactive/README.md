@@ -23,6 +23,7 @@ textbooks: no tooltips, and they carry their own inline styles rather than
 | Routing the Write | `write-routing-solutions.html` | four ways to place the writer, scored — TiDB/TiKV and sleet as reference |
 | Placing the Writer | `write-routing-placement.html` | the landed fix — rendezvous hashing, heartbeat liveness, the don't-promote rule, and why the duel is bounded rather than prevented. Five interactive SVG widgets (W1–W5), self-contained |
 | Requests, Not Bytes | `incremental-build-cost.html` | why the incremental index build inverted on staging — request-bound vs data-bound cost anatomy, measured ledger, why the read path never noticed, break-even calculator widget, and the L0–L3 fix ladder with implementation sketches |
+| Where the Time Goes | `read-write-path-performance.html` | the read and write paths drawn as they actually run, every finding re-verified against `main @ 8e91fbe`, and the benchmark / flamegraph / Grafana plan to price each one. Defers to `incremental-build-cost.html` on the WAL tail. Three annotated SVG diagrams, static |
 
 ## The interactive layer (after the [interactive-textbook skill](https://github.com/alharkan7/skills))
 

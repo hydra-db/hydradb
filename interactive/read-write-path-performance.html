@@ -1,0 +1,1812 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The read and write paths — where the time goes</title>
+<style>
+  :root {
+    --ground: #eef1f5;
+    --surface: #fbfcfd;
+    --surface-2: #e7ecf3;
+    --ink: #16202e;
+    --ink-2: #4d5c72;
+    --ink-3: #7c8ba1;
+    --rule: #c8d2de;
+    --rule-soft: #dbe3ec;
+    --accent: #1e4fd8;
+    --accent-soft: #dfe6fb;
+    --crit: #a3231c;
+    --crit-soft: #f7e2e0;
+    --high: #97621b;
+    --high-soft: #f8ecd9;
+    --med: #2b6079;
+    --med-soft: #dcecf3;
+    --ok: #106b4e;
+    --ok-soft: #dbefe6;
+
+    --font-display: -apple-system, BlinkMacSystemFont, "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+    --font-body: "Iowan Old Style", Charter, "Bitstream Charter", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+    --font-mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+    --measure: 68ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0b1626;
+      --surface: #111e31;
+      --surface-2: #16263c;
+      --ink: #dce7f5;
+      --ink-2: #93a8c4;
+      --ink-3: #6a7f9c;
+      --rule: #24374f;
+      --rule-soft: #1b2c42;
+      --accent: #7ba5ff;
+      --accent-soft: #17294a;
+      --crit: #ff8478;
+      --crit-soft: #3a1d1d;
+      --high: #e5b46a;
+      --high-soft: #3a2e18;
+      --med: #6fb8d6;
+      --med-soft: #16303d;
+      --ok: #56cfa1;
+      --ok-soft: #12332a;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0b1626;
+    --surface: #111e31;
+    --surface-2: #16263c;
+    --ink: #dce7f5;
+    --ink-2: #93a8c4;
+    --ink-3: #6a7f9c;
+    --rule: #24374f;
+    --rule-soft: #1b2c42;
+    --accent: #7ba5ff;
+    --accent-soft: #17294a;
+    --crit: #ff8478;
+    --crit-soft: #3a1d1d;
+    --high: #e5b46a;
+    --high-soft: #3a2e18;
+    --med: #6fb8d6;
+    --med-soft: #16303d;
+    --ok: #56cfa1;
+    --ok-soft: #12332a;
+  }
+
+  :root[data-theme="light"] {
+    --ground: #eef1f5;
+    --surface: #fbfcfd;
+    --surface-2: #e7ecf3;
+    --ink: #16202e;
+    --ink-2: #4d5c72;
+    --ink-3: #7c8ba1;
+    --rule: #c8d2de;
+    --rule-soft: #dbe3ec;
+    --accent: #1e4fd8;
+    --accent-soft: #dfe6fb;
+    --crit: #a3231c;
+    --crit-soft: #f7e2e0;
+    --high: #97621b;
+    --high-soft: #f8ecd9;
+    --med: #2b6079;
+    --med-soft: #dcecf3;
+    --ok: #106b4e;
+    --ok-soft: #dbefe6;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  .page {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 0 24px 96px;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0 48px;
+  }
+
+  @media (min-width: 1080px) {
+    .page { grid-template-columns: 210px minmax(0, 1fr); }
+  }
+
+  .masthead {
+    grid-column: 1 / -1;
+    border-bottom: 2px solid var(--ink);
+    padding: 56px 0 26px;
+    margin-bottom: 40px;
+  }
+
+  .docmeta {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 22px;
+    margin-bottom: 26px;
+  }
+
+  .docmeta b { color: var(--ink-2); font-weight: 500; }
+
+  h1 {
+    font-family: var(--font-display);
+    font-size: clamp(2.1rem, 5.4vw, 3.5rem);
+    font-weight: 700;
+    letter-spacing: -.032em;
+    line-height: 1.02;
+    margin: 0 0 .45em;
+    text-wrap: balance;
+    max-width: 20ch;
+  }
+
+  h1 .thin { font-weight: 300; color: var(--ink-2); display: block; }
+
+  .standfirst {
+    font-size: 1.16rem;
+    color: var(--ink-2);
+    max-width: 62ch;
+    margin: 0;
+    line-height: 1.55;
+  }
+
+  .spine { display: none; }
+
+  @media (min-width: 1080px) {
+    .spine {
+      display: block;
+      position: sticky;
+      top: 0;
+      align-self: start;
+      padding-top: 6px;
+      max-height: 100vh;
+      overflow-y: auto;
+    }
+  }
+
+  .spine ol { list-style: none; margin: 0; padding: 0; }
+
+  .spine a {
+    display: grid;
+    grid-template-columns: 2.2em 1fr;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.4;
+    letter-spacing: .02em;
+    color: var(--ink-3);
+    text-decoration: none;
+    padding: 7px 0 7px 10px;
+    border-left: 2px solid var(--rule-soft);
+    transition: color .15s, border-color .15s;
+  }
+
+  .spine a:hover, .spine a:focus-visible { color: var(--accent); border-left-color: var(--accent); }
+  .spine a .n { font-variant-numeric: tabular-nums; color: var(--ink-3); }
+
+  .body { min-width: 0; }
+  .body > * { max-width: var(--measure); }
+  .body > .wide { max-width: none; }
+
+  section { margin: 0 0 68px; }
+
+  h2 {
+    font-family: var(--font-display);
+    font-size: 1.62rem;
+    font-weight: 650;
+    letter-spacing: -.02em;
+    line-height: 1.18;
+    margin: 0 0 .2em;
+    text-wrap: balance;
+  }
+
+  h3 {
+    font-family: var(--font-display);
+    font-size: 1.06rem;
+    font-weight: 650;
+    letter-spacing: -.008em;
+    margin: 2.1em 0 .5em;
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .eyebrow::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
+
+  p { margin: 0 0 1.05em; }
+  .lede { font-size: 1.06rem; color: var(--ink-2); margin-bottom: 1.6em; }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+
+  code, .mono { font-family: var(--font-mono); font-size: .86em; }
+
+  p code, li code, td code, th code, dd code, .kv code, .q p code, .keep code {
+    background: var(--surface-2);
+    border: 1px solid var(--rule-soft);
+    border-radius: 3px;
+    padding: .08em .34em;
+    white-space: nowrap;
+  }
+
+  .src { font-family: var(--font-mono); font-size: .78em; color: var(--ink-3); white-space: nowrap; letter-spacing: -.01em; }
+  .src::before { content: "\21B3 "; }
+
+  ul, ol { margin: 0 0 1.05em; padding-left: 1.3em; }
+  li { margin-bottom: .4em; }
+
+  .chip {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 2px;
+    vertical-align: 2px;
+    white-space: nowrap;
+  }
+
+  .chip.crit { color: var(--crit); background: var(--crit-soft); }
+  .chip.high { color: var(--high); background: var(--high-soft); }
+  .chip.med  { color: var(--med);  background: var(--med-soft); }
+  .chip.ok   { color: var(--ok);   background: var(--ok-soft); }
+
+  .tablewrap {
+    overflow-x: auto;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    margin: 26px 0;
+  }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+
+  thead th {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+
+  tbody tr:last-child td { border-bottom: none; }
+  td.m, th.m { font-family: var(--font-mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+  td.nowrap { white-space: nowrap; }
+  td.note { font-family: var(--font-body); font-size: 14px; color: var(--ink-2); }
+  .wide-tbl { min-width: 880px; }
+
+  .caption {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--ink-3);
+    margin: -8px 0 30px;
+    letter-spacing: .01em;
+    max-width: 90ch;
+  }
+
+  pre.listing {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.62;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--rule);
+    color: var(--ink-2);
+    padding: 14px 16px;
+    margin: 22px 0;
+    overflow-x: auto;
+  }
+
+  pre.listing b { color: var(--ink); font-weight: 600; }
+  pre.listing i { font-style: normal; color: var(--crit); }
+  pre.listing u { text-decoration: none; color: var(--accent); }
+  pre.listing.rust { border-left-color: var(--accent); }
+  pre.listing.bad { border-left-color: var(--crit); }
+  pre.listing.shell { border-left-color: var(--ok); }
+
+  .rule-box {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.6;
+    background: var(--accent-soft);
+    color: var(--ink);
+    padding: 12px 14px;
+    border-radius: 2px;
+    margin: 20px 0;
+    overflow-x: auto;
+  }
+
+  .rule-box .lbl {
+    display: block;
+    font-size: 10px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 6px;
+  }
+
+  .keeps { display: grid; gap: 2px; margin: 24px 0; }
+
+  .keep {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 14px;
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--crit);
+    padding: 13px 18px;
+    align-items: baseline;
+  }
+
+  .keep[data-v="high"] { border-left-color: var(--high); }
+  .keep[data-v="med"]  { border-left-color: var(--med); }
+  .keep[data-v="ok"]   { border-left-color: var(--ok); }
+
+  .keep .kk {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--crit);
+    white-space: nowrap;
+  }
+
+  .keep[data-v="high"] .kk { color: var(--high); }
+  .keep[data-v="med"]  .kk { color: var(--med); }
+  .keep[data-v="ok"]   .kk { color: var(--ok); }
+  .keep .kv { font-size: .95rem; }
+
+  .fig {
+    margin: 30px 0 8px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 18px 18px 10px;
+    overflow-x: auto;
+  }
+
+  .fig svg { display: block; max-width: 100%; height: auto; min-width: 640px; }
+
+  .figlabel {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin-bottom: 12px;
+  }
+
+  .svg-box    { fill: var(--surface-2); stroke: var(--rule); stroke-width: 1; }
+  .svg-box-hot{ fill: var(--crit-soft); stroke: var(--crit); stroke-width: 1.2; }
+  .svg-box-warm{ fill: var(--high-soft); stroke: var(--high); stroke-width: 1.2; }
+  .svg-box-cool{ fill: var(--med-soft); stroke: var(--med); stroke-width: 1; }
+  .svg-box-ok { fill: var(--ok-soft); stroke: var(--ok); stroke-width: 1; }
+  .svg-t      { fill: var(--ink); font-family: var(--font-mono); font-size: 11px; }
+  .svg-t2     { fill: var(--ink-2); font-family: var(--font-mono); font-size: 10px; }
+  .svg-t3     { fill: var(--ink-3); font-family: var(--font-mono); font-size: 9.5px; }
+  .svg-tc     { fill: var(--crit); font-family: var(--font-mono); font-size: 10px; font-weight: 600; }
+  .svg-th     { fill: var(--high); font-family: var(--font-mono); font-size: 10px; font-weight: 600; }
+  .svg-line   { stroke: var(--rule); stroke-width: 1; fill: none; }
+  .svg-flow   { stroke: var(--ink-3); stroke-width: 1.4; fill: none; }
+  .svg-flow-hot { stroke: var(--crit); stroke-width: 1.6; fill: none; }
+  .svg-dash   { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 4 3; fill: none; }
+  .svg-life   { stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 4; }
+
+  .grid2 { display: grid; gap: 18px; margin: 24px 0; }
+  @media (min-width: 760px) { .grid2 { grid-template-columns: 1fr 1fr; } }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-top: 3px solid var(--accent);
+    padding: 15px 18px;
+  }
+
+  .card h4 {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 8px;
+  }
+
+  .card p { font-size: .92rem; margin: 0 0 .7em; color: var(--ink-2); }
+  .card p:last-child { margin-bottom: 0; }
+  .card ul { font-size: .92rem; color: var(--ink-2); margin-bottom: 0; }
+
+  footer {
+    grid-column: 1 / -1;
+    border-top: 1px solid var(--rule);
+    padding-top: 20px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--ink-3);
+    line-height: 1.7;
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<header class="masthead">
+  <div class="docmeta">
+    <span><b>Design note</b></span>
+    <span>2026-08-10</span>
+    <span>tree <b>main @ 8e91fbe</b></span>
+    <span>scope <b>src/shard/write.rs · src/shard/query.rs · src/core</b></span>
+    <span>status <b>analysis — every finding re-verified 2026-08-10</b></span>
+  </div>
+  <h1>Where the time goes<span class="thin">The read and write paths, drawn as they actually run</span></h1>
+  <p class="standfirst">
+    A structural read of the two hot paths in the kernel: what a write does between
+    the API call and the durable commit, what a read does between the Cypher string
+    and the rows, and the places in that machinery where the cost model is worse than
+    the architecture document implies. Then the harness — benchmarks, flamegraphs,
+    and a Grafana board — to turn each claim into a number.
+  </p>
+  <div class="rule-box" style="margin-top:26px; max-width:none">
+    <span class="lbl">Sources, and what this note is not</span>
+    <b>Read the WAL-tail half of this elsewhere first.</b>
+    <code>interactive/incremental-build-cost.html</code> (2026-08-05) already anatomises
+    the WAL tail as a <em>request-bound</em> rather than data-bound cost, measured on
+    staging, with an L0–L3 fix ladder. That ladder landed. This note does not re-derive
+    it and defers to it wherever they overlap — see R1.<br><br>
+    Twenty-four findings were enumerated against an earlier tree, and every one was
+    re-checked against <code>main @ 8e91fbe</code> on 2026-08-10.
+    <b>Twenty-one stand verbatim; two are fixed (W6, R1); one is partly fixed (R5).</b>
+    A twenty-fifth, R1b, is what survives of R1 after its fix. The three that moved are
+    marked in place rather than quietly deleted, because what changed and why is more
+    useful than a clean list — and because this same re-check is what the next reader
+    will have to do.
+  </div>
+</header>
+
+<nav class="spine" aria-label="Contents">
+  <ol>
+    <li><a href="#s1"><span class="n">01</span><span>The shape</span></a></li>
+    <li><a href="#s2"><span class="n">02</span><span>Write path</span></a></li>
+    <li><a href="#s3"><span class="n">03</span><span>Write findings</span></a></li>
+    <li><a href="#s4"><span class="n">04</span><span>Read path</span></a></li>
+    <li><a href="#s5"><span class="n">05</span><span>Read findings</span></a></li>
+    <li><a href="#s6"><span class="n">06</span><span>Cross-cutting</span></a></li>
+    <li><a href="#s7"><span class="n">07</span><span>Benchmarks</span></a></li>
+    <li><a href="#s8"><span class="n">08</span><span>Flamegraphs</span></a></li>
+    <li><a href="#s9"><span class="n">09</span><span>Grafana board</span></a></li>
+    <li><a href="#s10"><span class="n">10</span><span>Order of work</span></a></li>
+  </ol>
+</nav>
+
+<main class="body">
+
+<!-- ==================== 1 ==================== -->
+<section id="s1">
+  <p class="eyebrow">01 — Orientation</p>
+  <h2>The shape of the thing</h2>
+  <p class="lede">
+    Three layers, and every performance question in this note is about which layer a
+    given operation actually lands in.
+  </p>
+
+  <p>
+    <code>architecture.md</code> describes a stateless query tier over SlateDB over S3, with
+    memory and NVMe as disposable caches. That is accurate. What it does not describe
+    is the <em>cost model</em>: how many storage round trips one edge write costs, how
+    many one <code>MATCH</code> costs, and what serialises against what. This note fills
+    that in from the code.
+  </p>
+
+  <div class="fig wide">
+    <div class="figlabel">Figure 1 — the three layers, and the four caches between them</div>
+    <svg viewBox="0 0 980 340" role="img" aria-label="Layer diagram: protocol, kernel, SlateDB, object store">
+      <rect x="10" y="14" width="960" height="60" class="svg-box" rx="2"/>
+      <text x="24" y="34" class="svg-t2">PROTOCOL — src/client</text>
+      <rect x="26" y="40" width="150" height="24" class="svg-box-cool" rx="2"/>
+      <text x="36" y="56" class="svg-t">Bolt 5.1–5.4 / TLS</text>
+      <rect x="186" y="40" width="150" height="24" class="svg-box-cool" rx="2"/>
+      <text x="196" y="56" class="svg-t">HTTPS JSON / NDJSON</text>
+      <rect x="346" y="40" width="300" height="24" class="svg-box-cool" rx="2"/>
+      <text x="356" y="56" class="svg-t">ClientQueryService — authz, quotas, gates</text>
+      <rect x="656" y="40" width="300" height="24" class="svg-box" rx="2"/>
+      <text x="666" y="56" class="svg-t3">query_gate + per-namespace gates (Semaphore)</text>
+
+      <rect x="10" y="86" width="960" height="128" class="svg-box" rx="2"/>
+      <text x="24" y="106" class="svg-t2">KERNEL — src/shard, src/engine, src/query</text>
+
+      <rect x="26" y="114" width="212" height="42" class="svg-box-warm" rx="2"/>
+      <text x="36" y="130" class="svg-t">parse → plan → optimise</text>
+      <text x="36" y="146" class="svg-t3">parsed_row_query_cache (Mutex)</text>
+
+      <rect x="248" y="114" width="212" height="42" class="svg-box-warm" rx="2"/>
+      <text x="258" y="130" class="svg-t">sparse traversal kernel</text>
+      <text x="258" y="146" class="svg-t3">graphblas_cache (Mutex) + matrix_cache</text>
+
+      <rect x="470" y="114" width="212" height="42" class="svg-box-warm" rx="2"/>
+      <text x="480" y="130" class="svg-t">WAL-tail overlay</text>
+      <text x="480" y="146" class="svg-th">cached + parallel since R1 fix</text>
+
+      <rect x="692" y="114" width="264" height="42" class="svg-box-hot" rx="2"/>
+      <text x="702" y="130" class="svg-t">write txn — read-modify-write</text>
+      <text x="702" y="146" class="svg-tc">one process-wide mutex</text>
+
+      <rect x="26" y="164" width="930" height="40" class="svg-box" rx="2"/>
+      <text x="36" y="180" class="svg-t2">row engine — match, filter, hydrate metadata, project, sort, window</text>
+      <text x="36" y="196" class="svg-t3">materialises every row before SKIP/LIMIT is applied  ·  src/shard/query.rs:4597</text>
+
+      <rect x="10" y="226" width="470" height="98" class="svg-box" rx="2"/>
+      <text x="24" y="246" class="svg-t2">SLATEDB — one Db per (namespace, graph, cell)</text>
+      <rect x="26" y="254" width="140" height="26" class="svg-box-ok" rx="2"/>
+      <text x="36" y="271" class="svg-t">writer (epoch)</text>
+      <rect x="176" y="254" width="140" height="26" class="svg-box-ok" rx="2"/>
+      <text x="186" y="271" class="svg-t">reader (refreshed)</text>
+      <rect x="326" y="254" width="140" height="26" class="svg-box-ok" rx="2"/>
+      <text x="336" y="271" class="svg-t">block / SST cache</text>
+      <text x="26" y="300" class="svg-t3">every kernel read sets DurabilityLevel::Remote — the memtable is</text>
+      <text x="26" y="314" class="svg-t3">excluded, so freshly written rows are re-read from durable storage</text>
+
+      <rect x="500" y="226" width="470" height="98" class="svg-box" rx="2"/>
+      <text x="514" y="246" class="svg-t2">OBJECT STORE — durable ground truth</text>
+      <rect x="516" y="254" width="104" height="26" class="svg-box-cool" rx="2"/>
+      <text x="526" y="271" class="svg-t">WAL</text>
+      <rect x="630" y="254" width="104" height="26" class="svg-box-cool" rx="2"/>
+      <text x="640" y="271" class="svg-t">SST + manifest</text>
+      <rect x="744" y="254" width="104" height="26" class="svg-box-cool" rx="2"/>
+      <text x="754" y="271" class="svg-t">CSC generations</text>
+      <rect x="858" y="254" width="98" height="26" class="svg-box-cool" rx="2"/>
+      <text x="868" y="271" class="svg-t">current ptr</text>
+      <text x="516" y="300" class="svg-t3">the read path GETs the current pointer whenever the in-process</text>
+      <text x="516" y="314" class="svg-t3">generation map misses  ·  src/engine/index_store.rs:64</text>
+
+      <path d="M 240 74 L 240 86" class="svg-flow" marker-end="url(#a1)"/>
+      <path d="M 240 214 L 240 226" class="svg-flow" marker-end="url(#a1)"/>
+      <path d="M 700 214 L 700 226 L 620 226" class="svg-flow" marker-end="url(#a1)"/>
+      <defs>
+        <marker id="a1" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 z" fill="currentColor" class="svg-t"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <p class="caption">
+    Red = the structure this note argues is still the dominant bottleneck: one mutex in
+    front of every write in the process. Amber = machinery whose implementation costs more
+    than its shape suggests, including the WAL-tail overlay — once red, now largely fixed
+    (R1) with a smaller residue (R1b). Green = SlateDB's own machinery, which is not the
+    problem.
+  </p>
+</section>
+
+<!-- ==================== 2 ==================== -->
+<section id="s2">
+  <p class="eyebrow">02 — Write path</p>
+  <h2>What one edge write actually does</h2>
+  <p class="lede">
+    Four nested serialisation points, then six to seven strictly sequential storage
+    reads, then a durable commit. The reads are inside the lock.
+  </p>
+
+  <p>
+    Take the simplest possible mutation, <code>GraphShard::write_edge</code>. The public
+    entry point validates, checks write authority, and then enters a retry loop that
+    holds two things for its whole duration: a permit from the global
+    <code>graph_write_gate</code> semaphore, and one of 64 <code>writer_lanes</code> mutexes
+    chosen by hashing the cell id.
+  </p>
+
+  <pre class="listing rust"><b>src/shard/write.rs:2562</b>
+let span = write_txn_span(&mutation.cell_id, Some(&mutation.edge_type));
+let _permit = self.acquire_graph_write_permit("write_edge").await?;   <u>// global semaphore</u>
+let _writer = self.writer_lane(&mutation.cell_id).lock().await;        <u>// 1 of 64 lanes</u>
+for attempt in 0..GRAPH_TXN_MAX_RETRIES {                              <u>// 32</u>
+    match self.write_edge_txn(&mutation).await { ... }
+}</pre>
+
+  <p>
+    So far so reasonable — 64 lanes means 64 cells can write concurrently. Except that
+    one level down, <code>write_edge_txn</code> calls <code>acquire_local_write_guard</code>,
+    and that function takes <em>cell_id as an argument and never uses it</em>:
+  </p>
+
+  <pre class="listing bad"><b>src/shard/lifecycle.rs:256</b>
+pub(crate) async fn acquire_local_write_guard(
+    &self,
+    cell_id: &str,            <i>// validated, then discarded</i>
+    operation: &'static str,
+) -> Result&lt;LocalWriteGuard&gt; {
+    validate_component("cell_id", cell_id)?;
+    validate_component("operation", operation)?;
+    let guard = LocalWriteGuard::new(
+        Arc::clone(&<i>self.local_write_guard</i>).lock_owned().await   <i>// ONE mutex, whole shard</i>
+    );
+    <i>self.db.refresh_writer_fence().await?;</i>                          <i>// manifest refresh, inside the lock</i>
+    Ok(guard)
+}</pre>
+
+  <p>
+    <code>local_write_guard</code> is a single <code>Arc&lt;Mutex&lt;()&gt;&gt;</code> created once per
+    shard (<span class="src">src/shard/lifecycle.rs:185</span>). Every write to every cell
+    in the process funnels through it. The 64 lanes above it can never do anything but
+    add a second uncontended acquire to the critical path.
+  </p>
+
+  <div class="fig wide">
+    <div class="figlabel">Figure 2 — write_edge, from call to durable commit</div>
+    <svg viewBox="0 0 980 470" role="img" aria-label="Write path sequence with lock nesting and sequential reads">
+      <text x="14" y="20" class="svg-t2">LOCK LADDER</text>
+
+      <rect x="14" y="30" width="300" height="26" class="svg-box-cool" rx="2"/>
+      <text x="24" y="47" class="svg-t">1 · graph_write_gate — Semaphore(N)</text>
+      <text x="322" y="47" class="svg-t3">backpressure_policy.max_concurrent_graph_writes</text>
+
+      <rect x="30" y="62" width="300" height="26" class="svg-box-cool" rx="2"/>
+      <text x="40" y="79" class="svg-t">2 · writer_lane[hash(cell) % 64]</text>
+      <text x="338" y="79" class="svg-t3">intended sharding — defeated by 3</text>
+
+      <rect x="46" y="94" width="300" height="26" class="svg-box-hot" rx="2"/>
+      <text x="56" y="111" class="svg-t">3 · local_write_guard — ONE per shard</text>
+      <text x="354" y="111" class="svg-tc">W1 — global serialisation of all writes</text>
+
+      <rect x="62" y="126" width="300" height="26" class="svg-box-hot" rx="2"/>
+      <text x="72" y="143" class="svg-t">4 · refresh_writer_fence()</text>
+      <text x="370" y="143" class="svg-tc">W2 — manifest refresh per write, inside 3</text>
+
+      <line x1="14" y1="168" x2="966" y2="168" class="svg-line"/>
+      <text x="14" y="188" class="svg-t2">INSIDE ONE SERIALIZABLE-SNAPSHOT TRANSACTION — all awaits sequential</text>
+
+      <rect x="14" y="200" width="120" height="34" class="svg-box-warm" rx="2"/>
+      <text x="24" y="216" class="svg-t">GET idem key</text>
+      <text x="24" y="229" class="svg-t3">hit ⇒ return</text>
+
+      <rect x="150" y="200" width="120" height="34" class="svg-box-warm" rx="2"/>
+      <text x="160" y="216" class="svg-t">GET out_edge</text>
+      <text x="160" y="229" class="svg-t3">+ segment scan</text>
+
+      <rect x="286" y="200" width="120" height="34" class="svg-box-warm" rx="2"/>
+      <text x="296" y="216" class="svg-t">GET vertex src</text>
+      <text x="296" y="229" class="svg-t3">metadata merge</text>
+
+      <rect x="422" y="200" width="120" height="34" class="svg-box-warm" rx="2"/>
+      <text x="432" y="216" class="svg-t">GET vertex dst</text>
+      <text x="432" y="229" class="svg-t3">metadata merge</text>
+
+      <rect x="558" y="200" width="120" height="34" class="svg-box-warm" rx="2"/>
+      <text x="568" y="216" class="svg-t">GET edge meta</text>
+
+      <rect x="694" y="200" width="120" height="34" class="svg-box-warm" rx="2"/>
+      <text x="704" y="216" class="svg-t">GET degree_out</text>
+
+      <rect x="830" y="200" width="136" height="34" class="svg-box-warm" rx="2"/>
+      <text x="840" y="216" class="svg-t">GET degree_in</text>
+      <text x="840" y="229" class="svg-t3">if reverse index</text>
+
+      <path d="M 134 217 L 150 217" class="svg-flow" marker-end="url(#a2)"/>
+      <path d="M 270 217 L 286 217" class="svg-flow" marker-end="url(#a2)"/>
+      <path d="M 406 217 L 422 217" class="svg-flow" marker-end="url(#a2)"/>
+      <path d="M 542 217 L 558 217" class="svg-flow" marker-end="url(#a2)"/>
+      <path d="M 678 217 L 694 217" class="svg-flow" marker-end="url(#a2)"/>
+      <path d="M 814 217 L 830 217" class="svg-flow" marker-end="url(#a2)"/>
+
+      <text x="14" y="258" class="svg-tc">W4 — 6–7 round trips in series, each DurabilityLevel::Remote, all holding lock 3</text>
+
+      <line x1="14" y1="274" x2="966" y2="274" class="svg-line"/>
+      <text x="14" y="294" class="svg-t2">BUFFERED PUTS (cheap, in-memory until commit)</text>
+
+      <rect x="14" y="304" width="150" height="26" class="svg-box" rx="2"/>
+      <text x="24" y="321" class="svg-t">out_edge record</text>
+      <rect x="176" y="304" width="150" height="26" class="svg-box" rx="2"/>
+      <text x="186" y="321" class="svg-t">in_edge record</text>
+      <rect x="338" y="304" width="150" height="26" class="svg-box" rx="2"/>
+      <text x="348" y="321" class="svg-t">degree counters</text>
+      <rect x="500" y="304" width="150" height="26" class="svg-box" rx="2"/>
+      <text x="510" y="321" class="svg-t">idempotency rec</text>
+      <rect x="662" y="304" width="304" height="26" class="svg-box-warm" rx="2"/>
+      <text x="672" y="321" class="svg-t">matrix_dirty + adjacency_generation</text>
+      <text x="672" y="341" class="svg-th">W6 — re-put per edge in batches, same key every time</text>
+
+      <line x1="14" y1="356" x2="966" y2="356" class="svg-line"/>
+
+      <rect x="14" y="370" width="460" height="40" class="svg-box-hot" rx="2"/>
+      <text x="24" y="387" class="svg-t">commit_txn_traced → SlateDB commit(await_durable)</text>
+      <text x="24" y="403" class="svg-tc">W3 — one WAL PUT per mutation; no group commit across callers</text>
+
+      <rect x="490" y="370" width="476" height="40" class="svg-box" rx="2"/>
+      <text x="500" y="387" class="svg-t">retry on conflict → yield_now() → repeat from the top</text>
+      <text x="500" y="403" class="svg-t3">up to GRAPH_TXN_MAX_RETRIES = 32, no backoff, re-does every GET above</text>
+
+      <text x="14" y="440" class="svg-t2">THROUGHPUT CEILING  ≈  1 / (lock-3 hold time)  =  1 / (fence refresh + 7 reads + durable commit)</text>
+      <text x="14" y="458" class="svg-t3">independent of cell count, independent of writer_lane count, independent of client concurrency</text>
+
+      <defs>
+        <marker id="a2" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 z" fill="currentColor" class="svg-t"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <p class="caption">
+    The ledger for one <code>write_edge</code>. The batch path has the same structure with the
+    per-mutation reads multiplied by batch size — see W5.
+  </p>
+
+  <h3>The batch path is the single path, N times</h3>
+  <p>
+    <code>write_edge_mutations_batch_txn_locked</code> is where ingest throughput is
+    actually decided, and it is a straight <code>for</code> loop over mutations with an
+    <code>.await</code> per storage lookup inside it
+    (<span class="src">src/shard/write.rs:4166</span>). Per mutation: a GET on the
+    idempotency key, a GET on the out-edge key, and — on the insert path — a prefix
+    scan of that source's segments. Then, after the loop, one GET per distinct
+    <code>(edge_type, src)</code> to read the degree counter forward.
+  </p>
+  <p>
+    For a 1 024-edge batch across 1 024 distinct sources, that is roughly 3 000
+    sequential storage operations inside one transaction, inside the global write
+    mutex. There is no <code>get_batch</code>, no <code>join_all</code>, no pipelining. If the
+    average lookup costs 200 µs against a warm local cache, the batch costs 600 ms
+    before the commit even starts, and no other write in the process can proceed
+    during it.
+  </p>
+</section>
+
+<!-- ==================== 3 ==================== -->
+<section id="s3">
+  <p class="eyebrow">03 — Findings</p>
+  <h2>Write path, ranked</h2>
+
+  <div class="keeps">
+    <div class="keep">
+      <span class="kk">W1 · crit</span>
+      <span class="kv"><b>One mutex for every write in the process.</b>
+        <code>acquire_local_write_guard</code> takes the shard-wide <code>local_write_guard</code>
+        and ignores its <code>cell_id</code> parameter, so the 64 <code>writer_lanes</code> above it
+        are dead weight. Multi-tenant write throughput does not scale with cells, cores, or
+        client concurrency.
+        <span class="src">src/shard/lifecycle.rs:256 · src/core/state.rs:81 · src/shard/lifecycle.rs:187</span>
+      </span>
+    </div>
+    <div class="keep">
+      <span class="kk">W2 · crit</span>
+      <span class="kv"><b>A manifest refresh on every write attempt, inside that mutex.</b>
+        <code>refresh_writer_fence</code> takes <code>writer_open_gate</code> and calls
+        <code>writer.refresh_manifest()</code>. It is a fencing check, and it is correct to
+        make one — but making it per attempt rather than per interval puts a SlateDB
+        manifest operation on the serialised critical path of every mutation. Retries
+        re-pay it 32 times.
+        <span class="src">src/core/state.rs:428 · src/shard/lifecycle.rs:264</span>
+      </span>
+    </div>
+    <div class="keep">
+      <span class="kk">W3 · crit</span>
+      <span class="kv"><b>No group commit.</b> Each mutation commits its own transaction with
+        <code>await_durable</code>. Because W1 serialises callers, concurrent writers cannot
+        amortise a WAL flush between them — the classic fix (batch the queue behind the lock
+        into one transaction) is unavailable while the lock is held for the whole
+        read-modify-write.
+        <span class="src">src/shard/write.rs:2934 · src/codec.rs:137</span>
+      </span>
+    </div>
+    <div class="keep">
+      <span class="kk">W4 · high</span>
+      <span class="kv"><b>Six to seven sequential reads before the first put.</b> Idempotency,
+        edge existence, segment scan, two vertex metadata reads, edge metadata, and one or two
+        degree counters — each an independent key, each awaited in order. They are independent
+        of one another and could be issued concurrently.
+        <span class="src">src/shard/write.rs:2756–2901</span>
+      </span>
+    </div>
+    <div class="keep">
+      <span class="kk">W5 · high</span>
+      <span class="kv"><b>Batch writes are N serial single writes.</b> No batched
+        <code>get</code>, no concurrency across mutations, no reuse of the segment scan across
+        the batch except a per-<code>(type, src)</code> memo built lazily inside the loop.
+        <span class="src">src/shard/write.rs:4166–4324</span>
+      </span>
+    </div>
+    <div class="keep" data-v="ok">
+      <span class="kk">W6 · fixed</span>
+      <span class="kv"><b>The dirty marker was re-written once per edge. It is now once per batch.</b>
+        <code>mark_adjacency_dirty_txn</code> has become
+        <code>mark_topology_change_txn</code>, which takes the whole
+        <code>&amp;[(VertexId, VertexId, bool)]</code> change set and is called once per
+        transaction rather than once per inserted edge — so the two fixed keys and the
+        <code>write.index_update</code> span are paid once, not N times. The change-set
+        parameter also feeds the xlog coverage floor the incremental builder relies on.
+        <span class="src">src/shard/write.rs:5740</span>
+      </span>
+    </div>
+    <div class="keep" data-v="med">
+      <span class="kk">W7 · med</span>
+      <span class="kv"><b>Every write formats a token it never uses.</b>
+        <code>LocalWriteGuard::new</code> builds <code>"{millis}-{pid}-{counter}"</code> with a
+        <code>SystemTime::now()</code> syscall, and <code>renew()</code>/<code>release()</code> are
+        both <code>Ok(())</code>. Vestigial from an era when the guard was a distributed lease.
+        <span class="src">src/core/state.rs:999–1015</span>
+      </span>
+    </div>
+    <div class="keep" data-v="med">
+      <span class="kk">W8 · med</span>
+      <span class="kv"><b>Keys are heap strings built with <code>format!</code>.</b> A single
+        batched edge insert allocates a fresh <code>String</code> for the idempotency key, the
+        out-edge key, the in-edge key, both degree keys, and both dirty-marker keys — seven
+        allocations plus integer formatting per edge, then <code>as_bytes()</code> to hand them
+        to SlateDB. A <code>SmallVec</code>-backed byte-key builder would remove the allocation
+        entirely.
+        <span class="src">src/keys.rs</span>
+      </span>
+    </div>
+    <div class="keep" data-v="med">
+      <span class="kk">W9 · med</span>
+      <span class="kv"><b>Retry has no backoff.</b> A serialisable conflict retries after
+        <code>tokio::task::yield_now()</code> — 32 times, immediately, re-executing the full
+        read chain each time. Under contention this converts one slow write into 32×
+        the storage load.
+        <span class="src">src/shard/write.rs:2567–2588</span>
+      </span>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== 4 ==================== -->
+<section id="s4">
+  <p class="eyebrow">04 — Read path</p>
+  <h2>What one query actually does</h2>
+  <p class="lede">
+    A four-rung dispatch ladder. Rung one is a compiled sparse kernel over an immutable
+    CSC index and is genuinely fast. The fall-through is a full scan with an N+1
+    hydration loop — and the conditions that trigger the fall-through are more common
+    than they look.
+  </p>
+
+  <div class="fig wide">
+    <div class="figlabel">Figure 3 — execute_opencypher_rows, and where a query can fall off the fast path</div>
+    <svg viewBox="0 0 980 560" role="img" aria-label="Read path dispatch ladder with fall-through conditions">
+      <rect x="14" y="14" width="220" height="34" class="svg-box" rx="2"/>
+      <text x="24" y="30" class="svg-t">Cypher string + params</text>
+      <text x="24" y="43" class="svg-t3">from Bolt RUN / HTTPS</text>
+
+      <rect x="254" y="14" width="240" height="34" class="svg-box-hot" rx="2"/>
+      <text x="264" y="30" class="svg-t">parsed_row_query_cache</text>
+      <text x="264" y="43" class="svg-tc">R7 — bypassed entirely if params ≠ ∅</text>
+
+      <rect x="514" y="14" width="220" height="34" class="svg-box" rx="2"/>
+      <text x="524" y="30" class="svg-t">plan + optimiser passes</text>
+
+      <rect x="754" y="14" width="212" height="34" class="svg-box" rx="2"/>
+      <text x="764" y="30" class="svg-t">pin snapshot, read_epoch</text>
+
+      <path d="M 234 31 L 254 31" class="svg-flow" marker-end="url(#a3)"/>
+      <path d="M 494 31 L 514 31" class="svg-flow" marker-end="url(#a3)"/>
+      <path d="M 734 31 L 754 31" class="svg-flow" marker-end="url(#a3)"/>
+
+      <line x1="14" y1="62" x2="966" y2="62" class="svg-line"/>
+      <text x="14" y="80" class="svg-t2">DISPATCH LADDER — first match wins  ·  src/shard/query.rs:710</text>
+
+      <rect x="14" y="92" width="640" height="30" class="svg-box-ok" rx="2"/>
+      <text x="24" y="112" class="svg-t">1 · graph kernel row query — variable-hop reachability, count, node-id window</text>
+      <rect x="14" y="126" width="640" height="26" class="svg-box-cool" rx="2"/>
+      <text x="24" y="144" class="svg-t">2 · source-relationship-id rows</text>
+      <rect x="14" y="156" width="640" height="26" class="svg-box-cool" rx="2"/>
+      <text x="24" y="174" class="svg-t">3 · relationship count</text>
+      <rect x="14" y="186" width="640" height="26" class="svg-box-cool" rx="2"/>
+      <text x="24" y="204" class="svg-t">4 · relationship rows</text>
+      <rect x="14" y="216" width="640" height="34" class="svg-box-hot" rx="2"/>
+      <text x="24" y="233" class="svg-t">5 · generic row engine — match_row_patterns → hydrate → project → sort</text>
+      <text x="24" y="246" class="svg-tc">R11/R12 — full edge-type scan, per-row metadata GETs, sort-then-window</text>
+
+      <rect x="674" y="92" width="292" height="158" class="svg-box" rx="2"/>
+      <text x="684" y="110" class="svg-t2">FALL-THROUGH TRIGGERS</text>
+      <text x="684" y="130" class="svg-t3">· no CSC generation published yet</text>
+      <text x="684" y="146" class="svg-t3">· snapshot.seq() ≠ read_epoch  (R2)</text>
+      <text x="684" y="162" class="svg-t3">· graphblas cache miss + no newer gen</text>
+      <text x="684" y="178" class="svg-t3">· WAL tail Unavailable (files collected)</text>
+      <text x="684" y="194" class="svg-t3">· tail exceeds max_query_scan_edges</text>
+      <text x="684" y="210" class="svg-t3">· sparse_kernel == Adjacency</text>
+      <text x="684" y="234" class="svg-tc">each returns Ok(None) — silent demotion</text>
+
+      <line x1="14" y1="264" x2="966" y2="264" class="svg-line"/>
+      <text x="14" y="282" class="svg-t2">RUNG 1 IN DETAIL — the compiled path</text>
+
+      <rect x="14" y="294" width="176" height="46" class="svg-box-warm" rx="2"/>
+      <text x="24" y="311" class="svg-t">artifact lookup</text>
+      <text x="24" y="326" class="svg-t3">cache scan, else</text>
+      <text x="24" y="338" class="svg-th">object-store GET (R10)</text>
+
+      <rect x="204" y="294" width="176" height="46" class="svg-box-warm" rx="2"/>
+      <text x="214" y="311" class="svg-t">graphblas_cache</text>
+      <text x="214" y="326" class="svg-t3">miss ⇒ decode CSC</text>
+      <text x="214" y="338" class="svg-t3">+ compile (gated)</text>
+
+      <rect x="394" y="294" width="252" height="46" class="svg-box-hot" rx="2"/>
+      <text x="404" y="311" class="svg-t">WAL tail: base_seq+1 … read_epoch</text>
+      <text x="404" y="326" class="svg-th">WAL files cached by id, fetched in parallel</text>
+      <text x="404" y="338" class="svg-th">edge resolution also parallel; file-count gate</text>
+
+      <rect x="660" y="294" width="306" height="46" class="svg-box-ok" rx="2"/>
+      <text x="670" y="311" class="svg-t">expand_range_with_overlay → SuiteSparse</text>
+      <text x="670" y="326" class="svg-t3">spawn_blocking; queue time counted separately</text>
+      <text x="670" y="338" class="svg-t3">src/shard/query.rs:9 (kernel.expand span)</text>
+
+      <path d="M 190 317 L 204 317" class="svg-flow" marker-end="url(#a3)"/>
+      <path d="M 380 317 L 394 317" class="svg-flow" marker-end="url(#a3)"/>
+      <path d="M 646 317 L 660 317" class="svg-flow-hot" marker-end="url(#a3h)"/>
+
+      <line x1="14" y1="356" x2="966" y2="356" class="svg-line"/>
+      <text x="14" y="374" class="svg-t2">THE WAL TAIL, EXPANDED  ·  src/shard/topology_tail.rs:83</text>
+
+      <rect x="14" y="386" width="120" height="30" class="svg-box" rx="2"/>
+      <text x="24" y="405" class="svg-t">wal_id = G+1</text>
+      <rect x="144" y="386" width="120" height="30" class="svg-box" rx="2"/>
+      <text x="154" y="405" class="svg-t">wal_id = G+2</text>
+      <rect x="274" y="386" width="120" height="30" class="svg-box" rx="2"/>
+      <text x="284" y="405" class="svg-t">…</text>
+      <rect x="404" y="386" width="120" height="30" class="svg-box" rx="2"/>
+      <text x="414" y="405" class="svg-t">wal_id = last</text>
+      <text x="534" y="405" class="svg-t3">→ decode every entry, filter to this cell + edge type</text>
+
+      <rect x="14" y="424" width="510" height="30" class="svg-box-hot" rx="2"/>
+      <text x="24" y="443" class="svg-t">for each affected (src,dst):  edge_exists_in_storage_snapshot()</text>
+      <text x="534" y="443" class="svg-tc">= 2 GETs + 1 prefix scan, each</text>
+
+      <rect x="14" y="462" width="952" height="30" class="svg-box-warm" rx="2"/>
+      <text x="24" y="481" class="svg-t">result: GraphTopologyOverlay — still not memoised across queries on (cell, edge_type, base_seq, read_epoch)  [R1b]</text>
+
+      <text x="14" y="516" class="svg-t2">READ LATENCY  ∝  (WAL FILES since last publish)  ·  request-bound, not data-bound</text>
+      <text x="14" y="534" class="svg-t3">A request costs the same whether it returns one useful edge or forty thousand — see incremental-build-cost.html.</text>
+      <text x="14" y="548" class="svg-t3">The max_wal_tail_files gate now declines the walk rather than grinding through it; the query then demotes to rung 5.</text>
+
+      <defs>
+        <marker id="a3" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 z" fill="currentColor" class="svg-t"/>
+        </marker>
+        <marker id="a3h" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 z" fill="currentColor" class="svg-tc"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+  <p class="caption">
+    The compiled path is good. The problem is everything that must be true for a query to
+    stay on it, and the fact that the overlay work is redone from scratch every time.
+  </p>
+
+  <h3>The tail is the architecture's load-bearing shortcut, and its sharpest edge</h3>
+  <p>
+    Serving an index generation built at sequence <em>N</em> for a query pinned at
+    <em>M</em> by replaying <em>N+1..M</em> from the WAL is what lets writes be visible
+    without waiting for an index cycle. It is a good design, and its sharp edge has
+    already been found and filed down once.
+  </p>
+  <p>
+    The edge was that the cost is <em>request-bound</em>, not data-bound: the delta is
+    stored as one tiny WAL file per flush, so the price tracks the number of write
+    flushes rather than the number of changed edges. A tenant trickling 200 edges over
+    twenty minutes produces far more files — and therefore far more cost — than a bulk
+    load writing 100k edges in ten seconds. That anatomy, measured on staging, is
+    <code>interactive/incremental-build-cost.html</code>, and its fix ladder landed:
+    parsed WAL files are cached by id, file fetches and per-edge resolution both run
+    through <code>buffered(...)</code>, and <code>max_wal_tail_files</code> declines a walk
+    that would be too expensive rather than performing it.
+  </p>
+  <p>
+    What survives is smaller and worth stating precisely. Two queries arriving a
+    millisecond apart against the same cell, edge type and <code>read_epoch</code> still
+    resolve the same affected edges and build byte-identical overlays independently.
+    The <em>files</em> are cached; the <em>overlay</em> is not. There is still no memo on
+    <code>(cell, edge_type, base_sequence, read_epoch)</code>, which is exactly the key
+    that would make the second one free — and
+    <code>build_graph_index_incremental</code>'s own doc comment still says the read path
+    computes this delta "and then throws away". That is R1b, and unlike the original R1
+    it deserves a measurement before a fix.
+  </p>
+
+  <h3>Every kernel read excludes the memtable</h3>
+  <p>
+    <code>remote_read_options()</code> pins <code>durability_filter: DurabilityLevel::Remote</code>,
+    which SlateDB defines as "only data currently stored durably in object storage" —
+    the default is <code>Memory</code>, which also serves the in-memory unflushed data.
+    Block caching has since been made size-aware, but the durability filter has not.
+  </p>
+  <pre class="listing bad"><b>src/codec.rs:162</b>
+pub(crate) fn remote_read_options() -> ReadOptions {
+    ReadOptions { durability_filter: <i>DurabilityLevel::Remote</i>, ..Default::default() }
+}
+
+pub(crate) fn remote_scan_options() -> ScanOptions {
+    ScanOptions::default()
+        .with_durability_filter(<i>DurabilityLevel::Remote</i>)
+        .with_cache_blocks(<i>false</i>)
+}
+
+<u>// added since: the right half of the original finding</u>
+pub(crate) fn remote_scan_options_for_expected_items(expected_items: usize) -> ScanOptions {
+    ScanOptions::default()
+        .with_durability_filter(<i>DurabilityLevel::Remote</i>)
+        .with_cache_blocks(<u>expected_items &lt;= MAX_CACHED_REMOTE_SCAN_ITEMS</u>)
+}</pre>
+  <p>
+    The block-cache half is now handled the way it should be: a small repeated scan
+    populates the cache, a large one-shot scan does not evict the working set, and the
+    caller's own size estimate decides which it is. Call sites still using the
+    unconditional <code>remote_scan_options()</code> are worth auditing individually, but
+    the mechanism exists.
+  </p>
+  <p>
+    The durability filter is untouched, and it is the larger of the two.
+    <code>Remote</code> is presumably deliberate — it keeps snapshot semantics honest
+    against a fenced writer — but it means a read-your-write workload pays
+    object-store-cache latency for data written microseconds ago, on <em>every</em>
+    kernel read. That is still the single highest-leverage measurement in the plan:
+    flip it in a branch build and diff the flamegraph (B4). If the delta is large, the
+    correctness argument deserves re-examining per call site rather than being applied
+    globally — and if it is small, this finding should be struck.
+  </p>
+</section>
+
+<!-- ==================== 5 ==================== -->
+<section id="s5">
+  <p class="eyebrow">05 — Findings</p>
+  <h2>Read path, ranked</h2>
+
+  <div class="keeps">
+    <div class="keep" data-v="ok">
+      <span class="kk">R1 · fixed</span>
+      <span class="kv"><b>The WAL-tail walk was serial, uncached and unbounded. All three are now addressed.</b>
+        This was the headline read-path finding and it is no longer accurate. Current
+        <code>topology_tail_since</code> carries a <code>WalTailFileCache</code> of parsed WAL
+        files keyed by WAL id — a WAL id names an immutable object, so a cached parse never
+        goes stale and eviction exists only to bound memory. File fetches and per-edge
+        resolution both run through <code>buffered(wal_tail_fetch_concurrency())</code>
+        instead of a serial loop, and a <code>max_wal_tail_files</code> gate declines the
+        walk rather than grinding through it. The reasoning is
+        <code>interactive/incremental-build-cost.html</code>; the shape of the fix is that
+        note's L0–L3 ladder.
+        <span class="src">src/shard/topology_tail.rs:219–360</span>
+      </span>
+    </div>
+    <div class="keep" data-v="high">
+      <span class="kk">R1b · med</span>
+      <span class="kv"><b>What remains: the overlay itself is still per-query.</b> The
+        <em>files</em> are cached and the fetches are parallel, but the resulting
+        <code>GraphTopologyOverlay</code> is not memoised. Two queries against the same
+        <code>(cell, edge_type, base_sequence, read_epoch)</code> still resolve the same
+        affected edges independently — cheaper than before, and still duplicated work on a
+        key that is exactly available. Much smaller than the original finding; worth a
+        measurement before a fix.
+        <span class="src">src/shard/topology_tail.rs:335–359</span>
+      </span>
+    </div>
+    <div class="keep">
+      <span class="kk">R2 · crit</span>
+      <span class="kv"><b>Any concurrent write knocks a query off the compiled path.</b>
+        <code>compiled_graphblas_query_snapshot</code> pins a fresh snapshot and returns
+        <code>Ok(None)</code> if <code>snapshot.seq() != read_epoch</code>. Under a mixed
+        read/write workload this fires constantly, and the fall-through is the rung-5 full
+        scan. The counter that would show it —
+        <code>graph_query_rust_sparse_fallbacks</code> — exists; nothing charts it.
+        <span class="src">src/shard/query.rs:5556 · src/shard/topology_tail.rs:90</span>
+      </span>
+    </div>
+    <div class="keep">
+      <span class="kk">R3 · high</span>
+      <span class="kv"><b><code>snapshot_at</code> hard-errors unless the epoch is exactly current.</b>
+        The batch neighbour APIs read <code>current_epoch</code> and then call
+        <code>snapshot_at</code> with it; a write landing in between turns the query into an
+        <code>UnsupportedQuery</code> error rather than a slightly-stale read. Availability
+        degrades with write rate.
+        <span class="src">src/shard/lifecycle.rs:706–733 · src/shard/query.rs:5703</span>
+      </span>
+    </div>
+    <div class="keep">
+      <span class="kk">R4 · high</span>
+      <span class="kv"><b>Frontier expansion is serial, one source at a time.</b>
+        <code>out_neighbors_batch_at_with_cancellation</code> and
+        <code>reachable_from_storage_frontier</code> both loop
+        <code>for source in frontier { …await… }</code>. Each source costs three prefix scans
+        (edges, segment tombstones, segments). A 1 000-node frontier is 3 000 sequential
+        scans where the snapshot is immutable and they could all run concurrently.
+        <span class="src">src/shard/query.rs:5751 · src/shard/query.rs:5143 · src/shard/query.rs:130</span>
+      </span>
+    </div>
+    <div class="keep" data-v="high">
+      <span class="kk">R5 · partly fixed</span>
+      <span class="kv"><b>Block caching is now size-aware; the durability filter is not.</b>
+        <code>remote_scan_options_for_expected_items</code> enables
+        <code>cache_blocks</code> when a scan expects at most
+        <code>MAX_CACHED_REMOTE_SCAN_ITEMS</code>, so small repeated scans populate the cache
+        and only large one-shot scans bypass it — which was the right half of the original
+        finding. Unchanged: <em>every</em> kernel read still sets
+        <code>DurabilityLevel::Remote</code>, which SlateDB defines as excluding in-memory
+        unflushed data. A read-your-write workload still pays object-store-cache latency for
+        data written microseconds ago. That is plausibly deliberate, and B4 exists to price
+        it rather than presume it wrong.
+        <span class="src">src/codec.rs:162–180</span>
+      </span>
+    </div>
+    <div class="keep">
+      <span class="kk">R6 · high</span>
+      <span class="kv"><b>One heap <code>String</code> allocated per key, per scanned row.</b>
+        Every scan loop in the codebase does
+        <code>String::from_utf8_lossy(&amp;kv.key).into_owned()</code> before parsing — including
+        the hot ones. On a million-edge scan that is a million allocations whose only purpose
+        is to hold a key that is already valid UTF-8 in a borrowed buffer.
+        <code>std::str::from_utf8(&amp;kv.key)</code> borrows instead, as
+        <code>collect_topology_entry</code> already does.
+        <span class="src">src/shard/query.rs:116,147,158,177 · src/codec.rs:23,83,103 · src/engine/artifact_build.rs:606</span>
+      </span>
+    </div>
+    <div class="keep">
+      <span class="kk">R7 · high</span>
+      <span class="kv"><b>Parameterised queries never hit the plan cache.</b>
+        <code>parsed_opencypher_row_query</code> returns early whenever
+        <code>parameters</code> is non-empty, so every query from a Neo4j driver — which
+        parameterises by default — re-runs <code>libcypher-parser</code> and the full lowering
+        on every execution. The cache only serves literal-embedded SQL-injection-shaped
+        queries. Splitting parse (parameter-independent) from parameter substitution would
+        make the cache serve the workload it was built for.
+        <span class="src">src/shard/query.rs:501</span>
+      </span>
+    </div>
+    <div class="keep">
+      <span class="kk">R8 · high</span>
+      <span class="kv"><b>The bounded cache is an O(n) LRU behind an exclusive async mutex.</b>
+        <code>BoundedGraphCache::get</code> takes <code>&amp;mut self</code>, so even a hit needs the
+        exclusive <code>tokio::sync::Mutex</code>; <code>evict_one</code> linearly scans the whole
+        <code>BTreeMap</code> for the minimum <code>last_access</code> and runs in a
+        <code>while</code> loop until under budget; <code>get_latest_by</code> — the artifact
+        lookup on every compiled query — scans every entry. Every query serialises on these.
+        <span class="src">src/core/cache.rs:241,355,248 · src/engine/artifact_build.rs:564</span>
+      </span>
+    </div>
+    <div class="keep" data-v="high">
+      <span class="kk">R9 · med</span>
+      <span class="kv"><b>Cache keys allocate two <code>String</code>s per lookup.</b>
+        <code>MatrixCacheKey::new(cell_id, edge_type, epoch)</code> and its four siblings
+        <code>to_string()</code> both components on construction — including on the read-only
+        probe path, before it is known whether an insert will happen.
+        <span class="src">src/core/cache.rs:11–117</span>
+      </span>
+    </div>
+    <div class="keep" data-v="high">
+      <span class="kk">R10 · med</span>
+      <span class="kv"><b>A generation-map miss becomes an object-store GET on the query path.</b>
+        <code>graph_index_generation_at</code> → <code>discover_graph_index</code> →
+        <code>current_graph_index</code> does an unconditional
+        <code>object_store().get(current_ptr)</code>. There is no negative cache and no TTL, so a
+        cold or evicted entry costs a full round trip mid-query, twice in the refresh-retry
+        branch.
+        <span class="src">src/engine/index_store.rs:64,85,388</span>
+      </span>
+    </div>
+    <div class="keep" data-v="high">
+      <span class="kk">R11 · med</span>
+      <span class="kv"><b>The rung-5 row engine is a textbook N+1.</b>
+        <code>match_edge_row_pattern_full_scan</code> materialises every edge of the type, then
+        per edge calls <code>push_matching_edge_row</code>, which does a relationship lookup plus
+        two metadata hydrations — each an awaited storage read, memoised only within the one
+        query.
+        <span class="src">src/shard/query.rs:3599–3694</span>
+      </span>
+    </div>
+    <div class="keep" data-v="high">
+      <span class="kk">R12 · med</span>
+      <span class="kv"><b><code>LIMIT</code> is applied after everything is built and sorted.</b>
+        <code>finish_projected_rows</code> dedupes, sorts, and only then skips and truncates.
+        <code>MATCH …&nbsp;RETURN&nbsp;… LIMIT 10</code> over a million matches builds and sorts a
+        million rows. Relatedly, <code>out_neighbors_at_for_query</code> scans every edge of the
+        type and filters <code>edge.src == src</code> — an O(E) full scan for a single-source
+        adjacency lookup.
+        <span class="src">src/shard/query.rs:4597 · src/shard/query.rs:5930</span>
+      </span>
+    </div>
+    <div class="keep" data-v="med">
+      <span class="kk">R13 · med</span>
+      <span class="kv"><b>Overlay deletions are quadratic in the frontier.</b>
+        In <code>expand_range_with_overlay</code>, removing a destination runs
+        <code>frontier.iter().any(…)</code> with a <code>compiled_graphblas_contains_edge</code>
+        probe inside, per changed destination per hop. Delete-heavy workloads with wide
+        frontiers pay |frontier| × |changes| kernel probes.
+        <span class="src">src/shard/topology_tail.rs:217–239</span>
+      </span>
+    </div>
+    <div class="keep" data-v="med">
+      <span class="kk">R14 · med</span>
+      <span class="kv"><b><code>graph_index_generations</code> is unbounded.</b> Unlike its
+        neighbours it is a bare <code>Mutex&lt;BTreeMap&gt;</code> with no entry cap and no byte
+        budget — it grows by one entry per generation discovered, for the process lifetime,
+        removed only by <code>forget_graph_index_generation</code>.
+        <span class="src">src/core/state.rs:87</span>
+      </span>
+    </div>
+    <div class="keep" data-v="med">
+      <span class="kk">R15 · med</span>
+      <span class="kv"><b><code>in_neighbors</code> without a reverse index materialises the whole graph.</b>
+        The <code>else</code> branch calls <code>canonical_adjacency_at</code> for the entire edge
+        type and then filters, for any number of requested destinations.
+        <span class="src">src/shard/query.rs:5849</span>
+      </span>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== 6 ==================== -->
+<section id="s6">
+  <p class="eyebrow">06 — Cross-cutting</p>
+  <h2>Three things that are true of both paths</h2>
+
+  <div class="grid2">
+    <div class="card">
+      <h4>Async, but not concurrent</h4>
+      <p>
+        Both paths are written as <code>async fn</code> and both are effectively sequential.
+        Every fan-out — batch mutations, frontier expansion, tail edge resolution, batch
+        existence checks — is a <code>for</code> loop with an <code>.await</code> in the body.
+      </p>
+      <p>
+        The pinned snapshot makes these trivially parallelisable: reads against
+        <code>GraphStorageSnapshot</code> are immutable and independent. A bounded
+        <code>buffer_unordered</code> over the same work would turn latency-bound loops into
+        throughput-bound ones without touching semantics.
+      </p>
+    </div>
+    <div class="card">
+      <h4>Allocation per unit of work</h4>
+      <p>
+        A <code>String</code> per key built, a <code>String</code> per key parsed, two
+        <code>String</code>s per cache probe, a token string per write, a
+        <code>BTreeSet</code>/<code>BTreeMap</code> per intermediate collection. None of it is
+        wrong; all of it is on the hot path.
+      </p>
+      <p>
+        These are the allocations a flamegraph will surface as a wide <code>malloc</code> /
+        <code>memcpy</code> band underneath otherwise-sensible frames. Fix them after the
+        structural items, not before — they are 10–30% wins under a 10× problem.
+      </p>
+    </div>
+    <div class="card">
+      <h4>Silent demotion</h4>
+      <p>
+        Six distinct conditions turn a compiled traversal into a full scan, and all six
+        return <code>Ok(None)</code>. The query still succeeds; it just costs a hundred times
+        more. From the outside this looks like unexplained p99 variance.
+      </p>
+      <p>
+        The instrumentation to see it already exists —
+        <code>artifact.lookup</code> records <code>turbolay.outcome</code>,
+        <code>storage.wal_tail</code> records <code>complete</code>/<code>unavailable</code>, and
+        <code>graph_query_rust_sparse_fallbacks</code> counts the demotions. Panel 4 of the
+        dashboard below is that signal.
+      </p>
+    </div>
+    <div class="card">
+      <h4>What is genuinely good</h4>
+      <p>
+        The metrics layer: 65 lock-free relaxed counters plus fixed-bucket histograms
+        designed specifically to avoid the OTel <code>RwLock</code> + <code>HashMap</code> +
+        per-attribute <code>Mutex</code> on the query path
+        (<span class="src">src/core/histogram.rs:1</span>). The span tree — <code>shard.write_txn</code>,
+        <code>storage.commit</code>, <code>artifact.lookup</code>, <code>storage.wal_tail</code>,
+        <code>kernel.expand</code> — is already shaped for exactly this investigation, including
+        counting <code>spawn_blocking</code> queue time separately from compute.
+      </p>
+      <p>
+        This means the dashboard in §09 is a config exercise, not an instrumentation
+        project.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== 7 ==================== -->
+<section id="s7">
+  <p class="eyebrow">07 — Benchmarks</p>
+  <h2>Turning each claim into a number</h2>
+  <p class="lede">
+    Every finding above is a hypothesis with a predicted shape. A benchmark is only
+    worth running if a specific finding predicts what it will show.
+  </p>
+
+  <p>
+    Four harnesses already exist and cover more ground than a new one would:
+    <code>examples/write_profile.rs</code> (ingest, batched and trusted-append, with the
+    bulk-import stage counters wired up), <code>examples/query_bench.rs</code> (cold/hot/
+    concurrent, parameterised by fan-out and hop count), <code>examples/batch_benchmark.rs</code>,
+    and <code>examples/incremental_index_bench.rs</code>. Run them through
+    <code>just</code>, not bare <code>cargo</code> — the FFI env vars are exported there.
+  </p>
+
+  <div class="tablewrap">
+    <table class="wide-tbl">
+      <thead>
+        <tr><th>#</th><th>Experiment</th><th>Tests</th><th>Method</th><th>Predicted result if the finding is real</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="m">B1</td>
+          <td class="note"><b>Write concurrency sweep</b></td>
+          <td class="m">W1 W2 W3</td>
+          <td class="note">Drive <code>write_edge</code> at client concurrency 1, 2, 4, 8, 16, 32 against a single shard, once with all writes to one cell and once spread over 64 cells.</td>
+          <td class="note">Throughput flat from concurrency 2 upward, and <em>identical</em> for 1 cell and 64 cells. That flatness is W1 stated as a graph.</td>
+        </tr>
+        <tr>
+          <td class="m">B2</td>
+          <td class="note"><b>Lock-hold decomposition</b></td>
+          <td class="m">W2 W3 W4</td>
+          <td class="note">Under B1's saturated case, take the ratio of <code>storage.commit</code> span duration to <code>shard.write_txn</code> span duration.</td>
+          <td class="note">Commit is a minority of the write. The majority is fence refresh + the sequential GET chain — which says group commit alone will not fix throughput.</td>
+        </tr>
+        <tr>
+          <td class="m">B3</td>
+          <td class="note"><b>Batch-size curve</b></td>
+          <td class="m">W5</td>
+          <td class="note"><code>write_profile</code> with <code>GRAPH_WRITE_PROFILE_BATCH_SIZE</code> ∈ {64, 256, 1024, 4096}; plot edges/s and per-edge latency.</td>
+          <td class="note">Per-edge cost roughly constant in batch size instead of falling — the batch amortises the commit but not the N serial reads.</td>
+        </tr>
+        <tr>
+          <td class="m">B4</td>
+          <td class="note"><b>Durability filter A/B</b></td>
+          <td class="m">R5</td>
+          <td class="note">Branch build flipping <code>remote_read_options</code> to <code>Memory</code>; run <code>query_bench</code> hot and cold, plus the correctness suite. The block-cache half is already handled by <code>remote_scan_options_for_expected_items</code>, so this now isolates the durability filter alone.</td>
+          <td class="note">A large hot-path delta with the correctness suite still green would make the global application of <code>Remote</code> the most valuable single thing to revisit.</td>
+        </tr>
+        <tr>
+          <td class="m">B5</td>
+          <td class="note"><b>Index-lag sweep</b></td>
+          <td class="m">R1b R2</td>
+          <td class="note">Publish one generation, then accumulate the delta two ways at equal edge count — as few large flushes and as many small ones — and measure the same 2-hop traversal after each. Vary <em>flush count</em>, not just edge count.</td>
+          <td class="note">Latency tracking WAL <em>file</em> count rather than edge count, confirming the cost is request-bound. With the file cache warm the second identical query should be much cheaper; if it is not, R1b is real and the overlay memo is worth building.</td>
+        </tr>
+        <tr>
+          <td class="m">B6</td>
+          <td class="note"><b>Mixed read/write</b></td>
+          <td class="m">R2 R3</td>
+          <td class="note">Steady 5k reads/s while stepping write rate 0 → 500/s; chart <code>graph_query_rust_sparse_fallbacks</code> rate and the <code>UnsupportedQuery</code> error class.</td>
+          <td class="note">Fallback rate climbing with write rate, and <code>snapshot_at</code> errors appearing at all. Reads and writes are supposed to be independent; this shows they are not.</td>
+        </tr>
+        <tr>
+          <td class="m">B7</td>
+          <td class="note"><b>Parameterised vs literal</b></td>
+          <td class="m">R7</td>
+          <td class="note">Same query 10 000 times, once with <code>$id</code> parameters and once with the value inlined. Compare <code>graph_cache_parsed_row_query_hits</code>.</td>
+          <td class="note">Zero hits in the parameterised run, and a per-query parse cost that shows up as a wide <code>libcypher-parser</code> band in the flamegraph.</td>
+        </tr>
+        <tr>
+          <td class="m">B8</td>
+          <td class="note"><b>Fan-out scaling</b></td>
+          <td class="m">R4</td>
+          <td class="note"><code>query_bench</code> across its existing fan-out ladder (50 → 10 000), on the storage-frontier path with the compiled kernel disabled.</td>
+          <td class="note">Wall time linear in frontier size with near-zero CPU utilisation — the signature of a latency-bound serial loop, and the case for <code>buffer_unordered</code>.</td>
+        </tr>
+        <tr>
+          <td class="m">B9</td>
+          <td class="note"><b>Cache-mutex contention</b></td>
+          <td class="m">R8</td>
+          <td class="note">Hot query, all cache hits, concurrency 1 → 64. Watch per-query latency and total throughput.</td>
+          <td class="note">Throughput plateauing well below core count on a workload doing no I/O at all — that plateau is the exclusive mutex on <code>BoundedGraphCache::get</code>.</td>
+        </tr>
+        <tr>
+          <td class="m">B10</td>
+          <td class="note"><b>LIMIT sensitivity</b></td>
+          <td class="m">R12</td>
+          <td class="note">Same <code>MATCH</code> with <code>LIMIT</code> 10 / 1 000 / 100 000 over a large match set.</td>
+          <td class="note">Latency independent of <code>LIMIT</code> — the row engine builds and sorts everything regardless.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="rule-box">
+    <span class="lbl">Bench hygiene</span>
+    Object store: run each experiment against both <code>local_object_store</code> and MinIO
+    (<code>scripts/minio_query_bench.sh</code>). A finding that only appears against S3-latency
+    storage is a different finding from one that appears on local disk — the serial-await
+    items (W4, W5, R4) should get dramatically worse against MinIO, and that difference is
+    the proof. Report edges/s and p50/p95/p99 separately; means hide exactly the demotion
+    behaviour this note is about.
+  </div>
+</section>
+
+<!-- ==================== 8 ==================== -->
+<section id="s8">
+  <p class="eyebrow">08 — Flamegraphs</p>
+  <h2>Four profiles, not one</h2>
+  <p class="lede">
+    A single mixed profile will show a flat, uninformative spread. Profile each path in
+    isolation, and profile the off-CPU time separately — most of these findings are
+    waiting, not computing.
+  </p>
+
+  <p>
+    Add a <code>[profile.profiling]</code> section inheriting <code>release</code> with
+    <code>debug = 1</code> and <code>strip = false</code> so symbols survive; the existing
+    release profile is what production runs, and the frame names are what makes a
+    flamegraph readable.
+  </p>
+
+  <pre class="listing shell"><b>Cargo.toml</b>
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false
+split-debuginfo = "packed"</pre>
+
+  <div class="tablewrap">
+    <table class="wide-tbl">
+      <thead>
+        <tr><th>#</th><th>Profile</th><th>Tool</th><th>Target</th><th>Look for</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="m">F1</td>
+          <td class="note"><b>On-CPU, write</b></td>
+          <td class="m">cargo-flamegraph / perf</td>
+          <td class="note"><code>write_profile</code>, batch 1024, saturated</td>
+          <td class="note">Width of <code>format!</code>/<code>alloc</code> under <code>keys::*</code> (W8); <code>refresh_manifest</code> (W2); encode/decode vs actual SlateDB work.</td>
+        </tr>
+        <tr>
+          <td class="m">F2</td>
+          <td class="note"><b>Off-CPU, write</b></td>
+          <td class="m">tokio-console, or <code>offcputime</code>/perf sched</td>
+          <td class="note">same workload</td>
+          <td class="note">Time parked on <code>local_write_guard</code>. This is the W1 proof: an off-CPU flamegraph dominated by one mutex is unambiguous in a way a CPU profile is not.</td>
+        </tr>
+        <tr>
+          <td class="m">F3</td>
+          <td class="note"><b>On-CPU, read (compiled)</b></td>
+          <td class="m">cargo-flamegraph</td>
+          <td class="note"><code>query_bench</code> hot, index fresh</td>
+          <td class="note">Split between SuiteSparse frames and everything around them. If the GraphBLAS band is thin, the kernel is not the cost — the plumbing is.</td>
+        </tr>
+        <tr>
+          <td class="m">F4</td>
+          <td class="note"><b>On-CPU, read (lagging index)</b></td>
+          <td class="m">cargo-flamegraph</td>
+          <td class="note"><code>query_bench</code> after B5's 100k-edge lag</td>
+          <td class="note">A <code>topology_tail_since</code> tower with <code>edge_exists_in_storage_snapshot</code> underneath it, plus <code>from_utf8_lossy</code>/<code>into_owned</code> (R6). Diffing F3 against F4 <em>is</em> the cost of R1.</td>
+        </tr>
+        <tr>
+          <td class="m">F5</td>
+          <td class="note"><b>Differential</b></td>
+          <td class="m">flamegraph.pl --negate</td>
+          <td class="note">B4's two builds</td>
+          <td class="note">Exactly what changes when the durability filter and block caching change. A differential graph answers B4 in one image.</td>
+        </tr>
+        <tr>
+          <td class="m">F6</td>
+          <td class="note"><b>Allocation</b></td>
+          <td class="m">heaptrack / dhat</td>
+          <td class="note">read and write, one run each</td>
+          <td class="note">Allocation count per edge processed. Ties W8, R6, and R9 to one number that is easy to track as a regression gate.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>
+    On macOS <code>perf</code> is unavailable and <code>samply</code> or Instruments is the
+    substitute; on Linux prefer <code>perf record -F 997 --call-graph dwarf</code>. Because
+    the traversal runs on <code>spawn_blocking</code>, make sure the profiler samples all
+    threads — the <code>kernel.expand</code> span already tells you how much of that duration
+    was queueing rather than working, so cross-check the two.
+  </p>
+
+  <div class="rule-box">
+    <span class="lbl">Add to the justfile</span>
+    <code>just flame-write</code> · <code>just flame-query</code> · <code>just flame-query-lagging</code> — each
+    exporting the same FFI env vars the other recipes do, writing SVGs to
+    <code>target/flamegraphs/&lt;name&gt;-&lt;git-sha&gt;.svg</code>. Naming by SHA is what makes the
+    before/after comparison possible three weeks later.
+  </div>
+</section>
+
+<!-- ==================== 9 ==================== -->
+<section id="s9">
+  <p class="eyebrow">09 — Grafana</p>
+  <h2>The dashboard, panel by panel</h2>
+  <p class="lede">
+    The node already exposes <code>/metrics</code> and the chart already ships a
+    <code>ServiceMonitor</code>. Everything below uses series that exist today; the two
+    gaps are flagged as such.
+  </p>
+
+  <p>
+    Five histogram families are exported with real buckets —
+    <code>graph_client_operation_read_duration_seconds</code>,
+    <code>graph_client_operation_write_duration_seconds</code>,
+    <code>graph_query_rows_duration_microseconds</code>, and the two transport families —
+    so <code>histogram_quantile</code> works. Everything else is a monotone counter, which
+    means stage timings come out as <em>means</em> (<code>rate(sum)/rate(count)</code>), not
+    quantiles. That is a real limitation and the runbook
+    <code>docs/runbooks/duration-histograms.md</code> already says the buckets carry
+    20–30% quantile error by design. Chart accordingly: these panels answer "did it move
+    2×", not "did p99 move 5 ms".
+  </p>
+
+  <h3>Row 1 — Is it healthy? <span class="chip ok">SLO</span></h3>
+  <div class="tablewrap">
+    <table class="wide-tbl">
+      <thead><tr><th>Panel</th><th>Query</th><th>Reads on</th></tr></thead>
+      <tbody>
+        <tr>
+          <td class="note"><b>Read latency quantiles</b></td>
+          <td class="m">histogram_quantile(0.5|0.95|0.99, sum by (le) (rate(graph_client_operation_read_duration_seconds_bucket[5m])))</td>
+          <td class="note">The top-line SLO. Overlay the three quantiles on one panel; divergence between p50 and p99 is the demotion signature.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Write latency quantiles</b></td>
+          <td class="m">histogram_quantile(…, rate(graph_client_operation_write_duration_seconds_bucket[5m]))</td>
+          <td class="note">Under W1 this rises with <em>offered</em> concurrency even at constant per-write work — the queueing signal.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Throughput</b></td>
+          <td class="m">rate(graph_query_completed[1m]) · rate(graph_write_commits[1m])</td>
+          <td class="note">Pair with the latency panels; flat throughput + rising latency = saturation, not slowness.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Error class breakdown</b></td>
+          <td class="m">sum by (class) (rate(graph_query_failed_by_class[5m]))</td>
+          <td class="note">The <code>fencing</code> and <code>contention</code> classes are the W1/W2 tells; <code>admission</code> is the scan-limit trip from R1.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Row 2 — Write path <span class="chip crit">W1–W3</span></h3>
+  <div class="tablewrap">
+    <table class="wide-tbl">
+      <thead><tr><th>Panel</th><th>Query</th><th>Reads on</th></tr></thead>
+      <tbody>
+        <tr>
+          <td class="note"><b>Retry amplification</b></td>
+          <td class="m">rate(graph_write_retries[5m]) / rate(graph_write_commits[5m])</td>
+          <td class="note">Retries per successful commit. W9 says this has no backoff, so anything above ~0.1 is storage load being multiplied for free. Alert at 0.5.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Attempts vs commits</b></td>
+          <td class="m">rate(graph_write_attempts[5m]) − rate(graph_write_commits[5m])</td>
+          <td class="note">The gap is rejections and exhaustions — writes that consumed the global lock and produced nothing.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Write backpressure</b></td>
+          <td class="m">rate(graph_backpressure_waits[5m])</td>
+          <td class="note">Non-zero means the <code>graph_write_gate</code> semaphore is saturated. Under W1 this saturates at a permit count far below what the config implies is possible.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Bulk import stage split</b></td>
+          <td class="m">rate(graph_bulk_import_{preflight,batch_build,counter_read,commit}_microseconds[5m]) / rate(graph_bulk_import_batches_profiled[5m])</td>
+          <td class="note">Four series stacked: mean µs per batch by stage. If <code>counter_read</code> and <code>preflight</code> dwarf <code>commit</code>, W4/W5 are confirmed in production, not just in a bench.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Row 3 — Read path and the fast/slow split <span class="chip crit">R1 R2</span></h3>
+  <div class="tablewrap">
+    <table class="wide-tbl">
+      <thead><tr><th>Panel</th><th>Query</th><th>Reads on</th></tr></thead>
+      <tbody>
+        <tr>
+          <td class="note"><b>Compiled-path demotion rate</b> <span class="chip crit">key</span></td>
+          <td class="m">rate(graph_query_rust_sparse_fallbacks[5m]) / rate(graph_query_rows_started[5m])</td>
+          <td class="note">The fraction of queries that fell off the compiled kernel. This is the most diagnostic single number on the board and nothing charts it today. Alert if it crosses ~0.05 sustained.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Artifact vs rebuilt snapshots</b></td>
+          <td class="m">rate(graph_query_graphblas_artifact_snapshots[5m]) vs rate(graph_query_graphblas_rebuilt_snapshots[5m])</td>
+          <td class="note">Rebuilds are the expensive branch. A rising rebuild share means the indexer is not keeping up (R1).</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Artifact lookup mean</b></td>
+          <td class="m">rate(graph_query_artifact_lookup_microseconds[5m]) / rate(graph_query_rows_started[5m])</td>
+          <td class="note">R10: when the generation map misses, this jumps to object-store round-trip scale. A step change here is a cache-sizing problem, not a storage problem.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>GraphBLAS cache mean</b></td>
+          <td class="m">rate(graph_query_graphblas_cache_microseconds[5m]) / rate(graph_query_rows_started[5m])</td>
+          <td class="note">Covers hydrate + decode + compile. Compare against the hit ratio panel below — high time with a high hit ratio points at R8's mutex rather than at compilation.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Kernel queue vs compute</b></td>
+          <td class="m">rate(graph_compute_queue_microseconds[5m]) / rate(graph_compute_duration_microseconds[5m])</td>
+          <td class="note">Ratio above ~0.3 means <code>spawn_blocking</code> is the bottleneck, not the traversal. The <code>kernel.expand</code> span was built for exactly this question.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Rows returned per query</b></td>
+          <td class="m">rate(graph_query_rows_returned[5m]) / rate(graph_query_rows_completed[5m])</td>
+          <td class="note">Latency that rises while this stays flat means the extra cost is not result size — it is the tail (R1) or the demotion (R2).</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Row 4 — Caches <span class="chip high">R7 R8 R9</span></h3>
+  <div class="tablewrap">
+    <table class="wide-tbl">
+      <thead><tr><th>Panel</th><th>Query</th><th>Reads on</th></tr></thead>
+      <tbody>
+        <tr>
+          <td class="note"><b>Hit ratio, all five caches</b></td>
+          <td class="m">rate(graph_cache_&lt;kind&gt;_hits[5m]) / (rate(…_hits[5m]) + rate(…_misses[5m]))</td>
+          <td class="note">One line per kind: <code>graphblas</code>, <code>matrix_adjacency</code>, <code>matrix_artifact</code>, <code>parsed_row_query</code>, <code>relationship_rows</code>, <code>relationship_property_rows</code>. <b>The parsed-row-query line pinned near zero is R7 visible in production.</b></td>
+        </tr>
+        <tr>
+          <td class="note"><b>Eviction pressure</b></td>
+          <td class="m">rate(graph_cache_evictions[5m]) / rate(graph_cache_insertions[5m])</td>
+          <td class="note">Approaching 1 means the cache is thrashing, and under R8 each eviction is an O(n) scan holding the mutex — so this panel is also a latency panel.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Resident bytes vs budget</b></td>
+          <td class="m">graph_cache_resident_bytes</td>
+          <td class="note">Byte-budget headroom. Pair with entry counts to distinguish "too many small entries" from "one enormous matrix".</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Hydration queue</b></td>
+          <td class="m">rate(graph_cache_hydration_waited[5m]) / rate(graph_cache_hydration_started[5m])</td>
+          <td class="note">The fraction of hydrations that blocked on the permit gate — cold-start cost made visible.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Tenant quota rejections</b></td>
+          <td class="m">rate(graph_cache_tenant_quota_rejections[5m])</td>
+          <td class="note">Non-zero means a tenant's working set will not fit its per-cell quota and is being recomputed on every query.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Row 5 — Indexer <span class="chip crit">upstream of R1</span></h3>
+  <div class="tablewrap">
+    <table class="wide-tbl">
+      <thead><tr><th>Panel</th><th>Query</th><th>Reads on</th></tr></thead>
+      <tbody>
+        <tr>
+          <td class="note"><b>Build rate and duration</b></td>
+          <td class="m">rate(graph_artifact_builds_completed[5m]) · rate(graph_artifact_build_duration_microseconds[5m]) / rate(graph_artifact_builds_completed[5m])</td>
+          <td class="note">Indexer health <em>is</em> read-path health. When builds stop, R1's tail grows on every read.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>Started minus completed</b></td>
+          <td class="m">rate(graph_artifact_builds_started[5m]) − rate(graph_artifact_builds_completed[5m])</td>
+          <td class="note">Failing or contended builds. Sustained non-zero is the alert that predicts a read-latency incident before it happens.</td>
+        </tr>
+        <tr>
+          <td class="note"><b>GC keys deleted</b></td>
+          <td class="m">rate(graph_gc_keys_deleted[5m]) · rate(graph_gc_jobs_completed[5m])</td>
+          <td class="note">Generation retention working. GC that outruns retention is what makes a WAL tail <code>Unavailable</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>The two gaps</h3>
+  <div class="keeps">
+    <div class="keep" data-v="high">
+      <span class="kk">Gap 1</span>
+      <span class="kv"><b>Index lag is not a metric.</b> The board can show that builds are
+        happening, but not <em>how far behind</em> the current generation is —
+        <code>read_epoch − generation.base_sequence</code>, which is precisely the quantity R1
+        says read latency is proportional to. Both numbers already exist on the
+        <code>artifact.lookup</code> and <code>storage.wal_tail</code> spans
+        (<code>turbolay.read_epoch</code>, <code>turbolay.base_sequence</code>). Exporting the
+        difference as one gauge per <code>(cell, edge_type)</code> would make the most important
+        curve in §07 continuously observable.
+      </span>
+    </div>
+    <div class="keep" data-v="high">
+      <span class="kk">Gap 2</span>
+      <span class="kv"><b>Lock wait is not a metric.</b> There is no counter for time spent
+        parked on <code>local_write_guard</code>. <code>graph_backpressure_waits</code> covers the
+        semaphore gates but not the mutex, and the mutex is the one that matters (W1). A
+        single <code>write_lock_wait_us</code> counter alongside the existing write counters
+        would turn W1 from an argument into a graph — and would prove the fix worked.
+      </span>
+    </div>
+  </div>
+
+  <div class="rule-box">
+    <span class="lbl">Provisioning</span>
+    Ship the board as JSON under <code>charts/turbolay/</code> beside the existing
+    <code>servicemonitor.yaml</code>, templated into a <code>grafana_dashboard</code>-labelled
+    ConfigMap so the sidecar picks it up. That keeps the dashboard versioned with the
+    metric names it depends on — a rename in <code>admin.rs</code>'s
+    <code>PROMETHEUS_COUNTERS</code> table and the panel that breaks then move in one commit.
+  </div>
+</section>
+
+<!-- ==================== 10 ==================== -->
+<section id="s10">
+  <p class="eyebrow">10 — Sequence</p>
+  <h2>What to do in what order</h2>
+
+  <div class="keeps">
+    <div class="keep" data-v="ok">
+      <span class="kk">First</span>
+      <span class="kv"><b>Measure, do not fix.</b> Land the dashboard, the two missing
+        metrics, and the flamegraph recipes. Run B1, B5, and B6. Those three curves either
+        confirm W1, R1b, and R2 or send this note back for revision — which is exactly what
+        happened to the original R1, and is the point of running them.</span>
+    </div>
+    <div class="keep" data-v="ok">
+      <span class="kk">Then</span>
+      <span class="kv"><b>The one structural item left.</b> Make
+        <code>local_write_guard</code> per-cell — it already takes the cell id — and move the
+        fence refresh off the per-attempt path onto an interval, so W1 and W2 stop being the
+        write ceiling. The read-path twin of this has already been done: the WAL-tail ladder
+        landed and R1 is closed. Nothing else on the list changes the shape of the write
+        curve; this does.</span>
+    </div>
+    <div class="keep" data-v="med">
+      <span class="kk">Then</span>
+      <span class="kv"><b>Concurrency in the fan-outs.</b> W4, W5, R4 — bounded
+        <code>buffer_unordered</code> over work that is already independent against a pinned
+        snapshot. Mechanical, individually verifiable, and each one is a separate PR with
+        its own before/after flamegraph.</span>
+    </div>
+    <div class="keep" data-v="med">
+      <span class="kk">Then</span>
+      <span class="kv"><b>The plan cache and the cache implementation.</b> R7 (split parse
+        from parameter binding) and R8 (a sharded, non-exclusive cache with O(1) eviction).
+        Both are contained changes with a clear metric to prove them: the parsed-row-query
+        hit ratio, and the concurrency plateau in B9.</span>
+    </div>
+    <div class="keep" data-v="med">
+      <span class="kk">Last</span>
+      <span class="kv"><b>Allocation and micro-cost.</b> W7, W8, R6, R9 — worth doing,
+        worth doing <em>after</em> the above, and worth gating with the heaptrack number from
+        F6 so they do not silently regress.</span>
+    </div>
+  </div>
+
+  <p>
+    Two caveats worth stating plainly. First, <code>DurabilityLevel::Remote</code> and
+    <code>snapshot_at</code>'s exact-epoch requirement (R3, R5) look like performance bugs
+    and may well be deliberate correctness decisions whose reasoning is not written down
+    where this reading found it. B4 and B6 are designed to price them, not to presume them
+    wrong; if the price is high, the question is whether the guarantee must hold at every
+    call site or only at some.<br><br>
+    Second, and more usefully: this note has already been wrong once. Its original headline
+    read-path finding described a serial, uncached, unbounded WAL-tail walk, and by the time
+    it was re-checked that had been measured, documented and fixed by someone else. A static
+    reading of a moving tree has a shelf life. Re-verify before acting, and treat the
+    <code>file:line</code> references as the thing to check rather than the thing to trust.
+  </p>
+</section>
+
+</main>
+
+<footer>
+  Design note · read from <code>main @ 8e91fbe</code> · every finding re-verified 2026-08-10 · analysis only, no code changed.<br>
+  Companion notes: <code>incremental-build-cost.html</code> (the WAL-tail cost anatomy this note defers to), <code>write-routing-problem.html</code>, <code>write-routing-solutions.html</code>, <code>write-routing-placement.html</code>.<br>
+  Primary sources: <code>src/shard/write.rs</code>, <code>src/shard/query.rs</code>, <code>src/shard/topology_tail.rs</code>, <code>src/shard/lifecycle.rs</code>, <code>src/core/state.rs</code>, <code>src/core/cache.rs</code>, <code>src/codec.rs</code>, <code>src/engine/index_store.rs</code>, <code>src/engine/artifact_build.rs</code>, <code>src/bin/graph_node/admin.rs</code>.
+</footer>
+
+</div>
+</body>
+</html>
