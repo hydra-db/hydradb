@@ -89,8 +89,13 @@ Ubuntu or WSL:
 sudo apt-get update
 sudo apt-get install -y \
   build-essential clang libclang-dev cmake pkg-config \
-  libcypher-parser-dev libgraphblas-dev
+  libcypher-parser-dev libgraphblas-dev \
+  curl git python3 python3-venv
 ```
+
+The last line is not needed to build, but the steps below use it: `curl` for
+the Rust installer and the readiness checks, `git` to clone, and `python3-venv`
+for the Neo4j driver used by `scripts/runtime_smoke.sh`.
 
 macOS with Homebrew:
 
