@@ -1,622 +1,270 @@
-# SlateDB Graph Kernel
+# Turbolay
 
-`slatedb-graph-kernel` is a Rust graph storage and query kernel built on top of
-SlateDB. The object store is the durable source of truth, while local SSD/NVMe
-and memory are cache layers controlled through SlateDB settings and graph-layer
-cache policy.
+[![CI](https://github.com/usecortex/turbolay2/actions/workflows/ci.yml/badge.svg)](https://github.com/usecortex/turbolay2/actions/workflows/ci.yml)
+[![OpenCypher TCK](https://github.com/usecortex/turbolay2/actions/workflows/opencypher-tck.yml/badge.svg)](https://github.com/usecortex/turbolay2/actions/workflows/opencypher-tck.yml)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+[![Rust 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](rust-toolchain.toml)
 
-The crate is intentionally kept outside the SlateDB repository. SlateDB stays an
-upstream dependency pinned in `Cargo.toml`/`Cargo.lock`. SlateDB owns writer
-fencing, WAL durability, storage snapshots, compaction, and object-store
-coordination; this crate owns the graph model, topology artifacts, traversal
-kernels, query planner, and operational harnesses.
+Turbolay is an object-store-native distributed graph database written in Rust.
+It combines durable graph storage on SlateDB with snapshot-consistent
+OpenCypher queries, GraphBLAS traversal, Neo4j-compatible Bolt connectivity,
+and an HTTPS query API.
 
-## What Is Implemented
+S3-compatible object storage is the durable source of truth. Query nodes and
+indexers keep only disposable state in memory and on local SSD or NVMe, so they
+can be replaced or scaled without moving the graph itself.
 
-- Durable edge writes, deletes, bulk import, trusted segment append,
-  idempotency records, and degree/index maintenance.
-- One SlateDB writer and any number of `DbReader` processes per graph store.
-  SlateDB writer epochs, WAL barriers, and serializable transactions provide
-  fencing and commit ordering.
-- Controllerless stateless nodes: every node can read every configured cell;
-  write requests lazily open a cached writer and rely on SlateDB for safety.
-- Query-scoped `DbSnapshot`/`DbReaderSnapshot` reads, immutable graph-index
-  publication, bounded generation GC, and full graph export/verifier digests.
-- Canonical outbound adjacency segments for high-throughput ingestion and one
-  content-addressed CSC graph-index format for sparse traversal.
-- Compute-compute separation: graph nodes serve reads and canonical writes;
-  independent `graph-indexer` workers build CSC generations asynchronously.
-- Causal reads stay entirely on the local reader/cache path. Strong reads first
-  refresh SlateDB from object storage, then pin one snapshot. Both modes combine
-  an indexed base with the committed WAL tail when indexing lags.
-- Sparse traversal through the Rust kernel by default, with optional SuiteSparse
-  GraphBLAS FFI for compiled CSC traversal.
-- OpenCypher row query execution behind the `opencypher` feature, including
-  parsing through `libcypher-parser`, row result sets, pages/cursors,
-  cancellation, limits, stats, and optimizer passes.
-- Optional TCP query transport with required auth by default, optional TLS/mTLS,
-  static directory discovery, and Kubernetes/Consul/etcd discovery helpers.
-- Public Bolt 5.1-5.4 over TLS for Neo4j-driver compatibility and an HTTPS
-  query API with typed JSON or streaming NDJSON responses. Both adapters share
-  one scoped authentication, authorization, quota, cancellation, bookmark, and
-  deadline service.
-- Local filesystem, MinIO, and S3-compatible object-store workflows through
-  SlateDB/object-store configuration.
+## Why Turbolay
 
-## Repository Layout
+- **Object-store durability.** Graph records, WALs, manifests, and immutable
+  traversal indexes live in S3-compatible storage.
+- **Independent compute.** Query nodes and indexers scale separately and can
+  rebuild their local caches from durable state.
+- **Safe writer handoff.** Object-store CAS leases select the active writer for
+  each cell, while SlateDB writer epochs fence stale writers.
+- **Consistent reads.** Every query runs against one pinned SlateDB snapshot.
+  Indexed traversal combines a compiled CSC generation with its visible WAL
+  overlay.
+- **Graph-native execution.** The planner uses property indexes, reverse
+  adjacency, sparse traversal, and SuiteSparse GraphBLAS where appropriate.
+- **Familiar clients.** Applications can use Neo4j drivers over Bolt 5.x or the
+  typed JSON and streaming NDJSON HTTP API.
+- **Bounded operation.** Authentication, authorization, deadlines, result
+  limits, backpressure, cancellation, cache budgets, metrics, and traces are
+  part of the server runtime.
 
-```text
-src/core/        configuration, error types, public model types, cache policy
-src/shard/       GraphShard lifecycle, writes, reads, query execution, maintenance
-src/engine/      immutable graph indexes, GC, routed multi-reader runtime
-src/query/       OpenCypher lowering, algebra, optimizer, transport, TCK parser
-src/client/      shared public query service plus Bolt/TLS and HTTPS adapters
-src/sparse_kernel.rs
-                 Rust sparse traversal and optional SuiteSparse GraphBLAS FFI
-examples/        smoke, stress, correctness, benchmark, and profiling binaries
-scripts/         local, MinIO, query, write, stress, and chaos harnesses
-charts/turbolay/ production Helm chart for graph nodes and indexer workers
-architecture.md  high-level system design and low-level component flows
+## Architecture
+
+```mermaid
+flowchart LR
+    C["Applications<br/>Neo4j drivers or HTTPS"]
+    SVC["Service or load balancer"]
+
+    subgraph Q["Query tier"]
+        Q1["graph-node"]
+        Q2["graph-node"]
+        QN["graph-node"]
+    end
+
+    subgraph I["Indexing tier"]
+        IX1["graph-indexer"]
+        IXN["graph-indexer"]
+    end
+
+    CACHE["Disposable memory and SSD cache"]
+    STORE["S3-compatible object storage<br/>WAL, SSTs, leases, CSC generations"]
+
+    C --> SVC
+    SVC --> Q1
+    SVC --> Q2
+    SVC --> QN
+    Q1 <--> CACHE
+    Q2 <--> CACHE
+    QN <--> CACHE
+    Q1 <--> STORE
+    Q2 <--> STORE
+    QN <--> STORE
+    IX1 <--> STORE
+    IXN <--> STORE
 ```
 
-## Requirements
+Query nodes serve reads and canonical graph mutations. Indexer workers build
+immutable CSC generations asynchronously and publish them through atomic
+object-store pointers. Readers remain correct when an index is absent or behind
+because the visible WAL tail is applied to the indexed base.
 
-Base build:
+See [architecture.md](architecture.md) for the storage model, query pipeline,
+writer coordination, index lifecycle, and failure semantics.
 
-- Rust stable 1.91 or newer
-- `pkg-config`, `cmake`, `clang`, and normal C/C++ build tools
-- `just` for recipe shortcuts; required by the commands in
-  [Run Locally](#run-locally)
+## Getting Started
 
-Native query/traversal features:
+### Prerequisites
 
-- `opencypher`: native `libcypher-parser`
-SuiteSparse GraphBLAS is **not** a feature — it is always linked, because it is
-the kernel we run in production, so its development headers and library are
-required for a plain `cargo build`. To run traversals on a pure-Rust kernel
-instead, switch at runtime; no rebuild is needed.
-
-`GRAPH_SPARSE_KERNEL` selects one of `adjacency` (uncompiled BFS), `compact`
-(compiled flat CSC, no C) or `suitesparse` (the default). **It is read by the
-`graph-node` binary only** — embedders set `GraphCachePolicy::sparse_kernel`
-directly, and it has no effect on `cargo test`. The older
-`GRAPH_COMPILED_KERNEL=compact` changes the *default* that policy field starts
-at, so it does apply to the library and its tests; an explicit
-`GRAPH_SPARSE_KERNEL`, or a policy set in code, always wins over it.
-
-Note that `adjacency` is a capability downgrade, not just a slower path. It has
-no count or window pushdown, and it routes queries through the storage frontier,
-which enforces `max_query_scan_edges` / `max_query_intermediate_rows` /
-`max_query_result_vertices` — limits the compiled path does not apply. A large
-traversal that succeeds on `suitesparse` can fail outright on `adjacency`.
-- `query-transport-tls`: Rustls dependencies are pulled by Cargo; you provide
-  certificates/configuration in the embedding service
+Turbolay requires Rust 1.91 or newer, a C/C++ toolchain,
+`libcypher-parser`, and SuiteSparse GraphBLAS.
 
 Ubuntu or WSL:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config libcypher-parser-dev libgraphblas-dev
-cargo install just --locked
+sudo apt-get install -y \
+  build-essential clang libclang-dev cmake pkg-config \
+  libcypher-parser-dev libgraphblas-dev
 ```
 
 macOS with Homebrew:
 
 ```bash
 xcode-select --install
-brew install rustup just cmake pkg-config llvm suite-sparse
+brew install just cmake pkg-config llvm suite-sparse
 brew install cleishm/neo4j/libcypher-parser
-rustup default stable
+
+# Rust, only if `rustup toolchain list` does not already show a stable toolchain:
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-`libcypher-parser` is not in homebrew-core; a plain
-`brew install libcypher-parser` fails with `No available formula`. The
-fully-qualified `cleishm/neo4j/...` name adds the tap automatically.
+`libcypher-parser` is not in homebrew-core; the fully-qualified
+`cleishm/neo4j/...` name adds the tap automatically. A plain
+`brew install libcypher-parser` fails with `No available formula`.
 
-Homebrew's `rustup` formula no longer provides a `rustup-init` binary. If you
-already manage Rust with rustup, skip it — `rust-toolchain.toml` pins
-`channel = "stable"`, so any rustup-managed stable toolchain works. To install
-from scratch instead: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`.
+Rust comes from the official installer rather than Homebrew because the
+`rustup` formula is keg-only and no longer ships a `rustup-init` binary, so
+`brew install rustup` leaves nothing named `rustup` on `PATH`.
+`rust-toolchain.toml` pins `channel = "stable"`, so any rustup-managed stable
+toolchain works.
 
-Then verify both native libraries resolve:
+No `PKG_CONFIG_PATH` export is needed: `libcypher-parser` is not keg-only, so
+Homebrew links `cypher-parser.pc` into the default `pkg-config` search path.
 
-```bash
-just native-check
-```
+[`just`](https://github.com/casey/just) is the supported command runner for the
+repository. Install it with `cargo install just --locked` when your package
+manager does not provide it. Docker is optional and is used only by MinIO,
+Neo4j comparison, image-build, and Kubernetes harnesses.
 
-Silence and exit 0 mean both were found; the recipe compiles nothing. It runs
-`pkg-config --exists cypher-parser` and a `test -f` for `libgraphblas.dylib`.
-`pkg-config: command not found` means `pkg-config` itself is missing from the
-`brew install` line above.
-
-You do **not** need to export `LIBRARY_PATH` or `RUSTFLAGS="-L ..."` for
-SuiteSparse. `build.rs` resolves the GraphBLAS link-search path itself, in this
-order: `GRAPHBLAS_LIB_DIR`, then `pkg-config --libs-only-L GraphBLAS`, then
-`brew --prefix suite-sparse`/lib on macOS. It emits nothing when none resolve,
-which is the correct behaviour on Debian/Ubuntu where `libgraphblas-dev` lands
-on the default linker path.
-
-## Build And Test
+### Clone and verify
 
 ```bash
 git clone https://github.com/usecortex/turbolay2.git
 cd turbolay2
 
-cargo test --locked --lib
-GRAPH_COMPILED_KERNEL=compact cargo test --locked --lib   # pure-Rust compiled kernel
-cargo test --locked --features opencypher --lib
-cargo check --locked --examples --features opencypher
-cargo test --locked --all-targets --features public-client-protocols
-```
-
-With `just`:
-
-```bash
-just
-just ci
-```
-
-CI runs default and native feature checks on Ubuntu. macOS CI validates the
-default and chaos-harness feature sets, so native `opencypher,graphblas` support
-on macOS should be checked locally when those libraries are installed.
-
-## Run Locally
-
-Everything here runs one process against the local filesystem. No Docker, no
-S3, no Kubernetes. Every command below was executed end to end on macOS (arm64)
-and on a clean Ubuntu 24.04 container; the only platform difference is the two
-Homebrew paths noted below, which Linux does not need.
-
-### Configure an object store
-
-Every local harness and the node itself load their object store through
-SlateDB's environment loader, so two variables are always required:
-
-```bash
-mkdir -p /tmp/sgk-store
-export CLOUD_PROVIDER=local
-export LOCAL_PATH=/tmp/sgk-store
-```
-
-`LOCAL_PATH` must already exist; it is not created for you. Accepted
-`CLOUD_PROVIDER` values are `local`, `memory`, `aws`, `azure`, and `gcp`. These
-may also live in a `.env` file in the working directory. Without them:
-
-```text
-Error: Slate(Error { msg: "invalid environment variable CLOUD_PROVIDER value `null`", ... })
-```
-
-`null` there means the variable is absent, not that it holds the string
-`"null"`.
-
-### Smoke-test the storage kernel
-
-```bash
+just native-check
 just smoke
 ```
 
-Prints `graph object-store smoke passed at epoch 10`. This exercises the write,
-index, and read paths in-process and exits. It does not start a server.
+The smoke example creates a local graph, writes and deletes edges, runs a sparse
+traversal, closes the database, reopens it, and verifies the durable result.
+The recipe creates and removes an isolated local object-store directory. Use
+`just smoke-graphblas` to pin the traversal kernel to SuiteSparse GraphBLAS.
 
-### Run the full node with one command
-
-`scripts/runtime_smoke.sh` builds `graph-node`, starts it, drives it over both
-Bolt and HTTP, and shuts it down. It is the fastest end-to-end check that the
-runtime works on your machine.
-
-It needs the Neo4j Python driver, and both Homebrew's and Debian's Python refuse
-a bare `pip install` under PEP 668, so use a virtualenv. On Debian/Ubuntu the
-venv module is packaged separately: `apt-get install -y python3-venv`.
+To exercise the same flow against an ephemeral MinIO instance:
 
 ```bash
-python3 -m venv /tmp/sgk-venv && /tmp/sgk-venv/bin/pip install neo4j
+just minio-smoke
 ```
 
-Scripts under `scripts/` invoke `cargo` directly and therefore do **not**
-inherit the build environment the justfile exports. Set it yourself:
+### Run a local server
+
+The following starts a single plaintext development node backed by a local
+directory. TLS is required by default in deployed environments; plaintext must
+be enabled explicitly.
 
 ```bash
-export BINDGEN_EXTRA_CLANG_ARGS="-I$(brew --prefix)/include"   # macOS only
-export LIBRARY_PATH="$(brew --prefix)/lib"                     # macOS only
-export RUST_MIN_STACK=33554432                                 # every platform
-```
+mkdir -p .turbolay/store .turbolay/cache
+printf '%s\n' 'local-development-token-32-bytes' > .turbolay/auth-token
 
-```bash
-PYTHON=/tmp/sgk-venv/bin/python bash scripts/runtime_smoke.sh
-```
-
-Prints `runtime-smoke-ok`. The node's own log is at
-`/tmp/sgk-runtime-smoke/node.log`; read it first if the script fails.
-
-### Start a node you can connect to
-
-`runtime_smoke.sh` stops the node when it finishes. To leave one running:
-
-```bash
-ROOT=/tmp/sgk-local
-mkdir -p "$ROOT/store" "$ROOT/cache"
-printf '%s\n' 'local-dev-auth-token-32-characters-long' >"$ROOT/auth-token"
-
-export CLOUD_PROVIDER=local LOCAL_PATH="$ROOT/store"
-export GRAPH_NAMESPACE=local GRAPH_ID=default
-export GRAPH_CELL_ID=cell-0 GRAPH_CELLS=cell-0 GRAPH_DATA_PATH=data
-export GRAPH_ALLOW_PLAINTEXT=true GRAPH_AUTH_TOKEN_FILE="$ROOT/auth-token"
-export GRAPH_DATA_CACHE_BYTES=67108864 GRAPH_DATA_CACHE_DIR="$ROOT/cache"
+export CLOUD_PROVIDER=local
+export LOCAL_PATH="$PWD/.turbolay/store"
+export GRAPH_NAMESPACE=default
+export GRAPH_ID=default
+export GRAPH_CELL_ID=cell-0
+export GRAPH_CELLS=cell-0
 export GRAPH_NODE_ID=node-0
-export GRAPH_BOLT_ADDR=127.0.0.1:17687 GRAPH_ADVERTISED_BOLT_ADDR=127.0.0.1:17687
-export GRAPH_BOLT_NODE_ADDRESSES=node-0=127.0.0.1:17687
-export GRAPH_HTTP_ADDR=127.0.0.1:18443 GRAPH_ADMIN_ADDR=127.0.0.1:19091
-export RUST_MIN_STACK=33554432 RUST_LOG=info
+export GRAPH_BOLT_NODE_ADDRESSES=node-0=127.0.0.1:7687
+export GRAPH_ADVERTISED_BOLT_ADDR=127.0.0.1:7687
+export GRAPH_DATA_CACHE_DIR="$PWD/.turbolay/cache"
+export GRAPH_AUTH_TOKEN_FILE="$PWD/.turbolay/auth-token"
+export GRAPH_ALLOW_PLAINTEXT=true
 
-cargo build --locked --features server-runtime --bin graph-node
-target/debug/graph-node
+# graph-node's async query futures exceed the default thread stack. Without
+# this the node builds, serves /readyz, and then aborts on the first query.
+export RUST_MIN_STACK=33554432
+
+# macOS: cargo is invoked directly here, so it does not inherit what the
+# justfile exports. Linux installs these on default search paths already.
+if command -v brew >/dev/null; then
+  export BINDGEN_EXTRA_CLANG_ARGS="-I$(brew --prefix)/include"
+  export LIBRARY_PATH="$(brew --prefix)/lib"
+fi
+
+cargo run --locked --features server-runtime --bin graph-node
 ```
 
-The node runs in the foreground and does not return. The auth token must be at
-least 32 characters. `GRAPH_ALLOW_PLAINTEXT=true` disables the TLS requirement
-on both public adapters and is for local development only.
+The node runs in the foreground and does not return; that is it working, not
+hanging. Run the checks below from a second shell.
 
-| Endpoint | Address |
-|---|---|
-| Bolt | `127.0.0.1:17687` |
-| HTTP query API | `127.0.0.1:18443` |
-| Admin, health, metrics | `127.0.0.1:19091` |
+The node listens on:
 
-From a second shell:
+| Endpoint | Address | Purpose |
+|---|---|---|
+| Bolt | `127.0.0.1:7687` | Neo4j-driver-compatible queries |
+| HTTP | `127.0.0.1:8443` | JSON and NDJSON query API |
+| Admin | `127.0.0.1:9090` | readiness and Prometheus metrics |
 
-```bash
-curl -fsS http://127.0.0.1:19091/readyz && echo READY
-curl -fsS http://127.0.0.1:19091/metrics | grep graph_runtime_ready
-```
+In another terminal, write and read a small graph through HTTP:
 
 ```bash
-TOKEN=local-dev-auth-token-32-characters-long
+TOKEN='local-development-token-32-bytes'
 
-curl -fsS -X POST http://127.0.0.1:18443/v1/graphs/default/query \
-  -H "Authorization: Bearer $TOKEN" -H 'X-Graph-Namespace: local' \
+curl -sS http://127.0.0.1:8443/v1/graphs/default/query \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'X-Graph-Namespace: default' \
   -H 'Content-Type: application/json' \
   --data '{"cell_id":"cell-0","query":"CREATE (a {id: 1})-[:FOLLOWS]->(b {id: 2})"}'
 
-curl -fsS -X POST http://127.0.0.1:18443/v1/graphs/default/query \
-  -H "Authorization: Bearer $TOKEN" -H 'X-Graph-Namespace: local' \
+curl -sS http://127.0.0.1:8443/v1/graphs/default/query \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'X-Graph-Namespace: default' \
   -H 'Content-Type: application/json' \
   --data '{"cell_id":"cell-0","query":"MATCH (a {id: 1})-[:FOLLOWS]->(b) RETURN b.id AS id"}'
 ```
 
-The second call returns `{"type":"vertex_id","value":2}`. The
-`X-Graph-Namespace` header must match `GRAPH_NAMESPACE`.
+The second call returns one row containing
+`{"type":"vertex_id","value":2}`. A listening port is not proof the node works;
+a round-tripped write is.
 
-Any Neo4j driver connects over Bolt:
+For a scripted Bolt and HTTP round trip, install the Python Neo4j driver and
+run. Homebrew's and Debian's Python both refuse a bare `pip install` under
+PEP 668, so use a virtualenv (`apt-get install -y python3-venv` on
+Debian/Ubuntu):
 
 ```bash
-/tmp/sgk-venv/bin/python - <<'PY'
-from neo4j import GraphDatabase
-TOKEN = "local-dev-auth-token-32-characters-long"
-with GraphDatabase.driver("bolt://127.0.0.1:17687", auth=("neo4j", TOKEN)) as d:
-    d.verify_connectivity()
-    with d.session(database="default") as s:
-        print(dict(s.run("MATCH (a {id: 1})-[:FOLLOWS]->(b) RETURN b.id AS id").single(strict=True)))
-PY
+python3 -m venv /tmp/turbolay-venv && /tmp/turbolay-venv/bin/pip install neo4j
+PYTHON=/tmp/turbolay-venv/bin/python bash scripts/runtime_smoke.sh
 ```
 
-### Troubleshooting
+Prints `runtime-smoke-ok`. The node's log is at
+`/tmp/sgk-runtime-smoke/node.log`; read it first if the script fails.
+
+### Troubleshooting local runs
 
 | Symptom | Cause and fix |
 |---|---|
-| `pkg-config: command not found` | `brew install pkg-config` |
 | `No available formula with the name "libcypher-parser"` | Use the tap: `brew install cleishm/neo4j/libcypher-parser` |
-| `zsh: command not found: rustup-init` | Homebrew's `rustup` no longer ships it; use `rustup default stable` |
-| `invalid environment variable CLOUD_PROVIDER value \`null\`` | `CLOUD_PROVIDER` unset; see "Configure an object store" |
-| `wrapper.h:4:10: fatal error: 'cypher-parser.h' file not found` | `BINDGEN_EXTRA_CLANG_ARGS` unset while running a script that calls `cargo` directly |
+| `command not found: rustup-init` | Homebrew's `rustup` is keg-only and no longer ships it; use the official installer above |
+| `invalid environment variable CLOUD_PROVIDER value \`null\`` | `CLOUD_PROVIDER` is unset — `null` means absent, not the string. `local` also needs `LOCAL_PATH`, pointing at a directory that already exists |
+| `wrapper.h:4:10: fatal error: 'cypher-parser.h' file not found` | `BINDGEN_EXTRA_CLANG_ARGS` unset while invoking `cargo` directly on macOS. Prefer `just`, which exports it |
 | Node answers `/readyz`, then aborts with `has overflowed its stack` on the first query | `RUST_MIN_STACK` unset; export `33554432` |
-| `curl: (7) Failed to connect ... port 19091` | The node is not running; `graph-node` holds the foreground, so start it in its own shell |
+| `curl: (7) Failed to connect ... port 9090` | The node is not running. `graph-node` holds the foreground, so start it in its own shell |
 
-## Kubernetes Deployment
+Agents working in this repository should read [AGENTS.md](AGENTS.md), which
+carries the same sequence plus repository conventions and failure modes.
 
-The production Helm chart deploys graph nodes, services, network policies,
-disruption budgets, object-store configuration, and optional cert-manager,
-External Secrets, and ServiceMonitor resources. It does not deploy a writable
-separate graph controller database.
+## Querying
 
-For a public single-node K3s evaluation host with Docker, Helm, `kubectl`, the
-AWS CLI, and OpenSSL already installed, the deployment helper builds the current
-checkout, provisions auth and TLS secrets, imports the image into K3s, and
-installs the chart:
+Turbolay supports a practical OpenCypher subset for graph reads and mutations,
+including typed relationships, bounded variable-length paths, property and
+label predicates, ordering, pagination, aggregation, `OPTIONAL MATCH`, `UNION`,
+and batched `UNWIND` writes.
 
-```bash
-TURBOLAY_S3_BUCKET=graph-benchmark ./scripts/deploy_single_node_k3s.sh
-```
-
-On EC2 the public DNS name and IP are discovered automatically. Elsewhere, set
-`TURBOLAY_PUBLIC_HOST`. The script prints the Bolt and HTTPS endpoints and keeps
-the generated client token under `~/.config/turbolay-single-node/`.
-
-```bash
-helm upgrade --install turbolay charts/turbolay \
-  --namespace turbolay \
-  --create-namespace \
-  --values charts/turbolay/examples/values-eks.yaml \
-  --atomic \
-  --timeout 15m
-```
-
-Copy the EKS example before use and replace its account, IAM role, DNS, issuer,
-bucket, and image values. See `charts/turbolay/README.md` for TLS, authentication,
-cache storage, upgrade, and verification details. Helm is the single supported
-Kubernetes deployment source; environment values live in `hydradb-argocd`.
-
-## Feature Flags
-
-| Feature | Purpose |
-|---|---|
-| default | Storage kernel, graph APIs, Rust sparse traversal, no native parser/GraphBLAS |
-| `opencypher` | Enables OpenCypher parsing and row query execution through `libcypher-parser-sys` |
-| `graphblas` | Enables direct FFI to `libgraphblas` from `src/sparse_kernel.rs` |
-| `chaos-harness` | Builds the hard-fence worker used by stress/failover scripts |
-| `query-transport` | Enables TCP query client/server types and serde row frames |
-| `query-transport-tls` | Adds TLS/mTLS config provider support for TCP query transport |
-| `query-service-discovery` | Adds Kubernetes EndpointSlice, Consul, and etcd discovery helpers |
-| `client-api` | Enables the protocol-independent authenticated client query service |
-| `bolt-server` | Adds the Bolt 5.1-5.4 server and requires TLS unless plaintext is explicitly enabled |
-| `http-api` | Adds the HTTPS typed JSON and NDJSON query API |
-| `public-client-protocols` | Enables both Bolt and HTTPS public adapters |
-| `server-runtime` | Builds the production graph-node service and native query stack |
-| `indexer-runtime` | Builds the independent graph-indexer worker and admin server |
-
-The GraphBLAS path does not depend on a Rust GraphBLAS crate. It links directly
-to the system library with `#[link(name = "graphblas")]`.
-
-## Object Store And Cache Model
-
-The object store is the durable graph store. For local development use
-`local_object_store(path)`. For MinIO/S3-compatible storage use
-`object_store_from_env(...)`, which delegates to SlateDB's object-store loader.
-The MinIO scripts generate env files containing values such as:
+Applications can connect with a Neo4j driver using a routed URI:
 
 ```text
-CLOUD_PROVIDER=aws
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-AWS_REGION=us-east-1
-AWS_DEFAULT_REGION=us-east-1
-AWS_ENDPOINT=http://127.0.0.1:19000
-AWS_BUCKET=...
-AWS_ALLOW_HTTP=true
-AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false
+neo4j://127.0.0.1:7687
 ```
 
-Caching is two-layer:
-
-- SlateDB object-store cache: configured through `GraphCacheConfig`, including
-  disk cache directory, cache size, cache-on-put, and SST preload.
-- Graph-layer memory cache: configured through `GraphCachePolicy`, including
-  matrix adjacencies, compiled GraphBLAS matrices, parsed row queries, and
-  hydration concurrency. `GraphMemoryConfig` independently caps compiled
-  matrices and all relationship-result cache payloads by resident bytes;
-  oversized query results remain correct but are not retained.
-
-Derived topology is not written back into SlateDB. Indexer workers publish
-immutable CSC objects under `_graph_index/<cell>/<edge-type>/generations/` and
-atomically advance a small `current` pointer. Query nodes discover that pointer,
-hydrate the selected generation through the normal object-store/NVMe cache, and
-retain only bounded compiled matrices in memory. Generation GC retains the
-configured number of previous objects and never downloads CSC payloads merely
-to identify their sequence.
-
-## Falkor S3 Import
-
-Falkor JSONL exports can be imported directly from the same object store used by
-the graph kernel. The importer accepts manifests with either a legacy `graph`
-field or the Falkor export identity fields `org_id` plus `tenant_id`.
-
-Expected source prefix layout:
-
-```text
-<source-prefix>/manifest.json
-<source-prefix>/nodes.jsonl
-<source-prefix>/edges.jsonl
-```
-
-Run an S3 import by pointing `object_store_from_env` at the destination bucket
-and passing the export object prefix:
-
-```bash
-export CLOUD_PROVIDER=aws
-export AWS_BUCKET=graph-benchmark
-export AWS_REGION=us-east-1
-export AWS_DEFAULT_REGION=us-east-1
-
-cargo run --features json-properties --example falkor_import -- \
-  --source-prefix 2026-07-08/gjnh5kebnw/7gezp2vebo \
-  --db-path __slatedb_graph_kernel/imports/gjnh5kebnw/7gezp2vebo \
-  --cell-id 7gezp2vebo \
-  --duplicate-policy preserve \
-  --build-artifacts
-```
-
-`preserve` is the only supported duplicate policy because Falkor exports can be
-multigraphs. Relationship ids from Falkor are stored as graph relationship ids,
-and non-integral JSON numbers such as timestamps are stored as float properties.
-
-After import, reopen the graph from S3 and run a row query:
-
-```bash
-cargo run --features opencypher --example cypher_query -- \
-  --db-path __slatedb_graph_kernel/imports/gjnh5kebnw/7gezp2vebo \
-  --cell-id 7gezp2vebo \
-  --query "MATCH (u)-[r:RELATES]->(v) RETURN count(*) AS total"
-```
-
-Benchmark the same imported S3 data across cold, warm, and hot cache paths:
-
-```bash
-cargo run --features opencypher --example falkor_query_bench -- \
-  --db-path __slatedb_graph_kernel/imports/gjnh5kebnw/7gezp2vebo \
-  --cell-id 7gezp2vebo \
-  --query "MATCH (u {id: 11})-[r:RELATES]->(v {id: 10}) RETURN r.raw_relation AS raw" \
-  --cache-dir target/slatedb-graph-s3-cache \
-  --cold-iters 3 \
-  --warm-iters 3 \
-  --hot-iters 50
-```
-
-The benchmark opens a fresh reader without disk cache for `cold`, reopens with a
-seeded SlateDB disk cache for `warm`, and reuses one open reader for `hot` so
-graph-layer memory caches are active. Set `--cold-iters 0`, `--warm-iters 0`,
-or `--hot-iters 0` to skip a cache phase during focused investigations.
-
-## Write And Read APIs
-
-The main embedding type is `GraphShard`. It can be opened as a read shard, a
-standalone writer, or through a routed `GraphNode`/`RoutedGraphCluster`.
-
-Common write paths:
-
-- `write_edge`, `write_edge_with_vertex_metadata`, `write_edge_with_full_metadata`
-- `delete_edge`
-- `write_edge_mutations_batch`
-- `ingest_edge_mutations`
-- `bulk_import_edges`, `bulk_import_edges_chunked`
-- `bulk_append_edges_trusted_chunked`
-- `bulk_append_out_adjacency_segment_trusted`
-
-Common read and matrix paths:
-
-- `edge_exists`, `out_neighbors`, `out_degree`
-- `snapshot` (a stable current SlateDB snapshot); `snapshot_at` validates current bookmarks and rejects detached historical replay
-- `build_adjacency_image`, `build_matrix_tiles`
-- `matrix_reachable`, `matrix_reachable_with_kernel`, `direct_snapshot_reachable`
-- `delete_graph_artifacts_before`
-- `export_live_graph_digest`, `verify_current_graph`
-
-Minimal local example:
-
-```rust
-use slatedb_graph_kernel::{local_object_store, EdgeMutation, GraphShard, Result};
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let store = local_object_store("target/local-graph-store")?;
-    let shard = GraphShard::open_standalone_writer("demo-db", store).await?;
-
-    shard
-        .write_edge(EdgeMutation {
-            cell_id: "reddit-home".to_string(),
-            edge_type: "FOLLOWS".to_string(),
-            src: 1,
-            dst: 2,
-            idempotency_key: "follow-1-2".to_string(),
-        })
-        .await?;
-
-    let epoch = shard.current_epoch("reddit-home").await?;
-    let neighbors = shard
-        .out_neighbors_at("reddit-home", "FOLLOWS", 1, epoch)
-        .await?;
-
-    assert_eq!(neighbors, vec![2]);
-    shard.close().await
-}
-```
-
-## Query Engine
-
-OpenCypher support is enabled with `--features opencypher`. The row engine
-returns `QueryResultSet` or `QueryResultPage` and is available on `GraphShard`,
-`RoutedGraphCluster`, and the optional TCP transport.
-
-Currently supported query shapes include:
-
-- `MATCH ... RETURN` over node patterns and directed typed relationships.
-- Multi-edge path patterns in one `MATCH`.
-- `OPTIONAL MATCH`.
-- `UNION` and `UNION ALL`, preserving `UNION ALL` leg order.
-- Bounded variable-length relationships such as `[:FOLLOWS*1..20]`.
-- Node labels, node properties, relationship properties, and `id` constraints.
-- Property values support unsigned integers, floats, booleans, and strings.
-  JSON import helpers preserve non-negative JSON integers as integers and
-  floating JSON numbers as native floats.
-- `WHERE` boolean combinations over property/id comparisons with `=`, `<>`,
-  `<`, `>`, `<=`, and `>=`.
-- `ORDER BY`, `SKIP`, `LIMIT`, aliases, and parameter values.
-- `DISTINCT` row projection and deduplication before windowing.
-- Aggregates: `count(*)`, `count(expr)`, `sum(expr)`, `avg(expr)`,
-  and `collect(expr)`.
-- Mutations: `CREATE` edge patterns, `MERGE` edge patterns, relationship and
-  vertex `DELETE`, `DETACH DELETE`, and `SET`/`REMOVE` labels and properties.
-
-Known query limits:
-
-- Unbounded variable-length paths are rejected; provide an explicit max hop.
-- Undirected relationships are rejected.
-- `RETURN *` is rejected.
-- `WITH` is pass-through only; it must keep every in-scope binding unchanged.
-- Native row execution is materialized for many plans; page APIs and the graph
-  kernel fast path avoid materializing the hottest bounded reachability cases.
-
-Example:
-
-```rust
-use slatedb_graph_kernel::{QueryContext, QueryValue};
-
-let rows = shard
-    .execute_cypher_rows(
-        QueryContext::new("reddit-home", "query-1").with_timeout_ms(30_000),
-        "MATCH (u {id: 1})-[:FOLLOWS*1..5]->(v) \
-         RETURN v.id AS id ORDER BY id LIMIT 10",
-    )
-    .await?;
-
-for row in rows.rows {
-    if let [QueryValue::VertexId(id)] = row.values.as_slice() {
-        println!("{id}");
-    }
-}
-```
+Use `neo4j+s://` with a publicly trusted certificate or `neo4j+ssc://` for a
+self-signed development certificate. Direct `bolt://` node addresses are for
+diagnostics and targeted failure tests; write-capable clustered clients should
+use routing.
 
 ### Native path procedures
 
-`algo.SPpaths` returns bounded paths between two vertex ids. `algo.SSpaths`
-returns bounded paths starting at one vertex id. `algo.MSpaths` resolves many
-source and optional target vertices through a property index and evaluates all
-of them in one request. All three execute against one pinned SlateDB snapshot
-and use the current compiled GraphBLAS CSC plus its WAL tail when an index is
-available.
+Turbolay includes native snapshot-scoped path procedures:
 
-```cypher
-CALL algo.SPpaths({
-  sourceNode: $source,
-  targetNode: $target,
-  relTypes: ['RELATES'],
-  relDirection: 'both',
-  maxLen: 3,
-  weightProp: 'weight',
-  costProp: 'cost',
-  maxCost: 10,
-  pathCount: 5
-})
-YIELD path, pathWeight, pathCost
-RETURN path, pathWeight, pathCost
-```
-
-`sourceNode` and `targetNode` are non-negative vertex ids. Scalar options may
-be literals or parameters. `pathCount: 0` returns every path tied at the
-minimum weight; a positive value returns at most that many paths in ascending
-weight, cost, hop-count, and deterministic topology order. Paths are simple
-(a vertex is not revisited), `maxLen` is capped by the runtime traversal limit,
-and query edge, intermediate-row, result, byte, cancellation, and timeout
-budgets remain enforced. Bolt clients receive a native Bolt `PATH`, including
-the original direction of relationships traversed in either direction.
-
-Use `algo.MSpaths` to replace client-side path-query fan-out. Selector values
-must resolve through the named property index. With `pairwise: true`, duplicate
-self and symmetric source/target pairs are omitted. `pathCount` is enforced per
-source/target pair and `resultLimit` bounds the complete response. For
-unweighted pairwise reads, `fairRelationshipVariants: true` selects up to
-`pathCount` structural paths and then returns every concrete parallel-edge
-combination for those paths within `resultLimit`. Variants are admitted in
-round-robin structural-path order so one highly connected pair cannot consume
-the response budget before other selected paths contribute a result.
+- `algo.SPpaths` finds bounded paths between one source and one target.
+- `algo.SSpaths` finds bounded paths from one source.
+- `algo.MSpaths` resolves many indexed source and target values and evaluates
+  them together, avoiding client-side query fan-out.
 
 ```cypher
 CALL algo.MSpaths({
@@ -636,153 +284,180 @@ YIELD path
 RETURN path
 ```
 
-## Public Client Protocols
+The procedures use one pinned storage snapshot, compiled GraphBLAS topology
+when available, the visible WAL overlay, and bounded metadata hydration.
 
-Enable both public adapters with `--features public-client-protocols`. Create a
-single `ClientQueryService` over the routed cluster, then pass clones of that
-service to `ClientBoltServer` and `ClientHttpServer`. The shared service:
+## Read Consistency
 
-- classifies OpenCypher before authorization so read grants cannot run writes;
-- enforces graph and hierarchical namespace grants;
-- applies global and namespace concurrency limits;
-- caps query size, parameter count, page size, and total stream runtime;
-- pins paged reads to one SlateDB storage sequence and emits scoped bookmarks;
-- supports cancellation without letting query ids cross principals or scopes.
+Turbolay exposes two read modes:
 
-There are exactly two read-consistency modes:
+| Mode | Behavior |
+|---|---|
+| `causal` | Uses the node's current durable reader view and refreshes when a supplied bookmark requires a newer sequence. This is the default hot path. |
+| `strong` | Refreshes the SlateDB reader from object storage before pinning the query snapshot. This pays the object-store freshness cost. |
 
-- `causal` is the default hot path. It uses the node's current durable reader
-  view and refreshes only when a supplied bookmark requires a newer sequence.
-- `strong` refreshes the SlateDB reader from object storage before pinning the
-  query snapshot, so it observes every durable write committed before that
-  refresh completed. It intentionally pays the object-store freshness check.
+HTTPS requests set `"consistency": "causal"` or `"strong"` in the request
+body. Bolt clients set `consistency` in `RUN` metadata or
+`turbolay.consistency` in transaction metadata.
 
-HTTPS accepts `"consistency": "causal"` or `"strong"` in the query body. Bolt
-accepts the same value in RUN metadata as `consistency`, or as
-`tx_metadata["turbolay.consistency"]`. Mutation queries reject `strong` because
-write acknowledgement already defines their durable commit point.
+## Kubernetes
 
-Bolt supports `HELLO`, `LOGON`, `LOGOFF`, auto-commit `RUN`, bounded or complete
-`PULL`/`DISCARD`, `RESET`, `GOODBYE`, `ROUTE`, and telemetry acknowledgement.
-Explicit `BEGIN`, `COMMIT`, and `ROLLBACK` are rejected until cross-query
-transaction semantics exist. TLS is required by default. Configure
-`ObjectStoreBoltRoutingTableProvider` advertises every node for reads and one
-stable preferred node for writes. This preserves writer/cache locality only;
-direct writes to another promotable node remain safe because SlateDB owns the
-writer fence. If no routing provider or complete static routing table is
-configured, `ROUTE` fails closed; direct `bolt://` sessions continue to work.
+The Helm chart deploys query nodes, indexer workers, services, cache volumes,
+network policies, disruption budgets, TLS resources, authentication, and
+optional Prometheus integration.
 
-The HTTPS API exposes:
+```bash
+helm upgrade --install turbolay charts/turbolay \
+  --namespace turbolay \
+  --create-namespace \
+  --values charts/turbolay/examples/values-eks.yaml \
+  --atomic \
+  --timeout 15m
+```
+
+Copy and edit the example values before deploying. Object-store credentials,
+bucket names, image references, TLS, advertised Bolt addresses, and workload
+identity are environment-specific. See the [Helm chart guide](charts/turbolay/README.md)
+for configuration and rollout details.
+
+## Observability
+
+The public HTTP server exposes `GET /healthz`. The graph-node and indexer admin
+servers expose:
 
 ```text
-POST /v1/graphs/{graph_id}/query
-POST /v1/graphs/{graph_id}/queries/{query_id}/cancel
-GET  /healthz
+GET /readyz
+GET /metrics
 ```
 
-Query requests require `Authorization: Bearer ...` and, by default, an
-`x-graph-namespace` header. Send `Accept: application/x-ndjson` to stream a
-header, typed row records, and a final bookmark summary across bounded backend
-cursor pages. HTTPS and Bolt plaintext modes are available only through methods
-whose names explicitly begin with `insecure_`.
+The runtime emits structured tracing fields for query fingerprints, access
+paths, cache outcomes, consistency mode, scope, cell, storage sequence, and
+planner decisions. Build with `--features server-runtime,otlp` or
+`--features indexer-runtime,otlp` to export OpenTelemetry data.
 
-## Optimizer And Stats
+Prometheus duration histograms have deliberately different units. Read
+[docs/runbooks/duration-histograms.md](docs/runbooks/duration-histograms.md)
+before building latency dashboards or alerts.
 
-The row query optimizer uses both structural heuristics and persisted stats.
-It can select vertex label/property indexes, edge property indexes, full scans,
-bound expands, reverse expands, expand-into, graph-kernel reachability, and hash
-join shortcuts.
+## Development
 
-Stats APIs include:
+Run `just` or `just help` to list the command surface. Recipes use Bash and run
+from the repository root. The full native suite requires `libcypher-parser` and
+SuiteSparse GraphBLAS.
 
-- `refresh_edge_type_query_stats`
-- `refresh_vertex_label_query_stats`
-- `refresh_vertex_property_query_stats`
-- `refresh_edge_property_query_stats`
-- `refresh_vertex_property_histogram_query_stats`
-- `refresh_edge_property_histogram_query_stats`
-- `start_query_stats_refresh_job`
+### Verification Recipes
 
-Stats refresh scans run outside write locks and publish with snapshot
-revalidation.
+| Recipe | Coverage |
+|---|---|
+| `just native-check` | Verifies that `cypher-parser` and GraphBLAS are discoverable |
+| `just fmt`, `just fmt-check` | Formats Rust or checks formatting without modifying files |
+| `just clippy` | Default-feature lint used by CI |
+| `just clippy-chaos`, `just clippy-opencypher` | Chaos-harness and OpenCypher lint configurations |
+| `just clippy-native`, `just clippy-client-protocols`, `just clippy-runtime` | Full native, public protocol, and production runtime lint configurations |
+| `just check` | Checks every default-feature target |
+| `just check-all-features` | Checks every target with every Cargo feature |
+| `just check-client-api`, `just check-bolt-server` | Checks shared client code and standalone Bolt independently |
+| `just check-examples`, `just check-examples-native`, `just check-examples-chaos` | Checks example targets under their supported feature sets |
+| `just test [cargo test args]` | Runs default library tests and forwards optional arguments |
+| `just test-opencypher`, `just test-native`, `just test-client-protocols`, `just test-chaos` | Runs the major library and public-protocol test matrices |
+| `just test-server-runtime`, `just test-indexer`, `just test-node-otlp` | Runs graph-node, indexer, and OTLP binary tests |
+| `just test-placement`, `just test-telemetry` | Lints and tests the two workspace crates |
+| `just ci` | Runs the complete local CI-equivalent sequence; a clean feature-matrix run can take tens of minutes (25m 41s in the verification run for this README) |
 
-## Useful Commands
+`scripts/ci_local.sh` is a compatibility entry point that sets a shared Cargo
+target directory and delegates to `just ci`, so the script and Justfile cannot
+silently drift into different test matrices.
 
-```bash
-just smoke                    # local object-store smoke
-just smoke-graphblas          # local smoke with GraphBLAS traversal
-just stress                   # local multiprocess stress and recovery checks
-just fence                    # local stale-writer/fence takeover proof
-just query-bench              # OpenCypher hot/warm/cold query benchmark
-just query-correctness        # exact query correctness checks
-just query-memory-profile     # low-memory query/build/concurrency profile
-just minio-smoke              # Docker MinIO smoke
-just minio-chaos              # Docker MinIO chaos
-just minio-fence              # MinIO fence takeover proof
-just minio-query-bench        # MinIO query benchmark
-just minio-query-correctness  # MinIO query correctness checks
+### Local Harnesses
+
+| Recipe | What it runs | Output or side effect |
+|---|---|---|
+| `just smoke` | Isolated local object-store write, traversal, reopen, and verification | Temporary directory removed on exit |
+| `just smoke-graphblas` | The same smoke flow with SuiteSparse selected explicitly | Temporary directory removed on exit |
+| `just query-correctness` | Exact OpenCypher result checks | `bench-results/query_correctness.csv` and `.log` |
+| `just query-bench` | Configurable cold, hot, and concurrent query benchmark | `bench-results/query_bench_full.csv` and `.log` by default |
+| `just query-memory-profile` | Build/query memory matrix with runtime-selectable kernels | Results and logs under the configured benchmark directory |
+| `just stress` | Multiprocess writes, restart recovery, compaction, GC, and verification | Temporary local stores removed on exit |
+| `just fence` | Hard SlateDB writer-takeover proof | Temporary local stores removed on exit |
+
+The benchmark recipes intentionally use production-sized defaults and can run
+for a long time. Override their documented `GRAPH_QUERY_*` environment
+variables for a small development sample.
+
+### Docker And MinIO Harnesses
+
+| Recipe | Purpose |
+|---|---|
+| `just minio-smoke` | Runs the object-store smoke flow against an ephemeral MinIO container |
+| `just minio-query-correctness` | Runs exact query checks against MinIO |
+| `just minio-query-bench` | Runs the query benchmark against MinIO |
+| `just minio-chaos` | Pauses, restarts, and recovers MinIO during graph operations |
+| `just minio-fence` | Runs writer takeover against MinIO |
+| `just minio-mbt` | Replays the formal MBT adapters against MinIO; unavailable in this checkout because the referenced `tests/formal_mbt*.rs` targets are absent |
+
+The MinIO recipes create isolated containers, networks, buckets, and temporary
+configuration files. Their cleanup traps remove those resources unless a
+recipe-specific keep flag is set. Docker may pull pinned images on the first
+run.
+
+### Standalone Scripts
+
+The scripts below are not all exposed as Just recipes because several operate
+external infrastructure or incur cloud cost.
+
+| Script | Requirements and behavior |
+|---|---|
+| `scripts/runtime_smoke.sh` | Builds `graph-node`, checks readiness and metrics, then exercises Bolt, scoped databases, HTTP, and graceful shutdown; requires Python `neo4j` |
+| `scripts/bolt_neo4j_driver_smoke.sh` | Exercises direct and routing Bolt URIs through the official Python Neo4j driver |
+| `scripts/query_bench.sh`, `scripts/query_correctness.sh`, `scripts/query_memory_profile.sh` | Implement the corresponding local Just recipes |
+| `scripts/multiprocess_stress.sh`, `scripts/fence_takeover.sh` | Implement the local stress and fencing recipes |
+| `scripts/minio_*.sh` | MinIO smoke, correctness, benchmark, chaos, fencing, MBT, and write-profile harnesses; require Docker |
+| `scripts/multinode_k3s.sh` | Creates a disposable multi-node K3d cluster and performs disruptive failover tests; requires Docker, K3d, kubectl, and Helm |
+| `scripts/deploy_single_node_k3s.sh` | Builds and deploys to an existing K3s host using an S3 bucket; changes Kubernetes and AWS resources |
+| `scripts/ec2_graphblas_benchmark.sh` | Runs the containerized GraphBLAS benchmark against S3 on EC2; uses AWS credentials and can incur cost |
+| `scripts/run_s3_bolt_benchmark.sh` | Starts the S3-backed Bolt benchmark and optionally deletes its benchmark prefix afterward |
+| `scripts/neo4j_exact_hop_benchmark.sh` | Pulls and runs Neo4j in Docker for comparison measurements |
+| `scripts/bolt_graphblas_client.py`, `scripts/falkordb_bolt_benchmark.py`, `scripts/s3_bolt_driver_benchmark.py` | Python benchmark clients used by the shell harnesses; require the `neo4j` package |
+| `scripts/multinode_k3s_client.py` | Runs inside the disposable K3d client Pod created by `multinode_k3s.sh` |
+
+`just update-slatedb` is a maintenance command, not a verification command. It
+updates the pinned SlateDB dependency in `Cargo.lock`; review and test the
+resulting lockfile diff before committing it.
+
+### Repository layout
+
+```text
+src/core/           configuration, graph model, cache policy, errors
+src/shard/          storage lifecycle, reads, writes, queries, path procedures
+src/engine/         routing, placement, immutable indexes, index GC
+src/query/          OpenCypher parsing, algebra, planning, transport types
+src/client/         Bolt, HTTP, authentication, quotas, cursors
+src/sparse_kernel/  Rust sparse and SuiteSparse GraphBLAS execution
+crates/             placement and telemetry workspace crates
+charts/turbolay/    Kubernetes Helm chart
+examples/           smoke, import, benchmark, and correctness programs
+scripts/            local, MinIO, stress, fencing, and deployment harnesses
+docs/               architecture notes, runbooks, benchmarks, and verification
 ```
 
-The non-MinIO recipes above read their object store from the environment, so
-export `CLOUD_PROVIDER` and `LOCAL_PATH` first — see [Run Locally](#run-locally).
-The `minio-*` recipes generate their own env files and need Docker.
+## Documentation
 
-Benchmark and correctness outputs are written under `bench-results/`.
+| Document | Contents |
+|---|---|
+| [Architecture](architecture.md) | End-to-end design, snapshots, writer ownership, query execution, and indexing |
+| [Helm chart guide](charts/turbolay/README.md) | Kubernetes configuration, TLS, authentication, upgrades, and verification |
+| [Duration histograms](docs/runbooks/duration-histograms.md) | Correct latency units, PromQL, aggregation, and alerting |
+| [Correctness casebook](docs/bugs-found-fixed/README.md) | Reproduced storage and query invariants with regression evidence |
+| [Formal verification](docs/formal-methods/0003-turbolay-quint-verification-evidence.md) | Quint and model-based testing evidence |
+| [Jepsen report](docs/jepsen/jepsen-consistency-report.md) | Distributed consistency test results |
 
-To enable GraphBLAS for query benchmarks on machines with native GraphBLAS:
+## Contributing
 
-```bash
-GRAPH_QUERY_BENCH_FEATURES=opencypher,graphblas \
-GRAPH_QUERY_BENCH_MAX_GRAPHBLAS_MATRICES=1 \
-just query-bench
-```
+Issues and pull requests are welcome. Keep changes focused, add regression
+coverage for behavioral changes, and run `just ci` before opening a pull
+request. Changes to storage, fencing, snapshots, routing, or index publication
+should state the invariant they preserve and include a failure-oriented test.
 
-## Storage And Concurrency Model
+## License
 
-The production data path follows SlateDB's single-writer, multi-reader model:
-
-1. Every node lazily opens a `DbReader` for every configured cell and keeps only
-   disposable memory/NVMe caches locally.
-2. A write-routed node must first win the cell's object-store CAS lease. The
-   lease uses S3's server timestamp and a process-unique holder ID, so separate
-   nodes and overlapping restarts cannot both authorize promotion. The winner
-   lazily opens and caches the SlateDB writer; SlateDB's writer epoch and WAL
-   barrier remain the final stale-writer fence.
-3. Every query pins one `DbSnapshot` or `DbReaderSnapshot`, so canonical records
-   and indexes come from exactly one durable SlateDB storage sequence.
-4. Bookmarks are SlateDB commit sequences. A reader explicitly refreshes and
-   waits until its durable sequence reaches the bookmark before serving data.
-5. Indexer workers pin a durable SlateDB reader snapshot, build one immutable
-   CSC generation, and publish its base sequence plus exact WAL cursor through
-   an object-store compare-and-swap pointer.
-6. Query nodes never rebuild a full topology index. They run GraphBLAS over the
-   discovered base and overlay committed topology changes from the SlateDB WAL
-   through the pinned query sequence. If the required WAL has already been
-   compacted away, the query uses bounded source-scoped canonical reads.
-7. Bolt routing advertises the active lease owner for writes and all live nodes
-   as readers. Rendezvous placement selects the contender when no lease exists;
-   the durable CAS lease, not a node-local heartbeat view, grants write access.
-8. Public pagination uses bounded server-held result cursors, so continuation
-   pages never replay a query or publish graph-owned retention records.
-
-This keeps S3 as the durable source of truth, local SSD/NVMe as SlateDB's block
-cache, and memory for bounded query plans and compiled GraphBLAS matrices.
-
-## Production Boundary
-
-The repository contains the deployable graph-node service, storage/query engine,
-public protocols, chart, stress tools, and verification paths. Production
-promotion still requires environment-specific evidence rather than more storage
-coordination code:
-
-- long-running multi-node and real-S3 soak tests under throttling, latency,
-  timeout, restart, and membership-change faults;
-- dashboards and alerts for SlateDB fencing, object-store errors, query latency,
-  memory budgets, graph-index lag, WAL-tail size, and rejected work;
-- an explicit OpenCypher compatibility policy backed by larger TCK reports;
-- deployment certificate rotation, secret management, backup/restore drills,
-  and tested rollback procedures.
-
-The safest way to evaluate a new environment is: run default tests, native
-feature tests, local smoke, MinIO smoke, query correctness, stress, and then a
-long soak using the same object store and cache settings intended for deployment.
+Turbolay is licensed under the [GNU Affero General Public License v3.0](LICENSE).

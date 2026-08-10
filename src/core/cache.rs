@@ -4,8 +4,32 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[cfg(feature = "opencypher")]
-use crate::{EdgeMetadata, RelationshipId, VertexId, VertexPropertyValue};
+use crate::{
+    EdgeMetadata, GraphScope, QueryResultSet, RelationshipId, VertexId, VertexPropertyValue,
+};
 use crate::{GraphCacheMetrics, StorageSequence};
+
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct NativePathResultCacheKey {
+    pub(crate) scope: GraphScope,
+    pub(crate) cell_id: String,
+    pub(crate) procedure: String,
+    pub(crate) read_epoch: StorageSequence,
+    pub(crate) max_result_bytes: Option<u64>,
+}
+
+#[cfg(feature = "opencypher")]
+impl NativePathResultCacheKey {
+    pub(crate) fn estimated_resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.cell_id.capacity())
+            .saturating_add(self.procedure.capacity())
+    }
+}
+
+#[cfg(feature = "opencypher")]
+pub(crate) type NativePathResultCacheValue = Arc<QueryResultSet>;
 #[cfg(feature = "opencypher")]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RelationshipRowsCacheKey {

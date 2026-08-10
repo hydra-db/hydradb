@@ -45,9 +45,9 @@ pub use client::service::{
 pub(crate) use core::cache::BoundedGraphCache;
 #[cfg(feature = "opencypher")]
 pub(crate) use core::cache::{
-    source_relationship_rows_resident_bytes, RelationshipPropertyRowsCacheKey,
-    RelationshipRowsCacheEntry, RelationshipRowsCacheKey, RelationshipRowsCacheValue,
-    SourceRelationshipRowsCacheKey,
+    source_relationship_rows_resident_bytes, NativePathResultCacheKey, NativePathResultCacheValue,
+    RelationshipPropertyRowsCacheKey, RelationshipRowsCacheEntry, RelationshipRowsCacheKey,
+    RelationshipRowsCacheValue, SourceRelationshipRowsCacheKey,
 };
 pub(crate) use core::config::{open_graph_db, open_graph_reader};
 pub use core::config::{

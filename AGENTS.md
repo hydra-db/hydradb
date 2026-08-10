@@ -89,8 +89,13 @@ step exports the same three variables the justfile would have.
 
 The complete sequence, executed end to end on macOS (arm64) and on a clean
 Ubuntu 24.04 container. Everything runs one process against the local
-filesystem: no Docker, no S3, no Kubernetes. `README.md` has the same sequence
-with prose for humans.
+filesystem: no Docker, no S3, no Kubernetes. `README.md`'s "Run a local server"
+covers the same ground for humans, in less detail.
+
+The ports and paths here (`17687`/`18443`/`19091`, `/tmp/sgk-*`) deliberately
+differ from the README's (`7687`/`8443`/`9090`, `.turbolay/`) so an agent's node
+cannot collide with one a developer is already running, and so nothing is
+written inside the checkout.
 
 **Environment does not survive between steps.** If each command you run gets a
 fresh shell — which is true for most agent tool calls — then every `export` is

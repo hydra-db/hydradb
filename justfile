@@ -247,7 +247,12 @@ ci: native-check fmt-check clippy clippy-chaos clippy-opencypher clippy-native c
 
 # Run the local object-store smoke test.
 smoke:
-    cargo run --example object_store_smoke
+    #!/usr/bin/env bash
+    set -euo pipefail
+    store_root="$(mktemp -d)"
+    trap 'rm -rf "$store_root"' EXIT
+    CLOUD_PROVIDER=local LOCAL_PATH="$store_root" \
+      cargo run --locked --example object_store_smoke
 
 # SuiteSparse is the default kernel now that the cargo feature is gone, so this
 # differs from `smoke` only by pinning it — which is the point, since `smoke`
@@ -255,7 +260,12 @@ smoke:
 # `example/object_store_smoke.rs` also accepts `compact` and `rust`.
 # Run the local object-store smoke test pinned to the SuiteSparse kernel.
 smoke-graphblas:
-    GRAPH_MATRIX_KERNEL=graphblas cargo run --example object_store_smoke
+    #!/usr/bin/env bash
+    set -euo pipefail
+    store_root="$(mktemp -d)"
+    trap 'rm -rf "$store_root"' EXIT
+    CLOUD_PROVIDER=local LOCAL_PATH="$store_root" GRAPH_MATRIX_KERNEL=graphblas \
+      cargo run --locked --example object_store_smoke
 
 # Run local multiprocess stress against the local filesystem object store.
 stress:

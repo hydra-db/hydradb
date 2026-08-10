@@ -4,6 +4,8 @@
 //! module's compiled-matrix representation without calling into SuiteSparse.
 //! See the module docs in `mod.rs` for how the two relate.
 
+#[cfg(feature = "opencypher")]
+use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::ptr::null_mut;
@@ -267,6 +269,12 @@ impl CompiledCompactCscMatrix {
             .saturating_sub(self.pointer(ordinal)) as u64
     }
 
+    #[cfg(feature = "opencypher")]
+    fn vertex_degree(&self, vertex: VertexId) -> u64 {
+        self.ordinal(vertex)
+            .map_or(0, |ordinal| self.degree(ordinal))
+    }
+
     fn pointer(&self, ordinal: usize) -> usize {
         self.pointers.get(ordinal)
     }
@@ -294,6 +302,21 @@ impl CompiledCompactCscMatrix {
         };
         self.neighbor_range(ordinal)
             .map(|index| self.vertices[self.neighbor(index)])
+            .collect()
+    }
+
+    #[cfg(feature = "opencypher")]
+    fn neighbors_intersecting(
+        &self,
+        vertex: VertexId,
+        allowed: &BTreeSet<VertexId>,
+    ) -> Vec<VertexId> {
+        let Some(ordinal) = self.ordinal(vertex) else {
+            return Vec::new();
+        };
+        self.neighbor_range(ordinal)
+            .map(|index| self.vertices[self.neighbor(index)])
+            .filter(|neighbor| allowed.contains(neighbor))
             .collect()
     }
 
@@ -706,6 +729,38 @@ impl CompiledGraphBlasMatrix {
     #[cfg(feature = "opencypher")]
     pub(crate) fn out_neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
         self.canonical_out.neighbors(vertex)
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn in_degree(&self, vertex: VertexId) -> u64 {
+        self.canonical_in
+            .get_or_init(|| self.canonical_out.transpose())
+            .vertex_degree(vertex)
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn out_degree(&self, vertex: VertexId) -> u64 {
+        self.canonical_out.vertex_degree(vertex)
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn in_neighbors_intersecting(
+        &self,
+        vertex: VertexId,
+        allowed: &BTreeSet<VertexId>,
+    ) -> Vec<VertexId> {
+        self.canonical_in
+            .get_or_init(|| self.canonical_out.transpose())
+            .neighbors_intersecting(vertex, allowed)
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) fn out_neighbors_intersecting(
+        &self,
+        vertex: VertexId,
+        allowed: &BTreeSet<VertexId>,
+    ) -> Vec<VertexId> {
+        self.canonical_out.neighbors_intersecting(vertex, allowed)
     }
 
     pub(crate) fn expand_range(
