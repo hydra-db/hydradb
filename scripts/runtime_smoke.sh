@@ -4,6 +4,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PYTHON="${PYTHON:-python3}"
+
+# This script calls cargo directly, so it never inherits the justfile's exports.
+# graph-node's async query futures exceed the default thread stack: without this
+# the node builds, serves /readyz, and then aborts with a stack overflow on the
+# first query. Matches justfile:18. An already-exported value wins.
+export RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}"
+
 cargo build --locked --features server-runtime --bin graph-node
 
 ROOT="${GRAPH_RUNTIME_SMOKE_ROOT:-/tmp/sgk-runtime-smoke}"

@@ -5,6 +5,10 @@
 # Generated benchmark and stress outputs
 /bench-results/
 
+# Local development node store and cache, created by the README's
+# "Run a local server" section
+/.turbolay/
+
 # Keep Cargo.lock tracked for reproducible prototype builds.
 # Cargo.lock
 

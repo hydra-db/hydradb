@@ -89,19 +89,37 @@ Ubuntu or WSL:
 sudo apt-get update
 sudo apt-get install -y \
   build-essential clang libclang-dev cmake pkg-config \
-  libcypher-parser-dev libgraphblas-dev
+  libcypher-parser-dev libgraphblas-dev \
+  curl git python3 python3-venv
 ```
+
+The last line is not needed to build, but the steps below use it: `curl` for
+the Rust installer and the readiness checks, `git` to clone, and `python3-venv`
+for the Neo4j driver used by `scripts/runtime_smoke.sh`.
 
 macOS with Homebrew:
 
 ```bash
 xcode-select --install
-brew install rustup-init just cmake pkg-config llvm suite-sparse
+brew install just cmake pkg-config llvm suite-sparse
 brew install cleishm/neo4j/libcypher-parser
-rustup-init
 
-export PKG_CONFIG_PATH="$(brew --prefix libcypher-parser)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+# Rust, only if `rustup toolchain list` does not already show a stable toolchain:
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
+
+`libcypher-parser` is not in homebrew-core; the fully-qualified
+`cleishm/neo4j/...` name adds the tap automatically. A plain
+`brew install libcypher-parser` fails with `No available formula`.
+
+Rust comes from the official installer rather than Homebrew because the
+`rustup` formula is keg-only and no longer ships a `rustup-init` binary, so
+`brew install rustup` leaves nothing named `rustup` on `PATH`.
+`rust-toolchain.toml` pins `channel = "stable"`, so any rustup-managed stable
+toolchain works.
+
+No `PKG_CONFIG_PATH` export is needed: `libcypher-parser` is not keg-only, so
+Homebrew links `cypher-parser.pc` into the default `pkg-config` search path.
 
 [`just`](https://github.com/casey/just) is the supported command runner for the
 repository. Install it with `cargo install just --locked` when your package
@@ -111,8 +129,8 @@ Neo4j comparison, image-build, and Kubernetes harnesses.
 ### Clone and verify
 
 ```bash
-git clone https://github.com/usecortex/turbolay2.git
-cd turbolay2
+git clone https://github.com/hydra-db/hydradb.git
+cd hydradb
 
 just native-check
 just smoke
@@ -152,8 +170,22 @@ export GRAPH_DATA_CACHE_DIR="$PWD/.turbolay/cache"
 export GRAPH_AUTH_TOKEN_FILE="$PWD/.turbolay/auth-token"
 export GRAPH_ALLOW_PLAINTEXT=true
 
+# graph-node's async query futures exceed the default thread stack. Without
+# this the node builds, serves /readyz, and then aborts on the first query.
+export RUST_MIN_STACK=33554432
+
+# macOS: cargo is invoked directly here, so it does not inherit what the
+# justfile exports. Linux installs these on default search paths already.
+if command -v brew >/dev/null; then
+  export BINDGEN_EXTRA_CLANG_ARGS="-I$(brew --prefix)/include"
+  export LIBRARY_PATH="$(brew --prefix)/lib"
+fi
+
 cargo run --locked --features server-runtime --bin graph-node
 ```
+
+The node runs in the foreground and does not return; that is it working, not
+hanging. Run the checks below from a second shell.
 
 The node listens on:
 
@@ -181,13 +213,45 @@ curl -sS http://127.0.0.1:8443/v1/graphs/default/query \
   --data '{"cell_id":"cell-0","query":"MATCH (a {id: 1})-[:FOLLOWS]->(b) RETURN b.id AS id"}'
 ```
 
+The second call returns one row containing
+`{"type":"vertex_id","value":2}`. A listening port is not proof the node works;
+a round-tripped write is.
+
 For a scripted Bolt and HTTP round trip, install the Python Neo4j driver and
-run:
+run. Homebrew's and Debian's Python both refuse a bare `pip install` under
+PEP 668, so use a virtualenv (`apt-get install -y python3-venv` on
+Debian/Ubuntu):
 
 ```bash
-python3 -m pip install neo4j
-bash scripts/runtime_smoke.sh
+python3 -m venv /tmp/turbolay-venv && /tmp/turbolay-venv/bin/pip install neo4j
+
+# macOS: this script calls cargo directly, so it does not inherit what the
+# justfile exports. Without this it fails at bindgen with
+# `'cypher-parser.h' file not found`. Linux needs neither.
+if command -v brew >/dev/null; then
+  export BINDGEN_EXTRA_CLANG_ARGS="-I$(brew --prefix)/include"
+  export LIBRARY_PATH="$(brew --prefix)/lib"
+fi
+
+PYTHON=/tmp/turbolay-venv/bin/python bash scripts/runtime_smoke.sh
 ```
+
+Prints `runtime-smoke-ok`. The node's log is at
+`/tmp/sgk-runtime-smoke/node.log`; read it first if the script fails.
+
+### Troubleshooting local runs
+
+| Symptom | Cause and fix |
+|---|---|
+| `No available formula with the name "libcypher-parser"` | Use the tap: `brew install cleishm/neo4j/libcypher-parser` |
+| `command not found: rustup-init` | Homebrew's `rustup` is keg-only and no longer ships it; use the official installer above |
+| `invalid environment variable CLOUD_PROVIDER value \`null\`` | `CLOUD_PROVIDER` is unset — `null` means absent, not the string. `local` also needs `LOCAL_PATH`, pointing at a directory that already exists |
+| `wrapper.h:4:10: fatal error: 'cypher-parser.h' file not found` | `BINDGEN_EXTRA_CLANG_ARGS` unset while invoking `cargo` directly on macOS. Prefer `just`, which exports it |
+| Node answers `/readyz`, then aborts with `has overflowed its stack` on the first query | `RUST_MIN_STACK` unset; export `33554432` |
+| `curl: (7) Failed to connect ... port 9090` | The node is not running. `graph-node` holds the foreground, so start it in its own shell |
+
+Agents working in this repository should read [AGENTS.md](AGENTS.md), which
+carries the same sequence plus repository conventions and failure modes.
 
 ## Querying
 
