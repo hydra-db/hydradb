@@ -224,6 +224,15 @@ Debian/Ubuntu):
 
 ```bash
 python3 -m venv /tmp/turbolay-venv && /tmp/turbolay-venv/bin/pip install neo4j
+
+# macOS: this script calls cargo directly, so it does not inherit what the
+# justfile exports. Without this it fails at bindgen with
+# `'cypher-parser.h' file not found`. Linux needs neither.
+if command -v brew >/dev/null; then
+  export BINDGEN_EXTRA_CLANG_ARGS="-I$(brew --prefix)/include"
+  export LIBRARY_PATH="$(brew --prefix)/lib"
+fi
+
 PYTHON=/tmp/turbolay-venv/bin/python bash scripts/runtime_smoke.sh
 ```
 
