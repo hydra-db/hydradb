@@ -8002,6 +8002,137 @@ async fn relationship_property_delete_retry_does_not_expand_to_recreated_structu
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn relationship_merge_batch_preserves_identity_and_updates_at_scale() {
+    const BATCH_SIZE: u64 = 64;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/relationship-merge-batch", object_store).await;
+    let vertices = (0..BATCH_SIZE).flat_map(|index| {
+        [
+            (index + 1, VertexMetadata::default().with_label("Entity")),
+            (
+                index + 10_001,
+                VertexMetadata::default().with_label("Chunk"),
+            ),
+        ]
+    });
+    assert_eq!(
+        shard
+            .import_vertex_metadata_batch("reddit-home", vertices)
+            .await
+            .unwrap(),
+        (BATCH_SIZE * 2) as usize
+    );
+
+    let relationships = |rank| {
+        (0..BATCH_SIZE).map(move |index| {
+            let external_id = 50_000 + index;
+            RelationshipMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "PRESENT_IN".to_string(),
+                src: index + 1,
+                dst: index + 10_001,
+                relationship_id: external_id,
+                metadata: EdgeMetadata::default()
+                    .with_property("id", VertexPropertyValue::Integer(external_id))
+                    .with_property("rank", VertexPropertyValue::Integer(rank)),
+            }
+        })
+    };
+    let inserted = shard
+        .merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "PRESENT_IN",
+            relationships(1),
+            "relationship-merge-batch-insert",
+            ("Entity", "Chunk"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(inserted.relationships_inserted, BATCH_SIZE);
+    assert_eq!(inserted.structural_edges_inserted, BATCH_SIZE);
+
+    let unchanged = shard
+        .merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "PRESENT_IN",
+            relationships(1),
+            "relationship-merge-batch-unchanged",
+            ("Entity", "Chunk"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(unchanged.relationships_inserted, 0);
+    assert_eq!(unchanged.relationships_already_existed, BATCH_SIZE);
+    assert_eq!(unchanged.structural_edges_inserted, 0);
+
+    let updated = shard
+        .merge_relationships_batch_between_labeled_vertices(
+            "reddit-home",
+            "PRESENT_IN",
+            relationships(2),
+            "relationship-merge-batch-update",
+            ("Entity", "Chunk"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.relationships_inserted, 0);
+    assert_eq!(updated.relationships_already_existed, BATCH_SIZE);
+    assert_eq!(
+        shard
+            .read_counter(&keys::last_relationship_id("reddit-home"))
+            .await
+            .unwrap(),
+        BATCH_SIZE
+    );
+    for index in 0..BATCH_SIZE {
+        assert_eq!(
+            shard
+                .out_degree("reddit-home", "PRESENT_IN", index + 1)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            shard
+                .read_counter(&keys::relationship_count(
+                    "reddit-home",
+                    "PRESENT_IN",
+                    index + 1,
+                    index + 10_001,
+                ))
+                .await
+                .unwrap(),
+            1
+        );
+        let key = keys::relationship(
+            "reddit-home",
+            "PRESENT_IN",
+            index + 1,
+            index + 10_001,
+            index + 1,
+        );
+        let record =
+            decode_relationship_record(&key, &shard.read_remote(&key).await.unwrap().unwrap())
+                .unwrap();
+        assert_eq!(
+            record.metadata.properties.get("id"),
+            Some(&VertexPropertyValue::Integer(50_000 + index))
+        );
+        assert_eq!(
+            record.metadata.properties.get("rank"),
+            Some(&VertexPropertyValue::Integer(2))
+        );
+    }
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn multigraph_relationship_import_preserves_parallel_relationship_rows() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/multigraph-relationship-import", object_store).await;
