@@ -1,6 +1,9 @@
 use super::*;
 
+use futures::{stream, StreamExt as _, TryStreamExt as _};
 use tracing::Instrument as _;
+
+const RELATIONSHIP_IMPORT_READ_CONCURRENCY: usize = 32;
 
 /// Stamp a failure onto the span that raised it.
 ///
@@ -1532,25 +1535,32 @@ impl GraphShard {
         self.validate_write_fence_txn(&txn, cell_id, options.operation)
             .await?;
         if let Some((source_label, destination_label)) = options.endpoint_labels {
-            let mut validated = BTreeSet::new();
+            let mut required_labels = BTreeMap::<VertexId, BTreeSet<&str>>::new();
             for relationship in relationships {
                 for (vertex, label) in [
                     (relationship.src, source_label),
                     (relationship.dst, destination_label),
                 ] {
-                    if !validated.insert((vertex, label)) {
-                        continue;
-                    }
-                    let key = keys::vertex(cell_id, vertex);
-                    let Some(value) = read_txn_remote(&txn, &key).await? else {
-                        return Err(GraphError::UnsupportedQuery {
-                            dialect: "OpenCypher",
-                            feature: format!(
-                                "MATCH endpoint vertex {vertex} with label {label} does not exist"
-                            ),
-                        });
-                    };
-                    let metadata = decode_vertex_metadata(&key, &value)?;
+                    required_labels.entry(vertex).or_default().insert(label);
+                }
+            }
+            let endpoint_keys = required_labels
+                .keys()
+                .map(|vertex| keys::vertex(cell_id, *vertex));
+            let endpoint_values = read_txn_remote_many(&txn, endpoint_keys).await?;
+            for (vertex, labels) in required_labels {
+                let key = keys::vertex(cell_id, vertex);
+                let Some(value) = endpoint_values.get(&key).and_then(Option::as_ref) else {
+                    let label = labels.iter().next().copied().unwrap_or("<unknown>");
+                    return Err(GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: format!(
+                            "MATCH endpoint vertex {vertex} with label {label} does not exist"
+                        ),
+                    });
+                };
+                let metadata = decode_vertex_metadata(&key, value)?;
+                for label in labels {
                     if !metadata.labels.contains(label) {
                         return Err(GraphError::UnsupportedQuery {
                             dialect: "OpenCypher",
@@ -1576,16 +1586,19 @@ impl GraphShard {
         let current_relationship_id =
             read_counter_txn(&txn, &keys::last_relationship_id(cell_id)).await?;
         let mut relationships = relationships.to_vec();
+        let mut prefetched_relationships = BTreeMap::<RelationshipId, RelationshipRecord>::new();
         let mut next_relationship_id = current_relationship_id;
         if options.create_always {
-            for relationship in &mut relationships {
-                relationship.relationship_id = next_available_relationship_id_txn(
-                    &txn,
-                    cell_id,
-                    &mut next_relationship_id,
-                    "CREATE",
-                )
-                .await?;
+            let allocated = next_available_relationship_ids_txn(
+                &txn,
+                cell_id,
+                &mut next_relationship_id,
+                relationships.len(),
+                "CREATE",
+            )
+            .await?;
+            for (relationship, relationship_id) in relationships.iter_mut().zip(allocated) {
+                relationship.relationship_id = relationship_id;
             }
         } else if options.update_existing_metadata {
             #[cfg(not(feature = "opencypher"))]
@@ -1595,47 +1608,68 @@ impl GraphShard {
             });
             #[cfg(feature = "opencypher")]
             {
-                let mut resolved = Vec::new();
-                for relationship in relationships {
-                    let external_id = relationship.relationship_id;
-                    let identity = VertexPropertyValue::Integer(external_id);
-                    if relationship.metadata.properties.get("id") != Some(&identity) {
-                        return Err(GraphError::CorruptValue {
-                            key: format!(
-                                "cell/{cell_id}/relationship-merge/{edge_type}/{}/{external_id}",
-                                relationship.src
-                            ),
-                            reason:
-                                "relationship MERGE identity metadata does not match the parsed id"
+                let lookups = stream::iter(relationships.into_iter().map(|relationship| {
+                    let txn = &txn;
+                    async move {
+                        let external_id = relationship.relationship_id;
+                        let identity = VertexPropertyValue::Integer(external_id);
+                        if relationship.metadata.properties.get("id") != Some(&identity) {
+                            return Err(GraphError::CorruptValue {
+                                key: format!(
+                                    "cell/{cell_id}/relationship-merge/{edge_type}/{}/{external_id}",
+                                    relationship.src
+                                ),
+                                reason: "relationship MERGE identity metadata does not match the parsed id"
                                     .to_string(),
-                        });
-                    }
-                    let existing_ids = relationship_ids_for_edge_property_txn(
-                        &txn,
-                        RelationshipPropertyTxnLookup {
-                            cell_id,
-                            edge_type,
-                            src: relationship.src,
-                            dst: relationship.dst,
-                            property: "id",
-                            value: &identity,
-                        },
-                    )
-                    .await?;
-                    if existing_ids.is_empty() {
-                        let mut inserted = relationship;
-                        inserted.relationship_id = next_available_relationship_id_txn(
-                            &txn,
-                            cell_id,
-                            &mut next_relationship_id,
-                            "MERGE",
+                            });
+                        }
+                        let existing = relationship_records_for_edge_property_txn(
+                            txn,
+                            RelationshipPropertyTxnLookup {
+                                cell_id,
+                                edge_type,
+                                src: relationship.src,
+                                dst: relationship.dst,
+                                property: "id",
+                                value: &identity,
+                            },
                         )
                         .await?;
+                        Ok::<_, GraphError>((relationship, existing))
+                    }
+                }))
+                .buffered(RELATIONSHIP_IMPORT_READ_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await?;
+                let missing = lookups
+                    .iter()
+                    .filter(|(_, existing)| existing.is_empty())
+                    .count();
+                let allocated = next_available_relationship_ids_txn(
+                    &txn,
+                    cell_id,
+                    &mut next_relationship_id,
+                    missing,
+                    "MERGE",
+                )
+                .await?;
+                let mut allocated = allocated.into_iter();
+                let mut resolved = Vec::with_capacity(lookups.len());
+                for (relationship, existing) in lookups {
+                    if existing.is_empty() {
+                        let mut inserted = relationship;
+                        inserted.relationship_id =
+                            allocated.next().ok_or_else(|| GraphError::CorruptValue {
+                                key: keys::last_relationship_id(cell_id),
+                                reason: "relationship id allocation returned too few ids"
+                                    .to_string(),
+                            })?;
                         resolved.push(inserted);
                     } else {
-                        for relationship_id in existing_ids {
+                        for record in existing {
                             let mut matched = relationship.clone();
-                            matched.relationship_id = relationship_id;
+                            matched.relationship_id = record.relationship_id;
+                            prefetched_relationships.insert(record.relationship_id, record);
                             resolved.push(matched);
                         }
                     }
@@ -1652,6 +1686,88 @@ impl GraphShard {
         let mut relationships_inserted = Vec::new();
         let mut relationships_updated = Vec::<(RelationshipRecord, EdgeMetadata)>::new();
         let mut relationships_already_existed = 0_u64;
+        let unresolved = relationships
+            .iter()
+            .filter(|relationship| {
+                !prefetched_relationships.contains_key(&relationship.relationship_id)
+            })
+            .map(|relationship| {
+                (
+                    relationship.relationship_id,
+                    keys::relationship(
+                        cell_id,
+                        edge_type,
+                        relationship.src,
+                        relationship.dst,
+                        relationship.relationship_id,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let id_keys = relationships
+            .iter()
+            .map(|relationship| keys::relationship_id(cell_id, relationship.relationship_id));
+        let id_values = read_txn_remote_many(&txn, id_keys).await?;
+        let mut record_keys = BTreeMap::<RelationshipId, (String, bool)>::new();
+        for (relationship_id, record) in &prefetched_relationships {
+            let id_key = keys::relationship_id(cell_id, *relationship_id);
+            let Some(value) = id_values.get(&id_key).and_then(Option::as_ref) else {
+                continue;
+            };
+            let target_key =
+                std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+                    key: id_key,
+                    reason: format!("relationship id pointer is not UTF-8: {err}"),
+                })?;
+            let prefetched_key = keys::relationship(
+                &record.cell_id,
+                &record.edge_type,
+                record.src,
+                record.dst,
+                record.relationship_id,
+            );
+            if target_key != prefetched_key {
+                // Preserve the durable id pointer as the authority when the
+                // property index and id index disagree. The identity check
+                // below will surface the same conflict as the serial path.
+                record_keys.insert(*relationship_id, (target_key.to_string(), true));
+            }
+        }
+        for (relationship_id, fallback_key) in &unresolved {
+            let id_key = keys::relationship_id(cell_id, *relationship_id);
+            match id_values.get(&id_key).and_then(Option::as_ref) {
+                Some(value) => {
+                    let target_key =
+                        std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
+                            key: id_key,
+                            reason: format!("relationship id pointer is not UTF-8: {err}"),
+                        })?;
+                    record_keys.insert(*relationship_id, (target_key.to_string(), true));
+                }
+                None => {
+                    record_keys.insert(*relationship_id, (fallback_key.clone(), false));
+                }
+            }
+        }
+        let record_values =
+            read_txn_remote_many(&txn, record_keys.values().map(|(key, _)| key.clone())).await?;
+        for (relationship_id, (record_key, required)) in record_keys {
+            match record_values.get(&record_key).and_then(Option::as_ref) {
+                Some(value) => {
+                    prefetched_relationships.insert(
+                        relationship_id,
+                        decode_relationship_record(&record_key, value)?,
+                    );
+                }
+                None if required => {
+                    return Err(GraphError::CorruptValue {
+                        key: keys::relationship_id(cell_id, relationship_id),
+                        reason: format!("relationship id points at missing record {record_key}"),
+                    });
+                }
+                None => {}
+            }
+        }
         for relationship in &relationships {
             let rel_key = keys::relationship(
                 cell_id,
@@ -1660,37 +1776,9 @@ impl GraphShard {
                 relationship.dst,
                 relationship.relationship_id,
             );
-            let id_key = keys::relationship_id(cell_id, relationship.relationship_id);
-            let existing = match read_txn_remote(&txn, &id_key).await? {
-                Some(value) => {
-                    let target_key =
-                        std::str::from_utf8(&value).map_err(|err| GraphError::CorruptValue {
-                            key: id_key.clone(),
-                            reason: format!("relationship id pointer is not UTF-8: {err}"),
-                        })?;
-                    match read_txn_remote(&txn, target_key).await? {
-                        Some(value) => {
-                            let record = decode_relationship_record(target_key, &value)?;
-                            Some(record)
-                        }
-                        None => {
-                            return Err(GraphError::CorruptValue {
-                                key: id_key,
-                                reason: format!(
-                                    "relationship id points at missing record {target_key}"
-                                ),
-                            });
-                        }
-                    }
-                }
-                None => match read_txn_remote(&txn, &rel_key).await? {
-                    Some(value) => {
-                        let record = decode_relationship_record(&rel_key, &value)?;
-                        Some(record)
-                    }
-                    None => None,
-                },
-            };
+            let existing = prefetched_relationships
+                .get(&relationship.relationship_id)
+                .cloned();
             if let Some(existing) = existing {
                 let requested = RelationshipRecord {
                     cell_id: cell_id.to_string(),
@@ -1775,52 +1863,74 @@ impl GraphShard {
         }
 
         let mut structural_edges = BTreeSet::<(VertexId, VertexId)>::new();
-        let mut structural_edges_already_existed = 0_u64;
-        let mut segment_neighbors_by_src = BTreeMap::<VertexId, BTreeSet<VertexId>>::new();
         for relationship in &relationships_inserted {
-            if !structural_edges.insert((relationship.src, relationship.dst)) {
-                continue;
-            }
-            if !fresh_cell {
-                if read_txn_remote(
-                    &txn,
-                    &keys::out_edge(cell_id, edge_type, relationship.src, relationship.dst),
-                )
-                .await?
-                .is_some()
+            structural_edges.insert((relationship.src, relationship.dst));
+        }
+        let mut structural_edges_to_insert = structural_edges.clone();
+        if !fresh_cell && !structural_edges.is_empty() {
+            let direct_edge_values = read_txn_remote_many(
+                &txn,
+                structural_edges
+                    .iter()
+                    .map(|(src, dst)| keys::out_edge(cell_id, edge_type, *src, *dst)),
+            )
+            .await?;
+            let mut missing_by_src = BTreeMap::<VertexId, BTreeSet<VertexId>>::new();
+            for (src, dst) in &structural_edges {
+                let key = keys::out_edge(cell_id, edge_type, *src, *dst);
+                if direct_edge_values
+                    .get(&key)
+                    .and_then(Option::as_ref)
+                    .is_some()
                 {
-                    structural_edges_already_existed =
-                        structural_edges_already_existed.saturating_add(1);
-                    continue;
+                    structural_edges_to_insert.remove(&(*src, *dst));
+                } else {
+                    missing_by_src.entry(*src).or_default().insert(*dst);
                 }
-                let segment_exists = match segment_neighbors_by_src.get(&relationship.src) {
-                    Some(neighbors) => neighbors.contains(&relationship.dst),
-                    None => {
-                        let neighbors = out_segment_neighbors_for_src_txn(
-                            &txn,
-                            cell_id,
-                            edge_type,
-                            relationship.src,
-                            current_epoch,
-                        )
-                        .await?;
-                        let exists = neighbors.contains(&relationship.dst);
-                        segment_neighbors_by_src.insert(relationship.src, neighbors);
-                        exists
+            }
+            let segment_neighbors = stream::iter(missing_by_src.keys().copied().map(|src| {
+                let txn = &txn;
+                async move {
+                    let neighbors = out_segment_neighbors_for_src_txn(
+                        txn,
+                        cell_id,
+                        edge_type,
+                        src,
+                        current_epoch,
+                    )
+                    .await?;
+                    Ok::<_, GraphError>((src, neighbors))
+                }
+            }))
+            .buffered(RELATIONSHIP_IMPORT_READ_CONCURRENCY)
+            .try_collect::<BTreeMap<_, _>>()
+            .await?;
+            for (src, destinations) in missing_by_src {
+                if let Some(neighbors) = segment_neighbors.get(&src) {
+                    for dst in destinations {
+                        if neighbors.contains(&dst) {
+                            structural_edges_to_insert.remove(&(src, dst));
+                        }
                     }
-                };
-                if segment_exists {
-                    structural_edges_already_existed =
-                        structural_edges_already_existed.saturating_add(1);
-                    continue;
                 }
             }
         }
         let structural_edges_inserted =
-            u64::try_from(structural_edges.len()).map_err(|err| GraphError::CorruptValue {
-                key: "relationship_import".to_string(),
-                reason: format!("too many structural edges in one import: {err}"),
-            })? - structural_edges_already_existed;
+            u64::try_from(structural_edges_to_insert.len()).map_err(|err| {
+                GraphError::CorruptValue {
+                    key: "relationship_import".to_string(),
+                    reason: format!("too many structural edges in one import: {err}"),
+                }
+            })?;
+        let structural_edges_already_existed = u64::try_from(
+            structural_edges
+                .len()
+                .saturating_sub(structural_edges_to_insert.len()),
+        )
+        .map_err(|err| GraphError::CorruptValue {
+            key: "relationship_import".to_string(),
+            reason: format!("too many existing structural edges in one import: {err}"),
+        })?;
         let relationships_inserted_count =
             u64::try_from(relationships_inserted.len()).map_err(|err| {
                 GraphError::CorruptValue {
@@ -1853,14 +1963,45 @@ impl GraphShard {
         let write_reverse_index = self.writes_reverse_index();
         let mut out_increments = BTreeMap::<VertexId, u64>::new();
         let mut in_increments = BTreeMap::<VertexId, u64>::new();
-        for (src, dst) in structural_edges {
-            if !fresh_cell
-                && edge_epoch_at_txn(&txn, cell_id, edge_type, src, dst, current_epoch)
-                    .await?
-                    .is_some()
-            {
-                continue;
+        for (src, dst) in &structural_edges_to_insert {
+            *out_increments.entry(*src).or_insert(0) += 1;
+            if write_reverse_index {
+                *in_increments.entry(*dst).or_insert(0) += 1;
             }
+        }
+        let mut relationship_count_increments = BTreeMap::<(VertexId, VertexId), u64>::new();
+        for relationship in &relationships_inserted {
+            *relationship_count_increments
+                .entry((relationship.src, relationship.dst))
+                .or_insert(0) += 1;
+        }
+        let counter_keys = out_increments
+            .keys()
+            .map(|src| keys::degree_out(cell_id, edge_type, *src))
+            .chain(
+                in_increments
+                    .keys()
+                    .map(|dst| keys::degree_in(cell_id, edge_type, *dst)),
+            )
+            .chain(
+                relationship_count_increments
+                    .keys()
+                    .map(|(src, dst)| keys::relationship_count(cell_id, edge_type, *src, *dst)),
+            );
+        let counter_values = if fresh_cell {
+            BTreeMap::new()
+        } else {
+            read_txn_remote_many(&txn, counter_keys).await?
+        };
+        let topology_changes = structural_edges_to_insert
+            .iter()
+            .map(|(src, dst)| (*src, *dst, true))
+            .collect::<Vec<_>>();
+        if !topology_changes.is_empty() {
+            self.mark_topology_change_txn(&txn, cell_id, edge_type, epoch, &topology_changes)
+                .await?;
+        }
+        for (src, dst) in structural_edges_to_insert {
             let record = EdgeRecord {
                 cell_id: cell_id.to_string(),
                 edge_type: edge_type.to_string(),
@@ -1868,8 +2009,6 @@ impl GraphShard {
                 dst,
             };
             let edge_value = encode_edge_record(&record);
-            self.mark_topology_change_txn(&txn, cell_id, edge_type, epoch, &[(src, dst, true)])
-                .await?;
             txn.put(
                 keys::out_edge(cell_id, edge_type, src, dst).as_bytes(),
                 &edge_value,
@@ -1880,28 +2019,16 @@ impl GraphShard {
                     &edge_value,
                 )?;
             }
-            *out_increments.entry(src).or_insert(0) += 1;
-            if write_reverse_index {
-                *in_increments.entry(dst).or_insert(0) += 1;
-            }
         }
         for (src, increment) in out_increments {
             let key = keys::degree_out(cell_id, edge_type, src);
-            let base = if fresh_cell {
-                0
-            } else {
-                read_counter_txn(&txn, &key).await?
-            };
+            let base = counter_value(&counter_values, &key, fresh_cell)?;
             txn.put(key.as_bytes(), encode_u64(base + increment))?;
         }
         if write_reverse_index {
             for (dst, increment) in in_increments {
                 let key = keys::degree_in(cell_id, edge_type, dst);
-                let base = if fresh_cell {
-                    0
-                } else {
-                    read_counter_txn(&txn, &key).await?
-                };
+                let base = counter_value(&counter_values, &key, fresh_cell)?;
                 txn.put(key.as_bytes(), encode_u64(base + increment))?;
             }
         }
@@ -1954,19 +2081,9 @@ impl GraphShard {
             delete_relationship_property_indexes_txn(&txn, record, previous_metadata)?;
             put_relationship_property_indexes_txn(&txn, record)?;
         }
-        let mut relationship_count_increments = BTreeMap::<(VertexId, VertexId), u64>::new();
-        for relationship in &relationships_inserted {
-            *relationship_count_increments
-                .entry((relationship.src, relationship.dst))
-                .or_insert(0) += 1;
-        }
         for ((src, dst), increment) in relationship_count_increments {
             let key = keys::relationship_count(cell_id, edge_type, src, dst);
-            let base = if fresh_cell {
-                0
-            } else {
-                read_counter_txn(&txn, &key).await?
-            };
+            let base = counter_value(&counter_values, &key, fresh_cell)?;
             txn.put(key.as_bytes(), encode_u64(base + increment))?;
         }
         if max_requested_relationship_id > current_relationship_id {
@@ -5358,33 +5475,83 @@ fn put_relationship_property_indexes_txn(
     Ok(())
 }
 
-async fn next_available_relationship_id_txn(
+async fn read_txn_remote_many(
     txn: &DbTransaction,
-    cell_id: &str,
-    cursor: &mut RelationshipId,
-    operation: &str,
-) -> Result<RelationshipId> {
-    loop {
-        *cursor = cursor
-            .checked_add(1)
-            .ok_or_else(|| GraphError::CorruptValue {
-                key: keys::last_relationship_id(cell_id),
-                reason: format!("relationship id overflow during {operation}"),
-            })?;
-        if read_txn_remote(txn, &keys::relationship_id(cell_id, *cursor))
-            .await?
-            .is_none()
-        {
-            return Ok(*cursor);
-        }
+    keys: impl IntoIterator<Item = String>,
+) -> Result<BTreeMap<String, Option<Bytes>>> {
+    let keys = keys.into_iter().collect::<BTreeSet<_>>();
+    // Callers finish each read phase before mutating the transaction. Every
+    // point read still records its key for serializable conflict detection;
+    // bounded overlap only hides independent object-store round trips.
+    stream::iter(keys.into_iter().map(|key| async move {
+        let value = read_txn_remote(txn, &key).await?;
+        Ok::<_, GraphError>((key, value))
+    }))
+    .buffer_unordered(RELATIONSHIP_IMPORT_READ_CONCURRENCY)
+    .try_collect()
+    .await
+}
+
+fn counter_value(
+    values: &BTreeMap<String, Option<Bytes>>,
+    key: &str,
+    fresh_cell: bool,
+) -> Result<u64> {
+    if fresh_cell {
+        return Ok(0);
+    }
+    match values.get(key) {
+        Some(Some(value)) => decode_u64(key, value),
+        Some(None) => Ok(0),
+        None => Err(GraphError::CorruptValue {
+            key: key.to_string(),
+            reason: "batched counter read did not include the requested key".to_string(),
+        }),
     }
 }
 
+async fn next_available_relationship_ids_txn(
+    txn: &DbTransaction,
+    cell_id: &str,
+    cursor: &mut RelationshipId,
+    count: usize,
+    operation: &str,
+) -> Result<Vec<RelationshipId>> {
+    let mut available = Vec::with_capacity(count);
+    while available.len() < count {
+        let remaining = count - available.len();
+        let mut candidates = Vec::with_capacity(remaining);
+        for _ in 0..remaining {
+            *cursor = cursor
+                .checked_add(1)
+                .ok_or_else(|| GraphError::CorruptValue {
+                    key: keys::last_relationship_id(cell_id),
+                    reason: format!("relationship id overflow during {operation}"),
+                })?;
+            candidates.push(*cursor);
+        }
+        let existing = read_txn_remote_many(
+            txn,
+            candidates
+                .iter()
+                .map(|relationship_id| keys::relationship_id(cell_id, *relationship_id)),
+        )
+        .await?;
+        for relationship_id in candidates {
+            let key = keys::relationship_id(cell_id, relationship_id);
+            if existing.get(&key).and_then(Option::as_ref).is_none() {
+                available.push(relationship_id);
+            }
+        }
+    }
+    Ok(available)
+}
+
 #[cfg(feature = "opencypher")]
-async fn relationship_ids_for_edge_property_txn(
+async fn relationship_records_for_edge_property_txn(
     txn: &DbTransaction,
     lookup: RelationshipPropertyTxnLookup<'_>,
-) -> Result<Vec<RelationshipId>> {
+) -> Result<Vec<RelationshipRecord>> {
     let RelationshipPropertyTxnLookup {
         cell_id,
         edge_type,
@@ -5398,7 +5565,7 @@ async fn relationship_ids_for_edge_property_txn(
         cell_id, edge_type, property, &encoded, src, dst,
     );
     let mut iter = txn.scan_prefix(prefix.as_bytes(), ..).await?;
-    let mut relationship_ids = Vec::new();
+    let mut relationships = Vec::new();
     while let Some(kv) = iter.next().await? {
         let key = String::from_utf8_lossy(&kv.key).into_owned();
         let (
@@ -5431,12 +5598,12 @@ async fn relationship_ids_for_edge_property_txn(
         };
         let record = decode_relationship_record(&record_key, &record_value)?;
         if record.metadata.properties.get(property) == Some(value) {
-            relationship_ids.push(relationship_id);
+            relationships.push(record);
         }
     }
-    relationship_ids.sort_unstable();
-    relationship_ids.dedup();
-    Ok(relationship_ids)
+    relationships.sort_by_key(|record| record.relationship_id);
+    relationships.dedup_by_key(|record| record.relationship_id);
+    Ok(relationships)
 }
 
 async fn live_relationships_for_edge_txn(
