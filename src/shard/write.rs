@@ -2789,36 +2789,54 @@ impl GraphShard {
             (mutation.src, src_metadata),
             (mutation.dst, dst_metadata),
         ])?;
-        let _permit = self
-            .acquire_graph_write_permit("write_edge_with_vertex_metadata")
-            .await?;
-        let _writer = self.writer_lane(&mutation.cell_id).lock().await;
-        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
-            match self
-                .write_edge_with_vertex_metadata_txn(&mutation, &metadata_updates)
-                .await
-            {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+        let span = write_txn_span(&mutation.cell_id, Some(&mutation.edge_type));
+        async {
+            let _permit = self
+                .acquire_graph_write_permit("write_edge_with_vertex_metadata")
+                .instrument(tracing::info_span!(
+                    "write.permit_acquire",
+                    turbolay.cell_id = %mutation.cell_id,
+                    error.class = tracing::field::Empty,
+                ))
+                .await?;
+            let _writer = self
+                .writer_lane(&mutation.cell_id)
+                .lock()
+                .instrument(tracing::info_span!(
+                    "write.lane_lock",
+                    turbolay.cell_id = %mutation.cell_id,
+                ))
+                .await;
+            for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+                match self
+                    .write_edge_with_vertex_metadata_txn(&mutation, &metadata_updates)
+                    .await
                 {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
-                    tokio::task::yield_now().await;
+                    Err(err)
+                        if is_retryable_write_conflict(&err)
+                            && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                    {
+                        self.operation_metrics
+                            .write_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(result) => {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Ok(result);
+                    }
+                    result => return result,
                 }
-                Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(result);
-                }
-                result => return result,
             }
+            Err(GraphError::RetryExhausted {
+                operation: "graph transaction",
+                attempts: GRAPH_TXN_MAX_RETRIES,
+            })
         }
-        Err(GraphError::RetryExhausted {
-            operation: "graph transaction",
-            attempts: GRAPH_TXN_MAX_RETRIES,
-        })
+        .instrument(span)
+        .await
     }
 
     async fn write_edge_with_vertex_metadata_txn(
@@ -2859,36 +2877,54 @@ impl GraphShard {
             (mutation.src, src_metadata),
             (mutation.dst, dst_metadata),
         ])?;
-        let _permit = self
-            .acquire_graph_write_permit("write_edge_with_full_metadata")
-            .await?;
-        let _writer = self.writer_lane(&mutation.cell_id).lock().await;
-        for attempt in 0..GRAPH_TXN_MAX_RETRIES {
-            match self
-                .write_edge_with_full_metadata_txn(&mutation, &metadata_updates, &edge_metadata)
-                .await
-            {
-                Err(err)
-                    if is_retryable_write_conflict(&err) && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+        let span = write_txn_span(&mutation.cell_id, Some(&mutation.edge_type));
+        async {
+            let _permit = self
+                .acquire_graph_write_permit("write_edge_with_full_metadata")
+                .instrument(tracing::info_span!(
+                    "write.permit_acquire",
+                    turbolay.cell_id = %mutation.cell_id,
+                    error.class = tracing::field::Empty,
+                ))
+                .await?;
+            let _writer = self
+                .writer_lane(&mutation.cell_id)
+                .lock()
+                .instrument(tracing::info_span!(
+                    "write.lane_lock",
+                    turbolay.cell_id = %mutation.cell_id,
+                ))
+                .await;
+            for attempt in 0..GRAPH_TXN_MAX_RETRIES {
+                match self
+                    .write_edge_with_full_metadata_txn(&mutation, &metadata_updates, &edge_metadata)
+                    .await
                 {
-                    self.operation_metrics
-                        .write_retries
-                        .fetch_add(1, Ordering::Relaxed);
-                    tokio::task::yield_now().await;
+                    Err(err)
+                        if is_retryable_write_conflict(&err)
+                            && attempt + 1 < GRAPH_TXN_MAX_RETRIES =>
+                    {
+                        self.operation_metrics
+                            .write_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(result) => {
+                        self.operation_metrics
+                            .write_commits
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Ok(result);
+                    }
+                    result => return result,
                 }
-                Ok(result) => {
-                    self.operation_metrics
-                        .write_commits
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(result);
-                }
-                result => return result,
             }
+            Err(GraphError::RetryExhausted {
+                operation: "graph transaction",
+                attempts: GRAPH_TXN_MAX_RETRIES,
+            })
         }
-        Err(GraphError::RetryExhausted {
-            operation: "graph transaction",
-            attempts: GRAPH_TXN_MAX_RETRIES,
-        })
+        .instrument(span)
+        .await
     }
 
     async fn write_edge_with_full_metadata_txn(
