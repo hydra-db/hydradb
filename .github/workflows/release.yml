@@ -1,0 +1,97 @@
+# Modelled on ../sleet's release.yml, minus the crates.io half: this workspace
+# is `publish = false`, so there is no validate/publish-to-crates job. A release
+# here is Linux server binaries (graph-node + graph-indexer) plus auto-generated
+# notes, attached to a GitHub Release. Container images ship separately via
+# container.yml.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+env:
+  # OpenCypher's async futures exceed the 2 MiB default thread stack; the native
+  # FFI build needs the same headroom CI uses. BINDGEN_EXTRA_CLANG_ARGS and
+  # LIBRARY_PATH are Homebrew/macOS-only and not needed on the Linux runner.
+  RUST_MIN_STACK: 33554432
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          package_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          test "v${package_version}" = "${GITHUB_REF_NAME}" \
+            || { echo "tag ${GITHUB_REF_NAME} != Cargo.toml v${package_version}"; exit 1; }
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-release
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev cmake \
+            pkg-config libcypher-parser-dev libgraphblas-dev
+      - name: Verify native dependencies
+        run: |
+          pkg-config --exists cypher-parser
+          ldconfig -p | grep -q libgraphblas
+      - name: Build release binaries
+        run: |
+          cargo build --release --locked --target "${TARGET}" \
+            --bin graph-node --bin graph-indexer \
+            --features server-runtime,indexer-runtime
+      - name: Package binaries
+        run: |
+          archive="turbolay-${GITHUB_REF_NAME}-${TARGET}"
+          mkdir "${archive}"
+          cp "target/${TARGET}/release/graph-node" "${archive}/"
+          cp "target/${TARGET}/release/graph-indexer" "${archive}/"
+          cp README.md LICENSE "${archive}/"
+          tar -czf "${archive}.tar.gz" "${archive}"
+          sha256sum "${archive}.tar.gz" > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turbolay-x86_64-unknown-linux-gnu
+          path: |
+            turbolay-*.tar.gz
+            SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: turbolay-*
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}" dist/*
+          --repo "${GITHUB_REPOSITORY}"
+          --verify-tag
+          --title "Turbolay ${GITHUB_REF_NAME}"
+          --generate-notes
