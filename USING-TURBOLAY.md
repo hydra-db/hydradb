@@ -368,8 +368,11 @@ SET n:Person, n.name = row.name, n.city = row.city
 ```
 
 Dropping the label half is what fails (`UNWIND vertex upsert requires exactly
-one SET label`) — not the properties. So a bulk load is **two requests**: one
-edge batch, one node batch carrying labels and properties together.
+one SET label`) — not the properties. So a bulk load is **two requests**: this
+node batch carrying labels and properties, then an edge batch. Write the
+**labels first** — the reverse order leaves a window in which the nodes exist
+unlabelled and undetectable. See [Batch writes](#batch-writes) for the full
+recipe and why the ordering matters.
 
 `shortestPath(...)` itself **parses and executes**. What fails is returning the
 path binding — and that fails identically for any path binding, shortest or not.
@@ -771,6 +774,17 @@ def cypher_strings(values):
         "'" + v.replace("\\", "\\\\").replace("'", "\\'") + "'"
         for v in values) + "]"
 ```
+
+Escape backslashes **before** quotes, as above; the reverse order corrupts a
+value containing both. Verified against the server, selecting nodes whose stored
+names came from parameters (so the names themselves are ground truth):
+
+| Value | Literal produced | Selects the node |
+|---|---|---|
+| `plain` | `['plain']` | yes |
+| `o'brien` | `['o\'brien']` | yes |
+| `back\slash` | `['back\\slash']` | yes |
+| `evil\'quote` | `['evil\\\'quote']` | yes |
 
 Treat the inputs as untrusted when you do this — inlining is exactly the
 injection surface parameters exist to avoid.
