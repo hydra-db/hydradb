@@ -12239,6 +12239,65 @@ async fn cypher_row_engine_rejects_excess_intermediate_rows() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_bound_one_hop_scan_limit_ignores_unrelated_edges() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = GraphShard::open_standalone_writer_with_options(
+        "graph/cypher-bound-one-hop-source-local",
+        object_store,
+        GraphOpenOptions {
+            limits: GraphLimits {
+                max_query_scan_edges: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for vertex_id in [1, 2] {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                vertex_id,
+                VertexMetadata::default().with_label("User"),
+            )
+            .await
+            .unwrap();
+    }
+    for (index, (src, dst)) in [(1, 2), (100, 101), (200, 201)].into_iter().enumerate() {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "reddit-home".to_string(),
+                edge_type: "FOLLOWS".to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-bound-one-hop-source-local-{index}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-bound-one-hop-source-local-read"),
+            "MATCH (u:User {id: 1})-[:FOLLOWS]->(v:User) RETURN v.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("v.id")],
+            vec![QueryRow::new(vec![QueryValue::VertexId(2)])],
+        )
+    );
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_row_engine_rejects_large_index_candidate_scans() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = GraphShard::open_standalone_writer_with_options(

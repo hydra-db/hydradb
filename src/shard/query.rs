@@ -6206,15 +6206,10 @@ impl GraphShard {
     ) -> Result<Vec<VertexId>> {
         validate_component("cell_id", cell_id)?;
         validate_component("edge_type", edge_type)?;
-        let mut neighbors = Vec::new();
-        for edge in self
-            .edges_at_with_budget(cell_id, edge_type, read_epoch, Some(budget))
-            .await?
-        {
+        let snapshot = self.snapshot_at(cell_id, read_epoch).await?;
+        let mut neighbors = snapshot.out_neighbors(edge_type, src).await?;
+        for _ in &neighbors {
             budget.check("query_out_neighbors_scan")?;
-            if edge.src == src {
-                neighbors.push(edge.dst);
-            }
         }
         neighbors.sort_unstable();
         Ok(neighbors)
