@@ -1266,11 +1266,17 @@ impl ClientQueryService {
         let action = self.authorize_query(session, &request)?;
         let parsed_unwind = parse_opencypher_unwind_batch(&request.query)?;
         let (batch_operation, scalar_parameters) = match parsed_unwind {
-            Some(parsed) => (
-                Some(resolve_unwind_batch(parsed, &request.parameters)?),
-                BTreeMap::new(),
-            ),
-            None => (None, scalar_query_parameters(&request.parameters)?),
+            Some(parsed) => {
+                tracing::Span::current().record("turbolay.query.kind", "batch");
+                (
+                    Some(resolve_unwind_batch(parsed, &request.parameters)?),
+                    BTreeMap::new(),
+                )
+            }
+            None => {
+                tracing::Span::current().record("turbolay.query.kind", "scalar");
+                (None, scalar_query_parameters(&request.parameters)?)
+            }
         };
         if batch_operation.as_ref().is_some_and(|operation| {
             operation.is_write() != (action == QueryTransportAction::Write)
@@ -1561,11 +1567,17 @@ impl ClientQueryService {
 
         let parsed_unwind = parse_opencypher_unwind_batch(&request.query)?;
         let (batch_operation, scalar_parameters) = match parsed_unwind {
-            Some(parsed) => (
-                Some(resolve_unwind_batch(parsed, &request.parameters)?),
-                BTreeMap::new(),
-            ),
-            None => (None, scalar_query_parameters(&request.parameters)?),
+            Some(parsed) => {
+                tracing::Span::current().record("turbolay.query.kind", "batch");
+                (
+                    Some(resolve_unwind_batch(parsed, &request.parameters)?),
+                    BTreeMap::new(),
+                )
+            }
+            None => {
+                tracing::Span::current().record("turbolay.query.kind", "scalar");
+                (None, scalar_query_parameters(&request.parameters)?)
+            }
         };
 
         let columns = if let Some(operation) = &batch_operation {
@@ -2264,6 +2276,7 @@ pub(crate) fn client_root_span(
                 turbolay.caller.step = tracing::field::Empty,
                 turbolay.read_epoch = tracing::field::Empty,
                 turbolay.query.rows_returned = tracing::field::Empty,
+                turbolay.query.kind = tracing::field::Empty,
                 runtime_limit_ms = tracing::field::Empty,
                 error.class = tracing::field::Empty,
                 turbolay.sampling.tail_keep = tracing::field::Empty,

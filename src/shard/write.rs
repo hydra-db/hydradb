@@ -1308,8 +1308,22 @@ impl GraphShard {
         let span = write_txn_span(cell_id, Some(edge_type));
         async {
             let mut retries = WriteRetryCount::new();
-            let _permit = self.acquire_graph_write_permit(options.operation).await?;
-            let _writer = self.writer_lane(cell_id).lock().await;
+            let _permit = self
+                .acquire_graph_write_permit(options.operation)
+                .instrument(tracing::info_span!(
+                    "write.permit_acquire",
+                    turbolay.cell_id = %cell_id,
+                    error.class = tracing::field::Empty,
+                ))
+                .await?;
+            let _writer = self
+                .writer_lane(cell_id)
+                .lock()
+                .instrument(tracing::info_span!(
+                    "write.lane_lock",
+                    turbolay.cell_id = %cell_id,
+                ))
+                .await;
             for attempt in 0..GRAPH_TXN_MAX_RETRIES {
                 match self
                     .import_relationships_batch_txn(
@@ -1533,6 +1547,11 @@ impl GraphShard {
             .begin(IsolationLevel::SerializableSnapshot)
             .await?;
         self.validate_write_fence_txn(&txn, cell_id, options.operation)
+            .instrument(tracing::info_span!(
+                "write.fence_validate",
+                turbolay.cell_id = %cell_id,
+                error.class = tracing::field::Empty,
+            ))
             .await?;
         if let Some((source_label, destination_label)) = options.endpoint_labels {
             let mut required_labels = BTreeMap::<VertexId, BTreeSet<&str>>::new();
@@ -2687,8 +2706,22 @@ impl GraphShard {
         let span = write_txn_span(&mutation.cell_id, Some(&mutation.edge_type));
         async {
             let mut retries = WriteRetryCount::new();
-            let _permit = self.acquire_graph_write_permit("write_edge").await?;
-            let _writer = self.writer_lane(&mutation.cell_id).lock().await;
+            let _permit = self
+                .acquire_graph_write_permit("write_edge")
+                .instrument(tracing::info_span!(
+                    "write.permit_acquire",
+                    turbolay.cell_id = %mutation.cell_id,
+                    error.class = tracing::field::Empty,
+                ))
+                .await?;
+            let _writer = self
+                .writer_lane(&mutation.cell_id)
+                .lock()
+                .instrument(tracing::info_span!(
+                    "write.lane_lock",
+                    turbolay.cell_id = %mutation.cell_id,
+                ))
+                .await;
             for attempt in 0..GRAPH_TXN_MAX_RETRIES {
                 match self.write_edge_txn(&mutation).await {
                     Err(err)
@@ -2891,6 +2924,11 @@ impl GraphShard {
             .begin(IsolationLevel::SerializableSnapshot)
             .await?;
         self.validate_write_fence_txn(&txn, &mutation.cell_id, operation)
+            .instrument(tracing::info_span!(
+                "write.fence_validate",
+                turbolay.cell_id = %mutation.cell_id,
+                error.class = tracing::field::Empty,
+            ))
             .await?;
         let idem_key = keys::idempotency(&mutation.cell_id, "create", &mutation.idempotency_key);
 
@@ -4148,8 +4186,22 @@ impl GraphShard {
         let span = write_txn_span(cell_id, common_edge_type(&mutations));
         async {
             let mut retries = WriteRetryCount::new();
-            let _permit = self.acquire_graph_write_permit(operation).await?;
-            let _writer = self.writer_lane(cell_id).lock().await;
+            let _permit = self
+                .acquire_graph_write_permit(operation)
+                .instrument(tracing::info_span!(
+                    "write.permit_acquire",
+                    turbolay.cell_id = %cell_id,
+                    error.class = tracing::field::Empty,
+                ))
+                .await?;
+            let _writer = self
+                .writer_lane(cell_id)
+                .lock()
+                .instrument(tracing::info_span!(
+                    "write.lane_lock",
+                    turbolay.cell_id = %cell_id,
+                ))
+                .await;
             for attempt in 0..GRAPH_TXN_MAX_RETRIES {
                 match self
                     .write_edge_mutations_batch_txn(cell_id, &mutations, operation, endpoint_labels)
@@ -4282,6 +4334,11 @@ impl GraphShard {
             .begin(IsolationLevel::SerializableSnapshot)
             .await?;
         self.validate_write_fence_txn(&txn, cell_id, operation)
+            .instrument(tracing::info_span!(
+                "write.fence_validate",
+                turbolay.cell_id = %cell_id,
+                error.class = tracing::field::Empty,
+            ))
             .await?;
 
         let mut idempotency_keys = BTreeSet::new();
