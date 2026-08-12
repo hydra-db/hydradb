@@ -458,6 +458,33 @@ pub(crate) fn expand_range_with_overlay(
     let mut reachable = BTreeSet::new();
     let mut edge_visits = 0_u64;
 
+    // A zero-length path is the start vertex itself, so `*0..n` includes it —
+    // and the level loop below starts at hop 1, so nothing else here can. Left
+    // out, `MATCH (a)-[:T*0..2]->(b)` silently dropped `a` from its own answer
+    // whenever a WAL overlay was active, while the non-overlay path
+    // (`expand_range_bitmap`, which seeds `result_seen` from `start_ordinals`)
+    // returned it.
+    //
+    // Membership is the same test the non-overlay path uses: the compiled
+    // dictionary is sources ∪ destinations, so a start with no incident edge is
+    // not a vertex of the graph and is not returned. The overlay clause covers
+    // a start the WAL has since given an outgoing edge to, which the compiled
+    // generation cannot know about yet.
+    //
+    // Known limit: a start that appears *only* as an overlay destination is
+    // still missed. Catching it needs a scan of the whole overlay per start,
+    // and the case is a vertex created after the last index build and reached
+    // by a zero-length path in the same query.
+    if min_hops == 0 {
+        reachable.extend(starts.iter().copied().filter(|start| {
+            crate::sparse_kernel::compiled_graphblas_contains_vertex(compiled, *start)
+                || overlay
+                    .states
+                    .get(start)
+                    .is_some_and(|destinations| destinations.values().any(|exists| *exists))
+        }));
+    }
+
     for hop in 1..=max_hops {
         if frontier.is_empty() {
             break;
@@ -585,6 +612,34 @@ mod tests {
             (2u64, BTreeSet::from([9u64])),
         ]);
         assert_overlay_walk_matches_range_expansion(&adjacency, &[0], 3, 3);
+    }
+
+    /// A zero-length path is the start vertex itself. `*0..n` must return it,
+    /// and the level loop starts at hop 1, so only an explicit seed can.
+    ///
+    /// Caught by the sweep below rather than written first: `min_hops == 0` is
+    /// reachable straight from Cypher — `lower_hop_range` accepts an explicit
+    /// `0` and `validate_reachable_hop_request` only rejects `min > max` — so
+    /// `MATCH (a)-[:T*0..2]->(b)` was dropping `a` whenever an overlay existed.
+    #[test]
+    fn a_zero_length_path_returns_the_start_vertex() {
+        let adjacency = crate::sparse_kernel::Adjacency::from([
+            (1u64, BTreeSet::from([2u64])),
+            (2u64, BTreeSet::from([3u64])),
+        ]);
+        for (min_hops, max_hops) in [(0u8, 0u8), (0, 1), (0, 2)] {
+            assert_overlay_walk_matches_range_expansion(&adjacency, &[1], min_hops, max_hops);
+        }
+    }
+
+    /// A start vertex with no incident edge is not a vertex of the graph, so
+    /// `*0..n` must not invent it. This is the same rule `start_ordinals`
+    /// applies on the non-overlay path, and getting it wrong in the other
+    /// direction would have been just as silent.
+    #[test]
+    fn a_zero_length_path_does_not_invent_an_absent_start() {
+        let adjacency = crate::sparse_kernel::Adjacency::from([(1u64, BTreeSet::from([2u64]))]);
+        assert_overlay_walk_matches_range_expansion(&adjacency, &[404], 0, 2);
     }
 
     /// The general guard, over shapes the two targeted cases do not cover:

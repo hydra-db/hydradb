@@ -287,6 +287,17 @@ impl CompiledCompactCscMatrix {
         self.indices.get(index)
     }
 
+    /// Whether the vertex is in this matrix's dictionary — which is
+    /// sources ∪ destinations, so it means "has at least one incident edge in
+    /// the generation this matrix was compiled from".
+    ///
+    /// `expand_range_bitmap` decides which start vertices a `*0..n` query
+    /// returns by exactly this test (through `start_ordinals`), so the overlay
+    /// walk has to be able to ask the same question to give the same answer.
+    fn contains_vertex(&self, vertex: VertexId) -> bool {
+        self.ordinal(vertex).is_some()
+    }
+
     fn contains_edge(&self, src: VertexId, dst: VertexId) -> bool {
         let (Some(src_ordinal), Some(dst_ordinal)) = (self.ordinal(src), self.ordinal(dst)) else {
             return false;
@@ -720,6 +731,13 @@ impl CompiledGraphBlasMatrix {
 
     pub(crate) fn contains_edge(&self, src: VertexId, dst: VertexId) -> bool {
         self.canonical_out.contains_edge(src, dst)
+    }
+
+    /// Whether the vertex exists in the compiled generation. Ungated for the
+    /// same reason as [`Self::out_neighbors`]: `shard::topology_tail` needs it
+    /// and is not behind `opencypher`.
+    pub(crate) fn contains_vertex(&self, vertex: VertexId) -> bool {
+        self.canonical_out.contains_vertex(vertex)
     }
 
     #[cfg(feature = "opencypher")]
