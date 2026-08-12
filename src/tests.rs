@@ -1657,6 +1657,81 @@ async fn cypher_graphblas_matrix_survives_interleaved_unrelated_writes() {
     assert_eq!(shard.graphblas_cache.lock().await.len(), 1);
 }
 
+/// `matrix_reachable` must answer the same question however it is asked.
+///
+/// Two things used to change the answer that have no business doing so: the
+/// number of start ids (one start took a storage-frontier walk with range
+/// semantics, two took `expand` with fixed-hop semantics) and whether a
+/// compiled matrix happened to be cached. The graph below cycles back through
+/// the start vertex, which is the only shape on which the two specifications
+/// disagree — and the reason no existing test caught this.
+#[tokio::test]
+async fn matrix_reachable_does_not_depend_on_start_arity_or_artifact_presence() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/matrix-reachable-hop-semantics", object_store).await;
+
+    // 1 -> 2, 2 -> 1, 2 -> 3. Vertex 1 is reachable from itself in two hops.
+    shard.write_edge(mutation(1, 2, "cycle-1")).await.unwrap();
+    shard.write_edge(mutation(2, 1, "cycle-2")).await.unwrap();
+    shard.write_edge(mutation(2, 3, "cycle-3")).await.unwrap();
+
+    let epoch = shard.current_epoch("reddit-home").await.unwrap();
+    let reachable = |starts: Vec<VertexId>| {
+        let shard = &shard;
+        async move {
+            shard
+                .matrix_reachable(
+                    "reddit-home",
+                    "USER_SUBSCRIBED_TO_SUBREDDIT",
+                    &starts,
+                    2,
+                    epoch,
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    // No artifact yet: the single-start branch walks storage, the multi-start
+    // branch materialises the adjacency. Adding an id that is not in the graph
+    // must not change what the query means.
+    let one_start = reachable(vec![1]).await;
+    let with_absent_start = reachable(vec![1, 999]).await;
+    assert_eq!(
+        one_start.vertices, with_absent_start.vertices,
+        "start-set arity must not change the answer"
+    );
+    assert!(
+        !one_start.vertices.contains(&1),
+        "a start vertex reached around a cycle is not part of its own answer"
+    );
+    assert_eq!(one_start.vertices, vec![2, 3]);
+
+    // Now publish an artifact so the compiled branch is eligible, and ask
+    // again. Whether a matrix is cached is a cost decision, not a semantic one.
+    shard
+        .build_matrix_tiles("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 2, 8)
+        .await
+        .unwrap();
+    let epoch = shard.current_epoch("reddit-home").await.unwrap();
+    let compiled = shard
+        .matrix_reachable(
+            "reddit-home",
+            "USER_SUBSCRIBED_TO_SUBREDDIT",
+            &[1],
+            2,
+            epoch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        compiled.vertices, one_start.vertices,
+        "the presence of a compiled artifact must not change the answer"
+    );
+
+    shard.close().await.unwrap();
+}
+
 fn mutation(src: VertexId, dst: VertexId, idempotency_key: &str) -> EdgeMutation {
     EdgeMutation {
         cell_id: "reddit-home".to_string(),

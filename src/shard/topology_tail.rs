@@ -457,17 +457,35 @@ pub(crate) fn expand_range_with_overlay(
     let mut frontier = starts.iter().copied().collect::<BTreeSet<_>>();
     let mut reachable = BTreeSet::new();
     let mut edge_visits = 0_u64;
-    let empty = BTreeMap::new();
+
+    // Hop zero is the start set itself, and the loop below only ever reaches
+    // hop one. Both compiled kernels seed their result with the starts they
+    // find in the matrix and drop the rest, so filter the same way or
+    // `min_hops == 0` disagrees with them in both directions.
+    if min_hops == 0 {
+        reachable.extend(frontier.iter().copied().filter(|start| {
+            crate::sparse_kernel::compiled_graphblas_contains_vertex(compiled, *start)
+        }));
+    }
 
     for hop in 1..=max_hops {
         if frontier.is_empty() {
             break;
         }
-        let frontier_values = frontier.iter().copied().collect::<Vec<_>>();
-        let base =
-            crate::sparse_kernel::expand_compiled_graphblas(compiled, &empty, &frontier_values, 1)?;
-        edge_visits = edge_visits.saturating_add(base.edge_visits);
-        let mut next = base.vertices.into_iter().collect::<BTreeSet<_>>();
+        // One hop is a *neighbourhood*, not a reachability query, and the two
+        // are not interchangeable. This used to call `expand(frontier, 1)`,
+        // which seeds its `seen` set with its `starts` and then strips them
+        // from the result — so every edge between two members of the same
+        // frontier vanished, dropping rows whenever `min_hops > 1` and
+        // collapsing the frontier a hop early when the only way forward ran
+        // through such an edge. Unioning per-vertex neighbourhoods has no
+        // start set and therefore no way to express that bug.
+        let mut next = BTreeSet::new();
+        for src in &frontier {
+            let neighbors = crate::sparse_kernel::compiled_graphblas_out_neighbors(compiled, *src);
+            edge_visits = edge_visits.saturating_add(neighbors.len() as u64);
+            next.extend(neighbors);
+        }
 
         for src in &frontier {
             let Some(changes) = overlay.states.get(src) else {
@@ -510,6 +528,111 @@ pub(crate) fn expand_range_with_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty overlay makes [`expand_range_with_overlay`] and
+    /// `expand_range_compiled_graphblas` the same specification, so any
+    /// disagreement between them is a bug in the overlay walk. Nothing pinned
+    /// that before, which is how the frontier defect below survived.
+    fn assert_overlay_walk_matches_range_expansion(
+        adjacency: &crate::sparse_kernel::Adjacency,
+        starts: &[VertexId],
+        min_hops: u8,
+        max_hops: u8,
+    ) {
+        let compiled = crate::sparse_kernel::compile_graphblas_matrix(
+            adjacency,
+            crate::sparse_kernel::SparseKernelBackend::CompactCsc,
+        )
+        .expect("the matrix compiles");
+
+        let with_overlay = expand_range_with_overlay(
+            &compiled,
+            &GraphTopologyOverlay::default(),
+            starts,
+            min_hops,
+            max_hops,
+        )
+        .expect("the overlay walk succeeds");
+        let without_overlay = crate::sparse_kernel::expand_range_compiled_graphblas(
+            &compiled,
+            &BTreeMap::new(),
+            starts,
+            min_hops,
+            max_hops,
+        )
+        .expect("the range expansion succeeds");
+
+        assert_eq!(
+            with_overlay.vertices, without_overlay.vertices,
+            "overlay walk disagreed for starts={starts:?} hops={min_hops}..{max_hops}"
+        );
+        assert_eq!(
+            with_overlay.edge_visits, without_overlay.edge_visits,
+            "overlay walk counted different work for starts={starts:?} hops={min_hops}..{max_hops}"
+        );
+    }
+
+    /// `0 -> 2`, `0 -> 3`, `3 -> 2`. The hop-1 frontier from `0` is `{2, 3}`,
+    /// and `3 -> 2` runs *inside* that frontier, so `2` is reachable at exactly
+    /// two hops. Expanding with `expand(frontier, 1)` hid it and returned `[]`.
+    #[test]
+    fn an_edge_between_two_frontier_members_survives_the_overlay_walk() {
+        let adjacency = crate::sparse_kernel::Adjacency::from([
+            (0u64, BTreeSet::from([2u64, 3u64])),
+            (3u64, BTreeSet::from([2u64])),
+        ]);
+        assert_overlay_walk_matches_range_expansion(&adjacency, &[0], 2, 2);
+    }
+
+    /// The same defect truncated the walk: with `2 -> 9` added, vertex `9` sits
+    /// three hops out and is reachable only through the intra-frontier edge, so
+    /// losing that edge emptied the frontier and returned `[]` instead of `[9]`.
+    #[test]
+    fn an_intra_frontier_edge_does_not_truncate_the_walk() {
+        let adjacency = crate::sparse_kernel::Adjacency::from([
+            (0u64, BTreeSet::from([2u64, 3u64])),
+            (3u64, BTreeSet::from([2u64])),
+            (2u64, BTreeSet::from([9u64])),
+        ]);
+        assert_overlay_walk_matches_range_expansion(&adjacency, &[0], 3, 3);
+    }
+
+    /// The general guard, over shapes the two targeted cases do not cover:
+    /// cycles through a start vertex, unknown starts, `min_hops == 0`, and
+    /// ranges wider than one hop.
+    #[test]
+    fn the_overlay_walk_agrees_with_range_expansion_across_hop_ranges() {
+        let graphs = [
+            // A cycle back through the start vertex.
+            crate::sparse_kernel::Adjacency::from([
+                (1u64, BTreeSet::from([2u64])),
+                (2u64, BTreeSet::from([1u64, 3u64])),
+            ]),
+            // A diamond, so a vertex is reached at two different depths.
+            crate::sparse_kernel::Adjacency::from([
+                (1u64, BTreeSet::from([2u64, 3u64])),
+                (2u64, BTreeSet::from([4u64])),
+                (3u64, BTreeSet::from([4u64])),
+                (4u64, BTreeSet::from([5u64])),
+            ]),
+            // A self-loop: the frontier contains its own neighbour.
+            crate::sparse_kernel::Adjacency::from([
+                (1u64, BTreeSet::from([1u64, 2u64])),
+                (2u64, BTreeSet::from([3u64])),
+            ]),
+        ];
+        for adjacency in &graphs {
+            for starts in [&[1u64][..], &[1, 2][..], &[404][..]] {
+                for min_hops in 0..=3u8 {
+                    for max_hops in min_hops..=3u8 {
+                        assert_overlay_walk_matches_range_expansion(
+                            adjacency, starts, min_hops, max_hops,
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[cfg(feature = "opencypher")]
     #[test]

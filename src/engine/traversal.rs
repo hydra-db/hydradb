@@ -1,5 +1,41 @@
 use super::*;
 use crate::shard::QueryBudget;
+use crate::sparse_kernel::FrontierWalk;
+
+/// The one place a [`SparseTraversal`] becomes a [`MatrixTraversalResult`], and
+/// therefore the one place `matrix_reachable`'s specification is stated.
+///
+/// That specification is [`FrontierWalk::FixedHops`]: vertices at BFS distance
+/// `1..=hops`, start vertices excluded. Most branches below reach it through
+/// `expand`, which strips its own start set. The overlay branch reaches it
+/// through a `1..=hops` range walk, which does not — so a start vertex sitting
+/// on a cycle came back from that branch and from no other, and one call
+/// answered three different ways depending on how many start ids it was handed
+/// and whether a matrix happened to be cached.
+///
+/// Normalising here rather than at each branch is the point: five call sites
+/// each remembering to strip is five chances to forget, and the last four years
+/// of this function are the evidence. For the branches that already strip, the
+/// `retain` is a no-op costing one set lookup per result vertex.
+fn matrix_traversal_result(
+    backend: TraversalBackend,
+    traversal: crate::sparse_kernel::SparseTraversal,
+    starts: &[VertexId],
+    hops: u8,
+    base_epoch: StorageSequence,
+) -> MatrixTraversalResult {
+    let start_set: BTreeSet<VertexId> = starts.iter().copied().collect();
+    let mut vertices = traversal.vertices;
+    vertices.retain(|vertex| !start_set.contains(vertex));
+    MatrixTraversalResult {
+        backend,
+        vertices,
+        hops,
+        base_epoch,
+        edge_visits: traversal.edge_visits,
+        sparse_kernel: traversal.backend,
+    }
+}
 
 impl GraphShard {
     pub async fn matrix_reachable(
@@ -76,12 +112,18 @@ impl GraphShard {
                 )
                 .await?
             else {
+                // One start walks outward from storage, touching only the
+                // reachable subgraph; anything else materialises the whole
+                // adjacency first. That is a cost decision and stays. What must
+                // not vary with it is the *answer*, so the walk is asked for
+                // fixed hops explicitly rather than being handed a `(1, hops)`
+                // pair that reads as a range.
                 let traversal = if let [start] = starts {
                     self.reachable_from_storage_frontier(
                         cell_id,
                         edge_type,
                         *start,
-                        (1, hops),
+                        FrontierWalk::FixedHops(hops),
                         read_epoch,
                         &QueryBudget::new(self.limits.max_query_runtime_ms, None),
                     )
@@ -92,14 +134,13 @@ impl GraphShard {
                         .await?;
                     expand_sparse(&adjacency, starts, hops, sparse_kernel)?
                 };
-                return Ok(MatrixTraversalResult {
-                    backend: TraversalBackend::DirectSnapshot,
-                    vertices: traversal.vertices,
+                return Ok(matrix_traversal_result(
+                    TraversalBackend::DirectSnapshot,
+                    traversal,
+                    starts,
                     hops,
                     base_epoch,
-                    edge_visits: traversal.edge_visits,
-                    sparse_kernel: traversal.backend,
-                });
+                ));
             };
             record_matrix_profile(profile, "cached_graphblas_matrix", started.elapsed(), 0);
 
@@ -124,14 +165,13 @@ impl GraphShard {
                 total_started.elapsed(),
                 0,
             );
-            return Ok(MatrixTraversalResult {
-                backend: TraversalBackend::MatrixSnapshot,
-                vertices: traversal.vertices,
+            return Ok(matrix_traversal_result(
+                TraversalBackend::MatrixSnapshot,
+                traversal,
+                starts,
                 hops,
                 base_epoch,
-                edge_visits: traversal.edge_visits,
-                sparse_kernel: traversal.backend,
-            });
+            ));
         }
 
         let started = Instant::now();
@@ -152,14 +192,13 @@ impl GraphShard {
             total_started.elapsed(),
             0,
         );
-        Ok(MatrixTraversalResult {
-            backend: TraversalBackend::MatrixSnapshot,
-            vertices: traversal.vertices,
+        Ok(matrix_traversal_result(
+            TraversalBackend::MatrixSnapshot,
+            traversal,
+            starts,
             hops,
             base_epoch,
-            edge_visits: traversal.edge_visits,
-            sparse_kernel: traversal.backend,
-        })
+        ))
     }
 
     pub async fn direct_snapshot_reachable(
@@ -181,14 +220,16 @@ impl GraphShard {
             .canonical_adjacency_at(cell_id, edge_type, read_epoch)
             .await?;
         let traversal = expand_sparse(&adjacency, starts, hops, SparseKernelBackend::Adjacency)?;
-        Ok(MatrixTraversalResult {
-            backend: TraversalBackend::DirectSnapshot,
-            vertices: traversal.vertices,
+        // `expand_sparse` already strips the start set, so this is a no-op —
+        // routed through the same helper anyway so `benchmark_hot_hops` is
+        // comparing two results built to one specification.
+        Ok(matrix_traversal_result(
+            TraversalBackend::DirectSnapshot,
+            traversal,
+            starts,
             hops,
-            base_epoch: 0,
-            edge_visits: traversal.edge_visits,
-            sparse_kernel: traversal.backend,
-        })
+            0,
+        ))
     }
 
     pub async fn benchmark_hot_hops(
@@ -211,5 +252,72 @@ impl GraphShard {
             direct,
             matrix,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sparse_kernel::{SparseKernelBackend, SparseTraversal};
+
+    fn traversal(vertices: Vec<VertexId>) -> SparseTraversal {
+        SparseTraversal {
+            vertices,
+            edge_visits: 7,
+            backend: SparseKernelBackend::Adjacency,
+        }
+    }
+
+    /// The specification, stated as a test: a start vertex never appears in its
+    /// own reachability answer, however it was reached.
+    ///
+    /// The range-backed branches return start vertices that sit on a cycle; the
+    /// `expand`-backed ones never do. This is the single point that reconciles
+    /// them, so it is the single point worth pinning.
+    #[test]
+    fn a_start_vertex_reached_around_a_cycle_is_stripped_from_the_result() {
+        let result = matrix_traversal_result(
+            TraversalBackend::MatrixSnapshot,
+            traversal(vec![1, 2, 3]),
+            &[1],
+            2,
+            0,
+        );
+        assert_eq!(result.vertices, vec![2, 3]);
+    }
+
+    /// Every start is stripped, not just the first, and a start absent from the
+    /// graph strips nothing. Both matter because the arity of `starts` used to
+    /// select the branch, and therefore the answer.
+    #[test]
+    fn stripping_covers_every_start_and_tolerates_unknown_ones() {
+        let result = matrix_traversal_result(
+            TraversalBackend::DirectSnapshot,
+            traversal(vec![1, 2, 3, 4]),
+            &[1, 3, 999],
+            3,
+            0,
+        );
+        assert_eq!(result.vertices, vec![2, 4]);
+    }
+
+    /// Idempotent, so routing the branches that already strip through it is
+    /// free of behaviour change — which is what makes it safe to apply to all
+    /// five rather than only the two that were wrong.
+    #[test]
+    fn normalising_an_already_stripped_result_changes_nothing() {
+        let already = traversal(vec![2, 3]);
+        let result = matrix_traversal_result(
+            TraversalBackend::MatrixSnapshot,
+            already.clone(),
+            &[1],
+            2,
+            9,
+        );
+        assert_eq!(result.vertices, already.vertices);
+        assert_eq!(result.edge_visits, already.edge_visits);
+        assert_eq!(result.sparse_kernel, already.backend);
+        assert_eq!(result.base_epoch, 9);
+        assert_eq!(result.hops, 2);
     }
 }

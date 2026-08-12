@@ -295,7 +295,10 @@ impl CompiledCompactCscMatrix {
             .any(|index| self.neighbor(index) == dst_ordinal)
     }
 
-    #[cfg(feature = "opencypher")]
+    /// Ungated, unlike its `_intersecting` sibling: `shard::topology_tail`'s
+    /// overlay walk needs a one-hop neighbourhood and is not itself behind
+    /// `opencypher`, so gating this would leave the overlay path unbuildable
+    /// with `default = []`.
     fn neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
         let Some(ordinal) = self.ordinal(vertex) else {
             return Vec::new();
@@ -719,6 +722,13 @@ impl CompiledGraphBlasMatrix {
         self.canonical_out.contains_edge(src, dst)
     }
 
+    /// Whether the compiled vertex set contains `vertex`. Both kernels take
+    /// their vertex set from the same CSC, so `canonical_out` answers for
+    /// either, and both drop start vertices that are missing from it.
+    pub(crate) fn contains_vertex(&self, vertex: VertexId) -> bool {
+        self.canonical_out.ordinal(vertex).is_some()
+    }
+
     #[cfg(feature = "opencypher")]
     pub(crate) fn in_neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
         self.canonical_in
@@ -726,7 +736,10 @@ impl CompiledGraphBlasMatrix {
             .neighbors(vertex)
     }
 
-    #[cfg(feature = "opencypher")]
+    /// The one-hop out-neighbourhood. Always served from `canonical_out`, which
+    /// both kernels populate, so this needs no replica lock and no `mxv`.
+    ///
+    /// Ungated for the reason given on [`CompiledCompactCscMatrix::neighbors`].
     pub(crate) fn out_neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
         self.canonical_out.neighbors(vertex)
     }

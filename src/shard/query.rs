@@ -5432,7 +5432,9 @@ impl GraphShard {
                 cell_id,
                 edge_type,
                 src,
-                (min_hops, max_hops),
+                // Cypher `*min..max` is a statement about walk lengths, so this
+                // is the range specification and must stay that way.
+                crate::sparse_kernel::FrontierWalk::HopRange(min_hops, max_hops),
                 read_epoch,
                 budget,
             )
@@ -5443,16 +5445,32 @@ impl GraphShard {
         Ok((traversal.vertices, traversal.edge_visits))
     }
 
+    /// Walk outward from `src` over storage, honouring whichever of the two
+    /// traversal specifications [`FrontierWalk`] names.
+    ///
+    /// Both callers used to pass a bare `(min, max)` pair, which cannot say
+    /// which specification the caller meant. Cypher `*min..max` wants
+    /// [`FrontierWalk::HopRange`]; `matrix_reachable` wants
+    /// [`FrontierWalk::FixedHops`] and was silently getting the range answer,
+    /// which returns start vertices reached around a cycle and re-counts the
+    /// degree of every revisited vertex.
     pub(crate) async fn reachable_from_storage_frontier(
         &self,
         cell_id: &str,
         edge_type: &str,
         src: VertexId,
-        hop_range: (u8, u8),
+        walk: crate::sparse_kernel::FrontierWalk,
         read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<crate::sparse_kernel::SparseTraversal> {
-        let (min_hops, max_hops) = hop_range;
+        let (min_hops, max_hops) = walk.bounds();
+        // `FixedHops` is BFS: a vertex is expanded at the first depth that
+        // reaches it and never again, which is what keeps `edge_visits` equal
+        // to the compiled kernels' count. `HopRange` must re-expand, because
+        // "reachable in exactly `d` hops" is a statement about walks, not
+        // about distance.
+        let dedupes = walk.dedupes_by_distance();
+        let mut seen = BTreeSet::from([src]);
         let snapshot = self.db.snapshot().await?;
         let mut frontier = BTreeSet::from([src]);
         let mut reachable = BTreeSet::new();
@@ -5475,7 +5493,15 @@ impl GraphShard {
                     edge_visits,
                     self.limits.max_query_scan_edges,
                 )?;
-                next.extend(neighbors);
+                if dedupes {
+                    next.extend(
+                        neighbors
+                            .into_iter()
+                            .filter(|neighbor| seen.insert(*neighbor)),
+                    );
+                } else {
+                    next.extend(neighbors);
+                }
             }
             ensure_limit(
                 "graph_storage_frontier_vertices",
@@ -5491,6 +5517,11 @@ impl GraphShard {
                 )?;
             }
             frontier = next;
+        }
+        if dedupes {
+            // `seen` was seeded with `src` so BFS never re-expands it; the
+            // result must exclude it too, matching `expand`.
+            reachable.remove(&src);
         }
         Ok(crate::sparse_kernel::SparseTraversal {
             vertices: reachable.into_iter().collect(),
