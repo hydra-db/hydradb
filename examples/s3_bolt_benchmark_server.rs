@@ -152,6 +152,7 @@ async fn main() -> BenchResult<()> {
             "relationship_rows": cache_resident.relationship_rows,
             "source_relationship_rows": cache_resident.source_relationship_rows,
             "relationship_property_rows": cache_resident.relationship_property_rows,
+            "native_path_results": cache_resident.native_path_results,
         },
         "process_rss_kib": process_rss_kib,
         "process_peak_rss_kib": process_peak_rss_kib,

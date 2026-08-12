@@ -235,11 +235,16 @@ impl GraphShard {
                 tenant_quota,
                 memory.max_relationship_property_rows_bytes,
             )),
+            // Its own budget. This used to be handed
+            // `memory.max_relationship_rows_bytes`, the same value
+            // `relationship_rows_cache` above already has in full — and
+            // `BoundedGraphCache` enforces its limit per instance, so the two
+            // together could hold twice what the operator configured.
             #[cfg(feature = "opencypher")]
             native_path_result_cache: Mutex::new(BoundedGraphCache::new_with_byte_limit(
                 cache_policy.max_relationship_row_sets,
                 tenant_quota,
-                memory.max_relationship_rows_bytes,
+                memory.max_native_path_result_bytes,
             )),
             #[cfg(feature = "opencypher")]
             native_path_page_cursors: Mutex::new(Default::default()),
@@ -323,6 +328,8 @@ impl GraphShard {
         #[cfg(feature = "opencypher")]
         let relationship_property_row_sets =
             self.relationship_property_rows_cache.lock().await.len();
+        #[cfg(feature = "opencypher")]
+        let native_path_results = self.native_path_result_cache.lock().await.len();
         GraphCacheEntryCounts {
             matrix_artifacts,
             matrix_adjacencies,
@@ -333,6 +340,8 @@ impl GraphShard {
             relationship_row_sets,
             #[cfg(feature = "opencypher")]
             relationship_property_row_sets,
+            #[cfg(feature = "opencypher")]
+            native_path_results,
         }
     }
 
@@ -355,6 +364,8 @@ impl GraphShard {
             .lock()
             .await
             .resident_bytes();
+        #[cfg(feature = "opencypher")]
+        let native_path_results = self.native_path_result_cache.lock().await.resident_bytes();
         GraphCacheResidentBytes {
             matrix_adjacencies,
             graphblas_matrices,
@@ -364,6 +375,8 @@ impl GraphShard {
             source_relationship_rows,
             #[cfg(feature = "opencypher")]
             relationship_property_rows,
+            #[cfg(feature = "opencypher")]
+            native_path_results,
         }
     }
 
@@ -822,6 +835,106 @@ mod tests {
         );
         drop(blocker);
         assert_eq!(resident.await, GraphCacheResidentBytes::default());
+
+        shard.close().await.unwrap();
+    }
+
+    /// Every byte-limited cache must be visible to the resident-bytes gauge.
+    ///
+    /// `native_path_result_cache` was not: it had a byte budget and no field in
+    /// [`GraphCacheResidentBytes`], so it could fill while the number an
+    /// operator watches stayed put and RSS growth read as a leak. The assertion
+    /// is on `total()` specifically, because that is what a ceiling alert
+    /// compares against.
+    #[cfg(feature = "opencypher")]
+    #[tokio::test]
+    async fn the_native_path_result_cache_is_visible_to_the_resident_byte_gauge() {
+        let shard = open_shard("native-path-cache-resident-bytes").await;
+        assert_eq!(shard.graph_cache_resident_bytes().await.total(), 0);
+
+        let key = crate::NativePathResultCacheKey {
+            scope: crate::GraphScope::default(),
+            cell_id: "reddit-home".to_string(),
+            procedure: "test.path".to_string(),
+            read_epoch: 1,
+            max_result_bytes: None,
+        };
+        shard.native_path_result_cache.lock().await.insert_sized(
+            key,
+            std::sync::Arc::new(crate::QueryResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                read_epoch: None,
+                storage_sequence: None,
+            }),
+            "reddit-home",
+            false,
+            512,
+            &shard.cache_metrics,
+        );
+
+        let resident = shard.graph_cache_resident_bytes().await;
+        assert_eq!(resident.native_path_results, 512);
+        assert_eq!(
+            resident.total(),
+            512,
+            "a cache with a byte budget but no field in the gauge is invisible"
+        );
+        assert_eq!(
+            shard.graph_cache_entry_counts().await.native_path_results,
+            1
+        );
+
+        shard.close().await.unwrap();
+    }
+
+    /// The two caches must not both be handed the same budget. They used to be,
+    /// so `GRAPH_MAX_RELATIONSHIP_ROWS_BYTES` bounded neither of them.
+    #[cfg(feature = "opencypher")]
+    #[tokio::test]
+    async fn the_native_path_cache_has_its_own_budget() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let memory = crate::GraphMemoryConfig {
+            max_relationship_rows_bytes: 4_096,
+            max_native_path_result_bytes: 1_024,
+            ..crate::GraphMemoryConfig::default()
+        };
+        let shard = GraphShard::open_standalone_writer_with_memory_options(
+            "graph/native-path-cache-own-budget",
+            object_store,
+            crate::GraphOpenOptions::default(),
+            memory,
+        )
+        .await
+        .unwrap();
+
+        // Over the native-path budget but well under the relationship-rows one:
+        // sharing the latter would have admitted this.
+        let key = crate::NativePathResultCacheKey {
+            scope: crate::GraphScope::default(),
+            cell_id: "reddit-home".to_string(),
+            procedure: "test.oversized".to_string(),
+            read_epoch: 1,
+            max_result_bytes: None,
+        };
+        let admitted = shard.native_path_result_cache.lock().await.insert_sized(
+            key,
+            std::sync::Arc::new(crate::QueryResultSet {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                read_epoch: None,
+                storage_sequence: None,
+            }),
+            "reddit-home",
+            false,
+            2_048,
+            &shard.cache_metrics,
+        );
+        assert!(
+            admitted.is_none(),
+            "an entry over the native-path budget must not be retained"
+        );
+        assert_eq!(shard.graph_cache_resident_bytes().await.total(), 0);
 
         shard.close().await.unwrap();
     }

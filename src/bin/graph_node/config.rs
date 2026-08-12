@@ -35,6 +35,7 @@ pub struct RuntimeConfig {
     pub max_relationship_rows_bytes: usize,
     pub max_source_relationship_rows_bytes: usize,
     pub max_relationship_property_rows_bytes: usize,
+    pub max_native_path_result_bytes: usize,
     pub max_concurrent_hydrations: usize,
     pub max_concurrent_matrix_compilations: usize,
     pub max_open_scopes: usize,
@@ -209,6 +210,14 @@ impl RuntimeConfig {
                 "GRAPH_MAX_RELATIONSHIP_PROPERTY_ROWS_BYTES",
                 16 * 1024 * 1024,
             )?,
+            // Separate from GRAPH_MAX_RELATIONSHIP_ROWS_BYTES, which the native
+            // path cache used to share in full — two caches each enforcing the
+            // same number meant the configured ceiling bounded neither.
+            max_native_path_result_bytes: parse_usize_allow_zero(
+                &values,
+                "GRAPH_MAX_NATIVE_PATH_RESULT_BYTES",
+                8 * 1024 * 1024,
+            )?,
             max_concurrent_hydrations: parse_usize(&values, "GRAPH_MAX_CONCURRENT_HYDRATIONS", 2)?,
             max_concurrent_matrix_compilations: parse_usize(
                 &values,
@@ -312,6 +321,7 @@ impl RuntimeConfig {
             max_relationship_rows_bytes: self.max_relationship_rows_bytes,
             max_source_relationship_rows_bytes: self.max_source_relationship_rows_bytes,
             max_relationship_property_rows_bytes: self.max_relationship_property_rows_bytes,
+            max_native_path_result_bytes: self.max_native_path_result_bytes,
             max_concurrent_matrix_compilations: self.max_concurrent_matrix_compilations,
         }
     }

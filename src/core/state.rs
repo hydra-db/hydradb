@@ -1346,8 +1346,18 @@ pub struct GraphCacheEntryCounts {
     pub relationship_row_sets: usize,
     #[cfg(feature = "opencypher")]
     pub relationship_property_row_sets: usize,
+    #[cfg(feature = "opencypher")]
+    pub native_path_results: usize,
 }
 
+/// Resident bytes per byte-limited cache.
+///
+/// **Every byte-limited cache on [`crate::GraphShard`] needs a field here.** A
+/// cache that has a `new_with_byte_limit` budget but no field is invisible to
+/// [`Self::total`], so an operator watching resident bytes against the
+/// configured ceiling sees a number that is correct for the caches that were
+/// remembered and blind to the ones that were not — and RSS growth from the
+/// missing cache reads as a leak. `native_path_results` was exactly that.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GraphCacheResidentBytes {
     pub matrix_adjacencies: usize,
@@ -1358,6 +1368,8 @@ pub struct GraphCacheResidentBytes {
     pub source_relationship_rows: usize,
     #[cfg(feature = "opencypher")]
     pub relationship_property_rows: usize,
+    #[cfg(feature = "opencypher")]
+    pub native_path_results: usize,
 }
 
 impl GraphCacheResidentBytes {
@@ -1370,6 +1382,7 @@ impl GraphCacheResidentBytes {
                     self.relationship_rows
                         .saturating_add(self.source_relationship_rows)
                         .saturating_add(self.relationship_property_rows)
+                        .saturating_add(self.native_path_results)
                 }
                 #[cfg(not(feature = "opencypher"))]
                 {
