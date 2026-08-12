@@ -458,6 +458,16 @@ pub(crate) fn expand_range_with_overlay(
     let mut reachable = BTreeSet::new();
     let mut edge_visits = 0_u64;
 
+    // Hop zero is the start set itself, and the loop below only ever reaches
+    // hop one. Both compiled kernels seed their result with the starts they
+    // find in the matrix and drop the rest, so filter the same way or
+    // `min_hops == 0` disagrees with them in both directions.
+    if min_hops == 0 {
+        reachable.extend(frontier.iter().copied().filter(|start| {
+            crate::sparse_kernel::compiled_graphblas_contains_vertex(compiled, *start)
+        }));
+    }
+
     for hop in 1..=max_hops {
         if frontier.is_empty() {
             break;
