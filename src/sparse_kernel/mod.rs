@@ -175,6 +175,53 @@ pub(crate) struct SparseTraversalCount {
     pub backend: SparseKernelBackend,
 }
 
+/// Which of the two traversal specifications in the capability table above a
+/// caller is asking for.
+///
+/// The distinction is not decoration. The two answers differ on exactly one
+/// class of vertex — a start that is reachable from a start — and on how much
+/// work they report, and confusing them is what made one `matrix_reachable`
+/// call return three different vertex sets depending on how many start ids it
+/// was given and whether a matrix happened to be cached.
+///
+/// Naming them is the fix: a walker that took `(min, max)` could not express
+/// which of the two its caller meant, so the caller's intent lived in a comment
+/// at the call site and drifted away from it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrontierWalk {
+    /// Vertices at BFS distance `1..=hops` from the start set, **excluding the
+    /// start vertices themselves**. Each vertex is expanded at most once, so
+    /// `edge_visits` counts every edge at most once.
+    ///
+    /// This is what [`expand`] computes and what `matrix_reachable`'s `hops`
+    /// parameter means.
+    FixedHops(u8),
+    /// Vertices reachable by a walk of length exactly `d`, for some `d` in
+    /// `min..=max`. A start vertex on a cycle **is** in the answer, and a
+    /// vertex revisited at several depths is expanded once per depth, so
+    /// `edge_visits` counts repeat traversals.
+    ///
+    /// This is what [`expand_range`] computes and what Cypher `*min..max`
+    /// means — there, "reachable in exactly 3 hops" genuinely has to re-walk.
+    HopRange(u8, u8),
+}
+
+impl FrontierWalk {
+    /// The `(min, max)` hop bounds to drive the level loop with.
+    pub(crate) fn bounds(self) -> (u8, u8) {
+        match self {
+            Self::FixedHops(hops) => (1, hops),
+            Self::HopRange(min_hops, max_hops) => (min_hops, max_hops),
+        }
+    }
+
+    /// Whether a vertex already expanded at a shallower depth must be skipped.
+    /// True for [`Self::FixedHops`] only — see the variant docs.
+    pub(crate) fn dedupes_by_distance(self) -> bool {
+        matches!(self, Self::FixedHops(_))
+    }
+}
+
 /// The kernel a [`GraphCachePolicy`] starts at, resolved once per process.
 ///
 /// The legacy `GRAPH_COMPILED_KERNEL` override supplies only this *default*, so
@@ -757,6 +804,25 @@ mod tests {
 
     // The legacy `GRAPH_COMPILED_KERNEL` override is deliberately not exercised
     // here: it is process-global and would race concurrent shard tests.
+    /// `FixedHops(h)` and `HopRange(1, h)` drive the same level loop and are
+    /// distinguished only by deduplication. That is the whole difference
+    /// between the two specifications, and it is why passing a bare `(1, h)`
+    /// pair could not express which one the caller meant.
+    #[test]
+    fn the_two_frontier_walks_share_bounds_but_not_deduplication() {
+        assert_eq!(FrontierWalk::FixedHops(3).bounds(), (1, 3));
+        assert_eq!(FrontierWalk::HopRange(1, 3).bounds(), (1, 3));
+
+        assert!(FrontierWalk::FixedHops(3).dedupes_by_distance());
+        assert!(!FrontierWalk::HopRange(1, 3).dedupes_by_distance());
+    }
+
+    #[test]
+    fn a_hop_range_keeps_its_own_lower_bound() {
+        assert_eq!(FrontierWalk::HopRange(2, 5).bounds(), (2, 5));
+        assert_eq!(FrontierWalk::HopRange(0, 0).bounds(), (0, 0));
+    }
+
     #[test]
     fn a_non_default_policy_kernel_is_returned_verbatim() {
         let policy = GraphCachePolicy {
