@@ -209,17 +209,31 @@ async fn run_node(
 
     // Read-only token if configured
     if let Some(path) = &config.read_token_file {
-        if let Ok(read_token) = std::fs::read_to_string(path) {
-            let read_token = read_token.trim();
-            if read_token.len() >= 32 && !read_token.eq_ignore_ascii_case("change-me") {
-                bearer_tokens.push(read_token.clone());
-                let read_grant = QueryTransportScopeGrant::graph_namespace(
-                    config.scope.namespace.clone(),
-                    config.scope.graph_id.clone(),
-                    true,
-                    [QueryTransportAction::Read, QueryTransportAction::Cancel],
+        match std::fs::read_to_string(path) {
+            Ok(token) => {
+                let token = token.trim();
+                if token.len() >= 32 && !token.eq_ignore_ascii_case("change-me") {
+                    bearer_tokens.push(token.clone());
+                    let read_grant = QueryTransportScopeGrant::graph_namespace(
+                        config.scope.namespace.clone(),
+                        config.scope.graph_id.clone(),
+                        true,
+                        [QueryTransportAction::Read, QueryTransportAction::Cancel],
+                    );
+                    authorizer = authorizer.with_bearer_grant(token.clone(), read_grant)?;
+                } else {
+                    warn!(
+                        "GRAPH_READ_TOKEN_FILE '{}' contains invalid token (must be >= 32 chars, not 'change-me')",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "GRAPH_READ_TOKEN_FILE '{}' unreadable: {}",
+                    path.display(),
+                    e
                 );
-                authorizer = authorizer.with_bearer_grant(read_token.clone(), read_grant)?;
             }
         }
     }
@@ -243,17 +257,31 @@ async fn run_node(
 
     // Admin token if configured
     if let Some(path) = &config.admin_token_file {
-        if let Ok(admin_token) = std::fs::read_to_string(path) {
-            let admin_token = admin_token.trim();
-            if admin_token.len() >= 32 && !admin_token.eq_ignore_ascii_case("change-me") {
-                bearer_tokens.push(admin_token.clone());
-                let admin_grant = QueryTransportScopeGrant::graph_namespace(
-                    config.scope.namespace.clone(),
-                    config.scope.graph_id.clone(),
-                    true,
-                    [QueryTransportAction::Admin],
+        match std::fs::read_to_string(path) {
+            Ok(token) => {
+                let token = token.trim();
+                if token.len() >= 32 && !token.eq_ignore_ascii_case("change-me") {
+                    bearer_tokens.push(token.clone());
+                    let admin_grant = QueryTransportScopeGrant::graph_namespace(
+                        config.scope.namespace.clone(),
+                        config.scope.graph_id.clone(),
+                        true,
+                        [QueryTransportAction::Admin],
+                    );
+                    authorizer = authorizer.with_bearer_grant(token.clone(), admin_grant)?;
+                } else {
+                    warn!(
+                        "GRAPH_ADMIN_TOKEN_FILE '{}' contains invalid token (must be >= 32 chars, not 'change-me')",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "GRAPH_ADMIN_TOKEN_FILE '{}' unreadable: {}",
+                    path.display(),
+                    e
                 );
-                authorizer = authorizer.with_bearer_grant(admin_token.clone(), admin_grant)?;
             }
         }
     }
