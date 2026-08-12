@@ -331,6 +331,13 @@ pub(crate) fn compiled_graphblas_contains_edge(
     compiled.contains_edge(src, dst)
 }
 
+pub(crate) fn compiled_graphblas_contains_vertex(
+    compiled: &CompiledGraphBlasMatrix,
+    vertex: VertexId,
+) -> bool {
+    compiled.contains_vertex(vertex)
+}
+
 #[cfg(feature = "opencypher")]
 pub(crate) fn compiled_graphblas_in_neighbors(
     compiled: &CompiledGraphBlasMatrix,
@@ -339,7 +346,8 @@ pub(crate) fn compiled_graphblas_in_neighbors(
     compiled.in_neighbors(vertex)
 }
 
-#[cfg(feature = "opencypher")]
+/// Ungated: `shard::topology_tail`'s overlay walk expands one hop at a time and
+/// is not behind `opencypher`. See [`CompiledGraphBlasMatrix::out_neighbors`].
 pub(crate) fn compiled_graphblas_out_neighbors(
     compiled: &CompiledGraphBlasMatrix,
     vertex: VertexId,

@@ -287,6 +287,17 @@ impl CompiledCompactCscMatrix {
         self.indices.get(index)
     }
 
+    /// Whether the vertex is in this matrix's dictionary — which is
+    /// sources ∪ destinations, so it means "has at least one incident edge in
+    /// the generation this matrix was compiled from".
+    ///
+    /// `expand_range_bitmap` decides which start vertices a `*0..n` query
+    /// returns by exactly this test (through `start_ordinals`), so the overlay
+    /// walk has to be able to ask the same question to give the same answer.
+    fn contains_vertex(&self, vertex: VertexId) -> bool {
+        self.ordinal(vertex).is_some()
+    }
+
     fn contains_edge(&self, src: VertexId, dst: VertexId) -> bool {
         let (Some(src_ordinal), Some(dst_ordinal)) = (self.ordinal(src), self.ordinal(dst)) else {
             return false;
@@ -295,7 +306,10 @@ impl CompiledCompactCscMatrix {
             .any(|index| self.neighbor(index) == dst_ordinal)
     }
 
-    #[cfg(feature = "opencypher")]
+    /// Ungated, unlike its `_intersecting` sibling: `shard::topology_tail`'s
+    /// overlay walk needs a one-hop neighbourhood and is not itself behind
+    /// `opencypher`, so gating this would leave the overlay path unbuildable
+    /// with `default = []`.
     fn neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
         let Some(ordinal) = self.ordinal(vertex) else {
             return Vec::new();
@@ -719,6 +733,13 @@ impl CompiledGraphBlasMatrix {
         self.canonical_out.contains_edge(src, dst)
     }
 
+    /// Whether the vertex exists in the compiled generation. Ungated for the
+    /// same reason as [`Self::out_neighbors`]: `shard::topology_tail` needs it
+    /// and is not behind `opencypher`.
+    pub(crate) fn contains_vertex(&self, vertex: VertexId) -> bool {
+        self.canonical_out.contains_vertex(vertex)
+    }
+
     #[cfg(feature = "opencypher")]
     pub(crate) fn in_neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
         self.canonical_in
@@ -726,7 +747,10 @@ impl CompiledGraphBlasMatrix {
             .neighbors(vertex)
     }
 
-    #[cfg(feature = "opencypher")]
+    /// The one-hop out-neighbourhood. Always served from `canonical_out`, which
+    /// both kernels populate, so this needs no replica lock and no `mxv`.
+    ///
+    /// Ungated for the reason given on [`CompiledCompactCscMatrix::neighbors`].
     pub(crate) fn out_neighbors(&self, vertex: VertexId) -> Vec<VertexId> {
         self.canonical_out.neighbors(vertex)
     }
