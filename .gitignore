@@ -20,7 +20,6 @@
 
 # IDE and editor files
 .idea/
-.vscode/
 *.iml
 
 # Python bytecode caches
@@ -32,9 +31,10 @@ __pycache__/
 Thumbs.db
 
 # Local environment files
-.env
 *.env
 docs/formal-methods-docs/
 docs/formal-methods/distributed-protocol-testing/
 # Generated PDFs (book builds, exports)
 *.pdf
+config.bat
+node_modules
