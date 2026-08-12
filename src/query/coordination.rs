@@ -4720,12 +4720,6 @@ fn authorize_query_transport_scope(
         .config
         .scope_authorizer
         .authorize(principal, scope, action)
-        || (action != QueryTransportAction::Admin
-            && runtime.config.scope_authorizer.authorize(
-                principal,
-                scope,
-                QueryTransportAction::Admin,
-            ))
     {
         return Ok(());
     }
