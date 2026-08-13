@@ -183,25 +183,113 @@ async fn run_node(
         config.index_discovery_interval,
     );
 
-    let token = config.read_auth_token()?;
-    let authorizer = StaticQueryTransportScopeAuthorizer::new().with_bearer_grant(
-        token.clone(),
-        QueryTransportScopeGrant::graph_namespace(
-            config.scope.namespace.clone(),
-            config.scope.graph_id.clone(),
-            true,
-            [
-                QueryTransportAction::Read,
-                QueryTransportAction::Write,
-                QueryTransportAction::Cancel,
-                QueryTransportAction::Admin,
-            ],
-        ),
-    )?;
+    let default_token = config.read_auth_token()?;
+
+    // Read optional per-action token files for least-privilege bearer token scoping.
+    // If a token file is configured and contains a valid token (>=32 chars, not "change-me"),
+    // it is added as a separate grant in the authorizer with its own action scope.
+    // The default token still grants all actions for backward compatibility.
+    let mut bearer_tokens: Vec<String> = Vec::new();
+    let mut authorizer = StaticQueryTransportScopeAuthorizer::new();
+
+    // Always add the default token with all actions (backward compatible)
+    bearer_tokens.push(default_token.clone());
+    let default_grant = QueryTransportScopeGrant::graph_namespace(
+        config.scope.namespace.clone(),
+        config.scope.graph_id.clone(),
+        true,
+        [
+            QueryTransportAction::Read,
+            QueryTransportAction::Write,
+            QueryTransportAction::Cancel,
+            QueryTransportAction::Admin,
+        ],
+    );
+    authorizer = authorizer.with_bearer_grant(default_token.clone(), default_grant)?;
+
+    // Read-only token if configured
+    if let Some(path) = &config.read_token_file {
+        match std::fs::read_to_string(path) {
+            Ok(token) => {
+                let token = token.trim();
+                if token.len() >= 32 && !token.eq_ignore_ascii_case("change-me") {
+                    bearer_tokens.push(token.clone());
+                    let read_grant = QueryTransportScopeGrant::graph_namespace(
+                        config.scope.namespace.clone(),
+                        config.scope.graph_id.clone(),
+                        true,
+                        [QueryTransportAction::Read, QueryTransportAction::Cancel],
+                    );
+                    authorizer = authorizer.with_bearer_grant(token.clone(), read_grant)?;
+                } else {
+                    warn!(
+                        "GRAPH_READ_TOKEN_FILE '{}' contains invalid token (must be >= 32 chars, not 'change-me')",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "GRAPH_READ_TOKEN_FILE '{}' unreadable: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    // Write token if configured
+    if let Some(path) = &config.write_token_file {
+        if let Ok(write_token) = std::fs::read_to_string(path) {
+            let write_token = write_token.trim();
+            if write_token.len() >= 32 && !write_token.eq_ignore_ascii_case("change-me") {
+                bearer_tokens.push(write_token.clone());
+                let write_grant = QueryTransportScopeGrant::graph_namespace(
+                    config.scope.namespace.clone(),
+                    config.scope.graph_id.clone(),
+                    true,
+                    [QueryTransportAction::Write, QueryTransportAction::Cancel],
+                );
+                authorizer = authorizer.with_bearer_grant(write_token.clone(), write_grant)?;
+            }
+        }
+    }
+
+    // Admin token if configured
+    if let Some(path) = &config.admin_token_file {
+        match std::fs::read_to_string(path) {
+            Ok(token) => {
+                let token = token.trim();
+                if token.len() >= 32 && !token.eq_ignore_ascii_case("change-me") {
+                    bearer_tokens.push(token.clone());
+                    let admin_grant = QueryTransportScopeGrant::graph_namespace(
+                        config.scope.namespace.clone(),
+                        config.scope.graph_id.clone(),
+                        true,
+                        [QueryTransportAction::Admin],
+                    );
+                    authorizer = authorizer.with_bearer_grant(token.clone(), admin_grant)?;
+                } else {
+                    warn!(
+                        "GRAPH_ADMIN_TOKEN_FILE '{}' contains invalid token (must be >= 32 chars, not 'change-me')",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "GRAPH_ADMIN_TOKEN_FILE '{}' unreadable: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+
     let service = ClientQueryService::new(
         Arc::clone(&node) as Arc<dyn slatedb_graph_kernel::QueryCellClient>,
         ClientQueryServiceConfig::default()
-            .with_required_bearer_token(token)
+            .with_required_bearer_tokens(bearer_tokens)
             .with_scope_authorizer(Arc::new(authorizer))
             .with_max_concurrent_queries(config.max_concurrent_queries)
             .with_max_query_runtime_ms(config.max_query_runtime_ms)
