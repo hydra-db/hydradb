@@ -788,6 +788,50 @@ async fn server_cursor_executes_once_and_release_invalidates_it() {
 }
 
 #[tokio::test]
+async fn server_cursor_page_accounting_stays_exact() {
+    let service = cursor_service(Arc::new(AtomicU64::new(0)), 4, 1 << 20, 1_000);
+    let session = authenticated_session(&service);
+    let request = ClientQueryRequest::new(
+        target(),
+        "query-cursor-accounting",
+        "MATCH (n {id: 1}) RETURN n.id AS value",
+    );
+
+    let mut cursor = service
+        .execute_page(&session, request.clone(), None, 1)
+        .await
+        .unwrap()
+        .page
+        .next_cursor;
+    assert!(cursor.is_some(), "four result rows leave a cursor behind");
+
+    // After every page, the cursor's own accounting and the shared gauge must
+    // both equal a fresh recount of the rows still buffered; incremental
+    // subtraction and full recomputation may never drift apart.
+    while let Some(token) = cursor {
+        {
+            let cursors = service.inner.cursors.lock().await;
+            let buffered = cursors
+                .get(&token.offset)
+                .expect("a live cursor stays registered");
+            let expected = query_rows_resident_bytes(&buffered.rows);
+            assert_eq!(buffered.resident_bytes, expected);
+            assert_eq!(
+                service.inner.cursor_buffer_bytes.load(Ordering::Relaxed),
+                expected
+            );
+        }
+        cursor = service
+            .execute_page(&session, request.clone(), Some(token), 1)
+            .await
+            .unwrap()
+            .page
+            .next_cursor;
+    }
+    assert_eq!(service.inner.cursor_buffer_bytes.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn server_cursor_enforces_count_and_buffer_admission() {
     let executions = Arc::new(AtomicU64::new(0));
     let service = cursor_service(Arc::clone(&executions), 1, 1 << 20, 1_000);
