@@ -216,6 +216,15 @@ pub struct GraphMemoryConfig {
     pub max_source_relationship_rows_bytes: usize,
     #[cfg(feature = "opencypher")]
     pub max_relationship_property_rows_bytes: usize,
+    /// Budget for the native path-procedure result cache.
+    ///
+    /// Its own knob rather than a share of [`Self::max_relationship_rows_bytes`]:
+    /// that field was previously handed to both caches in full, so the two
+    /// together could hold twice what the operator asked for. The two hold very
+    /// differently shaped values — whole `QueryResultSet`s here, relationship
+    /// row vectors there — so one number could not have described both anyway.
+    #[cfg(feature = "opencypher")]
+    pub max_native_path_result_bytes: usize,
     pub max_concurrent_matrix_compilations: usize,
 }
 
@@ -231,6 +240,11 @@ impl Default for GraphMemoryConfig {
             max_source_relationship_rows_bytes: 8 * 1024 * 1024,
             #[cfg(feature = "opencypher")]
             max_relationship_property_rows_bytes: 16 * 1024 * 1024,
+            // Matches what the cache was already being given, so the default
+            // resident ceiling of a shard is unchanged by this becoming
+            // explicit — only its accounting is.
+            #[cfg(feature = "opencypher")]
+            max_native_path_result_bytes: 8 * 1024 * 1024,
             max_concurrent_matrix_compilations: 1,
         }
     }
@@ -248,6 +262,8 @@ impl GraphMemoryConfig {
             max_source_relationship_rows_bytes: 2 * 1024 * 1024,
             #[cfg(feature = "opencypher")]
             max_relationship_property_rows_bytes: 4 * 1024 * 1024,
+            #[cfg(feature = "opencypher")]
+            max_native_path_result_bytes: 2 * 1024 * 1024,
             ..Self::default()
         }
     }
