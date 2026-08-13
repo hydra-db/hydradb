@@ -140,6 +140,13 @@ impl RuntimeConfig {
                 ),
             ),
         )?;
+        // Read before the struct literal because the native path-result budget
+        // below falls back to it. See that field for why.
+        let max_relationship_rows_bytes = parse_usize_allow_zero(
+            &values,
+            "GRAPH_MAX_RELATIONSHIP_ROWS_BYTES",
+            8 * 1024 * 1024,
+        )?;
         let config = Self {
             node_id: value(&values, "GRAPH_NODE_ID", "graph-node-0"),
             scope,
@@ -195,11 +202,7 @@ impl RuntimeConfig {
                 128 * 1024 * 1024,
             )?,
             sparse_kernel: parse_sparse_kernel(&values, "GRAPH_SPARSE_KERNEL")?,
-            max_relationship_rows_bytes: parse_usize_allow_zero(
-                &values,
-                "GRAPH_MAX_RELATIONSHIP_ROWS_BYTES",
-                8 * 1024 * 1024,
-            )?,
+            max_relationship_rows_bytes,
             max_source_relationship_rows_bytes: parse_usize_allow_zero(
                 &values,
                 "GRAPH_MAX_SOURCE_RELATIONSHIP_ROWS_BYTES",
@@ -212,11 +215,14 @@ impl RuntimeConfig {
             )?,
             // Separate from GRAPH_MAX_RELATIONSHIP_ROWS_BYTES, which the native
             // path cache used to share in full — two caches each enforcing the
-            // same number meant the configured ceiling bounded neither.
+            // same number meant the configured ceiling bounded neither. It
+            // *defaults* to that value rather than to a constant, so a
+            // deployment that lowered the row budget keeps the native-path
+            // ceiling it already had; raising it is now an explicit act.
             max_native_path_result_bytes: parse_usize_allow_zero(
                 &values,
                 "GRAPH_MAX_NATIVE_PATH_RESULT_BYTES",
-                8 * 1024 * 1024,
+                max_relationship_rows_bytes,
             )?,
             max_concurrent_hydrations: parse_usize(&values, "GRAPH_MAX_CONCURRENT_HYDRATIONS", 2)?,
             max_concurrent_matrix_compilations: parse_usize(
@@ -536,6 +542,7 @@ mod tests {
             memory.max_relationship_property_rows_bytes,
             16 * 1024 * 1024
         );
+        assert_eq!(memory.max_native_path_result_bytes, 8 * 1024 * 1024);
     }
 
     #[test]
@@ -733,5 +740,34 @@ mod tests {
         assert_eq!(memory.max_relationship_rows_bytes, 0);
         assert_eq!(memory.max_source_relationship_rows_bytes, 0);
         assert_eq!(memory.max_relationship_property_rows_bytes, 0);
+        assert_eq!(memory.max_native_path_result_bytes, 0);
+    }
+
+    /// An upgrade must not raise a ceiling the operator lowered. The native
+    /// path cache used to be handed `GRAPH_MAX_RELATIONSHIP_ROWS_BYTES` in
+    /// full, so it keeps inheriting that number until its own variable is set.
+    #[test]
+    fn native_path_budget_inherits_a_lowered_relationship_row_budget() {
+        let mut values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            (
+                "GRAPH_MAX_RELATIONSHIP_ROWS_BYTES".to_string(),
+                (4 * 1024 * 1024).to_string(),
+            ),
+        ]);
+        let memory = RuntimeConfig::from_values(values.clone())
+            .unwrap()
+            .graph_memory_config();
+        assert_eq!(memory.max_native_path_result_bytes, 4 * 1024 * 1024);
+
+        values.insert(
+            "GRAPH_MAX_NATIVE_PATH_RESULT_BYTES".to_string(),
+            (16 * 1024 * 1024).to_string(),
+        );
+        let memory = RuntimeConfig::from_values(values)
+            .unwrap()
+            .graph_memory_config();
+        assert_eq!(memory.max_relationship_rows_bytes, 4 * 1024 * 1024);
+        assert_eq!(memory.max_native_path_result_bytes, 16 * 1024 * 1024);
     }
 }
