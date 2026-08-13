@@ -4470,16 +4470,15 @@ where
         QueryLifecycleFinish::Cancelled => Err(cancelled_query_error()),
         QueryLifecycleFinish::NotCancelled | QueryLifecycleFinish::NotOwned => result,
     };
-    match &result {
-        Ok(_) => runtime
+    // Only successes are counted here. Every caller hands an `Err` from this
+    // function to `transport_error_response`, which owns `requests_failed`;
+    // counting failures in both places recorded each failed execution twice.
+    if result.is_ok() {
+        runtime
             .metrics
             .requests_completed
-            .fetch_add(1, Ordering::Relaxed),
-        Err(_) => runtime
-            .metrics
-            .requests_failed
-            .fetch_add(1, Ordering::Relaxed),
-    };
+            .fetch_add(1, Ordering::Relaxed);
+    }
     result
 }
 
