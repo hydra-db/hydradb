@@ -1740,10 +1740,12 @@ impl ClientQueryService {
         let mut cursor = cursors
             .remove(&token.offset)
             .expect("cursor was checked while holding the cursor lock");
-        let previous_bytes = cursor.resident_bytes;
         let page_rows = take_cursor_rows(&mut cursor.rows, page_size);
-        cursor.resident_bytes = query_rows_resident_bytes(&cursor.rows);
-        let released_bytes = previous_bytes.saturating_sub(cursor.resident_bytes);
+        // Charge the page that was drained rather than rescanning the rows
+        // still buffered: the tail rescan made paging O(rows² / page size),
+        // paid under the cursor lock every other connection shares.
+        let released_bytes = query_rows_resident_bytes(&page_rows);
+        cursor.resident_bytes = cursor.resident_bytes.saturating_sub(released_bytes);
         self.inner
             .cursor_buffer_bytes
             .fetch_sub(released_bytes, Ordering::Relaxed);
@@ -2322,8 +2324,8 @@ fn take_cursor_rows(rows: &mut VecDeque<QueryRow>, page_size: usize) -> Vec<Quer
     rows.drain(..count).collect()
 }
 
-fn query_rows_resident_bytes(rows: &VecDeque<QueryRow>) -> u64 {
-    rows.iter().fold(0_u64, |total, row| {
+fn query_rows_resident_bytes<'a>(rows: impl IntoIterator<Item = &'a QueryRow>) -> u64 {
+    rows.into_iter().fold(0_u64, |total, row| {
         total.saturating_add(row.estimated_resident_bytes())
     })
 }
