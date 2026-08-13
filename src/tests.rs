@@ -5948,6 +5948,72 @@ async fn tcp_query_transport_default_bind_rejects_unauthenticated_requests() {
 
 #[cfg(feature = "query-transport")]
 #[tokio::test]
+async fn tcp_query_transport_counts_a_failed_execution_once() {
+    struct FailingQueryClient;
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for FailingQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            _query: &str,
+        ) -> Result<QueryResultSet> {
+            Err(GraphError::UnsupportedQuery {
+                dialect: "QueryTransport",
+                feature: "executor fails after the request is admitted".to_string(),
+            })
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            let rows = self.execute_cypher_rows(context, query).await?;
+            Ok(QueryResultPage::new(rows.columns, rows.rows, None))
+        }
+    }
+
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "metrics-reader",
+            QueryTransportScopeGrant::read_graph(GraphScope::default()),
+        )
+        .unwrap();
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(FailingQueryClient),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("metrics-reader")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let err = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("metrics-reader")
+        .insecure_allow_plaintext()
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "query-transport-failed-once"),
+            "MATCH (u {id: 1}) RETURN u.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("executor fails"));
+
+    // One admitted request that failed in the executor must reconcile as
+    // started = completed + failed; the failure is counted exactly once.
+    let metrics = server.metrics();
+    assert_eq!(metrics.requests_started, 1);
+    assert_eq!(metrics.requests_completed, 0);
+    assert_eq!(metrics.requests_failed, 1);
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
 async fn tcp_query_transport_batches_page_rows_and_enforce_write_grants() {
     struct StaticBatchClient;
 
