@@ -23,11 +23,12 @@ use config::RuntimeConfig;
 use readiness::NodeReadiness;
 use slatedb::object_store::{path::Path, ObjectStore};
 use slatedb_graph_kernel::{
-    object_store_from_env, BoltServerConfig, ClientBoltServer, ClientHttpServer,
-    ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget,
-    HierarchicalClientDatabaseResolver, HttpQueryServerConfig, ObjectStoreBoltRoutingTableProvider,
-    ObjectStoreNodeDirectory, PlacementConfig, PlacementView, QueryTransportAction,
-    QueryTransportScopeGrant, ScopedRoutedGraphCluster, StaticQueryTransportScopeAuthorizer,
+    object_store_from_env, probe_conditional_put, BoltServerConfig, ClientBoltServer,
+    ClientHttpServer, ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget,
+    ConditionalPutSupport, HierarchicalClientDatabaseResolver, HttpQueryServerConfig,
+    ObjectStoreBoltRoutingTableProvider, ObjectStoreNodeDirectory, PlacementConfig, PlacementView,
+    QueryTransportAction, QueryTransportScopeGrant, ScopedRoutedGraphCluster,
+    StaticQueryTransportScopeAuthorizer,
 };
 use hydradb_placement::heartbeat::{delete_heartbeat, put_heartbeat, validate_node_id, Heartbeat};
 use hydradb_placement::liveness::HeartbeatAction;
@@ -133,6 +134,27 @@ async fn run_node(
     validate_node_id(&config.node_id)?;
     std::fs::create_dir_all(&config.data_cache_dir)?;
     let object_store = object_store_from_env(None)?;
+    // Asked once, here, because the answer decides whether this store can ever
+    // reclaim space. SlateDB's manifest GC is a compare-and-swap, so on a
+    // backend without conditional put every GC cycle fails and the store grows
+    // without bound — while reads, writes and /readyz all stay green. The first
+    // symptom is a per-cycle ERROR that arrives minutes into a write load, long
+    // after anyone is still reading the log, which is no warning at all.
+    match probe_conditional_put(object_store.as_ref(), &config.data_path).await {
+        Ok(ConditionalPutSupport::Supported) => {}
+        Ok(ConditionalPutSupport::Unsupported { store }) => tracing::warn!(
+            object_store = %store,
+            "object store does not implement conditional put, so SlateDB manifest \
+             garbage collection will fail on every cycle and reclaim nothing: the \
+             store grows without bound under sustained writes. Usable for smoke \
+             tests and local development, not for durable or long-running use — \
+             point CLOUD_PROVIDER at an S3-compatible backend for that"
+        ),
+        // Diagnostic only. A store that cannot answer the probe has a larger
+        // problem, and the first real write will report it with better context
+        // than a startup check can.
+        Err(error) => tracing::debug!(%error, "conditional-put probe did not complete"),
+    }
     let open_options = config.graph_open_options();
     let memory_config = config.graph_memory_config();
     let directory = ObjectStoreNodeDirectory::new(

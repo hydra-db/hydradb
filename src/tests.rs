@@ -3833,6 +3833,62 @@ async fn local_object_store_reopen_reads_from_remote_ground_truth() {
 }
 
 #[tokio::test]
+async fn the_local_filesystem_is_reported_as_lacking_conditional_put() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let object_store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(tempdir.path()).unwrap());
+
+    let support = probe_conditional_put(object_store.as_ref(), "graph/data")
+        .await
+        .unwrap();
+
+    assert!(!support.is_supported());
+    let ConditionalPutSupport::Unsupported { store } = support else {
+        panic!("LocalFileSystem does not implement PutMode::Update");
+    };
+    // Named by the store itself, so an operator can tell which backend the
+    // warning is about without reading it back off the configuration.
+    assert!(
+        store.contains("LocalFileSystem"),
+        "the store names itself in the report: {store}"
+    );
+}
+
+#[tokio::test]
+async fn an_in_memory_store_is_reported_as_supporting_conditional_put() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+    assert_eq!(
+        probe_conditional_put(object_store.as_ref(), "graph/data")
+            .await
+            .unwrap(),
+        ConditionalPutSupport::Supported
+    );
+}
+
+#[tokio::test]
+async fn the_conditional_put_probe_answers_the_same_on_every_restart() {
+    // The probe writes an object to ask its question. A leftover from the last
+    // start must not turn the next one into an AlreadyExists, which would read
+    // as a capability the store does not have.
+    let tempdir = tempfile::tempdir().unwrap();
+    let local: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(tempdir.path()).unwrap());
+    let memory: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+    for _ in 0..3 {
+        assert!(!probe_conditional_put(local.as_ref(), "graph/data")
+            .await
+            .unwrap()
+            .is_supported());
+        assert!(probe_conditional_put(memory.as_ref(), "graph/data")
+            .await
+            .unwrap()
+            .is_supported());
+    }
+}
+
+#[tokio::test]
 async fn second_writer_open_fences_first_writer_instance() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let path = "graph/writer-fence";
