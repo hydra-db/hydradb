@@ -2,8 +2,8 @@ use super::*;
 use crate::keys;
 
 use chrono::Utc;
-use tracing::Instrument as _;
 use hydradb_placement::cell_writer::{self, CellWriterRecord};
+use tracing::Instrument as _;
 
 /// Stamp a failure onto the span that raised it.
 ///
@@ -1883,10 +1883,10 @@ async fn close_routed_shards_best_effort(shards: BTreeMap<String, Arc<GraphShard
 
 #[cfg(all(test, feature = "query-transport"))]
 mod scoped_cluster_tests {
+    use hydradb_placement::heartbeat::{self, Heartbeat};
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path;
     use slatedb::object_store::prefix::PrefixStore;
-    use hydradb_placement::heartbeat::{self, Heartbeat};
 
     use super::*;
     use crate::NamespaceId;
@@ -3256,13 +3256,13 @@ mod cell_writer_record_tests {
 
     use async_trait::async_trait;
     use futures::stream::BoxStream;
+    use hydradb_placement::cell_writer::{read_cell_writer, CellWriterRecord, CELL_WRITER_PREFIX};
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path;
     use slatedb::object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
         PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
-    use hydradb_placement::cell_writer::{read_cell_writer, CellWriterRecord, CELL_WRITER_PREFIX};
 
     const CELL: &str = "cell-a";
     const FLEET: &[&str] = &["node-a", "node-b", "node-c"];

@@ -1,0 +1,478 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded pull-request runs, but never a `main` run: that would leave
+# no status on a commit that is already merged.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+# `RUST_MIN_STACK` matches justfile:18. OpenCypher's async query futures exceed
+# the 2 MiB default test-thread stack, and the suite then aborts with SIGABRT
+# instead of reporting the assertion that failed.
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: 33554432
+
+jobs:
+  # Asserts the chart invariants a template cannot express: that the closed
+  # network defaults stay closed, that `templates/validate.yaml` rejects what it
+  # claims to, and that runtime integers survive Helm's YAML round-trip without
+  # turning into scientific notation.
+  helm:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.17.3
+      - name: Validate single-node deployment script
+        env:
+          HYDRADB_S3_BUCKET: ci-hydradb-bucket
+          HYDRADB_PUBLIC_HOST: 203.0.113.10
+          HYDRADB_STATE_DIR: /tmp/hydradb-single-node
+        run: |
+          bash -n scripts/deploy_single_node_k3s.sh
+          bash -n scripts/ec2_graphblas_benchmark.sh
+          python3 -m py_compile scripts/bolt_graphblas_client.py
+          bash scripts/deploy_single_node_k3s.sh --render-only
+      - name: Lint Helm chart
+        run: helm lint charts/hydradb --values charts/hydradb/ci/ci-values.yaml
+      - name: Render secure EKS example
+        run: helm template hydradb charts/hydradb --namespace hydradb --values charts/hydradb/examples/values-eks.yaml > /tmp/hydradb-eks.yaml
+      - name: Render development example
+        run: helm template hydradb charts/hydradb --namespace hydradb --values charts/hydradb/examples/values-development.yaml > /tmp/hydradb-development.yaml
+      - name: Verify chart invariants
+        run: |
+          helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set auth.secretKey=custom-token > /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_AUTH_TOKEN_FILE: "/var/run/secrets/hydradb/custom-token"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_MAX_RELATIONSHIP_ROWS_BYTES: "8388608"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_MAX_SOURCE_RELATIONSHIP_ROWS_BYTES: "8388608"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_MAX_RELATIONSHIP_PROPERTY_ROWS_BYTES: "16777216"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'path: custom-token' /tmp/hydradb-custom-auth.yaml
+          if grep -q '^kind: RoleBinding$' /tmp/hydradb-custom-auth.yaml; then
+            echo "controllerless chart unexpectedly rendered a RoleBinding"
+            exit 1
+          fi
+          grep -q 'name: hydradb-bolt' /tmp/hydradb-custom-auth.yaml
+          grep -q 'name: hydradb-https' /tmp/hydradb-custom-auth.yaml
+          grep -q 'app.kubernetes.io/component: node' /tmp/hydradb-custom-auth.yaml
+          grep -q 'app.kubernetes.io/component: indexer' /tmp/hydradb-custom-auth.yaml
+          grep -q 'command: \["/usr/local/bin/graph-indexer"\]' /tmp/hydradb-custom-auth.yaml
+          grep -q 'name: hydradb-indexer-metrics' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_INDEX_DISCOVERY_INTERVAL_MS: "5000"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_RETAIN_PREVIOUS: "1"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_BUILD_MODE: "full"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_INCREMENTAL_MIN_EDGES: "250000"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_SCOPE_CONCURRENCY: "8"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_SCOPES_PER_CYCLE: "256"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_MAX_OPEN_SCOPES: "128"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_READINESS_FAILURE_THRESHOLD: "3"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_INDEXER_MAX_TAIL_FILES: "4096"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_WAL_TAIL_FETCH_CONCURRENCY: "16"' /tmp/hydradb-custom-auth.yaml
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set indexer.scopeConcurrency=64 \
+            --set indexer.maxOpenScopes=1 \
+            > /tmp/hydradb-invalid-indexer-capacity.yaml 2>&1; then
+            echo "indexer reader capacity below scope concurrency was accepted"
+            exit 1
+          fi
+          grep -q 'indexer.maxOpenScopes must be greater than or equal to indexer.scopeConcurrency' \
+            /tmp/hydradb-invalid-indexer-capacity.yaml
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set indexer.scopeConcurrency=16 \
+            --set indexer.scopesPerCycle=8 \
+            > /tmp/hydradb-invalid-indexer-cycle.yaml 2>&1; then
+            echo "indexer cycle budget below scope concurrency was accepted"
+            exit 1
+          fi
+          grep -q 'indexer.scopesPerCycle must be greater than or equal to indexer.scopeConcurrency' \
+            /tmp/hydradb-invalid-indexer-cycle.yaml
+          helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set indexer.buildMode=incremental \
+            --set indexer.incrementalMinEdges=1000000 \
+            --show-only templates/configmap.yaml > /tmp/hydradb-incremental-indexer.yaml
+          grep -q 'GRAPH_INDEXER_BUILD_MODE: "incremental"' /tmp/hydradb-incremental-indexer.yaml
+          grep -q 'GRAPH_INDEXER_INCREMENTAL_MIN_EDGES: "1000000"' /tmp/hydradb-incremental-indexer.yaml
+          if grep -q 'GRAPH_MATRIX_REFRESH_' /tmp/hydradb-custom-auth.yaml; then
+            echo "query-node matrix refresh configuration is still rendered"
+            exit 1
+          fi
+          grep -q 'Authorization: Bearer' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_DATA_CACHE_BYTES: "8589934592"' /tmp/hydradb-custom-auth.yaml
+          grep -q 'GRAPH_READER_WAL_REPLAY_CONCURRENCY: "16"' /tmp/hydradb-custom-auth.yaml
+          if grep -Eq 'GRAPH_[A-Z0-9_]+: "[0-9]+(\.[0-9]+)?e[+-][0-9]+"' /tmp/hydradb-custom-auth.yaml; then
+            echo "runtime integer was rendered in scientific notation"
+            exit 1
+          fi
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set-json runtime.maxConcurrentQueries=1.9 > /tmp/hydradb-fractional-runtime.yaml 2>&1; then
+            echo "fractional runtime integer was accepted"
+            exit 1
+          fi
+          helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set-string runtime.maxQueryRuntimeMs=18446744073709551615 \
+            > /tmp/hydradb-u64-runtime.yaml
+          grep -q 'GRAPH_MAX_QUERY_RUNTIME_MS: "18446744073709551615"' /tmp/hydradb-u64-runtime.yaml
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set-string runtime.maxQueryRuntimeMs=18446744073709551616 \
+            > /tmp/hydradb-u64-overflow.yaml 2>&1; then
+            echo "overflowing unsigned runtime integer was accepted"
+            exit 1
+          fi
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set-json 'graph.cells=["cell-0","cell-1"]' > /tmp/hydradb-multiple-cells.yaml 2>&1; then
+            echo "multiple cells in one runtime release were accepted"
+            exit 1
+          fi
+          helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            > /tmp/hydradb-digest-image.yaml
+          grep -q 'image: ghcr.io/hydra-db/hydradb@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' /tmp/hydradb-digest-image.yaml
+          helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set podDisruptionBudget.node.maxUnavailable=0 \
+            --set podDisruptionBudget.indexer.maxUnavailable=0 \
+            --show-only templates/poddisruptionbudgets.yaml > /tmp/hydradb-zero-disruptions.yaml
+          test "$(grep -c '^  maxUnavailable: 0$' /tmp/hydradb-zero-disruptions.yaml)" -eq 2
+          if grep -q '^  minAvailable:' /tmp/hydradb-zero-disruptions.yaml; then
+            echo "explicit zero maxUnavailable fell back to minAvailable"
+            exit 1
+          fi
+          grep -q 'port: 9000' /tmp/hydradb-development.yaml
+          grep -q 'app.kubernetes.io/component: helm-test' /tmp/hydradb-development.yaml
+          helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set tests.enabled=false \
+            --show-only templates/networkpolicy.yaml > /tmp/hydradb-default-policy.yaml
+          if grep -q 'cidr: 0.0.0.0/0' /tmp/hydradb-default-policy.yaml; then
+            echo "network policy unexpectedly permits universal IPv4 egress"
+            exit 1
+          fi
+          grep -q 'cidr: 10.0.0.0/8' /tmp/hydradb-default-policy.yaml
+          if awk '/^  ingress:/{ingress=1; next} /^  egress:/{ingress=0} ingress && /port: 8443/{found=1} END{exit found ? 0 : 1}' /tmp/hydradb-default-policy.yaml; then
+            echo "default client ingress unexpectedly permits HTTPS"
+            exit 1
+          fi
+          helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set-json 'networkPolicy.clientIngressFrom=[{"ipBlock":{"cidr":"10.20.0.0/16"}}]' > /tmp/hydradb-scoped-client.yaml
+          grep -q 'cidr: 10.20.0.0/16' /tmp/hydradb-scoped-client.yaml
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set-json 'networkPolicy.httpsEgressTo=[]' > /tmp/hydradb-unscoped-https.yaml 2>&1; then
+            echo "unscoped AWS HTTPS egress was accepted"
+            exit 1
+          fi
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set-json 'networkPolicy.httpsEgressTo=[{}]' > /tmp/hydradb-empty-https-peer.yaml 2>&1; then
+            echo "empty AWS HTTPS egress peer was accepted"
+            exit 1
+          fi
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set-json 'networkPolicy.httpsEgressTo=[{"ipBlock":{"cidr":"0.0.0.0/0"}}]' > /tmp/hydradb-universal-https.yaml 2>&1; then
+            echo "universal AWS HTTPS egress CIDR was accepted"
+            exit 1
+          fi
+          helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/custom-endpoint-values.yaml > /tmp/hydradb-custom-endpoint.yaml
+          grep -q 'port: 8080' /tmp/hydradb-custom-endpoint.yaml
+          grep -q 'cidr: 10.0.0.0/8' /tmp/hydradb-custom-endpoint.yaml
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set-string objectStore.aws.endpoint=https://object-store.example \
+            --set-json 'objectStore.aws.endpointEgressTo=[{"ipBlock":{"cidr":"10.30.0.0/16"}}]' \
+            --set-json 'networkPolicy.httpsEgressTo=[]' > /tmp/hydradb-custom-endpoint-without-sts.yaml 2>&1; then
+            echo "IRSA custom endpoint without scoped STS egress was accepted"
+            exit 1
+          fi
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/ci-values.yaml \
+            --set-string objectStore.aws.endpoint=http://object-store.example:8080 > /tmp/hydradb-unscoped-endpoint.yaml 2>&1; then
+            echo "unscoped custom object-store endpoint was accepted"
+            exit 1
+          fi
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/custom-endpoint-values.yaml \
+            --set-json 'objectStore.aws.endpointEgressTo=[{}]' > /tmp/hydradb-empty-endpoint-peer.yaml 2>&1; then
+            echo "empty custom object-store endpoint peer was accepted"
+            exit 1
+          fi
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/custom-endpoint-values.yaml \
+            --set-json 'objectStore.aws.endpointEgressTo=[{"namespaceSelector":{}}]' > /tmp/hydradb-empty-namespace-selector.yaml 2>&1; then
+            echo "empty custom object-store namespace selector was accepted"
+            exit 1
+          fi
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/custom-endpoint-values.yaml \
+            --set-json 'objectStore.aws.endpointEgressTo=[{"podSelector":{}}]' > /tmp/hydradb-empty-pod-selector.yaml 2>&1; then
+            echo "empty custom object-store Pod selector was accepted"
+            exit 1
+          fi
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/custom-endpoint-values.yaml \
+            --set-json 'objectStore.aws.endpointEgressTo=[{"ipBlock":{"cidr":"0.0.0.0/0"}}]' > /tmp/hydradb-universal-endpoint-cidr.yaml 2>&1; then
+            echo "universal custom object-store CIDR was accepted"
+            exit 1
+          fi
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/custom-endpoint-values.yaml \
+            --set-string objectStore.aws.endpoint=ftp://object-store.example > /tmp/hydradb-invalid-endpoint.yaml 2>&1; then
+            echo "unsupported object-store endpoint scheme was accepted"
+            exit 1
+          fi
+          if helm template hydradb charts/hydradb \
+            --namespace hydradb \
+            --values charts/hydradb/ci/custom-endpoint-values.yaml \
+            --set-string objectStore.aws.endpoint=http://object-store.example:70000 > /tmp/hydradb-invalid-port.yaml 2>&1; then
+            echo "invalid object-store endpoint port was accepted"
+            exit 1
+          fi
+      # Pinned by digest, like the actions above: this image is executed on the
+      # runner and decides whether invalid manifests reach main, so a repointed
+      # tag would change the gate without review. The digest is the multi-arch
+      # index, so it resolves on both amd64 and arm64 runners.
+      - name: Validate Kubernetes resources
+        env:
+          KUBECONFORM: ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e
+        run: |
+          docker run --rm -i "$KUBECONFORM" -strict -summary < /tmp/hydradb-development.yaml
+          docker run --rm -i "$KUBECONFORM" -strict -summary -ignore-missing-schemas < /tmp/hydradb-eks.yaml
+
+
+  # Each step names the `just` recipe it mirrors, in the justfile's own order.
+  # `scripts/ci_local.sh` promises `just ci` and this job mean the same thing,
+  # which holds only if the two lists are edited together: a new feature
+  # combination belongs in both, in the same commit.
+  test:
+    name: Linux feature matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # SHA-pinned like every other action here. The pin freezes the action's
+      # own code, not the compiler, so `toolchain` is stated explicitly rather
+      # than inherited from whichever branch the SHA was taken from.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      # Without this the job rebuilds all 398 locked dependencies every run.
+      # `save-if` keeps only main writing the entry, so branch-scoped caches
+      # cannot accumulate and evict what the next main build needs.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: linux-test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # `python3-venv` is for the runtime smoke at the end of the job.
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config \
+            libcypher-parser-dev libgraphblas-dev python3-venv
+
+      # Both are linked unconditionally, so fail here rather than ten minutes
+      # into a compile.
+      - name: Verify native dependencies             # just native-check
+        run: |
+          pkg-config --exists cypher-parser
+          ldconfig -p | grep -q libgraphblas
+
+      - name: Check formatting                       # just fmt-check
+        run: cargo fmt --all --check
+
+      # Six shipped feature combinations, none subsuming another: a lint only
+      # fires inside the cfg arms its feature set compiles. `--all-targets`
+      # covers examples and tests, which is why no `cargo check --examples`
+      # line follows.
+      - name: Clippy default feature set             # just clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Clippy chaos harness                   # just clippy-chaos
+        run: cargo clippy --locked --all-targets --features chaos-harness -- -D warnings
+      - name: Clippy OpenCypher feature set          # just clippy-opencypher
+        run: cargo clippy --locked --all-targets --features opencypher -- -D warnings
+      - name: Clippy full native feature set         # just clippy-native
+        run: cargo clippy --locked --all-targets --features opencypher,query-transport,query-transport-tls,query-service-discovery,public-client-protocols -- -D warnings
+      - name: Clippy public client protocols         # just clippy-client-protocols
+        run: cargo clippy --locked --all-targets --features public-client-protocols -- -D warnings
+      - name: Clippy production runtime              # just clippy-runtime
+        run: cargo clippy --locked --all-targets --features server-runtime,indexer-runtime -- -D warnings
+
+      # Every other cargo line here is bare and selects the root package only;
+      # the workspace members need an explicit `-p` or they go untested.
+      - name: Lint and test placement crate          # just test-placement
+        run: |
+          cargo clippy --locked --all-targets -p hydradb-placement -- -D warnings
+          cargo test --locked -p hydradb-placement
+
+      # Without `--features otlp` the sampler, exporter wiring and log bridge
+      # are not compiled at all.
+      - name: Lint and test telemetry crate          # just test-telemetry
+        run: |
+          cargo clippy --locked --all-targets -p hydradb-telemetry --features otlp -- -D warnings
+          cargo test --locked -p hydradb-telemetry --features otlp
+
+      # `--all-features`, not an enumerated list: a list silently stops covering
+      # the next feature added to Cargo.toml. Also the only line that reaches
+      # the root `otlp` switch the binaries' cfg arms read.
+      - name: Check every feature at once            # just check-all-features
+        run: cargo check --locked --all-targets --all-features
+
+      # Nothing else builds the shared client stack without a wire protocol on
+      # top, so an item gated on Bolt or HTTP can be called from `client-api`
+      # code and still compile everywhere else.
+      #
+      # `--lib` because `src/client/mod.rs`'s `#[cfg(test)]`
+      # `ClientTestTlsBundle` names `tokio_rustls` ungated, so this
+      # configuration's lib-test target does not build. Widen once that is fixed.
+      - name: Check shared client stack              # just check-client-api
+        run: cargo check --locked --features client-api --lib
+
+      # With `http-api` also on, anything Bolt is missing gets supplied by the
+      # other protocol and the gap stays hidden.
+      - name: Check standalone Bolt server           # just check-bolt-server
+        run: cargo check --locked --all-targets --features bolt-server
+
+      - name: Test default feature set               # just test
+        run: cargo test --locked --lib
+      - name: Test OpenCypher feature set            # just test-opencypher
+        run: cargo test --locked --features opencypher --lib
+
+      # `--all-targets`, not `--lib`: `--lib` builds the client stack as a plain
+      # dependency, so `src/client/service/tests.rs` never sees `cfg(test)` and
+      # its tests silently do not exist.
+      - name: Test full native feature set           # just test-native
+        run: cargo test --locked --all-targets --features opencypher,query-transport,query-transport-tls,query-service-discovery,public-client-protocols
+
+      # Bolt and HTTP without query-service-discovery, as an embedder that
+      # brings its own routing builds them. Catches a `use reqwest::…` leaked
+      # into the shared client path, which the line above cannot.
+      - name: Test public client protocols           # just test-client-protocols
+        run: cargo test --locked --all-targets --features public-client-protocols
+
+      - name: Test chaos harness feature set         # just test-chaos
+        run: cargo test --locked --features chaos-harness --lib
+
+      - name: Test production runtime configuration  # just test-server-runtime
+        run: cargo test --locked --features server-runtime --bin graph-node
+
+      # The binary declares `required-features = ["indexer-runtime"]`, so no
+      # `--lib` or `--all-targets` line elsewhere builds its test target. This
+      # is the only step that executes indexer code.
+      - name: Test indexer runtime                   # just test-indexer
+        run: cargo test --locked --features indexer-runtime --bin graph-indexer
+
+      # The only tests proving an instrument reaches a collector rather than
+      # merely registering: an observable instrument whose callback the SDK
+      # never invokes is silent, and silence looks like a genuine zero.
+      - name: Test graph-node OTLP export            # just test-node-otlp
+        run: cargo test --locked --features server-runtime,otlp --bin graph-node
+
+      # End-to-end proof that the shipped binary serves a real Neo4j driver:
+      # builds graph-node, starts it, polls /readyz, drives it over Bolt and
+      # HTTP, then stops it. A listening port is not proof; a round-tripped
+      # write is.
+      #
+      # The virtualenv is not optional: Ubuntu's system Python is PEP 668
+      # externally-managed and refuses a bare `pip install`. The driver is held
+      # to one major series so a new major release cannot turn this job red on
+      # its own; both 5.x and 6.x speak the Bolt versions the server negotiates.
+      - name: Test production runtime lifecycle
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/venv"
+          "${RUNNER_TEMP}/venv/bin/pip" install --quiet --disable-pip-version-check 'neo4j>=6,<7'
+          PYTHON="${RUNNER_TEMP}/venv/bin/python" bash scripts/runtime_smoke.sh
+
+      # The node log is the first thing worth reading on a failure, and the
+      # script tears the node down on exit.
+      - name: Upload runtime smoke log
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtime-smoke-log
+          path: /tmp/sgk-runtime-smoke/node.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # macOS is a supported development platform and resolves native dependencies
+  # under Homebrew's prefix rather than the default search paths apt uses, so
+  # breakage here is invisible to the job above.
+  #
+  # Only the two feature sets that do not need libcypher-parser, to keep this a
+  # fast platform check. GraphBLAS is still linked unconditionally, but
+  # `build.rs` resolves the path itself via `brew --prefix suite-sparse`, so
+  # installing the formula is the whole setup.
+  macos-default:
+    name: macOS default features
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+          components: clippy
+      # A separate cache entry from the `test` job, and it has to be: rust-cache
+      # keys on runner OS and architecture, so a macOS target directory can
+      # never restore onto Linux.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: macos-default
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install native dependencies
+        run: brew install suite-sparse
+      - name: Clippy default feature set             # just clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Clippy chaos harness                   # just clippy-chaos
+        run: cargo clippy --locked --all-targets --features chaos-harness -- -D warnings
+      - name: Test default feature set               # just test
+        run: cargo test --locked --lib
+      - name: Test chaos harness feature set         # just test-chaos
+        run: cargo test --locked --features chaos-harness --lib

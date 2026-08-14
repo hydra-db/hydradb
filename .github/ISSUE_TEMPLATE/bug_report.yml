@@ -1,0 +1,156 @@
+name: Bug report
+description: Something in HydraDB behaves incorrectly — a crash, a wrong query result, or a broken deployment.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        These five have environmental causes rather than code ones. The full
+        list is in [AGENTS.md](https://github.com/hydra-db/hydradb/blob/main/AGENTS.md#failure-modes-worth-knowing-before-you-debug).
+
+        | Symptom | Cause |
+        |---|---|
+        | `invalid environment variable CLOUD_PROVIDER value` reporting `null` | `CLOUD_PROVIDER` is unset — `null` means absent, not the string. `local` also needs `LOCAL_PATH` pointing at a directory that already exists. |
+        | The node serves `/readyz`, then aborts with `has overflowed its stack` on the first query | `RUST_MIN_STACK` is unset. It looks like a query bug and is not. |
+        | `fatal error: 'cypher-parser.h' file not found` when building on macOS | `BINDGEN_EXTRA_CLANG_ARGS` is unset. Build through `just`, not bare `cargo`. |
+        | `curl: (7) Failed to connect` to the admin port | `graph-node` runs in the foreground and never returns. That is it working — start it in its own shell. |
+        | `No available formula with the name "libcypher-parser"` | Not in homebrew-core: `brew install cleishm/neo4j/libcypher-parser`. |
+
+        `Error: Slate(...)` comes from
+        [SlateDB](https://github.com/usecortex/slatedb), not from this crate.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I can reproduce this on the latest release or on current `main`.
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you observed, and what you expected instead. Paste exact error text rather than paraphrasing it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: |
+        The smallest sequence that shows the problem. For a query bug, include the
+        Cypher that sets the data up as well as the query that misbehaves — a
+        `MATCH` cannot be run without the `CREATE` that produced the data.
+      placeholder: |
+        1. Start a node with GRAPH_ALLOW_PLAINTEXT=true against a local store
+        2. CREATE (a {id: 1})-[:FOLLOWS]->(b {id: 2})
+        3. MATCH (a {id: 1})-[:FOLLOWS]->(b) RETURN b.id AS id
+        4. Returns two rows; expected one
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Release tag, image tag, or commit SHA. "latest" is not a version — `main` is rebased frequently, so a SHA is what makes a report reproducible.
+      placeholder: "v0.1.0, or sha-7bf77ac, or commit 6a2fbb1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Best guess is fine.
+      options:
+        - graph-node (queries, mutations, serving)
+        - graph-indexer (CSC generation building)
+        - Query planner / OpenCypher semantics
+        - Bolt protocol / Neo4j driver compatibility
+        - HTTP query API
+        - Storage, WAL, or writer fencing
+        - Sparse traversal kernel / GraphBLAS
+        - Helm chart or Kubernetes deployment
+        - Build, CI, or Docker image
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How it is running
+      options:
+        - Docker image from ghcr.io
+        - Built from source
+        - Helm chart
+        - Embedded as a library
+    validations:
+      required: true
+
+  - type: dropdown
+    id: object-store
+    attributes:
+      label: Object store backend
+      description: The `CLOUD_PROVIDER` value, or the S3-compatible service if you point `aws` at a custom endpoint.
+      options:
+        - local (filesystem)
+        - memory
+        - aws (S3)
+        - MinIO or another S3-compatible endpoint
+        - azure
+        - gcp
+    validations:
+      required: true
+
+  - type: dropdown
+    id: sparse-kernel
+    attributes:
+      label: Sparse kernel
+      description: |
+        `GRAPH_SPARSE_KERNEL`, read by the `graph-node` binary only. Worth
+        checking before reporting a wrong result: `adjacency` is a capability
+        downgrade, not merely a slower path — it has no count or window pushdown
+        and enforces scan and row limits the compiled path does not, so a
+        traversal that succeeds on `suitesparse` can fail outright on it.
+      options:
+        - suitesparse (default)
+        - compact
+        - adjacency
+        - Not applicable
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "Ubuntu 24.04 x86_64, or macOS 15 arm64, or EKS 1.31"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Relevant output, ideally with `RUST_LOG=debug`. If a node failed to
+        start or died, its log is the first thing worth reading — `node.log`
+        under the run directory. Trim to the relevant portion.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Graph size, concurrency, cell configuration, query limits you have raised or lowered, or anything that made the failure more or less likely.
+    validations:
+      required: false

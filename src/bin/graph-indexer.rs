@@ -13,6 +13,7 @@ use axum::routing::get;
 use axum::Router;
 use bytes::Bytes;
 use futures::StreamExt;
+use hydradb_telemetry::{semconv, ErrorClass, Outcome, ServiceIdentity, TelemetryConfig};
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{ObjectStoreExt, PutMode, UpdateVersion};
 use slatedb_graph_kernel::{
@@ -25,7 +26,6 @@ use tokio::sync::{watch, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tracing::field::Empty;
 use tracing::Instrument;
-use hydradb_telemetry::{semconv, ErrorClass, Outcome, ServiceIdentity, TelemetryConfig};
 
 type RuntimeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

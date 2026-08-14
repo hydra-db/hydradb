@@ -78,7 +78,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.91"
 description = "A SlateDB-backed object-store graph kernel"
-repository = "https://github.com/usecortex/slatedb-graph-kernel"
+repository = "https://github.com/hydra-db/hydradb"
+license = "AGPL-3.0-only"
 readme = "README.md"
 publish = false
 

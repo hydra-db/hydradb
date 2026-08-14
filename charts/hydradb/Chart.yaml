@@ -5,9 +5,9 @@ type: application
 version: 0.1.0
 appVersion: "0.1.0"
 kubeVersion: ">=1.27.0-0"
-home: https://github.com/usecortex/slatedb-graph-kernel
+home: https://github.com/hydra-db/hydradb
 sources:
-  - https://github.com/usecortex/slatedb-graph-kernel
+  - https://github.com/hydra-db/hydradb
 keywords:
   - graph
   - cypher
@@ -15,4 +15,6 @@ keywords:
   - object-storage
   - graphblas
 annotations:
-  artifacthub.io/license: Apache-2.0
+  # Must match LICENSE. This read Apache-2.0 while the repository shipped
+  # AGPL-3.0, which Artifact Hub would have published as the chart's licence.
+  artifacthub.io/license: AGPL-3.0-only
