@@ -197,6 +197,9 @@ write one:
 - `UNWIND ... CREATE` and `UNWIND MATCH ... CREATE` cannot be followed by
   another clause, and an `UNWIND MATCH` must end in `RETURN` or `DELETE`.
 - `UNWIND MATCH` does not take `OPTIONAL`, hints, or `WHERE`.
+- A batch carries at most 1024 rows. Admission control rejects a larger one
+  with `client_query_batch_items rejected by admission control`, so a loader
+  chunks its rows rather than sending one big list.
 
 Batches run through the client service that the Bolt server uses, because a
 parameter holding a list of maps is a transport-level type. The in-process shard
@@ -231,8 +234,42 @@ Config keys include `sourceNode`, `targetNode`, `sourceLabel`, `sourceProperty`,
 optional maximum cost. Setting `targetLabel` or `targetProperty` requires
 `targetValues` as well.
 
+The keys are not interchangeable across the three procedures. How an origin is
+named differs, and using the wrong form is a parse error rather than an empty
+result:
+
+| Procedure | Origin form |
+|---|---|
+| `algo.SPpaths`, `algo.SSpaths` | a single `sourceNode`, an **integer** node id |
+| `algo.MSpaths` | a `sourceLabel` / `sourceProperty` / `sourceValues` set |
+
+Passing a `sourceValues` set to `algo.SSpaths` is rejected with `missing
+OpenCypher query parameter $sourceNode`, and a string `sourceNode` is rejected
+with `sourceNode must be an integer node id`.
+
+`sourceValues` and `targetValues` are **lists of strings**, matched against a
+string-typed property. Integer values are rejected with `sourceValues must be a
+list of strings`, and string values matched against an integer property parse
+but select nothing, so a query that looks correct returns no rows. Where node
+ids are integers, carrying a string mirror of the id as a separate property and
+pointing `sourceProperty` at that is one way to address nodes here.
+
+The two value lists must also be written as literals. Supplying them through a
+query parameter is rejected with `composite parameter $name is only supported as
+an UNWIND input`, so they are inlined into the statement text.
+
+`relDirection` accepts `'incoming'`, `'outgoing'` and `'both'`, case-insensitively;
+other spellings such as `'in'` are rejected.
+
+Without an explicit `pathCount`, `algo.SSpaths` returns only the single shortest
+path even when more exist. Counting incoming neighbours therefore needs a
+`pathCount` high enough to cover the expected degree, or the result silently
+reads as one.
+
 Yieldable columns are `path`, `pathWeight` and `pathCost`. `RETURN` may only
-name columns that were yielded.
+name columns that were yielded, and it may not aggregate over them: `RETURN
+count(path)` is rejected with `unknown path projection count`, so counting
+happens on the client.
 
 Unlike a plain `MATCH`, these are the way to get whole paths back rather than
 endpoint projections.
