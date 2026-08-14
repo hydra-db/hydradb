@@ -1,0 +1,96 @@
+name: Feature request
+description: Propose a capability HydraDB does not have, or a change to one it does.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If you are unsure whether something is a missing feature or a bug, file
+        a bug report — it asks for the detail needed to tell the difference.
+
+        For a change large enough to need design discussion before code, open
+        the issue first and say so. Landed designs live in `docs/plans/` as
+        dated markdown; the issue is where the shape gets agreed.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: |
+        What are you trying to do that HydraDB makes hard or impossible today?
+        Describe the situation rather than the fix; the proposed change goes in
+        the next field.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What you would like to happen. Sketch the API, Cypher syntax, configuration key, or chart value if you have one in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, and why they were not enough.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Query language / OpenCypher coverage
+        - Query planner or execution
+        - Bolt protocol / driver compatibility
+        - HTTP query API
+        - Storage, durability, or writer coordination
+        - Indexing (graph-indexer, CSC generations)
+        - Sparse traversal kernels
+        - Observability (metrics, traces, logs)
+        - Deployment (Helm chart, Docker, Kubernetes)
+        - Configuration and operations
+        - Documentation
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: compatibility
+    attributes:
+      label: Compatibility
+      description: |
+        Tick anything this would change. None of these disqualify a proposal —
+        they decide whether it can land in a patch release or has to wait for a
+        breaking one, so it is better to flag them now than to discover them in
+        review.
+      options:
+        - label: Changes the result of a query that works today
+        - label: Changes the Bolt or HTTP wire format
+        - label: Changes the on-disk or object-store layout
+        - label: Adds or renames configuration, environment variables, or chart values
+        - label: Adds a new third-party dependency
+        - label: None of the above, or I am not sure
+
+  - type: dropdown
+    id: contributing
+    attributes:
+      label: Would you like to implement this?
+      description: Not a commitment, and a "no" costs a proposal nothing.
+      options:
+        - "Yes, I would like to work on it"
+        - "Yes, with guidance on where to start"
+        - "No, I am proposing it for someone else to pick up"
+    validations:
+      required: true

@@ -5,9 +5,17 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
 jobs:
   compatibility-report:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout kernel
         uses: actions/checkout@v4

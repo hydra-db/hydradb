@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/hydra-db/hydradb/blob/main/SECURITY.md
+    about: Do not open a public issue. Report it privately to the maintainers — SECURITY.md covers what to include.
+
+  - name: Question or usage help
+    url: https://github.com/hydra-db/hydradb/discussions
+    about: How to model something, why a query is slow, whether behaviour is intended.
+
+  - name: Build and development setup
+    url: https://github.com/hydra-db/hydradb/blob/main/DEVELOPMENT.md
+    about: Recipes and harnesses. AGENTS.md lists the failure modes that cost the most time to rediscover.

@@ -2,7 +2,14 @@ nameOverride: ""
 fullnameOverride: ""
 
 image:
-  repository: 525753068359.dkr.ecr.us-east-1.amazonaws.com/staging/hydradb
+  # The public multi-architecture image `container.yml` publishes on every `v*`
+  # tag. It has to be the default: this chart is installable from a public
+  # repository, and a default pointing at a private registry fails
+  # `helm install` for everyone outside the account that owns it.
+  #
+  # `tag` empty means the chart falls back to `.Chart.AppVersion`. Pin `digest`
+  # instead for a deployment that must not move when a tag is repointed.
+  repository: ghcr.io/hydra-db/hydradb
   tag: ""
   digest: ""
   pullPolicy: IfNotPresent
