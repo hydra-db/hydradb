@@ -169,9 +169,14 @@ also ships `graph-indexer`. For production, pin an image digest rather than
 > does not recover — logged at `ERROR` as
 > `error collecting garbage [resource=Manifest, error=ObjectStoreError(NotImplemented ...)]`.
 > Reads and `/readyz` keep succeeding while this happens, so the node looks
-> healthy. For anything beyond a smoke test use an S3-compatible backend; the
-> MinIO harness below (`just minio-smoke`) is the shortest path to one. See
-> [#81](https://github.com/hydra-db/hydradb/issues/81).
+> healthy. For anything beyond a smoke test, point the node at an S3-compatible
+> object store instead — `CLOUD_PROVIDER=aws` with `AWS_BUCKET_NAME`,
+> `AWS_DEFAULT_REGION`, and, for a local MinIO, `AWS_ENDPOINT` plus
+> `AWS_ALLOW_HTTP=true`. `CLOUD_PROVIDER` accepts `local`, `memory`, `aws`,
+> `azure` and `gcp`; `memory` is also fine for a throwaway smoke test where
+> durability does not matter. See the
+> [Helm chart guide](charts/hydradb/README.md) for the full object-store surface,
+> and [#81](https://github.com/hydra-db/hydradb/issues/81) for the reproduction.
 
 </details>
 
