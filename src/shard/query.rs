@@ -8959,12 +8959,29 @@ fn vertex_property_rank(value: &VertexPropertyValue) -> u8 {
     }
 }
 
+/// Every property-index key spelling that could hold a value
+/// [`vertex_property_values_equal`] would accept for `value`.
+///
+/// `encode_vertex_property_value_key` is injective over the *representation*:
+/// `5u64`, `5i64` and `5.0f64` are three different index keys. Equality is not
+/// — [`numeric_property_order`] compares all three numerically, and every
+/// caller here re-checks its candidates against it (or against
+/// `row_predicate_matches`, which reaches it) before a row is returned. That
+/// makes this function the candidate *producer* for that filter, so it has to
+/// emit a superset of the spellings the filter accepts. Emitting a subset is
+/// silent: the missing rows are never fetched, so the filter never gets to
+/// keep them, and the query answers with fewer rows and no error.
+///
+/// The three numeric variants therefore cross-reference each other whenever
+/// the conversion is exact, and only then — a lossy conversion would name a
+/// key holding a different number.
 #[cfg(feature = "opencypher")]
 fn equivalent_property_index_keys(value: &VertexPropertyValue) -> Vec<String> {
     let mut keys = BTreeSet::new();
     keys.insert(encode_vertex_property_value_key(value));
     match value {
         VertexPropertyValue::Integer(value) => {
+            insert_signed_integer_property_index_key(&mut keys, *value);
             if let Some(float) = VertexPropertyValue::exact_f64_from_u64(*value) {
                 insert_float_property_index_key(&mut keys, float);
                 if *value == 0 {
@@ -8973,8 +8990,12 @@ fn equivalent_property_index_keys(value: &VertexPropertyValue) -> Vec<String> {
             }
         }
         VertexPropertyValue::SignedInteger(value) => {
+            insert_unsigned_integer_property_index_key(&mut keys, *value);
             if let Some(float) = VertexPropertyValue::exact_f64_from_i64(*value) {
                 insert_float_property_index_key(&mut keys, float);
+                if *value == 0 {
+                    insert_float_property_index_key(&mut keys, -0.0);
+                }
             }
         }
         VertexPropertyValue::Float(value) => {
@@ -8982,14 +9003,21 @@ fn equivalent_property_index_keys(value: &VertexPropertyValue) -> Vec<String> {
                 insert_float_property_index_key(&mut keys, 0.0);
                 insert_float_property_index_key(&mut keys, -0.0);
             }
+            // Two independent `if`s, not an `if`/`else if`: a float in
+            // `0 ..= i64::MAX` has both an `Integer` and a `SignedInteger`
+            // spelling, and stopping at the first would leave the other
+            // unread.
             if let Some(integer) = VertexPropertyValue::exact_u64_from_f64(value.0) {
                 keys.insert(encode_vertex_property_value_key(
                     &VertexPropertyValue::Integer(integer),
                 ));
-            } else if let Some(integer) = VertexPropertyValue::exact_i64_from_f64(value.0) {
+                insert_signed_integer_property_index_key(&mut keys, integer);
+            }
+            if let Some(integer) = VertexPropertyValue::exact_i64_from_f64(value.0) {
                 keys.insert(encode_vertex_property_value_key(
-                    &VertexPropertyValue::from_i64(integer),
+                    &VertexPropertyValue::SignedInteger(integer),
                 ));
+                insert_unsigned_integer_property_index_key(&mut keys, integer);
             }
         }
         VertexPropertyValue::Bool(_) | VertexPropertyValue::String(_) => {}
@@ -9002,6 +9030,33 @@ fn insert_float_property_index_key(keys: &mut BTreeSet<String>, value: f64) {
     keys.insert(encode_vertex_property_value_key(
         &VertexPropertyValue::Float(QueryFloat(value)),
     ));
+}
+
+/// The `SignedInteger` spelling of an unsigned integer, when one exists.
+///
+/// `VertexPropertyValue::from_i64` canonicalizes a non-negative `i64` to
+/// `Integer`, so every value in `0 ..= i64::MAX` has two spellings and the
+/// transports only ever produce the first. The library API is public and can
+/// store either, and `numeric_property_order` treats them as one number, so
+/// the index lookup has to read both keys.
+#[cfg(feature = "opencypher")]
+fn insert_signed_integer_property_index_key(keys: &mut BTreeSet<String>, value: u64) {
+    if let Ok(value) = i64::try_from(value) {
+        keys.insert(encode_vertex_property_value_key(
+            &VertexPropertyValue::SignedInteger(value),
+        ));
+    }
+}
+
+/// The mirror of [`insert_signed_integer_property_index_key`]: the `Integer`
+/// spelling of a signed integer, for the non-negative half of `i64`.
+#[cfg(feature = "opencypher")]
+fn insert_unsigned_integer_property_index_key(keys: &mut BTreeSet<String>, value: i64) {
+    if let Ok(value) = u64::try_from(value) {
+        keys.insert(encode_vertex_property_value_key(
+            &VertexPropertyValue::Integer(value),
+        ));
+    }
 }
 
 #[cfg(feature = "opencypher")]
@@ -9098,5 +9153,174 @@ fn compare_u64_f64(left: u64, right: f64) -> std::cmp::Ordering {
         std::cmp::Ordering::Equal if floor == right => std::cmp::Ordering::Equal,
         std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
         ordering => ordering,
+    }
+}
+
+#[cfg(feature = "opencypher")]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every numeric spelling the engine can store, plus the two non-numeric
+    /// kinds, so the cross-check below also pins that they stay out of it.
+    ///
+    /// `i64::MAX` and `u64::MAX` are here for the conversions that must *not*
+    /// happen: neither is exactly representable as `f64`, and `u64::MAX` has
+    /// no signed spelling at all.
+    fn probes() -> Vec<VertexPropertyValue> {
+        vec![
+            VertexPropertyValue::Integer(0),
+            VertexPropertyValue::SignedInteger(0),
+            VertexPropertyValue::Float(QueryFloat(0.0)),
+            VertexPropertyValue::Float(QueryFloat(-0.0)),
+            VertexPropertyValue::Integer(5),
+            VertexPropertyValue::SignedInteger(5),
+            VertexPropertyValue::Float(QueryFloat(5.0)),
+            VertexPropertyValue::SignedInteger(-5),
+            VertexPropertyValue::Float(QueryFloat(-5.0)),
+            VertexPropertyValue::Float(QueryFloat(2.5)),
+            VertexPropertyValue::Integer(i64::MAX as u64),
+            VertexPropertyValue::SignedInteger(i64::MAX),
+            VertexPropertyValue::Integer(u64::MAX),
+            VertexPropertyValue::SignedInteger(i64::MIN),
+            VertexPropertyValue::Bool(true),
+            VertexPropertyValue::String("5".to_string()),
+        ]
+    }
+
+    /// The contract, stated once and checked over every pair.
+    ///
+    /// `equivalent_property_index_keys` is the candidate producer for a filter
+    /// that decides equality with `vertex_property_values_equal`, and every
+    /// caller re-checks its candidates against that filter. So the keys have
+    /// to be a *superset* of the spellings the filter accepts: a spelling this
+    /// function omits is never fetched, so the filter never sees it, and the
+    /// query answers with fewer rows and no error. Producing too many keys
+    /// only costs a scan; producing too few is a silent wrong answer.
+    #[test]
+    fn index_keys_cover_every_spelling_the_row_filter_calls_equal() {
+        for probe in probes() {
+            let keys = equivalent_property_index_keys(&probe);
+            for stored in probes() {
+                if !vertex_property_values_equal(&stored, &probe) {
+                    continue;
+                }
+                let key = encode_vertex_property_value_key(&stored);
+                assert!(
+                    keys.contains(&key),
+                    "a lookup for {probe:?} would never read the key {key} that \
+                     {stored:?} is stored under, yet the row filter calls them equal"
+                );
+            }
+        }
+    }
+
+    /// The gap the cross-check above was written to catch: `Integer(n)` and
+    /// `SignedInteger(n)` are one number to `numeric_property_order` and two
+    /// keys to `encode_vertex_property_value_key`, and the lookup has to read
+    /// both. `VertexPropertyValue::from_i64` canonicalizes a non-negative
+    /// `i64` to `Integer`, so the transports only ever write the first — but
+    /// the model type is public, an embedder can store either, and the value
+    /// that comes back out is whichever one was written.
+    #[test]
+    fn the_two_integer_spellings_of_one_number_read_each_other() {
+        let unsigned = encode_vertex_property_value_key(&VertexPropertyValue::Integer(5));
+        let signed = encode_vertex_property_value_key(&VertexPropertyValue::SignedInteger(5));
+        assert_ne!(unsigned, signed, "the two spellings must be distinct keys");
+
+        assert!(equivalent_property_index_keys(&VertexPropertyValue::Integer(5)).contains(&signed));
+        assert!(
+            equivalent_property_index_keys(&VertexPropertyValue::SignedInteger(5))
+                .contains(&unsigned)
+        );
+    }
+
+    /// A float that lands on an integer has to reach both integer spellings,
+    /// not the first one that fits. This is the `else if` the fix replaced:
+    /// every non-negative float in range matches the `u64` arm, so the `i64`
+    /// arm was unreachable for exactly the values that have two spellings.
+    #[test]
+    fn a_whole_float_reads_both_integer_spellings() {
+        let keys = equivalent_property_index_keys(&VertexPropertyValue::Float(QueryFloat(5.0)));
+        assert!(keys.contains(&encode_vertex_property_value_key(
+            &VertexPropertyValue::Integer(5)
+        )));
+        assert!(keys.contains(&encode_vertex_property_value_key(
+            &VertexPropertyValue::SignedInteger(5)
+        )));
+    }
+
+    /// Only *exact* conversions may name a key. A lossy one would send the
+    /// lookup at a key holding a different number, and the row filter would
+    /// then have to reject every row it found there.
+    #[test]
+    fn inexact_conversions_are_not_given_a_key() {
+        // `u64::MAX` has no signed spelling and no exact float.
+        let keys = equivalent_property_index_keys(&VertexPropertyValue::Integer(u64::MAX));
+        assert_eq!(
+            keys,
+            vec![encode_vertex_property_value_key(
+                &VertexPropertyValue::Integer(u64::MAX)
+            )]
+        );
+
+        // `i64::MAX` has both integer spellings but is not exactly a float.
+        let keys = equivalent_property_index_keys(&VertexPropertyValue::SignedInteger(i64::MAX));
+        assert_eq!(
+            keys.len(),
+            2,
+            "expected both integer spellings only: {keys:?}"
+        );
+        assert!(keys.contains(&encode_vertex_property_value_key(
+            &VertexPropertyValue::Integer(i64::MAX as u64)
+        )));
+
+        // A fractional float has no integer spelling at all.
+        let keys = equivalent_property_index_keys(&VertexPropertyValue::Float(QueryFloat(2.5)));
+        assert_eq!(
+            keys,
+            vec![encode_vertex_property_value_key(
+                &VertexPropertyValue::Float(QueryFloat(2.5))
+            )]
+        );
+    }
+
+    /// Widening must not reach across kinds. `5` and `"5"` are not equal to
+    /// the row filter, so the lookup must not scan the string's key.
+    #[test]
+    fn widening_stops_at_the_numeric_kinds() {
+        let keys = equivalent_property_index_keys(&VertexPropertyValue::Integer(5));
+        assert!(!keys.contains(&encode_vertex_property_value_key(
+            &VertexPropertyValue::String("5".to_string())
+        )));
+        assert!(!keys.contains(&encode_vertex_property_value_key(
+            &VertexPropertyValue::Bool(true)
+        )));
+        assert!(!keys.contains(&encode_vertex_property_value_key(
+            &VertexPropertyValue::Integer(6)
+        )));
+    }
+
+    /// Both zeroes, in every spelling, are one number. `-0.0` has its own
+    /// float key because `sortable_float_bits` is bit-exact, so it has to be
+    /// named explicitly from each of the four.
+    #[test]
+    fn every_spelling_of_zero_reads_every_other() {
+        let zeroes = [
+            VertexPropertyValue::Integer(0),
+            VertexPropertyValue::SignedInteger(0),
+            VertexPropertyValue::Float(QueryFloat(0.0)),
+            VertexPropertyValue::Float(QueryFloat(-0.0)),
+        ];
+        for probe in &zeroes {
+            let keys = equivalent_property_index_keys(probe);
+            for stored in &zeroes {
+                let key = encode_vertex_property_value_key(stored);
+                assert!(
+                    keys.contains(&key),
+                    "a lookup for {probe:?} misses {stored:?}"
+                );
+            }
+        }
     }
 }
