@@ -162,6 +162,17 @@ keeps the created files host-owned. The image entrypoint is `graph-node`; it
 also ships `graph-indexer`. For production, pin an image digest rather than
 `latest` — see the [Helm chart guide](charts/hydradb/README.md).
 
+> **`CLOUD_PROVIDER=local` is for smoke tests, not sustained writes.** The
+> `local` backend stores through `LocalFileSystem`, which does not implement
+> conditional puts (`put_opts` with `PutMode::Update`). Manifest garbage
+> collection needs them, so under a sustained write load GC begins failing and
+> does not recover — logged at `ERROR` as
+> `error collecting garbage [resource=Manifest, error=ObjectStoreError(NotImplemented ...)]`.
+> Reads and `/readyz` keep succeeding while this happens, so the node looks
+> healthy. For anything beyond a smoke test use an S3-compatible backend; the
+> MinIO harness below (`just minio-smoke`) is the shortest path to one. See
+> [#81](https://github.com/hydra-db/hydradb/issues/81).
+
 </details>
 
 <details>
