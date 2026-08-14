@@ -597,18 +597,41 @@ fn http_graph_scope(
     graph_id: String,
     allow_default_namespace: bool,
 ) -> std::result::Result<GraphScope, HttpApiError> {
-    let namespace = match headers
-        .get(GRAPH_NAMESPACE_HEADER)
-        .and_then(|value| value.to_str().ok())
-    {
-        Some(namespace) => NamespacePath::new(
-            namespace
-                .split('/')
-                .map(|segment| NamespaceId::new(segment.to_string()))
-                .collect::<Result<Vec<_>>>()
-                .map_err(HttpApiError::from_graph)?,
-        )
-        .map_err(HttpApiError::from_graph)?,
+    // The namespace is the tenancy boundary for the whole request: it becomes
+    // the `NamespacePath` half of the scope and so picks the physical store
+    // path. `None` here already means "the client sent no header, and has
+    // opted into the server default", so nothing else may be allowed to
+    // collapse into it. A header that is present but unreadable — bytes
+    // outside visible ASCII, which `HeaderValue::to_str` rejects — is a client
+    // naming a namespace and failing, which is a bad request, not consent to
+    // the default. The same is true of a namespace named more than once:
+    // picking the first of several conflicting values decides tenancy by
+    // accident. Both are separated out before the match so that a request
+    // naming a namespace either reaches that namespace or is refused.
+    let sent = headers.get_all(GRAPH_NAMESPACE_HEADER);
+    let mut sent = sent.iter();
+    let header = sent.next();
+    if sent.next().is_some() {
+        return Err(invalid_namespace(format!(
+            "{GRAPH_NAMESPACE_HEADER} must be sent at most once"
+        )));
+    }
+    let namespace = match header {
+        Some(value) => {
+            let namespace = value.to_str().map_err(|_| {
+                invalid_namespace(format!(
+                    "{GRAPH_NAMESPACE_HEADER} must contain only visible ASCII characters"
+                ))
+            })?;
+            NamespacePath::new(
+                namespace
+                    .split('/')
+                    .map(|segment| NamespaceId::new(segment.to_string()))
+                    .collect::<Result<Vec<_>>>()
+                    .map_err(HttpApiError::from_graph)?,
+            )
+            .map_err(HttpApiError::from_graph)?
+        }
         None if allow_default_namespace => NamespacePath::default(),
         None => {
             return Err(HttpApiError {
@@ -624,6 +647,20 @@ fn http_graph_scope(
         namespace,
         GraphId::new(graph_id).map_err(HttpApiError::from_graph)?,
     ))
+}
+
+/// The companion to the `missing_namespace` arm above: the header was sent but
+/// cannot be turned into a namespace. Kept distinct from the generic
+/// `invalid_request` so a client can tell a rejected tenancy header from a
+/// rejected query.
+fn invalid_namespace(message: String) -> HttpApiError {
+    HttpApiError {
+        status: StatusCode::BAD_REQUEST,
+        code: "invalid_namespace",
+        message,
+        owner: None,
+        authenticate: false,
+    }
 }
 
 fn accepts_ndjson(headers: &HeaderMap) -> bool {
