@@ -197,9 +197,10 @@ write one:
 - `UNWIND ... CREATE` and `UNWIND MATCH ... CREATE` cannot be followed by
   another clause, and an `UNWIND MATCH` must end in `RETURN` or `DELETE`.
 - `UNWIND MATCH` does not take `OPTIONAL`, hints, or `WHERE`.
-- A batch carries at most 1024 rows. Admission control rejects a larger one
-  with `client_query_batch_items rejected by admission control`, so a loader
-  chunks its rows rather than sending one big list.
+- A batch carries at most `max_parameters` rows, 1024 by default. Admission
+  control rejects a larger one with `client_query_batch_items rejected by
+  admission control`, so a loader chunks to whatever the deployment configures
+  rather than sending one big list.
 
 Batches run through the client service that the Bolt server uses, because a
 parameter holding a list of maps is a transport-level type. The in-process shard
