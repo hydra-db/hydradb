@@ -36,12 +36,12 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use hydradb_telemetry::semconv::L_CELL_ID;
+use hydradb_telemetry::{ServiceIdentity, TelemetryConfig};
 use slatedb_graph_kernel::{
     GraphCacheMetricsSnapshot, GraphId, GraphOperationalMetricsSnapshot, GraphScope,
     GraphShardRuntimeMetrics, NamespaceId, ScopedGraphShardRuntimeMetrics,
 };
-use hydradb_telemetry::semconv::L_CELL_ID;
-use hydradb_telemetry::{ServiceIdentity, TelemetryConfig};
 
 use super::{CounterSource, NodeCounters};
 

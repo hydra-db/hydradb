@@ -5,6 +5,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use hydradb_placement::cell_writer;
 use slatedb::bytes::Bytes;
 use slatedb::config::{ReadOptions, ScanOptions};
 use slatedb::object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -16,7 +17,6 @@ use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard, RwLock as AsyncRwLock, Semap
 #[cfg(feature = "opencypher")]
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
-use hydradb_placement::cell_writer;
 
 #[cfg(feature = "opencypher")]
 use crate::query::opencypher::ParsedRowQuery;

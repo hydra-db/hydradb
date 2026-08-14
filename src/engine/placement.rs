@@ -48,10 +48,10 @@ use super::*;
 use std::sync::{Mutex, PoisonError, RwLock};
 
 use chrono::Utc;
-use slatedb::object_store::path::Path;
 use hydradb_placement::hash as rendezvous;
 use hydradb_placement::heartbeat::{self, HeartbeatEntry, PlacementError};
 use hydradb_placement::liveness::{HeartbeatAction, LiveNodeSet, LiveView, NodeView, ViewState};
+use slatedb::object_store::path::Path;
 
 /// The two durations placement runs on: decision 5's 5s / 15s.
 ///
@@ -594,12 +594,12 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use futures::StreamExt;
+    use hydradb_placement::heartbeat::Heartbeat;
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
         PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
-    use hydradb_placement::heartbeat::Heartbeat;
 
     const SCOPE: &str = "acme/graphs/social";
     const CELL: &str = "cell-a";

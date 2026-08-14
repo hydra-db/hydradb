@@ -26,8 +26,7 @@
 use hydradb_telemetry::{ServiceIdentity, TelemetryConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let telemetry =
-        hydradb_telemetry::init(TelemetryConfig::from_env(ServiceIdentity::GraphNode))?;
+    let telemetry = hydradb_telemetry::init(TelemetryConfig::from_env(ServiceIdentity::GraphNode))?;
 
     tracing::info!("smoke: first line, outside any span");
 

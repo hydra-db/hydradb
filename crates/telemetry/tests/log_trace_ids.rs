@@ -24,12 +24,12 @@
 
 use std::sync::{Arc, Mutex};
 
+use hydradb_telemetry::layers::{HydraDBJson, RedactingFields};
+use hydradb_telemetry::sampling::HydraDBSampler;
+use hydradb_telemetry::{ServiceIdentity, TelemetryConfig};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::layer::SubscriberExt;
-use hydradb_telemetry::layers::{RedactingFields, HydraDBJson};
-use hydradb_telemetry::sampling::HydraDBSampler;
-use hydradb_telemetry::{ServiceIdentity, TelemetryConfig};
 
 /// Collects the rendered stdout lines.
 #[derive(Clone, Default)]
