@@ -221,11 +221,13 @@ impl MatrixRows {
 mod artifact_build;
 mod artifact_gc;
 mod cluster;
+mod conditional_put;
 mod index_store;
 mod placement;
 mod scope_directory;
 mod writer_lease;
 
+pub use conditional_put::{probe_conditional_put, ConditionalPutSupport};
 pub use placement::{CellOwnership, PlacementConfig, PlacementRefreshHandle, PlacementView};
 
 pub use scope_directory::ObjectStoreGraphScopeDirectory;

@@ -96,12 +96,12 @@ pub(crate) use core::write_batch::{GraphWriteBatch, GraphWriteGuard};
 #[cfg(feature = "query-transport")]
 pub use engine::ScopedRoutedGraphCluster;
 pub use engine::{
-    local_object_store, object_store_from_env, ArtifactGcResult, BenchmarkResult, CellOwnership,
-    GraphCluster, GraphIndexBuildPath, GraphIndexGeneration, GraphShardRuntimeMetrics,
-    MatrixArtifact, MatrixTraversalResult, ObjectStoreGraphScopeDirectory,
-    ObjectStoreNodeDirectory, ObjectStoreWriterLeaseDirectory, PlacementConfig,
-    PlacementRefreshHandle, PlacementView, RoutedGraphCluster, ScopedGraphShardRuntimeMetrics,
-    TraversalBackend, WriterLeaseOwner, WriterLeaseRenewalFailure,
+    local_object_store, object_store_from_env, probe_conditional_put, ArtifactGcResult,
+    BenchmarkResult, CellOwnership, ConditionalPutSupport, GraphCluster, GraphIndexBuildPath,
+    GraphIndexGeneration, GraphShardRuntimeMetrics, MatrixArtifact, MatrixTraversalResult,
+    ObjectStoreGraphScopeDirectory, ObjectStoreNodeDirectory, ObjectStoreWriterLeaseDirectory,
+    PlacementConfig, PlacementRefreshHandle, PlacementView, RoutedGraphCluster,
+    ScopedGraphShardRuntimeMetrics, TraversalBackend, WriterLeaseOwner, WriterLeaseRenewalFailure,
 };
 pub use locality::{
     compare_locality_layouts, locality_cell_id, locality_cell_prefix, locality_cell_prefix_len,
