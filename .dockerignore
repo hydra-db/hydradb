@@ -20,3 +20,17 @@ grafana
 interactive
 charts
 scripts
+
+# The same prose at the top of the tree: README.md, DEVELOPMENT.md,
+# architecture.md, cypher-compat.md and the agent guides. The directories above
+# leave these behind, so a README edit still invalidates `COPY . .` and rebuilds
+# graph-node and graph-indexer from source — the one file most likely to be
+# touched by a change that compiles to nothing.
+#
+# Root-level only, and deliberately so: `*` does not cross a path separator, so
+# this matches the six files above the source tree and nothing else. Every other
+# tracked `.md` already sits under one of the directories above; prose added
+# beside source later would need its own entry rather than silently vanishing
+# from the context. `readme = "README.md"` in Cargo.toml is packaging metadata
+# on a `publish = false` package — no build command reads the file.
+*.md
