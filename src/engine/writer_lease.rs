@@ -139,6 +139,14 @@ impl ObjectStoreWriterLeaseDirectory {
         *self.scope_users().entry(key).or_default() += 1;
     }
 
+    fn scope_is_registered(&self, scope: &GraphScope, node_id: &str) -> bool {
+        let key = ScopeLeaseUserKey {
+            scope: scope.clone(),
+            node_id: node_id.to_string(),
+        };
+        self.scope_users().contains_key(&key)
+    }
+
     pub async fn current_owner(
         &self,
         scope: &GraphScope,
@@ -203,6 +211,18 @@ impl ObjectStoreWriterLeaseDirectory {
         let cache_key = path.to_string();
         let renew_margin = self.lease_duration / 3;
         if force_renew {
+            // A forced renewal writes on the authority of a live scope
+            // registration, so that registration is a precondition of the write
+            // rather than something to discover once it has landed. Checking it
+            // here means the ordinary eviction — the registration dropped
+            // before this renewal starts — issues no write at all.
+            if !self.scope_is_registered(scope, node_id) {
+                self.local().remove(&cache_key);
+                return Err(GraphError::NotCellWriter {
+                    cell_id: cell_id.to_string(),
+                    owner: None,
+                });
+            }
             let local_is_valid = self.local().get(&cache_key).is_some_and(|lease| {
                 lease.node_id == node_id && Instant::now() < lease.valid_until
             });
@@ -306,6 +326,32 @@ impl ObjectStoreWriterLeaseDirectory {
                         write_started,
                     )
                     .await;
+                    // The precondition above narrows this window but cannot
+                    // close it: the registration can still be dropped while the
+                    // write is on the wire, and a write that lands after the
+                    // release racing it reinstates a lease that nothing will
+                    // renew and nothing will release. It would hold the cell
+                    // shut for a full `lease_duration`. This is the only branch
+                    // of this function that can fail after a durable write has
+                    // succeeded, so it is the only one that has to give that
+                    // write back.
+                    //
+                    // Abandonment is the exception. `abandon_scope` drops the
+                    // registration precisely so the durable lease outlives it
+                    // and this process can resume the cell, so a record parked
+                    // there is left to expire on its own terms.
+                    if force_renew && !self.scope_is_registered(scope, node_id) {
+                        let parked = self.abandoned().contains_key(&cache_key);
+                        self.local().remove(&cache_key);
+                        if !parked {
+                            self.release_stored(scope, cell_id, node_id, generation)
+                                .await?;
+                        }
+                        return Err(GraphError::NotCellWriter {
+                            cell_id: cell_id.to_string(),
+                            owner: None,
+                        });
+                    }
                     let lease = LocalWriterLease {
                         scope: scope.clone(),
                         cell_id: cell_id.to_string(),
@@ -317,24 +363,8 @@ impl ObjectStoreWriterLeaseDirectory {
                         // object's server-timestamped expiry.
                         valid_until,
                     };
-                    if force_renew {
-                        let users = self.scope_users();
-                        let key = ScopeLeaseUserKey {
-                            scope: scope.clone(),
-                            node_id: node_id.to_string(),
-                        };
-                        if !users.contains_key(&key) {
-                            return Err(GraphError::NotCellWriter {
-                                cell_id: cell_id.to_string(),
-                                owner: Some(node_id.to_string()),
-                            });
-                        }
-                        self.abandoned().remove(&cache_key);
-                        self.local().insert(cache_key, lease);
-                    } else {
-                        self.abandoned().remove(&cache_key);
-                        self.local().insert(cache_key, lease);
-                    }
+                    self.abandoned().remove(&cache_key);
+                    self.local().insert(cache_key, lease);
                     return Ok(generation);
                 }
                 Err(
@@ -857,9 +887,136 @@ fn parse_lease_u64(path: &Path, field: &str, value: Option<&str>) -> Result<u64>
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
+
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
     use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutResult,
+    };
 
     use super::*;
+
+    type LeaseWriteHook = Box<dyn FnOnce() + Send>;
+
+    /// An `InMemory` store that runs one callback from inside the next
+    /// writer-lease write, before that write is applied.
+    ///
+    /// The defect under test is a lost race, and a race reproduced by sleeping
+    /// is a test that fails on a loaded machine. Firing the callback from
+    /// within the write makes "the scope registration was dropped while this
+    /// compare-and-swap was on the wire" an ordering the test states outright.
+    struct ScopeDroppingStore {
+        inner: InMemory,
+        during_lease_write: StdMutex<Option<LeaseWriteHook>>,
+    }
+
+    impl ScopeDroppingStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: InMemory::new(),
+                during_lease_write: StdMutex::new(None),
+            })
+        }
+
+        fn arm(&self, hook: impl FnOnce() + Send + 'static) {
+            let hook: LeaseWriteHook = Box::new(hook);
+            let mut slot = self
+                .during_lease_write
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = Some(hook);
+        }
+
+        /// Fires for lease objects only. The clock probe writes under
+        /// `_coordination/…` and must not consume the callback.
+        fn fire_if_lease_write(&self, location: &Path) {
+            if !location.parts().any(|part| part.as_ref() == "_writer_leases") {
+                return;
+            }
+            let hook = self
+                .during_lease_write
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    impl fmt::Display for ScopeDroppingStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "ScopeDroppingStore({})", self.inner)
+        }
+    }
+
+    impl fmt::Debug for ScopeDroppingStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "ScopeDroppingStore({:?})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ScopeDroppingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> slatedb::object_store::Result<PutResult> {
+            self.fire_if_lease_write(location);
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> slatedb::object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> slatedb::object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, slatedb::object_store::Result<Path>>,
+        ) -> BoxStream<'static, slatedb::object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, slatedb::object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> slatedb::object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> slatedb::object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     fn directory(
         store: Arc<dyn ObjectStore>,
@@ -1059,6 +1216,112 @@ mod tests {
                 .unwrap()
                 .node_id,
             "node-0"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_renewal_that_loses_its_scope_mid_write_gives_the_lease_back() {
+        let store = ScopeDroppingStore::new();
+        let leases = directory(Arc::clone(&store), "holder-a", Duration::from_secs(30));
+        let scope = GraphScope::default();
+        leases.register_scope(&scope, "node-a");
+        leases
+            .acquire_or_renew(&scope, "cell-0", "node-a")
+            .await
+            .unwrap();
+
+        // `release_scope` drops the registration and drains the local record.
+        // Running both from inside the renewal's write puts them exactly where
+        // the outage needs them: after the renewal has proved its authority,
+        // and before the write that authority bought has landed.
+        let scope_users = Arc::clone(&leases.scope_users);
+        let local = Arc::clone(&leases.local);
+        let key = ScopeLeaseUserKey {
+            scope: scope.clone(),
+            node_id: "node-a".to_string(),
+        };
+        store.arm(move || {
+            scope_users
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key);
+            local
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        });
+
+        let failures = leases.renew_local("node-a").await;
+        assert_eq!(failures.len(), 1, "the renewal reports the lost scope");
+        assert!(failures[0].ownership_lost);
+
+        // The write that landed carries a fresh window. Left standing, nothing
+        // renews it and nothing releases it, so the cell is shut for a full
+        // lease duration.
+        assert!(leases
+            .current_owner(&scope, "cell-0")
+            .await
+            .unwrap()
+            .is_none());
+        let peer = directory(store, "holder-b", Duration::from_secs(30));
+        peer.register_scope(&scope, "node-b");
+        peer.acquire_or_renew(&scope, "cell-0", "node-b")
+            .await
+            .expect("a cell whose lease was given back is acquirable");
+    }
+
+    #[tokio::test]
+    async fn a_renewal_without_a_registration_leaves_an_abandoned_lease_alone() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let leases = directory(store, "holder-a", Duration::from_secs(30));
+        let scope = GraphScope::default();
+        leases.register_scope(&scope, "node-a");
+        let generation = leases
+            .acquire_or_renew(&scope, "cell-0", "node-a")
+            .await
+            .unwrap();
+
+        // Abandonment drops the registration on purpose, so that the durable
+        // lease outlives the eviction and this process can resume it. Put the
+        // parked record back in `local` to stand in for a renewal that read it
+        // before the eviction ran.
+        let path = leases.lease_path(&scope, "cell-0");
+        let cache_key = path.to_string();
+        leases.abandon_scope(&scope, "node-a");
+        let parked = leases
+            .abandoned()
+            .get(&cache_key)
+            .cloned()
+            .expect("abandonment parks the local record");
+        leases.local().insert(cache_key, parked);
+        let before = leases
+            .read_stored(&path)
+            .await
+            .unwrap()
+            .expect("the lease object outlives the abandonment");
+
+        let failures = leases.renew_local("node-a").await;
+        assert_eq!(failures.len(), 1, "the renewal reports the lost scope");
+
+        let after = leases
+            .read_stored(&path)
+            .await
+            .unwrap()
+            .expect("an abandoned lease is not released");
+        assert_eq!(
+            (after.generation, after.heartbeat, after.released),
+            (before.generation, before.heartbeat, false),
+            "a renewal with no registration to write on writes nothing at all"
+        );
+
+        leases.register_scope(&scope, "node-a");
+        assert_eq!(
+            leases
+                .acquire_or_renew(&scope, "cell-0", "node-a")
+                .await
+                .unwrap(),
+            generation,
+            "the parked lease resumes at its own generation"
         );
     }
 }
