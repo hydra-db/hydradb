@@ -110,6 +110,17 @@ exercises Bolt and HTTP against a throwaway store, printing `runtime-smoke-ok`.
 A single plaintext development node on a local directory. TLS is required in
 deployed environments and disabled explicitly here.
 
+> **`CLOUD_PROVIDER=local` is for smoke tests, not sustained writes.** The
+> `local` backend stores through `LocalFileSystem`, which does not implement
+> conditional puts (`put_opts` with `PutMode::Update`). Manifest garbage
+> collection needs them, so under a sustained write load GC begins failing and
+> does not recover — logged at `ERROR` as
+> `error collecting garbage [resource=Manifest, error=ObjectStoreError(NotImplemented ...)]`.
+> Reads and `/readyz` keep succeeding while this happens, so the node looks
+> healthy. For anything beyond a smoke test use an S3-compatible backend; the
+> MinIO harness below (`just minio-smoke`) is the shortest path to one. See
+> [#81](https://github.com/hydra-db/hydradb/issues/81).
+
 ```bash
 mkdir -p .hydradb/store .hydradb/cache
 printf '%s\n' 'local-development-token-32-bytes' > .hydradb/auth-token
