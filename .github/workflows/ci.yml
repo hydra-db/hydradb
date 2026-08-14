@@ -274,10 +274,16 @@ jobs:
             echo "invalid object-store endpoint port was accepted"
             exit 1
           fi
+      # Pinned by digest, like the actions above: this image is executed on the
+      # runner and decides whether invalid manifests reach main, so a repointed
+      # tag would change the gate without review. The digest is the multi-arch
+      # index, so it resolves on both amd64 and arm64 runners.
       - name: Validate Kubernetes resources
+        env:
+          KUBECONFORM: ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e
         run: |
-          docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary < /tmp/hydradb-development.yaml
-          docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary -ignore-missing-schemas < /tmp/hydradb-eks.yaml
+          docker run --rm -i "$KUBECONFORM" -strict -summary < /tmp/hydradb-development.yaml
+          docker run --rm -i "$KUBECONFORM" -strict -summary -ignore-missing-schemas < /tmp/hydradb-eks.yaml
 
 
   # Each step names the `just` recipe it mirrors, in the justfile's own order.
