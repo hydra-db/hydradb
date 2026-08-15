@@ -1168,19 +1168,33 @@ pub(crate) fn decode_commit_idempotency(
         reason: err.to_string(),
     })?;
     let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 8 || parts[0] != "graph-commit-idempotency-v1" {
+    if parts.first() != Some(&"graph-commit-idempotency-v1") {
         return Err(GraphError::CorruptValue {
             key: key.to_string(),
-            reason: "expected graph-commit-idempotency-v1 record with 8 fields".to_string(),
+            reason: "expected graph-commit-idempotency-v1 record".to_string(),
         });
     }
-    ensure_idempotent_edge(key, "create", mutation, &parts[4..8])?;
-    if parse_u64(key, parts[3], "fingerprint")? != fingerprint {
-        return Err(GraphError::IdempotencyConflict {
-            operation: "create",
-            idempotency_key: mutation.idempotency_key.clone(),
-            reason: "this key already stored a result for a different payload",
-        });
+    match parts.len() {
+        // Pre-fingerprint record written before payload fingerprinting shipped.
+        // No fingerprint was ever stored for it, so only identity can be checked.
+        7 => ensure_idempotent_edge(key, "create", mutation, &parts[3..7])?,
+        8 => {
+            ensure_idempotent_edge(key, "create", mutation, &parts[4..8])?;
+            if parse_u64(key, parts[3], "fingerprint")? != fingerprint {
+                return Err(GraphError::IdempotencyConflict {
+                    operation: "create",
+                    idempotency_key: mutation.idempotency_key.clone(),
+                    reason: "this key already stored a result for a different payload",
+                });
+            }
+        }
+        _ => {
+            return Err(GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: "expected graph-commit-idempotency-v1 record with 7 or 8 fields"
+                    .to_string(),
+            });
+        }
     }
     let already_existed = decode_bool_flag(key, parts[2], "already_existed")?;
     Ok(CommitResult {

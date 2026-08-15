@@ -3546,6 +3546,27 @@ async fn idempotency_keys_are_bound_to_the_original_metadata_payload() {
     assert_eq!(stored_edge, since);
 }
 
+#[test]
+fn decode_commit_idempotency_accepts_pre_fingerprint_records() {
+    let m = mutation(1, 2, "legacy-key");
+    let legacy_record = format!(
+        "graph-commit-idempotency-v1\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        5, 1, m.cell_id, m.edge_type, m.src, m.dst
+    )
+    .into_bytes();
+
+    let result = decode_commit_idempotency("idempotency-key", &m, 0xdead_beef, &legacy_record)
+        .unwrap();
+
+    assert_eq!(
+        result,
+        CommitResult {
+            epoch: 5,
+            already_existed: true,
+        }
+    );
+}
+
 #[tokio::test]
 async fn delete_edge_updates_canonical_snapshot_idempotently() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
