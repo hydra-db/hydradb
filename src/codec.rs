@@ -767,11 +767,16 @@ pub(crate) fn decode_out_edge_segment(key: &str, value: &[u8]) -> Result<OutEdge
     })
 }
 
-pub(crate) fn encode_commit_idempotency(mutation: &EdgeMutation, result: &CommitResult) -> Vec<u8> {
+pub(crate) fn encode_commit_idempotency(
+    mutation: &EdgeMutation,
+    fingerprint: u64,
+    result: &CommitResult,
+) -> Vec<u8> {
     format!(
-        "graph-commit-idempotency-v1\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        "graph-commit-idempotency-v1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         result.epoch,
         u8::from(result.already_existed),
+        fingerprint,
         mutation.cell_id,
         mutation.edge_type,
         mutation.src,
@@ -1155,6 +1160,7 @@ pub(crate) fn decode_cell_drop_idempotency(
 pub(crate) fn decode_commit_idempotency(
     key: &str,
     mutation: &EdgeMutation,
+    fingerprint: u64,
     value: &[u8],
 ) -> Result<CommitResult> {
     let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
@@ -1162,13 +1168,20 @@ pub(crate) fn decode_commit_idempotency(
         reason: err.to_string(),
     })?;
     let parts: Vec<&str> = text.trim_end_matches('\n').split('\t').collect();
-    if parts.len() != 7 || parts[0] != "graph-commit-idempotency-v1" {
+    if parts.len() != 8 || parts[0] != "graph-commit-idempotency-v1" {
         return Err(GraphError::CorruptValue {
             key: key.to_string(),
-            reason: "expected graph-commit-idempotency-v1 record with 7 fields".to_string(),
+            reason: "expected graph-commit-idempotency-v1 record with 8 fields".to_string(),
         });
     }
-    ensure_idempotent_edge(key, "create", mutation, &parts[3..7])?;
+    ensure_idempotent_edge(key, "create", mutation, &parts[4..8])?;
+    if parse_u64(key, parts[3], "fingerprint")? != fingerprint {
+        return Err(GraphError::IdempotencyConflict {
+            operation: "create",
+            idempotency_key: mutation.idempotency_key.clone(),
+            reason: "this key already stored a result for a different payload",
+        });
+    }
     let already_existed = decode_bool_flag(key, parts[2], "already_existed")?;
     Ok(CommitResult {
         epoch: parse_u64(key, parts[1], "epoch")?,

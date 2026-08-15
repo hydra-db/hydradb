@@ -3470,6 +3470,83 @@ async fn idempotency_keys_are_bound_to_the_original_edge() {
 }
 
 #[tokio::test]
+async fn idempotency_keys_are_bound_to_the_original_metadata_payload() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/idempotency-metadata-conflict", object_store).await;
+
+    let alice = VertexMetadata::default()
+        .with_property("name", VertexPropertyValue::String("alice".to_string()));
+    let bob = VertexMetadata::default()
+        .with_property("name", VertexPropertyValue::String("bob".to_string()));
+
+    shard
+        .write_edge_with_vertex_metadata(
+            mutation(1, 2, "vertex-metadata-conflict"),
+            alice.clone(),
+            VertexMetadata::default(),
+        )
+        .await
+        .unwrap();
+    let retry_err = shard
+        .write_edge_with_vertex_metadata(
+            mutation(1, 2, "vertex-metadata-conflict"),
+            bob,
+            VertexMetadata::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        retry_err,
+        GraphError::IdempotencyConflict {
+            operation: "create",
+            ref idempotency_key,
+            reason: "this key already stored a result for a different payload"
+        } if idempotency_key == "vertex-metadata-conflict"
+    ));
+    let alice_key = keys::vertex("reddit-home", 1);
+    let stored_alice = decode_vertex_metadata(
+        &alice_key,
+        &shard.read_remote(&alice_key).await.unwrap().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored_alice, alice);
+
+    let since = EdgeMetadata::default().with_property("since", VertexPropertyValue::Integer(2020));
+    let updated = EdgeMetadata::default().with_property("since", VertexPropertyValue::Integer(2021));
+    shard
+        .write_edge_with_full_metadata(
+            mutation(3, 4, "full-metadata-conflict"),
+            VertexMetadata::default(),
+            VertexMetadata::default(),
+            since.clone(),
+        )
+        .await
+        .unwrap();
+    let retry_err = shard
+        .write_edge_with_full_metadata(
+            mutation(3, 4, "full-metadata-conflict"),
+            VertexMetadata::default(),
+            VertexMetadata::default(),
+            updated,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        retry_err,
+        GraphError::IdempotencyConflict {
+            operation: "create",
+            ref idempotency_key,
+            reason: "this key already stored a result for a different payload"
+        } if idempotency_key == "full-metadata-conflict"
+    ));
+    let edge_key = keys::edge_metadata("reddit-home", "USER_SUBSCRIBED_TO_SUBREDDIT", 3, 4);
+    let stored_edge =
+        decode_edge_metadata(&edge_key, &shard.read_remote(&edge_key).await.unwrap().unwrap())
+            .unwrap();
+    assert_eq!(stored_edge, since);
+}
+
+#[tokio::test]
 async fn delete_edge_updates_canonical_snapshot_idempotently() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/delete-edge", object_store).await;
