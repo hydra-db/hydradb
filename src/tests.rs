@@ -11317,6 +11317,73 @@ async fn cypher_detach_delete_node_cascades_edges_and_metadata() {
 }
 
 #[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_anonymous_interior_node_joins_segments_instead_of_cross_joining() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-anonymous-interior-node", object_store).await;
+
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "anon-interior-seed-1"),
+            "CREATE (a:Person {id: 1})-[:R]->(b:Person {id: 2})",
+        )
+        .await
+        .unwrap();
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "anon-interior-seed-2"),
+            "CREATE (b:Person {id: 2})-[:S]->(c:Person {id: 3})",
+        )
+        .await
+        .unwrap();
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "anon-interior-seed-3"),
+            "CREATE (x:Person {id: 9})-[:S]->(y:Person {id: 10})",
+        )
+        .await
+        .unwrap();
+
+    // Only vertex 3 is reachable as a-[:R]->()-[:S]->c; vertex 10 sits behind
+    // an unrelated S edge and must not appear through a cross join.
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "anon-interior-read"),
+            "MATCH (a {id: 1})-[:R]->()-[:S]->(c) RETURN c.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 1);
+
+    let deleted = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "anon-interior-delete"),
+            "MATCH (a {id: 1})-[:R]->()-[:S]->(c) DETACH DELETE c",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted,
+        QueryOutput::Mutation(QueryMutationResult {
+            matched_rows: 1,
+            deleted_edges: 1,
+            updated_vertices: 1,
+            ..QueryMutationResult::default()
+        })
+    );
+
+    assert!(shard.edge_exists("reddit-home", "S", 9, 10).await.unwrap());
+    let survivor = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "anon-interior-survivor"),
+            "MATCH (n {id: 10}) RETURN n.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(survivor.rows.len(), 1);
+}
+
+#[cfg(feature = "opencypher")]
 #[test]
 fn cypher_relationship_properties_are_indexed_mutable_and_snapshot_safe() {
     std::thread::Builder::new()
