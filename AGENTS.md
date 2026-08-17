@@ -46,6 +46,7 @@ crates/telemetry/  tracing and OTLP export
 examples/          smoke, stress, correctness, benchmark, profiling binaries
 scripts/           local, MinIO, query, stress, and chaos harnesses
 charts/hydradb/   production Helm chart
+rfcs/              published design proposals, dated; see rfcs/README.md
 docs/plans/        design plans, dated; see conventions below
 docs/runbooks/     operational procedures
 interactive/       standalone HTML design documents
@@ -408,6 +409,16 @@ and what it holds, not just the repo, so the next session reads instead of
 re-deriving. `docs/plans/2026-07-25-sparse-kernel-backend-consolidation.md` is
 the reference example. `optimisation-phases.md` predates the convention; leave
 it unless asked, since `build.rs:10` references it by name.
+
+**RFCs are not plan documents.** `rfcs/` is tracked and public; `docs/plans/` is
+neither, and nothing under `docs/` or `interactive/` is committed. A plan says
+how we are going to do a piece of work and is disposable once the work lands. An
+RFC says why the format or the semantics are what they are and outlives every
+release that touches them. Both use the same `YYYY-MM-DD-kebab-case-title.md`
+naming so the two directories read alike. RFC status also lives in the directory
+(`rfcs/`, `rfcs/accepted/`, `rfcs/rejected/`), and where the directory and the
+frontmatter disagree, the directory wins. See [rfcs/README.md](rfcs/README.md)
+for when one is required.
 
 ## Things that will mislead you
 

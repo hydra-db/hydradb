@@ -472,6 +472,7 @@ crates/             placement and telemetry workspace crates
 charts/hydradb/    Kubernetes Helm chart
 examples/           smoke, import, benchmark, and correctness programs
 scripts/            local, MinIO, stress, fencing, and deployment harnesses
+rfcs/               design proposals for format and semantics changes
 docs/               architecture notes, runbooks, benchmarks, and verification
 ```
 
@@ -489,6 +490,8 @@ documented above.
 |---|---|
 | [Architecture](architecture.md) | End-to-end design, snapshots, writer ownership, query execution, and indexing |
 | [Helm chart guide](charts/hydradb/README.md) | Kubernetes configuration, TLS, authentication, upgrades, and verification |
+| [Contributing](CONTRIBUTING.md) | How a change gets proposed, reviewed, and merged |
+| [RFC process](rfcs/README.md) | When a design document is required, and its lifecycle |
 | [Duration histograms](docs/runbooks/duration-histograms.md) | Correct latency units, PromQL, aggregation, and alerting |
 | [Correctness casebook](docs/bugs-found-fixed/README.md) | Reproduced storage and query invariants with regression evidence |
 | [Formal verification](docs/formal-methods/0003-hydradb-quint-verification-evidence.md) | Quint and model-based testing evidence |
@@ -496,10 +499,16 @@ documented above.
 
 ## Contributing
 
-Issues and pull requests are welcome. Keep changes focused, add regression
-coverage for behavioral changes, and run `just ci` before opening a pull
-request. Changes to storage, fencing, snapshots, routing, or index publication
-should state the invariant they preserve and include a failure-oriented test.
+Issues and pull requests are welcome. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the full process; the short version is
+that everything starts as an issue, changes stay small, and `just ci` should be
+green on your fork before you open a pull request.
+
+Keep changes focused and add regression coverage for behavioral changes.
+Changes to storage, fencing, snapshots, routing, or index publication should
+state the invariant they preserve and include a failure-oriented test. Changes
+to the on-disk or wire format, or to query semantics, need an
+[RFC](rfcs/README.md) before the code.
 
 ## License
 
