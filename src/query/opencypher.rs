@@ -1365,7 +1365,7 @@ impl ParsedCypher {
 
             let mut patterns = Vec::new();
             let mut predicate = None;
-            for match_clause in match_clauses {
+            for (match_idx, match_clause) in match_clauses.into_iter().enumerate() {
                 if sys::cypher_ast_match_is_optional(match_clause) {
                     return unsupported(
                         "OPTIONAL MATCH mutations are not executable in Query engine",
@@ -1375,7 +1375,7 @@ impl ParsedCypher {
                     return unsupported("MATCH hints are not executable in Query engine mutations");
                 }
                 let pattern = checked_node(sys::cypher_ast_match_get_pattern(match_clause))?;
-                patterns.extend(lower_row_patterns(pattern, parameters)?);
+                patterns.extend(lower_row_patterns(pattern, match_idx as u32, parameters)?);
                 let match_predicate = sys::cypher_ast_match_get_predicate(match_clause);
                 if !match_predicate.is_null() {
                     predicate = Some(and_row_predicates(
@@ -2103,7 +2103,12 @@ fn lower_row_query_clauses(
         let mut scoped_bindings = BTreeSet::new();
         for clause in &clauses[..clauses.len() - 1] {
             if is_instance(*clause, sys::CYPHER_AST_MATCH) {
-                collect_match_clause_bindings(*clause, parameters, &mut scoped_bindings)?;
+                collect_match_clause_bindings(
+                    *clause,
+                    match_clauses.len() as u32,
+                    parameters,
+                    &mut scoped_bindings,
+                )?;
                 match_clauses.push(*clause);
                 continue;
             }
@@ -2200,14 +2205,14 @@ fn lower_match_return_rows(
         let mut patterns = Vec::new();
         let mut pattern_groups = Vec::new();
         let mut predicate = None;
-        for match_clause in match_clauses {
+        for (match_idx, match_clause) in match_clauses.iter().enumerate() {
             let optional = sys::cypher_ast_match_is_optional(*match_clause);
             if sys::cypher_ast_match_nhints(*match_clause) != 0 {
                 return unsupported("MATCH hints are not executable in Query engine");
             }
 
             let pattern = checked_node(sys::cypher_ast_match_get_pattern(*match_clause))?;
-            let group_patterns = lower_row_patterns(pattern, parameters)?;
+            let group_patterns = lower_row_patterns(pattern, match_idx as u32, parameters)?;
             patterns.extend(group_patterns.iter().cloned());
             let match_predicate = sys::cypher_ast_match_get_predicate(*match_clause);
             let group_predicate = if match_predicate.is_null() {
@@ -2304,12 +2309,13 @@ fn lower_match_return_rows(
 
 fn collect_match_clause_bindings(
     match_clause: *const AstNode,
+    match_idx: u32,
     parameters: &BTreeMap<String, VertexPropertyValue>,
     bindings: &mut BTreeSet<String>,
 ) -> Result<()> {
     unsafe {
         let pattern = checked_node(sys::cypher_ast_match_get_pattern(match_clause))?;
-        for pattern in lower_row_patterns(pattern, parameters)? {
+        for pattern in lower_row_patterns(pattern, match_idx, parameters)? {
             collect_row_pattern_bindings(&pattern, bindings);
         }
         Ok(())
@@ -3099,6 +3105,7 @@ fn lower_create_edge_path(
 
 fn lower_row_patterns(
     pattern: *const AstNode,
+    match_idx: u32,
     parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<Vec<RowPattern>> {
     unsafe {
@@ -3131,10 +3138,12 @@ fn lower_row_patterns(
                         // If it has no real name, give both segments the same
                         // synthetic one so the executor's binding-name join sees
                         // they must be the same vertex instead of cross-joining.
-                        let left_synthetic =
-                            (edge_idx > 0).then(|| synthetic_interior_binding(path_idx, left_idx));
-                        let right_synthetic = (edge_idx + 1 < edge_count)
-                            .then(|| synthetic_interior_binding(path_idx, right_idx));
+                        let left_synthetic = (edge_idx > 0).then(|| {
+                            synthetic_interior_binding(match_idx, path_idx, left_idx)
+                        });
+                        let right_synthetic = (edge_idx + 1 < edge_count).then(|| {
+                            synthetic_interior_binding(match_idx, path_idx, right_idx)
+                        });
                         patterns.push(RowPattern::Edge(lower_row_edge_path_segment(
                             path,
                             edge_idx,
@@ -3155,8 +3164,8 @@ fn lower_row_patterns(
     }
 }
 
-fn synthetic_interior_binding(path_idx: u32, element_idx: u32) -> String {
-    format!("{SYNTHETIC_ANON_NODE_PREFIX}{path_idx}_{element_idx}")
+fn synthetic_interior_binding(match_idx: u32, path_idx: u32, element_idx: u32) -> String {
+    format!("{SYNTHETIC_ANON_NODE_PREFIX}{match_idx}_{path_idx}_{element_idx}")
 }
 
 fn lower_create_node_pattern(
@@ -4273,6 +4282,38 @@ mod tests {
             parsed.columns,
             vec![QueryColumn::new("user"), QueryColumn::new("post")]
         );
+    }
+
+    #[test]
+    fn lowers_anonymous_interior_nodes_in_separate_match_clauses_without_colliding() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (a {id: 1})-[:R]->()-[:S]->(c) \
+             MATCH (x {id: 2})-[:T]->()-[:U]->(z) \
+             RETURN c.id, z.id",
+        )
+        .unwrap();
+        assert_eq!(parsed.patterns.len(), 4);
+        let RowPattern::Edge(first_r) = &parsed.patterns[0] else {
+            panic!("expected edge row pattern");
+        };
+        let RowPattern::Edge(first_s) = &parsed.patterns[1] else {
+            panic!("expected edge row pattern");
+        };
+        let RowPattern::Edge(second_t) = &parsed.patterns[2] else {
+            panic!("expected edge row pattern");
+        };
+        let RowPattern::Edge(second_u) = &parsed.patterns[3] else {
+            panic!("expected edge row pattern");
+        };
+        // Each MATCH clause's anonymous interior node must share a binding
+        // with its own other segment, but never with the other MATCH
+        // clause's anonymous interior node, since a per-clause-local
+        // synthetic name would otherwise collide across clauses.
+        assert!(first_r.dst.binding.is_some());
+        assert_eq!(first_r.dst.binding, first_s.src.binding);
+        assert!(second_t.dst.binding.is_some());
+        assert_eq!(second_t.dst.binding, second_u.src.binding);
+        assert_ne!(first_r.dst.binding, second_t.dst.binding);
     }
 
     #[test]

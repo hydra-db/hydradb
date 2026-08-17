@@ -11384,6 +11384,60 @@ async fn cypher_anonymous_interior_node_joins_segments_instead_of_cross_joining(
 }
 
 #[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_anonymous_interior_nodes_in_separate_match_clauses_do_not_collide() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard(
+        "graph/cypher-anonymous-interior-node-separate-clauses",
+        object_store,
+    )
+    .await;
+
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "anon-interior-clauses-seed-1"),
+            "CREATE (a:Person {id: 1})-[:R]->(b:Person {id: 2})",
+        )
+        .await
+        .unwrap();
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "anon-interior-clauses-seed-2"),
+            "CREATE (b:Person {id: 2})-[:S]->(c:Person {id: 3})",
+        )
+        .await
+        .unwrap();
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "anon-interior-clauses-seed-3"),
+            "CREATE (x:Person {id: 100})-[:T]->(m:Person {id: 200})",
+        )
+        .await
+        .unwrap();
+    shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "anon-interior-clauses-seed-4"),
+            "CREATE (m:Person {id: 200})-[:U]->(z:Person {id: 300})",
+        )
+        .await
+        .unwrap();
+
+    // Each MATCH clause's own anonymous interior node (b=2, m=200) must not
+    // be forced to equal the other clause's, which a per-clause-local
+    // synthetic binding name would do by accident.
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "anon-interior-clauses-read"),
+            "MATCH (a {id: 1})-[:R]->()-[:S]->(c) \
+             MATCH (x {id: 100})-[:T]->()-[:U]->(z) \
+             RETURN c.id AS c, z.id AS z",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 1);
+}
+
+#[cfg(feature = "opencypher")]
 #[test]
 fn cypher_relationship_properties_are_indexed_mutable_and_snapshot_safe() {
     std::thread::Builder::new()
