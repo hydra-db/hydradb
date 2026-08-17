@@ -3327,6 +3327,13 @@ fn lower_row_node_pattern(
     unsafe {
         ensure_instance(node, sys::CYPHER_AST_NODE_PATTERN, "node pattern")?;
         let identifier = node_identifier(node)?;
+        if let Some(name) = &identifier {
+            if name.starts_with(SYNTHETIC_ANON_NODE_PREFIX) {
+                return unsupported(format!(
+                    "node name {name} starts with a prefix reserved for Query engine's internal use"
+                ));
+            }
+        }
         let mut labels = BTreeSet::new();
         for idx in 0..sys::cypher_ast_node_pattern_nlabels(node) {
             let label = checked_node(sys::cypher_ast_node_pattern_get_label(node, idx))?;
@@ -4314,6 +4321,28 @@ mod tests {
         assert!(second_t.dst.binding.is_some());
         assert_eq!(second_t.dst.binding, second_u.src.binding);
         assert_ne!(first_r.dst.binding, second_t.dst.binding);
+    }
+
+    #[test]
+    fn rejects_a_user_variable_that_spells_the_synthetic_anon_prefix() {
+        // Nothing stops a query from naming its own variable with the same
+        // prefix the anonymous-interior-node join uses internally. Without
+        // this rejection, that name could collide with a synthetic binding
+        // generated elsewhere and force two unrelated nodes to be treated
+        // as the same vertex, or get silently dropped from WITH's scope.
+        let err = parse_opencypher_row_query(
+            "MATCH (a)-[:R]->(__hydradb_anon_0_0_2)-[:S]->(c) RETURN c.id",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GraphError::UnsupportedQuery { .. }));
+
+        // An ordinary name sharing only the leading underscores, not the
+        // reserved prefix, is unaffected.
+        let parsed = parse_opencypher_row_query(
+            "MATCH (a)-[:R]->(__b)-[:S]->(c) RETURN c.id",
+        )
+        .unwrap();
+        assert_eq!(parsed.patterns.len(), 2);
     }
 
     #[test]
