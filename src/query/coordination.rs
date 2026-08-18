@@ -3018,6 +3018,11 @@ fn merge_distributed_inner_join(
                     reason: "right row is missing join column".to_string(),
                 });
             };
+            // An inner join must drop a null-keyed row: null = null is not
+            // true, in Cypher as in SQL, so it can never satisfy the join.
+            if matches!(key, QueryValue::Null) {
+                continue;
+            }
             right_by_key.entry(key).or_default().push(row);
         }
 
@@ -3028,6 +3033,9 @@ fn merge_distributed_inner_join(
                     reason: "left row is missing join column".to_string(),
                 });
             };
+            if matches!(key, QueryValue::Null) {
+                continue;
+            }
             if let Some(right_rows) = right_by_key.get(key) {
                 for right_row in right_rows {
                     let mut values = left_row.values.clone();
@@ -3045,6 +3053,9 @@ fn merge_distributed_inner_join(
                     reason: "left row is missing join column".to_string(),
                 });
             };
+            if matches!(key, QueryValue::Null) {
+                continue;
+            }
             left_by_key.entry(key).or_default().push(row);
         }
 
@@ -3055,6 +3066,9 @@ fn merge_distributed_inner_join(
                     reason: "right row is missing join column".to_string(),
                 });
             };
+            if matches!(key, QueryValue::Null) {
+                continue;
+            }
             if let Some(left_rows) = left_by_key.get(key) {
                 for left_row in left_rows {
                     let mut values = left_row.values.clone();
@@ -4953,5 +4967,90 @@ mod scope_grant_tests {
             &GraphScope::new(tenant, GraphId::new("other").unwrap()),
             QueryTransportAction::Read,
         ));
+    }
+}
+
+#[cfg(test)]
+mod distributed_inner_join_tests {
+    use super::*;
+
+    fn leg(columns: &[&str], rows: Vec<Vec<QueryValue>>) -> QueryResultSet {
+        QueryResultSet::new(
+            columns
+                .iter()
+                .map(|name| crate::QueryColumn::new(*name))
+                .collect(),
+            rows.into_iter().map(QueryRow::new).collect(),
+        )
+    }
+
+    #[test]
+    fn drops_null_keyed_rows_on_the_right_hashed_branch() {
+        // right.rows.len() (2) <= left.rows.len() (3), so this exercises the
+        // branch that hashes the right leg and probes it from the left.
+        let left = leg(
+            &["id", "manager_id"],
+            vec![
+                vec![QueryValue::VertexId(1), QueryValue::VertexId(10)],
+                vec![QueryValue::VertexId(2), QueryValue::Null],
+                vec![QueryValue::VertexId(3), QueryValue::Null],
+            ],
+        );
+        let right = leg(
+            &["id"],
+            vec![vec![QueryValue::VertexId(10)], vec![QueryValue::Null]],
+        );
+        let mut leg_results = BTreeMap::new();
+        leg_results.insert("users".to_string(), left);
+        leg_results.insert("managers".to_string(), right);
+        let join = DistributedQueryJoin::inner("users", "manager_id", "managers", "id");
+
+        let merged = merge_distributed_inner_join(&leg_results, &join).unwrap();
+
+        assert_eq!(
+            merged.rows,
+            vec![QueryRow::new(vec![
+                QueryValue::VertexId(1),
+                QueryValue::VertexId(10),
+                QueryValue::VertexId(10),
+            ])]
+        );
+    }
+
+    #[test]
+    fn drops_null_keyed_rows_on_the_left_hashed_branch() {
+        // right.rows.len() (3) > left.rows.len() (2), so this exercises the
+        // mirrored branch that hashes the left leg and probes it from the
+        // right.
+        let left = leg(
+            &["id", "manager_id"],
+            vec![
+                vec![QueryValue::VertexId(1), QueryValue::VertexId(10)],
+                vec![QueryValue::VertexId(2), QueryValue::Null],
+            ],
+        );
+        let right = leg(
+            &["id"],
+            vec![
+                vec![QueryValue::VertexId(10)],
+                vec![QueryValue::Null],
+                vec![QueryValue::VertexId(20)],
+            ],
+        );
+        let mut leg_results = BTreeMap::new();
+        leg_results.insert("users".to_string(), left);
+        leg_results.insert("managers".to_string(), right);
+        let join = DistributedQueryJoin::inner("users", "manager_id", "managers", "id");
+
+        let merged = merge_distributed_inner_join(&leg_results, &join).unwrap();
+
+        assert_eq!(
+            merged.rows,
+            vec![QueryRow::new(vec![
+                QueryValue::VertexId(1),
+                QueryValue::VertexId(10),
+                QueryValue::VertexId(10),
+            ])]
+        );
     }
 }
