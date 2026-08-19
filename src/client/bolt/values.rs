@@ -267,8 +267,9 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             message: error.to_string(),
         },
         _ => {
+            let class = error.class();
             tracing::warn!(target: "slatedb_graph_kernel", error = %error, "Bolt suppressed internal graph error");
-            BoltError::Backend("internal query execution error".to_string())
+            BoltError::Backend(format!("internal query execution error ({class})"))
         }
     }
 }

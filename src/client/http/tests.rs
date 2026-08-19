@@ -171,6 +171,29 @@ fn a_routing_refusal_is_a_503_and_not_an_internal_error() {
     );
 }
 
+/// The catch-all arm withholds the error detail but must still name the
+/// coarse class (issue #107) so a client can tell a storage failure from a
+/// query bug without an operator pulling server logs.
+#[test]
+fn unclassified_graph_error_names_its_class_without_leaking_detail() {
+    let error = HttpApiError::from_graph(GraphError::CorruptValue {
+        key: "cell/edge/42".to_string(),
+        reason: "checksum mismatch".to_string(),
+    });
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(error.code, "internal");
+    assert!(
+        error.message.contains("corruption"),
+        "expected the class name in the message, got {:?}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("checksum mismatch"),
+        "the withheld detail must not leak onto the wire, got {:?}",
+        error.message
+    );
+}
+
 #[tokio::test]
 async fn http_api_enforces_auth_scope_and_returns_typed_json() {
     let backend = Arc::new(HttpTestClient {
