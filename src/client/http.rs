@@ -426,11 +426,12 @@ impl HttpApiError {
                 authenticate: false,
             },
             _ => {
+                let class = error.class();
                 tracing::warn!(target: "slatedb_graph_kernel", error = %error, "HTTP suppressed internal graph error");
                 Self {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     code: "internal",
-                    message: "internal query execution error".to_string(),
+                    message: format!("internal query execution error ({class})"),
                     owner: None,
                     authenticate: false,
                 }

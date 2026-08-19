@@ -1890,6 +1890,30 @@ async fn object_store_routing_advertises_nothing_when_no_live_node_is_addressabl
     }
 }
 
+/// The catch-all arm withholds the error detail but must still name the
+/// coarse class (issue #107) so a client can tell a storage failure from a
+/// query bug without an operator pulling server logs.
+#[test]
+fn unclassified_graph_error_names_its_class_without_leaking_detail() {
+    let error = GraphError::CorruptValue {
+        key: "cell/edge/42".to_string(),
+        reason: "checksum mismatch".to_string(),
+    };
+    match graph_error_to_bolt(error) {
+        BoltError::Backend(message) => {
+            assert!(
+                message.contains("corruption"),
+                "expected the class name in the message, got {message:?}"
+            );
+            assert!(
+                !message.contains("checksum mismatch"),
+                "the withheld detail must not leak onto the wire, got {message:?}"
+            );
+        }
+        other => panic!("expected a backend error, got {other:?}"),
+    }
+}
+
 /// The other half of the split: a routing *misconfiguration* stays a client
 /// error, because no other router will answer differently. Reached by giving the
 /// provider an address map that does not cover the fleet the placement view
