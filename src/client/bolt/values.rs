@@ -229,6 +229,25 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             code: "Neo.TransientError.Transaction.BookmarkTimeout".to_string(),
             message: error.to_string(),
         },
+        // "Outdated" is Neo4j's real code for 'transaction has seen state
+        // invalidated by a concurrent update, retrying will very likely
+        // succeed' -- an exact semantic match for an epoch that moved
+        // mid-read. "LeaseExpired" (below) fits SnapshotExpired specifically
+        // because the requested epoch has been compacted away entirely --
+        // retrying the identical request with the same stale epoch cannot
+        // succeed, but a managed-transaction retry (which neo4j drivers run
+        // as a fresh transaction function, not a resubmission of the same
+        // parameters) naturally acquires a new epoch and can.
+        GraphError::SnapshotChanged { .. } | GraphError::QueryStatsSnapshotChanged { .. } => {
+            BoltError::Query {
+                code: "Neo.TransientError.Transaction.Outdated".to_string(),
+                message: error.to_string(),
+            }
+        }
+        GraphError::SnapshotExpired { .. } => BoltError::Query {
+            code: "Neo.TransientError.Transaction.LeaseExpired".to_string(),
+            message: error.to_string(),
+        },
         GraphError::InvalidKeyComponent { .. }
         | GraphError::MissingQueryParameter { .. }
         | GraphError::QueryParse { .. }
@@ -266,6 +285,14 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             code: "Neo.TransientError.General.DatabaseUnavailable".to_string(),
             message: error.to_string(),
         },
+        // ControlWatermarkRegression is grouped into CLASS_FRESHNESS for
+        // telemetry purposes but is currently unreachable (never constructed
+        // anywhere in this codebase -- confirmed via grep across src/ and
+        // crates/) and describes a control-plane metadata anomaly, not a
+        // routine concurrent-write race like its siblings; mapping it to a
+        // retryable code without evidence it shares the same safe-retry
+        // semantics would be premature. It falls through here with the rest
+        // of the catch-all.
         _ => {
             tracing::warn!(target: "slatedb_graph_kernel", error = %error, "Bolt suppressed internal graph error");
             BoltError::Backend("internal query execution error".to_string())
