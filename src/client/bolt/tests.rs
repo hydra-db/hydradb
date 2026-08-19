@@ -1659,6 +1659,92 @@ fn a_write_to_a_non_owner_maps_to_the_not_a_leader_code_with_the_owner_hint() {
     }
 }
 
+/// Freshness-family probe: `graph_error_to_bolt` maps `SnapshotAhead`,
+/// `SnapshotChanged`, `QueryStatsSnapshotChanged` and `SnapshotExpired` to
+/// distinct `Neo.TransientError` codes so drivers retry them, while
+/// `ControlWatermarkRegression` -- ungrounded in any observed retry-safe
+/// behavior and never constructed anywhere in this codebase -- still falls
+/// through to the opaque, non-retryable `BoltError::Backend` catch-all, even
+/// though `GraphError::error_class` groups all five into the same
+/// `CLASS_FRESHNESS` bucket (error.rs).
+#[test]
+fn graph_error_to_bolt_freshness() {
+    // (variant name, error, expected BoltError::Query code substring; None means BoltError::Backend)
+    let cases: Vec<(&str, GraphError, Option<&str>)> = vec![
+        (
+            "SnapshotAhead",
+            GraphError::SnapshotAhead {
+                cell_id: "cell-a".to_string(),
+                read_epoch: 10,
+                current_epoch: 20,
+            },
+            Some("Neo.TransientError.Transaction.BookmarkTimeout"),
+        ),
+        (
+            "SnapshotExpired",
+            GraphError::SnapshotExpired {
+                cell_id: "cell-a".to_string(),
+                edge_type: "KNOWS".to_string(),
+                read_epoch: 5,
+                min_epoch: 15,
+            },
+            Some("Neo.TransientError.Transaction.LeaseExpired"),
+        ),
+        (
+            "SnapshotChanged",
+            GraphError::SnapshotChanged {
+                operation: "artifact-build",
+                cell_id: "cell-a".to_string(),
+                edge_type: "KNOWS".to_string(),
+                read_epoch: 5,
+                current_epoch: 15,
+            },
+            Some("Neo.TransientError.Transaction.Outdated"),
+        ),
+        (
+            "QueryStatsSnapshotChanged",
+            GraphError::QueryStatsSnapshotChanged {
+                operation: "stats-refresh",
+                cell_id: "cell-a".to_string(),
+                read_epoch: 5,
+                current_epoch: 15,
+            },
+            Some("Neo.TransientError.Transaction.Outdated"),
+        ),
+        (
+            "ControlWatermarkRegression",
+            GraphError::ControlWatermarkRegression {
+                cell_id: "cell-a".to_string(),
+                field: "compacted_watermark",
+                requested_epoch: 5,
+                current_epoch: 15,
+            },
+            None,
+        ),
+    ];
+
+    let mut table = String::from("variant -> BoltError variant -> code\n");
+    for (name, error, expected_code) in cases {
+        let bolt = graph_error_to_bolt(error);
+        match (&bolt, expected_code) {
+            (BoltError::Query { code, .. }, Some(expected)) => {
+                table.push_str(&format!("{name} -> Query -> {code}\n"));
+                assert_eq!(
+                    code, expected,
+                    "{name} should map to {expected}, got {code}"
+                );
+            }
+            (BoltError::Backend(_), None) => {
+                table.push_str(&format!("{name} -> Backend -> (opaque, non-retryable)\n"));
+            }
+            (other, _) => panic!(
+                "{name}: expected {expected_code:?}, got {other:?}"
+            ),
+        }
+    }
+    eprintln!("{table}");
+}
+
 #[test]
 fn an_idempotency_conflict_is_visible_and_non_retryable_to_bolt_clients() {
     let error = graph_error_to_bolt(GraphError::IdempotencyConflict {
