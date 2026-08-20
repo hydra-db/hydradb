@@ -23,8 +23,8 @@ use config::RuntimeConfig;
 use readiness::NodeReadiness;
 use slatedb::object_store::{path::Path, ObjectStore};
 use slatedb_graph_kernel::{
-    object_store_from_env, BoltServerConfig, ClientBoltServer, ClientHttpServer,
-    ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget,
+    object_store_from_env, probe_store_writable, BoltServerConfig, ClientBoltServer,
+    ClientHttpServer, ClientQueryService, ClientQueryServiceConfig, ClientQueryTarget,
     HierarchicalClientDatabaseResolver, HttpQueryServerConfig, ObjectStoreBoltRoutingTableProvider,
     ObjectStoreNodeDirectory, PlacementConfig, PlacementView, QueryTransportAction,
     QueryTransportScopeGrant, ScopedRoutedGraphCluster, StaticQueryTransportScopeAuthorizer,
@@ -133,6 +133,12 @@ async fn run_node(
     validate_node_id(&config.node_id)?;
     std::fs::create_dir_all(&config.data_cache_dir)?;
     let object_store = object_store_from_env(None)?;
+    // A container that cannot write to its store directory otherwise looks
+    // healthy: reads succeed, /readyz is green, and the first symptom is
+    // every write failing deep in the commit path with a generic execution
+    // error. Fail loudly here instead, before anything durable is staged on
+    // top of a store that cannot accept a write.
+    probe_store_writable(object_store.as_ref(), &config.data_path).await?;
     let open_options = config.graph_open_options();
     let memory_config = config.graph_memory_config();
     let directory = ObjectStoreNodeDirectory::new(
