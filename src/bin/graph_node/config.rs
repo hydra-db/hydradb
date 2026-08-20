@@ -317,11 +317,33 @@ impl RuntimeConfig {
     }
 
     pub fn read_auth_token(&self) -> ConfigResult<String> {
-        let token = std::fs::read_to_string(&self.auth_token_file)?
+        // Every other failure in this module names the variable it came from
+        // (`invalid {name}: {err}`); a bare `?` here was the one exception, and
+        // it surfaced as `Error: Os { code: 21, kind: IsADirectory }` with
+        // nothing tying it to a path or a setting. The node has already reached
+        // placement state `fresh` by this point, so the operator sees a healthy
+        // startup followed by a raw errno.
+        //
+        // `err.kind()` is carried through rather than flattened to
+        // `InvalidInput`: NotFound and IsADirectory are different operator
+        // mistakes -- an unmounted secret versus a directory where a file was
+        // expected -- and the kind is what a caller would match on.
+        let path = self.auth_token_file.display();
+        let token = std::fs::read_to_string(&self.auth_token_file)
+            .map_err(|err| {
+                Error::new(
+                    err.kind(),
+                    format!("cannot read GRAPH_AUTH_TOKEN_FILE at {path}: {err}"),
+                )
+            })?
             .trim()
             .to_string();
         if token.len() < 32 || token.eq_ignore_ascii_case("change-me") {
-            return invalid("graph auth token must contain at least 32 non-placeholder characters");
+            // Named too, so that a deployment mounting more than one secret
+            // knows which file was rejected.
+            return invalid(format!(
+                "graph auth token at {path} (GRAPH_AUTH_TOKEN_FILE) must contain at least 32 non-placeholder characters"
+            ));
         }
         Ok(token)
     }
@@ -487,6 +509,79 @@ fn invalid<T>(message: impl Into<String>) -> ConfigResult<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plaintext_config_with_auth_token(path: &std::path::Path) -> RuntimeConfig {
+        let values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            (
+                "GRAPH_AUTH_TOKEN_FILE".to_string(),
+                path.to_str().unwrap().to_string(),
+            ),
+        ]);
+        RuntimeConfig::from_values(values).unwrap()
+    }
+
+    #[test]
+    fn missing_auth_token_file_names_the_path_and_keeps_its_kind() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("absent-token");
+        let error = plaintext_config_with_auth_token(&path)
+            .read_auth_token()
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("GRAPH_AUTH_TOKEN_FILE"), "{message}");
+        assert!(message.contains(path.to_str().unwrap()), "{message}");
+        assert_eq!(
+            error.downcast_ref::<Error>().map(Error::kind),
+            Some(ErrorKind::NotFound),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn auth_token_directory_names_the_path_instead_of_a_raw_errno() {
+        // The GitHub-runner half of issue #101: `GRAPH_AUTH_TOKEN_FILE` points
+        // at a directory and startup exits with a bare `Os { code: 21 }`. The
+        // kind is deliberately not asserted -- platforms disagree on what
+        // reading a directory returns -- but the path must be in the message.
+        let directory = tempfile::tempdir().unwrap();
+        let error = plaintext_config_with_auth_token(directory.path())
+            .read_auth_token()
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("GRAPH_AUTH_TOKEN_FILE"), "{message}");
+        assert!(
+            message.contains(directory.path().to_str().unwrap()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn short_auth_token_names_the_file_it_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth-token");
+        std::fs::write(&path, "change-me").unwrap();
+        let error = plaintext_config_with_auth_token(&path)
+            .read_auth_token()
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("non-placeholder"), "{message}");
+        assert!(message.contains(path.to_str().unwrap()), "{message}");
+    }
+
+    #[test]
+    fn readable_auth_token_file_is_trimmed_and_accepted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth-token");
+        std::fs::write(&path, "  local-development-token-32-bytes\n").unwrap();
+        let token = plaintext_config_with_auth_token(&path)
+            .read_auth_token()
+            .unwrap();
+        assert_eq!(token, "local-development-token-32-bytes");
+    }
 
     #[test]
     fn production_runtime_requires_tls() {
