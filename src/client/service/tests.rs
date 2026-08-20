@@ -787,6 +787,61 @@ async fn server_cursor_executes_once_and_release_invalidates_it() {
     assert_eq!(executions.load(Ordering::Relaxed), 1);
 }
 
+/// Issue #115, from the other side: the owner check must stop pinning a cursor
+/// to a `query_id` without becoming a check that pins nothing.
+///
+/// A regenerated `query_id` — which is what the HTTP surface produces on every
+/// request — continues the cursor. A different query text still does not.
+#[tokio::test]
+async fn a_server_cursor_ignores_query_id_but_still_pins_the_query() {
+    let executions = Arc::new(AtomicU64::new(0));
+    let service = cursor_service(Arc::clone(&executions), 4, 1 << 20, 1_000);
+    let session = authenticated_session(&service);
+    let query = "MATCH (n {id: 1}) RETURN n.id AS value";
+    let first = service
+        .execute_page(
+            &session,
+            ClientQueryRequest::new(target(), "query-id-one", query),
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    let cursor = first.page.next_cursor.expect("remaining rows use a cursor");
+
+    let continued = service
+        .execute_page(
+            &session,
+            ClientQueryRequest::new(target(), "query-id-two", query),
+            Some(cursor),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(continued.page.rows.len(), 1);
+    // Still one execution: the continuation was served from the buffer rather
+    // than re-running the query under its new id.
+    assert_eq!(executions.load(Ordering::Relaxed), 1);
+
+    let error = service
+        .execute_page(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "query-id-three",
+                "MATCH (n {id: 2}) RETURN n.id AS value",
+            ),
+            Some(cursor),
+            1,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("does not belong to this query"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn server_cursor_enforces_count_and_buffer_admission() {
     let executions = Arc::new(AtomicU64::new(0));

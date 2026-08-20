@@ -1025,8 +1025,32 @@ struct ClientQueryServiceInner {
     cursor_buffer_bytes: AtomicU64,
 }
 
+/// Who a server cursor belongs to.
+///
+/// Deliberately *not* [`ClientQueryKey`], even though the two were the same
+/// type until this split. That key identifies one in-flight statement so it can
+/// be cancelled, and `query_id` is the whole point of it there. A cursor's
+/// owner is a different question — which authenticated identity read which
+/// scope — and `query_id` answers it wrongly, because it is a per-request
+/// correlation id rather than a property of the caller.
+///
+/// The HTTP surface mints one per request when the body omits it
+/// (`http-query-{n}`, `client/http.rs`), so page two never carried the id page
+/// one was stored under and every continuation failed the owner check: the
+/// rows sat in the cursor, complete and unreachable, until the TTL dropped
+/// them. Bolt was unaffected only incidentally — it holds one `query_id`
+/// across a statement's PULLs.
+///
+/// What still has to match is unchanged and is the part that was ever doing
+/// the work: principal, scope, target, query text, and parameters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ServerCursorOwner {
+    principal: QueryTransportPrincipal,
+    scope: GraphScope,
+}
+
 struct ServerQueryCursor {
-    owner: ClientQueryKey,
+    owner: ServerCursorOwner,
     target: ClientQueryTarget,
     query: String,
     parameters: BTreeMap<String, QueryParameterValue>,
@@ -1687,7 +1711,7 @@ impl ClientQueryService {
         let next_bytes = current_bytes.saturating_add(resident_bytes);
         let cursor_id = next_cursor_id(&self.inner.next_cursor_id, &cursors)?;
         let cursor = ServerQueryCursor {
-            owner: client_query_key(session, request),
+            owner: server_cursor_owner(session, request),
             target: request.target.clone(),
             query: request.query.clone(),
             parameters: request.parameters.clone(),
@@ -1719,7 +1743,7 @@ impl ClientQueryService {
     ) -> Result<ClientQueryPage> {
         let mut cursors = self.inner.cursors.lock().await;
         self.purge_expired_cursors(&mut cursors);
-        let expected_owner = client_query_key(session, request);
+        let expected_owner = server_cursor_owner(session, request);
         let Some(cursor) = cursors.get(&token.offset) else {
             return Err(GraphError::UnsupportedQuery {
                 dialect: "ClientProtocol",
@@ -1791,7 +1815,7 @@ impl ClientQueryService {
     ) -> bool {
         let mut cursors = self.inner.cursors.lock().await;
         self.purge_expired_cursors(&mut cursors);
-        let expected_owner = client_query_key(session, request);
+        let expected_owner = server_cursor_owner(session, request);
         let Some(cursor) = cursors.get(&token.offset) else {
             return false;
         };
@@ -2300,6 +2324,16 @@ fn client_query_key(session: &ClientQuerySession, request: &ClientQueryRequest) 
         principal: session.principal.clone(),
         scope: request.target.scope.clone(),
         query_id: request.query_id.clone(),
+    }
+}
+
+fn server_cursor_owner(
+    session: &ClientQuerySession,
+    request: &ClientQueryRequest,
+) -> ServerCursorOwner {
+    ServerCursorOwner {
+        principal: session.principal.clone(),
+        scope: request.target.scope.clone(),
     }
 }
 
