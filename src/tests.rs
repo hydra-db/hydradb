@@ -1,5 +1,5 @@
 use super::*;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use slatedb::object_store::local::LocalFileSystem;
 use slatedb::object_store::memory::InMemory;
 
@@ -3829,6 +3829,144 @@ async fn local_object_store_reopen_reads_from_remote_ground_truth() {
             .await
             .unwrap(),
         vec![600]
+    );
+}
+
+#[tokio::test]
+async fn writability_probe_passes_and_leaves_no_object_behind_on_a_healthy_store() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+    probe_store_writable(object_store.as_ref(), "graph/data")
+        .await
+        .unwrap();
+
+    let listed = object_store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert!(
+        listed.is_empty(),
+        "the probe object must not outlive the check: {listed:?}"
+    );
+}
+
+/// An `ObjectStore` whose every write fails, so the probe can be tested
+/// without depending on this process's UID or the host filesystem's
+/// permission bits: a chmod-based test would pass trivially when run as
+/// root, which this repo's own local harness and most CI containers do —
+/// root ignores Unix permission bits entirely.
+struct WriteRejectingStore;
+
+impl std::fmt::Display for WriteRejectingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WriteRejectingStore(permission denied)")
+    }
+}
+
+impl std::fmt::Debug for WriteRejectingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WriteRejectingStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for WriteRejectingStore {
+    async fn put_opts(
+        &self,
+        _location: &slatedb::object_store::path::Path,
+        _payload: slatedb::object_store::PutPayload,
+        _opts: slatedb::object_store::PutOptions,
+    ) -> slatedb::object_store::Result<slatedb::object_store::PutResult> {
+        Err(slatedb::object_store::Error::Generic {
+            store: "WriteRejectingStore",
+            source: "permission denied (simulated)".into(),
+        })
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        _location: &slatedb::object_store::path::Path,
+        _opts: slatedb::object_store::PutMultipartOptions,
+    ) -> slatedb::object_store::Result<Box<dyn slatedb::object_store::MultipartUpload>> {
+        Err(slatedb::object_store::Error::Generic {
+            store: "WriteRejectingStore",
+            source: "permission denied (simulated)".into(),
+        })
+    }
+
+    async fn get_opts(
+        &self,
+        location: &slatedb::object_store::path::Path,
+        _options: slatedb::object_store::GetOptions,
+    ) -> slatedb::object_store::Result<slatedb::object_store::GetResult> {
+        Err(slatedb::object_store::Error::NotFound {
+            path: location.to_string(),
+            source: "nothing was ever written".into(),
+        })
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            slatedb::object_store::Result<slatedb::object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<
+        'static,
+        slatedb::object_store::Result<slatedb::object_store::path::Path>,
+    > {
+        locations
+    }
+
+    fn list(
+        &self,
+        _prefix: Option<&slatedb::object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, slatedb::object_store::Result<slatedb::object_store::ObjectMeta>>
+    {
+        futures::stream::empty().boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        _prefix: Option<&slatedb::object_store::path::Path>,
+    ) -> slatedb::object_store::Result<slatedb::object_store::ListResult> {
+        Ok(slatedb::object_store::ListResult {
+            common_prefixes: vec![],
+            objects: vec![],
+            extensions: Default::default(),
+        })
+    }
+
+    async fn copy_opts(
+        &self,
+        _from: &slatedb::object_store::path::Path,
+        _to: &slatedb::object_store::path::Path,
+        _options: slatedb::object_store::CopyOptions,
+    ) -> slatedb::object_store::Result<()> {
+        Err(slatedb::object_store::Error::Generic {
+            store: "WriteRejectingStore",
+            source: "permission denied (simulated)".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn writability_probe_reports_a_store_that_rejects_writes() {
+    let error = probe_store_writable(&WriteRejectingStore, "graph/data")
+        .await
+        .unwrap_err();
+
+    let GraphError::StoreNotWritable { store, reason } = error else {
+        panic!("expected StoreNotWritable, got {error:?}");
+    };
+    assert!(
+        store.contains("WriteRejectingStore"),
+        "the store names itself in the report: {store}"
+    );
+    assert!(
+        reason.contains("permission denied"),
+        "the underlying reason is preserved: {reason}"
     );
 }
 

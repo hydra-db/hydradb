@@ -225,8 +225,10 @@ mod index_store;
 mod placement;
 mod scope_directory;
 mod writer_lease;
+mod writability_probe;
 
 pub use placement::{CellOwnership, PlacementConfig, PlacementRefreshHandle, PlacementView};
+pub use writability_probe::probe_store_writable;
 
 pub use scope_directory::ObjectStoreGraphScopeDirectory;
 pub use writer_lease::{

@@ -138,6 +138,12 @@ pub enum GraphError {
     RoutingUnavailable { reason: String },
     #[error("operation requires writable SlateDB shard storage")]
     ReadOnlyShardStorage,
+    #[error(
+        "object store {store} rejected a startup write test: {reason}. If this is a local \
+         directory, a Docker bind mount or named volume, check that the process's user can \
+         write to it — named volumes in particular are created root-owned by default"
+    )]
+    StoreNotWritable { store: String, reason: String },
     #[error("cell {cell_id} has been dropped; {operation} is rejected")]
     CellDropped {
         operation: &'static str,
@@ -326,7 +332,8 @@ impl GraphError {
             // durability setting, the other a write to a shard opened read-only.
             Self::UnsafeDurabilityConfig { .. }
             | Self::RoutedWriterConfigMismatch { .. }
-            | Self::ReadOnlyShardStorage => Self::CLASS_CONFIG,
+            | Self::ReadOnlyShardStorage
+            | Self::StoreNotWritable { .. } => Self::CLASS_CONFIG,
 
             Self::Slate(error)
                 if matches!(
