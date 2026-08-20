@@ -356,3 +356,72 @@ async fn http_api_serves_authenticated_queries_over_https() {
     drop(client);
     server.stop().await.unwrap();
 }
+
+/// Issue #115: an HTTP client that does not send `query_id` must still be able
+/// to walk its own cursor.
+///
+/// Every other test in this file passes an explicit `query_id`, which is the
+/// one shape that always worked — so the continuation path was covered without
+/// the configuration real clients use. Page two used to fail the cursor owner
+/// check here, because the handler mints `http-query-{n}` per request and the
+/// owner comparison included it.
+#[tokio::test]
+async fn http_continuation_without_a_client_query_id_returns_the_next_page() {
+    let backend = Arc::new(HttpTestClient {
+        observed_epochs: Mutex::new(Vec::new()),
+        refreshes: AtomicU64::new(0),
+    });
+    let server = ClientHttpServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        http_service(backend),
+        HttpQueryServerConfig::default()
+            .with_default_page_size(2)
+            .insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let url = format!("http://{}/v1/graphs/social/query", server.local_addr());
+    let client = reqwest::Client::new();
+    let page = |cursor: Option<u64>| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            let mut body = serde_json::json!({
+                "cell_id": "cell-a",
+                "query": "MATCH (n {id: 1}) RETURN n.id",
+                "page_size": 2
+            });
+            if let Some(cursor) = cursor {
+                body["cursor"] = serde_json::json!(cursor);
+            }
+            let response = client
+                .post(&url)
+                .bearer_auth("http-secret")
+                .header(GRAPH_NAMESPACE_HEADER, "acme")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            (status, body)
+        }
+    };
+
+    let (status, first) = page(None).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(first["rows"].as_array().unwrap().len(), 2);
+    let cursor = first["next_cursor"]
+        .as_u64()
+        .expect("a partial result advertises a cursor");
+
+    let (status, second) = page(Some(cursor)).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{second}");
+    assert_eq!(second["rows"].as_array().unwrap().len(), 1, "{second}");
+    assert_eq!(second["rows"][0][0]["value"], 3);
+    assert!(second["next_cursor"].is_null(), "{second}");
+
+    // Every row the query produced is now accounted for across the two pages,
+    // which is the property #115 reported as lost.
+    server.stop().await.unwrap();
+}
