@@ -194,6 +194,9 @@ write one:
 - Ids read fields from the row map, so `{id: row.vertex}`, and the alias has to
   be the one the `UNWIND` bound.
 - One relationship pattern per batch, one hop, directed.
+- Node patterns inside a batch match by id alone. A label goes in the `SET` of a
+  vertex upsert, or on the endpoints of the `UNWIND MATCH` that binds a
+  relationship — not on a node pattern written directly into `UNWIND ... CREATE`.
 - `UNWIND ... CREATE` and `UNWIND MATCH ... CREATE` cannot be followed by
   another clause, and an `UNWIND MATCH` must end in `RETURN` or `DELETE`.
 - `UNWIND MATCH` does not take `OPTIONAL`, hints, or `WHERE`.

@@ -967,7 +967,13 @@ impl ParsedCypher {
             }
             let expression = checked_node(sys::cypher_ast_unwind_get_expression(unwind))?;
             if !is_instance(expression, sys::CYPHER_AST_PARAMETER) {
-                return unsupported("UNWIND batch input must be a parameter");
+                // An inline list parses, so the rejection lands on a statement that reads
+                // like a working batch. Naming the input the batch wants keeps the next
+                // attempt from being the same literal list rearranged.
+                return unsupported(
+                    "UNWIND batch input must be a parameter holding a list of maps, \
+                     not an inline list",
+                );
             }
             let parameter = parameter_name(expression)?;
             let alias = identifier_name(checked_node(sys::cypher_ast_unwind_get_alias(unwind))?)?;
@@ -2931,7 +2937,9 @@ fn unwind_edge_template(
         let path = checked_node(sys::cypher_ast_pattern_get_path(pattern, 0))?;
         ensure_instance(path, sys::CYPHER_AST_PATTERN_PATH, "UNWIND edge path")?;
         if sys::cypher_ast_pattern_path_nelements(path) != 3 {
-            return unsupported("UNWIND batch supports one-hop relationships only");
+            return unsupported(
+                "UNWIND batch supports one-hop relationships only; send one batch per hop",
+            );
         }
         let left = checked_node(sys::cypher_ast_pattern_path_get_element(path, 0))?;
         let relationship = checked_node(sys::cypher_ast_pattern_path_get_element(path, 1))?;
@@ -2996,7 +3004,14 @@ fn unwind_node_id_field(
 ) -> Result<Option<String>> {
     unsafe {
         if sys::cypher_ast_node_pattern_nlabels(node) != 0 {
-            return unsupported("UNWIND batch node patterns do not support labels");
+            // Labelled batch writes do exist, just not in this shape. A message that only
+            // says "no labels" reads as "no labelled batch path at all", and the way out
+            // of that reading is one round trip per edge, so name the shapes that work.
+            return unsupported(
+                "UNWIND batch node patterns match by id alone; label a vertex in the SET \
+                 of an UNWIND MERGE upsert, and label relationship endpoints in an \
+                 UNWIND MATCH that binds them for CREATE or MERGE",
+            );
         }
         let properties = sys::cypher_ast_node_pattern_get_properties(node);
         if properties.is_null() {
@@ -3893,6 +3908,47 @@ mod tests {
                 destination_label: "Source".to_string(),
             }
         );
+    }
+
+    #[cfg(feature = "client-api")]
+    #[test]
+    fn labeled_unwind_create_names_the_labeled_batch_forms() {
+        // The labelled forms this points at are the ones covered by
+        // lowers_unwind_vertex_upsert_batch and
+        // lowers_unwind_create_between_matched_labeled_vertices, so a caller who
+        // follows the message lands on a batch that parses.
+        let err = parse_opencypher_unwind_batch(
+            "UNWIND $rows AS row \
+             CREATE (s:Source {id: row.source_vertex})-[:RELATES]->(d:Source {id: row.related_vertex})",
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("match by id alone"), "{message}");
+        assert!(message.contains("SET of an UNWIND MERGE upsert"), "{message}");
+        assert!(message.contains("MATCH that binds them"), "{message}");
+    }
+
+    #[cfg(feature = "client-api")]
+    #[test]
+    fn inline_unwind_list_names_the_batch_input_it_wanted() {
+        let err = parse_opencypher_unwind_batch("UNWIND [1, 2, 3] AS row CREATE (n {id: row})")
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("parameter holding a list of maps"), "{message}");
+        assert!(message.contains("not an inline list"), "{message}");
+    }
+
+    #[cfg(feature = "client-api")]
+    #[test]
+    fn multi_hop_unwind_batch_names_the_one_hop_rule() {
+        let err = parse_opencypher_unwind_batch(
+            "UNWIND $rows AS row \
+             CREATE (a {id: row.a})-[:RELATES]->(b {id: row.b})-[:RELATES]->(c {id: row.c})",
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("one-hop relationships only"), "{message}");
+        assert!(message.contains("one batch per hop"), "{message}");
     }
 
     #[cfg(feature = "client-api")]
