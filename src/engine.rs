@@ -587,6 +587,11 @@ fn naive_reachable(adjacency: &MatrixAdjacency, root: VertexId, hops: u8) -> Vec
             break;
         }
     }
+    // A cycle walks back onto the root, and unioning raw frontiers keeps it.
+    // Every kernel this oracle is checked against drops the start vertex
+    // (`sparse_kernel/mod.rs`, `graphblas.rs` twice over), so keeping it here
+    // reports a mismatch on a healthy graph.
+    reachable.remove(&root);
     reachable.into_iter().collect()
 }
 
