@@ -317,7 +317,16 @@ impl RuntimeConfig {
     }
 
     pub fn read_auth_token(&self) -> ConfigResult<String> {
-        let token = std::fs::read_to_string(&self.auth_token_file)?
+        let token = std::fs::read_to_string(&self.auth_token_file)
+            .map_err(|error| {
+                Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot read GRAPH_AUTH_TOKEN_FILE at {}: {error}",
+                        self.auth_token_file.display()
+                    ),
+                )
+            })?
             .trim()
             .to_string();
         if token.len() < 32 || token.eq_ignore_ascii_case("change-me") {
@@ -493,6 +502,39 @@ mod tests {
         let values = BTreeMap::from([("GRAPH_AUTH_TOKEN_FILE".to_string(), "/token".to_string())]);
         let error = RuntimeConfig::from_values(values).unwrap_err();
         assert!(error.to_string().contains("requires GRAPH_TLS_CERTIFICATE"));
+    }
+
+    #[test]
+    fn unreadable_auth_token_file_error_names_the_path() {
+        let missing = "/nonexistent-dir/auth-token";
+        let values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            ("GRAPH_AUTH_TOKEN_FILE".to_string(), missing.to_string()),
+        ]);
+        let config = RuntimeConfig::from_values(values).unwrap();
+        let error = config.read_auth_token().unwrap_err().to_string();
+        assert!(
+            error.contains(missing),
+            "error did not name the path: {error}"
+        );
+        assert!(
+            error.contains("GRAPH_AUTH_TOKEN_FILE"),
+            "error did not name the variable: {error}"
+        );
+    }
+
+    #[test]
+    fn directory_as_auth_token_file_error_names_the_path() {
+        let values = BTreeMap::from([
+            ("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string()),
+            ("GRAPH_AUTH_TOKEN_FILE".to_string(), "/tmp".to_string()),
+        ]);
+        let config = RuntimeConfig::from_values(values).unwrap();
+        let error = config.read_auth_token().unwrap_err().to_string();
+        assert!(
+            error.contains("/tmp"),
+            "error did not name the path: {error}"
+        );
     }
 
     #[test]
