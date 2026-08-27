@@ -1,4 +1,4 @@
-use super::values::bolt_parameter_to_property;
+use super::values::{bolt_parameter_to_property, graph_error_to_bolt};
 use super::wire::strict_decode_client_message;
 use super::*;
 use crate::{
@@ -1675,6 +1675,87 @@ fn an_idempotency_conflict_is_visible_and_non_retryable_to_bolt_clients() {
             assert!(message.contains("different payload"));
         }
         other => panic!("expected a non-retryable Neo client error, got {other:?}"),
+    }
+}
+
+/// Issue #105: Freshness errors are exposed as opaque Bolt backend errors.
+/// All five freshness GraphError variants must map to the transient
+/// BookmarkTimeout code so drivers recognize them as retryable.
+#[test]
+fn all_freshness_errors_map_to_bookmark_timeout() {
+    // SnapshotAhead
+    let ahead = graph_error_to_bolt(GraphError::SnapshotAhead {
+        cell_id: "cell-a".to_string(),
+        read_epoch: 100,
+        current_epoch: 50,
+    });
+    match ahead {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.TransientError.Transaction.BookmarkTimeout");
+            assert!(message.contains("ahead"), "message should mention 'ahead'");
+        }
+        other => panic!("expected BookmarkTimeout for SnapshotAhead, got {other:?}"),
+    }
+
+    // SnapshotExpired
+    let expired = graph_error_to_bolt(GraphError::SnapshotExpired {
+        cell_id: "cell-a".to_string(),
+        edge_type: "out".to_string(),
+        read_epoch: 10,
+        min_epoch: 50,
+    });
+    match expired {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.TransientError.Transaction.BookmarkTimeout");
+            assert!(message.contains("expired"), "message should mention 'expired'");
+        }
+        other => panic!("expected BookmarkTimeout for SnapshotExpired, got {other:?}"),
+    }
+
+    // SnapshotChanged
+    let changed = graph_error_to_bolt(GraphError::SnapshotChanged {
+        operation: "scan",
+        cell_id: "cell-b".to_string(),
+        edge_type: "in".to_string(),
+        read_epoch: 75,
+        current_epoch: 80,
+    });
+    match changed {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.TransientError.Transaction.BookmarkTimeout");
+            assert!(message.contains("changed"), "message should mention 'changed'");
+        }
+        other => panic!("expected BookmarkTimeout for SnapshotChanged, got {other:?}"),
+    }
+
+    // QueryStatsSnapshotChanged
+    let stats_changed = graph_error_to_bolt(GraphError::QueryStatsSnapshotChanged {
+        operation: "analyze",
+        cell_id: "cell-c".to_string(),
+        read_epoch: 60,
+        current_epoch: 65,
+    });
+    match stats_changed {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.TransientError.Transaction.BookmarkTimeout");
+            assert!(message.contains("stats"), "message should mention 'stats'");
+        }
+        other => panic!("expected BookmarkTimeout for QueryStatsSnapshotChanged, got {other:?}"),
+    }
+
+    // ControlWatermarkRegression
+    let regression = graph_error_to_bolt(GraphError::ControlWatermarkRegression {
+        cell_id: "cell-d".to_string(),
+        field: "write_watermark",
+        requested_epoch: 30,
+        current_epoch: 20,
+    });
+    match regression {
+        BoltError::Query { code, message } => {
+            assert_eq!(code, "Neo.TransientError.Transaction.BookmarkTimeout");
+            assert!(message.contains("regression"), "message should mention 'regression'");
+        }
+        other => panic!("expected BookmarkTimeout for ControlWatermarkRegression, got {other:?}"),
     }
 }
 
