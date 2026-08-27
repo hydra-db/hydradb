@@ -33,15 +33,20 @@ silently drift into different test matrices.
 
 ## Local Harnesses
 
-| Recipe | What it runs | Output or side effect |
+The recipes below are wired in the `justfile` but their shell scripts are not
+yet tracked in this repository ([#88](https://github.com/hydra-db/hydradb/issues/88)).
+Running them prints a clear error naming the missing script. Use
+`just verify-harness-scripts` to list which scripts are present on a checkout.
+
+| Recipe | What it runs | Status |
 |---|---|---|
-| `just smoke` | Isolated local object-store write, traversal, reopen, and verification | Temporary directory removed on exit |
-| `just smoke-graphblas` | The same smoke flow with SuiteSparse selected explicitly | Temporary directory removed on exit |
-| `just query-correctness` | Exact OpenCypher result checks | `bench-results/query_correctness.csv` and `.log` |
-| `just query-bench` | Configurable cold, hot, and concurrent query benchmark | `bench-results/query_bench_full.csv` and `.log` by default |
-| `just query-memory-profile` | Build/query memory matrix with runtime-selectable kernels | Results and logs under the configured benchmark directory |
-| `just stress` | Multiprocess writes, restart recovery, compaction, GC, and verification | Temporary local stores removed on exit |
-| `just fence` | Hard SlateDB writer-takeover proof | Temporary local stores removed on exit |
+| `just smoke` | Isolated local object-store write, traversal, reopen, and verification | Available |
+| `just smoke-graphblas` | The same smoke flow with SuiteSparse selected explicitly | Available |
+| `just query-memory-profile` | Build/query memory matrix with runtime-selectable kernels | Available |
+| `just query-correctness` | Exact OpenCypher result checks | Script not tracked ([#88](https://github.com/hydra-db/hydradb/issues/88)) |
+| `just query-bench` | Configurable cold, hot, and concurrent query benchmark | Script not tracked ([#88](https://github.com/hydra-db/hydradb/issues/88)) |
+| `just stress` | Multiprocess writes, restart recovery, compaction, GC, and verification | Script not tracked ([#88](https://github.com/hydra-db/hydradb/issues/88)) |
+| `just fence` | Hard SlateDB writer-takeover proof | Script not tracked ([#88](https://github.com/hydra-db/hydradb/issues/88)) |
 
 The benchmark recipes intentionally use production-sized defaults and can run
 for a long time. Override their documented `GRAPH_QUERY_*` environment
@@ -49,14 +54,17 @@ variables for a small development sample.
 
 ## Docker And MinIO Harnesses
 
-| Recipe | Purpose |
-|---|---|
-| `just minio-smoke` | Runs the object-store smoke flow against an ephemeral MinIO container |
-| `just minio-query-correctness` | Runs exact query checks against MinIO |
-| `just minio-query-bench` | Runs the query benchmark against MinIO |
-| `just minio-chaos` | Pauses, restarts, and recovers MinIO during graph operations |
-| `just minio-fence` | Runs writer takeover against MinIO |
-| `just minio-mbt` | Replays the formal MBT adapters against MinIO; unavailable in this checkout because the referenced `tests/formal_mbt*.rs` targets are absent |
+These recipes also depend on shell scripts that are not tracked in the public
+tree ([#88](https://github.com/hydra-db/hydradb/issues/88)).
+
+| Recipe | Purpose | Status |
+|---|---|---|
+| `just minio-smoke` | Runs the object-store smoke flow against an ephemeral MinIO container | Script not tracked ([#88](https://github.com/hydra-db/hydradb/issues/88)) |
+| `just minio-query-correctness` | Runs exact query checks against MinIO | Script not tracked ([#88](https://github.com/hydra-db/hydradb/issues/88)) |
+| `just minio-query-bench` | Runs the query benchmark against MinIO | Script not tracked ([#88](https://github.com/hydra-db/hydradb/issues/88)) |
+| `just minio-chaos` | Pauses, restarts, and recovers MinIO during graph operations | Script not tracked ([#88](https://github.com/hydra-db/hydradb/issues/88)) |
+| `just minio-fence` | Runs writer takeover against MinIO | Script not tracked ([#88](https://github.com/hydra-db/hydradb/issues/88)) |
+| `just minio-mbt` | Replays the formal MBT adapters against MinIO | Script not tracked ([#88](https://github.com/hydra-db/hydradb/issues/88)) |
 
 The MinIO recipes create isolated containers, networks, buckets, and temporary
 configuration files. Their cleanup traps remove those resources unless a

@@ -267,20 +267,56 @@ smoke-graphblas:
     CLOUD_PROVIDER=local LOCAL_PATH="$store_root" GRAPH_MATRIX_KERNEL=graphblas \
       cargo run --locked --example object_store_smoke
 
+# Fail fast when a harness script is referenced but not shipped in this tree.
+# See https://github.com/hydra-db/hydradb/issues/88
+[private]
+_require-harness-script script:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    script="{{script}}"
+    if [[ ! -f "$script" ]]; then
+      echo "error: $script is not included in this repository checkout." >&2
+      echo "Available harnesses on a clean checkout: smoke, smoke-graphblas, query-memory-profile." >&2
+      echo "See DEVELOPMENT.md and https://github.com/hydra-db/hydradb/issues/88 for status." >&2
+      exit 1
+    fi
+
+# List every shell script the justfile invokes and whether it is tracked.
+verify-harness-scripts:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    missing=0
+    while read -r script; do
+      if git ls-files --error-unmatch "$script" >/dev/null 2>&1; then
+        echo "OK      $script"
+      else
+        echo "MISSING $script"
+        missing=$((missing + 1))
+      fi
+    done < <(grep -E 'bash scripts/|_require-harness-script scripts/' justfile | grep -oE 'scripts/[A-Za-z0-9_.-]+\.sh' | sort -u)
+    if [[ "$missing" -gt 0 ]]; then
+      echo "$missing harness script(s) are not tracked; see https://github.com/hydra-db/hydradb/issues/88" >&2
+      exit 1
+    fi
+
 # Run local multiprocess stress against the local filesystem object store.
 stress:
+    @just _require-harness-script scripts/multiprocess_stress.sh
     bash scripts/multiprocess_stress.sh
 
 # Run hard write-fence takeover proof against the local filesystem object store.
 fence:
+    @just _require-harness-script scripts/fence_takeover.sh
     bash scripts/fence_takeover.sh
 
 # Run MinIO smoke test. Requires Docker.
 minio-smoke:
+    @just _require-harness-script scripts/minio_smoke.sh
     bash scripts/minio_smoke.sh
 
 # Run Query engine Cypher query benchmarks.
 query-bench:
+    @just _require-harness-script scripts/query_bench.sh
     bash scripts/query_bench.sh
 
 # Run low-memory query/build/concurrency profiling.
@@ -289,26 +325,32 @@ query-memory-profile:
 
 # Run Query engine exact query correctness benchmark.
 query-correctness:
+    @just _require-harness-script scripts/query_correctness.sh
     bash scripts/query_correctness.sh
 
 # Run Query engine Cypher query benchmarks against MinIO. Requires Docker.
 minio-query-bench:
+    @just _require-harness-script scripts/minio_query_bench.sh
     bash scripts/minio_query_bench.sh
 
 # Run Query engine exact query correctness benchmark against MinIO. Requires Docker.
 minio-query-correctness:
+    @just _require-harness-script scripts/minio_query_correctness.sh
     bash scripts/minio_query_correctness.sh
 
 # Run MinIO chaos test. Requires Docker.
 minio-chaos:
+    @just _require-harness-script scripts/minio_chaos.sh
     bash scripts/minio_chaos.sh
 
 # Run hard write-fence takeover proof against MinIO. Requires Docker.
 minio-fence:
+    @just _require-harness-script scripts/minio_fence_takeover.sh
     bash scripts/minio_fence_takeover.sh
 
 # Replay all six Quint Connect adapters against isolated MinIO paths. Requires Docker.
 minio-mbt:
+    @just _require-harness-script scripts/minio_mbt.sh
     bash scripts/minio_mbt.sh
 
 # Refresh the pinned SlateDB Git dependency in Cargo.lock.

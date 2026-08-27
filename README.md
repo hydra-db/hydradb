@@ -230,11 +230,11 @@ traversal, closes the database, reopens it, and verifies the durable result.
 The recipe creates and removes an isolated local object-store directory. Use
 `just smoke-graphblas` to pin the traversal kernel to SuiteSparse GraphBLAS.
 
-To exercise the same flow against an ephemeral MinIO instance:
-
-```bash
-just minio-smoke
-```
+To exercise the same flow against an ephemeral MinIO instance, use
+`just minio-smoke`. That recipe is not available on a clean checkout because the
+shell script it invokes is not tracked in this repository yet; see
+[#88](https://github.com/hydra-db/hydradb/issues/88). Until those harness
+scripts ship, `just smoke` is the supported local verification path.
 
 #### Run a local server
 
