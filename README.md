@@ -158,7 +158,31 @@ already exists, which is why `hydradb-data/store` is created before the mount.
 but the bind-mounted `hydradb-data` is owned by the host user, so without it the
 container cannot write its store or cache and fails on the first storage
 operation. Running as the host user makes the mounted directories writable and
-keeps the created files host-owned. The image entrypoint is `graph-node`; it
+keeps the created files host-owned.
+
+**Docker Compose named volumes** hit the same permission mismatch with a
+different cause. A bind mount inherits the host directory's ownership; a named
+volume is created root-owned, so UID `10001` cannot write to it even though
+reads and `/readyz` look healthy. Every write then fails with a generic query
+error unless the underlying storage failure is visible in the container log.
+Either run the service as root for development:
+
+```yaml
+services:
+  hydradb:
+    image: ghcr.io/hydra-db/hydradb:latest
+    user: "0:0"
+    volumes:
+      - hydradb-data:/data
+volumes:
+  hydradb-data:
+```
+
+or pre-create the volume with ownership that matches the image user before
+starting the node. The bind-mount recipe above (`--user "$(id -u):$(id -g)"`)
+does not apply to named volumes.
+
+The image entrypoint is `graph-node`; it
 also ships `graph-indexer`. For production, pin an image digest rather than
 `latest` — see the [Helm chart guide](charts/hydradb/README.md).
 
