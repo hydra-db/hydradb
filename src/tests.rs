@@ -11894,6 +11894,57 @@ async fn cypher_starts_with_uses_current_index_and_rejects_graph_epoch_replay() 
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_min_max_aggregates_compute_correctly() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-min-max-aggregates", object_store).await;
+
+    for (vertex, score, name) in [(1, 10, "alice"), (2, 30, "bob"), (3, 20, "carol")] {
+        shard
+            .set_vertex_metadata(
+                "cell-0",
+                vertex,
+                VertexMetadata::default()
+                    .with_label("User")
+                    .with_property("score", VertexPropertyValue::Integer(score))
+                    .with_property("name", VertexPropertyValue::String(name.to_string())),
+            )
+            .await
+            .unwrap();
+    }
+
+    let min_max = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "min-max-score"),
+            "MATCH (u:User) RETURN min(u.score) AS min_score, max(u.score) AS max_score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        min_max.rows,
+        vec![QueryRow::new(vec![
+            QueryValue::Property(VertexPropertyValue::Integer(10)),
+            QueryValue::Property(VertexPropertyValue::Integer(30)),
+        ])]
+    );
+
+    let min_max_str = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "min-max-name"),
+            "MATCH (u:User) RETURN min(u.name) AS min_name, max(u.name) AS max_name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        min_max_str.rows,
+        vec![QueryRow::new(vec![
+            QueryValue::Property(VertexPropertyValue::String("alice".to_string())),
+            QueryValue::Property(VertexPropertyValue::String("carol".to_string())),
+        ])]
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_tck_style_row_corpus_covers_supported_clause_semantics() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-tck-style-corpus", object_store).await;

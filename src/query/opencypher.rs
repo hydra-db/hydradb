@@ -174,6 +174,8 @@ pub enum RowAggregateFunction {
     Count,
     Sum,
     Avg,
+    Min,
+    Max,
     Collect,
 }
 
@@ -2880,6 +2882,10 @@ fn row_aggregate_function(name: &str) -> Option<RowAggregateFunction> {
         Some(RowAggregateFunction::Sum)
     } else if name.eq_ignore_ascii_case("avg") {
         Some(RowAggregateFunction::Avg)
+    } else if name.eq_ignore_ascii_case("min") {
+        Some(RowAggregateFunction::Min)
+    } else if name.eq_ignore_ascii_case("max") {
+        Some(RowAggregateFunction::Max)
     } else if name.eq_ignore_ascii_case("collect") {
         Some(RowAggregateFunction::Collect)
     } else {
@@ -2892,6 +2898,8 @@ fn aggregate_function_name(function: RowAggregateFunction) -> &'static str {
         RowAggregateFunction::Count => "count",
         RowAggregateFunction::Sum => "sum",
         RowAggregateFunction::Avg => "avg",
+        RowAggregateFunction::Min => "min",
+        RowAggregateFunction::Max => "max",
         RowAggregateFunction::Collect => "collect",
     }
 }
@@ -3832,6 +3840,29 @@ mod tests {
                 Some(RowPredicate::StartsWith { ref prefix, .. }) if prefix == expected
             ));
         }
+    }
+
+    #[test]
+    fn lowers_min_and_max_aggregates() {
+        let min_query = "MATCH (s:Source) RETURN min(s.weight) AS min_val";
+        let parsed_min = parse_opencypher_row_query_with_parameters(min_query, &BTreeMap::new()).unwrap();
+        assert!(matches!(
+            parsed_min.projections.as_slice(),
+            [RowProjection::Aggregate {
+                function: RowAggregateFunction::Min,
+                expression: RowExpression::Property { ref binding, ref property },
+            }] if binding == "s" && property == "weight"
+        ));
+
+        let max_query = "MATCH (s:Source) RETURN max(s.weight) AS max_val";
+        let parsed_max = parse_opencypher_row_query_with_parameters(max_query, &BTreeMap::new()).unwrap();
+        assert!(matches!(
+            parsed_max.projections.as_slice(),
+            [RowProjection::Aggregate {
+                function: RowAggregateFunction::Max,
+                expression: RowExpression::Property { ref binding, ref property },
+            }] if binding == "s" && property == "weight"
+        ));
     }
 
     #[cfg(feature = "client-api")]

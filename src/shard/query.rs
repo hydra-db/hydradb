@@ -7866,6 +7866,8 @@ enum AggregateAccumulator {
     CountExpression(u64),
     Sum(u128),
     Avg { sum: u128, count: u64 },
+    Min(Option<QueryValue>),
+    Max(Option<QueryValue>),
     Collect(Vec<QueryValue>),
 }
 
@@ -8607,6 +8609,8 @@ fn new_aggregate_accumulator(projection: &RowProjection) -> Result<AggregateAccu
             RowAggregateFunction::Count => AggregateAccumulator::CountExpression(0),
             RowAggregateFunction::Sum => AggregateAccumulator::Sum(0),
             RowAggregateFunction::Avg => AggregateAccumulator::Avg { sum: 0, count: 0 },
+            RowAggregateFunction::Min => AggregateAccumulator::Min(None),
+            RowAggregateFunction::Max => AggregateAccumulator::Max(None),
             RowAggregateFunction::Collect => AggregateAccumulator::Collect(Vec::new()),
         },
         _ => {
@@ -8673,6 +8677,46 @@ fn apply_aggregate_projection(
             }
         }
         (
+            AggregateAccumulator::Min(min_val),
+            RowProjection::Aggregate {
+                function: RowAggregateFunction::Min,
+                expression,
+            },
+        ) => {
+            if let Some(value) = expression_query_value(row, expression)? {
+                if !matches!(value, QueryValue::Null) {
+                    match min_val {
+                        None => *min_val = Some(value),
+                        Some(current) => {
+                            if compare_query_values(&value, current) == std::cmp::Ordering::Less {
+                                *min_val = Some(value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (
+            AggregateAccumulator::Max(max_val),
+            RowProjection::Aggregate {
+                function: RowAggregateFunction::Max,
+                expression,
+            },
+        ) => {
+            if let Some(value) = expression_query_value(row, expression)? {
+                if !matches!(value, QueryValue::Null) {
+                    match max_val {
+                        None => *max_val = Some(value),
+                        Some(current) => {
+                            if compare_query_values(&value, current) == std::cmp::Ordering::Greater {
+                                *max_val = Some(value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (
             AggregateAccumulator::Collect(values),
             RowProjection::Aggregate {
                 function: RowAggregateFunction::Collect,
@@ -8726,6 +8770,9 @@ fn finalize_aggregate(state: &AggregateAccumulator) -> Result<QueryValue> {
         AggregateAccumulator::Avg { sum: _, count: 0 } => QueryValue::Null,
         AggregateAccumulator::Avg { sum, count } => {
             QueryValue::Float(QueryFloat(*sum as f64 / *count as f64))
+        }
+        AggregateAccumulator::Min(value) | AggregateAccumulator::Max(value) => {
+            value.clone().unwrap_or(QueryValue::Null)
         }
         AggregateAccumulator::Collect(values) => QueryValue::List(values.clone()),
     })
