@@ -860,7 +860,7 @@ async fn main() -> RuntimeResult<()> {
         max_wal_tail_files,
         ..GraphLimits::default()
     };
-    let admin_addr = env_value("GRAPH_INDEXER_ADMIN_ADDR", "0.0.0.0:9091").parse::<SocketAddr>()?;
+    let admin_addr = env_value("GRAPH_INDEXER_ADMIN_ADDR", "127.0.0.1:9091").parse::<SocketAddr>()?;
 
     let metrics = Arc::new(IndexerMetrics::default());
     let admin = IndexerAdminServer::bind(admin_addr, Arc::clone(&metrics)).await?;

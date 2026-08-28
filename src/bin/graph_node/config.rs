@@ -226,7 +226,7 @@ impl RuntimeConfig {
             writer_lease_duration,
             bolt_addr: parse_socket(&values, "GRAPH_BOLT_ADDR", "0.0.0.0:7687")?,
             http_addr: parse_socket(&values, "GRAPH_HTTP_ADDR", "0.0.0.0:8443")?,
-            admin_addr: parse_socket(&values, "GRAPH_ADMIN_ADDR", "0.0.0.0:9090")?,
+            admin_addr: parse_socket(&values, "GRAPH_ADMIN_ADDR", "127.0.0.1:9090")?,
             bolt_node_addresses,
             auth_token_file: PathBuf::from(value(
                 &values,
@@ -517,6 +517,10 @@ mod tests {
         assert_eq!(config.bolt_authentication_timeout, Duration::from_secs(30));
         assert_eq!(config.bolt_idle_timeout, Duration::from_secs(15 * 60));
         assert_eq!(config.bolt_max_connection_age, Duration::from_secs(60 * 60));
+        assert_eq!(
+            config.admin_addr,
+            "127.0.0.1:9090".parse().expect("admin addr")
+        );
         let memory = config.graph_memory_config();
         assert_eq!(memory.max_graphblas_bytes, 128 * 1024 * 1024);
         assert_eq!(memory.max_matrix_adjacency_bytes, 0);

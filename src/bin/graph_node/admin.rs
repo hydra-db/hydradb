@@ -596,6 +596,7 @@ impl AdminServer {
 
     fn serve(listener: TcpListener, local_addr: SocketAddr, state: AdminState) -> Result<Self> {
         let router = Router::new()
+            // Bind address is chosen by GRAPH_ADMIN_ADDR; default is loopback-only.
             .route("/livez", get(live))
             .route("/readyz", get(readiness))
             .route("/metrics", get(metrics))

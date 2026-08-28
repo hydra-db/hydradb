@@ -148,9 +148,15 @@ docker run --rm \
   -e GRAPH_DATA_CACHE_DIR=/data/cache \
   -e GRAPH_AUTH_TOKEN_FILE=/data/auth-token \
   -e GRAPH_ALLOW_PLAINTEXT=true \
+  -e GRAPH_ADMIN_ADDR=0.0.0.0:9090 \
   -e RUST_MIN_STACK=33554432 \
   ghcr.io/hydra-db/hydradb:latest
 ```
+
+`GRAPH_ADMIN_ADDR=0.0.0.0:9090` is required here so `-p 9090:9090` can reach the
+admin server from the host. The binary defaults to `127.0.0.1:9090`, which keeps
+`/metrics` and `/readyz` off the LAN unless you opt in. Do not publish the admin
+port on untrusted networks without a firewall or NetworkPolicy in front of it.
 
 The node runs in the foreground. `LOCAL_PATH` must point at a directory that
 already exists, which is why `hydradb-data/store` is created before the mount.
