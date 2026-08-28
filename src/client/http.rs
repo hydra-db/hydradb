@@ -413,6 +413,29 @@ impl HttpApiError {
                 owner: owner.clone(),
                 authenticate: false,
             },
+            GraphError::IdempotencyConflict { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "idempotency_conflict",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
+            GraphError::ConditionalWriteConflict { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "write_conflict",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
+            GraphError::ReadOnlyShardStorage
+            | GraphError::UnsafeDurabilityConfig { .. }
+            | GraphError::RoutedWriterConfigMismatch { .. } => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_configuration",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
             GraphError::InvalidKeyComponent { .. }
             | GraphError::GraphScopeMismatch { .. }
             | GraphError::MissingQueryParameter { .. }
