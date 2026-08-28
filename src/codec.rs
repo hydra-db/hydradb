@@ -604,7 +604,7 @@ fn hex_decode(key: &str, text: &str) -> Result<Vec<u8>> {
         });
     }
     let mut bytes = Vec::with_capacity(text.len() / 2);
-    for pair in text.as_bytes().chunks_exact(2) {
+    for pair in text.as_bytes().as_chunks::<2>().0 {
         let high = hex_value(pair[0]).ok_or_else(|| GraphError::CorruptValue {
             key: key.to_string(),
             reason: format!("invalid hex digit {}", pair[0] as char),
@@ -750,13 +750,8 @@ pub(crate) fn decode_out_edge_segment(key: &str, value: &[u8]) -> Result<OutEdge
         });
     }
     let mut destinations = Vec::with_capacity(expected_count);
-    for chunk in edge_bytes.chunks_exact(8) {
-        destinations.push(u64::from_be_bytes(chunk.try_into().map_err(|_| {
-            GraphError::CorruptValue {
-                key: key.to_string(),
-                reason: "invalid graph-out-segment destination bytes".to_string(),
-            }
-        })?));
+    for chunk in edge_bytes.as_chunks::<8>().0 {
+        destinations.push(u64::from_be_bytes(*chunk));
     }
     Ok(OutEdgeSegment {
         cell_id,

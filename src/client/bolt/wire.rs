@@ -27,8 +27,8 @@ where
     }
     let mut proposals = [0_u8; 16];
     stream.read_exact(&mut proposals).await?;
-    for proposal in proposals.chunks_exact(4) {
-        if proposal == BOLT_MANIFEST_V1 {
+    for proposal in proposals.as_chunks::<4>().0 {
+        if *proposal == BOLT_MANIFEST_V1 {
             stream.write_all(&BOLT_MANIFEST_V1).await?;
             write_varint(stream, 1).await?;
             stream.write_all(&[0, 3, 4, 5]).await?;

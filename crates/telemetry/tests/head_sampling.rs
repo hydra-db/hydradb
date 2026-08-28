@@ -23,12 +23,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hydradb_telemetry::sampling::HydraDBSampler;
+use hydradb_telemetry::semconv;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanProcessor};
 use tracing_subscriber::layer::SubscriberExt;
-use hydradb_telemetry::sampling::HydraDBSampler;
-use hydradb_telemetry::semconv;
 
 /// Collects whatever survives sampling.
 #[derive(Debug, Default, Clone)]
@@ -79,10 +79,8 @@ fn exported_spans(ratio: f64, body: impl FnOnce()) -> Vec<String> {
 #[test]
 fn a_force_recorded_after_the_span_starts_cannot_keep_the_trace() {
     let exported = exported_spans(0.0, || {
-        let span = tracing::info_span!(
-            "query.plan",
-            hydradb.sampling.force = tracing::field::Empty,
-        );
+        let span =
+            tracing::info_span!("query.plan", hydradb.sampling.force = tracing::field::Empty,);
         let entered = span.enter();
         // …the planner runs, and only now is the verdict known…
         span.record("hydradb.sampling.force", true);

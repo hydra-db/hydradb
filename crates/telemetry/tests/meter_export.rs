@@ -40,7 +40,6 @@ use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMe
 use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
 
-use opentelemetry::metrics::MeterProvider as _;
 use hydradb_telemetry::meter::{
     CounterSpec, CounterUnit, HistogramSpec, HistogramUnit, ObservableCounter, ObservableHistogram,
     LE_INFINITY,
@@ -50,6 +49,7 @@ use hydradb_telemetry::semconv::{
     L_DB_SYSTEM_NAME,
 };
 use hydradb_telemetry::{ServiceIdentity, TelemetryConfig};
+use opentelemetry::metrics::MeterProvider as _;
 
 /// One exported series, flattened to what the assertions are about.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]

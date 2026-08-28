@@ -20,6 +20,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use config::RuntimeConfig;
+use hydradb_placement::heartbeat::{delete_heartbeat, put_heartbeat, validate_node_id, Heartbeat};
+use hydradb_placement::liveness::HeartbeatAction;
+use hydradb_telemetry::{ServiceIdentity, TelemetryConfig};
 use readiness::NodeReadiness;
 use slatedb::object_store::{path::Path, ObjectStore};
 use slatedb_graph_kernel::{
@@ -29,9 +32,6 @@ use slatedb_graph_kernel::{
     ObjectStoreNodeDirectory, PlacementConfig, PlacementView, QueryTransportAction,
     QueryTransportScopeGrant, ScopedRoutedGraphCluster, StaticQueryTransportScopeAuthorizer,
 };
-use hydradb_placement::heartbeat::{delete_heartbeat, put_heartbeat, validate_node_id, Heartbeat};
-use hydradb_placement::liveness::HeartbeatAction;
-use hydradb_telemetry::{ServiceIdentity, TelemetryConfig};
 
 type RuntimeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

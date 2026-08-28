@@ -880,9 +880,7 @@ pub const OTEL_COUNTERS: &[OtelCounter] = &[
     OtelCounter {
         source: CounterSource::ShardCache,
         field: "relationship_property_rows_misses",
-        export: OtelCounterExport::PerCell(
-            "hydradb.shard.cache.relationship_property_rows.misses",
-        ),
+        export: OtelCounterExport::PerCell("hydradb.shard.cache.relationship_property_rows.misses"),
     },
     OtelCounter {
         source: CounterSource::ShardCache,
@@ -2189,8 +2187,9 @@ mod tests {
                 .any(|label| label.key() == "db.namespace"),
             "db.namespace became a metric label"
         );
-        assert!(hydradb_telemetry::semconv::SPAN_ONLY_KEYS
-            .contains(&hydradb_telemetry::semconv::SCOPE));
+        assert!(
+            hydradb_telemetry::semconv::SPAN_ONLY_KEYS.contains(&hydradb_telemetry::semconv::SCOPE)
+        );
     }
 
     /// `le` is the join between the two exports. The seconds rendering is the

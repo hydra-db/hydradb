@@ -728,8 +728,10 @@ fn decode_index_u64s(key: &str, value: &[u8], cursor: &mut usize, field: &str) -
         })?;
     *cursor = end;
     Ok(bytes
-        .chunks_exact(std::mem::size_of::<u64>())
-        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("u64 byte width")))
+        .as_chunks::<{ std::mem::size_of::<u64>() }>()
+        .0
+        .iter()
+        .map(|chunk| u64::from_le_bytes(*chunk))
         .collect())
 }
 

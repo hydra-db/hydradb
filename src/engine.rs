@@ -1807,7 +1807,9 @@ fn decode_binary_u64s(
         field,
     )?;
     bytes
-        .chunks_exact(std::mem::size_of::<u64>())
+        .as_chunks::<{ std::mem::size_of::<u64>() }>()
+        .0
+        .iter()
         .map(|chunk| decode_binary_u64_bytes(key, chunk, field))
         .collect()
 }
@@ -1831,7 +1833,7 @@ fn decode_binary_u32s_from_u64s(
         field,
     )?;
     let mut out = Vec::with_capacity(len);
-    for chunk in bytes.chunks_exact(std::mem::size_of::<u64>()) {
+    for chunk in bytes.as_chunks::<{ std::mem::size_of::<u64>() }>().0 {
         let value = decode_binary_u64_bytes(key, chunk, field)?;
         out.push(u32::try_from(value).map_err(|_| GraphError::CorruptValue {
             key: key.to_string(),
