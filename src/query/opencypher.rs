@@ -247,6 +247,14 @@ pub enum RowPredicate {
         expression: RowExpression,
         prefix: String,
     },
+    EndsWith {
+        expression: RowExpression,
+        suffix: String,
+    },
+    Contains {
+        expression: RowExpression,
+        substring: String,
+    },
     And(Box<RowPredicate>, Box<RowPredicate>),
     Or(Box<RowPredicate>, Box<RowPredicate>),
     Not(Box<RowPredicate>),
@@ -2775,6 +2783,28 @@ fn lower_row_predicate(
                     prefix,
                 });
             }
+            if op == sys::CYPHER_OP_ENDS_WITH {
+                let RowExpression::Literal(VertexPropertyValue::String(suffix)) =
+                    lower_row_expression(right, parameters)?
+                else {
+                    return unsupported("ENDS WITH requires a string literal or parameter");
+                };
+                return Ok(RowPredicate::EndsWith {
+                    expression: lower_row_expression(left, parameters)?,
+                    suffix,
+                });
+            }
+            if op == sys::CYPHER_OP_CONTAINS {
+                let RowExpression::Literal(VertexPropertyValue::String(substring)) =
+                    lower_row_expression(right, parameters)?
+                else {
+                    return unsupported("CONTAINS requires a string literal or parameter");
+                };
+                return Ok(RowPredicate::Contains {
+                    expression: lower_row_expression(left, parameters)?,
+                    substring,
+                });
+            }
             if let Ok(op) = row_comparison_op(op) {
                 return Ok(RowPredicate::Compare {
                     left: lower_row_expression(left, parameters)?,
@@ -3832,6 +3862,72 @@ mod tests {
                 Some(RowPredicate::StartsWith { ref prefix, .. }) if prefix == expected
             ));
         }
+    }
+
+    #[test]
+    fn lowers_ends_with_string_predicate() {
+        let parameters = BTreeMap::from([(
+            "suffix".to_string(),
+            VertexPropertyValue::String("-hydra".to_string()),
+        )]);
+        let parsed = parse_opencypher_row_query_with_parameters(
+            "MATCH (s:Source) WHERE s.name ENDS WITH $suffix RETURN s.id",
+            &parameters,
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.predicate,
+            Some(RowPredicate::EndsWith {
+                expression: RowExpression::Property { ref binding, ref property },
+                ref suffix,
+            }) if binding == "s" && property == "name" && suffix == "-hydra"
+        ));
+    }
+
+    #[test]
+    fn lowers_contains_string_predicate() {
+        let parameters = BTreeMap::from([(
+            "substring".to_string(),
+            VertexPropertyValue::String("ydr".to_string()),
+        )]);
+        let parsed = parse_opencypher_row_query_with_parameters(
+            "MATCH (s:Source) WHERE s.name CONTAINS $substring RETURN s.id",
+            &parameters,
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.predicate,
+            Some(RowPredicate::Contains {
+                expression: RowExpression::Property { ref binding, ref property },
+                ref substring,
+            }) if binding == "s" && property == "name" && substring == "ydr"
+        ));
+    }
+
+    #[test]
+    fn ends_with_accepts_literal_on_right() {
+        let parsed = parse_opencypher_row_query_with_parameters(
+            "MATCH (s:Source) WHERE s.name ENDS WITH \"db\" RETURN s.id",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.predicate,
+            Some(RowPredicate::EndsWith { ref suffix, .. }) if suffix == "db"
+        ));
+    }
+
+    #[test]
+    fn contains_accepts_literal_on_right() {
+        let parsed = parse_opencypher_row_query_with_parameters(
+            "MATCH (s:Source) WHERE s.name CONTAINS \"ydr\" RETURN s.id",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.predicate,
+            Some(RowPredicate::Contains { ref substring, .. }) if substring == "ydr"
+        ));
     }
 
     #[cfg(feature = "client-api")]

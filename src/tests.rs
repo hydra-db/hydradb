@@ -11894,6 +11894,106 @@ async fn cypher_starts_with_uses_current_index_and_rejects_graph_epoch_replay() 
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_ends_with_filters_vertices_by_suffix() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-ends-with", object_store).await;
+
+    for (vertex, value) in [(1, "hydradb"), (2, "slatedb"), (3, "rocksdb")] {
+        shard
+            .set_vertex_metadata(
+                "cell-0",
+                vertex,
+                VertexMetadata::default()
+                    .with_label("Source")
+                    .with_property("name", VertexPropertyValue::String(value.to_string())),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "ends-with-db")
+                .with_parameter("suffix", VertexPropertyValue::String("db".to_string())),
+            "MATCH (s:Source) WHERE s.name ENDS WITH $suffix RETURN s.id ORDER BY s.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(1)]),
+            QueryRow::new(vec![QueryValue::VertexId(2)]),
+            QueryRow::new(vec![QueryValue::VertexId(3)]),
+        ]
+    );
+
+    let rows_literal = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "ends-with-literal"),
+            "MATCH (s:Source) WHERE s.name ENDS WITH \"slatedb\" RETURN s.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_literal.rows,
+        vec![QueryRow::new(vec![QueryValue::VertexId(2)])]
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_contains_filters_vertices_by_substring() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-contains", object_store).await;
+
+    for (vertex, value) in [(1, "hydradb"), (2, "hydra-graph"), (3, "slatedb")] {
+        shard
+            .set_vertex_metadata(
+                "cell-0",
+                vertex,
+                VertexMetadata::default()
+                    .with_label("Source")
+                    .with_property("name", VertexPropertyValue::String(value.to_string())),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "contains-hydra")
+                .with_parameter(
+                    "substring",
+                    VertexPropertyValue::String("hydra".to_string()),
+                ),
+            "MATCH (s:Source) WHERE s.name CONTAINS $substring RETURN s.id ORDER BY s.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(1)]),
+            QueryRow::new(vec![QueryValue::VertexId(2)]),
+        ]
+    );
+
+    let rows_literal = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "contains-literal"),
+            "MATCH (s:Source) WHERE s.name CONTAINS \"slate\" RETURN s.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_literal.rows,
+        vec![QueryRow::new(vec![QueryValue::VertexId(3)])]
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_tck_style_row_corpus_covers_supported_clause_semantics() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-tck-style-corpus", object_store).await;

@@ -66,19 +66,23 @@ when omitted, and must not exceed the maximum.
 
 Boolean combinations of property comparisons, using `AND`, `OR` and `NOT`.
 
-Comparison operators: `=`, `<>`, `<`, `>`, `<=`, `>=`, and `STARTS WITH`.
+Comparison operators: `=`, `<>`, `<`, `>`, `<=`, `>=`, `STARTS WITH`, `ENDS WITH`,
+and `CONTAINS`.
 
 ```cypher
 MATCH (s:Score) WHERE s.score > 3.0 RETURN s.id AS score_id ORDER BY score_id
 MATCH (s:S) WHERE s.a = 1 AND (s.b > 2 OR NOT s.c = 3) RETURN s.id
 MATCH (s:Source) WHERE s.thread_id STARTS WITH $prefix RETURN s.id
+MATCH (s:Source) WHERE s.name ENDS WITH $suffix RETURN s.id
+MATCH (s:Source) WHERE s.name CONTAINS $substring RETURN s.id
 ```
 
-`STARTS WITH` needs a string literal or a parameter on the right.
+`STARTS WITH`, `ENDS WITH`, and `CONTAINS` each need a string literal or a
+parameter on the right. All three are case-sensitive. `STARTS WITH` accelerates
+through a string-property index when the query shape allows it; `ENDS WITH` and
+`CONTAINS` always scan.
 
-`IN`, `ENDS WITH`, `CONTAINS` and `IS NULL` are not supported. All four are
-rejected with the same message, that `WHERE` supports boolean combinations of
-property comparisons.
+`IN` and `IS NULL` are not supported.
 
 ### RETURN
 
@@ -263,7 +267,7 @@ Rejected at parse time, with the reason in the error:
 - `WITH` that aliases, filters, orders, or drops a binding
 - Aggregate arguments marked `DISTINCT`, and `count(DISTINCT *)`
 - Aggregates beyond `count`, `sum`, `avg` and `collect`, so no `min` or `max`
-- `IN`, `ENDS WITH`, `CONTAINS` and `IS NULL` in `WHERE`
+- `IN` and `IS NULL` in `WHERE` (use `STARTS WITH`, `ENDS WITH`, or `CONTAINS` for string filtering)
 - `MATCH` hints
 - Nested unions, mixed `UNION` and `UNION ALL`, and unions containing writes
 - Variable-length relationships in `CREATE` and `MERGE`
