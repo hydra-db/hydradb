@@ -5555,6 +5555,83 @@ async fn query_windows_bound_neighbor_results() {
     shard.close().await.unwrap();
 }
 
+/// One vertex can appear in many rows, so a row-shaped result is not bounded by
+/// a vertex count. Two sources converging on each target give four pairs per
+/// target: eight rows naming two vertices, and only the row cap may reject them.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn row_results_answer_to_the_row_cap_not_the_vertex_cap() {
+    async fn seeded(path: &str, limits: GraphLimits) -> GraphShard {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard = GraphShard::open_standalone_writer_with_limits(path, object_store, limits)
+            .await
+            .unwrap();
+        for (idx, (src, dst)) in [(1, 2), (1, 3), (4, 2), (4, 3)].into_iter().enumerate() {
+            shard
+                .write_edge(typed_mutation(
+                    "cell-a",
+                    "E",
+                    src,
+                    dst,
+                    &format!("row-cap-{idx}"),
+                ))
+                .await
+                .unwrap();
+        }
+        shard.build_graph_index("cell-a", "E").await.unwrap();
+        shard
+    }
+
+    const EIGHT_ROWS_TWO_VERTICES: &str = "MATCH (a)-[:E]->(t)<-[:E]-(b) RETURN t.id AS id";
+
+    let allowed = seeded(
+        "graph/row-cap-vertex-tight",
+        GraphLimits {
+            max_query_result_vertices: 3,
+            max_query_result_rows: 100,
+            ..GraphLimits::default()
+        },
+    )
+    .await
+    .execute_cypher_rows(
+        QueryContext::new("cell-a", "vertex-cap-tight"),
+        EIGHT_ROWS_TWO_VERTICES,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        allowed.rows.len(),
+        8,
+        "eight rows naming two vertices must survive a vertex cap of three"
+    );
+
+    let rejected = seeded(
+        "graph/row-cap-row-tight",
+        GraphLimits {
+            max_query_result_vertices: 100,
+            max_query_result_rows: 3,
+            ..GraphLimits::default()
+        },
+    )
+    .await
+    .execute_cypher_rows(
+        QueryContext::new("cell-a", "row-cap-tight"),
+        EIGHT_ROWS_TWO_VERTICES,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            rejected,
+            GraphError::AdmissionRejected {
+                operation: "query_result_rows",
+                ..
+            }
+        ),
+        "the row cap must be what rejects a row result, got {rejected:?}"
+    );
+}
+
 #[cfg(feature = "query-transport")]
 async fn test_read_transport_json(
     reader: &mut tokio::io::BufReader<tokio::net::TcpStream>,

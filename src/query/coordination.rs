@@ -3182,7 +3182,7 @@ impl QueryCellClient for RoutedGraphCluster {
                 crate::codec::ensure_limit(
                     "query_batch_result_rows",
                     row_count as u64,
-                    shard.limits.max_query_result_vertices as u64,
+                    shard.limits.max_query_result_rows as u64,
                 )?;
                 let mut rows = Vec::with_capacity(row_count);
                 let mut result_bytes = 0_u64;

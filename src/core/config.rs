@@ -21,6 +21,14 @@ pub struct GraphLimits {
     pub max_traversal_hops: u8,
     pub max_artifact_build_edges: u64,
     pub max_query_result_vertices: usize,
+    /// Cap on rows returned by a single query.
+    ///
+    /// Distinct from [`GraphLimits::max_query_result_vertices`]: one vertex can
+    /// appear in many rows, so a row-shaped result is not bounded by a vertex
+    /// count. Row paths that reported `query_result_rows` and
+    /// `query_batch_result_rows` were previously measured against the vertex
+    /// cap, which rejected wide results that named very few vertices.
+    pub max_query_result_rows: usize,
     pub max_query_intermediate_rows: usize,
     pub max_query_index_candidates: usize,
     pub max_query_scan_edges: u64,
@@ -45,6 +53,7 @@ impl Default for GraphLimits {
             max_traversal_hops: 16,
             max_artifact_build_edges: 10_000_000,
             max_query_result_vertices: 100_000,
+            max_query_result_rows: 100_000,
             max_query_intermediate_rows: 250_000,
             max_query_index_candidates: 250_000,
             max_query_scan_edges: 1_000_000,
