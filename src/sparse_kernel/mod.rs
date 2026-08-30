@@ -754,6 +754,180 @@ mod tests {
         assert_eq!(compact.edge_visits, rust.edge_visits);
     }
 
+    /// Deterministic xorshift so a failure names a reproducible seed.
+    fn seeded_rng(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed | 1;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
+    }
+
+    /// A pseudo-random graph reaching shapes `test_adjacency` never takes: self
+    /// loops, cycles back into the start set, and dense fan-out.
+    fn random_adjacency(rng: &mut impl FnMut() -> u64, vertices: u64, edges: usize) -> Adjacency {
+        let mut adjacency: Adjacency = BTreeMap::new();
+        for _ in 0..edges {
+            adjacency
+                .entry(rng() % vertices)
+                .or_default()
+                .insert(rng() % vertices);
+        }
+        adjacency
+    }
+
+    /// Starts drawn from vertices the graph actually mentions.
+    ///
+    /// A start with no edges at all is deliberately out of scope here: the three
+    /// kernels disagree about whether a zero-hop range returns it, which is
+    /// tracked separately. Keeping it out leaves this covering the shapes where
+    /// the kernels are expected to agree today.
+    fn random_starts(
+        rng: &mut impl FnMut() -> u64,
+        adjacency: &Adjacency,
+        count: u64,
+    ) -> Vec<VertexId> {
+        let known: Vec<VertexId> = adjacency
+            .iter()
+            .flat_map(|(src, dsts)| std::iter::once(*src).chain(dsts.iter().copied()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        (0..count)
+            .map(|_| known[(rng() % known.len() as u64) as usize])
+            .collect()
+    }
+
+    /// The module header claims all three kernels agree on results. The fixed
+    /// fixture checks that on one hand-written graph at one depth, so this
+    /// checks it across randomised graphs at every depth including zero.
+    #[test]
+    fn every_kernel_agrees_on_randomised_graphs() {
+        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
+        for seed in 1..=32_u64 {
+            let mut rng = seeded_rng(seed);
+            let vertices = 2 + seed % 17;
+            let adjacency = random_adjacency(&mut rng, vertices, 4 + (seed as usize % 40));
+            let starts = random_starts(&mut rng, &adjacency, 1 + seed % 3);
+
+            for hops in 0..=3_u8 {
+                let rust = expand(&adjacency, &starts, hops, SparseKernelBackend::Adjacency)
+                    .expect("adjacency expansion should succeed");
+                for backend in [
+                    SparseKernelBackend::CompactCsc,
+                    SparseKernelBackend::SuiteSparse,
+                ] {
+                    let other = expand(&adjacency, &starts, hops, backend)
+                        .expect("compiled expansion should succeed");
+                    assert_eq!(
+                        other.vertices, rust.vertices,
+                        "seed {seed} hops {hops} {backend:?} disagreed on vertices"
+                    );
+                    assert_eq!(
+                        other.edge_visits, rust.edge_visits,
+                        "seed {seed} hops {hops} {backend:?} disagreed on edge visits"
+                    );
+                }
+            }
+
+            for (min_hops, max_hops) in [(0, 2_u8), (1, 3), (2, 2)] {
+                let rust = expand_range(
+                    &adjacency,
+                    &starts,
+                    min_hops,
+                    max_hops,
+                    SparseKernelBackend::Adjacency,
+                )
+                .expect("adjacency range expansion should succeed");
+                for backend in [
+                    SparseKernelBackend::CompactCsc,
+                    SparseKernelBackend::SuiteSparse,
+                ] {
+                    let other = expand_range(&adjacency, &starts, min_hops, max_hops, backend)
+                        .expect("compiled range expansion should succeed");
+                    assert_eq!(
+                        other.vertices, rust.vertices,
+                        "seed {seed} range {min_hops}..{max_hops} {backend:?} disagreed"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Counts and edge membership exist only on the compiled rungs, so kernel 1
+    /// cannot be their oracle and nothing currently compares them to anything.
+    /// Check the two compiled kernels against each other, counts against the
+    /// materialised set, and membership against the source adjacency.
+    #[cfg(feature = "opencypher")]
+    #[test]
+    fn compiled_kernels_agree_on_counts_and_edge_membership() {
+        let _guard = REPLICA_ENV_LOCK.lock().expect("env lock poisoned");
+        for seed in 1..=32_u64 {
+            let mut rng = seeded_rng(seed.wrapping_mul(0x9e37_79b9));
+            let vertices = 2 + seed % 17;
+            let adjacency = random_adjacency(&mut rng, vertices, 4 + (seed as usize % 40));
+            let starts = random_starts(&mut rng, &adjacency, 1 + seed % 3);
+
+            let compact = compile_graphblas_matrix(&adjacency, SparseKernelBackend::CompactCsc)
+                .expect("compact CSC compile should succeed");
+            let suitesparse =
+                compile_graphblas_matrix(&adjacency, SparseKernelBackend::SuiteSparse)
+                    .expect("SuiteSparse compile should succeed");
+
+            for (min_hops, max_hops) in [(0, 2_u8), (1, 3), (2, 2)] {
+                let compact_count = expand_range_count_compiled_graphblas(
+                    &compact, &adjacency, &starts, min_hops, max_hops,
+                )
+                .expect("compact CSC count should succeed");
+                let suitesparse_count = expand_range_count_compiled_graphblas(
+                    &suitesparse,
+                    &adjacency,
+                    &starts,
+                    min_hops,
+                    max_hops,
+                )
+                .expect("SuiteSparse count should succeed");
+                assert_eq!(
+                    compact_count.vertices, suitesparse_count.vertices,
+                    "seed {seed} range {min_hops}..{max_hops} counts disagreed"
+                );
+
+                let materialized = expand_range_compiled_graphblas(
+                    &suitesparse,
+                    &adjacency,
+                    &starts,
+                    min_hops,
+                    max_hops,
+                )
+                .expect("SuiteSparse range expansion should succeed");
+                assert_eq!(
+                    suitesparse_count.vertices,
+                    materialized.vertices.len() as u64,
+                    "seed {seed} range {min_hops}..{max_hops} count left the materialised set"
+                );
+            }
+
+            for src in 0..vertices {
+                for dst in 0..vertices {
+                    let present = adjacency
+                        .get(&src)
+                        .is_some_and(|neighbors| neighbors.contains(&dst));
+                    for (name, compiled) in
+                        [("compact CSC", &compact), ("SuiteSparse", &suitesparse)]
+                    {
+                        assert_eq!(
+                            compiled_graphblas_contains_edge(compiled, src, dst),
+                            present,
+                            "seed {seed} {name} disagreed on edge {src} -> {dst}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // The legacy `GRAPH_COMPILED_KERNEL` override is deliberately not exercised
     // here: it is process-global and would race concurrent shard tests.
     #[test]
