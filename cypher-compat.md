@@ -74,11 +74,9 @@ MATCH (s:S) WHERE s.a = 1 AND (s.b > 2 OR NOT s.c = 3) RETURN s.id
 MATCH (s:Source) WHERE s.thread_id STARTS WITH $prefix RETURN s.id
 ```
 
-`STARTS WITH` needs a string literal or a parameter on the right.
+`STARTS WITH` needs a string literal or a parameter on the right. `IS NULL` and `IS NOT NULL` test property absence or presence.
 
-`IN`, `ENDS WITH`, `CONTAINS` and `IS NULL` are not supported. All four are
-rejected with the same message, that `WHERE` supports boolean combinations of
-property comparisons.
+`IN` is not supported. It is rejected with the message that `WHERE` supports boolean combinations of property comparisons.
 
 ### RETURN
 
@@ -263,7 +261,7 @@ Rejected at parse time, with the reason in the error:
 - `WITH` that aliases, filters, orders, or drops a binding
 - Aggregate arguments marked `DISTINCT`, and `count(DISTINCT *)`
 - Aggregates beyond `count`, `sum`, `avg` and `collect`, so no `min` or `max`
-- `IN`, `ENDS WITH`, `CONTAINS` and `IS NULL` in `WHERE`
+- `IN` in `WHERE`
 - `MATCH` hints
 - Nested unions, mixed `UNION` and `UNION ALL`, and unions containing writes
 - Variable-length relationships in `CREATE` and `MERGE`

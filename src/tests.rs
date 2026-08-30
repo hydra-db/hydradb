@@ -11894,6 +11894,60 @@ async fn cypher_starts_with_uses_current_index_and_rejects_graph_epoch_replay() 
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_is_null_and_is_not_null_predicates_filter_rows_correctly() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-is-null-predicates", object_store).await;
+
+    shard
+        .set_vertex_metadata(
+            "cell-0",
+            1,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("name", VertexPropertyValue::String("alice".to_string()))
+                .with_property("email", VertexPropertyValue::String("alice@example.com".to_string())),
+        )
+        .await
+        .unwrap();
+
+    shard
+        .set_vertex_metadata(
+            "cell-0",
+            2,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("name", VertexPropertyValue::String("bob".to_string())),
+        )
+        .await
+        .unwrap();
+
+    let not_null = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "is-not-null-query"),
+            "MATCH (u:User) WHERE u.email IS NOT NULL RETURN u.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        not_null.rows,
+        vec![QueryRow::new(vec![QueryValue::VertexId(1)])]
+    );
+
+    let is_null = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "is-null-query"),
+            "MATCH (u:User) WHERE u.email IS NULL RETURN u.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        is_null.rows,
+        vec![QueryRow::new(vec![QueryValue::VertexId(2)])]
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_tck_style_row_corpus_covers_supported_clause_semantics() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-tck-style-corpus", object_store).await;

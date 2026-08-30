@@ -247,6 +247,8 @@ pub enum RowPredicate {
         expression: RowExpression,
         prefix: String,
     },
+    IsNull(RowExpression),
+    IsNotNull(RowExpression),
     And(Box<RowPredicate>, Box<RowPredicate>),
     Or(Box<RowPredicate>, Box<RowPredicate>),
     Not(Box<RowPredicate>),
@@ -2792,6 +2794,14 @@ fn lower_row_predicate(
                     arg, parameters,
                 )?)));
             }
+            if op == sys::CYPHER_OP_IS_NULL {
+                let arg = checked_node(sys::cypher_ast_unary_operator_get_argument(predicate))?;
+                return Ok(RowPredicate::IsNull(lower_row_expression(arg, parameters)?));
+            }
+            if op == sys::CYPHER_OP_IS_NOT_NULL {
+                let arg = checked_node(sys::cypher_ast_unary_operator_get_argument(predicate))?;
+                return Ok(RowPredicate::IsNotNull(lower_row_expression(arg, parameters)?));
+            }
         }
     }
     unsupported("WHERE currently supports boolean combinations of property comparisons")
@@ -3832,6 +3842,25 @@ mod tests {
                 Some(RowPredicate::StartsWith { ref prefix, .. }) if prefix == expected
             ));
         }
+    }
+
+    #[test]
+    fn lowers_is_null_and_is_not_null_predicates() {
+        let is_null_query = "MATCH (s:Source) WHERE s.deleted_at IS NULL RETURN s.id";
+        let parsed_null = parse_opencypher_row_query_with_parameters(is_null_query, &BTreeMap::new()).unwrap();
+        assert!(matches!(
+            parsed_null.predicate,
+            Some(RowPredicate::IsNull(RowExpression::Property { ref binding, ref property }))
+                if binding == "s" && property == "deleted_at"
+        ));
+
+        let is_not_null_query = "MATCH (s:Source) WHERE s.email IS NOT NULL RETURN s.id";
+        let parsed_not_null = parse_opencypher_row_query_with_parameters(is_not_null_query, &BTreeMap::new()).unwrap();
+        assert!(matches!(
+            parsed_not_null.predicate,
+            Some(RowPredicate::IsNotNull(RowExpression::Property { ref binding, ref property }))
+                if binding == "s" && property == "email"
+        ));
     }
 
     #[cfg(feature = "client-api")]

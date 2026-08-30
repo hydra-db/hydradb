@@ -8066,6 +8066,18 @@ fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<b
                 RowScalarValue::Value(_) | RowScalarValue::Missing => false,
             }
         }
+        RowPredicate::IsNull(expression) => {
+            match eval_row_expression(row, expression)? {
+                RowScalarValue::Missing => true,
+                RowScalarValue::Value(_) => false,
+            }
+        }
+        RowPredicate::IsNotNull(expression) => {
+            match eval_row_expression(row, expression)? {
+                RowScalarValue::Missing => false,
+                RowScalarValue::Value(_) => true,
+            }
+        }
         RowPredicate::And(left, right) => {
             row_predicate_matches(row, left)? && row_predicate_matches(row, right)?
         }
@@ -8100,7 +8112,10 @@ fn predicate_guarantees_string_property(
             predicate_guarantees_string_property(left, binding, property)
                 && predicate_guarantees_string_property(right, binding, property)
         }
-        RowPredicate::Compare { .. } | RowPredicate::Not(_) => false,
+        RowPredicate::Compare { .. }
+        | RowPredicate::IsNull(_)
+        | RowPredicate::IsNotNull(_)
+        | RowPredicate::Not(_) => false,
     }
 }
 
@@ -8194,7 +8209,11 @@ pub(super) fn row_predicate_relationship_property_constraint(
             }
             Some(left)
         }
-        RowPredicate::Compare { .. } | RowPredicate::StartsWith { .. } | RowPredicate::Not(_) => {
+        RowPredicate::Compare { .. }
+        | RowPredicate::StartsWith { .. }
+        | RowPredicate::IsNull(_)
+        | RowPredicate::IsNotNull(_)
+        | RowPredicate::Not(_) => {
             None
         }
     }
