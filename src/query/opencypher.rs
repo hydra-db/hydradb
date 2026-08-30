@@ -247,6 +247,10 @@ pub enum RowPredicate {
         expression: RowExpression,
         prefix: String,
     },
+    In {
+        expression: RowExpression,
+        values: Vec<VertexPropertyValue>,
+    },
     And(Box<RowPredicate>, Box<RowPredicate>),
     Or(Box<RowPredicate>, Box<RowPredicate>),
     Not(Box<RowPredicate>),
@@ -2775,6 +2779,12 @@ fn lower_row_predicate(
                     prefix,
                 });
             }
+            if op == sys::CYPHER_OP_IN {
+                return Ok(RowPredicate::In {
+                    expression: lower_row_expression(left, parameters)?,
+                    values: lower_row_list_values(right, parameters)?,
+                });
+            }
             if let Ok(op) = row_comparison_op(op) {
                 return Ok(RowPredicate::Compare {
                     left: lower_row_expression(left, parameters)?,
@@ -2837,6 +2847,24 @@ fn lower_row_expression(
     Ok(RowExpression::Literal(scalar_property_value(
         expression, parameters,
     )?))
+}
+
+fn lower_row_list_values(
+    node: *const AstNode,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<Vec<VertexPropertyValue>> {
+    unsafe {
+        if is_instance(node, sys::CYPHER_AST_COLLECTION) {
+            let count = sys::cypher_ast_collection_nelements(node);
+            let mut values = Vec::with_capacity(count as usize);
+            for idx in 0..count {
+                let elem = checked_node(sys::cypher_ast_collection_get_element(node, idx))?;
+                values.push(scalar_property_value(elem, parameters)?);
+            }
+            return Ok(values);
+        }
+    }
+    unsupported("IN predicate requires a list literal of property values")
 }
 
 fn lower_row_aggregate_expression(
@@ -3832,6 +3860,24 @@ mod tests {
                 Some(RowPredicate::StartsWith { ref prefix, .. }) if prefix == expected
             ));
         }
+    }
+
+    #[test]
+    fn lowers_in_collection_predicate() {
+        let query = "MATCH (s:Source) WHERE s.role IN ['admin', 'moderator'] RETURN s.id";
+        let parsed = parse_opencypher_row_query_with_parameters(query, &BTreeMap::new()).unwrap();
+        assert!(matches!(
+            parsed.predicate,
+            Some(RowPredicate::In {
+                expression: RowExpression::Property { ref binding, ref property },
+                ref values,
+            }) if binding == "s"
+                && property == "role"
+                && values == &[
+                    VertexPropertyValue::String("admin".to_string()),
+                    VertexPropertyValue::String("moderator".to_string()),
+                ]
+        ));
     }
 
     #[cfg(feature = "client-api")]

@@ -8066,6 +8066,14 @@ fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<b
                 RowScalarValue::Value(_) | RowScalarValue::Missing => false,
             }
         }
+        RowPredicate::In { expression, values } => {
+            match eval_row_expression(row, expression)? {
+                RowScalarValue::Value(val) => {
+                    values.iter().any(|v| vertex_property_values_equal(&val, v))
+                }
+                RowScalarValue::Missing => false,
+            }
+        }
         RowPredicate::And(left, right) => {
             row_predicate_matches(row, left)? && row_predicate_matches(row, right)?
         }
@@ -8100,7 +8108,7 @@ fn predicate_guarantees_string_property(
             predicate_guarantees_string_property(left, binding, property)
                 && predicate_guarantees_string_property(right, binding, property)
         }
-        RowPredicate::Compare { .. } | RowPredicate::Not(_) => false,
+        RowPredicate::Compare { .. } | RowPredicate::In { .. } | RowPredicate::Not(_) => false,
     }
 }
 
@@ -8179,6 +8187,14 @@ pub(super) fn row_predicate_relationship_property_constraint(
             right,
         } => row_property_literal_equality(left, right)
             .or_else(|| row_property_literal_equality(right, left)),
+        RowPredicate::In {
+            expression: RowExpression::Property { binding, property },
+            values,
+        } => Some(RowPredicateRelationshipPropertyConstraint {
+            binding: binding.clone(),
+            property: property.clone(),
+            values: values.clone(),
+        }),
         RowPredicate::And(left, right) => row_predicate_relationship_property_constraint(left)
             .or_else(|| row_predicate_relationship_property_constraint(right)),
         RowPredicate::Or(left, right) => {
@@ -8194,7 +8210,7 @@ pub(super) fn row_predicate_relationship_property_constraint(
             }
             Some(left)
         }
-        RowPredicate::Compare { .. } | RowPredicate::StartsWith { .. } | RowPredicate::Not(_) => {
+        RowPredicate::Compare { .. } | RowPredicate::StartsWith { .. } | RowPredicate::In { .. } | RowPredicate::Not(_) => {
             None
         }
     }

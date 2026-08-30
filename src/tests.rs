@@ -11894,6 +11894,59 @@ async fn cypher_starts_with_uses_current_index_and_rejects_graph_epoch_replay() 
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_in_predicate_filters_rows_correctly() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-in-predicate", object_store).await;
+
+    for (vertex, role, active) in [
+        (1, "admin", true),
+        (2, "moderator", true),
+        (3, "member", false),
+        (4, "guest", true),
+    ] {
+        shard
+            .set_vertex_metadata(
+                "cell-0",
+                vertex,
+                VertexMetadata::default()
+                    .with_label("User")
+                    .with_property("role", VertexPropertyValue::String(role.to_string()))
+                    .with_property("active", VertexPropertyValue::Bool(active)),
+            )
+            .await
+            .unwrap();
+    }
+
+    let roles_in = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "roles-in-query"),
+            "MATCH (u:User) WHERE u.role IN ['admin', 'moderator'] RETURN u.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        roles_in.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(1)]),
+            QueryRow::new(vec![QueryValue::VertexId(2)]),
+        ]
+    );
+
+    let combined_in = shard
+        .execute_cypher_rows(
+            QueryContext::new("cell-0", "combined-in-query"),
+            "MATCH (u:User) WHERE u.role IN ['member', 'guest'] AND u.active = true RETURN u.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        combined_in.rows,
+        vec![QueryRow::new(vec![QueryValue::VertexId(4)])]
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_tck_style_row_corpus_covers_supported_clause_semantics() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-tck-style-corpus", object_store).await;
