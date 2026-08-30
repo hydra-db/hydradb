@@ -257,6 +257,8 @@ pub enum RowExpression {
     NodeId { binding: String },
     Property { binding: String, property: String },
     Literal(VertexPropertyValue),
+    ToLower(Box<RowExpression>),
+    ToUpper(Box<RowExpression>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2828,6 +2830,38 @@ fn lower_row_expression(
     expression: *const AstNode,
     parameters: &BTreeMap<String, VertexPropertyValue>,
 ) -> Result<RowExpression> {
+    unsafe {
+        if is_instance(expression, sys::CYPHER_AST_APPLY_OPERATOR) {
+            if sys::cypher_ast_apply_operator_get_distinct(expression) {
+                return unsupported(
+                    "DISTINCT function arguments are not executable in Query engine",
+                );
+            }
+            let function_node =
+                checked_node(sys::cypher_ast_apply_operator_get_func_name(expression))?;
+            let function_name = function_name(function_node)?;
+            if function_name.eq_ignore_ascii_case("toLower") {
+                let argument_count = sys::cypher_ast_apply_operator_narguments(expression);
+                if argument_count != 1 {
+                    return unsupported("toLower function expects exactly one argument");
+                }
+                let argument =
+                    checked_node(sys::cypher_ast_apply_operator_get_argument(expression, 0))?;
+                let inner = lower_row_expression(argument, parameters)?;
+                return Ok(RowExpression::ToLower(Box::new(inner)));
+            }
+            if function_name.eq_ignore_ascii_case("toUpper") {
+                let argument_count = sys::cypher_ast_apply_operator_narguments(expression);
+                if argument_count != 1 {
+                    return unsupported("toUpper function expects exactly one argument");
+                }
+                let argument =
+                    checked_node(sys::cypher_ast_apply_operator_get_argument(expression, 0))?;
+                let inner = lower_row_expression(argument, parameters)?;
+                return Ok(RowExpression::ToUpper(Box::new(inner)));
+            }
+        }
+    }
     if let Some(binding) = node_id_expression_binding(expression)? {
         return Ok(RowExpression::NodeId { binding });
     }
@@ -2905,6 +2939,8 @@ fn row_expression_name(expression: &RowExpression) -> String {
         RowExpression::Literal(VertexPropertyValue::Bool(value)) => value.to_string(),
         RowExpression::Literal(VertexPropertyValue::Float(value)) => value.0.to_string(),
         RowExpression::Literal(VertexPropertyValue::String(value)) => format!("'{value}'"),
+        RowExpression::ToLower(inner) => format!("toLower({})", row_expression_name(inner)),
+        RowExpression::ToUpper(inner) => format!("toUpper({})", row_expression_name(inner)),
     }
 }
 
@@ -4600,6 +4636,36 @@ mod tests {
         assert_eq!(
             opencypher_query_fingerprint("MATCH ((("),
             query_shape_fingerprint("MATCH ((("),
+        );
+    }
+
+    #[test]
+    fn lowers_to_lower_and_to_upper_expressions() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (n:User) WHERE toLower(n.name) = 'alice' AND toUpper(n.role) = 'ADMIN' RETURN n.id",
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.predicate,
+            Some(RowPredicate::And(
+                Box::new(RowPredicate::Compare {
+                    left: RowExpression::ToLower(Box::new(RowExpression::Property {
+                        binding: "n".to_string(),
+                        property: "name".to_string(),
+                    })),
+                    op: RowComparisonOp::Eq,
+                    right: RowExpression::Literal(VertexPropertyValue::String("alice".to_string())),
+                }),
+                Box::new(RowPredicate::Compare {
+                    left: RowExpression::ToUpper(Box::new(RowExpression::Property {
+                        binding: "n".to_string(),
+                        property: "role".to_string(),
+                    })),
+                    op: RowComparisonOp::Eq,
+                    right: RowExpression::Literal(VertexPropertyValue::String("ADMIN".to_string())),
+                })
+            ))
         );
     }
 }

@@ -72,9 +72,12 @@ Comparison operators: `=`, `<>`, `<`, `>`, `<=`, `>=`, and `STARTS WITH`.
 MATCH (s:Score) WHERE s.score > 3.0 RETURN s.id AS score_id ORDER BY score_id
 MATCH (s:S) WHERE s.a = 1 AND (s.b > 2 OR NOT s.c = 3) RETURN s.id
 MATCH (s:Source) WHERE s.thread_id STARTS WITH $prefix RETURN s.id
+MATCH (u:User) WHERE toLower(u.name) = 'alice' AND toUpper(u.role) = 'ADMIN' RETURN u.id
 ```
 
 `STARTS WITH` needs a string literal or a parameter on the right.
+
+Scalar functions `toLower` and `toUpper` are supported in property expressions and comparisons.
 
 `IN`, `ENDS WITH`, `CONTAINS` and `IS NULL` are not supported. All four are
 rejected with the same message, that `WHERE` supports boolean combinations of

@@ -8232,6 +8232,18 @@ fn eval_row_expression(row: &BindingRow, expression: &RowExpression) -> Result<R
             })
         }
         RowExpression::Literal(value) => Ok(RowScalarValue::Value(value.clone())),
+        RowExpression::ToLower(inner) => match eval_row_expression(row, inner)? {
+            RowScalarValue::Value(VertexPropertyValue::String(s)) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::String(s.to_lowercase())))
+            }
+            RowScalarValue::Value(_) | RowScalarValue::Missing => Ok(RowScalarValue::Missing),
+        },
+        RowExpression::ToUpper(inner) => match eval_row_expression(row, inner)? {
+            RowScalarValue::Value(VertexPropertyValue::String(s)) => {
+                Ok(RowScalarValue::Value(VertexPropertyValue::String(s.to_uppercase())))
+            }
+            RowScalarValue::Value(_) | RowScalarValue::Missing => Ok(RowScalarValue::Missing),
+        },
     }
 }
 
@@ -8767,6 +8779,18 @@ fn expression_query_value(
             binding_property(row, binding, property)?.map(QueryValue::Property)
         }
         RowExpression::Literal(value) => Some(QueryValue::Property(value.clone())),
+        RowExpression::ToLower(inner) => match expression_query_value(row, inner)? {
+            Some(QueryValue::Property(VertexPropertyValue::String(s))) => {
+                Some(QueryValue::Property(VertexPropertyValue::String(s.to_lowercase())))
+            }
+            _ => None,
+        },
+        RowExpression::ToUpper(inner) => match expression_query_value(row, inner)? {
+            Some(QueryValue::Property(VertexPropertyValue::String(s))) => {
+                Some(QueryValue::Property(VertexPropertyValue::String(s.to_uppercase())))
+            }
+            _ => None,
+        },
     })
 }
 
@@ -9098,5 +9122,121 @@ fn compare_u64_f64(left: u64, right: f64) -> std::cmp::Ordering {
         std::cmp::Ordering::Equal if floor == right => std::cmp::Ordering::Equal,
         std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
         ordering => ordering,
+    }
+}
+
+#[cfg(all(test, feature = "opencypher"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_eval_row_expression_to_lower_and_to_upper() {
+        let mut row = BindingRow::default();
+        row.bind(Some("u"), 1);
+        let mut metadata = VertexMetadata::default();
+        metadata
+            .properties
+            .insert("name".to_string(), VertexPropertyValue::String("Alice".to_string()));
+        metadata
+            .properties
+            .insert("role".to_string(), VertexPropertyValue::String("Admin".to_string()));
+        metadata
+            .properties
+            .insert("age".to_string(), VertexPropertyValue::Integer(30));
+        row.metadata.insert("u".to_string(), metadata);
+
+        // toLower on string property
+        let expr_lower = RowExpression::ToLower(Box::new(RowExpression::Property {
+            binding: "u".to_string(),
+            property: "name".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_lower).unwrap(),
+            RowScalarValue::Value(VertexPropertyValue::String("alice".to_string()))
+        );
+
+        // toUpper on string property
+        let expr_upper = RowExpression::ToUpper(Box::new(RowExpression::Property {
+            binding: "u".to_string(),
+            property: "role".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_upper).unwrap(),
+            RowScalarValue::Value(VertexPropertyValue::String("ADMIN".to_string()))
+        );
+
+        // toLower on missing property -> Missing
+        let expr_missing = RowExpression::ToLower(Box::new(RowExpression::Property {
+            binding: "u".to_string(),
+            property: "nonexistent".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_missing).unwrap(),
+            RowScalarValue::Missing
+        );
+
+        // toLower on non-string property (integer) -> Missing
+        let expr_non_string = RowExpression::ToLower(Box::new(RowExpression::Property {
+            binding: "u".to_string(),
+            property: "age".to_string(),
+        }));
+        assert_eq!(
+            eval_row_expression(&row, &expr_non_string).unwrap(),
+            RowScalarValue::Missing
+        );
+
+        // toUpper on literal string
+        let expr_literal = RowExpression::ToUpper(Box::new(RowExpression::Literal(
+            VertexPropertyValue::String("hello world".to_string()),
+        )));
+        assert_eq!(
+            eval_row_expression(&row, &expr_literal).unwrap(),
+            RowScalarValue::Value(VertexPropertyValue::String("HELLO WORLD".to_string()))
+        );
+
+        // Nested toUpper(toLower(...))
+        let expr_nested = RowExpression::ToUpper(Box::new(RowExpression::ToLower(Box::new(
+            RowExpression::Property {
+                binding: "u".to_string(),
+                property: "name".to_string(),
+            },
+        ))));
+        assert_eq!(
+            eval_row_expression(&row, &expr_nested).unwrap(),
+            RowScalarValue::Value(VertexPropertyValue::String("ALICE".to_string()))
+        );
+
+        // expression_query_value for aggregates
+        assert_eq!(
+            expression_query_value(&row, &expr_lower).unwrap(),
+            Some(QueryValue::Property(VertexPropertyValue::String("alice".to_string())))
+        );
+        assert_eq!(
+            expression_query_value(&row, &expr_upper).unwrap(),
+            Some(QueryValue::Property(VertexPropertyValue::String("ADMIN".to_string())))
+        );
+        assert_eq!(
+            expression_query_value(&row, &expr_missing).unwrap(),
+            None
+        );
+        assert_eq!(
+            expression_query_value(&row, &expr_non_string).unwrap(),
+            None
+        );
+
+        // row_predicate_matches with toLower comparison
+        let pred = RowPredicate::Compare {
+            left: expr_lower,
+            op: RowComparisonOp::Eq,
+            right: RowExpression::Literal(VertexPropertyValue::String("alice".to_string())),
+        };
+        assert!(row_predicate_matches(&row, &pred).unwrap());
+
+        let pred_mismatch = RowPredicate::Compare {
+            left: expr_upper,
+            op: RowComparisonOp::Eq,
+            right: RowExpression::Literal(VertexPropertyValue::String("USER".to_string())),
+        };
+        assert!(!row_predicate_matches(&row, &pred_mismatch).unwrap());
     }
 }
