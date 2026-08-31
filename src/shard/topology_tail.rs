@@ -459,6 +459,10 @@ pub(crate) fn expand_range_with_overlay(
     let mut edge_visits = 0_u64;
     let empty = BTreeMap::new();
 
+    if min_hops == 0 {
+        reachable.extend(frontier.iter().copied());
+    }
+
     for hop in 1..=max_hops {
         if frontier.is_empty() {
             break;
@@ -580,5 +584,27 @@ mod tests {
             .collect::<Result<Vec<_>>>()
             .expect_err("the malformed record must still fail its owning edge type");
         assert!(matches!(error, GraphError::CorruptValue { .. }));
+    }
+
+    #[test]
+    fn expand_range_with_overlay_preserves_zero_hop_starts() {
+        let adjacency = BTreeMap::from([(1, BTreeSet::from([2]))]);
+        let csc = crate::sparse_kernel::graphblas_csc_from_adjacency(&adjacency).unwrap();
+        let compiled = crate::sparse_kernel::compile_graphblas_csc_owned(
+            csc,
+            crate::sparse_kernel::SparseKernelBackend::CompactCsc,
+        )
+        .unwrap();
+
+        let mut overlay = GraphTopologyOverlay::default();
+        overlay.set(2, 3, true);
+
+        // Zero-hop from isolated start vertex 99
+        let traversal = expand_range_with_overlay(&compiled, &overlay, &[99], 0, 2).unwrap();
+        assert_eq!(traversal.vertices, vec![99]);
+
+        // Zero-hop from connected start vertex 1 (should include 1, 2, 3)
+        let traversal_connected = expand_range_with_overlay(&compiled, &overlay, &[1], 0, 2).unwrap();
+        assert_eq!(traversal_connected.vertices, vec![1, 2, 3]);
     }
 }
