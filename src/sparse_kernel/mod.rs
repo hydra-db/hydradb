@@ -754,6 +754,24 @@ mod tests {
         assert_eq!(compact.edge_visits, rust.edge_visits);
     }
 
+    #[test]
+    fn kernels_agree_on_zero_hop_start_without_edges() {
+        let isolated: Adjacency = BTreeMap::from([(1, BTreeSet::from([2]))]);
+        let rust = expand_range(&isolated, &[99], 0, 1, SparseKernelBackend::Adjacency)
+            .expect("adjacency expansion should succeed");
+        let csc = graphblas_csc_from_adjacency(&isolated).expect("CSC build should succeed");
+        let compiled = compile_graphblas_csc_owned(csc, SparseKernelBackend::CompactCsc)
+            .expect("compact CSC compile should succeed");
+        let compact = expand_range_compiled_graphblas(&compiled, &isolated, &[99], 0, 1)
+            .expect("compact CSC expansion should succeed");
+        let compact_count = expand_range_count_compiled_graphblas(&compiled, &isolated, &[99], 0, 1)
+            .expect("compact CSC count should succeed");
+
+        assert_eq!(rust.vertices, vec![99]);
+        assert_eq!(compact.vertices, vec![99]);
+        assert_eq!(compact_count.vertices, 1);
+    }
+
     // The legacy `GRAPH_COMPILED_KERNEL` override is deliberately not exercised
     // here: it is process-global and would race concurrent shard tests.
     #[test]

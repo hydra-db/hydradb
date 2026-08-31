@@ -423,11 +423,21 @@ impl CompiledCompactCscMatrix {
         max_hops: u8,
     ) -> Result<SparseTraversal> {
         let (vertices, edge_visits) = self.expand_range_ordinals(starts, min_hops, max_hops)?;
+        let mut result_vertices: Vec<VertexId> = vertices
+            .into_iter()
+            .map(|ordinal| self.vertices[ordinal])
+            .collect();
+        if min_hops == 0 {
+            for start in starts {
+                if self.ordinal(*start).is_none() {
+                    result_vertices.push(*start);
+                }
+            }
+            result_vertices.sort_unstable();
+            result_vertices.dedup();
+        }
         Ok(SparseTraversal {
-            vertices: vertices
-                .into_iter()
-                .map(|ordinal| self.vertices[ordinal])
-                .collect(),
+            vertices: result_vertices,
             edge_visits,
             backend: SparseKernelBackend::CompactCsc,
         })
@@ -441,8 +451,20 @@ impl CompiledCompactCscMatrix {
         max_hops: u8,
     ) -> Result<SparseTraversalCount> {
         let (result_seen, edge_visits) = self.expand_range_bitmap(starts, min_hops, max_hops)?;
+        let mut count = result_seen.into_iter().filter(|seen| *seen).count() as u64;
+        if min_hops == 0 {
+            let mut unmapped = Vec::new();
+            for start in starts {
+                if self.ordinal(*start).is_none() {
+                    unmapped.push(*start);
+                }
+            }
+            unmapped.sort_unstable();
+            unmapped.dedup();
+            count += unmapped.len() as u64;
+        }
         Ok(SparseTraversalCount {
-            vertices: result_seen.into_iter().filter(|seen| *seen).count() as u64,
+            vertices: count,
             edge_visits,
             backend: SparseKernelBackend::CompactCsc,
         })
@@ -1013,15 +1035,27 @@ fn expand_range_with_compiled(
     compiled: &CompiledGraphBlasMatrixInner,
 ) -> Result<SparseTraversal> {
     let range = range_result_vector(starts, min_hops, max_hops, compiled)?;
-    let Some(result) = range.result.as_ref() else {
-        return Ok(empty_traversal());
+    let mut vertices = if let Some(result) = range.result.as_ref() {
+        let ordinals = extract_ordinals(result)?;
+        let mut v = Vec::with_capacity(ordinals.len());
+        for ordinal in ordinals {
+            v.push(compiled.ordinal_map.vertex(ordinal)?);
+        }
+        v
+    } else {
+        Vec::new()
     };
-    let ordinals = extract_ordinals(result)?;
-    let mut vertices = Vec::with_capacity(ordinals.len());
-    for ordinal in ordinals {
-        vertices.push(compiled.ordinal_map.vertex(ordinal)?);
+    if min_hops == 0 {
+        for start in starts {
+            if compiled.ordinal_map.try_ordinal(*start).is_none() {
+                vertices.push(*start);
+            }
+        }
+        vertices.sort_unstable();
+        vertices.dedup();
+    } else {
+        vertices.sort_unstable();
     }
-    vertices.sort_unstable();
     Ok(SparseTraversal {
         vertices,
         edge_visits: range.edge_visits,
@@ -1041,15 +1075,24 @@ fn expand_range_count_with_compiled(
         return exact_hop_count_with_compiled(starts, max_hops, compiled);
     }
     let range = range_result_vector(starts, min_hops, max_hops, compiled)?;
-    let Some(result) = range.result.as_ref() else {
-        return Ok(SparseTraversalCount {
-            vertices: 0,
-            edge_visits: range.edge_visits,
-            backend: SparseKernelBackend::SuiteSparse,
-        });
+    let mut count = if let Some(result) = range.result.as_ref() {
+        vector_nvals(result)?
+    } else {
+        0
     };
+    if min_hops == 0 {
+        let mut unmapped = Vec::new();
+        for start in starts {
+            if compiled.ordinal_map.try_ordinal(*start).is_none() {
+                unmapped.push(*start);
+            }
+        }
+        unmapped.sort_unstable();
+        unmapped.dedup();
+        count += unmapped.len() as u64;
+    }
     Ok(SparseTraversalCount {
-        vertices: vector_nvals(result)?,
+        vertices: count,
         edge_visits: range.edge_visits,
         backend: SparseKernelBackend::SuiteSparse,
     })
@@ -1061,6 +1104,16 @@ fn exact_hop_count_with_compiled(
     hops: u8,
     compiled: &mut CompiledGraphBlasMatrixInner,
 ) -> Result<SparseTraversalCount> {
+    if hops == 0 {
+        let mut unique_starts: Vec<VertexId> = starts.to_vec();
+        unique_starts.sort_unstable();
+        unique_starts.dedup();
+        return Ok(SparseTraversalCount {
+            vertices: unique_starts.len() as u64,
+            edge_visits: 0,
+            backend: SparseKernelBackend::SuiteSparse,
+        });
+    }
     let Some(matrix) = compiled.matrix.as_ref() else {
         return Ok(SparseTraversalCount {
             vertices: 0,
