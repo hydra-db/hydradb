@@ -4,7 +4,6 @@
 //! module's compiled-matrix representation without calling into SuiteSparse.
 //! See the module docs in `mod.rs` for how the two relate.
 
-#[cfg(feature = "opencypher")]
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -423,11 +422,18 @@ impl CompiledCompactCscMatrix {
         max_hops: u8,
     ) -> Result<SparseTraversal> {
         let (vertices, edge_visits) = self.expand_range_ordinals(starts, min_hops, max_hops)?;
+        let mut vertices: Vec<VertexId> = vertices
+            .into_iter()
+            .map(|ordinal| self.vertices[ordinal])
+            .collect();
+        if min_hops == 0 {
+            vertices.extend(unmapped_start_vertices(starts, |start| {
+                self.ordinal(start).is_some()
+            }));
+            vertices.sort_unstable();
+        }
         Ok(SparseTraversal {
-            vertices: vertices
-                .into_iter()
-                .map(|ordinal| self.vertices[ordinal])
-                .collect(),
+            vertices,
             edge_visits,
             backend: SparseKernelBackend::CompactCsc,
         })
@@ -441,8 +447,14 @@ impl CompiledCompactCscMatrix {
         max_hops: u8,
     ) -> Result<SparseTraversalCount> {
         let (result_seen, edge_visits) = self.expand_range_bitmap(starts, min_hops, max_hops)?;
+        let unmapped_starts = if min_hops == 0 {
+            unmapped_start_vertices(starts, |start| self.ordinal(start).is_some()).len() as u64
+        } else {
+            0
+        };
         Ok(SparseTraversalCount {
-            vertices: result_seen.into_iter().filter(|seen| *seen).count() as u64,
+            vertices: (result_seen.into_iter().filter(|seen| *seen).count() as u64)
+                .saturating_add(unmapped_starts),
             edge_visits,
             backend: SparseKernelBackend::CompactCsc,
         })
@@ -1013,13 +1025,18 @@ fn expand_range_with_compiled(
     compiled: &CompiledGraphBlasMatrixInner,
 ) -> Result<SparseTraversal> {
     let range = range_result_vector(starts, min_hops, max_hops, compiled)?;
-    let Some(result) = range.result.as_ref() else {
-        return Ok(empty_traversal());
-    };
-    let ordinals = extract_ordinals(result)?;
-    let mut vertices = Vec::with_capacity(ordinals.len());
-    for ordinal in ordinals {
-        vertices.push(compiled.ordinal_map.vertex(ordinal)?);
+    let mut vertices = Vec::new();
+    if let Some(result) = range.result.as_ref() {
+        let ordinals = extract_ordinals(result)?;
+        vertices.reserve(ordinals.len());
+        for ordinal in ordinals {
+            vertices.push(compiled.ordinal_map.vertex(ordinal)?);
+        }
+    }
+    if min_hops == 0 {
+        vertices.extend(unmapped_start_vertices(starts, |start| {
+            compiled.ordinal_map.try_ordinal(start).is_some()
+        }));
     }
     vertices.sort_unstable();
     Ok(SparseTraversal {
@@ -1041,15 +1058,23 @@ fn expand_range_count_with_compiled(
         return exact_hop_count_with_compiled(starts, max_hops, compiled);
     }
     let range = range_result_vector(starts, min_hops, max_hops, compiled)?;
+    let unmapped_starts = if min_hops == 0 {
+        unmapped_start_vertices(starts, |start| {
+            compiled.ordinal_map.try_ordinal(start).is_some()
+        })
+        .len() as u64
+    } else {
+        0
+    };
     let Some(result) = range.result.as_ref() else {
         return Ok(SparseTraversalCount {
-            vertices: 0,
+            vertices: unmapped_starts,
             edge_visits: range.edge_visits,
             backend: SparseKernelBackend::SuiteSparse,
         });
     };
     Ok(SparseTraversalCount {
-        vertices: vector_nvals(result)?,
+        vertices: vector_nvals(result)?.saturating_add(unmapped_starts),
         edge_visits: range.edge_visits,
         backend: SparseKernelBackend::SuiteSparse,
     })
@@ -1061,23 +1086,24 @@ fn exact_hop_count_with_compiled(
     hops: u8,
     compiled: &mut CompiledGraphBlasMatrixInner,
 ) -> Result<SparseTraversalCount> {
+    let zero_hop_starts = || starts.iter().copied().collect::<BTreeSet<_>>().len() as u64;
     let Some(matrix) = compiled.matrix.as_ref() else {
         return Ok(SparseTraversalCount {
-            vertices: 0,
+            vertices: if hops == 0 { zero_hop_starts() } else { 0 },
             edge_visits: 0,
             backend: SparseKernelBackend::SuiteSparse,
         });
     };
     let Some(degree_vector) = compiled.degree_vector.as_ref() else {
         return Ok(SparseTraversalCount {
-            vertices: 0,
+            vertices: if hops == 0 { zero_hop_starts() } else { 0 },
             edge_visits: 0,
             backend: SparseKernelBackend::SuiteSparse,
         });
     };
     if starts.is_empty() || compiled.ordinal_map.is_empty() {
         return Ok(SparseTraversalCount {
-            vertices: 0,
+            vertices: if hops == 0 { zero_hop_starts() } else { 0 },
             edge_visits: 0,
             backend: SparseKernelBackend::SuiteSparse,
         });
@@ -1093,7 +1119,7 @@ fn exact_hop_count_with_compiled(
     start_ordinals.dedup();
     if start_ordinals.is_empty() {
         return Ok(SparseTraversalCount {
-            vertices: 0,
+            vertices: if hops == 0 { zero_hop_starts() } else { 0 },
             edge_visits: 0,
             backend: SparseKernelBackend::SuiteSparse,
         });
@@ -1110,7 +1136,7 @@ fn exact_hop_count_with_compiled(
     clear_vector(&mut scratch.next)?;
     if hops == 0 {
         return Ok(SparseTraversalCount {
-            vertices: start_ordinals.len() as u64,
+            vertices: zero_hop_starts(),
             edge_visits: 0,
             backend: SparseKernelBackend::SuiteSparse,
         });
@@ -1223,6 +1249,19 @@ fn empty_range_vector() -> RangeVector {
         result: None,
         edge_visits: 0,
     }
+}
+
+fn unmapped_start_vertices(
+    starts: &[VertexId],
+    mut is_mapped: impl FnMut(VertexId) -> bool,
+) -> Vec<VertexId> {
+    let mut vertices = BTreeSet::new();
+    for start in starts {
+        if !is_mapped(*start) {
+            vertices.insert(*start);
+        }
+    }
+    vertices.into_iter().collect()
 }
 
 fn empty_traversal() -> SparseTraversal {
