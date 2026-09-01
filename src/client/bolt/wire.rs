@@ -29,10 +29,17 @@ where
     stream.read_exact(&mut proposals).await?;
     for proposal in proposals.chunks_exact(4) {
         if proposal == BOLT_MANIFEST_V1 {
-            stream.write_all(&BOLT_MANIFEST_V1).await?;
-            write_varint(stream, 1).await?;
-            stream.write_all(&[0, 3, 4, 5]).await?;
-            write_varint(stream, 0).await?;
+            // The whole manifest response must leave in one write. neo4j-driver
+            // parses it out of the first TCP segment it receives and raises
+            // ERR_OUT_OF_RANGE if the segment carries only a prefix, so writing
+            // the pieces separately lets segmentation split them and fail the
+            // handshake intermittently.
+            let mut response = Vec::with_capacity(16);
+            response.extend_from_slice(&BOLT_MANIFEST_V1);
+            push_varint(&mut response, 1);
+            response.extend_from_slice(&[0, 3, 4, 5]);
+            push_varint(&mut response, 0);
+            stream.write_all(&response).await?;
             stream.flush().await?;
             let mut selected = [0_u8; 4];
             stream.read_exact(&mut selected).await?;
@@ -79,19 +86,16 @@ fn exact_bolt_version(selected: [u8; 4]) -> Option<(u8, u8)> {
         .then_some(candidate)
 }
 
-async fn write_varint<S>(stream: &mut S, mut value: u64) -> std::result::Result<(), BoltError>
-where
-    S: AsyncWrite + Unpin + ?Sized,
-{
+fn push_varint(buffer: &mut Vec<u8>, mut value: u64) {
     loop {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
         if value != 0 {
             byte |= 0x80;
         }
-        stream.write_all(&[byte]).await?;
+        buffer.push(byte);
         if value == 0 {
-            return Ok(());
+            return;
         }
     }
 }
