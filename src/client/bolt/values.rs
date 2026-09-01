@@ -139,7 +139,11 @@ fn query_path_to_bolt(path: &QueryPath) -> std::result::Result<BoltPath, BoltErr
         .map(|(index, relationship)| {
             let id = match relationship.id {
                 Some(id) => i64::try_from(id).map_err(|_| bolt_integer_overflow(id))?,
-                None => -1_i64.saturating_sub(index as i64),
+                // Parenthesised deliberately: a method call binds tighter than
+                // unary minus, so `-1_i64.saturating_sub(n)` reads as
+                // `-(1 - n)`, which climbs into the positive ids that real
+                // relationships occupy.
+                None => (-1_i64).saturating_sub(index as i64),
             };
             Ok(BoltUnboundRelationship {
                 id,
@@ -270,5 +274,59 @@ pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
             tracing::warn!(target: "slatedb_graph_kernel", error = %error, "Bolt suppressed internal graph error");
             BoltError::Backend("internal query execution error".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod structural_relationship_id_tests {
+    use super::*;
+    use crate::{QueryPathNode, QueryPathRelationship};
+    use std::collections::BTreeMap;
+
+    fn node(id: u64) -> QueryPathNode {
+        QueryPathNode {
+            id,
+            labels: Vec::new(),
+            properties: BTreeMap::new(),
+        }
+    }
+
+    fn structural(src: u64, dst: u64) -> QueryPathRelationship {
+        QueryPathRelationship {
+            id: None,
+            edge_type: "E".to_string(),
+            src,
+            dst,
+            properties: BTreeMap::new(),
+        }
+    }
+
+    /// A relationship with no stored id is given a synthetic one, and it has to
+    /// stay clear of the non-negative ids real relationships occupy. Three hops
+    /// is the shortest path that reached the positive range before the
+    /// parentheses went in.
+    #[test]
+    fn synthetic_path_relationship_ids_stay_negative() {
+        let path = QueryPath {
+            nodes: (1..=6).map(node).collect(),
+            relationships: (1..=5).map(|src| structural(src, src + 1)).collect(),
+        };
+
+        let converted = query_value_to_bolt(&QueryValue::Path(Box::new(path)))
+            .expect("a structural path converts");
+        let BoltValue::Path(path) = converted else {
+            panic!("a path value converts to a Bolt path");
+        };
+
+        let ids: Vec<i64> = path
+            .rels
+            .iter()
+            .map(|relationship| relationship.id)
+            .collect();
+        assert_eq!(ids, vec![-1, -2, -3, -4, -5]);
+        assert!(
+            ids.iter().all(|id| *id < 0),
+            "synthetic ids must stay out of the range real relationships use, got {ids:?}"
+        );
     }
 }
