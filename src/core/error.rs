@@ -7,6 +7,59 @@ use crate::StorageSequence;
 #[cfg(test)]
 mod tests;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteGraphErrorClass {
+    Contention,
+    Fencing,
+    Routing,
+    Freshness,
+    Admission,
+    Timeout,
+    Query,
+    Authorization,
+    Corruption,
+    Configuration,
+    Storage,
+    Kernel,
+}
+
+impl RemoteGraphErrorClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Contention => "contention",
+            Self::Fencing => "fencing",
+            Self::Routing => "routing",
+            Self::Freshness => "freshness",
+            Self::Admission => "admission",
+            Self::Timeout => "timeout",
+            Self::Query => "query",
+            Self::Authorization => "authz",
+            Self::Corruption => "corruption",
+            Self::Configuration => "config",
+            Self::Storage => "storage",
+            Self::Kernel => "kernel",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Some(match value {
+            "contention" => Self::Contention,
+            "fencing" => Self::Fencing,
+            "routing" => Self::Routing,
+            "freshness" => Self::Freshness,
+            "admission" => Self::Admission,
+            "timeout" => Self::Timeout,
+            "query" => Self::Query,
+            "authz" => Self::Authorization,
+            "corruption" => Self::Corruption,
+            "config" => Self::Configuration,
+            "storage" => Self::Storage,
+            "kernel" => Self::Kernel,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum GraphError {
     #[error("slatedb error: {0}")]
@@ -200,6 +253,11 @@ pub enum GraphError {
         dialect: &'static str,
         feature: String,
     },
+    #[error("remote {} error: {message}", class.as_str())]
+    Remote {
+        class: RemoteGraphErrorClass,
+        message: String,
+    },
 }
 
 impl GraphError {
@@ -234,6 +292,25 @@ impl GraphError {
     /// to the vocabulary resizes every such array instead of silently leaving
     /// the new one uncounted.
     pub const CLASS_COUNT: usize = Self::CLASSES.len();
+
+    /// The query-transport representation of each error class, indexed by the
+    /// corresponding entry in [`Self::CLASSES`]. Keeping this array sized by
+    /// `CLASS_COUNT` makes a taxonomy addition require an explicit wire-class
+    /// decision.
+    const REMOTE_CLASSES: [RemoteGraphErrorClass; Self::CLASS_COUNT] = [
+        RemoteGraphErrorClass::Contention,
+        RemoteGraphErrorClass::Fencing,
+        RemoteGraphErrorClass::Routing,
+        RemoteGraphErrorClass::Freshness,
+        RemoteGraphErrorClass::Admission,
+        RemoteGraphErrorClass::Timeout,
+        RemoteGraphErrorClass::Query,
+        RemoteGraphErrorClass::Authorization,
+        RemoteGraphErrorClass::Corruption,
+        RemoteGraphErrorClass::Configuration,
+        RemoteGraphErrorClass::Storage,
+        RemoteGraphErrorClass::Kernel,
+    ];
 
     // Positions in `CLASSES`, so the match arms in `class_index` read as the
     // names they are. `class_constants_index_their_own_name` pins each one
@@ -275,6 +352,11 @@ impl GraphError {
         Self::CLASSES[self.class_index()]
     }
 
+    /// The recognized class to send for this error over query transport.
+    pub(crate) fn remote_class(&self) -> RemoteGraphErrorClass {
+        Self::REMOTE_CLASSES[self.class_index()]
+    }
+
     /// The same classification as [`Self::class`], as a position in
     /// [`Self::CLASSES`].
     ///
@@ -287,6 +369,20 @@ impl GraphError {
     /// is the vocabulary's own.
     pub fn class_index(&self) -> usize {
         match self {
+            Self::Remote { class, .. } => match class {
+                RemoteGraphErrorClass::Contention => Self::CLASS_CONTENTION,
+                RemoteGraphErrorClass::Fencing => Self::CLASS_FENCING,
+                RemoteGraphErrorClass::Routing => Self::CLASS_ROUTING,
+                RemoteGraphErrorClass::Freshness => Self::CLASS_FRESHNESS,
+                RemoteGraphErrorClass::Admission => Self::CLASS_ADMISSION,
+                RemoteGraphErrorClass::Timeout => Self::CLASS_TIMEOUT,
+                RemoteGraphErrorClass::Query => Self::CLASS_QUERY,
+                RemoteGraphErrorClass::Authorization => Self::CLASS_AUTHZ,
+                RemoteGraphErrorClass::Corruption => Self::CLASS_CORRUPTION,
+                RemoteGraphErrorClass::Configuration => Self::CLASS_CONFIG,
+                RemoteGraphErrorClass::Storage => Self::CLASS_STORAGE,
+                RemoteGraphErrorClass::Kernel => Self::CLASS_KERNEL,
+            },
             Self::ConditionalWriteConflict { .. }
             | Self::IdempotencyConflict { .. }
             | Self::ControlMetadataConflict { .. }

@@ -25,7 +25,8 @@ use super::service::{
 use crate::{
     GraphError, GraphId, GraphScope, NamespaceId, NamespacePath, QueryCursorToken, QueryFloat,
     QueryParameterValue, QueryPath, QueryTransportConnectionIdentity,
-    QueryTransportTlsServerConfigProvider, QueryValue, Result, VertexPropertyValue,
+    QueryTransportTlsServerConfigProvider, QueryValue, RemoteGraphErrorClass, Result,
+    VertexPropertyValue,
 };
 
 const GRAPH_NAMESPACE_HEADER: &str = "x-graph-namespace";
@@ -366,6 +367,56 @@ impl HttpApiError {
 
     fn from_graph_ref(error: &GraphError) -> Self {
         match error {
+            GraphError::Remote {
+                class: RemoteGraphErrorClass::Authorization,
+                message,
+            } => Self {
+                status: StatusCode::FORBIDDEN,
+                code: "permission_denied",
+                message: message.clone(),
+                owner: None,
+                authenticate: false,
+            },
+            GraphError::Remote {
+                class: RemoteGraphErrorClass::Admission,
+                message,
+            } => Self {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                code: "resource_exhausted",
+                message: message.clone(),
+                owner: None,
+                authenticate: false,
+            },
+            GraphError::Remote {
+                class: RemoteGraphErrorClass::Timeout,
+                message,
+            } => Self {
+                status: StatusCode::REQUEST_TIMEOUT,
+                code: "query_timeout",
+                message: message.clone(),
+                owner: None,
+                authenticate: false,
+            },
+            GraphError::Remote {
+                class: RemoteGraphErrorClass::Routing,
+                message,
+            } => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "routing_unavailable",
+                message: message.clone(),
+                owner: None,
+                authenticate: false,
+            },
+            GraphError::Remote {
+                class: RemoteGraphErrorClass::Freshness | RemoteGraphErrorClass::Query,
+                message,
+            } => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_request",
+                message: message.clone(),
+                owner: None,
+                authenticate: false,
+            },
             GraphError::GraphScopeAccessDenied { .. } => Self {
                 status: StatusCode::FORBIDDEN,
                 code: "permission_denied",

@@ -110,6 +110,25 @@ fn http_parameters_preserve_integer_sign_and_precision() {
     );
 }
 
+#[test]
+fn remote_query_error_class_preserves_only_safe_http_semantics() {
+    let admission = HttpApiError::from_graph(GraphError::Remote {
+        class: crate::RemoteGraphErrorClass::Admission,
+        message: "cell is saturated".to_string(),
+    });
+    assert_eq!(admission.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(admission.code, "resource_exhausted");
+    assert_eq!(admission.message, "cell is saturated");
+
+    let unknown_semantics = HttpApiError::from_graph(GraphError::Remote {
+        class: crate::RemoteGraphErrorClass::Storage,
+        message: "peer implementation detail".to_string(),
+    });
+    assert_eq!(unknown_semantics.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(unknown_semantics.code, "internal");
+    assert_eq!(unknown_semantics.message, "internal query execution error");
+}
+
 /// Touch point (c) for HTTP: 421 Misdirected Request, with the owner in the
 /// body because an HTTP client has no routing table to discard and re-fetch.
 /// The hint is *absent* rather than null when this node has shed its view —

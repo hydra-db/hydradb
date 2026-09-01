@@ -366,7 +366,13 @@ async fn transport_tokens_are_confined_to_granted_namespace_and_graph_scopes() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(denied, GraphError::UnsupportedQuery { .. }));
+    assert!(matches!(
+        denied,
+        GraphError::Remote {
+            class: RemoteGraphErrorClass::Authorization,
+            ..
+        }
+    ));
     assert!(denied.to_string().contains("not authorized"));
 
     for (index, mutation_query) in [

@@ -5948,6 +5948,95 @@ async fn tcp_query_transport_default_bind_rejects_unauthenticated_requests() {
 
 #[cfg(feature = "query-transport")]
 #[tokio::test]
+async fn tcp_query_transport_preserves_remote_error_classes() {
+    struct FailingQueryClient;
+
+    impl FailingQueryClient {
+        fn error(query: &str) -> GraphError {
+            match query {
+                "RETURN 1 AS admission" => GraphError::AdmissionRejected {
+                    operation: "test_admission",
+                    actual: 2,
+                    limit: 1,
+                },
+                "RETURN 1 AS timeout" => GraphError::QueryTimeout {
+                    operation: "test_timeout",
+                    elapsed_ms: 10,
+                    limit_ms: 5,
+                },
+                "RETURN 1 AS query_error" => GraphError::QueryParse {
+                    dialect: "openCypher",
+                    reason: "test query error".to_string(),
+                },
+                "RETURN 1 AS internal_error" => GraphError::CorruptValue {
+                    key: "internal/test-key".to_string(),
+                    reason: "sensitive test detail".to_string(),
+                },
+                _ => unreachable!("unexpected transport test query"),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl QueryCellClient for FailingQueryClient {
+        async fn execute_cypher_rows(
+            &self,
+            _context: QueryContext,
+            query: &str,
+        ) -> Result<QueryResultSet> {
+            Err(Self::error(query))
+        }
+
+        async fn execute_cypher_rows_page(
+            &self,
+            _context: QueryContext,
+            query: &str,
+            _cursor: Option<QueryCursorToken>,
+            _page_size: usize,
+        ) -> Result<QueryResultPage> {
+            Err(Self::error(query))
+        }
+    }
+
+    let server = TcpQueryServer::bind_with_config(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(FailingQueryClient),
+        QueryTransportServerConfig::default()
+            .with_required_bearer_token("transport-test-token")
+            .insecure_allow_plaintext(),
+    )
+    .await
+    .unwrap();
+    let client = TcpQueryCellClient::new(server.local_addr())
+        .with_bearer_token("transport-test-token")
+        .insecure_allow_plaintext();
+
+    for (query, expected_class) in [
+        ("RETURN 1 AS admission", "admission"),
+        ("RETURN 1 AS timeout", "timeout"),
+        ("RETURN 1 AS query_error", "query"),
+        ("RETURN 1 AS internal_error", "corruption"),
+    ] {
+        let error = client
+            .execute_cypher_rows(
+                QueryContext::new("cell-a", format!("transport-{query}")),
+                query,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.class(), expected_class, "{query} error class");
+        if query == "RETURN 1 AS internal_error" {
+            assert!(error.to_string().contains("internal query execution error"));
+            assert!(!error.to_string().contains("sensitive test detail"));
+        }
+    }
+
+    assert_eq!(client.metrics().client_retries, 0);
+    server.stop().await.unwrap();
+}
+
+#[cfg(feature = "query-transport")]
+#[tokio::test]
 async fn tcp_query_transport_batches_page_rows_and_enforce_write_grants() {
     struct StaticBatchClient;
 

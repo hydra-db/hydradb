@@ -55,7 +55,7 @@ pub use core::config::{
     GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphStorageMemoryConfig,
     DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
 };
-pub use core::error::{GraphError, Result};
+pub use core::error::{GraphError, RemoteGraphErrorClass, Result};
 // Widen this as H1 converts the remaining client duration counters. It is no
 // longer feature-gated: `GraphOperationalMetrics::query_rows_latency` is a
 // default-features field, so the type is constructed on every build.

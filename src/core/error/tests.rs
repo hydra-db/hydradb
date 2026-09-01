@@ -154,3 +154,19 @@ fn wrong_node_failures_are_routing_not_fencing() {
     assert_eq!(not_writer.class(), "routing");
     assert_eq!(unavailable.class(), "routing");
 }
+
+#[test]
+fn remote_error_classes_use_the_same_stable_taxonomy() {
+    let error = GraphError::Remote {
+        class: RemoteGraphErrorClass::Admission,
+        message: "cell is saturated".to_string(),
+    };
+
+    assert_eq!(error.class(), "admission");
+    assert_eq!(error.remote_class(), RemoteGraphErrorClass::Admission);
+    assert_eq!(
+        RemoteGraphErrorClass::from_wire("admission"),
+        Some(RemoteGraphErrorClass::Admission)
+    );
+    assert_eq!(RemoteGraphErrorClass::from_wire("future-class"), None);
+}

@@ -3,7 +3,8 @@ use boltr::types::{BoltDict, BoltNode, BoltPath, BoltUnboundRelationship, BoltVa
 
 use super::{ClientBookmark, ClientQueryTarget};
 use crate::{
-    GraphError, QueryFloat, QueryParameterValue, QueryPath, QueryValue, VertexPropertyValue,
+    GraphError, QueryFloat, QueryParameterValue, QueryPath, QueryValue, RemoteGraphErrorClass,
+    VertexPropertyValue,
 };
 
 const MAX_QUERY_PARAMETER_DEPTH: usize = 16;
@@ -223,6 +224,42 @@ pub(super) fn explicit_transactions_unsupported() -> BoltError {
 
 pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {
     match error {
+        GraphError::Remote {
+            class: RemoteGraphErrorClass::Authorization,
+            message,
+        } => BoltError::Forbidden(message),
+        GraphError::Remote {
+            class: RemoteGraphErrorClass::Admission,
+            message,
+        } => BoltError::ResourceExhausted(message),
+        GraphError::Remote {
+            class: RemoteGraphErrorClass::Freshness,
+            message,
+        } => BoltError::Query {
+            code: "Neo.TransientError.Transaction.BookmarkTimeout".to_string(),
+            message,
+        },
+        GraphError::Remote {
+            class: RemoteGraphErrorClass::Query,
+            message,
+        } => BoltError::Query {
+            code: "Neo.ClientError.Statement.InvalidSyntax".to_string(),
+            message,
+        },
+        GraphError::Remote {
+            class: RemoteGraphErrorClass::Timeout,
+            message,
+        } => BoltError::Query {
+            code: "Neo.TransientError.Transaction.Terminated".to_string(),
+            message,
+        },
+        GraphError::Remote {
+            class: RemoteGraphErrorClass::Routing,
+            message,
+        } => BoltError::Query {
+            code: "Neo.TransientError.General.DatabaseUnavailable".to_string(),
+            message,
+        },
         GraphError::GraphScopeAccessDenied { .. } => BoltError::Forbidden(error.to_string()),
         GraphError::AdmissionRejected { .. } => BoltError::ResourceExhausted(error.to_string()),
         GraphError::SnapshotAhead { .. } => BoltError::Query {

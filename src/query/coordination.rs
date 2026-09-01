@@ -2215,9 +2215,11 @@ impl QueryCellClient for TcpQueryCellClient {
                 "query/transport/rows",
                 "server returned cancel response for rows request",
             )),
-            QueryTransportResponse::Error { message } => {
-                Err(transport_remote_error("query/transport/rows", message))
-            }
+            QueryTransportResponse::Error { message, class } => Err(transport_remote_error(
+                "query/transport/rows",
+                message,
+                class,
+            )),
         }
     }
 
@@ -2247,9 +2249,11 @@ impl QueryCellClient for TcpQueryCellClient {
                 "query/transport/page",
                 "server returned cancel response for page request",
             )),
-            QueryTransportResponse::Error { message } => {
-                Err(transport_remote_error("query/transport/page", message))
-            }
+            QueryTransportResponse::Error { message, class } => Err(transport_remote_error(
+                "query/transport/page",
+                message,
+                class,
+            )),
         }
     }
 
@@ -2275,9 +2279,11 @@ impl QueryCellClient for TcpQueryCellClient {
                 "query/transport/batch",
                 "server returned cancel response for batch request",
             )),
-            QueryTransportResponse::Error { message } => {
-                Err(transport_remote_error("query/transport/batch", message))
-            }
+            QueryTransportResponse::Error { message, class } => Err(transport_remote_error(
+                "query/transport/batch",
+                message,
+                class,
+            )),
         }
     }
 
@@ -2307,9 +2313,10 @@ impl QueryCellClient for TcpQueryCellClient {
                 "query/transport/batch_page",
                 "server returned cancel response for batch page request",
             )),
-            QueryTransportResponse::Error { message } => Err(transport_remote_error(
+            QueryTransportResponse::Error { message, class } => Err(transport_remote_error(
                 "query/transport/batch_page",
                 message,
+                class,
             )),
         }
     }
@@ -2362,9 +2369,11 @@ impl TcpQueryCellClient {
                     "server returned query data for cancel request",
                 ))
             }
-            QueryTransportResponse::Error { message } => {
-                Err(transport_remote_error("query/transport/cancel", message))
-            }
+            QueryTransportResponse::Error { message, class } => Err(transport_remote_error(
+                "query/transport/cancel",
+                message,
+                class,
+            )),
         }
     }
 
@@ -3921,10 +3930,18 @@ impl QueryTransportRequest {
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum QueryTransportResponse {
-    Rows { result: QueryResultSet },
-    Page { result: QueryResultPage },
+    Rows {
+        result: QueryResultSet,
+    },
+    Page {
+        result: QueryResultPage,
+    },
     Cancelled,
-    Error { message: String },
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<String>,
+    },
 }
 
 #[cfg(feature = "query-transport")]
@@ -4089,6 +4106,7 @@ where
                 if control_only && !request.is_cancel() {
                     QueryTransportResponse::Error {
                         message: "connection is reserved for query cancellation".to_string(),
+                        class: Some(crate::RemoteGraphErrorClass::Query.as_str().to_string()),
                     }
                 } else {
                     execute_query_transport_request(
@@ -4102,6 +4120,7 @@ where
             }
             Err(err) => QueryTransportResponse::Error {
                 message: format!("invalid query transport request: {err}"),
+                class: Some(crate::RemoteGraphErrorClass::Query.as_str().to_string()),
             },
         };
         let close_connection = control_only
@@ -4395,6 +4414,7 @@ fn transport_version_error(version: u16) -> QueryTransportResponse {
         message: format!(
             "unsupported query transport version {version}; expected {QUERY_TRANSPORT_VERSION}"
         ),
+        class: Some(crate::RemoteGraphErrorClass::Query.as_str().to_string()),
     }
 }
 
@@ -4765,7 +4785,10 @@ fn transport_error_response(
             "internal query execution error".to_string()
         }
     };
-    QueryTransportResponse::Error { message }
+    QueryTransportResponse::Error {
+        message,
+        class: Some(err.remote_class().as_str().to_string()),
+    }
 }
 
 #[cfg(feature = "query-transport")]
@@ -4918,10 +4941,21 @@ fn transport_protocol_error(key: &str, reason: &str) -> GraphError {
 }
 
 #[cfg(feature = "query-transport")]
-fn transport_remote_error(key: &str, message: String) -> GraphError {
-    GraphError::UnsupportedQuery {
-        dialect: "QueryTransport",
-        feature: format!("{key}: {message}"),
+fn transport_remote_error(key: &str, message: String, class: Option<String>) -> GraphError {
+    match class {
+        Some(class) => match crate::RemoteGraphErrorClass::from_wire(&class) {
+            Some(class) => GraphError::Remote { class, message },
+            None => GraphError::CorruptValue {
+                key: key.to_string(),
+                reason: "unrecognized query transport error class".to_string(),
+            },
+        },
+        // Older servers sent only `message`; retain the legacy query-class
+        // fallback until every supported peer understands the optional field.
+        None => GraphError::UnsupportedQuery {
+            dialect: "QueryTransport",
+            feature: format!("{key}: {message}"),
+        },
     }
 }
 
@@ -4929,6 +4963,54 @@ fn transport_remote_error(key: &str, message: String) -> GraphError {
 mod scope_grant_tests {
     use super::*;
     use crate::NamespaceId;
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum LegacyQueryTransportResponse {
+        Error { message: String },
+    }
+
+    #[test]
+    fn query_transport_error_class_is_additive_and_validated() {
+        let legacy: QueryTransportResponse =
+            serde_json::from_str(r#"{"kind":"error","message":"legacy peer"}"#).unwrap();
+        assert!(matches!(
+            legacy,
+            QueryTransportResponse::Error { class: None, .. }
+        ));
+
+        let modern = QueryTransportResponse::Error {
+            message: "cell is saturated".to_string(),
+            class: Some("admission".to_string()),
+        };
+        let encoded = serde_json::to_string(&modern).unwrap();
+        let decoded_by_legacy_peer: LegacyQueryTransportResponse =
+            serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(
+            decoded_by_legacy_peer,
+            LegacyQueryTransportResponse::Error { message } if message == "cell is saturated"
+        ));
+
+        assert!(matches!(
+            transport_remote_error(
+                "query/transport/test",
+                "cell is saturated".to_string(),
+                Some("admission".to_string()),
+            ),
+            GraphError::Remote {
+                class: crate::RemoteGraphErrorClass::Admission,
+                ..
+            }
+        ));
+        assert!(matches!(
+            transport_remote_error(
+                "query/transport/test",
+                "untrusted detail".to_string(),
+                Some("future-class".to_string()),
+            ),
+            GraphError::CorruptValue { .. }
+        ));
+    }
 
     #[test]
     fn graph_namespace_grant_restricts_descendants_to_one_graph_id() {
