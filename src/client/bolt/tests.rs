@@ -303,6 +303,80 @@ async fn manifest_handshake_offers_and_validates_bolt_5_range() {
     assert_eq!(server_task.await.unwrap().unwrap(), (5, 4));
 }
 
+/// Records the size of every individual write so a test can assert how a
+/// response is split across writes, not just what its bytes are.
+struct WriteBoundaryRecorder<S> {
+    inner: S,
+    write_sizes: Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for WriteBoundaryRecorder<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for WriteBoundaryRecorder<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(written)) = &poll {
+            self.write_sizes.lock().unwrap().push(*written);
+        }
+        poll
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// neo4j-driver parses the manifest response out of the first TCP segment it
+/// receives; a response split across writes can arrive split across segments
+/// and kill the handshake with ERR_OUT_OF_RANGE. One write per response is the
+/// contract this pins.
+#[tokio::test]
+async fn manifest_handshake_response_is_a_single_write() {
+    let (mut client, server) = duplex(64);
+    let write_sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut recorder = WriteBoundaryRecorder {
+        inner: server,
+        write_sizes: Arc::clone(&write_sizes),
+    };
+    let server_task = tokio::spawn(async move { bolt_server_handshake(&mut recorder).await });
+    client.write_all(&BOLT_MAGIC).await.unwrap();
+    client
+        .write_all(&[
+            0, 0, 1, 0xff, // Manifest v1
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
+        .await
+        .unwrap();
+    let mut response = [0_u8; 10];
+    client.read_exact(&mut response).await.unwrap();
+    assert_eq!(response, [0, 0, 1, 0xff, 1, 0, 3, 4, 5, 0]);
+    assert_eq!(write_sizes.lock().unwrap().as_slice(), &[10]);
+    client.write_all(&[0, 0, 4, 5, 0]).await.unwrap();
+    assert_eq!(server_task.await.unwrap().unwrap(), (5, 4));
+}
+
 #[test]
 fn bolt_value_conversion_rejects_unsigned_overflow() {
     assert!(query_value_to_bolt(&QueryValue::Count(u64::MAX)).is_err());
