@@ -12107,6 +12107,15 @@ Feature: Background-dependent corpus cases
       | id |
       | 1 |
 
+  Scenario: also-depends-on-background
+    When executing query:
+      """
+      MATCH (n) RETURN count(n) AS count
+      """
+    Then the result should be, in order:
+      | count |
+      | 1 |
+
 Feature: Standalone corpus cases
 
   Scenario: standalone-query
@@ -12122,9 +12131,9 @@ Feature: Standalone corpus cases
     .unwrap();
 
     let report = corpus.compatibility_report();
-    assert_eq!(report.total_scenarios, 2);
+    assert_eq!(report.total_scenarios, 3);
     assert_eq!(report.runnable_scenarios, 1);
-    assert_eq!(report.skipped_scenarios, 1);
+    assert_eq!(report.skipped_scenarios, 2);
     assert_eq!(corpus.cases[0].name, "standalone-query");
     assert!(report
         .skipped
