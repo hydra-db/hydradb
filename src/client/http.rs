@@ -17,6 +17,7 @@ use futures::stream;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use ulid::Ulid;
 
 use super::service::{
     ClientBookmark, ClientQueryCredentials, ClientQueryPage, ClientQueryRequest,
@@ -503,6 +504,13 @@ async fn execute_query_inner(
         .collect::<std::result::Result<BTreeMap<_, _>, HttpApiError>>()?;
     let mut request =
         ClientQueryRequest::new(target, query_id, body.query).with_query_parameters(parameters);
+    // query_id is an ephemeral request handle, and the auto-assigned counter
+    // restarts at 1 with the process, so it must never become the durable
+    // mutation identity. Mint a globally unique one instead, as Bolt does.
+    request = request.with_server_generated_mutation_idempotency_key(format!(
+        "http-mutation-v1-{}",
+        Ulid::new()
+    ));
     if let Some(consistency) = body.consistency {
         request = request.with_consistency(consistency);
     }
