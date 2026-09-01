@@ -1935,6 +1935,34 @@ async fn cypher_rejects_metadata_multi_create_before_writing_any_edge() {
         .is_empty());
 }
 
+// A string property value is hex-encoded into the property index key, and
+// SlateDB panics on keys past u16::MAX bytes, so a value a little over 32 KiB
+// has to come back as a client error rather than reach the storage layer.
+#[tokio::test]
+async fn vertex_metadata_write_rejects_property_value_that_overflows_the_index_key() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/oversized-property-value", object_store).await;
+    let error = shard
+        .set_vertex_metadata(
+            "cell-a",
+            1,
+            VertexMetadata::default()
+                .with_property("blob", VertexPropertyValue::String("x".repeat(64 * 1024))),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, GraphError::UnsupportedQuery { .. }));
+    shard
+        .set_vertex_metadata(
+            "cell-a",
+            1,
+            VertexMetadata::default()
+                .with_property("blob", VertexPropertyValue::String("small".to_string())),
+        )
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn batch_reads_enforce_configured_request_limit_before_scanning() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
