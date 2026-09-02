@@ -190,7 +190,7 @@ impl From<&str> for QueryTransportSecret {
 #[cfg(feature = "query-transport")]
 impl QueryTransportClientConfig {
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.bearer_token = QueryTransportSecret::try_new(token).ok();
+        self.bearer_token = Some(QueryTransportSecret::new(token));
         self
     }
 
@@ -272,6 +272,11 @@ impl QueryTransportClientConfig {
             return transport_config_error(
                 "client connection and control-connection limits must be greater than zero",
             );
+        }
+        if let Some(secret) = &self.bearer_token {
+            if !secret.is_valid() {
+                return transport_config_error("bearer token cannot be empty");
+            }
         }
         #[cfg(feature = "query-transport-tls")]
         {
@@ -1791,7 +1796,7 @@ impl TcpQueryCellClient {
     }
 
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.config.bearer_token = QueryTransportSecret::try_new(token).ok();
+        self.config.bearer_token = Some(QueryTransportSecret::new(token));
         self
     }
 
@@ -4953,5 +4958,39 @@ mod scope_grant_tests {
             &GraphScope::new(tenant, GraphId::new("other").unwrap()),
             QueryTransportAction::Read,
         ));
+    }
+}
+
+#[cfg(all(test, feature = "query-transport"))]
+mod bearer_token_tests {
+    use super::*;
+
+    #[test]
+    fn bearer_token_empty_is_not_silently_anonymous() {
+        // Empty and whitespace-only tokens must be rejected during validation.
+        for token in ["", "   "] {
+            let cfg = QueryTransportClientConfig::default()
+                .with_bearer_token(token)
+                .insecure_allow_plaintext();
+            assert!(
+                cfg.bearer_token.is_some(),
+                "empty token must be stored as Some(invalid), not None"
+            );
+            assert!(
+                !cfg.bearer_token.as_ref().unwrap().is_valid(),
+                "empty token must be invalid"
+            );
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("bearer token cannot be empty"),
+                "expected bearer token empty error, got {err}"
+            );
+        }
+        // Valid token must still pass.
+        let ok = QueryTransportClientConfig::default()
+            .with_bearer_token("secret")
+            .insecure_allow_plaintext();
+        assert!(ok.validate().is_ok());
+        assert!(ok.bearer_token.as_ref().unwrap().is_valid());
     }
 }
