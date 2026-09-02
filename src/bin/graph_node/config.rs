@@ -317,7 +317,16 @@ impl RuntimeConfig {
     }
 
     pub fn read_auth_token(&self) -> ConfigResult<String> {
-        let token = std::fs::read_to_string(&self.auth_token_file)?
+        let token = std::fs::read_to_string(&self.auth_token_file)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to read graph auth token from {}: {error}",
+                        self.auth_token_file.display()
+                    ),
+                )
+            })?
             .trim()
             .to_string();
         if token.len() < 32 || token.eq_ignore_ascii_case("change-me") {
@@ -723,5 +732,41 @@ mod tests {
         assert_eq!(memory.max_relationship_rows_bytes, 0);
         assert_eq!(memory.max_source_relationship_rows_bytes, 0);
         assert_eq!(memory.max_relationship_property_rows_bytes, 0);
+    }
+    #[test]
+    fn read_auth_token_error_names_missing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing-auth-token");
+
+        let mut values =
+            BTreeMap::from([("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string())]);
+        values.insert(
+            "GRAPH_AUTH_TOKEN_FILE".to_string(),
+            path.display().to_string(),
+        );
+
+        let config = RuntimeConfig::from_values(values).unwrap();
+        let error = config.read_auth_token().unwrap_err();
+
+        assert!(error.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn read_auth_token_error_names_directory() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let mut values =
+            BTreeMap::from([("GRAPH_ALLOW_PLAINTEXT".to_string(), "true".to_string())]);
+        values.insert(
+            "GRAPH_AUTH_TOKEN_FILE".to_string(),
+            directory.path().display().to_string(),
+        );
+
+        let config = RuntimeConfig::from_values(values).unwrap();
+        let error = config.read_auth_token().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains(&directory.path().display().to_string()));
     }
 }
