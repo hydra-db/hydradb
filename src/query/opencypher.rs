@@ -247,6 +247,14 @@ pub enum RowPredicate {
         expression: RowExpression,
         prefix: String,
     },
+    EndsWith {
+        expression: RowExpression,
+        suffix: String,
+    },
+    Contains {
+        expression: RowExpression,
+        substring: String,
+    },
     And(Box<RowPredicate>, Box<RowPredicate>),
     Or(Box<RowPredicate>, Box<RowPredicate>),
     Not(Box<RowPredicate>),
@@ -2775,6 +2783,28 @@ fn lower_row_predicate(
                     prefix,
                 });
             }
+            if op == sys::CYPHER_OP_ENDS_WITH {
+                let RowExpression::Literal(VertexPropertyValue::String(suffix)) =
+                    lower_row_expression(right, parameters)?
+                else {
+                    return unsupported("ENDS WITH requires a string literal or parameter");
+                };
+                return Ok(RowPredicate::EndsWith {
+                    expression: lower_row_expression(left, parameters)?,
+                    suffix,
+                });
+            }
+            if op == sys::CYPHER_OP_CONTAINS {
+                let RowExpression::Literal(VertexPropertyValue::String(substring)) =
+                    lower_row_expression(right, parameters)?
+                else {
+                    return unsupported("CONTAINS requires a string literal or parameter");
+                };
+                return Ok(RowPredicate::Contains {
+                    expression: lower_row_expression(left, parameters)?,
+                    substring,
+                });
+            }
             if let Ok(op) = row_comparison_op(op) {
                 return Ok(RowPredicate::Compare {
                     left: lower_row_expression(left, parameters)?,
@@ -3815,6 +3845,41 @@ mod tests {
                 expression: RowExpression::Property { ref binding, ref property },
                 ref prefix,
             }) if binding == "s" && property == "thread_id" && prefix == "thread-"
+        ));
+    }
+
+    #[test]
+    fn lowers_ends_with_string_predicate() {
+        let parameters = BTreeMap::from([(
+            "suffix".to_string(),
+            VertexPropertyValue::String("-active".to_string()),
+        )]);
+        let parsed = parse_opencypher_row_query_with_parameters(
+            "MATCH (s:Source) WHERE s.status ENDS WITH $suffix RETURN s.id",
+            &parameters,
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.predicate,
+            Some(RowPredicate::EndsWith {
+                expression: RowExpression::Property { ref binding, ref property },
+                ref suffix,
+            }) if binding == "s" && property == "status" && suffix == "-active"
+        ));
+    }
+
+    #[test]
+    fn lowers_contains_string_predicate() {
+        let parsed = parse_opencypher_row_query(
+            "MATCH (s:Source) WHERE s.name CONTAINS 'alpha' RETURN s.id",
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.predicate,
+            Some(RowPredicate::Contains {
+                expression: RowExpression::Property { ref binding, ref property },
+                ref substring,
+            }) if binding == "s" && property == "name" && substring == "alpha"
         ));
     }
 
