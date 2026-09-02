@@ -8066,6 +8066,22 @@ fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<b
                 RowScalarValue::Value(_) | RowScalarValue::Missing => false,
             }
         }
+        RowPredicate::EndsWith { expression, suffix } => {
+            match eval_row_expression(row, expression)? {
+                RowScalarValue::Value(VertexPropertyValue::String(value)) => {
+                    value.ends_with(suffix)
+                }
+                RowScalarValue::Value(_) | RowScalarValue::Missing => false,
+            }
+        }
+        RowPredicate::Contains { expression, substring } => {
+            match eval_row_expression(row, expression)? {
+                RowScalarValue::Value(VertexPropertyValue::String(value)) => {
+                    value.contains(substring)
+                }
+                RowScalarValue::Value(_) | RowScalarValue::Missing => false,
+            }
+        }
         RowPredicate::And(left, right) => {
             row_predicate_matches(row, left)? && row_predicate_matches(row, right)?
         }
@@ -8091,7 +8107,9 @@ fn predicate_guarantees_string_property(
                 },
             ..
         } => candidate_binding == binding && candidate_property == property,
-        RowPredicate::StartsWith { .. } => false,
+        RowPredicate::StartsWith { .. }
+        | RowPredicate::EndsWith { .. }
+        | RowPredicate::Contains { .. } => false,
         RowPredicate::And(left, right) => {
             predicate_guarantees_string_property(left, binding, property)
                 || predicate_guarantees_string_property(right, binding, property)
@@ -8194,7 +8212,11 @@ pub(super) fn row_predicate_relationship_property_constraint(
             }
             Some(left)
         }
-        RowPredicate::Compare { .. } | RowPredicate::StartsWith { .. } | RowPredicate::Not(_) => {
+        RowPredicate::Compare { .. }
+        | RowPredicate::StartsWith { .. }
+        | RowPredicate::EndsWith { .. }
+        | RowPredicate::Contains { .. }
+        | RowPredicate::Not(_) => {
             None
         }
     }

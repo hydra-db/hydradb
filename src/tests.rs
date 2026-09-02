@@ -11894,6 +11894,107 @@ async fn cypher_starts_with_uses_current_index_and_rejects_graph_epoch_replay() 
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn opencypher_contains_and_ends_with_property_filters_evaluate_correctly() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-string-predicates", object_store).await;
+
+    shard
+        .set_vertex_metadata(
+            "test-cell",
+            1,
+            VertexMetadata::default()
+                .with_label("Item")
+                .with_property("sku", VertexPropertyValue::String("APP-PHONE-PRO".to_string()))
+                .with_property("name", VertexPropertyValue::String("Flagship Phone".to_string())),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "test-cell",
+            2,
+            VertexMetadata::default()
+                .with_label("Item")
+                .with_property("sku", VertexPropertyValue::String("APP-TABLET-LITE".to_string()))
+                .with_property("name", VertexPropertyValue::String("Budget Tablet".to_string())),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "test-cell",
+            3,
+            VertexMetadata::default()
+                .with_label("Item")
+                .with_property("sku", VertexPropertyValue::String("ACC-CASE-PRO".to_string()))
+                .with_property("name", VertexPropertyValue::String("Phone Case Pro".to_string())),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "test-cell",
+            4,
+            VertexMetadata::default()
+                .with_label("Item")
+                .with_property("sku", VertexPropertyValue::from_i64(12345))
+                .with_property("name", VertexPropertyValue::Bool(false)),
+        )
+        .await
+        .unwrap();
+
+    let contains_query = "MATCH (i:Item) WHERE i.name CONTAINS 'Phone' RETURN i.id ORDER BY i.id";
+    let res = shard
+        .execute_cypher_rows(
+            QueryContext::new("test-cell", "test-contains"),
+            contains_query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(1)]),
+            QueryRow::new(vec![QueryValue::VertexId(3)]),
+        ]
+    );
+
+    let ends_with_query = "MATCH (i:Item) WHERE i.sku ENDS WITH $suffix RETURN i.id ORDER BY i.id";
+    let res = shard
+        .execute_cypher_rows(
+            QueryContext::new("test-cell", "test-ends-with")
+                .with_parameter("suffix", VertexPropertyValue::String("-PRO".to_string())),
+            ends_with_query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(1)]),
+            QueryRow::new(vec![QueryValue::VertexId(3)]),
+        ]
+    );
+
+    let combined_query = "MATCH (i:Item) WHERE i.sku STARTS WITH 'APP-' AND (i.sku ENDS WITH '-PRO' OR i.name CONTAINS 'Tablet') RETURN i.id ORDER BY i.id";
+    let res = shard
+        .execute_cypher_rows(
+            QueryContext::new("test-cell", "test-combined"),
+            combined_query,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(1)]),
+            QueryRow::new(vec![QueryValue::VertexId(2)]),
+        ]
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_tck_style_row_corpus_covers_supported_clause_semantics() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-tck-style-corpus", object_store).await;

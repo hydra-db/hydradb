@@ -66,19 +66,18 @@ when omitted, and must not exceed the maximum.
 
 Boolean combinations of property comparisons, using `AND`, `OR` and `NOT`.
 
-Comparison operators: `=`, `<>`, `<`, `>`, `<=`, `>=`, and `STARTS WITH`.
+Comparison operators: `=`, `<>`, `<`, `>`, `<=`, `>=`, `STARTS WITH`, `ENDS WITH`, and `CONTAINS`.
 
 ```cypher
 MATCH (s:Score) WHERE s.score > 3.0 RETURN s.id AS score_id ORDER BY score_id
 MATCH (s:S) WHERE s.a = 1 AND (s.b > 2 OR NOT s.c = 3) RETURN s.id
 MATCH (s:Source) WHERE s.thread_id STARTS WITH $prefix RETURN s.id
+MATCH (n:Item) WHERE n.sku ENDS WITH '-PRO' AND n.name CONTAINS 'Phone' RETURN n.id
 ```
 
-`STARTS WITH` needs a string literal or a parameter on the right.
+`STARTS WITH`, `ENDS WITH`, and `CONTAINS` need a string literal or a parameter on the right.
 
-`IN`, `ENDS WITH`, `CONTAINS` and `IS NULL` are not supported. All four are
-rejected with the same message, that `WHERE` supports boolean combinations of
-property comparisons.
+`IN` and `IS NULL` are not supported. Both are rejected with the same message, that `WHERE` supports boolean combinations of property comparisons.
 
 ### RETURN
 
