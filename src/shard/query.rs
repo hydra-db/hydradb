@@ -7864,7 +7864,7 @@ enum RowScalarValue {
 enum AggregateAccumulator {
     CountAll(u64),
     CountExpression(u64),
-    Sum(u128),
+    Sum { sum: u128, count: u64 },
     Avg { sum: u128, count: u64 },
     Collect(Vec<QueryValue>),
 }
@@ -8605,7 +8605,7 @@ fn new_aggregate_accumulator(projection: &RowProjection) -> Result<AggregateAccu
         RowProjection::CountAll => AggregateAccumulator::CountAll(0),
         RowProjection::Aggregate { function, .. } => match function {
             RowAggregateFunction::Count => AggregateAccumulator::CountExpression(0),
-            RowAggregateFunction::Sum => AggregateAccumulator::Sum(0),
+            RowAggregateFunction::Sum => AggregateAccumulator::Sum { sum: 0, count: 0 },
             RowAggregateFunction::Avg => AggregateAccumulator::Avg { sum: 0, count: 0 },
             RowAggregateFunction::Collect => AggregateAccumulator::Collect(Vec::new()),
         },
@@ -8640,7 +8640,7 @@ fn apply_aggregate_projection(
             }
         }
         (
-            AggregateAccumulator::Sum(sum),
+            AggregateAccumulator::Sum { sum, count },
             RowProjection::Aggregate {
                 function: RowAggregateFunction::Sum,
                 expression,
@@ -8653,6 +8653,7 @@ fn apply_aggregate_projection(
                         feature: "sum aggregate overflowed".to_string(),
                     }
                 })?;
+                *count = count.saturating_add(1);
             }
         }
         (
@@ -8715,7 +8716,8 @@ fn finalize_aggregate(state: &AggregateAccumulator) -> Result<QueryValue> {
         AggregateAccumulator::CountAll(count) | AggregateAccumulator::CountExpression(count) => {
             QueryValue::Count(*count)
         }
-        AggregateAccumulator::Sum(sum) => {
+        AggregateAccumulator::Sum { sum: _, count: 0 } => QueryValue::Null,
+        AggregateAccumulator::Sum { sum, count: _ } => {
             QueryValue::Property(VertexPropertyValue::Integer((*sum).try_into().map_err(
                 |_| GraphError::UnsupportedQuery {
                     dialect: "OpenCypher",
@@ -9098,5 +9100,31 @@ fn compare_u64_f64(left: u64, right: f64) -> std::cmp::Ordering {
         std::cmp::Ordering::Equal if floor == right => std::cmp::Ordering::Equal,
         std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
         ordering => ordering,
+    }
+}
+
+#[cfg(all(test, feature = "opencypher"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sum_aggregate_returns_null_when_empty_or_all_missing() {
+        let empty_sum = AggregateAccumulator::Sum { sum: 0, count: 0 };
+        assert_eq!(finalize_aggregate(&empty_sum).unwrap(), QueryValue::Null);
+
+        let populated_sum = AggregateAccumulator::Sum { sum: 42, count: 2 };
+        assert_eq!(
+            finalize_aggregate(&populated_sum).unwrap(),
+            QueryValue::Property(VertexPropertyValue::Integer(42))
+        );
+    }
+
+    #[test]
+    fn avg_and_count_accumulators() {
+        let empty_avg = AggregateAccumulator::Avg { sum: 0, count: 0 };
+        assert_eq!(finalize_aggregate(&empty_avg).unwrap(), QueryValue::Null);
+
+        let empty_count = AggregateAccumulator::CountAll(0);
+        assert_eq!(finalize_aggregate(&empty_count).unwrap(), QueryValue::Count(0));
     }
 }

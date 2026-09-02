@@ -11143,7 +11143,7 @@ async fn cypher_row_engine_executes_grouped_aggregates() {
             ],
             vec![QueryRow::new(vec![
                 QueryValue::Count(0),
-                QueryValue::Property(VertexPropertyValue::Integer(0)),
+                QueryValue::Null,
                 QueryValue::Null,
                 QueryValue::List(Vec::new()),
             ])],
