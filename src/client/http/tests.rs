@@ -356,3 +356,35 @@ async fn http_api_serves_authenticated_queries_over_https() {
     drop(client);
     server.stop().await.unwrap();
 }
+
+#[test]
+fn an_unreadable_namespace_header_is_rejected_rather_than_defaulted() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static(GRAPH_NAMESPACE_HEADER),
+        HeaderValue::from_bytes(&[0xff]).expect("a valid header byte"),
+    );
+
+    let error = http_graph_scope(&headers, "social".to_string(), true)
+        .expect_err("a present but unreadable namespace header must not default");
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "invalid_namespace");
+}
+
+#[test]
+fn a_duplicated_namespace_header_is_rejected() {
+    let mut headers = HeaderMap::new();
+    headers.append(
+        HeaderName::from_static(GRAPH_NAMESPACE_HEADER),
+        HeaderValue::from_static("tenant1"),
+    );
+    headers.append(
+        HeaderName::from_static(GRAPH_NAMESPACE_HEADER),
+        HeaderValue::from_static("tenant2"),
+    );
+
+    let error = http_graph_scope(&headers, "social".to_string(), true)
+        .expect_err("duplicated namespace header must be rejected");
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "invalid_namespace");
+}

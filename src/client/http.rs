@@ -597,18 +597,33 @@ fn http_graph_scope(
     graph_id: String,
     allow_default_namespace: bool,
 ) -> std::result::Result<GraphScope, HttpApiError> {
-    let namespace = match headers
-        .get(GRAPH_NAMESPACE_HEADER)
-        .and_then(|value| value.to_str().ok())
-    {
-        Some(namespace) => NamespacePath::new(
-            namespace
-                .split('/')
-                .map(|segment| NamespaceId::new(segment.to_string()))
-                .collect::<Result<Vec<_>>>()
-                .map_err(HttpApiError::from_graph)?,
-        )
-        .map_err(HttpApiError::from_graph)?,
+    if headers.get_all(GRAPH_NAMESPACE_HEADER).iter().count() > 1 {
+        return Err(HttpApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_namespace",
+            message: format!("{GRAPH_NAMESPACE_HEADER} header must not be duplicated"),
+            owner: None,
+            authenticate: false,
+        });
+    }
+    let namespace = match headers.get(GRAPH_NAMESPACE_HEADER) {
+        Some(value) => {
+            let namespace = value.to_str().map_err(|_| HttpApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_namespace",
+                message: format!("{GRAPH_NAMESPACE_HEADER} must be visible ASCII"),
+                owner: None,
+                authenticate: false,
+            })?;
+            NamespacePath::new(
+                namespace
+                    .split('/')
+                    .map(|segment| NamespaceId::new(segment.to_string()))
+                    .collect::<Result<Vec<_>>>()
+                    .map_err(HttpApiError::from_graph)?,
+            )
+            .map_err(HttpApiError::from_graph)?
+        }
         None if allow_default_namespace => NamespacePath::default(),
         None => {
             return Err(HttpApiError {
