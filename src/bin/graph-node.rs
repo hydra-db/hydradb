@@ -74,10 +74,45 @@ fn install_trace_context_bridge() {
 #[cfg(not(feature = "otlp"))]
 fn install_trace_context_bridge() {}
 
-#[tokio::main]
-async fn main() -> RuntimeResult<()> {
-    // First statement in the process: everything after it, including a config
-    // error, is logged rather than lost. `init` is total — with no
+/// The stack an OpenCypher query needs. Its async futures overflow tokio's
+/// 2 MiB default, and they do it on the first query rather than at startup, so
+/// a node that takes the size from its environment passes every probe and then
+/// aborts under traffic. Owning it here is what makes that unreachable for a
+/// deployment — image, chart, or bare `docker run` — that sets nothing.
+const WORKER_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+/// `WORKER_STACK_BYTES`, or `requested` when it asks for more.
+///
+/// This keeps `RUST_MIN_STACK` an override and stops it being a prerequisite:
+/// tokio consults the variable only when no explicit size is given, so raising
+/// it has to keep working from here instead. Anything below the floor — unset,
+/// empty, or unparseable included — leaves the floor standing. It takes the
+/// value rather than reading the variable so the rule is testable without
+/// mutating the environment of a running test binary.
+fn worker_stack_bytes(requested: Option<&str>) -> usize {
+    requested
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        .max(WORKER_STACK_BYTES)
+}
+
+fn main() -> RuntimeResult<()> {
+    // Built by hand because `#[tokio::main]` offers no way to size worker
+    // stacks, which is the whole point of this function.
+    let requested_stack = std::env::var("RUST_MIN_STACK").ok();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(worker_stack_bytes(requested_stack.as_deref()))
+        .build()?
+        .block_on(run())
+}
+
+/// Everything `main` was before the runtime above had to be built explicitly.
+/// Distinct from `run_node`, which is what starts serving once configuration
+/// has been read.
+async fn run() -> RuntimeResult<()> {
+    // First statement inside the runtime: everything after it, including a
+    // config error, is logged rather than lost. `init` is total — with no
     // `OTEL_EXPORTER_OTLP_ENDPOINT` set it installs the fmt layer alone, so a
     // missing collector is never why a node fails to boot.
     let telemetry_config = TelemetryConfig::from_env(ServiceIdentity::GraphNode);
@@ -615,6 +650,18 @@ mod tests {
     use slatedb::object_store::{memory::InMemory, ObjectStoreExt};
 
     use super::*;
+
+    /// The floor is the entire point of the constant: a deployment that sets
+    /// nothing gets it, and one that asks for less does not get less.
+    #[test]
+    fn worker_stack_floor_survives_the_environment() {
+        assert_eq!(worker_stack_bytes(None), WORKER_STACK_BYTES);
+        assert_eq!(worker_stack_bytes(Some("")), WORKER_STACK_BYTES);
+        assert_eq!(worker_stack_bytes(Some("not a number")), WORKER_STACK_BYTES);
+        assert_eq!(worker_stack_bytes(Some("2097152")), WORKER_STACK_BYTES);
+        assert_eq!(worker_stack_bytes(Some("33554432")), WORKER_STACK_BYTES);
+        assert_eq!(worker_stack_bytes(Some("67108864")), 64 * 1024 * 1024);
+    }
 
     /// Long enough to cover many publisher ticks, short enough that a genuine
     /// hang fails the test instead of the suite.

@@ -367,7 +367,7 @@ deeper.
 |---|---|
 | `invalid environment variable CLOUD_PROVIDER value \`null\`` | `CLOUD_PROVIDER` unset. `null` means absent, not the string. Accepted: `local`, `memory`, `aws`, `azure`, `gcp`. `local` also needs `LOCAL_PATH`, pointing at a directory that **already exists**. |
 | `wrapper.h:4:10: fatal error: 'cypher-parser.h' file not found` | `BINDGEN_EXTRA_CLANG_ARGS` unset on macOS. Use `just`, or export it. |
-| Node serves `/readyz`, then aborts with `has overflowed its stack` on the first query | `RUST_MIN_STACK` unset. The node starts fine and dies on first use, so this looks like a query bug and is not. |
+| Node serves `/readyz`, then aborts with `has overflowed its stack` on the first query | Not an unset `RUST_MIN_STACK`: `graph-node` floors its own worker stacks at `33554432`, so only a query needing more than that reaches this. Raising the variable above the floor still works. |
 | `curl: (7) Failed to connect ... 19091` | `graph-node` runs in the **foreground** and never returns. That is it working. Start it in its own shell. |
 | `cannot close database reader while snapshots are active` | A `GraphSnapshot` is still alive when `close()` runs. Drop it first. Fixed on current `main`; appears on older commits. |
 | `No available formula with the name "libcypher-parser"` | Not in homebrew-core. `brew install cleishm/neo4j/libcypher-parser`. |

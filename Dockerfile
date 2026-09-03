@@ -67,8 +67,13 @@ RUN cargo build --locked --release --features server-runtime \
 
 FROM ubuntu:24.04 AS runtime-base
 
+# `graph-node` sizes its own worker stacks, so this default is for everything
+# on this stage that does not: `s3-bolt-benchmark-server` links the same query
+# engine and still takes the size from the environment, and it is what any
+# thread the runtime did not spawn gets.
 ENV DEBIAN_FRONTEND=noninteractive \
-    RUST_LOG=info
+    RUST_LOG=info \
+    RUST_MIN_STACK=33554432
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates libcypher-parser-dev libgraphblas-dev && \
