@@ -58,6 +58,11 @@ The range covers every path from the minimum through the maximum, so `*1..3`
 returns everything reachable in one, two or three hops rather than only those
 exactly three long.
 
+Variable-length `MATCH` requires the source node to have a fixed integer
+`id`. Source nodes matched only by labels or other properties are not
+supported for variable-length traversal. For inbound patterns, the source
+node is the right-hand node, so it must carry the fixed `id`.
+
 The maximum is required. `*1..` and `*` are rejected, because an unbounded
 traversal on a large graph has no predictable cost. The minimum defaults to 1
 when omitted, and must not exceed the maximum.
