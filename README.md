@@ -341,7 +341,7 @@ a round-tripped write is.
 | `command not found: rustup-init` | Homebrew's `rustup` is keg-only and no longer ships it; use the official installer above |
 | `invalid environment variable CLOUD_PROVIDER value \`null\`` | `CLOUD_PROVIDER` is unset — `null` means absent, not the string. `local` also needs `LOCAL_PATH`, pointing at a directory that already exists |
 | `wrapper.h:4:10: fatal error: 'cypher-parser.h' file not found` | `BINDGEN_EXTRA_CLANG_ARGS` unset while invoking `cargo` directly on macOS. Prefer `just`, which exports it |
-| Node answers `/readyz`, then aborts with `has overflowed its stack` on the first query | `RUST_MIN_STACK` unset; export `33554432` |
+| Node answers `/readyz`, then aborts with `has overflowed its stack` on the first query | Not an unset `RUST_MIN_STACK`: the node floors its worker stacks at `33554432` itself. Export a *larger* value for a query that needs more |
 | `curl: (7) Failed to connect ... port 9090` | The node is not running. `graph-node` holds the foreground, so start it in its own shell |
 
 </details>
