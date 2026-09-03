@@ -1927,6 +1927,87 @@ async fn object_store_routing_reports_a_missing_owner_address_as_a_config_error(
         "a config mismatch is not transient: {error:?}"
     );
 }
+#[test]
+fn bolt_synthetic_relationship_ids_are_negative_and_sequential() {
+    use super::values::query_path_to_bolt;
+    use crate::query::{QueryPath, QueryPathNode, QueryPathRelationship};
+    let nodes = vec![
+        QueryPathNode {
+            id: 0,
+            labels: vec![],
+            properties: Default::default(),
+        },
+        QueryPathNode {
+            id: 1,
+            labels: vec![],
+            properties: Default::default(),
+        },
+        QueryPathNode {
+            id: 2,
+            labels: vec![],
+            properties: Default::default(),
+        },
+        QueryPathNode {
+            id: 3,
+            labels: vec![],
+            properties: Default::default(),
+        },
+        QueryPathNode {
+            id: 4,
+            labels: vec![],
+            properties: Default::default(),
+        },
+        QueryPathNode {
+            id: 5,
+            labels: vec![],
+            properties: Default::default(),
+        },
+    ];
+    let rels = vec![
+        QueryPathRelationship {
+            edge_type: String::new(),
+            src: 0,
+            dst: 1,
+            properties: Default::default(),
+            id: None,
+        },
+        QueryPathRelationship {
+            edge_type: String::new(),
+            src: 1,
+            dst: 2,
+            properties: Default::default(),
+            id: None,
+        },
+        QueryPathRelationship {
+            edge_type: String::new(),
+            src: 2,
+            dst: 3,
+            properties: Default::default(),
+            id: None,
+        },
+        QueryPathRelationship {
+            edge_type: String::new(),
+            src: 3,
+            dst: 4,
+            properties: Default::default(),
+            id: None,
+        },
+        QueryPathRelationship {
+            edge_type: String::new(),
+            src: 4,
+            dst: 5,
+            properties: Default::default(),
+            id: None,
+        },
+    ];
+    let path = QueryPath {
+        nodes,
+        relationships: rels,
+    };
+    let bolt_path = query_path_to_bolt(&path).expect("failed to convert path to bolt");
+    let ids: Vec<i64> = bolt_path.rels.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![-1, -2, -3, -4, -5]);
+}
 
 async fn send_test_bolt_client_message<W>(writer: &mut ChunkWriter<W>, message: &ClientMessage)
 where

@@ -139,7 +139,7 @@ fn query_path_to_bolt(path: &QueryPath) -> std::result::Result<BoltPath, BoltErr
         .map(|(index, relationship)| {
             let id = match relationship.id {
                 Some(id) => i64::try_from(id).map_err(|_| bolt_integer_overflow(id))?,
-                None => -1_i64.saturating_sub(index as i64),
+                None => (-1_i64).saturating_sub(index as i64),
             };
             Ok(BoltUnboundRelationship {
                 id,
