@@ -2476,6 +2476,18 @@ fn resolve_unwind_batch(
             source_label,
             destination_label,
         }),
+        ParsedUnwindBatchKind::CreateEdgesWithLabeledEndpoints {
+            edge_type,
+            source_field,
+            destination_field,
+            source_label,
+            destination_label,
+        } => Ok(QueryBatchOperation::CreateEdgesWithLabeledEndpoints {
+            edge_type,
+            edges: unwind_batch_edges(rows, &source_field, &destination_field)?,
+            source_label,
+            destination_label,
+        }),
         ParsedUnwindBatchKind::DeleteEdges {
             edge_type,
             source_field,
@@ -2722,6 +2734,7 @@ fn batch_operation_columns(operation: &QueryBatchOperation) -> Vec<QueryColumn> 
         } => vec![source_column.clone(), destination_column.clone()],
         QueryBatchOperation::CreateEdges { .. }
         | QueryBatchOperation::CreateEdgesBetweenLabeledVertices { .. }
+        | QueryBatchOperation::CreateEdgesWithLabeledEndpoints { .. }
         | QueryBatchOperation::DeleteEdges { .. }
         | QueryBatchOperation::DeleteVertices { .. }
         | QueryBatchOperation::DeleteRelationshipsByProperty { .. }

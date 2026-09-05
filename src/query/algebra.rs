@@ -169,6 +169,12 @@ pub enum QueryBatchOperation {
         source_label: String,
         destination_label: String,
     },
+    CreateEdgesWithLabeledEndpoints {
+        edge_type: String,
+        edges: Vec<QueryBatchEdge>,
+        source_label: String,
+        destination_label: String,
+    },
     UpsertVertices {
         vertices: Vec<QueryBatchVertex>,
     },
@@ -241,6 +247,7 @@ impl QueryBatchOperation {
             self,
             Self::CreateEdges { .. }
                 | Self::CreateEdgesBetweenLabeledVertices { .. }
+                | Self::CreateEdgesWithLabeledEndpoints { .. }
                 | Self::DeleteEdges { .. }
                 | Self::DeleteVertices { .. }
                 | Self::DeleteRelationshipsByProperty { .. }
@@ -257,6 +264,7 @@ impl QueryBatchOperation {
             Self::OutNeighbors { sources, .. } => sources.len(),
             Self::CreateEdges { edges, .. }
             | Self::CreateEdgesBetweenLabeledVertices { edges, .. }
+            | Self::CreateEdgesWithLabeledEndpoints { edges, .. }
             | Self::DeleteEdges { edges, .. } => edges.len(),
             Self::DeleteVertices { vertices, .. } => vertices.len(),
             Self::DeleteRelationshipsByProperty { values, .. } => values.len(),

@@ -73,6 +73,13 @@ pub(crate) enum ParsedUnwindBatchKind {
         source_label: String,
         destination_label: String,
     },
+    CreateEdgesWithLabeledEndpoints {
+        edge_type: String,
+        source_field: String,
+        destination_field: String,
+        source_label: String,
+        destination_label: String,
+    },
     DeleteEdges {
         edge_type: String,
         source_field: String,
@@ -914,6 +921,7 @@ impl ParsedCypher {
                     batch.kind,
                     ParsedUnwindBatchKind::CreateEdges { .. }
                         | ParsedUnwindBatchKind::CreateEdgesBetweenLabeledVertices { .. }
+                        | ParsedUnwindBatchKind::CreateEdgesWithLabeledEndpoints { .. }
                         | ParsedUnwindBatchKind::DeleteEdges { .. }
                         | ParsedUnwindBatchKind::DeleteVertices { .. }
                         | ParsedUnwindBatchKind::DeleteRelationshipsByProperty { .. }
@@ -1003,17 +1011,33 @@ impl ParsedCypher {
                     return unsupported("UNWIND CREATE cannot be followed by another clause");
                 }
                 let pattern = checked_node(sys::cypher_ast_create_get_pattern(second))?;
-                let edge = unwind_edge_template(pattern, &alias, true)?;
-                return Ok(Some(ParsedUnwindBatch {
-                    parameter,
-                    kind: ParsedUnwindBatchKind::CreateEdges {
+                let edge = unwind_edge_template(pattern, &alias, true, true)?;
+                let kind = match (edge.source_label, edge.destination_label) {
+                    (None, None) => ParsedUnwindBatchKind::CreateEdges {
                         edge_type: edge.edge_type,
                         source_field: edge.source_field,
                         destination_field: edge.destination_field.ok_or_else(|| {
                             unsupported_value("UNWIND CREATE requires destination id field")
                         })?,
                     },
-                }));
+                    (Some(source_label), Some(destination_label)) => {
+                        ParsedUnwindBatchKind::CreateEdgesWithLabeledEndpoints {
+                            edge_type: edge.edge_type,
+                            source_field: edge.source_field,
+                            destination_field: edge.destination_field.ok_or_else(|| {
+                                unsupported_value("UNWIND CREATE requires destination id field")
+                            })?,
+                            source_label,
+                            destination_label,
+                        }
+                    }
+                    _ => {
+                        return unsupported(
+                            "UNWIND CREATE labels must be specified on both endpoint nodes",
+                        );
+                    }
+                };
+                return Ok(Some(ParsedUnwindBatch { parameter, kind }));
             }
 
             if !is_instance(second, sys::CYPHER_AST_MATCH) || !(3..=4).contains(&clause_count) {
@@ -1143,7 +1167,7 @@ impl ParsedCypher {
                         },
                     }));
                 }
-                let edge = unwind_edge_template(pattern, &alias, true)?;
+                let edge = unwind_edge_template(pattern, &alias, true, false)?;
                 let relationship_binding = edge.relationship_binding.ok_or_else(|| {
                     unsupported_value("UNWIND DELETE requires a named relationship")
                 })?;
@@ -1173,7 +1197,7 @@ impl ParsedCypher {
             if clause_count != 3 {
                 return unsupported("UNWIND MATCH RETURN cannot be followed by another clause");
             }
-            let edge = unwind_edge_template(pattern, &alias, false)?;
+            let edge = unwind_edge_template(pattern, &alias, false, false)?;
             let destination_binding = edge.destination_binding.ok_or_else(|| {
                 unsupported_value("UNWIND batch read requires a named destination node")
             })?;
@@ -2915,6 +2939,8 @@ struct UnwindEdgeTemplate {
     destination_field: Option<String>,
     destination_binding: Option<String>,
     relationship_binding: Option<String>,
+    source_label: Option<String>,
+    destination_label: Option<String>,
 }
 
 #[cfg(feature = "client-api")]
@@ -2922,6 +2948,7 @@ fn unwind_edge_template(
     pattern: *const AstNode,
     unwind_alias: &str,
     require_destination_field: bool,
+    allow_endpoint_labels: bool,
 ) -> Result<UnwindEdgeTemplate> {
     unsafe {
         ensure_instance(pattern, sys::CYPHER_AST_PATTERN, "UNWIND edge pattern")?;
@@ -2960,10 +2987,17 @@ fn unwind_edge_template(
             0,
         ))?)?;
         let relationship_binding = rel_identifier(relationship)?;
-        let left_field = unwind_node_id_field(left, unwind_alias, true)?;
-        let right_field = unwind_node_id_field(right, unwind_alias, require_destination_field)?;
+        let left_field = unwind_node_id_field(left, unwind_alias, true, allow_endpoint_labels)?;
+        let right_field = unwind_node_id_field(
+            right,
+            unwind_alias,
+            require_destination_field,
+            allow_endpoint_labels,
+        )?;
         let left_binding = node_identifier(left)?;
         let right_binding = node_identifier(right)?;
+        let left_label = unwind_node_label(left)?;
+        let right_label = unwind_node_label(right)?;
         match sys::cypher_ast_rel_pattern_get_direction(relationship) {
             sys::cypher_rel_direction::CYPHER_REL_OUTBOUND => Ok(UnwindEdgeTemplate {
                 edge_type,
@@ -2972,6 +3006,8 @@ fn unwind_edge_template(
                 destination_field: right_field,
                 destination_binding: right_binding,
                 relationship_binding,
+                source_label: left_label,
+                destination_label: right_label,
             }),
             sys::cypher_rel_direction::CYPHER_REL_INBOUND => Ok(UnwindEdgeTemplate {
                 edge_type,
@@ -2980,6 +3016,8 @@ fn unwind_edge_template(
                 destination_field: left_field,
                 destination_binding: left_binding,
                 relationship_binding,
+                source_label: right_label,
+                destination_label: left_label,
             }),
             sys::cypher_rel_direction::CYPHER_REL_BIDIRECTIONAL => {
                 unsupported("UNWIND batch does not support undirected relationships")
@@ -2993,9 +3031,10 @@ fn unwind_node_id_field(
     node: *const AstNode,
     unwind_alias: &str,
     required: bool,
+    allow_label: bool,
 ) -> Result<Option<String>> {
     unsafe {
-        if sys::cypher_ast_node_pattern_nlabels(node) != 0 {
+        if !allow_label && sys::cypher_ast_node_pattern_nlabels(node) != 0 {
             return unsupported("UNWIND batch node patterns do not support labels");
         }
         let properties = sys::cypher_ast_node_pattern_get_properties(node);
@@ -3021,6 +3060,20 @@ fn unwind_node_id_field(
             return unsupported("UNWIND batch node id references the wrong row alias");
         }
         Ok(Some(field))
+    }
+}
+
+#[cfg(feature = "client-api")]
+fn unwind_node_label(node: *const AstNode) -> Result<Option<String>> {
+    unsafe {
+        match sys::cypher_ast_node_pattern_nlabels(node) {
+            0 => Ok(None),
+            1 => label_name(checked_node(sys::cypher_ast_node_pattern_get_label(
+                node, 0,
+            ))?)
+            .map(Some),
+            _ => unsupported("UNWIND CREATE endpoint nodes support exactly one label"),
+        }
     }
 }
 
@@ -3893,6 +3946,45 @@ mod tests {
                 destination_label: "Source".to_string(),
             }
         );
+    }
+
+    #[cfg(feature = "client-api")]
+    #[test]
+    fn lowers_unwind_create_between_labeled_vertices() {
+        let parsed = parse_opencypher_unwind_batch(
+            "UNWIND $rows AS row \
+             CREATE (s:Source {id: row.source_vertex}) \
+                    -[:FORCEFUL_RELATION]-> \
+                    (r:Related {id: row.related_vertex})",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.parameter, "rows");
+        assert_eq!(
+            parsed.kind,
+            ParsedUnwindBatchKind::CreateEdgesWithLabeledEndpoints {
+                edge_type: "FORCEFUL_RELATION".to_string(),
+                source_field: "source_vertex".to_string(),
+                destination_field: "related_vertex".to_string(),
+                source_label: "Source".to_string(),
+                destination_label: "Related".to_string(),
+            }
+        );
+    }
+
+    #[cfg(feature = "client-api")]
+    #[test]
+    fn rejects_unwind_create_with_a_label_on_only_one_endpoint() {
+        let error = parse_opencypher_unwind_batch(
+            "UNWIND $rows AS row \
+             CREATE (s:Source {id: row.source_vertex}) \
+                    -[:FORCEFUL_RELATION]-> \
+                    (r {id: row.related_vertex})",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("labels must be specified on both endpoint nodes"));
     }
 
     #[cfg(feature = "client-api")]

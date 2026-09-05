@@ -4181,6 +4181,7 @@ impl GraphShard {
             cell_id,
             mutations.into_iter().collect(),
             None,
+            false,
             "write_edge_mutations_batch",
         )
         .await
@@ -4200,7 +4201,28 @@ impl GraphShard {
             cell_id,
             mutations.into_iter().collect(),
             Some((source_label, destination_label)),
+            false,
             "write_edge_mutations_batch_between_labeled_vertices",
+        )
+        .await
+    }
+
+    #[cfg(feature = "opencypher")]
+    pub(crate) async fn write_edge_mutations_batch_creating_labeled_vertices(
+        &self,
+        cell_id: &str,
+        mutations: impl IntoIterator<Item = EdgeMutation>,
+        source_label: &str,
+        destination_label: &str,
+    ) -> Result<EdgeMutationBatchResult> {
+        validate_component("source_label", source_label)?;
+        validate_component("destination_label", destination_label)?;
+        self.write_edge_mutations_batch_with_endpoint_labels(
+            cell_id,
+            mutations.into_iter().collect(),
+            Some((source_label, destination_label)),
+            true,
+            "write_edge_mutations_batch_creating_labeled_vertices",
         )
         .await
     }
@@ -4210,6 +4232,7 @@ impl GraphShard {
         cell_id: &str,
         mutations: Vec<EdgeMutation>,
         endpoint_labels: Option<(&str, &str)>,
+        create_endpoint_labels: bool,
         operation: &'static str,
     ) -> Result<EdgeMutationBatchResult> {
         validate_component("cell_id", cell_id)?;
@@ -4259,7 +4282,13 @@ impl GraphShard {
                 .await;
             for attempt in 0..GRAPH_TXN_MAX_RETRIES {
                 match self
-                    .write_edge_mutations_batch_txn(cell_id, &mutations, operation, endpoint_labels)
+                    .write_edge_mutations_batch_txn(
+                        cell_id,
+                        &mutations,
+                        operation,
+                        endpoint_labels,
+                        create_endpoint_labels,
+                    )
                     .await
                 {
                     Err(err)
@@ -4368,10 +4397,17 @@ impl GraphShard {
         mutations: &[EdgeMutation],
         operation: &'static str,
         endpoint_labels: Option<(&str, &str)>,
+        create_endpoint_labels: bool,
     ) -> Result<EdgeMutationBatchResult> {
         let lock = self.acquire_local_write_guard(cell_id, operation).await?;
         let result = self
-            .write_edge_mutations_batch_txn_locked(cell_id, mutations, operation, endpoint_labels)
+            .write_edge_mutations_batch_txn_locked(
+                cell_id,
+                mutations,
+                operation,
+                endpoint_labels,
+                create_endpoint_labels,
+            )
             .await;
         finish_local_write(lock, result).await
     }
@@ -4382,6 +4418,7 @@ impl GraphShard {
         mutations: &[EdgeMutation],
         operation: &'static str,
         endpoint_labels: Option<(&str, &str)>,
+        create_endpoint_labels: bool,
     ) -> Result<EdgeMutationBatchResult> {
         let txn = self
             .db
@@ -4424,6 +4461,97 @@ impl GraphShard {
         let mut inserted = 0_u64;
         let mut already_existed = 0_u64;
 
+        if create_endpoint_labels {
+            let (source_label, destination_label) =
+                endpoint_labels.ok_or_else(|| GraphError::CorruptValue {
+                    key: operation.to_string(),
+                    reason: "creating endpoint labels requires labels".to_string(),
+                })?;
+            let requested_labels = format!("{source_label}\0{destination_label}");
+            let idempotency_values = read_txn_remote_many(
+                &txn,
+                mutations.iter().flat_map(|mutation| {
+                    [
+                        keys::idempotency(cell_id, "create", &mutation.idempotency_key),
+                        keys::idempotency(cell_id, "create-labels", &mutation.idempotency_key),
+                    ]
+                }),
+            )
+            .await?;
+            let mut pending_label_idempotency = BTreeSet::new();
+            for mutation in mutations {
+                let edge_key = keys::idempotency(cell_id, "create", &mutation.idempotency_key);
+                let labels_key =
+                    keys::idempotency(cell_id, "create-labels", &mutation.idempotency_key);
+                match (
+                    idempotency_values.get(&edge_key).and_then(Option::as_ref),
+                    idempotency_values.get(&labels_key).and_then(Option::as_ref),
+                ) {
+                    (Some(_), Some(value)) if value.as_ref() == requested_labels.as_bytes() => {}
+                    (Some(_), _) | (None, Some(_)) => {
+                        return Err(GraphError::IdempotencyConflict {
+                            operation: "create",
+                            idempotency_key: mutation.idempotency_key.clone(),
+                            reason:
+                                "a labelled edge create was retried with different endpoint labels"
+                                    .to_string(),
+                        })
+                    }
+                    (None, None) => {
+                        pending_label_idempotency.insert(mutation.idempotency_key.clone());
+                    }
+                }
+            }
+            let mut labels_by_vertex = BTreeMap::<VertexId, BTreeSet<String>>::new();
+            for mutation in mutations {
+                if !pending_label_idempotency.contains(&mutation.idempotency_key) {
+                    continue;
+                }
+                labels_by_vertex
+                    .entry(mutation.src)
+                    .or_default()
+                    .insert(source_label.to_string());
+                labels_by_vertex
+                    .entry(mutation.dst)
+                    .or_default()
+                    .insert(destination_label.to_string());
+            }
+            let endpoint_keys = labels_by_vertex
+                .keys()
+                .map(|vertex| keys::vertex(cell_id, *vertex));
+            let endpoint_values = read_txn_remote_many(&txn, endpoint_keys).await?;
+            let mut labels_changed = false;
+            for (vertex, labels) in labels_by_vertex {
+                let key = keys::vertex(cell_id, vertex);
+                let previous = match endpoint_values.get(&key).and_then(Option::as_ref) {
+                    Some(value) => decode_vertex_metadata(&key, &value)?,
+                    None => VertexMetadata::default(),
+                };
+                let mut next = previous.clone();
+                next.labels.extend(labels);
+                if next != previous {
+                    labels_changed = true;
+                    apply_vertex_metadata_update_txn(
+                        &txn,
+                        cell_id,
+                        vertex,
+                        &previous,
+                        &next,
+                        commit_epoch,
+                    )?;
+                }
+            }
+            if labels_changed {
+                next_epoch = commit_epoch;
+            }
+            for idempotency_key in pending_label_idempotency {
+                txn.put(
+                    keys::idempotency(cell_id, "create-labels", &idempotency_key).as_bytes(),
+                    requested_labels.as_bytes(),
+                )?;
+            }
+        }
+
         for mutation in mutations {
             let idem_key = keys::idempotency(cell_id, "create", &mutation.idempotency_key);
             if let Some(value) = read_txn_remote(&txn, &idem_key).await? {
@@ -4437,31 +4565,33 @@ impl GraphShard {
                 continue;
             }
 
-            if let Some((source_label, destination_label)) = endpoint_labels {
-                for (vertex, label) in [
-                    (mutation.src, source_label),
-                    (mutation.dst, destination_label),
-                ] {
-                    if !validated_endpoints.insert((vertex, label.to_string())) {
-                        continue;
-                    }
-                    let key = keys::vertex(cell_id, vertex);
-                    let Some(value) = read_txn_remote(&txn, &key).await? else {
-                        return Err(GraphError::UnsupportedQuery {
-                            dialect: "OpenCypher",
-                            feature: format!(
+            if !create_endpoint_labels {
+                if let Some((source_label, destination_label)) = endpoint_labels {
+                    for (vertex, label) in [
+                        (mutation.src, source_label),
+                        (mutation.dst, destination_label),
+                    ] {
+                        if !validated_endpoints.insert((vertex, label.to_string())) {
+                            continue;
+                        }
+                        let key = keys::vertex(cell_id, vertex);
+                        let Some(value) = read_txn_remote(&txn, &key).await? else {
+                            return Err(GraphError::UnsupportedQuery {
+                                dialect: "OpenCypher",
+                                feature: format!(
                                 "MATCH endpoint vertex {vertex} with label {label} does not exist"
                             ),
-                        });
-                    };
-                    let metadata = decode_vertex_metadata(&key, &value)?;
-                    if !metadata.labels.contains(label) {
-                        return Err(GraphError::UnsupportedQuery {
-                            dialect: "OpenCypher",
-                            feature: format!(
-                                "MATCH endpoint vertex {vertex} does not have label {label}"
-                            ),
-                        });
+                            });
+                        };
+                        let metadata = decode_vertex_metadata(&key, &value)?;
+                        if !metadata.labels.contains(label) {
+                            return Err(GraphError::UnsupportedQuery {
+                                dialect: "OpenCypher",
+                                feature: format!(
+                                    "MATCH endpoint vertex {vertex} does not have label {label}"
+                                ),
+                            });
+                        }
                     }
                 }
             }

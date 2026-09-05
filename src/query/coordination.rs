@@ -3272,6 +3272,37 @@ impl QueryCellClient for RoutedGraphCluster {
                     .await?;
                 Ok(QueryResultSet::new(Vec::new(), Vec::new()))
             }
+            crate::QueryBatchOperation::CreateEdgesWithLabeledEndpoints {
+                edge_type,
+                edges,
+                source_label,
+                destination_label,
+            } => {
+                self.ensure_local_writer(&context.cell_id).await?;
+                let mutations =
+                    edges
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, edge)| crate::EdgeMutation {
+                            cell_id: context.cell_id.clone(),
+                            edge_type: edge_type.clone(),
+                            src: edge.src,
+                            dst: edge.dst,
+                            idempotency_key: format!(
+                                "{}.unwind-create-labelled.{index:020}",
+                                context.idempotency_key
+                            ),
+                        });
+                shard
+                    .write_edge_mutations_batch_creating_labeled_vertices(
+                        &context.cell_id,
+                        mutations,
+                        &source_label,
+                        &destination_label,
+                    )
+                    .await?;
+                Ok(QueryResultSet::new(Vec::new(), Vec::new()))
+            }
             crate::QueryBatchOperation::UpsertVertices { vertices } => {
                 self.ensure_local_writer(&context.cell_id).await?;
                 shard
