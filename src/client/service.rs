@@ -1264,6 +1264,7 @@ impl ClientQueryService {
         // it was measured against.
         tracing::Span::current().record("runtime_limit_ms", runtime_limit_ms);
         let action = self.authorize_query(session, &request)?;
+        self.validate_bookmark_target(&request)?;
         let parsed_unwind = parse_opencypher_unwind_batch(&request.query)?;
         let (batch_operation, scalar_parameters) = match parsed_unwind {
             Some(parsed) => (
@@ -1297,7 +1298,7 @@ impl ClientQueryService {
                 &cancellation_token,
                 runtime_limit_ms,
                 async {
-                    self.validate_bookmark(&request).await?;
+                    self.await_bookmark(&request, &cancellation_token).await?;
                     self.refresh_strong_read(&request, action, &cancellation_token)
                         .await?;
                     let mut context = query_context(
@@ -1461,6 +1462,7 @@ impl ClientQueryService {
                 &cancellation_token,
                 runtime_limit_ms,
                 async {
+                    self.await_bookmark(&request, &cancellation_token).await?;
                     if let Some(cursor) = cursor {
                         return self
                             .continue_server_cursor(session, &request, cursor, page_size)
@@ -1557,7 +1559,7 @@ impl ClientQueryService {
         let runtime_limit_ms = self.normalize_runtime_limit(&mut request)?;
         tracing::Span::current().record("runtime_limit_ms", runtime_limit_ms);
         let action = self.authorize_query(session, &request)?;
-        self.validate_bookmark(&request).await?;
+        self.validate_bookmark_target(&request)?;
 
         let parsed_unwind = parse_opencypher_unwind_batch(&request.query)?;
         let (batch_operation, scalar_parameters) = match parsed_unwind {
@@ -1909,7 +1911,7 @@ impl ClientQueryService {
         self.authorize_any_action(session, scope, &[action], action.as_str())
     }
 
-    async fn validate_bookmark(&self, request: &ClientQueryRequest) -> Result<()> {
+    fn validate_bookmark_target(&self, request: &ClientQueryRequest) -> Result<()> {
         let Some(bookmark) = &request.bookmark else {
             return Ok(());
         };
@@ -1919,7 +1921,21 @@ impl ClientQueryService {
                 actual: format!("{} cell {}", bookmark.target.scope, bookmark.target.cell_id),
             });
         }
-        self.ensure_bookmark(bookmark).await
+        Ok(())
+    }
+
+    async fn await_bookmark(
+        &self,
+        request: &ClientQueryRequest,
+        cancellation_token: &QueryCancellationToken,
+    ) -> Result<()> {
+        let Some(bookmark) = &request.bookmark else {
+            return Ok(());
+        };
+        tokio::select! {
+            result = self.ensure_bookmark(bookmark) => result,
+            _ = cancellation_token.cancelled() => Err(client_query_cancelled()),
+        }
     }
 
     async fn refresh_strong_read(
