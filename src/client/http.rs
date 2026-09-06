@@ -782,6 +782,36 @@ struct NdjsonQueryState {
     done: bool,
 }
 
+impl NdjsonQueryState {
+    async fn release_cursor(&mut self) {
+        let Some(cursor) = self.next_cursor.take() else {
+            return;
+        };
+        let _ = self
+            .service
+            .release_server_cursor(&self.session, &self.request, cursor)
+            .await;
+    }
+}
+
+impl Drop for NdjsonQueryState {
+    fn drop(&mut self) {
+        let Some(cursor) = self.next_cursor else {
+            return;
+        };
+        let service = self.service.clone();
+        let session = self.session.clone();
+        let request = self.request.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = service
+                    .release_server_cursor(&session, &request, cursor)
+                    .await;
+            });
+        }
+    }
+}
+
 fn ndjson_response(
     service: ClientQueryService,
     session: ClientQuerySession,
@@ -821,13 +851,14 @@ fn ndjson_response(
                 match remaining_http_runtime_ms(state.deadline, state.runtime_limit_ms) {
                     Ok(remaining_runtime_ms) => remaining_runtime_ms,
                     Err(error) => {
+                        state.release_cursor().await;
                         enqueue_ndjson_error(&mut state, &error);
                         state.done = true;
                         continue;
                     }
                 };
             state.request.max_runtime_ms = Some(remaining_runtime_ms);
-            let cursor = state.next_cursor.take();
+            let cursor = state.next_cursor;
             match state
                 .service
                 .execute_page(
@@ -842,6 +873,7 @@ fn ndjson_response(
                     state.request.read_epoch = page.read_epoch;
                     state.next_cursor = page.page.next_cursor;
                     if let Err(error) = enqueue_ndjson_rows(&mut state, &page) {
+                        state.release_cursor().await;
                         enqueue_ndjson_error(&mut state, &error);
                         state.done = true;
                     } else if state.next_cursor.is_none() {
@@ -854,6 +886,7 @@ fn ndjson_response(
                     }
                 }
                 Err(error) => {
+                    state.release_cursor().await;
                     enqueue_ndjson_error(&mut state, &error);
                     state.done = true;
                 }
