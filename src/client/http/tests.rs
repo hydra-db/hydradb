@@ -94,6 +94,24 @@ fn http_service(client: Arc<HttpTestClient>) -> ClientQueryService {
     .unwrap()
 }
 
+fn cursor_limited_http_service(client: Arc<HttpTestClient>) -> ClientQueryService {
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "http-secret",
+            QueryTransportScopeGrant::read_graph(http_scope()),
+        )
+        .unwrap();
+    ClientQueryService::new(
+        client,
+        crate::ClientQueryServiceConfig::default()
+            .with_required_bearer_token("http-secret")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_max_page_size(8)
+            .with_server_cursor_limits(1, 1 << 20, 60_000),
+    )
+    .unwrap()
+}
+
 #[test]
 fn http_parameters_preserve_integer_sign_and_precision() {
     assert_eq!(
@@ -312,6 +330,73 @@ async fn ndjson_stream_uses_one_snapshot_backed_server_cursor() {
     assert_eq!(lines.last().unwrap()["type"], "summary");
     assert_eq!(backend.observed_epochs.lock().await.as_slice(), &[None]);
     server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_an_ndjson_response_releases_its_server_cursor() {
+    let backend = Arc::new(HttpTestClient {
+        observed_epochs: Mutex::new(Vec::new()),
+        refreshes: AtomicU64::new(0),
+    });
+    let service = cursor_limited_http_service(backend);
+    let session = service
+        .authenticate(
+            &ClientQueryCredentials::Bearer("http-secret".to_string()),
+            &QueryTransportConnectionIdentity::default(),
+        )
+        .unwrap();
+    let request = ClientQueryRequest::new(
+        ClientQueryTarget::new(http_scope(), "cell-a").unwrap(),
+        "http-dropped-stream",
+        "MATCH (n) RETURN n.id",
+    );
+    let first_page = service
+        .execute_page(&session, request.clone(), None, 1)
+        .await
+        .unwrap();
+    assert!(first_page.page.next_cursor.is_some());
+
+    drop(
+        ndjson_response(
+            service.clone(),
+            session.clone(),
+            request,
+            1,
+            first_page,
+            Instant::now() + Duration::from_secs(1),
+            1_000,
+        )
+        .unwrap(),
+    );
+
+    let next_page = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            match service
+                .execute_page(
+                    &session,
+                    ClientQueryRequest::new(
+                        ClientQueryTarget::new(http_scope(), "cell-a").unwrap(),
+                        "http-next-stream",
+                        "MATCH (n) RETURN n.id",
+                    ),
+                    None,
+                    1,
+                )
+                .await
+            {
+                Ok(page) => break page,
+                Err(GraphError::AdmissionRejected {
+                    operation: "client_server_cursors",
+                    ..
+                }) => tokio::time::sleep(Duration::from_millis(1)).await,
+                Err(error) => panic!("unexpected second query error: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("dropping the NDJSON response must release its cursor");
+
+    assert!(next_page.page.next_cursor.is_some());
 }
 
 #[tokio::test]
