@@ -179,6 +179,10 @@ struct ConsistencyTestClient {
 
 struct BlockingRefreshClient;
 
+struct BlockingBookmarkClient {
+    executions: Arc<AtomicU64>,
+}
+
 #[async_trait]
 impl QueryCellClient for BlockingRefreshClient {
     async fn execute_cypher_rows(
@@ -212,6 +216,48 @@ impl QueryCellClient for BlockingRefreshClient {
         &self,
         _scope: &GraphScope,
         _cell_id: &str,
+    ) -> Result<Option<StorageSequence>> {
+        std::future::pending().await
+    }
+}
+
+#[async_trait]
+impl QueryCellClient for BlockingBookmarkClient {
+    async fn execute_cypher_rows(
+        &self,
+        _context: QueryContext,
+        _query: &str,
+    ) -> Result<QueryResultSet> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        Ok(QueryResultSet::new(Vec::new(), Vec::new())
+            .with_read_epoch(7)
+            .with_storage_sequence(7))
+    }
+
+    async fn execute_cypher_rows_page(
+        &self,
+        context: QueryContext,
+        query: &str,
+        _cursor: Option<QueryCursorToken>,
+        _page_size: usize,
+    ) -> Result<QueryResultPage> {
+        let result = self.execute_cypher_rows(context, query).await?;
+        Ok(QueryResultPage::new(result.columns, result.rows, None))
+    }
+
+    async fn current_storage_sequence(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+    ) -> Result<Option<StorageSequence>> {
+        Ok(Some(7))
+    }
+
+    async fn wait_for_storage_sequence(
+        &self,
+        _scope: &GraphScope,
+        _cell_id: &str,
+        _minimum: StorageSequence,
     ) -> Result<Option<StorageSequence>> {
         std::future::pending().await
     }
@@ -495,6 +541,23 @@ fn service() -> ClientQueryService {
     .unwrap()
 }
 
+fn blocking_bookmark_service(executions: Arc<AtomicU64>) -> ClientQueryService {
+    let authorizer = StaticQueryTransportScopeAuthorizer::new()
+        .with_bearer_grant(
+            "secret",
+            QueryTransportScopeGrant::read_graph(GraphScope::default()),
+        )
+        .unwrap();
+    ClientQueryService::new(
+        Arc::new(BlockingBookmarkClient { executions }),
+        ClientQueryServiceConfig::default()
+            .with_required_bearer_token("secret")
+            .with_scope_authorizer(Arc::new(authorizer))
+            .with_max_query_runtime_ms(10),
+    )
+    .unwrap()
+}
+
 fn cursor_service(
     executions: Arc<AtomicU64>,
     max_cursors: usize,
@@ -678,6 +741,125 @@ async fn strong_read_timeout_does_not_wait_for_a_blocked_storage_refresh() {
     ));
     assert!(started.elapsed() < Duration::from_millis(250));
     assert_eq!(service.active_query_count().await, 0);
+}
+
+#[tokio::test]
+async fn bookmark_wait_counts_against_the_query_runtime_limit() {
+    let executions = Arc::new(AtomicU64::new(0));
+    let service = blocking_bookmark_service(Arc::clone(&executions));
+    let session = authenticated_session(&service);
+
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_millis(250),
+        service.execute_rows(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "query-blocked-bookmark-timeout",
+                "MATCH (n {id: 1}) RETURN n.id",
+            )
+            .after_bookmark(ClientBookmark::new(target(), 8)),
+        ),
+    )
+    .await
+    .expect("bookmark wait must respect the query runtime limit")
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        GraphError::QueryTimeout {
+            operation: "client_query_runtime",
+            limit_ms: 10,
+            ..
+        }
+    ));
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert_eq!(service.active_query_count().await, 0);
+}
+
+#[tokio::test]
+async fn paged_bookmark_wait_counts_against_the_query_runtime_limit() {
+    let executions = Arc::new(AtomicU64::new(0));
+    let service = blocking_bookmark_service(Arc::clone(&executions));
+    let session = authenticated_session(&service);
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(250),
+        service.execute_page(
+            &session,
+            ClientQueryRequest::new(
+                target(),
+                "query-blocked-paged-bookmark-timeout",
+                "MATCH (n {id: 1}) RETURN n.id",
+            )
+            .after_bookmark(ClientBookmark::new(target(), 8)),
+            None,
+            1,
+        ),
+    )
+    .await
+    .expect("paged bookmark wait must respect the query runtime limit")
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        GraphError::QueryTimeout {
+            operation: "client_query_runtime",
+            limit_ms: 10,
+            ..
+        }
+    ));
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert_eq!(service.active_query_count().await, 0);
+}
+
+#[tokio::test]
+async fn bookmark_wait_can_be_cancelled_before_query_execution() {
+    let executions = Arc::new(AtomicU64::new(0));
+    let service = blocking_bookmark_service(Arc::clone(&executions));
+    let session = authenticated_session(&service);
+    let query = {
+        let service = service.clone();
+        let session = session.clone();
+        tokio::spawn(async move {
+            service
+                .execute_rows(
+                    &session,
+                    ClientQueryRequest::new(
+                        target(),
+                        "query-blocked-bookmark-cancel",
+                        "MATCH (n {id: 1}) RETURN n.id",
+                    )
+                    .after_bookmark(ClientBookmark::new(target(), 8)),
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while service.active_query_count().await == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    service
+        .cancel(
+            &session,
+            &GraphScope::default(),
+            "query-blocked-bookmark-cancel",
+        )
+        .await
+        .unwrap();
+    assert!(query
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string()
+        .contains("client_query_cancelled"));
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
