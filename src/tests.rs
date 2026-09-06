@@ -11153,6 +11153,100 @@ async fn cypher_row_engine_executes_grouped_aggregates() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_sum_accepts_signed_integer_properties() {
+    assert_signed_integer_aggregate(
+        "sum",
+        &[(1, -2), (2, 5)],
+        QueryValue::Property(VertexPropertyValue::Integer(3)),
+    )
+    .await;
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_avg_accepts_signed_integer_properties() {
+    assert_signed_integer_aggregate(
+        "avg",
+        &[(1, -2), (2, 5)],
+        QueryValue::Float(QueryFloat(1.5)),
+    )
+    .await;
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_sum_returns_signed_integer_when_negative() {
+    assert_signed_integer_aggregate(
+        "sum",
+        &[(1, -5), (2, 2)],
+        QueryValue::Property(VertexPropertyValue::SignedInteger(-3)),
+    )
+    .await;
+}
+
+#[cfg(feature = "opencypher")]
+async fn assert_signed_integer_aggregate(
+    function: &str,
+    scores: &[(u64, i64)],
+    expected: QueryValue,
+) {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/signed-integer-aggregates", object_store).await;
+    for (id, score) in scores {
+        shard
+            .set_vertex_metadata(
+                "reddit-home",
+                *id,
+                VertexMetadata::default()
+                    .with_label("Score")
+                    .with_property("score", VertexPropertyValue::from_i64(*score)),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Confirm both values reach the row engine before testing aggregation.
+    let input = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "signed-aggregate-input"),
+            "MATCH (n:Score) RETURN n.score AS score ORDER BY n.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        input,
+        QueryResultSet::new(
+            vec![QueryColumn::new("score")],
+            scores
+                .iter()
+                .map(|(_, score)| {
+                    QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::from_i64(
+                        *score,
+                    ))])
+                })
+                .collect(),
+        )
+    );
+
+    let result = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "signed-aggregate-result"),
+            &format!("MATCH (n:Score) RETURN {function}(n.score) AS result"),
+        )
+        .await;
+    assert_eq!(
+        result.unwrap_or_else(|error| panic!(
+            "{function} rejected signed integer properties: {error}"
+        )),
+        QueryResultSet::new(
+            vec![QueryColumn::new("result")],
+            vec![QueryRow::new(vec![expected])],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_executes_set_remove_delete_and_merge_mutations() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-mutations", object_store).await;
