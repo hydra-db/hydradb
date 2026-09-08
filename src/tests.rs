@@ -11263,6 +11263,50 @@ async fn cypher_executes_set_remove_delete_and_merge_mutations() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_mutation_where_not_excludes_rows_with_missing_properties() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-mutation-where-not-null", object_store).await;
+
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("age", VertexPropertyValue::Integer(30)),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            2,
+            VertexMetadata::default().with_label("User"),
+        )
+        .await
+        .unwrap();
+
+    let mutation = shard
+        .execute_cypher(
+            QueryContext::new("reddit-home", "cypher-mutation-where-not-null"),
+            "MATCH (n:User) WHERE NOT (n.age = 30) SET n.flag = true",
+        )
+        .await
+        .unwrap();
+    assert_eq!(mutation, QueryOutput::Mutation(QueryMutationResult::default()));
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-mutation-where-not-null-read"),
+            "MATCH (n:User {flag: true}) RETURN n.id",
+        )
+        .await
+        .unwrap();
+    assert!(rows.rows.is_empty());
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_detach_delete_node_cascades_edges_and_metadata() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-detach-delete-node", object_store).await;
@@ -13210,6 +13254,74 @@ async fn cypher_rows_filter_project_and_sort_vertex_metadata() {
             ],
         )
     );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn cypher_where_not_excludes_rows_with_missing_properties() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-where-not-null", object_store).await;
+
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("age", VertexPropertyValue::Integer(30))
+                .with_property("name", VertexPropertyValue::String("ada".to_string()))
+                .with_property("active", VertexPropertyValue::Bool(true)),
+        )
+        .await
+        .unwrap();
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            2,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("active", VertexPropertyValue::Bool(true)),
+        )
+        .await
+        .unwrap();
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-where-not-null"),
+            "MATCH (n:User) WHERE NOT (n.age = 30) RETURN n.id ORDER BY n.id",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        QueryResultSet::new(vec![QueryColumn::new("n.id")], Vec::new())
+    );
+
+    for (query_id, query) in [
+        (
+            "cypher-where-not-missing-starts-with",
+            "MATCH (n:User) WHERE NOT (n.name STARTS WITH 'a') RETURN n.id ORDER BY n.id",
+        ),
+        (
+            "cypher-where-not-missing-and",
+            "MATCH (n:User) WHERE NOT (n.age = 30 AND n.active = true) RETURN n.id ORDER BY n.id",
+        ),
+        (
+            "cypher-where-not-missing-or",
+            "MATCH (n:User) WHERE NOT (n.age = 30 OR n.active = false) RETURN n.id ORDER BY n.id",
+        ),
+    ] {
+        let rows = shard
+            .execute_cypher_rows(QueryContext::new("reddit-home", query_id), query)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            QueryResultSet::new(vec![QueryColumn::new("n.id")], Vec::new()),
+            "{query_id}"
+        );
+    }
 }
 
 #[cfg(feature = "opencypher")]
