@@ -373,6 +373,13 @@ impl HttpApiError {
                 owner: None,
                 authenticate: false,
             },
+            GraphError::IdempotencyConflict { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "idempotency_conflict",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
             GraphError::AdmissionRejected { .. } => Self {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 code: "resource_exhausted",
