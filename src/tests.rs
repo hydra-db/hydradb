@@ -13214,6 +13214,162 @@ async fn cypher_rows_filter_project_and_sort_vertex_metadata() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn missing_property_predicate_three_valued_logic() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/missing-property-3vl", object_store).await;
+
+    // User 1 has age 30
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            1,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("id", VertexPropertyValue::Integer(1))
+                .with_property("age", VertexPropertyValue::Integer(30)),
+        )
+        .await
+        .unwrap();
+
+    // User 2 has NO age property
+    shard
+        .set_vertex_metadata(
+            "reddit-home",
+            2,
+            VertexMetadata::default()
+                .with_label("User")
+                .with_property("id", VertexPropertyValue::Integer(2)),
+        )
+        .await
+        .unwrap();
+
+    // 1. Positive match on age = 30 returns user 1 only
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-missing-prop-1"),
+            "MATCH (n:User) WHERE n.age = 30 RETURN n.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::Integer(1)
+            )])],
+        )
+    );
+
+    // 2. Negated match NOT (n.age = 30):
+    // User 1: age = 30 is true, NOT true is false -> excluded
+    // User 2: age is missing, so age = 30 is null, NOT null is null -> excluded (Issue #186 fix)
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-missing-prop-2"),
+            "MATCH (n:User) WHERE NOT (n.age = 30) RETURN n.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(vec![QueryColumn::new("id")], vec![])
+    );
+
+    // 3. Inequality n.age <> 30:
+    // User 1: 30 <> 30 is false -> excluded
+    // User 2: missing <> 30 is null -> excluded
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-missing-prop-3"),
+            "MATCH (n:User) WHERE n.age <> 30 RETURN n.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(vec![QueryColumn::new("id")], vec![])
+    );
+
+    // 4. Negated inequality NOT (n.age <> 30):
+    // User 1: 30 <> 30 is false, NOT false is true -> included!
+    // User 2: missing <> 30 is null, NOT null is null -> excluded!
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-missing-prop-4"),
+            "MATCH (n:User) WHERE NOT (n.age <> 30) RETURN n.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::Integer(1)
+            )])],
+        )
+    );
+
+    // 5. OR predicate: n.age = 30 OR n.id = 2
+    // User 1: age = 30 is true -> true
+    // User 2: age = 30 is null, id = 2 is true -> null OR true = true
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-missing-prop-5"),
+            "MATCH (n:User) WHERE n.age = 30 OR n.id = 2 RETURN n.id AS id ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::Integer(1))]),
+                QueryRow::new(vec![QueryValue::Property(VertexPropertyValue::Integer(2))]),
+            ],
+        )
+    );
+
+    // 6. AND predicate: n.age = 30 AND n.id = 2
+    // User 1: true AND false = false
+    // User 2: null AND true = null -> excluded
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-missing-prop-6"),
+            "MATCH (n:User) WHERE n.age = 30 AND n.id = 2 RETURN n.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(vec![QueryColumn::new("id")], vec![])
+    );
+
+    // 7. STARTS WITH on present non-string property:
+    // User 1: age is integer 30 -> n.age STARTS WITH '3' is false -> NOT (false) is true -> included!
+    // User 2: age is missing -> null -> NOT (null) is null -> excluded!
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-missing-prop-7"),
+            "MATCH (n:User) WHERE NOT (n.age STARTS WITH '3') RETURN n.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![QueryColumn::new("id")],
+            vec![QueryRow::new(vec![QueryValue::Property(
+                VertexPropertyValue::Integer(1)
+            )])],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn vertex_metadata_indexes_are_replaced_on_update() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/vertex-metadata-index-update", object_store).await;

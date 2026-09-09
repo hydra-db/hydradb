@@ -8051,7 +8051,46 @@ fn vertex_metadata_matches(metadata: &VertexMetadata, node: &RowNodePattern) -> 
 }
 
 #[cfg(feature = "opencypher")]
-fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<bool> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TriBool {
+    True,
+    False,
+    Null,
+}
+
+#[cfg(feature = "opencypher")]
+impl TriBool {
+    fn not(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Null => Self::Null,
+        }
+    }
+
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::False, _) | (_, Self::False) => Self::False,
+            (Self::True, Self::True) => Self::True,
+            _ => Self::Null,
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::True, _) | (_, Self::True) => Self::True,
+            (Self::False, Self::False) => Self::False,
+            _ => Self::Null,
+        }
+    }
+
+    fn is_true(self) -> bool {
+        matches!(self, Self::True)
+    }
+}
+
+#[cfg(feature = "opencypher")]
+fn eval_row_predicate(row: &BindingRow, predicate: &RowPredicate) -> Result<TriBool> {
     Ok(match predicate {
         RowPredicate::Compare { left, op, right } => compare_row_values(
             eval_row_expression(row, left)?,
@@ -8061,19 +8100,39 @@ fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<b
         RowPredicate::StartsWith { expression, prefix } => {
             match eval_row_expression(row, expression)? {
                 RowScalarValue::Value(VertexPropertyValue::String(value)) => {
-                    value.starts_with(prefix)
+                    if value.starts_with(prefix) {
+                        TriBool::True
+                    } else {
+                        TriBool::False
+                    }
                 }
-                RowScalarValue::Value(_) | RowScalarValue::Missing => false,
+                RowScalarValue::Value(_) => TriBool::False,
+                RowScalarValue::Missing => TriBool::Null,
             }
         }
         RowPredicate::And(left, right) => {
-            row_predicate_matches(row, left)? && row_predicate_matches(row, right)?
+            let left_val = eval_row_predicate(row, left)?;
+            if left_val == TriBool::False {
+                TriBool::False
+            } else {
+                left_val.and(eval_row_predicate(row, right)?)
+            }
         }
         RowPredicate::Or(left, right) => {
-            row_predicate_matches(row, left)? || row_predicate_matches(row, right)?
+            let left_val = eval_row_predicate(row, left)?;
+            if left_val == TriBool::True {
+                TriBool::True
+            } else {
+                left_val.or(eval_row_predicate(row, right)?)
+            }
         }
-        RowPredicate::Not(inner) => !row_predicate_matches(row, inner)?,
+        RowPredicate::Not(inner) => eval_row_predicate(row, inner)?.not(),
     })
+}
+
+#[cfg(feature = "opencypher")]
+fn row_predicate_matches(row: &BindingRow, predicate: &RowPredicate) -> Result<bool> {
+    Ok(eval_row_predicate(row, predicate)?.is_true())
 }
 
 #[cfg(feature = "opencypher")]
@@ -8240,11 +8299,15 @@ fn compare_row_values(
     left: RowScalarValue,
     op: RowComparisonOp,
     right: RowScalarValue,
-) -> Result<bool> {
+) -> Result<TriBool> {
     let (RowScalarValue::Value(left), RowScalarValue::Value(right)) = (left, right) else {
-        return Ok(false);
+        return Ok(TriBool::Null);
     };
-    compare_vertex_property_values(&left, op, &right)
+    Ok(if compare_vertex_property_values(&left, op, &right)? {
+        TriBool::True
+    } else {
+        TriBool::False
+    })
 }
 
 #[cfg(feature = "opencypher")]
@@ -9098,5 +9161,139 @@ fn compare_u64_f64(left: u64, right: f64) -> std::cmp::Ordering {
         std::cmp::Ordering::Equal if floor == right => std::cmp::Ordering::Equal,
         std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
         ordering => ordering,
+    }
+}
+
+#[cfg(all(test, feature = "opencypher"))]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use crate::core::VertexMetadata;
+
+    #[test]
+    fn test_tribool_logic() {
+        assert_eq!(TriBool::True.not(), TriBool::False);
+        assert_eq!(TriBool::False.not(), TriBool::True);
+        assert_eq!(TriBool::Null.not(), TriBool::Null);
+
+        assert_eq!(TriBool::True.and(TriBool::True), TriBool::True);
+        assert_eq!(TriBool::True.and(TriBool::False), TriBool::False);
+        assert_eq!(TriBool::True.and(TriBool::Null), TriBool::Null);
+        assert_eq!(TriBool::False.and(TriBool::True), TriBool::False);
+        assert_eq!(TriBool::False.and(TriBool::False), TriBool::False);
+        assert_eq!(TriBool::False.and(TriBool::Null), TriBool::False);
+        assert_eq!(TriBool::Null.and(TriBool::True), TriBool::Null);
+        assert_eq!(TriBool::Null.and(TriBool::False), TriBool::False);
+        assert_eq!(TriBool::Null.and(TriBool::Null), TriBool::Null);
+
+        assert_eq!(TriBool::True.or(TriBool::True), TriBool::True);
+        assert_eq!(TriBool::True.or(TriBool::False), TriBool::True);
+        assert_eq!(TriBool::True.or(TriBool::Null), TriBool::True);
+        assert_eq!(TriBool::False.or(TriBool::True), TriBool::True);
+        assert_eq!(TriBool::False.or(TriBool::False), TriBool::False);
+        assert_eq!(TriBool::False.or(TriBool::Null), TriBool::Null);
+        assert_eq!(TriBool::Null.or(TriBool::True), TriBool::True);
+        assert_eq!(TriBool::Null.or(TriBool::False), TriBool::Null);
+        assert_eq!(TriBool::Null.or(TriBool::Null), TriBool::Null);
+
+        assert!(TriBool::True.is_true());
+        assert!(!TriBool::False.is_true());
+        assert!(!TriBool::Null.is_true());
+    }
+
+    #[test]
+    fn test_row_predicate_missing_property_evaluates_to_null() {
+        let mut node = RowNodePattern::default();
+        node.binding = Some("n".to_string());
+        let mut row = BindingRow::from_node(&node, 1).unwrap();
+        let metadata = VertexMetadata {
+            labels: vec!["User".to_string()],
+            properties: BTreeMap::new(),
+        };
+        row.metadata.insert("n".to_string(), metadata);
+
+        let compare_pred = RowPredicate::Compare {
+            left: RowExpression::Property {
+                binding: "n".to_string(),
+                property: "age".to_string(),
+            },
+            op: RowComparisonOp::Eq,
+            right: RowExpression::Literal(VertexPropertyValue::Integer(30)),
+        };
+
+        // n.age = 30 -> Null -> not true
+        assert!(!row_predicate_matches(&row, &compare_pred).unwrap());
+
+        // NOT (n.age = 30) -> NOT Null = Null -> not true (fixes #186)
+        let not_pred = RowPredicate::Not(Box::new(compare_pred.clone()));
+        assert!(!row_predicate_matches(&row, &not_pred).unwrap());
+
+        // n.age <> 30 -> Null -> not true
+        let ne_pred = RowPredicate::Compare {
+            left: RowExpression::Property {
+                binding: "n".to_string(),
+                property: "age".to_string(),
+            },
+            op: RowComparisonOp::Ne,
+            right: RowExpression::Literal(VertexPropertyValue::Integer(30)),
+        };
+        assert!(!row_predicate_matches(&row, &ne_pred).unwrap());
+
+        // NOT (n.age <> 30) -> NOT Null = Null -> not true
+        let not_ne_pred = RowPredicate::Not(Box::new(ne_pred));
+        assert!(!row_predicate_matches(&row, &not_ne_pred).unwrap());
+
+        // StartsWith on missing property -> Null -> not true
+        let starts_with_pred = RowPredicate::StartsWith {
+            expression: RowExpression::Property {
+                binding: "n".to_string(),
+                property: "name".to_string(),
+            },
+            prefix: "A".to_string(),
+        };
+        assert!(!row_predicate_matches(&row, &starts_with_pred).unwrap());
+
+        // NOT (n.name STARTS WITH 'A') -> NOT Null = Null -> not true
+        let not_starts_with = RowPredicate::Not(Box::new(starts_with_pred));
+        assert!(!row_predicate_matches(&row, &not_starts_with).unwrap());
+
+        // StartsWith on present non-string property -> False
+        let non_string_starts_with = RowPredicate::StartsWith {
+            expression: RowExpression::Property {
+                binding: "n".to_string(),
+                property: "age".to_string(),
+            },
+            prefix: "A".to_string(),
+        };
+        let mut row_with_age = BindingRow::from_node(&node, 1).unwrap();
+        let mut props = BTreeMap::new();
+        props.insert("age".to_string(), VertexPropertyValue::Integer(30));
+        row_with_age.metadata.insert(
+            "n".to_string(),
+            VertexMetadata {
+                labels: vec!["User".to_string()],
+                properties: props,
+            },
+        );
+        // Present integer property does not start with string -> False -> excluded
+        assert!(!row_predicate_matches(&row_with_age, &non_string_starts_with).unwrap());
+        // NOT (present integer STARTS WITH 'A') -> NOT False = True -> included
+        let not_non_string_starts_with = RowPredicate::Not(Box::new(non_string_starts_with));
+        assert!(row_predicate_matches(&row_with_age, &not_non_string_starts_with).unwrap());
+
+        // Missing property in OR: (n.age = 30 OR n.id = 1) -> Null OR True = True
+        let id_pred = RowPredicate::Compare {
+            left: RowExpression::NodeId {
+                binding: "n".to_string(),
+            },
+            op: RowComparisonOp::Eq,
+            right: RowExpression::Literal(VertexPropertyValue::Integer(1)),
+        };
+        let or_pred = RowPredicate::Or(Box::new(compare_pred.clone()), Box::new(id_pred.clone()));
+        assert!(row_predicate_matches(&row, &or_pred).unwrap());
+
+        // Missing property in AND: (n.age = 30 AND n.id = 1) -> Null AND True = Null -> false
+        let and_pred = RowPredicate::And(Box::new(compare_pred), Box::new(id_pred));
+        assert!(!row_predicate_matches(&row, &and_pred).unwrap());
     }
 }
