@@ -447,9 +447,9 @@ paths, cache outcomes, consistency mode, scope, cell, storage sequence, and
 planner decisions. Build with `--features server-runtime,otlp` or
 `--features indexer-runtime,otlp` to export OpenTelemetry data.
 
-Prometheus duration histograms have deliberately different units. Read
-[docs/runbooks/duration-histograms.md](docs/runbooks/duration-histograms.md)
-before building latency dashboards or alerts.
+Prometheus duration histograms have deliberately different units. Read the
+metric HELP text (and Helm `serviceMonitor` notes) before building latency
+dashboards or alerts.
 
 ## Development
 
@@ -471,8 +471,9 @@ src/sparse_kernel/  Rust sparse and SuiteSparse GraphBLAS execution
 crates/             placement and telemetry workspace crates
 charts/hydradb/    Kubernetes Helm chart
 examples/           smoke, import, benchmark, and correctness programs
-scripts/            local, MinIO, stress, fencing, and deployment harnesses
-docs/               architecture notes, runbooks, benchmarks, and verification
+scripts/            local smoke, deploy, and profile helpers
+architecture.md     storage, snapshots, writers, indexing
+cypher-compat.md    OpenCypher subset accepted today
 ```
 
 ## Benchmarks
@@ -488,11 +489,11 @@ documented above.
 | Document | Contents |
 |---|---|
 | [Architecture](architecture.md) | End-to-end design, snapshots, writer ownership, query execution, and indexing |
+| [OpenCypher subset](cypher-compat.md) | What the engine accepts today, and what it rejects at parse time |
 | [Helm chart guide](charts/hydradb/README.md) | Kubernetes configuration, TLS, authentication, upgrades, and verification |
-| [Duration histograms](docs/runbooks/duration-histograms.md) | Correct latency units, PromQL, aggregation, and alerting |
-| [Correctness casebook](docs/bugs-found-fixed/README.md) | Reproduced storage and query invariants with regression evidence |
-| [Formal verification](docs/formal-methods/0003-hydradb-quint-verification-evidence.md) | Quint and model-based testing evidence |
-| [Jepsen report](docs/jepsen/jepsen-consistency-report.md) | Distributed consistency test results |
+| [Agent notes](AGENTS.md) | How to build, run, and not trip over `RUST_MIN_STACK` |
+| [Development](DEVELOPMENT.md) | Verification recipes and local harnesses |
+| [Published engine benches](https://hydra-db.github.io/benchmark/) | In-process MinIO numbers, with methodology |
 
 ## Contributing
 
