@@ -413,11 +413,27 @@ impl HttpApiError {
                 owner: owner.clone(),
                 authenticate: false,
             },
+            // Every CLASS_FRESHNESS variant (`GraphError::class_index`) is a
+            // wait, not a defect: the epoch the caller asked for has not landed
+            // here yet, or moved while they read. Same reasoning as
+            // `RoutingUnavailable` above, and the same 503 the Bolt mapping
+            // reaches for when answering `SnapshotAhead` with `Neo.TransientError`.
+            // A 4xx would tell every client and proxy never to retry.
+            GraphError::SnapshotAhead { .. }
+            | GraphError::SnapshotExpired { .. }
+            | GraphError::SnapshotChanged { .. }
+            | GraphError::QueryStatsSnapshotChanged { .. }
+            | GraphError::ControlWatermarkRegression { .. } => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "freshness",
+                message: error.to_string(),
+                owner: None,
+                authenticate: false,
+            },
             GraphError::InvalidKeyComponent { .. }
             | GraphError::GraphScopeMismatch { .. }
             | GraphError::MissingQueryParameter { .. }
             | GraphError::QueryParse { .. }
-            | GraphError::SnapshotAhead { .. }
             | GraphError::UnsupportedQuery { .. } => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "invalid_request",

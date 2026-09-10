@@ -356,3 +356,72 @@ async fn http_api_serves_authenticated_queries_over_https() {
     drop(client);
     server.stop().await.unwrap();
 }
+
+/// A freshness error is a wait, not a bad request: the epoch the caller asked
+/// for has not landed on this node yet, or moved while they were reading. The
+/// same request succeeds on retry, so it has to arrive as a 503 — a 4xx tells
+/// every client library and proxy in front of it never to try again. Bolt
+/// answers `SnapshotAhead` with `Neo.TransientError`; this provides the HTTP
+/// analogue for the freshness family, and the guard below keeps the arm from
+/// swallowing real client errors on its way past.
+#[test]
+fn a_stale_snapshot_is_a_503_and_not_a_bad_request() {
+    let freshness = [
+        GraphError::SnapshotAhead {
+            cell_id: "cell-a".to_string(),
+            read_epoch: 9,
+            current_epoch: 4,
+        },
+        GraphError::SnapshotExpired {
+            cell_id: "cell-a".to_string(),
+            edge_type: "KNOWS".to_string(),
+            read_epoch: 9,
+            min_epoch: 12,
+        },
+        GraphError::SnapshotChanged {
+            operation: "scan",
+            cell_id: "cell-a".to_string(),
+            edge_type: "KNOWS".to_string(),
+            read_epoch: 9,
+            current_epoch: 11,
+        },
+        GraphError::QueryStatsSnapshotChanged {
+            operation: "stats",
+            cell_id: "cell-a".to_string(),
+            read_epoch: 9,
+            current_epoch: 11,
+        },
+        GraphError::ControlWatermarkRegression {
+            cell_id: "cell-a".to_string(),
+            field: "applied_epoch",
+            requested_epoch: 9,
+            current_epoch: 4,
+        },
+    ];
+
+    for error in freshness {
+        let class = error.class();
+        let rendered = error.to_string();
+        let mapped = HttpApiError::from_graph(error);
+        assert_eq!(class, "freshness", "{rendered} must stay CLASS_FRESHNESS");
+        assert_eq!(
+            mapped.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{rendered} must be retryable, not terminal"
+        );
+        assert_eq!(mapped.code, "freshness");
+        assert_eq!(
+            mapped.message, rendered,
+            "the epochs are the whole diagnostic; they must reach the client"
+        );
+    }
+
+    // The arm sits above the bad-request group, so a genuine client error must
+    // still fall through to it.
+    let malformed = HttpApiError::from_graph(GraphError::QueryParse {
+        dialect: "OpenCypher",
+        reason: "unexpected token".to_string(),
+    });
+    assert_eq!(malformed.status, StatusCode::BAD_REQUEST);
+    assert_eq!(malformed.code, "invalid_request");
+}
