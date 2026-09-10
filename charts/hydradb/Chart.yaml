@@ -5,9 +5,9 @@ type: application
 version: 0.1.0
 appVersion: "0.1.0"
 kubeVersion: ">=1.27.0-0"
-home: https://github.com/usecortex/slatedb-graph-kernel
+home: https://github.com/hydra-db/hydradb
 sources:
-  - https://github.com/usecortex/slatedb-graph-kernel
+  - https://github.com/hydra-db/hydradb
 keywords:
   - graph
   - cypher
@@ -15,4 +15,4 @@ keywords:
   - object-storage
   - graphblas
 annotations:
-  artifacthub.io/license: Apache-2.0
+  artifacthub.io/license: AGPL-3.0
