@@ -15759,3 +15759,62 @@ async fn xlog_purge_forces_one_bootstrap_then_recovers() {
     let check = shard.build_graph_index(cell_id, edge_type).await.unwrap();
     assert_eq!(incremental.generation, check.generation);
 }
+
+/// The verifier compares three traversals against one oracle, so the oracle has
+/// to agree with the kernels about the start vertex. All three kernels drop it
+/// (`sparse_kernel/mod.rs:430`, `graphblas.rs:409`, `graphblas.rs:956`); the
+/// oracle unions raw frontiers and so keeps it whenever a cycle walks back. On
+/// any graph with a cycle through a checked root the verifier then reports a
+/// corruption that is not there. Acyclic graphs hide it, which is why every
+/// other verifier test passes.
+#[tokio::test]
+async fn the_verifier_is_clean_on_a_graph_whose_cycle_returns_to_its_root() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/verify-cyclic-root", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+    shard.write_edge(mutation(1, 2, "cycle-out")).await.unwrap();
+    shard
+        .write_edge(mutation(2, 1, "cycle-back"))
+        .await
+        .unwrap();
+
+    let report = shard
+        .verify_current_graph(cell_id, edge_type, 2, 8)
+        .await
+        .unwrap();
+    assert!(
+        report.is_clean(),
+        "a two-cycle is a healthy graph, not a corrupt one: {:?}",
+        report.mismatch_samples
+    );
+}
+
+#[tokio::test]
+async fn the_verifier_is_clean_on_a_graph_whose_cycle_returns_to_its_root_with_wal_overlay() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/verify-cyclic-root-overlay", object_store).await;
+    let cell_id = "reddit-home";
+    let edge_type = "USER_SUBSCRIBED_TO_SUBREDDIT";
+
+    // Write initial edge and compile generation 1 index
+    shard.write_edge(mutation(1, 2, "cycle-out")).await.unwrap();
+    shard.build_graph_index(cell_id, edge_type).await.unwrap();
+
+    // Write return edge into WAL overlay (compiled generation now predates read epoch)
+    shard
+        .write_edge(mutation(2, 1, "cycle-back"))
+        .await
+        .unwrap();
+
+    let report = shard
+        .verify_current_graph(cell_id, edge_type, 2, 8)
+        .await
+        .unwrap();
+    assert!(
+        report.is_clean(),
+        "a two-cycle with WAL overlay is a healthy graph, not a corrupt one: {:?}",
+        report.mismatch_samples
+    );
+}

@@ -77,15 +77,18 @@ impl GraphShard {
                 .await?
             else {
                 let traversal = if let [start] = starts {
-                    self.reachable_from_storage_frontier(
-                        cell_id,
-                        edge_type,
-                        *start,
-                        (1, hops),
-                        read_epoch,
-                        &QueryBudget::new(self.limits.max_query_runtime_ms, None),
-                    )
-                    .await?
+                    let mut t = self
+                        .reachable_from_storage_frontier(
+                            cell_id,
+                            edge_type,
+                            *start,
+                            (1, hops),
+                            read_epoch,
+                            &QueryBudget::new(self.limits.max_query_runtime_ms, None),
+                        )
+                        .await?;
+                    t.vertices.retain(|v| v != start);
+                    t
                 } else {
                     let adjacency = self
                         .canonical_adjacency_at(cell_id, edge_type, read_epoch)
@@ -106,9 +109,12 @@ impl GraphShard {
             let started = Instant::now();
             let empty_adjacency = BTreeMap::new();
             let traversal = if let Some(overlay) = overlay {
-                crate::shard::topology_tail::expand_range_with_overlay(
+                let mut t = crate::shard::topology_tail::expand_range_with_overlay(
                     &compiled, &overlay, starts, 1, hops,
-                )?
+                )?;
+                let start_set = starts.iter().copied().collect::<BTreeSet<_>>();
+                t.vertices.retain(|vertex| !start_set.contains(vertex));
+                t
             } else {
                 expand_compiled_graphblas(&compiled, &empty_adjacency, starts, hops)?
             };
