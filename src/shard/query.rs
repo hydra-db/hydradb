@@ -4930,7 +4930,7 @@ impl GraphShard {
             let mut seen = BTreeSet::new();
             for row in projected {
                 budget.check("cypher_distinct_rows")?;
-                if seen.insert(row.row.values.clone()) {
+                if seen.insert(SemanticQueryRowKey(row.row.values.clone())) {
                     deduped.push(row);
                 }
             }
@@ -8542,10 +8542,10 @@ fn aggregate_projected_rows(
         .filter_map(|(idx, projection)| is_aggregate_projection(projection).then_some(idx))
         .collect();
 
-    let mut groups = BTreeMap::<Vec<QueryValue>, Vec<AggregateAccumulator>>::new();
+    let mut groups = BTreeMap::<SemanticQueryRowKey, Vec<AggregateAccumulator>>::new();
     if bindings.is_empty() && group_projection_indexes.is_empty() {
         groups.insert(
-            Vec::new(),
+            SemanticQueryRowKey(Vec::new()),
             aggregate_projection_indexes
                 .iter()
                 .map(|idx| new_aggregate_accumulator(&projections[*idx]))
@@ -8559,7 +8559,7 @@ fn aggregate_projected_rows(
         for idx in &group_projection_indexes {
             group_key.push(project_single_binding_value(&binding, &projections[*idx])?);
         }
-        let states = match groups.entry(group_key) {
+        let states = match groups.entry(SemanticQueryRowKey(group_key)) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
                 aggregate_projection_indexes
@@ -8588,7 +8588,7 @@ fn aggregate_projected_rows(
                 values.push(finalize_aggregate(&states[aggregate_idx])?);
                 aggregate_idx += 1;
             } else {
-                values.push(group_key[group_idx].clone());
+                values.push(group_key.0[group_idx].clone());
                 group_idx += 1;
             }
         }
@@ -8920,6 +8920,45 @@ fn compare_query_values(left: &QueryValue, right: &QueryValue) -> std::cmp::Orde
     }
 }
 
+/// A query result row key ordered by OpenCypher value semantics.
+///
+/// Rust's derived ordering keeps numeric storage variants distinct, while
+/// OpenCypher compares equal numeric values as one value. This key is used only
+/// for transient query grouping and deduplication; storage ordering is unchanged.
+#[cfg(feature = "opencypher")]
+#[derive(Clone, Debug)]
+struct SemanticQueryRowKey(Vec<QueryValue>);
+
+#[cfg(feature = "opencypher")]
+impl PartialEq for SemanticQueryRowKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+#[cfg(feature = "opencypher")]
+impl Eq for SemanticQueryRowKey {}
+
+#[cfg(feature = "opencypher")]
+impl PartialOrd for SemanticQueryRowKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[cfg(feature = "opencypher")]
+impl Ord for SemanticQueryRowKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for (left, right) in self.0.iter().zip(&other.0) {
+            let ordering = compare_query_values(left, right);
+            if ordering != std::cmp::Ordering::Equal {
+                return ordering;
+            }
+        }
+        self.0.len().cmp(&other.0.len())
+    }
+}
+
 #[cfg(feature = "opencypher")]
 fn compare_vertex_property_order(
     left: &VertexPropertyValue,
@@ -9098,5 +9137,57 @@ fn compare_u64_f64(left: u64, right: f64) -> std::cmp::Ordering {
         std::cmp::Ordering::Equal if floor == right => std::cmp::Ordering::Equal,
         std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
         ordering => ordering,
+    }
+}
+
+#[cfg(all(test, feature = "opencypher"))]
+mod numeric_grouping_regression_tests {
+    use super::*;
+
+    #[test]
+    fn equal_integer_and_float_properties_share_aggregate_group() {
+        let integer = VertexPropertyValue::Integer(1);
+        let float = VertexPropertyValue::Float(QueryFloat(1.0));
+        assert_eq!(
+            numeric_property_order(&integer, &float),
+            Some(std::cmp::Ordering::Equal),
+            "the query evaluator considers these values numerically equal"
+        );
+
+        // Model two distinct nodes for RETURN n.x, count(*).
+        let bindings = [integer, float]
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let mut row = BindingRow::default();
+                row.values.insert("n".into(), index as u64 + 1);
+                let mut metadata = VertexMetadata::default();
+                metadata.properties.insert("x".into(), value);
+                row.metadata.insert("n".into(), metadata);
+                row
+            })
+            .collect();
+
+        let groups = aggregate_projected_rows(
+            bindings,
+            &[
+                RowProjection::Property {
+                    binding: "n".into(),
+                    property: "x".into(),
+                },
+                RowProjection::CountAll,
+            ],
+            &[QueryColumn::new("x"), QueryColumn::new("count")],
+            &[],
+            &QueryBudget::new(None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            groups.len(),
+            1,
+            "equal integer and float properties must form one aggregate group"
+        );
+        assert_eq!(groups[0].row.values[1], QueryValue::Count(2));
     }
 }
