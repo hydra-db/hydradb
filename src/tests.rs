@@ -10368,6 +10368,51 @@ async fn cypher_rows_distinct_deduplicates_before_windowing() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_distinct_deduplicates_equal_integer_and_float_properties() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-distinct-numeric-equivalence", object_store).await;
+
+    shard
+        .set_vertex_metadata_batch(
+            "reddit-home",
+            [
+                (
+                    1,
+                    VertexMetadata::default()
+                        .with_label("Item")
+                        .with_property("x", VertexPropertyValue::Integer(1)),
+                ),
+                (
+                    2,
+                    VertexMetadata::default()
+                        .with_label("Item")
+                        .with_property("x", VertexPropertyValue::Float(QueryFloat(1.0))),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let distinct = shard
+        .execute_cypher_rows(
+            QueryContext::new("reddit-home", "cypher-distinct-numeric-equivalence-read"),
+            "MATCH (n:Item) RETURN DISTINCT n.x AS x ORDER BY x",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(distinct.columns, vec![QueryColumn::new("x")]);
+    assert_eq!(
+        distinct.rows,
+        vec![QueryRow::new(vec![QueryValue::Property(
+            VertexPropertyValue::Integer(1),
+        )])]
+    );
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_rows_page_returns_bounded_cursor_pages() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-row-pages", object_store).await;
