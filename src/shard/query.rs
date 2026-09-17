@@ -7864,8 +7864,8 @@ enum RowScalarValue {
 enum AggregateAccumulator {
     CountAll(u64),
     CountExpression(u64),
-    Sum(u128),
-    Avg { sum: u128, count: u64 },
+    Sum(i128),
+    Avg { sum: i128, count: u64 },
     Collect(Vec<QueryValue>),
 }
 
@@ -8647,7 +8647,7 @@ fn apply_aggregate_projection(
             },
         ) => {
             if let Some(value) = aggregate_integer_value(row, expression, "sum")? {
-                *sum = sum.checked_add(u128::from(value)).ok_or_else(|| {
+                *sum = sum.checked_add(value).ok_or_else(|| {
                     GraphError::UnsupportedQuery {
                         dialect: "OpenCypher",
                         feature: "sum aggregate overflowed".to_string(),
@@ -8663,7 +8663,7 @@ fn apply_aggregate_projection(
             },
         ) => {
             if let Some(value) = aggregate_integer_value(row, expression, "avg")? {
-                *sum = sum.checked_add(u128::from(value)).ok_or_else(|| {
+                *sum = sum.checked_add(value).ok_or_else(|| {
                     GraphError::UnsupportedQuery {
                         dialect: "OpenCypher",
                         feature: "avg aggregate overflowed".to_string(),
@@ -8698,10 +8698,13 @@ fn aggregate_integer_value(
     row: &BindingRow,
     expression: &RowExpression,
     function: &str,
-) -> Result<Option<u64>> {
+) -> Result<Option<i128>> {
     match eval_row_expression(row, expression)? {
         RowScalarValue::Missing => Ok(None),
-        RowScalarValue::Value(VertexPropertyValue::Integer(value)) => Ok(Some(value)),
+        RowScalarValue::Value(VertexPropertyValue::Integer(value)) => Ok(Some(i128::from(value))),
+        RowScalarValue::Value(VertexPropertyValue::SignedInteger(value)) => {
+            Ok(Some(i128::from(value)))
+        }
         RowScalarValue::Value(_) => Err(GraphError::UnsupportedQuery {
             dialect: "OpenCypher",
             feature: format!("{function} aggregate requires integer values"),
@@ -8716,12 +8719,22 @@ fn finalize_aggregate(state: &AggregateAccumulator) -> Result<QueryValue> {
             QueryValue::Count(*count)
         }
         AggregateAccumulator::Sum(sum) => {
-            QueryValue::Property(VertexPropertyValue::Integer((*sum).try_into().map_err(
-                |_| GraphError::UnsupportedQuery {
-                    dialect: "OpenCypher",
-                    feature: "sum aggregate exceeds u64 result range".to_string(),
-                },
-            )?))
+            let property_value = if *sum >= 0 {
+                VertexPropertyValue::Integer((*sum).try_into().map_err(
+                    |_| GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: "sum aggregate exceeds u64 result range".to_string(),
+                    },
+                )?)
+            } else {
+                VertexPropertyValue::SignedInteger((*sum).try_into().map_err(
+                    |_| GraphError::UnsupportedQuery {
+                        dialect: "OpenCypher",
+                        feature: "sum aggregate exceeds i64 result range".to_string(),
+                    },
+                )?)
+            };
+            QueryValue::Property(property_value)
         }
         AggregateAccumulator::Avg { sum: _, count: 0 } => QueryValue::Null,
         AggregateAccumulator::Avg { sum, count } => {

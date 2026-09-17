@@ -11153,6 +11153,85 @@ async fn cypher_row_engine_executes_grouped_aggregates() {
 
 #[cfg(feature = "opencypher")]
 #[tokio::test]
+async fn cypher_row_aggregates_signed_integers() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/cypher-row-aggregates-signed", object_store).await;
+
+    for (idx, (edge_type, src, dst)) in [
+        ("SCORED", 1, 10),
+        ("SCORED", 1, 11),
+        ("SCORED", 2, 20),
+        ("SCORED", 2, 21),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        shard
+            .write_edge(EdgeMutation {
+                cell_id: "scores-cell".to_string(),
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                idempotency_key: format!("cypher-signed-edge-{idx}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    for (node, score) in [
+        (10, VertexPropertyValue::SignedInteger(-2)),
+        (11, VertexPropertyValue::Integer(5)),
+        (20, VertexPropertyValue::SignedInteger(-5)),
+        (21, VertexPropertyValue::Integer(2)),
+    ] {
+        shard
+            .set_vertex_metadata(
+                "scores-cell",
+                node,
+                VertexMetadata::default()
+                    .with_label("Score")
+                    .with_property("score", score),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = shard
+        .execute_cypher_rows(
+            QueryContext::new("scores-cell", "cypher-signed-read"),
+            "MATCH (u)-[:SCORED]->(s:Score) \
+             RETURN u.id AS user, sum(s.score) AS total, avg(s.score) AS average \
+             ORDER BY user",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        QueryResultSet::new(
+            vec![
+                QueryColumn::new("user"),
+                QueryColumn::new("total"),
+                QueryColumn::new("average"),
+            ],
+            vec![
+                QueryRow::new(vec![
+                    QueryValue::VertexId(1),
+                    QueryValue::Property(VertexPropertyValue::Integer(3)),
+                    QueryValue::Float(QueryFloat(1.5)),
+                ]),
+                QueryRow::new(vec![
+                    QueryValue::VertexId(2),
+                    QueryValue::Property(VertexPropertyValue::SignedInteger(-3)),
+                    QueryValue::Float(QueryFloat(-1.5)),
+                ]),
+            ],
+        )
+    );
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
 async fn cypher_executes_set_remove_delete_and_merge_mutations() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let shard = open_test_shard("graph/cypher-mutations", object_store).await;
